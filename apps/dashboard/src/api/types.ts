@@ -1474,14 +1474,22 @@ export type InterviewMetricStatus = "measured" | "unmeasured";
 export type InterviewMetricUnit =
   | "ratio"
   | "answers_per_update"
-  | "operations_per_inquiry";
+  | "operations_per_inquiry"
+  // Issue #338: how much work one conversation cost is not a ratio, and
+  // expressing it as one would hide the thing being measured.
+  | "per_session";
 // Issue #334: joint_understanding は共同理解の質を測る別カテゴリ。効率化指標
 // (確認件数・承認速度)と同じ数値へまとめない。
 export type InterviewMetricCategory =
   | "user_burden"
   | "accuracy"
   | "ux_quality"
-  | "joint_understanding";
+  | "joint_understanding"
+  // Issue #338: `joint_understanding` counts UTILIZATION and close labels.
+  // These two answer different questions and must not be averaged with it or
+  // with each other — an efficiency gain must never read as a quality gain.
+  | "joint_understanding_quality"
+  | "joint_understanding_burden";
 export type InterviewMetricKey =
   | "answers_per_understanding_update"
   | "unknown_answer_rate"
@@ -1507,7 +1515,20 @@ export type InterviewMetricKey =
   | "joint_understanding_unknown_finding_rate"
   | "joint_understanding_reflux_rate"
   | "joint_understanding_investigation_answered_rate"
-  | "joint_understanding_developer_question_rate";
+  | "joint_understanding_developer_question_rate"
+  // Issue #338: outcome-lineage quality, derived from the finite lineage
+  // events rather than from a close label.
+  | "joint_understanding_unknown_resolution_rate"
+  | "joint_understanding_hypothesis_reversal_rate"
+  | "joint_understanding_hypothesis_correction_rate"
+  | "joint_understanding_adoption_reconfirmation_rate"
+  | "joint_understanding_decision_undo_rate"
+  | "joint_understanding_classification_correction_rate"
+  // Issue #338: developer burden, per session.
+  | "joint_understanding_rounds_per_session"
+  | "joint_understanding_developer_actions_per_session"
+  | "joint_understanding_developer_findings_per_session"
+  | "joint_understanding_question_reask_rate";
 
 // Issue #341: `guardrail` only designates which metrics are worth watching.
 // Whether a metric is *currently* in a bad state is a separate evaluated

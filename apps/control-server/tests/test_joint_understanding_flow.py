@@ -387,6 +387,8 @@ def test_an_investigation_failure_keeps_the_answer_and_the_session(
 
 
 def test_the_unknown_flow_refuses_an_already_answered_question(admin_client, monkeypatch):
+    """A real answer must not be silently replaced by 「わからない」 -- correcting
+    it is the answer endpoint's job, which supersedes rather than overwrites."""
     token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
     qa = _create_qa(admin_client, headers, session_id)
     admin_client.post(
@@ -401,6 +403,53 @@ def test_the_unknown_flow_refuses_an_already_answered_question(admin_client, mon
     )
     assert r.status_code == 409, r.text
     assert r.json()["detail"]["code"] == "qa_already_answered"
+
+
+def test_saying_unknown_again_retries_the_same_conversation(admin_client, monkeypatch):
+    """A developer whose first attempt failed must not be stranded.
+
+    Repeating 「わからない」 keeps the recorded answer as it is and gives them
+    another attempt at the routing and the investigation -- continuing the SAME
+    session, because a retry has to carry the earlier rounds' leads (#330) and
+    two open sessions on one question would each hold half the history.
+    """
+    token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
+    qa = _create_qa(admin_client, headers, session_id)
+
+    # First attempt: the router is unavailable, so nothing is investigated.
+    _stub_router(monkeypatch, None, error="reasoning model call failed")
+    first = admin_client.post(
+        f"/interview/sessions/{session_id}/qa/{qa['id']}/unknown",
+        json={"answer_text": "分からない", "actor": "root"}, headers=headers,
+    )
+    assert first.json()["next_step"] == "routing_unavailable"
+    assert first.json()["joint_understanding_id"] is None
+
+    # Second attempt: it works, and the recorded answer is untouched.
+    _stub_router(monkeypatch, "system_researchable")
+    _stub_investigation(monkeypatch, findings=1)
+    second = admin_client.post(
+        f"/interview/sessions/{session_id}/qa/{qa['id']}/unknown",
+        json={"answer_text": "上書きしない", "actor": "root"}, headers=headers,
+    )
+    assert second.status_code == 200, second.text
+    ju_id = second.json()["joint_understanding_id"]
+    assert ju_id is not None
+    row = _qa_row(qa["id"])
+    assert row["answer_text"] == "分からない"
+    assert row["status"] == "unconfirmed"
+
+    # A third attempt continues that same conversation rather than opening a
+    # second one.
+    third = admin_client.post(
+        f"/interview/sessions/{session_id}/qa/{qa['id']}/unknown",
+        json={"answer_text": "", "actor": "root"}, headers=headers,
+    )
+    assert third.json()["joint_understanding_id"] == ju_id
+    listed = admin_client.get(
+        f"/interview/sessions/{session_id}/joint-understanding", headers=headers,
+    ).json()["items"]
+    assert [item["id"] for item in listed] == [ju_id]
 
 
 # --- The shared evidence feed ---------------------------------------------------

@@ -5373,6 +5373,52 @@ consumer は `understanding_build` / `alignment_build` / `inquiry_answer` の 3 
   記録してスキップし、round を失敗させず、**無制限の fallback 探索へ
   置き換えない**。
 
+#### Phase 4: 結果 lineage と品質評価(Issue #338)
+
+- **既存の 8 指標は「利用率と自己申告状態」しか測っていなかった。** 開始率、
+  close outcome、Finding 種別、reflux 件数 — いずれも「使われた」「どのラベルで
+  終わった」を答える。Epic #328 が問う「理解は改善したか」には答えられない。
+  outcome ラベルは会話についての主張であって、その後どうなったかの観測ではない:
+  `understood` で閉じたセッションと、2 ラウンド後に仮説が覆ったセッションが、
+  どちらも「結論に至った」1 件として数えられていた。
+- **`app/joint_lineage.py` は有限イベント列を永続事実から導出する。** 遷移時に
+  書かず導出するのは、このコードベースが他所でも採る規律と同じ理由(#337 の
+  adoption state、#349 の未解消失敗): 保存した lifecycle 値は記述対象の行から
+  乖離しうるが、導出値は乖離しない。同じ行が常に同じイベントを生むので、
+  指標が再現可能になる。
+- **不明の発生と解消は 1 つの lineage。** `unknown` Finding が後続 Finding に
+  supersede されたら `unknown_resolved`、セッションが閉じても残っていたら
+  `unknown_remained`。無関係な 2 つのカウントでは「いくつの不明が解消したか」に
+  答えられない。**終端に達していない subject は分母から除外する** —
+  未決着の仮説を成功にも失敗にも数えるのは、起きていない結果を報告することで
+  あり、close ラベルを品質の代理にするのと同じ誤りである。
+- **仮説の「反転」と「訂正」を分ける。** 事実で置き換えられた(reversed)のと
+  別の仮説へ改められた(corrected)のは、収束しているか迷走しているかの違いで
+  ある。まとめると、その区別が消える。
+- **判断の undo は観測可能な形に落とす。** closed は terminal なので reopen は
+  観測できない。「決めた後、同じ項目でもう一度対話を開いた」が観測可能な undo で
+  あり、これが #311 の開始条件が待っている 2 つの観測クラスのうちの 1 つ。
+- **分類の誤りも数える。** router が「コードで答えられる」と判定した質問
+  (`system_researchable`)が引き継ぎ・中断で終わったら誤分類。これが 2 つ目の
+  観測クラス。「routing がずれている気がする」ではなく数えられる形にする。
+- **カテゴリを 3 つに分ける。** `joint_understanding`(利用状況・効率)、
+  `joint_understanding_quality`(結果 lineage)、`joint_understanding_burden`
+  (1 セッションあたりの負担)。合成スコアはどこにも作らない —
+  **効率の改善を質の改善として表示しない**ため。guardrail は既存の直交フラグの
+  ままで、カテゴリにはしない。
+- **`per_session` 単位を追加し、表示側の fallthrough を潰した。** 旧
+  `formatMetricValue` は ratio 以外をすべて 「操作/疑問」 と表示していたので、
+  新しい単位は別の単位名で描画されていた — #366 が取り除こうとしている
+  「1 つの表示語が 2 つの事実を運ぶ」欠陥そのもの。
+- **`GET /interview/joint-understanding/lineage` は観測のみ。**
+  `bulk_approval_readiness` は #311 の開始条件を**カウントと明示的に未設定の
+  threshold** で返す。go/no-go は返さない — #311 を gate すべき数値は実データから
+  決めるべきもので、ここで判定を返せばそれ自体が Issue #338 が禁じる自己申告
+  readiness スコアになる(#341 が threshold を未設定にしたのと同じ規律)。
+  なお path は `/joint-understanding/lineage` ではない: `GET
+  /joint-understanding/{ju_id}` が先に登録された int path param を持つため、
+  その綴りでは "lineage" を id として解釈しようとして 422 になる。
+
 ## システムインタビューの状態駆動ワークフロー UX(Issue #342)
 
 Issue #342(サブイシュー #343-#346)は、システムインタビュー画面を

@@ -57,6 +57,25 @@ Persist:
 Do not require or expose hidden chain-of-thought. Store concise reasons,
 evidence references, risks, and recommendations from the structured response.
 
+## Time Budgets (Issue #339)
+
+`LLMClient.generate_text(..., timeout=...)` overrides the provider's configured
+socket timeout for one call. Any loop with an overall time budget MUST pass a
+per-call deadline derived from the remaining budget:
+
+- checking the clock between iterations bounds the loop's own bookkeeping, not
+  the round trip that actually spends the time, so one hung call can overrun the
+  whole budget while every between-iteration check passes;
+- when the remaining budget is below the floor for making a call at all, stop
+  instead of starting a call you would have to abandon.
+
+A budget stop is a **research limitation** — a real result. Distinguish it from
+an **execution failure**, which is the absence of a result: a limitation may
+carry an `unknown` finding, a failure must produce no finding at all, only the
+audit row and the recovery action. See
+`app/investigation_loop.RESEARCH_LIMITATIONS` /
+`EXECUTION_FAILURE_CLASSES` for the finite sets.
+
 ## Safety Precedence
 
 - deterministic repository boundaries and safety denylists override LLM output

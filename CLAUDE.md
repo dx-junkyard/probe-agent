@@ -505,6 +505,56 @@ creating incomplete persistence or execution paths for later phases.
       and skipped — never escalated to a round failure, never replaced by an
       unbounded fallback search.
 
+    **#338 (implemented).** The metrics that can answer whether understanding
+    improved, as opposed to whether the feature was used:
+    - The pre-existing 8 `joint_understanding` metrics count UTILIZATION and
+      close labels. An outcome label is a claim about the conversation, not an
+      observation of what happened afterwards — a session that closed
+      `understood` and one whose hypothesis was reversed two rounds later both
+      counted as a conclusion.
+    - `app/joint_lineage.py` DERIVES the finite event stream from persisted
+      facts rather than writing it at transition time, for the reason applied in
+      #337 and #349: a stored lifecycle value can drift from the rows it
+      describes, a derived one cannot — and the same rows always produce the
+      same events, which is what makes the metrics reproducible.
+    - **An unknown's creation and its resolution are ONE lineage**
+      (`supersedes_subject_id`); two unrelated counts cannot answer "how many
+      gaps got closed". **Subjects with no terminal verdict are excluded from
+      every denominator** — counting an open hypothesis as a success or a
+      failure reports an outcome that has not happened, which is the same
+      mistake as reading a close label as a quality result.
+    - `hypothesis_reversed` (replaced by a fact) and `hypothesis_corrected`
+      (replaced by another hypothesis) stay separate: the difference is whether
+      the system is converging or churning.
+    - A decision `undone` is observable as **a new session on the same origin
+      after one closed `decided`** — a closed session is terminal, so there is
+      no reopen to watch. A `classification_corrected` is a
+      `system_researchable` question the developer had to hand off. These are
+      the two observation classes #311's start condition waits on, and they are
+      now countable rather than inferred from a feeling.
+    - **Three categories, no composite**: `joint_understanding`
+      (utilization/efficiency), `joint_understanding_quality` (outcome
+      lineage), `joint_understanding_burden` (per-session cost). An efficiency
+      gain must never be displayed as a quality gain. `guardrail` stays the
+      existing orthogonal per-metric flag, not a category.
+    - The `per_session` unit exists because "how much work one conversation
+      cost" is not a ratio. `UNIT_SUFFIX` matches every unit exhaustively; the
+      old fallthrough rendered any non-ratio as 「操作/疑問」, i.e. under another
+      unit's name.
+    - `GET /interview/joint-understanding/lineage` is **observation only**.
+      `bulk_approval_readiness` returns counts with an explicitly
+      `threshold_unset` verdict — never a go/no-go for #311, because the number
+      that should gate it has to come from real data and returning a verdict
+      here would be the self-reported readiness score #338 forbids (the same
+      discipline #341 applies to its thresholds). The path is NOT
+      `/joint-understanding/lineage`: `GET /joint-understanding/{ju_id}` is
+      registered earlier with an int path param and would 422 on "lineage".
+    - Every new metric is `watch: false` in
+      `app/policies/interview_metric_attention.yaml` for now, deliberately:
+      what counts as too many reversed hypotheses has to be decided from real
+      observations, and a number invented here would be the same self-reported
+      judgement.
+
 16. Issue #342 — システムインタビューを状態駆動型の開発者ワークフローへ
     再設計する (sub-issues #343-#346). This is a **UX specification** issue:
     every sub-issue lists Dashboard component changes, API/DB/state-management

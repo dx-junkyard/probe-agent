@@ -70,6 +70,7 @@ from ..joint_premise import (
     system_producer,
     validate_provenance,
 )
+from ..joint_lineage import bulk_approval_readiness, derive_lineage
 from ..joint_understanding import (
     ORIGIN_KINDS,
     SCHEMA_VERSION,
@@ -107,8 +108,12 @@ from ..models import (
     JointUnderstandingHoldRequest,
     InterviewQaUnknownOut,
     InterviewQaUnknownRequest,
+    JointUnderstandingBulkApprovalCriterionOut,
     JointUnderstandingInvestigateOut,
     JointUnderstandingInvestigateRequest,
+    JointUnderstandingLineageEventOut,
+    JointUnderstandingLineageOut,
+    JointUnderstandingSessionBurdenOut,
     JointUnderstandingListOut,
     JointUnderstandingOptionOut,
     JointUnderstandingOut,
@@ -1493,7 +1498,13 @@ def answer_qa_unknown(
                 status_code=409,
                 detail="This question has already been superseded by a newer revision",
             )
-        if qa["status"] not in ("open", "skipped"):
+        already_unknown = (
+            qa["status"] == "unconfirmed" and bool(qa["answer_unknown"])
+        )
+        if qa["status"] not in ("open", "skipped") and not already_unknown:
+            # A real answer exists. Correcting it is the answer endpoint's job
+            # (it supersedes rather than overwrites); silently replacing it with
+            # 「わからない」 here would discard an answer the developer gave.
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -1504,17 +1515,23 @@ def answer_qa_unknown(
                     ),
                 },
             )
-        conn.execute("BEGIN")
-        try:
-            _write_first_qa_answer(
-                conn, qa_id=qa_id, answer_text=payload.answer_text,
-                answer_unknown=True, status="unconfirmed",
-                actor=principal.username or payload.actor, now=started_at,
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        if not already_unknown:
+            conn.execute("BEGIN")
+            try:
+                _write_first_qa_answer(
+                    conn, qa_id=qa_id, answer_text=payload.answer_text,
+                    answer_unknown=True, status="unconfirmed",
+                    actor=principal.username or payload.actor, now=started_at,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        # Saying 「わからない」 again on an already-unknown question is a RETRY,
+        # not a dead end: the recorded answer stands as it is, and the developer
+        # gets another attempt at the routing and the investigation that may
+        # have failed the first time. Rejecting it would strand exactly the
+        # developer whose first attempt did not work.
         qa = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
         question_text = qa["question_text"]
         router_context = _qa_router_context(qa)
@@ -1571,32 +1588,56 @@ def answer_qa_unknown(
                 next_step="developer_answer_required",
             )
 
-        premise = capture_premise_bundle(
-            conn,
-            origin_kind="qa", origin_id=qa_id,
-            session_row=interview_session, system_id=system_id, now=routed_at,
-        )
-        cur = conn.execute(
-            """INSERT INTO joint_understanding_session
-                (session_id, system_id, origin_kind, origin_id, trigger,
-                 question_text, status, premise_snapshot_id, premise_commit_sha,
-                 premise_revision_id, premise_content_hash,
-                 premise_capability_digest, premise_intent_digest,
-                 premise_review_subject_id, premise_tracking_version,
-                 premise_captured_at, schema_version, created_at, updated_at)
-            VALUES (?, ?, 'qa', ?, 'unknown_answer', ?, 'open', ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?)""",
-            (
-                session_id, system_id, qa_id, question_text,
-                premise["premise_snapshot_id"], premise["premise_commit_sha"],
-                premise["premise_revision_id"], premise["premise_content_hash"],
-                premise["premise_capability_digest"], premise["premise_intent_digest"],
-                premise["premise_review_subject_id"],
-                premise["premise_tracking_version"], premise["premise_captured_at"],
-                SCHEMA_VERSION, routed_at, routed_at,
-            ),
-        )
-        ju_id = cur.lastrowid
+        # Reuse an unfinished conversation on this question rather than opening
+        # a second one. A retry has to continue the session that already carries
+        # the earlier rounds' leads (#330's continuity), and two open sessions on
+        # one question would each be investigating half the history.
+        existing = conn.execute(
+            """SELECT id FROM joint_understanding_session
+               WHERE session_id = ? AND system_id = ? AND origin_kind = 'qa'
+                 AND origin_id = ? AND status != 'closed'
+               ORDER BY id DESC LIMIT 1""",
+            (session_id, system_id, qa_id),
+        ).fetchone()
+        if existing is not None:
+            ju_id = existing["id"]
+            conn.execute(
+                "UPDATE joint_understanding_session SET status = 'open', "
+                "updated_at = ? WHERE id = ?",
+                (routed_at, ju_id),
+            )
+            premise = None
+        else:
+            premise = capture_premise_bundle(
+                conn,
+                origin_kind="qa", origin_id=qa_id,
+                session_row=interview_session, system_id=system_id, now=routed_at,
+            )
+        if premise is not None:
+            cur = conn.execute(
+                """INSERT INTO joint_understanding_session
+                    (session_id, system_id, origin_kind, origin_id, trigger,
+                     question_text, status, premise_snapshot_id,
+                     premise_commit_sha, premise_revision_id,
+                     premise_content_hash, premise_capability_digest,
+                     premise_intent_digest, premise_review_subject_id,
+                     premise_tracking_version, premise_captured_at,
+                     schema_version, created_at, updated_at)
+                VALUES (?, ?, 'qa', ?, 'unknown_answer', ?, 'open', ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id, system_id, qa_id, question_text,
+                    premise["premise_snapshot_id"], premise["premise_commit_sha"],
+                    premise["premise_revision_id"], premise["premise_content_hash"],
+                    premise["premise_capability_digest"],
+                    premise["premise_intent_digest"],
+                    premise["premise_review_subject_id"],
+                    premise["premise_tracking_version"],
+                    premise["premise_captured_at"],
+                    SCHEMA_VERSION, routed_at, routed_at,
+                ),
+            )
+            ju_id = cur.lastrowid
 
     if not payload.investigate:
         return _out(
@@ -1939,6 +1980,95 @@ def reflux_joint_understanding(
             skipped_not_fact=skipped_not_fact,
             skipped_unverified=skipped_unverified,
         )
+
+
+# --- Outcome lineage (Issue #338) ----------------------------------------------
+
+
+# NOT "/joint-understanding/lineage": `GET /joint-understanding/{ju_id}` is
+# registered earlier and takes an int path param, so that spelling would try to
+# parse "lineage" as an id and 422 before reaching here.
+@router.get(
+    "/interview/joint-understanding/lineage",
+    response_model=JointUnderstandingLineageOut,
+)
+def get_joint_understanding_lineage(
+    session_id: Optional[int] = Query(default=None),
+    system_id: int = Depends(get_system_id),
+) -> JointUnderstandingLineageOut:
+    """The finite outcome-lineage events for this System, plus per-session burden.
+
+    Issue #338's observation surface. The existing metrics count utilization and
+    close labels, which cannot answer "did understanding improve" -- an outcome
+    label is a claim about the conversation, not an observation of what happened
+    afterwards. These events are what happened: which gaps closed, which
+    hypotheses were reversed rather than corrected, which questions had to be
+    asked twice, which decisions did not hold.
+
+    Everything here is DERIVED from persisted rows (``app/joint_lineage.py``),
+    never written at transition time, so the same database always produces the
+    same events -- and a stored lifecycle value cannot drift out of sync with
+    the facts it describes.
+
+    ``bulk_approval_readiness`` reports the two observation classes Issue #311's
+    start condition waits on, as COUNTS with an explicitly unset threshold. It
+    is deliberately not a go/no-go: the number that should gate #311 has to be
+    decided from real data, and returning a verdict here would be exactly the
+    self-reported readiness score Issue #338 forbids.
+
+    probe-agent:
+      role: API boundary exposing the derived outcome lineage and per-session
+        burden without scoring or combining them
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify the same rows always produce the same events, that no composite score is returned, that #311 readiness reports counts with an unset threshold rather than a verdict, and that another System's sessions never appear.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        if session_id is not None:
+            _get_interview_session_or_404(conn, session_id, system_id)
+        summary = derive_lineage(conn, system_id=system_id, session_id=session_id)
+    return JointUnderstandingLineageOut(
+        system_id=system_id,
+        generated_at=now,
+        events=[
+            JointUnderstandingLineageEventOut(
+                event_kind=event.event_kind,
+                subject_kind=event.subject_kind,
+                subject_id=event.subject_id,
+                session_id=event.session_id,
+                joint_understanding_id=event.joint_understanding_id,
+                at=event.at,
+                supersedes_subject_id=event.supersedes_subject_id,
+                detail=event.detail,
+            )
+            for event in summary.events
+        ],
+        burdens=[
+            JointUnderstandingSessionBurdenOut(
+                joint_understanding_id=burden.joint_understanding_id,
+                session_id=burden.session_id,
+                rounds=burden.rounds,
+                developer_actions=burden.developer_actions,
+                developer_findings=burden.developer_findings,
+                questions_asked=burden.questions_asked,
+                reasks=burden.reasks,
+            )
+            for burden in summary.burdens
+        ],
+        bulk_approval_readiness=[
+            JointUnderstandingBulkApprovalCriterionOut(
+                key=criterion.key,
+                observed=criterion.observed,
+                verdict=criterion.verdict,
+                note=criterion.note,
+            )
+            for criterion in bulk_approval_readiness(summary)
+        ],
+    )
 
 
 # --- Status transitions --------------------------------------------------------

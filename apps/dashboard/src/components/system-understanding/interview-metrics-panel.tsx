@@ -19,6 +19,7 @@ import type {
   InterviewMetricKey,
   InterviewMetricOut,
   InterviewMetricsOut,
+  InterviewMetricUnit,
 } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -52,19 +53,37 @@ const METRIC_LABELS: Record<InterviewMetricKey, string> = {
   joint_understanding_reflux_rate: "回答へ転記せず理解へ反映された事実の割合",
   joint_understanding_investigation_answered_rate: "調査だけで答えに到達した割合",
   joint_understanding_developer_question_rate: "判断質問まで到達した通訳の割合",
+  // Issue #338: 結果 lineage から導いた質の指標。close 時のラベルではなく、
+  // 「その後どうなったか」を数える。
+  joint_understanding_unknown_resolution_rate: "記録した不明点が解消された割合",
+  joint_understanding_hypothesis_reversal_rate: "仮説が事実によって覆された割合",
+  joint_understanding_hypothesis_correction_rate: "仮説が別の仮説へ訂正された割合",
+  joint_understanding_adoption_reconfirmation_rate: "暫定採用の再確認が必要になった割合",
+  joint_understanding_decision_undo_rate: "判断がやり直された割合",
+  joint_understanding_classification_correction_rate: "質問の分類が誤っていた割合",
+  // Issue #338: 開発者の負担。質の指標とは別カテゴリで、合成しない。
+  joint_understanding_rounds_per_session: "1 セッションあたりの調査ラウンド数",
+  joint_understanding_developer_actions_per_session: "1 セッションあたりの操作数",
+  joint_understanding_developer_findings_per_session: "1 セッションあたりの自分の記述数",
+  joint_understanding_question_reask_rate: "同じ対話で再質問まで至った割合",
 };
 
 const CATEGORY_LABELS: Record<InterviewMetricCategory, string> = {
   user_burden: "ユーザー負担",
   accuracy: "精度",
   ux_quality: "UX品質",
-  joint_understanding: "共同理解の質",
+  joint_understanding: "共同理解の利用状況",
+  joint_understanding_quality: "共同理解の質(結果 lineage)",
+  joint_understanding_burden: "共同理解の負担",
 };
 
 // 共同理解の質は最後の独立したセクションとして並べる — 効率化指標と同じ
 // グループに混ぜない(Issue #334)。
+// Issue #338: 質・負担・利用状況を独立したセクションとして並べる。効率の改善を
+// 質の改善として読ませないために、同じグループへ混ぜない。
 const CATEGORY_ORDER: InterviewMetricCategory[] = [
   "user_burden", "accuracy", "ux_quality", "joint_understanding",
+  "joint_understanding_quality", "joint_understanding_burden",
 ];
 const METRIC_ORDER = Object.keys(METRIC_LABELS) as InterviewMetricKey[];
 
@@ -77,11 +96,23 @@ function byMetricOrder(a: InterviewMetricOut, b: InterviewMetricOut): number {
   return metricOrder(a) - metricOrder(b);
 }
 
+// Issue #338: one suffix per unit, matched exhaustively. The previous fallthrough
+// labelled anything that was not a ratio 「操作/疑問」, so a new unit would have
+// been rendered with another unit's name — the same "one displayed word carrying
+// two facts" defect #366 exists to remove.
+const UNIT_SUFFIX: Record<InterviewMetricUnit, string> = {
+  ratio: "%",
+  answers_per_update: " 回/更新",
+  operations_per_inquiry: " 操作/疑問",
+  per_session: " 件/セッション",
+};
+
 function formatMetricValue(metric: InterviewMetricOut): string {
   if (metric.status !== "measured" || metric.value == null) return "未計測";
-  if (metric.unit === "ratio") return `${(metric.value * 100).toFixed(1)}%`;
-  if (metric.unit === "answers_per_update") return `${metric.value.toFixed(2)} 回/更新`;
-  return `${metric.value.toFixed(2)} 操作/疑問`;
+  if (metric.unit === "ratio") {
+    return `${(metric.value * 100).toFixed(1)}${UNIT_SUFFIX.ratio}`;
+  }
+  return `${metric.value.toFixed(2)}${UNIT_SUFFIX[metric.unit]}`;
 }
 
 function formatThresholdValue(metric: InterviewMetricOut, threshold: number): string {

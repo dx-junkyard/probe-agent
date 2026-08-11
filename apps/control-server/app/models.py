@@ -3241,10 +3241,23 @@ InterviewMetricTargetKind = Literal[
 # as, or averaged with, the efficiency numbers in the other categories.
 InterviewMetricCategory = Literal[
     "user_burden", "accuracy", "ux_quality", "joint_understanding",
+    # Issue #338: the existing `joint_understanding` category counts
+    # UTILIZATION and close labels -- how much the feature was used and what it
+    # said about itself. These two answer different questions and must not be
+    # averaged with it or with each other:
+    #   joint_understanding_quality -- did understanding actually improve
+    #     (gaps closed, hypotheses that held, decisions that stuck)
+    #   joint_understanding_burden  -- what it cost the developer
+    # Keeping them apart is the point: an efficiency gain must never be
+    # displayed as a quality gain.
+    "joint_understanding_quality", "joint_understanding_burden",
 ]
 InterviewMetricStatus = Literal["measured", "unmeasured"]
 InterviewMetricUnit = Literal[
     "ratio", "answers_per_update", "operations_per_inquiry",
+    # Issue #338: per-session burden counts. A rate would hide the thing being
+    # measured -- "how much work did one conversation cost" is not a ratio.
+    "per_session",
 ]
 InterviewMetricKey = Literal[
     "answers_per_understanding_update",
@@ -3273,6 +3286,19 @@ InterviewMetricKey = Literal[
     "joint_understanding_reflux_rate",
     "joint_understanding_investigation_answered_rate",
     "joint_understanding_developer_question_rate",
+    # Issue #338: outcome-lineage quality. Every one is derived from the finite
+    # lineage events (app/joint_lineage.py), never from a close label.
+    "joint_understanding_unknown_resolution_rate",
+    "joint_understanding_hypothesis_reversal_rate",
+    "joint_understanding_hypothesis_correction_rate",
+    "joint_understanding_adoption_reconfirmation_rate",
+    "joint_understanding_decision_undo_rate",
+    "joint_understanding_classification_correction_rate",
+    # Issue #338: developer burden, per session.
+    "joint_understanding_rounds_per_session",
+    "joint_understanding_developer_actions_per_session",
+    "joint_understanding_developer_findings_per_session",
+    "joint_understanding_question_reask_rate",
 ]
 # The same finite key set as a plain tuple, so the external attention policy
 # (Issue #341) can be validated for terminal coverage at load time.
@@ -4202,6 +4228,76 @@ class JointUnderstandingRefluxOut(BaseModel):
     intelligence_run_id: Optional[int] = None
     premise_snapshot_id: Optional[int] = None
     created_at: float
+
+
+# Issue #338: the finite lineage vocabularies. Mirrored here from
+# app/joint_lineage.py so an out-of-set value is not representable in the API.
+JointUnderstandingLineageEventKind = Literal[
+    "unknown_created", "unknown_resolved", "unknown_remained",
+    "hypothesis_created", "hypothesis_confirmed", "hypothesis_reversed",
+    "hypothesis_corrected", "hypothesis_superseded",
+    "question_asked", "question_reasked", "question_withdrawn",
+    "decision_proposed", "decision_adopted", "decision_rejected",
+    "decision_undone",
+    "classification_corrected",
+]
+JointUnderstandingLineageSubjectKind = Literal[
+    "unknown", "hypothesis", "question", "decision", "classification",
+]
+# Issue #338: `threshold_unset` is neither a pass nor a failure. The criterion
+# is measured; what counts as enough is a decision nobody has made yet, and
+# inventing a number here would be the self-reported readiness score this issue
+# forbids (the same discipline #341 applies to its metric thresholds).
+JointUnderstandingBulkApprovalVerdict = Literal["unmeasured", "threshold_unset"]
+
+
+class JointUnderstandingLineageEventOut(BaseModel):
+    event_kind: JointUnderstandingLineageEventKind
+    subject_kind: JointUnderstandingLineageSubjectKind
+    # A finding id for an unknown/hypothesis; a Joint Understanding session id
+    # for a question/decision/classification.
+    subject_id: int
+    session_id: int
+    joint_understanding_id: int
+    at: float
+    # The successor that closed this subject's lineage, where there is one. This
+    # is what makes an unknown's creation and its resolution ONE lineage rather
+    # than two unrelated counts.
+    supersedes_subject_id: Optional[int] = None
+    detail: str = ""
+
+
+class JointUnderstandingSessionBurdenOut(BaseModel):
+    joint_understanding_id: int
+    session_id: int
+    rounds: int = 0
+    developer_actions: int = 0
+    developer_findings: int = 0
+    questions_asked: int = 0
+    reasks: int = 0
+
+
+class JointUnderstandingBulkApprovalCriterionOut(BaseModel):
+    """One observed count behind Issue #311's start condition."""
+
+    key: Literal["observed_sessions", "misclassification_cases", "undo_cases"]
+    observed: int
+    verdict: JointUnderstandingBulkApprovalVerdict
+    note: str
+
+
+class JointUnderstandingLineageOut(BaseModel):
+    system_id: int
+    schema_version: Literal["joint-understanding-lineage-v1"] = (
+        "joint-understanding-lineage-v1"
+    )
+    generated_at: float
+    events: List[JointUnderstandingLineageEventOut] = Field(default_factory=list)
+    burdens: List[JointUnderstandingSessionBurdenOut] = Field(default_factory=list)
+    # Observation only. Deliberately NOT a go/no-go for Issue #311.
+    bulk_approval_readiness: List[JointUnderstandingBulkApprovalCriterionOut] = Field(
+        default_factory=list,
+    )
 
 
 class JointUnderstandingRefluxResultOut(BaseModel):
