@@ -462,7 +462,7 @@ def _setup(client, repo_path, commit_sha):
     ju = client.post(
         f"/interview/sessions/{session_id}/joint-understanding",
         json={
-            "origin_kind": "qa", "origin_id": qa["id"], "trigger": "unknown_answer",
+            "origin_kind": "qa", "origin_id": qa["id"], "trigger": "explicit_request",
             "question_text": "alpha の呼び出し元が分かりません",
         },
         headers=headers,

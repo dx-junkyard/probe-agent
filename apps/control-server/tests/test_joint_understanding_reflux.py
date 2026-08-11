@@ -27,6 +27,8 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from joint_understanding_helpers import insert_producer_finding
+
 from app.joint_understanding import (
     JointUnderstandingValidationError,
     can_reflux,
@@ -57,30 +59,40 @@ def test_outcome_basis_rules():
     for outcome in ("understood", "doubt_resolved", "handed_off", "abandoned"):
         validate_outcome_basis(
             outcome=outcome, outcome_finding_ids=[], known_finding_ids=set(),
-            premise_state="fresh",
+            premise_state="current",
         )
     # Adoption / decision must name their basis...
     for outcome in ("hypothesis_adopted", "decided"):
         with pytest.raises(JointUnderstandingValidationError, match="must name"):
             validate_outcome_basis(
                 outcome=outcome, outcome_finding_ids=[], known_finding_ids={1},
-                premise_state="fresh",
+                premise_state="current",
             )
         # ...which has to belong to this session...
         with pytest.raises(JointUnderstandingValidationError, match="outside this session"):
             validate_outcome_basis(
                 outcome=outcome, outcome_finding_ids=[9], known_finding_ids={1},
-                premise_state="fresh",
+                premise_state="current",
             )
-        # ...and is refused outright on a stale premise.
+        # ...and is refused outright on any premise that is not current.
+        # Issue #337: 'missing' and 'invalid' are refused too -- both used to
+        # report as 'fresh' and were let through.
+        for blocked in ("stale", "missing", "invalid"):
+            with pytest.raises(JointUnderstandingValidationError, match="premise"):
+                validate_outcome_basis(
+                    outcome=outcome, outcome_finding_ids=[1], known_finding_ids={1},
+                    premise_state=blocked,
+                )
+        # A legacy row's stored 'fresh' verdict is readable but is not a
+        # comparable premise, so it cannot support an assertion either.
         with pytest.raises(JointUnderstandingValidationError, match="premise"):
             validate_outcome_basis(
                 outcome=outcome, outcome_finding_ids=[1], known_finding_ids={1},
-                premise_state="stale",
+                premise_state="fresh",
             )
         validate_outcome_basis(
             outcome=outcome, outcome_finding_ids=[1], known_finding_ids={1},
-            premise_state="fresh",
+            premise_state="current",
         )
 
 
@@ -89,10 +101,11 @@ def test_non_asserting_outcomes_are_allowed_on_a_stale_premise():
     assert anything about the system, so a moved snapshot cannot invalidate
     it -- only adoption and decision are blocked."""
     for outcome in ("understood", "doubt_resolved", "handed_off", "abandoned"):
-        validate_outcome_basis(
-            outcome=outcome, outcome_finding_ids=[], known_finding_ids=set(),
-            premise_state="stale",
-        )
+        for state in ("stale", "missing", "invalid"):
+            validate_outcome_basis(
+                outcome=outcome, outcome_finding_ids=[], known_finding_ids=set(),
+                premise_state=state,
+            )
 
 
 # --- Route-level ----------------------------------------------------------------
@@ -175,26 +188,48 @@ def _setup(client, origin_kind="qa"):
         f"/interview/sessions/{session_id}/joint-understanding",
         json={
             "origin_kind": origin_kind, "origin_id": origin_id,
-            "trigger": "unknown_answer", "question_text": "根拠が分かりません",
+            "trigger": "explicit_request", "question_text": "根拠が分かりません",
         },
         headers=headers,
     ).json()["session"]["id"]
     return headers, system["id"], session_id, snapshot_id, qa, ju_id, run_id
 
 
-def _add_finding(client, headers, ju_id, run_id, **overrides):
-    body = {
-        "origin_role": "investigation", "claim_kind": "fact",
-        "statement": "リトライは3回で打ち切られる",
-        "evidence": [{"path": "app/retry.py", "start_line": 1, "end_line": 5}],
-        "decision_method": "reasoning_llm", "intelligence_run_id": run_id,
-    }
-    body.update(overrides)
-    if body["origin_role"] == "investigation" and body["claim_kind"] == "hypothesis":
-        body.setdefault("next_investigation", "競合する説明を追加調査する")
-    r = client.post(f"/joint-understanding/{ju_id}/findings", json=body, headers=headers)
-    assert r.status_code == 201, r.text
-    return r.json()["id"]
+def _add_finding(client, headers, ju_id, run_id, *, system_id=None, **overrides):
+    """Insert one producer-authored finding, the way its producer does.
+
+    Issue #337 made POST .../findings developer-only: an investigation or
+    translation finding is written exclusively by /investigate or /translate,
+    which validate the citations against the pinned snapshot. These tests need
+    the finding to already exist so they can exercise reflux / outcome basis /
+    metrics, so they write it as the producer would rather than through an
+    endpoint that correctly refuses it.
+    """
+    role = overrides.pop("origin_role", "investigation")
+    if role == "developer":
+        body = {
+            "origin_role": "developer", "claim_kind": "inference",
+            "statement": "自分の判断を書く", "decision_method": "manual",
+        }
+        body.update(overrides)
+        r = client.post(
+            f"/joint-understanding/{ju_id}/findings", json=body, headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+    if system_id is None:
+        system_id = int(headers["X-Probe-System-Id"])
+    overrides.pop("decision_method", None)
+    evidence = overrides.pop("evidence", None)
+    if evidence is not None:
+        evidence = [
+            {"summary": "", **item} for item in evidence
+        ]
+    return insert_producer_finding(
+        ju_id=ju_id, system_id=system_id, origin_role=role,
+        intelligence_run_id=overrides.pop("intelligence_run_id", run_id),
+        evidence=evidence, **overrides,
+    )
 
 
 def _qa_row(qa_id):
@@ -213,7 +248,7 @@ def test_reflux_reaches_the_qa_investigation_slot_not_the_answer(admin_client):
     assert r.status_code == 201, r.text
     body = r.json()
     assert body["target_kind"] == "qa_investigation"
-    assert body["premise_state"] == "fresh"
+    assert body["premise_state"] == "current"
     assert [x["finding_id"] for x in body["refluxed"]] == [finding_id]
     assert all(x["decision_method"] == "reasoning_llm" for x in body["refluxed"])
     assert body["refluxed"][0]["evidence"][0]["path"] == "app/retry.py"
@@ -352,13 +387,16 @@ def test_stale_premise_blocks_reflux_and_asserting_outcomes(admin_client):
     for outcome in ("hypothesis_adopted", "decided"):
         r = admin_client.post(
             f"/joint-understanding/{ju_id}/close",
-            json={"outcome": outcome, "outcome_finding_ids": [finding_id]}, headers=headers,
+            json={"outcome": outcome, "outcome_reason": "この結論で進む",
+                  "outcome_finding_ids": [finding_id]},
+            headers=headers,
         )
         assert r.status_code == 409, r.text
 
     # Closing without asserting anything is still possible.
     r = admin_client.post(
-        f"/joint-understanding/{ju_id}/close", json={"outcome": "abandoned"}, headers=headers,
+        f"/joint-understanding/{ju_id}/close", json={"outcome": "abandoned", "outcome_reason": "今回は打ち切る"},
+        headers=headers,
     )
     assert r.status_code == 200, r.text
     assert r.json()["outcome_premise_state"] == "stale"
@@ -372,17 +410,24 @@ def test_terminal_states_are_distinct_and_record_their_basis(admin_client):
         ("decided", False),
     ):
         headers, system_id, session_id, snapshot_id, qa, ju_id, run_id = _setup(admin_client)
-        finding_id = _add_finding(admin_client, headers, ju_id, run_id)
+        # Issue #337: an adoption may only rest on a current investigation
+        # hypothesis; every other outcome may rest on any current finding.
+        finding_id = _add_finding(
+            admin_client, headers, ju_id, run_id,
+            **({"claim_kind": "hypothesis"} if outcome == "hypothesis_adopted" else {}),
+        )
         r = admin_client.post(
             f"/joint-understanding/{ju_id}/close",
-            json={"outcome": outcome, "outcome_finding_ids": [finding_id]}, headers=headers,
+            json={"outcome": outcome, "outcome_reason": "この結論で進む",
+                  "outcome_finding_ids": [finding_id]},
+            headers=headers,
         )
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["outcome"] == outcome
         assert body["outcome_is_provisional"] is provisional
         assert body["outcome_finding_ids"] == [finding_id]
-        assert body["outcome_premise_state"] == "fresh"
+        assert body["outcome_premise_state"] == "current"
 
 
 def test_adoption_stays_provisional_and_does_not_reflux_the_hypothesis(admin_client):
@@ -397,7 +442,8 @@ def test_adoption_stays_provisional_and_does_not_reflux_the_hypothesis(admin_cli
     assert reflux["refluxed"] == []
     r = admin_client.post(
         f"/joint-understanding/{ju_id}/close",
-        json={"outcome": "hypothesis_adopted", "outcome_finding_ids": [hypothesis_id]},
+        json={"outcome": "hypothesis_adopted", "outcome_reason": "暫定でこの説を採る",
+              "outcome_finding_ids": [hypothesis_id]},
         headers=headers,
     )
     assert r.status_code == 200, r.text
@@ -419,7 +465,9 @@ def test_outcome_basis_must_belong_to_this_session(admin_client):
     _add_finding(admin_client, headers, ju_id, run_id)
     r = admin_client.post(
         f"/joint-understanding/{ju_id}/close",
-        json={"outcome": "decided", "outcome_finding_ids": [9_999]}, headers=headers,
+        json={"outcome": "decided", "outcome_reason": "決めた",
+              "outcome_finding_ids": [9_999]},
+        headers=headers,
     )
     assert r.status_code == 422, r.text
 
@@ -473,12 +521,22 @@ def test_joint_understanding_metrics_are_deterministic_and_separate(admin_client
         admin_client, headers, ju_id, run_id,
         claim_kind="unknown", statement="通知先は特定できなかった", evidence=[],
     )
+    # Issue #337: 'hypothesis_adopted' may only adopt a current investigation
+    # hypothesis, so the basis has to be one -- adopting a plain fact would
+    # make the provisional marker say nothing about what was adopted.
+    hypothesis_id = _add_finding(
+        admin_client, headers, ju_id, run_id,
+        claim_kind="hypothesis", statement="打ち切りは設定由来と思われる",
+    )
     admin_client.post(f"/joint-understanding/{ju_id}/reflux", headers=headers)
-    admin_client.post(
+    r = admin_client.post(
         f"/joint-understanding/{ju_id}/close",
-        json={"outcome": "hypothesis_adopted", "outcome_finding_ids": [finding_id]},
+        json={"outcome": "hypothesis_adopted", "outcome_reason": "暫定採用",
+              "outcome_finding_ids": [hypothesis_id]},
         headers=headers,
     )
+    assert r.status_code == 200, r.text
+    assert finding_id
 
     metrics = _metrics(admin_client, headers)
     joint = {k: m for k, m in metrics.items() if m["category"] == "joint_understanding"}
@@ -486,10 +544,14 @@ def test_joint_understanding_metrics_are_deterministic_and_separate(admin_client
     # Efficiency metrics keep their own categories -- nothing was merged.
     assert all(m["category"] != "joint_understanding" for k, m in metrics.items() if k not in joint)
 
-    assert joint["joint_understanding_from_unknown_rate"]["value"] == 1.0
+    # Issue #336: this session was started explicitly, so the from-unknown rate
+    # is 0. 'unknown_answer' is now written only by the 「わからない」 entry
+    # point, which is what makes the rate a real observation instead of a
+    # restatement of whatever the caller put in the request body.
+    assert joint["joint_understanding_from_unknown_rate"]["value"] == 0.0
     assert joint["joint_understanding_provisional_outcome_rate"]["value"] == 1.0
     assert joint["joint_understanding_provisional_outcome_rate"]["guardrail"] is True
-    assert joint["joint_understanding_unknown_finding_rate"]["value"] == 0.5
+    assert joint["joint_understanding_unknown_finding_rate"]["value"] == round(1 / 3, 6)
     assert joint["joint_understanding_reflux_rate"]["value"] == 1.0
 
     # Deterministic: same data, same result.

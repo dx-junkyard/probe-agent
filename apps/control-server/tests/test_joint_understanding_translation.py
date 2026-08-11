@@ -26,6 +26,8 @@ from typing import Any, Dict, List, Optional
 import pytest
 from fastapi.testclient import TestClient
 
+from joint_understanding_helpers import insert_producer_finding
+
 from app.joint_understanding import ACTION_KINDS
 from app.llm import LLMClient, LLMConfig, LLMError, MockLLMClient
 from app.understanding_translator import (
@@ -323,22 +325,19 @@ def _setup(client):
     ju_id = client.post(
         f"/interview/sessions/{session_id}/joint-understanding",
         json={
-            "origin_kind": "qa", "origin_id": qa["id"], "trigger": "unknown_answer",
+            "origin_kind": "qa", "origin_id": qa["id"], "trigger": "explicit_request",
             "question_text": "リトライ回数の根拠が分かりません",
         },
         headers=headers,
     ).json()["session"]["id"]
 
-    finding_id = client.post(
-        f"/joint-understanding/{ju_id}/findings",
-        json={
-            "origin_role": "investigation", "claim_kind": "fact",
-            "statement": "リトライは3回で打ち切られる",
-            "evidence": [{"path": "app/retry.py", "start_line": 1, "end_line": 5}],
-            "decision_method": "reasoning_llm", "intelligence_run_id": run_id,
-        },
-        headers=headers,
-    ).json()["id"]
+    # Issue #337: an investigation finding is written by its producer, not by
+    # the developer-only findings endpoint.
+    finding_id = insert_producer_finding(
+        ju_id=ju_id, system_id=system["id"], origin_role="investigation",
+        claim_kind="fact", statement="リトライは3回で打ち切られる",
+        intelligence_run_id=run_id,
+    )
     return headers, system["id"], qa, ju_id, finding_id
 
 
