@@ -655,3 +655,122 @@ The Interview page's overview layer, on top of #349's state machine and
   interview-proposal-card)`) — the cockpit's disabled reasons quote workflow
   state labels, so a bare `/承認/` or `/編集/` role query now matches more
   than one button.
+
+## Interview コックピットの情報設計 (issue #358, subs #359-#363)
+
+Layered on #356. Everything in the #356 section above still holds — this
+adds the ordering, density, and width rules. Dashboard-only: no endpoint, no
+mutation, no permission change.
+
+- **The first view leads with the action.** `CockpitStatusSummary`'s primary
+  element is 「次にやること」 + exactly ONE CTA; 完成度 is one tile among the
+  counts. The CTA **navigates only** (scroll + focus) — the state's primary
+  action stays the single executor inside its work surface (原則 P1). Only
+  `state_primary` takes its label from the server's `primary_action`; the
+  page supplies it, `model.ts` returns `actionLabel: null`.
+- `CockpitModel.nextStep` is a first-match finite table (`retry_qa` →
+  loading → missing category → unresolved question → review category →
+  `state_primary`). Not a score. Adding a branch means adding a row.
+- **Main-column order is contract**: 現在地 → 例外/戻り要求 → status summary
+  → the state's work surface → 未解決事項 + Q&A 進捗 → 全体像 (Brief, map).
+  This supersedes #351's 「Brief at the top of the main column」 for
+  `W3`-`W7`. In `W1`/`W2` (and with no workflow state) the Brief IS the work
+  surface — `W2`'s 「この理解で進む」 lives in it — so it leads there. Render
+  it from ONE value; never two instances.
+- **Unresolved grouping key is the finite category key only** (5 keys +
+  `null`). 「意味的に近い質問をまとめる」 is membership in an already-finite
+  server-derived set — never similarity, embeddings, or keyword scoring
+  (Principle 6). Top 3 groups initially; 「残り N 件を表示」 counts hidden
+  *questions*; every non-representative question keeps its own open button
+  or it becomes unreachable. Expanding focuses the first revealed row,
+  collapsing returns focus to the toggle.
+- **Any grid row pairing a tall card with a short one needs `items-start`.**
+  CSS Grid's default `stretch` is what made the Q&A progress card 3,416px
+  tall next to the unresolved list.
+- **Map cards are a scan**: 番号 / 名称 / 状態 / one-line 要約 only; caption
+  and hint live in the detail pane. `missing`/`review` get ring emphasis
+  plus a 「要対応」 text marker (never colour alone). The fixed 5-category
+  order never changes — do not sort by status. The detail pane is
+  `xl:sticky`; below `xl` the map's 「選択中のカテゴリの詳細へ」 is the
+  keyboard/mobile route to it.
+- **Auxiliary information is one disclosure area**
+  (`CockpitAuxiliaryPanel`/`CockpitAuxiliarySection`). Which sections exist
+  is still #342 §3.3's state matrix — only the density changed. Three things
+  never go inside a collapsed disclosure: a pending handoff list (it drops
+  into the area only at 0 待ち), blocking/degraded failures (they stay in
+  `WorkflowExceptions` above the summary), and the recovery actions of a
+  currently-failed process (its section opens by default).
+- **`focusCockpitTarget` opens every ancestor `<details>` first.** A closed
+  `<details>` keeps its children in the DOM, so `querySelector` finds them
+  and `focus()` then fails silently — the CTA appears to do nothing. When
+  the target IS a `<details>`, focus its `<summary>`.
+- Session number / Snapshot / status belong to `cockpit-header-meta` alone.
+  `CockpitSessionInfo` must not repeat them; the header's 「セッション情報」
+  button is its entry point.
+- **Below `md` the sidebar is an overlay Drawer** (`AppLayout` owns the open
+  state; the header's `md:hidden` menu button toggles it): focus trap,
+  Escape, close on navigation, focus back to the toggle. At `md`+ the
+  existing rail and its collapse/expand are unchanged. `main` is
+  `p-4 md:p-6`. jsdom does not evaluate media queries — assert on the
+  responsive class names plus real behaviour, not on a simulated width.
+- Tests: `cockpit-unresolved.test.tsx`, `cockpit-map-detail.test.tsx`,
+  `layout-navigation.test.tsx`, plus the Interview page group in
+  `dashboard-contracts.test.tsx` (order, disclosure, header de-duplication).
+
+## オーバーレイの面は 1 つの規則で揃える (`lib/modal-surface.ts`)
+
+Any surface that covers the page content — the mobile nav Drawer (#362), the
+assistant panel (#102) — uses `useModalSurface`. It is the single
+implementation of four rules, and a second copy of them is how one surface
+ends up without Escape or without focus return:
+
+- focus moves into the panel on open,
+- Escape closes it,
+- Tab/Shift+Tab cycle inside it (focus never falls back to the page behind),
+- focus returns to the element that was focused before opening.
+
+The panel needs `tabIndex={-1}`, `role="dialog"`, `aria-modal="true"`, and an
+accessible name. A backdrop that closes on click is the caller's job (the
+hook does not render anything) and is **required** for a surface that can
+cover the whole viewport — at 390px the assistant panel is full width, so a
+single close button in the corner is not an escape route.
+
+`returnFocusRef` is for openers that stay mounted (the header's menu button).
+When the opener is unmounted while the surface is open — the assistant's
+floating button is — the hook's default cannot work: the remembered node is
+detached, and the button comes back as a NEW node. Focus the re-mounted
+element from the component instead.
+
+**The assistant's floating button and `<main>`'s `pb-24` are one pair.**
+The button is `fixed` over the scroll area, so the padding is what guarantees
+page content ends above it (#102: the assistant must not hide a screen's
+primary action). Changing the button's `bottom-*` without the padding — or
+the reverse — puts it back on top of the primary action at narrow widths.
+
+### #358 のレビューで直した 3 点 (再発させない)
+
+- **`xl:sticky` は右カラム(Grid の直接の子)に付ける。** 中の詳細ペインだけを
+  sticky にすると、動ける範囲がその親=右カラムの内容高さ(約 875px)に閉じ、
+  行の高さ(約 2,477px)ぶんスクロールする理解マップへ着く前に画面外へ流れる。
+  Grid の直接の子なら containing block は行いっぱいの grid area なので、
+  #359 のために必要な `items-start` と両立する。カラムごと sticky にするのは、
+  詳細ペインだけを浮かせると通常フローに残る補助情報の上へ重なるため。
+  背が高い場合に下端へ到達できるよう `xl:max-h-[...] xl:overflow-y-auto` を
+  必ず添える。
+- **主作業面は 1280 × 720 の初期表示に入っていること。** ソース順で上にある
+  だけでは足りず、実測できる要件である。サマリーの統計は既定で閉じた
+  `<details>` (`cockpit-status-stats`)、画面の説明文はセッション未選択時のみ、
+  ページ root は `space-y-4`。`W2` の主操作「この理解で進む」は Brief カードの
+  **ヘッダー側**に置く(カードが約 566px あり、本文の下だと初期表示に入らない)
+  — カードは 1 枚、主操作も 1 つのままで #351 の条件は変わらない。上部に何かを
+  足すときは、この予算を消費していないか実測して確かめること。
+- **詳細ペインの展開状態はカテゴリ切替でリセットする。** 展開状態はコンポー
+  ネントが持つので、リセットしないと 2 つ目以降のカテゴリが全件展開で始まり、
+  段階的開示が最初のクリック以降ずっと無効になる。effect ではなくレンダー中の
+  「props 変化に応じた state 調整」で畳む(effect だと一度古い状態で描いてから
+  畳み直すちらつきになる)。
+
+実ブラウザでの確認は、`container.innerHTML` を書き出して `dist/assets/*.css`
+と一緒に静的 HTML へ入れ、Chromium (`/opt/pw-browsers/chromium`) で測ると
+本番と同じ CSS のまま寸法を検証できる。Playwright はリポジトリの依存には
+追加しないこと(この確認は使い捨てで行う)。

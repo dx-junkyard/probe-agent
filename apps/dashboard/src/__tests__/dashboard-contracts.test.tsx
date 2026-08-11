@@ -3749,6 +3749,52 @@ describe("Interview page", () => {
     });
   });
 
+  /**
+   * Issue #358 用の `W3` (質問に回答する) セッション。未解決質問が 1 件あり、
+   * 主作業面・未解決事項・補助情報がすべて描かれる状態。
+   */
+  function mockInterviewW3Cockpit() {
+    mockInterviewApi({
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 1 },
+      },
+      proposals: [],
+      session: {
+        stage: "gap_questions",
+        understanding_confirmed_at: 5,
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [understandingItem("POST /traces")],
+          probe_flow_candidates: [understandingItem("summarize flow")],
+        },
+        open_questions: [
+          { question: "トレース収集は独立した責務か", category: "capability", priority: "high" },
+        ],
+      },
+      qaList: {
+        session_id: 7,
+        system_id: 1,
+        items: [
+          {
+            id: 31, session_id: 7, system_id: 1,
+            question_text: "トレース収集は独立した責務か",
+            question_category: "capability", question_source: "reviewer",
+            hypothesis: null, evidence_refs: [], runtime_evidence: null,
+            answer_text: null, answer_unknown: null, status: "open",
+            answered_by: null, superseded_by_id: null, created_at: 1, answered_at: null,
+          },
+        ],
+        open_count: 1,
+        high_priority_open_count: 1,
+        answers_revised_at: null,
+      },
+    });
+  }
+
   // Issue #356: インタビュー・コックピット。ファーストビューの全体像 (完成度
   // / 要確認 / 未設定 / 次にやること)、5 カテゴリの全体マップ、選択に追従する
   // 詳細・修正ペイン、未解決事項、Q&A 進捗が 1 画面に揃うこと。状態集約その
@@ -3840,9 +3886,190 @@ describe("Interview page", () => {
     expect(screen.getByTestId("cockpit-qa-open")).toHaveTextContent("1 件");
     expect(screen.getByTestId("cockpit-qa-total")).toHaveTextContent("2 件");
 
-    // セッション情報 (§7)。
-    expect(screen.getByTestId("cockpit-session-info")).toHaveTextContent("Snapshot 42");
+    // セッション情報 (§7)。Issue #361: セッション番号 / Snapshot /
+    // ステータスはヘッダーが正準で、セッション情報カードには再掲しない。
+    expect(screen.getByTestId("cockpit-header-meta")).toHaveTextContent("Snapshot 42");
+    expect(screen.getByTestId("cockpit-session-info")).not.toHaveTextContent("Snapshot 42");
     expect(screen.getByTestId("cockpit-session-participants")).toHaveTextContent("admin");
+  });
+
+  // Issue #360: ファーストビューの主役は「次にやること」と 1 つの主 CTA で、
+  // 対応する主作業面はその直後に来る。全体像 (Understanding Brief / 理解の
+  // 全体マップ) は主作業面より後ろ。
+  it("W3 では 次にやること → 主作業面 → 未解決事項 → 全体像 の順で描かれる", async () => {
+    mockInterviewW3Cockpit();
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    const { container } = render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await screen.findByTestId("cockpit-status-summary");
+    const order = (testId: string) => {
+      const index = container.innerHTML.indexOf(`data-testid="${testId}"`);
+      expect(index, `${testId} が描かれていない`).toBeGreaterThan(-1);
+      return index;
+    };
+    expect(order("cockpit-next-step")).toBeLessThan(order("work-surface-W3"));
+    expect(order("work-surface-W3")).toBeLessThan(order("cockpit-unresolved-items"));
+    expect(order("cockpit-unresolved-items")).toBeLessThan(order("understanding-brief"));
+    expect(order("understanding-brief")).toBeLessThan(order("cockpit-understanding-map"));
+    // Brief は 1 つの値から描かれる。2 箇所に同時には出ない (原則 P7)。
+    expect(screen.getAllByTestId("understanding-brief")).toHaveLength(1);
+
+    // レビュー指摘 P1: 主作業面を初期表示 (1280 x 720) へ入れるため、
+    // サマリーの統計は既定で畳む。主 CTA はその外に出ていること。
+    const stats = screen.getByTestId("cockpit-status-stats") as HTMLDetailsElement;
+    expect(stats.open).toBe(false);
+    expect(stats.contains(screen.getByTestId("cockpit-completion-percent"))).toBe(true);
+    expect(stats.contains(screen.getByTestId("cockpit-next-step-action"))).toBe(false);
+    // #356 の受け入れ条件。詳細タイルを畳んでも、判断に必要な件数は
+    // 常に見える summary に残す。
+    expect(screen.getByTestId("cockpit-status-compact-counts"))
+      .toHaveTextContent("要確認 1 · 未設定 1件");
+
+    // セッション表示中は画面の説明文を出さない (縦を主作業面へ譲る)。
+    expect(screen.queryByText(/理解の全体像を確認し、曖昧な箇所を順番に解消します/))
+      .toBeNull();
+  });
+
+  // Issue #363 (レビュー指摘 P1): sticky は右カラム **そのもの** に付ける。
+  // 中の詳細ペインだけを sticky にすると、動ける範囲が「中身ぶんの高さしか
+  // 無い右カラム」に限られ、理解マップへ到達する前に画面外へ流れ去る。
+  // Grid の直接の子であれば、動ける範囲は行の高さいっぱいの grid area になる。
+  it("詳細ペインの sticky は Grid の直接の子である右カラムに付く", async () => {
+    mockInterviewW3Cockpit();
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const panel = await screen.findByTestId("cockpit-detail-panel");
+    const column = panel.closest<HTMLElement>(".grid > div");
+    expect(column).not.toBeNull();
+    expect(column!.className).toMatch(/xl:sticky/);
+    // 高さがビューポートを超えても下端へ到達できるよう、内部スクロールを持つ。
+    expect(column!.className).toMatch(/xl:overflow-y-auto/);
+    // 詳細ペインを別の sticky ラッパーで包み直さない (二重 sticky にすると
+    // 内側は再び右カラムの高さに閉じ込められる)。
+    const wrapper = panel.parentElement!;
+    expect(wrapper).toBe(column);
+
+    // 未解決事項と Q&A 進捗を並べる内側の Grid は `items-start` のまま
+    // (背の高いカードに合わせて Q&A カードが引き伸ばされない、#359)。
+    const unresolved = screen.getByTestId("cockpit-unresolved-items");
+    expect(unresolved.parentElement!.className).toMatch(/items-start/);
+  });
+
+  // Issue #360 の例外: `W2` では Brief 自体が判断対象で、主操作
+  // 「この理解で進む」も同じカードにある (#351 / 原則 P2)。この状態でだけ
+  // Brief が主作業面の位置に立つ。
+  it("W2 では Brief が主作業面の位置に立ち、全体マップより先に来る", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { understanding_unconfirmed: true },
+      },
+      proposals: [],
+      session: {
+        stage: "purpose_confirmation",
+        understanding_confirmed_at: null,
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [understandingItem("POST /traces")],
+          probe_flow_candidates: [understandingItem("summarize flow")],
+        },
+        open_questions: [],
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    const { container } = render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await screen.findByTestId("cockpit-status-summary");
+    const html = container.innerHTML;
+    const brief = html.indexOf('data-testid="understanding-brief"');
+    const work = html.indexOf('data-testid="work-surface-W2"');
+    const map = html.indexOf('data-testid="cockpit-understanding-map"');
+    expect(brief).toBeGreaterThan(-1);
+    expect(brief).toBeLessThan(work);
+    expect(work).toBeLessThan(map);
+    expect(screen.getAllByTestId("understanding-brief")).toHaveLength(1);
+
+    // レビュー指摘 P1: `W2` の主操作「この理解で進む」は Brief カードの
+    // 見出し側にある。本文の下だとカードが約 566px あるため、初期表示
+    // (1280 x 720) に主操作が入らなかった。カードの中にある、という #351 の
+    // 条件は変わらないので、カードは 1 枚・主操作も 1 つのまま。
+    const confirm = screen.getByTestId("understanding-confirm-block");
+    const briefCard = screen.getByTestId("understanding-brief");
+    expect(briefCard.contains(confirm)).toBe(true);
+    expect(screen.getAllByTestId("understanding-confirm-block")).toHaveLength(1);
+    const briefHtml = briefCard.innerHTML;
+    expect(briefHtml.indexOf('data-testid="understanding-confirm-block"'))
+      .toBeLessThan(briefHtml.indexOf('id="brief-body"'));
+  });
+
+  // Issue #361: 補助情報は折りたたみの中。閉じていても、そこへ移動する CTA は
+  // 祖先の `<details>` を開いてからフォーカスするので機能し続ける。
+  it("補助情報は折りたたまれ、詳細ペインの CTA から開いて到達できる", async () => {
+    mockInterviewW3Cockpit();
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await screen.findByTestId("cockpit-auxiliary");
+    const changeSetEntry = screen.getByTestId("cockpit-aux-change-set") as HTMLDetailsElement;
+    const qaEntry = screen.getByTestId("cockpit-aux-qa-list") as HTMLDetailsElement;
+    expect(changeSetEntry.open).toBe(false);
+    expect(qaEntry.open).toBe(false);
+
+    // 「直接編集する」は `change-set-panel` へ移動する。閉じたままだと
+    // フォーカスが当たらないので、祖先の折りたたみが開くこと自体が契約。
+    fireEvent.click(screen.getByTestId("cockpit-action-direct_edit"));
+    expect(changeSetEntry.open).toBe(true);
+
+    // ヘッダーの「セッション情報」もその折りたたみを開く (ヘッダーの
+    // バッジと同じ内容を右カラムへ常設しないための入口)。
+    const sessionEntry = screen.getByTestId("cockpit-aux-session") as HTMLDetailsElement;
+    expect(sessionEntry.open).toBe(false);
+    fireEvent.click(screen.getByTestId("cockpit-open-session-info"));
+    expect(sessionEntry.open).toBe(true);
   });
 
   // Issue #356 指摘 P2: 「この項目を開く」は、作業面の先頭操作ではなく、その
@@ -7419,6 +7646,60 @@ describe("Per-screen assistant panel", () => {
     expect(suggestions[0].textContent).toContain(
       "Why is 'Intelligence reasoning model configuration' blocked?",
     );
+  });
+
+  // Issue #358 追補: 開いたパネルは本文の上に重なるモーダルな面である。
+  // 390px 幅では画面全体を覆うので、閉じる手段が右上のボタン 1 つだけだと
+  // 逃げ場が無い。背景・Escape・フォーカストラップ・戻りフォーカスは
+  // サイドバー Drawer (#362) と同じ `useModalSurface` の規則で揃える。
+  test("開いたアシスタントは背景・Escape・フォーカストラップを持つ", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/system-understanding");
+
+    fireEvent.click(screen.getByTestId("assistant-button"));
+    const panel = await screen.findByTestId("assistant-panel");
+    expect(panel).toHaveAttribute("role", "dialog");
+    expect(panel).toHaveAttribute("aria-modal", "true");
+
+    // 開いた直後、フォーカスは面の中にある (背後の本文を操作させない)。
+    expect(panel.contains(document.activeElement)).toBe(true);
+
+    // Tab は面の中で循環する。最後の要素から進むと先頭へ戻る。
+    const focusables = Array.from(
+      panel.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    expect(focusables.length).toBeGreaterThan(1);
+    focusables[focusables.length - 1].focus();
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(focusables[0]);
+
+    // 背景クリックで閉じる。
+    fireEvent.click(screen.getByTestId("assistant-backdrop"));
+    expect(screen.queryByTestId("assistant-panel")).toBeNull();
+
+    // Escape でも閉じ、閉じたらフォーカスは開くボタンへ戻る。
+    const button = screen.getByTestId("assistant-button");
+    button.focus();
+    fireEvent.click(button);
+    await screen.findByTestId("assistant-panel");
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("assistant-panel")).toBeNull());
+    expect(document.activeElement).toBe(screen.getByTestId("assistant-button"));
+  });
+
+  // Issue #102: アシスタントは画面の主操作を隠さない。浮いているボタンの
+  // 位置と `<main>` の予約余白 (`pb-24`) は対で意味を持つ。
+  test("閉じているボタンは狭い画面で端へ寄り、本文の予約余白と対応する", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/system-understanding");
+
+    const floating = screen.getByTestId("assistant-button").parentElement!;
+    expect(floating.className).toMatch(/bottom-4/);
+    expect(floating.className).toMatch(/right-4/);
+    expect(floating.className).toMatch(/md:bottom-6/);
+    expect(floating.className).toMatch(/md:right-6/);
   });
 
   test("closed agent button can show a snapshot notice bubble", async () => {

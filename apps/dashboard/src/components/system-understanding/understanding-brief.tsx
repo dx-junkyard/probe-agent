@@ -602,12 +602,22 @@ export function UnderstandingBriefPanel({
   return (
     <Card data-testid="understanding-brief" data-display={display}>
       <CardHeader className="pb-2">
-        <CardTitle className="text-sm">現在のシステム理解</CardTitle>
-        <CardDescription>
-          {display === "full"
-            ? "この内容が今回の対象として正しいかを判断してください。"
-            : "確認済みの理解の要点です。詳細は展開して確認できます。"}
-        </CardDescription>
+        {/* `full` (= `W2`) では、このカードが判断対象であると同時に主作業面
+            でもあり、主操作「この理解で進む」を内包する (#351 / 原則 P2)。
+            主操作は見出しと同じ行に置く: 本文の下 (レビュー指摘前の位置) だと
+            カードが約 566px あるため、1280 x 720 の初期表示に主操作が入らな
+            かった。カードの中にある、という #351 の条件は変わらない。 */}
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div className="min-w-0">
+            <CardTitle className="text-sm">現在のシステム理解</CardTitle>
+            <CardDescription>
+              {display === "full"
+                ? "この内容が今回の対象として正しいかを判断してください。"
+                : "確認済みの理解の要点です。詳細は展開して確認できます。"}
+            </CardDescription>
+          </div>
+          {display === "full" && primaryAction}
+        </div>
       </CardHeader>
       <CardContent className="space-y-4">
         <ReadinessSummary brief={brief} />
@@ -627,7 +637,9 @@ export function UnderstandingBriefPanel({
           )}
         </div>
 
-        {primaryAction}
+        {/* `full` のときはヘッダー側で描いているので、ここでは出さない
+            (同じ主操作を 1 カードに 2 つ置かない、原則 P7)。 */}
+        {display !== "full" && primaryAction}
 
         {display === "compact" && (
           <button
