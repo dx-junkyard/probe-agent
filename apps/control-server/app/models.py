@@ -3241,10 +3241,23 @@ InterviewMetricTargetKind = Literal[
 # as, or averaged with, the efficiency numbers in the other categories.
 InterviewMetricCategory = Literal[
     "user_burden", "accuracy", "ux_quality", "joint_understanding",
+    # Issue #338: the existing `joint_understanding` category counts
+    # UTILIZATION and close labels -- how much the feature was used and what it
+    # said about itself. These two answer different questions and must not be
+    # averaged with it or with each other:
+    #   joint_understanding_quality -- did understanding actually improve
+    #     (gaps closed, hypotheses that held, decisions that stuck)
+    #   joint_understanding_burden  -- what it cost the developer
+    # Keeping them apart is the point: an efficiency gain must never be
+    # displayed as a quality gain.
+    "joint_understanding_quality", "joint_understanding_burden",
 ]
 InterviewMetricStatus = Literal["measured", "unmeasured"]
 InterviewMetricUnit = Literal[
     "ratio", "answers_per_update", "operations_per_inquiry",
+    # Issue #338: per-session burden counts. A rate would hide the thing being
+    # measured -- "how much work did one conversation cost" is not a ratio.
+    "per_session",
 ]
 InterviewMetricKey = Literal[
     "answers_per_understanding_update",
@@ -3273,6 +3286,19 @@ InterviewMetricKey = Literal[
     "joint_understanding_reflux_rate",
     "joint_understanding_investigation_answered_rate",
     "joint_understanding_developer_question_rate",
+    # Issue #338: outcome-lineage quality. Every one is derived from the finite
+    # lineage events (app/joint_lineage.py), never from a close label.
+    "joint_understanding_unknown_resolution_rate",
+    "joint_understanding_hypothesis_reversal_rate",
+    "joint_understanding_hypothesis_correction_rate",
+    "joint_understanding_adoption_reconfirmation_rate",
+    "joint_understanding_decision_undo_rate",
+    "joint_understanding_classification_correction_rate",
+    # Issue #338: developer burden, per session.
+    "joint_understanding_rounds_per_session",
+    "joint_understanding_developer_actions_per_session",
+    "joint_understanding_developer_findings_per_session",
+    "joint_understanding_question_reask_rate",
 ]
 # The same finite key set as a plain tuple, so the external attention policy
 # (Issue #341) can be validated for terminal coverage at load time.
@@ -3704,10 +3730,48 @@ JointUnderstandingActionKind = Literal[
 ]
 JointUnderstandingDecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 JointUnderstandingRuntimeCheck = Literal["match", "mismatch", "unobserved", "stale"]
-# Issue #332: whether the premise this session was investigated against still
-# holds. 'stale' blocks hypothesis_adopted / decided.
-JointUnderstandingPremiseState = Literal["fresh", "stale"]
+# Issue #337: whether the premise this session was investigated against still
+# holds, evaluated from the shared Issue #308 premise bundle rather than from
+# the snapshot id alone. Only 'current' permits hypothesis_adopted / decided /
+# reflux. 'missing' (the premise disappeared) and 'invalid' (no comparable
+# bundle was ever captured) both used to report as 'fresh' -- a premise that
+# cannot be found is not a premise that still holds.
+JointUnderstandingPremiseState = Literal["current", "stale", "missing", "invalid"]
+# The same set plus the pre-#337 value, for a premise verdict READ back from a
+# row that was closed before this contract existed. Never produced anew.
+JointUnderstandingRecordedPremiseState = Literal[
+    "current", "stale", "missing", "invalid", "fresh",
+]
+# Issue #337: the single finite reason behind a non-'current' verdict. Split by
+# recovery path -- stale can be re-investigated, missing cannot.
+JointUnderstandingPremiseReason = Literal[
+    "premise_not_captured", "premise_incomplete",
+    "pinned_snapshot_removed", "origin_removed",
+    "origin_superseded", "pinned_commit_changed", "origin_content_changed",
+    "capability_scope_changed", "linked_intent_changed",
+]
+# Issue #337: WHICH code path produced a finding, as distinct from whose voice
+# it speaks in (origin_role). 'legacy' is read-only -- what a row written
+# before provenance was recorded reports.
+JointUnderstandingProducerKind = Literal[
+    "investigation_loop", "translator", "developer_api", "legacy",
+]
+# Issue #337: whether an authenticated human stands behind the row. Resolved
+# from the request's Principal, never from its body.
+JointUnderstandingActorKind = Literal["user", "system", "legacy"]
+# Issue #337: the derived state of one provisionally adopted hypothesis.
+JointUnderstandingAdoptionState = Literal[
+    "provisional", "reconfirmation_required", "basis_withdrawn",
+]
 JointUnderstandingRefluxTargetKind = Literal["qa_investigation", "session_ledger"]
+# Issue #336: the existing formal operation an action leads to. The three
+# `*_correct` / `*_create` / `*_answer` values name an endpoint OUTSIDE this
+# feature, and only that endpoint's own manual record completes them.
+JointUnderstandingFormalOperation = Literal[
+    "joint_investigate", "joint_translate", "joint_hold",
+    "joint_close_provisional", "joint_close_decided",
+    "intent_correct", "question_handoff_create", "origin_item_answer",
+]
 
 
 class JointUnderstandingEvidenceIn(BaseModel):
@@ -3758,12 +3822,28 @@ class JointUnderstandingFindingOut(BaseModel):
     decision_method: JointUnderstandingDecisionMethod
     intelligence_run_id: Optional[int] = None
     is_mock: bool = False
+    # Issue #337: provenance on two independent axes. producer_kind is which
+    # code path wrote the row; actor_kind is whether an authenticated human
+    # stands behind it. Both are 'legacy' on rows written before the contract
+    # existed -- unknown, and never assumed to be a human.
+    producer_kind: JointUnderstandingProducerKind = "legacy"
+    actor_kind: JointUnderstandingActorKind = "legacy"
+    actor_username: Optional[str] = None
     created_at: float
 
 
 class JointUnderstandingFindingCreate(BaseModel):
-    """Append one finding. Findings are never updated or deleted -- a
-    correction is a new finding carrying ``supersedes_finding_id``."""
+    """Append one DEVELOPER finding.
+
+    Issue #337 made this endpoint developer-only. ``investigation`` and
+    ``translation`` findings are written exclusively by their internal
+    producers (``/investigate``, ``/translate``), which validate their evidence
+    and their reasoning run against the pinned snapshot; accepting them here
+    let a caller post an unverifiable "fact" with fabricated citations, and
+    accepting ``developer`` from any caller let a request body record a
+    sentence as the human's own judgement. ``origin_role`` is kept in the
+    payload so the rejection is explicit rather than a silent reinterpretation.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3790,7 +3870,11 @@ class JointUnderstandingActionOut(BaseModel):
     joint_understanding_id: int
     system_id: int
     action_kind: JointUnderstandingActionKind
+    # Display label only. Issue #337: `actor_kind`/`actor_username` are the
+    # authenticated identity, resolved from the request's Principal.
     actor: Optional[str] = None
+    actor_kind: JointUnderstandingActorKind = "legacy"
+    actor_username: Optional[str] = None
     note: Optional[str] = None
     decision_method: Literal["manual"] = "manual"
     created_at: float
@@ -3800,6 +3884,9 @@ class JointUnderstandingActionCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action_kind: JointUnderstandingActionKind
+    # A caller-supplied label (e.g. a team name). Issue #337: it is NOT the
+    # identity -- the recorded actor comes from the authenticated Principal, so
+    # this can no longer be used to attribute an action to someone else.
     actor: Optional[str] = Field(default=None, max_length=200)
     note: Optional[str] = Field(default=None, max_length=2_000)
 
@@ -3823,13 +3910,57 @@ class JointUnderstandingOut(BaseModel):
     # 'stale' means the interview session has moved to a newer snapshot than
     # this session pinned, so adopt/decide are refused until re-investigation.
     outcome_finding_ids: List[int] = Field(default_factory=list)
-    outcome_premise_state: Optional[JointUnderstandingPremiseState] = None
-    premise_state: JointUnderstandingPremiseState = "fresh"
+    outcome_premise_state: Optional[JointUnderstandingRecordedPremiseState] = None
+    outcome_premise_reason: Optional[JointUnderstandingPremiseReason] = None
+    # Issue #337: who closed the session, recorded from the authenticated
+    # Principal. A close is a manual decision; an outcome whose decider cannot
+    # be recovered after a reload is not an audit record.
+    closed_by_actor_kind: Optional[JointUnderstandingActorKind] = None
+    closed_by_username: Optional[str] = None
+    # Issue #336: the origin row that is CURRENT today. For `qa` and `intent`,
+    # corrections are additive -- the pinned `origin_id` becomes a superseded row
+    # the moment the developer revises it -- so a consumer matching a session to
+    # the live item must use this, not `origin_id`. Reported rather than
+    # substituted: the session keeps pointing at the row the conversation
+    # started from.
+    current_origin_id: Optional[int] = None
+    premise_state: JointUnderstandingPremiseState = "invalid"
+    premise_reason: Optional[JointUnderstandingPremiseReason] = None
+    # Issue #337: the shared Issue #308 premise bundle as captured at creation.
+    # premise_commit_sha (not the snapshot id) is what decides staleness: the
+    # same commit re-pinned under a new snapshot row is the same premise.
     premise_snapshot_id: Optional[int] = None
+    premise_commit_sha: Optional[str] = None
+    premise_revision_id: Optional[int] = None
+    premise_tracking_version: Optional[str] = None
+    premise_captured_at: Optional[float] = None
     schema_version: str
     created_at: float
     updated_at: float
     closed_at: Optional[float] = None
+
+
+class JointUnderstandingAdoptionOut(BaseModel):
+    """One provisionally adopted hypothesis (Issue #337).
+
+    ``state`` is derived at read time from the captured premise versus the
+    current one, so it can never claim `provisional` for an adoption whose
+    ground has since moved.
+    """
+
+    id: int
+    joint_understanding_id: int
+    system_id: int
+    finding_id: int
+    state: JointUnderstandingAdoptionState
+    adopted_by_actor_kind: JointUnderstandingActorKind
+    adopted_by_username: Optional[str] = None
+    adoption_reason: str = ""
+    premise_snapshot_id: Optional[int] = None
+    premise_commit_sha: Optional[str] = None
+    premise_revision_id: Optional[int] = None
+    decision_method: Literal["manual"] = "manual"
+    adopted_at: float
 
 
 class JointUnderstandingDetailOut(BaseModel):
@@ -3848,6 +3979,10 @@ class JointUnderstandingDetailOut(BaseModel):
     # Issue #332: system-verified facts attached to the understanding surface
     # WITHOUT being recorded as anyone's answer.
     reflux: List["JointUnderstandingRefluxOut"] = Field(default_factory=list)
+    # Issue #337: every provisionally adopted hypothesis, with its derived
+    # re-confirmation state. This is what keeps a provisional adoption from
+    # aging silently into something indistinguishable from a fact.
+    hypothesis_adoptions: List[JointUnderstandingAdoptionOut] = Field(default_factory=list)
     # The finite next-action menu for the session's current status,
     # deterministically ordered (empty once closed/held).
     available_actions: List[JointUnderstandingActionKind] = Field(default_factory=list)
@@ -3872,10 +4007,14 @@ class JointUnderstandingCloseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     outcome: JointUnderstandingOutcome
-    outcome_reason: Optional[str] = Field(default=None, max_length=2_000)
+    # Issue #337: the developer's stated judgement, now REQUIRED. A close is
+    # the manual decision record of this conversation; "what was decided" with
+    # no text is an outcome label, not a decision anyone can audit later.
+    outcome_reason: str = Field(..., min_length=1, max_length=2_000)
     # Issue #332: which findings the outcome rests on. Required for
     # 'hypothesis_adopted' and 'decided' -- an adoption or a decision that
-    # cannot name its basis is not auditable.
+    # cannot name its basis is not auditable. Issue #337 additionally rejects a
+    # superseded, mock, or (for an adoption) non-hypothesis basis.
     outcome_finding_ids: List[int] = Field(default_factory=list, max_length=50)
 
 
@@ -3891,6 +4030,44 @@ JointUnderstandingStopReason = Literal[
     "answered", "budget_exhausted", "no_new_evidence", "unresolved", "failed",
 ]
 JointUnderstandingRoundStatus = Literal["completed", "unresolved", "failed"]
+# Issue #339: the finite outcome class, so a caller never has to inspect
+# `stop_reason` and guess which side of the limitation/failure split it is on.
+JointUnderstandingOutcomeClass = Literal[
+    "answered", "research_limitation", "execution_failure",
+]
+# Issue #339: WHERE an execution failure broke, because the recovery differs --
+# configuration and a missing snapshot are not retries, an API/schema/timeout
+# failure is.
+JointUnderstandingFailureClass = Literal[
+    "config_invalid", "snapshot_unavailable", "api_failure", "schema_invalid",
+    "timeout",
+]
+# Issue #339: the finite exploration sources. The first four are Epic #328's;
+# the last four are the structural breadth this issue adds.
+JointUnderstandingExplorationSourceKind = Literal[
+    "path_name", "symbol_index", "entrypoint_index", "file_content",
+    "dependency", "call_graph", "git_history", "runtime_facts",
+]
+
+
+class JointUnderstandingExplorationSourceOut(BaseModel):
+    """One exploration source's contribution to one round (Issue #339)."""
+
+    id: int
+    round_id: int
+    system_id: int
+    source_kind: JointUnderstandingExplorationSourceKind
+    # The pinned commit for git history, the snapshot id for the index /
+    # content / runtime sources.
+    revision: str
+    candidates_found: int = 0
+    queries_run: int = 0
+    elapsed_seconds: float = 0.0
+    truncated: bool = False
+    # A failed source is recorded and skipped: it never fails the round, and it
+    # is never replaced by an unbounded fallback search.
+    error_details: Optional[str] = None
+    created_at: float
 
 
 class JointUnderstandingRoundOut(BaseModel):
@@ -3919,6 +4096,19 @@ class JointUnderstandingRoundOut(BaseModel):
     elapsed_seconds: float = 0.0
     intelligence_run_id: Optional[int] = None
     error_details: Optional[str] = None
+    # Issue #339: set ONLY for an execution failure. A research limitation
+    # (budget_exhausted / no_new_evidence / unresolved) is a real,
+    # evidence-backed result and leaves this NULL -- "the system looked and
+    # could not tell" must stay distinguishable from "the system could not
+    # look".
+    failure_class: Optional[JointUnderstandingFailureClass] = None
+    outcome_class: JointUnderstandingOutcomeClass = "research_limitation"
+    # One entry per exploration source this round used, each with its own
+    # revision and budget consumption. Per source because "the round only read
+    # the pinned revision" is a claim about each source separately.
+    sources: List["JointUnderstandingExplorationSourceOut"] = Field(
+        default_factory=list,
+    )
     created_at: float
 
 
@@ -3981,6 +4171,13 @@ class JointUnderstandingActionMenuEntryOut(BaseModel):
     action_kind: JointUnderstandingActionKind
     label: str
     what_changes: str
+    # Issue #336: which existing formal operation this action leads to, and
+    # whether that operation is performed by an endpoint OUTSIDE this feature.
+    # Recording the action never completes it -- the distinction previously had
+    # no machine-readable form, so a conversation could accumulate actions that
+    # never became anything.
+    formal_operation: JointUnderstandingFormalOperation
+    completes_outside_session: bool = False
 
 
 class JointUnderstandingTranslationOut(BaseModel):
@@ -4040,6 +4237,76 @@ class JointUnderstandingRefluxOut(BaseModel):
     created_at: float
 
 
+# Issue #338: the finite lineage vocabularies. Mirrored here from
+# app/joint_lineage.py so an out-of-set value is not representable in the API.
+JointUnderstandingLineageEventKind = Literal[
+    "unknown_created", "unknown_resolved", "unknown_remained",
+    "hypothesis_created", "hypothesis_confirmed", "hypothesis_reversed",
+    "hypothesis_corrected", "hypothesis_superseded",
+    "question_asked", "question_reasked", "question_withdrawn",
+    "decision_proposed", "decision_adopted", "decision_rejected",
+    "decision_undone",
+    "classification_corrected",
+]
+JointUnderstandingLineageSubjectKind = Literal[
+    "unknown", "hypothesis", "question", "decision", "classification",
+]
+# Issue #338: `threshold_unset` is neither a pass nor a failure. The criterion
+# is measured; what counts as enough is a decision nobody has made yet, and
+# inventing a number here would be the self-reported readiness score this issue
+# forbids (the same discipline #341 applies to its metric thresholds).
+JointUnderstandingBulkApprovalVerdict = Literal["unmeasured", "threshold_unset"]
+
+
+class JointUnderstandingLineageEventOut(BaseModel):
+    event_kind: JointUnderstandingLineageEventKind
+    subject_kind: JointUnderstandingLineageSubjectKind
+    # A finding id for an unknown/hypothesis; a Joint Understanding session id
+    # for a question/decision/classification.
+    subject_id: int
+    session_id: int
+    joint_understanding_id: int
+    at: float
+    # The successor that closed this subject's lineage, where there is one. This
+    # is what makes an unknown's creation and its resolution ONE lineage rather
+    # than two unrelated counts.
+    supersedes_subject_id: Optional[int] = None
+    detail: str = ""
+
+
+class JointUnderstandingSessionBurdenOut(BaseModel):
+    joint_understanding_id: int
+    session_id: int
+    rounds: int = 0
+    developer_actions: int = 0
+    developer_findings: int = 0
+    questions_asked: int = 0
+    reasks: int = 0
+
+
+class JointUnderstandingBulkApprovalCriterionOut(BaseModel):
+    """One observed count behind Issue #311's start condition."""
+
+    key: Literal["observed_sessions", "misclassification_cases", "undo_cases"]
+    observed: int
+    verdict: JointUnderstandingBulkApprovalVerdict
+    note: str
+
+
+class JointUnderstandingLineageOut(BaseModel):
+    system_id: int
+    schema_version: Literal["joint-understanding-lineage-v1"] = (
+        "joint-understanding-lineage-v1"
+    )
+    generated_at: float
+    events: List[JointUnderstandingLineageEventOut] = Field(default_factory=list)
+    burdens: List[JointUnderstandingSessionBurdenOut] = Field(default_factory=list)
+    # Observation only. Deliberately NOT a go/no-go for Issue #311.
+    bulk_approval_readiness: List[JointUnderstandingBulkApprovalCriterionOut] = Field(
+        default_factory=list,
+    )
+
+
 class JointUnderstandingRefluxResultOut(BaseModel):
     joint_understanding_id: int
     system_id: int
@@ -4052,6 +4319,59 @@ class JointUnderstandingRefluxResultOut(BaseModel):
     # system-established facts (inference / hypothesis / unknown / conflict).
     skipped_not_fact: int = 0
     skipped_unverified: int = 0
+
+
+# Issue #336: the single 「わからない」 entry point's finite next step. The
+# internal route names (system_researchable / hybrid / human_only) deliberately
+# do not appear here -- the Dashboard maps these to its own copy, and an
+# internal classification name is not a developer-facing label.
+# The Question Router's finite classification, mirrored here because this
+# response is a new contract and an out-of-set value must not be representable.
+# The router owns the canonical set (app/question_router.ROUTE_CATEGORIES).
+JointUnderstandingRouteCategory = Literal[
+    "human_only", "system_researchable", "hybrid",
+]
+JointUnderstandingUnknownNextStep = Literal[
+    # A joint investigation ran and produced findings; the conversation has
+    # material to show.
+    "joint_investigation_started",
+    # A session is open (investigation skipped, failed, or found nothing new).
+    # The conversation is retryable and nothing was lost.
+    "joint_understanding_opened",
+    # Only the developer can answer this. The normal answer / handoff path is
+    # what comes next; no session was opened.
+    "developer_answer_required",
+    # The classification itself could not be made (configuration or API
+    # failure). Fail-closed: no session, no guess, and the recorded unknown
+    # answer stands.
+    "routing_unavailable",
+]
+
+
+class InterviewQaUnknownRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # 「わからない」 with an optional note. Never becomes a developer finding
+    # (Epic #328): "I don't know" is not a statement about the system.
+    answer_text: str = Field(default="", max_length=20_000)
+    actor: str = Field(..., min_length=1, max_length=200)
+    # Off only for callers that want to open the session and drive the
+    # investigation themselves (the JU panel's own retry does this).
+    investigate: bool = True
+
+
+class InterviewQaUnknownOut(BaseModel):
+    session_id: int
+    system_id: int
+    # The question row as recorded -- committed before routing runs, so it is
+    # present on every outcome including the failure ones.
+    qa: "InterviewQaOut"
+    route_category: Optional[JointUnderstandingRouteCategory] = None
+    knowledge_area: Optional[KnowledgeArea] = None
+    joint_understanding_id: Optional[int] = None
+    next_step: JointUnderstandingUnknownNextStep
+    investigation_stop_reason: Optional[JointUnderstandingStopReason] = None
+    error: Optional[str] = None
 
 
 JointUnderstandingDetailOut.model_rebuild()

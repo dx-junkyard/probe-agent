@@ -37,6 +37,8 @@ non-error outcome: the caller substitutes a fixed, server-authored message
 
 from __future__ import annotations
 
+import json
+
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -96,10 +98,22 @@ def _build_router_context(
     context_pack: InterviewContextPack,
     conversation: List[Dict[str, str]],
     origin_summary: Optional[str],
+    verified_evidence: Optional[List[Dict[str, object]]] = None,
 ) -> str:
     parts: List[str] = []
     if origin_summary:
         parts.append(f"Original item under discussion (context only): {origin_summary}")
+    if verified_evidence:
+        # Issue #336: facts a joint investigation already established against
+        # the pinned snapshot. Given to the ROUTER so a question the system has
+        # already answered is not classified as needing a fresh investigation --
+        # and so a question that only needs the developer's judgement on top of
+        # those facts is classified as the hybrid it actually is.
+        parts.append(
+            "Already-verified investigation facts (established by reading the "
+            "pinned snapshot; not developer answers):\n"
+            + json.dumps(verified_evidence, ensure_ascii=False)
+        )
     parts.append(
         f"Snapshot has {context_pack.total_symbols} indexed symbol(s) and "
         f"{context_pack.total_entrypoints} entrypoint(s) "
@@ -126,6 +140,7 @@ def generate_inquiry_answer(
     conn=None,
     system_id: Optional[int] = None,
     snapshot_id: Optional[int] = None,
+    verified_evidence: Optional[List[Dict[str, object]]] = None,
 ) -> InquiryAnswerResult:
     """Generate one assistant answer for an Inquiry conversation turn.
 
@@ -162,7 +177,9 @@ def generate_inquiry_answer(
             provider=config.provider, model=config.model, is_mock=False, error=str(exc),
         )
 
-    router_context = _build_router_context(context_pack, conversation, origin_summary)
+    router_context = _build_router_context(
+        context_pack, conversation, origin_summary, verified_evidence,
+    )
     route = route_question(client, config, question_text=question_text, context=router_context, language=language)
 
     if route.error:

@@ -79,6 +79,11 @@ from ..alignment import (
     validate_evidence_against_snapshot,
 )
 from ..auth import Principal, get_system_id, require_user
+from ..understanding_evidence_feed import (
+    current_entries as feed_current_entries,
+    prompt_facts as feed_prompt_facts,
+    record_consumption as feed_record_consumption,
+)
 from ..capability_graph import (
     CapabilityGraphError,
     confirmed_graph_for_revision,
@@ -656,6 +661,15 @@ def _run_alignment_build_core(session_id: int, system_id: int) -> AlignmentBuild
                 ),
             )
 
+        # Issue #336: the Alignment build reads the same shared evidence feed
+        # the Understanding rebuild does, so a verified investigation fact
+        # informs whether the Intent and the current system actually agree --
+        # instead of sitting in the joint_understanding_reflux ledger unread.
+        feed_entries = feed_current_entries(
+            conn, system_id=system_id, session_id=session_id,
+        )
+        verified_evidence = feed_prompt_facts(feed_entries)
+
     config = LLMConfig.intelligence_from_env()
     client_error: Optional[str] = None
     try:
@@ -678,6 +692,7 @@ def _run_alignment_build_core(session_id: int, system_id: int) -> AlignmentBuild
             current_understanding=current_understanding,
             gap_analysis=gap_analysis,
             confirmed_capability_graph=current_capability_graph,
+            verified_evidence=verified_evidence or None,
         )
 
     completed_at = time.time()
@@ -1214,6 +1229,19 @@ def _run_alignment_build_core(session_id: int, system_id: int) -> AlignmentBuild
             # Inquiry's answer or the origin item's user_decision.
             evaluate_inquiry_premises(
                 conn, system_id=system_id, session_id=session_id, built_at=completed_at,
+            )
+            # Issue #336: record that this build USED these verified facts.
+            # Not a confirmation -- answering the Alignment items is the human
+            # gate, and it has its own manual record per item.
+            feed_record_consumption(
+                conn,
+                system_id=system_id,
+                session_id=session_id,
+                consumer_kind="alignment_build",
+                entry_ids=[entry.id for entry in feed_entries],
+                revision_id=revision["id"],
+                intelligence_run_id=run_id,
+                now=completed_at,
             )
             conn.execute("COMMIT")
         except Exception:

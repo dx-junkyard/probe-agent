@@ -10,6 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { JointUnderstandingEntry } from "@/components/system-understanding/joint-understanding-entry";
 import { InquiryPremiseNotice } from "@/components/system-understanding/inquiry-premise-notice";
 import {
   useCreateInterviewInquiry,
@@ -564,6 +565,20 @@ export function InquiryPanel({
                 >
                   今回は保留する
                 </Button>
+                {/* Issue #336: 「疑問が解消しなかった」 is the most common way a
+                    developer discovers they do not know either (Epic #328), so
+                    the 共同理解 flow is reachable from here too. It never
+                    resolves, reopens, or holds the Inquiry — those stay the
+                    buttons beside it, and the Inquiry's own status is untouched. */}
+                {inquiryId !== null && (
+                  <JointUnderstandingEntry
+                    sessionId={sessionId}
+                    originKind="inquiry"
+                    originId={inquiryId}
+                    questionText="この疑問は自分でも判断できません。一緒に確かめたいです"
+                    label="一緒に確かめる"
+                  />
+                )}
               </div>
             </>
           )}

@@ -74,6 +74,11 @@ from ..db import get_conn
 from ..interview_context import build_interview_context
 from ..interview_language import interview_message, resolve_message_language
 from ..inquiry_answering import InquiryAnswerResult, generate_inquiry_answer
+from ..understanding_evidence_feed import (
+    current_entries as feed_current_entries,
+    prompt_facts as feed_prompt_facts,
+    record_consumption as feed_record_consumption,
+)
 from ..inquiry_premise import (
     PREMISE_TRACKING_VERSION,
     capability_scope_digest_for_item,
@@ -370,6 +375,7 @@ def _generate_and_store_answer(
     question_text: str,
     conversation: List[Dict[str, str]],
     origin_summary: Optional[str],
+    session_id: Optional[int] = None,
     now: float,
 ) -> _AnswerOutcome:
     """Run inquiry answer generation and persist the audit + message rows.
@@ -403,6 +409,11 @@ def _generate_and_store_answer(
         ).fetchone()
         repo_path = snapshot_row["repo_path"] if snapshot_row else None
         commit_sha = snapshot_row["commit_sha"] if snapshot_row else None
+        # Issue #336: the same shared evidence feed the Understanding and
+        # Alignment rebuilds read. Given to the router/answer so a doubt the
+        # system has already established is not re-investigated from scratch.
+        feed_entries = feed_current_entries(conn, system_id=system_id)
+        verified_evidence = feed_prompt_facts(feed_entries)
 
     # Phase 2 (DB lock released): route + investigate + compose. ``conn`` is
     # deliberately not passed down -- investigate() opens its own short-lived
@@ -421,6 +432,7 @@ def _generate_and_store_answer(
             commit_sha=commit_sha,
             system_id=system_id,
             snapshot_id=snapshot_id,
+            verified_evidence=verified_evidence or None,
         )
     except LLMError as exc:
         result = InquiryAnswerResult(
@@ -440,6 +452,8 @@ def _generate_and_store_answer(
             system_id=system_id,
             snapshot_id=snapshot_id,
             inquiry_id=inquiry_id,
+            session_id=session_id,
+            consumed_evidence_ids=[entry.id for entry in feed_entries],
             now=now,
             completed_at=completed_at,
         )
@@ -452,6 +466,8 @@ def _persist_answer_outcome(
     system_id: int,
     snapshot_id: int,
     inquiry_id: int,
+    session_id: Optional[int] = None,
+    consumed_evidence_ids: Optional[List[int]] = None,
     now: float,
     completed_at: float,
 ) -> _AnswerOutcome:
@@ -491,6 +507,21 @@ def _persist_answer_outcome(
         ),
     )
     run_id = run_cur.lastrowid
+
+    # Issue #336: record that this answer USED the shared feed's facts. Not a
+    # confirmation -- resolving the Inquiry is the human gate and has its own
+    # manual transition record.
+    if session_id is not None and consumed_evidence_ids:
+        feed_record_consumption(
+            conn,
+            system_id=system_id,
+            session_id=session_id,
+            consumer_kind="inquiry_answer",
+            entry_ids=consumed_evidence_ids,
+            revision_id=None,
+            intelligence_run_id=run_id,
+            now=completed_at,
+        )
 
     if result.error:
         return _AnswerOutcome(run_id=run_id, message_id=None, error=result.error)
@@ -760,6 +791,7 @@ def create_inquiry(
         question_text=payload.question_text,
         conversation=[{"role": "user", "content": payload.question_text}],
         origin_summary=origin_summary,
+        session_id=session_id,
         now=now,
     )
     if outcome.error:
@@ -869,7 +901,8 @@ def post_inquiry_message(
                     "message": f"Inquiry is '{inquiry['status']}', not open",
                 },
             )
-        session = _get_session_or_404(conn, inquiry["session_id"], system_id)
+        session_id = inquiry["session_id"]
+        session = _get_session_or_404(conn, session_id, system_id)
         origin_summary = _validate_origin_exists(
             conn, inquiry["origin_kind"], inquiry["origin_id"], inquiry["session_id"], system_id,
         )
@@ -907,6 +940,7 @@ def post_inquiry_message(
         question_text=payload.content,
         conversation=conversation,
         origin_summary=origin_summary,
+        session_id=session_id,
         now=now,
     )
     if outcome.error:

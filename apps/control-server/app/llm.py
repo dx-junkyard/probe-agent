@@ -121,12 +121,34 @@ class LLMClient(ABC):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
-        """Generate a text response from chat-style messages."""
+        """Generate a text response from chat-style messages.
+
+        ``timeout`` overrides the provider's configured socket timeout for
+        THIS call only (Issue #339). An iterative loop with an overall time
+        budget needs the individual call to be interruptible: checking the
+        clock between rounds bounds the loop's own bookkeeping, not the round
+        trip that actually consumes the time, so a single hung call could
+        overrun the whole budget while every between-round check passed.
+        """
 
 
 class LLMError(RuntimeError):
     pass
+
+
+def _effective_timeout(config: LLMConfig, override: Optional[float]) -> float:
+    """The socket timeout for one call: the override when it is usable.
+
+    A non-positive override means the caller has no time left, which is a bug
+    on their side (they should not call at all) -- falling back to the full
+    configured timeout would silently turn a spent budget into a fresh one, so
+    the smallest positive value is used instead and the call fails fast.
+    """
+    if override is None:
+        return config.timeout
+    return max(0.001, min(float(override), config.timeout))
 
 
 class LLMResourceLimitError(RuntimeError):
@@ -206,6 +228,7 @@ class OpenAIChatClient(LLMClient):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         payload: Dict[str, Any] = {
             "model": self.config.model,
@@ -224,7 +247,7 @@ class OpenAIChatClient(LLMClient):
             + "/chat/completions",
             payload,
             headers={"Authorization": f"Bearer {self.config.api_key}"},
-            timeout=self.config.timeout,
+            timeout=_effective_timeout(self.config, timeout),
         )
         try:
             return response["choices"][0]["message"]["content"] or ""
@@ -244,6 +267,7 @@ class AnthropicClient(LLMClient):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         system_parts = [m["content"] for m in messages if m.get("role") == "system"]
         non_system = [m for m in messages if m.get("role") != "system"]
@@ -264,7 +288,7 @@ class AnthropicClient(LLMClient):
                 "x-api-key": self.config.api_key,
                 "anthropic-version": "2023-06-01",
             },
-            timeout=self.config.timeout,
+            timeout=_effective_timeout(self.config, timeout),
         )
         try:
             parts = response.get("content") or []
@@ -285,6 +309,7 @@ class GeminiClient(LLMClient):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         system_instructions = [
             {"parts": [{"text": m["content"]}]}
@@ -318,7 +343,7 @@ class GeminiClient(LLMClient):
             f"{base.rstrip('/')}/models/{self.config.model}:generateContent?key={self.config.api_key}",
             payload,
             headers={},
-            timeout=self.config.timeout,
+            timeout=_effective_timeout(self.config, timeout),
         )
         try:
             # When finishReason is MAX_TOKENS, content can be missing or empty.
@@ -341,6 +366,7 @@ class MockLLMClient(LLMClient):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         joined = "\n".join(m.get("content", "") for m in messages)
         if "CANDIDATE_STUDIO_PROPOSAL_JSON" in joined:
@@ -449,12 +475,14 @@ class _QuotaLLMClient(LLMClient):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         _consume_current_system_quota()
         return self._delegate.generate_text(
             redact_messages(messages),
             temperature=temperature,
             max_tokens=max_tokens,
+            timeout=timeout,
         )
 
 
@@ -467,12 +495,14 @@ class _QuotaMockLLMClient(MockLLMClient):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         _consume_current_system_quota()
         return super().generate_text(
             redact_messages(messages),
             temperature=temperature,
             max_tokens=max_tokens,
+            timeout=timeout,
         )
 
 

@@ -54,7 +54,7 @@ from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 # Vision に対してこのシステムが担う役割」) and must never be produced by
 # folding the two together; the Understanding Brief shows them separately and
 # labels their provenance separately.
-PROMPT_VERSION = "understanding-review-v6"
+PROMPT_VERSION = "understanding-review-v7"
 SCHEMA_VERSION = "understanding-review-v2"
 DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
 DEFAULT_REVIEW_MAX_NODES_PER_TYPE = 5
@@ -327,6 +327,7 @@ def _build_review_prompt(
     answered_qa: Optional[List[Dict[str, Any]]] = None,
     unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
     alignment_feedback: Optional[List[Dict[str, Any]]] = None,
+    verified_evidence: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build the review prompt from graph + code facts."""
     parts: List[str] = []
@@ -394,6 +395,22 @@ def _build_review_prompt(
             parts.append(
                 f"- [{gap.gap_type}] {_trim(gap.node_name, 140)}: {_trim(gap.notes, 180)}"
             )
+
+    if verified_evidence:
+        # Issue #336: verified investigation facts from the shared evidence
+        # feed. They are deliberately their OWN section rather than merged into
+        # the Q&A block: these were established by reading the pinned snapshot,
+        # not answered by the developer, and the two provenances must not be
+        # conflated. Each carries its code citations, so the reviewer can cite
+        # them the same way it cites a graph node's evidence.
+        parts.append(
+            "\n## System-verified investigation facts (established by reading the "
+            "pinned snapshot during a joint investigation, each with its own code "
+            "citations; decision_method=reasoning_llm. These are NOT developer "
+            "answers -- treat them as established code facts, and prefer them over "
+            "a graph hypothesis they contradict.)"
+        )
+        parts.append(_trim_json(verified_evidence, QA_PROMPT_MAX_CHARS))
 
     if answered_qa:
         parts.append(
@@ -469,6 +486,7 @@ def generate_understanding_review(
     answered_qa: Optional[List[Dict[str, Any]]] = None,
     unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
     alignment_feedback: Optional[List[Dict[str, Any]]] = None,
+    verified_evidence: Optional[List[Dict[str, Any]]] = None,
 ) -> ReviewResult:
     """Generate a system understanding review from graph + code facts.
 
@@ -477,6 +495,12 @@ def generate_understanding_review(
     the conversational interview turn, so an answer given only via the Q&A
     panel (never posted as an ``interview_message``) still reaches
     ``current_understanding`` regeneration.
+
+    ``verified_evidence`` (Issue #336) carries the shared evidence feed's
+    current verified investigation facts. They are a SEPARATE input from
+    ``answered_qa`` on purpose: a fact established by reading the pinned
+    snapshot has a different provenance from a developer's answer, and merging
+    them would make the rebuilt understanding unable to say which is which.
 
     ``alignment_feedback`` carries explicit terminal decisions from
     Alignment Review. In particular, ``needs_change``,
@@ -500,6 +524,7 @@ def generate_understanding_review(
         graph, reconciliation, history,
         answered_qa=answered_qa, unconfirmed_qa=unconfirmed_qa,
         alignment_feedback=alignment_feedback,
+        verified_evidence=verified_evidence,
     )
     try:
         max_output_tokens = _review_max_output_tokens()

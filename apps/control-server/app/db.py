@@ -2829,17 +2829,41 @@ CREATE TABLE IF NOT EXISTS joint_understanding_session (
     -- the one this session pinned) blocks adopt/decide entirely.
     outcome_finding_ids TEXT NOT NULL DEFAULT '[]',
     outcome_premise_state TEXT,
-    -- The snapshot this session's investigation is pinned to, captured at
-    -- creation (same discipline as an Inquiry's premise bundle, Issue #308)
-    -- so a later round is never silently rebased onto a newer snapshot.
+    -- Issue #337: the reason code behind outcome_premise_state, and WHO
+    -- closed the session. A close is a manual decision, so the deciding
+    -- human and their stated reason must both survive a reload -- an
+    -- outcome with no recoverable decider is not an audit record.
+    outcome_premise_reason TEXT,
+    closed_by_actor_kind  TEXT,
+    closed_by_user_id     INTEGER,
+    closed_by_username    TEXT,
+    -- The premise bundle (Issue #337), sharing Issue #308's column names
+    -- because it is the same bundle: snapshot + pinned commit + origin
+    -- revision + origin content hash + confirmed Capability scope digest
+    -- (+ the linked Intent digest and the review-subject anchor where the
+    -- origin has them). premise_snapshot_id alone was never enough -- an
+    -- Intent correction or an Alignment rebuild moves the ground without
+    -- moving the snapshot, and a NULL premise was previously read as a
+    -- satisfied one. app/joint_premise.py evaluates them into the finite
+    -- current | stale | missing | invalid verdict; a bundle that cannot be
+    -- compared is 'invalid' and blocks the asserting outcomes.
     premise_snapshot_id INTEGER,
+    premise_commit_sha  TEXT,
+    premise_revision_id INTEGER,
+    premise_content_hash TEXT,
+    premise_capability_digest TEXT,
+    premise_intent_digest TEXT,
+    premise_review_subject_id TEXT,
+    premise_tracking_version TEXT,
+    premise_captured_at REAL,
     schema_version      TEXT NOT NULL,
     created_at          REAL NOT NULL,
     updated_at          REAL NOT NULL,
     closed_at           REAL,
     FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
-    FOREIGN KEY (premise_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+    FOREIGN KEY (premise_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (premise_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_session
@@ -2875,10 +2899,24 @@ CREATE TABLE IF NOT EXISTS joint_understanding_finding (
     decision_method         TEXT NOT NULL,
     intelligence_run_id     INTEGER,
     is_mock                 INTEGER NOT NULL DEFAULT 0,
+    -- Issue #337: provenance, on two axes that must not collapse into one.
+    -- producer_kind is WHICH CODE PATH wrote the row (investigation_loop /
+    -- translator / developer_api); actor_kind is WHETHER AN AUTHENTICATED
+    -- HUMAN stands behind it. Both come from the route and the resolved
+    -- Principal, never from the request body -- previously a body claiming
+    -- origin_role='developer' was enough to record any caller's sentence as
+    -- the human's own judgement, with decision_method='manual' attached.
+    -- NULL on rows written before this contract; they report 'legacy',
+    -- which is never assumed to be a human (app/joint_premise.py).
+    producer_kind           TEXT,
+    actor_kind              TEXT,
+    actor_user_id           INTEGER,
+    actor_username          TEXT,
     created_at              REAL NOT NULL,
     FOREIGN KEY (joint_understanding_id)
         REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (actor_user_id) REFERENCES users (id) ON DELETE SET NULL,
     FOREIGN KEY (supersedes_finding_id)
         REFERENCES joint_understanding_finding (id) ON DELETE SET NULL,
     FOREIGN KEY (intelligence_run_id)
@@ -2897,17 +2935,75 @@ CREATE TABLE IF NOT EXISTS joint_understanding_action (
     joint_understanding_id  INTEGER NOT NULL,
     system_id               INTEGER NOT NULL,
     action_kind             TEXT NOT NULL,
+    -- Free-text display label the caller may supply. Issue #337: this is NOT
+    -- the identity. actor_kind/actor_user_id below come from the resolved
+    -- Principal, so a request body can no longer name who acted.
     actor                   TEXT,
+    actor_kind              TEXT,
+    actor_user_id           INTEGER,
+    actor_username          TEXT,
     note                    TEXT,
     decision_method         TEXT NOT NULL DEFAULT 'manual',
     created_at              REAL NOT NULL,
     FOREIGN KEY (joint_understanding_id)
         REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
-    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (actor_user_id) REFERENCES users (id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_joint_understanding_action_session
     ON joint_understanding_action (joint_understanding_id, id);
+
+-- One provisionally adopted hypothesis (Issue #337).
+--
+-- `outcome='hypothesis_adopted'` is explicitly PROVISIONAL, but before this
+-- table the only trace of it was the closed session's outcome label. Nothing
+-- said WHICH hypothesis was adopted against WHICH premise, so nothing could
+-- bring it back for re-confirmation when that premise later moved -- the
+-- adoption quietly aged into something indistinguishable from a fact.
+--
+-- Every row is an immutable capture: the basis finding plus the premise
+-- digests as they stood at adoption time. The lifecycle state
+-- (provisional | reconfirmation_required | basis_withdrawn) is DERIVED from
+-- comparing that capture against the current premise
+-- (app/joint_premise.adoption_state), never stored -- the same discipline
+-- Issue #349 applies to an unresolved blocking failure, and for the same
+-- reason: a stored state can drift out of sync with the facts it describes.
+CREATE TABLE IF NOT EXISTS joint_understanding_hypothesis_adoption (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    finding_id              INTEGER NOT NULL,
+    adopted_by_actor_kind   TEXT NOT NULL,
+    adopted_by_user_id      INTEGER,
+    adopted_by_username     TEXT,
+    adoption_reason         TEXT NOT NULL DEFAULT '',
+    premise_snapshot_id     INTEGER,
+    premise_commit_sha      TEXT,
+    premise_revision_id     INTEGER,
+    premise_content_hash    TEXT,
+    premise_capability_digest TEXT,
+    premise_intent_digest   TEXT,
+    decision_method         TEXT NOT NULL DEFAULT 'manual',
+    adopted_at              REAL NOT NULL,
+    UNIQUE (joint_understanding_id, finding_id),
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (finding_id)
+        REFERENCES joint_understanding_finding (id) ON DELETE CASCADE,
+    FOREIGN KEY (adopted_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+    FOREIGN KEY (premise_snapshot_id)
+        REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (premise_revision_id)
+        REFERENCES understanding_revision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_adoption_session
+    ON joint_understanding_hypothesis_adoption (joint_understanding_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_adoption_system
+    ON joint_understanding_hypothesis_adoption (system_id, adopted_at);
 
 -- One iterative investigation round (Epic #328 Phase B / Issue #330).
 -- Append-only audit of what a round actually did -- which candidates it
@@ -2938,6 +3034,13 @@ CREATE TABLE IF NOT EXISTS joint_understanding_investigation_round (
     elapsed_seconds         REAL NOT NULL DEFAULT 0,
     intelligence_run_id     INTEGER,
     error_details           TEXT,
+    -- Issue #339: the finite execution-failure class
+    -- (app/investigation_loop.EXECUTION_FAILURE_CLASSES). NULL for a round
+    -- that succeeded AND for one that ended in a research limitation -- a
+    -- limitation is a real, evidence-backed result, not a broken run, and
+    -- collapsing the two is what made "the system looked and could not tell"
+    -- indistinguishable from "the system could not look".
+    failure_class           TEXT,
     created_at              REAL NOT NULL,
     FOREIGN KEY (joint_understanding_id)
         REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
@@ -2948,6 +3051,47 @@ CREATE TABLE IF NOT EXISTS joint_understanding_investigation_round (
 
 CREATE INDEX IF NOT EXISTS idx_joint_understanding_round_session
     ON joint_understanding_investigation_round (joint_understanding_id, id);
+
+-- One exploration source's contribution to one investigation round
+-- (Issue #339).
+--
+-- The round row records what the round read in total. That is not enough to
+-- check the boundary the added sources have to respect: "this round only read
+-- the pinned revision" is a claim about EACH source, and a git-history source
+-- that walked past the pinned commit would be invisible in a round-level
+-- total. So every source records its own revision (the pinned commit for git
+-- history, the snapshot id for the index/content/runtime sources), its own
+-- budget consumption, and its own failure.
+--
+-- A failed source is recorded and skipped -- it never fails the round, and it
+-- is never replaced by an unbounded fallback search (Issue #339: 予算超過時に
+-- 無制限の fallback 探索を行わない). source_kind is validated against
+-- app/snapshot_explorers.EXPLORATION_SOURCE_KINDS before insert.
+CREATE TABLE IF NOT EXISTS joint_understanding_exploration_source (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id                INTEGER NOT NULL,
+    joint_understanding_id  INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    source_kind             TEXT NOT NULL,
+    revision                TEXT NOT NULL,
+    candidates_found        INTEGER NOT NULL DEFAULT 0,
+    queries_run             INTEGER NOT NULL DEFAULT 0,
+    elapsed_seconds         REAL NOT NULL DEFAULT 0,
+    truncated               INTEGER NOT NULL DEFAULT 0,
+    error_details           TEXT,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (round_id)
+        REFERENCES joint_understanding_investigation_round (id) ON DELETE CASCADE,
+    FOREIGN KEY (joint_understanding_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_exploration_round
+    ON joint_understanding_exploration_source (round_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_exploration_source_kind
+    ON joint_understanding_exploration_source (system_id, source_kind, created_at);
 
 -- One translation pass (Epic #328 Phase C / Issue #331): the investigation's
 -- findings restated in terms of purpose, user impact, the gap against that
@@ -3033,6 +3177,105 @@ CREATE TABLE IF NOT EXISTS joint_understanding_reflux (
 
 CREATE INDEX IF NOT EXISTS idx_joint_understanding_reflux_session
     ON joint_understanding_reflux (joint_understanding_id, id);
+
+-- The shared verified-evidence feed (Issue #336).
+--
+-- Reflux (#332) attached a verified fact WITHOUT recording it as anyone's
+-- answer, but for every origin except 'qa' the attachment was the
+-- joint_understanding_reflux row itself -- and no rebuild read that table. The
+-- fact was recorded, attributable, and invisible to every consumer that could
+-- have used it, which is exactly the isolated third conversation Epic #328 set
+-- out to remove. This table is the one place a verified fact is published to
+-- and the one place a rebuild reads it from.
+--
+-- Provenance is its own: decision_method is always 'reasoning_llm' here, never
+-- 'manual'. A rebuild has to be able to tell an investigated fact apart from a
+-- developer's confirmed answer, which is why the feed is a separate prompt
+-- input rather than being merged into the Q&A section.
+--
+-- content_digest is a publication digest over the source session, finding, and
+-- the canonical semantic digest of the statement/evidence. Currency depends on
+-- the source session's premise, so two independent investigations establishing
+-- the same fact must remain distinct: an old source may become stale while a
+-- newer source remains current. UNIQUE makes retrying the exact same
+-- publication idempotent without conflating those two provenance records.
+--
+-- `superseded` is a manual/administrative override only. The ordinary currency
+-- rules are evaluated at READ time (app/understanding_evidence_feed.
+-- current_entries): a finding a later finding corrected, and a source session
+-- whose Issue #337 premise verdict is no longer 'current', are both excluded
+-- there. Neither is knowable when the fact is published, and an excluded entry
+-- must stay readable as history rather than being deleted or rewritten.
+CREATE TABLE IF NOT EXISTS understanding_evidence_feed (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id               INTEGER NOT NULL,
+    session_id              INTEGER NOT NULL,
+    source_kind             TEXT NOT NULL,
+    source_id               INTEGER NOT NULL,
+    finding_id              INTEGER NOT NULL,
+    origin_kind             TEXT NOT NULL,
+    origin_id               INTEGER NOT NULL,
+    statement               TEXT NOT NULL,
+    evidence_json           TEXT NOT NULL DEFAULT '[]',
+    runtime_evidence_json   TEXT NOT NULL DEFAULT '[]',
+    decision_method         TEXT NOT NULL DEFAULT 'reasoning_llm',
+    intelligence_run_id     INTEGER,
+    premise_snapshot_id     INTEGER,
+    premise_commit_sha      TEXT,
+    content_digest          TEXT NOT NULL,
+    superseded              INTEGER NOT NULL DEFAULT 0,
+    schema_version          TEXT NOT NULL,
+    created_at              REAL NOT NULL,
+    UNIQUE (system_id, content_digest),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (finding_id)
+        REFERENCES joint_understanding_finding (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id)
+        REFERENCES intelligence_runs (id) ON DELETE SET NULL,
+    FOREIGN KEY (premise_snapshot_id)
+        REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_evidence_feed_system
+    ON understanding_evidence_feed (system_id, session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_evidence_feed_source
+    ON understanding_evidence_feed (source_kind, source_id);
+
+-- Which rebuild used which verified fact (Issue #336).
+--
+-- Deliberately separate from human confirmation. A row here says the AI fed a
+-- fact into a rebuild; interview_session.understanding_confirmed_at (and Issue
+-- #312's Capability confirmation) says a human accepted the RESULT. Recording
+-- both in one place would let "the AI used this" be read as "the developer
+-- agreed with it" -- the conflation Epic #328 forbids between an investigation
+-- fact and a developer's decision.
+CREATE TABLE IF NOT EXISTS understanding_evidence_consumption (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    evidence_id             INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    session_id              INTEGER NOT NULL,
+    consumer_kind           TEXT NOT NULL,
+    revision_id             INTEGER,
+    intelligence_run_id     INTEGER,
+    consumed_at             REAL NOT NULL,
+    UNIQUE (evidence_id, consumer_kind, intelligence_run_id),
+    FOREIGN KEY (evidence_id)
+        REFERENCES understanding_evidence_feed (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (revision_id)
+        REFERENCES understanding_revision (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id)
+        REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_evidence_consumption_evidence
+    ON understanding_evidence_consumption (evidence_id, consumer_kind);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_evidence_consumption_session
+    ON understanding_evidence_consumption (system_id, session_id, consumed_at);
 
 -- Alignment Review / Review Queue (Issue #287). Contrasts confirmed/proposed
 -- Intent Brief items (interview_intent_item, Issue #284) against the
@@ -5069,6 +5312,64 @@ def init_db() -> None:
             conn, "joint_understanding_session", ju_cols,
             "outcome_premise_state", "TEXT",
         )
+        # Issue #337: the shared premise bundle, the close decision audit, and
+        # the provenance columns. All legitimately NULL on existing rows, and
+        # the NULLs are meaningful rather than merely absent: a session with
+        # no premise_tracking_version evaluates 'invalid'
+        # (premise_not_captured) and therefore cannot adopt a hypothesis,
+        # record a decision, or reflux. Compatibility here means "the old row
+        # stays readable and keeps its recorded outcome", never "the old row
+        # is promoted to a satisfied premise" -- the pre-#337 code returned
+        # 'fresh' for exactly these rows, which is the bug being fixed.
+        for _column_name, _definition in (
+            ("outcome_premise_reason", "TEXT"),
+            ("closed_by_actor_kind", "TEXT"),
+            ("closed_by_user_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL"),
+            ("closed_by_username", "TEXT"),
+            ("premise_commit_sha", "TEXT"),
+            (
+                "premise_revision_id",
+                "INTEGER REFERENCES understanding_revision(id) ON DELETE SET NULL",
+            ),
+            ("premise_content_hash", "TEXT"),
+            ("premise_capability_digest", "TEXT"),
+            ("premise_intent_digest", "TEXT"),
+            ("premise_review_subject_id", "TEXT"),
+            ("premise_tracking_version", "TEXT"),
+            ("premise_captured_at", "REAL"),
+        ):
+            _add_column_if_missing(
+                conn, "joint_understanding_session", ju_cols,
+                _column_name, _definition,
+            )
+        # Issue #339: the finite execution-failure class on a round, so a
+        # research limitation (a real result) is never read as a broken run.
+        ju_round_cols = _columns(conn, "joint_understanding_investigation_round")
+        _add_column_if_missing(
+            conn, "joint_understanding_investigation_round", ju_round_cols,
+            "failure_class", "TEXT",
+        )
+        ju_finding_cols = _columns(conn, "joint_understanding_finding")
+        for _column_name, _definition in (
+            ("producer_kind", "TEXT"),
+            ("actor_kind", "TEXT"),
+            ("actor_user_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL"),
+            ("actor_username", "TEXT"),
+        ):
+            _add_column_if_missing(
+                conn, "joint_understanding_finding", ju_finding_cols,
+                _column_name, _definition,
+            )
+        ju_action_cols = _columns(conn, "joint_understanding_action")
+        for _column_name, _definition in (
+            ("actor_kind", "TEXT"),
+            ("actor_user_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL"),
+            ("actor_username", "TEXT"),
+        ):
+            _add_column_if_missing(
+                conn, "joint_understanding_action", ju_action_cols,
+                _column_name, _definition,
+            )
         reflux_cols = _columns(conn, "joint_understanding_reflux")
         if reflux_cols and "runtime_evidence_json" not in reflux_cols:
             conn.execute(

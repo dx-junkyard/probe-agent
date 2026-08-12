@@ -39,6 +39,15 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, Optional, Sequence, Set
 
+from .joint_premise import (
+    ASSERTABLE_PREMISE_STATES,
+    LEGACY_PREMISE_STATES,
+    OUTCOMES_REQUIRING_BASIS as _OUTCOMES_REQUIRING_BASIS,
+    PREMISE_STATES as _PREMISE_STATES,
+    BasisFinding,
+    validate_basis,
+)
+
 SCHEMA_VERSION = "joint-understanding-v1"
 
 # --- Finite vocabularies (Principle 6) ---------------------------------------
@@ -103,6 +112,50 @@ ACTION_KINDS = (
     "hold",
     "handoff",
     "decide",
+)
+
+# Which existing formal operation each action leads to (Issue #336).
+#
+# Recording an action is a record of intent. It is NOT the operation, and the
+# distinction had no machine-readable form before: the developer chose
+# 「意図を修正する」 and nothing connected that to `POST
+# /interview/intent/{id}/correct`, so the conversation could accumulate actions
+# that never became anything. This table is the deterministic server catalog of
+# where each action actually goes.
+#
+# Two of them complete inside this feature (`joint_investigate`,
+# `joint_translate`); `joint_hold` and the two close variants are this
+# session's own lifecycle. The rest name an endpoint OUTSIDE it, and those are
+# the ones that must never be treated as done because an action row exists.
+FORMAL_OPERATIONS = (
+    "joint_investigate",
+    "joint_translate",
+    "joint_hold",
+    "joint_close_provisional",
+    "joint_close_decided",
+    "intent_correct",
+    "question_handoff_create",
+    "origin_item_answer",
+)
+
+ACTION_FORMAL_OPERATIONS: Dict[str, str] = {
+    "request_investigation": "joint_investigate",
+    "explain_reasoning": "joint_translate",
+    "compare_options": "joint_translate",
+    "adopt_hypothesis": "joint_close_provisional",
+    "revise_intent": "intent_correct",
+    "hold": "joint_hold",
+    "handoff": "question_handoff_create",
+    "decide": "joint_close_decided",
+}
+
+# Operations performed by an endpoint OUTSIDE this feature. Recording the
+# action opens them; only their own endpoint completes them, and the completion
+# is that endpoint's `decision_method: manual` record -- never this one.
+EXTERNAL_FORMAL_OPERATIONS = (
+    "intent_correct",
+    "question_handoff_create",
+    "origin_item_answer",
 )
 
 DECISION_METHODS = ("deterministic", "reasoning_llm", "manual")
@@ -266,11 +319,17 @@ REFLUX_TARGET_KINDS = ("qa_investigation", "session_ledger")
 REFLUXABLE_CLAIM_KINDS = ("fact",)
 
 # Outcomes that assert something forward-looking and therefore need both a
-# named basis and a still-valid premise.
-OUTCOMES_REQUIRING_BASIS = ("hypothesis_adopted", "decided")
+# named basis and a still-valid premise. Issue #337 moved the definition of
+# what a VALID basis IS into app/joint_premise.py -- it now also rejects a
+# superseded, mock, or non-hypothesis basis -- while the set itself stays
+# re-exported here so the contract remains readable in one place.
+OUTCOMES_REQUIRING_BASIS = _OUTCOMES_REQUIRING_BASIS
 
-# Finite premise verdicts evaluated at close/reflux time.
-PREMISE_STATES = ("fresh", "stale")
+# Finite premise verdicts (Issue #337): current | stale | missing | invalid.
+# 'fresh' is the pre-#337 value and is read-only; it never appears in a new
+# evaluation. The two added states are the two cases the old pair had to lie
+# about -- a premise that disappeared, and a session that never captured one.
+PREMISE_STATES = _PREMISE_STATES
 
 
 def can_reflux(origin_role: str, claim_kind: str) -> bool:
@@ -283,29 +342,68 @@ def reflux_target_kind(origin_kind: str) -> str:
     return "qa_investigation" if origin_kind == "qa" else "session_ledger"
 
 
+# Why an asserting outcome was refused on premise grounds, one message per
+# finite premise verdict. Separate messages because the recovery differs: a
+# stale premise can be re-investigated, a missing one cannot be recovered at
+# all, and an uncaptured one was never comparable in the first place.
+_PREMISE_REFUSAL_MESSAGES = {
+    "stale": (
+        "the premise this session was investigated against has changed; "
+        "re-investigate first"
+    ),
+    "missing": (
+        "the premise this session was investigated against no longer exists; "
+        "open a new session against the current state"
+    ),
+    "invalid": (
+        "this session has no comparable premise (it predates premise tracking, "
+        "or was opened without a pinned snapshot); open a new session"
+    ),
+}
+
+
 def validate_outcome_basis(
     *,
     outcome: str,
     outcome_finding_ids: Sequence[int],
     known_finding_ids: Iterable[int],
     premise_state: str,
+    basis_findings: Optional[Dict[int, BasisFinding]] = None,
 ) -> None:
     """Guard the two outcomes that assert something beyond "we talked".
 
     ``hypothesis_adopted`` and ``decided`` must name the findings they rest
-    on, and those findings must belong to this session. Both are refused
-    outright on a ``stale`` premise: an answer given against a premise that
-    no longer exists must not become a current decision (the same rule
-    Issue #308 applies to an Inquiry, evaluated here at close time).
+    on. Issue #337 tightened what qualifies, fail-closed on all four counts:
+
+    - the premise must be ``current``. ``stale`` was already refused;
+      ``missing`` and ``invalid`` are now refused too, where the pre-#337 code
+      reported both as ``fresh`` and let them through.
+    - a basis finding must belong to this session (System isolation follows,
+      since findings are session-scoped and sessions are System-scoped),
+    - it must not be superseded (a claim the investigation itself corrected)
+      and must not be mock output,
+    - for ``hypothesis_adopted`` it must actually BE a current investigation
+      hypothesis with a verified run and evidence -- otherwise the provisional
+      marker says nothing about what was adopted.
+
+    ``basis_findings`` is the caller's map of this session's findings. It is
+    optional only so the pre-#337 id-only check still works for callers that
+    have nothing more to offer; when omitted the last three rules cannot be
+    applied and the caller is trusting a weaker contract.
     """
     _require_member(outcome, SESSION_OUTCOMES, "outcome")
-    _require_member(premise_state, PREMISE_STATES, "premise_state")
+    if premise_state not in PREMISE_STATES and premise_state not in LEGACY_PREMISE_STATES:
+        raise JointUnderstandingValidationError(
+            f"premise_state must be one of {list(PREMISE_STATES)}, got {premise_state!r}"
+        )
     if outcome not in OUTCOMES_REQUIRING_BASIS:
         return
-    if premise_state == "stale":
+    if premise_state not in ASSERTABLE_PREMISE_STATES:
+        detail = _PREMISE_REFUSAL_MESSAGES.get(
+            premise_state, "the premise this session relied on is not current"
+        )
         raise JointUnderstandingValidationError(
-            f"Cannot record outcome '{outcome}': the premise this session was "
-            "investigated against has changed; re-investigate first"
+            f"Cannot record outcome '{outcome}': {detail}"
         )
     if not outcome_finding_ids:
         raise JointUnderstandingValidationError(
@@ -317,6 +415,32 @@ def validate_outcome_basis(
         raise JointUnderstandingValidationError(
             f"outcome_finding_ids reference findings outside this session: {unknown}"
         )
+    if basis_findings is None:
+        return
+    _code, message = validate_basis(
+        outcome=outcome,
+        outcome_finding_ids=outcome_finding_ids,
+        findings_by_id=basis_findings,
+    )
+    if message:
+        raise JointUnderstandingValidationError(message)
+
+
+def formal_operation_for(action_kind: str) -> str:
+    """The existing formal operation ``action_kind`` leads to (deterministic)."""
+    _require_member(action_kind, ACTION_KINDS, "action_kind")
+    return ACTION_FORMAL_OPERATIONS[action_kind]
+
+
+def completes_outside_session(action_kind: str) -> bool:
+    """Whether the action's operation is performed by an endpoint elsewhere.
+
+    True means the action record is an intent to go there, and the operation is
+    finished only by that endpoint's own manual record -- reading the action row
+    as completion would be exactly the "AI decided it" conflation Epic #328
+    forbids.
+    """
+    return formal_operation_for(action_kind) in EXTERNAL_FORMAL_OPERATIONS
 
 
 def available_action_kinds(status: str) -> List[str]:

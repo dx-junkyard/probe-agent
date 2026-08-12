@@ -72,7 +72,7 @@ from .interview_intent_agent import INTENT_FIELDS
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 from .runtime_alignment import RUNTIME_CHECK_STATES
 
-PROMPT_VERSION = "alignment-v2"
+PROMPT_VERSION = "alignment-v3"
 SCHEMA_VERSION = "alignment-v2"
 
 ALIGNMENT_STATES = ("aligned", "gap", "unknown", "conflict", "not_applicable")
@@ -799,6 +799,7 @@ def _build_user_prompt(
     current_understanding: Optional[Dict[str, object]],
     gap_analysis: Optional[List[Dict[str, object]]],
     confirmed_capability_graph: Optional[Dict[str, object]] = None,
+    verified_evidence: Optional[List[Dict[str, object]]] = None,
 ) -> str:
     parts = [
         "## Intent Brief (current, non-superseded items; only the user can decide these)",
@@ -811,6 +812,19 @@ def _build_user_prompt(
         "(the only allowed capability dependency ids)",
         json.dumps(confirmed_capability_graph or {}, ensure_ascii=False),
     ]
+    if verified_evidence:
+        # Issue #336: verified investigation facts from the shared evidence
+        # feed. Their own section, separate from the Intent Brief and from the
+        # understanding: these were established by reading the pinned snapshot,
+        # and the developer has decided nothing about them. Merging them into
+        # the Intent Brief would turn an investigated fact into a stated intent.
+        parts.append(
+            "\n## System-verified investigation facts (established by reading the "
+            "pinned snapshot; decision_method=reasoning_llm. NOT developer intent "
+            "and NOT a developer answer -- use them as code facts when judging "
+            "whether the Intent and the current system actually agree.)"
+        )
+        parts.append(json.dumps(verified_evidence, ensure_ascii=False))
     return "\n".join(parts)
 
 
@@ -822,6 +836,7 @@ def generate_alignment_proposal(
     current_understanding: Optional[Dict[str, object]],
     gap_analysis: Optional[List[Dict[str, object]]],
     confirmed_capability_graph: Optional[Dict[str, object]] = None,
+    verified_evidence: Optional[List[Dict[str, object]]] = None,
 ) -> AlignmentProposalResult:
     """Propose alignment items contrasting Intent vs Current System.
 
@@ -848,6 +863,7 @@ def generate_alignment_proposal(
         current_understanding,
         gap_analysis,
         confirmed_capability_graph,
+        verified_evidence,
     )
 
     try:

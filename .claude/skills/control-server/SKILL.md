@@ -848,6 +848,47 @@ Rules for any new artifact:
   into `insufficient_data` (denominator empty / sample below minimum) and
   `not_measurable` (the underlying fact is not recorded at all).
 
+## Joint Understanding premise / provenance / lineage (issues #337-#339, #336)
+
+`app/joint_premise.py` is the single premise and provenance contract for Joint
+Understanding, and it REUSES Issue #308's bundle (same column names, same digest
+helpers) rather than defining a parallel one.
+
+- Premise verdicts are the finite `current` / `stale` / `missing` / `invalid`,
+  first-match. Only `current` permits `hypothesis_adopted` / `decided` / reflux.
+  A premise that was never captured is `invalid`, NOT satisfied — the pre-#337
+  gate returned "fresh" for an uncaptured premise, an unresolvable session, and
+  a deleted snapshot, so its failure mode was permissive.
+- Staleness is decided by the pinned COMMIT, never the snapshot id (the same
+  commit re-pinned under a new snapshot row is the same premise). The
+  Understanding revision is captured for audit and lineage and is NEVER a
+  staleness input.
+- Three separate provenance axes on every finding: `origin_role` (whose voice),
+  `producer_kind` (which code path), `actor_kind` (whether an authenticated
+  human stands behind it). All resolved from the route and the `Principal`,
+  never from a request body. `POST /joint-understanding/{id}/findings` is
+  developer-only; producer roles are 403.
+- `app/understanding_evidence_feed.py` is the ONLY place a verified fact is
+  published to and the only place a rebuild reads it from. Currency (a corrected
+  finding, a non-`current` premise) is evaluated at READ time because neither is
+  knowable at publish time, and an excluded entry stays readable as history.
+  Publication is idempotent on a digest over the fact's MEANING that excludes
+  the finding id.
+- A rebuild's CONSUMPTION of a fact and a human's CONFIRMATION of the result are
+  separate tables. Writing them in one place would let "the AI fed this in" read
+  as "the developer agreed with it".
+- `app/joint_lineage.py` derives the finite outcome events; nothing about a
+  subject's lifecycle is stored. A subject with no terminal verdict is excluded
+  from every metric denominator.
+- Metric categories stay separate: `joint_understanding` (utilization),
+  `joint_understanding_quality` (outcome lineage), `joint_understanding_burden`
+  (per-session cost). No composite score anywhere, ever.
+- A literal path segment that collides with an existing `{id}` route must not
+  reuse its prefix: `GET /joint-understanding/{ju_id}` is registered first with
+  an int param, so the lineage endpoint is
+  `/interview/joint-understanding/lineage`.
+
+
 ## Rules
 
 - Validate incoming payloads.

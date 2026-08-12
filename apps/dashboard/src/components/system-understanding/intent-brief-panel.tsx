@@ -20,6 +20,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import { InquiryPanel } from "@/components/system-understanding/inquiry-panel";
+import { JointUnderstandingEntry } from "@/components/system-understanding/joint-understanding-entry";
 import {
   useActiveInquiriesByOrigin,
   useConfirmInterviewIntentItem,
@@ -246,6 +247,15 @@ function IntentItemRow({
                   >
                     対象外
                   </Button>
+                  {/* Issue #336: the same 共同理解 flow the Q&A card uses.
+                      Opening it never confirms, corrects, or declines the
+                      item — those stay the three buttons above. */}
+                  <JointUnderstandingEntry
+                    sessionId={sessionId}
+                    originKind="intent"
+                    originId={item.id}
+                    questionText={`この意図をどう決めるべきか分かりません: ${item.value_text}`}
+                  />
                 </>
               )}
               {reopenableInquiryId ? (

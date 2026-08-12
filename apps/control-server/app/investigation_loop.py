@@ -85,11 +85,19 @@ from .investigation_agent import (
     _strip_fences,
 )
 from .joint_understanding import CLAIM_KINDS
+from .snapshot_explorers import (
+    ExplorerResult,
+    call_graph_candidates,
+    dependency_candidates,
+    git_history_candidates,
+    merge_candidates,
+    runtime_discovery_candidates,
+)
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 from .runtime_alignment import RUNTIME_CHECK_STATES
 
-PROMPT_VERSION = "investigation-loop-v1"
-SCHEMA_VERSION = "investigation-loop-v1"
+PROMPT_VERSION = "investigation-loop-v2"
+SCHEMA_VERSION = "investigation-loop-v2"
 
 # Finite stop reasons (Principle 6). Every loop ends with exactly one:
 #   answered         -- a round concluded with grounded findings and nothing
@@ -103,6 +111,44 @@ SCHEMA_VERSION = "investigation-loop-v1"
 STOP_REASONS = (
     "answered", "budget_exhausted", "no_new_evidence", "unresolved", "failed",
 )
+
+# Issue #339: `failed` lumped every way a run could end badly into one value,
+# so a RESEARCH LIMITATION (the system looked and could not establish the
+# answer) and an EXECUTION FAILURE (the system could not look at all) were
+# indistinguishable. They mean opposite things to the developer and they have
+# opposite consequences:
+#
+# - a limitation is a real, evidence-backed result. "We could not determine X"
+#   is a first-class finding, and the round that produced it is trustworthy.
+# - a failure is the ABSENCE of a result. It must not produce a finding at all,
+#   because a finding would assert something about the system that nothing was
+#   read to support -- only the audit event and the recovery action remain.
+RESEARCH_LIMITATIONS = ("budget_exhausted", "no_new_evidence", "unresolved")
+
+# Finite execution-failure classes. Each names WHERE the run broke, because the
+# recovery differs: configuration and auth are operator actions, a missing
+# snapshot cannot be retried as-is, and an API/schema/timeout failure is a
+# retry.
+EXECUTION_FAILURE_CLASSES = (
+    "config_invalid",
+    "snapshot_unavailable",
+    "api_failure",
+    "schema_invalid",
+    "timeout",
+)
+
+# The finite outcome class a caller (and the UI) reads instead of inspecting
+# `stop_reason` and guessing which side of the split it is on.
+OUTCOME_CLASSES = ("answered", "research_limitation", "execution_failure")
+
+
+def outcome_class_for(stop_reason: str) -> str:
+    """The finite outcome class for a stop reason (deterministic)."""
+    if stop_reason == "answered":
+        return "answered"
+    if stop_reason in RESEARCH_LIMITATIONS:
+        return "research_limitation"
+    return "execution_failure"
 
 DEFAULT_MAX_ROUNDS = 3
 DEFAULT_TOTAL_LLM_CALLS = 3
@@ -194,6 +240,12 @@ class LoopRound:
     unread_candidates: List[str] = field(default_factory=list)
     pruned_evidence: List[Dict[str, object]] = field(default_factory=list)
     pruned_findings: int = 0
+    # Issue #339: one entry per exploration source this round used, each with
+    # its own revision, budget consumption, and failure. Per source because
+    # "the round only read the pinned revision" has to be checkable for each
+    # source separately, not asserted for the round as a whole.
+    source_audits: List["ExplorerResult"] = field(default_factory=list)
+    failure_class: Optional[str] = None
     files_read: int = 0
     chars_read: int = 0
     llm_calls: int = 0
@@ -212,11 +264,22 @@ class InvestigationLoopResult:
     rounds: List[LoopRound] = field(default_factory=list)
     findings: List[LoopFinding] = field(default_factory=list)
     carry_over: LoopCarryOver = field(default_factory=LoopCarryOver)
+    # Issue #339: set only for an EXECUTION failure -- never for a research
+    # limitation, which is a real result rather than a broken run.
+    failure_class: Optional[str] = None
     error: Optional[str] = None
 
     @property
     def total_llm_calls(self) -> int:
         return sum(r.llm_calls for r in self.rounds)
+
+    @property
+    def outcome_class(self) -> str:
+        return outcome_class_for(self.stop_reason)
+
+    @property
+    def is_research_limitation(self) -> bool:
+        return self.outcome_class == "research_limitation"
 
 
 # --- Raw response schema ------------------------------------------------------
@@ -409,17 +472,29 @@ def _round_candidates(
     index_paths: Sequence[str],
     already_read: Set[str],
     limit: int,
+    structural_paths: Sequence[str] = (),
 ) -> List[str]:
-    """Merge path-name and index/content candidates, minus what was read.
+    """Merge the candidate sources, minus what was read, in priority order.
 
-    Index/content hits come first: on a second round they are what carries
-    the previous round's leads, whereas the path-name scan mostly re-proposes
-    the same files.
+    Index/content hits come first: on a second round they are what carries the
+    previous round's leads, whereas the path-name scan mostly re-proposes the
+    same files.
+
+    ``structural_paths`` (Issue #339's dependency / call-graph / git-history /
+    runtime sources) comes LAST, and that ordering is the contract. Those
+    sources answer "what is around these files", so they are only meaningful
+    relative to the files the question itself pointed at -- putting them earlier
+    would let them displace the direct match on a small per-round read budget,
+    which is breadth bought by losing the thing that was actually asked about.
     """
     tracked = set(paths)
     ordered: List[str] = []
     seen: Set[str] = set()
-    for path in list(index_paths) + _path_name_candidates(paths, keywords, limit * 2):
+    for path in (
+        list(index_paths)
+        + _path_name_candidates(paths, keywords, limit * 2)
+        + list(structural_paths)
+    ):
         if path in seen or path in already_read or path not in tracked:
             continue
         seen.add(path)
@@ -450,6 +525,81 @@ def _dedupe(values: Sequence[str], limit: int) -> List[str]:
         if len(out) >= limit:
             break
     return out
+
+
+# The floor below which starting an LLM call cannot honour the remaining time
+# budget. Not a soft hint: below it the loop stops rather than making a call it
+# would have to abandon.
+_MIN_CALL_SECONDS = 2.0
+
+# How many already-plausible files seed the structural sources. They answer
+# "what is around THESE files", so they need somewhere to start; the seed set is
+# capped so the added breadth cannot grow the round's cost without bound.
+_MAX_SEED_PATHS = 5
+
+
+def _seed_paths(*, carry: LoopCarryOver) -> List[str]:
+    """The files the structural sources explore around.
+
+    ONLY files already established as relevant: what earlier rounds actually
+    read, most recent first, since the newest read is the current lead.
+    Deliberately NOT the path-name or index matches -- seeding from a keyword
+    guess would make the structural sources a second guess about the same
+    guess, and their whole value is being anchored to a file that is known to
+    matter.
+
+    An empty result means nothing is established yet, and the caller skips the
+    structural sources entirely for that round.
+    """
+    seeds: List[str] = []
+    for path in reversed(carry.read_paths):
+        if path and path not in seeds:
+            seeds.append(path)
+        if len(seeds) >= _MAX_SEED_PATHS:
+            break
+    return seeds
+
+
+def _structural_sources(
+    conn,
+    *,
+    system_id: int,
+    snapshot_id: int,
+    seed_paths: Sequence[str],
+    seed_symbols: Sequence[str],
+    include_runtime: bool,
+) -> List[ExplorerResult]:
+    """Run the DB-backed structural sources, each independently audited.
+
+    A source that raises is recorded as failed and skipped: one broken source
+    must not fail the round, and it must not be replaced by an unbounded
+    fallback search either (Issue #339).
+    """
+    results: List[ExplorerResult] = []
+    plans = [
+        ("dependency", lambda: dependency_candidates(
+            conn, snapshot_id=snapshot_id, system_id=system_id, seed_paths=seed_paths,
+        )),
+        ("call_graph", lambda: call_graph_candidates(
+            conn, snapshot_id=snapshot_id, system_id=system_id,
+            seed_paths=seed_paths, seed_symbols=seed_symbols,
+        )),
+    ]
+    if include_runtime:
+        plans.append(("runtime_facts", lambda: runtime_discovery_candidates(
+            conn, snapshot_id=snapshot_id, system_id=system_id,
+        )))
+    for source_kind, run in plans:
+        started = time.monotonic()
+        try:
+            outcome = run()
+        except sqlite3.Error as exc:
+            outcome = ExplorerResult(
+                source_kind=source_kind, revision=str(snapshot_id), error=str(exc),
+            )
+        outcome.elapsed_seconds = time.monotonic() - started
+        results.append(outcome)
+    return results
 
 
 # --- Prompt assembly ----------------------------------------------------------
@@ -639,6 +789,7 @@ def run_investigation_loop(
         return InvestigationLoopResult(
             provider=config.provider, model=config.model, is_mock=is_mock,
             stop_reason="failed", carry_over=carry,
+            failure_class="config_invalid",
             error=(
                 "Joint Understanding investigation requires a configured reasoning "
                 "model; mock/heuristic fallback is prohibited"
@@ -646,11 +797,16 @@ def run_investigation_loop(
         )
 
     try:
-        entries = list_tree_entries(repo_path, commit_sha)
+        entries = list_tree_entries(
+            repo_path,
+            commit_sha,
+            timeout=max(0.001, budget.timeout_seconds),
+        )
     except GitError as exc:
         return InvestigationLoopResult(
             provider=config.provider, model=config.model, is_mock=False,
             stop_reason="failed", carry_over=carry,
+            failure_class="snapshot_unavailable",
             error=f"Failed to list the pinned snapshot: {exc}",
         )
     paths = [e.path for e in entries if e.object_type == "blob" and e.mode != "120000"]
@@ -686,17 +842,69 @@ def run_investigation_loop(
 
         # DB reads happen here, strictly BEFORE this round's reasoning call.
         index_paths: List[str] = []
-        if system_id is not None and snapshot_id is not None:
+        source_audits: List[ExplorerResult] = []
+        # Issue #339: the structural sources answer "what is AROUND these
+        # files", so they need files that already matter. They are therefore
+        # skipped while nothing has been read yet: the first round of a fresh
+        # investigation answers the question as asked, from the direct matches,
+        # and the added breadth follows the leads that round produced. Seeding
+        # them from keywords instead would spend the first round's read budget
+        # on files that are merely adjacent to a guess -- and on a small
+        # per-round budget that costs the file the developer actually asked
+        # about. A RESUMED run has carried-over read paths, so its first round
+        # is lead-driven and does get them.
+        structural_seeds = _seed_paths(carry=carry)
+        if structural_seeds:
+            if system_id is not None and snapshot_id is not None:
+                from .db import get_conn
+
+                with get_conn() as conn:
+                    index_paths = _index_candidates(
+                        conn, system_id, snapshot_id, keywords,
+                        budget.max_files_per_round * 3,
+                    )
+                    source_audits.extend(
+                        _structural_sources(
+                            conn,
+                            system_id=system_id,
+                            snapshot_id=snapshot_id,
+                            seed_paths=structural_seeds,
+                            seed_symbols=carry.search_leads,
+                            include_runtime=budget.max_runtime_facts > 0,
+                        )
+                    )
+            # git history runs OUTSIDE the DB connection -- it is a subprocess,
+            # and app/db.py's lock must never be held across one.
+            remaining_for_history = budget.timeout_seconds - (time.monotonic() - start)
+            if remaining_for_history > 0:
+                source_audits.append(
+                    git_history_candidates(
+                        repo_path=repo_path, commit_sha=commit_sha,
+                        seed_paths=structural_seeds,
+                        timeout_seconds=remaining_for_history,
+                    )
+                )
+        elif system_id is not None and snapshot_id is not None:
             from .db import get_conn
 
             with get_conn() as conn:
                 index_paths = _index_candidates(
-                    conn, system_id, snapshot_id, keywords, budget.max_files_per_round * 3,
+                    conn, system_id, snapshot_id, keywords,
+                    budget.max_files_per_round * 3,
                 )
 
         read_limit = min(budget.max_files_per_round, remaining_files)
+        tracked = set(paths)
+        structural = merge_candidates(
+            source_audits,
+            tracked_paths=tracked,
+            already_read=already_read,
+            limit=budget.max_files_per_round * 2,
+        )
         candidates = _round_candidates(
-            paths=paths, keywords=keywords, index_paths=index_paths,
+            paths=paths, keywords=keywords,
+            index_paths=index_paths,
+            structural_paths=structural,
             already_read=already_read,
             limit=max(read_limit + 1, budget.max_files_per_round * 3),
         )
@@ -704,16 +912,20 @@ def run_investigation_loop(
             stop_reason = "no_new_evidence" if result.rounds else "unresolved"
             break
 
+        remaining_for_reads = budget.timeout_seconds - (time.monotonic() - start)
+        if remaining_for_reads <= 0:
+            stop_reason = "budget_exhausted"
+            break
         round_budget = InvestigationBudget(
             max_files=read_limit,
             max_snippet_chars=remaining_chars,
             max_llm_calls=1,
             max_evidence_items=20,
             max_runtime_facts=budget.max_runtime_facts,
-            timeout_seconds=max(1, budget.timeout_seconds),
+            timeout_seconds=remaining_for_reads,
         )
         snippets, _timed_out = _read_candidates(
-            repo_path, commit_sha, candidates, round_budget, round_start,
+            repo_path, commit_sha, candidates, round_budget, time.monotonic(),
         )
         if not snippets:
             stop_reason = "no_new_evidence" if result.rounds else "unresolved"
@@ -744,6 +956,16 @@ def run_investigation_loop(
         carry.read_paths = _dedupe(carry.read_paths + read_now, 200)
         unread = [p for p in candidates if p not in set(read_now)]
 
+        # Issue #339: the time budget is a HARD limit, applied to the call
+        # itself. Checking the clock between rounds bounds the loop's own
+        # bookkeeping, not the round trip that actually spends the time -- a
+        # single hung call could overrun the whole budget while every
+        # between-round check passed. Below the floor there is no time left to
+        # make a call with, so the loop stops instead of starting one.
+        remaining_seconds = budget.timeout_seconds - (time.monotonic() - start)
+        if remaining_seconds < _MIN_CALL_SECONDS:
+            stop_reason = "budget_exhausted"
+            break
         try:
             raw = client.generate_text(
                 [
@@ -752,15 +974,20 @@ def run_investigation_loop(
                 ],
                 temperature=0.2,
                 max_tokens=3072,
+                timeout=remaining_seconds,
             )
         except LLMError as exc:
+            timed_out = time.monotonic() - start >= budget.timeout_seconds
             result.rounds.append(LoopRound(
                 round_index=round_index, status="failed", error=str(exc),
                 read_snippets=snippets, candidate_paths=candidates, unread_candidates=unread,
                 files_read=files_read, chars_read=chars_read, llm_calls=1,
                 elapsed_seconds=time.monotonic() - round_start,
+                source_audits=source_audits,
+                failure_class="timeout" if timed_out else "api_failure",
             ))
             stop_reason = "failed"
+            result.failure_class = "timeout" if timed_out else "api_failure"
             result.error = str(exc)
             break
 
@@ -773,8 +1000,10 @@ def run_investigation_loop(
                 read_snippets=snippets, candidate_paths=candidates, unread_candidates=unread,
                 files_read=files_read, chars_read=chars_read, llm_calls=1,
                 elapsed_seconds=time.monotonic() - round_start,
+                source_audits=source_audits, failure_class="schema_invalid",
             ))
             stop_reason = "failed"
+            result.failure_class = "schema_invalid"
             result.error = message
             break
 
@@ -785,8 +1014,10 @@ def run_investigation_loop(
                 read_snippets=snippets, candidate_paths=candidates, unread_candidates=unread,
                 files_read=files_read, chars_read=chars_read, llm_calls=1,
                 elapsed_seconds=time.monotonic() - round_start,
+                source_audits=source_audits, failure_class="schema_invalid",
             ))
             stop_reason = "failed"
+            result.failure_class = "schema_invalid"
             result.error = message
             break
 
@@ -815,6 +1046,7 @@ def run_investigation_loop(
             pruned_evidence=pruned_evidence, pruned_findings=dropped,
             files_read=files_read, chars_read=chars_read, llm_calls=1,
             elapsed_seconds=time.monotonic() - round_start,
+            source_audits=source_audits,
         ))
         result.findings.extend(findings)
 

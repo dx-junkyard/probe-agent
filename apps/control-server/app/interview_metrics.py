@@ -302,6 +302,217 @@ def _implementation_question_transfer_metric(
     )
 
 
+def _joint_understanding_lineage_metrics(
+    conn: sqlite3.Connection, system_id: int,
+) -> "list[InterviewMetricOut]":
+    """Outcome-lineage quality and burden metrics (Issue #338).
+
+    The `joint_understanding` metrics below count utilization and close labels.
+    These count what actually HAPPENED to the unknowns, hypotheses, questions
+    and decisions a conversation produced -- derived from the finite lineage
+    events in ``app/joint_lineage.py``, never from an outcome label.
+
+    Two categories, deliberately not one and deliberately not merged with the
+    efficiency numbers: `joint_understanding_quality` (did understanding
+    improve) and `joint_understanding_burden` (what it cost the developer). An
+    efficiency gain must never be displayed as a quality gain, and there is no
+    composite anywhere.
+
+    Every denominator counts only subjects that reached a TERMINAL verdict. An
+    open hypothesis is neither confirmed nor reversed, and putting it on either
+    side would report an outcome that has not happened -- which is the same
+    mistake as reading a close label as a quality result.
+    """
+    from .joint_lineage import derive_lineage
+
+    lineage = derive_lineage(conn, system_id=system_id)
+    metrics: "list[InterviewMetricOut]" = []
+    sessions = len(lineage.burdens)
+
+    unknown_terminal = lineage.terminal_subjects("unknown")
+    metrics.append(_measured(
+        key="joint_understanding_unknown_resolution_rate",
+        category="joint_understanding_quality",
+        guardrail=False,
+        description=(
+            "調査が記録した不明点のうち、後続の Finding で解消された割合。"
+            "不明の発生から解消までを同じ lineage で数える(close 時のラベルでは測らない)。"
+        ),
+        formula="unknown_resolved / (unknown_resolved + unknown_remained)",
+        sources=["joint_understanding_finding.claim_kind", ".supersedes_finding_id"],
+        unit="ratio",
+        numerator=lineage.count("unknown_resolved"),
+        denominator=unknown_terminal,
+    ))
+
+    hypothesis_terminal = lineage.terminal_subjects("hypothesis")
+    metrics.append(_unmeasured(
+        key="joint_understanding_hypothesis_reversal_rate",
+        category="joint_understanding_quality",
+        guardrail=True,
+        description=(
+            "明示的に反転が確認された仮説の割合。fact への supersede だけでは"
+            "確認か反転か判別しない。"
+        ),
+        formula="hypothesis_reversed / terminal hypotheses",
+        sources=["joint_understanding_finding.claim_kind", ".supersedes_finding_id"],
+        unit="ratio",
+        reason="explicit_observation_contract_pending",
+    ))
+    metrics.append(_measured(
+        key="joint_understanding_hypothesis_correction_rate",
+        category="joint_understanding_quality",
+        guardrail=True,
+        description=(
+            "決着した仮説のうち、別の仮説へ訂正された割合。"
+            "反転(事実で覆る)と区別する — 収束しているか、迷走しているかが違う。"
+        ),
+        formula="hypothesis_corrected / terminal hypotheses",
+        sources=["joint_understanding_finding.claim_kind", ".supersedes_finding_id"],
+        unit="ratio",
+        numerator=lineage.count("hypothesis_corrected"),
+        denominator=hypothesis_terminal,
+    ))
+
+    adoptions = conn.execute(
+        "SELECT COUNT(*) AS n FROM joint_understanding_hypothesis_adoption "
+        "WHERE system_id = ?",
+        (system_id,),
+    ).fetchone()["n"]
+    reconfirmation_required = _adoptions_requiring_reconfirmation(conn, system_id)
+    metrics.append(_measured(
+        key="joint_understanding_adoption_reconfirmation_rate",
+        category="joint_understanding_quality",
+        guardrail=True,
+        description=(
+            "暫定採用した仮説のうち、前提が動いて再確認が必要になった割合。"
+            "暫定採用が静かに事実へ変わっていないかを見る。"
+        ),
+        formula="adoptions whose premise is no longer current / all adoptions",
+        sources=["joint_understanding_hypothesis_adoption"],
+        unit="ratio",
+        numerator=reconfirmation_required,
+        denominator=adoptions,
+    ))
+
+    metrics.append(_unmeasured(
+        key="joint_understanding_decision_undo_rate",
+        category="joint_understanding_quality",
+        guardrail=True,
+        description=(
+            "明示的に取り消された判断の割合。再度会話を開いたことだけでは undo としない。"
+        ),
+        formula="decision_undone / terminal decisions",
+        sources=["joint_understanding_session.outcome", ".origin_kind", ".origin_id"],
+        unit="ratio",
+        reason="explicit_observation_contract_pending",
+    ))
+    metrics.append(_unmeasured(
+        key="joint_understanding_classification_correction_rate",
+        category="joint_understanding_quality",
+        guardrail=True,
+        description=(
+            "明示的に訂正された Question Router 分類の割合。"
+            "引き継ぎ・中断だけでは誤分類としない。"
+        ),
+        formula="classification_corrected / routed qa-origin sessions",
+        sources=["interview_qa.route_category", "joint_understanding_session.outcome"],
+        unit="ratio",
+        reason="explicit_observation_contract_pending",
+    ))
+
+    metrics.append(_measured(
+        key="joint_understanding_rounds_per_session",
+        category="joint_understanding_burden",
+        guardrail=False,
+        description="1 セッションあたりの調査ラウンド数。",
+        formula="investigation rounds / joint understanding sessions",
+        sources=["joint_understanding_investigation_round"],
+        unit="per_session",
+        numerator=sum(b.rounds for b in lineage.burdens),
+        denominator=sessions,
+    ))
+    metrics.append(_measured(
+        key="joint_understanding_developer_actions_per_session",
+        category="joint_understanding_burden",
+        guardrail=False,
+        description="1 セッションあたりの開発者の操作数(選んだ行動の記録)。",
+        formula="developer actions / joint understanding sessions",
+        sources=["joint_understanding_action"],
+        unit="per_session",
+        numerator=sum(b.developer_actions for b in lineage.burdens),
+        denominator=sessions,
+    ))
+    metrics.append(_measured(
+        key="joint_understanding_developer_findings_per_session",
+        category="joint_understanding_burden",
+        guardrail=False,
+        description="1 セッションあたりに開発者が自分で書いた記述の数。",
+        formula="developer findings / joint understanding sessions",
+        sources=["joint_understanding_finding.origin_role"],
+        unit="per_session",
+        numerator=sum(b.developer_findings for b in lineage.burdens),
+        denominator=sessions,
+    ))
+    metrics.append(_measured(
+        key="joint_understanding_question_reask_rate",
+        category="joint_understanding_burden",
+        guardrail=True,
+        description=(
+            "人へ質問したセッションのうち、同じ対話で再質問まで至った割合。"
+            "同じことを繰り返し聞かれる負担を測る。"
+        ),
+        formula="question_reasked / sessions that asked at least once",
+        sources=["joint_understanding_translation.ask_developer"],
+        unit="ratio",
+        numerator=lineage.count("question_reasked"),
+        denominator=sum(1 for b in lineage.burdens if b.questions_asked > 0),
+    ))
+    return metrics
+
+
+def _adoptions_requiring_reconfirmation(
+    conn: sqlite3.Connection, system_id: int,
+) -> int:
+    """Adoptions whose premise is no longer current (Issue #337's derived state).
+
+    Read here rather than stored, for the same reason #337 derives it: a stored
+    lifecycle value can drift out of sync with the premise it describes.
+    """
+    from .joint_premise import ASSERTABLE_PREMISE_STATES, evaluate_session_premise
+
+    rows = conn.execute(
+        """SELECT a.finding_id, a.joint_understanding_id
+           FROM joint_understanding_hypothesis_adoption AS a
+           WHERE a.system_id = ? ORDER BY a.id""",
+        (system_id,),
+    ).fetchall()
+    if not rows:
+        return 0
+    verdicts: "dict[int, str]" = {}
+    count = 0
+    for row in rows:
+        ju_id = row["joint_understanding_id"]
+        if ju_id not in verdicts:
+            session = conn.execute(
+                "SELECT * FROM joint_understanding_session WHERE id = ? AND system_id = ?",
+                (ju_id, system_id),
+            ).fetchone()
+            verdicts[ju_id] = (
+                evaluate_session_premise(conn, session).state
+                if session is not None
+                else "missing"
+            )
+        superseded = conn.execute(
+            "SELECT 1 FROM joint_understanding_finding "
+            "WHERE supersedes_finding_id = ? LIMIT 1",
+            (row["finding_id"],),
+        ).fetchone()
+        if superseded is not None or verdicts[ju_id] not in ASSERTABLE_PREMISE_STATES:
+            count += 1
+    return count
+
+
 def _joint_understanding_metrics(
     conn: sqlite3.Connection, system_id: int,
 ) -> "list[InterviewMetricOut]":
@@ -851,6 +1062,7 @@ def build_interview_metrics(
     metrics.append(_origin_return_metric(conn, system_id))
     metrics.append(_implementation_question_transfer_metric(conn, system_id))
     metrics.extend(_joint_understanding_metrics(conn, system_id))
+    metrics.extend(_joint_understanding_lineage_metrics(conn, system_id))
 
     metrics, attention = apply_attention(metrics, policy=attention_policy)
 

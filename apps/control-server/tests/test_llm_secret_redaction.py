@@ -142,7 +142,9 @@ def test_quota_wrapper_redacts_immediately_before_delegate(monkeypatch):
     events = []
 
     class CapturingClient(llm.LLMClient):
-        def generate_text(self, messages, *, temperature=None, max_tokens=None):
+        def generate_text(
+            self, messages, *, temperature=None, max_tokens=None, timeout=None,
+        ):
             events.append(("delegate", copy.deepcopy(messages)))
             return "ok"
 
@@ -183,7 +185,9 @@ def test_every_provider_path_receives_only_redacted_messages(
     )
 
     if provider == "mock":
-        def capture_mock(self, messages, *, temperature=None, max_tokens=None):
+        def capture_mock(
+            self, messages, *, temperature=None, max_tokens=None, timeout=None,
+        ):
             captured.append(copy.deepcopy(messages))
             return "ok"
 

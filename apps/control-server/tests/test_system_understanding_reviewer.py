@@ -490,7 +490,7 @@ class TestQaInjection:
         # Bumped for the Alignment-feedback injection (v5) and again for the
         # Vision section (v6). The audit record must never claim an output was
         # produced by a prompt that no longer exists.
-        assert PROMPT_VERSION == "understanding-review-v6"
+        assert PROMPT_VERSION == "understanding-review-v7"
 
 
 class TestEnumValidation:
@@ -640,7 +640,7 @@ class TestOutputLanguage:
         system_msg = client.calls[0]["messages"][0]["content"]
         assert "in Japanese" in system_msg
         assert "enum values" in system_msg
-        assert result.prompt_version == "understanding-review-v6"
+        assert result.prompt_version == "understanding-review-v7"
         assert "review_capabilities" in system_msg
 
     def test_english_directive(self, monkeypatch):
@@ -763,5 +763,5 @@ class TestVisionSection:
     def test_prompt_and_schema_versions_record_the_vision_change(self):
         from app.system_understanding_reviewer import PROMPT_VERSION, SCHEMA_VERSION
 
-        assert PROMPT_VERSION == "understanding-review-v6"
+        assert PROMPT_VERSION == "understanding-review-v7"
         assert SCHEMA_VERSION == "understanding-review-v2"

@@ -56,8 +56,21 @@ from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..auth import get_system_id
+from ..auth import Principal, get_principal, get_system_id
 from ..db import get_conn
+from ..joint_premise import (
+    ASSERTABLE_PREMISE_STATES,
+    BasisFinding,
+    JointPremiseError,
+    adoption_state,
+    capture_premise_bundle,
+    developer_producer,
+    evaluate_session_premise,
+    resolve_premise_facts,
+    system_producer,
+    validate_provenance,
+)
+from ..joint_lineage import bulk_approval_readiness, derive_lineage
 from ..joint_understanding import (
     ORIGIN_KINDS,
     SCHEMA_VERSION,
@@ -74,23 +87,33 @@ from ..investigation_loop import (
     InvestigationLoopBudget,
     InvestigationLoopResult,
     LoopCarryOver,
+    outcome_class_for,
     run_investigation_loop,
 )
+from ..snapshot_explorers import EXPLORATION_SOURCE_KINDS
 from ..interview_language import get_interview_language, resolve_message_language
 from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
     JointUnderstandingActionCreate,
     JointUnderstandingActionMenuEntryOut,
     JointUnderstandingActionOut,
+    JointUnderstandingAdoptionOut,
     JointUnderstandingCloseRequest,
     JointUnderstandingCreate,
     JointUnderstandingDetailOut,
     JointUnderstandingEvidenceOut,
+    JointUnderstandingExplorationSourceOut,
     JointUnderstandingFindingCreate,
     JointUnderstandingFindingOut,
     JointUnderstandingHoldRequest,
+    InterviewQaUnknownOut,
+    InterviewQaUnknownRequest,
+    JointUnderstandingBulkApprovalCriterionOut,
     JointUnderstandingInvestigateOut,
     JointUnderstandingInvestigateRequest,
+    JointUnderstandingLineageEventOut,
+    JointUnderstandingLineageOut,
+    JointUnderstandingSessionBurdenOut,
     JointUnderstandingListOut,
     JointUnderstandingOptionOut,
     JointUnderstandingOut,
@@ -103,6 +126,7 @@ from ..models import (
     JointUnderstandingTranslateRequest,
     JointUnderstandingTranslationOut,
 )
+from ..understanding_evidence_feed import publish_joint_understanding_finding
 from ..understanding_translator import (
     FindingSummary,
     TranslationResult,
@@ -170,31 +194,40 @@ def _column(row, name: str):
     return row[name] if name in row.keys() else None
 
 
-def _premise_state(conn, ju_row) -> str:
-    """Whether the premise this session was investigated against still holds.
+def _current_origin_id(conn, ju_row) -> Optional[int]:
+    """The origin row that is current today, for a consumer matching the session.
 
-    Deterministic and structural (Principle 6): the session pinned a snapshot
-    at creation; if its interview session has since moved to a different one,
-    every finding here was established against a premise that is no longer
-    current. That is 'stale', and Phase D refuses to turn a stale
-    investigation into an adoption or a decision -- the same rule Issue #308
-    applies to an Inquiry, evaluated at close/reflux time instead of at
-    rebuild time. A session with no pinned snapshot is treated as fresh:
-    nothing was pinned, so nothing can have moved out from under it.
+    `interview_qa` and `interview_intent_item` correct additively, so the pinned
+    `origin_id` is a superseded row the moment the developer revises the item.
+    A consumer that matched only on `origin_id` would stop finding the session --
+    the conversation would disappear from the card the moment its question got
+    an answer revision, which is exactly the "a later step must not cost
+    something the developer already had" rule this epic is built on.
     """
-    pinned = ju_row["premise_snapshot_id"]
-    if pinned is None:
-        return "fresh"
-    current = conn.execute(
-        "SELECT snapshot_id FROM interview_session WHERE id = ? AND system_id = ?",
-        (ju_row["session_id"], ju_row["system_id"]),
-    ).fetchone()
-    if current is None:
-        return "fresh"
-    return "fresh" if current["snapshot_id"] == pinned else "stale"
+    facts = resolve_premise_facts(conn, ju_row)
+    if facts is None or facts.current_origin_id is None:
+        return ju_row["origin_id"]
+    return facts.current_origin_id
 
 
-def _session_out(row, premise_state: str = "fresh") -> JointUnderstandingOut:
+def _premise_verdict(conn, ju_row):
+    """The session's finite premise verdict, from the shared #308 bundle.
+
+    Issue #337 replaced this function's original body -- a comparison of
+    ``interview_session.snapshot_id`` against the pinned id -- with
+    ``app/joint_premise.evaluate_session_premise``. The old version reported
+    ``fresh`` in three cases where the premise was in fact unknown or gone
+    (nothing pinned, the interview session unresolvable, the pinned snapshot
+    deleted), and it could not see an Intent correction, an Alignment rebuild,
+    or a superseded Inquiry at all -- none of which move the snapshot id.
+    Every consumer here now reads the same verdict from the same rows.
+    """
+    return evaluate_session_premise(conn, ju_row)
+
+
+def _session_out(row, verdict=None, current_origin_id=None) -> JointUnderstandingOut:
+    state = verdict.state if verdict is not None else "invalid"
+    reason = verdict.reason_code if verdict is not None else "premise_not_captured"
     return JointUnderstandingOut(
         id=row["id"],
         session_id=row["session_id"],
@@ -209,8 +242,17 @@ def _session_out(row, premise_state: str = "fresh") -> JointUnderstandingOut:
         outcome_reason=row["outcome_reason"],
         outcome_finding_ids=json.loads(_column(row, "outcome_finding_ids") or "[]"),
         outcome_premise_state=_column(row, "outcome_premise_state"),
-        premise_state=premise_state,
+        outcome_premise_reason=_column(row, "outcome_premise_reason"),
+        closed_by_actor_kind=_column(row, "closed_by_actor_kind"),
+        closed_by_username=_column(row, "closed_by_username"),
+        current_origin_id=current_origin_id if current_origin_id is not None else row["origin_id"],
+        premise_state=state,
+        premise_reason=reason,
         premise_snapshot_id=row["premise_snapshot_id"],
+        premise_commit_sha=_column(row, "premise_commit_sha"),
+        premise_revision_id=_column(row, "premise_revision_id"),
+        premise_tracking_version=_column(row, "premise_tracking_version"),
+        premise_captured_at=_column(row, "premise_captured_at"),
         schema_version=row["schema_version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -226,6 +268,9 @@ def _finding_out(row) -> JointUnderstandingFindingOut:
         origin_role=row["origin_role"],
         claim_kind=row["claim_kind"],
         statement=row["statement"],
+        producer_kind=_column(row, "producer_kind") or "legacy",
+        actor_kind=_column(row, "actor_kind") or "legacy",
+        actor_username=_column(row, "actor_username"),
         evidence=[
             JointUnderstandingEvidenceOut(**e) for e in json.loads(row["evidence_json"])
         ],
@@ -253,10 +298,60 @@ def _action_out(row) -> JointUnderstandingActionOut:
         system_id=row["system_id"],
         action_kind=row["action_kind"],
         actor=row["actor"],
+        actor_kind=_column(row, "actor_kind") or "legacy",
+        actor_username=_column(row, "actor_username"),
         note=row["note"],
         decision_method="manual",
         created_at=row["created_at"],
     )
+
+
+def _adoption_out(row, *, premise_state: str, basis_superseded: bool) -> JointUnderstandingAdoptionOut:
+    return JointUnderstandingAdoptionOut(
+        id=row["id"],
+        joint_understanding_id=row["joint_understanding_id"],
+        system_id=row["system_id"],
+        finding_id=row["finding_id"],
+        state=adoption_state(
+            premise_state=premise_state, basis_superseded=basis_superseded,
+        ),
+        adopted_by_actor_kind=row["adopted_by_actor_kind"],
+        adopted_by_username=row["adopted_by_username"],
+        adoption_reason=row["adoption_reason"] or "",
+        premise_snapshot_id=row["premise_snapshot_id"],
+        premise_commit_sha=row["premise_commit_sha"],
+        premise_revision_id=row["premise_revision_id"],
+        decision_method="manual",
+        adopted_at=row["adopted_at"],
+    )
+
+
+def _superseded_finding_ids(findings) -> set:
+    """Findings a later finding in the same session has corrected."""
+    return {
+        r["supersedes_finding_id"]
+        for r in findings
+        if r["supersedes_finding_id"] is not None
+    }
+
+
+def _basis_findings(findings) -> Dict[int, BasisFinding]:
+    """The subset of each finding that decides outcome-basis eligibility."""
+    superseded = _superseded_finding_ids(findings)
+    return {
+        row["id"]: BasisFinding(
+            id=row["id"],
+            origin_role=row["origin_role"],
+            claim_kind=row["claim_kind"],
+            is_mock=bool(row["is_mock"]),
+            superseded=row["id"] in superseded,
+            intelligence_run_id=row["intelligence_run_id"],
+            has_evidence=bool(
+                json.loads(row["evidence_json"]) or json.loads(row["runtime_evidence_json"])
+            ),
+        )
+        for row in findings
+    }
 
 
 def _detail(conn, ju_row) -> JointUnderstandingDetailOut:
@@ -276,6 +371,13 @@ def _detail(conn, ju_row) -> JointUnderstandingDetailOut:
         "WHERE joint_understanding_id = ? ORDER BY id",
         (ju_id,),
     ).fetchall()
+    sources_by_round: Dict[int, list] = {}
+    for source in conn.execute(
+        "SELECT * FROM joint_understanding_exploration_source "
+        "WHERE joint_understanding_id = ? ORDER BY id",
+        (ju_id,),
+    ).fetchall():
+        sources_by_round.setdefault(source["round_id"], []).append(source)
     translations = conn.execute(
         "SELECT * FROM joint_understanding_translation "
         "WHERE joint_understanding_id = ? ORDER BY id",
@@ -286,13 +388,30 @@ def _detail(conn, ju_row) -> JointUnderstandingDetailOut:
         "WHERE joint_understanding_id = ? ORDER BY id",
         (ju_id,),
     ).fetchall()
+    adoption_rows = conn.execute(
+        "SELECT * FROM joint_understanding_hypothesis_adoption "
+        "WHERE joint_understanding_id = ? ORDER BY id",
+        (ju_id,),
+    ).fetchall()
+    verdict = _premise_verdict(conn, ju_row)
+    superseded = _superseded_finding_ids(findings)
     return JointUnderstandingDetailOut(
-        session=_session_out(ju_row, _premise_state(conn, ju_row)),
+        session=_session_out(ju_row, verdict, _current_origin_id(conn, ju_row)),
         findings=[_finding_out(f) for f in findings],
         actions=[_action_out(a) for a in actions],
-        investigation_rounds=[_round_out(r) for r in rounds],
+        investigation_rounds=[
+            _round_out(r, sources_by_round.get(r["id"], [])) for r in rounds
+        ],
         translations=[_translation_out(t) for t in translations],
         reflux=[_reflux_out(r) for r in reflux_rows],
+        hypothesis_adoptions=[
+            _adoption_out(
+                r,
+                premise_state=verdict.state,
+                basis_superseded=r["finding_id"] in superseded,
+            )
+            for r in adoption_rows
+        ],
         available_actions=available_action_kinds(ju_row["status"]),
     )
 
@@ -319,10 +438,30 @@ def create_joint_understanding(
     "I don't know" is not a statement about the system (Epic #328's
     「わからない」を開発者の意図として混入させない boundary).
 
-    The session pins the interview session's current snapshot as its premise
-    so later rounds (Phase B) are never silently rebased onto a newer one.
+    The session captures the shared Issue #308 premise bundle (Issue #337):
+    the pinned snapshot AND its commit, the origin revision, the origin's own
+    content digest, the confirmed Capability scope digest, the linked Intent
+    digest, and the review-subject anchor where the origin has one. Pinning
+    only the snapshot id was not enough -- an Intent correction, an Alignment
+    rebuild, or a superseded Inquiry all move the ground the conversation
+    stands on without moving the snapshot.
     """
     now = time.time()
+    if payload.trigger != "explicit_request":
+        # Issue #336: `trigger` records WHICH PATH ran, so it cannot be a claim
+        # in a request body. 'unknown_answer' is written only by
+        # POST .../qa/{qa_id}/unknown, where the developer really did answer
+        # 「わからない」 and the router really did decide to investigate.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "joint_understanding_trigger_not_settable",
+                "message": (
+                    "Only 'explicit_request' may be started here; "
+                    "'unknown_answer' is recorded by the 「わからない」 flow itself"
+                ),
+            },
+        )
     with get_conn() as conn:
         interview_session = _get_interview_session_or_404(conn, session_id, system_id)
         _require_origin_exists(
@@ -332,16 +471,32 @@ def create_joint_understanding(
             session_id=session_id,
             system_id=system_id,
         )
+        premise = capture_premise_bundle(
+            conn,
+            origin_kind=payload.origin_kind,
+            origin_id=payload.origin_id,
+            session_row=interview_session,
+            system_id=system_id,
+            now=now,
+        )
         cur = conn.execute(
             """INSERT INTO joint_understanding_session
                 (session_id, system_id, origin_kind, origin_id, trigger,
-                 question_text, status, premise_snapshot_id, schema_version,
-                 created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
+                 question_text, status, premise_snapshot_id, premise_commit_sha,
+                 premise_revision_id, premise_content_hash,
+                 premise_capability_digest, premise_intent_digest,
+                 premise_review_subject_id, premise_tracking_version,
+                 premise_captured_at, schema_version, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id, system_id, payload.origin_kind, payload.origin_id,
                 payload.trigger, payload.question_text,
-                interview_session["snapshot_id"], SCHEMA_VERSION, now, now,
+                premise["premise_snapshot_id"], premise["premise_commit_sha"],
+                premise["premise_revision_id"], premise["premise_content_hash"],
+                premise["premise_capability_digest"], premise["premise_intent_digest"],
+                premise["premise_review_subject_id"],
+                premise["premise_tracking_version"], premise["premise_captured_at"],
+                SCHEMA_VERSION, now, now,
             ),
         )
         row = conn.execute(
@@ -389,7 +544,7 @@ def list_joint_understanding(
         ).fetchall()
         return JointUnderstandingListOut(
             session_id=session_id, system_id=system_id,
-            items=[_session_out(r, _premise_state(conn, r)) for r in rows],
+            items=[_session_out(r, _premise_verdict(conn, r), _current_origin_id(conn, r)) for r in rows],
         )
 
 
@@ -417,26 +572,49 @@ def append_finding(
     ju_id: int,
     payload: JointUnderstandingFindingCreate,
     system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
 ) -> JointUnderstandingFindingOut:
-    """Append one finding to an open Joint Understanding session.
+    """Append one DEVELOPER finding to an open Joint Understanding session.
 
     There is no update or delete counterpart: a correction is a new finding
     carrying ``supersedes_finding_id``, so an explanation can always be
     traced back to the exact claim it came from even after it was revised.
 
-    The role contract (``app/joint_understanding.validate_finding``) is
-    enforced here, fail-closed with 422 and nothing persisted:
+    Issue #337 narrowed this endpoint to ``origin_role='developer'``. The
+    ``investigation`` and ``translation`` roles are written exclusively by
+    their internal producers (``/investigate``, ``/translate``), which validate
+    every citation against the pinned snapshot and every reasoning run against
+    this session's premise. Accepting those roles from a request body meant an
+    unverifiable "fact" with fabricated citations could be stored beside real
+    ones -- and accepting ``developer`` from any caller meant a request body
+    could record a sentence as the human's own judgement, with
+    ``decision_method='manual'`` attached. Both are 403 with a finite code
+    rather than a silent reinterpretation of what the caller asked for.
 
-    - a translation may not carry evidence and must reference at least one
-      finding OF THIS SESSION (traceability -- generalized wording always
-      resolves back to a technical claim and its evidence),
-    - a developer finding is always ``manual`` and never carries an
-      intelligence run or mock flag (a model can never speak in the
-      developer's name),
-    - an investigation hypothesis must list competing explanations and
-      refutation conditions (a hypothesis is not a low-confidence claim).
+    The recorded provenance comes from the ROUTE and the authenticated
+    ``Principal``, never from the payload: ``producer_kind='developer_api'``,
+    ``actor_kind='user'``, plus the caller's user id and username.
+
+    The role contract (``app/joint_understanding.validate_finding``) is still
+    enforced, fail-closed with 422 and nothing persisted: a developer finding
+    is always ``manual``, never carries an intelligence run or mock flag, and
+    never carries snapshot evidence of its own (a judgement is not evidence).
     """
     now = time.time()
+    if payload.origin_role != "developer":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "joint_understanding_producer_internal",
+                "message": (
+                    f"origin_role='{payload.origin_role}' is written only by its "
+                    "internal producer; use /investigate or /translate"
+                ),
+            },
+        )
+    producer = developer_producer(
+        user_id=principal.user_id, username=principal.username,
+    )
     with get_conn() as conn:
         ju = _get_or_404(conn, ju_id, system_id)
         if ju["status"] != "open":
@@ -454,37 +632,15 @@ def append_finding(
                 (ju_id,),
             ).fetchall()
         }
-        if payload.intelligence_run_id is not None:
-            run = conn.execute(
-                "SELECT system_id, snapshot_id, decision_method, status, is_mock "
-                "FROM intelligence_runs WHERE id = ? AND system_id = ?",
-                (payload.intelligence_run_id, system_id),
-            ).fetchone()
-            if run is None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="intelligence_run_id must reference a run of this System",
-                )
-            if payload.decision_method == "reasoning_llm" and (
-                run["decision_method"] != "reasoning_llm" or run["status"] != "completed"
-            ):
-                raise HTTPException(
-                    status_code=422,
-                    detail="A reasoning finding must reference a completed reasoning run",
-                )
-            if bool(run["is_mock"]) != payload.is_mock:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Finding is_mock must match its intelligence run",
-                )
-            if (
-                ju["premise_snapshot_id"] is not None
-                and run["snapshot_id"] != ju["premise_snapshot_id"]
-            ):
-                raise HTTPException(
-                    status_code=422,
-                    detail="intelligence_run_id must use this session's pinned snapshot",
-                )
+        # The run-provenance checks that used to live here (run belongs to this
+        # System, is a completed reasoning run, its is_mock matches, its
+        # snapshot is this session's) are gone with Issue #337, not weakened:
+        # this endpoint now only accepts `developer` findings, which must carry
+        # `intelligence_run_id IS NULL` (validate_finding enforces that below).
+        # The two internal producers create the run they reference themselves,
+        # from this session's own system_id and pinned snapshot_id, so the same
+        # invariants hold structurally there. A guard that can no longer fire is
+        # worse than none: it reads as a live defence of a path that is closed.
         try:
             validate_finding(
                 origin_role=payload.origin_role,
@@ -501,7 +657,15 @@ def append_finding(
                 known_finding_ids=known_ids,
                 supersedes_finding_id=payload.supersedes_finding_id,
             )
+            validate_provenance(
+                producer_kind=producer.producer_kind,
+                origin_role=payload.origin_role,
+                actor_kind=producer.actor_kind,
+                actor_user_id=producer.actor_user_id,
+            )
         except JointUnderstandingValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except JointPremiseError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
 
         cur = conn.execute(
@@ -511,8 +675,9 @@ def append_finding(
                  supports_finding_ids, competing_explanations,
                  refutation_conditions, next_investigation, uncertainty,
                  supersedes_finding_id, decision_method, intelligence_run_id,
-                 is_mock, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 is_mock, producer_kind, actor_kind, actor_user_id,
+                 actor_username, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ju_id, system_id, payload.origin_role, payload.claim_kind,
                 payload.statement,
@@ -525,7 +690,9 @@ def append_finding(
                 json.dumps(list(payload.refutation_conditions), ensure_ascii=False),
                 payload.next_investigation, payload.uncertainty,
                 payload.supersedes_finding_id, payload.decision_method,
-                payload.intelligence_run_id, 1 if payload.is_mock else 0, now,
+                payload.intelligence_run_id, 1 if payload.is_mock else 0,
+                producer.producer_kind, producer.actor_kind,
+                producer.actor_user_id, producer.actor_username, now,
             ),
         )
         conn.execute(
@@ -541,7 +708,23 @@ def append_finding(
 # --- Iterative investigation (Phase B / #330) ----------------------------------
 
 
-def _round_out(row) -> JointUnderstandingRoundOut:
+def _exploration_source_out(row) -> JointUnderstandingExplorationSourceOut:
+    return JointUnderstandingExplorationSourceOut(
+        id=row["id"],
+        round_id=row["round_id"],
+        system_id=row["system_id"],
+        source_kind=row["source_kind"],
+        revision=row["revision"],
+        candidates_found=row["candidates_found"],
+        queries_run=row["queries_run"],
+        elapsed_seconds=row["elapsed_seconds"],
+        truncated=bool(row["truncated"]),
+        error_details=row["error_details"],
+        created_at=row["created_at"],
+    )
+
+
+def _round_out(row, sources=()) -> JointUnderstandingRoundOut:
     return JointUnderstandingRoundOut(
         id=row["id"],
         joint_understanding_id=row["joint_understanding_id"],
@@ -562,6 +745,9 @@ def _round_out(row) -> JointUnderstandingRoundOut:
         elapsed_seconds=row["elapsed_seconds"],
         intelligence_run_id=row["intelligence_run_id"],
         error_details=row["error_details"],
+        failure_class=_column(row, "failure_class"),
+        outcome_class=outcome_class_for(row["stop_reason"] or "unresolved"),
+        sources=[_exploration_source_out(source) for source in sources],
         created_at=row["created_at"],
     )
 
@@ -654,8 +840,9 @@ def _persist_loop(
                  stop_reason, conclusion, search_leads, open_hypotheses,
                  missing_evidence, read_paths, unread_candidates,
                  pruned_findings, files_read, chars_read, llm_calls,
-                 elapsed_seconds, intelligence_run_id, error_details, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 elapsed_seconds, intelligence_run_id, error_details,
+                 failure_class, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ju_id, system_id, loop_round.round_index, loop_round.status,
                 result.stop_reason if persisted_index == len(result.rounds) - 1 else None,
@@ -667,13 +854,41 @@ def _persist_loop(
                 json.dumps(loop_round.unread_candidates, ensure_ascii=False),
                 loop_round.pruned_findings, loop_round.files_read, loop_round.chars_read,
                 loop_round.llm_calls, loop_round.elapsed_seconds, run_id,
-                loop_round.error, completed_at,
+                loop_round.error, loop_round.failure_class, completed_at,
             ),
         )
-        round_outs.append(_round_out(conn.execute(
-            "SELECT * FROM joint_understanding_investigation_round WHERE id = ?",
-            (round_cur.lastrowid,),
-        ).fetchone()))
+        round_id = round_cur.lastrowid
+        # Issue #339: one audit row per exploration source, with its own
+        # revision and budget consumption. The round total cannot answer "did
+        # each source stay on the pinned revision?", which is the boundary the
+        # added structural sources have to respect.
+        for source in loop_round.source_audits:
+            if source.source_kind not in EXPLORATION_SOURCE_KINDS:
+                continue
+            conn.execute(
+                """INSERT INTO joint_understanding_exploration_source
+                    (round_id, joint_understanding_id, system_id, source_kind,
+                     revision, candidates_found, queries_run, elapsed_seconds,
+                     truncated, error_details, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    round_id, ju_id, system_id, source.source_kind,
+                    source.revision, len(source.candidates), source.queries_run,
+                    source.elapsed_seconds, 1 if source.truncated else 0,
+                    source.error, completed_at,
+                ),
+            )
+        round_outs.append(_round_out(
+            conn.execute(
+                "SELECT * FROM joint_understanding_investigation_round WHERE id = ?",
+                (round_id,),
+            ).fetchone(),
+            conn.execute(
+                "SELECT * FROM joint_understanding_exploration_source "
+                "WHERE round_id = ? ORDER BY id",
+                (round_id,),
+            ).fetchall(),
+        ))
 
         for finding in loop_round.findings:
             known_ids = {
@@ -710,9 +925,9 @@ def _persist_loop(
                      supports_finding_ids, competing_explanations,
                      refutation_conditions, next_investigation, uncertainty,
                      supersedes_finding_id, decision_method, intelligence_run_id,
-                     is_mock, created_at)
+                     is_mock, producer_kind, actor_kind, created_at)
                 VALUES (?, ?, 'investigation', ?, ?, ?, ?, '[]', ?, ?, ?, ?, NULL,
-                        'reasoning_llm', ?, ?, ?)""",
+                        'reasoning_llm', ?, ?, 'investigation_loop', 'system', ?)""",
                 (
                     ju_id, system_id, finding.claim_kind, finding.statement,
                     json.dumps(
@@ -854,7 +1069,8 @@ def investigate_joint_understanding(
         result = InvestigationLoopResult(
             provider=config.provider, model=config.model,
             is_mock=config.provider == "mock",
-            stop_reason="failed", carry_over=carry_over, error=str(exc),
+            stop_reason="failed", carry_over=carry_over,
+            failure_class="config_invalid", error=str(exc),
         )
     completed_at = time.time()
 
@@ -925,12 +1141,54 @@ def _translation_out(row) -> JointUnderstandingTranslationOut:
     )
 
 
+def _research_state(conn, ju_id: int, ju_row) -> "tuple[Optional[str], bool]":
+    """The Question Router's classification and whether research is finished.
+
+    Both come from persisted facts, never from the model's own opinion of how
+    complete it is:
+
+    - the classification is the ``interview_qa.route_category`` recorded by the
+      「わからない」 entry point (Issue #336) for a ``qa`` origin; other origins
+      have no routed question, so it is None and the gate falls back to its
+      material rule.
+    - research is "exhausted" when the latest round did NOT stop on a budget and
+      left no leads or missing evidence behind. A budget stop means more reading
+      is possible, which makes asking the developer premature.
+    """
+    route_category = None
+    if ju_row["origin_kind"] == "qa":
+        row = conn.execute(
+            "SELECT route_category FROM interview_qa WHERE id = ? AND system_id = ?",
+            (ju_row["origin_id"], ju_row["system_id"]),
+        ).fetchone()
+        if row is not None:
+            route_category = row["route_category"]
+    latest = conn.execute(
+        """SELECT stop_reason, search_leads, missing_evidence
+           FROM joint_understanding_investigation_round
+           WHERE joint_understanding_id = ? ORDER BY id DESC LIMIT 1""",
+        (ju_id,),
+    ).fetchone()
+    if latest is None:
+        # No round has run: nothing has been researched, so nothing is
+        # exhausted -- the gate holds the question back rather than asking
+        # before the system has looked at all.
+        return route_category, False
+    if latest["stop_reason"] == "budget_exhausted":
+        return route_category, False
+    leads = json.loads(latest["search_leads"] or "[]")
+    missing = json.loads(latest["missing_evidence"] or "[]")
+    return route_category, not (leads or missing)
+
+
 def _action_menu(language: str) -> List[JointUnderstandingActionMenuEntryOut]:
     return [
         JointUnderstandingActionMenuEntryOut(
             action_kind=entry.action_kind,
             label=entry.label,
             what_changes=entry.what_changes,
+            formal_operation=entry.formal_operation,
+            completes_outside_session=entry.completes_outside_session,
         )
         for entry in build_action_menu(language)
     ]
@@ -1005,6 +1263,7 @@ def translate_joint_understanding(
             )
             for r in rows
         ]
+        route_category, research_exhausted = _research_state(conn, ju_id, ju)
 
     # Phase 2 (DB lock released): the reasoning call.
     config = LLMConfig.intelligence_from_env()
@@ -1096,9 +1355,10 @@ def translate_joint_understanding(
                      supports_finding_ids, competing_explanations,
                      refutation_conditions, next_investigation, uncertainty,
                      supersedes_finding_id, decision_method, intelligence_run_id,
-                     is_mock, created_at)
+                     is_mock, producer_kind, actor_kind, created_at)
                 VALUES (?, ?, 'translation', ?, ?, '[]', '[]', ?, '[]', '[]',
-                        NULL, '', NULL, 'reasoning_llm', ?, ?, ?)""",
+                        NULL, '', NULL, 'reasoning_llm', ?, ?,
+                        'translator', 'system', ?)""",
                 (
                     ju_id, system_id, statement.claim_kind, statement.text,
                     json.dumps(statement.supports_finding_ids),
@@ -1117,6 +1377,13 @@ def translate_joint_understanding(
             statements=result.statements,
             decision_question=result.decision_question,
             open_unknowns=result.open_unknowns,
+            # Issue #339: the gate reads the Question Router's classification
+            # and whether investigation is actually finished, so the two stop
+            # disagreeing about what the human is for. A `system_researchable`
+            # question is never handed over, and a question is held back while
+            # more reading could still answer it.
+            route_category=route_category,
+            research_exhausted=research_exhausted,
         )
         translation_cur = conn.execute(
             """INSERT INTO joint_understanding_translation
@@ -1161,6 +1428,273 @@ def translate_joint_understanding(
         )
 
 
+# --- The single 「わからない」 entry point (Issue #336) --------------------------
+
+
+def _qa_router_context(qa_row) -> str:
+    """The same deterministic context string the Question Router already gets."""
+    parts = [f"question_category: {qa_row['question_category']}"]
+    if qa_row["hypothesis"]:
+        parts.append(f"hypothesis: {qa_row['hypothesis']}")
+    if qa_row["answer_text"]:
+        parts.append(f"existing (unconfirmed) answer: {qa_row['answer_text']}")
+    return "; ".join(parts)
+
+
+@router.post(
+    "/interview/sessions/{session_id}/qa/{qa_id}/unknown",
+    response_model=InterviewQaUnknownOut,
+)
+def answer_qa_unknown(
+    session_id: int,
+    qa_id: int,
+    payload: InterviewQaUnknownRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> InterviewQaUnknownOut:
+    """「わからない」: record it, then start the investigation it deserves.
+
+    This is Issue #336's single flow. Before it, 「わからない」 was two
+    unrelated things bolted together by the Dashboard: the #142 answer flow
+    wrote ``status='unconfirmed'`` and knew nothing about Joint Understanding,
+    while a separate ``route-and-investigate`` call did a one-shot
+    investigation and knew nothing about the answer. A Joint Understanding
+    session was never opened from a real 「わからない」 at all.
+
+    The order here is the contract, not a convenience:
+
+    1. **The unknown answer is recorded first, in its own committed
+       transaction.** Everything after this point may fail -- the router, the
+       reasoning configuration, the investigation -- and the developer keeps
+       every option they had: the answer stands, and correcting it, handing it
+       off, or answering it later are all still reachable (Issue #336's
+       "failure must not cost an existing opportunity").
+    2. **The Question Router decides whether to investigate at all.** Only
+       ``system_researchable`` and ``hybrid`` open a session; ``human_only``
+       does not, because there is nothing in the code to find and opening a
+       conversation would just be a slower way of asking the same question
+       back. This is the classification's finite output, never a keyword guess.
+    3. **``hybrid`` investigates before it asks.** The researchable part is
+       consumed first and the translation gate (``understanding_translator.
+       ask_developer``) is what decides whether a question still has to reach
+       the developer -- so the human is asked only what is left after the
+       system did its part.
+
+    ``trigger='unknown_answer'`` is written HERE and only here: the public
+    create endpoint forces ``explicit_request``, so the audit distinction
+    between an automatic and a deliberate start is a fact about which path ran,
+    not a claim in a request body.
+
+    ``next_step`` is a finite value the Dashboard maps to its own copy. The
+    internal route names (``system_researchable`` / ``hybrid`` /
+    ``human_only``) are deliberately not part of it.
+
+    probe-agent:
+      role: API boundary that turns a developer's 「わからない」 into a routed,
+        auto-started joint investigation without ever losing the recorded answer
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: io
+      state_effects: [database-read, database-write, external-api]
+      probe_value: Verify the unknown answer is recorded even when routing or investigation fails, that human_only never opens a session, that system_researchable/hybrid do, and that trigger is recorded as unknown_answer only on this path.
+    """
+    from ..interview_language import get_interview_language
+    from ..investigation_persistence import persist_route_run
+    from ..question_router import route_question
+    from .interview import _get_qa_or_404, _get_session_or_404, _qa_out, _write_first_qa_answer
+
+    started_at = time.time()
+
+    # Step 1 (committed before anything can fail): the unknown answer itself.
+    with get_conn() as conn:
+        interview_session = _get_session_or_404(conn, session_id, system_id)
+        qa = _get_qa_or_404(conn, qa_id, session_id, system_id)
+        if qa["superseded_by_id"] is not None or qa["status"] == "revised":
+            raise HTTPException(
+                status_code=409,
+                detail="This question has already been superseded by a newer revision",
+            )
+        already_unknown = (
+            qa["status"] == "unconfirmed" and bool(qa["answer_unknown"])
+        )
+        if qa["status"] not in ("open", "skipped") and not already_unknown:
+            # A real answer exists. Correcting it is the answer endpoint's job
+            # (it supersedes rather than overwrites); silently replacing it with
+            # 「わからない」 here would discard an answer the developer gave.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "qa_already_answered",
+                    "message": (
+                        "This question already has an answer; correct it through "
+                        "the answer endpoint instead"
+                    ),
+                },
+            )
+        if not already_unknown:
+            conn.execute("BEGIN")
+            try:
+                _write_first_qa_answer(
+                    conn, qa_id=qa_id, answer_text=payload.answer_text,
+                    answer_unknown=True, status="unconfirmed",
+                    actor=principal.username or payload.actor, now=started_at,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        # Saying 「わからない」 again on an already-unknown question is a RETRY,
+        # not a dead end: the recorded answer stands as it is, and the developer
+        # gets another attempt at the routing and the investigation that may
+        # have failed the first time. Rejecting it would strand exactly the
+        # developer whose first attempt did not work.
+        qa = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
+        question_text = qa["question_text"]
+        router_context = _qa_router_context(qa)
+        snapshot_id = interview_session["snapshot_id"]
+        recorded_qa = _qa_out(qa)
+
+    def _out(**overrides) -> InterviewQaUnknownOut:
+        base = dict(
+            session_id=session_id, system_id=system_id, qa=recorded_qa,
+            route_category=None, knowledge_area=None,
+            joint_understanding_id=None, next_step="developer_answer_required",
+            investigation_stop_reason=None, error=None,
+        )
+        base.update(overrides)
+        return InterviewQaUnknownOut(**base)
+
+    # Step 2 (DB lock released): classify. A failure here is reported, never
+    # substituted with a guess (Principle 6) -- and it costs nothing already
+    # recorded.
+    config = LLMConfig.intelligence_from_env()
+    try:
+        client = create_llm_client(config)
+        route = route_question(
+            client, config,
+            question_text=question_text, context=router_context,
+            language=get_interview_language(),
+        )
+    except (LLMError, ValueError) as exc:
+        return _out(next_step="routing_unavailable", error=str(exc))
+    routed_at = time.time()
+
+    # Step 3: persist the route audit row and the classification.
+    with get_conn() as conn:
+        run_id = persist_route_run(
+            conn, system_id=system_id, snapshot_id=snapshot_id, route=route,
+            now=started_at, completed_at=routed_at,
+        )
+        if route.error or route.category is None:
+            return _out(next_step="routing_unavailable", error=route.error)
+        conn.execute(
+            "UPDATE interview_qa SET route_category = ?, route_run_id = ?, "
+            "knowledge_area = ? WHERE id = ? AND system_id = ?",
+            (route.category, run_id, route.knowledge_area, qa_id, system_id),
+        )
+        qa = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
+        recorded_qa = _qa_out(qa)
+
+        if route.category == "human_only":
+            # Nothing in the code can answer this, so opening a joint
+            # investigation would only be a slower way of handing the same
+            # question back. The normal answer / handoff path is what is next.
+            return _out(
+                route_category=route.category, knowledge_area=route.knowledge_area,
+                next_step="developer_answer_required",
+            )
+
+        # Reuse an unfinished conversation on this question rather than opening
+        # a second one. A retry has to continue the session that already carries
+        # the earlier rounds' leads (#330's continuity), and two open sessions on
+        # one question would each be investigating half the history.
+        existing = conn.execute(
+            """SELECT id FROM joint_understanding_session
+               WHERE session_id = ? AND system_id = ? AND origin_kind = 'qa'
+                 AND origin_id = ? AND status != 'closed'
+               ORDER BY id DESC LIMIT 1""",
+            (session_id, system_id, qa_id),
+        ).fetchone()
+        if existing is not None:
+            ju_id = existing["id"]
+            conn.execute(
+                "UPDATE joint_understanding_session SET status = 'open', "
+                "updated_at = ? WHERE id = ?",
+                (routed_at, ju_id),
+            )
+            premise = None
+        else:
+            premise = capture_premise_bundle(
+                conn,
+                origin_kind="qa", origin_id=qa_id,
+                session_row=interview_session, system_id=system_id, now=routed_at,
+            )
+        if premise is not None:
+            cur = conn.execute(
+                """INSERT INTO joint_understanding_session
+                    (session_id, system_id, origin_kind, origin_id, trigger,
+                     question_text, status, premise_snapshot_id,
+                     premise_commit_sha, premise_revision_id,
+                     premise_content_hash, premise_capability_digest,
+                     premise_intent_digest, premise_review_subject_id,
+                     premise_tracking_version, premise_captured_at,
+                     schema_version, created_at, updated_at)
+                VALUES (?, ?, 'qa', ?, 'unknown_answer', ?, 'open', ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id, system_id, qa_id, question_text,
+                    premise["premise_snapshot_id"], premise["premise_commit_sha"],
+                    premise["premise_revision_id"], premise["premise_content_hash"],
+                    premise["premise_capability_digest"],
+                    premise["premise_intent_digest"],
+                    premise["premise_review_subject_id"],
+                    premise["premise_tracking_version"],
+                    premise["premise_captured_at"],
+                    SCHEMA_VERSION, routed_at, routed_at,
+                ),
+            )
+            ju_id = cur.lastrowid
+
+    if not payload.investigate:
+        return _out(
+            route_category=route.category, knowledge_area=route.knowledge_area,
+            joint_understanding_id=ju_id, next_step="joint_understanding_opened",
+        )
+
+    # Step 4 (DB lock released): the investigation itself, through exactly the
+    # same endpoint function the JU panel calls -- one investigation
+    # implementation, one audit shape, one budget. Its 502 is caught: a failed
+    # investigation must not undo the recorded answer or hide the session that
+    # is now open and retryable.
+    try:
+        investigation = investigate_joint_understanding(
+            ju_id,
+            JointUnderstandingInvestigateRequest(
+                research_focus=route.research_focus,
+                search_keywords=list(route.search_keywords),
+            ),
+            system_id=system_id,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return _out(
+            route_category=route.category, knowledge_area=route.knowledge_area,
+            joint_understanding_id=ju_id, next_step="joint_understanding_opened",
+            error=str(detail.get("message") or exc.detail),
+        )
+    return _out(
+        route_category=route.category, knowledge_area=route.knowledge_area,
+        joint_understanding_id=ju_id,
+        next_step=(
+            "joint_investigation_started"
+            if investigation.findings
+            else "joint_understanding_opened"
+        ),
+        investigation_stop_reason=investigation.stop_reason,
+    )
+
+
 # --- Developer actions ---------------------------------------------------------
 
 
@@ -1173,6 +1707,7 @@ def record_action(
     ju_id: int,
     payload: JointUnderstandingActionCreate,
     system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
 ) -> JointUnderstandingDetailOut:
     """Record the next understanding action the developer chose.
 
@@ -1181,6 +1716,11 @@ def record_action(
     ``decide`` here does not decide the origin item -- both only become an
     outcome through ``/close``, and the origin item's own endpoint remains
     the only way to answer it.
+
+    Issue #337: ``payload.actor`` is kept as a display label, but the recorded
+    IDENTITY (``actor_kind`` / ``actor_user_id`` / ``actor_username``) comes
+    from the authenticated ``Principal``. A request body can no longer
+    attribute a manual action to someone who did not make it.
     """
     now = time.time()
     with get_conn() as conn:
@@ -1195,10 +1735,14 @@ def record_action(
             )
         conn.execute(
             """INSERT INTO joint_understanding_action
-                (joint_understanding_id, system_id, action_kind, actor, note,
+                (joint_understanding_id, system_id, action_kind, actor,
+                 actor_kind, actor_user_id, actor_username, note,
                  decision_method, created_at)
-            VALUES (?, ?, ?, ?, ?, 'manual', ?)""",
-            (ju_id, system_id, payload.action_kind, payload.actor, payload.note, now),
+            VALUES (?, ?, ?, ?, 'user', ?, ?, ?, 'manual', ?)""",
+            (
+                ju_id, system_id, payload.action_kind, payload.actor,
+                principal.user_id, principal.username, payload.note, now,
+            ),
         )
         conn.execute(
             "UPDATE joint_understanding_session SET updated_at = ? WHERE id = ?",
@@ -1293,9 +1837,11 @@ def reflux_joint_understanding(
       non-answer slot -- their built rows are owned by the Alignment /
       Understanding rebuild -- so the ledger row IS the attachment rather
       than a write that a rebuild would silently discard.
-    - a ``stale`` premise (the interview session moved to a newer snapshot
-      than this session pinned) refuses the whole call: an old investigation
-      must not be attached as current understanding.
+    - any premise verdict other than ``current`` refuses the whole call: an
+      investigation whose ground has moved, disappeared, or was never
+      comparable must not be attached as current understanding. Issue #337
+      widened this from ``stale`` alone -- ``missing`` and ``invalid`` used to
+      report as ``fresh`` and were let through.
 
     Repeating the call is idempotent per finding: already-attached facts are
     counted, not duplicated.
@@ -1313,19 +1859,35 @@ def reflux_joint_understanding(
     now = time.time()
     with get_conn() as conn:
         ju = _get_or_404(conn, ju_id, system_id)
-        premise_state = _premise_state(conn, ju)
-        if premise_state == "stale":
+        verdict = _premise_verdict(conn, ju)
+        premise_state = verdict.state
+        if premise_state not in ASSERTABLE_PREMISE_STATES:
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "code": "joint_understanding_premise_stale",
+                    "code": "joint_understanding_premise_not_current",
                     "message": (
-                        "The premise this session was investigated against has "
-                        "changed; re-investigate before attaching its facts"
+                        "The premise this session was investigated against is no "
+                        "longer current; re-investigate before attaching its facts"
                     ),
+                    "premise_state": premise_state,
+                    "premise_reason": verdict.reason_code,
                 },
             )
         target_kind = reflux_target_kind(ju["origin_kind"])
+        # The Q&A row to attach to is the CURRENT one, not necessarily the one
+        # the session pinned: `interview_qa` corrects additively, so an answer
+        # revision between opening the session and refluxing leaves the pinned
+        # row `revised` and invisible to the dashboard. The premise gate above
+        # already confirmed the question itself is unchanged, so the end of
+        # that chain is the same question -- writing to the pinned row would
+        # attach the facts where nobody reads them.
+        facts = resolve_premise_facts(conn, ju)
+        target_id = None
+        if target_kind == "qa_investigation":
+            target_id = (
+                facts.current_origin_id if facts is not None else None
+            ) or ju["origin_id"]
         findings = conn.execute(
             "SELECT * FROM joint_understanding_finding "
             "WHERE joint_understanding_id = ? ORDER BY id",
@@ -1374,14 +1936,30 @@ def reflux_joint_understanding(
                      intelligence_run_id, premise_snapshot_id, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?)""",
                 (
-                    ju_id, system_id, finding["id"], target_kind,
-                    ju["origin_id"] if target_kind == "qa_investigation" else None,
+                    ju_id, system_id, finding["id"], target_kind, target_id,
                     finding["statement"], finding["evidence_json"],
                     finding["runtime_evidence_json"],
                     finding["intelligence_run_id"], ju["premise_snapshot_id"], now,
                 ),
             )
             new_ids.append(cur.lastrowid)
+            # Issue #336: the same fact also enters the shared evidence feed,
+            # which is what the Understanding / Alignment / Inquiry rebuilds
+            # read. Before this, a non-'qa' origin's facts reached the reflux
+            # ledger and stopped there -- recorded, attributable, and invisible
+            # to every consumer that could have used them.
+            publish_joint_understanding_finding(
+                conn,
+                system_id=system_id,
+                session_id=ju["session_id"],
+                joint_understanding_id=ju_id,
+                origin_kind=ju["origin_kind"],
+                origin_id=target_id or ju["origin_id"],
+                finding_row=finding,
+                premise_snapshot_id=_column(ju, "premise_snapshot_id"),
+                premise_commit_sha=_column(ju, "premise_commit_sha"),
+                now=now,
+            )
 
         rows = [
             conn.execute(
@@ -1403,7 +1981,7 @@ def reflux_joint_understanding(
                 (ju_id,),
             ).fetchall()
             _write_qa_investigation(
-                conn, qa_id=ju["origin_id"], system_id=system_id, rows=current_rows,
+                conn, qa_id=target_id, system_id=system_id, rows=current_rows,
             )
         conn.execute(
             "UPDATE joint_understanding_session SET updated_at = ? WHERE id = ?",
@@ -1419,6 +1997,95 @@ def reflux_joint_understanding(
             skipped_not_fact=skipped_not_fact,
             skipped_unverified=skipped_unverified,
         )
+
+
+# --- Outcome lineage (Issue #338) ----------------------------------------------
+
+
+# NOT "/joint-understanding/lineage": `GET /joint-understanding/{ju_id}` is
+# registered earlier and takes an int path param, so that spelling would try to
+# parse "lineage" as an id and 422 before reaching here.
+@router.get(
+    "/interview/joint-understanding/lineage",
+    response_model=JointUnderstandingLineageOut,
+)
+def get_joint_understanding_lineage(
+    session_id: Optional[int] = Query(default=None),
+    system_id: int = Depends(get_system_id),
+) -> JointUnderstandingLineageOut:
+    """The finite outcome-lineage events for this System, plus per-session burden.
+
+    Issue #338's observation surface. The existing metrics count utilization and
+    close labels, which cannot answer "did understanding improve" -- an outcome
+    label is a claim about the conversation, not an observation of what happened
+    afterwards. These events are what happened: which gaps closed, which
+    hypotheses were reversed rather than corrected, which questions had to be
+    asked twice, which decisions did not hold.
+
+    Everything here is DERIVED from persisted rows (``app/joint_lineage.py``),
+    never written at transition time, so the same database always produces the
+    same events -- and a stored lifecycle value cannot drift out of sync with
+    the facts it describes.
+
+    ``bulk_approval_readiness`` reports the two observation classes Issue #311's
+    start condition waits on, as COUNTS with an explicitly unset threshold. It
+    is deliberately not a go/no-go: the number that should gate #311 has to be
+    decided from real data, and returning a verdict here would be exactly the
+    self-reported readiness score Issue #338 forbids.
+
+    probe-agent:
+      role: API boundary exposing the derived outcome lineage and per-session
+        burden without scoring or combining them
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: read
+      state_effects: [database-read]
+      probe_value: Verify the same rows always produce the same events, that no composite score is returned, that #311 readiness reports counts with an unset threshold rather than a verdict, and that another System's sessions never appear.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        if session_id is not None:
+            _get_interview_session_or_404(conn, session_id, system_id)
+        summary = derive_lineage(conn, system_id=system_id, session_id=session_id)
+    return JointUnderstandingLineageOut(
+        system_id=system_id,
+        generated_at=now,
+        events=[
+            JointUnderstandingLineageEventOut(
+                event_kind=event.event_kind,
+                subject_kind=event.subject_kind,
+                subject_id=event.subject_id,
+                session_id=event.session_id,
+                joint_understanding_id=event.joint_understanding_id,
+                at=event.at,
+                supersedes_subject_id=event.supersedes_subject_id,
+                detail=event.detail,
+            )
+            for event in summary.events
+        ],
+        burdens=[
+            JointUnderstandingSessionBurdenOut(
+                joint_understanding_id=burden.joint_understanding_id,
+                session_id=burden.session_id,
+                rounds=burden.rounds,
+                developer_actions=burden.developer_actions,
+                developer_findings=burden.developer_findings,
+                questions_asked=burden.questions_asked,
+                reasks=burden.reasks,
+            )
+            for burden in summary.burdens
+        ],
+        bulk_approval_readiness=[
+            JointUnderstandingBulkApprovalCriterionOut(
+                key=criterion.key,
+                observed=criterion.observed,
+                verdict=criterion.verdict,
+                note=criterion.note,
+            )
+            for criterion in bulk_approval_readiness(summary)
+        ],
+    )
 
 
 # --- Status transitions --------------------------------------------------------
@@ -1454,7 +2121,7 @@ def hold_joint_understanding(
         row = conn.execute(
             "SELECT * FROM joint_understanding_session WHERE id = ?", (ju_id,),
         ).fetchone()
-        return _session_out(row, _premise_state(conn, row))
+        return _session_out(row, _premise_verdict(conn, row), _current_origin_id(conn, row))
 
 
 @router.post("/joint-understanding/{ju_id}/resume", response_model=JointUnderstandingOut)
@@ -1472,7 +2139,7 @@ def resume_joint_understanding(
         row = conn.execute(
             "SELECT * FROM joint_understanding_session WHERE id = ?", (ju_id,),
         ).fetchone()
-        return _session_out(row, _premise_state(conn, row))
+        return _session_out(row, _premise_verdict(conn, row), _current_origin_id(conn, row))
 
 
 @router.post("/joint-understanding/{ju_id}/close", response_model=JointUnderstandingOut)
@@ -1480,6 +2147,7 @@ def close_joint_understanding(
     ju_id: int,
     payload: JointUnderstandingCloseRequest,
     system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
 ) -> JointUnderstandingOut:
     """Close the session with an explicitly typed outcome.
 
@@ -1493,47 +2161,97 @@ def close_joint_understanding(
     records that the developer reached a decision in this conversation. The
     item's own answer/confirm endpoint stays the only way to record it, and
     a closed session is terminal -- continuing means opening a new one.
+
+    Issue #337 made the close itself an audit record. Every close persists WHO
+    closed it (from the authenticated ``Principal``, not the body), the
+    developer's stated judgement (``outcome_reason``, now required), the basis
+    findings, and the premise verdict with its reason code -- so an outcome
+    read back after a reload can still say who decided what, on what grounds,
+    against which premise. ``hypothesis_adopted`` additionally writes a
+    ``joint_understanding_hypothesis_adoption`` row per basis finding, which is
+    what lets the provisional adoption be brought back for re-confirmation
+    when its premise later moves instead of quietly aging into a fact.
     """
     now = time.time()
     with get_conn() as conn:
         ju = _get_or_404(conn, ju_id, system_id)
         _transition(conn, ju, "closed", now)
-        premise_state = _premise_state(conn, ju)
-        known_ids = {
-            r["id"]
-            for r in conn.execute(
-                "SELECT id FROM joint_understanding_finding WHERE joint_understanding_id = ?",
-                (ju_id,),
-            ).fetchall()
-        }
+        verdict = _premise_verdict(conn, ju)
+        premise_state = verdict.state
+        findings = conn.execute(
+            "SELECT * FROM joint_understanding_finding "
+            "WHERE joint_understanding_id = ? ORDER BY id",
+            (ju_id,),
+        ).fetchall()
+        basis = _basis_findings(findings)
         try:
             validate_outcome_basis(
                 outcome=payload.outcome,
                 outcome_finding_ids=payload.outcome_finding_ids,
-                known_finding_ids=known_ids,
+                known_finding_ids=basis.keys(),
                 premise_state=premise_state,
+                basis_findings=basis,
             )
         except JointUnderstandingValidationError as exc:
-            # A stale premise is a state conflict (409); a missing or
-            # unresolvable basis is a malformed request (422).
-            status_code = 409 if premise_state == "stale" else 422
+            # A premise that is not current is a state conflict (409); a
+            # missing, foreign, superseded, mock, or wrong-kind basis is a
+            # malformed request (422).
+            status_code = (
+                409 if premise_state not in ASSERTABLE_PREMISE_STATES else 422
+            )
             raise HTTPException(
                 status_code=status_code,
-                detail={"code": "joint_understanding_outcome_rejected", "message": str(exc)},
+                detail={
+                    "code": "joint_understanding_outcome_rejected",
+                    "message": str(exc),
+                    "premise_state": premise_state,
+                    "premise_reason": verdict.reason_code,
+                },
             )
         conn.execute(
             """UPDATE joint_understanding_session
                SET status = 'closed', outcome = ?, outcome_reason = ?,
                    outcome_finding_ids = ?, outcome_premise_state = ?,
+                   outcome_premise_reason = ?, closed_by_actor_kind = 'user',
+                   closed_by_user_id = ?, closed_by_username = ?,
                    updated_at = ?, closed_at = ?
                WHERE id = ?""",
             (
                 payload.outcome, payload.outcome_reason,
                 json.dumps(list(payload.outcome_finding_ids)), premise_state,
+                verdict.reason_code, principal.user_id, principal.username,
                 now, now, ju_id,
             ),
         )
+        if payload.outcome == "hypothesis_adopted":
+            # One immutable adoption row per adopted hypothesis, capturing the
+            # premise it was adopted against. INSERT OR IGNORE keeps a repeated
+            # close attempt from duplicating rows; the session transition table
+            # already makes 'closed' terminal, so this is belt-and-braces.
+            for finding_id in payload.outcome_finding_ids:
+                conn.execute(
+                    """INSERT OR IGNORE INTO joint_understanding_hypothesis_adoption
+                        (joint_understanding_id, system_id, finding_id,
+                         adopted_by_actor_kind, adopted_by_user_id,
+                         adopted_by_username, adoption_reason,
+                         premise_snapshot_id, premise_commit_sha,
+                         premise_revision_id, premise_content_hash,
+                         premise_capability_digest, premise_intent_digest,
+                         decision_method, adopted_at)
+                    VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)""",
+                    (
+                        ju_id, system_id, finding_id,
+                        principal.user_id, principal.username, payload.outcome_reason,
+                        _column(ju, "premise_snapshot_id"),
+                        _column(ju, "premise_commit_sha"),
+                        _column(ju, "premise_revision_id"),
+                        _column(ju, "premise_content_hash"),
+                        _column(ju, "premise_capability_digest"),
+                        _column(ju, "premise_intent_digest"),
+                        now,
+                    ),
+                )
         row = conn.execute(
             "SELECT * FROM joint_understanding_session WHERE id = ?", (ju_id,),
         ).fetchone()
-        return _session_out(row, _premise_state(conn, row))
+        return _session_out(row, _premise_verdict(conn, row), _current_origin_id(conn, row))

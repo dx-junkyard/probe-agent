@@ -1474,14 +1474,22 @@ export type InterviewMetricStatus = "measured" | "unmeasured";
 export type InterviewMetricUnit =
   | "ratio"
   | "answers_per_update"
-  | "operations_per_inquiry";
+  | "operations_per_inquiry"
+  // Issue #338: how much work one conversation cost is not a ratio, and
+  // expressing it as one would hide the thing being measured.
+  | "per_session";
 // Issue #334: joint_understanding は共同理解の質を測る別カテゴリ。効率化指標
 // (確認件数・承認速度)と同じ数値へまとめない。
 export type InterviewMetricCategory =
   | "user_burden"
   | "accuracy"
   | "ux_quality"
-  | "joint_understanding";
+  | "joint_understanding"
+  // Issue #338: `joint_understanding` counts UTILIZATION and close labels.
+  // These two answer different questions and must not be averaged with it or
+  // with each other — an efficiency gain must never read as a quality gain.
+  | "joint_understanding_quality"
+  | "joint_understanding_burden";
 export type InterviewMetricKey =
   | "answers_per_understanding_update"
   | "unknown_answer_rate"
@@ -1507,7 +1515,20 @@ export type InterviewMetricKey =
   | "joint_understanding_unknown_finding_rate"
   | "joint_understanding_reflux_rate"
   | "joint_understanding_investigation_answered_rate"
-  | "joint_understanding_developer_question_rate";
+  | "joint_understanding_developer_question_rate"
+  // Issue #338: outcome-lineage quality, derived from the finite lineage
+  // events rather than from a close label.
+  | "joint_understanding_unknown_resolution_rate"
+  | "joint_understanding_hypothesis_reversal_rate"
+  | "joint_understanding_hypothesis_correction_rate"
+  | "joint_understanding_adoption_reconfirmation_rate"
+  | "joint_understanding_decision_undo_rate"
+  | "joint_understanding_classification_correction_rate"
+  // Issue #338: developer burden, per session.
+  | "joint_understanding_rounds_per_session"
+  | "joint_understanding_developer_actions_per_session"
+  | "joint_understanding_developer_findings_per_session"
+  | "joint_understanding_question_reask_rate";
 
 // Issue #341: `guardrail` only designates which metrics are worth watching.
 // Whether a metric is *currently* in a bad state is a separate evaluated
@@ -4281,13 +4302,72 @@ export type JointUnderstandingStatementLayer =
   | "gap"
   | "consistency"
   | "decision";
-export type JointUnderstandingPremiseState = "fresh" | "stale";
+// Issue #337: the finite premise verdict, evaluated from the shared Issue #308
+// premise bundle rather than from the pinned snapshot id alone. Only "current"
+// permits hypothesis_adopted / decided / reflux. "missing" (a premise that was
+// captured and has since disappeared) and "invalid" (no comparable bundle was
+// ever captured) both used to report as "fresh".
+export type JointUnderstandingPremiseState =
+  | "current"
+  | "stale"
+  | "missing"
+  | "invalid";
+// The same set plus the pre-#337 value, for a verdict READ BACK from a session
+// closed before this contract existed. Never produced anew.
+export type JointUnderstandingRecordedPremiseState =
+  | JointUnderstandingPremiseState
+  | "fresh";
+export type JointUnderstandingPremiseReason =
+  | "premise_not_captured"
+  | "premise_incomplete"
+  | "pinned_snapshot_removed"
+  | "origin_removed"
+  | "origin_superseded"
+  | "pinned_commit_changed"
+  | "origin_content_changed"
+  | "capability_scope_changed"
+  | "linked_intent_changed";
+// Issue #337: WHICH code path produced a finding, as distinct from whose voice
+// it speaks in (origin_role). "legacy" is read-only.
+export type JointUnderstandingProducerKind =
+  | "investigation_loop"
+  | "translator"
+  | "developer_api"
+  | "legacy";
+// Issue #337: whether an authenticated human stands behind the row.
+export type JointUnderstandingActorKind = "user" | "system" | "legacy";
+export type JointUnderstandingAdoptionState =
+  | "provisional"
+  | "reconfirmation_required"
+  | "basis_withdrawn";
 export type JointUnderstandingStopReason =
   | "answered"
   | "budget_exhausted"
   | "no_new_evidence"
   | "unresolved"
   | "failed";
+// Issue #339: the finite outcome class, so a caller never has to inspect
+// `stop_reason` and guess which side of the limitation/failure split it is on.
+export type JointUnderstandingOutcomeClass =
+  | "answered"
+  | "research_limitation"
+  | "execution_failure";
+// Issue #339: WHERE an execution failure broke, because the recovery differs.
+export type JointUnderstandingFailureClass =
+  | "config_invalid"
+  | "snapshot_unavailable"
+  | "api_failure"
+  | "schema_invalid"
+  | "timeout";
+export type JointUnderstandingExplorationSourceKind =
+  | "path_name"
+  | "symbol_index"
+  | "entrypoint_index"
+  | "file_content"
+  | "dependency"
+  | "call_graph"
+  | "git_history"
+  | "runtime_facts";
 
 export interface JointUnderstandingEvidenceOut {
   path: string;
@@ -4320,6 +4400,9 @@ export interface JointUnderstandingFindingOut {
   decision_method: string;
   intelligence_run_id: number | null;
   is_mock: boolean;
+  producer_kind: JointUnderstandingProducerKind;
+  actor_kind: JointUnderstandingActorKind;
+  actor_username: string | null;
   created_at: number;
 }
 
@@ -4328,10 +4411,30 @@ export interface JointUnderstandingActionOut {
   joint_understanding_id: number;
   system_id: number;
   action_kind: JointUnderstandingActionKind;
+  // Display label only; actor_kind/actor_username are the authenticated
+  // identity the server resolved from the request's Principal (Issue #337).
   actor: string | null;
+  actor_kind: JointUnderstandingActorKind;
+  actor_username: string | null;
   note: string | null;
   decision_method: "manual";
   created_at: number;
+}
+
+export interface JointUnderstandingAdoptionOut {
+  id: number;
+  joint_understanding_id: number;
+  system_id: number;
+  finding_id: number;
+  state: JointUnderstandingAdoptionState;
+  adopted_by_actor_kind: JointUnderstandingActorKind;
+  adopted_by_username: string | null;
+  adoption_reason: string;
+  premise_snapshot_id: number | null;
+  premise_commit_sha: string | null;
+  premise_revision_id: number | null;
+  decision_method: "manual";
+  adopted_at: number;
 }
 
 export interface JointUnderstandingRoundOut {
@@ -4353,6 +4456,31 @@ export interface JointUnderstandingRoundOut {
   llm_calls: number;
   elapsed_seconds: number;
   intelligence_run_id: number | null;
+  error_details: string | null;
+  // Issue #339: set ONLY for an execution failure. A research limitation
+  // (budget_exhausted / no_new_evidence / unresolved) is a real,
+  // evidence-backed result and leaves this null -- "the system looked and could
+  // not tell" must stay distinguishable from "the system could not look".
+  failure_class: JointUnderstandingFailureClass | null;
+  outcome_class: JointUnderstandingOutcomeClass;
+  sources: JointUnderstandingExplorationSourceOut[];
+  created_at: number;
+}
+
+export interface JointUnderstandingExplorationSourceOut {
+  id: number;
+  round_id: number;
+  system_id: number;
+  source_kind: JointUnderstandingExplorationSourceKind;
+  // The pinned commit for git history, the snapshot id for the index /
+  // content / runtime sources.
+  revision: string;
+  candidates_found: number;
+  queries_run: number;
+  elapsed_seconds: number;
+  truncated: boolean;
+  // A failed source is recorded and skipped: it never fails the round, and it
+  // is never replaced by an unbounded fallback search.
   error_details: string | null;
   created_at: number;
 }
@@ -4422,9 +4550,22 @@ export interface JointUnderstandingOut {
   outcome_is_provisional: boolean;
   outcome_reason: string | null;
   outcome_finding_ids: number[];
-  outcome_premise_state: JointUnderstandingPremiseState | null;
+  outcome_premise_state: JointUnderstandingRecordedPremiseState | null;
+  outcome_premise_reason: JointUnderstandingPremiseReason | null;
+  closed_by_actor_kind: JointUnderstandingActorKind | null;
+  closed_by_username: string | null;
+  // Issue #336: the origin row that is CURRENT today. `interview_qa` and
+  // `interview_intent_item` correct additively, so `origin_id` becomes a
+  // superseded row the moment the developer revises the item -- matching a
+  // session to the live item must use this.
+  current_origin_id: number | null;
   premise_state: JointUnderstandingPremiseState;
+  premise_reason: JointUnderstandingPremiseReason | null;
   premise_snapshot_id: number | null;
+  premise_commit_sha: string | null;
+  premise_revision_id: number | null;
+  premise_tracking_version: string | null;
+  premise_captured_at: number | null;
   schema_version: string;
   created_at: number;
   updated_at: number;
@@ -4438,6 +4579,7 @@ export interface JointUnderstandingDetailOut {
   investigation_rounds: JointUnderstandingRoundOut[];
   translations: JointUnderstandingTranslationOut[];
   reflux: JointUnderstandingRefluxOut[];
+  hypothesis_adoptions: JointUnderstandingAdoptionOut[];
   available_actions: JointUnderstandingActionKind[];
 }
 
@@ -4459,6 +4601,34 @@ export interface JointUnderstandingInvestigateOut {
 export interface JointUnderstandingTranslateOut {
   translation: JointUnderstandingTranslationOut;
   action_menu: JointUnderstandingActionMenuEntryOut[];
+}
+
+// Issue #336: the single 「わからない」 entry point. The internal route names
+// (system_researchable / hybrid / human_only) deliberately do not appear in
+// `next_step` -- an internal classification name is not a developer-facing
+// label, so the page maps these four values to its own copy.
+export type JointUnderstandingUnknownNextStep =
+  | "joint_investigation_started"
+  | "joint_understanding_opened"
+  | "developer_answer_required"
+  | "routing_unavailable";
+export type JointUnderstandingRouteCategory =
+  | "human_only"
+  | "system_researchable"
+  | "hybrid";
+
+export interface InterviewQaUnknownOut {
+  session_id: number;
+  system_id: number;
+  // Committed before routing runs, so it is present on every outcome
+  // including the failure ones.
+  qa: InterviewQaOut;
+  route_category: JointUnderstandingRouteCategory | null;
+  knowledge_area: KnowledgeArea | null;
+  joint_understanding_id: number | null;
+  next_step: JointUnderstandingUnknownNextStep;
+  investigation_stop_reason: JointUnderstandingStopReason | null;
+  error: string | null;
 }
 
 export interface JointUnderstandingRefluxResultOut {

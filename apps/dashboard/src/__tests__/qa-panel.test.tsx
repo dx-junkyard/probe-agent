@@ -245,14 +245,17 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
 
   // --- Issue #295 §4.8: 「わからない」→ 自動調査接続 --------------------
 
-  test("「わからない」triggers the batch route-and-investigate endpoint for this question, showing a short status only", async () => {
+  test("「わからない」は 1 回の呼び出しで記録し、分類に従って調査を始める(Issue #336)", async () => {
+    // 以前は route-and-investigate を呼び、失敗したら #142 の回答フローへ
+    // 落とす、という無関係な 2 呼び出しだった。実際の「わからない」から共同
+    // 理解が始まることは一度も無かった。
     mockQaList([makeQa({ id: 1 })]);
-    let resolveInvestigate: (v: InterviewQaRouteInvestigateBatchOut) => void;
-    const investigatePromise = new Promise<InterviewQaRouteInvestigateBatchOut>(resolve => {
-      resolveInvestigate = resolve;
+    let resolveUnknown: (v: unknown) => void;
+    const unknownPromise = new Promise<unknown>(resolve => {
+      resolveUnknown = resolve;
     });
     mockApi.post.mockImplementation((path: string) => {
-      if (path === "/interview/sessions/1/qa/route-and-investigate") return investigatePromise;
+      if (path === "/interview/sessions/1/qa/1/unknown") return unknownPromise;
       return Promise.resolve(undefined);
     });
 
@@ -262,48 +265,52 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
     fireEvent.click(within(item).getByText("回答する"));
     fireEvent.click(within(item).getByTestId("qa-answer-unknown-1"));
 
-    // Only a short status line while investigating -- no answer call yet,
-    // and the わからない button itself is replaced (no duplicate firing).
-    expect(within(item).getByTestId("qa-answer-unknown-investigating-1")).toHaveTextContent(
-      "関連コードとテストを確認しています",
-    );
+    // 実行中は短い状況表示だけ。ボタンは差し替わるので二重発火しない。
     await waitFor(() => {
-      // PR #296 review fix (Finding 4): scoped to qa_ids=[1] -- never the
-      // whole-session batch -- for this single question's 「わからない」.
-      expect(mockApi.post).toHaveBeenCalledWith(
-        "/interview/sessions/1/qa/route-and-investigate", { qa_ids: [1] },
+      expect(within(item).getByTestId("qa-answer-unknown-investigating-1")).toHaveTextContent(
+        "関連コードとテストを確認しています",
       );
     });
     expect(within(item).queryByTestId("qa-answer-unknown-1")).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/1/qa/1/unknown",
+        { answer_text: "", actor: "dev" },
+      );
+    });
+    // 旧フローの 2 呼び出しはどちらも起きない。
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/interview/sessions/1/qa/route-and-investigate", expect.anything(),
+    );
     expect(mockApi.post).not.toHaveBeenCalledWith(
       "/interview/sessions/1/qa/1/answer", expect.anything(),
     );
 
-    resolveInvestigate!({
+    resolveUnknown!({
       session_id: 1, system_id: 1,
-      results: [{ qa_id: 1, route_category: "system_researchable", knowledge_area: null, investigation_status: "completed", error: null }],
-      counts: { routed: 1, investigated: 1, failed: 0, skipped_cap: 0 },
+      qa: makeQa({ id: 1, status: "unconfirmed" }),
+      route_category: "system_researchable", knowledge_area: null,
+      joint_understanding_id: 42, next_step: "joint_investigation_started",
+      investigation_stop_reason: "answered", error: null,
     });
 
-    // Investigation succeeded for this question: never falls back to
-    // recording an unknown answer, and returns to the normal confirm view.
     await waitFor(() => {
       expect(within(item).queryByTestId("qa-answer-unknown-investigating-1")).not.toBeInTheDocument();
     });
-    expect(mockApi.post).not.toHaveBeenCalledWith(
-      "/interview/sessions/1/qa/1/answer", expect.anything(),
-    );
     expect(within(item).getByText("回答する")).toBeInTheDocument();
   });
 
-  test("investigation API failure falls back to the original #142 わからない flow (never loses the answer opportunity)", async () => {
+  test("コードでは答えられない質問は調査を始めず、回答・引き継ぎの機会を残す(Issue #336)", async () => {
     mockQaList([makeQa({ id: 1 })]);
     mockApi.post.mockImplementation((path: string) => {
-      if (path === "/interview/sessions/1/qa/route-and-investigate") {
-        return Promise.reject(new Error("boom"));
-      }
-      if (path === "/interview/sessions/1/qa/1/answer") {
-        return Promise.resolve({ qa: makeQa({ id: 1, status: "unconfirmed" }), previous: null, regeneration_recommended: false });
+      if (path === "/interview/sessions/1/qa/1/unknown") {
+        return Promise.resolve({
+          session_id: 1, system_id: 1,
+          qa: makeQa({ id: 1, status: "unconfirmed" }),
+          route_category: "human_only", knowledge_area: "product_intent",
+          joint_understanding_id: null, next_step: "developer_answer_required",
+          investigation_stop_reason: null, error: null,
+        });
       }
       return Promise.resolve(undefined);
     });
@@ -317,33 +324,33 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
-        "/interview/sessions/1/qa/1/answer",
-        expect.objectContaining({ answer_unknown: true }),
+        "/interview/sessions/1/qa/1/unknown", { answer_text: "", actor: "dev" },
       );
     });
     await waitFor(() => {
+      // 内部の分類名(human_only)は出さない。
       expect(toast.info).toHaveBeenCalledWith(
-        "「わからない」として記録しました。仮説を立てて確認質問を続けます。",
+        expect.stringContaining("あなたの回答か引き継ぎが必要です"),
       );
     });
   });
 
-  test("a question not covered by the batch result (e.g. cap/skip) also falls back to the #142 flow", async () => {
+  test("自動調査が失敗しても記録は残り、対話は再試行できる(Issue #336)", async () => {
     mockQaList([makeQa({ id: 1 })]);
     mockApi.post.mockImplementation((path: string) => {
-      if (path === "/interview/sessions/1/qa/route-and-investigate") {
-        const batch: InterviewQaRouteInvestigateBatchOut = {
-          session_id: 1, system_id: 1, results: [],
-          counts: { routed: 0, investigated: 0, failed: 0, skipped_cap: 1 },
-        };
-        return Promise.resolve(batch);
-      }
-      if (path === "/interview/sessions/1/qa/1/answer") {
-        return Promise.resolve({ qa: makeQa({ id: 1, status: "unconfirmed" }), previous: null, regeneration_recommended: false });
+      if (path === "/interview/sessions/1/qa/1/unknown") {
+        return Promise.resolve({
+          session_id: 1, system_id: 1,
+          qa: makeQa({ id: 1, status: "unconfirmed" }),
+          route_category: "system_researchable", knowledge_area: null,
+          joint_understanding_id: 42, next_step: "joint_understanding_opened",
+          investigation_stop_reason: null, error: "API failure",
+        });
       }
       return Promise.resolve(undefined);
     });
 
+    const { toast } = await import("sonner");
     await renderQaPanel({ sessionId: 1, actor: "dev", approvedCount: 1, answerableAreas: [] });
 
     const item = await screen.findByTestId("qa-item-1");
@@ -351,9 +358,8 @@ describe("QaPanel route-and-investigate wiring (Issue #286 review fix, Finding 1
     fireEvent.click(within(item).getByTestId("qa-answer-unknown-1"));
 
     await waitFor(() => {
-      expect(mockApi.post).toHaveBeenCalledWith(
-        "/interview/sessions/1/qa/1/answer",
-        expect.objectContaining({ answer_unknown: true }),
+      expect(toast.info).toHaveBeenCalledWith(
+        expect.stringContaining("調査は完了できませんでした"),
       );
     });
   });

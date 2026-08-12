@@ -118,3 +118,30 @@ metrics:
     watch: false
   - key: joint_understanding_developer_question_rate
     watch: false
+  # Issue #338: outcome-lineage quality and burden. Every one is `watch: false`
+  # for now, deliberately and for the same reason #341 left its thresholds
+  # unset: what counts as "too many reversed hypotheses" or "too much burden per
+  # session" has to be decided from real observations of this System, and a
+  # number invented here would be exactly the self-reported quality judgement
+  # Issue #338 forbids. They are measured and readable today; designating one a
+  # notification target is a separate, later decision.
+  - key: joint_understanding_unknown_resolution_rate
+    watch: false
+  - key: joint_understanding_hypothesis_reversal_rate
+    watch: false
+  - key: joint_understanding_hypothesis_correction_rate
+    watch: false
+  - key: joint_understanding_adoption_reconfirmation_rate
+    watch: false
+  - key: joint_understanding_decision_undo_rate
+    watch: false
+  - key: joint_understanding_classification_correction_rate
+    watch: false
+  - key: joint_understanding_rounds_per_session
+    watch: false
+  - key: joint_understanding_developer_actions_per_session
+    watch: false
+  - key: joint_understanding_developer_findings_per_session
+    watch: false
+  - key: joint_understanding_question_reask_rate
+    watch: false

@@ -2125,6 +2125,31 @@ def create_interview_qa(
         return _qa_out(row)
 
 
+def _write_first_qa_answer(
+    conn,
+    *,
+    qa_id: int,
+    answer_text: str,
+    answer_unknown: bool,
+    status: str,
+    actor: str,
+    now: float,
+) -> None:
+    """Record the FIRST answer on a question's own row (no supersede needed).
+
+    Extracted (Issue #336) so the single 「わからない」 entry point records the
+    unknown answer through exactly this write rather than a similar-looking
+    copy. The caller owns the transaction.
+    """
+    conn.execute(
+        """UPDATE interview_qa
+           SET answer_text = ?, answer_unknown = ?, status = ?, answered_by = ?,
+               answered_at = ?
+           WHERE id = ?""",
+        (answer_text, 1 if answer_unknown else 0, status, actor, now, qa_id),
+    )
+
+
 @router.post(
     "/interview/sessions/{session_id}/qa/{qa_id}/answer",
     response_model=InterviewQaAnswerOut,
@@ -2208,19 +2233,10 @@ def answer_interview_qa(
         conn.execute("BEGIN")
         try:
             if qa["status"] in ("open", "skipped"):
-                conn.execute(
-                    """UPDATE interview_qa
-                       SET answer_text = ?, answer_unknown = ?, status = ?, answered_by = ?,
-                           answered_at = ?
-                       WHERE id = ?""",
-                    (
-                        payload.answer_text,
-                        1 if payload.answer_unknown else 0,
-                        new_status,
-                        payload.actor,
-                        now,
-                        qa_id,
-                    ),
+                _write_first_qa_answer(
+                    conn, qa_id=qa_id, answer_text=payload.answer_text,
+                    answer_unknown=payload.answer_unknown, status=new_status,
+                    actor=payload.actor, now=now,
                 )
                 conn.execute("COMMIT")
                 updated = conn.execute(
@@ -3216,6 +3232,11 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
     snapshot_id = session["snapshot_id"]
 
     from ..docs_code_reconciler import reconcile
+    from ..understanding_evidence_feed import (
+        current_entries as feed_current_entries,
+        prompt_facts as feed_prompt_facts,
+        record_consumption as feed_record_consumption,
+    )
     from ..system_understanding_service import _load_graph_for_snapshot
     from ..system_understanding_reviewer import (
         PROMPT_VERSION as REVIEW_PROMPT_VERSION,
@@ -3328,6 +3349,18 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
             conn, session_id, system_id
         )
 
+        # Issue #336: the canonical rebuild reads the shared evidence feed.
+        # Before this, a joint investigation's verified facts reached the
+        # Understanding only if a human retyped them into an answer -- for a
+        # non-'qa' origin they never reached it at all. The entries are
+        # filtered for currency at read time (a corrected finding and a
+        # non-current premise are both excluded), and the ids are kept so the
+        # consumption can be recorded once the run exists.
+        feed_entries = feed_current_entries(
+            conn, system_id=system_id, session_id=session_id,
+        )
+        verified_evidence = feed_prompt_facts(feed_entries)
+
     # Phase 2 (DB lock released): the reasoning call. The LLM client
     # opens its own connection to consume System quota, so it must not
     # run while this thread holds one (see app/db.py).
@@ -3339,6 +3372,7 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
         answered_qa=answered_qa_pairs,
         unconfirmed_qa=unconfirmed_qa_pairs or None,
         alignment_feedback=alignment_feedback,
+        verified_evidence=verified_evidence or None,
     )
 
     # Phase 3 (DB lock re-acquired): persist the review outcome.
@@ -3467,6 +3501,23 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
             (session_id, system_id, snapshot_id, run_id, understanding_json, gap_json, now),
         )
         revision_id = revision_cur.lastrowid
+
+        # Issue #336: record that this rebuild USED these verified facts. This
+        # is deliberately not a confirmation -- the developer accepting the
+        # rebuilt understanding is a separate fact with its own record
+        # (understanding_confirmed_at / the Issue #312 Capability
+        # confirmation). Writing both here would let "the AI fed this in" read
+        # as "the developer agreed with it".
+        feed_record_consumption(
+            conn,
+            system_id=system_id,
+            session_id=session_id,
+            consumer_kind="understanding_build",
+            entry_ids=[entry.id for entry in feed_entries],
+            revision_id=revision_id,
+            intelligence_run_id=run_id,
+            now=now,
+        )
         try:
             limit = revision_limit()
         except ValueError:
