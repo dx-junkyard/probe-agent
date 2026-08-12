@@ -14,13 +14,11 @@ conversation, not an observation of what happened afterwards:
 - a question the system asked three times counts as three translations, not as
   one question the developer had to answer repeatedly.
 
-This module derives the finite event stream that CAN answer it. Everything here
-is derived from persisted facts rather than written at transition time, for the
-reason the codebase applies elsewhere (#337's adoption state, #349's unresolved
-failure): a stored lifecycle value can drift out of sync with the rows it
-describes, and a derived one cannot. The same rows always produce the same
-events, which is what makes the metrics reproducible (Issue #338's determinism
-gate).
+This module derives only the finite events that persisted facts can establish
+without interpretation. Everything here is derived from persisted facts rather
+than guessed from adjacent outcomes. The same rows always produce the same
+events, which makes the metrics reproducible; a transition that can mean two
+things remains unmeasured until an explicit observation contract is captured.
 
 The lineage deliberately does NOT score anything. It reports what happened, in
 finite terms, and the metrics layer aggregates it into separate quality /
@@ -50,7 +48,8 @@ from typing import Dict, List, Optional, Sequence, Set
 # hypothesis_*: a candidate explanation and what became of it
 # question_*  : a question the system decided to put to the developer
 # decision_*  : the developer's own judgement and whether it held
-# classification_corrected: the Question Router's route turned out to be wrong
+# classification_corrected: reserved for an explicit future observation that
+# the Question Router's route turned out to be wrong
 LINEAGE_EVENT_KINDS = (
     "unknown_created",
     "unknown_resolved",
@@ -172,16 +171,6 @@ class LineageSummary:
         })
 
 
-def _current_ids(finding_rows: Sequence) -> Set[int]:
-    """Finding ids no later finding in the same session has superseded."""
-    superseded = {
-        r["supersedes_finding_id"]
-        for r in finding_rows
-        if r["supersedes_finding_id"] is not None
-    }
-    return {r["id"] for r in finding_rows} - superseded
-
-
 def derive_lineage(conn, *, system_id: int, session_id: Optional[int] = None) -> LineageSummary:
     """Derive the finite lineage events for a System (or one interview session).
 
@@ -227,21 +216,13 @@ def derive_lineage(conn, *, system_id: int, session_id: Optional[int] = None) ->
             WHERE joint_understanding_id IN ({placeholders}) ORDER BY id""",
         tuple(ju_ids),
     ).fetchall()
-    adoptions = conn.execute(
-        f"""SELECT * FROM joint_understanding_hypothesis_adoption
-            WHERE joint_understanding_id IN ({placeholders}) ORDER BY id""",
-        tuple(ju_ids),
-    ).fetchall()
-
     findings_by_ju: Dict[int, List] = {}
     for row in findings:
         findings_by_ju.setdefault(row["joint_understanding_id"], []).append(row)
-    adoptions_by_finding = {row["finding_id"]: row for row in adoptions}
 
     for session in sessions:
         ju_id = session["id"]
         own_findings = findings_by_ju.get(ju_id, [])
-        current = _current_ids(own_findings)
         # finding id -> the finding that superseded it, for the successor link.
         successor: Dict[int, object] = {
             r["supersedes_finding_id"]: r
@@ -270,7 +251,7 @@ def derive_lineage(conn, *, system_id: int, session_id: Optional[int] = None) ->
 
             if finding["claim_kind"] == "unknown":
                 _event("unknown_created", finding_id, at=finding["created_at"])
-                if replacement is not None:
+                if replacement is not None and replacement["claim_kind"] != "unknown":
                     # A later finding replaced the gap with something: the
                     # unknown and its resolution are ONE lineage, which is what
                     # lets "how many gaps got closed" be counted at all.
@@ -292,34 +273,25 @@ def derive_lineage(conn, *, system_id: int, session_id: Optional[int] = None) ->
             if finding["claim_kind"] != "hypothesis":
                 continue
             _event("hypothesis_created", finding_id, at=finding["created_at"])
-            adoption = adoptions_by_finding.get(finding_id)
             if replacement is not None:
-                # First-match, and the order matters: replaced by a FACT means
-                # the investigation established the truth and the hypothesis was
-                # wrong or right on evidence (reversed); replaced by another
-                # hypothesis means the candidate explanation itself was revised
-                # (corrected). Collapsing them would hide whether the system is
-                # converging or churning.
+                # Replacing a hypothesis with another hypothesis is an explicit
+                # correction. A fact successor only says the hypothesis was
+                # superseded: without an explicit relation it may confirm OR
+                # refute the hypothesis, so reporting a reversal would invent
+                # an observation that is not present in the rows.
                 kind = (
-                    "hypothesis_reversed"
-                    if replacement["claim_kind"] == "fact"
-                    else "hypothesis_corrected"
+                    "hypothesis_corrected"
+                    if replacement["claim_kind"] == "hypothesis"
+                    else "hypothesis_superseded"
                 )
                 _event(
                     kind, finding_id, at=replacement["created_at"],
                     supersedes_subject_id=replacement["id"],
                     detail=replacement["claim_kind"],
                 )
-            elif adoption is not None and finding_id in current:
-                # Adopted and still standing on its own evidence.
-                _event(
-                    "hypothesis_confirmed", finding_id, at=adoption["adopted_at"],
-                )
-            elif closed:
-                _event(
-                    "hypothesis_superseded", finding_id,
-                    at=session["closed_at"] or session["updated_at"],
-                )
+            # A provisional human adoption is not evidence confirmation, and a
+            # session close does not by itself settle a hypothesis. Both remain
+            # non-terminal until an explicit observation contract is recorded.
 
         # Questions: a translation that concluded the developer must be asked.
         asked = 0
@@ -349,14 +321,6 @@ def derive_lineage(conn, *, system_id: int, session_id: Optional[int] = None) ->
                 "decision_adopted", ju_id,
                 at=session["closed_at"] or session["updated_at"],
             )
-        elif closed and proposed and session["outcome"] in ("abandoned", "handed_off"):
-            # The developer moved to decide and then did not: a real, countable
-            # outcome that the close label alone reads as a neutral close.
-            _event(
-                "decision_rejected", ju_id,
-                at=session["closed_at"] or session["updated_at"],
-                detail=session["outcome"] or "",
-            )
 
         summary.burdens.append(SessionBurden(
             joint_understanding_id=ju_id,
@@ -373,78 +337,8 @@ def derive_lineage(conn, *, system_id: int, session_id: Optional[int] = None) ->
             reasks=max(0, asked - 1),
         ))
 
-    summary.events.extend(_decision_undo_events(sessions, system_id))
-    summary.events.extend(_classification_correction_events(conn, sessions, system_id))
     summary.events.sort(key=lambda e: (e.at, e.joint_understanding_id, e.event_kind))
     return summary
-
-
-def _decision_undo_events(sessions: Sequence, system_id: int) -> List[LineageEvent]:
-    """A decision undone: a NEW session opened on the same origin after one
-    closed ``decided``.
-
-    A closed session is terminal, so there is no "reopen" to observe. Coming
-    back to the same confirmation item after deciding it IS the observable undo,
-    and it is the signal #311's start condition needs -- a decision that did not
-    hold. The successor's own id is recorded so the pair is traceable.
-    """
-    events: List[LineageEvent] = []
-    decided: Dict[tuple, object] = {}
-    for session in sorted(sessions, key=lambda r: r["id"]):
-        key = (session["origin_kind"], session["origin_id"])
-        earlier = decided.get(key)
-        if earlier is not None:
-            events.append(LineageEvent(
-                event_kind="decision_undone",
-                subject_kind="decision",
-                subject_id=earlier["id"],
-                system_id=system_id,
-                session_id=earlier["session_id"],
-                joint_understanding_id=earlier["id"],
-                at=session["created_at"],
-                supersedes_subject_id=session["id"],
-            ))
-            decided.pop(key)
-        if session["status"] == "closed" and session["outcome"] == "decided":
-            decided[key] = session
-    return events
-
-
-def _classification_correction_events(
-    conn, sessions: Sequence, system_id: int,
-) -> List[LineageEvent]:
-    """The Question Router's route turned out to be wrong.
-
-    Observable in exactly one deterministic shape: a session the router sent to
-    investigation because the code could answer it (``system_researchable``)
-    that the developer then had to hand off or abandon. That is a
-    misclassification, and it is one of the two observation classes #311's start
-    condition is waiting on -- so it has to be countable rather than inferred
-    from a feeling that the routing is off.
-    """
-    events: List[LineageEvent] = []
-    for session in sessions:
-        if session["origin_kind"] != "qa" or session["status"] != "closed":
-            continue
-        if session["outcome"] not in ("handed_off", "abandoned"):
-            continue
-        row = conn.execute(
-            "SELECT route_category FROM interview_qa WHERE id = ? AND system_id = ?",
-            (session["origin_id"], system_id),
-        ).fetchone()
-        if row is None or row["route_category"] != "system_researchable":
-            continue
-        events.append(LineageEvent(
-            event_kind="classification_corrected",
-            subject_kind="classification",
-            subject_id=session["id"],
-            system_id=system_id,
-            session_id=session["session_id"],
-            joint_understanding_id=session["id"],
-            at=session["closed_at"] or session["updated_at"],
-            detail=session["outcome"] or "",
-        ))
-    return events
 
 
 # --- #311's start condition (observation only) ---------------------------------
@@ -483,8 +377,17 @@ def bulk_approval_readiness(summary: LineageSummary) -> List[BulkApprovalCriteri
         "misclassification_cases": summary.count("classification_corrected"),
         "undo_cases": summary.count("decision_undone"),
     }
-    return [
-        BulkApprovalCriterion(
+    result: List[BulkApprovalCriterion] = []
+    for key in BULK_APPROVAL_CRITERIA:
+        if key != "observed_sessions":
+            result.append(BulkApprovalCriterion(
+                key=key,
+                observed=0,
+                verdict="unmeasured",
+                note="explicit observation contract is not yet defined",
+            ))
+            continue
+        result.append(BulkApprovalCriterion(
             key=key,
             observed=counts[key],
             verdict="unmeasured" if observed_sessions == 0 else "threshold_unset",
@@ -494,9 +397,8 @@ def bulk_approval_readiness(summary: LineageSummary) -> List[BulkApprovalCriteri
                 else "measured; the threshold that would gate #311 is deliberately "
                      "unset until there is enough real data to choose one"
             ),
-        )
-        for key in BULK_APPROVAL_CRITERIA
-    ]
+        ))
+    return result
 
 
 __all__ = [

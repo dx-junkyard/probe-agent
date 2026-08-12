@@ -336,8 +336,14 @@ def _read_candidates(
         if time.monotonic() - start_time > budget.timeout_seconds:
             timed_out = True
             break
+        remaining_seconds = budget.timeout_seconds - (time.monotonic() - start_time)
+        if remaining_seconds <= 0:
+            timed_out = True
+            break
         try:
-            raw = read_file_at_commit(repo_path, commit_sha, path)
+            raw = read_file_at_commit(
+                repo_path, commit_sha, path, timeout=remaining_seconds,
+            )
         except GitError:
             continue
         text = raw.decode("utf-8", errors="replace")

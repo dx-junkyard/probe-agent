@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set
 
@@ -273,6 +274,7 @@ def git_history_candidates(
     seed_paths: Sequence[str],
     max_commits: int = MAX_GIT_HISTORY_COMMITS,
     limit: int = MAX_GIT_HISTORY_CANDIDATES,
+    timeout_seconds: float = GIT_HISTORY_TIMEOUT_SECONDS,
 ) -> ExplorerResult:
     """Files that changed together with the seeds, in the pinned history.
 
@@ -286,6 +288,7 @@ def git_history_candidates(
     reasoning model's call on the evidence.
     """
     result = ExplorerResult(source_kind="git_history", revision=commit_sha)
+    started = time.monotonic()
     seeds = [p for p in dict.fromkeys(seed_paths) if p][:MAX_SEEDS]
     if not seeds:
         return result
@@ -298,12 +301,13 @@ def git_history_candidates(
         log = _run_git(
             repo_path,
             ["log", commit_sha, f"-n{max_commits}", "--format=%H", "--", *seeds],
-            timeout=GIT_HISTORY_TIMEOUT_SECONDS,
+            timeout=max(0.001, min(GIT_HISTORY_TIMEOUT_SECONDS, timeout_seconds)),
         )
     except GitError as exc:
         result.error = str(exc)
         return result
     result.queries_run += 1
+    result.elapsed_seconds = time.monotonic() - started
     if log.returncode != 0:
         result.error = (
             log.stderr.decode("utf-8", errors="replace").strip()
@@ -318,6 +322,10 @@ def git_history_candidates(
     if not commits:
         return result
 
+    remaining_seconds = timeout_seconds - (time.monotonic() - started)
+    if remaining_seconds <= 0:
+        result.error = "git history exploration exceeded its time budget"
+        return result
     try:
         # --no-walk lists exactly these commits and nothing else, so the walk
         # cannot leave the pinned commit's history even though no pathspec
@@ -325,12 +333,13 @@ def git_history_candidates(
         log = _run_git(
             repo_path,
             ["log", "--no-walk", "--format=%x00%H", "--name-only", *commits],
-            timeout=GIT_HISTORY_TIMEOUT_SECONDS,
+            timeout=max(0.001, min(GIT_HISTORY_TIMEOUT_SECONDS, remaining_seconds)),
         )
     except GitError as exc:
         result.error = str(exc)
         return result
     result.queries_run += 1
+    result.elapsed_seconds = time.monotonic() - started
     if log.returncode != 0:
         result.error = (
             log.stderr.decode("utf-8", errors="replace").strip()

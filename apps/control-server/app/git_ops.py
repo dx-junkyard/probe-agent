@@ -86,7 +86,7 @@ def _run_git(
     repo_path: str,
     args: List[str],
     *,
-    timeout: int = 30,
+    timeout: float = 30,
     input_bytes: Optional[bytes] = None,
 ) -> subprocess.CompletedProcess:
     try:
@@ -339,8 +339,12 @@ def classify_source_type(path: str) -> str:
     return "source"
 
 
-def list_tree_entries(repo_path: str, commit_sha: str) -> List[GitTreeEntry]:
-    result = _run_git(repo_path, ["ls-tree", "-r", "-z", commit_sha])
+def list_tree_entries(
+    repo_path: str, commit_sha: str, *, timeout: float = 30,
+) -> List[GitTreeEntry]:
+    result = _run_git(
+        repo_path, ["ls-tree", "-r", "-z", commit_sha], timeout=timeout,
+    )
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         raise GitError(f"git ls-tree failed: {stderr}")
@@ -367,10 +371,14 @@ def list_tree_entries(repo_path: str, commit_sha: str) -> List[GitTreeEntry]:
     return entries
 
 
-def read_file_at_commit(repo_path: str, commit_sha: str, path: str) -> bytes:
+def read_file_at_commit(
+    repo_path: str, commit_sha: str, path: str, *, timeout: float = 30,
+) -> bytes:
     if not _is_safe_git_path(path):
         raise GitError(f"Unsafe Git path: {path!r}")
-    result = _run_git(repo_path, ["show", f"{commit_sha}:{path}"])
+    result = _run_git(
+        repo_path, ["show", f"{commit_sha}:{path}"], timeout=timeout,
+    )
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         raise GitError(f"Cannot read {path} at {commit_sha}: {stderr}")

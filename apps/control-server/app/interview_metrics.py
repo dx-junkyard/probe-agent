@@ -346,19 +346,18 @@ def _joint_understanding_lineage_metrics(
     ))
 
     hypothesis_terminal = lineage.terminal_subjects("hypothesis")
-    metrics.append(_measured(
+    metrics.append(_unmeasured(
         key="joint_understanding_hypothesis_reversal_rate",
         category="joint_understanding_quality",
         guardrail=True,
         description=(
-            "決着した仮説のうち、後続の事実によって覆された割合。"
-            "高止まりは、確かめきれないまま仮説を前提に進めていることを示す。"
+            "明示的に反転が確認された仮説の割合。fact への supersede だけでは"
+            "確認か反転か判別しない。"
         ),
         formula="hypothesis_reversed / terminal hypotheses",
         sources=["joint_understanding_finding.claim_kind", ".supersedes_finding_id"],
         unit="ratio",
-        numerator=lineage.count("hypothesis_reversed"),
-        denominator=hypothesis_terminal,
+        reason="explicit_observation_contract_pending",
     ))
     metrics.append(_measured(
         key="joint_understanding_hypothesis_correction_rate",
@@ -396,40 +395,30 @@ def _joint_understanding_lineage_metrics(
         denominator=adoptions,
     ))
 
-    decision_terminal = lineage.terminal_subjects("decision")
-    metrics.append(_measured(
+    metrics.append(_unmeasured(
         key="joint_understanding_decision_undo_rate",
         category="joint_understanding_quality",
         guardrail=True,
         description=(
-            "決着した判断のうち、同じ項目で対話をやり直した割合(判断が持たなかった)。"
+            "明示的に取り消された判断の割合。再度会話を開いたことだけでは undo としない。"
         ),
         formula="decision_undone / terminal decisions",
         sources=["joint_understanding_session.outcome", ".origin_kind", ".origin_id"],
         unit="ratio",
-        numerator=lineage.count("decision_undone"),
-        denominator=decision_terminal,
+        reason="explicit_observation_contract_pending",
     ))
-    classified = conn.execute(
-        """SELECT COUNT(*) AS n FROM joint_understanding_session AS s
-           JOIN interview_qa AS q ON q.id = s.origin_id AND q.system_id = s.system_id
-           WHERE s.system_id = ? AND s.origin_kind = 'qa'
-             AND q.route_category IS NOT NULL""",
-        (system_id,),
-    ).fetchone()["n"]
-    metrics.append(_measured(
+    metrics.append(_unmeasured(
         key="joint_understanding_classification_correction_rate",
         category="joint_understanding_quality",
         guardrail=True,
         description=(
-            "分類済みの質問のうち、コードで答えられる想定だったのに"
-            "引き継ぎ・中断で終わった割合(分類の誤り)。"
+            "明示的に訂正された Question Router 分類の割合。"
+            "引き継ぎ・中断だけでは誤分類としない。"
         ),
         formula="classification_corrected / routed qa-origin sessions",
         sources=["interview_qa.route_category", "joint_understanding_session.outcome"],
         unit="ratio",
-        numerator=lineage.count("classification_corrected"),
-        denominator=classified,
+        reason="explicit_observation_contract_pending",
     ))
 
     metrics.append(_measured(

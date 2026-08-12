@@ -19,10 +19,11 @@ input rather than as a second opinion:
   premise it was established against. It is never ``manual``: nobody answered
   anything, and a rebuild must be able to tell an investigated fact apart from
   a developer's confirmed answer.
-- **Idempotent publication.** The digest over ``(source_kind, statement,
-  evidence, runtime_evidence)`` is unique per System, so re-running reflux --
-  or refluxing incrementally as later rounds add findings -- never publishes
-  the same fact twice.
+- **Idempotent publication.** The publication digest includes the source
+  session and finding as well as the fact's semantic digest. Re-running reflux
+  for the same finding is idempotent, while an independent investigation may
+  re-establish the same fact against a newer premise without being hidden by
+  an older, subsequently stale source.
 - **Currency at read time, not at write time.** ``current_entries`` drops an
   entry whose finding a later finding corrected, and every entry whose source
   session's premise is no longer ``current`` (Issue #337's verdict, evaluated
@@ -169,6 +170,43 @@ def compute_evidence_digest(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def compute_publication_digest(
+    *,
+    source_kind: str,
+    source_id: int,
+    finding_id: int,
+    statement: str,
+    evidence: Sequence[Dict[str, object]],
+    runtime_evidence: Sequence[Dict[str, object]],
+) -> str:
+    """Idempotency key for one attributable publication.
+
+    Currency is evaluated from the source session's premise. Consequently,
+    two sessions that establish the same semantic fact are not interchangeable:
+    the older source may become stale while the newer source remains current.
+    Keeping the source and finding in this key preserves that distinction while
+    making a retry of the exact same publication deterministic.
+    """
+    semantic_digest = compute_evidence_digest(
+        source_kind=source_kind,
+        statement=statement,
+        evidence=evidence,
+        runtime_evidence=runtime_evidence,
+    )
+    canonical = json.dumps(
+        {
+            "semantic_digest": semantic_digest,
+            "source_kind": source_kind,
+            "source_id": int(source_id),
+            "finding_id": int(finding_id),
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def publish_joint_understanding_finding(
     conn,
     *,
@@ -191,8 +229,10 @@ def publish_joint_understanding_finding(
     """
     evidence = json.loads(finding_row["evidence_json"])
     runtime_evidence = json.loads(finding_row["runtime_evidence_json"])
-    digest = compute_evidence_digest(
+    digest = compute_publication_digest(
         source_kind="joint_understanding",
+        source_id=joint_understanding_id,
+        finding_id=finding_row["id"],
         statement=finding_row["statement"],
         evidence=evidence,
         runtime_evidence=runtime_evidence,
@@ -354,6 +394,7 @@ __all__ = [
     "FEED_SOURCE_KINDS",
     "FeedEntry",
     "compute_evidence_digest",
+    "compute_publication_digest",
     "current_entries",
     "prompt_facts",
     "publish_joint_understanding_finding",

@@ -5290,11 +5290,11 @@ rebuild の入力にしている。
   確立時の premise を持つ。決して `manual` ではない — 誰も何も回答していないし、
   rebuild は「調査された事実」と「開発者の確定回答」を区別できなければならない。
   だから Q&A セクションへ混ぜず、独立した prompt 入力にしている。
-- **冪等な publish**: `content_digest` は `(source_kind, statement, evidence spans,
-  runtime checks)` の canonical sha256 で、**finding id を含めない**。同じ span から
-  同じ statement を確立した 2 ラウンドは同じ事実であり、rebuild には 1 回だけ
-  見えるべきである。`UNIQUE (system_id, content_digest)` により、reflux の再実行も
-  増分実行も caller が publish 済みを管理せずに冪等になる。
+- **冪等な publish**: `content_digest` は source session、finding、fact の semantic
+  digest を含む canonical sha256。同じ finding の再送は同じ publication だが、別の
+  premise で独立に再検証された同内容の fact は別の来歴である。前者だけを
+  `UNIQUE (system_id, content_digest)` で重複排除する。これにより古い source が
+  stale になっても、新しい current premise で再検証された fact を失わない。
 - **currency は write 時ではなく read 時に評価する**(`current_entries`)。
   後続 finding に訂正された fact と、source session の premise が `current`
   でなくなった fact を除外する。どちらも publish 時点では知り得ない。除外された
@@ -5413,15 +5413,13 @@ Inquiry からの導線を入れたのは、「疑問が解消しなかった」
   答えられない。**終端に達していない subject は分母から除外する** —
   未決着の仮説を成功にも失敗にも数えるのは、起きていない結果を報告することで
   あり、close ラベルを品質の代理にするのと同じ誤りである。
-- **仮説の「反転」と「訂正」を分ける。** 事実で置き換えられた(reversed)のと
-  別の仮説へ改められた(corrected)のは、収束しているか迷走しているかの違いで
-  ある。まとめると、その区別が消える。
-- **判断の undo は観測可能な形に落とす。** closed は terminal なので reopen は
-  観測できない。「決めた後、同じ項目でもう一度対話を開いた」が観測可能な undo で
-  あり、これが #311 の開始条件が待っている 2 つの観測クラスのうちの 1 つ。
-- **分類の誤りも数える。** router が「コードで答えられる」と判定した質問
-  (`system_researchable`)が引き継ぎ・中断で終わったら誤分類。これが 2 つ目の
-  観測クラス。「routing がずれている気がする」ではなく数えられる形にする。
+- **観測されていない反転・undo・誤分類を推測しない。** 仮説を別の仮説で
+  supersede したことは訂正だが、fact で supersede しただけでは確認か反転かを
+  判別できない。仮説の暫定採用も確認ではない。同様に、`decided` 後に同じ項目で
+  新しい会話を開いたことは undo を、`system_researchable` が引き継ぎ・中断で
+  終わったことは Router 誤分類を、それぞれ必ずしも意味しない。明示的な
+  user-observation 契約が決まるまではこれらを `unmeasured` とし、#311 の開始条件へ
+  推測値を渡さない。
 - **カテゴリを 3 つに分ける。** `joint_understanding`(利用状況・効率)、
   `joint_understanding_quality`(結果 lineage)、`joint_understanding_burden`
   (1 セッションあたりの負担)。合成スコアはどこにも作らない —

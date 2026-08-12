@@ -437,8 +437,9 @@ creating incomplete persistence or execution paths for later phases.
       `manual`, so a rebuild can tell an investigated fact from a developer's
       answer — which is why it is a separate prompt section and never merged
       into the Q&A block); idempotent publication (`content_digest` over the
-      fact's MEANING, **excluding the finding id**, so re-running or
-      incrementally running reflux never duplicates); and **currency evaluated
+      source session, finding, and the fact's semantic digest, so retrying the
+      same publication never duplicates without conflating an independent
+      re-verification under a newer premise); and **currency evaluated
       at READ time** (`current_entries` excludes a corrected finding and a
       non-`current` premise) — neither is knowable at publish time, and an
       excluded entry stays readable as history rather than being deleted.
@@ -532,15 +533,15 @@ creating incomplete persistence or execution paths for later phases.
       every denominator** — counting an open hypothesis as a success or a
       failure reports an outcome that has not happened, which is the same
       mistake as reading a close label as a quality result.
-    - `hypothesis_reversed` (replaced by a fact) and `hypothesis_corrected`
-      (replaced by another hypothesis) stay separate: the difference is whether
-      the system is converging or churning.
-    - A decision `undone` is observable as **a new session on the same origin
-      after one closed `decided`** — a closed session is terminal, so there is
-      no reopen to watch. A `classification_corrected` is a
-      `system_researchable` question the developer had to hand off. These are
-      the two observation classes #311's start condition waits on, and they are
-      now countable rather than inferred from a feeling.
+    - Hypothesis-to-hypothesis supersession is an explicit correction. A fact
+      successor is only `hypothesis_superseded`: it may confirm or refute the
+      hypothesis, so reversal remains `unmeasured` until an explicit relation
+      is captured. Provisional adoption is likewise not confirmation.
+    - Opening another session after `decided` does not prove an undo, and a
+      `system_researchable` question ending in handoff does not prove Router
+      misclassification. Those two #311 observation classes remain
+      `unmeasured` until an explicit user-observation contract is defined;
+      guessed zeroes or inferred events are prohibited.
     - **Three categories, no composite**: `joint_understanding`
       (utilization/efficiency), `joint_understanding_quality` (outcome
       lineage), `joint_understanding_burden` (per-session cost). An efficiency

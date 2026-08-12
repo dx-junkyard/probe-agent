@@ -218,9 +218,26 @@ def test_an_unresolved_unknown_is_a_real_result_not_a_missing_one(admin_client):
     assert rate["denominator"] == 1
 
 
-def test_a_reversed_hypothesis_is_distinguished_from_a_corrected_one(admin_client):
-    """Collapsing them would hide whether the system is converging on an answer
-    or churning through candidate explanations."""
+def test_replacing_an_unknown_with_an_unknown_is_not_resolution(admin_client):
+    token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
+    qa = _create_qa(admin_client, headers, session_id)
+    ju_id = _open_ju(admin_client, headers, session_id, "qa", qa["id"])
+    run_id = _insert_run(system_id, snapshot_id)
+    first = insert_producer_finding(
+        ju_id=ju_id, system_id=system_id, claim_kind="unknown",
+        statement="通知先は特定できなかった", evidence=[],
+        intelligence_run_id=run_id,
+    )
+    insert_producer_finding(
+        ju_id=ju_id, system_id=system_id, claim_kind="unknown",
+        statement="設定と環境変数のどちらか特定できない", evidence=[],
+        supersedes_finding_id=first, intelligence_run_id=run_id,
+    )
+    assert "unknown_resolved" not in _kinds(_lineage(admin_client, headers))
+
+
+def test_a_fact_successor_does_not_invent_hypothesis_reversal(admin_client):
+    """A fact may confirm or refute the hypothesis; supersession alone cannot say."""
     token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
     qa = _create_qa(admin_client, headers, session_id)
     ju_id = _open_ju(admin_client, headers, session_id, "qa", qa["id"])
@@ -247,15 +264,18 @@ def test_a_reversed_hypothesis_is_distinguished_from_a_corrected_one(admin_clien
 
     body = _lineage(admin_client, headers)
     kinds = _kinds(body)
-    assert kinds.count("hypothesis_reversed") == 1
+    assert kinds.count("hypothesis_reversed") == 0
+    assert kinds.count("hypothesis_superseded") == 1
     assert kinds.count("hypothesis_corrected") == 1
 
     metrics = _metrics(admin_client, headers)
     reversal = metrics["joint_understanding_hypothesis_reversal_rate"]
     correction = metrics["joint_understanding_hypothesis_correction_rate"]
-    # Two hypotheses reached a verdict; one of each kind.
-    assert reversal["denominator"] == 2
-    assert reversal["value"] == 0.5
+    # Reversal requires an explicit observation contract and therefore cannot
+    # be reported as a measured zero from the ambiguous successor shape.
+    assert reversal["status"] == "unmeasured"
+    assert reversal["value"] is None
+    assert reversal["unmeasured_reason"] == "explicit_observation_contract_pending"
     assert correction["value"] == 0.5
     # Both are guardrails, and both live in the quality category.
     assert reversal["guardrail"] is True
@@ -282,7 +302,8 @@ def test_a_maintained_adoption_is_confirmed_and_a_moved_premise_needs_recheck(
         },
         headers=headers,
     )
-    assert "hypothesis_confirmed" in _kinds(_lineage(admin_client, headers))
+    # Provisional adoption is not evidence confirmation.
+    assert "hypothesis_confirmed" not in _kinds(_lineage(admin_client, headers))
     recheck = _metrics(admin_client, headers)[
         "joint_understanding_adoption_reconfirmation_rate"
     ]
@@ -305,10 +326,8 @@ def test_a_maintained_adoption_is_confirmed_and_a_moved_premise_needs_recheck(
     assert after["guardrail"] is True
 
 
-def test_a_decision_that_did_not_hold_is_observable(admin_client):
-    """A closed session is terminal, so there is no reopen to observe. Coming
-    back to the same item after deciding it IS the undo, and it is one of the
-    two observation classes #311's start condition waits on."""
+def test_reopening_an_item_does_not_invent_a_decision_undo(admin_client):
+    """A new discussion can clarify a decision without undoing it."""
     token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
     qa = _create_qa(admin_client, headers, session_id)
     first = _open_ju(admin_client, headers, session_id, "qa", qa["id"])
@@ -336,17 +355,15 @@ def test_a_decision_that_did_not_hold_is_observable(admin_client):
     # The developer comes back to the same question.
     _open_ju(admin_client, headers, session_id, "qa", qa["id"])
     body = _lineage(admin_client, headers)
-    undone = next(e for e in body["events"] if e["event_kind"] == "decision_undone")
-    assert undone["subject_id"] == first
+    assert "decision_undone" not in _kinds(body)
     undo_rate = _metrics(admin_client, headers)["joint_understanding_decision_undo_rate"]
-    assert undo_rate["value"] == 1.0
+    assert undo_rate["status"] == "unmeasured"
+    assert undo_rate["unmeasured_reason"] == "explicit_observation_contract_pending"
     assert undo_rate["guardrail"] is True
 
 
-def test_a_misrouted_question_is_countable(admin_client):
-    """The router said the code could answer it and the developer had to hand it
-    off. That is a misclassification, and it has to be countable rather than
-    inferred from a feeling that routing is off."""
+def test_handoff_does_not_invent_a_router_misclassification(admin_client):
+    """Handoff may be operational even when the original route was correct."""
     token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
     qa = _create_qa(admin_client, headers, session_id)
     ju_id = _open_ju(admin_client, headers, session_id, "qa", qa["id"])
@@ -364,11 +381,12 @@ def test_a_misrouted_question_is_countable(admin_client):
         headers=headers,
     )
     body = _lineage(admin_client, headers)
-    assert "classification_corrected" in _kinds(body)
+    assert "classification_corrected" not in _kinds(body)
     rate = _metrics(admin_client, headers)[
         "joint_understanding_classification_correction_rate"
     ]
-    assert rate["value"] == 1.0
+    assert rate["status"] == "unmeasured"
+    assert rate["unmeasured_reason"] == "explicit_observation_contract_pending"
     assert rate["guardrail"] is True
 
 
@@ -511,9 +529,12 @@ def test_bulk_approval_readiness_reports_counts_never_a_verdict(admin_client):
     observed = _lineage(admin_client, headers)
     for criterion in observed["bulk_approval_readiness"]:
         assert criterion["verdict"] in BULK_APPROVAL_VERDICTS
-        # Measured, and explicitly not judged.
-        assert criterion["verdict"] == "threshold_unset"
-        assert "unset" in criterion["note"]
+        if criterion["key"] == "observed_sessions":
+            assert criterion["verdict"] == "threshold_unset"
+            assert "unset" in criterion["note"]
+        else:
+            assert criterion["verdict"] == "unmeasured"
+            assert "explicit observation contract" in criterion["note"]
     sessions = next(
         c for c in observed["bulk_approval_readiness"] if c["key"] == "observed_sessions"
     )
@@ -533,7 +554,9 @@ def test_lineage_metrics_are_unmeasured_without_observations(admin_client):
     for key in lineage_keys:
         assert metrics[key]["status"] == "unmeasured", key
         assert metrics[key]["value"] is None
-        assert metrics[key]["unmeasured_reason"] == "no_observations"
+        assert metrics[key]["unmeasured_reason"] in (
+            "no_observations", "explicit_observation_contract_pending",
+        )
 
 
 def test_lineage_can_be_scoped_to_one_interview_session(admin_client):

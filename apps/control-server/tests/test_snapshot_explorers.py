@@ -444,6 +444,36 @@ def test_git_history_reports_its_own_failure_without_raising(tmp_path):
     assert result.candidates == []
 
 
+def test_git_history_uses_one_overall_deadline_for_both_commands(monkeypatch):
+    """The second git command gets only the time left by the first one."""
+    import app.snapshot_explorers as explorers
+
+    timeouts: List[float] = []
+
+    class _Completed:
+        returncode = 0
+        stderr = b""
+
+        def __init__(self, stdout: bytes):
+            self.stdout = stdout
+
+    responses = iter((_Completed(b"abc123\n"), _Completed(b"\x00abc123\nother.py\n")))
+
+    def _fake_run(repo_path, args, *, timeout, **kwargs):
+        timeouts.append(timeout)
+        return next(responses)
+
+    monkeypatch.setattr(explorers, "_run_git", _fake_run)
+    result = git_history_candidates(
+        repo_path="/repo", commit_sha="abc123", seed_paths=["seed.py"],
+        timeout_seconds=0.5,
+    )
+    assert result.ok
+    assert len(timeouts) == 2
+    assert all(0 < value <= 0.5 for value in timeouts)
+    assert timeouts[1] <= timeouts[0]
+
+
 def test_git_history_needs_a_seed():
     result = git_history_candidates(
         repo_path="/tmp", commit_sha="abc123", seed_paths=[],

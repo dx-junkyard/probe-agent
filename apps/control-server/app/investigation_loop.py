@@ -797,7 +797,11 @@ def run_investigation_loop(
         )
 
     try:
-        entries = list_tree_entries(repo_path, commit_sha)
+        entries = list_tree_entries(
+            repo_path,
+            commit_sha,
+            timeout=max(0.001, budget.timeout_seconds),
+        )
     except GitError as exc:
         return InvestigationLoopResult(
             provider=config.provider, model=config.model, is_mock=False,
@@ -871,12 +875,15 @@ def run_investigation_loop(
                     )
             # git history runs OUTSIDE the DB connection -- it is a subprocess,
             # and app/db.py's lock must never be held across one.
-            source_audits.append(
-                git_history_candidates(
-                    repo_path=repo_path, commit_sha=commit_sha,
-                    seed_paths=structural_seeds,
+            remaining_for_history = budget.timeout_seconds - (time.monotonic() - start)
+            if remaining_for_history > 0:
+                source_audits.append(
+                    git_history_candidates(
+                        repo_path=repo_path, commit_sha=commit_sha,
+                        seed_paths=structural_seeds,
+                        timeout_seconds=remaining_for_history,
+                    )
                 )
-            )
         elif system_id is not None and snapshot_id is not None:
             from .db import get_conn
 
@@ -905,16 +912,20 @@ def run_investigation_loop(
             stop_reason = "no_new_evidence" if result.rounds else "unresolved"
             break
 
+        remaining_for_reads = budget.timeout_seconds - (time.monotonic() - start)
+        if remaining_for_reads <= 0:
+            stop_reason = "budget_exhausted"
+            break
         round_budget = InvestigationBudget(
             max_files=read_limit,
             max_snippet_chars=remaining_chars,
             max_llm_calls=1,
             max_evidence_items=20,
             max_runtime_facts=budget.max_runtime_facts,
-            timeout_seconds=max(1, budget.timeout_seconds),
+            timeout_seconds=remaining_for_reads,
         )
         snippets, _timed_out = _read_candidates(
-            repo_path, commit_sha, candidates, round_budget, round_start,
+            repo_path, commit_sha, candidates, round_budget, time.monotonic(),
         )
         if not snippets:
             stop_reason = "no_new_evidence" if result.rounds else "unresolved"

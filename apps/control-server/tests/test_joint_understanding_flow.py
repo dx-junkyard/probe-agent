@@ -37,6 +37,7 @@ from app.joint_understanding import (
 from app.understanding_evidence_feed import (
     FEED_CONSUMER_KINDS,
     compute_evidence_digest,
+    compute_publication_digest,
 )
 
 
@@ -86,6 +87,27 @@ def test_evidence_digest_is_content_addressed():
     other = dict(args)
     other["statement"] = "リトライは5回で打ち切られる"
     assert compute_evidence_digest(**other) != compute_evidence_digest(**args)
+
+
+def test_publication_digest_preserves_independent_source_currency():
+    """A fact re-established under a new premise is a new publication.
+
+    A semantic-only UNIQUE key makes the first (later stale) source suppress
+    the second (still current) source. Exact retries remain idempotent, but
+    provenance must not be collapsed across source sessions or findings.
+    """
+    args = dict(
+        source_kind="joint_understanding",
+        source_id=10,
+        finding_id=20,
+        statement="リトライは3回で打ち切られる",
+        evidence=[{"path": "app/retry.py", "start_line": 8, "end_line": 9}],
+        runtime_evidence=[],
+    )
+    first = compute_publication_digest(**args)
+    assert compute_publication_digest(**args) == first
+    assert compute_publication_digest(**{**args, "source_id": 11}) != first
+    assert compute_publication_digest(**{**args, "finding_id": 21}) != first
 
 
 def test_consumer_kinds_contain_no_human_action():
@@ -611,6 +633,48 @@ def test_a_non_current_premise_removes_a_fact_from_the_current_feed(admin_client
     assert _current_feed(system_id) == []
     # Still stored, still attributable: excluded, not erased.
     assert len(_feed_rows(system_id)) == 1
+
+
+def test_same_fact_reverified_on_current_premise_survives_stale_old_source(admin_client):
+    """An old semantic duplicate must not poison a newer verified source."""
+    token, system_id, headers, snapshot_id, session_id = _setup(admin_client)
+    qa = _create_qa(admin_client, headers, session_id)
+    old_ju_id = _open_ju(admin_client, headers, session_id, "qa", qa["id"])
+    insert_producer_finding(
+        ju_id=old_ju_id,
+        system_id=system_id,
+        intelligence_run_id=_insert_run(system_id, snapshot_id),
+    )
+    old_reflux = admin_client.post(
+        f"/joint-understanding/{old_ju_id}/reflux", headers=headers,
+    )
+    assert old_reflux.status_code == 201, old_reflux.text
+
+    from app.db import get_conn
+
+    current_snapshot_id = _insert_snapshot(system_id, "def456")
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE interview_session SET snapshot_id = ? WHERE id = ?",
+            (current_snapshot_id, session_id),
+        )
+    assert _current_feed(system_id) == []
+
+    current_ju_id = _open_ju(admin_client, headers, session_id, "qa", qa["id"])
+    insert_producer_finding(
+        ju_id=current_ju_id,
+        system_id=system_id,
+        intelligence_run_id=_insert_run(system_id, current_snapshot_id),
+    )
+    current_reflux = admin_client.post(
+        f"/joint-understanding/{current_ju_id}/reflux", headers=headers,
+    )
+    assert current_reflux.status_code == 201, current_reflux.text
+
+    current = _current_feed(system_id)
+    assert [entry.source_id for entry in current] == [current_ju_id]
+    assert [entry.statement for entry in current] == ["リトライは3回で打ち切られる"]
+    assert len(_feed_rows(system_id)) == 2
 
 
 def test_the_feed_is_system_isolated(admin_client):

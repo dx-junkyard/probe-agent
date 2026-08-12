@@ -3193,11 +3193,12 @@ CREATE INDEX IF NOT EXISTS idx_joint_understanding_reflux_session
 -- developer's confirmed answer, which is why the feed is a separate prompt
 -- input rather than being merged into the Q&A section.
 --
--- content_digest is a canonical sha256 over (source_kind, statement, evidence
--- spans, runtime checks) -- the fact's MEANING, deliberately not including the
--- finding id. Two rounds establishing the same statement from the same span
--- are the same fact, so UNIQUE (system_id, content_digest) makes a repeated or
--- incremental reflux idempotent without the caller tracking what it published.
+-- content_digest is a publication digest over the source session, finding, and
+-- the canonical semantic digest of the statement/evidence. Currency depends on
+-- the source session's premise, so two independent investigations establishing
+-- the same fact must remain distinct: an old source may become stale while a
+-- newer source remains current. UNIQUE makes retrying the exact same
+-- publication idempotent without conflating those two provenance records.
 --
 -- `superseded` is a manual/administrative override only. The ordinary currency
 -- rules are evaluated at READ time (app/understanding_evidence_feed.
