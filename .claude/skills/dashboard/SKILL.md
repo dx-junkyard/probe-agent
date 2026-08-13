@@ -865,6 +865,14 @@ Overview は稼働メトリクス画面ではない。`GET /overview` が返す 
 - Runtime の observed / known はどちらも component 数。Capability カバレッジ
   は `capability_coverage_state` が `computed` のときだけ比率で出す。
 - Overview のカードは `CardTitle as="h2"`。`h1 → h2 → h3` を崩さない。
+- **`findings_baseline_state` の `unavailable` を「未確認」と書かない。**
+  読めなかったことを、開発者についての断定に変換しない。
+- URL 由来の選択（`?experiment=` 等）は、対象が今も操作可能な状態のときだけ
+  適用する。手動操作と URL 由来は別 state にし、手動を優先する。
+- 時間に依存する画面は `staleTime: 0` を明示する。アプリ全体の既定は 30 秒
+  なので、`refetchOnWindowFocus` / `refetchOnReconnect` だけ付けても効かない。
+- 実ブラウザでしか検証できないもの（時計駆動の再取得、reload、layout）は
+  `apps/dashboard/browser-tests/` に残す。Playwright は依存に入れない。
 - 部分失敗は `degraded_sections` の領域だけ落とし、他は描き続ける。
   「取得できませんでした」を「発見がありません」「受信が止まっています」と
   同じ文言にしない。

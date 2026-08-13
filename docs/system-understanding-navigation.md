@@ -874,6 +874,12 @@ keyword score も client heuristic も使わない。
   `developer_intent` を落とすと、開発者が確定した Vision が AI の推測として
   表示される。集約で出所が割れたときは `mixed`（勝者を選ぶと、他が同意した
   という意味になる）。
+- **「前回」の基準は 3 値。** `has_baseline` / `no_baseline` / `unavailable`。
+  Brief が読めなかったときに「まだ確認していない」と書くのは、こちらの失敗を
+  開発者についての断定に変換することになる。この場合 findings も
+  `unavailable` にして、`new` / `ongoing` を一切付けない。
+- **provenance の索引は `(section, name)`。** 3 つの section は独立した名前空間
+  なので、名前だけで引くと同名 claim が互いを上書きする。
 - **発生時刻は状態が成立した時刻。** connectivity finding は最終受信ではなく
   閾値を超えた瞬間（`last_real_trace_at + delayed/stale_after_seconds`）を
   `first_seen` にする。既定値ではこの差が最大 1 日あり、確認直後の障害が
@@ -903,7 +909,7 @@ keyword score も client heuristic も使わない。
 | 9 | freshness `never_received`（疎通のみ） | `start_observation` |
 | 10 | freshness `delayed` / `stale` | `restore_observation` |
 | 11 | 完了済み experiment が未決定 | `record_experiment_decision`（`?experiment=<id>`） |
-| 12 | 適用済みで未公開の patch がある | `publish_change`（`?patch=<id>`） |
+| 12 | 適用済みで未公開の**計測** patch がある | `publish_instrumentation`（`?patch=<id>`） |
 | 13 | 評価済み候補が 1 件もない | `create_candidate` |
 | 14 | 上記以外 | `start_next_cycle` |
 
@@ -918,11 +924,18 @@ keyword score も client heuristic も使わない。
   「未構築」、Runtime 取得失敗を「未接続」と読み替えると、すでに理解済み・
   受信中のシステムに間違った CTA を出すことになる。ただし行 1-2 は
   repository/snapshot だけを読むので、他が全滅でも答える。
-- **行 12 の identity は patch。** `probe_patches.id` →
-  `publish_jobs.patch_id` で、`completed` のみを公開とみなす。System 全体で
-  「publish が一度でも成功したか」を見ると、最初の公開が以後すべての変更を
-  公開済みに見せてしまう。adopted な experiment は patch も publish job も
-  参照していないため、この行には使わない（存在しない lineage を推測しない）。
+- **行 12 が公開するのは計測 patch であり、改善変更ではない。** identity は
+  `probe_patches.id` → `publish_jobs.patch_id` で `completed` のみを公開と
+  みなす（System 全体で「publish が一度でも成功したか」を見ると、最初の公開が
+  以後すべての変更を公開済みに見せる）。ただしこの patch は probe plan 由来の
+  計測 patch なので、action key は `publish_instrumentation`、文言も計測に
+  限定し、改善サイクルが閉じたとは言わない。adopted な experiment は patch も
+  publish job も参照していないため、「採用した改善が公開済みか」は答えられず、
+  答えない。
+- **next action の fact は group ごとに guard する。** repository / experiments
+  / publish / variants / decisions の各 loader を個別に囲み、失敗を availability
+  に落とす。例外を `0` / `None` / `False` に変換しない。落ちた group は
+  `degraded_detail` に `next_action.<group>` として残る。
 - CTA は既存の人間確認ゲートを一切迂回しない。案内するだけで、承認・採否・
   公開はそれぞれの画面の `decision_method: manual` 記録のままである。
 

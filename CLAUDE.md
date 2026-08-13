@@ -1113,14 +1113,39 @@ creating incomplete persistence or execution paths for later phases.
       `developer_decision` (a record of their judgement) stay distinct; an
       aggregation whose sources disagree is `mixed`, because naming one implies
       the others agreed.
-    - **Row 12's identity is the patch** (`probe_patches.id` →
-      `publish_jobs.patch_id`, `completed` only, System-scoped on both sides).
-      Two System-wide existence checks — "an adopted experiment exists" and
-      "a publish job once succeeded" — made the first successful publish cover
-      every later change forever. An adopted Experiment deliberately does NOT
-      feed this row: `experiments` references neither a patch nor a publish
-      job, and `publish_jobs` publishes probe-plan instrumentation patches, so
-      inventing the link would leave a CTA nothing could ever clear.
+    - **Row 12 publishes INSTRUMENTATION, and says so.** Its identity is the
+      patch (`probe_patches.id` → `publish_jobs.patch_id`, `completed` only,
+      System-scoped on both sides) — two System-wide existence checks ("an
+      adopted experiment exists", "a publish job once succeeded") made the
+      first successful publish cover every later change forever. But the
+      patch it identifies is a probe-plan MEASUREMENT patch, so the row is
+      `publish_instrumentation` / 「計測の変更を公開する」 and never claims an
+      improvement cycle closed. `experiments` references neither a patch nor a
+      publish job, so 「採用した改善は公開済みか」 is a question this
+      projection cannot answer and therefore does not. Do not revert to an
+      adopted-experiment existence check, and do not invent the lineage: a
+      column nothing writes leaves a CTA nothing can clear. Persisting
+      adopt → variant → artifact → publish job is its own issue.
+    - **Every next-action fact group has its own guarded loader**
+      (`load_repository_fact` / `load_pending_experiments` /
+      `resolve_pending_publish` / `load_variant_facts` /
+      `load_decision_facts`). They ran as bare SQL inside `build_overview`, so
+      one bad statement turned a page whose Brief, Runtime health, findings
+      and loop had all loaded into a 500. A failure sets the group's
+      availability flag and records `next_action.<group>` in
+      `degraded_detail`; it never becomes `0` / `None` / `False`.
+    - **`findings_baseline_state` is three values**, not two.
+      `confirmed_at is None` meant both "the developer never confirmed" and
+      "we could not read whether they did", and the screen asserted the first.
+      An unreadable Brief now reports `unavailable` and makes findings
+      `unavailable` too — no finding may carry a `new` / `ongoing` verdict
+      against a baseline that could not be read.
+    - **Claim provenance is indexed by `(section, name)`.** The three Brief
+      sections are independent namespaces; keyed by name alone, whichever
+      section was walked last overwrote the others, so a Vision change could
+      inherit a Capability's provenance. The section vocabulary is
+      `understanding_brief.BRIEF_SECTIONS`, which is what
+      `UnderstandingChange.section` already carries.
     - **A finding is dated from when its state BEGAN.** A `connectivity_lost`
       finding's `first_seen` is the threshold crossing
       (`last_real_trace_at + delayed/stale_after_seconds`), not the last trace:
@@ -1174,6 +1199,21 @@ creating incomplete persistence or execution paths for later phases.
       DISPLAY and never substitutes a guessed value. 「取得できませんでした」,
       「発見がありません」 and 「受信が止まっています」 are different
       sentences.
+    - **A deep link never expands a settled Experiment.** The CTA's id is a
+      snapshot of when the Overview rendered; by the time the link is opened
+      the experiment may be adopted / rejected / needs_more_data or no longer
+      completed. The URL-driven selection and the developer's own expansion
+      are separate states, and the URL one applies only to a row that is
+      present, `completed` and `undecided` — otherwise the page falls back to
+      the plain list and selects no substitute.
+    - **Three #384 acceptance conditions are verified in a real browser**
+      (`apps/dashboard/browser-tests/`, Playwright deliberately NOT a repo
+      dependency): the clock-driven `receiving_now → delayed → stale →
+      receiving_now` transition with no reload, the Experiment deep link
+      across a reload, and the degraded render. That harness found a real
+      defect — the app-wide `staleTime: 30_000` silently suppressed the
+      Overview's focus/reconnect refetch, so `useOverview` now sets
+      `staleTime: 0`.
     - **Snapshot / commit / snapshot freshness / understanding revision / last
       confirmation are first-view context**, not a disclosure: they qualify
       every claim, finding and CTA on the page. `snapshot_freshness` is the

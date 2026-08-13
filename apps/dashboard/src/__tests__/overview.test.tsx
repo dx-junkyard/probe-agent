@@ -112,6 +112,7 @@ function overview(overrides: Partial<OverviewOut> = {}): OverviewOut {
     findings: [],
     findings_initial_count: 0,
     findings_state: "no_findings",
+    findings_baseline_state: "has_baseline",
     findings_baseline_label: "前回あなたがシステム理解を確認した時点",
     findings_baseline_at: 100,
     next_action: null,
@@ -336,7 +337,8 @@ describe("Findings (Issue #382)", () => {
           findings: [],
           findings_state: "not_compared",
           findings_baseline_at: null,
-          findings_baseline_label: "まだ理解を確認していないため、比較の基準がありません",
+          findings_baseline_state: "no_baseline",
+    findings_baseline_label: "まだ理解を確認していないため、比較の基準がありません",
         })}
       />,
     );

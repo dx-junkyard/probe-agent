@@ -97,6 +97,10 @@ __all__ = [
     "build_loop_stages",
     "build_overview",
     "resolve_pending_publish",
+    "load_repository_fact",
+    "load_pending_experiments",
+    "load_variant_facts",
+    "load_decision_facts",
 ]
 
 
@@ -212,6 +216,12 @@ LOOP_STAGE_NEXT_MILESTONE: Dict[str, str] = {
 
 
 # --- §1. Findings ------------------------------------------------------------
+
+
+class _BriefUnavailable(Exception):
+    """Raised internally when findings cannot be built because the Brief could
+    not be read. Distinct from a genuine extraction failure so the two report
+    different sentences."""
 
 
 @dataclass(frozen=True)
@@ -400,8 +410,16 @@ def collect_findings(inputs: FindingInputs) -> List[Finding]:
     # A claim's provenance carries into the finding about its change. Hardcoding
     # `implementation_fact` here reported a developer-authored Vision edit as a
     # code reading.
+    #
+    # The key is (section, name), not name alone: the three sections are
+    # independent namespaces, and a Vision and a Core Capability may legitimately
+    # share a name. Keyed by name, whichever section was walked last silently
+    # overwrote the others, so a Vision change could inherit a Capability's
+    # provenance. The section vocabulary comes from `understanding_brief`'s own
+    # `BRIEF_SECTIONS`, which is also what `UnderstandingChange.section` carries.
     claim_provenance = {
-        claim.name: _claim_provenance(claim) for claim in _brief_claims(brief)
+        (section, claim.name): _claim_provenance(claim)
+        for section, claim in _brief_claims_by_section(brief)
     }
     by_section: Dict[str, List[Any]] = {}
     for change in changes:
@@ -413,9 +431,9 @@ def collect_findings(inputs: FindingInputs) -> List[Finding]:
         )
         provenance = aggregate_provenance(
             [
-                claim_provenance[c.name]
+                claim_provenance[(c.section, c.name)]
                 for c in section_changes
-                if c.name in claim_provenance
+                if (c.section, c.name) in claim_provenance
             ]
         )
         out.append(
@@ -658,6 +676,28 @@ def collect_findings(inputs: FindingInputs) -> List[Finding]:
     return out
 
 
+def _brief_claims_by_section(brief: Optional[Any]) -> List[Tuple[str, Any]]:
+    """``(section, claim)`` for every Brief claim.
+
+    The section keys are `understanding_brief.BRIEF_SECTIONS`' first elements,
+    which is exactly what `UnderstandingChange.section` reports -- so a change
+    and its claim are matched on the same vocabulary rather than on two
+    hand-written lists that could drift.
+    """
+    if brief is None:
+        return []
+    out: List[Tuple[str, Any]] = []
+    for section, _kind in understanding_brief.BRIEF_SECTIONS:
+        if section == "vision":
+            vision = getattr(brief, "vision", None)
+            if vision is not None:
+                out.append((section, vision))
+            continue
+        for claim in getattr(brief, section, []) or []:
+            out.append((section, claim))
+    return out
+
+
 def _brief_claims(brief: Optional[Any]) -> List[Any]:
     if brief is None:
         return []
@@ -877,6 +917,15 @@ class NextActionFacts:
     brief_available: bool = True
     runtime_available: bool = True
     workflow_available: bool = True
+    #: The remaining fact groups, each loaded by its own guarded loader. A
+    #: failing SQL statement must not become `0` / `None` / `False`: an
+    #: unreadable experiment table is not "no experiments", and a failing
+    #: publish query is not "nothing to publish".
+    repository_available: bool = True
+    experiments_available: bool = True
+    variants_available: bool = True
+    publish_available: bool = True
+    decisions_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -945,6 +994,12 @@ def decide_next_action(
         "unavailable",
         "現在の状態を判定できなかったため、次の操作を提示できません。推測での案内は行いません。",
     )
+
+    # Rows 1-2 read the repository configuration and the snapshot status. With
+    # those unreadable there is no first row to answer with, and every later
+    # row presupposes them.
+    if not facts.repository_available:
+        return unavailable
 
     # 1: no repository. Nothing downstream can be evaluated without one.
     if not facts.repository_configured:
@@ -1158,6 +1213,10 @@ def decide_next_action(
             "",
         )
 
+    # Rows 11-13 read the experiment / publish / variant tables.
+    if not facts.experiments_available or not facts.publish_available:
+        return unavailable
+
     # 11: an evaluation finished and is waiting on the human gate. The CTA
     #     carries the specific Experiment, so the developer lands on the row
     #     rather than on a list they have to search.
@@ -1182,33 +1241,51 @@ def decide_next_action(
             "",
         )
 
-    # 12: an applied patch this System has not published. The identity is the
-    #     patch, not the System: "some publish job once succeeded" made every
-    #     later change look published forever.
+    # 12: an applied INSTRUMENTATION patch this System has not published.
+    #
+    #     What this row is not: the improvement cycle's Publish step. The
+    #     identity `probe_patches.id` -> `publish_jobs.patch_id` is real and
+    #     per-target, but what it identifies is a probe-plan measurement patch.
+    #     Nothing persists a link from an adopted Experiment (or its variant)
+    #     to a patch or a publish job, so 「採用した改善を公開したか」 is a
+    #     question this projection cannot answer. It therefore does not answer
+    #     it: the row is named, worded and scoped for measurement publishing
+    #     only, and no rule claims an improvement cycle has closed.
+    #
+    #     Placed above row 13 deliberately: publishing work already applied is
+    #     a short finishing step, and leaving it undone means the team cannot
+    #     see the instrumentation the observations came from. Starting a new
+    #     candidate is the larger next move.
     if facts.pending_publish is not None:
         pending_publish = facts.pending_publish
         return (
             OverviewAction(
-                key="publish_change",
-                label="公開へ進む",
+                key="publish_instrumentation",
+                label="計測の変更を公開する",
                 reason=(
-                    f"適用済みで未公開の変更が {pending_publish.count} 件あります。"
+                    f"適用済みで未公開の計測 patch が {pending_publish.count} 件あります。"
                 ),
                 completion_condition=(
-                    "この変更の Pull Request が作成されること（merge はあなたが行います）。"
+                    "この計測 patch の Pull Request が作成されること（merge はあなたが行います）。"
                 ),
-                value="レビュー可能な形で変更が出て、この改善サイクルが閉じます。",
+                value=(
+                    "観測に使っている計測コードをレビュー可能な形で共有できます。"
+                    "改善候補の採否や公開はこの操作とは別です。"
+                ),
                 target=Target(
                     route="/github",
                     label="GitHub 連携を開く",
                     params={"patch": str(pending_publish.patch_id)},
                 ),
                 rule_row=12,
-                source_state_ids=("publish.patches.unpublished",),
+                source_state_ids=("publish.instrumentation_patches.unpublished",),
             ),
             "available",
             "",
         )
+
+    if not facts.variants_available or not facts.decisions_available:
+        return unavailable
 
     # 13: observing normally, nothing evaluated yet.
     if not facts.completed_variant_run_exists and not facts.decided_experiment_exists:
@@ -1347,6 +1424,7 @@ class OverviewResult:
     finding_statuses: List[str] = field(default_factory=list)
     findings_initial_count: int = 0
     findings_state: str = "not_compared"
+    findings_baseline_state: str = "unavailable"
     findings_baseline_label: str = ""
     findings_baseline_at: Optional[float] = None
     next_action: Optional[OverviewAction] = None
@@ -1357,6 +1435,62 @@ class OverviewResult:
     runtime: Optional[RuntimeHealth] = None
     degraded_sections: List[str] = field(default_factory=list)
     degraded_detail: Dict[str, str] = field(default_factory=dict)
+
+
+# --- Guarded fact loaders ----------------------------------------------------
+#
+# Each next-action fact group is loaded by its own function so `build_overview`
+# can catch a failure per group and report it, rather than letting one bad
+# statement turn the whole response into a 500. Before this split, a failing
+# publish query took down a page whose Brief, Runtime health, findings and loop
+# had all loaded fine.
+#
+# None of these ever returns a "safe default" on failure -- they raise, and the
+# caller records the group as unavailable. A `0` returned from an exception is
+# the same lie as `not_built` for an unreadable Brief.
+
+
+def load_repository_fact(conn, system_id: int) -> bool:
+    """Is a repository configured for this System (same truthiness rule as
+    `system_state._repository_state_items`: an empty `repo_path` is not
+    configured)."""
+    config = state_facts.get_repository_config(conn, system_id)
+    return config is not None and bool(config["repo_path"])
+
+
+def load_pending_experiments(conn, system_id: int) -> List[Dict[str, Any]]:
+    """Completed experiments with no recorded human decision, newest first.
+
+    The ordering is total (`completed_at DESC, id DESC`) so the CTA deep-links
+    to the same experiment on every request.
+    """
+    return [
+        dict(row)
+        for row in conn.execute(
+            """SELECT id, completed_at FROM experiments
+                WHERE system_id = ? AND status = 'completed'
+                  AND human_decision = 'undecided'
+                ORDER BY completed_at DESC, id DESC""",
+            (system_id,),
+        ).fetchall()
+    ]
+
+
+def load_variant_facts(conn, system_id: int) -> Tuple[int, Optional[float]]:
+    """``(completed non-baseline replay variant count, newest completed_at)``."""
+    row = conn.execute(
+        """SELECT COUNT(*) AS n, MAX(completed_at) AS last_at FROM replay_variants
+            WHERE system_id = ? AND status = 'completed' AND is_baseline = 0""",
+        (system_id,),
+    ).fetchone()
+    if row is None:
+        return 0, None
+    return (row["n"] or 0), row["last_at"]
+
+
+def load_decision_facts(conn, system_id: int) -> bool:
+    """Has any experiment in this System recorded a human decision."""
+    return state_facts.has_decided_experiment(conn, system_id)
 
 
 def resolve_pending_publish(conn, system_id: int) -> Optional[PendingPublish]:
@@ -1636,20 +1770,53 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
         except Exception as exc:  # pragma: no cover - defensive
             _degrade(result, "runtime", exc)
 
-        undecided = conn.execute(
-            """SELECT id, completed_at FROM experiments
-                WHERE system_id = ? AND status = 'completed' AND human_decision = 'undecided'
-                ORDER BY completed_at DESC, id DESC""",
-            (system_id,),
-        ).fetchall()
-        pending_publish = resolve_pending_publish(conn, system_id)
-        variants = conn.execute(
-            """SELECT COUNT(*) AS n, MAX(completed_at) AS last_at FROM replay_variants
-                WHERE system_id = ? AND status = 'completed' AND is_baseline = 0""",
-            (system_id,),
-        ).fetchone()
+        # Each fact group is loaded under its own guard. A failure records the
+        # group as unavailable and leaves its value at the conservative
+        # default -- which no rule is then allowed to read.
+        undecided: List[Dict[str, Any]] = []
+        pending_publish: Optional[PendingPublish] = None
+        variant_count, variant_at = 0, None
+        repository_configured = False
+        decided_experiment_exists = False
+        available = {
+            "repository": True,
+            "experiments": True,
+            "variants": True,
+            "publish": True,
+            "decisions": True,
+        }
+        for group, load in (
+            ("repository", lambda: load_repository_fact(conn, system_id)),
+            ("experiments", lambda: load_pending_experiments(conn, system_id)),
+            ("publish", lambda: resolve_pending_publish(conn, system_id)),
+            ("variants", lambda: load_variant_facts(conn, system_id)),
+            ("decisions", lambda: load_decision_facts(conn, system_id)),
+        ):
+            try:
+                loaded = load()
+            except Exception as exc:  # pragma: no cover - defensive
+                available[group] = False
+                _degrade(result, "next_action", exc, detail_key=f"next_action.{group}")
+                continue
+            if group == "repository":
+                repository_configured = loaded
+            elif group == "experiments":
+                undecided = loaded
+            elif group == "publish":
+                pending_publish = loaded
+            elif group == "variants":
+                variant_count, variant_at = loaded
+            else:
+                decided_experiment_exists = loaded
 
         try:
+            if brief is None:
+                # Without the Brief there is no baseline, so no finding could
+                # be honestly labelled `new` or `ongoing` -- and every
+                # Brief-derived finding is missing anyway. Reporting
+                # `unavailable` is the whole answer; the Runtime section still
+                # renders on its own.
+                raise _BriefUnavailable()
             result.findings, result.finding_statuses, result.findings_state = _findings(
                 brief=brief,
                 gathered=gathered,
@@ -1659,74 +1826,96 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 runtime_checks=runtime_checks,
                 runtime=result.runtime,
                 undecided=undecided,
-                completed_variant_count=(variants["n"] or 0) if variants else 0,
-                completed_variant_at=(variants["last_at"] if variants else None),
+                completed_variant_count=variant_count,
+                completed_variant_at=variant_at,
             )
             result.findings_initial_count = min(
                 len(result.findings), INITIAL_FINDING_LIMIT
+            )
+        except _BriefUnavailable:
+            result.findings = []
+            result.finding_statuses = []
+            result.findings_state = "unavailable"
+            if "findings" not in result.degraded_sections:
+                result.degraded_sections.append("findings")
+            result.degraded_detail["findings"] = (
+                "システム理解を取得できなかったため、変化を比較できませんでした。"
             )
         except Exception as exc:  # pragma: no cover - defensive
             _degrade(result, "findings", exc)
             result.findings_state = "unavailable"
 
-        baseline_at = getattr(brief, "confirmed_at", None) if brief else None
-        result.findings_baseline_at = baseline_at
-        result.findings_baseline_label = (
-            "前回あなたがシステム理解を確認した時点"
-            if baseline_at is not None
-            else "まだ理解を確認していないため、比較の基準がありません"
-        )
-
-        if "next_action" not in result.degraded_sections:
-            config = state_facts.get_repository_config(conn, system_id)
-            # Availability is passed alongside each fact rather than folded
-            # into it. A section that failed to load leaves its defaults in
-            # place, and the flag is what stops any rule from reading them --
-            # so an unreadable Brief can never be mistaken for 「未構築」.
-            action_facts = NextActionFacts(
-                repository_configured=config is not None and bool(config["repo_path"]),
-                latest_snapshot_status=latest_snapshot_status,
-                ready_snapshot_exists=result.latest_ready_snapshot_id is not None,
-                readiness_state=(
-                    brief.readiness_state if brief is not None else "not_built"
-                ),
-                workflow_state=workflow_state,
-                interview_session_id=session_id,
-                connectivity_state=(
-                    result.runtime.state if result.runtime else "no_signal"
-                ),
-                connectivity_freshness=(
-                    result.runtime.freshness if result.runtime else "never_received"
-                ),
-                undecided_experiment=(
-                    PendingExperiment(
-                        experiment_id=undecided[0]["id"],
-                        count=len(undecided),
-                        completed_at=undecided[0]["completed_at"],
-                    )
-                    if undecided
-                    else None
-                ),
-                undecided_experiment_count=len(undecided),
-                pending_publish=pending_publish,
-                completed_variant_run_exists=bool(variants and (variants["n"] or 0) > 0),
-                decided_experiment_exists=state_facts.has_decided_experiment(
-                    conn, system_id
-                ),
-                brief_available=brief is not None,
-                runtime_available=result.runtime is not None,
-                workflow_available=gathered is not None,
+        # Three states, not two. 「確認していない」 is a claim about the
+        # developer; 「読めなかった」 is a claim about this request. Collapsing
+        # them told a System whose Brief happened to fail that its developer
+        # had never confirmed anything.
+        if brief is None:
+            result.findings_baseline_state = "unavailable"
+            result.findings_baseline_at = None
+            result.findings_baseline_label = (
+                "比較の基準を取得できませんでした。確認済みかどうかは判定していません"
             )
-            action, state, message = decide_next_action(action_facts)
-            result.next_action = _attach_finding_sources(action, result.findings)
-            result.next_action_state = state
-            result.next_action_message = message
+        elif brief.confirmed_at is None:
+            result.findings_baseline_state = "no_baseline"
+            result.findings_baseline_at = None
+            result.findings_baseline_label = (
+                "まだ理解を確認していないため、比較の基準がありません"
+            )
         else:
-            result.next_action_state = "unavailable"
-            result.next_action_message = (
-                "現在の状態を判定できなかったため、次の操作を提示できません。"
-                "推測での案内は行いません。"
-            )
+            result.findings_baseline_state = "has_baseline"
+            result.findings_baseline_at = brief.confirmed_at
+            result.findings_baseline_label = "前回あなたがシステム理解を確認した時点"
+
+        # `decide_next_action` is ALWAYS called now. Availability travels with
+        # the facts, so the rule table itself decides how far it can safely
+        # evaluate -- there is no outer "skip everything" branch that could
+        # disagree with it.
+        action_facts = NextActionFacts(
+            repository_configured=repository_configured,
+            latest_snapshot_status=latest_snapshot_status,
+            ready_snapshot_exists=result.latest_ready_snapshot_id is not None,
+            readiness_state=(
+                brief.readiness_state if brief is not None else "not_built"
+            ),
+            workflow_state=workflow_state,
+            interview_session_id=session_id,
+            connectivity_state=(
+                result.runtime.state if result.runtime else "no_signal"
+            ),
+            connectivity_freshness=(
+                result.runtime.freshness if result.runtime else "never_received"
+            ),
+            undecided_experiment=(
+                PendingExperiment(
+                    experiment_id=undecided[0]["id"],
+                    count=len(undecided),
+                    completed_at=undecided[0]["completed_at"],
+                )
+                if undecided
+                else None
+            ),
+            undecided_experiment_count=len(undecided),
+            pending_publish=pending_publish,
+            completed_variant_run_exists=variant_count > 0,
+            decided_experiment_exists=decided_experiment_exists,
+            brief_available=brief is not None,
+            runtime_available=result.runtime is not None,
+            workflow_available=gathered is not None,
+            repository_available=available["repository"],
+            experiments_available=available["experiments"],
+            variants_available=available["variants"],
+            publish_available=available["publish"],
+            decisions_available=available["decisions"],
+        )
+        action, state, message = decide_next_action(action_facts)
+        result.next_action = _attach_finding_sources(action, result.findings)
+        result.next_action_state = state
+        result.next_action_message = message
+        if state == "unavailable" and "next_action" not in result.degraded_sections:
+            # The rule table failed closed on a fact whose own loader
+            # succeeded (Brief / Runtime / workflow), so record the section
+            # here rather than leaving the Dashboard to infer it.
+            result.degraded_sections.append("next_action")
 
     return result
 
@@ -1834,7 +2023,19 @@ def _findings(
     return ordered, statuses, findings_state(ordered, baseline_at=baseline_at)
 
 
-def _degrade(result: OverviewResult, section: str, exc: Exception) -> None:
+def _degrade(
+    result: OverviewResult,
+    section: str,
+    exc: Exception,
+    *,
+    detail_key: Optional[str] = None,
+) -> None:
+    """Record one section as degraded.
+
+    `detail_key` lets several fact groups degrade the same displayed section
+    while still naming which group failed, so an operator can tell a failing
+    publish query from a failing experiment query.
+    """
     if section not in result.degraded_sections:
         result.degraded_sections.append(section)
-    result.degraded_detail[section] = f"{type(exc).__name__}: {exc}"
+    result.degraded_detail[detail_key or section] = f"{type(exc).__name__}: {exc}"

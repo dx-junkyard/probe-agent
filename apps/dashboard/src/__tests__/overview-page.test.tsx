@@ -7,7 +7,7 @@
 // contract that the old metric cards / Component table are gone from the first
 // view.
 
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -93,6 +93,7 @@ function overview(overrides: Partial<OverviewOut> = {}): OverviewOut {
     findings: [],
     findings_initial_count: 0,
     findings_state: "not_compared",
+    findings_baseline_state: "no_baseline",
     findings_baseline_label: "まだ理解を確認していないため、比較の基準がありません",
     findings_baseline_at: null,
     next_action: {
@@ -376,26 +377,20 @@ describe("Experiments deep link (Issue #383)", () => {
     mockSystems = [{ id: 1, name: "alpha" }];
   });
 
-  const experiments = [
-    {
+  function experiment(overrides: Record<string, unknown>) {
+    return {
       id: 11, system_id: 1, feature_id: "f", objective: "o", snapshot_id: 1,
       baseline_commit: "abc", config_revision: "r", execution_config: "{}",
       status: "completed", error: null, human_decision: "undecided",
       human_decision_variant_key: null, human_decision_note: "",
       created_at: 1, started_at: 1, completed_at: 2, variants: [],
-    },
-    {
-      id: 12, system_id: 1, feature_id: "g", objective: "o2", snapshot_id: 1,
-      baseline_commit: "abc", config_revision: "r", execution_config: "{}",
-      status: "completed", error: null, human_decision: "undecided",
-      human_decision_variant_key: null, human_decision_note: "",
-      created_at: 1, started_at: 1, completed_at: 3, variants: [],
-    },
-  ];
+      ...overrides,
+    };
+  }
 
-  function mockExperiments() {
+  function mockExperiments(rows: unknown[]) {
     mockApi.get.mockImplementation((path: string) => {
-      if (path === "/experiments") return Promise.resolve(experiments);
+      if (path === "/experiments") return Promise.resolve(rows);
       if (path === "/snapshots") return Promise.resolve([]);
       if (path === "/repository/drafts/latest") {
         return Promise.resolve({ system_profile_draft: null, feature_drafts: [] });
@@ -411,30 +406,67 @@ describe("Experiments deep link (Issue #383)", () => {
     });
   }
 
-  test("?experiment=<id> expands that row, and a reload lands on the same one", async () => {
-    mockExperiments();
-    const { container } = await renderExperiments("/experiments?experiment=12");
-    await waitFor(() =>
-      expect(container.querySelector('[data-testid="experiment-row-12"]')).toBeTruthy(),
-    );
-    // The linked row is the expanded one — a count alone would have dropped the
-    // developer on the list and made them find it again (#383).
-    await waitFor(() =>
-      expect(
-        container.querySelector('[data-testid="experiment-detail-12"]'),
-      ).toBeTruthy(),
-    );
-    expect(container.querySelector('[data-testid="experiment-detail-11"]')).toBeNull();
+  const expanded = (container: HTMLElement, id: number) =>
+    container.querySelector(`[data-testid="experiment-detail-${id}"]`);
+  const row = (container: HTMLElement, id: number) =>
+    container.querySelector(`[data-testid="experiment-row-${id}"]`);
+
+  test("a completed + undecided target is expanded, and a reload lands on it again", async () => {
+    mockExperiments([experiment({ id: 11 }), experiment({ id: 12, completed_at: 3 })]);
+    const first = await renderExperiments("/experiments?experiment=12");
+    await waitFor(() => expect(expanded(first.container, 12)).toBeTruthy());
+    expect(expanded(first.container, 11)).toBeNull();
+    first.unmount();
+
+    // The URL is the whole state, so a reload reproduces the selection.
+    const second = await renderExperiments("/experiments?experiment=12");
+    await waitFor(() => expect(expanded(second.container, 12)).toBeTruthy());
   });
 
-  test("an id from another System (or a deleted one) falls back to the plain list", async () => {
-    mockExperiments();
+  // The CTA's id is a snapshot of when the Overview rendered. By the time the
+  // link is opened the experiment may already be settled — expanding it under
+  // a 「採否を記録する」 CTA would claim a decision is pending when it is not.
+  test.each([
+    ["adopted", { human_decision: "adopted" }],
+    ["rejected", { human_decision: "rejected" }],
+    ["needs_more_data", { human_decision: "needs_more_data" }],
+    ["running", { status: "running" }],
+    ["failed", { status: "failed" }],
+    ["draft", { status: "draft" }],
+  ])("a %s target expands nothing and falls back to the list", async (_label, overrides) => {
+    mockExperiments([experiment({ id: 11, ...overrides })]);
+    const { container } = await renderExperiments("/experiments?experiment=11");
+    await waitFor(() => expect(row(container, 11)).toBeTruthy());
+    expect(expanded(container, 11)).toBeNull();
+  });
+
+  test("an unknown or another System's id expands nothing and selects no substitute", async () => {
+    mockExperiments([experiment({ id: 11 })]);
     const { container } = await renderExperiments("/experiments?experiment=999");
-    await waitFor(() =>
-      expect(container.querySelector('[data-testid="experiment-row-11"]')).toBeTruthy(),
-    );
-    expect(container.querySelector('[data-testid="experiment-detail-999"]')).toBeNull();
-    expect(container.querySelector('[data-testid="experiment-detail-11"]')).toBeNull();
+    await waitFor(() => expect(row(container, 11)).toBeTruthy());
+    expect(expanded(container, 999)).toBeNull();
+    // Explicitly: it does not silently open some other row instead.
+    expect(expanded(container, 11)).toBeNull();
+  });
+
+  test("manual expansion still works after an invalid target, and the linked row can be collapsed", async () => {
+    mockExperiments([experiment({ id: 11 }), experiment({ id: 12, completed_at: 3 })]);
+    const { container } = await renderExperiments("/experiments?experiment=999");
+    await waitFor(() => expect(row(container, 11)).toBeTruthy());
+
+    fireEvent.click(row(container, 11)!.querySelector(".cursor-pointer")!);
+    await waitFor(() => expect(expanded(container, 11)).toBeTruthy());
+
+    fireEvent.click(row(container, 11)!.querySelector(".cursor-pointer")!);
+    await waitFor(() => expect(expanded(container, 11)).toBeNull());
+  });
+
+  test("the linked row can be collapsed by the developer", async () => {
+    mockExperiments([experiment({ id: 12, completed_at: 3 })]);
+    const { container } = await renderExperiments("/experiments?experiment=12");
+    await waitFor(() => expect(expanded(container, 12)).toBeTruthy());
+    fireEvent.click(row(container, 12)!.querySelector(".cursor-pointer")!);
+    await waitFor(() => expect(expanded(container, 12)).toBeNull());
   });
 });
 

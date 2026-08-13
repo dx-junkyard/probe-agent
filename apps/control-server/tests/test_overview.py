@@ -94,7 +94,7 @@ def test_action_rule_rows_each_reachable():
             dict(undecided_experiment=PendingExperiment(experiment_id=4, count=2)),
             "record_experiment_decision",
         ),
-        (12, dict(pending_publish=PendingPublish(patch_id=9)), "publish_change"),
+        (12, dict(pending_publish=PendingPublish(patch_id=9)), "publish_instrumentation"),
         (
             13,
             dict(completed_variant_run_exists=False, decided_experiment_exists=False),
@@ -321,6 +321,56 @@ def test_change_finding_reports_mixed_when_sources_disagree():
     assert changed.provenance == "mixed"
 
 
+def test_same_name_in_two_sections_keeps_each_provenance():
+    """Vision and Core Capability are independent namespaces. Keyed by name
+    alone, whichever section was walked last overwrote the others, so a Vision
+    change could inherit a Capability's provenance."""
+    shared = "要約"
+    findings = collect_findings(
+        FindingInputs(
+            brief=_Brief(
+                vision=_Claim("vision", shared, "confirmed", provenance="developer_intent"),
+                core_capabilities=[
+                    _Claim("core_capability", shared, "confirmed", provenance="runtime_observation"),
+                ],
+                changes=[
+                    _Change("vision", "Vision", shared, "説明が変わりました。"),
+                    _Change("core_capabilities", "主要機能", shared, "説明が変わりました。"),
+                ],
+                confirmed_at=1.0,
+            ),
+            revision_created_at=2.0,
+        )
+    )
+    by_section = {
+        f.dedupe_key: f.provenance
+        for f in findings
+        if f.kind == "understanding_changed"
+    }
+    assert by_section["understanding_changed:vision"] == "developer_intent"
+    assert by_section["understanding_changed:core_capabilities"] == "runtime_observation"
+
+
+def test_a_removed_claim_still_falls_back_explicitly():
+    """A change naming a claim that no longer exists has no provenance to
+    inherit; the documented rule applies rather than a neighbouring section's
+    same-named claim."""
+    findings = collect_findings(
+        FindingInputs(
+            brief=_Brief(
+                core_capabilities=[
+                    _Claim("core_capability", "残った機能", "confirmed", provenance="runtime_observation"),
+                ],
+                changes=[_Change("vision", "Vision", "消えた Vision", "削除されました。")],
+                confirmed_at=1.0,
+            ),
+            revision_created_at=2.0,
+        )
+    )
+    changed = [f for f in findings if f.kind == "understanding_changed"][0]
+    assert changed.provenance == "implementation_fact"
+
+
 def test_aggregate_provenance_rules():
     assert aggregate_provenance(["developer_intent"]) == "developer_intent"
     assert aggregate_provenance(["ai_hypothesis", "ai_hypothesis"]) == "ai_hypothesis"
@@ -363,8 +413,43 @@ def test_publish_row_is_per_patch_not_per_system():
         **{**_healthy(), "pending_publish": PendingPublish(patch_id=42, count=1)}
     )
     action, _state, _msg = decide_next_action(facts)
-    assert action.key == "publish_change"
+    assert action.key == "publish_instrumentation"
     assert action.target.params == {"patch": "42"}
+
+
+def test_publish_row_never_claims_an_improvement_cycle_closed():
+    """`probe_patches` are probe-plan MEASUREMENT patches. Nothing links an
+    adopted Experiment to a patch or a publish job, so the Overview must not
+    describe publishing one as closing the improvement cycle."""
+    facts = NextActionFacts(
+        **{**_healthy(), "pending_publish": PendingPublish(patch_id=42)}
+    )
+    action, _state, _msg = decide_next_action(facts)
+    assert action.key == "publish_instrumentation"
+    text = f"{action.label}{action.reason}{action.completion_condition}{action.value}"
+    assert "改善サイクルが閉じ" not in text
+    assert "計測" in action.label
+    # It also says explicitly that adoption/publication of a candidate is a
+    # different thing, so the two cannot be read as one.
+    assert "改善候補" in action.value
+
+
+def test_an_adopted_experiment_alone_produces_no_publish_cta():
+    """There is no persisted lineage from an adopted Experiment to a patch, so
+    「採用した改善は公開済みか」 is a question this projection cannot answer --
+    and therefore does not answer. Reverting to a System-wide existence check
+    would reintroduce the identity defect."""
+    facts = NextActionFacts(
+        **{
+            **_healthy(),
+            "pending_publish": None,
+            "decided_experiment_exists": True,
+            "completed_variant_run_exists": True,
+        }
+    )
+    action, state, _msg = decide_next_action(facts)
+    assert action.key == "start_next_cycle"
+    assert state == "complete"
 
 
 def test_no_pending_patch_means_no_publish_cta():
@@ -1188,6 +1273,159 @@ def test_pending_publish_ordering_is_deterministic(admin_client, tmp_path):
     assert first.patch_id == newest
     assert first.patch_id == second.patch_id
     assert first.count == 3
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [
+        "load_repository_fact",
+        "load_pending_experiments",
+        "resolve_pending_publish",
+        "load_variant_facts",
+        "load_decision_facts",
+    ],
+)
+def test_one_failing_fact_loader_never_takes_down_the_page(
+    admin_client, tmp_path, monkeypatch, loader
+):
+    """#384: 部分失敗で画面全体が空にならない。
+
+    Before the loaders were split out, these queries ran unguarded inside
+    `build_overview`, so a single bad statement turned a page whose Brief,
+    Runtime health and loop had all loaded fine into a 500.
+    """
+    token = _login(admin_client)
+    system_id = _create_system(admin_client, token, f"Loader-{loader}")
+    repo, sha = _init_repo(tmp_path, f"repo-{loader}")
+    admin_client.put(
+        "/repository", json={"repo_path": repo}, headers=_headers(token, system_id)
+    )
+    _insert_snapshot(system_id, repo, sha)
+
+    from app import overview_projection
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError(f"{loader} unavailable")
+
+    monkeypatch.setattr(overview_projection, loader, _boom)
+
+    response = admin_client.get("/overview", headers=_headers(token, system_id))
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    # The failure is recorded and attributed to the group that failed.
+    assert "next_action" in body["degraded_sections"]
+    assert any(key.startswith("next_action") for key in body["degraded_detail"])
+
+    # The independent sections still render -- that is the whole point.
+    assert body["brief"] is not None
+    assert body["runtime"] is not None
+    assert body["loop_stages"]
+
+    # Whatever action IS returned must never be one that reads the failed
+    # group. This System has no understanding yet, so rows 1-7 legitimately
+    # answer first: fail-closed removes guesses, it does not blank a decision
+    # that was already made from facts that WERE readable.
+    action = body["next_action"]
+    if action is not None:
+        assert action["key"] in ("prepare_repository", "build_understanding")
+        assert action["rule_row"] <= 7
+
+
+def test_a_failed_loader_blocks_the_rows_that_read_it():
+    """The pure counterpart: once the earlier rows stop matching, a failed
+    group's rows are skipped and the table refuses to fall through to a later
+    one (#383 要件 3)."""
+    for flag in (
+        "experiments_available",
+        "publish_available",
+        "variants_available",
+        "decisions_available",
+    ):
+        action, state, message = decide_next_action(
+            NextActionFacts(**{**_healthy(), flag: False})
+        )
+        assert action is None, flag
+        assert state == "unavailable", flag
+        assert message
+
+    # A failing repository loader stops the table at its very first row.
+    action, state, _msg = decide_next_action(
+        NextActionFacts(**{**_healthy(), "repository_available": False})
+    )
+    assert action is None and state == "unavailable"
+
+
+def test_a_failed_publish_loader_does_not_become_nothing_to_publish():
+    """`0` / `None` from an exception is the same lie as `not_built` for an
+    unreadable Brief: it would silently promote row 13."""
+    action, state, _msg = decide_next_action(
+        NextActionFacts(
+            **{
+                **_healthy(),
+                "publish_available": False,
+                "pending_publish": None,
+                "completed_variant_run_exists": False,
+                "decided_experiment_exists": False,
+            }
+        )
+    )
+    assert action is None
+    assert state == "unavailable"
+
+
+def test_a_failing_loader_does_not_affect_another_system(admin_client, tmp_path):
+    """The degradation is per request, not sticky and not shared."""
+    token = _login(admin_client)
+    system_id = _create_system(admin_client, token, "LoaderScope")
+    repo, sha = _init_repo(tmp_path, "repo-loader-scope")
+    admin_client.put(
+        "/repository", json={"repo_path": repo}, headers=_headers(token, system_id)
+    )
+    _insert_snapshot(system_id, repo, sha)
+    body = admin_client.get("/overview", headers=_headers(token, system_id)).json()
+    assert body["degraded_sections"] == []
+    assert body["next_action"] is not None
+
+
+def test_findings_baseline_distinguishes_unavailable_from_unconfirmed(
+    admin_client, tmp_path, monkeypatch
+):
+    """#382: 取得不能と未確認を混同しない。"""
+    token = _login(admin_client)
+    system_id = _create_system(admin_client, token, "Baseline")
+    repo, sha = _init_repo(tmp_path, "repo-baseline")
+    admin_client.put(
+        "/repository", json={"repo_path": repo}, headers=_headers(token, system_id)
+    )
+    _insert_snapshot(system_id, repo, sha)
+
+    # Brief reads fine, nothing confirmed -> the developer HAS not confirmed.
+    body = admin_client.get("/overview", headers=_headers(token, system_id)).json()
+    assert body["findings_baseline_state"] == "no_baseline"
+    assert body["findings_state"] == "not_compared"
+    assert "まだ理解を確認していない" in body["findings_baseline_label"]
+
+    # Brief cannot be read -> we do not know whether they confirmed.
+    from app import overview_projection
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("brief unavailable")
+
+    monkeypatch.setattr(
+        overview_projection.understanding_brief, "build_understanding_brief", _boom
+    )
+    body = admin_client.get("/overview", headers=_headers(token, system_id)).json()
+    assert body["findings_baseline_state"] == "unavailable"
+    assert body["findings_state"] == "unavailable"
+    assert "取得できませんでした" in body["findings_baseline_label"]
+    # The confident sentence must NOT appear.
+    assert "まだ理解を確認していない" not in body["findings_baseline_label"]
+    # No finding may carry a new/ongoing verdict against a baseline we could
+    # not read.
+    assert body["findings"] == []
+    # Runtime still renders on its own.
+    assert body["runtime"] is not None
 
 
 def test_snapshot_freshness_and_context_are_server_decided(admin_client, tmp_path):

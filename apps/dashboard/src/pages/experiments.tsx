@@ -93,12 +93,32 @@ export default function ExperimentsPage() {
     && (githubConnections ?? []).some(c => c.status === "connected");
   const { data: snapshots } = useSnapshots();
   const { data: drafts } = useLatestDrafts();
-  // Seeded from the URL, so a deep link from the Overview's 「採否を記録する」
-  // CTA lands on the row and a reload restores it. Plain initial state rather
-  // than an effect: the developer can collapse it immediately afterwards, and
-  // an id that is not in this System's list (another System's, a deleted one)
-  // simply matches no card — the page falls back to the plain list.
-  const [expandedId, setExpandedId] = useState<number | null>(focusExperimentId);
+  // The URL-driven selection and the developer's own expansion are kept as two
+  // separate states. `expandedId` is only ever set by a click; the URL target
+  // is validated against the loaded list and applied until the developer
+  // touches a row.
+  //
+  // Validation matters because the CTA's id is a snapshot of the moment the
+  // Overview was rendered. By the time the link is opened — a saved URL, a
+  // second tab, a decision recorded in between — the experiment may already be
+  // adopted / rejected / needs_more_data, or no longer completed. Expanding a
+  // settled experiment under a 「採否を記録する」 CTA tells the developer there
+  // is a decision to make when there is not.
+  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [urlTargetDismissed, setUrlTargetDismissed] = useState(false);
+  const resolvedUrlTarget =
+    focusExperimentId != null && !urlTargetDismissed && experiments
+      ? experiments.find(
+        (e) =>
+          e.id === focusExperimentId &&
+          e.status === "completed" &&
+          (e.human_decision ?? "undecided") === "undecided",
+      )?.id ?? null
+      : null;
+  // A row the developer opened wins; otherwise the validated URL target. An
+  // unknown id, another System's id, or a settled one resolves to null and the
+  // page renders the plain list — it never auto-selects a different row.
+  const effectiveExpandedId = expandedId ?? resolvedUrlTarget;
   const [showCreate, setShowCreate] = useState(false);
   const [draftDismissed, setDraftDismissed] = useState(false);
 
@@ -214,7 +234,7 @@ export default function ExperimentsPage() {
       <ContextHeader />
       {/* Issue #371: same rail as Components / Candidate Studio / Workbench. */}
       <ImprovementLoopRail
-        experiment={(experiments ?? []).find(e => e.id === expandedId) ?? null}
+        experiment={(experiments ?? []).find(e => e.id === effectiveExpandedId) ?? null}
         componentId={fromComponentParam}
         traceId={fromTraceParam}
         replayRunId={replayRunId}
@@ -265,8 +285,13 @@ export default function ExperimentsPage() {
             <ExperimentCard
               key={exp.id}
               exp={exp}
-              expanded={expandedId === exp.id}
-              onToggle={() => setExpandedId(expandedId === exp.id ? null : exp.id)}
+              expanded={effectiveExpandedId === exp.id}
+              onToggle={() => {
+                // Any manual toggle takes over from the URL target, so the
+                // linked row can be collapsed like any other.
+                setUrlTargetDismissed(true);
+                setExpandedId(effectiveExpandedId === exp.id ? null : exp.id);
+              }}
               runExperiment={runExperiment}
               makeDecision={makeDecision}
               githubPublishAvailable={githubPublishAvailable}

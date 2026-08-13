@@ -6379,6 +6379,64 @@ Dashboard が id を比較し直すことはしない。`CardTitle` に `as` を
 Overview のカードだけを `h2` に昇格して `h1 → h2 → h3` の見出し階層を成立
 させた(既存画面の見出し構造は変えていない)。
 
+### 再レビューで直した 5 点
+
+1 回目の修正を再レビューした結果、まだ「誤った意味を断言する経路」と
+「部分障害で画面全体を失う経路」が残っていた。
+
+**計測 patch を改善変更の公開として扱っていた。** `probe_patches` は probe
+plan 由来の**計測 patch** であり、Experiment で評価・採用された改善 variant
+ではない。`experiments` / `replay_variants` と `probe_patches` /
+`publish_jobs` の間には改善変更の lineage が永続化されていない。それなのに
+rule 12 は「公開へ進む」「この改善サイクルが閉じます」と表示していた。
+
+方針 B（CTA の再定義）を採用した。action key を `publish_instrumentation` に
+変え、文言を「計測の変更を公開する」「観測に使っている計測コードをレビュー
+可能な形で共有できます。改善候補の採否や公開はこの操作とは別です」にした。
+改善サイクルの Publish 到達は**主張しない**。方針 A（lineage の永続化）を
+選ばなかったのは、書き込む主体が存在しない列を足しても CTA が永久に解消
+しないためで、実装するなら adopt → variant → artifact → publish job を通す
+別 Issue が必要である。adopted experiment の存在チェックへ戻すことは、前回の
+identity 欠陥の再発なので禁止する。
+
+**next action 用 fact の一部が guard の外にあった。** Brief / Runtime /
+workflow には section 単位の例外処理があったが、undecided experiments /
+pending publish / completed variants / repository config / decided experiments
+は素の SQL のままで、`resolve_pending_publish()` が例外になると `/overview`
+全体が 500 になった。Brief も Runtime health も findings も loop も表示できる
+状態でである。
+
+fact group ごとに loader を切り出し（`load_repository_fact` /
+`load_pending_experiments` / `resolve_pending_publish` / `load_variant_facts` /
+`load_decision_facts`）、それぞれを個別に guard して `NextActionFacts` の
+availability に落とすようにした。例外を `0` / `None` / `False` に変換しない。
+`degraded_detail` は `next_action.<group>` のキーでどの group が落ちたかを
+残す。`decide_next_action` は常に呼ばれ、どこまで安全に評価できるかは rule
+table 自身が決める（外側に「全部飛ばす」分岐を置くと二重定義になる）。
+
+**Brief 取得不能を「未確認」と断言していた。** `confirmed_at` の `None` が
+「確認していない」と「読めなかった」の両方に使われ、表示は前者に断定して
+いた。`findings_baseline_state` を `has_baseline` / `no_baseline` /
+`unavailable` の 3 値にし、Brief が読めなかったときは
+「比較の基準を取得できませんでした。確認済みかどうかは判定していません」と
+表示する。この場合 findings は `unavailable` にして、確認基準に対する
+`new` / `ongoing` を一切付けない。Runtime section は独立して表示し続ける。
+
+**provenance の索引が claim 名だけだった。** Vision / System Purpose /
+Core Capability は独立した名前空間なので、同名 claim があると後から走査した
+section が先の provenance を上書きし、Vision の変更 finding に Capability の
+provenance が付きうる。索引キーを `(section, name)` にした。section 語彙は
+`understanding_brief.BRIEF_SECTIONS` を正本として共有しており、
+`UnderstandingChange.section` が運ぶ値と同一である。
+
+**既決定 Experiment も URL から展開されていた。** CTA の id は Overview を
+描画した瞬間のスナップショットなので、保存した URL を後で開く / 別タブで
+決定する / reload 前に状態が変わる、で容易に古くなる。URL 由来の選択と
+開発者の手動展開を別 state にし、URL 由来は「一覧に存在する」かつ
+`status == completed` かつ `human_decision == undecided` のときだけ有効に
+した。不一致なら一覧へ落ち、代わりの行を勝手に選ぶこともしない。手動展開は
+常に URL 由来より優先されるので、リンクで開いた行も畳める。
+
 ### ファーストビューの実測
 
 情報順だけでは目的を果たさない -- #358 と同じ失敗をここでも一度踏んだ。
@@ -6406,6 +6464,31 @@ innerHTML` の静的 HTML)。レビュー後の初期コンテキスト行ぶん
 Runtime health は 1280×720 で 1144px、つまり初期ビューの外にある。これは
 意図どおりで、二次領域を主役にしないという #380 UX 原則 4 の帰結である。
 Playwright はリポジトリの依存には入れていない(#358 と同じ扱い)。
+
+### 実ブラウザ検証（`apps/dashboard/browser-tests/`）
+
+jsdom には layout も時計駆動の refetch も実ナビゲーションも無いので、#384 の
+受け入れ条件のうち 3 つはそこでは検証できない。実 Control Server と build 済み
+SPA を Chromium で動かして検証し、スクリプトをリポジトリに残した。
+
+1. **`receiving_now → delayed → stale → receiving_now`**（reload なし・操作
+   なし）。System の閾値を 6s / 14s に絞り、freshness・connectivity finding・
+   CTA が同じ応答から同時に更新されることを確認する。
+2. **Experiment deep link**: undecided な対象は到達時と reload 後の両方で
+   展開され、adopted な対象と未知の id は何も展開せず一覧へ落ちる。
+3. **degraded**: Brief 取得失敗を注入しても Runtime / loop は描画され、CTA は
+   推測されず、読めなかった baseline が「未確認」と表示されない。
+
+1 は実サーバーの時計そのものを検証するので実サーバーで動かす。2・3 は
+ブラウザ側の挙動（router / reload / render）が対象なので応答は route
+interception で固定している（サーバー側の projection は pytest が担当）。
+
+**この検証が実際に見つけた欠陥**: Overview の `refetchOnWindowFocus` /
+`refetchOnReconnect` が効いていなかった。アプリ全体の `staleTime: 30_000`
+（`main.tsx`）の内側では focus 由来の refetch がスキップされるためである。
+interval 由来の遷移は動く（`refetchInterval` は `staleTime` を無視する）ので、
+実ブラウザで実際にタブへ戻る操作をしないと現れない。`useOverview` に
+`staleTime: 0` を明示した。
 
 ### アクセシビリティの実測
 

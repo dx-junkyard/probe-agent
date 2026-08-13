@@ -77,6 +77,15 @@ function EmptyState({ overview }: { overview: OverviewOut }) {
         <p className="text-muted-foreground">
           「発見がない」という意味ではありません。取得に失敗しています。
         </p>
+        {/* The baseline is a separate axis: we may have failed to read whether
+            the developer ever confirmed the understanding at all. Saying
+            「まだ確認していない」 here would assert something about them from a
+            failure of ours (#382). */}
+        {overview.findings_baseline_state === "unavailable" && (
+          <p className="text-muted-foreground" data-testid="overview-findings-baseline-unavailable">
+            {overview.findings_baseline_label}
+          </p>
+        )}
       </div>
     );
   }

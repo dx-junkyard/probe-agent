@@ -4933,6 +4933,9 @@ export type OverviewFindingsState =
   | "not_compared"
   | "unavailable";
 
+/** 「前回」の基準を読めたか。読めないことと、存在しないことは別。 */
+export type OverviewBaselineState = "has_baseline" | "no_baseline" | "unavailable";
+
 export type OverviewActionKey =
   | "create_system"
   | "prepare_repository"
@@ -4944,7 +4947,8 @@ export type OverviewActionKey =
   | "start_observation"
   | "restore_observation"
   | "record_experiment_decision"
-  | "publish_change"
+  /** 計測 patch の公開。改善変更の公開ではない（lineage が存在しないため）。 */
+  | "publish_instrumentation"
   | "create_candidate"
   | "start_next_cycle";
 
@@ -5062,6 +5066,7 @@ export interface OverviewOut {
   findings: OverviewFindingOut[];
   findings_initial_count: number;
   findings_state: OverviewFindingsState;
+  findings_baseline_state: OverviewBaselineState;
   findings_baseline_label: string;
   findings_baseline_at: number | null;
   next_action: OverviewActionOut | null;

@@ -68,6 +68,9 @@ Overview の「次にすること」は 1 件だけで、操作名に加えて**
 | `developer_intent` | 開発者が表明した意図・目標 | 開発者が下した採否判断 |
 | `developer_decision` | 採否・確認などの判断記録 | 開発者が表明した意図 |
 | `mixed`（provenance） | 集約した出所が複数に割れた | 出所が不明 |
+| `publish_instrumentation` | 計測 patch を公開する | 採用した改善変更を公開する |
+| `no_baseline`（Overview） | 開発者がまだ理解を確認していない | 基準を読めなかった |
+| `unavailable`（baseline） | 基準を読めなかった | 開発者が確認していない |
 
 ## 4. 空状態・失敗状態
 

@@ -146,6 +146,7 @@ def get_overview(system_id: int = Depends(get_system_id)) -> OverviewOut:
         findings=findings,
         findings_initial_count=result.findings_initial_count,
         findings_state=result.findings_state,
+        findings_baseline_state=result.findings_baseline_state,
         findings_baseline_label=result.findings_baseline_label,
         findings_baseline_at=result.findings_baseline_at,
         next_action=_action_out(result.next_action),

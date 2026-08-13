@@ -7712,6 +7712,13 @@ OverviewFindingsState = Literal[
     "unavailable",
 ]
 
+#: Whether the 「前回」 baseline could be read at all, kept apart from whether
+#: one EXISTS. `unavailable` used to be indistinguishable from
+#: `no_baseline`, so a Brief that failed to load rendered the confident
+#: sentence 「まだ理解を確認していないため、比較の基準がありません」 about a
+#: System whose developer may well have confirmed it yesterday.
+OverviewBaselineState = Literal["has_baseline", "no_baseline", "unavailable"]
+
 #: The single primary action. `create_system` is reachable only through the
 #: Dashboard's zero-System branch (the endpoint is System-scoped, so it cannot
 #: be evaluated server-side); it lives in this one vocabulary anyway so the
@@ -7727,7 +7734,12 @@ OverviewActionKey = Literal[
     "start_observation",
     "restore_observation",
     "record_experiment_decision",
-    "publish_change",
+    # NOT "publish the improvement": `publish_jobs` publishes probe-plan
+    # INSTRUMENTATION patches, and no persisted lineage connects an adopted
+    # Experiment to a patch or a job. Naming this key for what it actually
+    # publishes is the whole point — the previous `publish_change` told the
+    # developer 「この改善サイクルが閉じます」 about a measurement patch.
+    "publish_instrumentation",
     "create_candidate",
     "start_next_cycle",
 ]
@@ -7918,6 +7930,7 @@ class OverviewOut(BaseModel):
     findings_initial_count: int = 0
     findings_state: OverviewFindingsState
     #: What 「前回」 means for this System, stated rather than implied.
+    findings_baseline_state: OverviewBaselineState = "unavailable"
     findings_baseline_label: str = ""
     findings_baseline_at: Optional[float] = None
     next_action: Optional[OverviewActionOut] = None

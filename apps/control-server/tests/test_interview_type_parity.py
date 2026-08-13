@@ -114,6 +114,7 @@ FINITE_TYPE_NAMES = (
     "OverviewSection",
     "OverviewSnapshotFreshness",
     "OverviewCoverageState",
+    "OverviewBaselineState",
 )
 
 

@@ -3419,6 +3419,14 @@ export function useOverview() {
       return OVERVIEW_MAX_STALENESS_MS;
     },
     // A tab the developer comes back to must not show yesterday's reading.
+    //
+    // `staleTime: 0` is load-bearing, not a default repeated for show. The
+    // app-wide default is 30s (`main.tsx`), and a focus/reconnect refetch is
+    // SKIPPED while data is still within it — so these two flags were inert
+    // for the first 30 seconds of every visit. A browser test caught it: the
+    // interval transitions worked (`refetchInterval` ignores `staleTime`)
+    // while returning to the tab showed the old reading.
+    staleTime: 0,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
   });
