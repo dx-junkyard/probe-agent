@@ -6298,6 +6298,87 @@ Overview の Get Started 順序リスト(#212 / #259 / #267)と、その per-ste
 #374)が持つ。旧 4 metric card と Component 完全一覧もファーストビューから
 外れた(Component 一覧は `/components` にのみ置く)。
 
+### レビューで直した 6 点
+
+実装レビューで、canonical fact を取得できなかった場合の扱い、provenance、
+改善サイクルの identity、時間追従、coverage の単位、finding の発生時刻に
+未達が見つかった。いずれも「表示が惜しい」ではなく「間違ったことを断言する」
+種類の欠陥である。
+
+**部分障害時に推測の CTA を出していた。** Brief 取得失敗を `not_built`、
+Runtime 取得失敗を `no_signal` / `never_received` に読み替えていたため、
+すでに理解済みのシステムに「システムを理解する」、何週間も Trace を受信して
+いるシステムに「SDK を接続する」と表示しうる。これは #366 が一つの Epic を
+かけて潰した「1つの表示語が2つの事実を兼ねる」欠陥そのもので、しかも間違って
+いる語が行動の指示なので影響が大きい。`NextActionFacts` に
+`brief_available` / `runtime_available` / `workflow_available` を持たせ、
+読めなかった fact を既定値に落とさず、その fact を読む行を評価しない。
+飛ばした行が答えだった可能性がある以上、後ろの行に落とすこともできないので
+`unavailable` を返す。ただし fail-closed は fail-blank ではない: 行 1-2 は
+repository/snapshot だけを読むので、他が全滅でも答えられる。
+
+**provenance を正本どおり保持していなかった。** Overview 側の enum に
+`developer_intent` が無く、変換関数が未知の値を `ai_hypothesis` に落として
+いたため、開発者が書いて確定した Vision が AI の推測として表示されていた。
+#381/#382 が防ごうとしている混同そのものである。`OverviewFindingProvenance`
+を Brief の語彙の**厳密な上位集合**にして変換を恒等写像にし、finding 固有の
+3 値(`developer_decision` / `system_process` / `mixed`)を足した。
+`developer_intent`(表明した意図)と `developer_decision`(採否・確認の判断
+記録)は別物として分けている。理解変更 finding は変更対象 claim の provenance
+を引き継ぎ、複数に割れたときは `mixed`(集約が勝者を選ぶと、他が同意したと
+いう意味になる)。全削除で引き継ぐ元が無い場合だけ `implementation_fact` を
+明示的な規則として使う。
+
+**publish 判定が System 全体の存在チェックだった。** 「adopted な experiment が
+1件でもある」と「成功した publish job が1件でもある」を独立に見ていたため、
+サイクル A を公開した後はサイクル B が永久に公開済みに見えた。identity は
+`probe_patches.id` -> `publish_jobs.patch_id` に変更した。`completed` のみを
+公開とみなし(`failed` / `cancelled` / `retryable_failed` は公開ではない)、
+両側を System で絞り、適用日時降順 + id で決定的に 1 件を選ぶ。CTA は
+`?patch=<id>` を運ぶ。
+
+**adopted experiment を publish 判定に使わないのは意図的である。**
+`experiments` は patch も publish job も参照しておらず、`publish_jobs` が
+公開するのは probe plan 由来の計測 patch である(Experiments 画面から GitHub
+への導線が `?patch=` を渡さず手動選択させているのはこのため)。存在しない
+lineage を列で足しても、何も書き込まないので CTA が永久に解消しない。
+レビューは「必要な参照を追加する」も選択肢に挙げていたが、実在する identity
+だけを使い、experiment 側は主張しない方を選んだ。
+
+**時間・状態変化に追従していなかった。** `waiting` のときだけ poll していた
+ので、画面を開いたまま受信が停止・復旧しても Runtime と CTA が古いままだった。
+サーバーが返す経過秒としきい値から**次の境界までの時間**を計算して再取得し
+(ブラウザの時計は duration にしか使わない)、境界が無い場合も 5 分の上限で
+再取得する。上限は「受信停止を検知するまでの最大遅延」として明示した値で、
+window focus / reconnect でも再取得する。
+
+**coverage が別 entity どうしの割り算だった。** `COUNT(DISTINCT
+component_id)` を Core Capability 数の隣に置いていたので、1 Capability に
+複数 component が紐づくと分子が分母を超えうる。component は component の
+分母(`known_component_count`)と並べ、Capability カバレッジは
+`capability_coverage_state="not_computed"` として「算出していない」と述べる。
+component -> Capability の対応が保存されていない以上、比率は出せない。
+
+**connectivity finding の発生時刻が最終受信時刻だった。** 停止が始まったのは
+最終受信ではなく**閾値を超えた瞬間**(`last_real_trace_at + delayed/stale_
+after_seconds`)である。既定値ではこの差が最大 1 日あるので、確認直後に
+発生した障害が「前回の確認時点から継続」と誤分類されていた。`freshness_onset`
+で導出し、`delayed` -> `stale` の昇格では id を保ったまま summary と
+`last_updated` を更新する(同じ障害なので identity は変えない)。
+
+**Experiment への deep link と reload 復元。** 採否待ちの CTA は件数しか
+持たず `/experiments` へ飛ばしていた。対象 id を `NextActionFacts` に入れ
+(`completed_at DESC, id DESC` で決定的に 1 件)、`?experiment=<id>` を付け、
+Experiments 画面はそれを初期 state として読む。存在しない・別 System の id は
+どのカードにも一致しないので、一覧へ安全に落ちる。
+
+**初期コンテキストと heading。** Snapshot / commit / freshness / 理解リビジョン
+/ 最後の確認をページ見出し直下に出した(ページ上の全ての主張と CTA を限定
+する情報なので、`details` の中には置けない)。freshness はサーバーの判定で、
+Dashboard が id を比較し直すことはしない。`CardTitle` に `as` を足し、
+Overview のカードだけを `h2` に昇格して `h1 → h2 → h3` の見出し階層を成立
+させた(既存画面の見出し構造は変えていない)。
+
 ### ファーストビューの実測
 
 情報順だけでは目的を果たさない -- #358 と同じ失敗をここでも一度踏んだ。
@@ -6313,18 +6394,35 @@ desktop の初期 viewport で把握できる」を満たしていない。
 そのままで、読み上げ順も同じである。
 
 実測(Chromium `/opt/pw-browsers/chromium-1194`、ビルド済み CSS + `container.
-innerHTML` の静的 HTML):
+innerHTML` の静的 HTML)。レビュー後の初期コンテキスト行ぶん 25px 下がった値:
 
 | viewport | Brief | Vision | Purpose | 主要機能 | findings | 次にすること | CTA | 改善ループ | 横スクロール |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1280×720 | 100 | 293 | 417 | 609 | 100 | 100 | 173 | 471 | なし |
-| 1440×900 | 100 | 293 | 417 | 585 | 100 | 100 | 173 | 451 | なし |
-| 768×1024 | 100 | 273 | 367 | 515 | 854 | 1559 | — | — | なし |
-| 390×844 | 100 | 325 | 473 | 731 | 1282 | 2403 | — | — | なし |
+| 1280×720 | 125 | 318 | 442 | 634 | 125 | 125 | 198 | 496 | なし |
+| 1440×900 | 125 | 318 | 442 | 610 | 125 | 125 | 198 | 476 | なし |
+| 768×1024 | 125 | 298 | 392 | 540 | 879 | 1584 | — | — | なし |
+| 390×844 | 165 | 390 | 538 | 796 | 1347 | 2468 | — | — | なし |
 
-Runtime health は 1280×720 で 1119px、つまり初期ビューの外にある。これは
+Runtime health は 1280×720 で 1144px、つまり初期ビューの外にある。これは
 意図どおりで、二次領域を主役にしないという #380 UX 原則 4 の帰結である。
 Playwright はリポジトリの依存には入れていない(#358 と同じ扱い)。
+
+### アクセシビリティの実測
+
+同じ Chromium で確認した。
+
+- 見出し階層: `h1 Overview` → `h2 System Brief` / `h2 今わかったこと` /
+  `h2 次にすること` / `h2 改善ループの現在地` / `h2 Runtime health`、
+  Brief の中だけ `h3`。**レベルの飛びなし**。
+- Tab 順は DOM 順(= 意味順)と一致。10 個の focusable がすべて到達可能で、
+  閉じた `<details>` の中のリンクは開くまで tab 対象にならない。
+- `<details>` は summary の操作で開閉する(Runtime の累積、Brief の要素一覧)。
+- 状態はすべてテキストを併記: 「再確認が必要です」「受信が途絶えています」
+  「判断の前提が変わりました」「前回の確認より後に発生」。色だけの表現なし。
+- `aria-current="step"` は現在の phase 1 件だけ。
+- CTA の accessible name は結果を述べる(「理解を確認する」「Component と
+  Trace の詳細」)。
+- animation は使っていないので reduced motion の分岐は無い。
 
 jsdom では実寸を測れないので、`overview-page.test.tsx` は測定が依存する構造
 (Brief / findings / 次にすること が Grid の**別々の直接の子**であること)を

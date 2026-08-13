@@ -4905,12 +4905,27 @@ export type OverviewFindingSeverity =
 /** `not_compared` は「新しい発見がない」とは別の答え。同じ表示にしてはならない。 */
 export type OverviewFindingStatus = "new" | "ongoing" | "not_compared";
 
+/**
+ * 先頭4つは `UnderstandingProvenanceKind` と同一の値。claim の出所は変換せず
+ * そのまま finding に引き継ぐ（`developer_intent` を落として `ai_hypothesis`
+ * にすると、開発者が確定した Vision が AI の推測として表示される）。
+ * 残り3つは finding 固有: 判断の記録 / probe-agent 自身の処理記録 / 出所が
+ * 複数に割れた集約。
+ */
 export type OverviewFindingProvenance =
-  | "ai_hypothesis"
+  | "developer_intent"
   | "implementation_fact"
   | "runtime_observation"
+  | "ai_hypothesis"
   | "developer_decision"
-  | "system_process";
+  | "system_process"
+  | "mixed";
+
+/** 固定した snapshot が HEAD の断面かどうか。サーバーが決める。 */
+export type OverviewSnapshotFreshness = "current" | "stale" | "unavailable";
+
+/** Capability 単位の観測カバレッジを算出できたか。今日は `not_computed`。 */
+export type OverviewCoverageState = "computed" | "not_computed";
 
 export type OverviewFindingsState =
   | "has_findings"
@@ -5024,8 +5039,13 @@ export interface OverviewRuntimeHealthOut {
   partial_count: number;
   unreplayable_count: number;
   not_captured_count: number;
-  observed_capability_count: number;
+  /** window 内に trace を出した component 数。Capability 数とは別 entity。 */
+  observed_component_count: number;
+  known_component_count: number;
   core_capability_count: number;
+  capability_coverage_state: OverviewCoverageState;
+  observed_capability_count: number | null;
+  unmapped_component_count: number | null;
 }
 
 export interface OverviewOut {
@@ -5036,6 +5056,9 @@ export interface OverviewOut {
   snapshot_id: number | null;
   snapshot_commit_sha: string | null;
   latest_ready_snapshot_id: number | null;
+  snapshot_freshness: OverviewSnapshotFreshness;
+  understanding_revision_id: number | null;
+  understanding_confirmed_at: number | null;
   findings: OverviewFindingOut[];
   findings_initial_count: number;
   findings_state: OverviewFindingsState;

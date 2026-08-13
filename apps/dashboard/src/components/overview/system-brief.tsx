@@ -1,8 +1,15 @@
 import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { formatTimestamp } from "@/lib/utils";
 import { CONFIRMATION_VARIANT, READINESS_VARIANT } from "./display";
+
+/** Section keys the server reports counts for, in the developer's words. */
+const SECTION_LABELS: Record<string, string> = {
+  capability_elements: "機能要素",
+  supporting_elements: "支援要素",
+  api_boundaries: "API 境界",
+  probe_flow_candidates: "プローブ対象フロー候補",
+};
 import type { OverviewOut, UnderstandingBriefClaimOut } from "@/api/types";
 
 // Issue #381: the first view answers 「このシステムは何のためにあり、AI はどう
@@ -58,7 +65,7 @@ export function SystemBriefCard({
     return (
       <Card data-testid="overview-brief-unavailable">
         <CardHeader>
-          <CardTitle className="text-base">System Brief</CardTitle>
+          <CardTitle as="h2" className="text-base">System Brief</CardTitle>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
           <p>現在のシステム理解を取得できませんでした。</p>
@@ -81,7 +88,7 @@ export function SystemBriefCard({
   return (
     <Card data-testid="overview-system-brief">
       <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0">
-        <CardTitle className="text-base">System Brief</CardTitle>
+        <CardTitle as="h2" className="text-base">System Brief</CardTitle>
         <Badge
           variant={READINESS_VARIANT[brief.readiness_state]}
           data-testid="overview-readiness-badge"
@@ -190,42 +197,26 @@ export function SystemBriefCard({
         {/* Progressive disclosure: the full tree, the evidence, the API
             boundaries and the supporting elements all live on the Interview
             screen. The Overview links to them, it does not reimplement them. */}
+        {/* Snapshot / revision / last confirmation moved to the page header
+            (#381): they qualify everything on the page, so they are first-view
+            context rather than a detail. What stays here is the per-section
+            inventory and the route to the full tree. */}
         <details data-testid="overview-brief-details">
           <summary className="cursor-pointer text-xs text-muted-foreground">
-            対象 Snapshot・リビジョン・詳細への入口
+            この理解に含まれる要素と、詳細への入口
           </summary>
           <dl className="mt-2 space-y-1 text-xs text-muted-foreground">
-            <div>
-              <dt className="inline font-medium">対象 Snapshot: </dt>
-              <dd className="inline">
-                {brief.snapshot_id ?? "—"}
-                {overview.snapshot_commit_sha && (
-                  <code className="ml-1 font-mono">
-                    {overview.snapshot_commit_sha.slice(0, 8)}
-                  </code>
-                )}
-                {overview.latest_ready_snapshot_id != null &&
-                  brief.snapshot_id != null &&
-                  overview.latest_ready_snapshot_id !== brief.snapshot_id && (
-                    <span className="ml-1 text-amber-700 dark:text-amber-300">
-                      （最新の snapshot は {overview.latest_ready_snapshot_id}）
-                    </span>
-                  )}
-              </dd>
-            </div>
-            <div>
-              <dt className="inline font-medium">理解のリビジョン: </dt>
-              <dd className="inline">{brief.revision_id ?? "—"}</dd>
-            </div>
-            <div>
-              <dt className="inline font-medium">最後に確認した時点: </dt>
-              <dd className="inline">
-                {brief.confirmed_at != null ? formatTimestamp(brief.confirmed_at) : "未確認"}
-              </dd>
-            </div>
+            {overview.latest_ready_snapshot_id != null &&
+              brief.snapshot_id != null &&
+              overview.latest_ready_snapshot_id !== brief.snapshot_id && (
+                <div>
+                  <dt className="inline font-medium">最新の snapshot: </dt>
+                  <dd className="inline">#{overview.latest_ready_snapshot_id}</dd>
+                </div>
+              )}
             {Object.entries(brief.detail_counts).map(([section, count]) => (
               <div key={section}>
-                <dt className="inline font-medium">{section}: </dt>
+                <dt className="inline font-medium">{SECTION_LABELS[section] ?? section}: </dt>
                 <dd className="inline">{count} 件</dd>
               </div>
             ))}

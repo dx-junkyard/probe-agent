@@ -15,9 +15,23 @@ const CardHeader = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivElement>>(
 );
 CardHeader.displayName = "CardHeader";
 
-const CardTitle = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref) => (
-    <div ref={ref} className={cn("font-semibold leading-none tracking-tight", className)} {...props} />
+/**
+ * Card titles render a `div` by default, which is deliberate: most cards on
+ * this dashboard are not section landmarks, and promoting all of them at once
+ * would rewrite the heading outline of every existing screen.
+ *
+ * `as` lets a screen opt one card into a real heading. The Overview does
+ * (Issue #384): it is a page whose cards ARE its top-level sections, so
+ * without this its outline jumped `h1` → `h3` and the main sections could not
+ * be reached by heading navigation at all.
+ */
+type CardTitleProps = HTMLAttributes<HTMLHeadingElement> & {
+  as?: "div" | "h2" | "h3" | "h4";
+};
+
+const CardTitle = forwardRef<HTMLHeadingElement, CardTitleProps>(
+  ({ className, as: Tag = "div", ...props }, ref) => (
+    <Tag ref={ref} className={cn("font-semibold leading-none tracking-tight", className)} {...props} />
   )
 );
 CardTitle.displayName = "CardTitle";

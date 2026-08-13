@@ -869,6 +869,15 @@ keyword score も client heuristic も使わない。
   3 枠のうち 2 枠を占めることはない。
 - **id は原因から導出**する（行 id ではない）。理解を作り直すと行番号は
   変わるが、同じ発見の id は変わらない。変わると「継続」と表示できない。
+- **provenance は claim のものをそのまま引き継ぐ。** finding の provenance
+  語彙は Brief の語彙の厳密な上位集合で、変換は恒等写像である。
+  `developer_intent` を落とすと、開発者が確定した Vision が AI の推測として
+  表示される。集約で出所が割れたときは `mixed`（勝者を選ぶと、他が同意した
+  という意味になる）。
+- **発生時刻は状態が成立した時刻。** connectivity finding は最終受信ではなく
+  閾値を超えた瞬間（`last_real_trace_at + delayed/stale_after_seconds`）を
+  `first_seen` にする。既定値ではこの差が最大 1 日あり、確認直後の障害が
+  「継続」と誤分類されていた。
 - **「前回」の定義**: 開発者自身の 理解の確認（`understanding_confirmed_at`）。
   永続化された人間の判断であって、暗黙の page view ではない。Overview を
   開いても何も書き込まれない。
@@ -893,8 +902,8 @@ keyword score も client heuristic も使わない。
 | 8 | connectivity `no_signal` | `connect_sdk` |
 | 9 | freshness `never_received`（疎通のみ） | `start_observation` |
 | 10 | freshness `delayed` / `stale` | `restore_observation` |
-| 11 | 完了済み experiment が未決定 | `record_experiment_decision` |
-| 12 | adopted があり publish 未成功 | `publish_change` |
+| 11 | 完了済み experiment が未決定 | `record_experiment_decision`（`?experiment=<id>`） |
+| 12 | 適用済みで未公開の patch がある | `publish_change`（`?patch=<id>`） |
 | 13 | 評価済み候補が 1 件もない | `create_candidate` |
 | 14 | 上記以外 | `start_next_cycle` |
 
@@ -903,6 +912,17 @@ keyword score も client heuristic も使わない。
   ためである。
 - `waiting` / `unavailable` は action を**持たない**。実行できない操作を
   disabled で常設しない（#383）。
+- **取得できなかった fact は既定値に落とさない。** `NextActionFacts` の
+  `brief_available` / `runtime_available` / `workflow_available` が false の
+  とき、その fact を読む行は評価せず `unavailable` を返す。Brief 取得失敗を
+  「未構築」、Runtime 取得失敗を「未接続」と読み替えると、すでに理解済み・
+  受信中のシステムに間違った CTA を出すことになる。ただし行 1-2 は
+  repository/snapshot だけを読むので、他が全滅でも答える。
+- **行 12 の identity は patch。** `probe_patches.id` →
+  `publish_jobs.patch_id` で、`completed` のみを公開とみなす。System 全体で
+  「publish が一度でも成功したか」を見ると、最初の公開が以後すべての変更を
+  公開済みに見せてしまう。adopted な experiment は patch も publish job も
+  参照していないため、この行には使わない（存在しない lineage を推測しない）。
 - CTA は既存の人間確認ゲートを一切迂回しない。案内するだけで、承認・採否・
   公開はそれぞれの画面の `decision_method: manual` 記録のままである。
 
@@ -917,6 +937,23 @@ keyword score も client heuristic も使わない。
   mode 内訳）と Component 完全一覧はファーストビューから外れた。累積値は
   `details` の中に「現在の稼働状態ではありません」と明記して残し、Component
   一覧は `/components` にのみ置く。
+- **observed / known は両方とも component。** Capability 単位のカバレッジは
+  `capability_coverage_state="not_computed"` として「算出していない」と述べる。
+  component → Capability の対応が保存されていないため、比率を出すと別 entity
+  どうしの割り算になり、分子が分母を超えうる。
+- 画面は次の freshness 境界（サーバーの経過秒 + しきい値から算出）で自動再取得
+  し、境界が無いときも 5 分を上限に再取得する。受信停止を検知するまでの
+  最大遅延はこの 5 分である。
+
+### ファーストビューと見出し
+
+- Snapshot / commit / snapshot freshness / 理解リビジョン / 最後の確認は
+  ページ見出し直下に出す。ページ上の全ての主張と CTA を限定する情報なので
+  `details` には入れない。freshness はサーバーの判定で、Dashboard が
+  snapshot id を比較し直すことはしない。
+- 見出しは `h1 Overview` → 各セクション `h2` → Brief 内 `h3`。`CardTitle` の
+  `as` で Overview のカードだけを昇格しており、他画面の見出し構造は変えて
+  いない。
 
 ### 廃止されたもの
 

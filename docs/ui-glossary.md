@@ -62,6 +62,12 @@ Overview の「次にすること」は 1 件だけで、操作名に加えて**
 | `no_findings`（Overview） | 比較した結果、重要な新規発見が無い | 比較していない |
 | `unavailable`（Overview） | 取得に失敗した | 該当が無い |
 | `waiting`（Overview 主操作） | システムが処理中で、押す操作が無い | 操作が禁止されている |
+| `unavailable`（Overview 主操作） | 判定に必要な事実を読めなかった | まだその段階に達していない |
+| `observed_component_count` | window 内に trace を出した component 数 | 観測済み Capability 数 |
+| `not_computed`（coverage） | 算出していない | カバレッジが 0 |
+| `developer_intent` | 開発者が表明した意図・目標 | 開発者が下した採否判断 |
+| `developer_decision` | 採否・確認などの判断記録 | 開発者が表明した意図 |
+| `mixed`（provenance） | 集約した出所が複数に割れた | 出所が不明 |
 
 ## 4. 空状態・失敗状態
 

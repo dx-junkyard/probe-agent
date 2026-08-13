@@ -8,6 +8,7 @@
 // view.
 
 import { render, screen, waitFor, within } from "@testing-library/react";
+import { Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
@@ -46,13 +47,13 @@ vi.mock("@/api/auth", () => ({
   AuthProvider: ({ children }: { children: ReactNode }) => children,
 }));
 
-function createWrapper() {
+function createWrapper(initialEntries: string[] = ["/"]) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>
-      <MemoryRouter>{children}</MemoryRouter>
+      <MemoryRouter initialEntries={initialEntries}>{children}</MemoryRouter>
     </QueryClientProvider>
   );
 }
@@ -86,6 +87,9 @@ function overview(overrides: Partial<OverviewOut> = {}): OverviewOut {
     snapshot_id: null,
     snapshot_commit_sha: null,
     latest_ready_snapshot_id: null,
+    snapshot_freshness: "unavailable",
+    understanding_revision_id: null,
+    understanding_confirmed_at: null,
     findings: [],
     findings_initial_count: 0,
     findings_state: "not_compared",
@@ -134,8 +138,12 @@ function overview(overrides: Partial<OverviewOut> = {}): OverviewOut {
       partial_count: 0,
       unreplayable_count: 0,
       not_captured_count: 0,
-      observed_capability_count: 0,
+      observed_component_count: 0,
+      known_component_count: 0,
       core_capability_count: 0,
+      capability_coverage_state: "not_computed",
+      observed_capability_count: null,
+      unmapped_component_count: null,
     },
     degraded_sections: [],
     degraded_detail: {},
@@ -269,6 +277,82 @@ describe("Overview page (Issue #384)", () => {
     expect(screen.queryByTestId("overview-findings-none")).not.toBeInTheDocument();
   });
 
+  test("a degraded next action renders as a sentence, never as a disabled button", async () => {
+    // #383: 推測でCTAを出さない。The server returns `unavailable`; the page must
+    // not fill the gap with a default CTA of its own.
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/overview"
+        ? Promise.resolve(
+          overview({
+            next_action: null,
+            next_action_state: "unavailable",
+            next_action_message: "現在の状態を判定できませんでした。",
+            degraded_sections: ["brief"],
+            brief: null,
+          }),
+        )
+        : Promise.resolve(null),
+    );
+    await renderPage();
+
+    expect(await screen.findByTestId("overview-next-action-unavailable")).toHaveTextContent(
+      "現在の状態を判定できませんでした。",
+    );
+    expect(screen.queryByTestId("overview-next-action-cta")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /する$/ })).not.toBeInTheDocument();
+  });
+
+  test("Snapshot, revision and last confirmation are first-view context", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/overview"
+        ? Promise.resolve(
+          overview({
+            snapshot_id: 31,
+            snapshot_commit_sha: "41e8b78c9d2a",
+            latest_ready_snapshot_id: 33,
+            snapshot_freshness: "stale",
+            understanding_revision_id: 24,
+            understanding_confirmed_at: 1_759_000_000,
+          }),
+        )
+        : Promise.resolve(null),
+    );
+    const { container } = await renderPage();
+
+    const context = await screen.findByTestId("overview-context");
+    expect(context).toHaveTextContent("#31");
+    expect(context).toHaveTextContent("41e8b78c");
+    expect(context).toHaveTextContent("最新ではない断面");
+    expect(context).toHaveTextContent("#24");
+    // Server-decided: the page never compares snapshot ids itself.
+    expect(
+      within(context).getByText(/最新ではない断面/).closest("[data-snapshot-freshness]"),
+    ).toHaveAttribute("data-snapshot-freshness", "stale");
+    // It precedes the Brief, so the context is read before the claims it
+    // qualifies — on every viewport, since it is in the page header.
+    const brief = screen.getByTestId("overview-system-brief");
+    expect(context.compareDocumentPosition(brief) & 4).toBeTruthy();
+    expect(container).toBeTruthy();
+  });
+
+  test("the page heading outline is h1 -> h2 with no skipped level", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/overview" ? Promise.resolve(overview()) : Promise.resolve(null),
+    );
+    await renderPage();
+    await screen.findByTestId("overview-system-brief");
+
+    expect(screen.getByRole("heading", { level: 1, name: "Overview" })).toBeInTheDocument();
+    const h2s = screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
+    expect(h2s).toEqual([
+      "System Brief",
+      "今わかったこと",
+      "次にすること",
+      "改善ループの現在地",
+      "Runtime health",
+    ]);
+  });
+
   test("the single CTA carries the server's action key and route", async () => {
     mockApi.get.mockImplementation((path: string) =>
       path === "/overview" ? Promise.resolve(overview()) : Promise.resolve(null),
@@ -279,5 +363,123 @@ describe("Overview page (Issue #384)", () => {
     expect(cta).toHaveAttribute("data-action-key", "prepare_repository");
     expect(cta).toHaveAttribute("href", "/repository");
     await waitFor(() => expect(screen.getAllByTestId("overview-next-action-cta")).toHaveLength(1));
+  });
+});
+
+
+// ── Experiments deep link from the Overview CTA (Issue #383) ─────────
+
+describe("Experiments deep link (Issue #383)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+    mockSystems = [{ id: 1, name: "alpha" }];
+  });
+
+  const experiments = [
+    {
+      id: 11, system_id: 1, feature_id: "f", objective: "o", snapshot_id: 1,
+      baseline_commit: "abc", config_revision: "r", execution_config: "{}",
+      status: "completed", error: null, human_decision: "undecided",
+      human_decision_variant_key: null, human_decision_note: "",
+      created_at: 1, started_at: 1, completed_at: 2, variants: [],
+    },
+    {
+      id: 12, system_id: 1, feature_id: "g", objective: "o2", snapshot_id: 1,
+      baseline_commit: "abc", config_revision: "r", execution_config: "{}",
+      status: "completed", error: null, human_decision: "undecided",
+      human_decision_variant_key: null, human_decision_note: "",
+      created_at: 1, started_at: 1, completed_at: 3, variants: [],
+    },
+  ];
+
+  function mockExperiments() {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/experiments") return Promise.resolve(experiments);
+      if (path === "/snapshots") return Promise.resolve([]);
+      if (path === "/repository/drafts/latest") {
+        return Promise.resolve({ system_profile_draft: null, feature_drafts: [] });
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  async function renderExperiments(entry: string) {
+    const { default: ExperimentsPage } = await import("@/pages/experiments");
+    return render(<Routes><Route path="/experiments" element={<ExperimentsPage />} /></Routes>, {
+      wrapper: createWrapper([entry]),
+    });
+  }
+
+  test("?experiment=<id> expands that row, and a reload lands on the same one", async () => {
+    mockExperiments();
+    const { container } = await renderExperiments("/experiments?experiment=12");
+    await waitFor(() =>
+      expect(container.querySelector('[data-testid="experiment-row-12"]')).toBeTruthy(),
+    );
+    // The linked row is the expanded one — a count alone would have dropped the
+    // developer on the list and made them find it again (#383).
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-testid="experiment-detail-12"]'),
+      ).toBeTruthy(),
+    );
+    expect(container.querySelector('[data-testid="experiment-detail-11"]')).toBeNull();
+  });
+
+  test("an id from another System (or a deleted one) falls back to the plain list", async () => {
+    mockExperiments();
+    const { container } = await renderExperiments("/experiments?experiment=999");
+    await waitFor(() =>
+      expect(container.querySelector('[data-testid="experiment-row-11"]')).toBeTruthy(),
+    );
+    expect(container.querySelector('[data-testid="experiment-detail-999"]')).toBeNull();
+    expect(container.querySelector('[data-testid="experiment-detail-11"]')).toBeNull();
+  });
+});
+
+// ── Time-dependent refresh (Issue #384 / review P1-4) ────────────────
+
+describe("Overview refresh cadence", () => {
+  test("schedules a refetch just after the next freshness boundary", async () => {
+    const { overviewBoundaryDelay, OVERVIEW_MAX_STALENESS_MS } = await import("@/api/hooks");
+    const runtime = overview().runtime!;
+
+    // 100s since the last trace, `delayed` at 900s -> wake at 801s.
+    expect(
+      overviewBoundaryDelay({
+        ...overview(),
+        runtime: { ...runtime, seconds_since_last_trace: 100 },
+      }),
+    ).toBe(801_000);
+
+    // Past `delayed`, the next boundary is `stale`.
+    expect(
+      overviewBoundaryDelay({
+        ...overview(),
+        runtime: { ...runtime, seconds_since_last_trace: 1000 },
+      }),
+    ).toBe(85_401_000);
+
+    // Past both: no boundary left, so the bounded ceiling takes over. Without
+    // it, a screen left open would never notice an externally-recorded
+    // decision or a completed publish.
+    expect(
+      overviewBoundaryDelay({
+        ...overview(),
+        runtime: { ...runtime, seconds_since_last_trace: 90_000 },
+      }),
+    ).toBeNull();
+    expect(OVERVIEW_MAX_STALENESS_MS).toBe(300_000);
+
+    // Nothing received yet: there is no elapsed time to measure from.
+    expect(
+      overviewBoundaryDelay({
+        ...overview(),
+        runtime: { ...runtime, seconds_since_last_trace: null },
+      }),
+    ).toBeNull();
+    expect(overviewBoundaryDelay({ ...overview(), runtime: null })).toBeNull();
+    expect(overviewBoundaryDelay(undefined)).toBeNull();
   });
 });

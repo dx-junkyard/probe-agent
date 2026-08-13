@@ -7,6 +7,8 @@ import { LoopRailCard, NextActionCard } from "@/components/overview/next-action"
 import { RuntimeHealthCard } from "@/components/overview/runtime-health";
 import { SystemBriefCard } from "@/components/overview/system-brief";
 import { targetHref } from "@/components/overview/display";
+import { formatTimestamp } from "@/lib/utils";
+import type { OverviewOut, OverviewSnapshotFreshness } from "@/api/types";
 
 // Issue #380: the Overview is the System Intelligence Brief / decision
 // cockpit, not a metrics screen.
@@ -112,7 +114,7 @@ export default function OverviewPage() {
 
   return (
     <div className="space-y-4">
-      <PageHeading system={system} />
+      <PageHeading system={system} overview={overview} />
 
       {overview.degraded_sections.length > 0 && (
         // A partial failure names what is missing and lets the rest render.
@@ -155,7 +157,31 @@ export default function OverviewPage() {
   );
 }
 
-function PageHeading({ system }: { system?: { name: string; environment?: string | null } }) {
+const SNAPSHOT_FRESHNESS_LABEL: Record<OverviewSnapshotFreshness, string> = {
+  current: "最新の断面",
+  stale: "最新ではない断面",
+  unavailable: "断面を特定できません",
+};
+
+/**
+ * The first-view System context.
+ *
+ * Which snapshot and which understanding revision the whole page is talking
+ * about belongs HERE, not inside a disclosure: every claim, finding and CTA
+ * below is qualified by it, and a developer who cannot see it does not know
+ * what the page is describing (#381).
+ *
+ * `snapshot_freshness` is the server's verdict. The Dashboard deliberately
+ * does not compare `snapshot_id` with `latest_ready_snapshot_id` itself —
+ * that second definition of 「最新か」 is exactly the drift #369 removed.
+ */
+function PageHeading({
+  system,
+  overview,
+}: {
+  system?: { name: string; environment?: string | null };
+  overview?: OverviewOut;
+}) {
   return (
     <div>
       <h1 className="text-2xl font-bold tracking-tight">Overview</h1>
@@ -168,6 +194,54 @@ function PageHeading({ system }: { system?: { name: string; environment?: string
         <p className="mt-1 text-muted-foreground">
           このシステムについて分かっていること、変わったこと、次にすることをまとめます。
         </p>
+      )}
+      {overview && (
+        <dl
+          className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground"
+          data-testid="overview-context"
+        >
+          <div className="flex gap-1">
+            <dt>Snapshot</dt>
+            <dd className="text-foreground" data-snapshot-freshness={overview.snapshot_freshness}>
+              {overview.snapshot_id != null ? (
+                <>
+                  #{overview.snapshot_id}
+                  {overview.snapshot_commit_sha && (
+                    <code className="ml-1 font-mono">
+                      {overview.snapshot_commit_sha.slice(0, 8)}
+                    </code>
+                  )}
+                </>
+              ) : (
+                "未固定"
+              )}
+              <span className="ml-1">
+                （{SNAPSHOT_FRESHNESS_LABEL[overview.snapshot_freshness]}）
+              </span>
+            </dd>
+          </div>
+          <div className="flex gap-1">
+            <dt>理解リビジョン</dt>
+            <dd className="text-foreground">
+              {overview.understanding_revision_id != null
+                ? `#${overview.understanding_revision_id}`
+                : "未構築"}
+            </dd>
+          </div>
+          <div className="flex gap-1">
+            <dt>最後の確認</dt>
+            <dd className="text-foreground">
+              {overview.understanding_confirmed_at != null
+                ? formatTimestamp(overview.understanding_confirmed_at)
+                : "未確認"}
+              {overview.brief?.readiness_state === "recheck_required" && (
+                <span className="ml-1 text-amber-700 dark:text-amber-300">
+                  再確認が必要
+                </span>
+              )}
+            </dd>
+          </div>
+        </dl>
       )}
     </div>
   );

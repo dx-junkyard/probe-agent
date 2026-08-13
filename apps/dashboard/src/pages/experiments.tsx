@@ -65,6 +65,16 @@ export default function ExperimentsPage() {
     ? Number(replayVariantIdParam) : null;
   const { data: replayPayload } = useVariantExperimentPayload(replayRunId, replayVariantId);
 
+  // Deep link from the Overview's 「採否を記録する」 CTA (Issue #383):
+  // ?experiment=<id> selects and expands that row. The CTA carries the id
+  // because a count alone drops the developer on a list and makes them find
+  // the row again -- and because a reload has to land on the same one.
+  const experimentIdParam = searchParams.get("experiment");
+  const focusExperimentId =
+    experimentIdParam && Number.isInteger(Number(experimentIdParam))
+      ? Number(experimentIdParam)
+      : null;
+
   // "Create Experiment from this trace" (Components Traces tab row action):
   // prefill context only, never a patch -- the developer fills in the rest.
   const fromTraceParam = searchParams.get("from_trace");
@@ -83,7 +93,12 @@ export default function ExperimentsPage() {
     && (githubConnections ?? []).some(c => c.status === "connected");
   const { data: snapshots } = useSnapshots();
   const { data: drafts } = useLatestDrafts();
-  const [expandedId, setExpandedId] = useState<number | null>(null);
+  // Seeded from the URL, so a deep link from the Overview's 「採否を記録する」
+  // CTA lands on the row and a reload restores it. Plain initial state rather
+  // than an effect: the developer can collapse it immediately afterwards, and
+  // an id that is not in this System's list (another System's, a deleted one)
+  // simply matches no card — the page falls back to the plain list.
+  const [expandedId, setExpandedId] = useState<number | null>(focusExperimentId);
   const [showCreate, setShowCreate] = useState(false);
   const [draftDismissed, setDraftDismissed] = useState(false);
 
@@ -455,7 +470,7 @@ function ExperimentCard({
   };
 
   return (
-    <Card>
+    <Card data-testid={`experiment-row-${exp.id}`} data-expanded={expanded}>
       <CardHeader className="cursor-pointer" onClick={onToggle}>
         <div className="flex items-start justify-between">
           <div>
@@ -479,7 +494,7 @@ function ExperimentCard({
         </div>
       </CardHeader>
       {expanded && (
-        <CardContent className="space-y-4">
+        <CardContent className="space-y-4" data-testid={`experiment-detail-${exp.id}`}>
           <div className="flex gap-2">
             {exp.status === "draft" && (
               <Button

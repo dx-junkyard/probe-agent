@@ -857,6 +857,14 @@ Overview は稼働メトリクス画面ではない。`GET /overview` が返す 
   明記する。Component 完全一覧は `/components` にのみ置く。
 - 空状態は 3 種を書き分ける: `no_findings`(新しい発見なし) /
   `not_compared`(比較基準がない) / `unavailable`(取得失敗)。
+- **サーバーが `unavailable` を返したら、代わりの CTA を出さない。** 取得
+  できなかった fact を「まだしていない」と読み替えるのはサーバー側でも禁止
+  だが、Dashboard 側で既定 CTA を補うのも同じ誤りである。
+- provenance ラベルはサーバーの値をそのまま出す。`developer_intent` を
+  「AI の解釈」と混ぜない。
+- Runtime の observed / known はどちらも component 数。Capability カバレッジ
+  は `capability_coverage_state` が `computed` のときだけ比率で出す。
+- Overview のカードは `CardTitle as="h2"`。`h1 → h2 → h3` を崩さない。
 - 部分失敗は `degraded_sections` の領域だけ落とし、他は描き続ける。
   「取得できませんでした」を「発見がありません」「受信が止まっています」と
   同じ文言にしない。

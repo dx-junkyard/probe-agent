@@ -112,6 +112,8 @@ FINITE_TYPE_NAMES = (
     "OverviewLoopStage",
     "OverviewLoopStageStatus",
     "OverviewSection",
+    "OverviewSnapshotFreshness",
+    "OverviewCoverageState",
 )
 
 

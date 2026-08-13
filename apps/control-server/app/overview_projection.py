@@ -96,6 +96,7 @@ __all__ = [
     "decide_next_action",
     "build_loop_stages",
     "build_overview",
+    "resolve_pending_publish",
 ]
 
 
@@ -160,11 +161,16 @@ FINDING_STATUS_LABELS: Dict[str, str] = {
 }
 
 FINDING_PROVENANCE_LABELS: Dict[str, str] = {
-    "ai_hypothesis": "AI の解釈・仮説",
+    # The first four are worded exactly like `understanding_brief`'s, because
+    # they ARE the same values: a claim's provenance carries into a finding
+    # about that claim unchanged.
+    "developer_intent": "開発者が明示した意図",
     "implementation_fact": "コード・ドキュメントの実装事実",
     "runtime_observation": "Runtime の観測",
+    "ai_hypothesis": "AI の解釈・仮説",
     "developer_decision": "あなたの判断の記録",
     "system_process": "システムの処理記録",
+    "mixed": "複数の出所",
 }
 
 FRESHNESS_LABELS: Dict[str, str] = {
@@ -300,6 +306,10 @@ class FindingInputs:
     #: exactly when nothing has arrived.
     connectivity_freshness: str = "never_received"
     last_real_trace_at: Optional[float] = None
+    #: The System's own freshness thresholds, needed to date the onset of a
+    #: `delayed` / `stale` state (see `freshness_onset`).
+    delayed_after_seconds: float = state_facts.DEFAULT_DELAYED_AFTER_SECONDS
+    stale_after_seconds: float = state_facts.DEFAULT_STALE_AFTER_SECONDS
     undecided_experiment_count: int = 0
     undecided_experiment_at: Optional[float] = None
     undecided_experiment_id: Optional[int] = None
@@ -387,6 +397,12 @@ def collect_findings(inputs: FindingInputs) -> List[Finding]:
     #    per section: five changed capabilities are one 「主要機能が変わった」
     #    finding, not five entries competing for the same three slots.
     changes = list(getattr(brief, "changes_since_confirmation", []) or [])
+    # A claim's provenance carries into the finding about its change. Hardcoding
+    # `implementation_fact` here reported a developer-authored Vision edit as a
+    # code reading.
+    claim_provenance = {
+        claim.name: _claim_provenance(claim) for claim in _brief_claims(brief)
+    }
     by_section: Dict[str, List[Any]] = {}
     for change in changes:
         by_section.setdefault(change.section, []).append(change)
@@ -394,6 +410,13 @@ def collect_findings(inputs: FindingInputs) -> List[Finding]:
         label = section_changes[0].section_label
         details = "、".join(
             sorted({f"{c.name}: {c.detail}" for c in section_changes})[:3]
+        )
+        provenance = aggregate_provenance(
+            [
+                claim_provenance[c.name]
+                for c in section_changes
+                if c.name in claim_provenance
+            ]
         )
         out.append(
             Finding(
@@ -403,7 +426,7 @@ def collect_findings(inputs: FindingInputs) -> List[Finding]:
                 decision_impact=(
                     "前回の確定をそのまま再利用できません。変更点を確認してから次に進んでください。"
                 ),
-                provenance="implementation_fact",
+                provenance=provenance,
                 dedupe_key=f"understanding_changed:{section}",
                 subject_key=f"section:{section}",
                 snapshot_id=snapshot_id,
@@ -533,6 +556,12 @@ def collect_findings(inputs: FindingInputs) -> List[Finding]:
     #    `never_received` is the setup state, not a regression, and is handled
     #    by the next action instead.
     if inputs.connectivity_freshness in ("delayed", "stale"):
+        onset = freshness_onset(
+            inputs.connectivity_freshness,
+            last_real_trace_at=inputs.last_real_trace_at,
+            delayed_after_seconds=inputs.delayed_after_seconds,
+            stale_after_seconds=inputs.stale_after_seconds,
+        )
         out.append(
             Finding(
                 kind="connectivity_lost",
@@ -550,8 +579,13 @@ def collect_findings(inputs: FindingInputs) -> List[Finding]:
                 dedupe_key="connectivity_lost",
                 subject_key="connectivity",
                 runtime_window_seconds=RUNTIME_WINDOW_SECONDS,
-                first_seen=inputs.last_real_trace_at,
-                last_updated=inputs.last_real_trace_at,
+                # The finding began when the threshold was CROSSED, not when
+                # the last trace arrived. Using the trace time made a system
+                # that went quiet after the developer's last confirmation read
+                # 「継続」 whenever its final trace predated that confirmation
+                # -- i.e. the newest problems looked like the oldest ones.
+                first_seen=onset,
+                last_updated=onset,
                 target=Target(route="/connect-sdk", label="SDK 接続を確認する"),
             )
         )
@@ -636,16 +670,70 @@ def _brief_claims(brief: Optional[Any]) -> List[Any]:
 
 
 def _claim_provenance(claim: Any) -> str:
-    """Map the Brief's own provenance axis onto the finding vocabulary.
+    """A claim's provenance, carried through unchanged.
 
-    The two sets deliberately differ: a finding can also come from a system
-    process or from the developer's own recorded decision, neither of which is
-    a claim about the target system.
+    `OverviewFindingProvenance` is a strict SUPERSET of the Brief's vocabulary
+    precisely so this is a pass-through. It used to fall back to
+    `ai_hypothesis` for anything it did not recognise, and since the Overview
+    set was missing `developer_intent`, a Vision the developer had written and
+    confirmed was displayed as the AI's guess -- the one confusion #381/#382
+    exist to prevent.
+
+    An unrecognised value now means the two vocabularies have drifted, which
+    is a contract bug rather than a claim about the system, so it reports
+    `mixed` (「複数の出所」) rather than naming a source that may be wrong.
+    `tests/test_interview_type_parity.py` is what keeps this unreachable.
     """
-    value = getattr(claim, "provenance", "ai_hypothesis")
+    value = getattr(claim, "provenance", None)
     if value in FINDING_PROVENANCES:
         return value
-    return "ai_hypothesis"
+    return "mixed"
+
+
+def aggregate_provenance(values: Sequence[str]) -> str:
+    """One provenance for a finding aggregated from several claims.
+
+    Finite and explicit (#382): one distinct source is that source, several
+    are `mixed`. Aggregation never picks a winner, because picking one implies
+    the others agreed with it.
+
+    An empty input means every changed claim was REMOVED, so none of them
+    exists in the current understanding to carry a provenance. A removal is
+    only observable by comparing two revisions the reviewer produced from the
+    code, so `implementation_fact` is the source of that observation -- stated
+    as a rule here rather than left as a silent default.
+    """
+    distinct = {value for value in values if value in FINDING_PROVENANCES}
+    if not distinct:
+        return "implementation_fact"
+    if len(distinct) == 1:
+        return next(iter(distinct))
+    return "mixed"
+
+
+def freshness_onset(
+    freshness: str,
+    *,
+    last_real_trace_at: Optional[float],
+    delayed_after_seconds: float,
+    stale_after_seconds: float,
+) -> Optional[float]:
+    """When the current reception state BEGAN.
+
+    `classify_connectivity_freshness` compares the age of the newest workload
+    trace against two thresholds, so the moment a system became `delayed` or
+    `stale` is exactly the moment that threshold was crossed -- the last trace
+    plus the threshold, not the last trace itself. The two differ by up to a
+    day at the default settings, which is more than enough to make a brand-new
+    outage report itself as pre-existing.
+    """
+    if last_real_trace_at is None:
+        return None
+    if freshness == "stale":
+        return last_real_trace_at + stale_after_seconds
+    if freshness == "delayed":
+        return last_real_trace_at + delayed_after_seconds
+    return last_real_trace_at
 
 
 def classify_status(
@@ -758,18 +846,71 @@ class NextActionFacts:
     repository_configured: bool = False
     latest_snapshot_status: Optional[str] = None
     ready_snapshot_exists: bool = False
-    #: `understanding_brief`'s verdict, reused verbatim.
+    #: `understanding_brief`'s verdict, reused verbatim. Only meaningful when
+    #: `brief_available` -- see the availability flags below.
     readiness_state: str = "not_built"
     #: `interview_workflow`'s canonical state, reused verbatim.
     workflow_state: str = "W0-A"
     interview_session_id: Optional[int] = None
     connectivity_state: str = "no_signal"
     connectivity_freshness: str = "never_received"
+    undecided_experiment: Optional["PendingExperiment"] = None
     undecided_experiment_count: int = 0
-    adopted_experiment_exists: bool = False
-    publish_job_succeeded: bool = False
+    pending_publish: Optional["PendingPublish"] = None
     completed_variant_run_exists: bool = False
     decided_experiment_exists: bool = False
+
+    # --- Availability of the canonical facts above --------------------------
+    #
+    # These exist because a fact that could not be READ is not the same fact as
+    # a step that has not been TAKEN, and the defaults above cannot express the
+    # difference. The first version substituted `not_built` for an unreadable
+    # Brief and `no_signal` / `never_received` for unreadable Runtime, so a
+    # failed section produced a confident, wrong CTA: 「システムを理解する」 for
+    # a system that was already understood, 「SDK を接続する」 for one that had
+    # been receiving traces for weeks. That is the same one-word-two-facts
+    # defect #366 spent an entire epic removing, and it is worse here because
+    # the wrong word is a call to action.
+    #
+    # An unavailable fact never falls back to a value; it removes every rule
+    # that reads it (`decide_next_action` fails closed).
+    brief_available: bool = True
+    runtime_available: bool = True
+    workflow_available: bool = True
+
+
+@dataclass(frozen=True)
+class PendingExperiment:
+    """A completed evaluation with no recorded human decision.
+
+    Carries the id so the CTA can deep-link to the exact row. A count alone
+    sends the developer to a list and makes them find it again.
+    """
+
+    experiment_id: int
+    count: int = 1
+    completed_at: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class PendingPublish:
+    """An applied patch with no completed publish job FOR THAT PATCH.
+
+    The identity is `probe_patches.id` -> `publish_jobs.patch_id`, which is the
+    only adopt-to-publish lineage this system actually persists. The first
+    version asked two independent System-wide existence questions ("is there an
+    adopted experiment" and "has any publish job ever succeeded"), so the first
+    successful publish made every later change look published forever.
+
+    An adopted Experiment deliberately does NOT feed this: `experiments` has no
+    reference to a patch or a publish job, and `publish_jobs` publishes
+    instrumentation patches from probe plans. Inventing a link would be a
+    guess, and a column nothing writes would leave the CTA permanently stuck.
+    """
+
+    patch_id: int
+    count: int = 1
+    applied_at: Optional[float] = None
 
 
 def decide_next_action(
@@ -786,11 +927,23 @@ def decide_next_action(
     `waiting` is not the absence of a rule -- it is the rule for "the system
     is working and there is nothing for you to press". It carries no action on
     purpose (#383: 実行不能な操作をdisabledで常設しない).
+
+    `unavailable` is the other no-action state and is NOT the same thing: the
+    system is not working on anything, we simply could not read the facts a
+    rule needs. Rows are skipped rather than evaluated against a default, and
+    if a skipped row could have been the answer the whole table returns
+    `unavailable` (#383: API部分失敗時は推測でCTAを出さず、安全なdegraded状態に
+    する).
     """
     interview_params = (
         {"session": str(facts.interview_session_id)}
         if facts.interview_session_id
         else {}
+    )
+    unavailable = (
+        None,
+        "unavailable",
+        "現在の状態を判定できなかったため、次の操作を提示できません。推測での案内は行いません。",
     )
 
     # 1: no repository. Nothing downstream can be evaluated without one.
@@ -840,6 +993,13 @@ def decide_next_action(
             "available",
             "",
         )
+
+    # Rows 3-7 all read the Brief's readiness verdict or the interview
+    # workflow state. If either could not be read, none of them may be
+    # evaluated -- and because one of them could have been the answer, the
+    # table cannot fall through to a later row either.
+    if not facts.brief_available or not facts.workflow_available:
+        return unavailable
 
     # 3: the system is building or updating the understanding.
     if facts.readiness_state == "building" or facts.workflow_state == "W1":
@@ -937,6 +1097,14 @@ def decide_next_action(
             "",
         )
 
+    # Rows 8-10 read the connectivity axes. Same rule: an unreadable Runtime
+    # section must not become 「まだ接続していません」. Rows 1-7 above have
+    # already been evaluated against facts that WERE readable, so reaching
+    # here means none of them matched -- and a later row cannot be promoted
+    # over a skipped one.
+    if not facts.runtime_available:
+        return unavailable
+
     # 8: understanding settled, nothing has ever arrived from the SDK.
     if facts.connectivity_state == "no_signal":
         return (
@@ -990,16 +1158,23 @@ def decide_next_action(
             "",
         )
 
-    # 11: an evaluation finished and is waiting on the human gate.
-    if facts.undecided_experiment_count > 0:
+    # 11: an evaluation finished and is waiting on the human gate. The CTA
+    #     carries the specific Experiment, so the developer lands on the row
+    #     rather than on a list they have to search.
+    if facts.undecided_experiment is not None:
+        pending = facts.undecided_experiment
         return (
             OverviewAction(
                 key="record_experiment_decision",
                 label="採否を記録する",
-                reason=f"評価が完了した候補が {facts.undecided_experiment_count} 件、未決定のまま残っています。",
+                reason=f"評価が完了した候補が {pending.count} 件、未決定のまま残っています。",
                 completion_condition="採用・不採用・追加データ必要のいずれかを記録すること。",
                 value="採用した場合は公開へ、そうでない場合は次の候補へ進めます。",
-                target=Target(route="/experiments", label="Experiments を開く"),
+                target=Target(
+                    route="/experiments",
+                    label="Experiments を開く",
+                    params={"experiment": str(pending.experiment_id)},
+                ),
                 rule_row=11,
                 source_state_ids=("proposal.experiments.undecided",),
             ),
@@ -1007,18 +1182,29 @@ def decide_next_action(
             "",
         )
 
-    # 12: adopted but never published.
-    if facts.adopted_experiment_exists and not facts.publish_job_succeeded:
+    # 12: an applied patch this System has not published. The identity is the
+    #     patch, not the System: "some publish job once succeeded" made every
+    #     later change look published forever.
+    if facts.pending_publish is not None:
+        pending_publish = facts.pending_publish
         return (
             OverviewAction(
                 key="publish_change",
                 label="公開へ進む",
-                reason="採用済みの変更があり、まだ公開されていません。",
-                completion_condition="Pull Request が作成されること（merge はあなたが行います）。",
+                reason=(
+                    f"適用済みで未公開の変更が {pending_publish.count} 件あります。"
+                ),
+                completion_condition=(
+                    "この変更の Pull Request が作成されること（merge はあなたが行います）。"
+                ),
                 value="レビュー可能な形で変更が出て、この改善サイクルが閉じます。",
-                target=Target(route="/github", label="GitHub 連携を開く"),
+                target=Target(
+                    route="/github",
+                    label="GitHub 連携を開く",
+                    params={"patch": str(pending_publish.patch_id)},
+                ),
                 rule_row=12,
-                source_state_ids=("publish.jobs.none",),
+                source_state_ids=("publish.patches.unpublished",),
             ),
             "available",
             "",
@@ -1134,8 +1320,12 @@ class RuntimeHealth:
     partial_count: int = 0
     unreplayable_count: int = 0
     not_captured_count: int = 0
-    observed_capability_count: int = 0
+    observed_component_count: int = 0
+    known_component_count: int = 0
     core_capability_count: int = 0
+    capability_coverage_state: str = "not_computed"
+    observed_capability_count: Optional[int] = None
+    unmapped_component_count: Optional[int] = None
 
 
 # --- §5. Assembly -------------------------------------------------------------
@@ -1150,6 +1340,9 @@ class OverviewResult:
     snapshot_id: Optional[int] = None
     snapshot_commit_sha: Optional[str] = None
     latest_ready_snapshot_id: Optional[int] = None
+    snapshot_freshness: str = "unavailable"
+    understanding_revision_id: Optional[int] = None
+    understanding_confirmed_at: Optional[float] = None
     findings: List[Finding] = field(default_factory=list)
     finding_statuses: List[str] = field(default_factory=list)
     findings_initial_count: int = 0
@@ -1164,6 +1357,44 @@ class OverviewResult:
     runtime: Optional[RuntimeHealth] = None
     degraded_sections: List[str] = field(default_factory=list)
     degraded_detail: Dict[str, str] = field(default_factory=dict)
+
+
+def resolve_pending_publish(conn, system_id: int) -> Optional[PendingPublish]:
+    """An applied patch this System has not published, or None.
+
+    The identity is `probe_patches.id` -> `publish_jobs.patch_id`, which is the
+    only adopt-to-publish lineage this schema actually persists. Three
+    properties matter and each was wrong in the first version:
+
+    * **Per patch, not per System.** "Has any publish job ever succeeded" made
+      the first success cover every later change forever.
+    * **Only `completed` counts.** `failed` / `cancelled` / `retryable_failed`
+      are not publications, so a patch whose job failed is still pending.
+    * **System-scoped on both sides.** The join is constrained to this
+      System's jobs as well as its patches.
+
+    Ordered newest-applied first with `id` as a total tiebreak, so the CTA
+    points at the same patch on every request.
+    """
+    rows = conn.execute(
+        """SELECT p.id AS id, p.applied_at AS applied_at
+             FROM probe_patches p
+            WHERE p.system_id = ?
+              AND p.apply_status = 'applied'
+              AND NOT EXISTS (
+                  SELECT 1 FROM publish_jobs j
+                   WHERE j.patch_id = p.id
+                     AND j.system_id = p.system_id
+                     AND j.status = 'completed'
+              )
+            ORDER BY p.applied_at DESC, p.id DESC""",
+        (system_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    return PendingPublish(
+        patch_id=rows[0]["id"], count=len(rows), applied_at=rows[0]["applied_at"]
+    )
 
 
 def _latest_interview_session_id(conn, system_id: int) -> Optional[int]:
@@ -1286,8 +1517,18 @@ def _runtime_health(
         partial_count=counts.partial,
         unreplayable_count=counts.unreplayable,
         not_captured_count=counts.not_captured,
-        observed_capability_count=(observed["n"] or 0) if observed else 0,
+        observed_component_count=(observed["n"] or 0) if observed else 0,
+        known_component_count=sum(mode_counts.values()),
         core_capability_count=capability_count,
+        # Capability coverage is NOT derivable today: a trace carries a
+        # `component_id` and nothing persists a component -> Core Capability
+        # mapping. The first version divided one by the other anyway, which is
+        # a ratio between two different entities and could exceed 100% as soon
+        # as one Capability had two components. Saying 「算出できません」 is the
+        # honest reading; approximating it is the #366 defect in a new place.
+        capability_coverage_state="not_computed",
+        observed_capability_count=None,
+        unmapped_component_count=None,
     )
 
 
@@ -1344,6 +1585,19 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
             ).fetchone()
             result.snapshot_commit_sha = row["commit_sha"] if row else None
 
+        # Decided here, never by the Dashboard comparing two ids. Same rule as
+        # #369: one definition of 「最新か」, on the server. `unavailable` is a
+        # real third value -- with no pinned snapshot or no ready snapshot to
+        # compare against, "behind" is not a fact we have.
+        if result.snapshot_id is None or result.latest_ready_snapshot_id is None:
+            result.snapshot_freshness = "unavailable"
+        elif result.snapshot_id == result.latest_ready_snapshot_id:
+            result.snapshot_freshness = "current"
+        else:
+            result.snapshot_freshness = "stale"
+        result.understanding_revision_id = getattr(brief, "revision_id", None)
+        result.understanding_confirmed_at = getattr(brief, "confirmed_at", None)
+
         # The interview workflow's canonical engine is reused, but only its
         # PURE half. `evaluate_session_workflow` persists the workflow
         # checkpoint and can open a backward request -- progress facts that
@@ -1388,10 +1642,7 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 ORDER BY completed_at DESC, id DESC""",
             (system_id,),
         ).fetchall()
-        adopted = conn.execute(
-            "SELECT id FROM experiments WHERE system_id = ? AND human_decision = 'adopted' LIMIT 1",
-            (system_id,),
-        ).fetchone()
+        pending_publish = resolve_pending_publish(conn, system_id)
         variants = conn.execute(
             """SELECT COUNT(*) AS n, MAX(completed_at) AS last_at FROM replay_variants
                 WHERE system_id = ? AND status = 'completed' AND is_baseline = 0""",
@@ -1428,6 +1679,10 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
 
         if "next_action" not in result.degraded_sections:
             config = state_facts.get_repository_config(conn, system_id)
+            # Availability is passed alongside each fact rather than folded
+            # into it. A section that failed to load leaves its defaults in
+            # place, and the flag is what stops any rule from reading them --
+            # so an unreadable Brief can never be mistaken for 「未構築」.
             action_facts = NextActionFacts(
                 repository_configured=config is not None and bool(config["repo_path"]),
                 latest_snapshot_status=latest_snapshot_status,
@@ -1443,15 +1698,24 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 connectivity_freshness=(
                     result.runtime.freshness if result.runtime else "never_received"
                 ),
-                undecided_experiment_count=len(undecided),
-                adopted_experiment_exists=adopted is not None,
-                publish_job_succeeded=state_facts.has_succeeded_publish_job(
-                    conn, system_id
+                undecided_experiment=(
+                    PendingExperiment(
+                        experiment_id=undecided[0]["id"],
+                        count=len(undecided),
+                        completed_at=undecided[0]["completed_at"],
+                    )
+                    if undecided
+                    else None
                 ),
+                undecided_experiment_count=len(undecided),
+                pending_publish=pending_publish,
                 completed_variant_run_exists=bool(variants and (variants["n"] or 0) > 0),
                 decided_experiment_exists=state_facts.has_decided_experiment(
                     conn, system_id
                 ),
+                brief_available=brief is not None,
+                runtime_available=result.runtime is not None,
+                workflow_available=gathered is not None,
             )
             action, state, message = decide_next_action(action_facts)
             result.next_action = _attach_finding_sources(action, result.findings)
@@ -1461,6 +1725,7 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
             result.next_action_state = "unavailable"
             result.next_action_message = (
                 "現在の状態を判定できなかったため、次の操作を提示できません。"
+                "推測での案内は行いません。"
             )
 
     return result
@@ -1546,6 +1811,16 @@ def _findings(
         runtime_checks=tuple(runtime_checks),
         connectivity_freshness=(runtime.freshness if runtime else "never_received"),
         last_real_trace_at=(runtime.last_real_trace_at if runtime else None),
+        delayed_after_seconds=(
+            runtime.delayed_after_seconds
+            if runtime
+            else state_facts.DEFAULT_DELAYED_AFTER_SECONDS
+        ),
+        stale_after_seconds=(
+            runtime.stale_after_seconds
+            if runtime
+            else state_facts.DEFAULT_STALE_AFTER_SECONDS
+        ),
         undecided_experiment_count=len(undecided),
         undecided_experiment_at=(undecided[0]["completed_at"] if undecided else None),
         undecided_experiment_id=(undecided[0]["id"] if undecided else None),

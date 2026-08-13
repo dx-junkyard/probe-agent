@@ -1095,6 +1095,47 @@ creating incomplete persistence or execution paths for later phases.
       rebuild renumbers `alignment_item` and `understanding_revision` rows
       while describing the same finding; an id that changed every rebuild
       would make every finding permanently `new` and `ongoing` unreachable.
+    - **An unreadable fact is never a fact's default value.** `NextActionFacts`
+      carries `brief_available` / `runtime_available` / `workflow_available`,
+      and a false flag REMOVES every rule that reads it rather than letting the
+      default stand. Substituting `not_built` for an unreadable Brief and
+      `no_signal` / `never_received` for unreadable Runtime told an already
+      understood system to 「システムを理解する」 and a receiving one to
+      「SDK を接続する」 — the #366 one-word-two-facts defect, with a call to
+      action as the wrong word. Fail-closed is not fail-blank: rows 1-2 read
+      repository/snapshot only and still answer when everything later is
+      unreadable.
+    - **`OverviewFindingProvenance` is a strict SUPERSET of the Brief's
+      vocabulary**, so a claim's provenance carries into a finding unchanged.
+      The first version omitted `developer_intent` and collapsed it to
+      `ai_hypothesis`, displaying a Vision the developer wrote and confirmed as
+      the AI's guess. `developer_intent` (what they said they wanted) and
+      `developer_decision` (a record of their judgement) stay distinct; an
+      aggregation whose sources disagree is `mixed`, because naming one implies
+      the others agreed.
+    - **Row 12's identity is the patch** (`probe_patches.id` →
+      `publish_jobs.patch_id`, `completed` only, System-scoped on both sides).
+      Two System-wide existence checks — "an adopted experiment exists" and
+      "a publish job once succeeded" — made the first successful publish cover
+      every later change forever. An adopted Experiment deliberately does NOT
+      feed this row: `experiments` references neither a patch nor a publish
+      job, and `publish_jobs` publishes probe-plan instrumentation patches, so
+      inventing the link would leave a CTA nothing could ever clear.
+    - **A finding is dated from when its state BEGAN.** A `connectivity_lost`
+      finding's `first_seen` is the threshold crossing
+      (`last_real_trace_at + delayed/stale_after_seconds`), not the last trace:
+      at the default thresholds those differ by up to a day, so a brand-new
+      outage reported itself as pre-existing.
+    - **The Overview follows the clock.** It refetches at the next freshness
+      boundary (computed from the server's elapsed seconds and thresholds, so
+      the browser clock is only ever used for a duration) and at a stated 5
+      minute ceiling otherwise. The ceiling IS the maximum detection lag for a
+      system going quiet, and it is written down rather than implied.
+    - **`observed_component_count` and `known_component_count` are both
+      components.** Capability-level coverage is `not_computed` and says so:
+      nothing persists a component → Capability mapping, so a ratio between the
+      two is a division across entities whose numerator can exceed its
+      denominator.
     - **「前回」 is the developer's own 理解の確認**
       (`understanding_confirmed_at`), a persisted human decision. Without one
       the status is `not_compared` — never 「新しい発見がない」. The three
@@ -1133,6 +1174,13 @@ creating incomplete persistence or execution paths for later phases.
       DISPLAY and never substitutes a guessed value. 「取得できませんでした」,
       「発見がありません」 and 「受信が止まっています」 are different
       sentences.
+    - **Snapshot / commit / snapshot freshness / understanding revision / last
+      confirmation are first-view context**, not a disclosure: they qualify
+      every claim, finding and CTA on the page. `snapshot_freshness` is the
+      server's verdict — the Dashboard never compares two snapshot ids itself
+      (#369's rule). `CardTitle` gained an `as` prop so the Overview's cards
+      are real `h2`s and the outline is `h1 → h2 → h3`; other screens' heading
+      structure is unchanged.
     - The Overview's Get Started ordered list (#212/#259/#267) and its
       per-step completion tests are **deleted**. The onboarding path lives on
       the Setup Guide (`components/setup-next-step.ts`, #374). Do not

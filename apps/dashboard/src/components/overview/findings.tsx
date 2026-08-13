@@ -112,7 +112,7 @@ export function FindingsCard({ overview }: { overview: OverviewOut }) {
   return (
     <Card data-testid="overview-findings">
       <CardHeader>
-        <CardTitle className="text-base">今わかったこと</CardTitle>
+        <CardTitle as="h2" className="text-base">今わかったこと</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {overview.findings.length === 0 ? (

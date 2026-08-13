@@ -7674,15 +7674,33 @@ OverviewFindingSeverity = Literal[
 #: different statements and must never render the same (#382).
 OverviewFindingStatus = Literal["new", "ongoing", "not_compared"]
 
-#: Where the finding's content came from. Same separation the Brief keeps
-#: between AI interpretation, implementation fact, runtime observation and
-#: human judgement, plus the system's own process records.
+#: Where the finding's content came from.
+#:
+#: The first four values are `UnderstandingProvenanceKind` VERBATIM, so a
+#: claim's provenance carries into a finding about it without translation.
+#: The first version of this set omitted `developer_intent`, and the mapping
+#: collapsed it to `ai_hypothesis` — which displayed a Vision the developer
+#: had written and confirmed as the AI's guess. That is the exact confusion
+#: #381/#382 exist to prevent, so the two vocabularies now overlap by
+#: construction rather than by a lossy map.
+#:
+#: The last three are finding-only, and each says something no claim can:
+#:
+#: * `developer_decision` — a record of the human's JUDGEMENT (adopt, confirm,
+#:   defer), as opposed to `developer_intent` which is what they said they
+#:   wanted. Deciding "reject this candidate" is not a statement of intent.
+#: * `system_process` — a fact about probe-agent's own run records, not about
+#:   the target system at all.
+#: * `mixed` — an aggregated finding whose sources genuinely disagree. It
+#:   exists so aggregation never has to pick one and imply the others agreed.
 OverviewFindingProvenance = Literal[
-    "ai_hypothesis",
+    "developer_intent",
     "implementation_fact",
     "runtime_observation",
+    "ai_hypothesis",
     "developer_decision",
     "system_process",
+    "mixed",
 ]
 
 #: The findings section as a whole. `unavailable` means the extraction itself
@@ -7718,6 +7736,20 @@ OverviewActionKey = Literal[
 #: action at all — a disabled catalogue of operations is explicitly forbidden
 #: (#383).
 OverviewActionState = Literal["available", "waiting", "complete", "unavailable"]
+
+#: Whether the pinned understanding is reading the repository's current head.
+#: Server-decided: the Dashboard must not compare snapshot ids itself, for the
+#: same reason #369 moved the Snapshot verdict server-side — two definitions of
+#: "current" drift. `unavailable` is a third value on purpose: an unreadable
+#: head is not evidence that the snapshot is behind.
+OverviewSnapshotFreshness = Literal["current", "stale", "unavailable"]
+
+#: Whether Capability-level observation coverage could be computed at all.
+#: `not_computed` is the honest value today: Trace rows carry a
+#: `component_id`, and no canonical component -> Core Capability mapping is
+#: persisted, so a "coverage" built from the two would be a ratio between
+#: different entities (and could exceed 100%). See `OverviewRuntimeHealthOut`.
+OverviewCoverageState = Literal["computed", "not_computed"]
 
 #: The improvement loop's six stages, in order. These are the existing
 #: `system_state.PHASE_ORDER` values under their developer-facing names — the
@@ -7844,9 +7876,21 @@ class OverviewRuntimeHealthOut(BaseModel):
     partial_count: int = 0
     unreplayable_count: int = 0
     not_captured_count: int = 0
-    #: Observation coverage over the Brief's Core Capabilities.
-    observed_capability_count: int = 0
+    #: DISTINCT components that produced a trace in the window. Named for
+    #: what it counts. It was previously called `observed_capability_count`
+    #: and rendered next to `core_capability_count` as if the two formed a
+    #: coverage ratio — they are different entities, and the numerator could
+    #: exceed the denominator whenever one Capability had several components.
+    observed_component_count: int = 0
+    #: All components known to this System, so the count above has a
+    #: denominator of its OWN entity.
+    known_component_count: int = 0
     core_capability_count: int = 0
+    #: Capability-level coverage is not computed today (no persisted
+    #: component -> Capability mapping). Stated rather than approximated.
+    capability_coverage_state: OverviewCoverageState = "not_computed"
+    observed_capability_count: Optional[int] = None
+    unmapped_component_count: Optional[int] = None
 
 
 class OverviewOut(BaseModel):
@@ -7861,6 +7905,14 @@ class OverviewOut(BaseModel):
     snapshot_commit_sha: Optional[str] = None
     #: The System's newest ready snapshot, for 「この理解はどの断面か」.
     latest_ready_snapshot_id: Optional[int] = None
+    #: Server-decided (never a client id comparison). See
+    #: `OverviewSnapshotFreshness`.
+    snapshot_freshness: OverviewSnapshotFreshness = "unavailable"
+    #: The Understanding revision the Brief was built from, and when the
+    #: developer last confirmed one -- both part of the first-view context, so
+    #: 「どの断面のどの版の理解か」 is answerable without opening a disclosure.
+    understanding_revision_id: Optional[int] = None
+    understanding_confirmed_at: Optional[float] = None
     findings: List[OverviewFindingOut] = []
     #: How many findings the initial view shows (cap 3, never a pad).
     findings_initial_count: int = 0

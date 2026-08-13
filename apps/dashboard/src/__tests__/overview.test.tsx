@@ -106,6 +106,9 @@ function overview(overrides: Partial<OverviewOut> = {}): OverviewOut {
     snapshot_id: 42,
     snapshot_commit_sha: "abcdef1234",
     latest_ready_snapshot_id: 42,
+    snapshot_freshness: "current",
+    understanding_revision_id: 3,
+    understanding_confirmed_at: 100,
     findings: [],
     findings_initial_count: 0,
     findings_state: "no_findings",
@@ -488,8 +491,12 @@ describe("Runtime health (Issue #384)", () => {
     partial_count: 1,
     unreplayable_count: 0,
     not_captured_count: 3,
-    observed_capability_count: 2,
+    observed_component_count: 2,
+    known_component_count: 7,
     core_capability_count: 4,
+    capability_coverage_state: "not_computed" as const,
+    observed_capability_count: null,
+    unmapped_component_count: null,
   };
 
   test("the headline is the live workload freshness, not the cumulative milestone", () => {
@@ -545,6 +552,139 @@ describe("Runtime health (Issue #384)", () => {
     expect(screen.getByTestId("overview-runtime-unavailable")).toHaveTextContent(
       "受信が止まっているという意味ではありません",
     );
+  });
+});
+
+// ── review follow-ups: provenance / coverage / headings ───────────────
+
+describe("Provenance is rendered as the server reports it (Issue #382)", () => {
+  test("a developer-authored claim is not shown as an AI hypothesis", () => {
+    wrap(
+      <FindingsCard
+        overview={overview({
+          findings: [
+            finding({
+              id: "p",
+              provenance: "developer_intent",
+              provenance_label: "開発者が明示した意図",
+            }),
+          ],
+          findings_initial_count: 1,
+          findings_state: "has_findings",
+        })}
+      />,
+    );
+    const row = screen.getByTestId("overview-finding");
+    expect(within(row).getByText(/開発者が明示した意図/)).toBeInTheDocument();
+    expect(within(row).queryByText(/AI の解釈/)).not.toBeInTheDocument();
+  });
+
+  test("a mixed-source aggregation says so rather than naming one source", () => {
+    wrap(
+      <FindingsCard
+        overview={overview({
+          findings: [finding({ id: "m", provenance: "mixed", provenance_label: "複数の出所" })],
+          findings_initial_count: 1,
+          findings_state: "has_findings",
+        })}
+      />,
+    );
+    expect(within(screen.getByTestId("overview-finding")).getByText(/複数の出所/))
+      .toBeInTheDocument();
+  });
+});
+
+describe("Runtime coverage entity (Issue #384)", () => {
+  const base = {
+    state: "receiving" as const,
+    freshness: "receiving_now" as const,
+    freshness_label: "受信中",
+    transport_freshness: "receiving_now" as const,
+    last_real_trace_at: 1000,
+    seconds_since_last_trace: 10,
+    last_trace_at: 1000,
+    seconds_since_last_any_trace: 10,
+    evaluated_at: 1010,
+    real_trace_count_5m: 1,
+    real_trace_count_1h: 1,
+    real_trace_count_24h: 1,
+    delayed_after_seconds: 900,
+    stale_after_seconds: 86400,
+    component_count: 7,
+    total_trace_count: 10,
+    mode_counts: { trace: 7 },
+    window_seconds: 86400,
+    error_count: 0,
+    runtime_mismatch_count: 0,
+    replayable_count: 0,
+    partial_count: 0,
+    unreplayable_count: 0,
+    not_captured_count: 0,
+    observed_component_count: 5,
+    known_component_count: 7,
+    core_capability_count: 3,
+    capability_coverage_state: "not_computed" as const,
+    observed_capability_count: null,
+    unmapped_component_count: null,
+  };
+
+  test("component observation is shown against a component denominator", () => {
+    wrap(<RuntimeHealthCard overview={overview({ runtime: base })} />);
+    const quality = screen.getByTestId("overview-runtime-quality");
+    // Both sides of the ratio are components. Pairing 5 components with 3
+    // Capabilities produced a "coverage" that could exceed 100%.
+    expect(within(quality).getByText("5 / 7")).toBeInTheDocument();
+  });
+
+  test("Capability coverage says it is not computed rather than approximating", () => {
+    wrap(<RuntimeHealthCard overview={overview({ runtime: base })} />);
+    expect(screen.getByTestId("overview-runtime-coverage-unavailable")).toHaveTextContent(
+      "算出していません",
+    );
+    expect(screen.queryByTestId("overview-runtime-coverage")).not.toBeInTheDocument();
+  });
+
+  test("a real Capability coverage renders numerator, denominator and unmapped", () => {
+    wrap(
+      <RuntimeHealthCard
+        overview={overview({
+          runtime: {
+            ...base,
+            capability_coverage_state: "computed",
+            observed_capability_count: 2,
+            unmapped_component_count: 1,
+          },
+        })}
+      />,
+    );
+    const line = screen.getByTestId("overview-runtime-coverage");
+    expect(line).toHaveTextContent("2 / 3");
+    expect(line).toHaveTextContent("対応不明の component 1 件");
+  });
+});
+
+describe("Heading hierarchy (Issue #384)", () => {
+  test("each Overview section is a real h2", () => {
+    const { unmount } = wrap(
+      <SystemBriefCard interviewHref="/interview" overview={overview()} />,
+    );
+    expect(screen.getByRole("heading", { level: 2, name: "System Brief" })).toBeInTheDocument();
+    // The Brief's own sections sit one level below it, so the outline is
+    // h1 → h2 → h3 rather than h1 → h3.
+    expect(screen.getByRole("heading", { level: 3, name: /^Vision —/ })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 3, name: /System Purpose/ })).toBeInTheDocument();
+    unmount();
+
+    const second = wrap(<FindingsCard overview={overview()} />);
+    expect(screen.getByRole("heading", { level: 2, name: "今わかったこと" })).toBeInTheDocument();
+    second.unmount();
+
+    const third = wrap(<NextActionCard overview={overview()} />);
+    expect(screen.getByRole("heading", { level: 2, name: "次にすること" })).toBeInTheDocument();
+    third.unmount();
+
+    wrap(<RuntimeHealthCard overview={overview({ runtime: null, degraded_sections: ["runtime"] })} />);
+    expect(screen.getByRole("heading", { level: 2, name: "Runtime health" })).toBeInTheDocument();
   });
 });
 

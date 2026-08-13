@@ -28,7 +28,7 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
     return (
       <Card data-testid="overview-runtime-unavailable">
         <CardHeader>
-          <CardTitle className="text-base">Runtime health</CardTitle>
+          <CardTitle as="h2" className="text-base">Runtime health</CardTitle>
         </CardHeader>
         <CardContent className="text-sm text-muted-foreground">
           実行時の状態を取得できませんでした。受信が止まっているという意味ではありません。
@@ -45,7 +45,7 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
   return (
     <Card data-testid="overview-runtime">
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
-        <CardTitle className="text-base">Runtime health</CardTitle>
+        <CardTitle as="h2" className="text-base">Runtime health</CardTitle>
         <Badge
           variant={FRESHNESS_VARIANTS[runtime.freshness]}
           data-testid="overview-runtime-freshness"
@@ -118,13 +118,29 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
           </div>
           <div className="flex justify-between">
             <dt className="text-muted-foreground">観測済み component</dt>
-            <dd>{runtime.observed_capability_count}</dd>
-          </div>
-          <div className="flex justify-between">
-            <dt className="text-muted-foreground">主要機能</dt>
-            <dd>{runtime.core_capability_count}</dd>
+            {/* Both numbers are components. Putting this next to 主要機能 read
+                as a coverage ratio between two different entities, and the
+                numerator could exceed the denominator whenever one Capability
+                had several components (#384). */}
+            <dd>
+              {runtime.observed_component_count} / {runtime.known_component_count}
+            </dd>
           </div>
         </dl>
+        {runtime.capability_coverage_state === "not_computed" ? (
+          <p className="text-[11px] text-muted-foreground" data-testid="overview-runtime-coverage-unavailable">
+            主要機能ごとの観測カバレッジは算出していません。component と Capability
+            の対応が保存されていないため、比率を出すと別の単位どうしの割り算になります。
+          </p>
+        ) : (
+          <p className="text-[11px] text-muted-foreground" data-testid="overview-runtime-coverage">
+            観測済みの主要機能: {runtime.observed_capability_count} /{" "}
+            {runtime.core_capability_count}
+            {runtime.unmapped_component_count != null &&
+              runtime.unmapped_component_count > 0 &&
+              `（対応不明の component ${runtime.unmapped_component_count} 件は未観測に数えていません）`}
+          </p>
+        )}
         <p className="text-[11px] text-muted-foreground">
           error / 不一致 / replay の件数は直近 {windowHours} 時間の実 workload trace
           についてのものです。判定閾値は {formatDuration(runtime.delayed_after_seconds)}

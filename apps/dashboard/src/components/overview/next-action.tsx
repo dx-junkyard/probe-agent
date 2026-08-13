@@ -22,7 +22,7 @@ export function NextActionCard({ overview }: { overview: OverviewOut }) {
   return (
     <Card data-testid="overview-next-action" data-action-state={overview.next_action_state}>
       <CardHeader>
-        <CardTitle className="text-base">次にすること</CardTitle>
+        <CardTitle as="h2" className="text-base">次にすること</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {action ? (
@@ -82,7 +82,7 @@ export function LoopRailCard({ overview }: { overview: OverviewOut }) {
     return (
       <Card data-testid="overview-loop-unavailable">
         <CardHeader>
-          <CardTitle className="text-base">改善ループの現在地</CardTitle>
+          <CardTitle as="h2" className="text-base">改善ループの現在地</CardTitle>
         </CardHeader>
         <CardContent className="text-sm text-muted-foreground">
           現在地を取得できませんでした。
@@ -96,7 +96,7 @@ export function LoopRailCard({ overview }: { overview: OverviewOut }) {
   return (
     <Card data-testid="overview-loop">
       <CardHeader>
-        <CardTitle className="text-base">改善ループの現在地</CardTitle>
+        <CardTitle as="h2" className="text-base">改善ループの現在地</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {/* An ordered list, so the reading order and the semantic order are the
