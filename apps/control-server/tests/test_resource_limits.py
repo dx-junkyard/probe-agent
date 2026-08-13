@@ -70,6 +70,17 @@ def test_in_memory_limit_keys_include_database_identity(tmp_path, monkeypatch):
 
 def test_trace_rate_limit_is_per_legacy_token(legacy_client, monkeypatch):
     monkeypatch.setenv("CONTROL_TRACE_RATE_LIMIT_PER_SECOND", "2")
+    # Pin the limiter's clock. The trace limiter is a 1-SECOND fixed window
+    # keyed on `int(clock() // 1)`, so on a slow or loaded runner the third
+    # request can land in the next window and be legitimately allowed -- the
+    # assertion below would then fail while the limiter was working correctly.
+    # `FixedWindowLimiter` exposes the clock precisely so a test can decide
+    # which window it is testing; this one is about the per-token count within
+    # ONE window, not about when the window rolls over.
+    from app import resource_limits
+
+    monkeypatch.setattr(resource_limits._trace_limiter, "_clock", lambda: 1_000.0)
+
     first = legacy_client.post(
         "/traces", json=_trace("rate-1"), headers={"X-Api-Key": "legacy-a"}
     )
