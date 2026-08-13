@@ -3354,3 +3354,24 @@ export function useInterviewSessionStatusAudit(sessionId: number | null) {
     enabled: !!sessionId && !!getSystemId(),
   });
 }
+
+// --- Overview / System Intelligence Brief (Issues #380-#384) ----------------
+//
+// One query for the whole Overview. It is deliberately NOT assembled from the
+// Brief / workflow-state / connectivity / system-state queries on the client:
+// the Overview's job is to say what is settled and what to do next, and a CTA
+// stitched together from four independently-refetching caches can contradict
+// itself between two renders. The server composes it once (#380 principle 6).
+
+export function useOverview() {
+  return useQuery({
+    queryKey: sysKey("overview"),
+    queryFn: () => api.get<import("@/api/types").OverviewOut>("/overview"),
+    enabled: !!getSystemId(),
+    // Poll only while something is actually running, so 「作成しています」
+    // clears by itself. Nothing invalidates this query when a background
+    // build finishes on its own.
+    refetchInterval: (query) =>
+      query.state.data?.next_action_state === "waiting" ? 3000 : false,
+  });
+}

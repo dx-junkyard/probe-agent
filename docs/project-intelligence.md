@@ -6196,3 +6196,147 @@ sticky を Grid の直接の子である右カラム自身へ移すと、contain
 `work-surface-W3` 上端 470px / `W2` の主操作 495px、理解マップの先頭・中央・
 末尾いずれでも詳細ペインと「修正するには」が可視、390 × 844 で横スクロール
 無しを確認している。Playwright はリポジトリの依存には入れていない。
+
+## Overview を意思決定コックピットへ再設計(Epic #380, sub #381-#384)
+
+### 何が問題だったか
+
+Overview は Component 数 / Trace 総数 / 最終受信日時 / mode 内訳の 4 枚の
+metric card と Component 一覧が主情報で、Component が 0 件のときだけ
+Get Started の順序リストを出していた。
+
+これは MVP の「接続できたか、データがあるか」には十分だが、初見の印象が
+「内部 Component を監視する管理画面」で止まり、System Understanding →
+Runtime observation → safe improvement decision という製品の Vision が
+見えない。Component 一覧は Components / Traces 画面と役割が重複しており、
+Overview 固有の責務が曖昧だった。
+
+Epic の North Star は「開いた瞬間に、このシステムについて前回より賢くなり、
+根拠を理解したうえで次の一手を実行したくなる」。10 秒以内に 5 問
+(何のためのシステムか / AI はどう理解しているか / 前回から何が変わったか /
+いま注意すべきことは何か / 次の 1 操作は何か)に答えられる状態を目標とする。
+
+### 何を作ったか
+
+`app/overview_projection.py` + `routes/overview.py` の `GET /overview` が
+唯一の判断元。5 領域を**合成する**だけで、新しい理解モデルは 1 つも作らない。
+
+| 領域 | 再利用した正本 |
+| --- | --- |
+| System Brief / Decision Readiness | `understanding_brief.build_understanding_brief`(#351-#354) |
+| Interview の位置 | `interview_workflow` の純粋関数(#349) |
+| 改善ループの現在地 | `system_state.derive_user_phase`(#237/#256) |
+| Runtime の 2 軸 | `state_facts` の `state` / `freshness`(#370) |
+| replayability の内訳 | `replay_readiness.count_replayability`(#372) |
+
+画面順・rule table・finding 契約の詳細は
+`docs/system-understanding-navigation.md` の「Overview: System Intelligence
+Brief / 意思決定コックピット」節が正本。ここでは、後から変えるときに
+壊してはいけない判断だけを残す。
+
+### 後から変えるときに守ること
+
+**`evaluate_session_workflow` を呼ばない。** これは workflow checkpoint を
+永続化し、戻り要求を作る。Overview を眺めただけで Interview の進捗事実が
+書き込まれるのは、#382 の「暗黙の page view を人間判断として保存しない」に
+真っ向から反する。必要なのは候補状態だけなので、`gather_facts` +
+`evaluate_candidate_state`(どちらも純粋)を使う。Overview は何も書かない。
+
+**Brief を読むセッションは「その System の最新セッション」。** Interview 画面
+の自動選択と同じ `ORDER BY id DESC` である。別の規則にすると、Overview の
+Brief と Interview の Brief が違うセッションを指し、同じシステムについて
+2 つの理解が並ぶ。deep link もこのセッションに着地する。
+
+**finding の id は原因から導出する。** 行 id を使うと、理解を作り直すたびに
+Alignment 行も understanding revision も採番し直されて id が変わる。id が
+毎回変わる finding は永久に「新規」で、`ongoing` を表示できない。
+
+**「前回」は開発者自身の 理解の確認。** `understanding_confirmed_at` は
+永続化された人間の判断である。ページを開いた時刻を「前回」にすると、
+閲覧が承認として記録されることになる。基準が無い場合は `not_compared` を
+返す -- 「新しい発見がない」と言い切らない。
+
+**重複排除は 2 段。** `dedupe_key`(同一原因)だけでは足りない。矛盾していて
+かつ未確認でもある claim は、2 つの kind から 2 件出て 3 枠のうち 2 枠を
+占める。`subject_key` で kind をまたいで畳み、blocking な事実だけを残す。
+
+**severity は kind が持つ固定値で、finding ごとに計算しない。** 計算にすると
+それは重要度スコアであり、#382 の非目標そのものになる。順位のゲートは
+`severity → status → kind → last_updated → id` で全順序、同じ事実からは
+常に同じ 3 件が出る。
+
+**`waiting` / `unavailable` は action を持たない。** 実行できない操作を
+disabled で並べると、開発者は主操作を無視するようになる(#383 の明示条件)。
+「システムが処理中」「判定できなかった」は文章で言う。
+
+**行の順序が契約。** 特に 2 箇所:
+`W3`(必須質問が未回答)は「理解を確認する」より**上**。`W3` はまさに理解を
+確定できない状態なので、下に置くと押せない確認ボタンを出すことになる。
+freshness の `delayed` / `stale` は「採否を記録する」より**上**。更新の
+止まった観測を根拠に採否を判断させないためである。
+
+**Runtime health の見出しは `freshness`。** 累積の `state` を見出しにすると、
+14 日沈黙したシステムが緑の「受信中」を出す #370 のバグが戻る。累積値
+(Component 数 / Trace 総数 / mode 内訳)は `details` の中に「現在の稼働状態
+ではありません」と明記して残す。error / 不一致 / replay の件数は直近 24
+時間の有界ウィンドウで、累積値では「止まった」ことを示せない。
+
+**degrade は 1 領域だけ。** 領域ごとに例外を捕まえて `degraded_sections` に
+記録し、他は描き続ける。ただし失敗した領域の**表示**を落とすだけで、読めな
+かった事実を推測値で埋めない。「取得できませんでした」と「発見がありません」
+「受信が止まっています」は別の文言にする。
+
+**CTA は人間ゲートを迂回しない。** 理解の確認 / 提案の承認 / 差分の適用 /
+観測の開始 / 採否の記録 / publish はすべて元の画面の
+`decision_method: manual` 記録のまま。Overview は案内するだけである。
+
+### 廃止したもの
+
+Overview の Get Started 順序リスト(#212 / #259 / #267)と、その per-step
+完了判定テストを削除した。段階リストは「次の 1 操作」に置き換わり、
+オンボーディング導線自体は Setup Guide(`components/setup-next-step.ts`、
+#374)が持つ。旧 4 metric card と Component 完全一覧もファーストビューから
+外れた(Component 一覧は `/components` にのみ置く)。
+
+### ファーストビューの実測
+
+情報順だけでは目的を果たさない -- #358 と同じ失敗をここでも一度踏んだ。
+Brief の下に「今わかったこと」と「次にすること」を積む最初の版は、読み順は
+正しかったが 1280 × 720 で findings が 824px、CTA が 1066px に落ちていた。
+#384 の受け入れ条件「Vision / Purpose / findings / next action が通常
+desktop の初期 viewport で把握できる」を満たしていない。
+
+`xl` で **3 領域を横に並べる**(Brief 5 / findings 4 / 次にすること + 改善
+ループ + Runtime health 3 の 12 分割)ことで解決した。#384 が明示的に許して
+いる構成である。DOM 順は変えていないので、`xl` 未満で 1 カラムに畳んだときの
+読み順(Brief → 今わかったこと → 次にすること → 改善ループ → Runtime health)は
+そのままで、読み上げ順も同じである。
+
+実測(Chromium `/opt/pw-browsers/chromium-1194`、ビルド済み CSS + `container.
+innerHTML` の静的 HTML):
+
+| viewport | Brief | Vision | Purpose | 主要機能 | findings | 次にすること | CTA | 改善ループ | 横スクロール |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1280×720 | 100 | 293 | 417 | 609 | 100 | 100 | 173 | 471 | なし |
+| 1440×900 | 100 | 293 | 417 | 585 | 100 | 100 | 173 | 451 | なし |
+| 768×1024 | 100 | 273 | 367 | 515 | 854 | 1559 | — | — | なし |
+| 390×844 | 100 | 325 | 473 | 731 | 1282 | 2403 | — | — | なし |
+
+Runtime health は 1280×720 で 1119px、つまり初期ビューの外にある。これは
+意図どおりで、二次領域を主役にしないという #380 UX 原則 4 の帰結である。
+Playwright はリポジトリの依存には入れていない(#358 と同じ扱い)。
+
+jsdom では実寸を測れないので、`overview-page.test.tsx` は測定が依存する構造
+(Brief / findings / 次にすること が Grid の**別々の直接の子**であること)を
+回帰テストとして固定している。
+
+### 検証
+
+`tests/test_overview.py`(rule table 全 14 行と行の優先関係、finding の
+全 kind 到達性・2 段の重複排除・全順序の順位・3 つの空状態・status の
+3 値、loop rail、API の代表状態、System 分離、部分失敗、書き込みが無いこと)、
+`src/__tests__/overview.test.tsx`(表示コンポーネント: 二軸の分離、Vision
+不明時の非捏造、サーバー順の保持、3 つの空状態、waiting が disabled に
+ならないこと、freshness が見出しであること)、`src/__tests__/overview-page.test.tsx`
+(ページ: System 0 件、意味順、旧 metric card の不在、部分失敗、全体失敗、
+loading と empty の区別)。

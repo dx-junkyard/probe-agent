@@ -1065,6 +1065,84 @@ creating incomplete persistence or execution paths for later phases.
       terminology and label contract — most importantly the rule this whole
       epic exists to enforce: one displayed word must not carry two facts.
 
+22. Issue #380 (subs #381-#384) — the Overview as the System Intelligence
+    Brief / decision cockpit. The old screen led with Component 数 / Trace
+    総数 / 最終受信日時 / mode 内訳 and a full Component table, so it read as
+    an internal monitoring page and duplicated Components/Traces. It now
+    answers, in this order, 何のためのシステムか / 何が変わったか / 次の1操作 /
+    改善ループの現在地 / いま観測できているか. `app/overview_projection.py`
+    + `GET /overview` is the single canonical projection; the Dashboard
+    renders it and re-derives nothing. What it added, and what any later
+    change must preserve:
+    - **It composes existing canonical projections and adds no sixth
+      opinion.** The Brief and Decision Readiness ARE #351-#354's
+      `build_understanding_brief`; the interview position is #349's engine;
+      the loop rail is #237/#256's `derive_user_phase` under
+      developer-facing labels; the runtime axes are #370's `state` /
+      `freshness`. A third understanding model on the Overview is the
+      explicit non-goal.
+    - **It writes nothing.** `evaluate_session_workflow` is deliberately NOT
+      called — it persists the workflow checkpoint and can open a backward
+      request, so glancing at the Overview would record Interview progress.
+      `gather_facts` + `evaluate_candidate_state` (both pure) give the same
+      candidate state. No view, no acknowledgement, no "last seen" marker:
+      a page view is never a human decision (#382).
+    - The Brief is read for **the System's newest Interview session**
+      (`ORDER BY id DESC`), the same rule the Interview screen auto-selects
+      with, so the two screens can never describe different sessions — and
+      the Overview's deep links land on the one the developer will open.
+    - **A finding's id is derived from its cause, never from a row id.** A
+      rebuild renumbers `alignment_item` and `understanding_revision` rows
+      while describing the same finding; an id that changed every rebuild
+      would make every finding permanently `new` and `ongoing` unreachable.
+    - **「前回」 is the developer's own 理解の確認**
+      (`understanding_confirmed_at`), a persisted human decision. Without one
+      the status is `not_compared` — never 「新しい発見がない」. The three
+      empty states (`no_findings` / `not_compared` / `unavailable`) are three
+      different answers and never share copy.
+    - **Deduplication is two passes**: same root cause (`dedupe_key`), then
+      same subject across kinds (`subject_key`). A claim that is both
+      conflicting and unconfirmed would otherwise take two of the three
+      slots. `severity` is the fixed value its `kind` carries and is never
+      computed per finding — computing it would be the importance score #382
+      forbids. The order is `severity → status → kind → last_updated → id`:
+      every gate finite, the tie-break total, so the same facts always
+      produce the same three findings.
+    - `decide_next_action` is a **14-row first-match table returning exactly
+      zero or one action**, each with its 選定理由 / 完了条件 / 完了後の価値.
+      Two row orderings are load-bearing: `W3` (unanswered required
+      questions) sits ABOVE 理解を確認する, because `W3` is precisely the
+      state in which the understanding cannot be confirmed; and freshness
+      `delayed`/`stale` sits ABOVE 採否を記録する, so a decision is never
+      judged against observations that stopped updating.
+    - **`waiting` / `unavailable` carry no action.** A permanently disabled
+      control teaches the developer to ignore the primary action (#383);
+      「処理中です」 and 「判定できませんでした」 are sentences, not greyed
+      buttons. `create_system` lives in the same finite vocabulary but is
+      reachable only through the Dashboard's zero-System branch, since the
+      endpoint is System-scoped.
+    - **Runtime health's headline is `freshness`, never the cumulative
+      `state`** — that conflation is the #370 bug, and restoring it paints a
+      14-day-silent system green. Cumulative totals survive inside a
+      `<details>` labelled 「現在の稼働状態ではありません」; error / mismatch
+      / replay counts are measured over a bounded 24h window, because a
+      cumulative total can never show that something stopped. The full
+      Component list stays on `/components`.
+    - **A failed section degrades alone.** Each section is guarded
+      independently into `degraded_sections`; the guard drops that section's
+      DISPLAY and never substitutes a guessed value. 「取得できませんでした」,
+      「発見がありません」 and 「受信が止まっています」 are different
+      sentences.
+    - The Overview's Get Started ordered list (#212/#259/#267) and its
+      per-step completion tests are **deleted**. The onboarding path lives on
+      the Setup Guide (`components/setup-next-step.ts`, #374). Do not
+      reintroduce a step catalogue on the Overview.
+    Human gates are unchanged: 理解の確認 / Alignment 項目の確定 / 提案の
+    承認・編集・却下 / 差分の適用 / 観測の開始 / 採否の記録 / publish all
+    stay `decision_method: manual` on their own screens. See the Issue #380
+    sections in `docs/project-intelligence.md` and
+    `docs/system-understanding-navigation.md`.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,
