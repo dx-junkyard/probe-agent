@@ -97,10 +97,13 @@ __all__ = [
     "build_loop_stages",
     "build_overview",
     "resolve_pending_publish",
+    "resolve_pending_instrumentation_publish",
     "load_repository_fact",
     "load_pending_experiments",
     "load_variant_facts",
     "load_decision_facts",
+    "load_snapshot_commit",
+    "load_revision_created_at",
 ]
 
 
@@ -222,6 +225,10 @@ class _BriefUnavailable(Exception):
     """Raised internally when findings cannot be built because the Brief could
     not be read. Distinct from a genuine extraction failure so the two report
     different sentences."""
+
+
+class _FindingsUnavailable(Exception):
+    """A finding dependency could not be read; this is not an empty set."""
 
 
 @dataclass(frozen=True)
@@ -897,6 +904,7 @@ class NextActionFacts:
     undecided_experiment: Optional["PendingExperiment"] = None
     undecided_experiment_count: int = 0
     pending_publish: Optional["PendingPublish"] = None
+    pending_instrumentation_publish: Optional["PendingPublish"] = None
     completed_variant_run_exists: bool = False
     decided_experiment_exists: bool = False
 
@@ -925,7 +933,9 @@ class NextActionFacts:
     experiments_available: bool = True
     variants_available: bool = True
     publish_available: bool = True
+    instrumentation_publish_available: bool = True
     decisions_available: bool = True
+    snapshots_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -943,23 +953,13 @@ class PendingExperiment:
 
 @dataclass(frozen=True)
 class PendingPublish:
-    """An applied patch with no completed publish job FOR THAT PATCH.
-
-    The identity is `probe_patches.id` -> `publish_jobs.patch_id`, which is the
-    only adopt-to-publish lineage this system actually persists. The first
-    version asked two independent System-wide existence questions ("is there an
-    adopted experiment" and "has any publish job ever succeeded"), so the first
-    successful publish made every later change look published forever.
-
-    An adopted Experiment deliberately does NOT feed this: `experiments` has no
-    reference to a patch or a publish job, and `publish_jobs` publishes
-    instrumentation patches from probe plans. Inventing a link would be a
-    guess, and a column nothing writes would leave the CTA permanently stuck.
-    """
+    """One exact publish artifact and its semantic lineage."""
 
     patch_id: int
     count: int = 1
     applied_at: Optional[float] = None
+    experiment_id: Optional[int] = None
+    variant_id: Optional[int] = None
 
 
 def decide_next_action(
@@ -1017,6 +1017,12 @@ def decide_next_action(
             "available",
             "",
         )
+
+    # An unreadable snapshot projection is not evidence that no ready
+    # snapshot exists.  Once row 1 has been handled, every remaining rule
+    # presupposes snapshot state and must fail closed.
+    if not facts.snapshots_available:
+        return unavailable
 
     # 2: a snapshot exists but is not usable yet. Same action key, different
     #    reason -- 「構築中」 and 「失敗」 are the same next operation for the
@@ -1241,44 +1247,35 @@ def decide_next_action(
             "",
         )
 
-    # 12: an applied INSTRUMENTATION patch this System has not published.
-    #
-    #     What this row is not: the improvement cycle's Publish step. The
-    #     identity `probe_patches.id` -> `publish_jobs.patch_id` is real and
-    #     per-target, but what it identifies is a probe-plan measurement patch.
-    #     Nothing persists a link from an adopted Experiment (or its variant)
-    #     to a patch or a publish job, so 「採用した改善を公開したか」 is a
-    #     question this projection cannot answer. It therefore does not answer
-    #     it: the row is named, worded and scoped for measurement publishing
-    #     only, and no rule claims an improvement cycle has closed.
-    #
-    #     Placed above row 13 deliberately: publishing work already applied is
-    #     a short finishing step, and leaving it undone means the team cannot
-    #     see the instrumentation the observations came from. Starting a new
-    #     candidate is the larger next move.
+    # 12: the exact variant the developer adopted has a persisted publish
+    # artifact and no completed job for that same artifact.  This is the
+    # improvement loop's Publish step; no System-wide existence or timestamp
+    # inference participates.
     if facts.pending_publish is not None:
         pending_publish = facts.pending_publish
         return (
             OverviewAction(
-                key="publish_instrumentation",
-                label="計測の変更を公開する",
+                key="publish_improvement",
+                label="採用した改善を公開する",
                 reason=(
-                    f"適用済みで未公開の計測 patch が {pending_publish.count} 件あります。"
+                    f"採用済みで未公開の改善変更が {pending_publish.count} 件あります。"
                 ),
                 completion_condition=(
-                    "この計測 patch の Pull Request が作成されること（merge はあなたが行います）。"
+                    "この改善変更の Pull Request が作成されること（公開承認と merge はあなたが行います）。"
                 ),
                 value=(
-                    "観測に使っている計測コードをレビュー可能な形で共有できます。"
-                    "改善候補の採否や公開はこの操作とは別です。"
+                    "評価して採用した変更を、レビュー可能な形で共有できます。"
                 ),
                 target=Target(
                     route="/github",
                     label="GitHub 連携を開く",
-                    params={"patch": str(pending_publish.patch_id)},
+                    params={
+                        "patch": str(pending_publish.patch_id),
+                        "experiment": str(pending_publish.experiment_id),
+                    },
                 ),
                 rule_row=12,
-                source_state_ids=("publish.instrumentation_patches.unpublished",),
+                source_state_ids=("publish.improvement_artifacts.unpublished",),
             ),
             "available",
             "",
@@ -1287,7 +1284,8 @@ def decide_next_action(
     if not facts.variants_available or not facts.decisions_available:
         return unavailable
 
-    # 13: observing normally, nothing evaluated yet.
+    # 13: observing normally, nothing evaluated yet.  An unrelated pending
+    # instrumentation patch must not hide this improvement-loop step.
     if not facts.completed_variant_run_exists and not facts.decided_experiment_exists:
         return (
             OverviewAction(
@@ -1304,7 +1302,34 @@ def decide_next_action(
             "",
         )
 
-    # 14: one full cycle is behind us. Cyclical, so this is an offer to start
+    # 14: instrumentation publishing is a separate maintenance action.  Its
+    # wording and identity never claim that an adopted improvement was
+    # published, and it comes after the improvement-cycle decision rows.
+    if not facts.instrumentation_publish_available:
+        return unavailable
+
+    if facts.pending_instrumentation_publish is not None:
+        instrumentation = facts.pending_instrumentation_publish
+        return (
+            OverviewAction(
+                key="publish_instrumentation",
+                label="計測の変更を公開する",
+                reason=f"適用済みで未公開の計測 patch が {instrumentation.count} 件あります。",
+                completion_condition="この計測 patch の Pull Request が作成されること。",
+                value="観測に使っている計測コードをレビュー可能な形で共有できます。",
+                target=Target(
+                    route="/github",
+                    label="GitHub 連携を開く",
+                    params={"patch": str(instrumentation.patch_id)},
+                ),
+                rule_row=14,
+                source_state_ids=("publish.instrumentation_patches.unpublished",),
+            ),
+            "available",
+            "",
+        )
+
+    # 15: one full cycle is behind us. Cyclical, so this is an offer to start
     #     the next one -- not a claim that there is nothing left to do.
     return (
         OverviewAction(
@@ -1314,7 +1339,7 @@ def decide_next_action(
             completion_condition="新しい観測または新しい候補から、次の判断対象が生まれること。",
             value="変化を調べ直し、次の改善対象を選べます。",
             target=Target(route="/components", label="Components を開く"),
-            rule_row=14,
+            rule_row=15,
         ),
         "complete",
         "",
@@ -1494,27 +1519,51 @@ def load_decision_facts(conn, system_id: int) -> bool:
 
 
 def resolve_pending_publish(conn, system_id: int) -> Optional[PendingPublish]:
-    """An applied patch this System has not published, or None.
+    """An adopted improvement artifact with no completed job in its lineage."""
+    rows = conn.execute(
+        """SELECT a.id, a.patch_id, a.experiment_id, a.variant_id, a.created_at
+             FROM improvement_publish_artifacts a
+             JOIN experiments e
+               ON e.id = a.experiment_id AND e.system_id = a.system_id
+             JOIN experiment_variants v
+               ON v.id = a.variant_id AND v.experiment_id = e.id
+            WHERE a.system_id = ?
+              AND a.status = 'ready'
+              AND e.human_decision = 'adopted'
+              AND e.human_decision_variant_key = v.variant_key
+              AND NOT EXISTS (
+                  SELECT 1 FROM publish_jobs j
+                   WHERE j.patch_id = a.patch_id
+                     AND j.system_id = a.system_id
+                     AND j.status = 'completed'
+              )
+            ORDER BY a.created_at DESC, a.id DESC""",
+        (system_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    return PendingPublish(
+        patch_id=rows[0]["patch_id"],
+        count=len(rows),
+        applied_at=rows[0]["created_at"],
+        experiment_id=rows[0]["experiment_id"],
+        variant_id=rows[0]["variant_id"],
+    )
 
-    The identity is `probe_patches.id` -> `publish_jobs.patch_id`, which is the
-    only adopt-to-publish lineage this schema actually persists. Three
-    properties matter and each was wrong in the first version:
 
-    * **Per patch, not per System.** "Has any publish job ever succeeded" made
-      the first success cover every later change forever.
-    * **Only `completed` counts.** `failed` / `cancelled` / `retryable_failed`
-      are not publications, so a patch whose job failed is still pending.
-    * **System-scoped on both sides.** The join is constrained to this
-      System's jobs as well as its patches.
-
-    Ordered newest-applied first with `id` as a total tiebreak, so the CTA
-    points at the same patch on every request.
-    """
+def resolve_pending_instrumentation_publish(
+    conn, system_id: int
+) -> Optional[PendingPublish]:
+    """An applied instrumentation patch with no completed job for it."""
     rows = conn.execute(
         """SELECT p.id AS id, p.applied_at AS applied_at
              FROM probe_patches p
             WHERE p.system_id = ?
               AND p.apply_status = 'applied'
+              AND NOT EXISTS (
+                  SELECT 1 FROM improvement_publish_artifacts a
+                   WHERE a.patch_id = p.id AND a.system_id = p.system_id
+              )
               AND NOT EXISTS (
                   SELECT 1 FROM publish_jobs j
                    WHERE j.patch_id = p.id
@@ -1543,6 +1592,26 @@ def _latest_interview_session_id(conn, system_id: int) -> Optional[int]:
         (system_id,),
     ).fetchone()
     return row["id"] if row else None
+
+
+def load_snapshot_commit(
+    conn, system_id: int, snapshot_id: int
+) -> Optional[str]:
+    """Commit pinned by a System-scoped snapshot, or ``None`` if absent."""
+    row = conn.execute(
+        "SELECT commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
+        (snapshot_id, system_id),
+    ).fetchone()
+    return row["commit_sha"] if row else None
+
+
+def load_revision_created_at(conn, revision_id: int) -> Optional[float]:
+    """Creation time of one understanding revision."""
+    row = conn.execute(
+        "SELECT created_at FROM understanding_revision WHERE id = ?",
+        (revision_id,),
+    ).fetchone()
+    return row["created_at"] if row else None
 
 
 def _runtime_checks(conn, system_id: int, session_id: Optional[int]) -> List[Dict[str, Any]]:
@@ -1691,39 +1760,72 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
         _degrade(result, "loop", exc)
 
     with get_conn() as conn:
-        session_id = _latest_interview_session_id(conn, system_id)
+        availability = {
+            "session": True,
+            "snapshots": True,
+            "snapshot_commit": True,
+            "revision": True,
+            "runtime_checks": True,
+            "repository": True,
+            "experiments": True,
+            "variants": True,
+            "publish": True,
+            "instrumentation_publish": True,
+            "decisions": True,
+        }
+
+        session_id = None
+        try:
+            session_id = _latest_interview_session_id(conn, system_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            availability["session"] = False
+            _degrade(result, "brief", exc, detail_key="brief.session")
         result.interview_session_id = session_id
 
-        latest_ready = state_facts.get_latest_ready_snapshot(conn, system_id)
-        result.latest_ready_snapshot_id = latest_ready["id"] if latest_ready else None
-        latest_snapshot = state_facts.get_latest_snapshot(conn, system_id)
-        latest_snapshot_status = latest_snapshot["status"] if latest_snapshot else None
+        latest_ready = None
+        latest_snapshot_status = None
+        try:
+            latest_ready = state_facts.get_latest_ready_snapshot(conn, system_id)
+            result.latest_ready_snapshot_id = latest_ready["id"] if latest_ready else None
+            latest_snapshot = state_facts.get_latest_snapshot(conn, system_id)
+            latest_snapshot_status = latest_snapshot["status"] if latest_snapshot else None
+        except Exception as exc:  # pragma: no cover - defensive
+            availability["snapshots"] = False
+            result.latest_ready_snapshot_id = None
+            _degrade(result, "brief", exc, detail_key="brief.snapshots")
         latest_ready_at = None
         if latest_ready is not None:
             latest_ready_at = latest_ready["completed_at"] or latest_ready["created_at"]
 
         brief = None
-        try:
-            brief = understanding_brief.build_understanding_brief(
-                conn, system_id, session_id, now=now
-            )
-            result.brief = brief
-            result.snapshot_id = brief.snapshot_id
-        except Exception as exc:  # pragma: no cover - defensive
-            _degrade(result, "brief", exc)
+        if availability["session"]:
+            try:
+                brief = understanding_brief.build_understanding_brief(
+                    conn, system_id, session_id, now=now
+                )
+                result.brief = brief
+                result.snapshot_id = brief.snapshot_id
+            except Exception as exc:  # pragma: no cover - defensive
+                _degrade(result, "brief", exc)
 
         if result.snapshot_id is not None:
-            row = conn.execute(
-                "SELECT commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
-                (result.snapshot_id, system_id),
-            ).fetchone()
-            result.snapshot_commit_sha = row["commit_sha"] if row else None
+            try:
+                result.snapshot_commit_sha = load_snapshot_commit(
+                    conn, system_id, result.snapshot_id
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                availability["snapshot_commit"] = False
+                _degrade(result, "brief", exc, detail_key="brief.snapshot_commit")
 
         # Decided here, never by the Dashboard comparing two ids. Same rule as
         # #369: one definition of 「最新か」, on the server. `unavailable` is a
         # real third value -- with no pinned snapshot or no ready snapshot to
         # compare against, "behind" is not a fact we have.
-        if result.snapshot_id is None or result.latest_ready_snapshot_id is None:
+        if (
+            not availability["snapshots"]
+            or result.snapshot_id is None
+            or result.latest_ready_snapshot_id is None
+        ):
             result.snapshot_freshness = "unavailable"
         elif result.snapshot_id == result.latest_ready_snapshot_id:
             result.snapshot_freshness = "current"
@@ -1752,50 +1854,59 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
 
         revision_created_at = None
         if brief is not None and brief.revision_id is not None:
-            row = conn.execute(
-                "SELECT created_at FROM understanding_revision WHERE id = ?",
-                (brief.revision_id,),
-            ).fetchone()
-            revision_created_at = row["created_at"] if row else None
+            try:
+                revision_created_at = load_revision_created_at(conn, brief.revision_id)
+            except Exception as exc:  # pragma: no cover - defensive
+                availability["revision"] = False
+                _degrade(result, "findings", exc, detail_key="findings.revision")
 
         capability_count = len(getattr(brief, "core_capabilities", []) or [])
-        runtime_checks = _runtime_checks(conn, system_id, session_id)
-        runtime_mismatch_count = sum(
-            1 for row in runtime_checks if row.get("runtime_check") == "mismatch"
-        )
-        try:
-            result.runtime = _runtime_health(
-                conn, system_id, now, capability_count, runtime_mismatch_count
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            _degrade(result, "runtime", exc)
+        runtime_checks: List[Dict[str, Any]] = []
+        runtime_mismatch_count = 0
+        if availability["session"]:
+            try:
+                runtime_checks = _runtime_checks(conn, system_id, session_id)
+                runtime_mismatch_count = sum(
+                    1 for row in runtime_checks if row.get("runtime_check") == "mismatch"
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                availability["runtime_checks"] = False
+                _degrade(result, "runtime", exc, detail_key="runtime.checks")
+        else:
+            availability["runtime_checks"] = False
+
+        if availability["runtime_checks"]:
+            try:
+                result.runtime = _runtime_health(
+                    conn, system_id, now, capability_count, runtime_mismatch_count
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                _degrade(result, "runtime", exc)
 
         # Each fact group is loaded under its own guard. A failure records the
         # group as unavailable and leaves its value at the conservative
         # default -- which no rule is then allowed to read.
         undecided: List[Dict[str, Any]] = []
         pending_publish: Optional[PendingPublish] = None
+        pending_instrumentation_publish: Optional[PendingPublish] = None
         variant_count, variant_at = 0, None
         repository_configured = False
         decided_experiment_exists = False
-        available = {
-            "repository": True,
-            "experiments": True,
-            "variants": True,
-            "publish": True,
-            "decisions": True,
-        }
         for group, load in (
             ("repository", lambda: load_repository_fact(conn, system_id)),
             ("experiments", lambda: load_pending_experiments(conn, system_id)),
             ("publish", lambda: resolve_pending_publish(conn, system_id)),
+            (
+                "instrumentation_publish",
+                lambda: resolve_pending_instrumentation_publish(conn, system_id),
+            ),
             ("variants", lambda: load_variant_facts(conn, system_id)),
             ("decisions", lambda: load_decision_facts(conn, system_id)),
         ):
             try:
                 loaded = load()
             except Exception as exc:  # pragma: no cover - defensive
-                available[group] = False
+                availability[group] = False
                 _degrade(result, "next_action", exc, detail_key=f"next_action.{group}")
                 continue
             if group == "repository":
@@ -1804,6 +1915,8 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 undecided = loaded
             elif group == "publish":
                 pending_publish = loaded
+            elif group == "instrumentation_publish":
+                pending_instrumentation_publish = loaded
             elif group == "variants":
                 variant_count, variant_at = loaded
             else:
@@ -1817,6 +1930,19 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 # `unavailable` is the whole answer; the Runtime section still
                 # renders on its own.
                 raise _BriefUnavailable()
+            if not all(
+                (
+                    availability["session"],
+                    availability["snapshots"],
+                    availability["revision"],
+                    availability["runtime_checks"],
+                    availability["experiments"],
+                    availability["variants"],
+                    gathered is not None,
+                    result.runtime is not None,
+                )
+            ):
+                raise _FindingsUnavailable()
             result.findings, result.finding_statuses, result.findings_state = _findings(
                 brief=brief,
                 gathered=gathered,
@@ -1840,6 +1966,16 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 result.degraded_sections.append("findings")
             result.degraded_detail["findings"] = (
                 "システム理解を取得できなかったため、変化を比較できませんでした。"
+            )
+        except _FindingsUnavailable:
+            result.findings = []
+            result.finding_statuses = []
+            result.findings_state = "unavailable"
+            if "findings" not in result.degraded_sections:
+                result.degraded_sections.append("findings")
+            result.degraded_detail.setdefault(
+                "findings",
+                "変化の判定に必要な情報を取得できなかったため、発見の有無を判定していません。",
             )
         except Exception as exc:  # pragma: no cover - defensive
             _degrade(result, "findings", exc)
@@ -1896,16 +2032,19 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
             ),
             undecided_experiment_count=len(undecided),
             pending_publish=pending_publish,
+            pending_instrumentation_publish=pending_instrumentation_publish,
             completed_variant_run_exists=variant_count > 0,
             decided_experiment_exists=decided_experiment_exists,
             brief_available=brief is not None,
             runtime_available=result.runtime is not None,
             workflow_available=gathered is not None,
-            repository_available=available["repository"],
-            experiments_available=available["experiments"],
-            variants_available=available["variants"],
-            publish_available=available["publish"],
-            decisions_available=available["decisions"],
+            repository_available=availability["repository"],
+            experiments_available=availability["experiments"],
+            variants_available=availability["variants"],
+            publish_available=availability["publish"],
+            instrumentation_publish_available=availability["instrumentation_publish"],
+            decisions_available=availability["decisions"],
+            snapshots_available=availability["snapshots"],
         )
         action, state, message = decide_next_action(action_facts)
         result.next_action = _attach_finding_sources(action, result.findings)

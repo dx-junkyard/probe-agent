@@ -7734,11 +7734,9 @@ OverviewActionKey = Literal[
     "start_observation",
     "restore_observation",
     "record_experiment_decision",
-    # NOT "publish the improvement": `publish_jobs` publishes probe-plan
-    # INSTRUMENTATION patches, and no persisted lineage connects an adopted
-    # Experiment to a patch or a job. Naming this key for what it actually
-    # publishes is the whole point — the previous `publish_change` told the
-    # developer 「この改善サイクルが閉じます」 about a measurement patch.
+    # These are deliberately distinct identities: adopted experiment
+    # artifacts versus probe-plan instrumentation patches.
+    "publish_improvement",
     "publish_instrumentation",
     "create_candidate",
     "start_next_cycle",

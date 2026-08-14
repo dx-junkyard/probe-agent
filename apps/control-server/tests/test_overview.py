@@ -94,13 +94,18 @@ def test_action_rule_rows_each_reachable():
             dict(undecided_experiment=PendingExperiment(experiment_id=4, count=2)),
             "record_experiment_decision",
         ),
-        (12, dict(pending_publish=PendingPublish(patch_id=9)), "publish_instrumentation"),
+        (12, dict(pending_publish=PendingPublish(patch_id=9, experiment_id=4)), "publish_improvement"),
         (
             13,
             dict(completed_variant_run_exists=False, decided_experiment_exists=False),
             "create_candidate",
         ),
-        (14, {}, "start_next_cycle"),
+        (
+            14,
+            dict(pending_instrumentation_publish=PendingPublish(patch_id=10)),
+            "publish_instrumentation",
+        ),
+        (15, {}, "start_next_cycle"),
     ]
     for expected_row, overrides, expected_key in rows:
         facts = NextActionFacts(**{**_healthy(), **overrides})
@@ -124,7 +129,8 @@ def test_every_action_key_is_in_the_finite_vocabulary():
         dict(connectivity_freshness="never_received", connectivity_state="smoke_only"),
         dict(connectivity_freshness="stale"),
         dict(undecided_experiment=PendingExperiment(experiment_id=1)),
-        dict(pending_publish=PendingPublish(patch_id=1)),
+        dict(pending_publish=PendingPublish(patch_id=1, experiment_id=1)),
+        dict(pending_instrumentation_publish=PendingPublish(patch_id=2)),
         dict(completed_variant_run_exists=False, decided_experiment_exists=False),
         {},
     ):
@@ -406,32 +412,33 @@ def test_every_finding_provenance_is_in_the_finite_vocabulary():
 # --- publish identity (review P1-3) ------------------------------------------
 
 
-def test_publish_row_is_per_patch_not_per_system():
-    """A patch with no completed publish job of its own still needs publishing,
-    however many earlier publishes succeeded."""
+def test_improvement_publish_row_carries_the_adopted_lineage():
     facts = NextActionFacts(
-        **{**_healthy(), "pending_publish": PendingPublish(patch_id=42, count=1)}
+        **{
+            **_healthy(),
+            "pending_publish": PendingPublish(
+                patch_id=42, experiment_id=7, variant_id=9, count=1
+            ),
+        }
     )
     action, _state, _msg = decide_next_action(facts)
-    assert action.key == "publish_instrumentation"
-    assert action.target.params == {"patch": "42"}
+    assert action.key == "publish_improvement"
+    assert action.target.params == {"patch": "42", "experiment": "7"}
+    assert "採用した改善" in action.label
 
 
-def test_publish_row_never_claims_an_improvement_cycle_closed():
-    """`probe_patches` are probe-plan MEASUREMENT patches. Nothing links an
-    adopted Experiment to a patch or a publish job, so the Overview must not
-    describe publishing one as closing the improvement cycle."""
+def test_instrumentation_publish_is_separate_and_lower_priority():
     facts = NextActionFacts(
-        **{**_healthy(), "pending_publish": PendingPublish(patch_id=42)}
+        **{
+            **_healthy(),
+            "pending_instrumentation_publish": PendingPublish(patch_id=42),
+        }
     )
     action, _state, _msg = decide_next_action(facts)
     assert action.key == "publish_instrumentation"
     text = f"{action.label}{action.reason}{action.completion_condition}{action.value}"
-    assert "改善サイクルが閉じ" not in text
+    assert "採用した改善" not in text
     assert "計測" in action.label
-    # It also says explicitly that adoption/publication of a candidate is a
-    # different thing, so the two cannot be read as one.
-    assert "改善候補" in action.value
 
 
 def test_an_adopted_experiment_alone_produces_no_publish_cta():
@@ -954,6 +961,45 @@ def _applied_patch(system_id, snapshot_id, commit_sha, applied_at):
         ).lastrowid
 
 
+def _improvement_artifact(system_id, snapshot_id, commit_sha, created_at):
+    """Persist one adopted experiment -> variant -> transport patch lineage."""
+    from app.db import get_conn
+
+    patch_id = _applied_patch(system_id, snapshot_id, commit_sha, created_at)
+    with get_conn() as conn:
+        experiment_id = conn.execute(
+            """INSERT INTO experiments
+                   (system_id, feature_id, objective, snapshot_id, baseline_commit,
+                    config_revision, execution_config, status, human_decision,
+                    human_decision_variant_key, created_at, completed_at)
+               VALUES (?, 'feature', 'improve', ?, ?, 'v1', '{}', 'completed',
+                       'adopted', 'candidate', ?, ?)""",
+            (system_id, snapshot_id, commit_sha, created_at, created_at),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO experiment_variants
+                   (experiment_id, variant_key, label, is_baseline, patch_hash,
+                    status, completed_at)
+               VALUES (?, 'baseline', 'Baseline', 1, 'base', 'completed', ?)""",
+            (experiment_id, created_at),
+        )
+        variant_id = conn.execute(
+            """INSERT INTO experiment_variants
+                   (experiment_id, variant_key, label, is_baseline, patch_text,
+                    patch_hash, status, completed_at)
+               VALUES (?, 'candidate', 'Candidate', 0, 'diff', 'candidate',
+                       'completed', ?)""",
+            (experiment_id, created_at),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO improvement_publish_artifacts
+                   (system_id, experiment_id, variant_id, patch_id, status, created_at)
+               VALUES (?, ?, ?, ?, 'ready', ?)""",
+            (system_id, experiment_id, variant_id, patch_id, created_at),
+        )
+    return experiment_id, variant_id, patch_id
+
+
 def _github_connection(system_id):
     from app.db import get_conn
 
@@ -1168,6 +1214,55 @@ def test_a_failed_runtime_section_does_not_offer_a_connection_cta(
     assert body["next_action"]["key"] == "build_understanding"
 
 
+def test_pending_improvement_publish_uses_exact_lineage(admin_client, tmp_path):
+    token = _login(admin_client)
+    system_id = _create_system(admin_client, token, "ImprovementPublish")
+    repo, sha = _init_repo(tmp_path, "repo-improvement-publish")
+    snapshot_id = _insert_snapshot(system_id, repo, sha)
+    connection_id = _github_connection(system_id)
+    experiment_id, variant_id, patch_id = _improvement_artifact(
+        system_id, snapshot_id, sha, time.time()
+    )
+
+    from app.db import get_conn
+    from app.overview_projection import resolve_pending_publish
+
+    with get_conn() as conn:
+        pending = resolve_pending_publish(conn, system_id)
+    assert pending is not None
+    assert pending.patch_id == patch_id
+    assert pending.experiment_id == experiment_id
+    assert pending.variant_id == variant_id
+
+    # Failed/cancelled work is still unpublished; only completion closes this
+    # exact adopted variant's lineage.
+    _publish_job(system_id, connection_id, patch_id, snapshot_id, "failed")
+    with get_conn() as conn:
+        assert resolve_pending_publish(conn, system_id) is not None
+    _publish_job(system_id, connection_id, patch_id, snapshot_id, "completed")
+    with get_conn() as conn:
+        assert resolve_pending_publish(conn, system_id) is None
+
+    # A completed job for cycle A must not cover a later adopted variant B.
+    experiment_b, variant_b, patch_b = _improvement_artifact(
+        system_id, snapshot_id, sha, time.time() + 1
+    )
+    with get_conn() as conn:
+        pending_b = resolve_pending_publish(conn, system_id)
+    assert pending_b is not None
+    assert (pending_b.experiment_id, pending_b.variant_id, pending_b.patch_id) == (
+        experiment_b,
+        variant_b,
+        patch_b,
+    )
+
+    other_system = _create_system(admin_client, token, "ImprovementPublishOther")
+    other_snapshot = _insert_snapshot(other_system, repo, sha)
+    _improvement_artifact(other_system, other_snapshot, sha, time.time() + 2)
+    with get_conn() as conn:
+        assert resolve_pending_publish(conn, system_id).patch_id == patch_b
+
+
 def test_pending_publish_is_scoped_to_the_patch_not_the_system(admin_client, tmp_path):
     """A publish that succeeded for cycle A must not make cycle B look
     published.
@@ -1185,11 +1280,11 @@ def test_pending_publish_is_scoped_to_the_patch_not_the_system(admin_client, tmp
     now = time.time()
 
     from app.db import get_conn
-    from app.overview_projection import resolve_pending_publish
+    from app.overview_projection import resolve_pending_instrumentation_publish
 
     def _pending():
         with get_conn() as conn:
-            return resolve_pending_publish(conn, system_id)
+            return resolve_pending_instrumentation_publish(conn, system_id)
 
     assert _pending() is None
 
@@ -1221,10 +1316,10 @@ def test_pending_publish_ignores_failed_and_cancelled_jobs(admin_client, tmp_pat
         _publish_job(system_id, connection_id, patch_id, snapshot_id, status)
 
     from app.db import get_conn
-    from app.overview_projection import resolve_pending_publish
+    from app.overview_projection import resolve_pending_instrumentation_publish
 
     with get_conn() as conn:
-        pending = resolve_pending_publish(conn, system_id)
+        pending = resolve_pending_instrumentation_publish(conn, system_id)
     assert pending is not None and pending.patch_id == patch_id
 
 
@@ -1243,13 +1338,13 @@ def test_pending_publish_never_looks_across_systems(admin_client, tmp_path):
     patch_id = _applied_patch(system_id, snapshot_id, sha, time.time())
 
     from app.db import get_conn
-    from app.overview_projection import resolve_pending_publish
+    from app.overview_projection import resolve_pending_instrumentation_publish
 
     with get_conn() as conn:
-        assert resolve_pending_publish(conn, system_id).patch_id == patch_id
+        assert resolve_pending_instrumentation_publish(conn, system_id).patch_id == patch_id
         # The other System's own pending state is unaffected in both
         # directions: its patch IS published, so it has nothing pending.
-        assert resolve_pending_publish(conn, other) is None
+        assert resolve_pending_instrumentation_publish(conn, other) is None
 
 
 def test_pending_publish_ordering_is_deterministic(admin_client, tmp_path):
@@ -1265,11 +1360,11 @@ def test_pending_publish_ordering_is_deterministic(admin_client, tmp_path):
     _applied_patch(system_id, snapshot_id, sha, now - 100)
 
     from app.db import get_conn
-    from app.overview_projection import resolve_pending_publish
+    from app.overview_projection import resolve_pending_instrumentation_publish
 
     with get_conn() as conn:
-        first = resolve_pending_publish(conn, system_id)
-        second = resolve_pending_publish(conn, system_id)
+        first = resolve_pending_instrumentation_publish(conn, system_id)
+        second = resolve_pending_instrumentation_publish(conn, system_id)
     assert first.patch_id == newest
     assert first.patch_id == second.patch_id
     assert first.count == 3
@@ -1281,6 +1376,7 @@ def test_pending_publish_ordering_is_deterministic(admin_client, tmp_path):
         "load_repository_fact",
         "load_pending_experiments",
         "resolve_pending_publish",
+        "resolve_pending_instrumentation_publish",
         "load_variant_facts",
         "load_decision_facts",
     ],
@@ -1330,6 +1426,105 @@ def test_one_failing_fact_loader_never_takes_down_the_page(
     if action is not None:
         assert action["key"] in ("prepare_repository", "build_understanding")
         assert action["rule_row"] <= 7
+
+    if loader in ("load_pending_experiments", "load_variant_facts"):
+        assert body["findings_state"] == "unavailable"
+        assert body["findings"] == []
+        assert "findings" in body["degraded_sections"]
+
+
+@pytest.mark.parametrize(
+    ("owner", "loader"),
+    [
+        ("overview", "_latest_interview_session_id"),
+        ("state_facts", "get_latest_ready_snapshot"),
+        ("state_facts", "get_latest_snapshot"),
+        ("overview", "_runtime_checks"),
+    ],
+)
+def test_pre_section_read_failure_is_local_and_returns_200(
+    admin_client, tmp_path, monkeypatch, owner, loader
+):
+    token = _login(admin_client)
+    system_id = _create_system(admin_client, token, f"Guard-{loader}")
+    repo, sha = _init_repo(tmp_path, f"repo-guard-{loader}")
+    admin_client.put(
+        "/repository", json={"repo_path": repo}, headers=_headers(token, system_id)
+    )
+    _insert_snapshot(system_id, repo, sha)
+
+    from app import overview_projection
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError(f"{loader} unavailable")
+
+    target = overview_projection if owner == "overview" else overview_projection.state_facts
+    monkeypatch.setattr(target, loader, _boom)
+    response = admin_client.get("/overview", headers=_headers(token, system_id))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["findings_state"] == "unavailable"
+    # Runtime does not read snapshot projection state and must survive.  The
+    # loop legitimately degrades for the two snapshot loaders because its
+    # canonical system_state projection reads the same fact.
+    assert body["runtime"] is not None or loader in (
+        "_latest_interview_session_id",
+        "_runtime_checks",
+    )
+    if loader == "_runtime_checks":
+        assert body["brief"] is not None
+        assert body["runtime"] is None
+    else:
+        assert body["degraded_sections"]
+
+
+@pytest.mark.parametrize("loader", ["load_snapshot_commit", "load_revision_created_at"])
+def test_context_read_failure_does_not_blank_overview(
+    admin_client, tmp_path, monkeypatch, loader
+):
+    token = _login(admin_client)
+    system_id = _create_system(admin_client, token, f"ContextGuard-{loader}")
+    repo, sha = _init_repo(tmp_path, f"repo-context-guard-{loader}")
+    admin_client.put(
+        "/repository", json={"repo_path": repo}, headers=_headers(token, system_id)
+    )
+    snapshot_id = _insert_snapshot(system_id, repo, sha)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "guard"},
+        headers=_headers(token, system_id),
+    )
+    assert session.status_code in (200, 201), session.text
+
+    from app import overview_projection
+
+    if loader == "load_revision_created_at":
+        from dataclasses import replace
+
+        original = overview_projection.understanding_brief.build_understanding_brief
+
+        def _brief_with_revision(*args, **kwargs):
+            return replace(original(*args, **kwargs), revision_id=999999)
+
+        monkeypatch.setattr(
+            overview_projection.understanding_brief,
+            "build_understanding_brief",
+            _brief_with_revision,
+        )
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError(f"{loader} unavailable")
+
+    monkeypatch.setattr(overview_projection, loader, _boom)
+    response = admin_client.get("/overview", headers=_headers(token, system_id))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["brief"] is not None
+    assert body["runtime"] is not None
+    assert body["loop_stages"]
+    assert body["degraded_sections"]
+    if loader == "load_revision_created_at":
+        assert body["findings_state"] == "unavailable"
 
 
 def test_a_failed_loader_blocks_the_rows_that_read_it():

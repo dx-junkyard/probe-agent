@@ -1088,6 +1088,31 @@ CREATE TABLE IF NOT EXISTS experiment_variants (
 CREATE INDEX IF NOT EXISTS idx_experiment_variants_experiment
     ON experiment_variants (experiment_id, id);
 
+-- Canonical lineage for an adopted improvement that is ready to enter the
+-- existing approval-gated GitHub publish workflow.  ``patch_id`` is the
+-- transport artifact consumed by publish_jobs; experiment_id + variant_id
+-- are the semantic identity.  Overview must join through this table and may
+-- never infer lineage from System-wide timestamps or existence checks.
+CREATE TABLE IF NOT EXISTS improvement_publish_artifacts (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    experiment_id        INTEGER NOT NULL,
+    variant_id           INTEGER NOT NULL,
+    patch_id             INTEGER NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'ready',
+    error                TEXT,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (experiment_id) REFERENCES experiments (id) ON DELETE CASCADE,
+    FOREIGN KEY (variant_id) REFERENCES experiment_variants (id) ON DELETE CASCADE,
+    FOREIGN KEY (patch_id) REFERENCES probe_patches (id) ON DELETE CASCADE,
+    UNIQUE (experiment_id, variant_id),
+    UNIQUE (patch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_improvement_publish_artifacts_system
+    ON improvement_publish_artifacts (system_id, id DESC);
+
 CREATE TABLE IF NOT EXISTS experiment_commands (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     variant_id           INTEGER NOT NULL,

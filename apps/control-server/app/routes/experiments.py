@@ -32,6 +32,107 @@ PROMPT_VERSION = "experiment-interpretation-v1"
 SCHEMA_VERSION = "experiment-analysis-v1"
 
 
+def _materialize_improvement_publish_artifact(
+    conn, experiment, variant, *, now: float
+) -> int:
+    """Persist the exact adopted-variant -> publish-artifact lineage.
+
+    The GitHub publisher already has a hardened, approval-gated transport for
+    unified diffs (``probe_patches``).  An improvement artifact deliberately
+    reuses that transport, but its semantic identity lives in
+    ``improvement_publish_artifacts`` so an instrumentation patch can never be
+    mistaken for an adopted improvement.
+    """
+    existing = conn.execute(
+        """SELECT id FROM improvement_publish_artifacts
+            WHERE experiment_id = ? AND variant_id = ?""",
+        (experiment["id"], variant["id"]),
+    ).fetchone()
+    if existing is not None:
+        return existing["id"]
+
+    # The selected non-baseline variant and the baseline must both have
+    # completed successfully; this is the experiment's validation gate.
+    baseline = conn.execute(
+        """SELECT id FROM experiment_variants
+            WHERE experiment_id = ? AND is_baseline = 1 AND status = 'completed'
+            ORDER BY id LIMIT 1""",
+        (experiment["id"],),
+    ).fetchone()
+    if baseline is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Adoption requires a completed baseline before a publish artifact can be created",
+        )
+
+    run_id = conn.execute(
+        """INSERT INTO intelligence_runs
+               (system_id, snapshot_id, run_type, provider, model,
+                prompt_version, schema_version, decision_method, status,
+                is_mock, started_at, completed_at)
+           VALUES (?, ?, 'probe_plan', 'deterministic', 'experiment-adoption',
+                   'experiment-adoption-v1', 'improvement-publish-artifact-v1',
+                   'deterministic', 'completed', 0, ?, ?)""",
+        (experiment["system_id"], experiment["snapshot_id"], now, now),
+    ).lastrowid
+    plan_id = conn.execute(
+        """INSERT INTO probe_plans
+               (system_id, snapshot_id, intelligence_run_id, feature_id,
+                objective, status, origin, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'approved', 'experiment_adoption', ?, ?)""",
+        (
+            experiment["system_id"],
+            experiment["snapshot_id"],
+            run_id,
+            experiment["feature_id"],
+            experiment["objective"],
+            now,
+            now,
+        ),
+    ).lastrowid
+    patch_id = conn.execute(
+        """INSERT INTO probe_patches
+               (plan_id, system_id, snapshot_id, commit_sha, diff, status,
+                cleanup_state, created_at)
+           VALUES (?, ?, ?, ?, ?, 'generated', 'not_attempted', ?)""",
+        (
+            plan_id,
+            experiment["system_id"],
+            experiment["snapshot_id"],
+            experiment["baseline_commit"],
+            variant["patch_text"],
+            now,
+        ),
+    ).lastrowid
+
+    # The publisher re-checks these immediately before approval.  They are a
+    # structural projection of the already completed Experiment, not a second
+    # evaluation or an inferred success.
+    for validation_variant in ("baseline", "probed"):
+        conn.execute(
+            """INSERT INTO validation_runs
+                   (patch_id, system_id, variant, worktree_path,
+                    overall_success, trace_status, network_isolation,
+                    cleanup_state, created_at)
+               VALUES (?, ?, ?, '', 1, 'not_checked', 'not_requested',
+                       'not_attempted', ?)""",
+            (patch_id, experiment["system_id"], validation_variant, now),
+        )
+
+    return conn.execute(
+        """INSERT INTO improvement_publish_artifacts
+               (system_id, experiment_id, variant_id, patch_id, status, created_at)
+           VALUES (?, ?, ?, ?, 'ready', ?)""",
+        (
+            experiment["system_id"],
+            experiment["id"],
+            variant["id"],
+            patch_id,
+            now,
+        ),
+    ).lastrowid
+
+
 def _json_object(text: str) -> Dict[str, Any]:
     cleaned = text.strip()
     fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", cleaned, re.DOTALL)
@@ -647,7 +748,7 @@ def update_experiment_decision(
                 )
             variant = conn.execute(
                 """
-                SELECT variant_key, is_baseline, status
+                SELECT *
                 FROM experiment_variants
                 WHERE experiment_id = ? AND variant_key = ?
                 """,
@@ -663,6 +764,9 @@ def update_experiment_decision(
                     detail="Adopted variant must be a completed non-baseline variant",
                 )
             decision_variant_key = payload.variant_key
+            _materialize_improvement_publish_artifact(
+                conn, experiment, variant, now=time.time()
+            )
         conn.execute(
             """
             UPDATE experiments

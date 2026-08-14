@@ -214,6 +214,34 @@ def test_runs_baseline_and_two_variants_in_isolated_workspaces(
     )
     assert decision_response.json()["analysis"]["status"] == "analysis_failed"
 
+    # Adoption atomically materializes the canonical publish lineage.  The
+    # transport patch is the selected variant's exact diff and the existing
+    # publisher's explicit approval gate remains downstream.
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        artifact = conn.execute(
+            """SELECT a.*, p.diff
+                 FROM improvement_publish_artifacts a
+                 JOIN probe_patches p ON p.id = a.patch_id
+                WHERE a.experiment_id = ?""",
+            (created["id"],),
+        ).fetchone()
+        validation = conn.execute(
+            "SELECT variant, overall_success FROM validation_runs WHERE patch_id = ? ORDER BY variant",
+            (artifact["patch_id"],),
+        ).fetchall()
+    assert artifact["variant_id"] == next(
+        item["id"] for item in result["variants"] if item["variant_key"] == "variant-1"
+    )
+    assert artifact["diff"] == next(
+        item["patch_text"] for item in result["variants"] if item["variant_key"] == "variant-1"
+    )
+    assert [(row["variant"], row["overall_success"]) for row in validation] == [
+        ("baseline", 1),
+        ("probed", 1),
+    ]
+
     cleanup_response = admin_client.post("/experiments/cleanup", headers=headers)
     assert cleanup_response.status_code == 200
     assert cleanup_response.json()["cleaned_experiments"] == 1

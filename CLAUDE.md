@@ -1113,23 +1113,22 @@ creating incomplete persistence or execution paths for later phases.
       `developer_decision` (a record of their judgement) stay distinct; an
       aggregation whose sources disagree is `mixed`, because naming one implies
       the others agreed.
-    - **Row 12 publishes INSTRUMENTATION, and says so.** Its identity is the
-      patch (`probe_patches.id` → `publish_jobs.patch_id`, `completed` only,
-      System-scoped on both sides) — two System-wide existence checks ("an
-      adopted experiment exists", "a publish job once succeeded") made the
-      first successful publish cover every later change forever. But the
-      patch it identifies is a probe-plan MEASUREMENT patch, so the row is
-      `publish_instrumentation` / 「計測の変更を公開する」 and never claims an
-      improvement cycle closed. `experiments` references neither a patch nor a
-      publish job, so 「採用した改善は公開済みか」 is a question this
-      projection cannot answer and therefore does not. Do not revert to an
-      adopted-experiment existence check, and do not invent the lineage: a
-      column nothing writes leaves a CTA nothing can clear. Persisting
-      adopt → variant → artifact → publish job is its own issue.
+    - **Improvement Publish and instrumentation Publish have distinct
+      lineage.** Adopting a completed non-baseline Experiment variant writes
+      `experiment → selected variant → improvement_publish_artifact →
+      probe_patches transport → publish_job` atomically. Overview row 12 reads
+      only that exact current adopted lineage (`completed` jobs only,
+      System-scoped throughout) and may therefore say
+      `publish_improvement` / 「採用した改善を公開する」. A probe-plan
+      measurement patch remains `publish_instrumentation`; it is evaluated
+      after the improvement-cycle candidate/decision rows and never claims an
+      improvement cycle closed. Never replace either identity with independent
+      System-wide existence or timestamp checks: a previous cycle's publish
+      must not cover the current adopted variant.
     - **Every next-action fact group has its own guarded loader**
       (`load_repository_fact` / `load_pending_experiments` /
-      `resolve_pending_publish` / `load_variant_facts` /
-      `load_decision_facts`). They ran as bare SQL inside `build_overview`, so
+      `resolve_pending_publish` / `resolve_pending_instrumentation_publish` /
+      `load_variant_facts` / `load_decision_facts`). They ran as bare SQL inside `build_overview`, so
       one bad statement turned a page whose Brief, Runtime health, findings
       and loop had all loaded into a 500. A failure sets the group's
       availability flag and records `next_action.<group>` in

@@ -4947,7 +4947,8 @@ export type OverviewActionKey =
   | "start_observation"
   | "restore_observation"
   | "record_experiment_decision"
-  /** 計測 patch の公開。改善変更の公開ではない（lineage が存在しないため）。 */
+  | "publish_improvement"
+  /** 計測 patch の公開。改善変更の公開とは別の lineage。 */
   | "publish_instrumentation"
   | "create_candidate"
   | "start_next_cycle";
