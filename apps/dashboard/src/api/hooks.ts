@@ -3354,3 +3354,80 @@ export function useInterviewSessionStatusAudit(sessionId: number | null) {
     enabled: !!sessionId && !!getSystemId(),
   });
 }
+
+/**
+ * How long the Overview may keep showing a reception state that has since
+ * expired. The Overview's freshness reading, its relative "N分前", its
+ * connectivity finding and its CTA are all time-dependent: a screen left open
+ * while traffic stops must notice, and nothing pushes that event to us.
+ *
+ * 5 minutes is the worst-case detection lag this introduces, and it is stated
+ * here rather than left implicit.
+ */
+export const OVERVIEW_MAX_STALENESS_MS = 5 * 60_000;
+
+/** A running process is the one case worth watching closely. */
+export const OVERVIEW_RUNNING_POLL_MS = 3_000;
+
+/**
+ * When the next freshness threshold is crossed, in ms from now.
+ *
+ * The server sends the elapsed seconds it measured plus the System's own
+ * thresholds, so this lands on the real boundary without trusting the browser
+ * clock for anything but a duration. Refetching just after it means
+ * `receiving_now → delayed → stale` (and the CTA that follows freshness)
+ * update on their own instead of at the next reload.
+ */
+export function overviewBoundaryDelay(
+  data: import("@/api/types").OverviewOut | undefined,
+): number | null {
+  const runtime = data?.runtime;
+  if (!runtime) return null;
+  const elapsed = runtime.seconds_since_last_trace;
+  if (elapsed == null) return null;
+  const next = [runtime.delayed_after_seconds, runtime.stale_after_seconds]
+    .filter((threshold) => threshold > elapsed)
+    .sort((a, b) => a - b)[0];
+  if (next == null) return null;
+  // +1s so the refetch lands after the boundary rather than exactly on it.
+  return Math.max(1_000, (next - elapsed + 1) * 1_000);
+}
+
+// --- Overview / System Intelligence Brief (Issues #380-#384) ----------------
+//
+// One query for the whole Overview. It is deliberately NOT assembled from the
+// Brief / workflow-state / connectivity / system-state queries on the client:
+// the Overview's job is to say what is settled and what to do next, and a CTA
+// stitched together from four independently-refetching caches can contradict
+// itself between two renders. The server composes it once (#380 principle 6).
+export function useOverview() {
+  return useQuery({
+    queryKey: sysKey("overview"),
+    queryFn: () => api.get<import("@/api/types").OverviewOut>("/overview"),
+    enabled: !!getSystemId(),
+    // Three cadences, in priority order:
+    //   1. a running process -> watch it closely so 「作成しています」 clears;
+    //   2. the next freshness boundary -> so a system going quiet is noticed
+    //      at the moment it happens rather than on the next reload;
+    //   3. a bounded ceiling -> so an external change (a decision recorded on
+    //      another screen, a publish completing) cannot sit unnoticed forever.
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (data?.next_action_state === "waiting") return OVERVIEW_RUNNING_POLL_MS;
+      const boundary = overviewBoundaryDelay(data);
+      if (boundary != null) return Math.min(boundary, OVERVIEW_MAX_STALENESS_MS);
+      return OVERVIEW_MAX_STALENESS_MS;
+    },
+    // A tab the developer comes back to must not show yesterday's reading.
+    //
+    // `staleTime: 0` is load-bearing, not a default repeated for show. The
+    // app-wide default is 30s (`main.tsx`), and a focus/reconnect refetch is
+    // SKIPPED while data is still within it — so these two flags were inert
+    // for the first 30 seconds of every visit. A browser test caught it: the
+    // interval transitions worked (`refetchInterval` ignores `staleTime`)
+    // while returning to the tab showed the old reading.
+    staleTime: 0,
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
+  });
+}

@@ -345,11 +345,14 @@ The dashboard should support:
   re-requests proposal generation. When a requested turn yields no proposals
   and no error, show an informational toast (narrowing continues) — never a
   bare success toast that implies proposals were created.
-- Cross-page onboarding and navigation (Issue #212): Overview's zero-component
-  state shows a deterministic, ordered get-started list (Repository →
-  System Understanding → Connect SDK), optionally preceded by
-  `useSystemState()`'s `page_items["/"]` primary item via the canonical
-  `SystemStateBanner` when the server ever routes an item there. Probe
+- Cross-page onboarding and navigation (Issue #212): **the Overview part of
+  this bullet was superseded by Issue #384** — the ordered get-started list
+  (Repository → System Understanding → Connect SDK → Components) and its
+  `page_items["/"]` banner are gone, replaced by the single server-decided
+  primary action of `GET /overview` (see the Overview section below). Do not
+  reintroduce a step catalogue there; the onboarding path lives on the Setup
+  Guide (`components/setup-next-step.ts`, Issue #374). The rest of this
+  bullet is unchanged. Probe
   Planner's Feature field falls back to a prerequisite note (links to
   `/feature-map` and `/system-understanding`) plus an explicit
   "Enter feature id manually (advanced)" toggle when no Feature Map drafts
@@ -370,7 +373,9 @@ The dashboard should support:
   `diagnosis` phase (so it disappears as the phase advances). Used in
   Overview's zero-component state, Feature Map's empty features state, and the
   Probe Planner generate dialog when `phases`'s `preparation` is not
-  complete. The Probe Planner use is a steer, not a block: the manual
+  complete. **Issue #384 removed the Overview use** (the Overview now renders
+  `GET /overview`'s own next action); the Feature Map and Probe Planner uses
+  are unchanged. The Probe Planner use is a steer, not a block: the manual
   feature-id escape hatch and the generate API are unchanged. Setup Guide now
   also links back to Connect SDK (`setup-guide-connect-sdk-link`), making that
   pair bidirectional. Never derive phase or state copy client-side.
@@ -806,7 +811,7 @@ the reverse — puts it back on top of the primary action at narrow widths.
 - `ConnectivityBadge` は `freshness`(実 workload をいま受信しているか)を読む。
   smoke trace は transport の証明でしかないので、`transport_freshness` とは
   別軸として扱い、食い違うときだけ注記を出す。`state`
-  (一度でも疎通したか)は累積マイルストーンで、Overview のセットアップ
+  (一度でも疎通したか)は累積マイルストーンで、Setup Guide の
   チェックリストだけが読む。同じ緑ラベルで両方を表さない。
 - token の状態は `TokenOut.status` を読む。`revoked` / `expires_at` から
   ローカルに再計算しない (`lib/token-display.ts` は表示への写像だけを持つ)。
@@ -828,3 +833,46 @@ the reverse — puts it back on top of the primary action at narrow widths.
 - Trace 詳細は既定で折りたたむ (`TracePayloadPanel`)。展開前に型・件数・
   サイズ・redaction 状態を示す。redaction の3状態(未確認 / 秘匿値なし /
   redact済み)を2つに畳まないこと。
+
+## Overview = 意思決定コックピット (issue #380, subs #381-#384)
+
+Overview は稼働メトリクス画面ではない。`GET /overview` が返す 1 本の projection
+を描くだけの画面で、**意味の再導出を一切しない**。
+
+- 判定はすべてサーバ側。readiness、finding の重要度・順位、次の 1 操作、
+  runtime freshness のいずれも client で計算しない。`components/overview/`
+  に置いてよいのは表示テーブル(`display.ts`: 有限値 → badge variant、target →
+  href)だけで、ここに if 文で結論を作り始めたら設計が壊れている。
+- **main column の読み順は契約**: System Brief → 今わかったこと →
+  次にすること → 改善ループの現在地 → Runtime health。見出し順と読み上げ順を
+  一致させる。狭い画面では 1 カラム化するだけで、この順序は変えない。
+- **主操作は 1 件だけ**。`next_action` をそのまま描く。候補から選び直さない、
+  サーバが 0 件を返したときに既定 CTA を代わりに出さない、件数から組み立てない。
+  `waiting` / `unavailable` は**文章**で出す。disabled ボタンを常設しない。
+- finding は `findings.slice(0, findings_initial_count)` をサーバの順序のまま
+  描く。ここで sort をかけると、それが 2 つ目の重要度モデルになる。
+- **Overview を開くことは判断ではない**。閲覧・展開・ack のいずれも書き込まない。
+- Runtime health の見出しは `freshness`。累積(`state` / Component 数 /
+  Trace 総数 / mode 内訳)は `details` の中で「現在の稼働状態ではありません」と
+  明記する。Component 完全一覧は `/components` にのみ置く。
+- 空状態は 3 種を書き分ける: `no_findings`(新しい発見なし) /
+  `not_compared`(比較基準がない) / `unavailable`(取得失敗)。
+- **サーバーが `unavailable` を返したら、代わりの CTA を出さない。** 取得
+  できなかった fact を「まだしていない」と読み替えるのはサーバー側でも禁止
+  だが、Dashboard 側で既定 CTA を補うのも同じ誤りである。
+- provenance ラベルはサーバーの値をそのまま出す。`developer_intent` を
+  「AI の解釈」と混ぜない。
+- Runtime の observed / known はどちらも component 数。Capability カバレッジ
+  は `capability_coverage_state` が `computed` のときだけ比率で出す。
+- Overview のカードは `CardTitle as="h2"`。`h1 → h2 → h3` を崩さない。
+- **`findings_baseline_state` の `unavailable` を「未確認」と書かない。**
+  読めなかったことを、開発者についての断定に変換しない。
+- URL 由来の選択（`?experiment=` 等）は、対象が今も操作可能な状態のときだけ
+  適用する。手動操作と URL 由来は別 state にし、手動を優先する。
+- 時間に依存する画面は `staleTime: 0` を明示する。アプリ全体の既定は 30 秒
+  なので、`refetchOnWindowFocus` / `refetchOnReconnect` だけ付けても効かない。
+- 実ブラウザでしか検証できないもの（時計駆動の再取得、reload、layout）は
+  `apps/dashboard/browser-tests/` に残す。Playwright は依存に入れない。
+- 部分失敗は `degraded_sections` の領域だけ落とし、他は描き続ける。
+  「取得できませんでした」を「発見がありません」「受信が止まっています」と
+  同じ文言にしない。

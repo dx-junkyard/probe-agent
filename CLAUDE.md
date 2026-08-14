@@ -1065,6 +1065,172 @@ creating incomplete persistence or execution paths for later phases.
       terminology and label contract — most importantly the rule this whole
       epic exists to enforce: one displayed word must not carry two facts.
 
+22. Issue #380 (subs #381-#384) — the Overview as the System Intelligence
+    Brief / decision cockpit. The old screen led with Component 数 / Trace
+    総数 / 最終受信日時 / mode 内訳 and a full Component table, so it read as
+    an internal monitoring page and duplicated Components/Traces. It now
+    answers, in this order, 何のためのシステムか / 何が変わったか / 次の1操作 /
+    改善ループの現在地 / いま観測できているか. `app/overview_projection.py`
+    + `GET /overview` is the single canonical projection; the Dashboard
+    renders it and re-derives nothing. What it added, and what any later
+    change must preserve:
+    - **It composes existing canonical projections and adds no sixth
+      opinion.** The Brief and Decision Readiness ARE #351-#354's
+      `build_understanding_brief`; the interview position is #349's engine;
+      the loop rail is #237/#256's `derive_user_phase` under
+      developer-facing labels; the runtime axes are #370's `state` /
+      `freshness`. A third understanding model on the Overview is the
+      explicit non-goal.
+    - **It writes nothing.** `evaluate_session_workflow` is deliberately NOT
+      called — it persists the workflow checkpoint and can open a backward
+      request, so glancing at the Overview would record Interview progress.
+      `gather_facts` + `evaluate_candidate_state` (both pure) give the same
+      candidate state. No view, no acknowledgement, no "last seen" marker:
+      a page view is never a human decision (#382).
+    - The Brief is read for **the System's newest Interview session**
+      (`ORDER BY id DESC`), the same rule the Interview screen auto-selects
+      with, so the two screens can never describe different sessions — and
+      the Overview's deep links land on the one the developer will open.
+    - **A finding's id is derived from its cause, never from a row id.** A
+      rebuild renumbers `alignment_item` and `understanding_revision` rows
+      while describing the same finding; an id that changed every rebuild
+      would make every finding permanently `new` and `ongoing` unreachable.
+    - **An unreadable fact is never a fact's default value.** `NextActionFacts`
+      carries `brief_available` / `runtime_available` / `workflow_available`,
+      and a false flag REMOVES every rule that reads it rather than letting the
+      default stand. Substituting `not_built` for an unreadable Brief and
+      `no_signal` / `never_received` for unreadable Runtime told an already
+      understood system to 「システムを理解する」 and a receiving one to
+      「SDK を接続する」 — the #366 one-word-two-facts defect, with a call to
+      action as the wrong word. Fail-closed is not fail-blank: rows 1-2 read
+      repository/snapshot only and still answer when everything later is
+      unreadable.
+    - **`OverviewFindingProvenance` is a strict SUPERSET of the Brief's
+      vocabulary**, so a claim's provenance carries into a finding unchanged.
+      The first version omitted `developer_intent` and collapsed it to
+      `ai_hypothesis`, displaying a Vision the developer wrote and confirmed as
+      the AI's guess. `developer_intent` (what they said they wanted) and
+      `developer_decision` (a record of their judgement) stay distinct; an
+      aggregation whose sources disagree is `mixed`, because naming one implies
+      the others agreed.
+    - **Row 12 publishes INSTRUMENTATION, and says so.** Its identity is the
+      patch (`probe_patches.id` → `publish_jobs.patch_id`, `completed` only,
+      System-scoped on both sides) — two System-wide existence checks ("an
+      adopted experiment exists", "a publish job once succeeded") made the
+      first successful publish cover every later change forever. But the
+      patch it identifies is a probe-plan MEASUREMENT patch, so the row is
+      `publish_instrumentation` / 「計測の変更を公開する」 and never claims an
+      improvement cycle closed. `experiments` references neither a patch nor a
+      publish job, so 「採用した改善は公開済みか」 is a question this
+      projection cannot answer and therefore does not. Do not revert to an
+      adopted-experiment existence check, and do not invent the lineage: a
+      column nothing writes leaves a CTA nothing can clear. Persisting
+      adopt → variant → artifact → publish job is its own issue.
+    - **Every next-action fact group has its own guarded loader**
+      (`load_repository_fact` / `load_pending_experiments` /
+      `resolve_pending_publish` / `load_variant_facts` /
+      `load_decision_facts`). They ran as bare SQL inside `build_overview`, so
+      one bad statement turned a page whose Brief, Runtime health, findings
+      and loop had all loaded into a 500. A failure sets the group's
+      availability flag and records `next_action.<group>` in
+      `degraded_detail`; it never becomes `0` / `None` / `False`.
+    - **`findings_baseline_state` is three values**, not two.
+      `confirmed_at is None` meant both "the developer never confirmed" and
+      "we could not read whether they did", and the screen asserted the first.
+      An unreadable Brief now reports `unavailable` and makes findings
+      `unavailable` too — no finding may carry a `new` / `ongoing` verdict
+      against a baseline that could not be read.
+    - **Claim provenance is indexed by `(section, name)`.** The three Brief
+      sections are independent namespaces; keyed by name alone, whichever
+      section was walked last overwrote the others, so a Vision change could
+      inherit a Capability's provenance. The section vocabulary is
+      `understanding_brief.BRIEF_SECTIONS`, which is what
+      `UnderstandingChange.section` already carries.
+    - **A finding is dated from when its state BEGAN.** A `connectivity_lost`
+      finding's `first_seen` is the threshold crossing
+      (`last_real_trace_at + delayed/stale_after_seconds`), not the last trace:
+      at the default thresholds those differ by up to a day, so a brand-new
+      outage reported itself as pre-existing.
+    - **The Overview follows the clock.** It refetches at the next freshness
+      boundary (computed from the server's elapsed seconds and thresholds, so
+      the browser clock is only ever used for a duration) and at a stated 5
+      minute ceiling otherwise. The ceiling IS the maximum detection lag for a
+      system going quiet, and it is written down rather than implied.
+    - **`observed_component_count` and `known_component_count` are both
+      components.** Capability-level coverage is `not_computed` and says so:
+      nothing persists a component → Capability mapping, so a ratio between the
+      two is a division across entities whose numerator can exceed its
+      denominator.
+    - **「前回」 is the developer's own 理解の確認**
+      (`understanding_confirmed_at`), a persisted human decision. Without one
+      the status is `not_compared` — never 「新しい発見がない」. The three
+      empty states (`no_findings` / `not_compared` / `unavailable`) are three
+      different answers and never share copy.
+    - **Deduplication is two passes**: same root cause (`dedupe_key`), then
+      same subject across kinds (`subject_key`). A claim that is both
+      conflicting and unconfirmed would otherwise take two of the three
+      slots. `severity` is the fixed value its `kind` carries and is never
+      computed per finding — computing it would be the importance score #382
+      forbids. The order is `severity → status → kind → last_updated → id`:
+      every gate finite, the tie-break total, so the same facts always
+      produce the same three findings.
+    - `decide_next_action` is a **14-row first-match table returning exactly
+      zero or one action**, each with its 選定理由 / 完了条件 / 完了後の価値.
+      Two row orderings are load-bearing: `W3` (unanswered required
+      questions) sits ABOVE 理解を確認する, because `W3` is precisely the
+      state in which the understanding cannot be confirmed; and freshness
+      `delayed`/`stale` sits ABOVE 採否を記録する, so a decision is never
+      judged against observations that stopped updating.
+    - **`waiting` / `unavailable` carry no action.** A permanently disabled
+      control teaches the developer to ignore the primary action (#383);
+      「処理中です」 and 「判定できませんでした」 are sentences, not greyed
+      buttons. `create_system` lives in the same finite vocabulary but is
+      reachable only through the Dashboard's zero-System branch, since the
+      endpoint is System-scoped.
+    - **Runtime health's headline is `freshness`, never the cumulative
+      `state`** — that conflation is the #370 bug, and restoring it paints a
+      14-day-silent system green. Cumulative totals survive inside a
+      `<details>` labelled 「現在の稼働状態ではありません」; error / mismatch
+      / replay counts are measured over a bounded 24h window, because a
+      cumulative total can never show that something stopped. The full
+      Component list stays on `/components`.
+    - **A failed section degrades alone.** Each section is guarded
+      independently into `degraded_sections`; the guard drops that section's
+      DISPLAY and never substitutes a guessed value. 「取得できませんでした」,
+      「発見がありません」 and 「受信が止まっています」 are different
+      sentences.
+    - **A deep link never expands a settled Experiment.** The CTA's id is a
+      snapshot of when the Overview rendered; by the time the link is opened
+      the experiment may be adopted / rejected / needs_more_data or no longer
+      completed. The URL-driven selection and the developer's own expansion
+      are separate states, and the URL one applies only to a row that is
+      present, `completed` and `undecided` — otherwise the page falls back to
+      the plain list and selects no substitute.
+    - **Three #384 acceptance conditions are verified in a real browser**
+      (`apps/dashboard/browser-tests/`, Playwright deliberately NOT a repo
+      dependency): the clock-driven `receiving_now → delayed → stale →
+      receiving_now` transition with no reload, the Experiment deep link
+      across a reload, and the degraded render. That harness found a real
+      defect — the app-wide `staleTime: 30_000` silently suppressed the
+      Overview's focus/reconnect refetch, so `useOverview` now sets
+      `staleTime: 0`.
+    - **Snapshot / commit / snapshot freshness / understanding revision / last
+      confirmation are first-view context**, not a disclosure: they qualify
+      every claim, finding and CTA on the page. `snapshot_freshness` is the
+      server's verdict — the Dashboard never compares two snapshot ids itself
+      (#369's rule). `CardTitle` gained an `as` prop so the Overview's cards
+      are real `h2`s and the outline is `h1 → h2 → h3`; other screens' heading
+      structure is unchanged.
+    - The Overview's Get Started ordered list (#212/#259/#267) and its
+      per-step completion tests are **deleted**. The onboarding path lives on
+      the Setup Guide (`components/setup-next-step.ts`, #374). Do not
+      reintroduce a step catalogue on the Overview.
+    Human gates are unchanged: 理解の確認 / Alignment 項目の確定 / 提案の
+    承認・編集・却下 / 差分の適用 / 観測の開始 / 採否の記録 / publish all
+    stay `decision_method: manual` on their own screens. See the Issue #380
+    sections in `docs/project-intelligence.md` and
+    `docs/system-understanding-navigation.md`.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

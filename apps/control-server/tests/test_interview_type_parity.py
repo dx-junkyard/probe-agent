@@ -99,6 +99,22 @@ FINITE_TYPE_NAMES = (
     "UnderstandingProvenanceKind",
     "UnderstandingReadinessSeverity",
     "UnderstandingReadinessState",
+    # Issue #380-#384: the Overview cockpit's vocabularies. Same risk as the
+    # Brief's above -- the Dashboard branches on severity and status today,
+    # but a new finding kind or action key would type-check on one side alone.
+    "OverviewActionKey",
+    "OverviewActionState",
+    "OverviewFindingKind",
+    "OverviewFindingProvenance",
+    "OverviewFindingSeverity",
+    "OverviewFindingStatus",
+    "OverviewFindingsState",
+    "OverviewLoopStage",
+    "OverviewLoopStageStatus",
+    "OverviewSection",
+    "OverviewSnapshotFreshness",
+    "OverviewCoverageState",
+    "OverviewBaselineState",
 )
 
 

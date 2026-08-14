@@ -4875,3 +4875,206 @@ export interface UnderstandingBriefOut {
   revision_id: number | null;
   snapshot_id: number | null;
 }
+
+// --- Overview / System Intelligence Brief (Issues #380-#384) -----------------
+//
+// Every union below mirrors a server `Literal` in `app/models.py` one-for-one;
+// `test_interview_type_parity.py` fails if the two drift. The Overview renders
+// this projection and never re-derives a readiness verdict, a finding's
+// importance, or the next action from client state (#380 principle 6).
+
+export type OverviewFindingKind =
+  | "claim_conflict"
+  | "understanding_blocked"
+  | "understanding_changed"
+  | "capability_composition_stale"
+  | "unconfirmed_core_claim"
+  | "runtime_mismatch"
+  | "runtime_unobserved"
+  | "connectivity_lost"
+  | "snapshot_stale"
+  | "evaluation_decision_pending"
+  | "improvement_candidate_ready";
+
+export type OverviewFindingSeverity =
+  | "blocker"
+  | "human_decision_required"
+  | "material_change"
+  | "informative";
+
+/** `not_compared` は「新しい発見がない」とは別の答え。同じ表示にしてはならない。 */
+export type OverviewFindingStatus = "new" | "ongoing" | "not_compared";
+
+/**
+ * 先頭4つは `UnderstandingProvenanceKind` と同一の値。claim の出所は変換せず
+ * そのまま finding に引き継ぐ（`developer_intent` を落として `ai_hypothesis`
+ * にすると、開発者が確定した Vision が AI の推測として表示される）。
+ * 残り3つは finding 固有: 判断の記録 / probe-agent 自身の処理記録 / 出所が
+ * 複数に割れた集約。
+ */
+export type OverviewFindingProvenance =
+  | "developer_intent"
+  | "implementation_fact"
+  | "runtime_observation"
+  | "ai_hypothesis"
+  | "developer_decision"
+  | "system_process"
+  | "mixed";
+
+/** 固定した snapshot が HEAD の断面かどうか。サーバーが決める。 */
+export type OverviewSnapshotFreshness = "current" | "stale" | "unavailable";
+
+/** Capability 単位の観測カバレッジを算出できたか。今日は `not_computed`。 */
+export type OverviewCoverageState = "computed" | "not_computed";
+
+export type OverviewFindingsState =
+  | "has_findings"
+  | "no_findings"
+  | "not_compared"
+  | "unavailable";
+
+/** 「前回」の基準を読めたか。読めないことと、存在しないことは別。 */
+export type OverviewBaselineState = "has_baseline" | "no_baseline" | "unavailable";
+
+export type OverviewActionKey =
+  | "create_system"
+  | "prepare_repository"
+  | "build_understanding"
+  | "resolve_understanding_blocker"
+  | "answer_interview_questions"
+  | "confirm_understanding"
+  | "connect_sdk"
+  | "start_observation"
+  | "restore_observation"
+  | "record_experiment_decision"
+  /** 計測 patch の公開。改善変更の公開ではない（lineage が存在しないため）。 */
+  | "publish_instrumentation"
+  | "create_candidate"
+  | "start_next_cycle";
+
+export type OverviewActionState = "available" | "waiting" | "complete" | "unavailable";
+
+export type OverviewLoopStage =
+  | "setup"
+  | "preparation"
+  | "instrumentation"
+  | "observation"
+  | "evaluation"
+  | "publish";
+
+export type OverviewLoopStageStatus = "reached" | "current" | "future";
+
+export type OverviewSection = "brief" | "findings" | "next_action" | "loop" | "runtime";
+
+export interface OverviewTargetOut {
+  route: string;
+  label: string;
+  /** 遷移先が実際に読むパラメータ名で入る (#371 の規則)。 */
+  params: Record<string, string>;
+  anchor: string | null;
+}
+
+export interface OverviewFindingOut {
+  id: string;
+  kind: OverviewFindingKind;
+  kind_label: string;
+  severity: OverviewFindingSeverity;
+  severity_label: string;
+  status: OverviewFindingStatus;
+  status_label: string;
+  summary: string;
+  decision_impact: string;
+  provenance: OverviewFindingProvenance;
+  provenance_label: string;
+  snapshot_id: number | null;
+  revision_id: number | null;
+  runtime_window_seconds: number | null;
+  first_seen: number | null;
+  last_updated: number | null;
+  target: OverviewTargetOut | null;
+  evidence: Record<string, unknown>[];
+  occurrence_count: number;
+}
+
+export interface OverviewActionOut {
+  key: OverviewActionKey;
+  label: string;
+  reason: string;
+  completion_condition: string;
+  value: string;
+  target: OverviewTargetOut;
+  rule_row: number;
+  source_state_ids: string[];
+  source_finding_ids: string[];
+  blockers: string[];
+}
+
+export interface OverviewLoopStageOut {
+  stage: OverviewLoopStage;
+  label: string;
+  status: OverviewLoopStageStatus;
+  meaning: string;
+  next_milestone: string;
+  complete: boolean;
+}
+
+export interface OverviewRuntimeHealthOut {
+  state: ConnectivityState;
+  freshness: ConnectivityFreshness;
+  freshness_label: string;
+  transport_freshness: ConnectivityFreshness;
+  last_real_trace_at: number | null;
+  seconds_since_last_trace: number | null;
+  last_trace_at: number | null;
+  seconds_since_last_any_trace: number | null;
+  evaluated_at: number;
+  real_trace_count_5m: number;
+  real_trace_count_1h: number;
+  real_trace_count_24h: number;
+  delayed_after_seconds: number;
+  stale_after_seconds: number;
+  component_count: number;
+  total_trace_count: number;
+  mode_counts: Record<string, number>;
+  window_seconds: number;
+  error_count: number;
+  runtime_mismatch_count: number;
+  replayable_count: number;
+  partial_count: number;
+  unreplayable_count: number;
+  not_captured_count: number;
+  /** window 内に trace を出した component 数。Capability 数とは別 entity。 */
+  observed_component_count: number;
+  known_component_count: number;
+  core_capability_count: number;
+  capability_coverage_state: OverviewCoverageState;
+  observed_capability_count: number | null;
+  unmapped_component_count: number | null;
+}
+
+export interface OverviewOut {
+  system_id: number;
+  generated_at: number;
+  interview_session_id: number | null;
+  brief: UnderstandingBriefOut | null;
+  snapshot_id: number | null;
+  snapshot_commit_sha: string | null;
+  latest_ready_snapshot_id: number | null;
+  snapshot_freshness: OverviewSnapshotFreshness;
+  understanding_revision_id: number | null;
+  understanding_confirmed_at: number | null;
+  findings: OverviewFindingOut[];
+  findings_initial_count: number;
+  findings_state: OverviewFindingsState;
+  findings_baseline_state: OverviewBaselineState;
+  findings_baseline_label: string;
+  findings_baseline_at: number | null;
+  next_action: OverviewActionOut | null;
+  next_action_state: OverviewActionState;
+  next_action_message: string;
+  loop_stages: OverviewLoopStageOut[];
+  user_phase: string;
+  runtime: OverviewRuntimeHealthOut | null;
+  degraded_sections: OverviewSection[];
+  degraded_detail: Record<string, string>;
+}

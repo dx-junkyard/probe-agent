@@ -1,269 +1,248 @@
-import { Link } from "react-router-dom";
-import {
-  useComponents, useSystemState, useConnectivityStatus,
-  useLatestSnapshot, useLatestDrafts, useMyTokens,
-} from "@/api/hooks";
+import { useOverview } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
-import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { SystemStateBanner } from "@/components/system-state";
-import { PrerequisiteGuide } from "@/components/prerequisite-guide";
-import { Boxes, Activity, Clock, FolderCog, Compass, Plug, RadioTower, CheckCircle2 } from "lucide-react";
+import { FindingsCard } from "@/components/overview/findings";
+import { LoopRailCard, NextActionCard } from "@/components/overview/next-action";
+import { RuntimeHealthCard } from "@/components/overview/runtime-health";
+import { SystemBriefCard } from "@/components/overview/system-brief";
+import { targetHref } from "@/components/overview/display";
 import { formatTimestamp } from "@/lib/utils";
-import { isApiToken, isTokenUsable } from "@/lib/token-display";
+import type { OverviewOut, OverviewSnapshotFreshness } from "@/api/types";
 
-// Deterministic, ordered get-started steps for a brand-new System with zero
-// components (Issue #212). This is a static fallback list, not a heuristic
-// recommendation — every System needs the repository configured, System
-// Understanding built, and the SDK connected, in this order.
-// Issue #259: closes the dead end at step 3 -- once the SDK is connected
-// there was previously no onward link telling the developer where to go
-// look at the traces that start arriving. Step 4 is the only one with a
-// deterministic completion signal today (ConnectivityStatus, the same
-// finite state machine the header connectivity badge already reads, Issue
-// #165); the first three steps stay plain links, unchanged.
-// Issue #267: every step now gets its own deterministic completion signal
-// (previously only step 4 did), reusing the same presence-check pattern as
-// `components/prerequisite-checklist.tsx` -- no heuristic inference, just
-// existing API facts. `required` marks steps that are NOT technically
-// necessary to reach step 3->4 (connect-sdk.tsx's token issuance does not
-// depend on Repository/System Understanding being done first), per Issue
-// #267 item 2.
-const GET_STARTED_STEPS = [
-  {
-    to: "/repository", label: "1. Configure the repository", icon: FolderCog,
-    testId: "overview-link-repository", required: false,
-  },
-  {
-    to: "/system-understanding", label: "2. Build System Understanding", icon: Compass,
-    testId: "overview-link-system-understanding", required: false,
-  },
-  {
-    to: "/connect-sdk", label: "3. Connect the SDK", icon: Plug,
-    testId: "overview-link-connect-sdk", required: true,
-  },
-  {
-    to: "/components", label: "4. View traces in Components", icon: RadioTower,
-    testId: "overview-link-view-traces", required: true,
-  },
-] as const;
-
-const MODE_VARIANT = {
-  off: "secondary",
-  trace: "success",
-  shadow: "warning",
-} as const;
+// Issue #380: the Overview is the System Intelligence Brief / decision
+// cockpit, not a metrics screen.
+//
+// Order in the main column is contract, not styling — the same discipline
+// #358 fixed on the Interview cockpit. Reading top to bottom must answer the
+// Epic's five questions in order:
+//
+//   1. System Brief      -> 何のためのシステムで、AI はどう理解しているか
+//   2. 今わかったこと      -> 前回から何が変わり、何が分かったか
+//   3. 次にすること        -> 次の1操作と、その理由・完了条件・完了後の価値
+//   4. 改善ループの現在地   -> どこまで来ていて、次の意味的到達点は何か
+//   5. Runtime health     -> いま観測できているか（二次領域）
+//
+// The heading order and the DOM order are the same, so a screen reader gets
+// the same priority ordering as the eye.
+//
+// Everything semantic arrives already decided by `GET /overview`. This page
+// chooses layout and disclosure; it never picks a CTA, re-ranks a finding, or
+// re-derives a readiness verdict from counts (#380 UX原則 6).
 
 export default function OverviewPage() {
   const { systems, systemId } = useAuth();
-  const { data: components, isLoading } = useComponents();
-  // Canonical state projection (Issue #206); "/" carries no server-side
-  // items today (no rule targets the Overview route), so this is a cheap,
-  // optional primary item and the static ordered list below is always the
-  // deterministic fallback (Issue #212).
-  const { data: systemState } = useSystemState();
-  const primaryOverviewItem = systemState?.page_items["/"]?.[0] ?? null;
-  // Issue #259: drives step 4's completion below. This is a setup checklist,
-  // so it deliberately reads the cumulative milestone `state`, NOT Issue
-  // #370's live `freshness`: "you have connected the SDK" is a step that
-  // stays done once achieved. The header ConnectivityBadge reads `freshness`
-  // instead, because "is it receiving right now" is the operational question
-  // and it must reappear when traffic stops.
-  const { data: connectivity } = useConnectivityStatus();
-  // Issue #267: deterministic completion facts for steps 1-3, reusing the
-  // same hooks/pattern as `PrerequisiteChecklist` (snapshot presence, System
-  // Profile Draft presence) plus `connect-sdk.tsx`'s own token list.
-  // GET /tokens/me (auth.py) returns every api_tokens row for the user,
-  // including the `kind="session"` login token issued on every login
-  // (auth.py:119) -- that row is not an SDK/API credential and must not
-  // count here. Only `kind="api"` tokens (auth.py:366) that are still usable
-  // and scoped to the current System (or unscoped) represent an actual SDK
-  // connection.
-  // Issue #368: usability is the server's `status` field
-  // (`app/token_status.py`), not a local revoked/expires_at comparison -- a
-  // second local definition of "expired" is exactly the drift that made the
-  // Access Token list show expired tokens as active.
-  const { data: latestSnapshot } = useLatestSnapshot();
-  const { data: latestDrafts } = useLatestDrafts();
-  const { data: myTokens } = useMyTokens();
-  const hasActiveSdkToken = (myTokens ?? []).some((t) =>
-    isApiToken(t) &&
-    isTokenUsable(t.status) &&
-    (t.system_id == null || t.system_id === systemId)
-  );
-  const stepDone: Record<string, boolean> = {
-    "/repository": !!latestSnapshot,
-    "/system-understanding": !!latestDrafts?.system_profile_draft,
-    "/connect-sdk": hasActiveSdkToken,
-    "/components": connectivity?.state === "receiving",
-  };
-
+  const { data: overview, isLoading, isError, refetch } = useOverview();
   const system = systems.find((s) => s.id === systemId);
-  const totalTraces = components?.reduce((s, c) => s + c.trace_count, 0) ?? 0;
-  const lastSeen = components?.reduce((max, c) =>
-    c.last_seen && (!max || c.last_seen > max) ? c.last_seen : max, null as number | null);
-  const modeCount = components?.reduce((acc, c) => {
-    acc[c.mode] = (acc[c.mode] || 0) + 1;
-    return acc;
-  }, {} as Record<string, number>) ?? {};
+
+  // Zero Systems is not a state the System-scoped endpoint can be asked about,
+  // so it is answered here. It uses the same finite action vocabulary
+  // (`create_system`) rather than growing a second one.
+  if (systems.length === 0) {
+    return (
+      <div className="space-y-4">
+        <PageHeading system={undefined} />
+        <Card data-testid="overview-no-systems">
+          <CardHeader>
+            <CardTitle className="text-base">次にすること</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm" data-action-key="create_system">
+            <p className="font-medium">System を作成してください。</p>
+            <p className="text-muted-foreground">
+              System は観測対象のまとまりです。ヘッダーの「System を作成」から作成すると、
+              リポジトリの登録とシステム理解の構築に進めます。
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    // A skeleton in the same shape as the loaded page, so nothing shifts when
+    // it resolves — and so 「読み込み中」 never looks like 「空」 (#384).
+    return (
+      <div className="space-y-4" data-testid="overview-loading">
+        <PageHeading system={system} />
+        <div className="grid gap-4 xl:grid-cols-3">
+          <div className="space-y-4 xl:col-span-2">
+            <Skeleton className="h-64 w-full" />
+            <Skeleton className="h-40 w-full" />
+          </div>
+          <div className="space-y-4">
+            <Skeleton className="h-40 w-full" />
+            <Skeleton className="h-56 w-full" />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (isError || !overview) {
+    return (
+      <div className="space-y-4">
+        <PageHeading system={system} />
+        <Card data-testid="overview-load-error">
+          <CardHeader>
+            <CardTitle className="text-base">Overview を取得できませんでした</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            <p className="text-muted-foreground">
+              状態が分からないため、推測での案内は行いません。
+            </p>
+            <button
+              type="button"
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+              onClick={() => refetch()}
+            >
+              再試行
+            </button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  const interviewHref = targetHref({
+    route: "/interview",
+    label: "",
+    params: overview.interview_session_id
+      ? { session: String(overview.interview_session_id) }
+      : {},
+    anchor: null,
+  });
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">Overview</h1>
-        {system && (
-          <p className="text-muted-foreground mt-1">
-            {system.name}{system.environment ? ` — ${system.environment}` : ""}
-          </p>
-        )}
-      </div>
+    <div className="space-y-4">
+      <PageHeading system={system} overview={overview} />
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <MetricCard
-          title="Components"
-          value={isLoading ? undefined : String(components?.length ?? 0)}
-          icon={<Boxes className="h-4 w-4 text-muted-foreground" />}
-        />
-        <MetricCard
-          title="Total Traces"
-          value={isLoading ? undefined : totalTraces.toLocaleString()}
-          icon={<Activity className="h-4 w-4 text-muted-foreground" />}
-        />
-        <MetricCard
-          title="Last Seen"
-          value={isLoading ? undefined : formatTimestamp(lastSeen)}
-          icon={<Clock className="h-4 w-4 text-muted-foreground" />}
-        />
-        <MetricCard
-          title="Active Modes"
-          value={isLoading ? undefined : Object.entries(modeCount).map(([m, n]) => `${m}: ${n}`).join(", ") || "—"}
-          icon={<Activity className="h-4 w-4 text-muted-foreground" />}
-        />
-      </div>
+      {overview.degraded_sections.length > 0 && (
+        // A partial failure names what is missing and lets the rest render.
+        // The whole screen never goes blank because one section could not be
+        // derived (#384).
+        <Card data-testid="overview-degraded">
+          <CardContent className="p-4 text-sm">
+            <p className="font-medium">一部の情報を取得できませんでした。</p>
+            <p className="text-muted-foreground">
+              取得できなかった領域: {overview.degraded_sections.join(", ")}。
+              表示中の他の領域は最新の永続事実に基づいています。
+            </p>
+          </CardContent>
+        </Card>
+      )}
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Components</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {systems.length === 0 ? (
-            // Issue #265: distinct from the zero-*components* state below --
-            // there is no System selected at all yet, so components/traces
-            // cannot exist. Point at the header's "System を作成" control
-            // instead of showing the (System-scoped) get-started list.
-            <div className="space-y-2 py-8 text-center" data-testid="overview-no-systems">
-              <p className="text-sm font-medium">System を作成してください。</p>
-              <p className="text-sm text-muted-foreground">
-                トレースやコンポーネントを表示するには、まずヘッダーの
-                「System を作成」から System を作成してください。
-              </p>
-            </div>
-          ) : isLoading ? (
-            <div className="space-y-3">
-              {[1, 2, 3].map((i) => <Skeleton key={i} className="h-12 w-full" />)}
-            </div>
-          ) : !components?.length ? (
-            <div className="space-y-4 py-4" data-testid="overview-get-started">
-              {primaryOverviewItem && (
-                <SystemStateBanner item={primaryOverviewItem} testId="overview-primary-item" />
-              )}
-              {/* Issue #241: phase-appropriate start guide for a System that
-                  is still in setup/preparation. It renders nothing once
-                  preparation is complete (Issue #256's later
-                  instrumentation/observation/evaluation/publish phases), so
-                  the ordered fallback list below is what a fully-set-up
-                  System with no components still sees. */}
-              <PrerequisiteGuide testId="overview-prerequisite-guide" />
-              <p className="text-sm text-muted-foreground text-center">
-                No components registered yet. Connect the SDK to start tracing.
-              </p>
-              {/* Issue #267 item 2: the numbered order below is a suggested
-                  path, not a technical dependency -- SDK token issuance
-                  (step 3, connect-sdk.tsx) does not require the repository or
-                  System Understanding to be configured first. */}
-              <p className="text-xs text-muted-foreground text-center" data-testid="overview-get-started-shortest-path-note">
-                最短でTraceを見るには手順3→4だけで十分です。手順1・2は
-                <span className="font-medium">推奨（必須ではありません）</span>。
-              </p>
-              <ol className="mx-auto max-w-sm space-y-2 text-sm">
-                {GET_STARTED_STEPS.map(({ to, label, icon: Icon, testId, required }) => {
-                  const done = stepDone[to] ?? false;
-                  return (
-                    <li key={to}>
-                      <Link
-                        to={to}
-                        data-testid={testId}
-                        data-done={done}
-                        className="flex items-center gap-2 rounded-md border px-3 py-2 text-primary hover:bg-accent hover:underline"
-                      >
-                        {done ? (
-                          <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" data-testid={`${testId}-done`} />
-                        ) : (
-                          <Icon className="h-4 w-4 shrink-0" />
-                        )}
-                        <span>
-                          {label}
-                          {!required && (
-                            <span className="ml-1.5 text-xs text-muted-foreground">
-                              推奨(必須ではない)
-                            </span>
-                          )}
-                        </span>
-                      </Link>
-                    </li>
-                  );
-                })}
-              </ol>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b text-left">
-                    <th className="pb-2 font-medium text-muted-foreground">Component ID</th>
-                    <th className="pb-2 font-medium text-muted-foreground">Mode</th>
-                    <th className="pb-2 font-medium text-muted-foreground text-right">Traces</th>
-                    <th className="pb-2 font-medium text-muted-foreground text-right">Last Seen</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {components.map((c) => (
-                    <tr key={c.component_id} className="border-b last:border-0">
-                      <td className="py-3 font-mono text-xs">{c.component_id}</td>
-                      <td className="py-3">
-                        <Badge variant={MODE_VARIANT[c.mode] ?? "secondary"}>{c.mode}</Badge>
-                      </td>
-                      <td className="py-3 text-right">{c.trace_count.toLocaleString()}</td>
-                      <td className="py-3 text-right text-muted-foreground text-xs">
-                        {formatTimestamp(c.last_seen)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      {/* Desktop: the Brief holds the main area and everything else sits in the
+          ADJACENT column — the arrangement #384 explicitly allows, and the one
+          the first-view measurement forced. Stacking them under the Brief put
+          「今わかったこと」 at 824px on a 1280×720 screen: the reading order was
+          right, but two of the four things the developer must see in the first
+          view were below the fold. Source order is unchanged by the split, so
+          the single-column stack below `xl` still reads
+          Brief → findings → next action → loop → runtime.
+          `items-start` keeps the short column from stretching to the tall one. */}
+      <div className="grid items-start gap-4 xl:grid-cols-12">
+        <div className="xl:col-span-5">
+          <SystemBriefCard overview={overview} interviewHref={interviewHref} />
+        </div>
+        <div className="xl:col-span-4">
+          <FindingsCard overview={overview} />
+        </div>
+        <div className="space-y-4 xl:col-span-3">
+          <NextActionCard overview={overview} />
+          <LoopRailCard overview={overview} />
+          <RuntimeHealthCard overview={overview} />
+        </div>
+      </div>
     </div>
   );
 }
 
-function MetricCard({ title, value, icon }: { title: string; value?: string; icon: React.ReactNode }) {
+const SNAPSHOT_FRESHNESS_LABEL: Record<OverviewSnapshotFreshness, string> = {
+  current: "最新の断面",
+  stale: "最新ではない断面",
+  unavailable: "断面を特定できません",
+};
+
+/**
+ * The first-view System context.
+ *
+ * Which snapshot and which understanding revision the whole page is talking
+ * about belongs HERE, not inside a disclosure: every claim, finding and CTA
+ * below is qualified by it, and a developer who cannot see it does not know
+ * what the page is describing (#381).
+ *
+ * `snapshot_freshness` is the server's verdict. The Dashboard deliberately
+ * does not compare `snapshot_id` with `latest_ready_snapshot_id` itself —
+ * that second definition of 「最新か」 is exactly the drift #369 removed.
+ */
+function PageHeading({
+  system,
+  overview,
+}: {
+  system?: { name: string; environment?: string | null };
+  overview?: OverviewOut;
+}) {
   return (
-    <Card>
-      <CardContent className="p-6">
-        <div className="flex items-center justify-between">
-          <p className="text-sm font-medium text-muted-foreground">{title}</p>
-          {icon}
-        </div>
-        {value === undefined ? (
-          <Skeleton className="mt-2 h-7 w-20" />
-        ) : (
-          <p className="mt-2 text-2xl font-bold">{value}</p>
-        )}
-      </CardContent>
-    </Card>
+    <div>
+      <h1 className="text-2xl font-bold tracking-tight">Overview</h1>
+      {system ? (
+        <p className="mt-1 text-muted-foreground">
+          {system.name}
+          {system.environment ? ` — ${system.environment}` : ""}
+        </p>
+      ) : (
+        <p className="mt-1 text-muted-foreground">
+          このシステムについて分かっていること、変わったこと、次にすることをまとめます。
+        </p>
+      )}
+      {overview && (
+        <dl
+          className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground"
+          data-testid="overview-context"
+        >
+          <div className="flex gap-1">
+            <dt>Snapshot</dt>
+            <dd className="text-foreground" data-snapshot-freshness={overview.snapshot_freshness}>
+              {overview.snapshot_id != null ? (
+                <>
+                  #{overview.snapshot_id}
+                  {overview.snapshot_commit_sha && (
+                    <code className="ml-1 font-mono">
+                      {overview.snapshot_commit_sha.slice(0, 8)}
+                    </code>
+                  )}
+                </>
+              ) : (
+                "未固定"
+              )}
+              <span className="ml-1">
+                （{SNAPSHOT_FRESHNESS_LABEL[overview.snapshot_freshness]}）
+              </span>
+            </dd>
+          </div>
+          <div className="flex gap-1">
+            <dt>理解リビジョン</dt>
+            <dd className="text-foreground">
+              {overview.understanding_revision_id != null
+                ? `#${overview.understanding_revision_id}`
+                : "未構築"}
+            </dd>
+          </div>
+          <div className="flex gap-1">
+            <dt>最後の確認</dt>
+            <dd className="text-foreground">
+              {overview.understanding_confirmed_at != null
+                ? formatTimestamp(overview.understanding_confirmed_at)
+                : "未確認"}
+              {overview.brief?.readiness_state === "recheck_required" && (
+                <span className="ml-1 text-amber-700 dark:text-amber-300">
+                  再確認が必要
+                </span>
+              )}
+            </dd>
+          </div>
+        </dl>
+      )}
+    </div>
   );
 }

@@ -242,7 +242,10 @@ Pipeline Checklist の各 step ラベルは Issue #240 でサーバー正本化�
 | Experiments — decision `adopted` | GitHub | 遷移リンク（`data-testid="experiment-github-publish-link"`）。`?patch=` は付与されない（Publish Jobs タブで対象パッチを手動選択する）。githubPublishAvailable のときのみ表示 |
 | Experiments — decision `adopted` | Probe Planner | 「次の probe サイクルを開始」（`data-testid="experiment-probe-planner-link"`）。`?capability=<key>` があれば引き継ぐ |
 | Experiments — decision `rejected` / `needs_more_data` | AI Candidate Studio | 遷移リンクのみ（`data-testid="experiment-candidate-studio-link"`）。Experiment は `component_id` を持たないため prefill はしない |
-| Overview — Get Started ステップ 4「View traces in Components」 | Components | `/components`。SDK 接続後にトレースを見に行く導線。connectivity `receiving` で完了マーク（`data-done`、Issue #259） |
+| Overview — 「次にすること」の CTA | サーバーが決めた遷移先 | `GET /overview` の `next_action.target`（route + その画面自身のパラメータ名 + anchor）。Overview 側で遷移先を選ばない（Issue #383） |
+| Overview — finding の遷移先 | サーバーが決めた遷移先 | `GET /overview` の `findings[].target`。同上 |
+| Overview — System Brief の詳細 | Interview | `?session=<最新セッション>`。全文の理解・根拠・API 境界は Interview 側で開示する（Issue #381） |
+| Overview — Runtime health | Components / Connect SDK | Component 完全一覧は Overview に置かず `/components` へ（Issue #384） |
 
 `?capability=` は selection state ではなく navigation context である。Flow Explorer、
 Probe Planner、Experiments はこの値を使って Context Header と back link を表示し、
@@ -801,6 +804,175 @@ Capability Map は「実装構造」を起点とする探索パスを提供す�
    - **Probe Flow Candidates**: probe_value が設定された element。観測対象の候補
 4. **Flow Explorer に遷移**: Related APIs のリンクまたは "Open in Flow Explorer" ボタンから遷移
 5. **Probe Plan を作成**: Flow Explorer でノード/エッジを選択し、plan を submit すると自動的に Probe Planner に遷移
+
+## Overview: System Intelligence Brief / 意思決定コックピット（Issue #380-#384）
+
+Overview は「接続できたか・データがあるか」を確認する稼働メトリクス画面では
+なく、**開いた瞬間にこのシステムについて前回より賢くなり、根拠を理解した
+うえで次の一手を実行できる**画面である。
+
+### 情報アーキテクチャ（順序が契約）
+
+読み順は、親 Epic の 5 問にそのまま対応する。見出し順と読み上げ順は同じで、
+狭い画面でも 1 カラム化するだけでこの意味順は崩さない。
+
+`xl` 以上では **3 領域を横に並べる**(12 分割で Brief 5 / 今わかったこと 4 /
+次にすること + 改善ループ + Runtime health 3)。積み上げると 1280 × 720 で
+findings が 824px、CTA が 1066px に落ち、#384 の「Vision / Purpose /
+findings / next action が通常 desktop の初期 viewport で把握できる」を
+満たせなかったためである(実測値は `docs/project-intelligence.md`)。DOM 順は
+分割で変わらないので、1 カラム時の読み順は下表のままである。
+
+| # | 領域 | 答える問い | testid |
+| --- | --- | --- | --- |
+| 1 | System Brief | 何のためのシステムで、AI はどう理解しているか | `overview-system-brief` |
+| 2 | 今わかったこと | 前回から何が変わり、何が分かったか（最大 3 件） | `overview-findings` |
+| 3 | 次にすること | 次の 1 操作・理由・完了条件・完了後の価値 | `overview-next-action` |
+| 4 | 改善ループの現在地 | どこまで来ていて、次の意味的到達点は何か | `overview-loop` |
+| 5 | Runtime health | いま観測できているか（二次領域） | `overview-runtime` |
+
+### 正本は `GET /overview` ひとつ
+
+`app/overview_projection.py` + `routes/overview.py` が唯一の判断元である。
+Dashboard は描画だけを行い、readiness、finding の重要度・順位、次アクション、
+runtime freshness のいずれも client で再導出しない。
+
+Overview は**第三の理解モデルを作らない**。各領域は既存の canonical projection
+をそのまま合成している。
+
+| 領域 | 正本 | Issue |
+| --- | --- | --- |
+| System Brief / Decision Readiness | `understanding_brief.build_understanding_brief` | #351-#354 |
+| Interview の位置（W1 / W3 判定） | `interview_workflow.gather_facts` + `evaluate_candidate_state` | #349 |
+| 改善ループの現在地 | `system_state.derive_user_phase` | #237 / #256 |
+| Runtime の 2 軸 | `state_facts` の `state` / `freshness` | #370 |
+| replayability の内訳 | `replay_readiness.count_replayability` | #372 |
+
+Brief を読む Interview セッションは **その System の最新セッション**
+（`ORDER BY id DESC`）で、Interview 画面の自動選択と同じ規則である。
+これにより Overview の Brief と Interview の Brief が別セッションを指すことがない。
+
+`evaluate_session_workflow` は**呼ばない**。あれは workflow checkpoint と
+戻り要求を永続化するため、Overview を眺めただけで Interview の進捗事実が
+書き込まれてしまう。Overview は純粋関数側だけを再利用し、**何も書かない**。
+
+### 今わかったこと（#382）
+
+finding は 11 種の有限 kind、4 段の有限 severity、3 値の有限 status を持つ。
+選定・重複排除・順位付けはすべてサーバー側の決定的規則で、LLM の自由採点も
+keyword score も client heuristic も使わない。
+
+- **順位**: `severity → status → kind → last_updated 降順 → id`。全ゲートが
+  有限で、tie-break は全順序なので同じ事実からは常に同じ 3 件になる。
+- **重複排除は 2 段**: 同一原因（`dedupe_key`）を畳んだあと、同一主題
+  （`subject_key`）を kind をまたいで畳む。矛盾しており未確認でもある claim が
+  3 枠のうち 2 枠を占めることはない。
+- **id は原因から導出**する（行 id ではない）。理解を作り直すと行番号は
+  変わるが、同じ発見の id は変わらない。変わると「継続」と表示できない。
+- **provenance は claim のものをそのまま引き継ぐ。** finding の provenance
+  語彙は Brief の語彙の厳密な上位集合で、変換は恒等写像である。
+  `developer_intent` を落とすと、開発者が確定した Vision が AI の推測として
+  表示される。集約で出所が割れたときは `mixed`（勝者を選ぶと、他が同意した
+  という意味になる）。
+- **「前回」の基準は 3 値。** `has_baseline` / `no_baseline` / `unavailable`。
+  Brief が読めなかったときに「まだ確認していない」と書くのは、こちらの失敗を
+  開発者についての断定に変換することになる。この場合 findings も
+  `unavailable` にして、`new` / `ongoing` を一切付けない。
+- **provenance の索引は `(section, name)`。** 3 つの section は独立した名前空間
+  なので、名前だけで引くと同名 claim が互いを上書きする。
+- **発生時刻は状態が成立した時刻。** connectivity finding は最終受信ではなく
+  閾値を超えた瞬間（`last_real_trace_at + delayed/stale_after_seconds`）を
+  `first_seen` にする。既定値ではこの差が最大 1 日あり、確認直後の障害が
+  「継続」と誤分類されていた。
+- **「前回」の定義**: 開発者自身の 理解の確認（`understanding_confirmed_at`）。
+  永続化された人間の判断であって、暗黙の page view ではない。Overview を
+  開いても何も書き込まれない。
+- **空状態は 3 種**を区別する。`no_findings`（新しい発見なし）/
+  `not_compared`（比較基準がない）/ `unavailable`（取得失敗）。
+
+### 次にすること（#383）
+
+`decide_next_action` は 14 行の first-match rule table で、必ず 0 件または
+1 件を返す。行の順序が契約であり、前の行が満たされていない状態で後ろの行に
+飛ぶことはない。
+
+| 行 | 条件 | action key |
+| --- | --- | --- |
+| 1 | repository 未設定 | `prepare_repository` |
+| 2 | ready snapshot なし（構築中は `waiting`） | `prepare_repository` |
+| 3 | readiness `building` または workflow `W1` | （なし・`waiting`） |
+| 4 | readiness `blocked` | `resolve_understanding_blocker` |
+| 5 | readiness `not_built` | `build_understanding` |
+| 6 | workflow `W3`（必須質問が未回答） | `answer_interview_questions` |
+| 7 | readiness `needs_confirmation` / `recheck_required` | `confirm_understanding` |
+| 8 | connectivity `no_signal` | `connect_sdk` |
+| 9 | freshness `never_received`（疎通のみ） | `start_observation` |
+| 10 | freshness `delayed` / `stale` | `restore_observation` |
+| 11 | 完了済み experiment が未決定 | `record_experiment_decision`（`?experiment=<id>`） |
+| 12 | 適用済みで未公開の**計測** patch がある | `publish_instrumentation`（`?patch=<id>`） |
+| 13 | 評価済み候補が 1 件もない | `create_candidate` |
+| 14 | 上記以外 | `start_next_cycle` |
+
+- 行 6 が行 7 より上なのは、`W3` はまさに理解を確認できない状態だからである。
+- 行 10 が行 11 より上なのは、更新の止まった観測に対して採否を判断させない
+  ためである。
+- `waiting` / `unavailable` は action を**持たない**。実行できない操作を
+  disabled で常設しない（#383）。
+- **取得できなかった fact は既定値に落とさない。** `NextActionFacts` の
+  `brief_available` / `runtime_available` / `workflow_available` が false の
+  とき、その fact を読む行は評価せず `unavailable` を返す。Brief 取得失敗を
+  「未構築」、Runtime 取得失敗を「未接続」と読み替えると、すでに理解済み・
+  受信中のシステムに間違った CTA を出すことになる。ただし行 1-2 は
+  repository/snapshot だけを読むので、他が全滅でも答える。
+- **行 12 が公開するのは計測 patch であり、改善変更ではない。** identity は
+  `probe_patches.id` → `publish_jobs.patch_id` で `completed` のみを公開と
+  みなす（System 全体で「publish が一度でも成功したか」を見ると、最初の公開が
+  以後すべての変更を公開済みに見せる）。ただしこの patch は probe plan 由来の
+  計測 patch なので、action key は `publish_instrumentation`、文言も計測に
+  限定し、改善サイクルが閉じたとは言わない。adopted な experiment は patch も
+  publish job も参照していないため、「採用した改善が公開済みか」は答えられず、
+  答えない。
+- **next action の fact は group ごとに guard する。** repository / experiments
+  / publish / variants / decisions の各 loader を個別に囲み、失敗を availability
+  に落とす。例外を `0` / `None` / `False` に変換しない。落ちた group は
+  `degraded_detail` に `next_action.<group>` として残る。
+- CTA は既存の人間確認ゲートを一切迂回しない。案内するだけで、承認・採否・
+  公開はそれぞれの画面の `decision_method: manual` 記録のままである。
+
+### Runtime health は二次領域（#384）
+
+- 見出しは `freshness`（実 workload の生きた読み値）であって、累積の `state`
+  ではない。#370 の 2 軸分離をそのまま守る。
+- `transport_freshness` は workload と食い違うときだけ出す。
+- error / 不一致 / replay の件数は**直近 24 時間の有界ウィンドウ**。累積値では
+  「止まった」ことを示せない。
+- 旧 Overview の 4 つの metric card（Component 数 / Trace 総数 / Last Seen /
+  mode 内訳）と Component 完全一覧はファーストビューから外れた。累積値は
+  `details` の中に「現在の稼働状態ではありません」と明記して残し、Component
+  一覧は `/components` にのみ置く。
+- **observed / known は両方とも component。** Capability 単位のカバレッジは
+  `capability_coverage_state="not_computed"` として「算出していない」と述べる。
+  component → Capability の対応が保存されていないため、比率を出すと別 entity
+  どうしの割り算になり、分子が分母を超えうる。
+- 画面は次の freshness 境界（サーバーの経過秒 + しきい値から算出）で自動再取得
+  し、境界が無いときも 5 分を上限に再取得する。受信停止を検知するまでの
+  最大遅延はこの 5 分である。
+
+### ファーストビューと見出し
+
+- Snapshot / commit / snapshot freshness / 理解リビジョン / 最後の確認は
+  ページ見出し直下に出す。ページ上の全ての主張と CTA を限定する情報なので
+  `details` には入れない。freshness はサーバーの判定で、Dashboard が
+  snapshot id を比較し直すことはしない。
+- 見出しは `h1 Overview` → 各セクション `h2` → Brief 内 `h3`。`CardTitle` の
+  `as` で Overview のカードだけを昇格しており、他画面の見出し構造は変えて
+  いない。
+
+### 廃止されたもの
+
+Overview の Get Started 順序リスト（Issue #212 / #259 / #267）は削除された。
+段階リストは「次の 1 操作」に置き換わり、オンボーディング導線自体は Setup
+Guide（`components/setup-next-step.ts`、Issue #374）が持つ。
 
 ## Dogfooding: probe-agent 自身への System Understanding 適用
 

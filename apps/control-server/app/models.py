@@ -7628,3 +7628,317 @@ class UnderstandingBriefOut(BaseModel):
     confirmed_revision_id: Optional[int] = None
     revision_id: Optional[int] = None
     snapshot_id: Optional[int] = None
+
+
+# --- Overview / System Intelligence Brief (Issues #380-#384) -----------------
+#
+# The Overview screen's canonical projection. Every vocabulary below is a
+# finite `Literal` for the same two reasons the Understanding Brief's are
+# (#351): the response schema then carries the enum, and
+# `tests/test_interview_type_parity.py` holds the Dashboard union to the same
+# set. `app/overview_projection.py` derives its tuples from these with
+# `get_args`, so each set has exactly one definition.
+#
+# The Overview adds no new understanding model: its Brief section IS
+# `UnderstandingBriefOut` (#351-#354), its loop position IS `derive_user_phase`
+# (#237/#256), and its runtime numbers ARE the connectivity facts (#370).
+
+#: What kind of thing a 「今わかったこと」 finding is. Finite by construction:
+#: every kind is produced by exactly one deterministic extractor over
+#: persisted rows, never by a model scoring what matters.
+OverviewFindingKind = Literal[
+    "claim_conflict",
+    "understanding_blocked",
+    "understanding_changed",
+    "capability_composition_stale",
+    "unconfirmed_core_claim",
+    "runtime_mismatch",
+    "runtime_unobserved",
+    "connectivity_lost",
+    "snapshot_stale",
+    "evaluation_decision_pending",
+    "improvement_candidate_ready",
+]
+
+#: How the finding bears on the developer's decision. This is the ranking
+#: gate — a finite ladder, not a score.
+OverviewFindingSeverity = Literal[
+    "blocker",
+    "human_decision_required",
+    "material_change",
+    "informative",
+]
+
+#: Whether the finding appeared AFTER the comparison baseline. `not_compared`
+#: is a first-class value: 「新しい発見がない」 and 「まだ比較していない」 are
+#: different statements and must never render the same (#382).
+OverviewFindingStatus = Literal["new", "ongoing", "not_compared"]
+
+#: Where the finding's content came from.
+#:
+#: The first four values are `UnderstandingProvenanceKind` VERBATIM, so a
+#: claim's provenance carries into a finding about it without translation.
+#: The first version of this set omitted `developer_intent`, and the mapping
+#: collapsed it to `ai_hypothesis` — which displayed a Vision the developer
+#: had written and confirmed as the AI's guess. That is the exact confusion
+#: #381/#382 exist to prevent, so the two vocabularies now overlap by
+#: construction rather than by a lossy map.
+#:
+#: The last three are finding-only, and each says something no claim can:
+#:
+#: * `developer_decision` — a record of the human's JUDGEMENT (adopt, confirm,
+#:   defer), as opposed to `developer_intent` which is what they said they
+#:   wanted. Deciding "reject this candidate" is not a statement of intent.
+#: * `system_process` — a fact about probe-agent's own run records, not about
+#:   the target system at all.
+#: * `mixed` — an aggregated finding whose sources genuinely disagree. It
+#:   exists so aggregation never has to pick one and imply the others agreed.
+OverviewFindingProvenance = Literal[
+    "developer_intent",
+    "implementation_fact",
+    "runtime_observation",
+    "ai_hypothesis",
+    "developer_decision",
+    "system_process",
+    "mixed",
+]
+
+#: The findings section as a whole. `unavailable` means the extraction itself
+#: failed — never rendered as 「発見なし」.
+OverviewFindingsState = Literal[
+    "has_findings",
+    "no_findings",
+    "not_compared",
+    "unavailable",
+]
+
+#: Whether the 「前回」 baseline could be read at all, kept apart from whether
+#: one EXISTS. `unavailable` used to be indistinguishable from
+#: `no_baseline`, so a Brief that failed to load rendered the confident
+#: sentence 「まだ理解を確認していないため、比較の基準がありません」 about a
+#: System whose developer may well have confirmed it yesterday.
+OverviewBaselineState = Literal["has_baseline", "no_baseline", "unavailable"]
+
+#: The single primary action. `create_system` is reachable only through the
+#: Dashboard's zero-System branch (the endpoint is System-scoped, so it cannot
+#: be evaluated server-side); it lives in this one vocabulary anyway so the
+#: screen never grows a second action taxonomy.
+OverviewActionKey = Literal[
+    "create_system",
+    "prepare_repository",
+    "build_understanding",
+    "resolve_understanding_blocker",
+    "answer_interview_questions",
+    "confirm_understanding",
+    "connect_sdk",
+    "start_observation",
+    "restore_observation",
+    "record_experiment_decision",
+    # NOT "publish the improvement": `publish_jobs` publishes probe-plan
+    # INSTRUMENTATION patches, and no persisted lineage connects an adopted
+    # Experiment to a patch or a job. Naming this key for what it actually
+    # publishes is the whole point — the previous `publish_change` told the
+    # developer 「この改善サイクルが閉じます」 about a measurement patch.
+    "publish_instrumentation",
+    "create_candidate",
+    "start_next_cycle",
+]
+
+#: Why there is (or is not) an action. `waiting` / `unavailable` carry no
+#: action at all — a disabled catalogue of operations is explicitly forbidden
+#: (#383).
+OverviewActionState = Literal["available", "waiting", "complete", "unavailable"]
+
+#: Whether the pinned understanding is reading the repository's current head.
+#: Server-decided: the Dashboard must not compare snapshot ids itself, for the
+#: same reason #369 moved the Snapshot verdict server-side — two definitions of
+#: "current" drift. `unavailable` is a third value on purpose: an unreadable
+#: head is not evidence that the snapshot is behind.
+OverviewSnapshotFreshness = Literal["current", "stale", "unavailable"]
+
+#: Whether Capability-level observation coverage could be computed at all.
+#: `not_computed` is the honest value today: Trace rows carry a
+#: `component_id`, and no canonical component -> Core Capability mapping is
+#: persisted, so a "coverage" built from the two would be a ratio between
+#: different entities (and could exceed 100%). See `OverviewRuntimeHealthOut`.
+OverviewCoverageState = Literal["computed", "not_computed"]
+
+#: The improvement loop's six stages, in order. These are the existing
+#: `system_state.PHASE_ORDER` values under their developer-facing names — the
+#: Overview never introduces a second phase model.
+OverviewLoopStage = Literal[
+    "setup",
+    "preparation",
+    "instrumentation",
+    "observation",
+    "evaluation",
+    "publish",
+]
+
+OverviewLoopStageStatus = Literal["reached", "current", "future"]
+
+#: Which composed section could not be built. A partial failure degrades one
+#: section; it never blanks the screen (#384).
+OverviewSection = Literal["brief", "findings", "next_action", "loop", "runtime"]
+
+
+class OverviewTargetOut(BaseModel):
+    """Where a finding or an action sends the developer.
+
+    `params` carries the destination's OWN parameter names (the #371 rule),
+    so a link never navigates and then arrives with nothing selected.
+    """
+
+    route: str
+    label: str
+    params: Dict[str, str] = {}
+    anchor: Optional[str] = None
+
+
+class OverviewFindingOut(BaseModel):
+    #: Deterministic and stable across reloads: derived from the kind plus the
+    #: subject it is about, never from a row id that a rebuild would renumber.
+    id: str
+    kind: OverviewFindingKind
+    kind_label: str
+    severity: OverviewFindingSeverity
+    severity_label: str
+    status: OverviewFindingStatus
+    status_label: str
+    #: 短い結論 -- what was found.
+    summary: str
+    #: なぜ判断に重要か -- what it changes for the developer.
+    decision_impact: str
+    provenance: OverviewFindingProvenance
+    provenance_label: str
+    #: Which facts this finding was read against.
+    snapshot_id: Optional[int] = None
+    revision_id: Optional[int] = None
+    runtime_window_seconds: Optional[float] = None
+    first_seen: Optional[float] = None
+    last_updated: Optional[float] = None
+    target: Optional[OverviewTargetOut] = None
+    evidence: List[Dict[str, Any]] = []
+    #: How many same-cause findings this one represents (>= 1).
+    occurrence_count: int = 1
+
+
+class OverviewActionOut(BaseModel):
+    key: OverviewActionKey
+    label: str
+    #: 選定理由 -- which fact put this action first.
+    reason: str
+    #: 完了条件 -- how the developer knows it is done.
+    completion_condition: str
+    #: 完了後に得られる価値 / 次に開く段階.
+    value: str
+    target: OverviewTargetOut
+    #: The rule-table row that produced it, for auditing the first match.
+    rule_row: int
+    #: Facts and findings this action was derived from.
+    source_state_ids: List[str] = []
+    source_finding_ids: List[str] = []
+    #: What is still missing, when the action can be started but not finished
+    #: without it. Never used to render a disabled control.
+    blockers: List[str] = []
+
+
+class OverviewLoopStageOut(BaseModel):
+    stage: OverviewLoopStage
+    label: str
+    status: OverviewLoopStageStatus
+    #: What reaching this stage means, in the developer's terms.
+    meaning: str
+    #: The next semantic milestone; only set on the current stage.
+    next_milestone: str = ""
+    complete: bool = False
+
+
+class OverviewRuntimeHealthOut(BaseModel):
+    #: Cumulative lifecycle milestone (#370). Never regresses.
+    state: ConnectivityState
+    #: The live workload reading (#370). Regresses when traffic stops.
+    freshness: ConnectivityFreshness
+    freshness_label: str
+    #: The any-kind transport axis, shown only when it disagrees.
+    transport_freshness: ConnectivityFreshness
+    last_real_trace_at: Optional[float] = None
+    seconds_since_last_trace: Optional[float] = None
+    last_trace_at: Optional[float] = None
+    seconds_since_last_any_trace: Optional[float] = None
+    evaluated_at: float
+    real_trace_count_5m: int = 0
+    real_trace_count_1h: int = 0
+    real_trace_count_24h: int = 0
+    delayed_after_seconds: float
+    stale_after_seconds: float
+    component_count: int = 0
+    #: Cumulative totals, deliberately kept out of the first view.
+    total_trace_count: int = 0
+    mode_counts: Dict[str, int] = {}
+    #: Bounded-window quality facts. `window_seconds` states the window they
+    #: were measured over, so a count is never read as a lifetime total.
+    window_seconds: float = 0
+    error_count: int = 0
+    #: Claims whose persisted #290 `runtime_check` is `mismatch`. Read as
+    #: stored -- the Overview never re-runs a Runtime Reality Check and never
+    #: invents a second definition of "the observation disagrees".
+    runtime_mismatch_count: int = 0
+    replayable_count: int = 0
+    partial_count: int = 0
+    unreplayable_count: int = 0
+    not_captured_count: int = 0
+    #: DISTINCT components that produced a trace in the window. Named for
+    #: what it counts. It was previously called `observed_capability_count`
+    #: and rendered next to `core_capability_count` as if the two formed a
+    #: coverage ratio — they are different entities, and the numerator could
+    #: exceed the denominator whenever one Capability had several components.
+    observed_component_count: int = 0
+    #: All components known to this System, so the count above has a
+    #: denominator of its OWN entity.
+    known_component_count: int = 0
+    core_capability_count: int = 0
+    #: Capability-level coverage is not computed today (no persisted
+    #: component -> Capability mapping). Stated rather than approximated.
+    capability_coverage_state: OverviewCoverageState = "not_computed"
+    observed_capability_count: Optional[int] = None
+    unmapped_component_count: Optional[int] = None
+
+
+class OverviewOut(BaseModel):
+    system_id: int
+    generated_at: float
+    #: The Interview session the Brief was read from (the System's newest), or
+    #: None when no session exists yet.
+    interview_session_id: Optional[int] = None
+    #: The canonical Understanding Brief (#351-#354), reused verbatim.
+    brief: Optional[UnderstandingBriefOut] = None
+    snapshot_id: Optional[int] = None
+    snapshot_commit_sha: Optional[str] = None
+    #: The System's newest ready snapshot, for 「この理解はどの断面か」.
+    latest_ready_snapshot_id: Optional[int] = None
+    #: Server-decided (never a client id comparison). See
+    #: `OverviewSnapshotFreshness`.
+    snapshot_freshness: OverviewSnapshotFreshness = "unavailable"
+    #: The Understanding revision the Brief was built from, and when the
+    #: developer last confirmed one -- both part of the first-view context, so
+    #: 「どの断面のどの版の理解か」 is answerable without opening a disclosure.
+    understanding_revision_id: Optional[int] = None
+    understanding_confirmed_at: Optional[float] = None
+    findings: List[OverviewFindingOut] = []
+    #: How many findings the initial view shows (cap 3, never a pad).
+    findings_initial_count: int = 0
+    findings_state: OverviewFindingsState
+    #: What 「前回」 means for this System, stated rather than implied.
+    findings_baseline_state: OverviewBaselineState = "unavailable"
+    findings_baseline_label: str = ""
+    findings_baseline_at: Optional[float] = None
+    next_action: Optional[OverviewActionOut] = None
+    next_action_state: OverviewActionState
+    next_action_message: str = ""
+    loop_stages: List[OverviewLoopStageOut] = []
+    user_phase: str = "setup"
+    runtime: Optional[OverviewRuntimeHealthOut] = None
+    #: Sections whose derivation failed. The rest still render (#384).
+    degraded_sections: List[OverviewSection] = []
+    degraded_detail: Dict[str, str] = {}
