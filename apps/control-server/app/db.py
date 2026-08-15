@@ -4550,6 +4550,78 @@ CREATE INDEX IF NOT EXISTS idx_purpose_relation_decision_lookup
 
 CREATE INDEX IF NOT EXISTS idx_purpose_relation_decision_session
     ON purpose_relation_decision (session_id, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- Purpose Needs responses (Issue #389, docs/purpose-chain.md §2.6).
+--
+-- The developer's answer/defer/investigate to ONE derived Purpose Chain need
+-- (`app/purpose_needs.py`). Needs themselves are never persisted -- they are
+-- a pure projection recomputed from `purpose_chain.derive_purpose_chain` on
+-- every read, exactly like elements/relations. This table exists solely to
+-- record the developer's RESPONSE, because that cannot be re-derived: it is
+-- the developer's own action, not a structural fact.
+--
+-- Append-only, the same discipline as `purpose_relation_decision` /
+-- `interview_intent_item`: a later response to the same `need_id` inserts a
+-- NEW row and sets the prior current row's `superseded_by_id`; nothing is
+-- ever UPDATEd or DELETEd. `target_digest` captures
+-- `purpose_needs.target_digest_for(...)` for the need's target AT RESPONSE
+-- TIME, so `defer` and `unknown`/`investigate` can be told apart from a
+-- STALE `defer`/`unknown` whose target has since changed
+-- (`purpose_needs.apply_response_state` re-derives the need fresh on every
+-- read and compares digests -- a `defer` never silently expires by itself,
+-- it stops matching once the target's content actually moves).
+--
+-- `response_kind='confirm'|'correct'` never writes a second revision-chain
+-- implementation here: the row only LINKS to the audit row the EXISTING
+-- Intent Brief confirm/correct/create endpoints or
+-- `purpose_chain.record_relation_decision` already created
+-- (`linked_intent_item_id` / `linked_relation_decision_id`).
+-- `response_kind='unknown'|'investigate'` opens a Joint Understanding
+-- session with `trigger='purpose_need'` and links it
+-- (`linked_joint_session_id`) -- see `app/joint_premise.py`'s
+-- `origin_kind='purpose_need'` branch, which reads THIS table by
+-- `origin_id` to resolve and re-derive that session's premise.
+--
+-- `need_id` is the STABLE string id `purpose_needs.py` derives
+-- (`f"{need_code}:{target_id}"`), never a row id -- needs carry no row
+-- identity of their own to reference, exactly like Purpose Chain relations.
+CREATE TABLE IF NOT EXISTS purpose_need_response (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    session_id                  INTEGER NOT NULL,
+    need_id                     TEXT NOT NULL,
+    need_code                   TEXT NOT NULL,
+    response_kind               TEXT NOT NULL
+                                    CHECK (response_kind IN
+                                        ('confirm', 'correct', 'unknown', 'defer', 'investigate')),
+    value_text                  TEXT NOT NULL DEFAULT '',
+    target_kind                 TEXT NOT NULL CHECK (target_kind IN ('element', 'relation')),
+    target_id                   TEXT NOT NULL,
+    target_digest               TEXT NOT NULL,
+    decision_method              TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    responded_by                 TEXT,
+    linked_intent_item_id        INTEGER,
+    linked_relation_decision_id  INTEGER,
+    linked_joint_session_id      INTEGER,
+    superseded_by_id             INTEGER,
+    created_at                   REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (linked_intent_item_id) REFERENCES interview_intent_item (id) ON DELETE SET NULL,
+    FOREIGN KEY (linked_relation_decision_id) REFERENCES purpose_relation_decision (id) ON DELETE SET NULL,
+    FOREIGN KEY (linked_joint_session_id) REFERENCES joint_understanding_session (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES purpose_need_response (id) ON DELETE SET NULL
+);
+
+-- The lookup every read performs: "the current (non-superseded) response for
+-- THIS need, in THIS session". System-scoped so a foreign session_id can
+-- never surface another System's response.
+CREATE INDEX IF NOT EXISTS idx_purpose_need_response_lookup
+    ON purpose_need_response (system_id, session_id, need_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_purpose_need_response_session
+    ON purpose_need_response (session_id, id DESC);
 """
 
 

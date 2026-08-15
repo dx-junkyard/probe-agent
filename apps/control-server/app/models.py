@@ -3711,8 +3711,17 @@ class InterviewInquiryTransitionRequest(BaseModel):
 # item: 「わからない」 is an entry point into a shared investigation, never a
 # recorded developer intent.
 
-JointUnderstandingOriginKind = Literal["qa", "intent", "review_item", "inquiry"]
-JointUnderstandingTrigger = Literal["unknown_answer", "explicit_request"]
+# Issue #389 adds a fifth origin: a Purpose Chain need (`app/purpose_needs.py`)
+# whose developer response was 'unknown'/'investigate'. Its `origin_id` is a
+# `purpose_need_response.id` -- not a row in any of the four original origin
+# tables, because a need's target (an element or a relation) is a computed
+# projection with a stable STRING id, not a database row `POST
+# /purpose-chain/needs/{need_id}/respond` is the only writer of
+# `trigger='purpose_need'`, mirroring the 'unknown_answer' rule immediately
+# below: `trigger` records WHICH PATH opened the session, never a request
+# body's claim.
+JointUnderstandingOriginKind = Literal["qa", "intent", "review_item", "inquiry", "purpose_need"]
+JointUnderstandingTrigger = Literal["unknown_answer", "explicit_request", "purpose_need"]
 JointUnderstandingStatus = Literal["open", "held", "closed"]
 # hypothesis_adopted is explicitly PROVISIONAL (never a fact); decided is the
 # only final human value judgement. See SESSION_OUTCOMES.
@@ -8133,3 +8142,161 @@ class PurposeRelationDecisionRequest(BaseModel):
     session_id: int
     decision: Literal["confirmed", "rejected"]
     rationale: str = ""
+
+
+# --- Purpose Needs / adaptive next-question (Issue #389) ----------------------
+#
+# `docs/purpose-chain.md` §2 is the specification. A "need" is never "this
+# optional field is empty" -- every value below is derived deterministically
+# from the Purpose Chain projection (`app/purpose_needs.py`): an element that
+# is `unknown`, or a relation that is `unknown` / `conflicting` / `stale`.
+
+#: The 7 fixed need codes (§2.2). Each is a classification of an ALREADY
+#: system-generated signal into one of 7 buckets -- never a free-text
+#: question category, which is why this stays a Principle-6 finite set rather
+#: than a reasoning-model decision.
+PurposeNeedCode = Literal[
+    "frame_missing",
+    "relation_unknown",
+    "relation_conflict",
+    "capability_justification_missing",
+    "decision_criterion_missing",
+    "human_value_judgement_required",
+    "premise_recheck_required",
+]
+
+#: need_code -> answerability is a FIXED table (§2.3), not #286's
+#: reasoning-model Question Router: a system-generated need already has a
+#: known category by construction (Principle 6's "classification into a
+#: small explicit finite set"), unlike a developer's open-ended free-text
+#: question. `already_answered` / `unavailable` are never in the fixed table
+#: -- they are read from response history / degraded-section state at derive
+#: time (`app/purpose_needs.py.apply_response_state`).
+PurposeAnswerability = Literal[
+    "human_judgement", "system_researchable", "already_answered", "unavailable"
+]
+
+#: A need's own lifecycle given the developer's responses so far (§2.6/§2.7).
+#: `deferred` and `waiting` are both real, auditable outcomes of an explicit
+#: response -- never silently re-asked until the target's digest moves.
+PurposeNeedState = Literal["available", "waiting", "answered", "deferred", "unavailable"]
+
+#: 「分からない」 and 「今は答えない」 are answers, not errors -- each is its own
+#: persisted, auditable fact (§2.6), never collapsed into a single "skipped".
+PurposeResponseKind = Literal["confirm", "correct", "unknown", "defer", "investigate"]
+
+#: Why a `need_id` deep link did not resolve to itself (§2.7). Never a 5th
+#: "just show something" value -- the caller always learns which of these
+#: four happened before falling back to the current question (or none).
+PurposeQuestionFallbackReason = Literal["resolved", "not_found", "other_system", "deferred"]
+
+#: What kind of Purpose Chain thing a need targets (§2.5). Distinct from
+#: `PurposeSourceKind` (which existing TABLE an ELEMENT's content came from).
+PurposeNeedTargetKind = Literal["element", "relation"]
+
+
+class PurposeSuggestedAnswerOut(BaseModel):
+    """An AI candidate built ONLY from an existing row's own text (§2.5).
+
+    Never invented, and no LLM is called to produce it -- `text` is always
+    copied verbatim from an existing element's `display_statement`, together
+    with that element's own already-computed provenance/source. Absent
+    (`None` on the parent) whenever there is no grounded candidate.
+    """
+
+    text: str
+    provenance: UnderstandingProvenanceKind
+    source_kind: PurposeSourceKind
+    source_ids: List[str] = []
+    is_mock: bool = False
+
+
+class PurposeRoutedNeedOut(BaseModel):
+    """One `system_researchable` need alongside the selected question (§2.4).
+
+    Informational only -- routed needs never reach the developer as a
+    question themselves; the Dashboard may use this to point at the Joint
+    Understanding investigation that is expected to answer it instead.
+    """
+
+    need_id: str
+    need_code: PurposeNeedCode
+    target_kind: PurposeNeedTargetKind
+    target_id: str
+    target_label: str
+
+
+class PurposeQuestionOut(BaseModel):
+    """§2.5's question contract. `None` at the endpoint level means "質問なし"
+    (rule row 7) -- there is no empty/placeholder question object."""
+
+    need_id: str
+    need_code: PurposeNeedCode
+    #: 1-6, the `select_question` priority-table row that chose this need.
+    #: `None` when the question was reached only via an explicit `need_id`
+    #: deep link to a need with no row in the priority table (e.g.
+    #: `human_value_judgement_required`, which `select_question` never picks
+    #: on its own -- §2.4).
+    rule_row: Optional[int] = None
+    #: Fixed server copy (Principle 6/7) -- never model output.
+    prompt: str
+    why_now: str
+    blocked_decision: str
+    unlocks: str
+    defer_impact: str
+    target_kind: PurposeNeedTargetKind
+    target_id: str
+    target_label: str
+    answerability: PurposeAnswerability
+    suggested_answer: Optional[PurposeSuggestedAnswerOut] = None
+    state: PurposeNeedState
+    source_revision_ids: List[int] = []
+    #: Set only when a `need_id` deep link fell back to a different question
+    #: (or to none) -- see `PurposeQuestionFallbackReason`.
+    fallback_reason: Optional[PurposeQuestionFallbackReason] = None
+    routed_needs: List[PurposeRoutedNeedOut] = []
+
+
+class PurposeNeedRespondRequest(BaseModel):
+    """`decision_method` is always `manual` on the response row itself --
+    there is no field for the caller to set it to anything else. This is a
+    fact about WHO responded, independent of what a downstream investigation
+    (opened for `unknown`/`investigate`) later concludes with
+    `decision_method='reasoning_llm'`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: int
+    response_kind: PurposeResponseKind
+    #: The confirm/correct value, or a free-text rationale for defer/unknown/
+    #: investigate. Optional -- a bare `confirm` needs no text.
+    value_text: str = ""
+
+
+class PurposeNeedResponseOut(BaseModel):
+    id: int
+    session_id: int
+    system_id: int
+    need_id: str
+    need_code: PurposeNeedCode
+    response_kind: PurposeResponseKind
+    value_text: str
+    target_kind: PurposeNeedTargetKind
+    target_id: str
+    #: The target's digest AT RESPONSE TIME -- what a `defer` reappears
+    #: against once it no longer matches (§2.6).
+    target_digest: str
+    decision_method: str
+    responded_by: Optional[str] = None
+    #: Set when `confirm`/`correct` was reused through the existing Intent
+    #: Brief confirm/correct/create implementation (never a second
+    #: revision-chain implementation, §2.6).
+    linked_intent_item_id: Optional[int] = None
+    #: Set when `confirm`/`correct` was reused through
+    #: `purpose_chain.record_relation_decision`.
+    linked_relation_decision_id: Optional[int] = None
+    #: Set when `unknown`/`investigate` opened a Joint Understanding session
+    #: with `trigger='purpose_need'`.
+    linked_joint_session_id: Optional[int] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float

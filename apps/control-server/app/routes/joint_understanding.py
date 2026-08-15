@@ -181,6 +181,16 @@ def _require_origin_exists(
         "inquiry": (
             "SELECT id FROM interview_inquiry WHERE id = ? AND session_id = ? AND system_id = ?"
         ),
+        # Issue #389: 'purpose_need' origin sessions are opened only by
+        # `POST /purpose-chain/needs/{need_id}/respond`, never through this
+        # generic create endpoint (its own trigger check already forces
+        # 'explicit_request', which that route never sends). This entry
+        # exists so a caller who supplies origin_kind='purpose_need' here
+        # anyway gets a clean 404 for a nonexistent id instead of a KeyError
+        # crash from the lookup below.
+        "purpose_need": (
+            "SELECT id FROM purpose_need_response WHERE id = ? AND session_id = ? AND system_id = ?"
+        ),
     }
     row = conn.execute(queries[origin_kind], (origin_id, session_id, system_id)).fetchone()
     if row is None:

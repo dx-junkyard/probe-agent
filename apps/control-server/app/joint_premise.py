@@ -528,6 +528,32 @@ def compute_intent_content_hash(*, field: str, value_text: str) -> str:
     )
 
 
+def compute_purpose_need_content_hash(
+    *, need_id: str, target_kind: str, target_id: str, target_digest: Optional[str]
+) -> str:
+    """Digest of a ``purpose_need``-origin session's premise (Issue #389).
+
+    ``target_digest`` is ``purpose_needs.target_digest_for(...)`` re-evaluated
+    against the CURRENT Purpose Chain projection -- never the value captured
+    on the ``purpose_need_response`` row. Reusing the captured value here
+    would make this content hash trivially equal to itself forever (it is
+    read FROM that same row), which would silently defeat staleness
+    detection rather than support it. ``None`` when the target can no longer
+    be found in the current projection at all (its need resolved, or the
+    session/System context changed) -- a real, distinct digest value, not an
+    absence that gets treated as "unchanged".
+    """
+    return _canonical_digest(
+        {
+            "kind": "purpose_need",
+            "need_id": need_id,
+            "target_kind": target_kind,
+            "target_id": target_id,
+            "target_digest": target_digest,
+        }
+    )
+
+
 def compute_inquiry_content_hash(
     *,
     inquiry_content_hash: Optional[str],
@@ -619,12 +645,21 @@ def _current_row_id(conn, table: str, *, row_id: int, system_id: int) -> Optiona
     return current
 
 
-def _origin_facts(conn, *, origin_kind: str, origin_id: int, system_id: int) -> Dict[str, object]:
+def _origin_facts(
+    conn, *, origin_kind: str, origin_id: int, system_id: int, session_id: Optional[int] = None
+) -> Dict[str, object]:
     """Resolve one origin item's premise-bearing facts as they stand now.
 
     Returns ``{"exists", "superseded", "current_origin_id", "revision_id",
     "content_hash", "capability_digest", "intent_digest"}``. Per-origin, and
     deliberately not uniform: what "the premise moved" means differs by item.
+
+    ``session_id`` is used only by the ``purpose_need`` branch (Issue #389),
+    which must re-derive the Purpose Chain to compute the CURRENT digest of
+    the need's target -- the other three origins read their own tables
+    directly and need no session context. Both call sites
+    (``capture_premise_bundle`` / ``resolve_premise_facts``) already have a
+    session id on hand (the session row and the JU row respectively).
     """
     absent: Dict[str, object] = {
         "exists": False, "superseded": False, "current_origin_id": None,
@@ -718,6 +753,59 @@ def _origin_facts(conn, *, origin_kind: str, origin_id: int, system_id: int) -> 
             ),
             "intent_digest": _column(row, "premise_intent_digest"),
         }
+    if origin_kind == "purpose_need":
+        row = conn.execute(
+            "SELECT * FROM purpose_need_response WHERE id = ? AND system_id = ?",
+            (origin_id, system_id),
+        ).fetchone()
+        if row is None:
+            return absent
+        # Local imports: `purpose_chain`/`purpose_needs` do not import this
+        # module (no cycle), but importing them at module scope here would
+        # make joint_premise -- a module every JU read goes through -- pay
+        # the Purpose Chain import cost even for Systems that never open a
+        # purpose_need-origin session.
+        from . import purpose_chain as _purpose_chain
+        from .purpose_needs import resolve_need, derive_needs, target_digest_for
+
+        effective_session_id = session_id if session_id is not None else row["session_id"]
+        current_digest: Optional[str] = None
+        target_kind = row["target_kind"] if "target_kind" in row.keys() else None
+        try:
+            chain = _purpose_chain.derive_purpose_chain(conn, system_id, effective_session_id)
+            needs = derive_needs(chain)
+            # The need itself may no longer be derivable (its signal cleared)
+            # while its TARGET still is -- re-resolve the target directly
+            # rather than only through `resolve_need`, so a resolved need
+            # (relation now confirmed, element now present) still yields a
+            # comparable "it changed" digest instead of silently reporting
+            # `None` (which would misread as "gone" rather than "resolved").
+            need = resolve_need(needs, row["need_id"])
+            if need is not None:
+                current_digest = need.target_digest
+            elif target_kind == "element":
+                element = next((e for e in chain.elements if e.id == row["target_id"]), None)
+                current_digest = target_digest_for("element", element) if element is not None else None
+            elif target_kind == "relation":
+                relation = next((r for r in chain.relations if r.id == row["target_id"]), None)
+                current_digest = target_digest_for("relation", relation) if relation is not None else None
+        except Exception:  # pragma: no cover - defensive, mirrors purpose_chain's own guards
+            current_digest = None
+        content_hash = compute_purpose_need_content_hash(
+            need_id=row["need_id"],
+            target_kind=target_kind or "",
+            target_id=row["target_id"],
+            target_digest=current_digest,
+        )
+        return {
+            "exists": True,
+            "superseded": row["superseded_by_id"] is not None,
+            "current_origin_id": row["id"],
+            "revision_id": None,
+            "content_hash": content_hash,
+            "capability_digest": EMPTY_CAPABILITY_SCOPE_DIGEST,
+            "intent_digest": None,
+        }
     raise JointPremiseError(f"Unknown origin_kind: {origin_kind!r}")
 
 
@@ -757,6 +845,7 @@ def capture_premise_bundle(
             commit_sha = snapshot["commit_sha"]
     origin = _origin_facts(
         conn, origin_kind=origin_kind, origin_id=origin_id, system_id=system_id,
+        session_id=session_row["id"],
     )
     review_subject_id = None
     if origin_kind == "review_item":
@@ -842,6 +931,7 @@ def resolve_premise_facts(conn, ju_row) -> Optional[PremiseFacts]:
         origin_kind=ju_row["origin_kind"],
         origin_id=ju_row["origin_id"],
         system_id=system_id,
+        session_id=ju_row["session_id"],
     )
     return PremiseFacts(
         snapshot_exists=snapshot_exists,
@@ -893,6 +983,7 @@ __all__ = [
     "compute_intent_content_hash",
     "compute_intent_item_digest",
     "compute_inquiry_content_hash",
+    "compute_purpose_need_content_hash",
     "compute_qa_content_hash",
     "developer_producer",
     "evaluate_joint_premise",

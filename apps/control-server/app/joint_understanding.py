@@ -55,7 +55,7 @@ SCHEMA_VERSION = "joint-understanding-v1"
 # Which confirmation item the developer could not answer. 'inquiry' is
 # included because a doubt conversation that ends 'unresolved' is one of the
 # most common ways a developer discovers they do not know the answer either.
-ORIGIN_KINDS = ("qa", "intent", "review_item", "inquiry")
+ORIGIN_KINDS = ("qa", "intent", "review_item", "inquiry", "purpose_need")
 
 # How the session started. Deliberately only two values: whether the
 # developer said 「わからない」 or asked to work it out together changes what
