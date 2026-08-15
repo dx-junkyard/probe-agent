@@ -135,6 +135,13 @@ FINITE_TYPE_NAMES = (
     "PurposeResponseKind",
     "PurposeQuestionFallbackReason",
     "PurposeNeedTargetKind",
+    # Issue #391: the Purpose Verification (Experience/Outcome/Reuse) vocabularies.
+    "PurposeHypothesisState",
+    "PurposeOutcomeCriterionState",
+    "PurposeOutcomeEvidenceSource",
+    "PurposeOutcomeVerdict",
+    "PurposeOutcomeLineageState",
+    "PurposeVerificationConceptKind",
 )
 
 

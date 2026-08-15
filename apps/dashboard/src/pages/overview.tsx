@@ -1,4 +1,4 @@
-import { useOverview, usePurposeNextQuestion } from "@/api/hooks";
+import { useOverview } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -36,17 +36,19 @@ export default function OverviewPage() {
   const { data: overview, isLoading, isError, refetch } = useOverview();
   const system = systems.find((s) => s.id === systemId);
 
-  // Issue #390: the Purpose Frame's single next question. `GET /overview`
-  // carries the Purpose Chain projection but no question -- this is a
-  // second, small query, kept at PAGE level (not inside `PurposeFrameCard`)
-  // so the card stays a props-only display component like every other
-  // Overview card (`overview.test.tsx`'s convention: cards take props, only
-  // the page calls queries).
-  const purposeSessionId = overview?.purpose_chain?.session_id ?? overview?.interview_session_id ?? null;
-  const purposeQuestionQuery = usePurposeNextQuestion(purposeSessionId);
-  const purposeQuestionState: "loading" | "error" | "ready" = purposeQuestionQuery.isLoading
+  // Issue #391 §B: `GET /overview` now embeds the Purpose Frame's single
+  // next question (`purpose_question`) as its own guarded section, the same
+  // composition discipline the Brief and the Purpose Chain itself already
+  // follow (#380 principle 6: one composed projection, no second opinion).
+  // A prior version issued a SEPARATE `usePurposeNextQuestion` query here --
+  // that gave the question its own independent failure mode with no
+  // `degraded_sections` entry, which is exactly the thing #380 exists to
+  // prevent. `PurposeFrameCard` stays a props-only display component either
+  // way; only where its props come from changed.
+  const purposeQuestionDegraded = overview?.degraded_sections.includes("purpose_question") ?? false;
+  const purposeQuestionState: "loading" | "error" | "ready" = isLoading
     ? "loading"
-    : purposeQuestionQuery.isError
+    : purposeQuestionDegraded
       ? "error"
       : "ready";
 
@@ -170,7 +172,7 @@ export default function OverviewPage() {
           it is the causal read of the same claims. */}
       <PurposeFrameCard
         overview={overview}
-        question={purposeQuestionQuery.data ?? null}
+        question={overview.purpose_question ?? null}
         questionState={purposeQuestionState}
       />
 

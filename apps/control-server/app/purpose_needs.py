@@ -127,6 +127,7 @@ __all__ = [
     "build_suggested_answer",
     "build_question",
     "resolve_need",
+    "need_copy_for",
 ]
 
 
@@ -598,6 +599,16 @@ _NEED_COPY: Dict[str, Dict[str, str]] = {
 }
 
 _RULE_ROW_BY_CODE: Dict[str, int] = {code: row for row, code in PRIORITY_TABLE}
+
+
+def need_copy_for(need_code: str) -> Dict[str, str]:
+    """The fixed §2.9 copy block for one need code, UNFORMATTED (`{target}`
+    still literal). Exposed publicly (unlike `_NEED_COPY` itself) so
+    `app/purpose_verification.py` (#391) can reuse the exact same
+    `why_now`/`blocked_decision` wording a verification prompt's justifying
+    need already carries, rather than writing a second copy of it that could
+    drift from this one."""
+    return dict(_NEED_COPY[need_code])
 
 
 def build_question(

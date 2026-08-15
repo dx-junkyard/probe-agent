@@ -100,7 +100,7 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple, get_args
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, get_args
 
 from . import interview_workflow, understanding_brief
 from .models import (
@@ -565,10 +565,31 @@ def _capability_elements(
     ]
 
 
-def _resolution_level(element: PurposeElement, primary_relation_status: Optional[str]) -> str:
-    """§1.4, first match. `L3` is structurally unreachable until Issue #391
-    persists an Outcome Criterion with measure/baseline/target/window -- there
-    is no code path here that can ever return it, on purpose."""
+def _resolution_level(
+    element: PurposeElement,
+    primary_relation_status: Optional[str],
+    *,
+    has_full_outcome_criterion: bool = False,
+) -> str:
+    """§1.4, first match.
+
+    `L3` requires everything `L2` requires PLUS a qualifying Outcome
+    Criterion (#391, `app/purpose_verification.py`): the ladder is "今の判断
+    に使えるか", so a step of empirical evidence on top of an unconfirmed
+    element/relation would rank ABOVE a confirmed-but-unverified one, which
+    is backwards. `has_full_outcome_criterion` is computed by
+    `derive_purpose_chain` from `purpose_verification.
+    full_outcome_criterion_target_ids` -- true exactly when a
+    `purpose_outcome_criterion` row targets this element with all four of
+    measure/baseline_value/target_value/observation_window filled in.
+    """
+    if (
+        element.state == "present"
+        and element.confirmation == "confirmed"
+        and primary_relation_status == "confirmed"
+        and has_full_outcome_criterion
+    ):
+        return "L3"
     if (
         element.state == "present"
         and element.confirmation == "confirmed"
@@ -916,26 +937,76 @@ def derive_purpose_chain(
         relations = []
 
     # --- resolution levels (design decision 1) ---
+    #
+    # `full_outcome_element_ids` is its own tiny guarded read (#391): a
+    # failure here must never BLOCK the rest of the frame, and must never
+    # elevate anything past `L2` by accident -- an empty set is exactly the
+    # fail-closed default `L3` already requires, so no separate
+    # `degraded_sections` entry is warranted the way the frame/relations/
+    # capabilities sections need one (§0 invariant 6 protects against a
+    # DOWNGRADE reading as "nothing here", not against an upgrade that
+    # silently fails to happen).
+    full_outcome_element_ids: Set[str] = set()
+    full_outcome_relation_ids: Set[str] = set()
+    try:
+        from . import purpose_verification  # local import: see module docstring
+
+        full_outcome_targets = purpose_verification.full_outcome_criterion_target_ids(
+            conn, system_id, resolved_session_id
+        )
+        full_outcome_element_ids = {
+            target_id for target_kind, target_id in full_outcome_targets if target_kind == "element"
+        }
+        full_outcome_relation_ids = {
+            target_id for target_kind, target_id in full_outcome_targets if target_kind == "relation"
+        }
+    except Exception:  # pragma: no cover - defensive
+        full_outcome_element_ids = set()
+        full_outcome_relation_ids = set()
+
+    def _has_full_outcome(element: PurposeElement, primary_relation: Optional[PurposeRelation]) -> bool:
+        """An element qualifies for `L3` if an Outcome Criterion targets it
+        DIRECTLY, or targets its own PRIMARY relation (design decision 1's
+        `full_outcome_criterion_target_ids` note) -- since
+        `CREATABLE_NEED_CODES["outcome_criterion"]` only ever gates a
+        RELATION-targeted need, the second branch is the only one reachable
+        through the documented creation path today; the first exists so a
+        future element-targeted need code (if one is ever added) does not
+        require touching this function again."""
+        if element.id in full_outcome_element_ids:
+            return True
+        return primary_relation is not None and primary_relation.id in full_outcome_relation_ids
+
     relations_by_id = {r.id: r for r in relations}
     if beneficiary_element is not None and desired_element is not None:
         rel = relations_by_id.get(
             relation_id("problem_to_change", beneficiary_element.id, desired_element.id)
         )
         beneficiary_element.resolution_level = _resolution_level(
-            beneficiary_element, rel.status if rel else None
+            beneficiary_element,
+            rel.status if rel else None,
+            has_full_outcome_criterion=_has_full_outcome(beneficiary_element, rel),
         )
     elif beneficiary_element is not None:
-        beneficiary_element.resolution_level = _resolution_level(beneficiary_element, None)
+        beneficiary_element.resolution_level = _resolution_level(
+            beneficiary_element, None,
+            has_full_outcome_criterion=_has_full_outcome(beneficiary_element, None),
+        )
 
     if desired_element is not None and intervention_element is not None:
         rel = relations_by_id.get(
             relation_id("change_to_intervention", desired_element.id, intervention_element.id)
         )
         desired_element.resolution_level = _resolution_level(
-            desired_element, rel.status if rel else None
+            desired_element,
+            rel.status if rel else None,
+            has_full_outcome_criterion=_has_full_outcome(desired_element, rel),
         )
     elif desired_element is not None:
-        desired_element.resolution_level = _resolution_level(desired_element, None)
+        desired_element.resolution_level = _resolution_level(
+            desired_element, None,
+            has_full_outcome_criterion=_has_full_outcome(desired_element, None),
+        )
 
     if intervention_element is not None:
         capability_relations = [
@@ -943,12 +1014,24 @@ def derive_purpose_chain(
             for r in relations
             if r.kind == "intervention_to_capability" and r.source_id == intervention_element.id
         ]
+        # `intervention`'s primary status is the WORST of zero-or-many
+        # capability relations (design decision 1 above it), so its `L3`
+        # eligibility mirrors that: a criterion on the DIRECT element OR on
+        # ANY of those relations counts -- there is no single "the" primary
+        # relation to hand to `_has_full_outcome` here.
+        intervention_has_outcome = intervention_element.id in full_outcome_element_ids or any(
+            r.id in full_outcome_relation_ids for r in capability_relations
+        )
         intervention_element.resolution_level = _resolution_level(
-            intervention_element, _worst_relation_status(capability_relations)
+            intervention_element,
+            _worst_relation_status(capability_relations),
+            has_full_outcome_criterion=intervention_has_outcome,
         )
 
     for extra in additional_intervention:
-        extra.resolution_level = _resolution_level(extra, None)
+        extra.resolution_level = _resolution_level(
+            extra, None, has_full_outcome_criterion=_has_full_outcome(extra, None)
+        )
 
     for capability in capability_elements:
         rel = next(
@@ -959,7 +1042,11 @@ def derive_purpose_chain(
             ),
             None,
         )
-        capability.resolution_level = _resolution_level(capability, rel.status if rel else None)
+        capability.resolution_level = _resolution_level(
+            capability,
+            rel.status if rel else None,
+            has_full_outcome_criterion=_has_full_outcome(capability, rel),
+        )
 
     elements: List[PurposeElement] = [
         e for e in (beneficiary_element, desired_element, intervention_element) if e is not None

@@ -7785,9 +7785,11 @@ OverviewLoopStage = Literal[
 OverviewLoopStageStatus = Literal["reached", "current", "future"]
 
 #: Which composed section could not be built. A partial failure degrades one
-#: section; it never blanks the screen (#384).
+#: section; it never blanks the screen (#384). `purpose_question` (#390/#391)
+#: is its OWN section, separate from `purpose_chain`: a question failure
+#: must not read as the whole Purpose Frame failing, and vice versa.
 OverviewSection = Literal[
-    "brief", "findings", "next_action", "loop", "runtime", "purpose_chain"
+    "brief", "findings", "next_action", "loop", "runtime", "purpose_chain", "purpose_question"
 ]
 
 
@@ -7955,6 +7957,11 @@ class OverviewOut(BaseModel):
     #: `None` only when its own guarded loader failed -- see `purpose_chain`
     #: in `degraded_sections`.
     purpose_chain: Optional["PurposeChainOut"] = None
+    #: §4.5/#390's single adaptive next question over `purpose_chain` above
+    #: (#391), embedded here instead of a second client query. `None` means
+    #: either "no question right now" (§4.5's normal render) or "could not
+    #: be derived" -- told apart by `"purpose_question" in degraded_sections`.
+    purpose_question: Optional["PurposeQuestionOut"] = None
 
 
 # --- Purpose Chain (Issue #387 Epic / #388) -----------------------------------
@@ -8025,9 +8032,11 @@ PurposeStaleReason = Literal[
 #: 「今の判断に使えるか」, first-match over an element's own settledness and its
 #: PRIMARY relation's status -- never a count, never an average (§1.4:
 #: `frame_resolution_level` is the 3-slot MIN, explicitly not a mean or a
-#: percentage). `L3` needs an Outcome Criterion (#391) and is structurally
-#: unreachable until that lands; `purpose_chain.py` documents why rather than
-#: silently never emitting it.
+#: percentage). `L3` requires an `app/purpose_verification.py` (#391)
+#: `purpose_outcome_criterion` row that TARGETS this exact element and has
+#: all four of `measure` / `baseline_value` / `target_value` /
+#: `observation_window` filled in -- see `purpose_chain.py`'s
+#: `_resolution_level` for the exact check.
 PurposeResolutionLevel = Literal["L0", "L1", "L2", "L3"]
 
 #: Which existing table an element's content came from. `none` is a genuine
@@ -8232,11 +8241,14 @@ class PurposeQuestionOut(BaseModel):
 
     need_id: str
     need_code: PurposeNeedCode
-    #: 1-6, the `select_question` priority-table row that chose this need.
-    #: `None` when the question was reached only via an explicit `need_id`
-    #: deep link to a need with no row in the priority table (e.g.
-    #: `human_value_judgement_required`, which `select_question` never picks
-    #: on its own -- §2.4).
+    #: The `PRIORITY_TABLE` row that chose this need (§2.4), 1-based.
+    #:
+    #: Every need code now carries a row, so a need derived from the current
+    #: projection always has one. The field stays `Optional` for the case the
+    #: type cannot rule out: a `need_id` deep link naming a code this server
+    #: version does not know. Reporting `None` there is honest -- inventing a
+    #: row number for a rule that did not run would forge the audit record of
+    #: which rule matched.
     rule_row: Optional[int] = None
     #: Fixed server copy (Principle 6/7) -- never model output.
     prompt: str
@@ -8300,3 +8312,287 @@ class PurposeNeedResponseOut(BaseModel):
     linked_joint_session_id: Optional[int] = None
     superseded_by_id: Optional[int] = None
     created_at: float
+
+
+# --- Purpose Verification / Experience-Outcome-Reuse (Issue #391) ------------
+#
+# `docs/purpose-chain.md` §4 is the specification. Three OPTIONAL concepts a
+# developer may attach to a Purpose Chain element or relation, by the SAME
+# stable string identity `app/purpose_chain.py` already uses -- never a row
+# id, and never required for every System (§4.1: "全 System へ一律に要求しな
+# い"). Creation is only ever OFFERED alongside a currently-`available`
+# `app/purpose_needs.py` need whose code is in the fixed
+# `purpose_verification.CREATABLE_NEED_CODES` table; "the Purpose Frame is at
+# L1" is explicitly not a reason (§4.1), so there is no endpoint that lets a
+# caller create one without naming the justifying `need_id`.
+#
+# `decision_method` is hardcoded `'manual'` on every write in this area, same
+# as `purpose_chain.py` / `purpose_needs.py` -- this module calls no
+# reasoning model either (Principle 6), and an outcome's `observed` /
+# `contradicted` verdict is never inferred from a trace: it is always the
+# developer's own recorded reading of evidence they themselves curated
+# (§4.2).
+
+#: `experience_hypothesis` and `reuse_hypothesis` share this exact lifecycle
+#: (`docs/purpose-chain.md` §4.1: "state は experience と同じ") -- one
+#: `Literal` for both, since defining it twice would let the two drift apart
+#: for no reason.  `retired` is a manual withdrawal (the developer decided
+#: the hypothesis was wrong or no longer relevant); it is NEVER a synonym for
+#: "not yet confirmed".
+PurposeHypothesisState = Literal["proposed", "confirmed", "retired"]
+
+#: `purpose_outcome_criterion`'s own 6-value lifecycle (§4.1/§4.2).
+#: `proposed` / `confirmed` are the same manual commitment steps as a
+#: hypothesis; `observed` / `contradicted` are set ONLY together with an
+#: evidence write (`PurposeOutcomeResultRequest`) -- never derived from
+#: silence. `not_observed` ("analytics が無ければ") and `not_computed`
+#: ("canonical mapping が無ければ") are each their own explicit manual
+#: recording of why a verdict could not be reached, not a value the server
+#: infers from an empty column -- see `purpose_verification.py`'s module
+#: docstring for why an inferred value here would violate §4.2's "runtime
+#: trace だけで利用者の成功を推測しない" rule one level up.
+PurposeOutcomeCriterionState = Literal[
+    "proposed", "confirmed", "observed", "contradicted", "not_observed", "not_computed"
+]
+
+#: Which of the two evidence COLUMNS a result write targets. §4.2 requires
+#: human-reported evidence and runtime observation to stay in separate
+#: columns, never merged into one "result" -- this is the axis that picks
+#: which column `record_outcome_result` writes to.
+PurposeOutcomeEvidenceSource = Literal["human_reported", "runtime_observed"]
+
+#: A recorded verdict is a judgement about the evidence, always the
+#: developer's own reading of it (never computed from the evidence text).
+PurposeOutcomeVerdict = Literal["supports", "contradicts"]
+
+#: Whether an `experiment_id` / `candidate_version_id` lineage column
+#: resolves to a real, System-scoped row right now. `unresolved` (the id was
+#: set but the row is gone) is a genuine third value -- §4.3: "対応が無けれ
+#: ば「関連不明」と表示する" -- never silently downgraded to `none`, which
+#: would erase the fact that a lineage claim was once made.
+PurposeOutcomeLineageState = Literal["none", "linked", "unresolved"]
+
+#: Which of the three concepts a verification prompt or a listing row is
+#: about. Distinct from `PurposeNeedTargetKind` (element vs relation) -- this
+#: is "what kind of verification", not "what kind of Purpose Chain node".
+PurposeVerificationConceptKind = Literal[
+    "experience_hypothesis", "outcome_criterion", "reuse_hypothesis"
+]
+
+
+class PurposeExperienceHypothesisOut(BaseModel):
+    """A minimal claim about what a real user would experience if this
+    element/relation's causal claim holds. Free text (§4.1) -- the developer
+    states it themselves; this module invents no wording."""
+
+    id: int
+    system_id: int
+    session_id: int
+    target_kind: PurposeNeedTargetKind
+    target_id: str
+    #: Copied from the justifying need at creation time, for display without
+    #: a second lookup.
+    target_label: str
+    #: `purpose_chain.element_digest` / the relation's own identity fields at
+    #: CREATION time. Captured for audit; #391 does not re-check it against
+    #: the current chain on every read (no staleness re-derivation here --
+    #: an explicit non-goal for this issue, see the module docstring).
+    target_digest: str
+    #: The `purpose_needs` need that made this creatable (§4.1). Never a
+    #: guess -- the create endpoint refuses without one.
+    source_need_id: str
+    source_need_code: PurposeNeedCode
+    statement: str
+    state: PurposeHypothesisState
+    decision_method: str = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[float] = None
+    retired_by: Optional[str] = None
+    retired_at: Optional[float] = None
+    retirement_reason: str = ""
+
+
+class PurposeReuseHypothesisOut(BaseModel):
+    """Identical shape to `PurposeExperienceHypothesisOut` -- a separate
+    class (not a type alias) because the two are stored in separate tables
+    and are never interchangeable, even though every field matches."""
+
+    id: int
+    system_id: int
+    session_id: int
+    target_kind: PurposeNeedTargetKind
+    target_id: str
+    target_label: str
+    target_digest: str
+    source_need_id: str
+    source_need_code: PurposeNeedCode
+    statement: str
+    state: PurposeHypothesisState
+    decision_method: str = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[float] = None
+    retired_by: Optional[str] = None
+    retired_at: Optional[float] = None
+    retirement_reason: str = ""
+
+
+class PurposeOutcomeCriterionOut(BaseModel):
+    """成果証拠 (§4.1/§4.2/§4.3/§4.4). `measure` / `baseline_value` /
+    `target_value` / `observation_window` are the four fields §4.4 checks for
+    L3 -- all plain developer-authored text, never LLM output."""
+
+    id: int
+    system_id: int
+    session_id: int
+    target_kind: PurposeNeedTargetKind
+    target_id: str
+    target_label: str
+    target_digest: str
+    source_need_id: str
+    source_need_code: PurposeNeedCode
+    measure: str = ""
+    baseline_value: str = ""
+    target_value: str = ""
+    observation_window: str = ""
+    state: PurposeOutcomeCriterionState
+    #: §4.3: explicit lineage columns only, never a System-wide existence
+    #: check. `lineage_state` reports whether the id (when set) still
+    #: resolves -- `unresolved` renders as 「関連不明」, never as "no lineage".
+    experiment_id: Optional[int] = None
+    candidate_version_id: Optional[int] = None
+    lineage_state: PurposeOutcomeLineageState = "none"
+    #: §4.2: two SEPARATE evidence columns, never merged into one "result".
+    human_reported_evidence: Optional[str] = None
+    human_reported_verdict: Optional[PurposeOutcomeVerdict] = None
+    human_reported_at: Optional[float] = None
+    human_reported_by: Optional[str] = None
+    runtime_observation_text: Optional[str] = None
+    runtime_observation_verdict: Optional[PurposeOutcomeVerdict] = None
+    runtime_observed_at: Optional[float] = None
+    runtime_observed_by: Optional[str] = None
+    #: §4.2: "synthetic fixture の結果を実利用者の成果として表示しない" -- the
+    #: flag a result write carries, shown alongside the result, never
+    #: inferred from where the evidence came from.
+    is_synthetic: bool = False
+    decision_method: str = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[float] = None
+
+
+class PurposeVerificationStateOut(BaseModel):
+    """`GET /purpose-chain/verification` -- every concept currently recorded
+    for one session, grouped by kind. Not paginated (§0 invariant 5: this
+    Epic creates no dashboard of its own; the expected count per session is
+    small, gated as it is by needs)."""
+
+    system_id: int
+    session_id: Optional[int] = None
+    experience_hypotheses: List[PurposeExperienceHypothesisOut] = []
+    outcome_criteria: List[PurposeOutcomeCriterionOut] = []
+    reuse_hypotheses: List[PurposeReuseHypothesisOut] = []
+
+
+class PurposeVerificationPromptOut(BaseModel):
+    """§4.5's ONE verification prompt. At most one, chosen deterministically
+    (`purpose_verification.select_verification_prompt`) -- the same
+    at-most-one discipline `PurposeQuestionOut` already applies to Purpose
+    Needs, extended to verification-concept creation. `None` at the endpoint
+    level means 「検証条件はまだ必要ありません」 -- there is no empty
+    placeholder object."""
+
+    concept_kind: PurposeVerificationConceptKind
+    need_id: str
+    need_code: PurposeNeedCode
+    target_kind: PurposeNeedTargetKind
+    target_id: str
+    target_label: str
+    #: 何を検証するか. Fixed server copy (Principle 6/7), never model output.
+    prompt: str
+    #: なぜ今か -- reused verbatim from the justifying need's own copy
+    #: (`purpose_needs._NEED_COPY`), so this prompt and the underlying need's
+    #: own question never disagree about why now matters.
+    why_now: str
+    #: どの判断に効くか -- reused verbatim from the justifying need's
+    #: `blocked_decision`.
+    blocked_decision: str
+    #: 最小の観測方法 -- fixed copy naming the smallest thing worth writing
+    #: down for this concept kind (Principle 6: never model-authored).
+    observation_hint: str
+
+
+class PurposeExperienceHypothesisCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: int
+    #: The `purpose_needs` need this concept is being created FOR (§4.1) --
+    #: required, never inferred from the target alone.
+    need_id: str
+    statement: str
+
+
+class PurposeReuseHypothesisCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: int
+    need_id: str
+    statement: str
+
+
+class PurposeOutcomeCriterionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: int
+    need_id: str
+    measure: str
+    baseline_value: str
+    target_value: str
+    observation_window: str
+
+
+class PurposeVerificationSessionRequest(BaseModel):
+    """The bare `session_id` body every no-extra-input verification
+    transition needs (confirm actions on either hypothesis table, and the
+    outcome criterion's own confirm)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: int
+
+
+class PurposeHypothesisRetireRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: int
+    reason: str = ""
+
+
+class PurposeOutcomeCriterionLinkRequest(BaseModel):
+    """§4.3: explicit lineage only. Both fields optional, but at most one may
+    be set -- an outcome criterion has at most one canonical mapping, never a
+    pair of unrelated candidate/experiment ids at once."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: int
+    experiment_id: Optional[int] = None
+    candidate_version_id: Optional[int] = None
+
+
+class PurposeOutcomeResultRequest(BaseModel):
+    """Records a result against EXACTLY ONE of the two evidence columns
+    (`source` picks which), always paired with the developer's own verdict --
+    never a bare state transition with no evidence attached (§4.2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: int
+    source: PurposeOutcomeEvidenceSource
+    verdict: PurposeOutcomeVerdict
+    evidence_text: str
+    is_synthetic: bool = False

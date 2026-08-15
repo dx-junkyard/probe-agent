@@ -77,6 +77,8 @@ import type {
   CellRootDigestOut, CellAsksListOut, CellAskOut, CellAskSyncOut, CellAskDecision,
   PurposeChainOut, PurposeRelationOut, PurposeQuestionOut, PurposeNeedResponseOut,
   PurposeResponseKind,
+  PurposeVerificationPromptOut, PurposeVerificationConceptKind,
+  PurposeExperienceHypothesisOut, PurposeReuseHypothesisOut, PurposeOutcomeCriterionOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -3544,5 +3546,60 @@ export function useRespondPurposeNeed(sessionId: number | null) {
         { session_id: sessionId, response_kind: responseKind, value_text: valueText ?? "" },
       ),
     onSuccess: () => _invalidatePurposeChain(qc, sessionId),
+  });
+}
+
+// --- Purpose Verification: Experience / Outcome / Reuse (Issue #391) --------
+//
+// §4.5's restraint: ONE query for the at-most-one prompt, ONE mutation to
+// create the concept the prompt named. There is no listing/dashboard hook
+// here on purpose -- `docs/purpose-chain.md` §4.5 and this Epic's non-goals
+// explicitly rule out an outcome dashboard or a retention chart; the only
+// UI surface is the single prompt inside the Purpose Frame panel.
+
+/** `GET /purpose-chain/verification-prompt`. At most one prompt -- `null`
+ * means 「検証条件はまだ必要ありません」 (§4.5's normal render). */
+export function usePurposeVerificationPrompt(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("purposeVerificationPrompt"), sessionId],
+    queryFn: () => {
+      const qs = sessionId != null ? `?session_id=${sessionId}` : "";
+      return api.get<PurposeVerificationPromptOut | null>(
+        `/purpose-chain/verification-prompt${qs}`,
+      );
+    },
+    enabled: !!getSystemId(),
+  });
+}
+
+const _VERIFICATION_CREATE_PATH: Record<PurposeVerificationConceptKind, string> = {
+  experience_hypothesis: "/purpose-chain/experience-hypotheses",
+  outcome_criterion: "/purpose-chain/outcome-criteria",
+  reuse_hypothesis: "/purpose-chain/reuse-hypotheses",
+};
+
+/** Creates ONE verification concept from an active prompt. `fields` carries
+ * exactly what that concept kind's create request needs -- `statement` for
+ * the two hypothesis kinds, the four Outcome Criterion fields for that one
+ * -- the caller (the prompt's own minimal form) decides which. */
+export function useCreateVerificationConcept(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      conceptKind, needId, fields,
+    }: {
+      conceptKind: PurposeVerificationConceptKind;
+      needId: string;
+      fields: Record<string, string>;
+    }) =>
+      api.post<
+        PurposeExperienceHypothesisOut | PurposeReuseHypothesisOut | PurposeOutcomeCriterionOut
+      >(_VERIFICATION_CREATE_PATH[conceptKind], {
+        session_id: sessionId, need_id: needId, ...fields,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("purposeVerificationPrompt"), sessionId] });
+      _invalidatePurposeChain(qc, sessionId);
+    },
   });
 }

@@ -669,3 +669,66 @@ def test_purpose_needs_are_system_scoped(admin_client, tmp_path):
         admin_client, headers_b, "frame_missing:beneficiary_problem", session_a, "defer",
         expect=404,
     )
+
+
+# --- Overview embedding (Issue #391 §B: one composed section, not a second
+#     client query) ------------------------------------------------------------
+
+
+def test_overview_embeds_the_same_purpose_question_verbatim(admin_client, tmp_path):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs Overview Q")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    standalone = _question(admin_client, headers, session_id)
+    assert standalone is not None
+
+    overview = admin_client.get("/overview", headers=headers)
+    assert overview.status_code == 200, overview.text
+    embedded = overview.json()["purpose_question"]
+    assert embedded is not None
+    assert embedded["need_id"] == standalone["need_id"]
+    assert embedded["prompt"] == standalone["prompt"]
+    assert "purpose_question" not in overview.json()["degraded_sections"]
+
+
+def test_overview_purpose_question_is_none_once_answered(admin_client, tmp_path):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs Overview Q Answered")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    first = _question(admin_client, headers, session_id)
+    assert first is not None
+    _respond(admin_client, headers, first["need_id"], session_id, "defer", "後で")
+
+    overview = admin_client.get("/overview", headers=headers)
+    assert overview.status_code == 200, overview.text
+    # frame_missing:beneficiary_problem was deferred; the next-highest-
+    # priority available need (desired_change) becomes the question instead
+    # -- the Overview must reflect the SAME response history, not a stale
+    # unanswered one.
+    embedded = overview.json()["purpose_question"]
+    assert embedded is None or embedded["need_id"] != first["need_id"]
+
+
+def test_overview_degrades_only_purpose_question_on_failure(admin_client, tmp_path, monkeypatch):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs Overview Q Fail")
+    headers = _headers(token, system_id)
+    _create_session(admin_client, headers, snapshot_id)
+
+    from app import overview_projection
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated purpose_question failure")
+
+    monkeypatch.setattr(overview_projection.purpose_needs, "derive_needs", _boom)
+
+    overview = admin_client.get("/overview", headers=headers)
+    assert overview.status_code == 200, overview.text
+    body = overview.json()
+    assert body["purpose_question"] is None
+    assert "purpose_question" in body["degraded_sections"]
+    # The Purpose Chain itself (a completely separate section) still renders.
+    assert body["purpose_chain"] is not None
+    assert "purpose_chain" not in body["degraded_sections"]
+    assert body["brief"] is not None

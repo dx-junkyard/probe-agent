@@ -23,7 +23,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  useDecidePurposeRelation, usePurposeChain, usePurposeNextQuestion, useRespondPurposeNeed,
+  useCreateVerificationConcept,
+  useDecidePurposeRelation,
+  usePurposeChain,
+  usePurposeNextQuestion,
+  usePurposeVerificationPrompt,
+  useRespondPurposeNeed,
 } from "@/api/hooks";
 import {
   ANSWERABILITY_LABEL,
@@ -45,6 +50,148 @@ import {
 import type {
   PurposeChainOut, PurposeElementOut, PurposeQuestionOut, PurposeRelationOut,
 } from "@/api/types";
+
+// ── §4.5 検証条件 (Experience / Outcome / Reuse, Issue #391) ───────────────
+//
+// Deliberately minimal: the normal render is ONE sentence saying nothing is
+// needed. Only when the server names a currently-creatable concept
+// (`GET /purpose-chain/verification-prompt`) does ONE prompt appear, with
+// the minimum form for that concept kind and two ways out (create, or defer
+// the underlying need). There is no outcome dashboard, no retention chart,
+// no list of past hypotheses here — that is an explicit non-goal (§4.5 /
+// docs §5).
+
+const _VERIFICATION_CONCEPT_LABEL: Record<string, string> = {
+  experience_hypothesis: "最小の成功体験",
+  outcome_criterion: "成果証拠",
+  reuse_hypothesis: "再利用の契機",
+};
+
+function VerificationPromptSection({ sessionId }: { sessionId: number }) {
+  const promptQuery = usePurposeVerificationPrompt(sessionId);
+  const create = useCreateVerificationConcept(sessionId);
+  const respond = useRespondPurposeNeed(sessionId);
+  const [statement, setStatement] = useState("");
+  const [outcomeFields, setOutcomeFields] = useState({
+    measure: "", baseline_value: "", target_value: "", observation_window: "",
+  });
+
+  if (promptQuery.isLoading) {
+    return (
+      <p className="text-xs text-muted-foreground" data-testid="purpose-verification-loading">
+        検証条件を確認しています…
+      </p>
+    );
+  }
+
+  const prompt = promptQuery.data;
+  if (!prompt) {
+    return (
+      <p className="text-xs text-muted-foreground" data-testid="purpose-verification-none">
+        検証条件はまだ必要ありません。
+      </p>
+    );
+  }
+
+  const isOutcome = prompt.concept_kind === "outcome_criterion";
+  const canSubmit = isOutcome
+    ? Object.values(outcomeFields).every((v) => v.trim())
+    : statement.trim().length > 0;
+
+  const submitCreate = () => {
+    create.mutate(
+      {
+        conceptKind: prompt.concept_kind,
+        needId: prompt.need_id,
+        fields: isOutcome ? outcomeFields : { statement },
+      },
+      {
+        onSuccess: () => {
+          setStatement("");
+          setOutcomeFields({ measure: "", baseline_value: "", target_value: "", observation_window: "" });
+          toast.success("検証条件を記録しました");
+        },
+        onError: (e) => toast.error(String(e)),
+      },
+    );
+  };
+
+  const skip = () => {
+    respond.mutate(
+      { needId: prompt.need_id, responseKind: "defer" },
+      { onError: (e) => toast.error(String(e)) },
+    );
+  };
+
+  const busy = create.isPending || respond.isPending;
+
+  return (
+    <div
+      className="rounded-md border border-dashed p-3 space-y-2 text-sm"
+      data-testid="purpose-verification-prompt"
+      data-concept-kind={prompt.concept_kind}
+    >
+      <p className="text-xs font-semibold text-muted-foreground">
+        検証条件の提案 — {_VERIFICATION_CONCEPT_LABEL[prompt.concept_kind]}
+      </p>
+      <p className="font-medium">{prompt.prompt}</p>
+      <p className="text-muted-foreground">{prompt.why_now}</p>
+      <p className="text-muted-foreground">止まっている判断: {prompt.blocked_decision}</p>
+      <p className="text-xs text-muted-foreground">{prompt.observation_hint}</p>
+
+      {isOutcome ? (
+        <div className="grid grid-cols-2 gap-2">
+          {(
+            [
+              ["measure", "何を測るか"],
+              ["baseline_value", "今の値"],
+              ["target_value", "目指す値"],
+              ["observation_window", "観測期間"],
+            ] as const
+          ).map(([field, label]) => (
+            <label key={field} className="space-y-1 text-xs text-muted-foreground">
+              {label}
+              <input
+                className="block w-full rounded-md border bg-transparent px-2 py-1 text-sm"
+                value={outcomeFields[field]}
+                onChange={(e) => setOutcomeFields((prev) => ({ ...prev, [field]: e.target.value }))}
+                data-testid={`purpose-verification-outcome-${field}`}
+              />
+            </label>
+          ))}
+        </div>
+      ) : (
+        <Textarea
+          value={statement}
+          onChange={(e) => setStatement(e.target.value)}
+          rows={2}
+          placeholder="一文で書き留めてください"
+          data-testid="purpose-verification-statement"
+        />
+      )}
+
+      <div className="flex flex-wrap gap-2">
+        <Button
+          size="sm"
+          disabled={busy || !canSubmit}
+          onClick={submitCreate}
+          data-testid="purpose-verification-create"
+        >
+          検証条件として記録する
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy}
+          onClick={skip}
+          data-testid="purpose-verification-skip"
+        >
+          今は決めない(保留)
+        </Button>
+      </div>
+    </div>
+  );
+}
 
 // ── 現在の質問 (§2.4-§2.6) ────────────────────────────────────────────────
 
@@ -549,6 +696,13 @@ export function PurposeFramePanel({ sessionId, initialNeedId }: PurposeFramePane
         )}
 
         <CapabilitiesSection chain={chain} question={question} />
+
+        {/* §4.5 (Issue #391): the ONE verification prompt, or the one-line
+            "nothing needed" render. Not tied to a single element card --
+            §4.1's need-gated targets can be a relation the element cards
+            above already show, so this reads as one section for the whole
+            Purpose Frame rather than a duplicate badge per element. */}
+        {chain.session_id != null && <VerificationPromptSection sessionId={chain.session_id} />}
       </CardContent>
     </Card>
   );

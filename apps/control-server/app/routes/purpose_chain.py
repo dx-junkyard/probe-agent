@@ -44,11 +44,11 @@ probe-agent:
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .. import purpose_needs
+from .. import purpose_needs, purpose_verification
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from .interview_intent import _insert_item as _insert_intent_item
@@ -57,14 +57,26 @@ from ..joint_understanding import SCHEMA_VERSION as JU_SCHEMA_VERSION
 from ..models import (
     PurposeChainOut,
     PurposeElementOut,
+    PurposeExperienceHypothesisCreateRequest,
+    PurposeExperienceHypothesisOut,
     PurposeFrameOut,
+    PurposeHypothesisRetireRequest,
     PurposeNeedRespondRequest,
     PurposeNeedResponseOut,
+    PurposeOutcomeCriterionCreateRequest,
+    PurposeOutcomeCriterionLinkRequest,
+    PurposeOutcomeCriterionOut,
+    PurposeOutcomeResultRequest,
     PurposeQuestionOut,
     PurposeRelationDecisionRequest,
     PurposeRelationOut,
+    PurposeReuseHypothesisCreateRequest,
+    PurposeReuseHypothesisOut,
     PurposeRoutedNeedOut,
     PurposeSuggestedAnswerOut,
+    PurposeVerificationPromptOut,
+    PurposeVerificationSessionRequest,
+    PurposeVerificationStateOut,
 )
 from ..purpose_chain import (
     PurposeChainResult,
@@ -76,6 +88,7 @@ from ..purpose_chain import (
     record_relation_decision,
 )
 from ..purpose_needs import PurposeNeed, PurposeQuestion
+from ..purpose_verification import NotCreatable, NotFound as VerificationNotFound
 
 router = APIRouter()
 
@@ -675,3 +688,542 @@ def respond_to_purpose_need(
             "SELECT * FROM purpose_need_response WHERE id = ?", (response_id,)
         ).fetchone()
         return _need_response_out(row)
+
+
+# --- Purpose Verification: Experience / Outcome / Reuse (Issue #391) ---------
+#
+# `docs/purpose-chain.md` §4 is the specification; `app/purpose_verification.py`'s
+# module docstring is the design-decision record -- the same split #389's
+# section above uses (deterministic gating/lineage/derivation as pure/DB
+# functions there, this module a thin I/O boundary). Every create endpoint
+# below re-derives the Purpose Chain and its needs FRESH inside the same
+# request rather than trusting a client-supplied need snapshot, so a need
+# that resolved or went stale between the prompt being shown and the
+# developer acting on it is refused (422 `purpose_verification_not_creatable`)
+# rather than silently accepted.
+
+
+def _existing_verification_targets(
+    conn, system_id: int, session_id: int
+) -> Dict[str, Set[str]]:
+    """`concept_kind -> {f"{target_kind}:{target_id}", ...}` for every
+    target that already has at least one row of that kind -- used only to
+    keep `select_verification_prompt` from re-offering a target the
+    developer already acted on (§4.5)."""
+    out: Dict[str, Set[str]] = {kind: set() for kind in purpose_verification.CONCEPT_KINDS}
+    for concept_kind, table in (
+        ("experience_hypothesis", "purpose_experience_hypothesis"),
+        ("outcome_criterion", "purpose_outcome_criterion"),
+        ("reuse_hypothesis", "purpose_reuse_hypothesis"),
+    ):
+        rows = conn.execute(
+            f"""SELECT DISTINCT target_kind, target_id FROM {table}
+                WHERE system_id = ? AND session_id = ?""",
+            (system_id, session_id),
+        ).fetchall()
+        out[concept_kind] = {f"{r['target_kind']}:{r['target_id']}" for r in rows}
+    return out
+
+
+def _hypothesis_out(row, cls):
+    return cls(
+        id=row["id"],
+        system_id=row["system_id"],
+        session_id=row["session_id"],
+        target_kind=row["target_kind"],
+        target_id=row["target_id"],
+        target_label=row["target_label"],
+        target_digest=row["target_digest"],
+        source_need_id=row["source_need_id"],
+        source_need_code=row["source_need_code"],
+        statement=row["statement"],
+        state=row["state"],
+        decision_method=row["decision_method"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        confirmed_by=row["confirmed_by"],
+        confirmed_at=row["confirmed_at"],
+        retired_by=row["retired_by"],
+        retired_at=row["retired_at"],
+        retirement_reason=row["retirement_reason"],
+    )
+
+
+def _outcome_criterion_out(conn, system_id: int, row) -> PurposeOutcomeCriterionOut:
+    lineage_state = purpose_verification.resolve_lineage(
+        conn, system_id, row["experiment_id"], row["candidate_version_id"]
+    )
+    return PurposeOutcomeCriterionOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        session_id=row["session_id"],
+        target_kind=row["target_kind"],
+        target_id=row["target_id"],
+        target_label=row["target_label"],
+        target_digest=row["target_digest"],
+        source_need_id=row["source_need_id"],
+        source_need_code=row["source_need_code"],
+        measure=row["measure"],
+        baseline_value=row["baseline_value"],
+        target_value=row["target_value"],
+        observation_window=row["observation_window"],
+        state=row["state"],
+        experiment_id=row["experiment_id"],
+        candidate_version_id=row["candidate_version_id"],
+        lineage_state=lineage_state,
+        human_reported_evidence=row["human_reported_evidence"],
+        human_reported_verdict=row["human_reported_verdict"],
+        human_reported_at=row["human_reported_at"],
+        human_reported_by=row["human_reported_by"],
+        runtime_observation_text=row["runtime_observation_text"],
+        runtime_observation_verdict=row["runtime_observation_verdict"],
+        runtime_observed_at=row["runtime_observed_at"],
+        runtime_observed_by=row["runtime_observed_by"],
+        is_synthetic=bool(row["is_synthetic"]),
+        decision_method=row["decision_method"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        confirmed_by=row["confirmed_by"],
+        confirmed_at=row["confirmed_at"],
+    )
+
+
+def _require_session(conn, system_id: int, session_id: int):
+    row = conn.execute(
+        "SELECT id FROM interview_session WHERE id = ? AND system_id = ?",
+        (session_id, system_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    return row
+
+
+def _resolve_creatable_need(
+    conn, system_id: int, session_id: int, concept_kind: str, need_id: str
+) -> PurposeNeed:
+    chain = derive_purpose_chain(conn, system_id, session_id)
+    # `_needs_for_session` (not the bare `derive_needs`) so a need the
+    # developer already answered/deferred/is waiting on reports its REAL
+    # current state -- `derive_needs` alone always reports `available` and
+    # would let a stale/resolved need still justify a new creation.
+    needs = _needs_for_session(conn, system_id, chain)
+    try:
+        return purpose_verification.creatable_need(needs, concept_kind, need_id)
+    except NotCreatable:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "purpose_verification_not_creatable",
+                "message": (
+                    "This need is not currently available, or its code does "
+                    f"not justify creating a {concept_kind} (§4.1: creation "
+                    "is offered only alongside a real, currently-open need)."
+                ),
+            },
+        )
+
+
+@router.get("/purpose-chain/verification", response_model=PurposeVerificationStateOut)
+def get_purpose_verification(
+    session_id: Optional[int] = Query(default=None),
+    system_id: int = Depends(get_system_id),
+) -> PurposeVerificationStateOut:
+    """Every Experience Hypothesis / Outcome Criterion / Reuse Hypothesis
+    currently recorded for one session (§4.1). Read-only; creation and every
+    transition are their own endpoints below."""
+    with get_conn() as conn:
+        chain = derive_purpose_chain(conn, system_id, session_id)
+        resolved_session_id = chain.session_id
+        experience_rows = purpose_verification.list_experience_hypotheses(
+            conn, system_id, resolved_session_id
+        )
+        reuse_rows = purpose_verification.list_reuse_hypotheses(
+            conn, system_id, resolved_session_id
+        )
+        outcome_rows = purpose_verification.list_outcome_criteria(
+            conn, system_id, resolved_session_id
+        )
+        return PurposeVerificationStateOut(
+            system_id=system_id,
+            session_id=resolved_session_id,
+            experience_hypotheses=[
+                _hypothesis_out(r, PurposeExperienceHypothesisOut) for r in experience_rows
+            ],
+            outcome_criteria=[
+                _outcome_criterion_out(conn, system_id, r) for r in outcome_rows
+            ],
+            reuse_hypotheses=[
+                _hypothesis_out(r, PurposeReuseHypothesisOut) for r in reuse_rows
+            ],
+        )
+
+
+@router.get(
+    "/purpose-chain/verification-prompt",
+    response_model=Optional[PurposeVerificationPromptOut],
+)
+def get_purpose_verification_prompt(
+    session_id: Optional[int] = Query(default=None),
+    system_id: int = Depends(get_system_id),
+) -> Optional[PurposeVerificationPromptOut]:
+    """§4.5: AT MOST ONE verification prompt, or `null` for 「検証条件はまだ
+    必要ありません」. Writes nothing -- a page view is never an answer, the
+    same rule `GET /purpose-chain/next-question` already follows."""
+    with get_conn() as conn:
+        chain = derive_purpose_chain(conn, system_id, session_id)
+        resolved_session_id = chain.session_id
+        if resolved_session_id is None:
+            return None
+        needs = _needs_for_session(conn, system_id, chain)
+        existing = _existing_verification_targets(conn, system_id, resolved_session_id)
+        candidate = purpose_verification.select_verification_prompt(needs, existing)
+        if candidate is None:
+            return None
+        copy = purpose_needs.need_copy_for(candidate.need.code)
+        target = candidate.need.target_label
+        return PurposeVerificationPromptOut(
+            concept_kind=candidate.concept_kind,
+            need_id=candidate.need.id,
+            need_code=candidate.need.code,
+            target_kind=candidate.need.target_kind,
+            target_id=candidate.need.target_id,
+            target_label=target,
+            prompt=purpose_verification.PROMPT_TEXT[candidate.concept_kind].format(target=target),
+            why_now=copy["why_now"].format(target=target),
+            blocked_decision=copy["blocked_decision"].format(target=target),
+            observation_hint=purpose_verification.OBSERVATION_HINT[candidate.concept_kind],
+        )
+
+
+@router.post(
+    "/purpose-chain/experience-hypotheses",
+    response_model=PurposeExperienceHypothesisOut,
+    status_code=201,
+)
+def create_experience_hypothesis_endpoint(
+    payload: PurposeExperienceHypothesisCreateRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeExperienceHypothesisOut:
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        need = _resolve_creatable_need(
+            conn, system_id, payload.session_id, "experience_hypothesis", payload.need_id
+        )
+        new_id = purpose_verification.create_experience_hypothesis(
+            conn,
+            system_id=system_id,
+            session_id=payload.session_id,
+            need=need,
+            statement=payload.statement,
+            created_by=_principal_actor(principal),
+        )
+        row = conn.execute(
+            "SELECT * FROM purpose_experience_hypothesis WHERE id = ?", (new_id,)
+        ).fetchone()
+        return _hypothesis_out(row, PurposeExperienceHypothesisOut)
+
+
+@router.post(
+    "/purpose-chain/experience-hypotheses/{concept_id}/confirm",
+    response_model=PurposeExperienceHypothesisOut,
+)
+def confirm_experience_hypothesis_endpoint(
+    concept_id: int,
+    payload: PurposeVerificationSessionRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeExperienceHypothesisOut:
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        try:
+            purpose_verification.confirm_hypothesis(
+                conn,
+                "purpose_experience_hypothesis",
+                system_id=system_id,
+                session_id=payload.session_id,
+                concept_id=concept_id,
+                confirmed_by=_principal_actor(principal),
+            )
+        except VerificationNotFound:
+            raise HTTPException(status_code=404, detail="Experience hypothesis not found")
+        row = conn.execute(
+            "SELECT * FROM purpose_experience_hypothesis WHERE id = ?", (concept_id,)
+        ).fetchone()
+        return _hypothesis_out(row, PurposeExperienceHypothesisOut)
+
+
+@router.post(
+    "/purpose-chain/experience-hypotheses/{concept_id}/retire",
+    response_model=PurposeExperienceHypothesisOut,
+)
+def retire_experience_hypothesis_endpoint(
+    concept_id: int,
+    payload: PurposeHypothesisRetireRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeExperienceHypothesisOut:
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        try:
+            purpose_verification.retire_hypothesis(
+                conn,
+                "purpose_experience_hypothesis",
+                system_id=system_id,
+                session_id=payload.session_id,
+                concept_id=concept_id,
+                reason=payload.reason,
+                retired_by=_principal_actor(principal),
+            )
+        except VerificationNotFound:
+            raise HTTPException(status_code=404, detail="Experience hypothesis not found")
+        row = conn.execute(
+            "SELECT * FROM purpose_experience_hypothesis WHERE id = ?", (concept_id,)
+        ).fetchone()
+        return _hypothesis_out(row, PurposeExperienceHypothesisOut)
+
+
+@router.post(
+    "/purpose-chain/reuse-hypotheses",
+    response_model=PurposeReuseHypothesisOut,
+    status_code=201,
+)
+def create_reuse_hypothesis_endpoint(
+    payload: PurposeReuseHypothesisCreateRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeReuseHypothesisOut:
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        need = _resolve_creatable_need(
+            conn, system_id, payload.session_id, "reuse_hypothesis", payload.need_id
+        )
+        new_id = purpose_verification.create_reuse_hypothesis(
+            conn,
+            system_id=system_id,
+            session_id=payload.session_id,
+            need=need,
+            statement=payload.statement,
+            created_by=_principal_actor(principal),
+        )
+        row = conn.execute(
+            "SELECT * FROM purpose_reuse_hypothesis WHERE id = ?", (new_id,)
+        ).fetchone()
+        return _hypothesis_out(row, PurposeReuseHypothesisOut)
+
+
+@router.post(
+    "/purpose-chain/reuse-hypotheses/{concept_id}/confirm",
+    response_model=PurposeReuseHypothesisOut,
+)
+def confirm_reuse_hypothesis_endpoint(
+    concept_id: int,
+    payload: PurposeVerificationSessionRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeReuseHypothesisOut:
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        try:
+            purpose_verification.confirm_hypothesis(
+                conn,
+                "purpose_reuse_hypothesis",
+                system_id=system_id,
+                session_id=payload.session_id,
+                concept_id=concept_id,
+                confirmed_by=_principal_actor(principal),
+            )
+        except VerificationNotFound:
+            raise HTTPException(status_code=404, detail="Reuse hypothesis not found")
+        row = conn.execute(
+            "SELECT * FROM purpose_reuse_hypothesis WHERE id = ?", (concept_id,)
+        ).fetchone()
+        return _hypothesis_out(row, PurposeReuseHypothesisOut)
+
+
+@router.post(
+    "/purpose-chain/reuse-hypotheses/{concept_id}/retire",
+    response_model=PurposeReuseHypothesisOut,
+)
+def retire_reuse_hypothesis_endpoint(
+    concept_id: int,
+    payload: PurposeHypothesisRetireRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeReuseHypothesisOut:
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        try:
+            purpose_verification.retire_hypothesis(
+                conn,
+                "purpose_reuse_hypothesis",
+                system_id=system_id,
+                session_id=payload.session_id,
+                concept_id=concept_id,
+                reason=payload.reason,
+                retired_by=_principal_actor(principal),
+            )
+        except VerificationNotFound:
+            raise HTTPException(status_code=404, detail="Reuse hypothesis not found")
+        row = conn.execute(
+            "SELECT * FROM purpose_reuse_hypothesis WHERE id = ?", (concept_id,)
+        ).fetchone()
+        return _hypothesis_out(row, PurposeReuseHypothesisOut)
+
+
+@router.post(
+    "/purpose-chain/outcome-criteria",
+    response_model=PurposeOutcomeCriterionOut,
+    status_code=201,
+)
+def create_outcome_criterion_endpoint(
+    payload: PurposeOutcomeCriterionCreateRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeOutcomeCriterionOut:
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        need = _resolve_creatable_need(
+            conn, system_id, payload.session_id, "outcome_criterion", payload.need_id
+        )
+        new_id = purpose_verification.create_outcome_criterion(
+            conn,
+            system_id=system_id,
+            session_id=payload.session_id,
+            need=need,
+            measure=payload.measure,
+            baseline_value=payload.baseline_value,
+            target_value=payload.target_value,
+            observation_window=payload.observation_window,
+            created_by=_principal_actor(principal),
+        )
+        row = conn.execute(
+            "SELECT * FROM purpose_outcome_criterion WHERE id = ?", (new_id,)
+        ).fetchone()
+        return _outcome_criterion_out(conn, system_id, row)
+
+
+@router.post(
+    "/purpose-chain/outcome-criteria/{concept_id}/confirm",
+    response_model=PurposeOutcomeCriterionOut,
+)
+def confirm_outcome_criterion_endpoint(
+    concept_id: int,
+    payload: PurposeVerificationSessionRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeOutcomeCriterionOut:
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        try:
+            purpose_verification.confirm_outcome_criterion(
+                conn,
+                system_id=system_id,
+                session_id=payload.session_id,
+                concept_id=concept_id,
+                confirmed_by=_principal_actor(principal),
+            )
+        except VerificationNotFound:
+            raise HTTPException(status_code=404, detail="Outcome criterion not found")
+        row = conn.execute(
+            "SELECT * FROM purpose_outcome_criterion WHERE id = ?", (concept_id,)
+        ).fetchone()
+        return _outcome_criterion_out(conn, system_id, row)
+
+
+def _require_system_scoped_lineage_targets(
+    conn, system_id: int, experiment_id: Optional[int], candidate_version_id: Optional[int]
+) -> None:
+    """§4.3: an explicit lineage write must itself name a real, System-scoped
+    row -- refusing an id that does not resolve keeps a bad link from ever
+    being recorded in the first place (`resolve_lineage`'s `unresolved`
+    value exists for a link that goes stale LATER, e.g. a deleted
+    Experiment, never for one that was never valid)."""
+    if experiment_id is not None:
+        row = conn.execute(
+            "SELECT 1 FROM experiments WHERE id = ? AND system_id = ?",
+            (experiment_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Experiment not found")
+    if candidate_version_id is not None:
+        row = conn.execute(
+            "SELECT 1 FROM candidate_versions WHERE id = ? AND system_id = ?",
+            (candidate_version_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Candidate version not found")
+
+
+@router.post(
+    "/purpose-chain/outcome-criteria/{concept_id}/link",
+    response_model=PurposeOutcomeCriterionOut,
+)
+def link_outcome_criterion_endpoint(
+    concept_id: int,
+    payload: PurposeOutcomeCriterionLinkRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeOutcomeCriterionOut:
+    """§4.3: record the explicit `experiment_id`/`candidate_version_id`
+    lineage. Never a System-wide existence check for READING it later
+    (`resolve_lineage`) -- but WRITING a new link still requires the target
+    to exist right now, refused 404 otherwise."""
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        _require_system_scoped_lineage_targets(
+            conn, system_id, payload.experiment_id, payload.candidate_version_id
+        )
+        try:
+            purpose_verification.link_outcome_criterion(
+                conn,
+                system_id=system_id,
+                session_id=payload.session_id,
+                concept_id=concept_id,
+                experiment_id=payload.experiment_id,
+                candidate_version_id=payload.candidate_version_id,
+            )
+        except VerificationNotFound:
+            raise HTTPException(status_code=404, detail="Outcome criterion not found")
+        row = conn.execute(
+            "SELECT * FROM purpose_outcome_criterion WHERE id = ?", (concept_id,)
+        ).fetchone()
+        return _outcome_criterion_out(conn, system_id, row)
+
+
+@router.post(
+    "/purpose-chain/outcome-criteria/{concept_id}/result",
+    response_model=PurposeOutcomeCriterionOut,
+)
+def record_outcome_result_endpoint(
+    concept_id: int,
+    payload: PurposeOutcomeResultRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeOutcomeCriterionOut:
+    """Records the developer's OWN verdict against ONE evidence column pair
+    (`payload.source` picks human-reported vs runtime-observed -- §4.2, never
+    merged). This module computes nothing from `evidence_text`: `verdict` is
+    always the caller's own judgement, exactly like `purpose_chain.py`'s
+    relation decision never infers `confirmed`/`rejected` from the
+    endpoints' content."""
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        try:
+            purpose_verification.record_outcome_result(
+                conn,
+                system_id=system_id,
+                session_id=payload.session_id,
+                concept_id=concept_id,
+                source=payload.source,
+                verdict=payload.verdict,
+                evidence_text=payload.evidence_text,
+                is_synthetic=payload.is_synthetic,
+                recorded_by=_principal_actor(principal),
+            )
+        except VerificationNotFound:
+            raise HTTPException(status_code=404, detail="Outcome criterion not found")
+        row = conn.execute(
+            "SELECT * FROM purpose_outcome_criterion WHERE id = ?", (concept_id,)
+        ).fetchone()
+        return _outcome_criterion_out(conn, system_id, row)

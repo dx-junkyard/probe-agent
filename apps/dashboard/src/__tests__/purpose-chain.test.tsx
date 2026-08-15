@@ -31,6 +31,7 @@ import { PurposeFrameCard, purposeInterviewHref } from "@/components/purpose-cha
 // including the `mockApi` this mock factory closes over.
 import type {
   OverviewOut, PurposeChainOut, PurposeElementOut, PurposeQuestionOut, PurposeRelationOut,
+  PurposeVerificationPromptOut,
 } from "@/api/types";
 
 // ── fixtures ─────────────────────────────────────────────────────────────
@@ -271,20 +272,45 @@ describe("PurposeFrameCard (Overview Level 0, §3.1)", () => {
   });
 
   // State 3: Vision confirmed, Purpose hypothesis (mixed confirmation)
-  test("state 3: a confirmed element shows no unconfirmed badge while a sibling hypothesis element does", () => {
+  test("state 3: every element states BOTH its 確認状態 and its 出所, confirmed ones included", () => {
+    // Dogfooding finding (`docs/dogfooding-purpose-chain.md`): showing the
+    // badge only for unconfirmed elements expresses 「確認済み」 as the
+    // ABSENCE of a badge, which a first-time reader cannot tell apart from
+    // 「表示が出ていないだけ」 -- and with 出所 missing entirely they could not
+    // say whether the sentence was the developer's own or the AI's guess.
+    // Both axes are shown on every element, which is what the Epic's
+    // 「AI 候補と developer-confirmed intent を混同しない」 requires at Level 0.
     const c = chain({
       frame: {
-        beneficiary_problem: element({ id: "beneficiary_problem", kind: "beneficiary_problem", state: "present", display_statement: "課題", confirmation: "confirmed" }),
-        desired_change: element({ id: "desired_change", kind: "desired_change", state: "present", display_statement: "変化", confirmation: "confirmed" }),
-        intervention: element({ id: "intervention", kind: "intervention", state: "present", display_statement: "介入", confirmation: "ai_hypothesis" }),
+        beneficiary_problem: element({
+          id: "beneficiary_problem", kind: "beneficiary_problem", state: "present",
+          display_statement: "課題", confirmation: "confirmed",
+          confirmation_label: "確認済み", provenance: "developer_intent",
+          provenance_label: "開発者が明示した意図",
+        }),
+        desired_change: element({
+          id: "desired_change", kind: "desired_change", state: "present",
+          display_statement: "変化", confirmation: "confirmed",
+          confirmation_label: "確認済み", provenance: "developer_intent",
+          provenance_label: "開発者が明示した意図",
+        }),
+        intervention: element({
+          id: "intervention", kind: "intervention", state: "present",
+          display_statement: "介入", confirmation: "ai_hypothesis",
+        }),
       },
       frame_state: "complete",
     });
     wrap(<PurposeFrameCard overview={overview({ purpose_chain: c })} question={null} questionState="ready" />);
+
     const change = screen.getByTestId("overview-purpose-element-desired_change");
+    expect(change).toHaveTextContent("確認済み");
+    expect(change).toHaveTextContent("開発者が明示した意図");
     expect(within(change).queryByText("AI 仮説・未確認")).not.toBeInTheDocument();
+
     const intervention = screen.getByTestId("overview-purpose-element-intervention");
     expect(within(intervention).getByText("AI 仮説・未確認")).toBeInTheDocument();
+    expect(intervention).toHaveTextContent("AI の解釈・仮説");
   });
 
   // State 7: 質問不要
@@ -390,6 +416,25 @@ function panelWrapper() {
 function mockChainAndQuestion(c: PurposeChainOut | null, q: PurposeQuestionOut | null) {
   mockApi.get.mockImplementation((path: string) => {
     if (path.startsWith("/purpose-chain/next-question")) return Promise.resolve(q);
+    // §4.5 (Issue #391): no verification opportunity by default -- tests
+    // that need one call `mockChainAndQuestionAndVerification` instead, so
+    // every existing §3.2/§3.3 fixture keeps rendering the restraint text
+    // rather than accidentally receiving the CHAIN object as if it were a
+    // prompt (both paths start with `/purpose-chain`).
+    if (path.startsWith("/purpose-chain/verification-prompt")) return Promise.resolve(null);
+    if (path.startsWith("/purpose-chain")) return Promise.resolve(c);
+    return Promise.resolve(null);
+  });
+}
+
+function mockChainAndQuestionAndVerification(
+  c: PurposeChainOut | null,
+  q: PurposeQuestionOut | null,
+  prompt: PurposeVerificationPromptOut | null,
+) {
+  mockApi.get.mockImplementation((path: string) => {
+    if (path.startsWith("/purpose-chain/next-question")) return Promise.resolve(q);
+    if (path.startsWith("/purpose-chain/verification-prompt")) return Promise.resolve(prompt);
     if (path.startsWith("/purpose-chain")) return Promise.resolve(c);
     return Promise.resolve(null);
   });
@@ -666,5 +711,116 @@ describe("PurposeFramePanel (Interview Level 1, §3.2)", () => {
     mockChainAndQuestion(c, null);
     await renderPanel({ sessionId: 7 });
     expect(await screen.findByTestId("purpose-frame-degraded")).toHaveTextContent("relations");
+  });
+});
+
+// ── §4.5 検証条件 (Experience/Outcome/Reuse, Issue #391) ───────────────────
+
+function verificationPrompt(
+  overrides: Partial<PurposeVerificationPromptOut> = {},
+): PurposeVerificationPromptOut {
+  return {
+    concept_kind: "outcome_criterion",
+    need_id: "decision_criterion_missing:r1",
+    need_code: "decision_criterion_missing",
+    target_kind: "relation",
+    target_id: "r1",
+    target_label: "課題 → 望ましい変化",
+    prompt: "「課題 → 望ましい変化」について、成果を示す検証条件を定義しますか。",
+    why_now: "現在の next action や改善評価は、この関係が仮説のままでは判断できません。",
+    blocked_decision: "次に何をすべきかの判断、および改善の評価。",
+    observation_hint: "何を測るか・今の値・目指す値・観測期間を、それぞれ一言で書いてください。",
+    ...overrides,
+  };
+}
+
+describe("VerificationPromptSection (§4.5, Issue #391)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("the normal render is the one-line restraint text, not an empty section", async () => {
+    mockChainAndQuestionAndVerification(chain(), null, null);
+    await renderPanel({ sessionId: 7 });
+    expect(await screen.findByTestId("purpose-verification-none")).toHaveTextContent(
+      "検証条件はまだ必要ありません",
+    );
+    expect(screen.queryByTestId("purpose-verification-prompt")).not.toBeInTheDocument();
+  });
+
+  test("an available prompt shows what/why/which-decision/how, never a dashboard", async () => {
+    mockChainAndQuestionAndVerification(chain(), null, verificationPrompt());
+    await renderPanel({ sessionId: 7 });
+    const box = await screen.findByTestId("purpose-verification-prompt");
+    expect(box).toHaveTextContent("成果を示す検証条件");
+    expect(box).toHaveTextContent("次に何をすべきかの判断");
+    expect(box).toHaveTextContent("何を測るか");
+    // No outcome list/history/chart -- only the one active proposal's form.
+    expect(screen.queryByText(/一覧|履歴|グラフ/)).not.toBeInTheDocument();
+  });
+
+  test("an outcome_criterion prompt shows the 4 short fields, not a free-text statement", async () => {
+    mockChainAndQuestionAndVerification(chain(), null, verificationPrompt());
+    await renderPanel({ sessionId: 7 });
+    await screen.findByTestId("purpose-verification-prompt");
+    expect(screen.getByTestId("purpose-verification-outcome-measure")).toBeInTheDocument();
+    expect(screen.getByTestId("purpose-verification-outcome-baseline_value")).toBeInTheDocument();
+    expect(screen.getByTestId("purpose-verification-outcome-target_value")).toBeInTheDocument();
+    expect(screen.getByTestId("purpose-verification-outcome-observation_window")).toBeInTheDocument();
+    expect(screen.queryByTestId("purpose-verification-statement")).not.toBeInTheDocument();
+  });
+
+  test("an experience_hypothesis prompt shows a single free-text statement field", async () => {
+    mockChainAndQuestionAndVerification(
+      chain(), null,
+      verificationPrompt({ concept_kind: "experience_hypothesis", need_code: "capability_justification_missing" }),
+    );
+    await renderPanel({ sessionId: 7 });
+    await screen.findByTestId("purpose-verification-prompt");
+    expect(screen.getByTestId("purpose-verification-statement")).toBeInTheDocument();
+    expect(screen.queryByTestId("purpose-verification-outcome-measure")).not.toBeInTheDocument();
+  });
+
+  test("submitting an outcome_criterion posts to the outcome-criteria endpoint with the need id", async () => {
+    mockChainAndQuestionAndVerification(chain(), null, verificationPrompt());
+    mockApi.post.mockResolvedValue({ id: 1, state: "proposed" });
+    await renderPanel({ sessionId: 7 });
+    await screen.findByTestId("purpose-verification-prompt");
+
+    fireEvent.change(screen.getByTestId("purpose-verification-outcome-measure"), { target: { value: "継続率" } });
+    fireEvent.change(screen.getByTestId("purpose-verification-outcome-baseline_value"), { target: { value: "0%" } });
+    fireEvent.change(screen.getByTestId("purpose-verification-outcome-target_value"), { target: { value: "20%" } });
+    fireEvent.change(screen.getByTestId("purpose-verification-outcome-observation_window"), { target: { value: "30日間" } });
+    fireEvent.click(screen.getByTestId("purpose-verification-create"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalled());
+    const [path, body] = mockApi.post.mock.calls[0];
+    expect(path).toBe("/purpose-chain/outcome-criteria");
+    expect(body).toMatchObject({
+      session_id: 7, need_id: "decision_criterion_missing:r1",
+      measure: "継続率", baseline_value: "0%", target_value: "20%", observation_window: "30日間",
+    });
+  });
+
+  test("the create button stays disabled until every required field is filled", async () => {
+    mockChainAndQuestionAndVerification(chain(), null, verificationPrompt());
+    await renderPanel({ sessionId: 7 });
+    await screen.findByTestId("purpose-verification-prompt");
+    expect(screen.getByTestId("purpose-verification-create")).toBeDisabled();
+    fireEvent.change(screen.getByTestId("purpose-verification-outcome-measure"), { target: { value: "継続率" } });
+    expect(screen.getByTestId("purpose-verification-create")).toBeDisabled();
+  });
+
+  test("skipping defers the underlying need rather than posting a create request", async () => {
+    mockChainAndQuestionAndVerification(chain(), null, verificationPrompt());
+    mockApi.post.mockResolvedValue({ id: 1 });
+    await renderPanel({ sessionId: 7 });
+    fireEvent.click(await screen.findByTestId("purpose-verification-skip"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalled());
+    const [path, body] = mockApi.post.mock.calls[0];
+    expect(path).toBe("/purpose-chain/needs/decision_criterion_missing%3Ar1/respond");
+    expect(body).toMatchObject({ session_id: 7, response_kind: "defer" });
   });
 });

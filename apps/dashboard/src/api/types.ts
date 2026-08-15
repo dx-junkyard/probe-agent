@@ -4971,7 +4971,8 @@ export type OverviewSection =
   | "next_action"
   | "loop"
   | "runtime"
-  | "purpose_chain";
+  | "purpose_chain"
+  | "purpose_question";
 
 export interface OverviewTargetOut {
   route: string;
@@ -5088,6 +5089,12 @@ export interface OverviewOut {
    * `null` only when its own guarded loader failed -- see `purpose_chain`
    * in `degraded_sections`, never a synonym for "not derived yet". */
   purpose_chain?: PurposeChainOut | null;
+  /** §4.5/#391's single adaptive next question over `purpose_chain` above,
+   * embedded here instead of a second client query
+   * (`usePurposeNextQuestion`, removed from the Overview page). `null`
+   * means either "no question right now" or "could not be derived" -- told
+   * apart by `"purpose_question" in degraded_sections`. */
+  purpose_question?: PurposeQuestionOut | null;
 }
 
 // --- Purpose Chain (Issue #387 Epic / #388 / #390) --------------------------
@@ -5351,9 +5358,10 @@ export interface PurposeRoutedNeedOut {
 export interface PurposeQuestionOut {
   need_id: string;
   need_code: PurposeNeedCode;
-  /** 1-6, the `select_question` priority-table row that chose this need.
-   * `null` when reached only via an explicit `need_id` deep link to a need
-   * `select_question` never picks on its own. */
+  /** The `PRIORITY_TABLE` row that chose this need, 1-based. Every need code
+   * carries a row, so a need derived from the current projection always has
+   * one; `null` only for a deep link naming a code the server does not know
+   * (a forged row number would falsify which rule actually matched). */
   rule_row: number | null;
   prompt: string;
   why_now: string;
@@ -5412,4 +5420,204 @@ export interface PurposeNeedRespondRequest {
   session_id: number;
   response_kind: PurposeResponseKind;
   value_text?: string;
+}
+
+// --- Purpose Verification: Experience / Outcome / Reuse (Issue #391) --------
+//
+// `docs/purpose-chain.md` §4 is the specification. Three OPTIONAL concepts a
+// developer may attach to a Purpose Chain element/relation, by the SAME
+// stable string identity (`target_kind`/`target_id`) #388 already uses --
+// never a row id. Creation is offered only alongside a currently-available
+// `app/purpose_needs.py` need (never because a resolution level is low), so
+// every create request below carries a `need_id`.
+
+/** `experience_hypothesis` and `reuse_hypothesis` share this exact lifecycle
+ * (server: `app/purpose_verification.py`'s `PurposeHypothesisState`). */
+export type PurposeHypothesisState = "proposed" | "confirmed" | "retired";
+
+/** `purpose_outcome_criterion`'s own 6-value lifecycle. `observed` /
+ * `contradicted` are set only together with a recorded verdict -- never
+ * inferred from silence or from evidence text. `not_observed` ("analytics
+ * が無ければ") / `not_computed` ("canonical mapping が無ければ") are their
+ * own explicit facts, not a default value. */
+export type PurposeOutcomeCriterionState =
+  | "proposed"
+  | "confirmed"
+  | "observed"
+  | "contradicted"
+  | "not_observed"
+  | "not_computed";
+
+/** Which of the two evidence COLUMNS a result write targets (§4.2: human-
+ * reported evidence and runtime observation stay in separate columns,
+ * never merged into one "result"). */
+export type PurposeOutcomeEvidenceSource = "human_reported" | "runtime_observed";
+
+/** A recorded verdict is always the developer's OWN reading of the
+ * evidence -- never computed from the evidence text itself. */
+export type PurposeOutcomeVerdict = "supports" | "contradicts";
+
+/** Whether an `experiment_id` / `candidate_version_id` lineage column
+ * resolves to a real, System-scoped row right now. `unresolved` (the id was
+ * set but the row is gone) is a genuine third value -- §4.3: 対応が無けれ
+ * ば「関連不明」と表示する -- never silently downgraded to `none`. */
+export type PurposeOutcomeLineageState = "none" | "linked" | "unresolved";
+
+/** Which of the three concepts a verification prompt or listing row is
+ * about. Distinct from `PurposeNeedTargetKind` (element vs relation). */
+export type PurposeVerificationConceptKind =
+  | "experience_hypothesis"
+  | "outcome_criterion"
+  | "reuse_hypothesis";
+
+export interface PurposeExperienceHypothesisOut {
+  id: number;
+  system_id: number;
+  session_id: number;
+  target_kind: PurposeNeedTargetKind;
+  target_id: string;
+  target_label: string;
+  target_digest: string;
+  source_need_id: string;
+  source_need_code: PurposeNeedCode;
+  statement: string;
+  state: PurposeHypothesisState;
+  decision_method: string;
+  created_by: string | null;
+  created_at: number;
+  confirmed_by: string | null;
+  confirmed_at: number | null;
+  retired_by: string | null;
+  retired_at: number | null;
+  retirement_reason: string;
+}
+
+/** Identical shape to `PurposeExperienceHypothesisOut` -- a separate type
+ * because the two live in separate tables and are never interchangeable. */
+export interface PurposeReuseHypothesisOut {
+  id: number;
+  system_id: number;
+  session_id: number;
+  target_kind: PurposeNeedTargetKind;
+  target_id: string;
+  target_label: string;
+  target_digest: string;
+  source_need_id: string;
+  source_need_code: PurposeNeedCode;
+  statement: string;
+  state: PurposeHypothesisState;
+  decision_method: string;
+  created_by: string | null;
+  created_at: number;
+  confirmed_by: string | null;
+  confirmed_at: number | null;
+  retired_by: string | null;
+  retired_at: number | null;
+  retirement_reason: string;
+}
+
+export interface PurposeOutcomeCriterionOut {
+  id: number;
+  system_id: number;
+  session_id: number;
+  target_kind: PurposeNeedTargetKind;
+  target_id: string;
+  target_label: string;
+  target_digest: string;
+  source_need_id: string;
+  source_need_code: PurposeNeedCode;
+  measure: string;
+  baseline_value: string;
+  target_value: string;
+  observation_window: string;
+  state: PurposeOutcomeCriterionState;
+  /** §4.3: explicit lineage columns only, never a System-wide existence
+   * check. */
+  experiment_id: number | null;
+  candidate_version_id: number | null;
+  lineage_state: PurposeOutcomeLineageState;
+  /** §4.2: two SEPARATE evidence columns, never merged into one "result". */
+  human_reported_evidence: string | null;
+  human_reported_verdict: PurposeOutcomeVerdict | null;
+  human_reported_at: number | null;
+  human_reported_by: string | null;
+  runtime_observation_text: string | null;
+  runtime_observation_verdict: PurposeOutcomeVerdict | null;
+  runtime_observed_at: number | null;
+  runtime_observed_by: string | null;
+  /** §4.2: a synthetic fixture's result is never displayed as a real user's
+   * outcome -- this flag must be shown alongside the result. */
+  is_synthetic: boolean;
+  decision_method: string;
+  created_by: string | null;
+  created_at: number;
+  confirmed_by: string | null;
+  confirmed_at: number | null;
+}
+
+export interface PurposeVerificationStateOut {
+  system_id: number;
+  session_id: number | null;
+  experience_hypotheses: PurposeExperienceHypothesisOut[];
+  outcome_criteria: PurposeOutcomeCriterionOut[];
+  reuse_hypotheses: PurposeReuseHypothesisOut[];
+}
+
+/** §4.5: AT MOST ONE verification prompt. `null` at the endpoint level means
+ * 「検証条件はまだ必要ありません」 -- there is no empty placeholder object. */
+export interface PurposeVerificationPromptOut {
+  concept_kind: PurposeVerificationConceptKind;
+  need_id: string;
+  need_code: PurposeNeedCode;
+  target_kind: PurposeNeedTargetKind;
+  target_id: string;
+  target_label: string;
+  prompt: string;
+  why_now: string;
+  blocked_decision: string;
+  observation_hint: string;
+}
+
+export interface PurposeExperienceHypothesisCreateRequest {
+  session_id: number;
+  need_id: string;
+  statement: string;
+}
+
+export interface PurposeReuseHypothesisCreateRequest {
+  session_id: number;
+  need_id: string;
+  statement: string;
+}
+
+export interface PurposeOutcomeCriterionCreateRequest {
+  session_id: number;
+  need_id: string;
+  measure: string;
+  baseline_value: string;
+  target_value: string;
+  observation_window: string;
+}
+
+export interface PurposeVerificationSessionRequest {
+  session_id: number;
+}
+
+export interface PurposeHypothesisRetireRequest {
+  session_id: number;
+  reason?: string;
+}
+
+export interface PurposeOutcomeCriterionLinkRequest {
+  session_id: number;
+  experiment_id?: number | null;
+  candidate_version_id?: number | null;
+}
+
+export interface PurposeOutcomeResultRequest {
+  session_id: number;
+  source: PurposeOutcomeEvidenceSource;
+  verdict: PurposeOutcomeVerdict;
+  evidence_text: string;
+  is_synthetic?: boolean;
 }

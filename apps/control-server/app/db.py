@@ -4622,6 +4622,166 @@ CREATE INDEX IF NOT EXISTS idx_purpose_need_response_lookup
 
 CREATE INDEX IF NOT EXISTS idx_purpose_need_response_session
     ON purpose_need_response (session_id, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- Purpose Verification: Experience Hypothesis / Outcome Criterion / Reuse
+-- Hypothesis (Issue #391, docs/purpose-chain.md §4).
+--
+-- Three OPTIONAL concepts a developer may attach to one Purpose Chain
+-- element or relation, by the same STABLE STRING identity `purpose_chain.py`
+-- already uses (`target_kind` + `target_id`), never a row id -- elements and
+-- relations are themselves recomputed on every read and carry no row
+-- identity to reference (see the `purpose_relation_decision` comment above
+-- for why). None of these three is required for every System (§4.1): a row
+-- exists only when a developer explicitly created it, and creation is only
+-- ever OFFERED alongside a currently-available `purpose_needs` need --
+-- `source_need_id` / `source_need_code` record WHICH one, so "the Purpose
+-- Frame is at L1" can never be the reason a row exists (there is no code
+-- path that creates one without a real need to point at).
+--
+-- Unlike `purpose_relation_decision` / `purpose_need_response`, these rows
+-- are NOT append-only revision chains: each concept is a single row whose
+-- own lifecycle columns (`state` plus the confirmed_at/confirmed_by,
+-- retired_at/retired_by, human_reported_*/runtime_observed_* pairs) are
+-- updated in place by later manual actions. There is no digest-based
+-- staleness re-check against the CURRENT Purpose Chain here -- that
+-- machinery exists in #388 because a relation's `status` is recomputed from
+-- scratch every read, whereas a verification concept's own lifecycle is the
+-- thing being tracked, not a projection over other rows. `target_digest` is
+-- still captured at creation time for audit (what the target looked like
+-- when this was proposed), deliberately left as a non-goal for automatic
+-- re-evaluation in this issue.
+CREATE TABLE IF NOT EXISTS purpose_experience_hypothesis (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    session_id          INTEGER NOT NULL,
+    target_kind         TEXT NOT NULL CHECK (target_kind IN ('element', 'relation')),
+    target_id           TEXT NOT NULL,
+    target_label        TEXT NOT NULL DEFAULT '',
+    target_digest       TEXT NOT NULL,
+    source_need_id      TEXT NOT NULL,
+    source_need_code    TEXT NOT NULL,
+    statement           TEXT NOT NULL,
+    state               TEXT NOT NULL DEFAULT 'proposed'
+                             CHECK (state IN ('proposed', 'confirmed', 'retired')),
+    decision_method     TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    confirmed_by        TEXT,
+    confirmed_at        REAL,
+    retired_by          TEXT,
+    retired_at          REAL,
+    retirement_reason   TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_purpose_experience_hypothesis_session
+    ON purpose_experience_hypothesis (system_id, session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_purpose_experience_hypothesis_target
+    ON purpose_experience_hypothesis (system_id, session_id, target_kind, target_id);
+
+-- Identical shape to `purpose_experience_hypothesis` -- see that table's
+-- comment. A separate table (not a shared one with a `concept_kind`
+-- discriminator column) because #4.1 keeps the two concepts distinct even
+-- though their lifecycle happens to match; a shared table would tempt a
+-- future change to merge their meaning too.
+CREATE TABLE IF NOT EXISTS purpose_reuse_hypothesis (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    session_id          INTEGER NOT NULL,
+    target_kind         TEXT NOT NULL CHECK (target_kind IN ('element', 'relation')),
+    target_id           TEXT NOT NULL,
+    target_label        TEXT NOT NULL DEFAULT '',
+    target_digest       TEXT NOT NULL,
+    source_need_id      TEXT NOT NULL,
+    source_need_code    TEXT NOT NULL,
+    statement           TEXT NOT NULL,
+    state               TEXT NOT NULL DEFAULT 'proposed'
+                             CHECK (state IN ('proposed', 'confirmed', 'retired')),
+    decision_method     TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    confirmed_by        TEXT,
+    confirmed_at        REAL,
+    retired_by          TEXT,
+    retired_at          REAL,
+    retirement_reason   TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_purpose_reuse_hypothesis_session
+    ON purpose_reuse_hypothesis (system_id, session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_purpose_reuse_hypothesis_target
+    ON purpose_reuse_hypothesis (system_id, session_id, target_kind, target_id);
+
+-- 成果証拠. `measure` / `baseline_value` / `target_value` / `observation_window`
+-- are the four fields `purpose_chain._resolution_level` checks for L3
+-- (docs/purpose-chain.md §4.4) -- all plain developer-authored text.
+--
+-- `experiment_id` / `candidate_version_id` are §4.3's explicit lineage
+-- columns: intentionally NOT enforced by a FOREIGN KEY (a deleted
+-- Experiment/CandidateVersion must not silently delete this row's audit
+-- trail; `purpose_verification.py` resolves "does this id still exist" at
+-- READ time into `lineage_state`, so a missing target renders as `unresolved`
+-- / 「関連不明」 instead of erasing the fact that a lineage claim was made).
+--
+-- `human_reported_evidence`/`human_reported_verdict` and
+-- `runtime_observation_text`/`runtime_observation_verdict` are two SEPARATE
+-- column pairs (§4.2: "human-reported evidence and runtime observation are
+-- separate columns, never merged into one result") -- a result write
+-- (`purpose_verification.record_outcome_result`) always targets exactly one
+-- pair, named by its own `source` argument, and always carries the
+-- developer's own verdict alongside the evidence text: this module never
+-- infers `observed` vs `contradicted` from the evidence text itself
+-- (§4.2's "runtime trace だけで利用者の成功を推測しない", applied one layer
+-- up to ANY evidence, not just a raw trace).
+CREATE TABLE IF NOT EXISTS purpose_outcome_criterion (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    session_id                  INTEGER NOT NULL,
+    target_kind                 TEXT NOT NULL CHECK (target_kind IN ('element', 'relation')),
+    target_id                   TEXT NOT NULL,
+    target_label                 TEXT NOT NULL DEFAULT '',
+    target_digest               TEXT NOT NULL,
+    source_need_id              TEXT NOT NULL,
+    source_need_code            TEXT NOT NULL,
+    measure                     TEXT NOT NULL DEFAULT '',
+    baseline_value               TEXT NOT NULL DEFAULT '',
+    target_value                 TEXT NOT NULL DEFAULT '',
+    observation_window           TEXT NOT NULL DEFAULT '',
+    state                       TEXT NOT NULL DEFAULT 'proposed'
+                                     CHECK (state IN
+                                         ('proposed', 'confirmed', 'observed', 'contradicted',
+                                          'not_observed', 'not_computed')),
+    experiment_id                INTEGER,
+    candidate_version_id         INTEGER,
+    human_reported_evidence      TEXT,
+    human_reported_verdict       TEXT CHECK (human_reported_verdict IN ('supports', 'contradicts')),
+    human_reported_at            REAL,
+    human_reported_by            TEXT,
+    runtime_observation_text     TEXT,
+    runtime_observation_verdict  TEXT CHECK (runtime_observation_verdict IN ('supports', 'contradicts')),
+    runtime_observed_at          REAL,
+    runtime_observed_by          TEXT,
+    is_synthetic                 INTEGER NOT NULL DEFAULT 0,
+    decision_method               TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    created_by                    TEXT,
+    created_at                    REAL NOT NULL,
+    confirmed_by                  TEXT,
+    confirmed_at                  REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_purpose_outcome_criterion_session
+    ON purpose_outcome_criterion (system_id, session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_purpose_outcome_criterion_target
+    ON purpose_outcome_criterion (system_id, session_id, target_kind, target_id);
 """
 
 
