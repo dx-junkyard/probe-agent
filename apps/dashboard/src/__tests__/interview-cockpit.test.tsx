@@ -19,6 +19,8 @@ import type {
   GapItem,
   InterviewQaOut,
   OpenQuestion,
+  UnderstandingBriefClaimOut,
+  UnderstandingBriefOut,
   UnderstandingItem,
 } from "@/api/types";
 import {
@@ -100,6 +102,59 @@ function gap(overrides: Partial<GapItem> & { name: string }): GapItem {
   return { gap_type: "code_only", summary: "", severity: "medium", ...overrides };
 }
 
+function briefClaim(
+  name: string,
+  overrides: Partial<UnderstandingBriefClaimOut> = {},
+): UnderstandingBriefClaimOut {
+  return {
+    kind: "vision",
+    name,
+    summary: `${name} の説明`,
+    confirmation: "confirmed",
+    provenance: "developer_intent",
+    confirmation_label: "確認済み",
+    provenance_label: "開発者が明示した意図",
+    reason: "Intent Briefで確認済み",
+    contribution: "",
+    is_mock: false,
+    evidence: [],
+    related_docs: [],
+    related_apis: [],
+    ...overrides,
+  };
+}
+
+function canonicalBrief(
+  overrides: Partial<UnderstandingBriefOut> = {},
+): UnderstandingBriefOut {
+  return {
+    system_id: 1,
+    session_id: 7,
+    built: true,
+    vision: briefClaim("開発者が挙動を説明できる状態"),
+    vision_missing_information: [],
+    system_purpose: [briefClaim("実行データを収集し候補実装と比較する", {
+      kind: "system_purpose", provenance: "implementation_fact",
+    })],
+    core_capabilities: [briefClaim("トレース収集", {
+      kind: "core_capability", provenance: "implementation_fact",
+    })],
+    core_capability_initial_count: 1,
+    key_unconfirmed: [],
+    detail_counts: {},
+    readiness_state: "ready",
+    readiness_label: "この理解で進めます",
+    readiness_description: "",
+    readiness_reasons: [],
+    changes_since_confirmation: [],
+    confirmed_at: 1,
+    confirmed_revision_id: 1,
+    revision_id: 1,
+    snapshot_id: 1,
+    ...overrides,
+  };
+}
+
 // ── 完成度 ────────────────────────────────────────────────────────────
 
 describe("completionPercent", () => {
@@ -159,6 +214,32 @@ describe("buildCockpitModel のカテゴリ状態", () => {
     expect(model.missingCount).toBe(1);
     expect(model.defaultCategory).toBe("vision");
     expect(model.nextStep.title).toContain("Vision");
+  });
+
+  it("Intent Briefで確定したVisionは、旧session JSONに無くても設定済みとして扱う", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding({ vision: [] }),
+      brief: canonicalBrief(),
+      gaps: [],
+      openQuestions: [],
+      qaItems: [],
+    });
+
+    const vision = model.categories.find(c => c.key === "vision")!;
+    expect(vision.status).toBe("confirmed");
+    expect(vision.items.map(i => i.name)).toEqual(["開発者が挙動を説明できる状態"]);
+    expect(model.missingCount).toBe(0);
+  });
+
+  it("正準BriefでVisionが未設定なら、旧session JSONの値を再利用しない", () => {
+    const model = buildCockpitModel({
+      understanding: fullUnderstanding(),
+      brief: canonicalBrief({ vision: null }),
+      gaps: [],
+      openQuestions: [],
+      qaItems: [],
+    });
+    expect(model.categories.find(c => c.key === "vision")!.status).toBe("missing");
   });
 
   it("旧レスポンスで vision キーが存在しなくても落ちず、未設定として扱う", () => {

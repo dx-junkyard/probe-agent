@@ -26,6 +26,8 @@ import type {
   InterviewQaOut,
   InterviewWorkflowState,
   OpenQuestion,
+  UnderstandingBriefClaimOut,
+  UnderstandingBriefOut,
   UnderstandingItem,
 } from "@/api/types";
 import { WORKFLOW_STATE_LABELS } from "@/components/system-understanding/workflow-panel";
@@ -392,6 +394,55 @@ function sectionItems(
   return sections.flatMap(section => understanding[section] ?? []);
 }
 
+function briefClaimItem(claim: UnderstandingBriefClaimOut): UnderstandingItem {
+  return {
+    name: claim.name,
+    summary: claim.summary,
+    confidence: { level: claim.confirmation, reason: claim.reason },
+    evidence: claim.evidence.map(e => ({ ...e, summary: e.summary ?? "" })),
+    why_core: claim.contribution,
+    related_docs: claim.related_docs,
+    related_apis: claim.related_apis,
+    children: [],
+  };
+}
+
+/**
+ * Vision / Purpose / Core Capabilities are projected canonically by the
+ * Understanding Brief. In particular, a developer-confirmed Intent Brief
+ * goal becomes `brief.vision` without being copied into the older
+ * `session.current_understanding.vision` JSON. The cockpit must therefore use
+ * the Brief for those three categories, while retaining the session detail
+ * for the lower-level capability elements and the remaining categories.
+ */
+function categoryItems(input: CockpitInput, def: CategoryDefinition): UnderstandingItem[] {
+  if (!input.brief) return sectionItems(input.understanding, def.sections);
+  if (def.key === "vision") {
+    return input.brief.vision ? [briefClaimItem(input.brief.vision)] : [];
+  }
+  if (def.key === "system_purpose") {
+    return input.brief.system_purpose.map(briefClaimItem);
+  }
+  if (def.key === "capabilities") {
+    return [
+      ...input.brief.core_capabilities.map(briefClaimItem),
+      ...sectionItems(input.understanding, ["capability_elements", "supporting_elements"]),
+    ];
+  }
+  return sectionItems(input.understanding, def.sections);
+}
+
+function categoryBriefClaims(
+  brief: UnderstandingBriefOut | null | undefined,
+  key: CockpitCategoryKey,
+): UnderstandingBriefClaimOut[] {
+  if (!brief) return [];
+  if (key === "vision") return brief.vision ? [brief.vision] : [];
+  if (key === "system_purpose") return brief.system_purpose;
+  if (key === "capabilities") return brief.core_capabilities;
+  return [];
+}
+
 /**
  * gap をカテゴリへ割り当てる。
  *
@@ -604,6 +655,8 @@ function summarizeCategory(
 
 export interface CockpitInput {
   understanding: CurrentUnderstanding | null | undefined;
+  /** Canonical projection for Vision / Purpose / Core Capabilities. */
+  brief?: UnderstandingBriefOut | null;
   gaps: GapItem[] | null | undefined;
   openQuestions: OpenQuestion[] | null | undefined;
   qaItems: InterviewQaOut[] | null | undefined;
@@ -723,7 +776,7 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
   // 名前 → カテゴリの索引。名前の完全一致でだけ引く。
   const nameOwners = new Map<string, CockpitCategoryKey>();
   for (const def of COCKPIT_CATEGORIES) {
-    for (const item of sectionItems(input.understanding, def.sections)) {
+    for (const item of categoryItems(input, def)) {
       if (item.name && !nameOwners.has(item.name)) nameOwners.set(item.name, def.key);
     }
   }
@@ -738,7 +791,9 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
   }
 
   const categories: CockpitCategoryView[] = COCKPIT_CATEGORIES.map(def => {
-    const items = sectionItems(input.understanding, def.sections);
+    const items = categoryItems(input, def);
+    const briefClaims = categoryBriefClaims(input.brief, def.key);
+    const briefNeedsReview = briefClaims.some(claim => claim.confirmation !== "confirmed");
     const gaps = gapsByCategory.get(def.key) ?? [];
     const questions = unresolved.filter(q => q.category === def.key);
     // 内容の有無 (`missing`) と gap 由来の `review` は session 詳細だけで
@@ -748,7 +803,7 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
     const status: CockpitCategoryStatus | null =
       items.length === 0
         ? "missing"
-        : gaps.length > 0 || questions.length > 0
+        : briefNeedsReview || gaps.length > 0 || questions.length > 0
           ? "review"
           : qaReady
             ? "confirmed"

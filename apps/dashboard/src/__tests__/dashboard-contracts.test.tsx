@@ -2245,6 +2245,24 @@ function understandingBrief(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function understandingBriefClaim(kind: string, name: string) {
+  return {
+    kind,
+    name,
+    summary: "",
+    confirmation: "confirmed",
+    provenance: "user_statement",
+    confirmation_label: "確認済み",
+    provenance_label: "ユーザーの明示入力",
+    reason: "",
+    contribution: "",
+    is_mock: false,
+    evidence: [],
+    related_docs: [],
+    related_apis: [],
+  };
+}
+
 function mockInterviewApi(options: {
   approvedCount?: number;
   session?: Record<string, unknown>;
@@ -3798,6 +3816,10 @@ describe("Interview page", () => {
         facts: { open_required_questions: 1 },
       },
       proposals: [],
+      brief: {
+        system_purpose: [understandingBriefClaim("system_purpose", "Runtime probe platform")],
+        core_capabilities: [understandingBriefClaim("core_capability", "Trace ingestion")],
+      },
       session: {
         stage: "gap_questions",
         understanding_confirmed_at: 5,
@@ -3844,6 +3866,10 @@ describe("Interview page", () => {
         facts: { understanding_unconfirmed: true },
       },
       proposals: [],
+      brief: {
+        system_purpose: [understandingBriefClaim("system_purpose", "Runtime probe platform")],
+        core_capabilities: [understandingBriefClaim("core_capability", "Trace ingestion")],
+      },
       session: {
         stage: "purpose_confirmation",
         understanding_confirmed_at: null,
@@ -4192,6 +4218,12 @@ describe("Interview page", () => {
         facts: { understanding_unconfirmed: true },
       },
       proposals: [],
+      brief: {
+        vision: understandingBriefClaim("vision", "開発者が挙動を説明できる"),
+        vision_missing_information: [],
+        system_purpose: [understandingBriefClaim("system_purpose", "Runtime probe platform")],
+        core_capabilities: [understandingBriefClaim("core_capability", "Trace ingestion")],
+      },
       session: {
         stage: "purpose_confirmation",
         understanding_confirmed_at: null,

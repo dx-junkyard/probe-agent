@@ -1626,6 +1626,7 @@ export default function InterviewPage() {
   const cockpit = useMemo(
     () => buildCockpitModel({
       understanding: session?.current_understanding,
+      brief: understandingBrief,
       gaps: session?.gap_analysis,
       openQuestions: session?.open_questions,
       qaItems: qaListForFocus?.items,
@@ -1633,6 +1634,7 @@ export default function InterviewPage() {
     }),
     [
       session?.current_understanding,
+      understandingBrief,
       session?.gap_analysis,
       session?.open_questions,
       qaListForFocus?.items,
