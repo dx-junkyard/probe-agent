@@ -6521,3 +6521,164 @@ jsdom では実寸を測れないので、`overview-page.test.tsx` は測定が�
 ならないこと、freshness が見出しであること)、`src/__tests__/overview-page.test.tsx`
 (ページ: System 0 件、意味順、旧 metric card の不在、部分失敗、全体失敗、
 loading と empty の区別)。
+
+## Purpose Chain(Epic #387, sub #388-#391)
+
+### 何が問題だったか
+
+probe-agent は Vision(#351/#352 の `desired_change` にあたる)と System
+Purpose を「並んだ2つの文章」として同時に表示できていたが、片方からもう
+片方を**説明・検証**できる状態ではなかった——「このシステムは何のために
+あるのか」を、開発者が追跡可能な因果関係として確認する手段が無かった。
+同時に、初回に対象者ペルソナ・利用ジャーニー・成功指標まで全部入力させると、
+開発者は価値を得る前に要件定義フォームを埋めることになる。#387 はこの
+2 つを同時に解く: Vision / System Purpose / Capabilities を「対象者と現在の
+課題 → 望ましい変化 → システムの介入 → Capabilities」の追跡可能な連鎖
+(Purpose Chain)として扱いながら、初回に開発者へ求める入力は最小 3 要素
+(Purpose Frame)だけに保つ。
+
+### 何を作ったか
+
+`docs/purpose-chain.md` が正本の設計契約。実装は依存順に #388(canonical
+projection と lineage)→ #389(判断必要性に基づく適応的な次の質問)→
+#390(Overview / Interview の段階的開示 UX)。#391(Experience / Outcome /
+Reuse による検証)はこの Epic の最終段だが、この時点ではまだ実装されて
+いない — 契約は §4 に定義済みで、別 agent が実装中である。
+
+**新しい理解モデルは 1 つも作らない。** Purpose Frame の各要素は既存行の
+projection であり、`purpose_chain.py` は relation と lineage を足すだけ:
+
+| Purpose Frame 要素 | 正本(既存行) | 導出箇所 |
+| --- | --- | --- |
+| `beneficiary_problem`(対象者と現在の課題) | Intent Brief `pain` の最新非 superseded 行 | `purpose_chain._beneficiary_problem_element` |
+| `desired_change`(望ましい変化) | `understanding_brief.BriefResult.vision`(そのもの、`_resolve_vision` の結果を再利用) | `purpose_chain._desired_change_element` |
+| `intervention`(システムの介入) | `BriefResult.system_purpose` の claim(先頭が frame slot、残りは `elements` に `additional` として残る) | `purpose_chain._intervention_elements` |
+| `core_capability`(Capabilities、frame 外) | `BriefResult.core_capabilities` の claim | `purpose_chain._capability_elements` |
+
+relation kind は 3 つの固定値: `problem_to_change` / `change_to_intervention`
+/ `intervention_to_capability`。要素・relation そのものは
+`purpose_chain.derive_purpose_chain` が読みのたびに再計算する projection で
+行として保存しない — 保存するのは「システムでは再導出できない人間の判断」
+だけの 2 テーブル:
+
+| 決定 | table | 唯一の書き手 |
+| --- | --- | --- |
+| relation の confirmed / rejected(#388) | `purpose_relation_decision` | `purpose_chain.record_relation_decision` |
+| need への confirm / correct / unknown / defer / investigate(#389) | `purpose_need_response` | `routes/purpose_chain.py`(confirm/correct は既存の Intent Brief 書き込み・`record_relation_decision` へ委譲し、二重実装しない) |
+
+`確認状態(confirmation)` / `出所(provenance)` は `understanding_brief` の
+`UnderstandingConfirmationState` / `UnderstandingProvenanceKind` をそのまま
+再利用する(値を変換・翻訳しない)。#389 の 7 need code、固定
+answerability 表、7 行の質問選択 rule table は `app/purpose_needs.py` に
+ある。Dashboard は `overview.tsx` の `PurposeFrameCard`(Level 0)と
+`interview.tsx` の `PurposeFramePanel`(Level 1)で、どちらも server の
+判定を再導出せずそのまま描画する(`components/purpose-chain/model.ts` に
+あるのは順序と固定ラベルだけ)。
+
+### 後から変えるときに守ること
+
+**確認状態 / 出所は既存語彙をそのまま再利用し、変換しない。** #380 が
+`OverviewFindingProvenance` を厳密な上位集合にしたのと同じ理由: ここで
+独自のマッピングへ変換すると、開発者が確定した Vision が AI の推測として
+表示され得る。関連して `_weaker_provenance` の
+`_PROVENANCE_RANK`(relation の出所を決める強さ順位)は `Literal` の宣言
+順序から**あえて**導出せず、明示的な辞書として書いてある — 現時点では
+両者が一致しているが、それは偶然であり危険でもある。`UnderstandingProvenanceKind`
+の並びを(他の場所では見た目だけの変更である)並べ替えると、この辞書が
+独立に定義されていなければ全 relation の出所ラベルが黙って変わる。
+
+**`pain` は対象者と課題へ分解しない。** 自由記述の解釈は Principle 6 に
+反する。分解を実装すると、AI が補完した対象者が確認済みとして表示されうる
+——それは #388 が禁じている失敗そのものである。「対象者が書かれていない」
+ことへの対応は #389 の `frame_missing` need を通じた開発者自身の訂正に
+委ねる。
+
+**relation status は `unknown` を第 5 の値として持つ。** `hypothesis` へ
+畳むと、「接続を説明できない(端点が unknown)」と「未確認の仮説」が
+区別できなくなる。#389 の `relation_unknown` need はこの区別に依存して
+おり、`unknown` を落とすと「関係がない」との区別も失われる。
+
+**relation の決定は端点の確認からは決して昇格しない、追記のみの別行。**
+Vision を確認し Purpose を確認しても、「Purpose が Vision に資する」ことは
+自動的に確認されない——それは開発者が明示的に下す別の判断であり、
+`purpose_relation_decision` に `decision_method: manual` で記録する。端点の
+意味が後で動いても行は**削除しない**: `recheck_state` が `stale` になり、
+関係の status は `hypothesis` へ落ちるが、「あの時点の両端点に対して人が
+確定した」という監査事実は生き続ける。ここを UPDATE に変えると、過去に
+何を根拠に確認したかの記録が失われる。
+
+**変化の伝播は下流方向のみ。** Capability の変更は
+`intervention_to_capability` を stale にするが、`intervention` 自体は
+変えない(`purpose_chain.py` 設計判断 2、`_recheck_relation` が upstream の
+`recheck_state` を自分自身の digest 比較より先に見る)。ここを対称的な
+比較に変えると、下流の変更が上流の要素を stale と誤判定し、実際には
+変わっていない Vision や Purpose が「再確認が必要」と表示されるように
+なる。snapshot の変化による stale 化は `implementation_fact` 由来の
+evidence に限られ、`gather_facts(...).snapshot_stale` を読むだけで独自に
+git を呼ばない。
+
+**resolution level は要素ごとの min であり、スコアへ集約しない。**
+`frame_resolution_level` は 3 slot の有限段階(`L0`-`L3`)の最小値と明示
+されている。ここを平均や完成率へ変えると、#387 UX原則6(合成 score を
+作らない)に反し、Overview / Understanding Brief と同じ「confidence
+percentage を出さない」規律が破れる。
+
+**全 need code が優先度表(`PRIORITY_TABLE`)に行を持つ。** 行を持たない
+need code は明示的な `need_id` deep link でしか到達できないが、システムが
+提示しない質問への link は誰も生成しない——結果として「導出され、判断を
+止め、一度も聞かれない」need になり、これは導出しないのと区別できない。
+`human_value_judgement_required` は当初この表から漏れそうになった
+(frame-slot 要素の矛盾は relation 経由の `relation_conflict` でも表に
+出るため冗長に見える)が、2 件目以降の `intervention` 追加要素には
+relation が作られないため、その要素の矛盾には relation 経由の他の
+経路が一切ない。表に無いままにすると、この 1 種類の矛盾だけが永久に
+質問されない。
+
+**固定 need→answerability 表は #286 の reasoning router を置き換えない。**
+need はすでにシステムが 7 code のどれかへ分類し終えた信号(要素が
+`unknown`、relation が `unknown`/`conflicting`/`stale` など)で、
+「system_researchable か human_judgement か」は構造的に既知
+(Principle 6 が許す「小さな有限集合への分類」)。これに対し開発者自身の
+自由記述の追質問(Q&A / Inquiry 確認中に打ち込む文)には同じ構造が無く、
+`question_router.route_question` の reasoning-model 判定が必要であり続ける。
+固定表をここへ拡張して自由記述も分類しようとすると、Principle 6 が
+reasoning-model 専有と定めた領域へ heuristic を持ち込むことになる。
+
+**Purpose Frame panel は Interview の全体像(Understanding Brief と同じ
+領域)に置き、状態の主作業面より前には置かない。** #358 が実測で固定した
+契約: 「1280×720 の初期ビューポートに、その状態の主作業面が入っている
+こと」。Purpose Frame panel を主作業面より前・2 カラムの外に全幅で置くと、
+主作業面の上端がカード 1 枚ぶん押し下がり、この回帰済みの制約を壊す。
+Purpose Frame が読むのは Understanding Brief と同じ Vision / System Purpose
+/ Core Capabilities の行を因果順に読み直したものなので、主作業面より前で
+なく、Brief の直後・全体像の一部として置くのが正しい(`interview.tsx` の
+`purposeFramePanel` はこの理由をコメントで固定している)。
+
+### 検証
+
+`apps/control-server/tests/test_purpose_chain.py` が #388 の受け入れ条件を
+1 対 1 で検証する: 4 element kind すべてが到達可能で全ソースが既存行で
+あること、確認済み Intent `goal` がレビュアーの Vision claim より優先
+されること、AI 由来の relation が明示的な manual 決定なしに `confirmed`
+にならないこと、`unknown` / `conflicting` / `unavailable` / missing-information
+が別々の表示を持つこと、relation status 5 値すべての到達と first-match
+順序、change propagation 表の各行(下流のみの伝播、Capability 変更が
+`intervention` を変えないこと)、決定行の無い legacy System が
+`confirmed` にならないこと、端点変更後に relation が `stale` になっても
+決定行自体は残ること、System 分離、relation 導出の失敗時にも frame は
+返ること、`element_digest` のリロード再現性。`test_purpose_needs.py` は
+#389 を検証する: 7 need code すべてが実際に質問へ到達可能なこと、
+`select_question` が `system_researchable` を一度も返さないこと、優先度
+表の順序とタイブレークが決定的であること、応答 5 状態
+(available/waiting/answered/deferred/unavailable)の永続化、AI 候補が
+明示的な応答なしに `confirmed` にならないこと、optional な Intent field を
+空にしても need が発火しないこと(「need は空欄ではない」の構造的保証)、
+degraded section が推測の質問を作らないこと、`unknown`/`investigate` が
+`trigger='purpose_need'` の Joint Understanding session を開くこと、公開の
+Joint Understanding 作成 endpoint がその trigger 値を依然拒否すること、
+deep link の 4 つの fallback_reason、System 分離。Dashboard 側は
+`src/__tests__/purpose-chain.test.tsx` が `model.ts` の純粋関数と、
+Overview Level 0 / Interview Level 1 双方の状態別レンダリング(loading /
+質問なし / 質問 1 件 / 部分失敗 / relation 不明で決定不可 / 矛盾 /
+stale / deferred / system_researchable のルーティング表示 / セッション
+未選択)を検証する。
