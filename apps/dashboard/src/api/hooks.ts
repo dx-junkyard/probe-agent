@@ -75,6 +75,11 @@ import type {
   KnowledgeArea, HandoffOriginKind, HandoffPriority, HandoffStatus,
   QuestionHandoffListOut, QuestionHandoffOut, QuestionHandoffEvidenceRef,
   CellRootDigestOut, CellAsksListOut, CellAskOut, CellAskSyncOut, CellAskDecision,
+  PurposeChainOut, PurposeRelationOut, PurposeQuestionOut, PurposeNeedResponseOut,
+  PurposeResponseKind,
+  PurposeVerificationPromptOut, PurposeVerificationConceptKind,
+  PurposeExperienceHypothesisOut, PurposeReuseHypothesisOut, PurposeOutcomeCriterionOut,
+  PurposeVerificationStateOut, PurposeOutcomeEvidenceSource, PurposeOutcomeVerdict,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -3429,5 +3434,239 @@ export function useOverview() {
     staleTime: 0,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
+  });
+}
+
+// --- Purpose Chain (Issue #387 Epic / #388 / #389 / #390) -------------------
+//
+// `docs/purpose-chain.md` §0 invariant 2: the client re-derives no Purpose
+// Chain judgement. These queries fetch the server's canonical projection
+// verbatim; `components/purpose-chain/model.ts` only orders and labels what
+// the server already decided.
+
+/**
+ * `GET /purpose-chain`. `sessionId=null` reads the System's newest session
+ * (the same `ORDER BY id DESC` rule the Overview and the Understanding Brief
+ * already use), so the three screens can never disagree about "the current
+ * session". A `session_id` belonging to another System reads exactly like
+ * "unselected" -- decided server-side, never re-checked here.
+ */
+export function usePurposeChain(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("purposeChain"), sessionId],
+    queryFn: () =>
+      api.get<PurposeChainOut>(
+        sessionId ? `/purpose-chain?session_id=${sessionId}` : "/purpose-chain",
+      ),
+    enabled: !!getSystemId() && sessionId != null,
+  });
+}
+
+/**
+ * `GET /purpose-chain/next-question`. At most one question -- `needId`
+ * (when supplied) is a DEEP-LINK hint only; the server decides the actual
+ * fallback (§2.7's `fallback_reason`) rather than the Dashboard guessing
+ * whether the named need is still current.
+ */
+export function usePurposeNextQuestion(sessionId: number | null, needId?: string | null) {
+  return useQuery({
+    queryKey: [...sysKey("purposeNextQuestion"), sessionId, needId ?? null],
+    queryFn: () => {
+      const params = new URLSearchParams();
+      if (sessionId != null) params.set("session_id", String(sessionId));
+      if (needId) params.set("need_id", needId);
+      const qs = params.toString();
+      return api.get<PurposeQuestionOut | null>(
+        `/purpose-chain/next-question${qs ? `?${qs}` : ""}`,
+      );
+    },
+    enabled: !!getSystemId() && sessionId != null,
+  });
+}
+
+/**
+ * Any mutation below that changes a Purpose Chain fact must invalidate every
+ * consumer of it, not just this feature's own query -- the same #349 rule
+ * `_invalidateWorkflow` exists for: a missed invalidation here freezes the
+ * Purpose Frame panel until a reload. A relation decision or a need response
+ * can also move the Understanding Brief / workflow state (§2.6: `confirm`/
+ * `correct` on an Intent-sourced element reuses the EXISTING Intent
+ * confirm/correct machinery), and always changes what the Overview's
+ * embedded `purpose_chain` shows.
+ */
+function _invalidatePurposeChain(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("purposeChain"), sessionId] });
+  qc.invalidateQueries({ queryKey: sysKey("purposeNextQuestion") });
+  qc.invalidateQueries({ queryKey: sysKey("overview") });
+  _invalidateWorkflow(qc, sessionId);
+}
+
+/** The one write #388 performs: a human confirming or rejecting ONE relation. */
+export function useDecidePurposeRelation(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      relationId, decision, rationale,
+    }: {
+      relationId: string;
+      decision: "confirmed" | "rejected";
+      rationale?: string;
+    }) =>
+      api.post<PurposeRelationOut>(
+        `/purpose-chain/relations/${encodeURIComponent(relationId)}/decision`,
+        { session_id: sessionId, decision, rationale: rationale ?? "" },
+      ),
+    onSuccess: () => _invalidatePurposeChain(qc, sessionId),
+  });
+}
+
+/** `POST /purpose-chain/needs/{need_id}/respond` -- confirm / correct /
+ * unknown / defer / investigate, each a separately audited response kind
+ * (§2.6). This is the ONLY write path for a need response; it never infers
+ * one from a relation decision or an Intent confirm made elsewhere.
+ *
+ * No `rationale` field -- unlike the relation decision request, the server's
+ * `PurposeNeedRespondRequest` accepts only `session_id` / `response_kind` /
+ * `value_text` (`extra="forbid"`); a `correct` response's free text IS
+ * `value_text`, whether that means a corrected value (an element target) or
+ * a rejection reason (a relation target, where `correct` maps to
+ * `record_relation_decision(..., decision="rejected", rationale=value_text)`
+ * server-side). */
+export function useRespondPurposeNeed(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      needId, responseKind, valueText,
+    }: {
+      needId: string;
+      responseKind: PurposeResponseKind;
+      valueText?: string;
+    }) =>
+      api.post<PurposeNeedResponseOut>(
+        `/purpose-chain/needs/${encodeURIComponent(needId)}/respond`,
+        { session_id: sessionId, response_kind: responseKind, value_text: valueText ?? "" },
+      ),
+    onSuccess: () => _invalidatePurposeChain(qc, sessionId),
+  });
+}
+
+// --- Purpose Verification: Experience / Outcome / Reuse (Issue #391) --------
+//
+// §4.5's restraint: ONE query for the at-most-one prompt, ONE mutation to
+// create the concept the prompt named. There is no listing/dashboard hook
+// here on purpose -- `docs/purpose-chain.md` §4.5 and this Epic's non-goals
+// explicitly rule out an outcome dashboard or a retention chart; the only
+// UI surface is the single prompt inside the Purpose Frame panel.
+
+/** `GET /purpose-chain/verification-prompt`. At most one prompt -- `null`
+ * means 「検証条件はまだ必要ありません」 (§4.5's normal render). */
+export function usePurposeVerificationPrompt(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("purposeVerificationPrompt"), sessionId],
+    queryFn: () => {
+      const qs = sessionId != null ? `?session_id=${sessionId}` : "";
+      return api.get<PurposeVerificationPromptOut | null>(
+        `/purpose-chain/verification-prompt${qs}`,
+      );
+    },
+    enabled: !!getSystemId() && sessionId != null,
+  });
+}
+
+export function usePurposeVerificationState(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("purposeVerificationState"), sessionId],
+    queryFn: () => api.get<PurposeVerificationStateOut>(
+      `/purpose-chain/verification?session_id=${sessionId}`,
+    ),
+    enabled: !!getSystemId() && sessionId != null,
+  });
+}
+
+function _invalidatePurposeVerification(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("purposeVerificationState"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("purposeVerificationPrompt"), sessionId] });
+  _invalidatePurposeChain(qc, sessionId);
+}
+
+export function useConfirmVerificationConcept(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ kind, id }: { kind: PurposeVerificationConceptKind; id: number }) => {
+      const segment = kind === "experience_hypothesis" ? "experience-hypotheses"
+        : kind === "reuse_hypothesis" ? "reuse-hypotheses" : "outcome-criteria";
+      return api.post(`/${"purpose-chain"}/${segment}/${id}/confirm`, { session_id: sessionId });
+    },
+    onSuccess: () => _invalidatePurposeVerification(qc, sessionId),
+  });
+}
+
+export function useLinkOutcomeCriterion(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, experimentId, candidateVersionId }: { id: number; experimentId?: number; candidateVersionId?: number }) =>
+      api.post(`/purpose-chain/outcome-criteria/${id}/link`, {
+        session_id: sessionId,
+        experiment_id: experimentId ?? null,
+        candidate_version_id: candidateVersionId ?? null,
+      }),
+    onSuccess: () => _invalidatePurposeVerification(qc, sessionId),
+  });
+}
+
+export function useRecordOutcomeResult(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, source, verdict, evidenceText, isSynthetic }: {
+      id: number; source: PurposeOutcomeEvidenceSource; verdict: PurposeOutcomeVerdict;
+      evidenceText: string; isSynthetic: boolean;
+    }) => api.post(`/purpose-chain/outcome-criteria/${id}/result`, {
+      session_id: sessionId, source, verdict, evidence_text: evidenceText, is_synthetic: isSynthetic,
+    }),
+    onSuccess: () => _invalidatePurposeVerification(qc, sessionId),
+  });
+}
+
+export function useRecordOutcomeUnavailable(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, source, state, reason }: {
+      id: number; source: PurposeOutcomeEvidenceSource;
+      state: "not_observed" | "not_computed"; reason: string;
+    }) => api.post(`/purpose-chain/outcome-criteria/${id}/unavailable`, {
+      session_id: sessionId, source, state, reason,
+    }),
+    onSuccess: () => _invalidatePurposeVerification(qc, sessionId),
+  });
+}
+
+const _VERIFICATION_CREATE_PATH: Record<PurposeVerificationConceptKind, string> = {
+  experience_hypothesis: "/purpose-chain/experience-hypotheses",
+  outcome_criterion: "/purpose-chain/outcome-criteria",
+  reuse_hypothesis: "/purpose-chain/reuse-hypotheses",
+};
+
+/** Creates ONE verification concept from an active prompt. `fields` carries
+ * exactly what that concept kind's create request needs -- `statement` for
+ * the two hypothesis kinds, the four Outcome Criterion fields for that one
+ * -- the caller (the prompt's own minimal form) decides which. */
+export function useCreateVerificationConcept(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      conceptKind, needId, fields,
+    }: {
+      conceptKind: PurposeVerificationConceptKind;
+      needId: string;
+      fields: Record<string, string>;
+    }) =>
+      api.post<
+        PurposeExperienceHypothesisOut | PurposeReuseHypothesisOut | PurposeOutcomeCriterionOut
+      >(_VERIFICATION_CREATE_PATH[conceptKind], {
+        session_id: sessionId, need_id: needId, ...fields,
+      }),
+    onSuccess: () => {
+      _invalidatePurposeVerification(qc, sessionId);
+    },
   });
 }

@@ -1230,6 +1230,85 @@ creating incomplete persistence or execution paths for later phases.
     sections in `docs/project-intelligence.md` and
     `docs/system-understanding-navigation.md`.
 
+23. Issue #387 (subs #388-#391) — the Purpose Chain. probe-agent could
+    already display Vision and System Purpose as two claims; it could not
+    explain one FROM the other. This Epic connects 対象者と現在の課題 →
+    望ましい変化 → システムの介入 → Capabilities as a traceable chain, while
+    keeping what the developer is asked for on first use down to the three
+    Purpose Frame elements. `docs/purpose-chain.md` is the canonical
+    contract; read §0 before touching anything in this area. Implement in
+    dependency order #388 → #389 → #390 → #391. What must be preserved:
+    - **It adds no fifth understanding model.** The elements ARE existing
+      rows: `beneficiary_problem` is the Intent Brief `pain`,
+      `desired_change` IS `BriefResult.vision` (so the confirmed Intent
+      `goal` still outranks the reviewer's Vision, by reusing `_resolve_vision`
+      rather than re-implementing its first match), `intervention` is
+      `BriefResult.system_purpose`, and the capabilities are
+      `BriefResult.core_capabilities`. 確認状態 and 出所 are
+      `UnderstandingConfirmationState` / `UnderstandingProvenanceKind`
+      **verbatim** — the #380 superset rule, for the same reason: a lossy
+      translation displays a Vision the developer wrote and confirmed as the
+      AI's guess. Purpose Chain contributes the relations and the lineage,
+      nothing else.
+    - **`pain` is never parsed into 対象者 + 課題.** Splitting free text into
+      who-and-what is open-ended interpretation, so the missing half stays
+      `unknown` and the developer corrects it. An AI-completed beneficiary
+      that then reads as confirmed is the exact failure #388 forbids.
+    - **`unknown` / `unavailable` / missing are three different answers**, on
+      elements and on relations alike. `PurposeRelationStatus` therefore
+      carries `unknown` as a fifth value: 「Vision と Purpose の接続を説明
+      できない」 is #389's `relation_unknown` input, and omitting the relation
+      would make it indistinguishable from 「関係がない」.
+    - **A relation decision is append-only and is never promoted by
+      proximity.** Confirming Vision and confirming Purpose separately does
+      not confirm that the Purpose serves the Vision;
+      `purpose_relation_decision` records that judgement explicitly with
+      `decision_method: manual`, capturing both endpoints' digests. When an
+      endpoint's meaning later moves, the row is **not deleted** — the
+      relation reads `stale`, and the audit still says what a human decided
+      against which content.
+    - **Change propagation runs downstream only.** A Capability change makes
+      `intervention_to_capability` stale; it never edits the intervention
+      itself (#388's rule). A snapshot change staleness applies to
+      `implementation_fact` evidence alone, and is read from
+      `gather_facts(...).snapshot_stale` — never by calling git on this path.
+    - **Resolution level is per element and never aggregated into a score.**
+      `frame_resolution_level` is a `min` over a finite ladder, stated as
+      such; there is no System average, no completion rate, no confidence
+      percentage. #387 UX原則6.
+    - **A question is asked because a decision is blocked, never because a
+      field is empty.** #389's seven need codes are derived from the
+      projection (element `unknown`, relation `unknown`/`conflicting`/stale),
+      the selection is a 7-row first-match table returning zero or one
+      question with a deterministic tie-break, and a need whose fixed
+      answerability is `system_researchable` goes to the Joint Understanding
+      investigation instead of to the human (#387 UX原則4). That fixed
+      need→answerability table does not replace #286's reasoning router,
+      which still classifies the developer's own free-text questions.
+    - **「分からない」 and 「今は答えない」 are answers, not errors**, and
+      answer / defer / investigate are three separate persisted facts. A
+      deferred need does not reappear until its target's digest moves.
+    - **AI candidates come from existing rows only.** A suggested answer is a
+      `proposed` Intent item or an existing claim with its own source ids; no
+      LLM is called to invent one, and nothing becomes `confirmed` without an
+      explicit manual decision.
+    - **The client re-derives nothing** — Purpose summaries, relation status,
+      resolution level, the next question, and recheck reasons all arrive
+      decided. The Overview shows Level 0 (the three elements, then at most
+      ONE contextual question whose CTA navigates rather than executes); the
+      Interview shows Level 1; Level 2/3 attributes open only for a target a
+      current need points at.
+    - **Outcome is never inferred** (#391): runtime traces alone never prove a
+      user succeeded, unobservable is `not_observed`, uncomputable is
+      `not_computed`, and an Experience/Outcome/Reuse record links to a
+      Candidate/Experiment by explicit lineage id — never by a System-wide
+      existence check.
+    Human gates are unchanged: 理解の確認 / Alignment 項目の確定 / 提案の
+    承認・編集・却下 / 差分の適用 / 観測の開始 / 採否の記録 / publish, plus
+    the new relation decision and need response, all stay
+    `decision_method: manual`. See the Issue #387 section in
+    `docs/project-intelligence.md` and the contract in `docs/purpose-chain.md`.
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

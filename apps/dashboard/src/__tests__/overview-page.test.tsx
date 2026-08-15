@@ -345,7 +345,11 @@ describe("Overview page (Issue #384)", () => {
 
     expect(screen.getByRole("heading", { level: 1, name: "Overview" })).toBeInTheDocument();
     const h2s = screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
+    // Issue #390: the Purpose Frame leads the main column, above System
+    // Brief -- the Epic's question 「何のためのシステムか」 must be
+    // answerable before anything else on the page.
     expect(h2s).toEqual([
+      "目的の連鎖 (Purpose Chain)",
       "System Brief",
       "今わかったこと",
       "次にすること",

@@ -115,6 +115,33 @@ FINITE_TYPE_NAMES = (
     "OverviewSnapshotFreshness",
     "OverviewCoverageState",
     "OverviewBaselineState",
+    # Issue #388: the Purpose Chain's finite vocabularies. Same drift risk as
+    # the two families above -- the Dashboard branches on element/relation
+    # state today, but a new value would type-check on one side alone.
+    "PurposeElementKind",
+    "PurposeElementState",
+    "PurposeRelationKind",
+    "PurposeRelationStatus",
+    "PurposeRecheckState",
+    "PurposeStaleReason",
+    "PurposeResolutionLevel",
+    "PurposeSourceKind",
+    "PurposeFrameState",
+    "PurposeChainSection",
+    # Issue #389: the Purpose Needs / adaptive next-question vocabularies.
+    "PurposeNeedCode",
+    "PurposeAnswerability",
+    "PurposeNeedState",
+    "PurposeResponseKind",
+    "PurposeQuestionFallbackReason",
+    "PurposeNeedTargetKind",
+    # Issue #391: the Purpose Verification (Experience/Outcome/Reuse) vocabularies.
+    "PurposeHypothesisState",
+    "PurposeOutcomeCriterionState",
+    "PurposeOutcomeEvidenceSource",
+    "PurposeOutcomeVerdict",
+    "PurposeOutcomeLineageState",
+    "PurposeVerificationConceptKind",
 )
 
 

@@ -50,8 +50,16 @@ from ..models import (
     OverviewOut,
     OverviewRuntimeHealthOut,
     OverviewTargetOut,
+    PurposeChainOut,
     UnderstandingBriefOut,
 )
+# `_question_out` is `routes/purpose_chain.py`'s own conversion from a
+# `purpose_needs.PurposeQuestion` to its wire model -- reused here rather
+# than redefined, the same precedent `routes/purpose_chain.py` itself sets
+# by importing `_insert_item` from `routes/interview_intent.py`. One
+# conversion, so the Overview's embedded question can never render
+# differently from `GET /purpose-chain/next-question`'s own response.
+from .purpose_chain import _question_out as _purpose_question_out
 
 router = APIRouter()
 
@@ -161,4 +169,21 @@ def get_overview(system_id: int = Depends(get_system_id)) -> OverviewOut:
         ),
         degraded_sections=result.degraded_sections,
         degraded_detail=result.degraded_detail,
+        # The Purpose Chain (#388) is composed, not re-derived: the same
+        # dataclass-field-name-matches-model-field-name trick the Brief
+        # embedding above uses, since `PurposeChainResult`'s own fields
+        # (including `system_id`) already match `PurposeChainOut`'s.
+        purpose_chain=(
+            PurposeChainOut(**asdict(result.purpose_chain))
+            if result.purpose_chain is not None
+            else None
+        ),
+        # §4.5/#390: the Purpose Frame's single adaptive question, composed
+        # from that SAME `purpose_chain` value -- never a second,
+        # independently-derived one.
+        purpose_question=(
+            _purpose_question_out(result.purpose_question)
+            if result.purpose_question is not None
+            else None
+        ),
     )

@@ -888,6 +888,114 @@ helpers) rather than defining a parallel one.
   an int param, so the lineage endpoint is
   `/interview/joint-understanding/lineage`.
 
+## Purpose Chain / Purpose Needs (Epic #387, issues #388-#389)
+
+`docs/purpose-chain.md` is the design contract; `app/purpose_chain.py` (#388)
+and `app/purpose_needs.py` (#389) are its only two modules, and both stay
+strictly deterministic — no LLM call anywhere in either file (Principle 6).
+`GET /purpose-chain` and `GET /purpose-chain/next-question` write nothing; the
+ONLY two writes in this whole area are `purpose_chain.record_relation_decision`
+(one relation's confirmed/rejected judgement, table `purpose_relation_decision`)
+and `routes/purpose_chain.respond_to_purpose_need`'s insert into
+`purpose_need_response` — both append-only, the same `interview_intent_item`
+discipline: a new row is inserted and the prior current row's
+`superseded_by_id` is set; nothing is ever UPDATEd or DELETEd.
+
+- Every element and relation is a PURE PROJECTION recomputed on every read
+  from `understanding_brief.build_understanding_brief` claims and Intent
+  Brief `pain`/`goal` rows (`purpose_chain.derive_purpose_chain`) — it has no
+  row identity of its own. Element ids are therefore stable content hashes
+  (the bare `kind` for a frame-slot singleton, `kind + ":" + sha256(name)[:16]`
+  for a repeatable kind), and `relation_id` is
+  `f"{kind}:{source_id}->{target_id}"` — never a row id, which would be
+  reassigned on every Understanding rebuild while describing the same thing
+  (#380's rule, applied here).
+- The finite vocabularies (`PurposeElementKind`, `PurposeElementState`,
+  `PurposeRelationKind`, `PurposeRelationStatus`, `PurposeRecheckState`,
+  `PurposeStaleReason`, `PurposeResolutionLevel`, `PurposeSourceKind`,
+  `PurposeFrameState`, `PurposeChainSection`, plus #389's `PurposeNeedCode`,
+  `PurposeAnswerability`, `PurposeNeedState`, `PurposeResponseKind`,
+  `PurposeQuestionFallbackReason`, `PurposeNeedTargetKind`) are declared
+  exactly once as `Literal` aliases in `app/models.py`, mirrored into
+  `purpose_chain.py`/`purpose_needs.py` with `get_args`, and held to the
+  Dashboard's TypeScript unions by `test_interview_type_parity.py`'s
+  `FINITE_TYPE_NAMES`. Add a value in one place only and the Python tuple and
+  the frontend union silently stop matching it.
+- `element_digest` hashes only the MEANING-bearing fields (`statement` +
+  `confirmation` + `provenance` + `source_ids`) — never `id` or
+  `resolution_level` (itself derived FROM relations, so including it would
+  make the digest circular). This is exactly what `purpose_relation_decision.
+  source_digest`/`target_digest` capture at decision time, and what a later
+  read compares against to decide `recheck_state`.
+- Staleness propagates DOWNSTREAM ONLY, and the check order matters:
+  `_recheck_relation` looks at the immediate upstream relation's
+  `recheck_state` FIRST, and only falls back to comparing its OWN captured
+  decision digests when upstream is `current`. Reversing that order breaks
+  the propagation table in `docs/purpose-chain.md` §1.3: an `intervention`
+  change would then make `intervention_to_capability` read `source_changed`
+  (a direct digest mismatch, since `intervention` is literally its own
+  source) instead of `upstream_changed`, and `change_to_intervention`'s own
+  change would never read as the real cause.
+- A relation's `status` and `recheck_state` are independent axes: a STALE
+  confirmed decision reads as `status="hypothesis"` (it can no longer be
+  trusted as confirmed) while `recheck_state="stale"` explains why. The
+  decision row itself is NEVER deleted or overwritten when an endpoint
+  changes — `docs/purpose-chain.md` §1.5's audit requirement ("決定は
+  上書きされず、digest が動いても削除されない") depends on this; only a NEW
+  decision (a fresh `confirmed`/`rejected` call) supersedes the prior row.
+- `_PROVENANCE_RANK` (a relation's provenance is the weaker of its two
+  endpoints') is an EXPLICIT dict with an import-time completeness assert
+  against `get_args(UnderstandingProvenanceKind)`, deliberately NOT derived
+  from the Literal's declaration order even though the two currently agree.
+  Deriving it would mean a purely cosmetic reorder of
+  `UnderstandingProvenanceKind` anywhere else in the codebase silently
+  relabels every relation's 出所 — the exact confusion this Epic exists to
+  prevent, one layer down. Keep the rank explicit when a provenance value is
+  ever added.
+- `purpose_needs.PRIORITY_TABLE` has 7 rows, one per need code, INCLUDING
+  `human_value_judgement_required` at row 2. It looks redundant with row 1's
+  `relation_conflict` for a frame-slot or Capability element (whose relation
+  is already `conflicting` when the element itself is), but a 2nd+
+  `system_purpose` claim (an additional, non-frame-slot `intervention`
+  element, per `purpose_chain._intervention_elements`) never gets a relation
+  built at all — so for THAT element a conflict has no path to the developer
+  except this row. A need with no row in the priority table is reachable
+  only through an explicit `need_id` deep link, and nothing generates a link
+  to a question the system never offers — so leaving a need out of the table
+  is functionally identical to never deriving it at all.
+- `derive_purpose_chain(session_id=None)` resolves to the System's newest
+  Interview session (`ORDER BY id DESC`), the SAME rule `understanding_brief`
+  and the Overview already use. An explicit `session_id` belonging to
+  ANOTHER System reads exactly like "unselected", never a leak and never a
+  404 — matching `GET /interview/understanding-brief`'s existing rule so the
+  two screens can never disagree about which session is current.
+- `GET /overview` embeds `purpose_chain` as its OWN guarded section
+  (`overview_projection.py`), composing the existing projection rather than
+  re-deriving it — the #380 discipline applied here. It reads the Overview's
+  own already-resolved `session_id` rather than letting
+  `derive_purpose_chain` resolve a second, independent `None`, so the
+  Overview and the Purpose Chain endpoint can never describe different
+  sessions a request apart.
+- `unknown`/`investigate` responses to a need open a Joint Understanding
+  session with `origin_kind='purpose_need'`, `trigger='purpose_need'` — a
+  trigger value ONLY `routes/purpose_chain.py` writes (the public
+  `POST /joint-understanding` create endpoint still forces
+  `explicit_request`, mirroring #336's `unknown_answer` rule). This module
+  never runs the investigation itself; it opens the shared workspace via
+  `capture_premise_bundle` and leaves the investigation to the existing
+  Joint Understanding panel/endpoints, so there is one investigation
+  implementation regardless of which of the now-5 origins opened it.
+- `decided_by` (`purpose_relation_decision`) and `responded_by`
+  (`purpose_need_response`) always come from the authenticated `Principal`
+  (`_principal_actor`), never a request-body field — the same lesson #337
+  records for Joint Understanding's provenance: a body-supplied identity
+  lets a caller fabricate an audit trail. `decision_method` is hardcoded
+  `'manual'` in both write paths; there is no parameter to set it to
+  anything else.
+- A relation whose endpoint is `unknown`/`unavailable` can never be decided
+  (422 `purpose_relation_not_decidable`) — confirming or rejecting a
+  connection that has no real content yet would record a judgement about
+  something that does not exist.
 
 ## Rules
 

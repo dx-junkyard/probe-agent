@@ -39,6 +39,7 @@ from .routes import (
     probe_patterns,
     project_intelligence,
     publish_jobs,
+    purpose_chain,
     question_router,
     replay,
     replay_readiness,
@@ -129,6 +130,7 @@ def create_app() -> FastAPI:
     app.include_router(interview_refresh.router, dependencies=_auth)
     app.include_router(interview_workflow.router, dependencies=_auth)
     app.include_router(interview_brief.router, dependencies=_auth)
+    app.include_router(purpose_chain.router, dependencies=_auth)
     app.include_router(interview_change_sets.router, dependencies=_auth)
     app.include_router(question_router.router, dependencies=_auth)
     app.include_router(joint_understanding.router, dependencies=_auth)

@@ -54,7 +54,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, get_args
 
-from . import replay_readiness, state_facts, system_state, understanding_brief
+from . import (
+    purpose_chain,
+    purpose_needs,
+    replay_readiness,
+    state_facts,
+    system_state,
+    understanding_brief,
+)
 from .db import get_conn
 from .models import (
     SMOKE_CHECK_COMPONENT_ID,
@@ -1458,6 +1465,19 @@ class OverviewResult:
     loop_stages: List[OverviewLoopStageView] = field(default_factory=list)
     user_phase: str = "setup"
     runtime: Optional[RuntimeHealth] = None
+    #: The canonical Purpose Frame / Purpose Chain (#388), reused verbatim --
+    #: this module composes it, it never re-derives an element or a relation.
+    purpose_chain: Optional[purpose_chain.PurposeChainResult] = None
+    #: §4.5/#390's single adaptive next question over the SAME `purpose_chain`
+    #: value above (`app/purpose_needs.py.select_question`), embedded here so
+    #: the Dashboard reads it from the one composed `GET /overview` response
+    #: instead of a second client-side query with its own independent
+    #: failure mode (the #380 rule this Overview exists to enforce, applied
+    #: to the Purpose Frame's question the same way it already applies to
+    #: the Brief). `None` means either "no question right now" or "could not
+    #: be derived" -- the two are told apart by `"purpose_question" in
+    #: degraded_sections`, exactly like every other guarded section here.
+    purpose_question: Optional[purpose_needs.PurposeQuestion] = None
     degraded_sections: List[str] = field(default_factory=list)
     degraded_detail: Dict[str, str] = field(default_factory=dict)
 
@@ -1612,6 +1632,40 @@ def load_revision_created_at(conn, revision_id: int) -> Optional[float]:
         (revision_id,),
     ).fetchone()
     return row["created_at"] if row else None
+
+
+def _purpose_question(
+    conn, system_id: int, chain: "purpose_chain.PurposeChainResult"
+) -> Optional["purpose_needs.PurposeQuestion"]:
+    """`purpose_needs.select_question`, with the session's response history
+    folded in exactly the way `routes/purpose_chain.py`'s `GET
+    .../next-question` already does -- kept here rather than imported from
+    that route module (`overview_projection.py`, like every other fact
+    loader in this file, reads its own facts and does not depend on the
+    route layer) so the Overview's ONE `GET /overview` call carries the
+    question instead of the Dashboard issuing a second query with its own
+    independent failure mode (`app/overview_projection.py`'s module
+    docstring, principle "it composes existing canonical projections and
+    adds no sixth opinion" -- extended here from the Brief to the Purpose
+    Frame's adaptive question).
+
+    Writes nothing: like `derive_purpose_chain` itself, this only reads.
+    """
+    if chain.session_id is None:
+        return None
+    needs = purpose_needs.derive_needs(chain)
+    rows = conn.execute(
+        """SELECT * FROM purpose_need_response
+           WHERE system_id = ? AND session_id = ? AND superseded_by_id IS NULL""",
+        (system_id, chain.session_id),
+    ).fetchall()
+    responses = {row["need_id"]: row for row in rows}
+    needs = purpose_needs.apply_response_state(needs, responses)
+    selected = purpose_needs.select_question(needs)
+    if selected is None:
+        return None
+    routed = purpose_needs.routed_needs_for(needs)
+    return purpose_needs.build_question(selected, chain, routed_needs=routed)
 
 
 def _runtime_checks(conn, system_id: int, session_id: Optional[int]) -> List[Dict[str, Any]]:
@@ -1882,6 +1936,44 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 _degrade(result, "runtime", exc)
+
+        # The Purpose Chain (#388) is its own guarded section, composing the
+        # canonical projection rather than re-deriving it (#380 principle 6,
+        # applied here exactly as the Brief section already applies it). It
+        # reads the SAME `session_id` this function already resolved, so the
+        # Overview and the Purpose Chain can never describe different
+        # sessions -- `purpose_chain.derive_purpose_chain` would otherwise
+        # re-resolve "no session_id" to the latest one independently, which
+        # is safe on its own but not guaranteed to still agree after two
+        # separate reads a request apart.
+        if availability["session"]:
+            try:
+                result.purpose_chain = purpose_chain.derive_purpose_chain(
+                    conn, system_id, session_id, now=now
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                _degrade(result, "purpose_chain", exc)
+        else:
+            _degrade(
+                result,
+                "purpose_chain",
+                RuntimeError("interview session lookup unavailable"),
+                detail_key="purpose_chain.session",
+            )
+
+        # §4.5/#390: the Purpose Frame's single adaptive question, composed
+        # from the SAME `result.purpose_chain` value above -- never a second,
+        # independent `derive_purpose_chain` call. A failure here degrades
+        # only `purpose_question`; a missing/degraded `purpose_chain` above
+        # already means there is nothing to select a question FROM, so this
+        # is skipped rather than raising a confusing secondary error.
+        if result.purpose_chain is not None:
+            try:
+                result.purpose_question = _purpose_question(
+                    conn, system_id, result.purpose_chain
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                _degrade(result, "purpose_question", exc)
 
         # Each fact group is loaded under its own guard. A failure records the
         # group as unavailable and leaves its value at the conservative
