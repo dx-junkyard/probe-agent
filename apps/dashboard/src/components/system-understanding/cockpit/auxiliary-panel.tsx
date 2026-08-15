@@ -53,6 +53,7 @@ export function CockpitAuxiliarySection({
 }) {
   return (
     <details
+      id={`cockpit-aux-${id}`}
       className="rounded-md border px-3 py-2"
       data-testid={`cockpit-aux-${id}`}
       open={defaultOpen}

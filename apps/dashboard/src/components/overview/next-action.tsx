@@ -22,52 +22,52 @@ export function NextActionCard({ overview }: { overview: OverviewOut }) {
   return (
     <Card data-testid="overview-next-action" data-action-state={overview.next_action_state}>
       <CardHeader>
-        <CardTitle as="h2" className="text-base">次にすること</CardTitle>
+        <CardTitle as="h2" className="text-lg">次にすること</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {action ? (
           <>
             <Link
               to={targetHref(action.target)}
-              className="inline-flex items-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+              className="inline-flex items-center rounded-md bg-primary px-4 py-2 text-base font-medium text-primary-foreground hover:bg-primary/90"
               data-testid="overview-next-action-cta"
               data-action-key={action.key}
             >
               {action.label}
             </Link>
-            <dl className="space-y-1.5 text-sm">
+            <dl className="space-y-1.5 text-base">
               <div>
-                <dt className="text-xs font-medium text-muted-foreground">なぜこれが次か</dt>
+                <dt className="text-sm font-medium text-muted-foreground">なぜこれが次か</dt>
                 <dd data-testid="overview-next-action-reason">{action.reason}</dd>
               </div>
               <div>
-                <dt className="text-xs font-medium text-muted-foreground">完了条件</dt>
+                <dt className="text-sm font-medium text-muted-foreground">完了条件</dt>
                 <dd data-testid="overview-next-action-completion">{action.completion_condition}</dd>
               </div>
               <div>
-                <dt className="text-xs font-medium text-muted-foreground">完了すると</dt>
+                <dt className="text-sm font-medium text-muted-foreground">完了すると</dt>
                 <dd data-testid="overview-next-action-value">{action.value}</dd>
               </div>
             </dl>
             {action.blockers.length > 0 && (
-              <ul className="list-inside list-disc text-xs text-amber-700 dark:text-amber-300">
+              <ul className="list-inside list-disc text-sm text-amber-700 dark:text-amber-300">
                 {action.blockers.map((blocker) => (
                   <li key={blocker}>{blocker}</li>
                 ))}
               </ul>
             )}
             {action.source_finding_ids.length > 0 && (
-              <p className="text-[11px] text-muted-foreground" data-testid="overview-next-action-sources">
+              <p className="text-sm text-muted-foreground" data-testid="overview-next-action-sources">
                 上の「今わかったこと」{action.source_finding_ids.length} 件が理由です。
               </p>
             )}
           </>
         ) : overview.next_action_state === "waiting" ? (
-          <p className="text-sm" data-testid="overview-next-action-waiting">
+          <p className="text-base" data-testid="overview-next-action-waiting">
             {overview.next_action_message || "システムが処理中です。完了するまで操作はありません。"}
           </p>
         ) : (
-          <p className="text-sm" data-testid="overview-next-action-unavailable">
+          <p className="text-base" data-testid="overview-next-action-unavailable">
             {overview.next_action_message ||
               "現在の状態を判定できなかったため、次の操作を提示できません。推測での案内は行いません。"}
           </p>
@@ -82,9 +82,9 @@ export function LoopRailCard({ overview }: { overview: OverviewOut }) {
     return (
       <Card data-testid="overview-loop-unavailable">
         <CardHeader>
-          <CardTitle as="h2" className="text-base">改善ループの現在地</CardTitle>
+          <CardTitle as="h2" className="text-lg">改善ループの現在地</CardTitle>
         </CardHeader>
-        <CardContent className="text-sm text-muted-foreground">
+        <CardContent className="text-base text-muted-foreground">
           現在地を取得できませんでした。
         </CardContent>
       </Card>
@@ -96,7 +96,7 @@ export function LoopRailCard({ overview }: { overview: OverviewOut }) {
   return (
     <Card data-testid="overview-loop">
       <CardHeader>
-        <CardTitle as="h2" className="text-base">改善ループの現在地</CardTitle>
+        <CardTitle as="h2" className="text-lg">改善ループの現在地</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {/* An ordered list, so the reading order and the semantic order are the
@@ -115,7 +115,7 @@ export function LoopRailCard({ overview }: { overview: OverviewOut }) {
               aria-current={stage.status === "current" ? "step" : undefined}
             >
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-sm font-medium">{stage.label}</span>
+                <span className="text-base font-medium">{stage.label}</span>
                 <Badge
                   variant={
                     stage.status === "current"
@@ -129,20 +129,20 @@ export function LoopRailCard({ overview }: { overview: OverviewOut }) {
                 </Badge>
               </div>
               {stage.status === "current" && (
-                <p className="mt-1 text-xs text-muted-foreground">{stage.meaning}</p>
+                <p className="mt-1 text-sm text-muted-foreground">{stage.meaning}</p>
               )}
             </li>
           ))}
         </ol>
         {current?.next_milestone && (
-          <p className="text-xs text-muted-foreground" data-testid="overview-loop-next-milestone">
+          <p className="text-sm text-muted-foreground" data-testid="overview-loop-next-milestone">
             次の到達点: {current.next_milestone}
           </p>
         )}
         {/* 後退・再確認は通常の前進として見せない (#383). The Brief's own
             recheck verdict is the source; this only names it. */}
         {overview.brief?.readiness_state === "recheck_required" && (
-          <p className="text-xs text-amber-700 dark:text-amber-300" data-testid="overview-loop-recheck">
+          <p className="text-sm text-amber-700 dark:text-amber-300" data-testid="overview-loop-recheck">
             前回の確認後に理解が変わったため、先へ進む前に再確認が必要です。
           </p>
         )}

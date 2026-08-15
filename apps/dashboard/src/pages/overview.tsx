@@ -44,9 +44,9 @@ export default function OverviewPage() {
         <PageHeading system={undefined} />
         <Card data-testid="overview-no-systems">
           <CardHeader>
-            <CardTitle className="text-base">次にすること</CardTitle>
+            <CardTitle className="text-lg">次にすること</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-2 text-sm" data-action-key="create_system">
+          <CardContent className="space-y-2 text-base" data-action-key="create_system">
             <p className="font-medium">System を作成してください。</p>
             <p className="text-muted-foreground">
               System は観測対象のまとまりです。ヘッダーの「System を作成」から作成すると、
@@ -84,15 +84,15 @@ export default function OverviewPage() {
         <PageHeading system={system} />
         <Card data-testid="overview-load-error">
           <CardHeader>
-            <CardTitle className="text-base">Overview を取得できませんでした</CardTitle>
+            <CardTitle className="text-lg">Overview を取得できませんでした</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-2 text-sm">
+          <CardContent className="space-y-2 text-base">
             <p className="text-muted-foreground">
               状態が分からないため、推測での案内は行いません。
             </p>
             <button
               type="button"
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+              className="rounded-md border px-3 py-1.5 text-base hover:bg-accent"
               onClick={() => refetch()}
             >
               再試行
@@ -111,6 +111,22 @@ export default function OverviewPage() {
       : {},
     anchor: null,
   });
+  const visionHref = targetHref({
+    route: "/interview",
+    label: "",
+    params: overview.interview_session_id
+      ? { session: String(overview.interview_session_id) }
+      : {},
+    anchor: "cockpit-aux-intent",
+  });
+  const changeSetHref = targetHref({
+    route: "/interview",
+    label: "",
+    params: overview.interview_session_id
+      ? { session: String(overview.interview_session_id) }
+      : {},
+    anchor: "cockpit-aux-change-set",
+  });
 
   return (
     <div className="space-y-4">
@@ -121,7 +137,7 @@ export default function OverviewPage() {
         // The whole screen never goes blank because one section could not be
         // derived (#384).
         <Card data-testid="overview-degraded">
-          <CardContent className="p-4 text-sm">
+          <CardContent className="p-4 text-base">
             <p className="font-medium">一部の情報を取得できませんでした。</p>
             <p className="text-muted-foreground">
               取得できなかった領域: {overview.degraded_sections.join(", ")}。
@@ -142,7 +158,12 @@ export default function OverviewPage() {
           `items-start` keeps the short column from stretching to the tall one. */}
       <div className="grid items-start gap-4 xl:grid-cols-12">
         <div className="xl:col-span-5">
-          <SystemBriefCard overview={overview} interviewHref={interviewHref} />
+          <SystemBriefCard
+            overview={overview}
+            interviewHref={interviewHref}
+            visionHref={visionHref}
+            changeSetHref={changeSetHref}
+          />
         </div>
         <div className="xl:col-span-4">
           <FindingsCard overview={overview} />
@@ -197,7 +218,7 @@ function PageHeading({
       )}
       {overview && (
         <dl
-          className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground"
+          className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground"
           data-testid="overview-context"
         >
           <div className="flex gap-1">

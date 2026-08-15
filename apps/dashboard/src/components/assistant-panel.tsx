@@ -11,6 +11,10 @@ import {
 import type { AssistantAskOut, AssistantCitation, SystemStateItem } from "@/api/types";
 import { systemStateTarget } from "@/components/system-state";
 import { useModalSurface } from "@/lib/modal-surface";
+import {
+  OPEN_ASSISTANT_EVENT,
+  type OpenAssistantDetail,
+} from "@/lib/assistant-control";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -169,6 +173,19 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
 
   const { data: ctx } = useAssistantScreenContext(screenId, open);
   const ask = useAssistantAsk();
+
+  // System Brief and other in-page review affordances can open this existing
+  // conversation surface with a contextual draft. The draft is never sent
+  // automatically: the developer still reviews and submits it explicitly.
+  useEffect(() => {
+    const handleOpen = (event: Event) => {
+      const detail = (event as CustomEvent<OpenAssistantDetail>).detail;
+      setOpen(true);
+      if (detail?.question) setQuestion(detail.question);
+    };
+    window.addEventListener(OPEN_ASSISTANT_EVENT, handleOpen);
+    return () => window.removeEventListener(OPEN_ASSISTANT_EVENT, handleOpen);
+  }, []);
 
   const failingChecks = useMemo(
     () => (ctx?.screen_checks ?? []).filter((c) => c.severity !== "ok"),

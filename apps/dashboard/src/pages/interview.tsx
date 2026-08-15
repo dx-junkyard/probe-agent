@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   AlertCircle, CheckCircle, Download, FileCode, GitPullRequest,
@@ -1492,6 +1492,7 @@ function AlignmentSummaryHeader({
 }
 
 export default function InterviewPage() {
+  const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const sessionParam = Number(searchParams.get("session"));
   const selectedSessionId = Number.isFinite(sessionParam) && sessionParam > 0 ? sessionParam : null;
@@ -1693,6 +1694,17 @@ export default function InterviewPage() {
   const showTerminal = wState === "W7";
   // 会話の作業面は W2 / W3 のみ。W1 は現在地カードが進行を示す。
   const showConversationWork = showUnderstandingWork || showQuestionWork;
+
+  // Overview's "Vision を定義する" link targets the structured Intent Brief.
+  // Session data arrives asynchronously, so the browser's initial hash jump
+  // can run before the target exists. Reveal the details element and move
+  // focus once the selected session has rendered.
+  useEffect(() => {
+    if (!session) return;
+    const target = location.hash.slice(1);
+    if (target !== "cockpit-aux-intent" && target !== "cockpit-aux-change-set") return;
+    focusCockpitTarget(target);
+  }, [location.hash, session]);
   // 復旧操作の常設をやめる (§5.3-1): 対応する例外が今発生しているときだけ。
   // ブロッキング/劣化の再試行は `WorkflowExceptions` の 1 枚のカードが担う
   // (§4.4: 失敗内容・影響・復旧条件・再試行を同じ枠に置く) ため、各パネル
@@ -3323,16 +3335,18 @@ git commit`}
                   </CockpitSessionInfo>
                 </CockpitAuxiliarySection>
 
-                {/* Intent Brief (#51a/#51b): 確定・訂正は `W2` 完了時と `W4`。 */}
-                {(showUnderstandingWork || showAlignmentWork) && (
-                  <CockpitAuxiliarySection
-                    id="intent"
-                    title="Intent Brief"
-                    description="この改善で何を達成したいか (開発者の意図)。"
-                  >
-                    <IntentBriefPanel sessionId={session.id} />
-                  </CockpitAuxiliarySection>
-                )}
+                {/* Vision is developer intent and can be supplied or corrected
+                    independently of the current workflow state. Keeping this
+                    section mounted also makes Overview's direct link valid in
+                    W3/W5/W6/W7, rather than silently dropping the developer at
+                    the general interview composer. */}
+                <CockpitAuxiliarySection
+                  id="intent"
+                  title="Intent Brief"
+                  description="この改善で何を達成したいか (開発者の意図)。"
+                >
+                  <IntentBriefPanel sessionId={session.id} />
+                </CockpitAuxiliarySection>
 
                 {(showQuestionWork || showTerminal) && pendingHandoffCount === 0 && (
                   <CockpitAuxiliarySection
@@ -3354,11 +3368,12 @@ git commit`}
                 {/* まとめて修正 (#57, R2 補助): `W2` / `W3` / `W4` の訂正手段。
                     詳細ペインの「直接編集する」からここへ移動してくるので、
                     `focusCockpitTarget` が祖先の `<details>` を開く。 */}
-                {(showUnderstandingWork || showQuestionWork || showAlignmentWork) && (
+                {(showUnderstandingWork || showQuestionWork || showAlignmentWork
+                  || showProposalWork || showDiffWork || showTerminal) && (
                   <CockpitAuxiliarySection
                     id="change-set"
                     title="まとめて修正"
-                    description="修正内容を文章で書き、変更セットとして確認してから反映します。"
+                    description="AIとの確認で得た気づきや修正内容を文章で書き、変更セットとして確認してから反映します。"
                   >
                     <ChangeSetPanel sessionId={session.id} />
                   </CockpitAuxiliarySection>

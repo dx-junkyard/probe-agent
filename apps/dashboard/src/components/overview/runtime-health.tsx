@@ -28,9 +28,9 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
     return (
       <Card data-testid="overview-runtime-unavailable">
         <CardHeader>
-          <CardTitle as="h2" className="text-base">Runtime health</CardTitle>
+          <CardTitle as="h2" className="text-lg">Runtime health</CardTitle>
         </CardHeader>
-        <CardContent className="text-sm text-muted-foreground">
+        <CardContent className="text-base text-muted-foreground">
           実行時の状態を取得できませんでした。受信が止まっているという意味ではありません。
         </CardContent>
       </Card>
@@ -45,7 +45,7 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
   return (
     <Card data-testid="overview-runtime">
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
-        <CardTitle as="h2" className="text-base">Runtime health</CardTitle>
+        <CardTitle as="h2" className="text-lg">Runtime health</CardTitle>
         <Badge
           variant={FRESHNESS_VARIANTS[runtime.freshness]}
           data-testid="overview-runtime-freshness"
@@ -58,7 +58,7 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
         {/* Relative time comes from the server-measured elapsed seconds, so a
             skewed browser clock cannot turn a live system stale. The absolute
             timestamp is shown next to it (#384 受け入れ条件). */}
-        <p className="text-sm" data-testid="overview-runtime-last-seen">
+        <p className="text-base" data-testid="overview-runtime-last-seen">
           最終受信（実 workload）:{" "}
           {runtime.seconds_since_last_trace != null && runtime.last_real_trace_at != null ? (
             <>
@@ -74,13 +74,13 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
           )}
         </p>
         {showTransport && (
-          <p className="text-[11px] text-muted-foreground" data-testid="overview-runtime-transport">
+          <p className="text-sm text-muted-foreground" data-testid="overview-runtime-transport">
             疎通確認 trace は届いています（受信経路は正常）。上の状態は実 workload
             の trace についてのものです。
           </p>
         )}
 
-        <div className="grid grid-cols-3 gap-2 text-sm" data-testid="overview-runtime-windows">
+        <div className="grid grid-cols-3 gap-2 text-base" data-testid="overview-runtime-windows">
           {([
             ["直近5分", runtime.real_trace_count_5m],
             ["直近1時間", runtime.real_trace_count_1h],
@@ -88,12 +88,12 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
           ] as const).map(([label, count]) => (
             <div key={label} className="rounded-md border p-2">
               <div className="text-lg font-semibold">{count}</div>
-              <div className="text-xs text-muted-foreground">{label}</div>
+              <div className="text-sm text-muted-foreground">{label}</div>
             </div>
           ))}
         </div>
 
-        <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs" data-testid="overview-runtime-quality">
+        <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm" data-testid="overview-runtime-quality">
           <div className="flex justify-between">
             <dt className="text-muted-foreground">error</dt>
             <dd>{runtime.error_count}</dd>
@@ -128,12 +128,12 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
           </div>
         </dl>
         {runtime.capability_coverage_state === "not_computed" ? (
-          <p className="text-[11px] text-muted-foreground" data-testid="overview-runtime-coverage-unavailable">
+          <p className="text-sm text-muted-foreground" data-testid="overview-runtime-coverage-unavailable">
             主要機能ごとの観測カバレッジは算出していません。component と Capability
             の対応が保存されていないため、比率を出すと別の単位どうしの割り算になります。
           </p>
         ) : (
-          <p className="text-[11px] text-muted-foreground" data-testid="overview-runtime-coverage">
+          <p className="text-sm text-muted-foreground" data-testid="overview-runtime-coverage">
             観測済みの主要機能: {runtime.observed_capability_count} /{" "}
             {runtime.core_capability_count}
             {runtime.unmapped_component_count != null &&
@@ -141,7 +141,7 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
               `（対応不明の component ${runtime.unmapped_component_count} 件は未観測に数えていません）`}
           </p>
         )}
-        <p className="text-[11px] text-muted-foreground">
+        <p className="text-sm text-muted-foreground">
           error / 不一致 / replay の件数は直近 {windowHours} 時間の実 workload trace
           についてのものです。判定閾値は {formatDuration(runtime.delayed_after_seconds)}
           以上で「受信が途絶えています」、{formatDuration(runtime.stale_after_seconds)}
@@ -151,10 +151,10 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
         {/* Cumulative history, disclosed rather than displayed. These are the
             four metric cards the old Overview led with. */}
         <details data-testid="overview-runtime-cumulative">
-          <summary className="cursor-pointer text-xs text-muted-foreground">
+          <summary className="cursor-pointer text-sm text-muted-foreground">
             これまでの累積（現在の稼働状態ではありません）
           </summary>
-          <dl className="mt-2 space-y-1 text-xs text-muted-foreground">
+          <dl className="mt-2 space-y-1 text-sm text-muted-foreground">
             <div>
               <dt className="inline font-medium">Component 数: </dt>
               <dd className="inline">{runtime.component_count}</dd>
@@ -176,7 +176,7 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
 
         {/* The full Component list lives on Components, not here (#384: 完全
             一覧を Overview と Components で重複表示しない). */}
-        <div className="flex flex-wrap gap-3 text-xs">
+        <div className="flex flex-wrap gap-3 text-sm">
           <Link to="/components" className="text-primary underline" data-testid="overview-runtime-components-link">
             Component と Trace の詳細
           </Link>

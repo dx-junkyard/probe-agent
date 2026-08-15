@@ -35,16 +35,16 @@ function FindingRow({ finding }: { finding: OverviewFindingOut }) {
         <Badge variant="outline">{finding.kind_label}</Badge>
         <Badge variant={FINDING_STATUS_VARIANT[finding.status]}>{finding.status_label}</Badge>
         {finding.occurrence_count > 1 && (
-          <span className="text-xs text-muted-foreground">{finding.occurrence_count} 件</span>
+          <span className="text-sm text-muted-foreground">{finding.occurrence_count} 件</span>
         )}
       </div>
-      <p className="mt-2 text-sm font-medium">{finding.summary}</p>
+      <p className="mt-2 text-base font-medium">{finding.summary}</p>
       {/* 「何が起きたか」 alone is a notification. The impact is what makes it
           a finding. */}
-      <p className="mt-1 text-sm text-muted-foreground">
+      <p className="mt-1 text-base text-muted-foreground">
         判断への影響: {finding.decision_impact}
       </p>
-      <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+      <div className="mt-2 flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
         <span>出所: {finding.provenance_label}</span>
         {finding.snapshot_id != null && <span>snapshot {finding.snapshot_id}</span>}
         {finding.revision_id != null && <span>理解リビジョン {finding.revision_id}</span>}
@@ -58,7 +58,7 @@ function FindingRow({ finding }: { finding: OverviewFindingOut }) {
       {finding.target && (
         <Link
           to={targetHref(finding.target)}
-          className="mt-2 inline-block text-xs text-primary underline"
+          className="mt-2 inline-block text-sm text-primary underline"
           data-testid="overview-finding-target"
         >
           {finding.target.label}
@@ -72,7 +72,7 @@ function FindingRow({ finding }: { finding: OverviewFindingOut }) {
 function EmptyState({ overview }: { overview: OverviewOut }) {
   if (overview.findings_state === "unavailable") {
     return (
-      <div className="space-y-1 text-sm" data-testid="overview-findings-unavailable">
+      <div className="space-y-1 text-base" data-testid="overview-findings-unavailable">
         <p>今回の変化・発見を取得できませんでした。</p>
         <p className="text-muted-foreground">
           「発見がない」という意味ではありません。取得に失敗しています。
@@ -91,7 +91,7 @@ function EmptyState({ overview }: { overview: OverviewOut }) {
   }
   if (overview.findings_state === "not_compared") {
     return (
-      <div className="space-y-1 text-sm" data-testid="overview-findings-not-compared">
+      <div className="space-y-1 text-base" data-testid="overview-findings-not-compared">
         <p>まだ比較していません。</p>
         <p className="text-muted-foreground">
           {overview.findings_baseline_label}。理解を一度確認すると、それ以降の変化を
@@ -101,7 +101,7 @@ function EmptyState({ overview }: { overview: OverviewOut }) {
     );
   }
   return (
-    <div className="space-y-1 text-sm" data-testid="overview-findings-none">
+    <div className="space-y-1 text-base" data-testid="overview-findings-none">
       <p>重要な新しい発見はありません。</p>
       <p className="text-muted-foreground">
         比較の基準: {overview.findings_baseline_label}
@@ -121,7 +121,7 @@ export function FindingsCard({ overview }: { overview: OverviewOut }) {
   return (
     <Card data-testid="overview-findings">
       <CardHeader>
-        <CardTitle as="h2" className="text-base">今わかったこと</CardTitle>
+        <CardTitle as="h2" className="text-lg">今わかったこと</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {overview.findings.length === 0 ? (
@@ -136,14 +136,14 @@ export function FindingsCard({ overview }: { overview: OverviewOut }) {
             {hidden > 0 && (
               <button
                 type="button"
-                className="text-xs text-primary underline"
+                className="text-sm text-primary underline"
                 onClick={() => setExpanded((value) => !value)}
                 data-testid="overview-findings-toggle"
               >
                 {expanded ? "初期表示に戻す" : `残り ${hidden} 件を表示`}
               </button>
             )}
-            <p className="text-[11px] text-muted-foreground">
+            <p className="text-sm text-muted-foreground">
               比較の基準: {overview.findings_baseline_label}
               {overview.findings_baseline_at != null &&
                 `（${formatTimestamp(overview.findings_baseline_at)}）`}

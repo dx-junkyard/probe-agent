@@ -3891,7 +3891,7 @@ describe("Interview page", () => {
     const { default: InterviewPage } = await import("@/pages/interview");
     render(
       <QueryClientProvider client={qc}>
-        <MemoryRouter initialEntries={["/interview?session=7"]}>
+        <MemoryRouter initialEntries={["/interview?session=7#cockpit-aux-intent"]}>
           <InterviewPage />
         </MemoryRouter>
       </QueryClientProvider>,
@@ -3899,6 +3899,9 @@ describe("Interview page", () => {
 
     // ファーストビュー: 完成度・要確認・未設定・次にやること。
     await screen.findByTestId("cockpit-status-summary");
+    const intent = screen.getByTestId("cockpit-aux-intent") as HTMLDetailsElement;
+    expect(intent).toBeInTheDocument();
+    expect(intent.open).toBe(true);
     // Vision のみ未設定、Capabilities が要確認 → (3 + 0.5)/5 = 70%
     expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("70");
     expect(screen.getByTestId("cockpit-stat-missing")).toHaveTextContent("1");
@@ -3960,6 +3963,8 @@ describe("Interview page", () => {
     expect(order("understanding-brief")).toBeLessThan(order("cockpit-understanding-map"));
     // Brief は 1 つの値から描かれる。2 箇所に同時には出ない (原則 P7)。
     expect(screen.getAllByTestId("understanding-brief")).toHaveLength(1);
+    // Overview から Vision を定義できるよう、W3 でも Intent Brief を隠さない。
+    expect(screen.getByTestId("cockpit-aux-intent")).toBeInTheDocument();
 
     // レビュー指摘 P1: 主作業面を初期表示 (1280 x 720) へ入れるため、
     // サマリーの統計は既定で畳む。主 CTA はその外に出ていること。
@@ -7685,6 +7690,25 @@ describe("Per-screen assistant panel", () => {
     );
   });
 
+  test("an in-page review action opens the assistant with an unsent contextual draft", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/");
+    const { OPEN_ASSISTANT_EVENT } = await import("@/lib/assistant-control");
+
+    fireEvent(
+      window,
+      new CustomEvent(OPEN_ASSISTANT_EVENT, {
+        detail: { question: "Visionの根拠を確認したい" },
+      }),
+    );
+
+    expect(await screen.findByTestId("assistant-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("assistant-question-input")).toHaveValue(
+      "Visionの根拠を確認したい",
+    );
+    expect(mockApi.post).not.toHaveBeenCalledWith("/assistant/ask", expect.anything());
+  });
+
   // Issue #358 追補: 開いたパネルは本文の上に重なるモーダルな面である。
   // 390px 幅では画面全体を覆うので、閉じる手段が右上のボタン 1 つだけだと
   // 逃げ場が無い。背景・Escape・フォーカストラップ・戻りフォーカスは
@@ -11009,4 +11033,3 @@ describe("GitHub publish workflow UX gaps (Issue #267)", () => {
     expect(within(timeline).getByText("イベントはまだありません。")).toBeInTheDocument();
   });
 });
-

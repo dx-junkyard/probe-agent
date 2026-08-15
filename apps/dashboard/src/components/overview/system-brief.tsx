@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { CONFIRMATION_VARIANT, READINESS_VARIANT } from "./display";
+import { openScreenAssistant } from "@/lib/assistant-control";
 
 /** Section keys the server reports counts for, in the developer's words. */
 const SECTION_LABELS: Record<string, string> = {
@@ -27,7 +28,17 @@ import type { OverviewOut, UnderstandingBriefClaimOut } from "@/api/types";
  * AI-written sentence does not make the developer its author, and a confirmed
  * claim the system later changed must not keep reading 「確認済み」.
  */
-function Claim({ claim, testId }: { claim: UnderstandingBriefClaimOut; testId: string }) {
+function Claim({
+  claim,
+  testId,
+  sectionLabel,
+  changeHref,
+}: {
+  claim: UnderstandingBriefClaimOut;
+  testId: string;
+  sectionLabel: string;
+  changeHref: string;
+}) {
   return (
     <li className="rounded-md border p-3" data-testid={testId} data-confirmation={claim.confirmation}>
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -41,11 +52,25 @@ function Claim({ claim, testId }: { claim: UnderstandingBriefClaimOut; testId: s
         </span>
       </div>
       {claim.summary && (
-        <p className="mt-1 text-sm text-muted-foreground">{claim.summary}</p>
+        <p className="mt-1 text-base text-muted-foreground">{claim.summary}</p>
       )}
       {claim.contribution && (
-        <p className="mt-1 text-xs text-muted-foreground">目的への貢献: {claim.contribution}</p>
+        <p className="mt-1 text-sm text-muted-foreground">目的への貢献: {claim.contribution}</p>
       )}
+      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-sm" data-testid={`${testId}-actions`}>
+        <button
+          type="button"
+          className="text-primary underline underline-offset-2"
+          onClick={() => openScreenAssistant(
+            `System Brief の ${sectionLabel}「${claim.name}」について疑問があります。根拠と妥当性を確認し、修正が必要か一緒に整理してください。`,
+          )}
+        >
+          AIに質問する
+        </button>
+        <Link to={changeHref} className="text-primary underline underline-offset-2">
+          結論を反映する
+        </Link>
+      </div>
     </li>
   );
 }
@@ -53,9 +78,13 @@ function Claim({ claim, testId }: { claim: UnderstandingBriefClaimOut; testId: s
 export function SystemBriefCard({
   overview,
   interviewHref,
+  visionHref = interviewHref,
+  changeSetHref = interviewHref,
 }: {
   overview: OverviewOut;
   interviewHref: string;
+  visionHref?: string;
+  changeSetHref?: string;
 }) {
   const brief = overview.brief;
 
@@ -65,9 +94,9 @@ export function SystemBriefCard({
     return (
       <Card data-testid="overview-brief-unavailable">
         <CardHeader>
-          <CardTitle as="h2" className="text-base">System Brief</CardTitle>
+          <CardTitle as="h2" className="text-lg">System Brief</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-2 text-sm">
+        <CardContent className="space-y-2 text-base">
           <p>現在のシステム理解を取得できませんでした。</p>
           <p className="text-muted-foreground">
             表示できないのは要約だけです。理解そのものは
@@ -88,7 +117,7 @@ export function SystemBriefCard({
   return (
     <Card data-testid="overview-system-brief">
       <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0">
-        <CardTitle as="h2" className="text-base">System Brief</CardTitle>
+        <CardTitle as="h2" className="text-lg">System Brief</CardTitle>
         <Badge
           variant={READINESS_VARIANT[brief.readiness_state]}
           data-testid="overview-readiness-badge"
@@ -100,11 +129,11 @@ export function SystemBriefCard({
       <CardContent className="space-y-4">
         {/* Readiness is judgement material, not a permission. It explains; the
             single primary action stays visible either way (#353). */}
-        <p className="text-sm text-muted-foreground" data-testid="overview-readiness-description">
+        <p className="text-base text-muted-foreground" data-testid="overview-readiness-description">
           {brief.readiness_description}
         </p>
         {brief.readiness_reasons.length > 0 && (
-          <ul className="space-y-1 text-xs" data-testid="overview-readiness-reasons">
+          <ul className="space-y-1 text-sm" data-testid="overview-readiness-reasons">
             {brief.readiness_reasons.slice(0, 4).map((reason) => (
               <li key={`${reason.code}-${reason.target_name}`} className="flex gap-2">
                 <Badge
@@ -129,24 +158,29 @@ export function SystemBriefCard({
         )}
 
         <section data-testid="overview-vision">
-          <h3 className="text-sm font-semibold">Vision — 誰の状態をどう変えたいか</h3>
+          <h3 className="text-base font-semibold">Vision — 誰の状態をどう変えたいか</h3>
           {brief.vision ? (
             <ul className="mt-2">
-              <Claim claim={brief.vision} testId="overview-vision-claim" />
+              <Claim
+                claim={brief.vision}
+                testId="overview-vision-claim"
+                sectionLabel="Vision"
+                changeHref={visionHref}
+              />
             </ul>
           ) : (
             // Never a synthesised sentence. 「推定できない」 is itself a fact,
             // and the missing information is named so it can be supplied.
-            <div className="mt-2 rounded-md border border-dashed p-3 text-sm" data-testid="overview-vision-missing">
+            <div className="mt-2 rounded-md border border-dashed p-3 text-base" data-testid="overview-vision-missing">
               <p>Vision はまだ分かっていません。コードだけでは決まらない内容です。</p>
               {brief.vision_missing_information.length > 0 && (
-                <ul className="mt-1 list-inside list-disc text-xs text-muted-foreground">
+                <ul className="mt-1 list-inside list-disc text-sm text-muted-foreground">
                   {brief.vision_missing_information.map((item) => (
                     <li key={item}>{item}</li>
                   ))}
                 </ul>
               )}
-              <Link to={interviewHref} className="mt-2 inline-block text-xs text-primary underline">
+              <Link to={visionHref} className="mt-2 inline-block text-sm text-primary underline">
                 Vision を定義する
               </Link>
             </div>
@@ -154,44 +188,70 @@ export function SystemBriefCard({
         </section>
 
         <section data-testid="overview-system-purpose">
-          <h3 className="text-sm font-semibold">
+          <h3 className="text-base font-semibold">
             System Purpose — その Vision に対してこのシステムが担う役割
           </h3>
           {brief.system_purpose.length > 0 ? (
             <ul className="mt-2 space-y-2">
               {brief.system_purpose.map((claim) => (
-                <Claim key={claim.name} claim={claim} testId="overview-purpose-claim" />
+                <Claim
+                  key={claim.name}
+                  claim={claim}
+                  testId="overview-purpose-claim"
+                  sectionLabel="System Purpose"
+                  changeHref={changeSetHref}
+                />
               ))}
             </ul>
           ) : (
-            <p className="mt-2 text-sm text-muted-foreground" data-testid="overview-purpose-missing">
+            <p className="mt-2 text-base text-muted-foreground" data-testid="overview-purpose-missing">
               System Purpose をまだ抽出できていません。
             </p>
           )}
         </section>
 
         <section data-testid="overview-core-capabilities">
-          <h3 className="text-sm font-semibold">主要機能 (Core Capabilities)</h3>
+          <h3 className="text-base font-semibold">主要機能 (Core Capabilities)</h3>
           {capabilities.length > 0 ? (
             <ul className="mt-2 space-y-2">
               {capabilities.map((claim) => (
-                <Claim key={claim.name} claim={claim} testId="overview-capability-claim" />
+                <Claim
+                  key={claim.name}
+                  claim={claim}
+                  testId="overview-capability-claim"
+                  sectionLabel="Core Capabilities"
+                  changeHref={changeSetHref}
+                />
               ))}
             </ul>
           ) : (
-            <p className="mt-2 text-sm text-muted-foreground" data-testid="overview-capabilities-missing">
+            <p className="mt-2 text-base text-muted-foreground" data-testid="overview-capabilities-missing">
               主要機能をまだ抽出できていません。
             </p>
           )}
           {hiddenCapabilities > 0 && (
             <Link
               to={interviewHref}
-              className="mt-2 inline-block text-xs text-primary underline"
+              className="mt-2 inline-block text-sm text-primary underline"
               data-testid="overview-capabilities-more"
             >
               残り {hiddenCapabilities} 件と根拠を見る
             </Link>
           )}
+        </section>
+
+        <section
+          className="rounded-md border bg-muted/30 p-3 text-sm"
+          data-testid="overview-brief-review-guide"
+        >
+          <h3 className="font-semibold">疑問から反映まで</h3>
+          <ol className="mt-1 list-inside list-decimal space-y-1 text-muted-foreground">
+            <li>各項目の「AIに質問する」で、根拠や妥当性を対話して整理します。</li>
+            <li>結論が出たら「結論を反映する」から変更案を作り、差分を確認して適用します。</li>
+          </ol>
+          <p className="mt-2 text-muted-foreground">
+            AIとの会話だけではSystem Briefを書き換えません。VisionはIntent Brief、System PurposeとCore Capabilitiesは変更セットへの明示適用で反映します。
+          </p>
         </section>
 
         {/* Progressive disclosure: the full tree, the evidence, the API
@@ -202,10 +262,10 @@ export function SystemBriefCard({
             context rather than a detail. What stays here is the per-section
             inventory and the route to the full tree. */}
         <details data-testid="overview-brief-details">
-          <summary className="cursor-pointer text-xs text-muted-foreground">
+          <summary className="cursor-pointer text-sm text-muted-foreground">
             この理解に含まれる要素と、詳細への入口
           </summary>
-          <dl className="mt-2 space-y-1 text-xs text-muted-foreground">
+          <dl className="mt-2 space-y-1 text-sm text-muted-foreground">
             {overview.latest_ready_snapshot_id != null &&
               brief.snapshot_id != null &&
               overview.latest_ready_snapshot_id !== brief.snapshot_id && (
@@ -221,7 +281,7 @@ export function SystemBriefCard({
               </div>
             ))}
           </dl>
-          <Link to={interviewHref} className="mt-2 inline-block text-xs text-primary underline">
+          <Link to={interviewHref} className="mt-2 inline-block text-sm text-primary underline">
             全文の理解と根拠を開く
           </Link>
         </details>

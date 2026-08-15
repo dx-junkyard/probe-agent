@@ -134,6 +134,8 @@ describe("System Brief (Issue #381)", () => {
     wrap(
       <SystemBriefCard
         interviewHref="/interview?session=7"
+        visionHref="/interview?session=7#cockpit-aux-intent"
+        changeSetHref="/interview?session=7#cockpit-aux-change-set"
         overview={overview({
           brief: brief({
             vision: claim({
@@ -170,6 +172,37 @@ describe("System Brief (Issue #381)", () => {
     const purposeClaim = screen.getByTestId("overview-purpose-claim");
     expect(within(purposeClaim).getByText("AI 仮説・未確認")).toBeInTheDocument();
     expect(within(purposeClaim).getByText("コード・ドキュメントの実装事実")).toBeInTheDocument();
+    expect(within(visionClaim).getByText("結論を反映する")).toHaveAttribute(
+      "href", "/interview?session=7#cockpit-aux-intent",
+    );
+    expect(within(purposeClaim).getByText("結論を反映する")).toHaveAttribute(
+      "href", "/interview?session=7#cockpit-aux-change-set",
+    );
+    expect(screen.getByTestId("overview-brief-review-guide")).toHaveTextContent(
+      "AIとの会話だけではSystem Briefを書き換えません",
+    );
+  });
+
+  test("opens the screen assistant with the selected claim as an unsent question draft", () => {
+    const received: Event[] = [];
+    const listener = (event: Event) => received.push(event);
+    window.addEventListener("probe-agent:open-assistant", listener);
+    wrap(
+      <SystemBriefCard
+        interviewHref="/interview?session=7"
+        overview={overview({
+          brief: brief({
+            vision: claim({ kind: "vision", name: "開発者の判断を支援する" }),
+          }),
+        })}
+      />,
+    );
+
+    fireEvent.click(within(screen.getByTestId("overview-vision-claim")).getByText("AIに質問する"));
+    expect(received).toHaveLength(1);
+    expect((received[0] as CustomEvent<{ question: string }>).detail.question)
+      .toContain("Vision「開発者の判断を支援する」");
+    window.removeEventListener("probe-agent:open-assistant", listener);
   });
 
   test("a missing Vision names what is missing instead of inventing one", () => {
