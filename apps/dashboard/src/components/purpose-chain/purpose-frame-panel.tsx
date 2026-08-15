@@ -24,10 +24,15 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Textarea } from "@/components/ui/textarea";
 import {
   useCreateVerificationConcept,
+  useConfirmVerificationConcept,
+  useLinkOutcomeCriterion,
   useDecidePurposeRelation,
   usePurposeChain,
   usePurposeNextQuestion,
   usePurposeVerificationPrompt,
+  usePurposeVerificationState,
+  useRecordOutcomeResult,
+  useRecordOutcomeUnavailable,
   useRespondPurposeNeed,
 } from "@/api/hooks";
 import {
@@ -48,7 +53,8 @@ import {
   relationIsDecidable,
 } from "./model";
 import type {
-  PurposeChainOut, PurposeElementOut, PurposeQuestionOut, PurposeRelationOut,
+  PurposeChainOut, PurposeElementOut, PurposeOutcomeCriterionOut,
+  PurposeOutcomeEvidenceSource, PurposeQuestionOut, PurposeRelationOut,
 } from "@/api/types";
 
 // ── §4.5 検証条件 (Experience / Outcome / Reuse, Issue #391) ───────────────
@@ -67,6 +73,135 @@ const _VERIFICATION_CONCEPT_LABEL: Record<string, string> = {
   reuse_hypothesis: "再利用の契機",
 };
 
+const _OUTCOME_STATE_LABEL: Record<string, string> = {
+  proposed: "仮説", confirmed: "確認済み", observed: "観測済み",
+  contradicted: "矛盾", not_observed: "未観測", not_computed: "算出不能",
+};
+
+function RoutedNeedAction({ question, sessionId }: { question: PurposeQuestionOut; sessionId: number }) {
+  const respond = useRespondPurposeNeed(sessionId);
+  const routed = question.answerability === "human_judgement" ? question.routed_needs[0] : null;
+  if (!routed) return null;
+  return (
+    <div className="rounded-md border bg-muted/40 p-3 text-sm" data-testid="purpose-routed-need">
+      <p className="font-medium">システムで調査できる点</p>
+      <p className="text-muted-foreground">{routed.target_label}</p>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={respond.isPending}
+        onClick={() => respond.mutate(
+          { needId: routed.need_id, responseKind: "investigate" },
+          { onSuccess: () => toast.success("調査を依頼しました"), onError: (e) => toast.error(String(e)) },
+        )}
+        data-testid={`purpose-routed-investigate-${routed.need_id}`}
+      >
+        Joint Understanding で調査する
+      </Button>
+    </div>
+  );
+}
+
+function OutcomeCriterionCard({ row, sessionId }: { row: PurposeOutcomeCriterionOut; sessionId: number }) {
+  const confirm = useConfirmVerificationConcept(sessionId);
+  const link = useLinkOutcomeCriterion(sessionId);
+  const result = useRecordOutcomeResult(sessionId);
+  const unavailable = useRecordOutcomeUnavailable(sessionId);
+  const [source, setSource] = useState<PurposeOutcomeEvidenceSource>("human_reported");
+  const [evidence, setEvidence] = useState("");
+  const [synthetic, setSynthetic] = useState(false);
+  const [experimentId, setExperimentId] = useState("");
+  const [candidateId, setCandidateId] = useState("");
+  const busy = confirm.isPending || link.isPending || result.isPending || unavailable.isPending;
+  const reportError = (e: unknown) => toast.error(String(e));
+  const sourceFacts = [
+    ["利用者からの報告", row.human_reported_state, row.human_reported_evidence, row.human_reported_is_synthetic],
+    ["runtime観測", row.runtime_observation_state, row.runtime_observation_text, row.runtime_observation_is_synthetic],
+  ] as const;
+
+  return (
+    <div className="rounded-md border p-3 space-y-2" data-testid={`purpose-outcome-${row.id}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="font-medium">{row.target_label}: {row.measure}</p>
+        <Badge variant="outline">{_OUTCOME_STATE_LABEL[row.state]}</Badge>
+        <Badge variant="outline">lineage: {row.lineage_state === "linked" ? "接続済み" : row.lineage_state === "unresolved" ? "関連不明" : "未接続"}</Badge>
+      </div>
+      <p className="text-xs text-muted-foreground">基準 {row.baseline_value} → 目標 {row.target_value} / {row.observation_window}</p>
+      {sourceFacts.map(([label, state, text, isSynthetic]) => (
+        <p key={label} className="text-xs" data-testid={`purpose-outcome-source-${row.id}-${label}`}>
+          {label}: {state ? _OUTCOME_STATE_LABEL[state] : "記録なし"}
+          {isSynthetic ? "（synthetic fixture）" : ""}{text ? ` — ${text}` : ""}
+        </p>
+      ))}
+      {row.state === "proposed" && (
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => confirm.mutate(
+          { kind: "outcome_criterion", id: row.id }, { onError: reportError },
+        )}>検証条件を確認する</Button>
+      )}
+      <div className="grid gap-2 sm:grid-cols-2">
+        <label className="text-xs">Experiment ID
+          <input className="block w-full rounded-md border bg-transparent px-2 py-1" value={experimentId} onChange={(e) => { setExperimentId(e.target.value); if (e.target.value) setCandidateId(""); }} />
+        </label>
+        <label className="text-xs">Candidate version ID
+          <input className="block w-full rounded-md border bg-transparent px-2 py-1" value={candidateId} onChange={(e) => { setCandidateId(e.target.value); if (e.target.value) setExperimentId(""); }} />
+        </label>
+      </div>
+      <Button size="sm" variant="outline" disabled={busy || (!experimentId && !candidateId)} onClick={() => link.mutate({
+        id: row.id,
+        experimentId: experimentId ? Number(experimentId) : undefined,
+        candidateVersionId: candidateId ? Number(candidateId) : undefined,
+      }, { onError: reportError })}>改善候補へ接続する</Button>
+      <div className="space-y-2 rounded-md bg-muted/40 p-2">
+        <label className="text-xs">証拠の種類
+          <select className="ml-2 rounded-md border bg-background px-2 py-1" value={source} onChange={(e) => setSource(e.target.value as PurposeOutcomeEvidenceSource)}>
+            <option value="human_reported">利用者からの報告</option><option value="runtime_observed">runtime観測</option>
+          </select>
+        </label>
+        <Textarea rows={2} value={evidence} onChange={(e) => setEvidence(e.target.value)} placeholder="観測内容、または観測・算出できない理由" data-testid={`purpose-outcome-evidence-${row.id}`} />
+        <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={synthetic} onChange={(e) => setSynthetic(e.target.checked)} />synthetic fixture</label>
+        <div className="flex flex-wrap gap-2">
+          {(["supports", "contradicts"] as const).map((verdict) => (
+            <Button key={verdict} size="sm" variant="outline" disabled={busy || !evidence.trim()} onClick={() => result.mutate({ id: row.id, source, verdict, evidenceText: evidence, isSynthetic: synthetic }, { onError: reportError })}>
+              {verdict === "supports" ? "観測済みとして記録" : "矛盾として記録"}
+            </Button>
+          ))}
+          {(["not_observed", "not_computed"] as const).map((state) => (
+            <Button key={state} size="sm" variant="outline" disabled={busy || !evidence.trim()} onClick={() => unavailable.mutate({ id: row.id, source, state, reason: evidence }, { onError: reportError })}>
+              {state === "not_observed" ? "未観測として記録" : "算出不能として記録"}
+            </Button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VerificationStateSection({ sessionId }: { sessionId: number }) {
+  const query = usePurposeVerificationState(sessionId);
+  const confirm = useConfirmVerificationConcept(sessionId);
+  if (query.isLoading) return <p className="text-xs text-muted-foreground">記録済みの検証条件を読み込んでいます…</p>;
+  if (query.isError || !query.data) return <p className="text-xs text-destructive" data-testid="purpose-verification-state-error">記録済みの検証条件を取得できませんでした。</p>;
+  const data = query.data;
+  const hypotheses = [
+    ...data.experience_hypotheses.map((row) => ({ ...row, kind: "experience_hypothesis" as const, label: "成功体験" })),
+    ...data.reuse_hypotheses.map((row) => ({ ...row, kind: "reuse_hypothesis" as const, label: "再利用契機" })),
+  ];
+  if (hypotheses.length === 0 && data.outcome_criteria.length === 0) return null;
+  return (
+    <section className="space-y-2" aria-labelledby="purpose-verification-heading">
+      <h3 id="purpose-verification-heading" className="text-sm font-semibold">記録済みの検証条件</h3>
+      {hypotheses.map((row) => (
+        <div key={`${row.kind}-${row.id}`} className="rounded-md border p-3 text-sm" data-testid={`purpose-hypothesis-${row.kind}-${row.id}`}>
+          <p><span className="font-medium">{row.label}: </span>{row.statement}</p>
+          <p className="text-xs text-muted-foreground">{row.target_label} / {_OUTCOME_STATE_LABEL[row.state] ?? row.state}</p>
+          {row.state === "proposed" && <Button size="sm" variant="outline" disabled={confirm.isPending} onClick={() => confirm.mutate({ kind: row.kind, id: row.id })}>仮説を確認する</Button>}
+        </div>
+      ))}
+      {data.outcome_criteria.map((row) => <OutcomeCriterionCard key={row.id} row={row} sessionId={sessionId} />)}
+    </section>
+  );
+}
+
 function VerificationPromptSection({ sessionId }: { sessionId: number }) {
   const promptQuery = usePurposeVerificationPrompt(sessionId);
   const create = useCreateVerificationConcept(sessionId);
@@ -80,6 +215,14 @@ function VerificationPromptSection({ sessionId }: { sessionId: number }) {
     return (
       <p className="text-xs text-muted-foreground" data-testid="purpose-verification-loading">
         検証条件を確認しています…
+      </p>
+    );
+  }
+
+  if (promptQuery.isError) {
+    return (
+      <p className="text-xs text-destructive" data-testid="purpose-verification-error">
+        検証条件の必要性を取得できませんでした。
       </p>
     );
   }
@@ -211,7 +354,7 @@ function NeedResponseBlock({
   const [correcting, setCorrecting] = useState(false);
   const [draft, setDraft] = useState(question.suggested_answer?.text ?? "");
 
-  const submit = (kind: "confirm" | "correct" | "unknown" | "defer", valueText?: string) => {
+  const submit = (kind: "confirm" | "correct" | "unknown" | "defer" | "investigate", valueText?: string) => {
     respond.mutate(
       { needId: question.need_id, responseKind: kind, valueText },
       {
@@ -220,7 +363,8 @@ function NeedResponseBlock({
           toast.success(
             kind === "confirm" ? "確認しました"
               : kind === "correct" ? "訂正を記録しました"
-                : kind === "unknown" ? "調査を依頼しました"
+                : kind === "unknown" ? "わからないと記録しました"
+                  : kind === "investigate" ? "調査を依頼しました"
                   : "保留しました",
           );
         },
@@ -259,6 +403,9 @@ function NeedResponseBlock({
         <p className="text-muted-foreground">止まっている判断: {question.blocked_decision}</p>
       )}
       {question.unlocks && <p className="text-muted-foreground">回答すると: {question.unlocks}</p>}
+      {question.defer_impact && (
+        <p className="text-muted-foreground">保留した場合: {question.defer_impact}</p>
+      )}
       <p className="text-xs text-muted-foreground" data-testid="purpose-need-answerability">
         {ANSWERABILITY_LABEL[question.answerability]}
       </p>
@@ -276,7 +423,7 @@ function NeedResponseBlock({
           size="sm"
           variant="outline"
           disabled={busy}
-          onClick={() => submit("unknown")}
+          onClick={() => submit("investigate")}
           data-testid={`purpose-need-investigate-${question.need_id}`}
         >
           調査を依頼する
@@ -332,7 +479,16 @@ function NeedResponseBlock({
               onClick={() => submit("unknown")}
               data-testid={`purpose-need-unknown-${question.need_id}`}
             >
-              わからない・調査を依頼する
+              わからない
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => submit("investigate")}
+              data-testid={`purpose-need-investigate-${question.need_id}`}
+            >
+              調査を依頼する
             </Button>
             <Button
               size="sm"
@@ -371,9 +527,9 @@ function ElementCard({
       data-element-state={element?.state ?? "unavailable"}
     >
       <div className="flex items-start justify-between gap-2">
-        <h4 className="text-sm font-semibold text-muted-foreground">
+        <h3 className="text-sm font-semibold text-muted-foreground">
           {headingIndex}. {headingLabel}
-        </h4>
+        </h3>
         {element && (
           <div className="flex shrink-0 flex-wrap justify-end gap-1">
             <Badge variant={element.confirmation === "confirmed" ? "success" : "outline"}>
@@ -426,6 +582,14 @@ function ElementCard({
       )}
       {element && element.source_ids.length > 0 && (
         <p className="text-[11px] text-muted-foreground">出典: {element.source_ids.join("、")}</p>
+      )}
+      {element && (element.intent_revision_id != null || element.understanding_revision_id != null || element.snapshot_id != null) && (
+        <p className="text-[11px] text-muted-foreground" data-testid={`purpose-element-revisions-${kind}`}>
+          source revision:
+          {element.intent_revision_id != null ? ` Intent ${element.intent_revision_id}` : ""}
+          {element.understanding_revision_id != null ? ` Understanding ${element.understanding_revision_id}` : ""}
+          {element.snapshot_id != null ? ` Snapshot ${element.snapshot_id}` : ""}
+        </p>
       )}
 
       {/* §3.2: 「詳細を追加」ではなく「現在の判断を進めるために確認」として
@@ -574,9 +738,9 @@ function CapabilitiesSection({ chain, question }: { chain: PurposeChainOut; ques
   if (capabilities.length === 0) return null;
   return (
     <section className="space-y-2" aria-labelledby="purpose-capabilities-heading">
-      <h4 id="purpose-capabilities-heading" className="text-xs font-semibold uppercase text-muted-foreground">
+      <h3 id="purpose-capabilities-heading" className="text-xs font-semibold uppercase text-muted-foreground">
         Capabilities
-      </h4>
+      </h3>
       <div className="space-y-2">
         {capabilities.map((cap) => (
           <div key={cap.id} className="space-y-1">
@@ -642,7 +806,7 @@ export function PurposeFramePanel({ sessionId, initialNeedId }: PurposeFramePane
   return (
     <Card data-testid="purpose-frame-panel" data-frame-state={chain.frame_state}>
       <CardHeader>
-        <CardTitle className="text-sm">Purpose Chain — 目的の連鎖</CardTitle>
+        <CardTitle as="h2" className="text-sm">Purpose Chain — 目的の連鎖</CardTitle>
         <CardDescription>
           対象者と課題から、望ましい変化・システムの介入・Capabilities までを、判断できる根拠つきで確認します。
         </CardDescription>
@@ -653,10 +817,18 @@ export function PurposeFramePanel({ sessionId, initialNeedId }: PurposeFramePane
             一部を取得できませんでした: {chain.degraded_sections.join("、")}
           </p>
         )}
+        {questionQuery.isError && (
+          <p className="text-xs text-destructive" data-testid="purpose-question-error">
+            現在の質問を取得できませんでした。質問なしとは判定していません。
+          </p>
+        )}
         {question && !questionAwaitsHumanDecision(question) && question.state === "available" && (
           <p className="text-xs text-muted-foreground" data-testid="purpose-frame-routed-note">
             {ANSWERABILITY_LABEL[question.answerability]}
           </p>
+        )}
+        {question && chain.session_id != null && (
+          <RoutedNeedAction question={question} sessionId={chain.session_id} />
         )}
         <ol className="space-y-1">
           {slots.map((slot, i) => (
@@ -702,7 +874,12 @@ export function PurposeFramePanel({ sessionId, initialNeedId }: PurposeFramePane
             §4.1's need-gated targets can be a relation the element cards
             above already show, so this reads as one section for the whole
             Purpose Frame rather than a duplicate badge per element. */}
-        {chain.session_id != null && <VerificationPromptSection sessionId={chain.session_id} />}
+        {chain.session_id != null && (
+          <>
+            <VerificationStateSection sessionId={chain.session_id} />
+            <VerificationPromptSection sessionId={chain.session_id} />
+          </>
+        )}
       </CardContent>
     </Card>
   );

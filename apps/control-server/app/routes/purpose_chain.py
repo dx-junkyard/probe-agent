@@ -67,6 +67,7 @@ from ..models import (
     PurposeOutcomeCriterionLinkRequest,
     PurposeOutcomeCriterionOut,
     PurposeOutcomeResultRequest,
+    PurposeOutcomeUnavailableRequest,
     PurposeQuestionOut,
     PurposeRelationDecisionRequest,
     PurposeRelationOut,
@@ -155,6 +156,12 @@ def _relation_out(relation: PurposeRelation) -> PurposeRelationOut:
         decided_by=relation.decided_by,
         rationale=relation.rationale,
         evidence=[dict(item) for item in relation.evidence],
+        created_intent_revision_id=relation.created_intent_revision_id,
+        created_understanding_revision_id=relation.created_understanding_revision_id,
+        created_snapshot_id=relation.created_snapshot_id,
+        current_intent_revision_id=relation.current_intent_revision_id,
+        current_understanding_revision_id=relation.current_understanding_revision_id,
+        current_snapshot_id=relation.current_snapshot_id,
     )
 
 
@@ -374,7 +381,7 @@ def get_next_purpose_question(
     need_id: Optional[str] = Query(default=None),
     system_id: int = Depends(get_system_id),
 ) -> Optional[PurposeQuestionOut]:
-    """§2.7: the single next adaptive question, or `null` for 「質問なし」.
+    """§2.7: the single next adaptive question/routing action, or `null`.
 
     Writes nothing -- a page view is never recorded as an answer (§0
     invariant 4). With `need_id` omitted, this is exactly
@@ -383,7 +390,9 @@ def get_next_purpose_question(
     `/interview?purpose_need=<need_id>`), that SPECIFIC need is returned when
     it is still answerable; otherwise the response falls back to the current
     selected question (or `null`) and reports why via `fallback_reason` --
-    never a 5th silent state.
+    never a 5th silent state. A `system_researchable` need is returned only
+    when explicitly deep-linked or when no human-judgement question remains;
+    clients render it as an investigation action, not as a human question.
     """
     with get_conn() as conn:
         chain = derive_purpose_chain(conn, system_id, session_id)
@@ -392,15 +401,13 @@ def get_next_purpose_question(
 
         if need_id is not None:
             target_need = purpose_needs.resolve_need(needs, need_id)
-            if (
-                target_need is not None
-                and target_need.state == "available"
-                and target_need.answerability == "human_judgement"
-            ):
+            if target_need is not None and target_need.state == "available":
                 return _question_out(purpose_needs.build_question(target_need, chain, routed_needs=routed))
 
             reason = _fallback_reason(conn, system_id, chain, needs, need_id, target_need)
             selected = purpose_needs.select_question(needs)
+            if selected is None:
+                selected = routed[0] if routed else None
             if selected is None:
                 return None
             return _question_out(
@@ -410,6 +417,13 @@ def get_next_purpose_question(
             )
 
         selected = purpose_needs.select_question(needs)
+        # A researchable need is not a human-value question, but it still
+        # needs one reachable UI action that can explicitly route it to Joint
+        # Understanding.  Returning the first stable routed need only when no
+        # human question is pending keeps the at-most-one contract while
+        # avoiding the previous state where these needs silently disappeared.
+        if selected is None:
+            selected = routed[0] if routed else None
         if selected is None:
             return None
         return _question_out(purpose_needs.build_question(selected, chain, routed_needs=routed))
@@ -587,10 +601,28 @@ def respond_to_purpose_need(
             raise HTTPException(status_code=404, detail="Interview session not found")
 
         chain = derive_purpose_chain(conn, system_id, payload.session_id)
-        needs = purpose_needs.derive_needs(chain)
+        needs = _needs_for_session(conn, system_id, chain)
         need = purpose_needs.resolve_need(needs, need_id)
         if need is None:
             raise HTTPException(status_code=404, detail="Purpose Chain need not found")
+        if need.state != "available":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "purpose_need_not_available",
+                    "message": "This need is no longer available for a response.",
+                },
+            )
+        if need.answerability == "system_researchable" and payload.response_kind not in (
+            "investigate", "defer"
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "purpose_need_requires_research",
+                    "message": "This need can only be investigated or deferred.",
+                },
+            )
 
         actor = _principal_actor(principal)
         linked_intent_item_id: Optional[int] = None
@@ -775,10 +807,14 @@ def _outcome_criterion_out(conn, system_id: int, row) -> PurposeOutcomeCriterion
         human_reported_verdict=row["human_reported_verdict"],
         human_reported_at=row["human_reported_at"],
         human_reported_by=row["human_reported_by"],
+        human_reported_state=row["human_reported_state"],
+        human_reported_is_synthetic=bool(row["human_reported_is_synthetic"]),
         runtime_observation_text=row["runtime_observation_text"],
         runtime_observation_verdict=row["runtime_observation_verdict"],
         runtime_observed_at=row["runtime_observed_at"],
         runtime_observed_by=row["runtime_observed_by"],
+        runtime_observation_state=row["runtime_observation_state"],
+        runtime_observation_is_synthetic=bool(row["runtime_observation_is_synthetic"]),
         is_synthetic=bool(row["is_synthetic"]),
         decision_method=row["decision_method"],
         created_by=row["created_by"],
@@ -1219,6 +1255,38 @@ def record_outcome_result_endpoint(
                 verdict=payload.verdict,
                 evidence_text=payload.evidence_text,
                 is_synthetic=payload.is_synthetic,
+                recorded_by=_principal_actor(principal),
+            )
+        except VerificationNotFound:
+            raise HTTPException(status_code=404, detail="Outcome criterion not found")
+        row = conn.execute(
+            "SELECT * FROM purpose_outcome_criterion WHERE id = ?", (concept_id,)
+        ).fetchone()
+        return _outcome_criterion_out(conn, system_id, row)
+
+
+@router.post(
+    "/purpose-chain/outcome-criteria/{concept_id}/unavailable",
+    response_model=PurposeOutcomeCriterionOut,
+)
+def record_outcome_unavailable_endpoint(
+    concept_id: int,
+    payload: PurposeOutcomeUnavailableRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> PurposeOutcomeCriterionOut:
+    """Records an explicit `not_observed` or `not_computed` fact."""
+    with get_conn() as conn:
+        _require_session(conn, system_id, payload.session_id)
+        try:
+            purpose_verification.record_outcome_unavailable(
+                conn,
+                system_id=system_id,
+                session_id=payload.session_id,
+                concept_id=concept_id,
+                source=payload.source,
+                state=payload.state,
+                reason=payload.reason,
                 recorded_by=_principal_actor(principal),
             )
         except VerificationNotFound:

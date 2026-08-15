@@ -442,8 +442,43 @@ def test_human_reported_and_runtime_observed_evidence_stay_in_separate_columns(
     assert body["runtime_observation_text"] == "実行時の観測は肯定的だった"
     assert body["runtime_observation_verdict"] == "supports"
     assert body["is_synthetic"] is True
-    # The LATEST write's verdict decides the overall state.
-    assert body["state"] == "observed"
+    # A later supporting runtime observation must not hide contradictory
+    # human-reported evidence.
+    assert body["state"] == "contradicted"
+    assert body["human_reported_state"] == "contradicted"
+    assert body["runtime_observation_state"] == "observed"
+    assert body["human_reported_is_synthetic"] is False
+    assert body["runtime_observation_is_synthetic"] is True
+
+
+def test_not_observed_and_not_computed_are_explicit_source_scoped_facts(admin_client, tmp_path):
+    _t, _s, headers, session_id, need_id, _rel = _setup_with_decision_criterion_need(
+        admin_client, tmp_path, "System Verify Unavailable"
+    )
+    created = _create_outcome(admin_client, headers, session_id, need_id)
+    first = admin_client.post(
+        f"/purpose-chain/outcome-criteria/{created['id']}/unavailable",
+        json={
+            "session_id": session_id, "source": "runtime_observed",
+            "state": "not_observed", "reason": "analytics がない",
+        }, headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["runtime_observation_state"] == "not_observed"
+    assert first.json()["runtime_observation_text"] == "analytics がない"
+
+    second = admin_client.post(
+        f"/purpose-chain/outcome-criteria/{created['id']}/unavailable",
+        json={
+            "session_id": session_id, "source": "human_reported",
+            "state": "not_computed", "reason": "canonical mapping がない",
+        }, headers=headers,
+    )
+    assert second.status_code == 200, second.text
+    body = second.json()
+    assert body["human_reported_state"] == "not_computed"
+    assert body["runtime_observation_state"] == "not_observed"
+    assert body["state"] == "not_observed"
 
 
 # --- lineage: explicit id, resolved fresh, never a System-wide check --------
@@ -517,6 +552,19 @@ def test_link_rejects_an_experiment_id_from_another_system(admin_client, tmp_pat
         headers=headers_a,
     )
     assert resp.status_code == 404
+
+
+def test_link_rejects_two_competing_lineage_targets(admin_client, tmp_path):
+    _t, system_id, headers, session_id, need_id, _rel = _setup_with_decision_criterion_need(
+        admin_client, tmp_path, "System Verify TwoLinks"
+    )
+    created = _create_outcome(admin_client, headers, session_id, need_id)
+    resp = admin_client.post(
+        f"/purpose-chain/outcome-criteria/{created['id']}/link",
+        json={"session_id": session_id, "experiment_id": 1, "candidate_version_id": 2},
+        headers=headers,
+    )
+    assert resp.status_code == 422
 
 
 # --- L3 reachability (§4.4) --------------------------------------------------

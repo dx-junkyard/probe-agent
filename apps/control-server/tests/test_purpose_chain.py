@@ -569,15 +569,102 @@ def test_a_frame_derivation_failure_is_unavailable_not_missing(admin_client, tmp
     chain = _chain(admin_client, headers, session_id)
     assert "frame" in chain["degraded_sections"]
     assert "capabilities" in chain["degraded_sections"]
-    # The Brief read itself failed, so `frame_state` reports `unavailable`
-    # even though each individual slot still constructed gracefully as
-    # `unknown` (brief=None is a valid, non-raising input to the element
-    # builders) -- the degraded-section flag is what tells the caller this
-    # `unknown` is not to be trusted the way a genuine "nothing extracted"
-    # `unknown` would be.
+    # The Brief read itself failed. The affected slots and relations must say
+    # unavailable directly; clients must not reinterpret a global degraded
+    # flag to distinguish a read failure from genuinely missing content.
     assert chain["frame_state"] == "unavailable"
-    assert chain["frame"]["desired_change"]["state"] == "unknown"
-    assert chain["frame"]["intervention"]["state"] == "unknown"
+    assert chain["frame"]["desired_change"]["state"] == "unavailable"
+    assert chain["frame"]["intervention"]["state"] == "unavailable"
+    assert chain["frame"]["desired_change"]["missing_information"] == []
+    assert chain["frame"]["intervention"]["missing_information"] == []
+    assert all(relation["status"] == "unavailable" for relation in chain["relations"])
+
+
+def test_intent_read_failure_only_marks_the_intent_slot_unavailable(
+    admin_client, tmp_path, monkeypatch
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Broken Intent")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _set_pain(admin_client, headers, session_id, "読めるはずの課題")
+    _store_understanding(
+        session_id,
+        system_id,
+        snapshot_id,
+        _understanding(
+            vision=[_item("望ましい変化")],
+            system_purpose=[_item("介入")],
+        ),
+    )
+
+    from app import purpose_chain as pc_module
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated intent read failure")
+
+    monkeypatch.setattr(pc_module, "_latest_intent_item", _boom)
+
+    chain = _chain(admin_client, headers, session_id)
+    assert chain["frame"]["beneficiary_problem"]["state"] == "unavailable"
+    assert chain["frame"]["desired_change"]["state"] == "present"
+    assert chain["frame"]["intervention"]["state"] == "present"
+    problem_relation = _relation(
+        chain, "problem_to_change", "beneficiary_problem", "desired_change"
+    )
+    assert problem_relation["status"] == "unavailable"
+
+
+def test_one_frame_slot_projection_failure_does_not_blank_later_slots(
+    admin_client, tmp_path, monkeypatch
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Broken Slot")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _set_pain(admin_client, headers, session_id, "課題")
+    _store_understanding(
+        session_id,
+        system_id,
+        snapshot_id,
+        _understanding(
+            vision=[_item("望ましい変化")],
+            system_purpose=[_item("介入")],
+        ),
+    )
+
+    from app import purpose_chain as pc_module
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated beneficiary projection failure")
+
+    monkeypatch.setattr(pc_module, "_beneficiary_problem_element", _boom)
+
+    chain = _chain(admin_client, headers, session_id)
+    assert chain["frame"]["beneficiary_problem"]["state"] == "unavailable"
+    assert chain["frame"]["desired_change"]["state"] == "present"
+    assert chain["frame"]["intervention"]["state"] == "present"
+    assert chain["degraded_detail"]["frame.beneficiary_problem"].startswith("RuntimeError:")
+
+
+def test_fact_gathering_failure_preserves_independently_readable_intent(
+    admin_client, tmp_path, monkeypatch
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Broken Facts")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _set_pain(admin_client, headers, session_id, "独立して読める課題")
+
+    from app import purpose_chain as pc_module
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated broad fact read failure")
+
+    monkeypatch.setattr(pc_module.interview_workflow, "gather_facts", _boom)
+
+    chain = _chain(admin_client, headers, session_id)
+    assert chain["frame"]["beneficiary_problem"]["state"] == "present"
+    assert chain["frame"]["beneficiary_problem"]["statement"] == "独立して読める課題"
+    assert chain["frame"]["desired_change"]["state"] == "unavailable"
+    assert chain["frame"]["intervention"]["state"] == "unavailable"
 
 
 def test_relation_derivation_failure_still_returns_the_frame(admin_client, tmp_path, monkeypatch):
@@ -710,6 +797,46 @@ def test_changing_an_endpoint_after_confirmation_makes_it_stale_but_keeps_the_de
     # The decision audit fact survives untouched.
     assert rel_after["decision_id"] == decided["decision_id"]
     assert rel_after["decided_by"] == "root"
+
+
+def test_relation_exposes_created_and_current_revision_lineage(admin_client, tmp_path):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Relation Lineage")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    old_goal = _set_goal(admin_client, headers, session_id, "元の変化")
+    understanding_revision_id = _store_understanding(
+        session_id,
+        system_id,
+        snapshot_id,
+        _understanding(system_purpose=[_item("介入")]),
+    )
+
+    chain = _chain(admin_client, headers, session_id)
+    relation = _relation(
+        chain, "change_to_intervention", "desired_change", "intervention"
+    )
+    _decide(admin_client, headers, relation["id"], session_id, "confirmed")
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        decided_chain = purpose_chain.derive_purpose_chain(conn, system_id, session_id)
+    decided_relation = next(r for r in decided_chain.relations if r.id == relation["id"])
+    assert decided_relation.created_intent_revision_id == old_goal["id"]
+    assert decided_relation.created_understanding_revision_id == understanding_revision_id
+    assert decided_relation.created_snapshot_id == snapshot_id
+    assert decided_relation.current_intent_revision_id == old_goal["id"]
+    assert decided_relation.current_understanding_revision_id == understanding_revision_id
+    assert decided_relation.current_snapshot_id == snapshot_id
+
+    new_goal = _correct_intent(admin_client, headers, old_goal["id"], "新しい変化")
+    with get_conn() as conn:
+        refreshed_chain = purpose_chain.derive_purpose_chain(conn, system_id, session_id)
+    refreshed_relation = next(r for r in refreshed_chain.relations if r.id == relation["id"])
+    assert refreshed_relation.created_intent_revision_id == old_goal["id"]
+    assert refreshed_relation.current_intent_revision_id == new_goal["id"]
+    assert refreshed_relation.created_understanding_revision_id == understanding_revision_id
+    assert refreshed_relation.current_understanding_revision_id == understanding_revision_id
 
 
 # --- change propagation table (docs/purpose-chain.md §1.3) -------------------

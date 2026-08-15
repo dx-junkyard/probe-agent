@@ -32,11 +32,12 @@ The two solve different problems:
   6 reserves for a reasoning model. That is `question_router.route_question`,
   untouched by this module.
 
-**`system_researchable` needs never reach the developer as a question.**
+**`system_researchable` needs never reach the developer as a value question.**
 `select_question` (§2.4) only ever returns a `human_judgement` need; a
-`system_researchable` one is surfaced solely as an entry in `routed_needs`
-(informational -- the Dashboard is expected to point at the Joint
-Understanding investigation, not present it as something to answer).
+`system_researchable` one is surfaced as routing information. The HTTP layer
+may expose one such need as an explicit Joint Understanding action when no
+human question remains (or via a deep link), but never with confirm/correct
+controls.
 
 **No LLM call anywhere in this module** (Principle 6) -- every function here
 is a pure function of an already-derived `purpose_chain.PurposeChainResult`
@@ -405,9 +406,19 @@ def derive_needs(chain: "purpose_chain.PurposeChainResult") -> List[PurposeNeed]
                     _mk("decision_criterion_missing", _base_answerability("decision_criterion_missing"))
                 )
 
-    # --- human_value_judgement_required: an element itself is conflicting --
+    # --- human_value_judgement_required: an unlinked element is conflicting --
+    # Linked conflicts are resolved through their canonical relation decision;
+    # emitting a second element need would expose a deep-linkable question
+    # whose confirm/correct action has no Understanding-claim write path.
+    linked_element_ids = {
+        endpoint_id
+        for relation in chain.relations
+        for endpoint_id in (relation.source_id, relation.target_id)
+    }
     for element in chain.elements:
         if element.confirmation != "conflicting":
+            continue
+        if element.id in linked_element_ids:
             continue
         section = "capabilities" if element.kind == "core_capability" else "frame"
         label = element.display_statement or _FRAME_LABELS.get(element.kind, element.kind)
@@ -418,7 +429,11 @@ def derive_needs(chain: "purpose_chain.PurposeChainResult") -> List[PurposeNeed]
                 target_kind="element",
                 target_id=element.id,
                 target_label=label,
-                answerability="unavailable" if section in degraded else "human_judgement",
+                answerability=(
+                    "unavailable"
+                    if section in degraded or "relations" in degraded
+                    else "human_judgement"
+                ),
                 state="available",
                 target_digest=target_digest_for("element", element),
                 source_revision_ids=_revision_ids(element),

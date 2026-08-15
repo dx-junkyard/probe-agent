@@ -124,6 +124,7 @@ __all__ = [
     "confirm_outcome_criterion",
     "link_outcome_criterion",
     "record_outcome_result",
+    "record_outcome_unavailable",
     "list_experience_hypotheses",
     "list_reuse_hypotheses",
     "list_outcome_criteria",
@@ -526,18 +527,78 @@ def record_outcome_result(
         conn.execute(
             """UPDATE purpose_outcome_criterion
                    SET state = ?, human_reported_evidence = ?, human_reported_verdict = ?,
-                       human_reported_at = ?, human_reported_by = ?, is_synthetic = ?
+                       human_reported_at = ?, human_reported_by = ?,
+                       human_reported_state = ?, human_reported_is_synthetic = ?
                  WHERE id = ?""",
-            (state, evidence_text, verdict, now, recorded_by, int(is_synthetic), concept_id),
+            (state, evidence_text, verdict, now, recorded_by, state,
+             int(is_synthetic), concept_id),
         )
     else:
         conn.execute(
             """UPDATE purpose_outcome_criterion
                    SET state = ?, runtime_observation_text = ?, runtime_observation_verdict = ?,
-                       runtime_observed_at = ?, runtime_observed_by = ?, is_synthetic = ?
+                       runtime_observed_at = ?, runtime_observed_by = ?,
+                       runtime_observation_state = ?, runtime_observation_is_synthetic = ?
                  WHERE id = ?""",
-            (state, evidence_text, verdict, now, recorded_by, int(is_synthetic), concept_id),
+            (state, evidence_text, verdict, now, recorded_by, state,
+             int(is_synthetic), concept_id),
         )
+    _refresh_outcome_state(conn, concept_id)
+
+
+def _refresh_outcome_state(conn: sqlite3.Connection, concept_id: int) -> None:
+    """Aggregate source states without allowing the latest write to hide a conflict."""
+    row = conn.execute(
+        """SELECT human_reported_state, runtime_observation_state,
+                  human_reported_is_synthetic, runtime_observation_is_synthetic
+             FROM purpose_outcome_criterion WHERE id = ?""",
+        (concept_id,),
+    ).fetchone()
+    states = {row[0], row[1]} - {None}
+    aggregate_synthetic = int(bool(row[2]) or bool(row[3]))
+    for candidate in ("contradicted", "observed", "not_observed", "not_computed"):
+        if candidate in states:
+            conn.execute(
+                "UPDATE purpose_outcome_criterion SET state = ?, is_synthetic = ? WHERE id = ?",
+                (candidate, aggregate_synthetic, concept_id),
+            )
+            return
+def record_outcome_unavailable(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    session_id: int,
+    concept_id: int,
+    source: str,
+    state: str,
+    reason: str,
+    recorded_by: Optional[str],
+    now: Optional[float] = None,
+) -> None:
+    """Records `not_observed`/`not_computed` as an explicit sourced fact."""
+    _require_row(conn, "purpose_outcome_criterion", system_id, session_id, concept_id)
+    if state not in ("not_observed", "not_computed"):
+        raise ValueError(state)
+    now = time.time() if now is None else now
+    if source == "human_reported":
+        conn.execute(
+            """UPDATE purpose_outcome_criterion
+                  SET state = ?, human_reported_state = ?, human_reported_evidence = ?,
+                      human_reported_verdict = NULL, human_reported_at = ?,
+                      human_reported_by = ?, human_reported_is_synthetic = 0
+                WHERE id = ?""",
+            (state, state, reason, now, recorded_by, concept_id),
+        )
+    else:
+        conn.execute(
+            """UPDATE purpose_outcome_criterion
+                  SET state = ?, runtime_observation_state = ?, runtime_observation_text = ?,
+                      runtime_observation_verdict = NULL, runtime_observed_at = ?,
+                      runtime_observed_by = ?, runtime_observation_is_synthetic = 0
+                WHERE id = ?""",
+            (state, state, reason, now, recorded_by, concept_id),
+        )
+    _refresh_outcome_state(conn, concept_id)
 
 
 # --- §7. Listing -----------------------------------------------------------------

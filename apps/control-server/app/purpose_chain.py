@@ -267,6 +267,16 @@ class PurposeRelation:
     decided_by: Optional[str] = None
     rationale: str = ""
     evidence: List[Dict[str, Any]] = field(default_factory=list)
+    # Revision lineage at the time of the current manual decision, followed by
+    # the revision lineage of the endpoints in this freshly-built projection.
+    # Keeping both makes staleness explainable without asking the client to
+    # join the decision row back to its source elements.
+    created_intent_revision_id: Optional[int] = None
+    created_understanding_revision_id: Optional[int] = None
+    created_snapshot_id: Optional[int] = None
+    current_intent_revision_id: Optional[int] = None
+    current_understanding_revision_id: Optional[int] = None
+    current_snapshot_id: Optional[int] = None
 
 
 @dataclass
@@ -368,6 +378,24 @@ def _unknown_element(
         provenance_label=PROVENANCE_LABELS["ai_hypothesis"],
         source_kind="none",
         missing_information=list(missing_information),
+    )
+
+
+def _unavailable_element(kind: str) -> PurposeElement:
+    """Fail-closed placeholder for a source that could not be read.
+
+    It deliberately carries no ``missing_information``: nothing is known to
+    be missing from the persisted model; this request failed to read it.
+    """
+    return PurposeElement(
+        id=kind,
+        kind=kind,
+        state="unavailable",
+        confirmation="unknown",
+        confirmation_label=CONFIRMATION_LABELS["unknown"],
+        provenance="ai_hypothesis",
+        provenance_label=PROVENANCE_LABELS["ai_hypothesis"],
+        source_kind="none",
     )
 
 
@@ -740,6 +768,12 @@ def _build_relation(
     else:
         provenance = _weaker_provenance(source.provenance, target.provenance)
 
+    current_intent_revision_id = target.intent_revision_id or source.intent_revision_id
+    current_understanding_revision_id = (
+        target.understanding_revision_id or source.understanding_revision_id
+    )
+    current_snapshot_id = target.snapshot_id or source.snapshot_id
+
     return PurposeRelation(
         id=rel_id,
         kind=kind,
@@ -757,6 +791,14 @@ def _build_relation(
         rationale=decision["rationale"] if decision else "",
         # §1.3: evidence carried from the TARGET element, never invented.
         evidence=list(target.evidence),
+        created_intent_revision_id=(decision["intent_revision_id"] if decision else None),
+        created_understanding_revision_id=(
+            decision["understanding_revision_id"] if decision else None
+        ),
+        created_snapshot_id=(decision["snapshot_id"] if decision else None),
+        current_intent_revision_id=current_intent_revision_id,
+        current_understanding_revision_id=current_understanding_revision_id,
+        current_snapshot_id=current_snapshot_id,
     )
 
 
@@ -835,32 +877,80 @@ def derive_purpose_chain(
     degraded_sections: List[str] = []
     degraded_detail: Dict[str, str] = {}
 
-    effective_session_id = (
-        session_id if session_id is not None else _latest_interview_session_id(conn, system_id)
-    )
+    session_resolution_failed = False
+    effective_session_id = session_id
+    if effective_session_id is None:
+        try:
+            effective_session_id = _latest_interview_session_id(conn, system_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            session_resolution_failed = True
+            _degrade(
+                degraded_sections, degraded_detail, "frame", exc,
+                detail_key="frame.session",
+            )
+            _degrade(
+                degraded_sections, degraded_detail, "capabilities", exc,
+                detail_key="capabilities.session",
+            )
 
-    gathered = interview_workflow.gather_facts(conn, system_id, effective_session_id)
-    resolved_session_id = gathered.session["id"] if gathered.session else None
-    snapshot_stale = gathered.snapshot_stale
+    resolved_session_id: Optional[int] = None
+    snapshot_stale = False
+    if not session_resolution_failed:
+        try:
+            gathered = interview_workflow.gather_facts(conn, system_id, effective_session_id)
+            resolved_session_id = gathered.session["id"] if gathered.session else None
+            snapshot_stale = gathered.snapshot_stale
+        except Exception as exc:  # pragma: no cover - defensive
+            # Fact gathering is broader than Purpose Chain (workflow runs,
+            # questions, proposals, etc.). Its failure must not discard an
+            # independently readable Intent item. Recover only the scoped
+            # session identity here; the Brief performs its own guarded read.
+            _degrade(
+                degraded_sections, degraded_detail, "frame", exc,
+                detail_key="frame.facts",
+            )
+            _degrade(
+                degraded_sections, degraded_detail, "capabilities", exc,
+                detail_key="capabilities.facts",
+            )
+            if effective_session_id is not None:
+                try:
+                    row = conn.execute(
+                        "SELECT id FROM interview_session WHERE id = ? AND system_id = ?",
+                        (effective_session_id, system_id),
+                    ).fetchone()
+                    resolved_session_id = row["id"] if row else None
+                except Exception as session_exc:
+                    session_resolution_failed = True
+                    _degrade(
+                        degraded_sections, degraded_detail, "frame", session_exc,
+                        detail_key="frame.session",
+                    )
 
     brief: Optional[Any] = None
-    try:
-        brief = understanding_brief.build_understanding_brief(
-            conn, system_id, effective_session_id, now=now
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        _degrade(degraded_sections, degraded_detail, "frame", exc, detail_key="frame.brief")
-        _degrade(
-            degraded_sections, degraded_detail, "capabilities", exc, detail_key="capabilities.brief"
-        )
+    brief_unavailable = session_resolution_failed
+    if not brief_unavailable:
+        try:
+            brief = understanding_brief.build_understanding_brief(
+                conn, system_id, effective_session_id, now=now
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            brief_unavailable = True
+            _degrade(degraded_sections, degraded_detail, "frame", exc, detail_key="frame.brief")
+            _degrade(
+                degraded_sections, degraded_detail, "capabilities", exc,
+                detail_key="capabilities.brief",
+            )
 
     goal_item: Optional[Dict[str, Any]] = None
     pain_item: Optional[Dict[str, Any]] = None
+    intent_unavailable = session_resolution_failed
     if resolved_session_id is not None:
         try:
             goal_item = _latest_intent_item(conn, resolved_session_id, system_id, "goal")
             pain_item = _latest_intent_item(conn, resolved_session_id, system_id, "pain")
         except Exception as exc:  # pragma: no cover - defensive
+            intent_unavailable = True
             _degrade(degraded_sections, degraded_detail, "frame", exc, detail_key="frame.intent")
 
     understanding_revision_id = getattr(brief, "revision_id", None)
@@ -871,33 +961,62 @@ def derive_purpose_chain(
     intervention_element: Optional[PurposeElement] = None
     additional_intervention: List[PurposeElement] = []
     capability_elements: List[PurposeElement] = []
-    try:
-        beneficiary_element = _beneficiary_problem_element(pain_item)
-        desired_element = _desired_change_element(
-            brief,
-            goal_item,
-            snapshot_id=snapshot_id,
-            understanding_revision_id=understanding_revision_id,
-            snapshot_stale=snapshot_stale,
-        )
-        intervention_element, additional_intervention = _intervention_elements(
-            brief,
-            snapshot_id=snapshot_id,
-            understanding_revision_id=understanding_revision_id,
-            snapshot_stale=snapshot_stale,
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        _degrade(degraded_sections, degraded_detail, "frame", exc)
+    if intent_unavailable:
+        beneficiary_element = _unavailable_element("beneficiary_problem")
+    else:
+        try:
+            beneficiary_element = _beneficiary_problem_element(pain_item)
+        except Exception as exc:  # pragma: no cover - defensive
+            beneficiary_element = _unavailable_element("beneficiary_problem")
+            _degrade(
+                degraded_sections, degraded_detail, "frame", exc,
+                detail_key="frame.beneficiary_problem",
+            )
 
-    try:
-        capability_elements = _capability_elements(
-            brief,
-            snapshot_id=snapshot_id,
-            understanding_revision_id=understanding_revision_id,
-            snapshot_stale=snapshot_stale,
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        _degrade(degraded_sections, degraded_detail, "capabilities", exc)
+    if brief_unavailable:
+        desired_element = _unavailable_element("desired_change")
+        intervention_element = _unavailable_element("intervention")
+    else:
+        try:
+            desired_element = _desired_change_element(
+                brief,
+                goal_item,
+                snapshot_id=snapshot_id,
+                understanding_revision_id=understanding_revision_id,
+                snapshot_stale=snapshot_stale,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            desired_element = _unavailable_element("desired_change")
+            _degrade(
+                degraded_sections, degraded_detail, "frame", exc,
+                detail_key="frame.desired_change",
+            )
+
+        try:
+            intervention_element, additional_intervention = _intervention_elements(
+                brief,
+                snapshot_id=snapshot_id,
+                understanding_revision_id=understanding_revision_id,
+                snapshot_stale=snapshot_stale,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            intervention_element = _unavailable_element("intervention")
+            additional_intervention = []
+            _degrade(
+                degraded_sections, degraded_detail, "frame", exc,
+                detail_key="frame.intervention",
+            )
+
+    if not brief_unavailable:
+        try:
+            capability_elements = _capability_elements(
+                brief,
+                snapshot_id=snapshot_id,
+                understanding_revision_id=understanding_revision_id,
+                snapshot_stale=snapshot_stale,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            _degrade(degraded_sections, degraded_detail, "capabilities", exc)
 
     relations: List[PurposeRelation] = []
     try:
@@ -919,6 +1038,24 @@ def derive_purpose_chain(
                 ),
             )
             relations.append(change_to_intervention)
+
+            # Additional System Purpose claims are still interventions in the
+            # same causal chain. Leaving them unlinked made their conflicts
+            # produce an element-level human need that had no canonical
+            # confirmation path. Give each one the same explicit relation
+            # identity so the existing relation-decision workflow can resolve
+            # it without inventing a second claim-confirmation mechanism.
+            for extra_intervention in additional_intervention:
+                relations.append(
+                    _build_relation(
+                        conn, system_id, resolved_session_id,
+                        "change_to_intervention", desired_element, extra_intervention,
+                        upstream_stale=bool(
+                            problem_to_change is not None
+                            and problem_to_change.recheck_state == "stale"
+                        ),
+                    )
+                )
 
         if intervention_element is not None:
             for capability in capability_elements:

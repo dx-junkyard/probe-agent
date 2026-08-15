@@ -8114,6 +8114,18 @@ class PurposeRelationOut(BaseModel):
     #: Carried from the TARGET element's own evidence. Never invented for the
     #: relation itself (§1.3: 捏造しない).
     evidence: List[Dict[str, Any]] = []
+    #: Revisions captured when the current manual decision was created. They
+    #: remain fixed when an endpoint later changes, making the decision's
+    #: original scope auditable. ``None`` means this relation has no decision.
+    created_intent_revision_id: Optional[int] = None
+    created_understanding_revision_id: Optional[int] = None
+    created_snapshot_id: Optional[int] = None
+    #: Revisions of the endpoints in this freshly-derived projection. Comparing
+    #: these with the captured values above explains which generation the
+    #: relation currently describes without client-side source reconstruction.
+    current_intent_revision_id: Optional[int] = None
+    current_understanding_revision_id: Optional[int] = None
+    current_snapshot_id: Optional[int] = None
 
 
 class PurposeFrameOut(BaseModel):
@@ -8360,6 +8372,9 @@ PurposeOutcomeCriterionState = Literal[
 #: columns, never merged into one "result" -- this is the axis that picks
 #: which column `record_outcome_result` writes to.
 PurposeOutcomeEvidenceSource = Literal["human_reported", "runtime_observed"]
+PurposeOutcomeEvidenceState = Literal[
+    "observed", "contradicted", "not_observed", "not_computed"
+]
 
 #: A recorded verdict is a judgement about the evidence, always the
 #: developer's own reading of it (never computed from the evidence text).
@@ -8470,10 +8485,14 @@ class PurposeOutcomeCriterionOut(BaseModel):
     human_reported_verdict: Optional[PurposeOutcomeVerdict] = None
     human_reported_at: Optional[float] = None
     human_reported_by: Optional[str] = None
+    human_reported_state: Optional[PurposeOutcomeEvidenceState] = None
+    human_reported_is_synthetic: bool = False
     runtime_observation_text: Optional[str] = None
     runtime_observation_verdict: Optional[PurposeOutcomeVerdict] = None
     runtime_observed_at: Optional[float] = None
     runtime_observed_by: Optional[str] = None
+    runtime_observation_state: Optional[PurposeOutcomeEvidenceState] = None
+    runtime_observation_is_synthetic: bool = False
     #: §4.2: "synthetic fixture の結果を実利用者の成果として表示しない" -- the
     #: flag a result write carries, shown alongside the result, never
     #: inferred from where the evidence came from.
@@ -8583,6 +8602,12 @@ class PurposeOutcomeCriterionLinkRequest(BaseModel):
     experiment_id: Optional[int] = None
     candidate_version_id: Optional[int] = None
 
+    @model_validator(mode="after")
+    def exactly_zero_or_one_lineage_target(self):
+        if self.experiment_id is not None and self.candidate_version_id is not None:
+            raise ValueError("Specify at most one of experiment_id or candidate_version_id")
+        return self
+
 
 class PurposeOutcomeResultRequest(BaseModel):
     """Records a result against EXACTLY ONE of the two evidence columns
@@ -8596,3 +8621,14 @@ class PurposeOutcomeResultRequest(BaseModel):
     verdict: PurposeOutcomeVerdict
     evidence_text: str
     is_synthetic: bool = False
+
+
+class PurposeOutcomeUnavailableRequest(BaseModel):
+    """Explicitly records why one evidence source cannot yield a verdict."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: int
+    source: PurposeOutcomeEvidenceSource
+    state: Literal["not_observed", "not_computed"]
+    reason: str

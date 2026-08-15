@@ -79,6 +79,7 @@ import type {
   PurposeResponseKind,
   PurposeVerificationPromptOut, PurposeVerificationConceptKind,
   PurposeExperienceHypothesisOut, PurposeReuseHypothesisOut, PurposeOutcomeCriterionOut,
+  PurposeVerificationStateOut, PurposeOutcomeEvidenceSource, PurposeOutcomeVerdict,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -3457,7 +3458,7 @@ export function usePurposeChain(sessionId: number | null) {
       api.get<PurposeChainOut>(
         sessionId ? `/purpose-chain?session_id=${sessionId}` : "/purpose-chain",
       ),
-    enabled: !!getSystemId(),
+    enabled: !!getSystemId() && sessionId != null,
   });
 }
 
@@ -3479,7 +3480,7 @@ export function usePurposeNextQuestion(sessionId: number | null, needId?: string
         `/purpose-chain/next-question${qs ? `?${qs}` : ""}`,
       );
     },
-    enabled: !!getSystemId(),
+    enabled: !!getSystemId() && sessionId != null,
   });
 }
 
@@ -3568,7 +3569,74 @@ export function usePurposeVerificationPrompt(sessionId: number | null) {
         `/purpose-chain/verification-prompt${qs}`,
       );
     },
-    enabled: !!getSystemId(),
+    enabled: !!getSystemId() && sessionId != null,
+  });
+}
+
+export function usePurposeVerificationState(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("purposeVerificationState"), sessionId],
+    queryFn: () => api.get<PurposeVerificationStateOut>(
+      `/purpose-chain/verification?session_id=${sessionId}`,
+    ),
+    enabled: !!getSystemId() && sessionId != null,
+  });
+}
+
+function _invalidatePurposeVerification(qc: ReturnType<typeof useQueryClient>, sessionId: number | null) {
+  qc.invalidateQueries({ queryKey: [...sysKey("purposeVerificationState"), sessionId] });
+  qc.invalidateQueries({ queryKey: [...sysKey("purposeVerificationPrompt"), sessionId] });
+  _invalidatePurposeChain(qc, sessionId);
+}
+
+export function useConfirmVerificationConcept(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ kind, id }: { kind: PurposeVerificationConceptKind; id: number }) => {
+      const segment = kind === "experience_hypothesis" ? "experience-hypotheses"
+        : kind === "reuse_hypothesis" ? "reuse-hypotheses" : "outcome-criteria";
+      return api.post(`/${"purpose-chain"}/${segment}/${id}/confirm`, { session_id: sessionId });
+    },
+    onSuccess: () => _invalidatePurposeVerification(qc, sessionId),
+  });
+}
+
+export function useLinkOutcomeCriterion(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, experimentId, candidateVersionId }: { id: number; experimentId?: number; candidateVersionId?: number }) =>
+      api.post(`/purpose-chain/outcome-criteria/${id}/link`, {
+        session_id: sessionId,
+        experiment_id: experimentId ?? null,
+        candidate_version_id: candidateVersionId ?? null,
+      }),
+    onSuccess: () => _invalidatePurposeVerification(qc, sessionId),
+  });
+}
+
+export function useRecordOutcomeResult(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, source, verdict, evidenceText, isSynthetic }: {
+      id: number; source: PurposeOutcomeEvidenceSource; verdict: PurposeOutcomeVerdict;
+      evidenceText: string; isSynthetic: boolean;
+    }) => api.post(`/purpose-chain/outcome-criteria/${id}/result`, {
+      session_id: sessionId, source, verdict, evidence_text: evidenceText, is_synthetic: isSynthetic,
+    }),
+    onSuccess: () => _invalidatePurposeVerification(qc, sessionId),
+  });
+}
+
+export function useRecordOutcomeUnavailable(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, source, state, reason }: {
+      id: number; source: PurposeOutcomeEvidenceSource;
+      state: "not_observed" | "not_computed"; reason: string;
+    }) => api.post(`/purpose-chain/outcome-criteria/${id}/unavailable`, {
+      session_id: sessionId, source, state, reason,
+    }),
+    onSuccess: () => _invalidatePurposeVerification(qc, sessionId),
   });
 }
 
@@ -3598,8 +3666,7 @@ export function useCreateVerificationConcept(sessionId: number | null) {
         session_id: sessionId, need_id: needId, ...fields,
       }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: [...sysKey("purposeVerificationPrompt"), sessionId] });
-      _invalidatePurposeChain(qc, sessionId);
+      _invalidatePurposeVerification(qc, sessionId);
     },
   });
 }

@@ -242,14 +242,15 @@ def _respond(client, headers, need_id, session_id, response_kind, value_text="",
     return r.json() if expect < 400 else r
 
 
-def test_no_question_when_frame_is_complete_and_relations_confirmed(admin_client, tmp_path):
+def test_researchable_need_is_returned_as_routing_action_when_no_human_question_remains(admin_client, tmp_path):
     token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs Complete")
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
     _set_pain(admin_client, headers, session_id, "課題")
     _set_goal(admin_client, headers, session_id, "変化")
     _store_understanding(
-        session_id, system_id, snapshot_id, _understanding(system_purpose=[_item("目的")])
+        session_id, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("目的")], core_capabilities=[_item("機能")]),
     )
     chain = _chain(admin_client, headers, session_id)
     for kind in ("problem_to_change", "change_to_intervention"):
@@ -257,7 +258,27 @@ def test_no_question_when_frame_is_complete_and_relations_confirmed(admin_client
         _decide(admin_client, headers, rel["id"], session_id, "confirmed")
 
     question = _question(admin_client, headers, session_id)
-    assert question is None
+    assert question is not None
+    assert question["need_code"] == "capability_justification_missing"
+    assert question["answerability"] == "system_researchable"
+
+
+def test_researchable_need_deep_link_is_reachable_without_becoming_a_human_question(
+    admin_client, tmp_path
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs Routed Deep Link")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _set_pain(admin_client, headers, session_id, "課題")
+    _set_goal(admin_client, headers, session_id, "変化")
+    # intervention remains absent, so a human question and a researchable
+    # frame_missing need coexist. The explicit routed deep link must reach the
+    # latter instead of silently falling back to the human question.
+    need_id = "frame_missing:intervention"
+    question = _question(admin_client, headers, session_id, need_id=need_id)
+    assert question is not None
+    assert question["need_id"] == need_id
+    assert question["answerability"] == "system_researchable"
 
 
 def test_frame_missing_beneficiary_problem_is_the_next_question_when_nothing_is_set(
@@ -375,12 +396,11 @@ def test_relation_correct_rejects_the_relation(admin_client, tmp_path):
     assert rel_after["status"] == "conflicting"
 
 
-def test_ai_candidate_never_becomes_confirmed_without_an_explicit_response(
+def test_duplicate_element_conflict_deep_link_falls_back_without_confirming_claim(
     admin_client, tmp_path
 ):
-    """§2.8: a `suggested_answer` is never adopted automatically -- it is
-    only ever surfaced. Confirming still requires the developer's own
-    `respond` call."""
+    """A linked claim conflict uses its decidable relation, never a second
+    element-level confirmation mechanism."""
     token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs Suggest")
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
@@ -397,10 +417,9 @@ def test_ai_candidate_never_becomes_confirmed_without_an_explicit_response(
 
     question = _question(admin_client, headers, session_id, need_id=need_id)
     assert question is not None
-    assert question["need_id"] == need_id
-    assert question["suggested_answer"] is not None
-    assert question["suggested_answer"]["text"] == capability["display_statement"]
-    assert question["suggested_answer"]["is_mock"] is False
+    assert question["need_id"] != need_id
+    assert question["need_code"] == "relation_conflict"
+    assert question["fallback_reason"] == "resolved"
 
     # Nothing was written by the GET.
     after = _chain(admin_client, headers, session_id)
@@ -435,20 +454,14 @@ def test_an_element_conflict_that_a_relation_already_reports_is_asked_once(
     assert question["need_code"] == "relation_conflict"
 
 
-def test_a_conflicting_additional_intervention_is_asked_as_a_human_judgement(
+def test_a_conflicting_additional_intervention_uses_a_decidable_relation(
     admin_client, tmp_path
 ):
-    """The case that makes `human_value_judgement_required` a priority row.
-
-    The 2nd+ `system_purpose` claim is an ADDITIONAL `intervention` element and
-    `purpose_chain` builds no relation for it, so a conflict there has no
-    relation to surface through. Without a row of its own the need would be
-    derived, would block a judgement only the developer can make, and would
-    never once be offered.
-    """
+    """Additional Purpose claims are linked and use the relation workflow."""
     token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs HVJ Extra")
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
+    _set_goal(admin_client, headers, session_id, "望ましい変化")
     _store_understanding(
         session_id, system_id, snapshot_id,
         _understanding(
@@ -458,18 +471,49 @@ def test_a_conflicting_additional_intervention_is_asked_as_a_human_judgement(
     chain = _chain(admin_client, headers, session_id)
     additional = _by_kind(chain, "intervention")[1]
     assert additional["confirmation"] == "conflicting"
-    assert not [
+    extra_relations = [
         r
         for r in chain["relations"]
         if additional["id"] in (r["source_id"], r["target_id"])
-    ], "an additional intervention has no relation -- that is why this row exists"
+    ]
+    assert len(extra_relations) == 1
+    assert extra_relations[0]["kind"] == "change_to_intervention"
 
     question = _question(admin_client, headers, session_id)
     assert question is not None
-    assert question["need_code"] == "human_value_judgement_required"
-    assert question["target_id"] == additional["id"]
+    assert question["need_code"] == "relation_conflict"
+    assert question["target_id"] == extra_relations[0]["id"]
     assert question["answerability"] == "human_judgement"
-    assert question["rule_row"] == _RULE_ROW["human_value_judgement_required"]
+    assert question["rule_row"] == _RULE_ROW["relation_conflict"]
+
+    response = _respond(
+        admin_client, headers, question["need_id"], session_id, "confirm"
+    )
+    assert response["linked_relation_decision_id"] is not None
+
+
+def test_response_rejects_settled_or_misrouted_need_actions(admin_client, tmp_path):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs Guard")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    human_need = "frame_missing:beneficiary_problem"
+    _respond(admin_client, headers, human_need, session_id, "defer")
+    repeated = _respond(
+        admin_client, headers, human_need, session_id, "defer", expect=409
+    )
+    assert repeated.json()["detail"]["code"] == "purpose_need_not_available"
+
+    research_need = "frame_missing:intervention"
+    rejected = _respond(
+        admin_client, headers, research_need, session_id, "unknown", expect=422
+    )
+    assert rejected.json()["detail"]["code"] == "purpose_need_requires_research"
+    routed = _respond(
+        admin_client, headers, research_need, session_id, "investigate"
+    )
+    assert routed["response_kind"] == "investigate"
+    assert routed["linked_joint_session_id"] is not None
 
 
 def test_a_degraded_section_never_produces_a_guessed_question(admin_client, tmp_path, monkeypatch):
@@ -490,6 +534,32 @@ def test_a_degraded_section_never_produces_a_guessed_question(admin_client, tmp_
     if question is not None:
         assert question["answerability"] != "unavailable"
         assert not (question["need_code"] == "frame_missing" and question["target_id"] == "beneficiary_problem")
+
+
+def test_relation_failure_does_not_expose_an_unresolvable_element_question(
+    admin_client, tmp_path, monkeypatch
+):
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs Broken Relations")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _set_goal(admin_client, headers, session_id, "変化")
+    _store_understanding(
+        session_id, system_id, snapshot_id,
+        _understanding(
+            system_purpose=[_item("目的")],
+            core_capabilities=[_item("競合する機能", level="conflicting")],
+        ),
+    )
+
+    from app import purpose_chain as pc_module
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated relation failure")
+
+    monkeypatch.setattr(pc_module, "_build_relation", _boom)
+    question = _question(admin_client, headers, session_id)
+    if question is not None:
+        assert question["need_code"] != "human_value_judgement_required"
 
 
 def test_defer_persists_and_the_need_does_not_reappear_until_changed(admin_client, tmp_path):

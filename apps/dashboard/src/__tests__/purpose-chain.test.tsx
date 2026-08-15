@@ -31,7 +31,7 @@ import { PurposeFrameCard, purposeInterviewHref } from "@/components/purpose-cha
 // including the `mockApi` this mock factory closes over.
 import type {
   OverviewOut, PurposeChainOut, PurposeElementOut, PurposeQuestionOut, PurposeRelationOut,
-  PurposeVerificationPromptOut,
+  PurposeVerificationPromptOut, PurposeVerificationStateOut, PurposeOutcomeCriterionOut,
 } from "@/api/types";
 
 // ── fixtures ─────────────────────────────────────────────────────────────
@@ -71,6 +71,12 @@ function relation(overrides: Partial<PurposeRelationOut> & { id: string; kind: P
     decided_by: null,
     rationale: "",
     evidence: [],
+    created_intent_revision_id: null,
+    created_understanding_revision_id: null,
+    created_snapshot_id: null,
+    current_intent_revision_id: null,
+    current_understanding_revision_id: null,
+    current_snapshot_id: null,
     ...overrides,
   };
 }
@@ -339,6 +345,12 @@ describe("PurposeFrameCard (Overview Level 0, §3.1)", () => {
     expect(purposeInterviewHref(null)).toBe("/interview");
   });
 
+  test("a system-researchable need is labeled as a routing action", () => {
+    const q = question({ answerability: "system_researchable" });
+    wrap(<PurposeFrameCard overview={overview()} question={q} questionState="ready" />);
+    expect(screen.getByTestId("overview-purpose-question-cta")).toHaveTextContent("調査を依頼する");
+  });
+
   // State 11: 部分 API 失敗 (loading / error are distinct, and the whole card
   // degrades separately from a per-question failure)
   test("state 11a: loading the question is a distinct render from 'no question'", () => {
@@ -413,6 +425,11 @@ function panelWrapper() {
   );
 }
 
+const emptyVerification = (sessionId = 7): PurposeVerificationStateOut => ({
+  system_id: 1, session_id: sessionId,
+  experience_hypotheses: [], outcome_criteria: [], reuse_hypotheses: [],
+});
+
 function mockChainAndQuestion(c: PurposeChainOut | null, q: PurposeQuestionOut | null) {
   mockApi.get.mockImplementation((path: string) => {
     if (path.startsWith("/purpose-chain/next-question")) return Promise.resolve(q);
@@ -422,6 +439,7 @@ function mockChainAndQuestion(c: PurposeChainOut | null, q: PurposeQuestionOut |
     // rather than accidentally receiving the CHAIN object as if it were a
     // prompt (both paths start with `/purpose-chain`).
     if (path.startsWith("/purpose-chain/verification-prompt")) return Promise.resolve(null);
+    if (path.startsWith("/purpose-chain/verification?")) return Promise.resolve(emptyVerification());
     if (path.startsWith("/purpose-chain")) return Promise.resolve(c);
     return Promise.resolve(null);
   });
@@ -435,6 +453,7 @@ function mockChainAndQuestionAndVerification(
   mockApi.get.mockImplementation((path: string) => {
     if (path.startsWith("/purpose-chain/next-question")) return Promise.resolve(q);
     if (path.startsWith("/purpose-chain/verification-prompt")) return Promise.resolve(prompt);
+    if (path.startsWith("/purpose-chain/verification?")) return Promise.resolve(emptyVerification());
     if (path.startsWith("/purpose-chain")) return Promise.resolve(c);
     return Promise.resolve(null);
   });
@@ -579,13 +598,30 @@ describe("PurposeFramePanel (Interview Level 1, §3.2)", () => {
     expect(within(block).getByTestId(`purpose-need-correct-${q.need_id}`)).toBeInTheDocument();
   });
 
-  test("state 8: correct / unknown / defer are each a separate recorded response kind, and the request carries no rationale field", async () => {
+  test("state 8: correct / unknown / investigate / defer are separate response kinds and defer impact is visible", async () => {
     const c = chain();
     const q = question({ target_kind: "element", target_id: "desired_change" });
     mockChainAndQuestion(c, q);
     mockApi.post.mockResolvedValue({});
     await renderPanel({ sessionId: 7 });
     await screen.findByTestId("purpose-frame-panel");
+
+    expect(screen.getByText(`保留した場合: ${q.defer_impact}`)).toBeInTheDocument();
+
+    // `unknown` records that the developer does not know; it does not get
+    // silently promoted to an explicit investigation request.
+    fireEvent.click(screen.getByTestId(`purpose-need-unknown-${q.need_id}`));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      `/purpose-chain/needs/${encodeURIComponent(q.need_id)}/respond`,
+      { session_id: 7, response_kind: "unknown", value_text: "" },
+    ));
+
+    // `investigate` is independently selectable and independently audited.
+    fireEvent.click(screen.getByTestId(`purpose-need-investigate-${q.need_id}`));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      `/purpose-chain/needs/${encodeURIComponent(q.need_id)}/respond`,
+      { session_id: 7, response_kind: "investigate", value_text: "" },
+    ));
 
     // `defer`
     fireEvent.click(screen.getByTestId(`purpose-need-defer-${q.need_id}`));
@@ -661,7 +697,30 @@ describe("PurposeFramePanel (Interview Level 1, §3.2)", () => {
     fireEvent.click(within(block).getByTestId(`purpose-need-investigate-${q.need_id}`));
     await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
       `/purpose-chain/needs/${encodeURIComponent(q.need_id)}/respond`,
-      { session_id: 7, response_kind: "unknown", value_text: "" },
+      { session_id: 7, response_kind: "investigate", value_text: "" },
+    ));
+  });
+
+  test("a routed research need remains actionable beside the single human question", async () => {
+    const c = chain();
+    const routedNeed = {
+      need_id: "frame_missing:intervention",
+      need_code: "frame_missing" as const,
+      target_kind: "element" as const,
+      target_id: "intervention",
+      target_label: "システムの介入",
+    };
+    const q = question({ routed_needs: [routedNeed] });
+    mockChainAndQuestion(c, q);
+    mockApi.post.mockResolvedValue({});
+    await renderPanel({ sessionId: 7 });
+    await screen.findByTestId("purpose-frame-panel");
+
+    expect(screen.getAllByTestId(/^purpose-need-/)).not.toHaveLength(0);
+    fireEvent.click(screen.getByTestId(`purpose-routed-investigate-${routedNeed.need_id}`));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      `/purpose-chain/needs/${encodeURIComponent(routedNeed.need_id)}/respond`,
+      { session_id: 7, response_kind: "investigate", value_text: "" },
     ));
   });
 
@@ -712,6 +771,27 @@ describe("PurposeFramePanel (Interview Level 1, §3.2)", () => {
     await renderPanel({ sessionId: 7 });
     expect(await screen.findByTestId("purpose-frame-degraded")).toHaveTextContent("relations");
   });
+
+  test("question fetch failure is explicit and source revisions remain reachable", async () => {
+    const c = chain({ frame: {
+      ...chain().frame,
+      desired_change: element({
+        id: "desired_change", kind: "desired_change", statement: "変化",
+        intent_revision_id: 12, understanding_revision_id: 8, snapshot_id: 4,
+      }),
+    } });
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/purpose-chain/next-question")) return Promise.reject(new Error("boom"));
+      if (path.startsWith("/purpose-chain/verification-prompt")) return Promise.resolve(null);
+      if (path.startsWith("/purpose-chain/verification?")) return Promise.resolve(emptyVerification());
+      return Promise.resolve(c);
+    });
+    await renderPanel({ sessionId: 7 });
+    expect(await screen.findByTestId("purpose-question-error")).toBeInTheDocument();
+    expect(screen.getByTestId("purpose-element-revisions-desired_change")).toHaveTextContent("Intent 12 Understanding 8 Snapshot 4");
+    expect(screen.getByRole("heading", { level: 2, name: /Purpose Chain/ })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 3, name: /望ましい変化/ })).toBeInTheDocument();
+  });
 });
 
 // ── §4.5 検証条件 (Experience/Outcome/Reuse, Issue #391) ───────────────────
@@ -730,6 +810,23 @@ function verificationPrompt(
     why_now: "現在の next action や改善評価は、この関係が仮説のままでは判断できません。",
     blocked_decision: "次に何をすべきかの判断、および改善の評価。",
     observation_hint: "何を測るか・今の値・目指す値・観測期間を、それぞれ一言で書いてください。",
+    ...overrides,
+  };
+}
+
+function outcomeCriterion(overrides: Partial<PurposeOutcomeCriterionOut> = {}): PurposeOutcomeCriterionOut {
+  return {
+    id: 31, system_id: 1, session_id: 7, target_kind: "relation", target_id: "r1",
+    target_label: "課題 → 変化", target_digest: "digest", source_need_id: "need",
+    source_need_code: "decision_criterion_missing", measure: "理解できた割合",
+    baseline_value: "0%", target_value: "80%", observation_window: "30秒",
+    state: "proposed", experiment_id: null, candidate_version_id: null, lineage_state: "none",
+    human_reported_evidence: null, human_reported_verdict: null, human_reported_at: null,
+    human_reported_by: null, human_reported_state: null, human_reported_is_synthetic: false,
+    runtime_observation_text: "fixture", runtime_observation_verdict: "supports",
+    runtime_observed_at: 1, runtime_observed_by: "root", runtime_observation_state: "observed",
+    runtime_observation_is_synthetic: true, is_synthetic: true, decision_method: "manual",
+    created_by: "root", created_at: 1, confirmed_by: null, confirmed_at: null,
     ...overrides,
   };
 }
@@ -822,5 +919,52 @@ describe("VerificationPromptSection (§4.5, Issue #391)", () => {
     const [path, body] = mockApi.post.mock.calls[0];
     expect(path).toBe("/purpose-chain/needs/decision_criterion_missing%3Ar1/respond");
     expect(body).toMatchObject({ session_id: 7, response_kind: "defer" });
+  });
+
+  test("recorded outcomes show source-scoped state/synthetic provenance and expose lifecycle actions", async () => {
+    const state = emptyVerification();
+    state.outcome_criteria = [outcomeCriterion()];
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/purpose-chain/next-question")) return Promise.resolve(null);
+      if (path.startsWith("/purpose-chain/verification-prompt")) return Promise.resolve(null);
+      if (path.startsWith("/purpose-chain/verification?")) return Promise.resolve(state);
+      if (path.startsWith("/purpose-chain")) return Promise.resolve(chain());
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue(outcomeCriterion({ state: "confirmed" }));
+    await renderPanel({ sessionId: 7 });
+    const card = await screen.findByTestId("purpose-outcome-31");
+    expect(card).toHaveTextContent("runtime観測: 観測済み（synthetic fixture）");
+
+    fireEvent.click(within(card).getByRole("button", { name: "検証条件を確認する" }));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/purpose-chain/outcome-criteria/31/confirm", { session_id: 7 },
+    ));
+
+    fireEvent.change(within(card).getByLabelText("Experiment ID"), { target: { value: "9" } });
+    fireEvent.click(within(card).getByRole("button", { name: "改善候補へ接続する" }));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/purpose-chain/outcome-criteria/31/link",
+      { session_id: 7, experiment_id: 9, candidate_version_id: null },
+    ));
+
+    fireEvent.change(within(card).getByTestId("purpose-outcome-evidence-31"), { target: { value: "analyticsなし" } });
+    fireEvent.click(within(card).getByRole("button", { name: "未観測として記録" }));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/purpose-chain/outcome-criteria/31/unavailable",
+      { session_id: 7, source: "human_reported", state: "not_observed", reason: "analyticsなし" },
+    ));
+  });
+
+  test("verification prompt fetch failure is not rendered as 'not needed'", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/purpose-chain/next-question")) return Promise.resolve(null);
+      if (path.startsWith("/purpose-chain/verification-prompt")) return Promise.reject(new Error("boom"));
+      if (path.startsWith("/purpose-chain/verification?")) return Promise.resolve(emptyVerification());
+      return Promise.resolve(chain());
+    });
+    await renderPanel({ sessionId: 7 });
+    expect(await screen.findByTestId("purpose-verification-error")).toBeInTheDocument();
+    expect(screen.queryByTestId("purpose-verification-none")).not.toBeInTheDocument();
   });
 });

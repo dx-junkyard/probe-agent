@@ -4763,10 +4763,16 @@ CREATE TABLE IF NOT EXISTS purpose_outcome_criterion (
     human_reported_verdict       TEXT CHECK (human_reported_verdict IN ('supports', 'contradicts')),
     human_reported_at            REAL,
     human_reported_by            TEXT,
+    human_reported_state         TEXT CHECK (human_reported_state IN
+                                        ('observed', 'contradicted', 'not_observed', 'not_computed')),
+    human_reported_is_synthetic  INTEGER NOT NULL DEFAULT 0,
     runtime_observation_text     TEXT,
     runtime_observation_verdict  TEXT CHECK (runtime_observation_verdict IN ('supports', 'contradicts')),
     runtime_observed_at          REAL,
     runtime_observed_by          TEXT,
+    runtime_observation_state    TEXT CHECK (runtime_observation_state IN
+                                        ('observed', 'contradicted', 'not_observed', 'not_computed')),
+    runtime_observation_is_synthetic INTEGER NOT NULL DEFAULT 0,
     is_synthetic                 INTEGER NOT NULL DEFAULT 0,
     decision_method               TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
     created_by                    TEXT,
@@ -5900,6 +5906,20 @@ def init_db() -> None:
             columns = _columns(conn, table)
             if columns:
                 _add_column_if_missing(conn, table, columns, "redaction_json", "TEXT")
+        # Issue #391 review: evidence provenance is source-specific.  A single
+        # synthetic/state bit cannot describe a human report and a runtime
+        # observation when both exist on the same criterion.
+        outcome_columns = _columns(conn, "purpose_outcome_criterion")
+        if outcome_columns:
+            for column, definition in (
+                ("human_reported_state", "TEXT"),
+                ("human_reported_is_synthetic", "INTEGER NOT NULL DEFAULT 0"),
+                ("runtime_observation_state", "TEXT"),
+                ("runtime_observation_is_synthetic", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                _add_column_if_missing(
+                    conn, "purpose_outcome_criterion", outcome_columns, column, definition
+                )
         _migrate_alignment_manual_recheck_targets(conn)
         _ensure_legacy_system(conn)
     _validate_startup_environment()

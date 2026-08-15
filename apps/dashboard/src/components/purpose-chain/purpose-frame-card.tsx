@@ -115,7 +115,7 @@ export function PurposeFrameCard({ overview, question, questionState }: PurposeF
                         出所を出さないことも同じ欠落で、#387 UX原則8 と Epic の
                         受け入れ条件「AI 候補と developer-confirmed intent を
                         混同しない」は Level 0 でも満たす必要がある。 */}
-                    <p className="ml-4 mt-1 flex flex-wrap items-center gap-1.5">
+                    <div className="ml-4 mt-1 flex flex-wrap items-center gap-1.5">
                       <Badge variant="outline" className="font-normal">
                         <span className="sr-only">確認状態: </span>
                         {element!.confirmation_label}
@@ -124,7 +124,7 @@ export function PurposeFrameCard({ overview, question, questionState }: PurposeF
                         <span className="sr-only">出所: </span>
                         {element!.provenance_label}
                       </Badge>
-                    </p>
+                    </div>
                   </>
                 )}
               </li>
@@ -161,7 +161,9 @@ export function PurposeFrameCard({ overview, question, questionState }: PurposeF
               data-testid="overview-purpose-question-cta"
               aria-describedby={`overview-purpose-question-why-${question.need_id}`}
             >
-              1つの質問に答える
+              {question.answerability === "system_researchable"
+                ? "調査を依頼する"
+                : "1つの質問に答える"}
             </Link>
           </div>
         ) : (

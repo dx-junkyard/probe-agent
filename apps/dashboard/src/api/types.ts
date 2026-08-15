@@ -5249,6 +5249,12 @@ export interface PurposeRelationOut {
   /** Carried from the TARGET element's own evidence. Never invented for the
    * relation itself. */
   evidence: Record<string, unknown>[];
+  created_intent_revision_id: number | null;
+  created_understanding_revision_id: number | null;
+  created_snapshot_id: number | null;
+  current_intent_revision_id: number | null;
+  current_understanding_revision_id: number | null;
+  current_snapshot_id: number | null;
 }
 
 export interface PurposeFrameOut {
@@ -5452,6 +5458,8 @@ export type PurposeOutcomeCriterionState =
  * reported evidence and runtime observation stay in separate columns,
  * never merged into one "result"). */
 export type PurposeOutcomeEvidenceSource = "human_reported" | "runtime_observed";
+export type PurposeOutcomeEvidenceState =
+  | "observed" | "contradicted" | "not_observed" | "not_computed";
 
 /** A recorded verdict is always the developer's OWN reading of the
  * evidence -- never computed from the evidence text itself. */
@@ -5541,10 +5549,14 @@ export interface PurposeOutcomeCriterionOut {
   human_reported_verdict: PurposeOutcomeVerdict | null;
   human_reported_at: number | null;
   human_reported_by: string | null;
+  human_reported_state: PurposeOutcomeEvidenceState | null;
+  human_reported_is_synthetic: boolean;
   runtime_observation_text: string | null;
   runtime_observation_verdict: PurposeOutcomeVerdict | null;
   runtime_observed_at: number | null;
   runtime_observed_by: string | null;
+  runtime_observation_state: PurposeOutcomeEvidenceState | null;
+  runtime_observation_is_synthetic: boolean;
   /** §4.2: a synthetic fixture's result is never displayed as a real user's
    * outcome -- this flag must be shown alongside the result. */
   is_synthetic: boolean;
@@ -5620,4 +5632,11 @@ export interface PurposeOutcomeResultRequest {
   verdict: PurposeOutcomeVerdict;
   evidence_text: string;
   is_synthetic?: boolean;
+}
+
+export interface PurposeOutcomeUnavailableRequest {
+  session_id: number;
+  source: PurposeOutcomeEvidenceSource;
+  state: "not_observed" | "not_computed";
+  reason: string;
 }
