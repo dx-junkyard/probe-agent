@@ -70,14 +70,15 @@ Two design decisions the spec text leaves open, made explicitly here
    including a `core_capability` or a non-frame-slot `intervention` claim)
    whose `confirmation == "conflicting"`. This deliberately overlaps with
    `relation_conflict` for a frame-slot element (whose relation would already
-   read `conflicting` too, per `purpose_chain._relation_status` rule 3) --
-   the overlap is harmless because `select_question` never picks
-   `human_value_judgement_required` (it carries no row in the priority
-   table, see `PRIORITY_TABLE`) and it is reachable only through an explicit
-   `need_id` deep link. It is NOT redundant for an ADDITIONAL `intervention`
-   element (the 2nd+ `system_purpose` claim, `purpose_chain._intervention_elements`)
-   -- those never get a relation built at all, so an element-level conflict
-   there has no other way to surface as a need.
+   read `conflicting` too, per `purpose_chain._relation_status` rule 3); the
+   overlap costs nothing because `PRIORITY_TABLE` is first-match and the
+   relation conflict sits above it, so the developer is asked once. It is NOT
+   redundant for an ADDITIONAL `intervention` element (the 2nd+
+   `system_purpose` claim, `purpose_chain._intervention_elements`) -- those
+   never get a relation built at all, so an element-level conflict there has
+   no other way to surface as a need, which is exactly why this code carries a
+   priority row of its own rather than waiting for a deep link that nothing
+   would ever generate.
 
 probe-agent:
   role: Deterministic derivation of adaptive Purpose Chain follow-up
@@ -95,7 +96,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, get_args
 
 from . import purpose_chain
@@ -143,17 +144,28 @@ TARGET_KINDS: Tuple[str, ...] = get_args(PurposeNeedTargetKind)
 #: ("need_code の定義順") never actually discriminates between two DIFFERENT
 #: codes at the same row -- it only ever needs to break ties between two
 #: instances of the SAME code, which the third key (`need_id`, lexicographic)
-#: always does deterministically. `human_value_judgement_required` has
-#: deliberately NO row here (design decision 2 above): `select_question`
-#: never returns it; it is reachable only via `resolve_need`'s explicit
-#: `need_id` deep link.
+#: always does deterministically.
+#:
+#: `human_value_judgement_required` sits at row 2, immediately below the
+#: relation conflict it usually duplicates. Leaving it out of the table (so
+#: that it could only ever be reached through an explicit `need_id` deep link)
+#: looked harmless because a frame-slot or Capability element's conflict also
+#: makes its relation `conflicting`, which row 1 already asks about. But an
+#: ADDITIONAL `intervention` element -- the 2nd+ `system_purpose` claim --
+#: never gets a relation built at all, so for that element the conflict had NO
+#: path to the developer whatsoever: a need that exists, blocks a human-only
+#: judgement, and is never asked is indistinguishable from one that was never
+#: derived. First-match keeps the duplicate case honest: when the same subject
+#: also produced a relation conflict, row 1 wins and the developer is asked
+#: once.
 PRIORITY_TABLE: Tuple[Tuple[int, str], ...] = (
     (1, "relation_conflict"),
-    (2, "frame_missing"),
-    (3, "decision_criterion_missing"),
-    (4, "premise_recheck_required"),
-    (5, "relation_unknown"),
-    (6, "capability_justification_missing"),
+    (2, "human_value_judgement_required"),
+    (3, "frame_missing"),
+    (4, "decision_criterion_missing"),
+    (5, "premise_recheck_required"),
+    (6, "relation_unknown"),
+    (7, "capability_justification_missing"),
 )
 
 #: Fixed Japanese labels for the 3 frame slots (§0 invariant: UI copy is

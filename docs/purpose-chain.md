@@ -315,12 +315,20 @@ confirmed Intent 行があるとき。`unavailable` は対象 section が degrad
 **0 または 1 件**。優先順 (first match):
 
 1. 現在の安全な判断を止める `relation_conflict`
-2. 最小 Purpose Frame を成立させる human-only `frame_missing`
-3. 現在の next action / 改善評価を止める `decision_criterion_missing`
-4. stale になった確認済み前提 `premise_recheck_required`
-5. 下流 Capability の重要 relation `relation_unknown`
-6. `capability_justification_missing`
-7. それ以外 → 質問なし
+2. relation を持たない要素自体の矛盾 `human_value_judgement_required`
+3. 最小 Purpose Frame を成立させる human-only `frame_missing`
+4. 現在の next action / 改善評価を止める `decision_criterion_missing`
+5. stale になった確認済み前提 `premise_recheck_required`
+6. 下流 Capability の重要 relation `relation_unknown`
+7. `capability_justification_missing`
+8. それ以外 → 質問なし
+
+**全 need code が行を持つ。** 行を持たない code は明示的な `need_id` deep link
+でしか到達できないが、システムが提示しない質問への link は誰も生成しないので、
+「導出され、判断を止め、一度も聞かれない」need になる。これは導出しないのと
+区別できない。2 行目が典型例で、2 件目以降の `intervention` 要素には relation が
+作られないため、その矛盾は relation 経由では表に出ない。重複する場合は
+first-match により上位の行だけが質問になる (同じ対象を二度聞かない)。
 
 同順位は `(rule_row, need_code の定義順, need_id)` で決定的に解決する。LLM の
 自由 score も client heuristic も使わない。`answerability != human_judgement` の

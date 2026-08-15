@@ -41,6 +41,12 @@ from app.purpose_needs import (
     select_question,
 )
 
+#: Assert against the table rather than a literal row number: the row is an
+#: audit record of which rule matched, and inserting a rule above another one
+#: is a legitimate change that should not have to be chased through unrelated
+#: assertions.
+_RULE_ROW = {code: row for row, code in PRIORITY_TABLE}
+
 from test_purpose_chain import (  # noqa: F401  (reuse the same HTTP fixtures)
     _by_kind,
     _chain,
@@ -85,13 +91,24 @@ def _need(**overrides) -> PurposeNeed:
     return PurposeNeed(**base)
 
 
-def test_all_need_codes_are_reachable_in_the_priority_table_or_by_deep_link():
-    """Every one of the 7 need codes (§2.2) is either in `PRIORITY_TABLE`
-    (reachable via `select_question`) or explicitly reachable only via
-    `need_id` (`human_value_judgement_required`, design decision 2)."""
+def test_every_need_code_can_actually_become_a_question():
+    """All 7 need codes (§2.2) carry a `PRIORITY_TABLE` row.
+
+    A need code with no row can only ever be reached by an explicit `need_id`
+    deep link -- and nothing generates a link to a question the system never
+    offers, so such a need would be derived, would block a decision, and would
+    never be asked. That is indistinguishable from not deriving it at all,
+    which is why `human_value_judgement_required` is a row rather than a
+    deep-link-only value (see `PRIORITY_TABLE`'s comment).
+    """
     table_codes = {code for _, code in PRIORITY_TABLE}
-    assert table_codes | {"human_value_judgement_required"} == set(NEED_CODES)
-    assert len(PRIORITY_TABLE) == 6
+    assert table_codes == set(NEED_CODES)
+    assert len(PRIORITY_TABLE) == len(NEED_CODES)
+    # The rows are 1..N with no gaps and no duplicates: `rule_row` is an audit
+    # record of WHICH row matched, so it has to be a stable, dense index.
+    assert sorted(row for row, _ in PRIORITY_TABLE) == list(
+        range(1, len(PRIORITY_TABLE) + 1)
+    )
 
 
 def test_select_question_never_returns_a_system_researchable_need():
@@ -255,7 +272,7 @@ def test_frame_missing_beneficiary_problem_is_the_next_question_when_nothing_is_
     assert question["need_code"] == "frame_missing"
     assert question["target_id"] == "beneficiary_problem"
     assert question["answerability"] == "human_judgement"
-    assert question["rule_row"] == 2
+    assert question["rule_row"] == _RULE_ROW["frame_missing"]
     assert question["suggested_answer"] is None  # nothing exists to suggest
 
 
@@ -391,9 +408,18 @@ def test_ai_candidate_never_becomes_confirmed_without_an_explicit_response(
     assert after_capability["confirmation"] == "conflicting"
 
 
-def test_human_value_judgement_required_is_never_the_selected_question(admin_client, tmp_path):
-    """Design decision 2: `select_question` never picks this code on its
-    own (no priority row) -- it is reachable only by deep link."""
+def test_an_element_conflict_that_a_relation_already_reports_is_asked_once(
+    admin_client, tmp_path
+):
+    """A conflicting Capability derives BOTH needs, and the developer sees one.
+
+    The element's own conflict propagates into its `intervention_to_capability`
+    relation (`purpose_chain._relation_status` rule 3), so both
+    `relation_conflict` and `human_value_judgement_required` exist as derived
+    facts. `PRIORITY_TABLE` is first-match and the relation conflict sits
+    above, so exactly one question reaches the screen -- deriving both is
+    correct, asking both would be two questions about one subject.
+    """
     token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs HVJ")
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
@@ -406,7 +432,44 @@ def test_human_value_judgement_required_is_never_the_selected_question(admin_cli
     )
     question = _question(admin_client, headers, session_id)
     assert question is not None
-    assert question["need_code"] != "human_value_judgement_required"
+    assert question["need_code"] == "relation_conflict"
+
+
+def test_a_conflicting_additional_intervention_is_asked_as_a_human_judgement(
+    admin_client, tmp_path
+):
+    """The case that makes `human_value_judgement_required` a priority row.
+
+    The 2nd+ `system_purpose` claim is an ADDITIONAL `intervention` element and
+    `purpose_chain` builds no relation for it, so a conflict there has no
+    relation to surface through. Without a row of its own the need would be
+    derived, would block a judgement only the developer can make, and would
+    never once be offered.
+    """
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "System Needs HVJ Extra")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    _store_understanding(
+        session_id, system_id, snapshot_id,
+        _understanding(
+            system_purpose=[_item("主たる目的"), _item("競合する目的", level="conflicting")],
+        ),
+    )
+    chain = _chain(admin_client, headers, session_id)
+    additional = _by_kind(chain, "intervention")[1]
+    assert additional["confirmation"] == "conflicting"
+    assert not [
+        r
+        for r in chain["relations"]
+        if additional["id"] in (r["source_id"], r["target_id"])
+    ], "an additional intervention has no relation -- that is why this row exists"
+
+    question = _question(admin_client, headers, session_id)
+    assert question is not None
+    assert question["need_code"] == "human_value_judgement_required"
+    assert question["target_id"] == additional["id"]
+    assert question["answerability"] == "human_judgement"
+    assert question["rule_row"] == _RULE_ROW["human_value_judgement_required"]
 
 
 def test_a_degraded_section_never_produces_a_guessed_question(admin_client, tmp_path, monkeypatch):
