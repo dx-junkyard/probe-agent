@@ -1,4 +1,4 @@
-import { useOverview } from "@/api/hooks";
+import { useOverview, usePurposeNextQuestion } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -7,6 +7,7 @@ import { LoopRailCard, NextActionCard } from "@/components/overview/next-action"
 import { RuntimeHealthCard } from "@/components/overview/runtime-health";
 import { SystemBriefCard } from "@/components/overview/system-brief";
 import { targetHref } from "@/components/overview/display";
+import { PurposeFrameCard } from "@/components/purpose-chain/purpose-frame-card";
 import { formatTimestamp } from "@/lib/utils";
 import type { OverviewOut, OverviewSnapshotFreshness } from "@/api/types";
 
@@ -34,6 +35,20 @@ export default function OverviewPage() {
   const { systems, systemId } = useAuth();
   const { data: overview, isLoading, isError, refetch } = useOverview();
   const system = systems.find((s) => s.id === systemId);
+
+  // Issue #390: the Purpose Frame's single next question. `GET /overview`
+  // carries the Purpose Chain projection but no question -- this is a
+  // second, small query, kept at PAGE level (not inside `PurposeFrameCard`)
+  // so the card stays a props-only display component like every other
+  // Overview card (`overview.test.tsx`'s convention: cards take props, only
+  // the page calls queries).
+  const purposeSessionId = overview?.purpose_chain?.session_id ?? overview?.interview_session_id ?? null;
+  const purposeQuestionQuery = usePurposeNextQuestion(purposeSessionId);
+  const purposeQuestionState: "loading" | "error" | "ready" = purposeQuestionQuery.isLoading
+    ? "loading"
+    : purposeQuestionQuery.isError
+      ? "error"
+      : "ready";
 
   // Zero Systems is not a state the System-scoped endpoint can be asked about,
   // so it is answered here. It uses the same finite action vocabulary
@@ -146,6 +161,18 @@ export default function OverviewPage() {
           </CardContent>
         </Card>
       )}
+
+      {/* Issue #390 §3.1: the Purpose Frame leads the main column, above
+          System Brief -- the Epic's question 「何のためのシステムか」 must be
+          answerable before the rest of the page. It reuses the SAME rows
+          System Brief renders (Vision/System Purpose/Core Capabilities),
+          adding relation + lineage on top, so it is not a second summary --
+          it is the causal read of the same claims. */}
+      <PurposeFrameCard
+        overview={overview}
+        question={purposeQuestionQuery.data ?? null}
+        questionState={purposeQuestionState}
+      />
 
       {/* Desktop: the Brief holds the main area and everything else sits in the
           ADJACENT column — the arrangement #384 explicitly allows, and the one

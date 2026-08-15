@@ -4965,7 +4965,13 @@ export type OverviewLoopStage =
 
 export type OverviewLoopStageStatus = "reached" | "current" | "future";
 
-export type OverviewSection = "brief" | "findings" | "next_action" | "loop" | "runtime";
+export type OverviewSection =
+  | "brief"
+  | "findings"
+  | "next_action"
+  | "loop"
+  | "runtime"
+  | "purpose_chain";
 
 export interface OverviewTargetOut {
   route: string;
@@ -5078,4 +5084,332 @@ export interface OverviewOut {
   runtime: OverviewRuntimeHealthOut | null;
   degraded_sections: OverviewSection[];
   degraded_detail: Record<string, string>;
+  /** The canonical Purpose Frame / Purpose Chain (#388), reused verbatim.
+   * `null` only when its own guarded loader failed -- see `purpose_chain`
+   * in `degraded_sections`, never a synonym for "not derived yet". */
+  purpose_chain?: PurposeChainOut | null;
+}
+
+// --- Purpose Chain (Issue #387 Epic / #388 / #390) --------------------------
+//
+// `docs/purpose-chain.md` is the canonical design contract; §0 and §1 are the
+// server specification this mirrors. Two rules carry over unchanged from the
+// server (`app/models.py`'s own comment) and bind the Dashboard too:
+//
+// 1. **No new understanding model.** Every element/relation below reuses
+//    `UnderstandingConfirmationState` / `UnderstandingProvenanceKind`
+//    VERBATIM -- Purpose Chain adds relation + lineage on top of the exact
+//    same `understanding_brief` / Intent Brief rows the Overview System Brief
+//    and the Interview's Understanding Brief already render. This file must
+//    never define a second 確認状態/出所 vocabulary for the same claims.
+// 2. **Finite sets only, exact-name identity only.** Every union below is
+//    `test_interview_type_parity.py`'s `FINITE_TYPE_NAMES`-checked against
+//    the matching server `Literal` in `app/models.py`. No similarity/
+//    embedding/keyword join connects an element or a relation on this side
+//    either (Principle 6) -- the server has already decided identity by the
+//    time any of this reaches the Dashboard.
+
+/** The four Purpose Frame element kinds. Only three occupy the minimal
+ * Purpose Frame (`beneficiary_problem` / `desired_change` / `intervention`);
+ * `core_capability` elements hang off `intervention` via
+ * `intervention_to_capability` relations but are never a frame slot. */
+export type PurposeElementKind =
+  | "beneficiary_problem"
+  | "desired_change"
+  | "intervention"
+  | "core_capability";
+
+/** Whether an element's SOURCE ROW could be read and had content -- three
+ * values because "the row was read; nothing is there yet" (`unknown`) and
+ * "the read itself failed" (`unavailable`) are different facts and must
+ * never render as the same sentence (the same split #380 made for
+ * `OverviewFindingsState`). */
+export type PurposeElementState = "present" | "unknown" | "unavailable";
+
+/** The three fixed relation kinds of the minimal chain. Outcome-lineage
+ * relations (#391) are a later, separate addition -- do not add a 4th value
+ * here for them ahead of that issue. */
+export type PurposeRelationKind =
+  | "problem_to_change"
+  | "change_to_intervention"
+  | "intervention_to_capability";
+
+/** A relation's status, first-match over its endpoints and its current
+ * decision (server: `purpose_chain.derive_purpose_chain`). `unknown` is a
+ * genuine fifth value, not folded into `hypothesis`: "the connection cannot
+ * be explained because an endpoint has no content" is a different fact from
+ * "the connection is an unconfirmed guess". */
+export type PurposeRelationStatus =
+  | "confirmed"
+  | "hypothesis"
+  | "conflicting"
+  | "unknown"
+  | "unavailable";
+
+/** Whether a relation's DECISION still matches its endpoints' current
+ * content -- independent of `status`: a stale confirmed decision reads as
+ * `hypothesis` (status) while `recheck_state` explains *why*. The decision
+ * row itself is never deleted or overwritten. */
+export type PurposeRecheckState = "current" | "stale";
+
+/** Why a relation went stale. `upstream_changed` exists because staleness
+ * propagates exactly one direction (downstream) through the fixed chain;
+ * `snapshot_changed` is the one reason that comes from an ELEMENT's
+ * `evidence_stale` rather than from a captured decision digest mismatch. */
+export type PurposeStaleReason =
+  | "source_changed"
+  | "target_changed"
+  | "both_changed"
+  | "upstream_changed"
+  | "snapshot_changed";
+
+/** 「今の判断に使えるか」, first-match over an element's own settledness and
+ * its PRIMARY relation's status -- never a count, never an average
+ * (`frame_resolution_level` is the 3-slot MIN, never a mean or a
+ * percentage). `L3` needs an Outcome Criterion (#391) and is structurally
+ * unreachable until that lands. */
+export type PurposeResolutionLevel = "L0" | "L1" | "L2" | "L3";
+
+/** Which existing table an element's content came from. `none` is a genuine
+ * value (no row exists yet), not the absence of the field. */
+export type PurposeSourceKind = "intent_item" | "understanding_claim" | "none";
+
+/** The Purpose Frame's overall completeness, first-match over the 3 frame
+ * slots' `state`. `unavailable` is reserved for a guarded-loader failure
+ * while constructing a frame slot -- never for "nothing extracted yet"
+ * (that is `empty`). */
+export type PurposeFrameState = "complete" | "partial" | "empty" | "unavailable";
+
+/** Which composed section of the Purpose Chain failed to derive. A guarded
+ * loader records the section here and degrades ONLY that section -- a
+ * relation-derivation failure must still return the frame. */
+export type PurposeChainSection = "frame" | "relations" | "capabilities";
+
+export interface PurposeElementOut {
+  /** Stable across rebuilds: the bare kind for a frame-slot singleton, or
+   * `kind + ":" + sha256(name)[:16]` for a kind that can repeat
+   * (`core_capability`, and any `intervention` claim beyond the frame
+   * slot). Never a row id -- a row id is reassigned on every rebuild while
+   * describing the same element. */
+  id: string;
+  kind: PurposeElementKind;
+  state: PurposeElementState;
+  /** Level 0's 1〜2 文. The server never truncates; the Dashboard decides
+   * how much of this to show. */
+  display_statement: string;
+  /** The element's full text (claim name + summary, or an Intent Brief
+   * item's `value_text`). */
+  statement: string;
+  confirmation: UnderstandingConfirmationState;
+  confirmation_label: string;
+  provenance: UnderstandingProvenanceKind;
+  provenance_label: string;
+  resolution_level: PurposeResolutionLevel;
+  source_kind: PurposeSourceKind;
+  source_ids: string[];
+  intent_revision_id: number | null;
+  understanding_revision_id: number | null;
+  snapshot_id: number | null;
+  evidence: Record<string, unknown>[];
+  /** Can only be `true` for a `provenance == "implementation_fact"`
+   * element -- an Intent-sourced or AI-hypothesis element has no snapshot
+   * pin to go stale against. */
+  evidence_stale: boolean;
+  /** Fixed sentences naming what is missing, only populated when
+   * `state == "unknown"`. Never model output (Principle 6). */
+  missing_information: string[];
+  is_mock: boolean;
+}
+
+export interface PurposeRelationOut {
+  /** `f"{kind}:{source_id}->{target_id}"` -- stable because both endpoint
+   * ids are themselves stable. */
+  id: string;
+  kind: PurposeRelationKind;
+  source_id: string;
+  target_id: string;
+  status: PurposeRelationStatus;
+  status_label: string;
+  recheck_state: PurposeRecheckState;
+  stale_reason: PurposeStaleReason | null;
+  provenance: UnderstandingProvenanceKind;
+  provenance_label: string;
+  /** The current (non-superseded) `purpose_relation_decision` row, if any. */
+  decision_id: number | null;
+  decided_at: number | null;
+  decided_by: string | null;
+  rationale: string;
+  /** Carried from the TARGET element's own evidence. Never invented for the
+   * relation itself. */
+  evidence: Record<string, unknown>[];
+}
+
+export interface PurposeFrameOut {
+  beneficiary_problem: PurposeElementOut | null;
+  desired_change: PurposeElementOut | null;
+  intervention: PurposeElementOut | null;
+}
+
+export interface PurposeChainOut {
+  system_id: number;
+  session_id: number | null;
+  generated_at: number;
+  frame: PurposeFrameOut;
+  /** The frame's 3 elements plus any additional `intervention` claims and
+   * every `core_capability` claim. */
+  elements: PurposeElementOut[];
+  relations: PurposeRelationOut[];
+  /** The 3 frame slots' resolution level, MIN (never mean/percentage). */
+  frame_resolution_level: PurposeResolutionLevel;
+  frame_state: PurposeFrameState;
+  snapshot_id: number | null;
+  understanding_revision_id: number | null;
+  understanding_confirmed_at: number | null;
+  degraded_sections: PurposeChainSection[];
+  degraded_detail: Record<string, string>;
+}
+
+/** The one write `POST /purpose-chain/relations/{relation_id}/decision`
+ * performs. `decision_method` is always `manual` server-side -- there is no
+ * field here for the caller to set it to anything else. */
+export interface PurposeRelationDecisionRequest {
+  session_id: number;
+  decision: "confirmed" | "rejected";
+  rationale?: string;
+}
+
+// --- Issue #389 need/question contract --------------------------------------
+//
+// Pinned in `docs/purpose-chain.md` §2 and binding for both #389 (server) and
+// #390 (this Dashboard) regardless of implementation order -- #390's own
+// component tests mock `fetch` directly, so they do not depend on the server
+// module landing first. `app/purpose_needs.py` is the server-side owner.
+
+/** Which need code fired. "Optional field is empty" is never a need code --
+ * every value here is derived deterministically from the Purpose Chain
+ * projection (an element `unknown`, a relation `unknown`/`conflicting`/
+ * stale, etc.), never from a free-text absence check. */
+export type PurposeNeedCode =
+  | "frame_missing"
+  | "relation_unknown"
+  | "relation_conflict"
+  | "capability_justification_missing"
+  | "decision_criterion_missing"
+  | "human_value_judgement_required"
+  | "premise_recheck_required";
+
+/** need code -> answerability is a FIXED table server-side, not the #286
+ * free-text question router -- a system-generated need's answerability is
+ * structurally known at creation, never guessed. `system_researchable` means
+ * the Dashboard must never render a text-answer form for it: the need is
+ * routed to investigation instead (§2.3). */
+export type PurposeAnswerability =
+  | "human_judgement"
+  | "system_researchable"
+  | "already_answered"
+  | "unavailable";
+
+export type PurposeNeedState = "available" | "waiting" | "answered" | "deferred" | "unavailable";
+
+/** What a `POST .../respond` call records. `unknown` and `investigate` both
+ * route to investigation but are audited as separate response kinds (§2.6). */
+export type PurposeResponseKind = "confirm" | "correct" | "unknown" | "defer" | "investigate";
+
+/** Why a deep-linked `need_id` could not be shown as-is. A deep link must
+ * degrade SAFELY to the current question (or "no question"), never to an
+ * error page -- the need it named may have been answered, may belong to
+ * another System, or may since have been deferred. */
+export type PurposeQuestionFallbackReason = "resolved" | "not_found" | "other_system" | "deferred";
+
+export type PurposeNeedTargetKind = "element" | "relation";
+
+/** An existing-row-only candidate answer. Never LLM-generated at this call
+ * (§2.5: 根拠が無ければ候補を作らない, ここで LLM を呼ばない). */
+export interface PurposeSuggestedAnswerOut {
+  text: string;
+  provenance: UnderstandingProvenanceKind;
+  source_kind: PurposeSourceKind;
+  source_ids: string[];
+  is_mock: boolean;
+}
+
+/** One `system_researchable` need alongside the selected question (§2.4).
+ * Informational only -- a routed need never reaches the developer as a
+ * question itself; the Dashboard may use this to point at the Joint
+ * Understanding investigation expected to answer it instead. */
+export interface PurposeRoutedNeedOut {
+  need_id: string;
+  need_code: PurposeNeedCode;
+  target_kind: PurposeNeedTargetKind;
+  target_id: string;
+  target_label: string;
+}
+
+/** `GET /purpose-chain/next-question`. At most ONE question -- the server's
+ * `select_question` rule table (§2.4) returns 0 or 1, never a list, and the
+ * Dashboard must not assemble a second one from any other source. */
+export interface PurposeQuestionOut {
+  need_id: string;
+  need_code: PurposeNeedCode;
+  /** 1-6, the `select_question` priority-table row that chose this need.
+   * `null` when reached only via an explicit `need_id` deep link to a need
+   * `select_question` never picks on its own. */
+  rule_row: number | null;
+  prompt: string;
+  why_now: string;
+  blocked_decision: string;
+  unlocks: string;
+  defer_impact: string;
+  target_kind: PurposeNeedTargetKind;
+  target_id: string;
+  target_label: string;
+  answerability: PurposeAnswerability;
+  suggested_answer: PurposeSuggestedAnswerOut | null;
+  state: PurposeNeedState;
+  source_revision_ids: number[];
+  fallback_reason: PurposeQuestionFallbackReason | null;
+  routed_needs: PurposeRoutedNeedOut[];
+}
+
+/** `POST /purpose-chain/needs/{need_id}/respond`. Mirrors the
+ * `purpose_need_response` audit row (§2.6) -- confirm/correct/unknown/defer/
+ * investigate are separately audited facts, never collapsed into one. */
+export interface PurposeNeedResponseOut {
+  id: number;
+  session_id: number;
+  system_id: number;
+  need_id: string;
+  need_code: PurposeNeedCode;
+  response_kind: PurposeResponseKind;
+  value_text: string;
+  target_kind: PurposeNeedTargetKind;
+  target_id: string;
+  /** The target's digest AT RESPONSE TIME -- what a `defer` reappears
+   * against once it no longer matches (§2.6). */
+  target_digest: string;
+  decision_method: string;
+  responded_by: string | null;
+  /** Set when `confirm`/`correct` was reused through the EXISTING Intent
+   * Brief confirm/correct/create implementation (never a second
+   * revision-chain implementation). */
+  linked_intent_item_id: number | null;
+  /** Set when `confirm`/`correct` was reused through
+   * `purpose_chain.record_relation_decision`. */
+  linked_relation_decision_id: number | null;
+  /** Set when `unknown`/`investigate` opened a Joint Understanding session
+   * with `trigger='purpose_need'`. */
+  linked_joint_session_id: number | null;
+  superseded_by_id: number | null;
+  created_at: number;
+}
+
+/** `decision_method` is always `manual` server-side -- there is no field
+ * here for the caller to set it to anything else, and (unlike the relation
+ * decision request) there is no `rationale` field: a `correct` response's
+ * free text IS `value_text`, whether it is a corrected value (an element
+ * target) or a rejection reason (a relation target). */
+export interface PurposeNeedRespondRequest {
+  session_id: number;
+  response_kind: PurposeResponseKind;
+  value_text?: string;
 }

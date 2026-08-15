@@ -63,6 +63,7 @@ import { JointUnderstandingPanel } from "@/components/system-understanding/joint
 import { findOpenJointSession } from "@/components/system-understanding/joint-understanding-entry";
 import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
 import { InterviewMetricsPanel } from "@/components/system-understanding/interview-metrics-panel";
+import { PurposeFramePanel } from "@/components/purpose-chain/purpose-frame-panel";
 // Issue #356: インタビュー・コックピット。全体像 (完成度・理解の全体マップ・
 // 未解決事項・Q&A 進捗) と、選択項目の修正方法を 1 画面で把握できるようにする。
 // 集約と状態判定は `cockpit/model.ts` の純粋関数にあり、ここでは既存のデータ
@@ -2319,6 +2320,24 @@ export default function InterviewPage() {
       }
     />
   ) : null;
+
+  // Issue #390 §3.2 の Purpose Chain Level 1。Brief と同じ「全体像」領域に、
+  // Brief の直後だけへ置く。
+  //
+  // 全幅で 2 カラムの外(状態サマリーの下)へ置くと、#358 が実測で詰めた
+  // 「状態ごとの主作業面を 1280x720 の初期ビューポートへ入れる」制約を
+  // その場で壊す -- 主作業面の上端がカード 1 枚ぶん押し下がるためで、
+  // これは見た目の問題ではなく、#358 が回帰として固定した測定可能な契約
+  // (roadmap 20)。Purpose Frame が読むのは Brief と同じ Vision / System
+  // Purpose / Core Capabilities の行であり、因果順に読み直したものなので、
+  // 主作業面より前ではなく全体像の一部として Brief の直後に並ぶのが正しい。
+  const purposeFramePanel = session ? (
+    <PurposeFramePanel
+      sessionId={selectedSessionId}
+      initialNeedId={searchParams.get("purpose_need")}
+    />
+  ) : null;
+
   // 位置の判断は `cockpit/layout.ts` の純粋関数に閉じ込める (全状態ぶんを
   // 単体で検証できるようにするため)。
   const briefLeads = briefLeadsMainColumn(wState);
@@ -2595,7 +2614,12 @@ export default function InterviewPage() {
                     対象で、`W2` の主操作「この理解で進む」も同じカードにある
                     (#351 / 原則 P2)。この 2 状態でだけ Brief が主作業面の
                     位置に立つ。 */}
-                {briefLeads && understandingBriefPanel}
+                {briefLeads && (
+                  <>
+                    {understandingBriefPanel}
+                    {purposeFramePanel}
+                  </>
+                )}
 
                 {showAlignmentWork && (
                 <div className="space-y-4" data-testid="work-surface-W4">
@@ -3235,6 +3259,7 @@ git commit`}
                   `W1` / `W2` では Brief が主作業面の位置に立っているので、
                   ここには全体マップだけが残る (同じカードを 2 枚描かない)。 */}
               {!briefLeads && understandingBriefPanel}
+              {!briefLeads && purposeFramePanel}
 
               {/* Issue #356 §3 / Issue #363 — 理解の全体マップ。カード選択は
                   詳細・修正ペインを切り替えるだけで、ワークフロー状態には
