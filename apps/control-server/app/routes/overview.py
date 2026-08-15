@@ -50,6 +50,7 @@ from ..models import (
     OverviewOut,
     OverviewRuntimeHealthOut,
     OverviewTargetOut,
+    PurposeChainOut,
     UnderstandingBriefOut,
 )
 
@@ -161,4 +162,13 @@ def get_overview(system_id: int = Depends(get_system_id)) -> OverviewOut:
         ),
         degraded_sections=result.degraded_sections,
         degraded_detail=result.degraded_detail,
+        # The Purpose Chain (#388) is composed, not re-derived: the same
+        # dataclass-field-name-matches-model-field-name trick the Brief
+        # embedding above uses, since `PurposeChainResult`'s own fields
+        # (including `system_id`) already match `PurposeChainOut`'s.
+        purpose_chain=(
+            PurposeChainOut(**asdict(result.purpose_chain))
+            if result.purpose_chain is not None
+            else None
+        ),
     )

@@ -7777,7 +7777,9 @@ OverviewLoopStageStatus = Literal["reached", "current", "future"]
 
 #: Which composed section could not be built. A partial failure degrades one
 #: section; it never blanks the screen (#384).
-OverviewSection = Literal["brief", "findings", "next_action", "loop", "runtime"]
+OverviewSection = Literal[
+    "brief", "findings", "next_action", "loop", "runtime", "purpose_chain"
+]
 
 
 class OverviewTargetOut(BaseModel):
@@ -7940,3 +7942,194 @@ class OverviewOut(BaseModel):
     #: Sections whose derivation failed. The rest still render (#384).
     degraded_sections: List[OverviewSection] = []
     degraded_detail: Dict[str, str] = {}
+    #: The canonical Purpose Frame / Purpose Chain (#388), reused verbatim.
+    #: `None` only when its own guarded loader failed -- see `purpose_chain`
+    #: in `degraded_sections`.
+    purpose_chain: Optional["PurposeChainOut"] = None
+
+
+# --- Purpose Chain (Issue #387 Epic / #388) -----------------------------------
+#
+# docs/purpose-chain.md is the canonical design contract; §0 and §1 are the
+# specification this module implements. Two things §0 makes non-negotiable:
+#
+# 1. **No new understanding model.** `desired_change` IS
+#    `understanding_brief.BriefResult.vision`; `intervention` IS its
+#    `system_purpose` claims; Capabilities ARE its `core_capabilities` claims.
+#    `beneficiary_problem` is the Intent Brief `pain` field read the same way
+#    Understanding Brief already reads `goal` for Vision. Purpose Chain adds
+#    RELATION and LINEAGE on top of these existing rows -- it does not
+#    reclassify a claim's 確認状態/出所, which is why every element reuses
+#    `UnderstandingConfirmationState` / `UnderstandingProvenanceKind` and their
+#    existing label dicts rather than defining a second vocabulary.
+# 2. **Finite sets only, exact-name identity only.** Every vocabulary below is
+#    a `Literal` defined exactly once, mirrored into `app/purpose_chain.py`
+#    with `get_args`. No similarity/embedding/keyword join connects an element
+#    or a relation -- `understanding_diff`'s exact-name rule is the only
+#    identity rule in play.
+
+#: The four Purpose Frame element kinds. Only three (`beneficiary_problem`,
+#: `desired_change`, `intervention`) occupy the minimal Purpose Frame;
+#: `core_capability` elements hang off `intervention` via
+#: `intervention_to_capability` relations but are never part of the frame
+#: itself (§1.2/§1.6).
+PurposeElementKind = Literal[
+    "beneficiary_problem", "desired_change", "intervention", "core_capability"
+]
+
+#: Whether an element's SOURCE ROW could be read and had content. Three
+#: values, not two, for the same reason #380 split `unavailable` out of
+#: `not_built`: `unknown` (the row was read; there is nothing there yet -- a
+#: fact about the developer/system) and `unavailable` (the read itself failed
+#: -- a fact about THIS request) must never render as the same sentence.
+PurposeElementState = Literal["present", "unknown", "unavailable"]
+
+#: The three fixed relation kinds of the minimal chain (§0 diagram). Outcome
+#: lineage relations (#391) are a later, separate addition.
+PurposeRelationKind = Literal[
+    "problem_to_change", "change_to_intervention", "intervention_to_capability"
+]
+
+#: A relation's status, first-match over its endpoints and its current
+#: decision (`purpose_chain.derive_purpose_chain`). `unknown` is a genuine
+#: fifth value (not folded into `hypothesis`): "the connection cannot be
+#: explained because an endpoint has no content" is a different fact from "the
+#: connection is an unconfirmed guess", and #389's `relation_unknown` need
+#: depends on being able to tell them apart.
+PurposeRelationStatus = Literal["confirmed", "hypothesis", "conflicting", "unknown", "unavailable"]
+
+#: Whether a relation's DECISION still matches its endpoints' current content.
+#: Independent of `status`: a stale confirmed decision reads as `hypothesis`
+#: (status) while `recheck_state` explains *why* it can no longer be trusted
+#: as-is, and the decision row itself is never deleted or overwritten (§1.5).
+PurposeRecheckState = Literal["current", "stale"]
+
+#: Why a relation went stale. `upstream_changed` exists because staleness
+#: propagates exactly one direction (downstream) through the fixed chain --
+#: `snapshot_changed` is the one reason that comes from an ELEMENT's
+#: `evidence_stale` rather than from a captured decision digest comparing
+#: unequal.
+PurposeStaleReason = Literal[
+    "source_changed", "target_changed", "both_changed", "upstream_changed", "snapshot_changed"
+]
+
+#: 「今の判断に使えるか」, first-match over an element's own settledness and its
+#: PRIMARY relation's status -- never a count, never an average (§1.4:
+#: `frame_resolution_level` is the 3-slot MIN, explicitly not a mean or a
+#: percentage). `L3` needs an Outcome Criterion (#391) and is structurally
+#: unreachable until that lands; `purpose_chain.py` documents why rather than
+#: silently never emitting it.
+PurposeResolutionLevel = Literal["L0", "L1", "L2", "L3"]
+
+#: Which existing table an element's content came from. `none` is a genuine
+#: value (no row exists yet), not the absence of the field.
+PurposeSourceKind = Literal["intent_item", "understanding_claim", "none"]
+
+#: The Purpose Frame's overall completeness, first-match over the 3 frame
+#: slots' `state`. `unavailable` is reserved for a guarded-loader failure
+#: while constructing a frame slot -- never for "nothing extracted yet"
+#: (that is `empty`).
+PurposeFrameState = Literal["complete", "partial", "empty", "unavailable"]
+
+#: Which composed section of the Purpose Chain failed to derive. A guarded
+#: loader records the section here and degrades ONLY that section -- the
+#: #380 discipline (§0 invariant 6): a relation-derivation failure must still
+#: return the frame.
+PurposeChainSection = Literal["frame", "relations", "capabilities"]
+
+
+class PurposeElementOut(BaseModel):
+    #: Stable across rebuilds: the bare kind for a frame-slot singleton
+    #: (`"desired_change"`), or `kind + ":" + sha256(name)[:16]` for a kind
+    #: that can repeat (`core_capability`, and any `intervention` claim beyond
+    #: the frame slot). Never derived from a row id -- a row id is reassigned
+    #: on every rebuild while describing the same element (#380's rule,
+    #: applied here).
+    id: str
+    kind: PurposeElementKind
+    state: PurposeElementState
+    #: Level 0's 1〜2 文. The server never truncates; the Dashboard decides
+    #: how much of this to show.
+    display_statement: str = ""
+    #: The element's full text (claim name + summary, or an Intent Brief
+    #: item's `value_text`).
+    statement: str = ""
+    confirmation: UnderstandingConfirmationState
+    confirmation_label: str
+    provenance: UnderstandingProvenanceKind
+    provenance_label: str
+    resolution_level: PurposeResolutionLevel = "L0"
+    source_kind: PurposeSourceKind = "none"
+    source_ids: List[str] = []
+    intent_revision_id: Optional[int] = None
+    understanding_revision_id: Optional[int] = None
+    snapshot_id: Optional[int] = None
+    evidence: List[Dict[str, Any]] = []
+    #: Can only be `True` for a `provenance == "implementation_fact"`
+    #: element -- an Intent-sourced or AI-hypothesis element has no snapshot
+    #: pin to go stale against.
+    evidence_stale: bool = False
+    #: Fixed sentences naming what is missing, only populated when
+    #: `state == "unknown"`. Never model output (Principle 6).
+    missing_information: List[str] = []
+    is_mock: bool = False
+
+
+class PurposeRelationOut(BaseModel):
+    #: `f"{kind}:{source_id}->{target_id}"` -- stable because both endpoint
+    #: ids are themselves stable (never a row id).
+    id: str
+    kind: PurposeRelationKind
+    source_id: str
+    target_id: str
+    status: PurposeRelationStatus
+    status_label: str
+    recheck_state: PurposeRecheckState
+    stale_reason: Optional[PurposeStaleReason] = None
+    provenance: UnderstandingProvenanceKind
+    provenance_label: str
+    #: The current (non-superseded) `purpose_relation_decision` row, if any.
+    decision_id: Optional[int] = None
+    decided_at: Optional[float] = None
+    decided_by: Optional[str] = None
+    rationale: str = ""
+    #: Carried from the TARGET element's own evidence. Never invented for the
+    #: relation itself (§1.3: 捏造しない).
+    evidence: List[Dict[str, Any]] = []
+
+
+class PurposeFrameOut(BaseModel):
+    beneficiary_problem: Optional[PurposeElementOut] = None
+    desired_change: Optional[PurposeElementOut] = None
+    intervention: Optional[PurposeElementOut] = None
+
+
+class PurposeChainOut(BaseModel):
+    system_id: int
+    session_id: Optional[int] = None
+    generated_at: float
+    frame: PurposeFrameOut
+    #: The frame's 3 elements plus any additional `intervention` claims and
+    #: every `core_capability` claim (§1.6).
+    elements: List[PurposeElementOut] = []
+    relations: List[PurposeRelationOut] = []
+    #: The 3 frame slots' resolution level, MIN (never mean/percentage --
+    #: §0 invariant 5, §1.4).
+    frame_resolution_level: PurposeResolutionLevel = "L0"
+    frame_state: PurposeFrameState = "empty"
+    snapshot_id: Optional[int] = None
+    understanding_revision_id: Optional[int] = None
+    understanding_confirmed_at: Optional[float] = None
+    degraded_sections: List[PurposeChainSection] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class PurposeRelationDecisionRequest(BaseModel):
+    """The one write in this module. `decision_method` is always `manual` --
+    there is no field for the caller to set it to anything else."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: int
+    decision: Literal["confirmed", "rejected"]
+    rationale: str = ""

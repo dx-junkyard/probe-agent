@@ -54,7 +54,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, get_args
 
-from . import replay_readiness, state_facts, system_state, understanding_brief
+from . import purpose_chain, replay_readiness, state_facts, system_state, understanding_brief
 from .db import get_conn
 from .models import (
     SMOKE_CHECK_COMPONENT_ID,
@@ -1458,6 +1458,9 @@ class OverviewResult:
     loop_stages: List[OverviewLoopStageView] = field(default_factory=list)
     user_phase: str = "setup"
     runtime: Optional[RuntimeHealth] = None
+    #: The canonical Purpose Frame / Purpose Chain (#388), reused verbatim --
+    #: this module composes it, it never re-derives an element or a relation.
+    purpose_chain: Optional[purpose_chain.PurposeChainResult] = None
     degraded_sections: List[str] = field(default_factory=list)
     degraded_detail: Dict[str, str] = field(default_factory=dict)
 
@@ -1882,6 +1885,30 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 _degrade(result, "runtime", exc)
+
+        # The Purpose Chain (#388) is its own guarded section, composing the
+        # canonical projection rather than re-deriving it (#380 principle 6,
+        # applied here exactly as the Brief section already applies it). It
+        # reads the SAME `session_id` this function already resolved, so the
+        # Overview and the Purpose Chain can never describe different
+        # sessions -- `purpose_chain.derive_purpose_chain` would otherwise
+        # re-resolve "no session_id" to the latest one independently, which
+        # is safe on its own but not guaranteed to still agree after two
+        # separate reads a request apart.
+        if availability["session"]:
+            try:
+                result.purpose_chain = purpose_chain.derive_purpose_chain(
+                    conn, system_id, session_id, now=now
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                _degrade(result, "purpose_chain", exc)
+        else:
+            _degrade(
+                result,
+                "purpose_chain",
+                RuntimeError("interview session lookup unavailable"),
+                detail_key="purpose_chain.session",
+            )
 
         # Each fact group is loaded under its own guard. A failure records the
         # group as unavailable and leaves its value at the conservative

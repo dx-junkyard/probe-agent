@@ -4493,6 +4493,63 @@ CREATE TABLE IF NOT EXISTS interview_session_status_audit (
 
 CREATE INDEX IF NOT EXISTS idx_interview_session_status_audit_session
     ON interview_session_status_audit (session_id, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- Purpose Chain relation decisions (Issue #388, docs/purpose-chain.md §1.5).
+--
+-- The ONLY thing #388 persists. Elements and relations themselves are a pure
+-- projection over existing rows (Intent Brief items, understanding_revision
+-- claims) recomputed on every read -- this table exists solely to record a
+-- human's `confirmed` / `rejected` decision about ONE relation, because that
+-- decision cannot be re-derived: it is the developer's judgement, not a
+-- structural fact.
+--
+-- Append-only, exactly like `interview_intent_item` / #308's premise bundle:
+-- a correction inserts a NEW row and sets the prior row's `superseded_by_id`;
+-- nothing is ever UPDATEd or DELETEd. `source_digest` / `target_digest`
+-- capture `purpose_chain.element_digest()` for both endpoints AT DECISION
+-- TIME, so a later content change can be detected (`recheck_state = 'stale'`)
+-- WITHOUT invalidating the decision row itself -- the audit fact "a human
+-- confirmed this relation, given these exact endpoint contents, at this
+-- time" must survive every later edit, exactly as docs/purpose-chain.md
+-- §1.5 states: "決定は上書きされず、digest が動いても削除されない".
+--
+-- `relation_id` is the STABLE string id `purpose_chain.py` derives
+-- (`f"{relation_kind}:{source_element_id}->{target_element_id}"`), never a
+-- row id -- Purpose Chain elements/relations are recomputed on every read and
+-- carry no row identity of their own to reference.
+CREATE TABLE IF NOT EXISTS purpose_relation_decision (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    session_id                  INTEGER NOT NULL,
+    relation_id                 TEXT NOT NULL,
+    relation_kind                TEXT NOT NULL,
+    decision                    TEXT NOT NULL CHECK (decision IN ('confirmed', 'rejected')),
+    rationale                   TEXT NOT NULL DEFAULT '',
+    source_element_id           TEXT NOT NULL,
+    target_element_id           TEXT NOT NULL,
+    source_digest                TEXT NOT NULL,
+    target_digest                TEXT NOT NULL,
+    understanding_revision_id   INTEGER,
+    intent_revision_id          INTEGER,
+    snapshot_id                  INTEGER,
+    decision_method              TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    decided_by                   TEXT,
+    superseded_by_id             INTEGER,
+    created_at                   REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES purpose_relation_decision (id) ON DELETE SET NULL
+);
+
+-- The lookup every read performs: "the current (non-superseded) decision for
+-- THIS relation, in THIS session". System-scoped so a foreign session_id can
+-- never surface another System's decision.
+CREATE INDEX IF NOT EXISTS idx_purpose_relation_decision_lookup
+    ON purpose_relation_decision (system_id, session_id, relation_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_purpose_relation_decision_session
+    ON purpose_relation_decision (session_id, id DESC);
 """
 
 
