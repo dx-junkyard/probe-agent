@@ -876,3 +876,53 @@ Overview は稼働メトリクス画面ではない。`GET /overview` が返す 
 - 部分失敗は `degraded_sections` の領域だけ落とし、他は描き続ける。
   「取得できませんでした」を「発見がありません」「受信が止まっています」と
   同じ文言にしない。
+
+## Purpose Chain (issue #387, subs #388-#390)
+
+`GET /purpose-chain` / `GET /purpose-chain/next-question` が判定の唯一の元。
+`components/purpose-chain/purpose-frame-card.tsx`(Overview Level 0)と
+`purpose-frame-panel.tsx`(Interview Level 1)はどちらもそれを描画するだけ。
+
+- **意味的な再導出は一切しない。** 要素の `state`、relation の `status` /
+  `recheck_state` / `stale_reason`、`resolution_level`、`confirmation` /
+  `provenance` はすべて server の値をそのまま出す。表示専用の集約
+  ——3 要素の因果順、有限コードの固定日本語ラベル(`resolution_level` /
+  `stale_reason` / `answerability` / `PurposeNeedState` のように server が
+  ラベルを返さないもの)、どの relation がどの要素対を繋ぐかの配列探索——
+  だけが `components/purpose-chain/model.ts` にある。ここに判定用の if 文を
+  足し始めたら設計が壊れている(#356 の `cockpit/model.ts` と同じ規律)。
+- **Overview の CTA は navigate のみで、execute しない。**
+  `PurposeFrameCard` の質問カードは `purposeInterviewHref(sessionId,
+  question.need_id)` を組み立てた `<Link>` で、`/interview?purpose_need=
+  <need_id>` へ遷移するだけ。confirm / correct / わからない / 保留の実行は
+  Interview 側の `PurposeFramePanel`(`NeedResponseBlock`)だけが持つ —
+  #358 の「summary の CTA は遷移のみ、実行はその状態の主作業面の中だけ」
+  原則をそのまま適用している。
+- **`PurposeFramePanel` は Understanding Brief と同じ全体像領域に置き、
+  状態の主作業面より前には置かない。** #358 が実測で固定した契約
+  ——「1280×720 の初期ビューポートに、その状態の主作業面が入っている
+  こと」(roadmap entry 20)——をそのまま適用したもので、`pages/interview.tsx`
+  では `purposeFramePanel` を Brief の**直後**にだけ挿入する。全幅で
+  2 カラムの外(状態サマリーの下)へ動かすと、主作業面の上端がカード
+  1 枚ぶん押し下がり、#358 が回帰として固定したこの制約を壊す。
+- **5 つの表示状態を混同しない**(Overview / Interview 両方で個別に
+  component test がある):
+  - `loading` — chain / next-question の取得中。「質問なし」や「まだ
+    わかっていません」とは別の render(`overview-purpose-question-loading`
+    / `purpose-frame-panel-loading`)。
+  - `empty`(質問なし) — 判断を止めている need が現在 0 件。沈黙ではなく
+    「現時点で追加の確認は必要ありません」という肯定文で示す
+    (`overview-purpose-question-none`)。
+  - `unknown` — 要素の `state === "unknown"`(まだ分かっていない)、または
+    relation の `status === "unknown"`(端点が unknown で説明できない)。
+    「取得できません」(`unavailable`)と同じ文言にしない。
+  - `unavailable` — chain / section 自体の取得失敗(`degraded_sections` に
+    含まれる、または fetch 自体のエラー)。要素・relation が個別に
+    `unknown` であることとは別の事実。
+  - `conflict` — relation の `status === "conflicting"`、または要素の
+    `confirmation === "conflicting"`。unknown / hypothesis とは別の
+    バッジ・別の文言。
+  この 5 状態を 1 つの「取得できません」や 1 つの灰色バッジへ畳むと、
+  「読めなかった」と「読めたが中身がない/矛盾している」という別々の事実が
+  同じ表示になる(`docs/purpose-chain.md` §0 invariant 6 の Dashboard 側の
+  適用)。

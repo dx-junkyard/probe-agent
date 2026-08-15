@@ -69,10 +69,14 @@ lead review, see the implementation report):
    `_recheck_relation` below. `tests/test_purpose_chain.py` pins this
    ordering with a two-hop propagation case.
 3. **Relation `provenance` defaults to the "weaker" of its two endpoints'
-   provenance** (§1.3) using `get_args(UnderstandingProvenanceKind)`'s
-   declaration order as the strength ranking (index 0 = strongest). This
-   reuses the SAME vocabulary order `understanding_brief.PROVENANCE_LABELS`
-   is written in, rather than inventing a second ranking.
+   provenance** (§1.3), ranked by `_PROVENANCE_RANK` (rank 0 = strongest).
+   That ranking is written out explicitly rather than read off
+   `get_args(UnderstandingProvenanceKind)`'s declaration order: the two agree
+   today, which is precisely why deriving it is unsafe -- reordering the
+   Literal is a cosmetic edit everywhere else in this codebase, and it would
+   silently relabel every relation's 出所. See `_PROVENANCE_RANK`'s own
+   comment, and the import-time assert that catches a vocabulary addition
+   with no rank.
 4. `provenance_label` is added to `PurposeRelationOut` alongside `provenance`
    even though the spec's §1.3 field list only names `provenance` -- every
    other finite vocabulary surfaced to the Dashboard in this codebase pairs a
