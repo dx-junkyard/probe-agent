@@ -6883,3 +6883,64 @@ Node との接続はただの `evolution_node_link` である。
 候補内の node_key 重複)を個別に検証し、いずれも候補 0 件になることを
 assert する。採用は「提案だけでは Node が 0 件のまま」「二重採用は 409」
 「node_key 衝突は採用全体を中止し、半分だけ作らない」を含む。
+
+## Issue #398 — Phase 3: Exploration Workbench
+
+Phase 3 の問いは「どの LLM 候補が良いか」ではない。**同じ Node 契約・同じ
+評価条件に対して、LLM 実装と rule 実装と deterministic code 実装がどう
+比較されるか**である。この問いが表現できるのは、ADR-3 が「その Node が
+何を約束するか」と「今どうやってその約束を守っているか」を別々に
+versioned にしたからに他ならない。
+
+### 4 つの規則(いずれも構造で強制している)
+
+1. **これは比較の記録であって、2 つめの実行エンジンではない。** コードを
+   走らせるのは Replay(#242〜#246)/ Experiment(#26)/ offline shadow
+   sandbox のままで、variant は数値を出した run を**参照する**だけ。
+   source / patch / command の列も引数もどこにも無い — API からそれらを
+   受け取れば、既存機能が強制している pinned-snapshot・pinned-command・
+   network-off の sandbox を迂回できてしまう(Principle 8)。
+   `test_the_variant_contract_accepts_no_executable_content` がこれを
+   signature レベルで assert する。
+2. **一定に保つべきものは variant ではなく run に置く。** dataset /
+   snapshot / environment / evaluation policy 参照は `exploration_run` の
+   列なので、同一 run の 2 つの variant が別のデータセットで測られること
+   が**構造的に起こり得ない**。起きれば、比較に見えるのに比較になって
+   いない数値が残る。契約 version が違う implementation も拒否する —
+   別の約束どうしを比べることになる。
+3. **何も合成しない。** 各 dimension は自分の coverage を持つ独立した行で、
+   score / weight / total はどこにも無い。順位付けは
+   `rank_by_dimension(variants, dimension)` のように **dimension を必須
+   引数**にしてあり、「総合的に一番良い variant」を返す関数は存在しない。
+   方向(高い方が良いか)は `HIGHER_IS_BETTER` の明示表で、metric 名から
+   推測しない — 推測すると名前が一致しない metric で判定が黙って反転する。
+4. **欠測を勝ち負けに丸めない。** `value_state` は
+   `measured`/`not_applicable`/`not_measured`/`unsupported` の 4 値で、
+   両者の測定可能性が食い違う dimension は `incomparable` になる。
+   これが無いと「この variant に token cost は無い」と「この variant の
+   token cost は 0 だ」が同じ表示になり、**測られなかった方が勝つ**。
+   coverage が違えば `coverage_mismatch`(数値は見せるが比較はしない)。
+   未測定の variant は `ranked` の末尾ではなく `unranked` に分ける —
+   末尾に置けば「最下位」と読める。
+
+### 比較の判定順
+
+`compare_variants` は純関数の first-match 表で、行の順序が契約:
+(1) どちらかが `measured` でなければ `incomparable`(**算術より先**)、
+(2) coverage が違えば `coverage_mismatch`、(3) 等しければ `equal`、
+(4) それ以外は `HIGHER_IS_BETTER` に従って `better`/`worse`。
+片側にしか無い dimension は落とさず報告する — 候補側の safety 測定が
+無いことは、読み手が最も見なければならない事実である。
+
+### 完了は採用ではない
+
+`complete_run` は Node の maturity を変えず、implementation を pin せず、
+何も承認しない。採用は #399 の固定化ゲート + 人間承認(ADR-9)であり、
+比較が勝者を黙って昇格させたら、それこそこの Epic が禁じている自動採用に
+なる。baseline の無い run は完了できない(基準点の無い差分は差分ではない)。
+
+### 検証
+
+35 テスト。`incomparable` / `coverage_mismatch` / 片側欠測 / 方向表の
+網羅性 / `unranked` / composite 列の不在 / 実行参照の解決 / 契約 version
+不一致 / baseline 重複 / System 分離を個別に assert する。

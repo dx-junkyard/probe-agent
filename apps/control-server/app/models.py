@@ -9114,3 +9114,201 @@ class NodeDesignHandoffOut(BaseModel):
     missing_refs: List[str]
     created_by: Optional[str] = None
     created_at: float
+
+
+# ---------------------------------------------------------------------------
+# Exploration Workbench (Epic #394 Phase 3, Issue #398)
+#
+# Note what is absent, deliberately: no source, patch, or command field on any
+# variant model. A variant references an implementation and the existing run
+# that executed it. Accepting executable content at this boundary would let a
+# caller run code outside the pinned-snapshot, network-off sandbox that Replay
+# and Experiments enforce (Principle 8).
+#
+# Also absent: any score, weight, or total. #398 forbids compositing quality /
+# latency / cost / safety, and the reliable enforcement is to give the
+# combined number nowhere to live -- in the schema as well as in the table.
+# ---------------------------------------------------------------------------
+
+ExplorationDimension = Literal[
+    "output_quality", "error_rate", "latency", "cost", "resource", "safety", "coverage"
+]
+ExplorationValueState = Literal[
+    "measured", "not_applicable", "not_measured", "unsupported"
+]
+ExplorationExecutionState = Literal[
+    "not_executed", "executed", "not_executable", "unsupported"
+]
+ExplorationRefKind = Literal["replay_run", "replay_variant", "experiment"]
+ExplorationGenerator = Literal["manual", "reasoning_llm", "existing_implementation"]
+ExplorationDatasetKind = Literal["replay_set", "golden_set", "edge_cases", "mixed"]
+ExplorationVerdict = Literal[
+    "better", "worse", "equal", "incomparable", "coverage_mismatch"
+]
+
+
+class ExplorationRunCreateIn(BaseModel):
+    """Everything held CONSTANT across the run's variants lives here, so two
+    variants cannot have been measured against different datasets while still
+    looking like a comparison."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: int
+    node_version_id: int
+    objective: str = ""
+    dataset_kind: ExplorationDatasetKind = "replay_set"
+    dataset_ref: str = ""
+    snapshot_id: Optional[int] = None
+    commit_sha: str = ""
+    environment_ref: str = ""
+    evaluation_policy_ids: List[int] = Field(default_factory=list)
+    handoff_id: Optional[int] = None
+
+
+class ExplorationVariantCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    variant_key: str
+    modality: EvolutionImplementationModality
+    label: str = ""
+    is_baseline: bool = False
+    implementation_id: Optional[int] = None
+    config: Dict[str, Any] = Field(default_factory=dict)
+    provenance: Dict[str, Any] = Field(default_factory=dict)
+    generator: ExplorationGenerator = "manual"
+    applicability_envelope: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExplorationExecutionIn(BaseModel):
+    """`not_executable` and `unsupported` are first-class outcomes here, not
+    failures: a rule variant that cannot express a case has not lost on it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution_state: ExplorationExecutionState
+    execution_ref_kind: Optional[ExplorationRefKind] = None
+    execution_ref_id: Optional[int] = None
+    note: str = ""
+
+
+class ExplorationMeasurementIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dimension: ExplorationDimension
+    metric_name: str = ""
+    value_state: ExplorationValueState = "measured"
+    numeric_value: Optional[float] = None
+    unit: str = ""
+    covered_case_count: Optional[int] = None
+    total_case_count: Optional[int] = None
+    source: Literal["deterministic", "reasoning_llm", "manual"] = "deterministic"
+    note: str = ""
+
+
+class ExplorationMeasurementOut(BaseModel):
+    id: int
+    dimension: ExplorationDimension
+    metric_name: str
+    value_state: ExplorationValueState
+    numeric_value: Optional[float] = None
+    unit: str
+    covered_case_count: Optional[int] = None
+    total_case_count: Optional[int] = None
+    source: str
+    note: str
+
+
+class ExplorationVariantOut(BaseModel):
+    id: int
+    variant_key: str
+    label: str
+    is_baseline: bool
+    modality: EvolutionImplementationModality
+    implementation_id: Optional[int] = None
+    config: Dict[str, Any]
+    provenance: Dict[str, Any]
+    generator: ExplorationGenerator
+    applicability_envelope: Dict[str, Any]
+    execution_state: ExplorationExecutionState
+    execution_ref_kind: Optional[ExplorationRefKind] = None
+    execution_ref_id: Optional[int] = None
+    execution_note: str
+    created_by: Optional[str] = None
+    created_at: float
+    measurements: List[ExplorationMeasurementOut]
+
+
+class ExplorationComparisonOut(BaseModel):
+    """One dimension of one variant against the baseline.
+
+    `incomparable` and `coverage_mismatch` are verdicts, not errors. They are
+    what stops "this variant has no token cost" from displaying identically to
+    "this variant's token cost is zero"."""
+
+    dimension: ExplorationDimension
+    metric_name: str
+    verdict: ExplorationVerdict
+    baseline_state: ExplorationValueState
+    variant_state: ExplorationValueState
+    baseline_value: Optional[float] = None
+    variant_value: Optional[float] = None
+    delta: Optional[float] = None
+    baseline_coverage: Optional[List[int]] = None
+    variant_coverage: Optional[List[int]] = None
+    reason: str
+
+
+class ExplorationRunOut(BaseModel):
+    """The whole comparison. Carries no ranking and no overall verdict --
+    which dimension matters is the developer's judgement, and at
+    establishment time it is #399's gate, not this projection's."""
+
+    id: int
+    system_id: int
+    node_id: int
+    node_version_id: int
+    handoff_id: Optional[int] = None
+    objective: str
+    dataset_kind: ExplorationDatasetKind
+    dataset_ref: str
+    snapshot_id: Optional[int] = None
+    commit_sha: str
+    environment_ref: str
+    evaluation_policy_ids: List[int]
+    status: Literal["open", "completed", "abandoned"]
+    conclusion_note: str
+    baseline_variant_id: Optional[int] = None
+    comparable: bool
+    variants: List[ExplorationVariantOut]
+    comparisons: Dict[str, List[ExplorationComparisonOut]]
+    created_by: Optional[str] = None
+    created_at: float
+    completed_at: Optional[float] = None
+
+
+class ExplorationRunCompleteIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conclusion_note: str = ""
+
+
+class ExplorationRankingEntryOut(BaseModel):
+    variant_id: int
+    variant_key: str
+    modality: EvolutionImplementationModality
+    value: Optional[float] = None
+    value_state: ExplorationValueState
+
+
+class ExplorationRankingOut(BaseModel):
+    """Ranked by ONE named dimension. There is no overall ranking endpoint:
+    a caller that wants an order must say what it is ordering by, so a latency
+    ranking can never be presented as "the best variant".
+
+    `unranked` is a separate group rather than the tail of `ranked` --
+    sorting an unmeasured variant last would read as "worst"."""
+
+    dimension: ExplorationDimension
+    ranked: List[ExplorationRankingEntryOut]
+    unranked: List[ExplorationRankingEntryOut]

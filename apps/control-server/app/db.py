@@ -5244,6 +5244,176 @@ CREATE TABLE IF NOT EXISTS evolution_design_handoff (
 
 CREATE INDEX IF NOT EXISTS idx_evolution_design_handoff_system
     ON evolution_design_handoff (system_id, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- Exploration Workbench (Epic #394 Phase 3, Issue #398,
+-- app/exploration_workbench.py)
+--
+-- Phase 3's question is NOT "which LLM candidate is best" -- it is "for the
+-- SAME Node contract and the SAME evaluation refs, how do an LLM
+-- implementation, a rule implementation and a deterministic-code
+-- implementation compare". That is only expressible because ADR-3 versioned
+-- the contract separately from the implementation.
+--
+-- This is a RECORD of comparisons, not a second execution engine. Replay
+-- (#242-#246), Experiments (#26) and the offline shadow sandbox stay the
+-- only things that run code; an exploration variant REFERENCES the run that
+-- produced its numbers (`replay_run_id` / `replay_variant_id` /
+-- `experiment_id`) rather than re-implementing execution. That is why there
+-- is no source/patch/command column anywhere here: accepting free-form code
+-- through this API would bypass the pinned-snapshot, pinned-command,
+-- network-off sandbox those features already enforce (Principle 8).
+-- ---------------------------------------------------------------------------
+
+-- exploration_run: one comparison. Everything that must be held constant
+-- across the variants lives HERE, not on the variants, so it is structurally
+-- impossible for two variants in one run to have been measured against
+-- different datasets or different evaluation contracts -- which would make
+-- their numbers incomparable while still looking like a comparison.
+--
+-- `baseline_variant_id` is nullable only between INSERT and the baseline's
+-- own insert; a completed run without one is `invalid`, because a difference
+-- measured against nothing is not a difference.
+CREATE TABLE IF NOT EXISTS exploration_run (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                INTEGER NOT NULL,
+    node_id                  INTEGER NOT NULL,
+    node_version_id          INTEGER NOT NULL,
+    handoff_id               INTEGER,
+    objective                TEXT NOT NULL DEFAULT '',
+    dataset_kind             TEXT NOT NULL DEFAULT 'replay_set'
+                                 CHECK (dataset_kind IN
+                                     ('replay_set', 'golden_set', 'edge_cases', 'mixed')),
+    dataset_ref              TEXT NOT NULL DEFAULT '',
+    snapshot_id              INTEGER,
+    commit_sha               TEXT NOT NULL DEFAULT '',
+    environment_ref          TEXT NOT NULL DEFAULT '',
+    evaluation_policy_ids_json TEXT NOT NULL DEFAULT '[]',
+    baseline_variant_id      INTEGER,
+    status                   TEXT NOT NULL DEFAULT 'open'
+                                 CHECK (status IN ('open', 'completed', 'abandoned')),
+    conclusion_note          TEXT NOT NULL DEFAULT '',
+    created_by               TEXT,
+    created_at               REAL NOT NULL,
+    completed_at             REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_version_id) REFERENCES evolution_node_version (id) ON DELETE CASCADE,
+    FOREIGN KEY (handoff_id) REFERENCES evolution_design_handoff (id) ON DELETE SET NULL,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_exploration_run_node
+    ON exploration_run (system_id, node_id, id DESC);
+
+-- exploration_variant: one implementation measured in that run.
+--
+-- `modality` is the whole point: an exploration is comparable across
+-- modalities only because the contract (evolution_node_version) is the same
+-- row for every variant in the run. Provider/model names live in
+-- `config_json` / `provenance_json`, never in a column that participates in
+-- identity (#298's model-alias rule).
+--
+-- `applicability_envelope_json` records the inputs a variant CLAIMS to
+-- handle. It exists so a win can never be generalised past what was
+-- measured -- #399's establishment gate reads it, and "it worked on the
+-- cases it was built for" is otherwise indistinguishable from "it worked".
+--
+-- `execution_ref_kind` / `execution_ref_id` point at the run that actually
+-- executed this variant. NULL means the variant was registered but never
+-- executed, which is a real state (`not_executed`) and NOT a loss.
+CREATE TABLE IF NOT EXISTS exploration_variant (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                      INTEGER NOT NULL,
+    system_id                   INTEGER NOT NULL,
+    variant_key                 TEXT NOT NULL,
+    label                       TEXT NOT NULL DEFAULT '',
+    is_baseline                 INTEGER NOT NULL DEFAULT 0,
+    modality                    TEXT NOT NULL
+                                    CHECK (modality IN
+                                        ('reasoning_llm', 'lm_program', 'retrieval', 'router',
+                                         'small_model', 'rule', 'deterministic_code',
+                                         'workflow', 'manual', 'hybrid')),
+    implementation_id           INTEGER,
+    config_json                 TEXT NOT NULL DEFAULT '{}',
+    provenance_json             TEXT NOT NULL DEFAULT '{}',
+    generator                   TEXT NOT NULL DEFAULT 'manual'
+                                    CHECK (generator IN ('manual', 'reasoning_llm', 'existing_implementation')),
+    applicability_envelope_json TEXT NOT NULL DEFAULT '{}',
+    execution_ref_kind          TEXT
+                                    CHECK (execution_ref_kind IS NULL OR execution_ref_kind IN
+                                        ('replay_run', 'replay_variant', 'experiment')),
+    execution_ref_id            INTEGER,
+    execution_state             TEXT NOT NULL DEFAULT 'not_executed'
+                                    CHECK (execution_state IN
+                                        ('not_executed', 'executed', 'not_executable', 'unsupported')),
+    execution_note              TEXT NOT NULL DEFAULT '',
+    created_by                  TEXT,
+    created_at                  REAL NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES exploration_run (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (implementation_id)
+        REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    UNIQUE (run_id, variant_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exploration_variant_run
+    ON exploration_variant (run_id, id);
+
+-- exploration_measurement: ONE dimension of ONE variant. One row per
+-- dimension, deliberately -- not a metrics blob and not a score column.
+--
+-- #398 forbids composing quality / latency / cost / safety into a single
+-- number, and the reliable enforcement is structural: each dimension is its
+-- own row with its own coverage, and there is nowhere to write a total. A
+-- consumer that wants a ranking has to state which dimension it is ranking
+-- by.
+--
+-- `value_state` separates the four things a missing number can mean, which a
+-- NULL alone cannot: `measured` (a real reading), `not_applicable` (this
+-- dimension does not apply to this modality -- a `manual` variant has no
+-- token cost), `not_measured` (nothing measured it yet) and `unsupported`
+-- (the harness cannot measure it here). Rolling these into "0" or "-" is the
+-- #366 one-word-two-facts defect applied to a metric.
+--
+-- `covered_case_count` / `total_case_count` are per dimension because
+-- coverage genuinely differs between them -- a latency reading may cover
+-- every case while a quality judgement covers only the labelled ones, and
+-- comparing two variants at different coverage without saying so is the
+-- failure #398's "coverage 差を敗北や成功へ丸めない" names.
+CREATE TABLE IF NOT EXISTS exploration_measurement (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    variant_id         INTEGER NOT NULL,
+    run_id             INTEGER NOT NULL,
+    system_id          INTEGER NOT NULL,
+    dimension          TEXT NOT NULL
+                           CHECK (dimension IN
+                               ('output_quality', 'error_rate', 'latency', 'cost',
+                                'resource', 'safety', 'coverage')),
+    metric_name        TEXT NOT NULL DEFAULT '',
+    value_state        TEXT NOT NULL DEFAULT 'measured'
+                           CHECK (value_state IN
+                               ('measured', 'not_applicable', 'not_measured', 'unsupported')),
+    numeric_value      REAL,
+    unit               TEXT NOT NULL DEFAULT '',
+    covered_case_count INTEGER,
+    total_case_count   INTEGER,
+    -- Deterministic facts and a reasoning model's interpretation are kept
+    -- apart (CLAUDE.md: "Keep raw deterministic facts separate from LLM
+    -- interpretations in storage"). A judge model's opinion is never the
+    -- adoption basis on its own (#398).
+    source             TEXT NOT NULL DEFAULT 'deterministic'
+                           CHECK (source IN ('deterministic', 'reasoning_llm', 'manual')),
+    note               TEXT NOT NULL DEFAULT '',
+    created_at         REAL NOT NULL,
+    FOREIGN KEY (variant_id) REFERENCES exploration_variant (id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id) REFERENCES exploration_run (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (variant_id, dimension, metric_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exploration_measurement_variant
+    ON exploration_measurement (variant_id, dimension);
 """
 
 
