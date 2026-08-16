@@ -5075,6 +5075,175 @@ CREATE INDEX IF NOT EXISTS idx_evolution_node_event_node
 -- from colliding with each other under this constraint.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_evolution_node_event_idempotency
     ON evolution_node_event (node_id, idempotency_key) WHERE idempotency_key != '';
+
+-- ---------------------------------------------------------------------------
+-- Design Studio (Epic #394 Phase 2, Issue #397, app/node_design.py)
+--
+-- Phase 2 turns Vision -> Outcome -> Capability -> Flow into testable Node
+-- hypotheses. It creates NO second Vision/Purpose model: the Purpose Frame
+-- stays a projection recomputed by app/purpose_chain.py from existing rows,
+-- and the connection between it and a Node is an ordinary
+-- evolution_node_link (link_kind='purpose_element'/'capability'/'flow')
+-- whose decision_method already distinguishes an AI PROPOSAL
+-- ('reasoning_llm') from a developer's CONFIRMATION ('manual'). No new
+-- column is needed for that distinction, and adding one would create a
+-- second place for the two to disagree.
+--
+-- What Phase 2 does have to persist is the three things that cannot be
+-- re-derived: a decomposition proposal and the developer's decision on each
+-- candidate, the three evaluation contracts, and the handoff bundle.
+-- ---------------------------------------------------------------------------
+
+-- node_decomposition_proposal: ONE reasoning run that proposed one or more
+-- ways to cut a scope into Nodes. Persisting the run (not just its output)
+-- is what makes the proposal auditable under Principle 7 -- intelligence_run_id
+-- resolves to the provider/model/prompt version/schema version that produced
+-- it. A failed run is recorded with status='failed' and produces NO
+-- candidates: a heuristic decomposition must never be saved as if a
+-- reasoning model had produced it (Principle 6).
+CREATE TABLE IF NOT EXISTS node_decomposition_proposal (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    session_id          INTEGER,
+    scope_summary       TEXT NOT NULL DEFAULT '',
+    capability_ref      TEXT NOT NULL DEFAULT '',
+    flow_ref            TEXT NOT NULL DEFAULT '',
+    snapshot_id         INTEGER,
+    intelligence_run_id INTEGER,
+    status              TEXT NOT NULL DEFAULT 'proposed'
+                            CHECK (status IN ('proposed', 'failed')),
+    error_details       TEXT NOT NULL DEFAULT '',
+    is_mock             INTEGER NOT NULL DEFAULT 0,
+    decision_method     TEXT NOT NULL DEFAULT 'reasoning_llm'
+                            CHECK (decision_method = 'reasoning_llm'),
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE SET NULL,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_decomposition_proposal_system
+    ON node_decomposition_proposal (system_id, id DESC);
+
+-- node_decomposition_candidate: ONE way of cutting the scope, as a set of
+-- proposed nodes carried in nodes_json. #397 requires several cuts to be
+-- COMPARED, so a candidate is a whole decomposition, not a single node --
+-- comparing individual nodes across cuts would lose the only thing that
+-- distinguishes the cuts from each other.
+--
+-- `decision` is the developer's judgement and is the ONLY way a candidate
+-- becomes real. `adopted_node_ids_json` records which evolution_node rows
+-- the adoption created, so the audit trail runs proposal -> candidate ->
+-- Node without a System-wide guess about which nodes came from where.
+-- decision_method is CHECKed to 'manual': an LLM proposes cuts, a human
+-- adopts one (Principle 7, and #397's "Node 作成・relation 確認は人間操作").
+-- open_questions_json is kept as its own column rather than folded into the
+-- prose: #397 requires 未確定事項 to be visible, and a paragraph that
+-- mentions uncertainty reads as a completed answer.
+CREATE TABLE IF NOT EXISTS node_decomposition_candidate (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id           INTEGER NOT NULL,
+    system_id             INTEGER NOT NULL,
+    candidate_key         TEXT NOT NULL,
+    summary               TEXT NOT NULL DEFAULT '',
+    rationale             TEXT NOT NULL DEFAULT '',
+    nodes_json            TEXT NOT NULL DEFAULT '[]',
+    open_questions_json   TEXT NOT NULL DEFAULT '[]',
+    decision              TEXT NOT NULL DEFAULT 'pending'
+                              CHECK (decision IN ('pending', 'adopted', 'held', 'rejected')),
+    decision_note         TEXT NOT NULL DEFAULT '',
+    decision_method       TEXT NOT NULL DEFAULT 'manual'
+                              CHECK (decision_method = 'manual'),
+    decided_by            TEXT,
+    decided_at            REAL,
+    adopted_node_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES node_decomposition_proposal (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (proposal_id, candidate_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_decomposition_candidate_proposal
+    ON node_decomposition_candidate (proposal_id, id);
+
+-- evolution_evaluation_policy: the three evaluation contracts of ADR-7, kept
+-- in one table with a finite `level` discriminator rather than three tables,
+-- because they share every structural column and differ only in what they
+-- judge. What must NOT be shared is their MEANING, so:
+--
+-- * there is no score, weight, or total column anywhere in this table. A
+--   single weighted total is what ADR-7 forbids: a latency win must not be
+--   able to pay for a safety regression, and the only way to guarantee that
+--   is to have nowhere to write the combined number.
+-- * `criteria_json` (what must be REACHED to establish) and `floors_json`
+--   (what must not be BROKEN) are separate columns, not one list with a
+--   flag. They are consumed at different moments -- a criterion is read by
+--   the Phase 4 establishment gate, a floor is read there AND by Phase 5
+--   monitoring -- and merging them makes "we met the bar" and "we did not
+--   regress" indistinguishable in storage.
+--
+-- Append-only per (system_id, level, policy_key): a correction inserts a new
+-- version_number and supersedes the prior row, because a policy is what an
+-- establishment decision was made against and must survive later edits.
+CREATE TABLE IF NOT EXISTS evolution_evaluation_policy (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    policy_key       TEXT NOT NULL,
+    level            TEXT NOT NULL
+                         CHECK (level IN ('node', 'flow_capability', 'ux_outcome')),
+    version_number   INTEGER NOT NULL DEFAULT 1,
+    title            TEXT NOT NULL DEFAULT '',
+    subject_ref      TEXT NOT NULL DEFAULT '',
+    criteria_json    TEXT NOT NULL DEFAULT '[]',
+    floors_json      TEXT NOT NULL DEFAULT '[]',
+    unmeasured_json  TEXT NOT NULL DEFAULT '[]',
+    decision_method  TEXT NOT NULL DEFAULT 'manual'
+                         CHECK (decision_method IN ('deterministic', 'reasoning_llm', 'manual')),
+    created_by       TEXT,
+    created_at       REAL NOT NULL,
+    superseded_by_id INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES evolution_evaluation_policy (id) ON DELETE SET NULL,
+    UNIQUE (system_id, policy_key, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_evaluation_policy_lookup
+    ON evolution_evaluation_policy (system_id, level, id DESC);
+
+-- evolution_design_handoff: the bundle Phase 2 hands to Phase 3, assembled
+-- deterministically from rows that already exist. It stores REFERENCES, never
+-- copies: a copied criterion would keep reading as current after the policy
+-- it came from was superseded, which is the staleness class #337/#369 both
+-- had to fix elsewhere. `assembly_state` distinguishes a handoff that is
+-- complete from one assembled while something it points at was missing --
+-- 'incomplete' is a real, readable state, not an error to be smoothed over.
+CREATE TABLE IF NOT EXISTS evolution_design_handoff (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id              INTEGER NOT NULL,
+    session_id             INTEGER,
+    node_ids_json          TEXT NOT NULL DEFAULT '[]',
+    evaluation_policy_ids_json TEXT NOT NULL DEFAULT '[]',
+    dataset_refs_json      TEXT NOT NULL DEFAULT '[]',
+    probe_plan_id          INTEGER,
+    establishment_criteria_draft_json TEXT NOT NULL DEFAULT '[]',
+    reopen_criteria_draft_json TEXT NOT NULL DEFAULT '[]',
+    exploration_brief      TEXT NOT NULL DEFAULT '',
+    assembly_state         TEXT NOT NULL DEFAULT 'complete'
+                               CHECK (assembly_state IN ('complete', 'incomplete')),
+    missing_refs_json      TEXT NOT NULL DEFAULT '[]',
+    decision_method        TEXT NOT NULL DEFAULT 'manual'
+                               CHECK (decision_method = 'manual'),
+    created_by             TEXT,
+    created_at             REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE SET NULL,
+    FOREIGN KEY (probe_plan_id) REFERENCES probe_plans (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_design_handoff_system
+    ON evolution_design_handoff (system_id, id DESC);
 """
 
 

@@ -8904,3 +8904,213 @@ class EvolutionNodeTransitionOut(BaseModel):
     duplicate: bool
     maturity: EvolutionMaturityState
     event: Optional[EvolutionNodeEventOut] = None
+
+
+# ---------------------------------------------------------------------------
+# Design Studio (Epic #394 Phase 2, Issue #397)
+#
+# Note what is NOT here: there is no score, weight, or total field on any
+# evaluation model. ADR-7 forbids compositing the three levels into one
+# number, and the reliable way to enforce that is to give the number nowhere
+# to live -- in the schema as well as in the table.
+# ---------------------------------------------------------------------------
+
+EvolutionEvaluationLevel = Literal["node", "flow_capability", "ux_outcome"]
+DecompositionDecisionKind = Literal["adopted", "held", "rejected"]
+
+
+class DecompositionProposeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_summary: str
+    context: str = ""
+    session_id: Optional[int] = None
+    capability_ref: str = ""
+    flow_ref: str = ""
+
+
+class DecompositionCandidateOut(BaseModel):
+    id: int
+    proposal_id: int
+    candidate_key: str
+    summary: str
+    rationale: str
+    nodes: List[Dict[str, Any]]
+    open_questions: List[str]
+    decision: Literal["pending", "adopted", "held", "rejected"]
+    decision_note: str
+    decided_by: Optional[str] = None
+    decided_at: Optional[float] = None
+    adopted_node_ids: List[int]
+    created_at: float
+
+
+class DecompositionProposalOut(BaseModel):
+    id: int
+    system_id: int
+    session_id: Optional[int] = None
+    scope_summary: str
+    capability_ref: str
+    flow_ref: str
+    snapshot_id: Optional[int] = None
+    intelligence_run_id: Optional[int] = None
+    status: Literal["proposed", "failed"]
+    error_details: str
+    is_mock: bool
+    created_by: Optional[str] = None
+    created_at: float
+    candidates: List[DecompositionCandidateOut]
+
+
+class DecompositionDecisionIn(BaseModel):
+    """`pending` is deliberately not accepted: it is the initial state, not a
+    decision a developer can record."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: DecompositionDecisionKind
+    note: str = ""
+
+
+class DecompositionDecisionOut(BaseModel):
+    candidate: DecompositionCandidateOut
+    created_nodes: List[Dict[str, Any]]
+
+
+class EvaluationCriterionIn(BaseModel):
+    """One thing that must be REACHED before establishing.
+
+    Separate from a floor on purpose (ADR-7): the two are consumed at
+    different moments, and a single list with a flag makes "we met the bar"
+    and "we did not regress" indistinguishable in storage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    measure: str
+    target: str = ""
+    note: str = ""
+
+
+class EvaluationFloorIn(BaseModel):
+    """One property that must not REGRESS. Never traded off against a
+    criterion -- there is no weight field to trade with."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    measure: str
+    minimum: str = ""
+    note: str = ""
+
+
+class EvaluationUnmeasuredIn(BaseModel):
+    """Something this contract cannot currently measure, WITH its reason.
+
+    Recorded rather than omitted: an omitted criterion reads as "nothing to
+    check here", which is the #391 rule about never inferring an Outcome."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    reason: str
+
+
+class EvaluationPolicyCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    policy_key: str
+    level: EvolutionEvaluationLevel
+    title: str = ""
+    subject_ref: str = ""
+    criteria: List[EvaluationCriterionIn] = Field(default_factory=list)
+    floors: List[EvaluationFloorIn] = Field(default_factory=list)
+    unmeasured: List[EvaluationUnmeasuredIn] = Field(default_factory=list)
+
+
+class EvaluationPolicyOut(BaseModel):
+    id: int
+    policy_key: str
+    level: EvolutionEvaluationLevel
+    version_number: int
+    title: str
+    subject_ref: str
+    criteria: List[Dict[str, Any]]
+    floors: List[Dict[str, Any]]
+    unmeasured: List[Dict[str, Any]]
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class EvaluationPoliciesOut(BaseModel):
+    """Grouped by level, never merged into one list -- the ADR-7 separation
+    made structural rather than only documented."""
+
+    node: List[EvaluationPolicyOut]
+    flow_capability: List[EvaluationPolicyOut]
+    ux_outcome: List[EvaluationPolicyOut]
+
+
+class NodeLineageRelationOut(BaseModel):
+    """One design relation.
+
+    `relation_status` (was this relation proposed by AI or confirmed by the
+    developer) and `element_state` (is the Purpose element it points at
+    itself confirmed) are two independent axes. A confirmed relation to an
+    unconfirmed element is a real and common state, and collapsing the two
+    would hide it."""
+
+    link_id: int
+    link_kind: str
+    target_ref: str
+    target_name: Optional[str] = None
+    relation_status: Optional[str] = None
+    relation_decision_method: str
+    element_state: str
+    note: str
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class NodeLineageOut(BaseModel):
+    system_id: int
+    node_id: int
+    node_key: str
+    maturity: str
+    relations: List[NodeLineageRelationOut]
+    confirmed_relation_count: int
+    proposed_relation_count: int
+    purpose_frame_supplied: bool
+
+
+class NodeDesignHandoffCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_ids: List[int]
+    evaluation_policy_ids: List[int] = Field(default_factory=list)
+    dataset_refs: List[str] = Field(default_factory=list)
+    probe_plan_id: Optional[int] = None
+    establishment_criteria_draft: List[str] = Field(default_factory=list)
+    reopen_criteria_draft: List[str] = Field(default_factory=list)
+    exploration_brief: str = ""
+
+
+class NodeDesignHandoffOut(BaseModel):
+    """References are resolved at READ time, so a Node deleted or a policy
+    superseded after assembly shows up as it actually is now."""
+
+    id: int
+    system_id: int
+    session_id: Optional[int] = None
+    nodes: List[Dict[str, Any]]
+    evaluation_policies: List[Dict[str, Any]]
+    dataset_refs: List[str]
+    probe_plan_id: Optional[int] = None
+    establishment_criteria_draft: List[str]
+    reopen_criteria_draft: List[str]
+    exploration_brief: str
+    assembly_state: Literal["complete", "incomplete"]
+    missing_refs: List[str]
+    created_by: Optional[str] = None
+    created_at: float

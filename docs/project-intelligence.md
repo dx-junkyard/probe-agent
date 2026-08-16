@@ -6782,3 +6782,104 @@ Phase 0 は DB/API/UI を変更していないため、既存のテストスイ�
 inventory、compatibility seam と rollback、既存安全境界の維持明記、
 Phase 1〜6 の入力・出力・完了ゲート、AI型/固定処理型を含む pilot 選定、
 owner・期限付きの未決事項)を満たす。
+
+## Issue #396 — Phase 1: Evolution Node 契約と canonical lifecycle
+
+`docs/evolutionary-pipeline.md` の ADR-1〜ADR-9 をコードにした Phase。
+新規テーブル 5 つ、pure evaluator 1 つ、API 1 本、読み取り中心の
+inspector 1 画面。**既存の Component / Probe Cell / Cell Improvement /
+Cell Binding は 1 行も変更していない** — 読むだけで、書かない。
+
+### 何を作ったか
+
+- `app/evolution_node.py` — `evaluate_transition` は純関数(時計もDBも
+  client 状態も見ない)の first-match 表で、有限な 12 個の拒否コードを
+  返す。うち 2 つがこの Epic の中心規則:`llm_state_not_allowed` は
+  無条件で最初に評価され(LLM は canonical state を出力しない、
+  Principle 6)、`manual_approval_required` は system-recorded 遷移を
+  `established ↔ monitoring` の 2 つだけに限定し、それ以外は必ず名前の
+  ある人間を要求する(ADR-9)。
+- `reopened` は stable implementation の pin を要求も解除もしない。本番は
+  established 実装を動かし続けたまま探索する — 局所再探索が安全である
+  理由そのもので、テストで直接 assert している。
+- `fold_events` は append-only ログを畳み込んで maturity を再現する
+  (ADR-4)。保存された lifecycle 値は記述対象の行から drift しうるが、
+  ログがあれば drift を検出できる。だから projection の末尾としてだけで
+  なく専用エンドポイントとしても公開する。
+- `build_node_projection` は maturity / improvement_status / policy_mode を
+  3 つの正本から独立に読む。食い違っていてもそのまま返す。4 つめの軸は
+  `null` ではなく**ドキュメントから欠落**させる — `null` は「評価した
+  結果それが無かった」と読めてしまう。`interview_workflow.
+  evaluate_session_workflow` は checkpoint を永続化するので呼ばない
+  (読み取りが書き込んではならない、#380 の規則)。
+- `availability` は「読めなかった」を「既定値」と区別する(#380)。
+
+### 境界での規則
+
+拒否された遷移は 422 で、`detail.code` はドメイン層の有限コードをその
+まま返す — 言い換えると Dashboard が散文で分岐することになる。
+重複した `idempotency_key` は 409 ではなく 200 の `duplicate`:何も
+変えなかった再送は成功であり、409 にすると通常のネットワーク再送が
+開発者の解決すべき衝突に見える。actor は認証済み `Principal` から取り、
+body からは取らない(#337 の provenance 規則)。
+
+### 検証
+
+domain 49 + API 20 + dashboard 5。拒否コードは 1 つずつ個別のテストを
+持ち、3 軸の独立性は「Improvement が `adopted` かつ Component が
+`shadow` かつ Node は `validating`」という食い違う状態で assert する。
+
+## Issue #397 — Phase 2: Design Studio
+
+Vision → Outcome → Capability → Flow を検証可能な Node 仮説へ落とす層。
+**新しい Vision/Purpose 正本は作らない** — Purpose Frame は
+`app/purpose_chain.py` が既存行から都度導出する projection のままで、
+Node との接続はただの `evolution_node_link` である。
+
+### 4 つの構成要素
+
+1. **Purpose-to-Node lineage** (`derive_node_lineage`)。link の
+   `decision_method` が既に「AI の提案」と「開発者の確認」を区別して
+   いるので、新しい列は足さない — 足せば両者が食い違える場所が 1 つ
+   増えるだけ。`relation_status`(その関係を誰が決めたか)と
+   `element_state`(指している Purpose 要素自体が確定しているか)は
+   独立の 2 軸で、「確定した関係が未確定の要素を指している」という
+   実在する状態を潰さない。`component`/`probe_point`/`cell_binding` は
+   実装事実であって設計関係ではないので lineage から除外する。
+2. **Node decomposition**。reasoning model は 1 つの scope に対して
+   複数の**切り方全体**を提案する — 切り方をまたいで個々の node を
+   比較すると、切り方どうしを区別している唯一のものが失われる。
+   採用は別の `decision_method: manual` 記録で、Phase 1 の
+   `create_node`/`add_version` を通して本物の Node を作る。**モデルは
+   Node を作らない。** 失敗した run は失敗として保存され、候補は
+   0 件になる(Principle 6:heuristic fallback を作らない)。部分的に
+   妥当な応答は全体を拒否する — 壊れた候補だけ黙って落とすと、3 通りの
+   比較が最初から 2 通りだったかのように見える。
+3. **3 つの評価契約** (ADR-7)。score/weight/total 列はどこにも無い。
+   latency の改善が safety の劣化を買えないようにする確実な方法は、
+   合成した数値を書く場所を用意しないことである。`criteria`(到達すべき
+   もの)と `floors`(割ってはいけないもの)は別の列 — 読まれる時点が
+   違い、混ぜると「基準を満たした」と「劣化していない」が区別できなく
+   なる。`unmeasured` は理由付きで記録する(#391 の規則)。
+   API は level ごとに**グループ化して**返す。ADR-7 の分離を文書では
+   なく構造にしている。
+4. **Phase 3 への handoff**。参照だけを保存し、内容はコピーしない —
+   コピーした criterion は元の policy が superseded された後も current
+   として読めてしまう。解決できない参照は名前付きで残り bundle を
+   `incomplete` にする。黙って落とすと、失敗データセットを失った
+   handoff と最初から持っていなかった handoff が区別できない。
+
+### 接続規律
+
+`propose_decomposition` は**接続を一切取らない**。route は
+「読む → 閉じる → モデルを呼ぶ → 開き直して保存する」の順で動く。
+`get_conn()` を LLM 往復の間保持すると、lock は process-wide で
+非再帰なのでサーバ全体が再起動まで停止する。
+
+### 検証
+
+39 テスト。fail-closed は 7 通り(mock client / API エラー / 解析不能 /
+語彙外の side_effect_class / 語彙外の trust_boundary / out_of_scope 欠落 /
+候補内の node_key 重複)を個別に検証し、いずれも候補 0 件になることを
+assert する。採用は「提案だけでは Node が 0 件のまま」「二重採用は 409」
+「node_key 衝突は採用全体を中止し、半分だけ作らない」を含む。
