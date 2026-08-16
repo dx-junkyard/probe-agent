@@ -9312,3 +9312,124 @@ class ExplorationRankingOut(BaseModel):
     dimension: ExplorationDimension
     ranked: List[ExplorationRankingEntryOut]
     unranked: List[ExplorationRankingEntryOut]
+
+
+# ---------------------------------------------------------------------------
+# Stabilization Evidence Package (Epic #394 Phase 4, Issue #399)
+#
+# `approved_by` is never a request field: establishment is a named human's
+# decision, taken from the authenticated principal at the route (#337's
+# provenance rule). And as in Phase 3, there is no score anywhere -- every
+# criterion and floor is judged individually (ADR-7).
+# ---------------------------------------------------------------------------
+
+StabilizationEvidenceLevel = Literal["node", "flow_capability", "ux_outcome"]
+StabilizationEvidenceKind = Literal[
+    "criterion", "floor", "downstream_impact", "outcome", "stability"
+]
+StabilizationVerdict = Literal[
+    "met", "not_met", "held", "violated", "unmeasured", "not_applicable"
+]
+StabilizationRefKind = Literal[
+    "exploration_run", "exploration_variant", "replay_run", "experiment",
+    "evaluation_policy",
+]
+StabilizationStatus = Literal[
+    "draft", "under_review", "approved", "rejected", "superseded"
+]
+
+
+class StabilizationPackageCreateIn(BaseModel):
+    """The node version, baseline and rollback target are deliberately NOT
+    accepted here -- they are read from the Node's own current state, because
+    letting a caller assert them would let a package claim a rollback target
+    the Node does not have."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: int
+    candidate_implementation_id: int
+    exploration_run_id: Optional[int] = None
+    applicability_envelope: Dict[str, Any] = Field(default_factory=dict)
+    known_limitations: List[str] = Field(default_factory=list)
+    residual_risks: List[str] = Field(default_factory=list)
+    required_case_count: int = 0
+    stability_window_seconds: float = 0.0
+    observed_case_count: Optional[int] = None
+    observed_window_seconds: Optional[float] = None
+    outcome_unmeasured_reason: str = ""
+    rollback_plan: str = ""
+
+
+class StabilizationEvidenceIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_level: StabilizationEvidenceLevel
+    evidence_kind: StabilizationEvidenceKind
+    name: str
+    verdict: StabilizationVerdict
+    ref_kind: Optional[StabilizationRefKind] = None
+    ref_id: Optional[int] = None
+    evaluation_policy_id: Optional[int] = None
+    detail: str = ""
+    is_mock: bool = False
+    source: Literal["deterministic", "reasoning_llm", "manual"] = "deterministic"
+
+
+class StabilizationEvidenceOut(BaseModel):
+    id: int
+    evidence_kind: StabilizationEvidenceKind
+    name: str
+    verdict: StabilizationVerdict
+    ref_kind: Optional[StabilizationRefKind] = None
+    ref_id: Optional[int] = None
+    evaluation_policy_id: Optional[int] = None
+    detail: str
+    is_mock: bool
+    source: str
+
+
+class StabilizationGateOut(BaseModel):
+    """Recomputed on every read, never stored: a stored verdict drifts from
+    the evidence it describes."""
+
+    allowed: bool
+    reason_code: str
+    message: str
+    failing_evidence: List[str]
+
+
+class StabilizationPackageOut(BaseModel):
+    id: int
+    system_id: int
+    node_id: int
+    node_version_id: int
+    candidate_implementation_id: int
+    baseline_implementation_id: Optional[int] = None
+    rollback_implementation_id: Optional[int] = None
+    rollback_plan: str
+    exploration_run_id: Optional[int] = None
+    applicability_envelope: Dict[str, Any]
+    known_limitations: List[str]
+    residual_risks: List[str]
+    required_case_count: int
+    observed_case_count: Optional[int] = None
+    stability_window_seconds: float
+    observed_window_seconds: Optional[float] = None
+    outcome_unmeasured_reason: str
+    status: StabilizationStatus
+    approved_by: Optional[str] = None
+    approved_at: Optional[float] = None
+    decision_note: str
+    # Grouped by level, never merged: a Node-level win is not evidence that
+    # the Flow it sits in improved (ADR-7).
+    evidence: Dict[str, List[StabilizationEvidenceOut]]
+    gate: StabilizationGateOut
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class StabilizationDecisionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = ""

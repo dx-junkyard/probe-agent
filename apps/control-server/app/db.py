@@ -5414,6 +5414,138 @@ CREATE TABLE IF NOT EXISTS exploration_measurement (
 
 CREATE INDEX IF NOT EXISTS idx_exploration_measurement_variant
     ON exploration_measurement (variant_id, dimension);
+
+-- ---------------------------------------------------------------------------
+-- Stabilization Evidence Package (Epic #394 Phase 4, Issue #399,
+-- app/stabilization.py)
+--
+-- The record of WHY a Node was judged stable enough to establish. Fixation is
+-- explicitly NOT "we removed the LLM": it is "the conditions under which this
+-- processing works are now understood well enough to pin a reproducible,
+-- rollback-able implementation" -- an LLM implementation can be established
+-- exactly as legitimately as a rule one.
+--
+-- The package stores REFERENCES to evidence that already exists (exploration
+-- runs, replay runs, experiments, evaluation policies), never copies of their
+-- numbers. A copied number keeps reading as current after the run it came
+-- from is superseded or its dataset changes, which is the staleness class
+-- #337/#369 both had to fix elsewhere. Currency is therefore evaluated at
+-- GATE time, not at build time.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS stabilization_package (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                 INTEGER NOT NULL,
+    node_id                   INTEGER NOT NULL,
+    node_version_id           INTEGER NOT NULL,
+    -- The implementation this package argues should become the stable pin.
+    candidate_implementation_id INTEGER NOT NULL,
+    -- The implementation it is argued against. NULL only for a Node that has
+    -- never had a stable pin; the gate treats that as a first establishment
+    -- and says so, rather than silently comparing against nothing.
+    baseline_implementation_id INTEGER,
+    exploration_run_id        INTEGER,
+    -- What the package CLAIMS the candidate handles. The gate refuses an
+    -- empty envelope: "it worked on the cases it was built for" and "it
+    -- worked" are different claims, and only the first is ever demonstrated.
+    applicability_envelope_json TEXT NOT NULL DEFAULT '{}',
+    known_limitations_json    TEXT NOT NULL DEFAULT '[]',
+    residual_risks_json       TEXT NOT NULL DEFAULT '[]',
+    -- The package's own declaration of how much evidence it considers
+    -- sufficient. Stored per package rather than as a global constant
+    -- because #399 forbids a single fixed threshold across all domains --
+    -- but it is declared BEFORE the gate runs, so it cannot be lowered to
+    -- fit the result that came back.
+    required_case_count       INTEGER NOT NULL DEFAULT 0,
+    stability_window_seconds  REAL NOT NULL DEFAULT 0,
+    observed_case_count       INTEGER,
+    observed_window_seconds   REAL,
+    -- An unmeasured Outcome is recorded WITH the reason it could not be
+    -- measured. The gate accepts that; what it refuses is silence (#391's
+    -- rule: never infer an Outcome, never omit the fact that it is unknown).
+    outcome_unmeasured_reason TEXT NOT NULL DEFAULT '',
+    rollback_implementation_id INTEGER,
+    rollback_plan             TEXT NOT NULL DEFAULT '',
+    status                    TEXT NOT NULL DEFAULT 'draft'
+                                  CHECK (status IN
+                                      ('draft', 'under_review', 'approved',
+                                       'rejected', 'superseded')),
+    -- Approval is a person, always. `approved_by` is written from the
+    -- authenticated principal, never from a request body -- the #337
+    -- provenance rule.
+    approved_by               TEXT,
+    approved_at               REAL,
+    decision_note             TEXT NOT NULL DEFAULT '',
+    decision_method           TEXT NOT NULL DEFAULT 'manual'
+                                  CHECK (decision_method = 'manual'),
+    superseded_by_id          INTEGER,
+    created_by                TEXT,
+    created_at                REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_version_id) REFERENCES evolution_node_version (id) ON DELETE CASCADE,
+    FOREIGN KEY (candidate_implementation_id)
+        REFERENCES evolution_node_implementation (id) ON DELETE CASCADE,
+    FOREIGN KEY (baseline_implementation_id)
+        REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    FOREIGN KEY (rollback_implementation_id)
+        REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    FOREIGN KEY (exploration_run_id) REFERENCES exploration_run (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES stabilization_package (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stabilization_package_node
+    ON stabilization_package (system_id, node_id, id DESC);
+
+-- stabilization_evidence: one referenced result, with its own level and
+-- currency. `evidence_level` mirrors ADR-7's three contracts so Node,
+-- Flow/Capability and UX/Outcome evidence can never be counted as
+-- interchangeable -- a Node-level win is not evidence that the Flow it sits
+-- in improved.
+--
+-- `verdict` is the deterministic reading of that evidence, and `unmeasured`
+-- / `not_applicable` are real values rather than an absence: the gate needs
+-- to distinguish "the floor held" from "nobody measured the floor", and only
+-- the first may establish.
+--
+-- `is_mock` is carried explicitly because mock LLM output is test data
+-- (Principle 7) and must never become establishment evidence. It is a column
+-- rather than something inferred at gate time so the refusal is auditable
+-- after the fact.
+CREATE TABLE IF NOT EXISTS stabilization_evidence (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id       INTEGER NOT NULL,
+    system_id        INTEGER NOT NULL,
+    evidence_level   TEXT NOT NULL
+                         CHECK (evidence_level IN ('node', 'flow_capability', 'ux_outcome')),
+    evidence_kind    TEXT NOT NULL
+                         CHECK (evidence_kind IN
+                             ('criterion', 'floor', 'downstream_impact',
+                              'outcome', 'stability')),
+    name             TEXT NOT NULL,
+    verdict          TEXT NOT NULL
+                         CHECK (verdict IN
+                             ('met', 'not_met', 'held', 'violated',
+                              'unmeasured', 'not_applicable')),
+    ref_kind         TEXT
+                         CHECK (ref_kind IS NULL OR ref_kind IN
+                             ('exploration_run', 'exploration_variant', 'replay_run',
+                              'experiment', 'evaluation_policy')),
+    ref_id           INTEGER,
+    evaluation_policy_id INTEGER,
+    detail           TEXT NOT NULL DEFAULT '',
+    is_mock          INTEGER NOT NULL DEFAULT 0,
+    source           TEXT NOT NULL DEFAULT 'deterministic'
+                         CHECK (source IN ('deterministic', 'reasoning_llm', 'manual')),
+    created_at       REAL NOT NULL,
+    FOREIGN KEY (package_id) REFERENCES stabilization_package (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (evaluation_policy_id)
+        REFERENCES evolution_evaluation_policy (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stabilization_evidence_package
+    ON stabilization_evidence (package_id, evidence_level, id);
 """
 
 

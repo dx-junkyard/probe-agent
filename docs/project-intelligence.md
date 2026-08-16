@@ -6944,3 +6944,82 @@ versioned にしたからに他ならない。
 35 テスト。`incomparable` / `coverage_mismatch` / 片側欠測 / 方向表の
 網羅性 / `unranked` / composite 列の不在 / 実行参照の解決 / 契約 version
 不一致 / baseline 重複 / System 分離を個別に assert する。
+
+## Issue #399 — Phase 4: Stabilization Evidence Package と固定化ゲート
+
+Epic 全体が向かってきた判断 —「この Node の処理は、安定した実装を pin して
+よいだけ理解できたか」— を明示的な契約にする Phase。
+
+**固定化は「LLM をやめること」ではない。** 「この処理がどの条件下で動くかが
+分かったので、再現可能で rollback 可能な実装として定着させる」ことである。
+modality が `reasoning_llm` のままの実装も、`rule` の実装とまったく同じ
+正当性で established になれる。**ゲートは modality を読まない** —
+`GateFacts` に modality フィールドは無く、`evaluate_establishment_gate` の
+ソースに `modality` の文字列すら現れないことをテストが assert する。#399 の
+非目標は「LLM 利用の最小化を目的化すること」であり、modality を読めるゲートは
+その選好を埋め込めるゲートである。
+
+### ゲートの 3 つの性質
+
+1. **失敗だけでなく「不在」でも閉じる。** `floor_unmeasured` は
+   `floor_violated` と同じ強さで拒否する。「floor は守られた」と
+   「誰も floor を測っていない」は別の事実で、establish してよいのは前者
+   だけである。後者を通すのが、ゲートが黙って飾りになる経路そのもの。
+   Phase 3 の `incomparable` と同じ規律を、比較ではなく判断に適用している。
+2. **何も合成しない。** dimension をまたぐ算術は存在せず、criterion と
+   floor は 1 つずつ評価される。latency の改善が safety の劣化を買えない
+   (ADR-7)。テストは「latency も accuracy も cost も met、safety だけ
+   violated」で `floor_violated` になることを assert する。
+3. **ゲート通過は承認ではない。** 通過は package を*適格*にするだけで、
+   `approve_package` は名前のある人間を必須とし、`validating → established`
+   遷移は Phase 1 の evaluator を `decision_method: manual` で通す。
+   ゲート通過が source 適用・policy 変更・deploy・publish を行うことは無い
+   — それぞれ既存の別ゲートのまま(Principle 5/8)。
+
+### そのほかの規則
+
+- **証拠は参照であって複製ではなく、currency は gate 実行時に評価する。**
+  複製した数値は、元の run が superseded された後も current として読める。
+- **Outcome は「未計測でよいが、黙ってはいけない」。** 未計測の Outcome が
+  あって理由が記録されていなければ `outcome_unmeasured_unacknowledged` で
+  拒否する。Outcome 無しの establish は許すが、無言の establish は許さない
+  (#391)。
+- **applicability envelope が無ければ拒否する。** envelope が無いと成功が
+  全入力へ既定で一般化する。「作られたケースでは動いた」と「動いた」は別の
+  主張で、実証されたのは前者だけである。
+- **初回の establish は rollback 先を要求しない。** 一度も stable pin を
+  持ったことが無い Node には戻る先が無く、それは欠落ではなく正当な状態。
+  2 回目以降は必ず戻り先を名指しさせる。
+- **安定性の要件は package 自身が宣言する。** 全領域共通の固定 threshold は
+  #399 が禁じている。ただし宣言は gate 実行より前なので、返ってきた結果に
+  合わせて下げることはできない。
+- **構造的前提を証拠チェックより先に評価する。** candidate implementation が
+  消えている package に「safety floor が未計測です」と返すと、開発者を
+  間違った修正へ送ってしまう。
+- `approved_by` は認証済み principal から取り、request body には存在しない
+  (#337 の provenance 規則)。rollback 先も caller ではなく Node の現在の
+  stable pin から読む — caller に言わせると、Node が持っていない rollback
+  先を package が主張できてしまう。
+- reject は記録であって降格ではない。Node の maturity は動かない。
+- gate verdict は読むたびに再計算し、保存しない(保存した判定は記述対象の
+  証拠から drift する。#337/#338/#349 と同じ規律)。
+
+### Phase 1 との接続
+
+`load_node_facts` の `known_evidence_refs` に、その Node 自身の
+Stabilization Package (`stabilization_package:<id>`) を加えた。Phase 1 の
+`foreign_evidence` 規則の目的は「他の Node・他の System の証拠を拒否する」
+ことであり、それは維持されている — 問い合わせは node_id と system_id で
+絞られているので、別 Node の package は今も拒否される。テストが直接
+assert する。テーブルが存在しない DB でも Phase 1 が動き続けるよう、
+問い合わせは防御的に行う(テーブル欠如は「package 無し」であって、
+全遷移を止めるエラーではない)。
+
+### 検証
+
+36 テスト。17 個の refusal code すべてに個別のテストがあり、
+「code がテストに現れること」をソース走査で強制している(誰も出せない
+code は誰も強制していない規則である)。承認は Phase 1 の event log に
+`manual` で記録されること、gate は承認時に再評価されること(読んだ時点の
+PASS を信じない)、reject が Node を動かさないこと、rollback 先が
+Node から読まれることを含む。

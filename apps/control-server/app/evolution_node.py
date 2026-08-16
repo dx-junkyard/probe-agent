@@ -903,9 +903,32 @@ def load_node_facts(conn, *, system_id: int, node_id: int) -> NodeFacts:
             )
 
     links = _current_links(conn, system_id, node_id)
-    known_evidence_refs = frozenset(
+    known_evidence_refs = set(
         f"{link['link_kind']}:{link['target_ref']}" for link in links
     )
+
+    # A Stabilization Evidence Package (Phase 4, Issue #399) argued for THIS
+    # Node is this Node's own evidence, so it belongs in the set the
+    # `foreign_evidence` rule checks against. The rule's purpose is to refuse
+    # ANOTHER Node's or another System's evidence, and that is preserved: the
+    # query below is scoped to this node_id and system_id, so a package
+    # belonging to a different Node still fails the check.
+    #
+    # The table is queried defensively because `evolution_node.py` is Phase 1
+    # and must keep working against a database where Phase 4's tables have not
+    # been created yet -- a missing table means "no packages", never an error
+    # that would block every transition.
+    try:
+        package_rows = conn.execute(
+            "SELECT id FROM stabilization_package WHERE node_id = ? AND system_id = ?",
+            (node_id, system_id),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        package_rows = []
+    known_evidence_refs.update(
+        f"stabilization_package:{row['id']}" for row in package_rows
+    )
+    known_evidence_refs = frozenset(known_evidence_refs)
 
     return NodeFacts(
         maturity=node["maturity"],
