@@ -5546,6 +5546,196 @@ CREATE TABLE IF NOT EXISTS stabilization_evidence (
 
 CREATE INDEX IF NOT EXISTS idx_stabilization_evidence_package
     ON stabilization_evidence (package_id, evidence_level, id);
+
+-- ---------------------------------------------------------------------------
+-- Operations: monitoring, drift and local reopen
+-- (Epic #394 Phase 5, Issue #400, app/node_operations.py)
+--
+-- ADR-5's separation is what this whole area exists to express: `established`
+-- (the fixation decision is approved and a stable implementation is pinned)
+-- and `monitoring` (that Node is ALSO actually being observed) fail
+-- independently. Telemetry stopping does not make the fixation decision
+-- wrong, and a Node whose telemetry died must stay distinguishable from one
+-- under healthy observation -- collapsing them is the #366 one-word-two-facts
+-- defect.
+-- ---------------------------------------------------------------------------
+
+-- node_monitoring_contract: what "we are watching this" means for ONE Node,
+-- versioned. Append-only per node: a contract is what a monitoring judgement
+-- was made against, so it must survive later edits.
+--
+-- Every threshold lives here rather than as a global constant, for the same
+-- reason #399 refuses one establishment threshold: what counts as a drift
+-- differs per Node, and a number invented centrally would be applied to
+-- Nodes nobody looked at.
+--
+-- `observed_environment_ref` / `deployed_commit_sha` are separate from the
+-- Node's pinned snapshot on purpose: what is DEPLOYED and what was ANALYSED
+-- are different facts, and a drift report that conflated them would blame
+-- the code for an environment change.
+CREATE TABLE IF NOT EXISTS node_monitoring_contract (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                  INTEGER NOT NULL,
+    node_id                    INTEGER NOT NULL,
+    version_number             INTEGER NOT NULL DEFAULT 1,
+    observed_environment_ref   TEXT NOT NULL DEFAULT '',
+    deployed_commit_sha        TEXT NOT NULL DEFAULT '',
+    sampling_note              TEXT NOT NULL DEFAULT '',
+    -- The freshness budget: how long observation may be silent before the
+    -- Node reads as unobserved rather than healthy. Silence is never treated
+    -- as "fine" (#400: 未観測を正常扱いしない).
+    freshness_budget_seconds   REAL NOT NULL DEFAULT 0,
+    minimum_sample_count       INTEGER NOT NULL DEFAULT 0,
+    indicators_json            TEXT NOT NULL DEFAULT '[]',
+    reopen_conditions_json     TEXT NOT NULL DEFAULT '[]',
+    escalation_owner           TEXT NOT NULL DEFAULT '',
+    active                     INTEGER NOT NULL DEFAULT 1,
+    decision_method            TEXT NOT NULL DEFAULT 'manual'
+                                   CHECK (decision_method = 'manual'),
+    created_by                 TEXT,
+    created_at                 REAL NOT NULL,
+    superseded_by_id           INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES node_monitoring_contract (id) ON DELETE SET NULL,
+    UNIQUE (node_id, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_monitoring_contract_node
+    ON node_monitoring_contract (system_id, node_id, id DESC);
+
+-- node_drift_observation: a DETERMINISTIC reading against the contract. No
+-- interpretation lives here -- that is node_anomaly below, and the two are
+-- separate tables precisely so a structural fact and a reasoning model's
+-- reading of it can never be confused (CLAUDE.md: keep raw deterministic
+-- facts separate from LLM interpretations in storage).
+--
+-- `observation_state` distinguishes the three things a non-drifting reading
+-- can mean, which a boolean cannot: `within_budget` (measured, fine),
+-- `drift_detected` (measured, moved), `insufficient_sample` (measured too
+-- little to say) and `unobserved` (nothing arrived at all). The last two are
+-- never rolled into "fine".
+CREATE TABLE IF NOT EXISTS node_drift_observation (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    node_id               INTEGER NOT NULL,
+    contract_id           INTEGER NOT NULL,
+    indicator             TEXT NOT NULL,
+    indicator_kind        TEXT NOT NULL
+                              CHECK (indicator_kind IN
+                                  ('input_distribution', 'output_quality', 'error_rate',
+                                   'latency', 'cost', 'flow_success', 'outcome',
+                                   'human_correction', 'compatibility')),
+    observation_state     TEXT NOT NULL
+                              CHECK (observation_state IN
+                                  ('within_budget', 'drift_detected',
+                                   'insufficient_sample', 'unobserved')),
+    observed_value        REAL,
+    reference_value       REAL,
+    sample_count          INTEGER,
+    window_seconds        REAL,
+    last_observed_at      REAL,
+    detail                TEXT NOT NULL DEFAULT '',
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (contract_id)
+        REFERENCES node_monitoring_contract (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_drift_observation_node
+    ON node_drift_observation (system_id, node_id, id DESC);
+
+-- node_anomaly: the INTERPRETATION of one or more drift observations, in the
+-- finite taxonomy #400 enumerates.
+--
+-- `classification` is never produced by a heuristic fallback: a reasoning
+-- classification that fails leaves `unknown` with the failure recorded, and
+-- `unknown` is a real, actionable state rather than a placeholder. The point
+-- of the taxonomy is the distinction between a DEFECT and a
+-- frame-breaking signal (`new_use_case_signal`,
+-- `purpose_or_vision_reconsideration`): the first is fixed, the second means
+-- the design was aimed at the wrong thing, and treating the second as the
+-- first is how a system optimises its way further from its purpose.
+--
+-- `dedupe_key` is what stops one continuing condition producing a new reopen
+-- every polling cycle.
+CREATE TABLE IF NOT EXISTS node_anomaly (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    node_id             INTEGER NOT NULL,
+    contract_id         INTEGER,
+    classification      TEXT NOT NULL
+                            CHECK (classification IN
+                                ('implementation_defect', 'input_or_environment_drift',
+                                 'upstream_downstream_mismatch', 'evaluation_gap',
+                                 'new_use_case_signal',
+                                 'purpose_or_vision_reconsideration', 'unknown')),
+    severity            TEXT NOT NULL DEFAULT 'attention'
+                            CHECK (severity IN ('blocking', 'attention', 'informational')),
+    summary             TEXT NOT NULL DEFAULT '',
+    observation_ids_json TEXT NOT NULL DEFAULT '[]',
+    -- Which path produced the classification, and its provenance. A
+    -- reasoning failure is recorded rather than replaced (Principle 6).
+    decision_method     TEXT NOT NULL DEFAULT 'deterministic'
+                            CHECK (decision_method IN
+                                ('deterministic', 'reasoning_llm', 'manual')),
+    intelligence_run_id INTEGER,
+    classification_error TEXT NOT NULL DEFAULT '',
+    dedupe_key          TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open', 'acknowledged', 'resolved', 'superseded')),
+    created_at          REAL NOT NULL,
+    resolved_at         REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (contract_id) REFERENCES node_monitoring_contract (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_anomaly_node
+    ON node_anomaly (system_id, node_id, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_node_anomaly_dedupe
+    ON node_anomaly (node_id, dedupe_key)
+    WHERE dedupe_key != '' AND status IN ('open', 'acknowledged');
+
+-- node_reopen_plan: which Nodes a reopen would touch, and why.
+--
+-- The scope is proposed deterministically from the Node graph and then
+-- APPROVED by a human -- reopening is a maturity transition, and ADR-9
+-- allows no automatic ones. `stable_implementation_retained` is stored as an
+-- explicit assertion rather than assumed, because ADR-5's promise that
+-- production keeps running the established implementation during
+-- re-exploration is the property most likely to be quietly broken later.
+CREATE TABLE IF NOT EXISTS node_reopen_plan (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    origin_node_id              INTEGER NOT NULL,
+    anomaly_id                  INTEGER,
+    scope_node_ids_json         TEXT NOT NULL DEFAULT '[]',
+    scope_rationale_json        TEXT NOT NULL DEFAULT '[]',
+    excluded_node_ids_json      TEXT NOT NULL DEFAULT '[]',
+    reason                      TEXT NOT NULL DEFAULT '',
+    budget_note                 TEXT NOT NULL DEFAULT '',
+    stable_implementation_retained INTEGER NOT NULL DEFAULT 1,
+    status                      TEXT NOT NULL DEFAULT 'proposed'
+                                    CHECK (status IN
+                                        ('proposed', 'approved', 'rejected', 'completed')),
+    decision_method             TEXT NOT NULL DEFAULT 'manual'
+                                    CHECK (decision_method = 'manual'),
+    approved_by                 TEXT,
+    approved_at                 REAL,
+    decision_note               TEXT NOT NULL DEFAULT '',
+    created_by                  TEXT,
+    created_at                  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (origin_node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (anomaly_id) REFERENCES node_anomaly (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_reopen_plan_origin
+    ON node_reopen_plan (system_id, origin_node_id, id DESC);
 """
 
 

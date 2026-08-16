@@ -7023,3 +7023,66 @@ code は誰も強制していない規則である)。承認は Phase 1 の even
 `manual` で記録されること、gate は承認時に再評価されること(読んだ時点の
 PASS を信じない)、reject が Node を動かさないこと、rollback 先が
 Node から読まれることを含む。
+
+## Issue #400 — Phase 5: 運用 drift と局所再探索
+
+ADR-5 の分離を実際に表現する層。`established`(固定化判断が承認され安定実装が
+pin されている)と `monitoring`(その Node が実際に観測されている)は**独立に
+壊れる**。telemetry が止まっても固定化判断が誤りになるわけではなく、
+telemetry が死んだ Node は健全に観測されている Node と区別され続けなければ
+ならない。統合すると #366 の「一つの表示語が二つの事実を運ぶ」欠陥になる。
+
+### 4 つの規則
+
+1. **沈黙は健全ではない。** `evaluate_observation_health` は `unobserved` /
+   `insufficient_sample` を独立の状態として返し、「budget 内」へ丸めない。
+   判定順も契約で、`unobserved` が最初に来る — データが止まった Node は
+   drift した/しなかったのどちらとも判定できない。判定材料が無いのだから。
+   under-sample も drift 判定より先に評価する:データが少なすぎることは
+   「drift した」を否定する根拠にも肯定する根拠にもならない。
+2. **決定的事実と、その解釈は別の行。** `node_drift_observation` は測定値、
+   `node_anomaly` は結論。reasoning による分類が失敗したときは
+   `unknown` + `classification_error` を記録し、heuristic の当て推量へ
+   fallback しない(Principle 6)。「システムは何かを見たが、それが何かは
+   言えなかった」は実在する actionable な状態である。具体的な分類と
+   error を同時に持つことは拒否する — それこそが禁じられている fallback。
+3. **defect と frame-breaking signal は別の答え。** taxonomy の要点は、
+   `implementation_defect` は直すものだが `new_use_case_signal` /
+   `purpose_or_vision_reconsideration` は「設計が狙う先を間違えていた」の
+   合図だということ。後者を前者として扱うと、システムは自分の目的から
+   さらに遠ざかる方向へ最適化されていく。projection は
+   `frame_breaking` を明示する。
+4. **reopen は局所的で、承認制で、本番を落とさない。**
+   `propose_reopen_scope` は Node graph を決定的にたどる — 「同じ
+   Component / Probe Point / Capability / Flow に紐づいている」という
+   構造的事実であって、類似度判定ではない(Principle 6)。無関係な Node は
+   黙って省かず `excluded_node_ids` に**明示**する:読み手が「無関係な
+   Node は reopen されていない」を確認できる唯一の方法だから。承認は
+   名前のある人間(ADR-9)、そして**安定実装の pin は外れない** —
+   本番は established 実装を動かし続ける。それこそが再探索を安全に
+   始められる理由である。
+
+### そのほか
+
+- 同一条件の繰り返しは `dedupe_key` で 1 件に畳まれる。polling のたびに
+  新しい anomaly が生まれ、そのたびに reopen が生まれることを防ぐ。
+- 監視契約の閾値はすべて契約ごと。#399 が単一の固定 threshold を禁じるのと
+  同じ理由で、中央で決めた数値は誰も見ていない Node にも適用されてしまう。
+- `observed_environment_ref` / `deployed_commit_sha` は Node の pinned
+  snapshot と別に持つ。「何がデプロイされているか」と「何を解析したか」は
+  別の事実で、混ぜた drift 報告は環境変化をコードのせいにする。
+- 一括 reopen で遷移できない Node は強制せず結果を報告する。gate を黙って
+  無視する一括操作は、存在しない gate と同じ。
+
+### 検証
+
+26 テスト。fixture 自体が `established` に到達したことを assert する —
+到達していなければ、以降のテストが黙って `validating` の Node を検証して
+しまうため。
+
+### この Phase の範囲
+
+本コミットは domain 層(監視契約・drift 観測・anomaly taxonomy・reopen
+scope)とそのテストまで。operations cockpit の API/画面は Phase 6(#401)の
+統合対象であり、そこで既存 Overview / Components / Cell Fabric と合わせて
+配置する。
