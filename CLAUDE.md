@@ -1383,6 +1383,24 @@ creating incomplete persistence or execution paths for later phases.
     redaction (Principle 9)、network-off の隔離 worktree sandbox、
     Principle 5 の「target repo へ直接書かない」境界も不変。
 
+    **実装状況 (2026-08-16 時点)。** Phase 0〜5 (#395-#400) は実装・検証済み
+    で、各 Phase の設計判断は `docs/project-intelligence.md` の該当セクションに
+    記録してある。実装された正本モジュールは順に `app/evolution_node.py`
+    (Node 契約 / 12 個の有限拒否コードを持つ純粋な遷移 evaluator /
+    append-only lineage)、`app/node_design.py` (Purpose-to-Node lineage /
+    decomposition / 3 つの評価契約 / Phase 3 への handoff)、
+    `app/exploration_workbench.py` (modality 横断比較。合成なし、
+    `incomparable` / `coverage_mismatch` を持つ)、`app/stabilization.py`
+    (17 個の有限拒否コードを持つ固定化ゲート)、`app/node_operations.py`
+    (監視契約 / drift 観測 / anomaly taxonomy / 局所 reopen)。
+    **#401 Phase 6 (lifecycle UX 統合 / migration 完了 / dogfooding) は
+    未着手。** Phase 5 の operations cockpit API・画面も #401 の統合対象と
+    して残してある — 4 つ目の孤立したページを作らず、既存 Overview /
+    Components / Cell Fabric と合わせて再配置するため。なお #401 の受け入れ
+    条件は「dogfooding を agent の自己評価だけで完了扱いしない」ことを明示的な
+    非目標としているので、**実際の開発者による dogfooding 記録なしに #401 を
+    完了とみなしてはならない**。
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,
