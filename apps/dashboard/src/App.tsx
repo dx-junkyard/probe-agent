@@ -24,6 +24,7 @@ import WorkspacesPage from "./pages/workspaces";
 import SystemUnderstandingPage from "./pages/system-understanding";
 import GithubPage from "./pages/github";
 import CellFabricPage from "./pages/cell-fabric";
+import EvolutionNodesPage from "./pages/evolution-nodes";
 
 export default function App() {
   return (
@@ -51,6 +52,7 @@ export default function App() {
         <Route path="workspaces" element={<WorkspacesPage />} />
         <Route path="github" element={<GithubPage />} />
         <Route path="cell-fabric" element={<CellFabricPage />} />
+        <Route path="evolution-nodes" element={<EvolutionNodesPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="admin" element={<AdminPage />} />
       </Route>

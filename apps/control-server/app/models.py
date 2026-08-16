@@ -8632,3 +8632,275 @@ class PurposeOutcomeUnavailableRequest(BaseModel):
     source: PurposeOutcomeEvidenceSource
     state: Literal["not_observed", "not_computed"]
     reason: str
+
+
+# ---------------------------------------------------------------------------
+# Evolution Node (Epic #394 Phase 1, Issue #396)
+#
+# The finite vocabularies below are mirrored from `app/evolution_node.py`,
+# which owns them. They are re-declared here as `Literal` aliases rather than
+# imported so FastAPI puts a real enum in the OpenAPI schema and the
+# Dashboard's TypeScript unions cannot silently drift from the server -- the
+# same discipline `PurposeElementKind` and the #351 Brief vocabularies use.
+# `test_evolution_node_api.py` asserts the two definitions stay identical.
+# ---------------------------------------------------------------------------
+
+EvolutionMaturityState = Literal[
+    "exploring", "validating", "established", "monitoring", "reopened", "suspended"
+]
+EvolutionImplementationModality = Literal[
+    "reasoning_llm", "lm_program", "retrieval", "router", "small_model",
+    "rule", "deterministic_code", "workflow", "manual", "hybrid",
+]
+EvolutionLinkKind = Literal[
+    "component", "probe_point", "cell_binding", "capability", "flow",
+    "purpose_element", "feature",
+]
+EvolutionSideEffectClass = Literal[
+    "pure", "read_only", "local_write", "external_write", "irreversible"
+]
+EvolutionTrustBoundary = Literal[
+    "internal", "external_input", "external_output", "third_party"
+]
+EvolutionActorKind = Literal["developer", "system"]
+
+
+class EvolutionNodeCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_key: str
+    display_name: str = ""
+
+
+class EvolutionNodeVersionCreateIn(BaseModel):
+    """The Node's CONTRACT -- what it promises, not how it currently keeps
+    that promise (ADR-3). `evaluation_policy_refs` are refs, never inline
+    criteria: Phase 2 (#397) owns the three evaluation contracts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mission: str
+    input_contract: Optional[Dict[str, Any]] = None
+    output_contract: Optional[Dict[str, Any]] = None
+    side_effect_class: EvolutionSideEffectClass
+    trust_boundary: EvolutionTrustBoundary
+    scope: str = ""
+    out_of_scope: str = ""
+    establishment_criteria: List[str] = Field(default_factory=list)
+    reopen_criteria: List[str] = Field(default_factory=list)
+    evaluation_policy_refs: List[str] = Field(default_factory=list)
+
+
+class EvolutionNodeImplementationCreateIn(BaseModel):
+    """How the Node currently keeps its contract's promise (ADR-3).
+
+    Provider/model names belong inside `config` / `provenance` and never in a
+    field that participates in the implementation's identity -- the same rule
+    #298's Agent Role Card applies to model aliases. `modality` is the axis
+    that makes an LLM implementation and a rule implementation of the SAME
+    contract comparable.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_version_id: int
+    modality: EvolutionImplementationModality
+    config: Optional[Dict[str, Any]] = None
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    environment_ref: Optional[str] = None
+    provenance: Optional[Dict[str, Any]] = None
+
+
+class EvolutionNodeLinkCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    link_kind: EvolutionLinkKind
+    target_ref: str
+    target_row_id: Optional[int] = None
+    note: str = ""
+
+
+class EvolutionNodeStablePinIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    implementation_id: int
+    reason: str = ""
+
+
+class EvolutionNodeTransitionIn(BaseModel):
+    """A maturity transition request.
+
+    `decision_method` is deliberately NOT defaulted to `manual`: which of the
+    three it is decides whether a human stands behind this transition, and a
+    default would let a caller record a human decision by omission. The
+    domain layer rejects `reasoning_llm` outright -- an LLM never emits a
+    canonical state (Principle 6).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    to_state: EvolutionMaturityState
+    decision_method: Literal["deterministic", "reasoning_llm", "manual"]
+    actor: Optional[str] = None
+    actor_kind: EvolutionActorKind = "developer"
+    reason: str = ""
+    reason_code: str = ""
+    evidence_refs: List[str] = Field(default_factory=list)
+    idempotency_key: str = ""
+
+
+class EvolutionNodeSummaryOut(BaseModel):
+    id: int
+    system_id: int
+    node_key: str
+    display_name: str
+    maturity: EvolutionMaturityState
+    current_version_id: Optional[int] = None
+    current_implementation_id: Optional[int] = None
+    stable_implementation_id: Optional[int] = None
+    rollback_implementation_id: Optional[int] = None
+    monitoring_contract_ref: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class EvolutionNodesListOut(BaseModel):
+    nodes: List[EvolutionNodeSummaryOut]
+
+
+class EvolutionNodeVersionOut(BaseModel):
+    id: int
+    version_number: int
+    mission: str
+    scope: str
+    out_of_scope: str
+    input_contract: Dict[str, Any]
+    output_contract: Dict[str, Any]
+    side_effect_class: str
+    trust_boundary: str
+    establishment_criteria: List[str]
+    reopen_criteria: List[str]
+    evaluation_policy_refs: List[str]
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class EvolutionNodeImplementationOut(BaseModel):
+    id: int
+    implementation_number: int
+    node_version_id: int
+    modality: str
+    config: Dict[str, Any]
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    environment_ref: Optional[str] = None
+    provenance: Dict[str, Any]
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class EvolutionNodeLinkOut(BaseModel):
+    id: int
+    link_kind: str
+    target_ref: str
+    target_row_id: Optional[int] = None
+    note: str
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class EvolutionNodeEventOut(BaseModel):
+    id: int
+    event_kind: str
+    from_state: Optional[str] = None
+    to_state: Optional[str] = None
+    from_version_id: Optional[int] = None
+    to_version_id: Optional[int] = None
+    from_implementation_id: Optional[int] = None
+    to_implementation_id: Optional[int] = None
+    actor: Optional[str] = None
+    actor_kind: str
+    decision_method: str
+    reason_code: str
+    reason: str
+    # Named `evidence` (not `evidence_refs`) to match the domain layer's own
+    # event document: the stored value is a list of refs, and renaming it at
+    # the boundary would leave the API and the projection describing the
+    # same column under two names.
+    evidence: List[str]
+    # NULL for a request that opted out of idempotency entirely. An empty
+    # string is deliberately not used: the partial unique index excludes it,
+    # so "no key" and "the empty key" are not the same fact.
+    idempotency_key: Optional[str] = None
+    created_at: float
+
+
+class EvolutionNodeEventsOut(BaseModel):
+    node_id: int
+    events: List[EvolutionNodeEventOut]
+
+
+class EvolutionNodeProjectionOut(BaseModel):
+    """The canonical Node document.
+
+    `maturity`, `improvement_status` and `policy_mode` are three INDEPENDENT
+    axes and no consumer may combine them into one label (ADR-6). A `null`
+    on either of the latter two means "nothing of that kind is linked to
+    this Node" -- never "none is in progress". The fourth axis
+    (`workflow_phase`) is deliberately absent from the document rather than
+    `null`; Phase 6 (#401) wires it.
+
+    `availability[k] is False` means that block could not be read at all.
+    Paired with a `null` value it is a different fact from a `null` with
+    `availability[k] is True`, which is a genuine absence (#380).
+    """
+
+    schema_version: str
+    system_id: int
+    node_id: int
+    node_key: str
+    display_name: str
+    maturity: EvolutionMaturityState
+    current_version: Optional[EvolutionNodeVersionOut] = None
+    current_implementation: Optional[EvolutionNodeImplementationOut] = None
+    stable_implementation: Optional[EvolutionNodeImplementationOut] = None
+    rollback_implementation: Optional[EvolutionNodeImplementationOut] = None
+    links: List[EvolutionNodeLinkOut]
+    events: List[EvolutionNodeEventOut]
+    improvement_status: Optional[str] = None
+    policy_mode: Optional[str] = None
+    availability: Dict[str, bool]
+    updated_at: float
+
+
+class EvolutionNodeLegacyProjectionOut(BaseModel):
+    """ADR-8 compatibility view. Not a second canonical projection."""
+
+    schema_version: str
+    compatibility_projection: bool
+    system_id: int
+    node_id: int
+    node_key: str
+    component_id: Optional[str] = None
+    probe_point_ref: Optional[str] = None
+    cell_id: Optional[str] = None
+    maturity: EvolutionMaturityState
+
+
+class EvolutionNodeTransitionOut(BaseModel):
+    """`applied` and `duplicate` are separate booleans on purpose: a retry
+    that changed nothing is a success, not a failure, and the caller has to
+    be able to tell the two apart. A REJECTED transition never reaches this
+    model -- it is a 422 carrying the domain layer's own finite reason code.
+    """
+
+    applied: bool
+    duplicate: bool
+    maturity: EvolutionMaturityState
+    event: Optional[EvolutionNodeEventOut] = None

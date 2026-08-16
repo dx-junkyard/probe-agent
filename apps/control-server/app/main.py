@@ -20,6 +20,7 @@ from .routes import (
     connectivity,
     diagnostics,
     evaluation,
+    evolution_nodes,
     experiments,
     generation,
     github_connections,
@@ -107,6 +108,7 @@ def create_app() -> FastAPI:
     app.include_router(shadow.router, dependencies=_auth)
     app.include_router(evaluation.router, dependencies=_auth)
     app.include_router(experiments.router, dependencies=_auth)
+    app.include_router(evolution_nodes.router, dependencies=_auth)
     app.include_router(generation.router, dependencies=_auth)
     app.include_router(replay.router, dependencies=_auth)
     app.include_router(candidate_studio.router, dependencies=_auth)

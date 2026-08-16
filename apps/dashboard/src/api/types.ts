@@ -5640,3 +5640,161 @@ export interface PurposeOutcomeUnavailableRequest {
   state: "not_observed" | "not_computed";
   reason: string;
 }
+
+// --- Evolution Node (Epic #394 Phase 1, Issue #396) -------------------------
+//
+// These unions mirror the server's finite vocabularies
+// (`app/evolution_node.py`, re-declared as Literals in `app/models.py`).
+// They are the display vocabulary only -- the client never DECIDES any of
+// them. `apps/control-server/tests/test_evolution_node_api.py` holds the two
+// server-side definitions together; a drift between server and client shows
+// up here as a compile error the first time an unknown value is handled.
+
+export type EvolutionMaturityState =
+  | "exploring" | "validating" | "established" | "monitoring" | "reopened" | "suspended";
+
+export type EvolutionImplementationModality =
+  | "reasoning_llm" | "lm_program" | "retrieval" | "router" | "small_model"
+  | "rule" | "deterministic_code" | "workflow" | "manual" | "hybrid";
+
+export type EvolutionLinkKind =
+  | "component" | "probe_point" | "cell_binding" | "capability" | "flow"
+  | "purpose_element" | "feature";
+
+export interface EvolutionNodeSummary {
+  id: number;
+  system_id: number;
+  node_key: string;
+  display_name: string;
+  maturity: EvolutionMaturityState;
+  current_version_id: number | null;
+  current_implementation_id: number | null;
+  stable_implementation_id: number | null;
+  rollback_implementation_id: number | null;
+  monitoring_contract_ref: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface EvolutionNodesListOut {
+  nodes: EvolutionNodeSummary[];
+}
+
+export interface EvolutionNodeVersionOut {
+  id: number;
+  version_number: number;
+  mission: string;
+  scope: string;
+  out_of_scope: string;
+  input_contract: Record<string, unknown>;
+  output_contract: Record<string, unknown>;
+  side_effect_class: string;
+  trust_boundary: string;
+  establishment_criteria: string[];
+  reopen_criteria: string[];
+  evaluation_policy_refs: string[];
+  decision_method: string;
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface EvolutionNodeImplementationOut {
+  id: number;
+  implementation_number: number;
+  node_version_id: number;
+  modality: EvolutionImplementationModality;
+  config: Record<string, unknown>;
+  snapshot_id: number | null;
+  commit_sha: string | null;
+  environment_ref: string | null;
+  provenance: Record<string, unknown>;
+  decision_method: string;
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface EvolutionNodeLinkOut {
+  id: number;
+  link_kind: EvolutionLinkKind;
+  target_ref: string;
+  target_row_id: number | null;
+  note: string;
+  decision_method: string;
+  created_by: string | null;
+  created_at: number;
+}
+
+export interface EvolutionNodeEventOut {
+  id: number;
+  event_kind: string;
+  from_state: EvolutionMaturityState | null;
+  to_state: EvolutionMaturityState | null;
+  from_version_id: number | null;
+  to_version_id: number | null;
+  from_implementation_id: number | null;
+  to_implementation_id: number | null;
+  actor: string | null;
+  actor_kind: string;
+  decision_method: string;
+  reason_code: string;
+  reason: string;
+  evidence: string[];
+  idempotency_key: string | null;
+  created_at: number;
+}
+
+export interface EvolutionNodeEventsOut {
+  node_id: number;
+  events: EvolutionNodeEventOut[];
+}
+
+/** The canonical Node document.
+ *
+ * `maturity`, `improvement_status` and `policy_mode` are three INDEPENDENT
+ * axes (ADR-6) and must never be combined into one displayed label -- that
+ * conflation is the #366 "one displayed word carrying two facts" defect. The
+ * fourth axis (`workflow_phase`) is deliberately ABSENT from the document
+ * rather than null; Phase 6 (#401) wires it.
+ *
+ * `availability[k] === false` means the block could not be read at all,
+ * which is a different fact from a null value with `availability[k] === true`
+ * (a genuine absence). The two get different copy. */
+export interface EvolutionNodeProjectionOut {
+  schema_version: string;
+  system_id: number;
+  node_id: number;
+  node_key: string;
+  display_name: string;
+  maturity: EvolutionMaturityState;
+  current_version: EvolutionNodeVersionOut | null;
+  current_implementation: EvolutionNodeImplementationOut | null;
+  stable_implementation: EvolutionNodeImplementationOut | null;
+  rollback_implementation: EvolutionNodeImplementationOut | null;
+  links: EvolutionNodeLinkOut[];
+  events: EvolutionNodeEventOut[];
+  improvement_status: string | null;
+  policy_mode: string | null;
+  availability: Record<string, boolean>;
+  updated_at: number;
+}
+
+export interface EvolutionNodeLegacyProjectionOut {
+  schema_version: string;
+  compatibility_projection: boolean;
+  system_id: number;
+  node_id: number;
+  node_key: string;
+  component_id: string | null;
+  probe_point_ref: string | null;
+  cell_id: string | null;
+  maturity: EvolutionMaturityState;
+}
+
+export interface EvolutionNodeTransitionOut {
+  applied: boolean;
+  duplicate: boolean;
+  maturity: EvolutionMaturityState;
+  event: EvolutionNodeEventOut | null;
+}

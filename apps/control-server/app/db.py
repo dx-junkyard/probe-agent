@@ -4788,6 +4788,293 @@ CREATE INDEX IF NOT EXISTS idx_purpose_outcome_criterion_session
 
 CREATE INDEX IF NOT EXISTS idx_purpose_outcome_criterion_target
     ON purpose_outcome_criterion (system_id, session_id, target_kind, target_id);
+
+-- ---------------------------------------------------------------------------
+-- Evolution Node Fabric (Epic #394 Phase 1, Issue #396). See app/evolution_node.py
+-- for the pure finite-transition evaluator and the persistence/projection
+-- layer built on these five tables, and the "Evolution Node" section of
+-- docs/evolutionary-pipeline.md for the full design.
+--
+-- An Evolution Node is a NEW canonical entity, deliberately NOT a version-up
+-- of the Probe Cell (cell_definitions/cell_bindings, Issue #297/#299): the
+-- Cell owns the EXECUTION role (Role Card, orchestration, quality sampling);
+-- the Node owns the UNIT OF PROCESSING THAT EVOLVES -- its business I/O
+-- contract, its implementation modality, its maturity, its establishment/
+-- reopen criteria, and its rollback pin. A Node LINKS to a Cell Binding (and
+-- to a Component, a Probe Point, ...) through evolution_node_link below; it
+-- never duplicates or supersedes cell_bindings/cell_definitions rows.
+--
+-- evolution_node: one row per Node. Identity is (system_id, node_key) --
+-- node_key is a DEVELOPER-SUPPLIED stable slug, deliberately never derived
+-- from component_id: a Node is designed before instrumentation exists
+-- (Phase 2 of this Epic), may span several Components over its life, and
+-- must survive a Component rename without losing its own identity. The four
+-- *_implementation_id / current_version_id pointers are denormalized
+-- "current state" columns kept in sync by app/evolution_node.py's
+-- persistence functions inside the same transaction as the append-only row
+-- they point at (create_node/add_version/add_implementation/
+-- pin_stable_implementation) -- they are never written by a bare UPDATE
+-- outside that module, which is what keeps them from drifting out of sync
+-- with the append-only history in evolution_node_version/_implementation.
+-- monitoring_contract_ref is nullable and unused until Issue #400 (this
+-- Epic's Phase 5) wires a real monitoring contract; a NULL here is "no
+-- contract wired yet", never "monitoring failed".
+CREATE TABLE IF NOT EXISTS evolution_node (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    node_key                    TEXT NOT NULL,
+    display_name                TEXT NOT NULL DEFAULT '',
+    maturity                    TEXT NOT NULL DEFAULT 'exploring'
+                                    CHECK (maturity IN
+                                        ('exploring', 'validating', 'established',
+                                         'monitoring', 'reopened', 'suspended')),
+    current_version_id          INTEGER,
+    current_implementation_id   INTEGER,
+    stable_implementation_id    INTEGER,
+    rollback_implementation_id  INTEGER,
+    monitoring_contract_ref     TEXT,
+    schema_version               TEXT NOT NULL DEFAULT 'evolution-node-v1',
+    created_at                  REAL NOT NULL,
+    updated_at                  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (current_version_id) REFERENCES evolution_node_version (id) ON DELETE SET NULL,
+    FOREIGN KEY (current_implementation_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    FOREIGN KEY (stable_implementation_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    FOREIGN KEY (rollback_implementation_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    UNIQUE (system_id, node_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_node_system
+    ON evolution_node (system_id, id DESC);
+
+-- evolution_node_version: the Node's CONTRACT -- its business I/O shape, its
+-- side-effect/trust classification, and the criteria that decide when it may
+-- move to 'established'/'monitoring' or must move to 'reopened'. Append-only,
+-- the same discipline as cell_bindings: a correction inserts a NEW row with
+-- version_number = max+1 and sets the prior current row's superseded_by_id;
+-- app/evolution_node.py never UPDATEs mission/input_contract/etc in place,
+-- because a version is what an establishment/reopen decision was made
+-- AGAINST and that history must survive later edits.
+--
+-- mission/scope/out_of_scope are free-text (not JSON) -- they are read as
+-- prose, unlike input_contract/output_contract/establishment_criteria/
+-- reopen_criteria/evaluation_policy_refs, which ARE TEXT JSON because each is
+-- a structured list/object the pure evaluator and the projection need to
+-- walk programmatically. decision_method records who AUTHORED this contract
+-- version (deterministic/reasoning_llm/manual are all legitimate HERE,
+-- unlike a maturity transition -- see evaluate_transition's
+-- llm_state_not_allowed check in app/evolution_node.py, which is what keeps
+-- an LLM-authored contract DRAFT from ever becoming a maturity decision by
+-- itself).
+CREATE TABLE IF NOT EXISTS evolution_node_version (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id                     INTEGER NOT NULL,
+    system_id                   INTEGER NOT NULL,
+    version_number              INTEGER NOT NULL,
+    mission                     TEXT NOT NULL DEFAULT '',
+    scope                       TEXT NOT NULL DEFAULT '',
+    out_of_scope                TEXT NOT NULL DEFAULT '',
+    input_contract               TEXT NOT NULL DEFAULT '{}',
+    output_contract              TEXT NOT NULL DEFAULT '{}',
+    side_effect_class            TEXT NOT NULL
+                                    CHECK (side_effect_class IN
+                                        ('pure', 'read_only', 'local_write',
+                                         'external_write', 'irreversible')),
+    trust_boundary                TEXT NOT NULL
+                                    CHECK (trust_boundary IN
+                                        ('internal', 'external_input',
+                                         'external_output', 'third_party')),
+    establishment_criteria       TEXT NOT NULL DEFAULT '[]',
+    reopen_criteria               TEXT NOT NULL DEFAULT '[]',
+    evaluation_policy_refs        TEXT NOT NULL DEFAULT '[]',
+    decision_method               TEXT NOT NULL DEFAULT 'manual'
+                                    CHECK (decision_method IN
+                                        ('deterministic', 'reasoning_llm', 'manual')),
+    created_by                    TEXT,
+    created_at                    REAL NOT NULL,
+    superseded_by_id              INTEGER,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES evolution_node_version (id) ON DELETE SET NULL,
+    UNIQUE (node_id, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_node_version_node
+    ON evolution_node_version (node_id, version_number DESC);
+
+-- evolution_node_implementation: HOW the Node currently keeps its contract's
+-- promise. Append-only, same discipline as evolution_node_version --
+-- swapping implementations (e.g. moving from a reasoning_llm draft to a
+-- deterministic_code rewrite) inserts a new row rather than mutating the
+-- old one, because the establishment/monitoring history needs to say which
+-- exact implementation the evidence was gathered against.
+--
+-- node_version_id records which CONTRACT this implementation claims to
+-- satisfy; app/evolution_node.py's stale_implementation transition check
+-- compares it against the Node's current_version_id, so a contract edit
+-- that leaves an old implementation behind is caught structurally rather
+-- than silently let through. snapshot_id is nullable and ON DELETE SET NULL
+-- (not RESTRICT): a deleted repository snapshot must not block deleting
+-- unrelated snapshot history, and losing the snapshot pointer here still
+-- leaves commit_sha as the durable provenance fact (Principle 5).
+--
+-- config_json / provenance_json are the ONLY place a real provider/model
+-- name may appear for this implementation (Issue #298's Role Card
+-- model-alias rule, applied here): no other column on this table may
+-- participate in identity or a CHECK based on a literal provider/model
+-- name, so switching providers is a config-blob edit, never a schema or
+-- constraint change.
+CREATE TABLE IF NOT EXISTS evolution_node_implementation (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id               INTEGER NOT NULL,
+    system_id             INTEGER NOT NULL,
+    implementation_number INTEGER NOT NULL,
+    node_version_id       INTEGER NOT NULL,
+    modality              TEXT NOT NULL
+                              CHECK (modality IN
+                                  ('reasoning_llm', 'lm_program', 'retrieval', 'router',
+                                   'small_model', 'rule', 'deterministic_code', 'workflow',
+                                   'manual', 'hybrid')),
+    config_json           TEXT NOT NULL DEFAULT '{}',
+    snapshot_id            INTEGER,
+    commit_sha             TEXT,
+    environment_ref         TEXT,
+    provenance_json         TEXT NOT NULL DEFAULT '{}',
+    created_by              TEXT,
+    decision_method          TEXT NOT NULL DEFAULT 'manual'
+                                CHECK (decision_method IN
+                                    ('deterministic', 'reasoning_llm', 'manual')),
+    created_at               REAL NOT NULL,
+    superseded_by_id          INTEGER,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_version_id) REFERENCES evolution_node_version (id) ON DELETE RESTRICT,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    UNIQUE (node_id, implementation_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_node_implementation_node
+    ON evolution_node_implementation (node_id, implementation_number DESC);
+
+-- evolution_node_link: append-only links from a Node to an EXISTING asset
+-- (a Component, a Probe Point, a Cell Binding, a Capability, a Flow, a
+-- Purpose Chain element, a Feature). target_ref is always the STABLE STRING
+-- id of the target (a component_id, a stable Capability/Purpose-element id,
+-- ...) so a link keeps meaning even for a target whose row identity is
+-- itself recomputed on every read (the same discipline
+-- purpose_relation_decision uses above); target_row_id is the OPTIONAL row
+-- id for a target that does have one (a probe_points.id, a cell_bindings.id)
+-- and exists purely as a join shortcut -- app/evolution_node.py never trusts
+-- target_row_id alone without also checking target_ref/link_kind, so a
+-- caller cannot point a link at another System's row by id alone. Multiple
+-- concurrent links of the same kind are legitimate (a Node may span more
+-- than one Component), so a new link never automatically supersedes an
+-- older one of the same kind -- superseded_by_id exists for a future
+-- explicit "this link was corrected" operation, deliberately unused by
+-- Phase 1's add_link.
+CREATE TABLE IF NOT EXISTS evolution_node_link (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id           INTEGER NOT NULL,
+    system_id         INTEGER NOT NULL,
+    link_kind         TEXT NOT NULL
+                          CHECK (link_kind IN
+                              ('component', 'probe_point', 'cell_binding', 'capability',
+                               'flow', 'purpose_element', 'feature')),
+    target_ref        TEXT NOT NULL,
+    target_row_id     INTEGER,
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method    TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN
+                              ('deterministic', 'reasoning_llm', 'manual')),
+    created_by         TEXT,
+    created_at         REAL NOT NULL,
+    superseded_by_id   INTEGER,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES evolution_node_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_node_link_lookup
+    ON evolution_node_link (node_id, link_kind, id DESC);
+
+-- evolution_node_event: append-only lineage of everything that happened to a
+-- Node. This is what makes a drifted STORED evolution_node.maturity value
+-- detectable: app/evolution_node.py's fold_events() replays every
+-- event_kind='transition' row in id order and must reproduce the stored
+-- maturity, exactly as ADR-4 (docs/evolutionary-pipeline.md) requires -- a
+-- table that only stored the current maturity would have no way to notice
+-- a bad UPDATE outside the module ever happened.
+--
+-- from_state/to_state are only ever non-NULL together on a 'transition'
+-- event; every other event_kind uses the matching from_*_id/to_*_id pair
+-- instead (version_created -> from_version_id/to_version_id,
+-- implementation_created -> from_implementation_id/to_implementation_id,
+-- stable_pinned/rollback_pinned -> from_implementation_id/
+-- to_implementation_id), so a reader can tell what kind of pointer moved
+-- without inspecting reason_code.
+--
+-- idempotency_key + the partial unique index below are what let
+-- apply_transition() be safely retried: a client that resends the same
+-- transition request after a timeout must get back the SAME event row, not
+-- a second one that silently double-applies a state change the caller
+-- already believes happened. An empty idempotency_key ('') means "the
+-- caller did not ask for idempotency" and is deliberately excluded from the
+-- uniqueness constraint (via the partial index's WHERE clause), since many
+-- legitimate events share that empty value.
+--
+-- evidence_json holds ONLY REFS (never raw evidence content) -- the same
+-- discipline cell_improvements.canary_evidence_json already uses -- so an
+-- audit reader always resolves the evidence against its owning system of
+-- record instead of trusting a copy that could drift from it.
+CREATE TABLE IF NOT EXISTS evolution_node_event (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id                   INTEGER NOT NULL,
+    system_id                 INTEGER NOT NULL,
+    event_kind                TEXT NOT NULL
+                                  CHECK (event_kind IN
+                                      ('transition', 'version_created', 'implementation_created',
+                                       'link_created', 'stable_pinned', 'rollback_pinned')),
+    from_state                TEXT
+                                  CHECK (from_state IS NULL OR from_state IN
+                                      ('exploring', 'validating', 'established',
+                                       'monitoring', 'reopened', 'suspended')),
+    to_state                  TEXT
+                                  CHECK (to_state IS NULL OR to_state IN
+                                      ('exploring', 'validating', 'established',
+                                       'monitoring', 'reopened', 'suspended')),
+    from_version_id           INTEGER,
+    to_version_id             INTEGER,
+    from_implementation_id    INTEGER,
+    to_implementation_id      INTEGER,
+    actor                     TEXT,
+    actor_kind                TEXT NOT NULL DEFAULT 'developer'
+                                  CHECK (actor_kind IN ('developer', 'system')),
+    decision_method            TEXT NOT NULL DEFAULT 'manual'
+                                  CHECK (decision_method IN
+                                      ('deterministic', 'reasoning_llm', 'manual')),
+    reason_code                TEXT NOT NULL DEFAULT '',
+    reason                     TEXT NOT NULL DEFAULT '',
+    evidence_json               TEXT NOT NULL DEFAULT '[]',
+    idempotency_key             TEXT NOT NULL DEFAULT '',
+    created_at                  REAL NOT NULL,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (from_version_id) REFERENCES evolution_node_version (id) ON DELETE SET NULL,
+    FOREIGN KEY (to_version_id) REFERENCES evolution_node_version (id) ON DELETE SET NULL,
+    FOREIGN KEY (from_implementation_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    FOREIGN KEY (to_implementation_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_node_event_node
+    ON evolution_node_event (node_id, id DESC);
+
+-- A retried apply_transition() call must resolve to the SAME event, never a
+-- second row that double-applies the transition -- see the table comment
+-- above. The WHERE clause is what keeps ordinary events (idempotency_key='')
+-- from colliding with each other under this constraint.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_evolution_node_event_idempotency
+    ON evolution_node_event (node_id, idempotency_key) WHERE idempotency_key != '';
 """
 
 
