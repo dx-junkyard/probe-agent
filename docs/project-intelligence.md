@@ -6682,3 +6682,103 @@ Overview Level 0 / Interview Level 1 双方の状態別レンダリング(loadin
 質問なし / 質問 1 件 / 部分失敗 / relation 不明で決定不可 / 矛盾 /
 stale / deferred / system_researchable のルーティング表示 / セッション
 未選択)を検証する。
+
+## Issue #394 / #395 — 進化型パイプライン制御基盤
+
+### 何が問題だったか
+
+Component の policy mode、Probe Cell の Improvement status(#297〜#304)、
+Candidate Studio / Replay / Experiment(#242〜#252)、System Interview の
+状態駆動ワークフロー(#349)、Overview の意思決定プロジェクション(#380)は、
+いずれも「AI が生成したものを人間が承認し、運用しながら評価する」という
+同じ形の作業を、機能ごとに独立した語彙・ID・projection で実装してきた。
+これ以上同じ形を機能ごとに増やす前に、進化する処理単位そのもの
+(Evolution Node)を横断的な正本として導入する準備が要る。
+
+### 何を作ったか(Phase 0、Issue #395)
+
+`docs/evolutionary-pipeline.md` が正本。**この Phase ではコードを一切
+変更していない**(DB / API / UI いずれも無変更)——ADR・concept map・
+migration inventory・pilot 定義のみの設計文書。
+
+主要な ADR(全 9 件、根拠・却下案・検証方法は同文書 §4 に記載):
+
+- **ADR-1**: Evolution Node は Probe Cell 契約のバージョンアップではなく
+  新しい正本エンティティ。Cell は実行ロール、Node は進化する処理単位
+  そのものを所有し、既存 Cell のテーブル・schema は無変更のまま Node が
+  参照するだけ。
+- **ADR-2**: Node identity は `(system_id, node_key)`。`component_id`
+  からは導出しない。既存資産(component/probe_point/cell_binding/
+  capability/flow/purpose_element/feature)への参照は追記専用の
+  `evolution_node_link` で持つ。
+- **ADR-3**: contract version(`evolution_node_version`)と implementation
+  (`evolution_node_implementation`)を分離。1 つの契約に複数の実装が
+  ありうる。provider/model 名は identity に含めない(#298 と同じ規律)。
+- **ADR-4**: maturity は保存されるが、append-only の `evolution_node_event`
+  ログと常に整合する(#337/#338/#349 と同じ discipline)。
+- **ADR-5**: `established`(固定決定)と `monitoring`(実際に観測中)は
+  別状態。`reopened` は本番の pin implementation を外さない。`suspended`
+  はどこからでも到達する安全停止であり成熟の達成ではない。
+- **ADR-6**: Node maturity / Cell Improvement status / SDK policy mode /
+  Dashboard user phase(`derive_user_phase`)の 4 軸は互いから導出しない。
+  API は 4 つの独立フィールドを返す。
+- **ADR-7**: 評価は Node / Flow-Capability / UX-Outcome の 3 契約に分離し、
+  単一の重み付き score へ合成しない。floor(下回ってはならない)と
+  criterion(到達すべき)は別概念。
+- **ADR-8**: この Epic の初期 Phase では何も削除しない。既存資産は
+  `keep_canonical` | `adapt_behind_projection` | `migrate` | `deprecate`
+  | `remove_after_gate` に分類し、削除・データ移行を伴う分類は今回
+  存在しない。
+- **ADR-9**: maturity 遷移を自動化しない。決定的ゲート+人間承認、または
+  列挙済みの system-recorded observation transition のみ。LLM が
+  canonical state を直接出力すること、失敗時のヒューリスティック
+  フォールバックはいずれも禁止(Principle 6)。
+
+Migration inventory(同文書 §6)は DB table / API route / Dashboard
+route / domain module / docs を横断して分類した。**大半が
+`keep_canonical`** であり、これは意図した結果——何を消してよいかの
+証拠は Phase 1〜6 の実装と実運用を経て初めて揃う(ADR-8)。
+
+Pilot(同文書 §7)はいずれも現時点で Probe Point/Component/Cell の
+いずれにも紐づいていないことを確認済み(`@probe(` decorator は 3 つの
+モジュールいずれにも実際には付与されていない):
+
+1. `app/question_router.py`(genuinely ambiguous、LLM-appropriate の
+   参照例)
+2. `app/interview_workflow.py::evaluate_candidate_state`(既に
+   `established`+`deterministic_code` へ到達した参照例。実装後 2 回の
+   レビューで見つかった 9 件の不変条件違反は、いずれも「決定的コードが
+   自動で maturity を進めたことは一度もない」という ADR-9 の実例)
+3. `app/understanding_translator.py`(external boundary で LLM が
+   居続けるべき参照例)
+
+### 後から変えるときに守ること
+
+**Phase 1〜6(#396〜#401)は `docs/evolutionary-pipeline.md` が確定した
+語彙・境界の内側でのみ実装する。** ADR-1〜9 は再検討の対象ではなく、
+実装の前提として扱う——再検討したい場合は、この文書自体の改訂を先に
+行う(§0.1 の位置づけ通り)。
+
+**4 軸(ADR-6)を 1 つのバッジ・1 つの色・1 つの合成値へまとめない。**
+CLAUDE.md #366 が定式化した「1 つの表示語が 2 つの事実を兼ねる」欠陥を、
+この Epic で 4 つに拡張して再現しないための規律である。
+
+**既存の人間承認ゲート・SDK isolation・sandbox・redaction は一切
+緩和しない**(同文書 §9)。Evolution Node の maturity 遷移(ADR-9)は
+既存の `decision_method: manual` 規律をそのまま踏襲し、新しい自動承認
+経路を作らない。
+
+**未決事項(同文書 §10、3 件)に先回りして答えを作らない。** 特に
+`monitoring` の sub-state(#1)と Flow-level evaluation の参照方式(#2)
+は、実データが無い段階で決めると ADR-5/ADR-7 が禁じる「早すぎる合成」を
+設計レベルで先取りしてしまう。
+
+### 検証
+
+Phase 0 は DB/API/UI を変更していないため、既存のテストスイートは
+無変更のまま通る。`docs/evolutionary-pipeline.md` 自体が Issue #395 の
+受け入れ条件(product thesis の確定、主要概念の identity owner の一意性、
+4 軸の非混同、Vision→Node runtime evidence の lineage 定義、migration
+inventory、compatibility seam と rollback、既存安全境界の維持明記、
+Phase 1〜6 の入力・出力・完了ゲート、AI型/固定処理型を含む pilot 選定、
+owner・期限付きの未決事項)を満たす。
