@@ -17,6 +17,7 @@ What must hold:
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -575,6 +576,77 @@ class TestReopen:
         # the assertion is that every node's outcome is REPORTED either way.
         assert results[0]["node_id"] == node["id"]
         assert "reason_code" in results[0]
+
+    def test_a_blocked_node_in_scope_is_reported_not_applied_while_others_proceed(
+        self, admin_client
+    ):
+        """The `applied=False` branch with a real refusal: a Node in scope
+        that is already `reopened` cannot legally transition again. It must
+        be REPORTED with its refusal code -- never forced and never silently
+        dropped -- while the rest of the scope proceeds and every stable pin
+        stays set."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "OP-PartialScope")
+        with get_conn() as conn:
+            origin, _, origin_impl = _established_node(
+                conn, system_id, node_key="origin"
+            )
+            neighbour, _, neighbour_impl = _established_node(
+                conn, system_id, node_key="neighbour"
+            )
+            add_link(
+                conn, system_id=system_id, node_id=origin["id"],
+                link_kind="component", target_ref="svc-shared",
+            )
+            add_link(
+                conn, system_id=system_id, node_id=neighbour["id"],
+                link_kind="component", target_ref="svc-shared",
+            )
+            plan = create_reopen_plan(
+                conn, system_id=system_id, origin_node_id=origin["id"],
+                reason="p95 drifted past the contract budget",
+            )
+            assert set(json.loads(plan["scope_node_ids_json"])) == {
+                origin["id"], neighbour["id"]
+            }
+            # The neighbour is reopened on its own BEFORE this plan is
+            # approved, so `reopened -> reopened` is illegal at approval time.
+            apply_transition(
+                conn, system_id=system_id, node_id=neighbour["id"],
+                to_state="reopened", decision_method="manual", actor="alice",
+                reason="already under re-exploration",
+            )
+            row, results = approve_reopen_plan(
+                conn, system_id=system_id, plan_id=plan["id"], approved_by="alice",
+            )
+            after = {
+                node_id: conn.execute(
+                    """SELECT maturity, stable_implementation_id
+                           FROM evolution_node WHERE id = ?""",
+                    (node_id,),
+                ).fetchone()
+                for node_id in (origin["id"], neighbour["id"])
+            }
+
+        by_node = {r["node_id"]: r for r in results}
+        assert row["status"] == "approved"
+        assert by_node[origin["id"]]["applied"] is True
+        blocked = by_node[neighbour["id"]]
+        assert blocked["applied"] is False
+        assert blocked["duplicate"] is False
+        assert blocked["reason_code"] == "illegal_transition"
+        assert blocked["message"]
+        # The rest of the scope proceeded; nobody was forced.
+        assert after[origin["id"]]["maturity"] == "reopened"
+        assert after[neighbour["id"]]["maturity"] == "reopened"
+        # Production stays pinned on EVERY node, blocked or not (ADR-5).
+        assert after[origin["id"]]["stable_implementation_id"] == origin_impl["id"]
+        assert (
+            after[neighbour["id"]]["stable_implementation_id"]
+            == neighbour_impl["id"]
+        )
 
     def test_plans_and_anomalies_are_system_scoped(self, admin_client):
         from app.db import get_conn

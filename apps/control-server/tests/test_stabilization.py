@@ -40,6 +40,7 @@ from app.stabilization import (
     evaluate_establishment_gate,
     evaluate_package,
     reject_package,
+    supersede_package,
 )
 
 
@@ -89,6 +90,7 @@ def _facts(**overrides) -> GateFacts:
         node_maturity="validating",
         candidate_implementation_present=True,
         candidate_matches_node_version=True,
+        package_matches_node_version=True,
         evidence=(
             EvidenceFact("node", "criterion", "accuracy", "met"),
             EvidenceFact("node", "floor", "safety", "held"),
@@ -282,6 +284,31 @@ class TestGate:
             _facts(candidate_matches_node_version=False)
         )
         assert decision.reason_code == "candidate_version_mismatch"
+
+    def test_a_moved_contract_version_is_refused(self):
+        """The candidate can still match the package -- both were written
+        against the OLD contract -- so `candidate_version_mismatch` cannot
+        catch a Node whose contract moved after the package was written."""
+        decision = evaluate_establishment_gate(
+            _facts(package_matches_node_version=False)
+        )
+        assert decision.allowed is False
+        assert decision.reason_code == "contract_version_moved"
+
+    def test_a_stale_evidence_reference_is_refused(self):
+        """Evidence is referenced, never copied, precisely so currency can be
+        evaluated at gate time: a result whose source was deleted or ended
+        without completing is not current, however it read when attached."""
+        decision = evaluate_establishment_gate(
+            _facts(evidence=(
+                EvidenceFact("node", "criterion", "accuracy", "met",
+                             ref_current=False),
+                EvidenceFact("node", "floor", "safety", "held"),
+            ))
+        )
+        assert decision.allowed is False
+        assert decision.reason_code == "evidence_ref_stale"
+        assert decision.failing_evidence == ("accuracy",)
 
     def test_an_unmet_criterion_is_refused(self):
         decision = evaluate_establishment_gate(
@@ -483,6 +510,152 @@ class TestApproval:
         assert after["maturity"] == "validating"
         assert after["stable_implementation_id"] is None
 
+    def test_rejection_requires_a_named_person(self, admin_client):
+        """A rejection is a named human's decision exactly as an approval
+        is -- an anonymous rejection is not a reviewable record."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-AnonReject")
+        with get_conn() as conn:
+            node, _, implementation = _validating_node(conn, system_id)
+            package = _complete_package(conn, system_id, node, implementation)
+            with pytest.raises(StabilizationValidationError):
+                reject_package(
+                    conn, system_id=system_id, package_id=package["id"],
+                    rejected_by="  ",
+                )
+            after = conn.execute(
+                "SELECT status FROM stabilization_package WHERE id = ?",
+                (package["id"],),
+            ).fetchone()
+        assert after["status"] == "draft"
+
+    def test_a_moved_contract_version_flips_the_gate_verdict(self, admin_client):
+        """The reviewer's reproduction: the package reads ok, then the
+        contract version moves. The candidate still matches the PACKAGE's
+        frozen version, so only a check against the Node's CURRENT version
+        can change the verdict -- which `gather_gate_facts`' currency promise
+        requires."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-Moved")
+        with get_conn() as conn:
+            node, _, implementation = _validating_node(conn, system_id)
+            package = _complete_package(conn, system_id, node, implementation)
+            assert evaluate_package(
+                conn, system_id=system_id, package_id=package["id"]
+            ).allowed is True
+
+            add_version(
+                conn, system_id=system_id, node_id=node["id"], mission="m2",
+                input_contract={}, output_contract={}, side_effect_class="pure",
+                trust_boundary="internal",
+            )
+            decision = evaluate_package(
+                conn, system_id=system_id, package_id=package["id"]
+            )
+        assert decision.allowed is False
+        assert decision.reason_code == "contract_version_moved"
+
+    def test_a_refused_approval_leaves_no_half_established_state(self, admin_client):
+        """The reviewer's reproduction: the contract moves after the package
+        was written, then approval is attempted. The refusal must leave the
+        Node's pin, rollback slot, and event log exactly as they were -- a
+        committed pin on a Node that stayed `validating` is the half-state
+        ADR-4 forbids."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-Half")
+        with get_conn() as conn:
+            node, _, implementation = _validating_node(conn, system_id)
+            package = _complete_package(conn, system_id, node, implementation)
+            add_version(
+                conn, system_id=system_id, node_id=node["id"], mission="m2",
+                input_contract={}, output_contract={}, side_effect_class="pure",
+                trust_boundary="internal",
+            )
+            with pytest.raises(StabilizationConflictError):
+                approve_package(
+                    conn, system_id=system_id, package_id=package["id"],
+                    approved_by="alice",
+                )
+            after = conn.execute(
+                """SELECT maturity, stable_implementation_id,
+                          rollback_implementation_id
+                       FROM evolution_node WHERE id = ?""",
+                (node["id"],),
+            ).fetchone()
+            pin_events = conn.execute(
+                """SELECT COUNT(*) AS n FROM evolution_node_event
+                       WHERE node_id = ?
+                         AND event_kind IN ('stable_pinned', 'rollback_pinned')""",
+                (node["id"],),
+            ).fetchone()["n"]
+            package_after = conn.execute(
+                "SELECT status FROM stabilization_package WHERE id = ?",
+                (package["id"],),
+            ).fetchone()
+        assert after["maturity"] == "validating"
+        assert after["stable_implementation_id"] is None
+        assert after["rollback_implementation_id"] is None
+        assert pin_events == 0
+        assert package_after["status"] == "draft"
+
+    def test_a_race_refusal_after_the_pin_restores_the_pin_state(
+        self, admin_client, monkeypatch
+    ):
+        """The pre-validation makes a post-pin refusal a race-only path; when
+        that race happens anyway, the pin and its events must be restored in
+        the same request rather than surviving as a committed half-state."""
+        from app.db import get_conn
+        from app.evolution_node import TransitionApplyResult, TransitionDecision
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-Race")
+        with get_conn() as conn:
+            node, _, implementation = _validating_node(conn, system_id)
+            package = _complete_package(conn, system_id, node, implementation)
+
+            def _raced(*args, **kwargs):
+                return TransitionApplyResult(
+                    decision=TransitionDecision(
+                        False, "stale_implementation",
+                        "the contract moved between validation and apply",
+                    ),
+                    applied=False, duplicate=False, event=None, node={},
+                )
+
+            monkeypatch.setattr(evolution_node, "apply_transition", _raced)
+            with pytest.raises(StabilizationConflictError):
+                approve_package(
+                    conn, system_id=system_id, package_id=package["id"],
+                    approved_by="alice",
+                )
+            after = conn.execute(
+                """SELECT maturity, stable_implementation_id,
+                          rollback_implementation_id
+                       FROM evolution_node WHERE id = ?""",
+                (node["id"],),
+            ).fetchone()
+            pin_events = conn.execute(
+                """SELECT COUNT(*) AS n FROM evolution_node_event
+                       WHERE node_id = ?
+                         AND event_kind IN ('stable_pinned', 'rollback_pinned')""",
+                (node["id"],),
+            ).fetchone()["n"]
+            package_after = conn.execute(
+                "SELECT status FROM stabilization_package WHERE id = ?",
+                (package["id"],),
+            ).fetchone()
+        assert after["maturity"] == "validating"
+        assert after["stable_implementation_id"] is None
+        assert after["rollback_implementation_id"] is None
+        assert pin_events == 0
+        assert package_after["status"] == "draft"
+
     def test_the_rollback_target_is_read_from_the_node_not_the_caller(
         self, admin_client
     ):
@@ -641,6 +814,253 @@ class TestEvidenceRefScoping:
             )
         assert result.applied is False
         assert result.decision.reason_code == "foreign_evidence"
+
+
+class TestEvidenceRefCurrency:
+    """`stabilization_evidence.ref_id` carries no FK, so the row it named can
+    be gone or abandoned by the time the gate runs. Currency is re-resolved
+    at every evaluation -- the promise `gather_gate_facts` documents."""
+
+    def _package_with_run_evidence(self, conn, system_id, run_status="completed"):
+        node, version, implementation = _validating_node(conn, system_id)
+        run_id = conn.execute(
+            """INSERT INTO exploration_run
+                   (system_id, node_id, node_version_id, status, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (system_id, node["id"], version["id"], run_status, time.time()),
+        ).lastrowid
+        package = create_package(
+            conn, system_id=system_id, node_id=node["id"],
+            candidate_implementation_id=implementation["id"],
+            applicability_envelope={"inputs": "JP addresses"},
+        )
+        add_evidence(
+            conn, system_id=system_id, package_id=package["id"],
+            evidence_level="node", evidence_kind="criterion", name="accuracy",
+            verdict="met", ref_kind="exploration_run", ref_id=run_id,
+        )
+        add_evidence(
+            conn, system_id=system_id, package_id=package["id"],
+            evidence_level="node", evidence_kind="floor", name="safety",
+            verdict="held",
+        )
+        return package, run_id
+
+    def test_a_completed_source_run_stays_current(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-RefOk")
+        with get_conn() as conn:
+            package, _ = self._package_with_run_evidence(conn, system_id)
+            decision = evaluate_package(
+                conn, system_id=system_id, package_id=package["id"]
+            )
+        assert decision.allowed is True
+
+    def test_a_deleted_source_run_flips_the_gate(self, admin_client):
+        """A reference that no longer resolves would otherwise read as
+        `met` forever."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-RefGone")
+        with get_conn() as conn:
+            package, run_id = self._package_with_run_evidence(conn, system_id)
+            assert evaluate_package(
+                conn, system_id=system_id, package_id=package["id"]
+            ).allowed is True
+            conn.execute("DELETE FROM exploration_run WHERE id = ?", (run_id,))
+            decision = evaluate_package(
+                conn, system_id=system_id, package_id=package["id"]
+            )
+        assert decision.allowed is False
+        assert decision.reason_code == "evidence_ref_stale"
+        assert decision.failing_evidence == ("accuracy",)
+
+    def test_an_abandoned_source_run_flips_the_gate(self, admin_client):
+        """An abandoned run concluded it produced no usable result; a result
+        borrowed from it is not current evidence."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-RefDead")
+        with get_conn() as conn:
+            package, run_id = self._package_with_run_evidence(conn, system_id)
+            conn.execute(
+                "UPDATE exploration_run SET status = 'abandoned' WHERE id = ?",
+                (run_id,),
+            )
+            decision = evaluate_package(
+                conn, system_id=system_id, package_id=package["id"]
+            )
+        assert decision.allowed is False
+        assert decision.reason_code == "evidence_ref_stale"
+
+    def test_an_open_source_run_is_current_not_dead(self, admin_client):
+        """`open` is unfinished, not failed -- only a non-successful TERMINAL
+        state kills the reference."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-RefOpen")
+        with get_conn() as conn:
+            package, _ = self._package_with_run_evidence(
+                conn, system_id, run_status="open"
+            )
+            decision = evaluate_package(
+                conn, system_id=system_id, package_id=package["id"]
+            )
+        assert decision.allowed is True
+
+
+class TestSupersede:
+    def _two_packages(self, conn, system_id):
+        node, _, implementation = _validating_node(conn, system_id)
+        first = _complete_package(conn, system_id, node, implementation)
+        second = _complete_package(conn, system_id, node, implementation)
+        return node, first, second
+
+    def test_superseding_makes_package_superseded_reachable(self, admin_client):
+        """`package_superseded` must be producible through real code, not
+        only via manual DB edits -- a code nobody can produce is a rule
+        nobody enforces."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-Supersede")
+        with get_conn() as conn:
+            node, first, second = self._two_packages(conn, system_id)
+            row = supersede_package(
+                conn, system_id=system_id, package_id=first["id"],
+                successor_package_id=second["id"], superseded_by="alice",
+                note="newer evidence set",
+            )
+            decision = evaluate_package(
+                conn, system_id=system_id, package_id=first["id"]
+            )
+            after_node = conn.execute(
+                "SELECT maturity FROM evolution_node WHERE id = ?", (node["id"],)
+            ).fetchone()
+        assert row["status"] == "superseded"
+        assert row["superseded_by_id"] == second["id"]
+        assert row["approved_by"] == "alice"
+        assert decision.allowed is False
+        assert decision.reason_code == "package_superseded"
+        # Superseding is a record about packages; it moves the Node nowhere.
+        assert after_node["maturity"] == "validating"
+
+    def test_supersession_requires_a_named_person(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-SupAnon")
+        with get_conn() as conn:
+            _, first, second = self._two_packages(conn, system_id)
+            with pytest.raises(StabilizationValidationError):
+                supersede_package(
+                    conn, system_id=system_id, package_id=first["id"],
+                    successor_package_id=second["id"], superseded_by="  ",
+                )
+
+    def test_a_package_cannot_supersede_itself(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-SupSelf")
+        with get_conn() as conn:
+            _, first, _ = self._two_packages(conn, system_id)
+            with pytest.raises(StabilizationValidationError):
+                supersede_package(
+                    conn, system_id=system_id, package_id=first["id"],
+                    successor_package_id=first["id"], superseded_by="alice",
+                )
+
+    def test_a_decided_package_cannot_be_superseded(self, admin_client):
+        """An approved or rejected package is a decision that already
+        happened; rewriting its status would rewrite history."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-SupDecided")
+        with get_conn() as conn:
+            _, first, second = self._two_packages(conn, system_id)
+            reject_package(
+                conn, system_id=system_id, package_id=first["id"],
+                rejected_by="alice",
+            )
+            with pytest.raises(StabilizationConflictError):
+                supersede_package(
+                    conn, system_id=system_id, package_id=first["id"],
+                    successor_package_id=second["id"], superseded_by="alice",
+                )
+
+    def test_the_successor_must_argue_about_the_same_node(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-SupOtherNode")
+        with get_conn() as conn:
+            _, first, _ = self._two_packages(conn, system_id)
+            other_node, _, other_impl = _validating_node(
+                conn, system_id, node_key="other-node"
+            )
+            other_package = _complete_package(
+                conn, system_id, other_node, other_impl
+            )
+            with pytest.raises(StabilizationValidationError):
+                supersede_package(
+                    conn, system_id=system_id, package_id=first["id"],
+                    successor_package_id=other_package["id"],
+                    superseded_by="alice",
+                )
+
+    def test_a_dead_successor_is_refused(self, admin_client):
+        """Pointing "establish from that" at a rejected package would send
+        the developer to a dead end."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-SupDeadSucc")
+        with get_conn() as conn:
+            _, first, second = self._two_packages(conn, system_id)
+            reject_package(
+                conn, system_id=system_id, package_id=second["id"],
+                rejected_by="alice",
+            )
+            with pytest.raises(StabilizationConflictError):
+                supersede_package(
+                    conn, system_id=system_id, package_id=first["id"],
+                    successor_package_id=second["id"], superseded_by="alice",
+                )
+
+    def test_supersession_over_http_records_the_authenticated_person(
+        self, admin_client
+    ):
+        """The deciding person comes from the principal, never the body."""
+        from app.db import get_conn
+        from app.models import StabilizationSupersedeIn
+
+        assert "superseded_by" not in StabilizationSupersedeIn.model_fields
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ST-SupApi")
+        with get_conn() as conn:
+            _, first, second = self._two_packages(conn, system_id)
+        r = admin_client.post(
+            f"/stabilization/packages/{first['id']}/supersede",
+            json={"successor_package_id": second["id"], "note": "newer run"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Probe-System-Id": str(system_id),
+            },
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "superseded"
+        assert body["superseded_by_id"] == second["id"]
+        assert body["approved_by"] == "root"
+        assert body["gate"]["reason_code"] == "package_superseded"
 
 
 class TestMigration:

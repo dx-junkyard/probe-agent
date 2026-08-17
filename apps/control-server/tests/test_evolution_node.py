@@ -138,6 +138,47 @@ def _insert_cell_improvement(conn, system_id, cell_definition_id, status):
     )
 
 
+def _insert_probe_point_chain(conn, system_id, status="approved"):
+    """Minimal snapshot -> intelligence run -> probe plan -> probe point
+    chain (the FK spine `probe_points` requires), inserted directly --
+    mirrors `tests/test_cell_binding.py`'s fixture builders."""
+    now = time.time()
+    cur = conn.execute(
+        """INSERT INTO repository_snapshots
+               (system_id, repo_path, commit_sha, status, created_at, completed_at)
+           VALUES (?, '/tmp/repo', 'abc123', 'ready', ?, ?)""",
+        (system_id, now, now),
+    )
+    snapshot_id = cur.lastrowid
+    cur = conn.execute(
+        """INSERT INTO intelligence_runs
+               (system_id, snapshot_id, run_type, provider, model, prompt_version,
+                schema_version, decision_method, status, is_mock, started_at, completed_at)
+           VALUES (?, ?, 'probe_plan', 'mock', 'mock-model', 'v1', 'v1',
+                   'reasoning_llm', 'completed', 1, ?, ?)""",
+        (system_id, snapshot_id, now, now),
+    )
+    run_id = cur.lastrowid
+    cur = conn.execute(
+        """INSERT INTO probe_plans
+               (system_id, snapshot_id, intelligence_run_id, feature_id, objective,
+                status, origin, created_at, updated_at)
+           VALUES (?, ?, ?, 'feat-1', 'objective', 'approved', 'manual', ?, ?)""",
+        (system_id, snapshot_id, run_id, now, now),
+    )
+    plan_id = cur.lastrowid
+    cur = conn.execute(
+        """INSERT INTO probe_points
+               (plan_id, system_id, component_id, feature_id, path, symbol,
+                line_start, line_end, reason, recommended_mode, side_effect_risk,
+                replayability, denylist_hit, status, created_at, updated_at)
+           VALUES (?, ?, 'svc-probe', 'feat-1', 'app/x.py', 'do_x', 1, 10,
+                   'reason', 'trace', 'low', 'replayable', NULL, ?, ?, ?)""",
+        (plan_id, system_id, status, now, now),
+    )
+    return cur.lastrowid
+
+
 # ---------------------------------------------------------------------------
 # Part 1: the pure evaluator
 # ---------------------------------------------------------------------------
@@ -193,6 +234,17 @@ class TestRejectionCodes:
             _request(to_state="validating", decision_method="reasoning_llm"),
         )
         assert decision.reason_code == "llm_state_not_allowed"
+
+    def test_llm_state_not_allowed_outranks_unknown_target_state(self):
+        # "Unconditionally first" means literally first: even an UNKNOWN
+        # target state does not get to answer before the reasoning_llm
+        # refusal -- the caller's provenance is wrong before its payload is.
+        decision = evaluate_transition(
+            _facts(),
+            _request(to_state="not_a_state", decision_method="reasoning_llm"),
+        )
+        assert decision.reason_code == "llm_state_not_allowed"
+        assert TRANSITION_REJECTION_CODES[0] == "llm_state_not_allowed"
 
     def test_illegal_transition(self):
         decision = evaluate_transition(
@@ -344,6 +396,32 @@ class TestTransitionTable:
         )
         assert not decision.allowed
         assert decision.reason_code == "illegal_transition"
+
+    def test_monitoring_to_established_manual_deactivation_is_allowed(self):
+        # The system-recorded pair is asymmetric for a human: recording that
+        # observation STOPPED is a legitimate manual operations decision.
+        decision = evaluate_transition(
+            _facts(maturity="monitoring"),
+            _request(to_state="established"),
+        )
+        assert decision.allowed, decision
+
+    def test_monitoring_to_established_manual_still_requires_a_named_actor(self):
+        decision = evaluate_transition(
+            _facts(maturity="monitoring"),
+            _request(to_state="established", actor=None),
+        )
+        assert decision.reason_code == "manual_approval_required"
+
+    def test_established_to_monitoring_manual_activation_stays_refused(self):
+        # The other direction never opens to a human: a click claiming
+        # observation is RUNNING would masquerade as the monitoring
+        # evaluation's own reading.
+        decision = evaluate_transition(
+            _facts(maturity="established"),
+            _request(to_state="monitoring", reason="wishful"),
+        )
+        assert decision.reason_code == "manual_approval_required"
 
     def test_reopened_target_does_not_require_stable_implementation(self):
         # Row 8 gates only established/monitoring -- 'reopened' must be
@@ -511,6 +589,116 @@ class TestPersistenceLifecycle:
                 )
 
 
+class TestProbePointLinkGate:
+    """ADR-2's verification rule: `link_kind='probe_point'` may only name an
+    existing APPROVED probe point of the same System -- the same gate
+    `app/cell_binding.py` applies for Cell Bindings (#299)."""
+
+    def test_approved_probe_point_link_is_created(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-Approved")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-ok")
+            point_id = _insert_probe_point_chain(conn, system_id, status="approved")
+            link = add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="probe_point", target_ref=str(point_id),
+                target_row_id=point_id,
+            )
+            assert link["target_ref"] == str(point_id)
+            facts = load_node_facts(conn, system_id=system_id, node_id=node["id"])
+            assert f"probe_point:{point_id}" in facts.known_evidence_refs
+
+    def test_nonexistent_probe_point_is_refused(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-Missing")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-missing")
+            with pytest.raises(EvolutionNodeNotFoundError):
+                add_link(
+                    conn, system_id=system_id, node_id=node["id"],
+                    link_kind="probe_point", target_ref="999999",
+                )
+
+    def test_unapproved_probe_point_is_refused(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-Unapproved")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-unapproved")
+            point_id = _insert_probe_point_chain(conn, system_id, status="proposed")
+            with pytest.raises(EvolutionNodeConflictError):
+                add_link(
+                    conn, system_id=system_id, node_id=node["id"],
+                    link_kind="probe_point", target_ref=str(point_id),
+                )
+
+    def test_another_systems_probe_point_is_indistinguishable_from_missing(
+        self, admin_client
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        sys_a = _create_system(admin_client, token, "EN-PP-CrossA")
+        sys_b = _create_system(admin_client, token, "EN-PP-CrossB")
+        with get_conn() as conn:
+            point_id = _insert_probe_point_chain(conn, sys_a, status="approved")
+            node_b = create_node(conn, system_id=sys_b, node_key="pp-cross")
+            with pytest.raises(EvolutionNodeNotFoundError):
+                add_link(
+                    conn, system_id=sys_b, node_id=node_b["id"],
+                    link_kind="probe_point", target_ref=str(point_id),
+                )
+
+    def test_non_numeric_target_ref_is_a_validation_error(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-BadRef")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-badref")
+            with pytest.raises(EvolutionNodeValidationError):
+                add_link(
+                    conn, system_id=system_id, node_id=node["id"],
+                    link_kind="probe_point", target_ref="app/x.py:do_x",
+                )
+
+    def test_mismatched_target_row_id_is_a_validation_error(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-Mismatch")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-mismatch")
+            point_id = _insert_probe_point_chain(conn, system_id, status="approved")
+            with pytest.raises(EvolutionNodeValidationError):
+                add_link(
+                    conn, system_id=system_id, node_id=node["id"],
+                    link_kind="probe_point", target_ref=str(point_id),
+                    target_row_id=point_id + 1,
+                )
+
+    def test_other_link_kinds_do_not_consult_probe_points(self, admin_client):
+        # A component link with a free-form ref stays legal -- the gate is
+        # probe_point-specific.
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-Others")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-others")
+            link = add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="component", target_ref="svc-anything",
+            )
+            assert link["link_kind"] == "component"
+
+
 class TestIdempotency:
     def test_repeated_idempotency_key_applies_exactly_once(self, admin_client):
         from app.db import get_conn
@@ -583,6 +771,105 @@ class TestIdempotency:
                 idempotency_key="",
             )
             assert second.applied and not second.duplicate
+
+    def test_concurrent_duplicate_key_resolves_to_the_winner_event(
+        self, admin_client, monkeypatch
+    ):
+        """The SELECT-then-INSERT window: a concurrent request with the SAME
+        idempotency key commits its event AFTER our duplicate check and
+        BEFORE our insert. The unique-violation must resolve to the winner's
+        event with `duplicate=True` -- the same shape the sequential-retry
+        path returns -- never surface as an IntegrityError. The race is
+        reproduced deterministically by injecting the winner's committed
+        event through the `load_node_facts` seam, which runs exactly inside
+        that window."""
+        import app.evolution_node as en
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Idem-Race")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="idem-race")
+            version = add_version(
+                conn, system_id=system_id, node_id=node["id"], mission="m",
+                input_contract={}, output_contract={}, side_effect_class="pure",
+                trust_boundary="internal",
+            )
+            add_implementation(
+                conn, system_id=system_id, node_id=node["id"],
+                node_version_id=version["id"], modality="rule", created_by="alice",
+            )
+
+            real_load = en.load_node_facts
+            injected = {}
+
+            def racing_load_node_facts(conn_, **kwargs):
+                facts = real_load(conn_, **kwargs)
+                if not injected:
+                    # The concurrent winner: its transition event lands (and
+                    # autocommits) inside the check/insert window.
+                    row = en._insert_event(
+                        conn_, node_id=node["id"], system_id=system_id,
+                        event_kind="transition", from_state="exploring",
+                        to_state="validating", actor="rival",
+                        actor_kind="developer", decision_method="manual",
+                        idempotency_key="race-1",
+                    )
+                    conn_.execute(
+                        "UPDATE evolution_node SET maturity = 'validating' WHERE id = ?",
+                        (node["id"],),
+                    )
+                    injected["event_id"] = row["id"]
+                return facts
+
+            monkeypatch.setattr(en, "load_node_facts", racing_load_node_facts)
+            result = apply_transition(
+                conn, system_id=system_id, node_id=node["id"], to_state="validating",
+                decision_method="manual", actor="alice", idempotency_key="race-1",
+            )
+            assert result.duplicate and not result.applied
+            assert result.event["id"] == injected["event_id"]
+            assert result.node["maturity"] == "validating"
+
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node_event WHERE idempotency_key = ?",
+                ("race-1",),
+            ).fetchone()["n"]
+            assert count == 1
+
+    def test_unrelated_integrity_error_still_raises(self, admin_client, monkeypatch):
+        """Only a resolvable idempotency collision is downgraded to a
+        duplicate; any other unique violation re-raises unchanged (the
+        re-select is the discriminator)."""
+        import sqlite3 as sqlite3_module
+
+        import app.evolution_node as en
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Idem-OtherIE")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="idem-other")
+            version = add_version(
+                conn, system_id=system_id, node_id=node["id"], mission="m",
+                input_contract={}, output_contract={}, side_effect_class="pure",
+                trust_boundary="internal",
+            )
+            add_implementation(
+                conn, system_id=system_id, node_id=node["id"],
+                node_version_id=version["id"], modality="rule", created_by="alice",
+            )
+
+            def failing_insert_event(*args, **kwargs):
+                raise sqlite3_module.IntegrityError("CHECK constraint failed: elsewhere")
+
+            monkeypatch.setattr(en, "_insert_event", failing_insert_event)
+            with pytest.raises(sqlite3_module.IntegrityError):
+                apply_transition(
+                    conn, system_id=system_id, node_id=node["id"],
+                    to_state="validating", decision_method="manual", actor="alice",
+                    idempotency_key="no-such-winner",
+                )
 
 
 # ---------------------------------------------------------------------------

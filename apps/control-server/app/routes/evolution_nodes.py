@@ -73,6 +73,17 @@ _ERROR_STATUS = {
 
 _MAX_EVENT_LIMIT = 200
 
+#: Finite rejection codes owned by THIS route layer (not by
+#: `evolution_node.TRANSITION_REJECTION_CODES` -- the domain evaluator's
+#: vocabulary describes what a transition may ever be, while these two
+#: describe what the PUBLIC endpoint may be used for; internal callers such
+#: as `app/stabilization.py` and future #401 monitoring code legitimately
+#: call `apply_transition` in ways this endpoint refuses).
+ROUTE_TRANSITION_REJECTION_CODES = (
+    "deterministic_via_api_not_allowed",
+    "establishment_via_stabilization_required",
+)
+
 
 def _raise_domain_error(exc: evolution_node.EvolutionNodeError) -> None:
     for exc_type, status_code in _ERROR_STATUS.items():
@@ -324,14 +335,67 @@ def transition_evolution_node(
 ) -> EvolutionNodeTransitionOut:
     """Request a maturity transition.
 
-    The actor is taken from the authenticated `Principal`, never from the
-    body: a body-supplied actor would let any caller record a transition as
-    someone else's decision, which is exactly the provenance defect #337
-    fixed for Joint Understanding findings. A caller may still identify a
-    non-human actor through `actor_kind`, but only `system` is accepted
-    there and the domain layer restricts which transitions that may drive.
+    Provenance is never claimed by the caller (#337's rule, ADR-9): the
+    actor comes from the authenticated `Principal` and `actor_kind` is
+    forced to `developer` server-side -- an HTTP caller IS a human-driven
+    client, and letting the body say `system` would let any POST forge a
+    system-recorded observation transition. For the same reason
+    `decision_method='deterministic'` (the marker of exactly those
+    system-recorded transitions) is not settable here; only internal code
+    calling `apply_transition` directly may record one.
+    `decision_method='reasoning_llm'` still flows through so the domain
+    evaluator's own `llm_state_not_allowed` refusal stays visible verbatim.
+
+    `to_state='established'` has one sanctioned path (Phase 4's
+    Stabilization gate, `POST /stabilization-packages/{id}/approve`); the
+    one exception is `monitoring -> established`, which merely records that
+    observation stopped and remains a manual API operation.
     """
+    if payload.decision_method == "deterministic":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "deterministic_via_api_not_allowed",
+                "message": (
+                    "decision_method='deterministic' marks a system-recorded "
+                    "transition and cannot be claimed through this endpoint; "
+                    "a human decision is decision_method='manual'"
+                ),
+            },
+        )
     with get_conn() as conn:
+        if payload.to_state == "established":
+            node_row = conn.execute(
+                "SELECT maturity FROM evolution_node WHERE id = ? AND system_id = ?",
+                (node_id, system_id),
+            ).fetchone()
+            # A missing/foreign node falls through to apply_transition's own
+            # NotFound (404), keeping cross-System ids unprobeable.
+            if node_row is not None and node_row["maturity"] != "monitoring":
+                idem = (payload.idempotency_key or "").strip()
+                already_applied = idem and conn.execute(
+                    """SELECT id FROM evolution_node_event
+                           WHERE node_id = ? AND system_id = ? AND idempotency_key = ?""",
+                    (node_id, system_id, idem),
+                ).fetchone() is not None
+                # A retry of an ALREADY-APPLIED establishment must stay a 200
+                # duplicate, so the gate only refuses first-time requests.
+                if not already_applied:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "code": "establishment_via_stabilization_required",
+                            "message": (
+                                "establishment goes through the Stabilization "
+                                "gate: assemble a Stabilization Evidence "
+                                "Package and approve it via POST "
+                                "/stabilization-packages/{package_id}/approve. "
+                                "Only 'monitoring' -> 'established' (recording "
+                                "that observation stopped) may be requested "
+                                "here directly."
+                            ),
+                        },
+                    )
         try:
             result = evolution_node.apply_transition(
                 conn,
@@ -340,7 +404,7 @@ def transition_evolution_node(
                 to_state=payload.to_state,
                 decision_method=payload.decision_method,
                 actor=principal.username,
-                actor_kind=payload.actor_kind,
+                actor_kind="developer",
                 reason=payload.reason,
                 reason_code=payload.reason_code,
                 evidence_refs=payload.evidence_refs,
@@ -377,6 +441,7 @@ def transition_evolution_node(
 def list_evolution_node_events(
     node_id: int,
     limit: int = Query(default=50, ge=1, le=_MAX_EVENT_LIMIT),
+    offset: int = Query(default=0, ge=0),
     system_id: int = Depends(get_system_id),
     _principal: Principal = Depends(require_user),
 ) -> EvolutionNodeEventsOut:
@@ -384,12 +449,15 @@ def list_evolution_node_events(
 
     ADR-4: folding this log must reproduce the Node's stored maturity. The
     log is the reason a drifted stored value is detectable at all, so it is
-    exposed in its own right rather than only as the projection's tail.
+    exposed in its own right rather than only as the projection's tail --
+    and `offset` exists so a log longer than the bounded page limit can
+    still be read in full (a fold over a truncated log reconciles against
+    the wrong history).
     """
     with get_conn() as conn:
         try:
             events = evolution_node.list_events(
-                conn, system_id=system_id, node_id=node_id, limit=limit
+                conn, system_id=system_id, node_id=node_id, limit=limit, offset=offset
             )
         except evolution_node.EvolutionNodeError as exc:
             _raise_domain_error(exc)

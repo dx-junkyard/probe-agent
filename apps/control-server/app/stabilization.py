@@ -11,8 +11,12 @@ rollback-able implementation". An implementation whose modality stays
 the gate below never reads modality, deliberately.
 
 The gate (`evaluate_establishment_gate`) is a **pure first-match table over
-16 enumerated refusal codes**. Three properties matter more than the
-individual rows:
+an enumerated verdict vocabulary**: `GATE_REFUSAL_CODES` holds 18 refusal
+codes plus `"ok"`, the pass verdict. (Unlike Phase 1's
+`TRANSITION_REJECTION_CODES`, which enumerates rejections only, this tuple
+includes `"ok"` because it is the vocabulary of `GateDecision.reason_code`,
+and a pass is one of the values that field can carry.) Three properties
+matter more than the individual rows:
 
 1. **It fails closed on absence, not just on failure.** `floor_unmeasured`
    refuses as firmly as `floor_violated`, because "the safety floor held" and
@@ -49,7 +53,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, get_args
 
 from . import evolution_node
@@ -75,6 +79,7 @@ __all__ = [
     "evaluate_package",
     "approve_package",
     "reject_package",
+    "supersede_package",
     "build_package_projection",
 ]
 
@@ -120,9 +125,11 @@ GATE_REFUSAL_CODES: Tuple[str, ...] = (
     "node_not_validating",
     "candidate_implementation_missing",
     "candidate_version_mismatch",
+    "contract_version_moved",
     "node_evidence_missing",
     "foreign_evidence",
     "mock_evidence",
+    "evidence_ref_stale",
     "criterion_not_met",
     "floor_violated",
     "floor_unmeasured",
@@ -179,6 +186,11 @@ class EvidenceFact:
     verdict: str
     is_mock: bool = False
     belongs_to_package: bool = True
+    # Whether the reference this evidence carries still resolves AND its
+    # source run reached a successful (or still-open) state, evaluated at
+    # GATE time by `gather_gate_facts`. Evidence with no reference at all is
+    # trivially current -- there is nothing behind it to go stale.
+    ref_current: bool = True
     detail: str = ""
 
 
@@ -197,6 +209,11 @@ class GateFacts:
     node_maturity: str
     candidate_implementation_present: bool
     candidate_matches_node_version: bool
+    # Whether the Node's CURRENT contract version is still the one this
+    # package was written against. The candidate can match the package while
+    # both trail the Node -- a moved contract must change the verdict even
+    # though nothing inside the package changed.
+    package_matches_node_version: bool
     evidence: Tuple[EvidenceFact, ...]
     applicability_envelope_declared: bool
     rollback_target_present: bool
@@ -257,6 +274,15 @@ def evaluate_establishment_gate(facts: GateFacts) -> GateDecision:
             "The candidate implements a different contract version than the "
             "package's; the evidence describes a different promise.",
         )
+    if not facts.package_matches_node_version:
+        # The candidate can still match the package -- both were written
+        # against the OLD contract -- so the row above cannot catch this.
+        return GateDecision(
+            False, "contract_version_moved",
+            "The Node's contract version moved after this package was "
+            "written; its evidence argues for a promise the Node no longer "
+            "makes.",
+        )
 
     # --- provenance -------------------------------------------------------
     foreign = tuple(e.name for e in facts.evidence if not e.belongs_to_package)
@@ -275,6 +301,17 @@ def evaluate_establishment_gate(facts: GateFacts) -> GateDecision:
             False, "mock_evidence",
             "Mock output is test data and cannot be establishment evidence.",
             mock,
+        )
+    stale_refs = tuple(e.name for e in facts.evidence if not e.ref_current)
+    if stale_refs:
+        # Evidence is referenced, never copied, precisely so THIS check can
+        # exist: a result whose source was deleted or ended without
+        # completing is not current, however it read when it was attached.
+        return GateDecision(
+            False, "evidence_ref_stale",
+            "A referenced result no longer resolves, or its source run ended "
+            "without completing; the evidence is no longer current.",
+            stale_refs,
         )
 
     # --- required evidence ------------------------------------------------
@@ -601,6 +638,64 @@ def add_evidence(
     ).fetchone()
 
 
+# Where each `ref_kind` resolves, and the terminal states in which the
+# source itself concluded it produced no usable result. `open`/`running` are
+# NOT dead: a still-executing source is current, just unfinished. An
+# `exploration_variant` carries no status of its own, so its currency is its
+# parent run's.
+_EVIDENCE_REF_TABLES: Dict[str, str] = {
+    "exploration_run": "exploration_run",
+    "exploration_variant": "exploration_variant",
+    "replay_run": "replay_runs",
+    "experiment": "experiments",
+    "evaluation_policy": "evolution_evaluation_policy",
+}
+_EVIDENCE_REF_DEAD_STATUSES: Dict[str, Tuple[str, ...]] = {
+    "exploration_run": ("abandoned",),
+    "replay_run": ("failed",),
+    "experiment": ("failed",),
+}
+
+
+def _evidence_ref_current(
+    conn: sqlite3.Connection, system_id: int, ref_kind: str, ref_id: int
+) -> bool:
+    """Whether an evidence reference still resolves in this System, and its
+    source run is not in a non-successful terminal state.
+
+    Queried defensively the way `load_node_facts` treats Phase 4's own
+    tables: a table that does not exist means the reference does not resolve,
+    never a crash -- and an unresolvable reference is stale, because the gate
+    fails closed on absence.
+    """
+    if ref_kind not in _EVIDENCE_REF_TABLES:
+        return False
+    try:
+        if ref_kind == "exploration_variant":
+            row = conn.execute(
+                """SELECT r.status AS status FROM exploration_variant v
+                       JOIN exploration_run r ON r.id = v.run_id
+                       WHERE v.id = ? AND v.system_id = ?""",
+                (ref_id, system_id),
+            ).fetchone()
+            if row is None:
+                return False
+            return row["status"] not in _EVIDENCE_REF_DEAD_STATUSES["exploration_run"]
+        row = conn.execute(
+            f"SELECT * FROM {_EVIDENCE_REF_TABLES[ref_kind]} "
+            "WHERE id = ? AND system_id = ?",
+            (ref_id, system_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    if row is None:
+        return False
+    dead = _EVIDENCE_REF_DEAD_STATUSES.get(ref_kind)
+    if dead and row["status"] in dead:
+        return False
+    return True
+
+
 def gather_gate_facts(
     conn: sqlite3.Connection, *, system_id: int, package_id: int
 ) -> GateFacts:
@@ -641,6 +736,15 @@ def gather_gate_facts(
             # here belongs. The flag exists so the gate's refusal is expressible
             # as its own code rather than as an empty evidence list.
             belongs_to_package=row["system_id"] == system_id,
+            # Re-resolved on EVERY evaluation, per the currency promise in
+            # this function's docstring: `ref_id` carries no FK, so the row
+            # it named can be gone or abandoned by now.
+            ref_current=(
+                row["ref_kind"] is None
+                or _evidence_ref_current(
+                    conn, system_id, row["ref_kind"], row["ref_id"]
+                )
+            ),
             detail=row["detail"],
         )
         for row in evidence_rows
@@ -656,6 +760,9 @@ def gather_gate_facts(
         candidate_matches_node_version=(
             candidate is not None
             and candidate["node_version_id"] == package["node_version_id"]
+        ),
+        package_matches_node_version=(
+            node["current_version_id"] == package["node_version_id"]
         ),
         evidence=evidence,
         applicability_envelope_declared=bool(envelope),
@@ -701,12 +808,22 @@ def approve_package(
        change between reading and approving.
     2. A named human is required. `approved_by` comes from the authenticated
        principal at the route, never from a request body (#337's rule).
-    3. The candidate is pinned stable, which rotates the previous stable into
+    3. Phase 1's transition evaluator is consulted BEFORE anything is
+       written, against the facts as they will stand after the pin
+       (`evaluate_transition` is pure, so the one fact the pin changes can be
+       substituted without writing it). The pin and the transition commit in
+       separate transactions Phase 1 owns, so a refusal discovered only
+       after the pin would leave a committed half-state -- pinned but not
+       established -- which ADR-4 forbids.
+    4. The candidate is pinned stable, which rotates the previous stable into
        the rollback slot.
-    4. The `validating -> established` transition goes through Phase 1's own
+    5. The `validating -> established` transition goes through Phase 1's own
        evaluator with `decision_method: manual`. It is not written directly:
        Phase 1 owns the transition table and the event log, and a second
-       writer would be a second opinion about the Node's state.
+       writer would be a second opinion about the Node's state. It
+       re-evaluates once more as a defense against a race with step 3; if it
+       still refuses, the pin, rollback slot, and pin events are restored in
+       this same request so no half-state survives.
 
     This approves establishment ONLY. It applies no source, changes no
     policy, deploys nothing, and publishes nothing -- each of those keeps its
@@ -725,11 +842,48 @@ def approve_package(
             f"{decision.message}"
         )
 
+    node_id = package["node_id"]
+    reason_text = note or f"approved stabilization package {package_id}"
+    evidence_ref = f"stabilization_package:{package_id}"
+    request = evolution_node.TransitionRequest(
+        to_state="established",
+        decision_method="manual",
+        actor=approved_by,
+        actor_kind="developer",
+        reason=reason_text,
+        reason_code="stabilization_approved",
+        evidence_refs=(evidence_ref,),
+    )
+    # Pre-validate against the hypothetical post-pin facts, writing nothing.
+    # A refusal here (e.g. `stale_implementation` after the contract moved)
+    # must leave the pin, the rollback slot, and the event log untouched.
+    pre_facts = replace(
+        evolution_node.load_node_facts(conn, system_id=system_id, node_id=node_id),
+        has_stable_implementation=True,
+    )
+    pre_decision = evolution_node.evaluate_transition(pre_facts, request)
+    if not pre_decision.allowed:
+        raise StabilizationConflictError(
+            "The Node's own transition evaluator refuses the establishment "
+            f"({pre_decision.reason_code}): {pre_decision.message}"
+        )
+
     now = time.time()
+    node_before = conn.execute(
+        """SELECT stable_implementation_id, rollback_implementation_id, updated_at
+               FROM evolution_node WHERE id = ?""",
+        (node_id,),
+    ).fetchone()
+    last_event_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS max_id FROM evolution_node_event "
+        "WHERE node_id = ?",
+        (node_id,),
+    ).fetchone()["max_id"]
+
     evolution_node.pin_stable_implementation(
         conn,
         system_id=system_id,
-        node_id=package["node_id"],
+        node_id=node_id,
         implementation_id=package["candidate_implementation_id"],
         actor=approved_by,
         decision_method="manual",
@@ -738,17 +892,46 @@ def approve_package(
     transition = evolution_node.apply_transition(
         conn,
         system_id=system_id,
-        node_id=package["node_id"],
+        node_id=node_id,
         to_state="established",
         decision_method="manual",
         actor=approved_by,
         actor_kind="developer",
-        reason=note or f"approved stabilization package {package_id}",
+        reason=reason_text,
         reason_code="stabilization_approved",
-        evidence_refs=[f"stabilization_package:{package_id}"],
+        evidence_refs=[evidence_ref],
         idempotency_key=f"stabilization-{package_id}",
     )
     if not (transition.applied or transition.duplicate):
+        # Only a race with the pre-validation above can reach this branch.
+        # The pin already committed in Phase 1's own transaction, so restore
+        # the Node's pin state and remove the pin events this request wrote
+        # -- a stable pin the Node never established from is a half-state the
+        # event log must not claim (ADR-4).
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """UPDATE evolution_node
+                       SET stable_implementation_id = ?,
+                           rollback_implementation_id = ?, updated_at = ?
+                     WHERE id = ?""",
+                (
+                    node_before["stable_implementation_id"],
+                    node_before["rollback_implementation_id"],
+                    node_before["updated_at"],
+                    node_id,
+                ),
+            )
+            conn.execute(
+                """DELETE FROM evolution_node_event
+                       WHERE node_id = ? AND id > ?
+                         AND event_kind IN ('stable_pinned', 'rollback_pinned')""",
+                (node_id, last_event_id),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         raise StabilizationConflictError(
             "The Node's own transition evaluator refused the establishment "
             f"({transition.decision.reason_code}): {transition.decision.message}"
@@ -780,6 +963,11 @@ def reject_package(
     A rejection is a record that a human looked and said no; it is not a
     demotion, and it must not move the Node backwards on its own.
     """
+    if not (rejected_by or "").strip():
+        raise StabilizationValidationError(
+            "reject_package requires the rejecting person; a rejection is a "
+            "named human's decision exactly as an approval is"
+        )
     package = _require_package(conn, system_id, package_id)
     if package["status"] not in ("draft", "under_review"):
         raise StabilizationConflictError(
@@ -791,6 +979,71 @@ def reject_package(
                    decision_note = ?
                WHERE id = ?""",
         (rejected_by, time.time(), note, package_id),
+    )
+    return conn.execute(
+        "SELECT * FROM stabilization_package WHERE id = ?", (package_id,)
+    ).fetchone()
+
+
+def supersede_package(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    package_id: int,
+    successor_package_id: int,
+    superseded_by: str,
+    note: str = "",
+) -> sqlite3.Row:
+    """Retire an undecided package in favour of a newer one for the same Node.
+
+    Supersession is an explicit, named-human decision -- never an automatic
+    side effect of creating or approving another package. An automatic sweep
+    would decide, silently, that a newer package's argument replaces an older
+    one's, and those can argue for different candidates; whether the older
+    argument is dead is a judgement, so it is recorded like one
+    (`decision_method: manual`, the module's append-only discipline: the row
+    stays readable, its evidence stays attached, and `superseded_by_id` says
+    exactly which package to establish from instead).
+
+    Only an undecided (`draft`/`under_review`) package can be superseded: an
+    approved or rejected package is a decision that already happened, and
+    rewriting its status would rewrite history. The successor must argue
+    about the SAME Node and must itself still be alive (undecided or
+    approved) -- pointing "establish from that" at a rejected or superseded
+    package would send the developer to a dead end. Changes no Node state.
+    """
+    if not (superseded_by or "").strip():
+        raise StabilizationValidationError(
+            "supersede_package requires the deciding person; retiring a "
+            "package in favour of another is never an anonymous decision"
+        )
+    package = _require_package(conn, system_id, package_id)
+    if package_id == successor_package_id:
+        raise StabilizationValidationError(
+            "a package cannot supersede itself"
+        )
+    successor = _require_package(conn, system_id, successor_package_id)
+    if package["status"] not in ("draft", "under_review"):
+        raise StabilizationConflictError(
+            f"Package {package_id} is already {package['status']}; only an "
+            "undecided package can be superseded"
+        )
+    if successor["node_id"] != package["node_id"]:
+        raise StabilizationValidationError(
+            f"Package {successor_package_id} argues about a different Node; "
+            "a package is only superseded by a newer package for the same Node"
+        )
+    if successor["status"] not in ("draft", "under_review", "approved"):
+        raise StabilizationConflictError(
+            f"Package {successor_package_id} is {successor['status']} and "
+            "cannot be the package to establish from"
+        )
+    conn.execute(
+        """UPDATE stabilization_package
+               SET status = 'superseded', superseded_by_id = ?, approved_by = ?,
+                   approved_at = ?, decision_note = ?
+               WHERE id = ?""",
+        (successor_package_id, superseded_by, time.time(), note, package_id),
     )
     return conn.execute(
         "SELECT * FROM stabilization_package WHERE id = ?", (package_id,)
@@ -852,6 +1105,7 @@ def build_package_projection(
         "observed_window_seconds": package["observed_window_seconds"],
         "outcome_unmeasured_reason": package["outcome_unmeasured_reason"],
         "status": package["status"],
+        "superseded_by_id": package["superseded_by_id"],
         "approved_by": package["approved_by"],
         "approved_at": package["approved_at"],
         "decision_note": package["decision_note"],

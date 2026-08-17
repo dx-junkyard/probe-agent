@@ -8731,10 +8731,16 @@ class EvolutionNodeStablePinIn(BaseModel):
 class EvolutionNodeTransitionIn(BaseModel):
     """A maturity transition request.
 
-    `decision_method` is deliberately NOT defaulted to `manual`: which of the
-    three it is decides whether a human stands behind this transition, and a
-    default would let a caller record a human decision by omission. The
-    domain layer rejects `reasoning_llm` outright -- an LLM never emits a
+    Provenance fields (`actor`, `actor_kind`) are deliberately ABSENT: the
+    route derives both from the authenticated `Principal` (#337's rule,
+    ADR-9), so a caller can never record a transition as someone else's --
+    or as the system's -- decision. `decision_method` is deliberately NOT
+    defaulted to `manual`: which one it is decides whether a human stands
+    behind this transition, and a default would let a caller record a human
+    decision by omission. The full three-value Literal is kept so the route
+    can refuse `deterministic` with its own finite code
+    (`deterministic_via_api_not_allowed`) and let the domain layer refuse
+    `reasoning_llm` with `llm_state_not_allowed` -- an LLM never emits a
     canonical state (Principle 6).
     """
 
@@ -8742,8 +8748,6 @@ class EvolutionNodeTransitionIn(BaseModel):
 
     to_state: EvolutionMaturityState
     decision_method: Literal["deterministic", "reasoning_llm", "manual"]
-    actor: Optional[str] = None
-    actor_kind: EvolutionActorKind = "developer"
     reason: str = ""
     reason_code: str = ""
     evidence_refs: List[str] = Field(default_factory=list)
@@ -9418,6 +9422,8 @@ class StabilizationPackageOut(BaseModel):
     observed_window_seconds: Optional[float] = None
     outcome_unmeasured_reason: str
     status: StabilizationStatus
+    # Which package to establish from instead, when status='superseded'.
+    superseded_by_id: Optional[int] = None
     approved_by: Optional[str] = None
     approved_at: Optional[float] = None
     decision_note: str
@@ -9432,4 +9438,14 @@ class StabilizationPackageOut(BaseModel):
 class StabilizationDecisionIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    note: str = ""
+
+
+class StabilizationSupersedeIn(BaseModel):
+    """The successor package id is the one assertion the caller makes; who
+    decided comes from the authenticated principal, never the body (#337)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    successor_package_id: int
     note: str = ""

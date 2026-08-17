@@ -37,6 +37,7 @@ from ..models import (
     StabilizationEvidenceOut,
     StabilizationPackageCreateIn,
     StabilizationPackageOut,
+    StabilizationSupersedeIn,
 )
 
 router = APIRouter(prefix="/stabilization", tags=["stabilization"])
@@ -197,14 +198,66 @@ def reject_stabilization_package(
     principal: Principal = Depends(require_user),
 ) -> StabilizationPackageOut:
     """Reject the package. Moves the Node nowhere -- a rejection is a record
-    that a human looked and said no, not a demotion."""
+    that a human looked and said no, not a demotion. Like an approval, it is
+    a NAMED human's record: the rejecter comes from the authenticated
+    principal, and an unidentified account is refused."""
+    if not principal.username:
+        raise HTTPException(
+            status_code=403,
+            detail="Rejection requires an identified user account",
+        )
     with get_conn() as conn:
         try:
             stabilization.reject_package(
                 conn,
                 system_id=system_id,
                 package_id=package_id,
-                rejected_by=principal.username or "",
+                rejected_by=principal.username,
+                note=payload.note,
+            )
+            projection = stabilization.build_package_projection(
+                conn, system_id=system_id, package_id=package_id
+            )
+        except stabilization.StabilizationError as exc:
+            _raise_domain_error(exc)
+    return StabilizationPackageOut(**projection)
+
+
+@router.post(
+    "/packages/{package_id}/supersede", response_model=StabilizationPackageOut
+)
+def supersede_stabilization_package(
+    package_id: int,
+    payload: StabilizationSupersedeIn,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> StabilizationPackageOut:
+    """Retire an undecided package in favour of a newer one for the same Node.
+
+    Supersession is an explicit decision, deliberately NOT an automatic side
+    effect of creating or approving another package: whether a newer
+    package's argument replaces an older one's is a judgement, so it is
+    recorded like one -- a named human (from the authenticated principal,
+    never the body), `decision_method: manual`, append-only (the superseded
+    row keeps its evidence and points at its successor via
+    `superseded_by_id`). Only a `draft`/`under_review` package can be
+    superseded, the successor must argue about the same Node and must itself
+    be undecided or approved, and no Node state changes. A superseded
+    package's gate reads `package_superseded` from then on.
+    """
+    if not principal.username:
+        raise HTTPException(
+            status_code=403,
+            detail="Superseding a package requires an identified user account",
+        )
+    with get_conn() as conn:
+        try:
+            stabilization.supersede_package(
+                conn,
+                system_id=system_id,
+                package_id=package_id,
+                successor_package_id=payload.successor_package_id,
+                superseded_by=principal.username,
                 note=payload.note,
             )
             projection = stabilization.build_package_projection(

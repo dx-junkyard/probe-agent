@@ -225,14 +225,17 @@ ALLOWED_TRANSITIONS: Dict[str, FrozenSet[str]] = {
 }
 
 #: The ONLY transitions Phase 1 lets the system itself record
-#: (`decision_method='deterministic'`, `actor_kind='system'`). Both pairs are
-#: the monitoring contract being switched on/off by its own evaluation, not a
-#: human judgement call -- allowing `manual` here would let a developer's
-#: click masquerade as that automated evaluation, which is exactly what
-#: `evaluate_transition`'s `manual_approval_required` check refuses. Every
-#: other transition -- including moving OUT of `established`/`monitoring` by
-#: any path other than this exact pair -- requires a human (`manual` +
-#: a non-empty `actor`).
+#: (`decision_method='deterministic'`, `actor_kind='system'`): the monitoring
+#: contract being switched on/off by its own evaluation (ADR-9's enumerated
+#: observation transitions). For a HUMAN caller the pair is asymmetric:
+#: `established -> monitoring` (activation) is never `manual` -- a
+#: developer's click claiming observation is running would masquerade as the
+#: monitoring evaluation's own reading, which is exactly what
+#: `evaluate_transition`'s `manual_approval_required` check refuses --
+#: while `monitoring -> established` (deactivation: recording that
+#: observation stopped) MAY also be a manual operations decision by a named
+#: developer. Every other transition requires a human (`manual` + a
+#: non-empty `actor`).
 SYSTEM_RECORDED_TRANSITIONS: FrozenSet[Tuple[str, str]] = frozenset({
     ("established", "monitoring"),
     ("monitoring", "established"),
@@ -301,8 +304,8 @@ class TransitionDecision:
 #: in evaluation order. `"ok"` (allowed) is deliberately not a member of this
 #: tuple -- it is the ABSENCE of a rejection, not one more code in the set.
 TRANSITION_REJECTION_CODES: Tuple[str, ...] = (
-    "unknown_target_state",
     "llm_state_not_allowed",
+    "unknown_target_state",
     "illegal_transition",
     "manual_approval_required",
     "reason_required",
@@ -329,22 +332,23 @@ def evaluate_transition(facts: NodeFacts, request: TransitionRequest) -> Transit
 
     to_state = request.to_state
 
-    # 1: the target itself must be one of the six states.
-    if to_state not in MATURITY_STATES:
-        return TransitionDecision(
-            False, "unknown_target_state",
-            f"{to_state!r} is not a known maturity state",
-        )
-
-    # 2: an LLM never emits a canonical maturity state (Principle 6).
-    # Checked BEFORE legality so a reasoning-model caller is always told
-    # exactly why it was refused, regardless of whether the transition it
-    # asked for would otherwise be legal.
+    # 1: an LLM never emits a canonical maturity state (Principle 6).
+    # Genuinely unconditional and FIRST -- before even the target-state
+    # vocabulary check -- so a reasoning-model caller is always told exactly
+    # why it was refused, regardless of whether the state it asked for is
+    # known, legal, or anything else.
     if request.decision_method == "reasoning_llm":
         return TransitionDecision(
             False, "llm_state_not_allowed",
             "A maturity transition may never be recorded with "
             "decision_method='reasoning_llm'",
+        )
+
+    # 2: the target itself must be one of the six states.
+    if to_state not in MATURITY_STATES:
+        return TransitionDecision(
+            False, "unknown_target_state",
+            f"{to_state!r} is not a known maturity state",
         )
 
     # 3: the transition graph itself. `to_state == facts.maturity` is
@@ -357,23 +361,39 @@ def evaluate_transition(facts: NodeFacts, request: TransitionRequest) -> Transit
 
     pair = (facts.maturity, to_state)
     is_system_recorded = pair in SYSTEM_RECORDED_TRANSITIONS
+    is_manual_request = (
+        request.decision_method == "manual"
+        and request.actor_kind == "developer"
+        and bool((request.actor or "").strip())
+    )
 
-    # 4: authorization. The two system-recorded pairs require EXACTLY
+    # 4: authorization. The two system-recorded pairs accept
     # deterministic+system (see SYSTEM_RECORDED_TRANSITIONS above); every
-    # other transition requires manual + a real actor.
+    # other transition requires manual + a real actor. The pair is
+    # deliberately asymmetric for a HUMAN caller: `monitoring ->
+    # established` (deactivation -- recording that observation stopped) is
+    # also a legitimate manual operations decision, while `established ->
+    # monitoring` (activation) is never manual, because a developer's click
+    # claiming "the monitoring contract is actually observing" would
+    # masquerade as the monitoring evaluation's own reading.
     if is_system_recorded:
-        if request.decision_method != "deterministic" or request.actor_kind != "system":
+        system_recorded_ok = (
+            request.decision_method == "deterministic" and request.actor_kind == "system"
+        )
+        manual_deactivation_ok = pair == ("monitoring", "established") and is_manual_request
+        if not (system_recorded_ok or manual_deactivation_ok):
             return TransitionDecision(
                 False, "manual_approval_required",
                 f"{facts.maturity!r} -> {to_state!r} is system-recorded and "
-                "requires decision_method='deterministic' with actor_kind='system'",
+                "requires decision_method='deterministic' with actor_kind='system'"
+                + (
+                    ", or a manual deactivation by a named developer"
+                    if pair == ("monitoring", "established")
+                    else ""
+                ),
             )
     else:
-        if (
-            request.decision_method != "manual"
-            or request.actor_kind != "developer"
-            or not (request.actor or "").strip()
-        ):
+        if not is_manual_request:
             return TransitionDecision(
                 False, "manual_approval_required",
                 f"{facts.maturity!r} -> {to_state!r} requires a human decision: "
@@ -756,6 +776,45 @@ def add_implementation(
     return row
 
 
+def _require_approved_probe_point(
+    conn, *, system_id: int, target_ref: str, target_row_id: Optional[int]
+) -> None:
+    """Fail closed unless `target_ref` names an APPROVED probe point of THIS
+    System (ADR-2's verification rule, the same gate `app/cell_binding.py`'s
+    `_resolve_from_probe_point` applies for Cell Bindings).
+
+    A Probe Point's identity owner is `probe_points.id` (docs/
+    evolutionary-pipeline.md §3), so its stable string ref IS that id in
+    decimal form. A missing row and another System's row are deliberately
+    indistinguishable (both NotFound), so probe point ids can never be
+    probed across Systems through link creation."""
+    ref = (target_ref or "").strip()
+    try:
+        probe_point_id = int(ref)
+    except ValueError:
+        raise EvolutionNodeValidationError(
+            "a probe_point link's target_ref must be the probe_points.id of "
+            f"an approved Probe Point, got {target_ref!r}"
+        )
+    if target_row_id is not None and target_row_id != probe_point_id:
+        raise EvolutionNodeValidationError(
+            f"target_row_id {target_row_id} does not match the probe_point "
+            f"target_ref {target_ref!r}"
+        )
+    row = conn.execute(
+        "SELECT status FROM probe_points WHERE id = ? AND system_id = ?",
+        (probe_point_id, system_id),
+    ).fetchone()
+    if row is None:
+        raise EvolutionNodeNotFoundError(f"Probe point {probe_point_id} not found")
+    if row["status"] != "approved":
+        raise EvolutionNodeConflictError(
+            f"Probe point {probe_point_id} is not approved "
+            f"(status={row['status']!r}); only an approved Probe Point may "
+            "back a probe_point link"
+        )
+
+
 def add_link(
     conn,
     *,
@@ -779,6 +838,10 @@ def add_link(
     _check_membership(actor_kind, ACTOR_KINDS, "actor_kind")
     if not (target_ref or "").strip():
         raise EvolutionNodeValidationError("target_ref must not be empty")
+    if link_kind == "probe_point":
+        _require_approved_probe_point(
+            conn, system_id=system_id, target_ref=target_ref, target_row_id=target_row_id
+        )
 
     now = time.time()
     conn.execute("BEGIN")
@@ -1030,6 +1093,36 @@ def apply_transition(
             "SELECT * FROM evolution_node WHERE id = ?", (node_id,)
         ).fetchone()
         conn.execute("COMMIT")
+    except sqlite3.IntegrityError:
+        # A concurrent request with the SAME idempotency_key won the
+        # SELECT-then-INSERT race: its event landed between our duplicate
+        # check above and our insert, so the partial unique index refused
+        # ours. That retry is the situation idempotency exists for -- resolve
+        # to the winner's event exactly as the sequential-retry path does.
+        # Any other integrity violation re-raises unchanged: the re-select
+        # below is the discriminator, not the exception type.
+        conn.execute("ROLLBACK")
+        if idem:
+            existing_event = conn.execute(
+                """SELECT * FROM evolution_node_event
+                       WHERE node_id = ? AND system_id = ? AND idempotency_key = ?""",
+                (node_id, system_id, idem),
+            ).fetchone()
+            if existing_event is not None:
+                current_node = conn.execute(
+                    "SELECT * FROM evolution_node WHERE id = ?", (node_id,)
+                ).fetchone()
+                return TransitionApplyResult(
+                    decision=TransitionDecision(
+                        True, "ok",
+                        "Duplicate request; the original transition is unchanged.",
+                    ),
+                    applied=False,
+                    duplicate=True,
+                    event=existing_event,
+                    node=current_node,
+                )
+        raise
     except Exception:
         conn.execute("ROLLBACK")
         raise
@@ -1225,20 +1318,25 @@ event_doc = _event_doc
 
 
 def list_events(
-    conn, *, system_id: int, node_id: int, limit: int = 50
+    conn, *, system_id: int, node_id: int, limit: int = 50, offset: int = 0
 ) -> List[Dict[str, Any]]:
     """The Node's append-only lineage, newest first.
 
     Exposed in its own right (not just as `build_node_projection`'s tail)
     because ADR-4 makes the log the authority: folding it must reproduce the
     stored maturity, so an auditor has to be able to read the whole log
-    without also pulling the projection it is supposed to check.
+    without also pulling the projection it is supposed to check. `offset`
+    exists for exactly that reader: a long-lived Node's log outgrows any
+    single bounded page, and a fold over a truncated log would reconcile
+    against the wrong history.
     """
+    if offset < 0:
+        raise EvolutionNodeValidationError("offset must be >= 0")
     _require_node(conn, system_id, node_id)
     rows = conn.execute(
         """SELECT * FROM evolution_node_event WHERE node_id = ? AND system_id = ?
-               ORDER BY id DESC LIMIT ?""",
-        (node_id, system_id, limit),
+               ORDER BY id DESC LIMIT ? OFFSET ?""",
+        (node_id, system_id, limit, offset),
     ).fetchall()
     return [_event_doc(row) for row in rows]
 
