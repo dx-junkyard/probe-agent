@@ -7086,3 +7086,139 @@ telemetry が死んだ Node は健全に観測されている Node と区別さ�
 scope)とそのテストまで。operations cockpit の API/画面は Phase 6(#401)の
 統合対象であり、そこで既存 Overview / Components / Cell Fabric と合わせて
 配置する。
+
+## Epic #394 検証ラウンド(2026-08-17)
+
+Phase 0〜5(#395〜#400)の実装を、`docs/evolutionary-pipeline.md`
+(ADR-1〜9)・各 Issue の受け入れ条件・CLAUDE.md Core Design Principles に
+対して照合した。中核規律(純粋 evaluator、append-only lineage、3 軸独立
+projection、fail-closed 推論、3 評価契約の非合成、欠測の非丸め、System
+分離)は設計どおりだったが、**「比較・証拠・承認の記録が後段の判断の
+入力になる」という自らの前提に対する完全性**が複数箇所で破れており、
+以下を修正した。いずれも個別の再現/回帰テストを伴う。
+
+### 修正(#396 Phase 1)
+
+- **未承認 Probe Point リンクの拒否**(ADR-2 の検証方法そのもの):
+  `add_link(kind=probe_point)` が `probe_points` を一切照会していなかった。
+  `target_ref` は `probe_points.id` の 10 進文字列で、不存在/他 System は
+  404(id の System 横断プロービング防止の既存規則)、未承認は 409、
+  malformed は 422。#299 の `_resolve_from_probe_point` と同じゲート。
+- **provenance の偽装不能化**(ADR-9/#337): transition エンドポイントが
+  `actor_kind` を body から受けていたため、人間の POST が「system-recorded
+  observation transition」を名乗れた。`actor`/`actor_kind` を
+  `EvolutionNodeTransitionIn` から削除し、route が Principal から導出。
+  `decision_method='deterministic'` は route 層の有限コード
+  `deterministic_via_api_not_allowed`(ドメイン語彙とは分離、非交差を
+  テストで assert)で 422。`reasoning_llm` はドメインへ素通しし
+  `llm_state_not_allowed` の API 到達性を維持。
+- **rule 4 の非対称化**(ドメイン最小変更): `monitoring→established`
+  (観測停止の記録)のみ manual+実名 actor でも受理する。
+  `established→monitoring`(activation)は従来どおり
+  deterministic+system 専用。これがないと、公開 API から deterministic を
+  封じた時点で観測停止を人間が記録する経路が消える。12 拒否コードは不変。
+- **固定化ゲートの迂回閉鎖**: `POST /evolution-nodes/{id}/transitions` は
+  現 maturity が `monitoring` 以外での `to_state='established'` を
+  `establishment_via_stabilization_required`(422)で拒否し、
+  `POST /stabilization/packages/{id}/approve` へ誘導する。#399 のゲートを
+  通らない establish の公開経路はもう無い(ドメイン関数は内部呼び出し
+  向けにそのまま)。
+- **評価順序の正誤**: 「`llm_state_not_allowed` は無条件で最初」という
+  本書 #396 節の主張どおりに evaluator の行 1・2 を入れ替えた(従来は
+  `unknown_target_state` が先で、未知状態 + reasoning_llm の組で中心
+  規則のコードが返らなかった)。
+- **ADR-1 の DDL 凍結テスト**(`tests/test_evolution_compatibility.py`):
+  `cell_definitions`/`cell_bindings`/`agent_role_cards` の CREATE TABLE が
+  バイト単位で不変であることを assert。§8.1 の 3 pilot 登録 smoke テスト
+  (runtime 系テーブルへの書き込みゼロの assert 付き)と、ADR-3 の
+  「provider/model 実名が identity にもレスポンスにも無い」テストも追加。
+- **/events の offset ページング**(ADR-4): 上限 200 件でログ全量の
+  fold 検証が不可能だった。
+- **idempotency の競合窓**: 同一 key の並行 2 リクエスト目が
+  `IntegrityError`→500 になっていた。捕捉して勝者 event を 200
+  `duplicate` で返す(逐次リトライと同形)。
+
+### 修正(#397/#398 Phase 2/3)
+
+- **[critical] 実行参照の完了状態検証**: `attach_execution` が
+  draft/running/failed の Replay run / Experiment を `executed` の根拠と
+  して受理していた(§6.1 は「完了済み run」を明記)。終端 `completed`
+  以外は 409。
+- **完了済み run の改竄防止**: `attach_execution`/`record_measurement` が
+  run の status を見ず、`complete_run` 後の測定値を ON CONFLICT で無音
+  上書きできた——完了済み run はまさに #399 のゲートが読む evidence で
+  ある。`_require_open_run` で open を必須化。
+- **採用の all-or-nothing 化**: 保存済み候補に create_node/add_version が
+  拒否する値(空白のみの mission 等)が含まれると、1 個目の Node だけ
+  完全作成→2 個目が version 無し Node として残骸化→以後の再試行が
+  node_key 衝突で永久 409、というデッドエンドを再現確認。提案 parse 時に
+  Phase 1 の strip 検証をミラーして全体 fail-closed + 採用時に全候補
+  preflight(書き込みゼロで 422)+ route の error map に
+  `EvolutionNode*Error` を追加(残余 500 の排除)。
+- **方向表の fail-closed 化**: `HIGHER_IS_BETTER.get(dim, True)` が未知
+  dimension を silent に higher-is-better 扱いしていた。有限語彙外は
+  `ExplorationValidationError`。
+- **ranking の整合**: `rank_by_dimension` が metric_name/coverage を
+  無視し、baseline の p50 と candidate の p95 を同一順位表で比較できた。
+  `compare_variants` と同じ `(dimension, metric_name)` キーに統一し、
+  複数 metric_name は明示指定を要求(422)、coverage 基準は
+  「baseline の coverage、baseline 不在なら全 measured の単一 coverage」
+  の決定的規則、外れた variant は理由付き `unranked`。
+  `ExplorationRankingOut`/`EntryOut` に `metric_name`/`reason` を露出。
+
+### 修正(#399/#400 Phase 4/5)
+
+- **approve の原子性**(ADR-4): gate 再評価→pin(自前 COMMIT)→
+  Phase 1 遷移、の順だったため、遷移拒否後も pin・rollback 回転・
+  `stable_pinned` イベントが残る half-established 状態を再現確認。pin の
+  前に純粋 evaluator を「pin 後の仮想 facts」で事前検証し、レースで
+  なお失敗した場合は同一リクエスト内で pin 状態を復元する補償を追加。
+- **gate currency**: `contract_version_moved`(package 作成後に契約
+  version が動いた)と `evidence_ref_stale`(参照先 run の削除・
+  abandoned/failed 終端)を毎評価時に読む。ゲート語彙は 18 拒否コード +
+  `ok` になった(Phase 1 と異なり `GATE_REFUSAL_CODES` は
+  `GateDecision.reason_code` の語彙なので `ok` を含む——docstring に
+  明記)。
+- **supersede の実経路**: `POST /stabilization/packages/{id}/supersede`
+  (manual、Principal 由来の実名、対象は draft/under_review のみ、
+  後継は同一 Node の生存 package)。`package_superseded` が実コードで
+  到達可能になった。`reject` も approve と同型の実名必須に。
+- **bulk-reopen の報告分岐**: 遷移できない Node が `applied=false` で
+  報告される分岐に初めてテストが付いた(全 Node の stable pin 維持も
+  assert)。
+
+### 明示的な残件(未実装かつ本ラウンドでは対象外)
+
+いずれも実装の欠陥ではなく scope の記録である。#401 着手時にこの一覧を
+入力にすること。
+
+- **#398 既存導線の consolidation**: `candidate_versions` →
+  `evolution_node_implementation` のアダプタ(§6.1 の検証方法
+  「generated_code とアダプタ由来の実装参照が同一内容を指す」)は未実装。
+  Candidate Studio / Simulation Workbench の導線 inventory 化とともに
+  #401 の統合対象。
+- **Phase 2/3/5 の Dashboard UI**: `/evolution-nodes`(Phase 1 inspector)
+  以外の画面は #401 の再配置対象(既存記載どおり)。
+- **`exploration_run.status='abandoned'` の設定経路**: 語彙には存在するが
+  setter が無い(gate の `evidence_ref_stale` は defensive に判定済み)。
+- **monitoring contract の「actually active」**: `established→monitoring`
+  の要求は `monitoring_contract_ref` 非 NULL のみで、参照先 contract 行の
+  解決・`active` 列の読み取りは行わない(deactivate API も未実装)。
+  §10 未決事項 #1(coverage sub-state)と同じ設計判断領域なので、#400 の
+  運用データを得てから #401 で決める。
+- **#400 実装内容のうち**: notification/cooldown(dedupe のみ実装)、
+  realistic drift fixtures / long-running simulations、
+  replay→offline shadow→approved live shadow の順序を使う handoff の
+  自動化。drift→局所 reopen→再検証→再 establish の pilot 完走は #401 の
+  dogfooding 項目。
+- **#399 実装内容のうち**: decision UI(#401)、fixed-code variant を
+  established へ進める pilot 完走(#401 dogfooding)、§8.4 完了ゲートの
+  「pilot 2 の安定化過程の再検証」。
+- **§10 未決事項 #2**(Flow-level evaluation の identity)は Phase 2 完了
+  時点でも未解決のまま——`evolution_evaluation_policy.subject_ref` は
+  自由 TEXT で運用し、実データが揃う #401 で再評価する(答えの先取りを
+  しないという §10 自身の規律に従う)。
+- **Phase 1 ドメイン層の残余**: `stale_implementation` は current
+  implementation のみを見る(stable pin が旧契約の実装のままでも通る)。
+  公開 API 側は establishment 迂回閉鎖 + gate の `contract_version_moved`
+  で塞がっており、ドメイン単体の強化は #401 で判断する。

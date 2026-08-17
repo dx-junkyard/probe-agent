@@ -9303,6 +9303,10 @@ class ExplorationRankingEntryOut(BaseModel):
     modality: EvolutionImplementationModality
     value: Optional[float] = None
     value_state: ExplorationValueState
+    # Why an unranked variant is unranked (different metric_name, different
+    # coverage, nothing measured). Dropping this would leave the reader with
+    # a bare exclusion they cannot audit.
+    reason: str = ""
 
 
 class ExplorationRankingOut(BaseModel):
@@ -9314,6 +9318,9 @@ class ExplorationRankingOut(BaseModel):
     sorting an unmeasured variant last would read as "worst"."""
 
     dimension: ExplorationDimension
+    # The single metric this ranking was computed over -- readings under a
+    # different metric_name are in `unranked`, never silently mixed in.
+    metric_name: str = ""
     ranked: List[ExplorationRankingEntryOut]
     unranked: List[ExplorationRankingEntryOut]
 

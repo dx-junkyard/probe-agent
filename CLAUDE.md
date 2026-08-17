@@ -1391,8 +1391,15 @@ creating incomplete persistence or execution paths for later phases.
     decomposition / 3 つの評価契約 / Phase 3 への handoff)、
     `app/exploration_workbench.py` (modality 横断比較。合成なし、
     `incomparable` / `coverage_mismatch` を持つ)、`app/stabilization.py`
-    (17 個の有限拒否コードを持つ固定化ゲート)、`app/node_operations.py`
+    (18 個の有限拒否コード + `ok` の verdict 語彙を持つ固定化ゲート)、
+    `app/node_operations.py`
     (監視契約 / drift 観測 / anomaly taxonomy / 局所 reopen)。
+    2026-08-17 の検証ラウンドで、実行参照の完了状態検証・承認の原子性・
+    gate currency (`contract_version_moved` / `evidence_ref_stale`)・
+    provenance の偽装不能化・固定化ゲートの API 迂回閉鎖・採用の
+    all-or-nothing 化などを修正済み。修正一覧と #401 が引き継ぐ明示的な
+    残件は `docs/project-intelligence.md` の「Epic #394 検証ラウンド」節が
+    正本。
     **#401 Phase 6 (lifecycle UX 統合 / migration 完了 / dogfooding) は
     未着手。** Phase 5 の operations cockpit API・画面も #401 の統合対象と
     して残してある — 4 つ目の孤立したページを作らず、既存 Overview /

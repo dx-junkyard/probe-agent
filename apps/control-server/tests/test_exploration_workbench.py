@@ -979,6 +979,59 @@ class TestApi:
         assert r.status_code == 422, r.text
         assert r.json()["detail"]["code"] == "unknown_dimension"
 
+    def test_ranking_response_exposes_metric_name_and_unranked_reason(
+        self, admin_client
+    ):
+        """The exclusion audit trail must survive the HTTP boundary: a reader
+        of the API response has to see WHICH metric the ranking was computed
+        over and WHY an unranked variant was excluded, or the unranked group
+        is a bare verdict they cannot check."""
+        token, system_id, node, version = self._setup(admin_client)
+        r = admin_client.post(
+            "/exploration/runs",
+            json={"node_id": node["id"], "node_version_id": version["id"]},
+            headers=_headers(token, system_id),
+        )
+        run_id = r.json()["id"]
+        variant_ids = {}
+        for key, modality, is_baseline in (
+            ("base", "reasoning_llm", True),
+            ("rule", "rule", False),
+        ):
+            r = admin_client.post(
+                f"/exploration/runs/{run_id}/variants",
+                json={
+                    "variant_key": key, "modality": modality,
+                    "is_baseline": is_baseline,
+                },
+                headers=_headers(token, system_id),
+            )
+            assert r.status_code == 201, r.text
+            variant_ids[key] = r.json()["id"]
+        for key, metric in (("base", "p50"), ("rule", "p95")):
+            r = admin_client.post(
+                f"/exploration/variants/{variant_ids[key]}/measurements",
+                json={
+                    "dimension": "latency", "metric_name": metric,
+                    "numeric_value": 10.0, "unit": "ms",
+                    "covered_case_count": 5, "total_case_count": 5,
+                },
+                headers=_headers(token, system_id),
+            )
+            assert r.status_code == 201, r.text
+
+        r = admin_client.get(
+            f"/exploration/runs/{run_id}/ranking"
+            "?dimension=latency&metric_name=p50",
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["metric_name"] == "p50"
+        assert [e["variant_key"] for e in body["ranked"]] == ["base"]
+        assert [e["variant_key"] for e in body["unranked"]] == ["rule"]
+        assert "p95" in body["unranked"][0]["reason"]
+
     def test_a_run_in_another_system_is_404(self, admin_client):
         token, system_id, node, version = self._setup(admin_client)
         other = _create_system(admin_client, token, "EX-ApiOther")
