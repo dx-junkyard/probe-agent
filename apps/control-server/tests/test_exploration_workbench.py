@@ -125,23 +125,44 @@ def _insert_experiment(conn, system_id, snapshot_id, status):
     return cur.lastrowid
 
 
-def _insert_replay_run(conn, system_id, snapshot_id, status):
-    now = time.time()
+def _insert_replay_set(conn, system_id):
     cur = conn.execute(
         """INSERT INTO replay_sets (system_id, component_id, created_at)
            VALUES (?, 'comp-1', ?)""",
-        (system_id, now),
+        (system_id, time.time()),
     )
-    replay_set_id = cur.lastrowid
+    return cur.lastrowid
+
+
+def _insert_replay_run(
+    conn, system_id, snapshot_id, status, *, replay_set_id=None, commit_sha="deadbeef"
+):
+    if replay_set_id is None:
+        replay_set_id = _insert_replay_set(conn, system_id)
     cur = conn.execute(
         """INSERT INTO replay_runs
                (system_id, replay_set_id, component_id, snapshot_id, commit_sha,
                 symbol_path, symbol_qualified_name, status, trace_set_hash,
                 created_at)
-           VALUES (?, ?, 'comp-1', ?, 'deadbeef', 'a.py', 'mod.fn', ?, 'hash', ?)""",
-        (system_id, replay_set_id, snapshot_id, status, now),
+           VALUES (?, ?, 'comp-1', ?, ?, 'a.py', 'mod.fn', ?, 'hash', ?)""",
+        (system_id, replay_set_id, snapshot_id, commit_sha, status, time.time()),
     )
     return cur.lastrowid
+
+
+def _executed(conn, system_id, variant_id):
+    """Attach a real completed Replay run.
+
+    This is the legitimate sequence a measured number requires: the execution
+    that produced the numbers is named FIRST, then the numbers are recorded.
+    """
+    snapshot_id = _insert_snapshot(conn, system_id)
+    replay_run_id = _insert_replay_run(conn, system_id, snapshot_id, "completed")
+    return attach_execution(
+        conn, system_id=system_id, variant_id=variant_id,
+        execution_state="executed", execution_ref_kind="replay_run",
+        execution_ref_id=replay_run_id,
+    )
 
 
 def _run_with_variant(conn, system_id, *, node_key="explored", is_baseline=False):
@@ -155,6 +176,41 @@ def _run_with_variant(conn, system_id, *, node_key="explored", is_baseline=False
         modality="rule", is_baseline=is_baseline,
     )
     return run, variant
+
+
+def _completable_run(conn, system_id, *, node_key="explored"):
+    """A run that satisfies every completion gate.
+
+    A baseline and a candidate, each with a named execution and a recorded
+    reading -- i.e. an actual comparison. Every test that needs a COMPLETED
+    run builds it through this sequence rather than by writing numbers onto
+    unexecuted variants, because that shortcut is precisely what the gates
+    now refuse.
+    """
+    node, version = _node_with_version(conn, system_id, node_key=node_key)
+    run = create_run(
+        conn, system_id=system_id, node_id=node["id"],
+        node_version_id=version["id"],
+    )
+    baseline = add_variant(
+        conn, system_id=system_id, run_id=run["id"], variant_key="base",
+        modality="reasoning_llm", is_baseline=True,
+    )
+    _executed(conn, system_id, baseline["id"])
+    record_measurement(
+        conn, system_id=system_id, variant_id=baseline["id"],
+        dimension="latency", numeric_value=100.0,
+    )
+    candidate = add_variant(
+        conn, system_id=system_id, run_id=run["id"], variant_key="rule",
+        modality="rule",
+    )
+    _executed(conn, system_id, candidate["id"])
+    record_measurement(
+        conn, system_id=system_id, variant_id=candidate["id"],
+        dimension="latency", numeric_value=10.0,
+    )
+    return node, run, baseline, candidate
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +506,7 @@ class TestComparisonNeverRounds:
                 conn, system_id=system_id, run_id=run["id"], variant_key="base",
                 modality="reasoning_llm", is_baseline=True,
             )
+            _executed(conn, system_id, base["id"])
             record_measurement(
                 conn, system_id=system_id, variant_id=base["id"],
                 dimension="latency", numeric_value=100.0,
@@ -513,6 +570,7 @@ class TestMeasurementIntegrity:
                 conn, system_id=system_id, run_id=run["id"], variant_key="v",
                 modality="rule",
             )
+            _executed(conn, system_id, variant["id"])
             with pytest.raises(ExplorationValidationError):
                 record_measurement(
                     conn, system_id=system_id, variant_id=variant["id"],
@@ -688,13 +746,9 @@ class TestCompletedRunIsImmutable:
     silently rewritable afterwards."""
 
     def _completed_run(self, conn, system_id):
-        run, variant = _run_with_variant(conn, system_id, is_baseline=True)
-        record_measurement(
-            conn, system_id=system_id, variant_id=variant["id"],
-            dimension="latency", numeric_value=100.0,
-        )
+        _node, run, baseline, _candidate = _completable_run(conn, system_id)
         complete_run(conn, system_id=system_id, run_id=run["id"])
-        return run, variant
+        return run, baseline
 
     def test_a_measurement_cannot_be_overwritten_after_completion(
         self, admin_client
@@ -731,6 +785,388 @@ class TestCompletedRunIsImmutable:
                 )
 
 
+class TestMeasuredValueRequiresAnExecution:
+    """A number is a claim about something that RAN. Accepting a
+    caller-supplied figure on a variant nothing executed is the
+    self-reported-number hole: it completes a comparison and becomes #399's
+    evidence without anything ever having been measured."""
+
+    def test_a_measured_value_is_refused_before_an_execution_is_attached(
+        self, admin_client
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-MeasureOrder")
+        with get_conn() as conn:
+            _run, variant = _run_with_variant(conn, system_id)
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                record_measurement(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    dimension="latency", numeric_value=12.0,
+                )
+        assert excinfo.value.reason == "measured_without_execution"
+
+    def test_the_other_states_stay_recordable_without_an_execution(
+        self, admin_client
+    ):
+        """`not_applicable` / `not_measured` / `unsupported` are statements
+        ABOUT the absence of a reading -- recording them is how a gap stays
+        visible instead of being rounded away."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-GapStates")
+        with get_conn() as conn:
+            _run, variant = _run_with_variant(conn, system_id)
+            for state in ("not_applicable", "not_measured", "unsupported"):
+                row = record_measurement(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    dimension="cost", metric_name=state, value_state=state,
+                )
+                assert row["value_state"] == state
+
+    def test_attach_then_measure_is_the_workable_sequence(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-MeasureAfter")
+        with get_conn() as conn:
+            _run, variant = _run_with_variant(conn, system_id)
+            _executed(conn, system_id, variant["id"])
+            row = record_measurement(
+                conn, system_id=system_id, variant_id=variant["id"],
+                dimension="latency", numeric_value=12.0,
+            )
+        assert row["numeric_value"] == 12.0
+
+
+class TestExecutionRefMustMatchPinnedInputs:
+    """Existing and completed is not enough. A run produced under a different
+    dataset, snapshot or commit measured something else, and letting it in
+    puts incomparable numbers inside one comparison.
+
+    A fact recorded on only ONE side passes: you cannot verify what was never
+    recorded, and refusing it would reject every legitimate reference whose
+    table has no column for that fact."""
+
+    def _pinned_run(
+        self,
+        conn,
+        system_id,
+        *,
+        node_key="pinned",
+        snapshot_id=None,
+        commit_sha="",
+        dataset_ref="",
+        implementation_id=None,
+        modality="rule",
+    ):
+        node, version = _node_with_version(conn, system_id, node_key=node_key)
+        run = create_run(
+            conn, system_id=system_id, node_id=node["id"],
+            node_version_id=version["id"], snapshot_id=snapshot_id,
+            commit_sha=commit_sha, dataset_kind="replay_set",
+            dataset_ref=dataset_ref,
+        )
+        variant = add_variant(
+            conn, system_id=system_id, run_id=run["id"], variant_key="v",
+            modality=modality, implementation_id=implementation_id,
+        )
+        return node, version, run, variant
+
+    def test_a_snapshot_mismatch_is_refused(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-PinSnapshot")
+        with get_conn() as conn:
+            pinned_snapshot = _insert_snapshot(conn, system_id)
+            other_snapshot = _insert_snapshot(conn, system_id)
+            replay_run_id = _insert_replay_run(
+                conn, system_id, other_snapshot, "completed"
+            )
+            _n, _v, _run, variant = self._pinned_run(
+                conn, system_id, snapshot_id=pinned_snapshot
+            )
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                attach_execution(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    execution_state="executed", execution_ref_kind="replay_run",
+                    execution_ref_id=replay_run_id,
+                )
+        assert excinfo.value.reason == "pinned_input_mismatch"
+        assert "snapshot_id" in str(excinfo.value)
+
+    def test_a_commit_mismatch_is_refused(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-PinCommit")
+        with get_conn() as conn:
+            snapshot_id = _insert_snapshot(conn, system_id)
+            replay_run_id = _insert_replay_run(
+                conn, system_id, snapshot_id, "completed", commit_sha="0123456789ab",
+            )
+            _n, _v, _run, variant = self._pinned_run(
+                conn, system_id, commit_sha="ffffffffffff"
+            )
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                attach_execution(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    execution_state="executed", execution_ref_kind="replay_run",
+                    execution_ref_id=replay_run_id,
+                )
+        assert excinfo.value.reason == "pinned_input_mismatch"
+        assert "commit_sha" in str(excinfo.value)
+
+    def test_an_abbreviated_sha_of_the_same_commit_agrees(self, admin_client):
+        """A short sha and the full one are the same fact; refusing them
+        would make this gate unusable rather than safe."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-PinShortSha")
+        with get_conn() as conn:
+            snapshot_id = _insert_snapshot(conn, system_id)
+            replay_run_id = _insert_replay_run(
+                conn, system_id, snapshot_id, "completed",
+                commit_sha="0123456789abcdef0123456789abcdef01234567",
+            )
+            _n, _v, _run, variant = self._pinned_run(
+                conn, system_id, commit_sha="0123456"
+            )
+            row = attach_execution(
+                conn, system_id=system_id, variant_id=variant["id"],
+                execution_state="executed", execution_ref_kind="replay_run",
+                execution_ref_id=replay_run_id,
+            )
+        assert row["execution_state"] == "executed"
+
+    def test_a_different_replay_set_is_refused(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-PinDataset")
+        with get_conn() as conn:
+            snapshot_id = _insert_snapshot(conn, system_id)
+            pinned_set = _insert_replay_set(conn, system_id)
+            replay_run_id = _insert_replay_run(
+                conn, system_id, snapshot_id, "completed"
+            )
+            _n, _v, _run, variant = self._pinned_run(
+                conn, system_id, dataset_ref=f"replay_set:{pinned_set}"
+            )
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                attach_execution(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    execution_state="executed", execution_ref_kind="replay_run",
+                    execution_ref_id=replay_run_id,
+                )
+        assert excinfo.value.reason == "pinned_input_mismatch"
+        assert "dataset_replay_set" in str(excinfo.value)
+
+    def test_the_matching_replay_set_is_accepted(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-PinDatasetOk")
+        with get_conn() as conn:
+            snapshot_id = _insert_snapshot(conn, system_id)
+            replay_set_id = _insert_replay_set(conn, system_id)
+            replay_run_id = _insert_replay_run(
+                conn, system_id, snapshot_id, "completed",
+                replay_set_id=replay_set_id,
+            )
+            _n, _v, _run, variant = self._pinned_run(
+                conn, system_id, snapshot_id=snapshot_id, commit_sha="deadbeef",
+                dataset_ref=f"replay_set:{replay_set_id}",
+            )
+            row = attach_execution(
+                conn, system_id=system_id, variant_id=variant["id"],
+                execution_state="executed", execution_ref_kind="replay_run",
+                execution_ref_id=replay_run_id,
+            )
+        assert row["execution_ref_id"] == replay_run_id
+
+    def test_a_fact_recorded_on_only_one_side_passes(self, admin_client):
+        """The run pins no snapshot, no commit and no parseable dataset ref;
+        the Replay run records all three. Nothing contradicts anything."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-PinOneSided")
+        with get_conn() as conn:
+            snapshot_id = _insert_snapshot(conn, system_id)
+            replay_run_id = _insert_replay_run(
+                conn, system_id, snapshot_id, "completed"
+            )
+            _n, _v, _run, variant = self._pinned_run(
+                conn, system_id, dataset_ref="a curated golden corpus"
+            )
+            row = attach_execution(
+                conn, system_id=system_id, variant_id=variant["id"],
+                execution_state="executed", execution_ref_kind="replay_run",
+                execution_ref_id=replay_run_id,
+            )
+        assert row["execution_state"] == "executed"
+
+    def test_an_experiment_snapshot_mismatch_is_refused_and_a_match_accepted(
+        self, admin_client
+    ):
+        """`experiments` records the commit under `baseline_commit` and has no
+        dataset column at all -- the dataset fact is one-sided there."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-PinExperiment")
+        with get_conn() as conn:
+            pinned_snapshot = _insert_snapshot(conn, system_id)
+            other_snapshot = _insert_snapshot(conn, system_id)
+            mismatched = _insert_experiment(
+                conn, system_id, other_snapshot, "completed"
+            )
+            matching = _insert_experiment(
+                conn, system_id, pinned_snapshot, "completed"
+            )
+            _n, _v, _run, variant = self._pinned_run(
+                conn, system_id, snapshot_id=pinned_snapshot,
+                commit_sha="deadbeef", dataset_ref="replay_set:1",
+            )
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                attach_execution(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    execution_state="executed", execution_ref_kind="experiment",
+                    execution_ref_id=mismatched,
+                )
+            assert excinfo.value.reason == "pinned_input_mismatch"
+            row = attach_execution(
+                conn, system_id=system_id, variant_id=variant["id"],
+                execution_state="executed", execution_ref_kind="experiment",
+                execution_ref_id=matching,
+            )
+        assert row["execution_ref_id"] == matching
+
+    def test_a_replay_variant_inherits_its_parent_runs_pinned_facts(
+        self, admin_client
+    ):
+        """`replay_variants` has no snapshot/commit column of its own; the run
+        it hangs off is what pinned them."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-PinReplayVariant")
+        with get_conn() as conn:
+            pinned_snapshot = _insert_snapshot(conn, system_id)
+            other_snapshot = _insert_snapshot(conn, system_id)
+            parent_run = _insert_replay_run(
+                conn, system_id, other_snapshot, "completed"
+            )
+            replay_variant_id = conn.execute(
+                """INSERT INTO replay_variants
+                       (system_id, replay_run_id, variant_key, patch_hash, status,
+                        created_at)
+                   VALUES (?, ?, 'cand', 'hash', 'completed', ?)""",
+                (system_id, parent_run, time.time()),
+            ).lastrowid
+            _n, _v, _run, variant = self._pinned_run(
+                conn, system_id, snapshot_id=pinned_snapshot
+            )
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                attach_execution(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    execution_state="executed",
+                    execution_ref_kind="replay_variant",
+                    execution_ref_id=replay_variant_id,
+                )
+        assert excinfo.value.reason == "pinned_input_mismatch"
+        assert "snapshot_id" in str(excinfo.value)
+
+    def test_the_variants_own_implementation_is_checked_too(self, admin_client):
+        """The implementation records the snapshot its code was written
+        against; an execution at another snapshot measured something other
+        than the implementation this variant claims to be."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-PinImplementation")
+        with get_conn() as conn:
+            impl_snapshot = _insert_snapshot(conn, system_id)
+            other_snapshot = _insert_snapshot(conn, system_id)
+            replay_run_id = _insert_replay_run(
+                conn, system_id, other_snapshot, "completed"
+            )
+            node, version = _node_with_version(conn, system_id, node_key="impl-pin")
+            implementation = add_implementation(
+                conn, system_id=system_id, node_id=node["id"],
+                node_version_id=version["id"], modality="rule",
+                snapshot_id=impl_snapshot,
+            )
+            run = create_run(
+                conn, system_id=system_id, node_id=node["id"],
+                node_version_id=version["id"],
+            )
+            variant = add_variant(
+                conn, system_id=system_id, run_id=run["id"], variant_key="v",
+                modality="rule", implementation_id=implementation["id"],
+            )
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                attach_execution(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    execution_state="executed", execution_ref_kind="replay_run",
+                    execution_ref_id=replay_run_id,
+                )
+        assert excinfo.value.reason == "pinned_input_mismatch"
+        assert "implementation_snapshot_id" in str(excinfo.value)
+
+    def test_the_implementations_commit_is_checked_too(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-PinImplCommit")
+        with get_conn() as conn:
+            snapshot_id = _insert_snapshot(conn, system_id)
+            replay_run_id = _insert_replay_run(
+                conn, system_id, snapshot_id, "completed", commit_sha="0123456789ab",
+            )
+            node, version = _node_with_version(conn, system_id, node_key="impl-sha")
+            implementation = add_implementation(
+                conn, system_id=system_id, node_id=node["id"],
+                node_version_id=version["id"], modality="rule",
+                commit_sha="ffffffffffff",
+            )
+            run = create_run(
+                conn, system_id=system_id, node_id=node["id"],
+                node_version_id=version["id"],
+            )
+            variant = add_variant(
+                conn, system_id=system_id, run_id=run["id"], variant_key="v",
+                modality="rule", implementation_id=implementation["id"],
+            )
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                attach_execution(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    execution_state="executed", execution_ref_kind="replay_run",
+                    execution_ref_id=replay_run_id,
+                )
+        assert excinfo.value.reason == "pinned_input_mismatch"
+        assert "implementation_commit_sha" in str(excinfo.value)
+
+    def test_the_compared_facts_are_a_finite_documented_set(self):
+        assert set(workbench.PINNED_INPUT_FACTS) == {
+            "snapshot_id",
+            "commit_sha",
+            "dataset_replay_set",
+            "implementation_snapshot_id",
+            "implementation_commit_sha",
+        }
+        # Every ref kind this contract accepts must have a documented column
+        # mapping; a kind without one would silently skip the whole gate.
+        assert set(workbench._EXECUTION_REF_QUERIES) == set(
+            workbench.EXECUTION_REF_KINDS
+        )
+
+
 # ---------------------------------------------------------------------------
 # 5. Completing adopts nothing
 # ---------------------------------------------------------------------------
@@ -743,15 +1179,7 @@ class TestCompletion:
         token = _login(admin_client)
         system_id = _create_system(admin_client, token, "EX-Complete")
         with get_conn() as conn:
-            node, version = _node_with_version(conn, system_id)
-            run = create_run(
-                conn, system_id=system_id, node_id=node["id"],
-                node_version_id=version["id"],
-            )
-            add_variant(
-                conn, system_id=system_id, run_id=run["id"], variant_key="base",
-                modality="reasoning_llm", is_baseline=True,
-            )
+            node, run, _baseline, _candidate = _completable_run(conn, system_id)
             complete_run(conn, system_id=system_id, run_id=run["id"])
             after = conn.execute(
                 "SELECT maturity, stable_implementation_id FROM evolution_node "
@@ -773,8 +1201,9 @@ class TestCompletion:
                 conn, system_id=system_id, node_id=node["id"],
                 node_version_id=version["id"],
             )
-            with pytest.raises(ExplorationConflictError):
+            with pytest.raises(ExplorationConflictError) as excinfo:
                 complete_run(conn, system_id=system_id, run_id=run["id"])
+        assert excinfo.value.reason == "missing_baseline"
 
     def test_a_run_without_a_baseline_reports_comparable_false(self, admin_client):
         """An in-progress run must not read as "compared, and nothing
@@ -801,21 +1230,215 @@ class TestCompletion:
         token = _login(admin_client)
         system_id = _create_system(admin_client, token, "EX-Closed")
         with get_conn() as conn:
-            node, version = _node_with_version(conn, system_id)
-            run = create_run(
-                conn, system_id=system_id, node_id=node["id"],
-                node_version_id=version["id"],
-            )
-            add_variant(
-                conn, system_id=system_id, run_id=run["id"], variant_key="base",
-                modality="rule", is_baseline=True,
-            )
+            _node, run, _baseline, _candidate = _completable_run(conn, system_id)
             complete_run(conn, system_id=system_id, run_id=run["id"])
             with pytest.raises(ExplorationConflictError):
                 add_variant(
                     conn, system_id=system_id, run_id=run["id"], variant_key="late",
                     modality="reasoning_llm",
                 )
+
+
+class TestCompletionRequiresAnActualComparison:
+    """A completed run is what #399's establishment gate reads as evidence, so
+    closing one must mean something was compared. Each refusal below closes a
+    run that would otherwise LOOK complete while containing no comparison."""
+
+    def _open_run(self, conn, system_id, node_key="incomplete"):
+        node, version = _node_with_version(conn, system_id, node_key=node_key)
+        run = create_run(
+            conn, system_id=system_id, node_id=node["id"],
+            node_version_id=version["id"],
+        )
+        baseline = add_variant(
+            conn, system_id=system_id, run_id=run["id"], variant_key="base",
+            modality="reasoning_llm", is_baseline=True,
+        )
+        return run, baseline
+
+    def test_a_baseline_alone_is_not_a_comparison(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-BaselineOnly")
+        with get_conn() as conn:
+            run, baseline = self._open_run(conn, system_id)
+            _executed(conn, system_id, baseline["id"])
+            record_measurement(
+                conn, system_id=system_id, variant_id=baseline["id"],
+                dimension="latency", numeric_value=100.0,
+            )
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                complete_run(conn, system_id=system_id, run_id=run["id"])
+        assert excinfo.value.reason == "no_candidate_variant"
+
+    def test_an_unresolved_execution_state_blocks_completion(self, admin_client):
+        """`not_executed` is the column default, so it is also what a variant
+        whose execution was never recorded reads as -- nobody has said what
+        happened to it."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-Unresolved")
+        with get_conn() as conn:
+            run, baseline = self._open_run(conn, system_id)
+            _executed(conn, system_id, baseline["id"])
+            record_measurement(
+                conn, system_id=system_id, variant_id=baseline["id"],
+                dimension="latency", numeric_value=100.0,
+            )
+            add_variant(
+                conn, system_id=system_id, run_id=run["id"], variant_key="rule",
+                modality="rule",
+            )
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                complete_run(conn, system_id=system_id, run_id=run["id"])
+        assert excinfo.value.reason == "execution_unresolved"
+
+    def test_an_executed_variant_with_no_measurement_blocks_completion(
+        self, admin_client
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-Unmeasured")
+        with get_conn() as conn:
+            run, baseline = self._open_run(conn, system_id)
+            _executed(conn, system_id, baseline["id"])
+            record_measurement(
+                conn, system_id=system_id, variant_id=baseline["id"],
+                dimension="latency", numeric_value=100.0,
+            )
+            candidate = add_variant(
+                conn, system_id=system_id, run_id=run["id"], variant_key="rule",
+                modality="rule",
+            )
+            _executed(conn, system_id, candidate["id"])
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                complete_run(conn, system_id=system_id, run_id=run["id"])
+        assert excinfo.value.reason == "executed_without_measurement"
+
+    def test_a_measured_value_left_on_an_unexecuted_variant_blocks_completion(
+        self, admin_client
+    ):
+        """`record_measurement`'s gate applies when the number is written;
+        re-attaching a different execution state afterwards would otherwise
+        leave a self-reported figure behind."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-Detached")
+        with get_conn() as conn:
+            _node, run, _baseline, candidate = _completable_run(conn, system_id)
+            attach_execution(
+                conn, system_id=system_id, variant_id=candidate["id"],
+                execution_state="not_executable",
+            )
+            with pytest.raises(ExplorationConflictError) as excinfo:
+                complete_run(conn, system_id=system_id, run_id=run["id"])
+        assert excinfo.value.reason == "measured_without_execution"
+
+    def test_a_fully_resolved_run_including_not_executable_completes(
+        self, admin_client
+    ):
+        """`not_executable` is a recorded OUTCOME, never an unresolved state:
+        a rule variant that cannot express these cases has not lost on them,
+        and #398 requires that result be preserved rather than blocked."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-Resolved")
+        with get_conn() as conn:
+            run, baseline = self._open_run(conn, system_id)
+            _executed(conn, system_id, baseline["id"])
+            record_measurement(
+                conn, system_id=system_id, variant_id=baseline["id"],
+                dimension="latency", numeric_value=100.0,
+            )
+            measured = add_variant(
+                conn, system_id=system_id, run_id=run["id"], variant_key="rule",
+                modality="rule",
+            )
+            _executed(conn, system_id, measured["id"])
+            record_measurement(
+                conn, system_id=system_id, variant_id=measured["id"],
+                dimension="latency", numeric_value=8.0,
+            )
+            blocked = add_variant(
+                conn, system_id=system_id, run_id=run["id"], variant_key="manual",
+                modality="manual",
+            )
+            attach_execution(
+                conn, system_id=system_id, variant_id=blocked["id"],
+                execution_state="not_executable",
+                note="a human cannot be replayed over 50 cases",
+            )
+            record_measurement(
+                conn, system_id=system_id, variant_id=blocked["id"],
+                dimension="latency", value_state="not_applicable",
+            )
+            row = complete_run(
+                conn, system_id=system_id, run_id=run["id"],
+                conclusion_note="the rule holds on the covered cases",
+            )
+        assert row["status"] == "completed"
+        assert row["conclusion_note"] == "the rule holds on the covered cases"
+
+    def test_an_unsupported_variant_also_does_not_block(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-Unsupported")
+        with get_conn() as conn:
+            _node, run, _baseline, _candidate = _completable_run(conn, system_id)
+            extra = add_variant(
+                conn, system_id=system_id, run_id=run["id"], variant_key="small",
+                modality="small_model",
+            )
+            attach_execution(
+                conn, system_id=system_id, variant_id=extra["id"],
+                execution_state="unsupported",
+            )
+            row = complete_run(conn, system_id=system_id, run_id=run["id"])
+        assert row["status"] == "completed"
+
+    def test_the_refusal_reasons_are_a_finite_documented_set(self):
+        assert set(workbench.COMPLETION_REFUSAL_REASONS) == {
+            "missing_baseline",
+            "no_candidate_variant",
+            "execution_unresolved",
+            "executed_without_measurement",
+            "measured_without_execution",
+        }
+        # `not_executed` is the only unresolved state; the two recorded
+        # outcomes must never be treated as "nothing was said".
+        assert workbench.UNRESOLVED_EXECUTION_STATES == ("not_executed",)
+        assert set(workbench.UNRESOLVED_EXECUTION_STATES) <= set(
+            workbench.EXECUTION_STATES
+        )
+        assert {"not_executable", "unsupported"}.isdisjoint(
+            workbench.UNRESOLVED_EXECUTION_STATES
+        )
+
+    def test_completion_over_http_is_a_409_not_a_silent_success(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-CompleteHttp")
+        with get_conn() as conn:
+            run, baseline = self._open_run(conn, system_id)
+            _executed(conn, system_id, baseline["id"])
+            record_measurement(
+                conn, system_id=system_id, variant_id=baseline["id"],
+                dimension="latency", numeric_value=100.0,
+            )
+        r = admin_client.post(
+            f"/exploration/runs/{run['id']}/complete",
+            json={"conclusion_note": ""},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 409, r.text
+        assert "candidate" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -872,19 +1495,56 @@ class TestMigration:
 
 
 class TestApi:
-    def _setup(self, admin_client):
+    def _setup(self, admin_client, name="EX-Api"):
         from app.db import get_conn
 
         token = _login(admin_client)
-        system_id = _create_system(admin_client, token, "EX-Api")
+        system_id = _create_system(admin_client, token, name)
         with get_conn() as conn:
             node, version = _node_with_version(conn, system_id)
         return token, system_id, node, version
 
+    def _completed_replay_run(self, system_id, *, replay_set_id=None, snapshot_id=None):
+        """A real completed Replay run to hang an `executed` variant on."""
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            if snapshot_id is None:
+                snapshot_id = _insert_snapshot(conn, system_id)
+            if replay_set_id is None:
+                replay_set_id = _insert_replay_set(conn, system_id)
+            run_id = _insert_replay_run(
+                conn, system_id, snapshot_id, "completed",
+                replay_set_id=replay_set_id,
+            )
+        return run_id, replay_set_id, snapshot_id
+
+    def _attach_executed(self, client, token, system_id, variant_id, replay_run_id):
+        r = client.post(
+            f"/exploration/variants/{variant_id}/execution",
+            json={
+                "execution_state": "executed",
+                "execution_ref_kind": "replay_run",
+                "execution_ref_id": replay_run_id,
+            },
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 200, r.text
+        return r.json()
+
     def test_end_to_end_modality_comparison_over_http(self, admin_client):
         """The Epic's central capability: an LLM implementation and a rule
-        implementation of the SAME contract, measured on the same dataset."""
+        implementation of the SAME contract, measured on the same dataset.
+
+        The dataset the run pins is the Replay Set both executions actually
+        ran against -- not a decorative string. Measurements are recorded
+        only after each variant's execution is attached.
+        """
         token, system_id, node, version = self._setup(admin_client)
+        llm_run_id, replay_set_id, snapshot_id = self._completed_replay_run(system_id)
+        rule_run_id, _, _ = self._completed_replay_run(
+            system_id, replay_set_id=replay_set_id, snapshot_id=snapshot_id
+        )
 
         r = admin_client.post(
             "/exploration/runs",
@@ -893,7 +1553,9 @@ class TestApi:
                 "node_version_id": version["id"],
                 "objective": "can a rule replace the model here",
                 "dataset_kind": "replay_set",
-                "dataset_ref": "replay_set:1",
+                "dataset_ref": f"replay_set:{replay_set_id}",
+                "snapshot_id": snapshot_id,
+                "commit_sha": "deadbeef",
             },
             headers=_headers(token, system_id),
         )
@@ -918,6 +1580,9 @@ class TestApi:
         )
         assert r.status_code == 201, r.text
         rule_id = r.json()["id"]
+
+        self._attach_executed(admin_client, token, system_id, baseline_id, llm_run_id)
+        self._attach_executed(admin_client, token, system_id, rule_id, rule_run_id)
 
         for variant_id, latency, cost_state, cost in (
             (baseline_id, 900.0, "measured", 0.004),
@@ -1008,6 +1673,10 @@ class TestApi:
             )
             assert r.status_code == 201, r.text
             variant_ids[key] = r.json()["id"]
+            replay_run_id, _, _ = self._completed_replay_run(system_id)
+            self._attach_executed(
+                admin_client, token, system_id, variant_ids[key], replay_run_id
+            )
         for key, metric in (("base", "p50"), ("rule", "p95")):
             r = admin_client.post(
                 f"/exploration/variants/{variant_ids[key]}/measurements",

@@ -8,7 +8,12 @@ The domain layer is `app/stabilization.py`. Two boundary properties matter:
   a package must not change it (#380).
 - **`approved_by` comes from the authenticated principal, never the body.**
   Establishment is a named person's decision; accepting the name from a
-  request would let any caller record someone else's approval (#337).
+  request would let any caller record someone else's approval (#337). The
+  same holds for the parent reviewer.
+- **The parent review and the human approval are two endpoints, not one.**
+  `POST .../parent-review` records the parent's endorsement or decline;
+  `POST .../approve` records the human approval, and refuses when the same
+  person did both (#304).
 
 Approving establishes ONLY. It applies no source, changes no policy, deploys
 nothing, and publishes nothing -- each of those keeps its own separate human
@@ -37,6 +42,7 @@ from ..models import (
     StabilizationEvidenceOut,
     StabilizationPackageCreateIn,
     StabilizationPackageOut,
+    StabilizationParentReviewIn,
     StabilizationSupersedeIn,
 )
 
@@ -151,6 +157,52 @@ def add_stabilization_evidence(
     return evidence
 
 
+@router.post(
+    "/packages/{package_id}/parent-review", response_model=StabilizationPackageOut
+)
+def record_stabilization_parent_review(
+    package_id: int,
+    payload: StabilizationParentReviewIn,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> StabilizationPackageOut:
+    """Record the parent's endorsement or decline. NOT the approval.
+
+    #304 keeps parent approval and human approval as separate records. This
+    endpoint writes only the first: it moves no Node, pins nothing, and
+    changes the package's status not at all. The establishment gate then
+    requires an `endorsed` review, and `POST .../approve` refuses when the
+    approver is the same person who recorded it -- one person holding both
+    roles is not a review.
+
+    The reviewer comes from the authenticated principal, never the body
+    (#337), and the record is append-only: a recorded disposition is a 409,
+    because a changed mind supersedes the package rather than rewriting the
+    judgement that was already made.
+    """
+    if not principal.username:
+        raise HTTPException(
+            status_code=403,
+            detail="A parent review requires an identified user account",
+        )
+    with get_conn() as conn:
+        try:
+            stabilization.record_parent_review(
+                conn,
+                system_id=system_id,
+                package_id=package_id,
+                reviewed_by=principal.username,
+                disposition=payload.disposition,
+                note=payload.note,
+            )
+            projection = stabilization.build_package_projection(
+                conn, system_id=system_id, package_id=package_id
+            )
+        except stabilization.StabilizationError as exc:
+            _raise_domain_error(exc)
+    return StabilizationPackageOut(**projection)
+
+
 @router.post("/packages/{package_id}/approve", response_model=StabilizationPackageOut)
 def approve_stabilization_package(
     package_id: int,
@@ -164,6 +216,12 @@ def approve_stabilization_package(
     PASS is never trusted, because evidence, the Node's maturity, and the
     candidate can all change between reading and approving. A refused gate is
     a 409 carrying its finite reason code.
+
+    An `endorsed` parent review is one of the gate's requirements, and this
+    approval is additionally refused (409 `parent_approver_identical`) when
+    the approver is the person who recorded it: the two records exist to
+    separate two responsibilities, and one person holding both is not a
+    review (#304).
 
     This establishes only. Applying source, changing a policy, deploying and
     publishing all keep their own separate gates.

@@ -8,7 +8,7 @@ and a deterministic-code implementation compare". That question is only
 expressible because ADR-3 versioned what a Node PROMISES separately from how
 it currently keeps that promise.
 
-Four rules make this module correct, and every one of them is enforced
+Five rules make this module correct, and every one of them is enforced
 structurally rather than by convention:
 
 1. **This is a record of comparisons, not a second execution engine.** Replay
@@ -39,6 +39,16 @@ structurally rather than by convention:
    variants measured at different coverage are reported as such rather than
    compared silently.
 
+5. **A number is only ever a claim about something that ran, and a closed
+   comparison always contains a comparison.** A `measured` reading requires
+   the variant's execution to be attached first, an execution reference must
+   have been produced under the inputs THIS run pins (not merely exist and be
+   completed), and `complete_run` refuses a run with no candidate variant, an
+   unresolved execution state, an executed-but-unmeasured variant, or a
+   measured value with no execution behind it. Without these, a baseline plus
+   hand-typed numbers closes a run, and #399's establishment gate reads it as
+   evidence.
+
 probe-agent:
   role: Modality-neutral exploration run/variant contract and deterministic, non-composited comparison
   capability: evolution-control-plane
@@ -63,12 +73,15 @@ __all__ = [
     "MEASUREMENT_DIMENSIONS",
     "VALUE_STATES",
     "EXECUTION_STATES",
+    "UNRESOLVED_EXECUTION_STATES",
     "EXECUTION_REF_KINDS",
     "GENERATORS",
     "DATASET_KINDS",
     "RUN_STATUSES",
     "MEASUREMENT_SOURCES",
     "COMPARISON_VERDICTS",
+    "COMPLETION_REFUSAL_REASONS",
+    "PINNED_INPUT_FACTS",
     "HIGHER_IS_BETTER",
     "ExplorationError",
     "ExplorationNotFoundError",
@@ -101,6 +114,18 @@ VALUE_STATES: Tuple[str, ...] = get_args(ValueState)
 ExecutionState = Literal["not_executed", "executed", "not_executable", "unsupported"]
 EXECUTION_STATES: Tuple[str, ...] = get_args(ExecutionState)
 
+# The subset of `EXECUTION_STATES` that means "nobody has said yet what
+# happened to this variant". `not_executed` is the column default, so it is
+# also what a variant reads as when its execution was simply never recorded --
+# the two are indistinguishable in storage, and both are unresolved.
+#
+# `not_executable` and `unsupported` are deliberately NOT in this set. They are
+# recorded OUTCOMES: a human stated that this modality cannot run these cases,
+# which is a first-class result #398 requires be preserved rather than rounded
+# into a loss. Treating them as unresolved would make a comparison that
+# correctly reports "the rule cannot express this" impossible to close.
+UNRESOLVED_EXECUTION_STATES: Tuple[str, ...] = ("not_executed",)
+
 ExecutionRefKind = Literal["replay_run", "replay_variant", "experiment"]
 EXECUTION_REF_KINDS: Tuple[str, ...] = get_args(ExecutionRefKind)
 
@@ -128,6 +153,33 @@ ComparisonVerdict = Literal[
     "better", "worse", "equal", "incomparable", "coverage_mismatch"
 ]
 COMPARISON_VERDICTS: Tuple[str, ...] = get_args(ComparisonVerdict)
+
+# Why a comparison may not be closed. Every one of these describes a run that
+# would LOOK like a completed comparison while containing nothing that was
+# actually compared -- and a completed run is exactly what #399's
+# establishment gate reads as evidence, so the emptiness would be invisible
+# from there. The set is finite and each value names one distinct hole.
+CompletionRefusal = Literal[
+    "missing_baseline",
+    "no_candidate_variant",
+    "execution_unresolved",
+    "executed_without_measurement",
+    "measured_without_execution",
+]
+COMPLETION_REFUSAL_REASONS: Tuple[str, ...] = get_args(CompletionRefusal)
+
+# The pinned inputs an execution reference is checked against. A variant's
+# numbers are only comparable with the other variants' numbers if the run that
+# produced them ran under the SAME inputs this comparison pins, so each fact
+# here is one thing both sides can record about that.
+PinnedInputFact = Literal[
+    "snapshot_id",
+    "commit_sha",
+    "dataset_replay_set",
+    "implementation_snapshot_id",
+    "implementation_commit_sha",
+]
+PINNED_INPUT_FACTS: Tuple[str, ...] = get_args(PinnedInputFact)
 
 # Which direction counts as an improvement, per dimension. This table is the
 # ONLY place direction is encoded, and it is deliberately explicit rather
@@ -162,7 +214,19 @@ class ExplorationValidationError(ExplorationError):
 
 
 class ExplorationConflictError(ExplorationError):
-    """The row exists but is not in a state where this operation is legal."""
+    """The row exists but is not in a state where this operation is legal.
+
+    `reason` is the machine-readable member of a finite vocabulary
+    (`COMPLETION_REFUSAL_REASONS`, or `pinned_input_mismatch`) for the
+    refusals that have one. It is optional because the older conflicts in this
+    module carry only prose; a caller that reads `reason` must therefore treat
+    `None` as "this refusal is not one of the enumerated ones", never as a
+    default member of the set.
+    """
+
+    def __init__(self, message: str, *, reason: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _check_membership(value: str, vocabulary: Tuple[str, ...], field_name: str) -> None:
@@ -436,6 +500,184 @@ def add_variant(
     return row
 
 
+# Which columns of the referenced row are read, per execution ref kind.
+#
+# `replay_variant` reads its PARENT `replay_runs` row for snapshot/commit/set:
+# `replay_variants` has no pinned-input column of its own (it carries only a
+# patch and a status), and the run it hangs off is what actually pinned the
+# snapshot, the commit and the Replay Set. `experiments` records
+# `baseline_commit` under a different name and has no dataset column at all,
+# so its `replay_set_id` is selected as NULL -- a fact it does not record,
+# which is handled below as one-sided rather than as a mismatch.
+#
+# `environment_ref` and `node_version_id` are pinned by the exploration run
+# but recorded by NONE of the three referenced tables (`sandbox_config_json` /
+# `execution_config` are configuration blobs, not a comparable ref), so there
+# is deliberately no column for them here. Inventing a comparison out of a
+# blob would be a guess, not a structural check (Principle 6).
+_EXECUTION_REF_QUERIES: Dict[str, str] = {
+    "replay_run": """
+        SELECT r.id AS id, r.status AS status, r.snapshot_id AS snapshot_id,
+               r.commit_sha AS commit_sha, r.replay_set_id AS replay_set_id
+          FROM replay_runs r
+         WHERE r.id = ? AND r.system_id = ?
+    """,
+    "replay_variant": """
+        SELECT v.id AS id, v.status AS status, r.snapshot_id AS snapshot_id,
+               r.commit_sha AS commit_sha, r.replay_set_id AS replay_set_id
+          FROM replay_variants v
+          JOIN replay_runs r ON r.id = v.replay_run_id
+         WHERE v.id = ? AND v.system_id = ?
+    """,
+    "experiment": """
+        SELECT e.id AS id, e.status AS status, e.snapshot_id AS snapshot_id,
+               e.baseline_commit AS commit_sha, NULL AS replay_set_id
+          FROM experiments e
+         WHERE e.id = ? AND e.system_id = ?
+    """,
+}
+
+# Git's own minimum abbreviation length. A recorded sha and an abbreviated one
+# for the SAME commit are the same fact, so refusing them as a mismatch would
+# make this gate unusable on any flow that stores a short sha; anything below
+# this length is not treated as an abbreviation at all.
+_MIN_ABBREVIATED_SHA = 7
+
+
+def _sha_agrees(pinned: str, observed: str) -> bool:
+    """Structural sha comparison: equal, or one is the other's abbreviation.
+
+    No similarity and no normalisation beyond case/whitespace -- the outcome
+    is the finite pair agree/disagree (Principle 6).
+    """
+    left = pinned.strip().lower()
+    right = observed.strip().lower()
+    if left == right:
+        return True
+    shorter, longer = sorted((left, right), key=len)
+    return len(shorter) >= _MIN_ABBREVIATED_SHA and longer.startswith(shorter)
+
+
+def _pinned_replay_set_id(run: Mapping[str, Any]) -> Optional[int]:
+    """The Replay Set this comparison pins, when `dataset_ref` names one.
+
+    `dataset_ref` is free text by design (a run may point at a golden set, an
+    edge-case list or a mixed corpus), so it is only comparable when the run
+    declares `dataset_kind='replay_set'` AND the ref parses as a Replay Set
+    id -- `replay_set:<id>` or a bare `<id>`. Any other spelling is a fact
+    this side did not record in a comparable form, which is one-sided, not a
+    mismatch.
+    """
+    if run["dataset_kind"] != "replay_set":
+        return None
+    ref = (run["dataset_ref"] or "").strip()
+    prefix = "replay_set:"
+    if ref.startswith(prefix):
+        ref = ref[len(prefix):].strip()
+    return int(ref) if ref.isdigit() else None
+
+
+def _text_or_none(value: Any) -> Optional[str]:
+    text = (value or "").strip()
+    return text or None
+
+
+def _require_matching_pinned_inputs(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    run: Mapping[str, Any],
+    variant: Mapping[str, Any],
+    execution_ref_kind: str,
+    execution_ref_id: int,
+    referenced: Mapping[str, Any],
+) -> None:
+    """Refuse an execution produced under inputs this comparison does not pin.
+
+    Compared per ref kind (see `_EXECUTION_REF_QUERIES` for where each value
+    comes from):
+
+    | pinned by                      | fact                       | replay_run / replay_variant | experiment |
+    | ------------------------------ | -------------------------- | --------------------------- | ---------- |
+    | `exploration_run.snapshot_id`  | snapshot_id                | `replay_runs.snapshot_id`   | `experiments.snapshot_id` |
+    | `exploration_run.commit_sha`   | commit_sha                 | `replay_runs.commit_sha`    | `experiments.baseline_commit` |
+    | `exploration_run.dataset_ref`  | dataset_replay_set         | `replay_runs.replay_set_id` | not recorded |
+    | the variant's implementation   | implementation_snapshot_id | `replay_runs.snapshot_id`   | `experiments.snapshot_id` |
+    | the variant's implementation   | implementation_commit_sha  | `replay_runs.commit_sha`    | `experiments.baseline_commit` |
+
+    **A fact recorded on only one side passes.** That is not leniency, it is
+    the difference between the two failure modes: you cannot verify what was
+    never recorded, so refusing a one-sided fact would reject every legitimate
+    reference whose table simply has no column for it (an Experiment has no
+    Replay Set; a run created without a pinned snapshot has no snapshot to
+    disagree with) and make the gate unusable. Silently accepting a RECORDED
+    contradiction is the actual defect -- the referenced numbers then describe
+    a different dataset, snapshot or commit than the rest of the comparison
+    while still sitting in the same run.
+
+    The variant's implementation is checked as well as the run: the
+    implementation row records the snapshot/commit its code was written
+    against, so an execution at a different commit measured something other
+    than the implementation this variant claims to be.
+    """
+    checks: List[Tuple[str, Any, Any]] = [
+        ("snapshot_id", run["snapshot_id"], referenced["snapshot_id"]),
+        (
+            "commit_sha",
+            _text_or_none(run["commit_sha"]),
+            _text_or_none(referenced["commit_sha"]),
+        ),
+        (
+            "dataset_replay_set",
+            _pinned_replay_set_id(run),
+            referenced["replay_set_id"],
+        ),
+    ]
+
+    implementation_id = variant["implementation_id"]
+    if implementation_id is not None:
+        implementation = conn.execute(
+            """SELECT snapshot_id, commit_sha FROM evolution_node_implementation
+                   WHERE id = ? AND system_id = ?""",
+            (implementation_id, system_id),
+        ).fetchone()
+        if implementation is not None:
+            checks.append(
+                (
+                    "implementation_snapshot_id",
+                    implementation["snapshot_id"],
+                    referenced["snapshot_id"],
+                )
+            )
+            checks.append(
+                (
+                    "implementation_commit_sha",
+                    _text_or_none(implementation["commit_sha"]),
+                    _text_or_none(referenced["commit_sha"]),
+                )
+            )
+
+    for fact, pinned, observed in checks:
+        if pinned is None or observed is None:
+            continue
+        agrees = (
+            _sha_agrees(pinned, observed)
+            if fact in ("commit_sha", "implementation_commit_sha")
+            else pinned == observed
+        )
+        if not agrees:
+            # The refusal must name a documented fact: a message pointing at
+            # something outside `PINNED_INPUT_FACTS` would tell a reader to go
+            # check a column this gate does not actually compare.
+            _check_membership(fact, PINNED_INPUT_FACTS, "pinned input fact")
+            raise ExplorationConflictError(
+                f"{execution_ref_kind} {execution_ref_id} was produced under "
+                f"{fact} {observed!r}, but this comparison pins {pinned!r}; "
+                "numbers measured under different inputs are not comparable",
+                reason="pinned_input_mismatch",
+            )
+
+
 def attach_execution(
     conn: sqlite3.Connection,
     *,
@@ -455,11 +697,20 @@ def attach_execution(
     `not_executable` and `unsupported` are first-class outcomes, not
     failures to be smoothed over -- #398 requires that they are never
     rounded into a loss. A rule variant that cannot express a case has not
-    lost on that case; it has not been measured on it.
+    been measured on it; it has not lost on it.
+
+    Existing in this System and being completed is NOT enough. The referenced
+    run must also have been produced under the inputs this comparison pins --
+    otherwise results from another dataset, snapshot or commit enter the same
+    run and are compared as if they described the same thing. See
+    `_require_matching_pinned_inputs` for the per-ref-kind column table and
+    for why a fact recorded on only one side passes.
     """
     _check_membership(execution_state, EXECUTION_STATES, "execution_state")
     variant = _require_variant(conn, system_id, variant_id)
-    _require_open_run(conn, system_id, variant["run_id"], "attaching an execution")
+    run = _require_open_run(
+        conn, system_id, variant["run_id"], "attaching an execution"
+    )
 
     if execution_state == "executed":
         if execution_ref_kind is None or execution_ref_id is None:
@@ -469,13 +720,8 @@ def attach_execution(
                 "produced its numbers"
             )
         _check_membership(execution_ref_kind, EXECUTION_REF_KINDS, "execution_ref_kind")
-        table = {
-            "replay_run": "replay_runs",
-            "replay_variant": "replay_variants",
-            "experiment": "experiments",
-        }[execution_ref_kind]
         row = conn.execute(
-            f"SELECT id, status FROM {table} WHERE id = ? AND system_id = ?",
+            _EXECUTION_REF_QUERIES[execution_ref_kind],
             (execution_ref_id, system_id),
         ).fetchone()
         if row is None:
@@ -494,6 +740,15 @@ def attach_execution(
                 f"{execution_ref_kind} {execution_ref_id} is {row['status']!r}; "
                 "only a completed run can back execution_state 'executed'"
             )
+        _require_matching_pinned_inputs(
+            conn,
+            system_id=system_id,
+            run=run,
+            variant=variant,
+            execution_ref_kind=execution_ref_kind,
+            execution_ref_id=execution_ref_id,
+            referenced=row,
+        )
     elif execution_ref_kind is not None or execution_ref_id is not None:
         raise ExplorationValidationError(
             f"execution_state {execution_state!r} must not carry an execution "
@@ -534,6 +789,18 @@ def record_measurement(
     would be indistinguishable from a real reading the moment anything read
     the column instead of the state.
 
+    A `measured` reading additionally requires the variant's execution to
+    already be `executed`. A number is a claim about something that ran, and
+    without this the API accepts an arbitrary caller-supplied figure on a
+    variant nothing ever executed -- which then completes a comparison and
+    becomes #399's evidence. `attach_execution` therefore comes FIRST in the
+    sequence: attach the run that produced the numbers, then record them.
+
+    The other three `value_state`s are unaffected. `not_applicable`,
+    `not_measured` and `unsupported` are statements ABOUT the absence of a
+    reading, and recording them on an unexecuted variant is exactly how a gap
+    stays visible instead of being rounded away.
+
     `source` keeps a deterministic fact apart from a reasoning model's
     judgement in storage, which is what stops a judge model's opinion from
     quietly becoming the adoption basis (#398, and CLAUDE.md's rule on
@@ -565,6 +832,16 @@ def record_measurement(
     ):
         raise ExplorationValidationError(
             "covered_case_count cannot exceed total_case_count"
+        )
+    # Checked after the value validation above so a structurally invalid input
+    # is reported as such regardless of the variant's state -- the state gate
+    # answers a different question and would otherwise mask it.
+    if value_state == "measured" and variant["execution_state"] != "executed":
+        raise ExplorationConflictError(
+            f"variant {variant_id} is {variant['execution_state']!r}; a measured "
+            "value must be backed by a named execution, so attach the run that "
+            "produced it before recording numbers",
+            reason="measured_without_execution",
         )
 
     now = time.time()
@@ -1031,14 +1308,42 @@ def complete_run(
 ) -> sqlite3.Row:
     """Close a comparison.
 
-    Refused without a baseline: a difference measured against nothing is not
-    a difference, and a completed run is what #399's establishment gate will
-    read as evidence.
+    A completed run is what #399's establishment gate reads as evidence, so
+    completing must mean something was actually compared. Five things would
+    otherwise close a run that contains no comparison at all, and each is
+    refused with its own member of `COMPLETION_REFUSAL_REASONS`:
+
+    1. `missing_baseline` -- a difference measured against nothing is not a
+       difference.
+    2. `no_candidate_variant` -- a baseline alone is a measurement, not a
+       comparison. A run whose only variant IS the reference point has
+       nothing to compare the reference against.
+    3. `execution_unresolved` -- a variant still in an unresolved execution
+       state (`UNRESOLVED_EXECUTION_STATES`) has never had anything said
+       about it. `not_executable` / `unsupported` do not block: they are
+       recorded outcomes, and #398 requires they never be rounded into a
+       loss.
+    4. `executed_without_measurement` -- a variant that ran and recorded no
+       reading contributes nothing to the comparison, and reads as "compared,
+       and nothing differed" rather than "never measured".
+    5. `measured_without_execution` -- the completion-time invariant of
+       `record_measurement`'s rule. That gate applies when a number is
+       written; re-attaching a different execution state afterwards would
+       otherwise leave a caller-supplied figure behind on a variant nothing
+       executed. Checking it again here closes that door without freezing a
+       variant's execution state mid-run.
 
     Completing decides nothing about adoption. It does not change a Node's
     maturity, pin an implementation, or approve anything -- those are
     separate human gates (ADR-9), and a comparison that quietly promoted its
     winner would be exactly the automatic adoption this Epic forbids.
+
+    Note what is deliberately NOT required: two or more distinct modalities.
+    `docs/evolutionary-pipeline.md` §8.3 makes cross-modality comparison the
+    PHASE's completion gate -- the capability must exist -- not a property
+    every individual run must have. Comparing two variants of one modality
+    (two prompts, two rule sets) is a legitimate exploration, and refusing it
+    would be inventing a requirement the contract does not state.
     """
     run = _require_run(conn, system_id, run_id)
     if run["status"] != "open":
@@ -1048,8 +1353,54 @@ def complete_run(
     if run["baseline_variant_id"] is None:
         raise ExplorationConflictError(
             f"Exploration run {run_id} has no baseline; a comparison without a "
-            "reference point cannot be completed"
+            "reference point cannot be completed",
+            reason="missing_baseline",
         )
+
+    variants = conn.execute(
+        """SELECT v.id AS id, v.variant_key AS variant_key,
+                  v.is_baseline AS is_baseline, v.execution_state AS execution_state,
+                  (SELECT COUNT(*) FROM exploration_measurement m
+                        WHERE m.variant_id = v.id) AS measurement_count,
+                  (SELECT COUNT(*) FROM exploration_measurement m
+                        WHERE m.variant_id = v.id AND m.value_state = 'measured')
+                      AS measured_count
+               FROM exploration_variant v
+              WHERE v.run_id = ?
+              ORDER BY v.id""",
+        (run_id,),
+    ).fetchall()
+
+    if not any(not variant["is_baseline"] for variant in variants):
+        raise ExplorationConflictError(
+            f"Exploration run {run_id} has only a baseline; a comparison needs at "
+            "least one candidate variant to compare against it",
+            reason="no_candidate_variant",
+        )
+    for variant in variants:
+        if variant["execution_state"] in UNRESOLVED_EXECUTION_STATES:
+            raise ExplorationConflictError(
+                f"variant {variant['variant_key']!r} is "
+                f"{variant['execution_state']!r}; every variant must record what "
+                "happened to it (executed, not_executable or unsupported) before "
+                "the comparison can be closed",
+                reason="execution_unresolved",
+            )
+    for variant in variants:
+        if variant["execution_state"] == "executed" and not variant["measurement_count"]:
+            raise ExplorationConflictError(
+                f"variant {variant['variant_key']!r} was executed but has no "
+                "measurement; an executed variant with no recorded reading has "
+                "nothing to compare",
+                reason="executed_without_measurement",
+            )
+        if variant["execution_state"] != "executed" and variant["measured_count"]:
+            raise ExplorationConflictError(
+                f"variant {variant['variant_key']!r} is "
+                f"{variant['execution_state']!r} but carries a measured value; a "
+                "number must be backed by a named execution",
+                reason="measured_without_execution",
+            )
     conn.execute(
         """UPDATE exploration_run
                SET status = 'completed', conclusion_note = ?, completed_at = ?

@@ -11,12 +11,15 @@ rollback-able implementation". An implementation whose modality stays
 the gate below never reads modality, deliberately.
 
 The gate (`evaluate_establishment_gate`) is a **pure first-match table over
-an enumerated verdict vocabulary**: `GATE_REFUSAL_CODES` holds 18 refusal
+an enumerated verdict vocabulary**: `GATE_REFUSAL_CODES` holds 22 refusal
 codes plus `"ok"`, the pass verdict. (Unlike Phase 1's
 `TRANSITION_REJECTION_CODES`, which enumerates rejections only, this tuple
 includes `"ok"` because it is the vocabulary of `GateDecision.reason_code`,
-and a pass is one of the values that field can carry.) Three properties
-matter more than the individual rows:
+and a pass is one of the values that field can carry.) A single further code,
+`APPROVAL_REFUSAL_CODES`' `parent_approver_identical`, belongs to the
+approval rather than the gate -- the gate is recomputed on every read, where
+no approver exists to compare against. Five properties matter more than the
+individual rows:
 
 1. **It fails closed on absence, not just on failure.** `floor_unmeasured`
    refuses as firmly as `floor_violated`, because "the safety floor held" and
@@ -33,6 +36,18 @@ matter more than the individual rows:
    evaluator with `decision_method: manual` (ADR-9). Passing the gate never
    applies source, changes a policy, deploys, or publishes -- those keep
    their existing separate gates (Principle 5/8).
+4. **Nothing that can satisfy it may be self-reported.** An asserting verdict
+   (`met` / `held`) on a kind the gate can be satisfied by must cite a run
+   that was actually executed and still resolves in this System, and the
+   package must declare -- in advance, positively -- how much evidence it
+   considers sufficient. A negative verdict stays ref-free on purpose: it can
+   only ever block, and refusing must never be harder than establishing.
+5. **The parent review and the human approval are two records, never one.**
+   `record_parent_review` writes an `endorsed` / `declined` disposition with
+   its own reviewer and timestamp; `approve_package` writes the approval. The
+   gate requires the first, and the approval refuses when the same person
+   discharged both -- one person filling both roles reproduces exactly the
+   conflation the separation exists to prevent (#304).
 
 Evidence is referenced, never copied, and its currency is evaluated at GATE
 time rather than at build time: a copied number keeps reading as current
@@ -63,8 +78,13 @@ __all__ = [
     "EVIDENCE_KINDS",
     "EVIDENCE_VERDICTS",
     "PACKAGE_STATUSES",
+    "PARENT_REVIEW_DISPOSITIONS",
     "GATE_REFUSAL_CODES",
+    "APPROVAL_REFUSAL_CODES",
     "REQUIRED_EVIDENCE_LEVELS",
+    "ASSERTING_VERDICTS",
+    "REFERENCE_REQUIRED_EVIDENCE_KINDS",
+    "EXECUTION_REF_KINDS",
     "StabilizationError",
     "StabilizationNotFoundError",
     "StabilizationValidationError",
@@ -75,6 +95,7 @@ __all__ = [
     "evaluate_establishment_gate",
     "create_package",
     "add_evidence",
+    "record_parent_review",
     "gather_gate_facts",
     "evaluate_package",
     "approve_package",
@@ -110,6 +131,38 @@ EvidenceRefKind = Literal[
 ]
 EVIDENCE_REF_KINDS: Tuple[str, ...] = get_args(EvidenceRefKind)
 
+# The subset of `EVIDENCE_REF_KINDS` that names something that was actually
+# EXECUTED. `evaluation_policy` is deliberately excluded: a policy declares
+# what was required, never what was observed, so citing it as the provenance
+# of a `met` would be citing the question as the answer.
+EXECUTION_REF_KINDS: Tuple[str, ...] = (
+    "exploration_run", "exploration_variant", "replay_run", "experiment",
+)
+
+# The verdicts that ASSERT a result rather than report its absence. Only
+# these can ever move the gate toward a pass, so only these need provenance.
+#
+# `not_met` / `violated` deliberately stay ref-free. A negative self-report
+# can only ever BLOCK: no ordering of the gate's rows lets one establish
+# anything. Demanding provenance for a refusal would make refusing harder
+# than establishing, which is exactly backwards for a fail-closed gate --
+# a developer who noticed a regression must always be able to write it down.
+# `unmeasured` / `not_applicable` are ref-free by definition: there is no run
+# to cite, and that IS the fact being recorded.
+ASSERTING_VERDICTS: Tuple[str, ...] = ("met", "held")
+
+# The evidence kinds whose asserting verdicts can SATISFY a gate row, and
+# which therefore may not be self-reported.
+#
+# `downstream_impact` and `outcome` are excluded after checking how the gate
+# actually consumes them: it reads `downstream_impact` only to refuse
+# (`violated` / `not_met`) and `outcome` only to refuse (`unmeasured` with no
+# acknowledgement). A `met` row of either kind satisfies nothing, so it cannot
+# establish anything and is accepted without a reference.
+REFERENCE_REQUIRED_EVIDENCE_KINDS: Tuple[str, ...] = (
+    "criterion", "floor", "stability",
+)
+
 # Node-level evidence is required; Flow and Outcome evidence may legitimately
 # be absent-but-declared. The asymmetry is deliberate: a Node cannot be
 # established without evidence about the Node itself, but a Flow whose
@@ -117,6 +170,9 @@ EVIDENCE_REF_KINDS: Tuple[str, ...] = get_args(EvidenceRefKind)
 # are real, common, and #399-sanctioned states -- provided they are DECLARED
 # rather than silently missing.
 REQUIRED_EVIDENCE_LEVELS: Tuple[str, ...] = ("node",)
+
+ParentReviewDisposition = Literal["endorsed", "declined"]
+PARENT_REVIEW_DISPOSITIONS: Tuple[str, ...] = get_args(ParentReviewDisposition)
 
 GATE_REFUSAL_CODES: Tuple[str, ...] = (
     "ok",
@@ -129,16 +185,30 @@ GATE_REFUSAL_CODES: Tuple[str, ...] = (
     "node_evidence_missing",
     "foreign_evidence",
     "mock_evidence",
+    "evidence_ref_missing",
     "evidence_ref_stale",
     "criterion_not_met",
     "floor_violated",
     "floor_unmeasured",
     "downstream_impact_violated",
     "outcome_unmeasured_unacknowledged",
+    "stability_declaration_missing",
     "stability_window_insufficient",
     "applicability_envelope_missing",
     "rollback_target_missing",
+    "parent_review_missing",
+    "parent_review_declined",
 )
+
+# Refusals that belong to the APPROVAL, not to the gate. The gate is a pure
+# function of the package's persisted facts and is recomputed on every read,
+# where no approver exists yet -- so "the parent reviewer and the approver are
+# the same person" cannot be one of its rows without giving a read an
+# approver to look at. It is enumerated here so the refusal is still a finite,
+# machine-readable code rather than only a sentence (#304: parent approval and
+# human approval are separate records, and one person filling both roles is
+# the conflation the separation exists to prevent).
+APPROVAL_REFUSAL_CODES: Tuple[str, ...] = ("parent_approver_identical",)
 
 
 class StabilizationError(ValueError):
@@ -191,6 +261,11 @@ class EvidenceFact:
     # GATE time by `gather_gate_facts`. Evidence with no reference at all is
     # trivially current -- there is nothing behind it to go stale.
     ref_current: bool = True
+    # Whether this row cites something that was actually EXECUTED (one of
+    # `EXECUTION_REF_KINDS`). Defaults to False so the gate fails closed on a
+    # fact nobody supplied: a row read from a database written before this
+    # rule existed must refuse, not pass.
+    execution_ref_present: bool = False
     detail: str = ""
 
 
@@ -223,6 +298,12 @@ class GateFacts:
     observed_case_count: Optional[int]
     stability_window_seconds: float
     observed_window_seconds: Optional[float]
+    # The parent review's recorded disposition, or None when no parent has
+    # reviewed the package yet. Kept as its OWN fact rather than folded into
+    # the approval: #304's rule is that parent approval and human approval are
+    # separate records, and a single "approved" bit cannot say which of the
+    # two responsibilities was actually discharged.
+    parent_review_disposition: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -302,6 +383,26 @@ def evaluate_establishment_gate(facts: GateFacts) -> GateDecision:
             "Mock output is test data and cannot be establishment evidence.",
             mock,
         )
+    unreferenced = tuple(
+        e.name
+        for e in facts.evidence
+        if e.kind in REFERENCE_REQUIRED_EVIDENCE_KINDS
+        and e.verdict in ASSERTING_VERDICTS
+        and not e.execution_ref_present
+    )
+    if unreferenced:
+        # A hand-typed `met` is a claim, not a result. `add_evidence` refuses
+        # one at write time so the developer learns immediately; this row
+        # exists because rows written before that validation -- or written
+        # around it -- must not be able to establish a Node either. Nothing
+        # that can SATISFY this gate is accepted on its author's word.
+        return GateDecision(
+            False, "evidence_ref_missing",
+            "An asserted result cites no executed run. Evidence that can "
+            "satisfy this gate must reference an exploration run, exploration "
+            "variant, replay run, or experiment in this System.",
+            unreferenced,
+        )
     stale_refs = tuple(e.name for e in facts.evidence if not e.ref_current)
     if stale_refs:
         # Evidence is referenced, never copied, precisely so THIS check can
@@ -315,12 +416,26 @@ def evaluate_establishment_gate(facts: GateFacts) -> GateDecision:
         )
 
     # --- required evidence ------------------------------------------------
+    #
+    # Presence is not enough: the required level must carry at least one
+    # ASSERTED result (a criterion met, a floor held, a stability result).
+    # A level satisfied by a single `not_applicable` outcome row would let a
+    # package clear this row with a sentence that demonstrates nothing -- and
+    # since only asserting rows of these kinds require a reference, that is
+    # also the only reading under which "nothing that can satisfy the gate is
+    # self-reported" stays true.
     for level in REQUIRED_EVIDENCE_LEVELS:
-        if not any(e.level == level for e in facts.evidence):
+        if not any(
+            e.level == level
+            and e.kind in REFERENCE_REQUIRED_EVIDENCE_KINDS
+            and e.verdict in ASSERTING_VERDICTS
+            for e in facts.evidence
+        ):
             return GateDecision(
                 False, "node_evidence_missing",
-                f"No {level}-level evidence: a Node cannot be established "
-                "without evidence about the Node itself.",
+                f"No asserted {level}-level result: a Node cannot be "
+                "established without at least one criterion met, floor held, "
+                "or stability result about the Node itself.",
             )
 
     # --- criteria and floors, each checked individually -------------------
@@ -394,31 +509,45 @@ def evaluate_establishment_gate(facts: GateFacts) -> GateDecision:
     # The requirement is per package (no global threshold -- #399 forbids one)
     # but it is declared before the gate runs, so it cannot be lowered to fit
     # the result that came back.
-    if facts.required_case_count > 0:
-        if facts.observed_case_count is None:
-            return GateDecision(
-                False, "stability_window_insufficient",
-                "The number of observed cases is unknown; an unmeasured sample "
-                "is not a sufficient one.",
-            )
-        if facts.observed_case_count < facts.required_case_count:
-            return GateDecision(
-                False, "stability_window_insufficient",
-                f"{facts.observed_case_count} cases observed, "
-                f"{facts.required_case_count} required by this package.",
-            )
-    if facts.stability_window_seconds > 0:
-        if facts.observed_window_seconds is None:
-            return GateDecision(
-                False, "stability_window_insufficient",
-                "The observed stability window is unknown.",
-            )
-        if facts.observed_window_seconds < facts.stability_window_seconds:
-            return GateDecision(
-                False, "stability_window_insufficient",
-                "The observed stability window is shorter than this package "
-                "declared necessary.",
-            )
+    #
+    # The DECLARATION itself is mandatory, and that is the point of this row:
+    # the columns default to 0, and a 0 requirement is not "no requirement",
+    # it is "this package never said how much evidence would be enough". Under
+    # the old `> 0` guards those defaults made both checks vanish, so a
+    # package that had measured nothing passed the stability section outright.
+    # The MAGNITUDE stays the developer's -- #399's non-goal forbids a single
+    # fixed threshold across all domains -- but it must be a positive number
+    # they chose, declared before the result came back.
+    if facts.required_case_count <= 0 or facts.stability_window_seconds <= 0:
+        return GateDecision(
+            False, "stability_declaration_missing",
+            "This package declares no sample coverage or no stability window. "
+            "How much evidence is enough is this package's own decision, but "
+            "it has to be a positive one and it has to be made in advance.",
+        )
+    if facts.observed_case_count is None:
+        return GateDecision(
+            False, "stability_window_insufficient",
+            "The number of observed cases is unknown; an unmeasured sample "
+            "is not a sufficient one.",
+        )
+    if facts.observed_case_count < facts.required_case_count:
+        return GateDecision(
+            False, "stability_window_insufficient",
+            f"{facts.observed_case_count} cases observed, "
+            f"{facts.required_case_count} required by this package.",
+        )
+    if facts.observed_window_seconds is None:
+        return GateDecision(
+            False, "stability_window_insufficient",
+            "The observed stability window is unknown.",
+        )
+    if facts.observed_window_seconds < facts.stability_window_seconds:
+        return GateDecision(
+            False, "stability_window_insufficient",
+            "The observed stability window is shorter than this package "
+            "declared necessary.",
+        )
 
     # --- generalisation and reversibility ---------------------------------
     if not facts.applicability_envelope_declared:
@@ -440,11 +569,34 @@ def evaluate_establishment_gate(facts: GateFacts) -> GateDecision:
             "implementation must name where it returns to.",
         )
 
+    # --- the parent review, which is not the human approval ---------------
+    #
+    # Last, deliberately. The structural rows come first because telling a
+    # developer their candidate is gone while the floor reads unmeasured sends
+    # them to fix the wrong thing; by exactly the same logic, sending them to
+    # ask a parent for a review while the evidence is still broken wastes
+    # somebody else's attention on a package that cannot pass anyway.
+    if facts.parent_review_disposition is None:
+        return GateDecision(
+            False, "parent_review_missing",
+            "No parent review is recorded. The parent's endorsement and the "
+            "approver's decision are separate responsibilities and each has "
+            "to be discharged by someone.",
+        )
+    if facts.parent_review_disposition == "declined":
+        return GateDecision(
+            False, "parent_review_declined",
+            "The parent declined this package. A decline is a recorded "
+            "judgement, not an obstacle to route around: argue the case again "
+            "in a new package.",
+        )
+
     return GateDecision(
         True, "ok",
-        "Every declared criterion and floor is satisfied, the result is bounded "
-        "by a declared envelope, and the change is reversible. A human approval "
-        "is still required.",
+        "Every declared criterion and floor is satisfied against a referenced "
+        "run, the result is bounded by a declared envelope, the change is "
+        "reversible, and a parent has endorsed it. A separate human approval, "
+        "by someone other than that parent, is still required.",
     )
 
 
@@ -578,6 +730,13 @@ def add_evidence(
     not resolve is refused rather than stored unresolvable: the gate would
     otherwise have to decide what an unresolvable reference means, and every
     answer to that is worse than not accepting it.
+
+    An ASSERTING verdict on a kind the gate can be satisfied by must carry an
+    execution reference, and it is refused here as well as at gate time. The
+    two checks are not redundant: this one exists so the developer learns the
+    moment they try to write a claim rather than a result, and the gate's own
+    row exists because a row that reached the table some other way -- an older
+    schema, a direct write -- must not be able to establish a Node either.
     """
     _check_membership(evidence_level, EVIDENCE_LEVELS, "evidence_level")
     _check_membership(evidence_kind, EVIDENCE_KINDS, "evidence_kind")
@@ -588,6 +747,20 @@ def add_evidence(
         raise StabilizationConflictError(
             f"Package {package_id} is {package['status']}; evidence is not added "
             "to a decided package"
+        )
+
+    if (
+        evidence_kind in REFERENCE_REQUIRED_EVIDENCE_KINDS
+        and verdict in ASSERTING_VERDICTS
+        and ref_kind not in EXECUTION_REF_KINDS
+    ):
+        # `evaluation_policy` is a ref_kind but not an execution one: it says
+        # what was required, never what was observed.
+        raise StabilizationValidationError(
+            f"A {verdict!r} {evidence_kind} must reference the run that "
+            f"produced it (ref_kind one of {', '.join(EXECUTION_REF_KINDS)}); "
+            "an asserted result recorded on its author's word is a claim, not "
+            "evidence"
         )
 
     if ref_kind is not None:
@@ -608,6 +781,17 @@ def add_evidence(
         if row is None:
             raise StabilizationNotFoundError(
                 f"{ref_kind} {ref_id} not found in this System"
+            )
+        ref_node_id = _evidence_ref_node_id(conn, system_id, ref_kind, ref_id)
+        if ref_node_id is not None and ref_node_id != package["node_id"]:
+            # System scoping alone is not enough now that a reference is
+            # REQUIRED: without this, a developer who has to supply one could
+            # satisfy the requirement with any run in the System, and a result
+            # about a different Node would be establishing this one.
+            raise StabilizationValidationError(
+                f"{ref_kind} {ref_id} argues about Node {ref_node_id}, not "
+                f"Node {package['node_id']}; a result about a different Node "
+                "is not evidence about this one"
             )
 
     if evaluation_policy_id is not None:
@@ -638,6 +822,63 @@ def add_evidence(
     ).fetchone()
 
 
+def record_parent_review(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    package_id: int,
+    reviewed_by: str,
+    disposition: str,
+    note: str = "",
+) -> sqlite3.Row:
+    """Record the PARENT's review of a package. Not the approval.
+
+    #304 keeps parent approval and human approval as separate records, and
+    this is the parent half. The two answer different questions -- "does the
+    owner of the surrounding work endorse this argument?" and "does a
+    responsible human authorise the establishment?" -- and a single
+    `approved_by` column cannot say which was discharged. Both are
+    `decision_method: manual`; neither substitutes for the other.
+
+    Append-only, like every other decision this module records. A disposition
+    that has been written is not overwritten and not withdrawn: a parent who
+    changes their mind supersedes the package (`supersede_package`) exactly as
+    any other content change does, so the earlier judgement stays readable
+    next to the reasoning that replaced it. Only an undecided package can be
+    reviewed -- reviewing a package after it was approved, rejected, or
+    superseded would attach a review to a decision that already happened.
+    """
+    if not (reviewed_by or "").strip():
+        raise StabilizationValidationError(
+            "record_parent_review requires the reviewing person; a parent "
+            "review is a named human's record exactly as an approval is"
+        )
+    _check_membership(disposition, PARENT_REVIEW_DISPOSITIONS, "disposition")
+    package = _require_package(conn, system_id, package_id)
+    if package["status"] not in ("draft", "under_review"):
+        raise StabilizationConflictError(
+            f"Package {package_id} is {package['status']}; a parent review is "
+            "not recorded against a decided package"
+        )
+    if package["parent_review_disposition"] is not None:
+        raise StabilizationConflictError(
+            f"Package {package_id} already carries a parent review "
+            f"({package['parent_review_disposition']}) by "
+            f"{package['parent_reviewed_by']!r}; a recorded review is not "
+            "overwritten -- supersede the package with a newer one instead"
+        )
+    conn.execute(
+        """UPDATE stabilization_package
+               SET parent_reviewed_by = ?, parent_reviewed_at = ?,
+                   parent_review_disposition = ?, parent_review_note = ?
+             WHERE id = ?""",
+        (reviewed_by, time.time(), disposition, note, package_id),
+    )
+    return conn.execute(
+        "SELECT * FROM stabilization_package WHERE id = ?", (package_id,)
+    ).fetchone()
+
+
 # Where each `ref_kind` resolves, and the terminal states in which the
 # source itself concluded it produced no usable result. `open`/`running` are
 # NOT dead: a still-executing source is current, just unfinished. An
@@ -655,6 +896,60 @@ _EVIDENCE_REF_DEAD_STATUSES: Dict[str, Tuple[str, ...]] = {
     "replay_run": ("failed",),
     "experiment": ("failed",),
 }
+
+
+# How to read the Node a reference argues about, for the reference kinds that
+# have one. `replay_runs` and `experiments` are COMPONENT-scoped and carry no
+# Node at all, and an `evaluation_policy` names a level rather than a Node --
+# there is nothing to compare, so those kinds are bound by System only. That
+# is a real limit and is stated rather than papered over with a guessed
+# component-to-Node mapping (`evolution_node_link` is optional and many-to-one,
+# so inferring one would invent a fact).
+_EVIDENCE_REF_NODE_SQL: Dict[str, str] = {
+    "exploration_run": (
+        "SELECT node_id FROM exploration_run WHERE id = ? AND system_id = ?"
+    ),
+    "exploration_variant": (
+        "SELECT r.node_id AS node_id FROM exploration_variant v "
+        "JOIN exploration_run r ON r.id = v.run_id "
+        "WHERE v.id = ? AND v.system_id = ?"
+    ),
+}
+
+
+def _evidence_ref_node_id(
+    conn: sqlite3.Connection, system_id: int, ref_kind: str, ref_id: Optional[int]
+) -> Optional[int]:
+    """The Node a reference argues about, or None when it names no Node.
+
+    None covers two different situations on purpose, and both are handled the
+    same way HERE while being distinguished elsewhere: a reference kind that
+    is not Node-scoped (nothing to compare) and a reference that no longer
+    resolves (`_evidence_ref_current` is the check that catches that, and it
+    reports `evidence_ref_stale` rather than `foreign_evidence` -- a deleted
+    run is not somebody else's run).
+    """
+    sql = _EVIDENCE_REF_NODE_SQL.get(ref_kind)
+    if sql is None or ref_id is None:
+        return None
+    try:
+        row = conn.execute(sql, (ref_id, system_id)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return None if row is None else row["node_id"]
+
+
+def _evidence_ref_node_matches(
+    conn: sqlite3.Connection,
+    system_id: int,
+    ref_kind: Optional[str],
+    ref_id: Optional[int],
+    node_id: int,
+) -> bool:
+    if ref_kind is None:
+        return True
+    other = _evidence_ref_node_id(conn, system_id, ref_kind, ref_id)
+    return other is None or other == node_id
 
 
 def _evidence_ref_current(
@@ -731,11 +1026,21 @@ def gather_gate_facts(
             name=row["name"],
             verdict=row["verdict"],
             is_mock=bool(row["is_mock"]),
-            # The SQL above already restricts to this package, and add_evidence
-            # resolves every reference against this System -- so anything read
-            # here belongs. The flag exists so the gate's refusal is expressible
-            # as its own code rather than as an empty evidence list.
-            belongs_to_package=row["system_id"] == system_id,
+            # Two independent ways a row can be somebody else's, folded into
+            # the one code whose message already names all three: the evidence
+            # row itself belonging to another System, and its reference
+            # arguing about another Node. The second is re-checked here rather
+            # than trusted from `add_evidence` for the same reason as the ref
+            # currency below -- a run can be re-pointed or the row can have
+            # reached the table some other way, and a result about a different
+            # Node must never establish this one.
+            belongs_to_package=(
+                row["system_id"] == system_id
+                and _evidence_ref_node_matches(
+                    conn, system_id, row["ref_kind"], row["ref_id"],
+                    package["node_id"],
+                )
+            ),
             # Re-resolved on EVERY evaluation, per the currency promise in
             # this function's docstring: `ref_id` carries no FK, so the row
             # it named can be gone or abandoned by now.
@@ -744,6 +1049,13 @@ def gather_gate_facts(
                 or _evidence_ref_current(
                     conn, system_id, row["ref_kind"], row["ref_id"]
                 )
+            ),
+            # Structural, not a judgement: does this row cite something that
+            # was executed at all? A row written before `add_evidence`
+            # required one reads False here and the gate refuses it, which is
+            # the whole point of checking at gate time as well.
+            execution_ref_present=(
+                row["ref_kind"] in EXECUTION_REF_KINDS and row["ref_id"] is not None
             ),
             detail=row["detail"],
         )
@@ -775,6 +1087,7 @@ def gather_gate_facts(
         observed_case_count=package["observed_case_count"],
         stability_window_seconds=package["stability_window_seconds"],
         observed_window_seconds=package["observed_window_seconds"],
+        parent_review_disposition=package["parent_review_disposition"],
     )
 
 
@@ -840,6 +1153,21 @@ def approve_package(
         raise StabilizationConflictError(
             f"The establishment gate refuses this package ({decision.reason_code}): "
             f"{decision.message}"
+        )
+
+    # The gate already required an `endorsed` parent review; what it cannot
+    # check is WHO gave it, because a gate recomputed on every read has no
+    # approver to compare against. One person discharging both roles is not a
+    # shortcut through a formality -- it is the conflation #304 separates the
+    # two records to prevent, and it is refused here with its own finite code.
+    parent = (package["parent_reviewed_by"] or "").strip()
+    if parent and parent.casefold() == approved_by.strip().casefold():
+        raise StabilizationConflictError(
+            "The establishment approval is refused (parent_approver_identical): "
+            f"{parent!r} recorded the parent review and cannot also be the "
+            "approver. The parent's endorsement and the human approval are "
+            "separate responsibilities, and one person holding both is not a "
+            "review."
         )
 
     node_id = package["node_id"]
@@ -1106,6 +1434,15 @@ def build_package_projection(
         "outcome_unmeasured_reason": package["outcome_unmeasured_reason"],
         "status": package["status"],
         "superseded_by_id": package["superseded_by_id"],
+        # Two decisions, shown as two records with their own who/when. Merging
+        # them into one "approved" line would erase which responsibility was
+        # actually discharged, which is the whole point of keeping them apart
+        # (#304). A NULL disposition means "no parent has reviewed this yet",
+        # never "the parent had nothing to say".
+        "parent_reviewed_by": package["parent_reviewed_by"],
+        "parent_reviewed_at": package["parent_reviewed_at"],
+        "parent_review_disposition": package["parent_review_disposition"],
+        "parent_review_note": package["parent_review_note"] or "",
         "approved_by": package["approved_by"],
         "approved_at": package["approved_at"],
         "decision_note": package["decision_note"],

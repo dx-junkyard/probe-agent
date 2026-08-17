@@ -140,6 +140,7 @@ def _drive_to_monitoring(client, token, system_id, node_key):
     tests), and `established -> monitoring` is system-recorded, so both
     legs use `evolution_node.apply_transition` directly."""
     from app.db import get_conn
+    from app.node_operations import create_monitoring_contract
 
     node = _create_node(client, token, system_id, node_key)
     version = _add_version(client, token, system_id, node["id"])
@@ -168,9 +169,12 @@ def _drive_to_monitoring(client, token, system_id, node_key):
             evidence_refs=[f"capability:cap-{node_key}"],
         )
         assert result.applied, result.decision
-        conn.execute(
-            "UPDATE evolution_node SET monitoring_contract_ref = 'contract-1' WHERE id = ?",
-            (node["id"],),
+        # A REAL monitoring contract: the gate now refuses a ref that does
+        # not resolve to an active, non-superseded contract of this Node, so
+        # a hand-written string here would make the fixture unreachable.
+        create_monitoring_contract(
+            conn, system_id=system_id, node_id=node["id"],
+            freshness_budget_seconds=60.0, minimum_sample_count=1,
         )
         result = evolution_node.apply_transition(
             conn, system_id=system_id, node_id=node["id"], to_state="monitoring",
@@ -793,6 +797,95 @@ class TestFiniteFieldValidation:
             headers=_headers(token, system_id),
         )
         assert r.status_code == 422, r.text
+
+
+# ---------------------------------------------------------------------------
+# 5b. A frozen contract and the maturity-lineage reconciliation
+# ---------------------------------------------------------------------------
+
+
+class TestFrozenContractApi:
+    def test_new_version_on_an_established_node_is_409(self, admin_client):
+        """The domain's conflict surfaces as 409, and its message names the
+        way out (reopen/suspend) rather than dead-ending the developer."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-Frozen")
+        node_id = _drive_to_monitoring(admin_client, token, system_id, "frozen-api")
+
+        # monitoring -> established (recording that observation stopped) is
+        # the one establishment this endpoint accepts directly.
+        r = _transition(
+            admin_client, token, system_id, node_id, to_state="established",
+            evidence_refs=["capability:cap-frozen-api"],
+        )
+        assert r.status_code == 200, r.text
+
+        r = admin_client.post(
+            f"/evolution-nodes/{node_id}/versions",
+            json={
+                "mission": "revised",
+                "input_contract": {},
+                "output_contract": {},
+                "side_effect_class": "pure",
+                "trust_boundary": "internal",
+            },
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        assert "reopened" in detail and "suspended" in detail
+
+        # Still exactly one version, still current.
+        r = admin_client.get(
+            f"/evolution-nodes/{node_id}", headers=_headers(token, system_id)
+        )
+        assert r.json()["current_version"]["version_number"] == 1
+
+    def test_projection_reports_the_folded_maturity_and_its_consistency(
+        self, admin_client
+    ):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-Fold")
+        node = _create_node(admin_client, token, system_id, "fold-api")
+        version = _add_version(admin_client, token, system_id, node["id"])
+        _add_implementation(admin_client, token, system_id, node["id"], version["id"])
+        _transition(admin_client, token, system_id, node["id"], to_state="validating")
+
+        r = admin_client.get(
+            f"/evolution-nodes/{node['id']}", headers=_headers(token, system_id)
+        )
+        projection = r.json()
+        assert projection["maturity"] == "validating"
+        assert projection["folded_maturity"] == "validating"
+        assert projection["maturity_consistent"] is True
+        assert projection["availability"]["maturity_lineage"] is True
+
+    def test_a_drifted_stored_maturity_is_visible_over_http(self, admin_client):
+        """ADR-4 makes the event log the authority; a reader of the canonical
+        projection must be able to SEE a drifted cache, not just an auditor
+        refolding the log by hand."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-Drift")
+        node = _create_node(admin_client, token, system_id, "drift-api")
+        version = _add_version(admin_client, token, system_id, node["id"])
+        _add_implementation(admin_client, token, system_id, node["id"], version["id"])
+        _transition(admin_client, token, system_id, node["id"], to_state="validating")
+
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE evolution_node SET maturity = 'suspended' WHERE id = ?",
+                (node["id"],),
+            )
+
+        r = admin_client.get(
+            f"/evolution-nodes/{node['id']}", headers=_headers(token, system_id)
+        )
+        projection = r.json()
+        assert projection["maturity"] == "suspended"
+        assert projection["folded_maturity"] == "validating"
+        assert projection["maturity_consistent"] is False
 
 
 # ---------------------------------------------------------------------------

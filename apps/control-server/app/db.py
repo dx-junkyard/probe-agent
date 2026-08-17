@@ -5470,9 +5470,24 @@ CREATE TABLE IF NOT EXISTS stabilization_package (
                                   CHECK (status IN
                                       ('draft', 'under_review', 'approved',
                                        'rejected', 'superseded')),
+    -- The PARENT's review, which is not the approval (#304: parent approval
+    -- and human approval are separate records that must not be conflated).
+    -- NULL disposition means "no parent has reviewed this yet" -- never "the
+    -- parent had nothing to say". Written from the authenticated principal,
+    -- never from a request body, and append-only: a recorded disposition is
+    -- not overwritten, a changed mind supersedes the package.
+    parent_reviewed_by        TEXT,
+    parent_reviewed_at        REAL,
+    parent_review_disposition TEXT
+                                  CHECK (parent_review_disposition IS NULL OR
+                                         parent_review_disposition IN
+                                             ('endorsed', 'declined')),
+    parent_review_note        TEXT,
     -- Approval is a person, always. `approved_by` is written from the
     -- authenticated principal, never from a request body -- the #337
-    -- provenance rule.
+    -- provenance rule. `approve_package` additionally refuses when this is
+    -- the same person as `parent_reviewed_by`: one person holding both roles
+    -- is the conflation the separation exists to prevent.
     approved_by               TEXT,
     approved_at               REAL,
     decision_note             TEXT NOT NULL DEFAULT '',
@@ -6867,6 +6882,28 @@ def init_db() -> None:
             ):
                 _add_column_if_missing(
                     conn, "purpose_outcome_criterion", outcome_columns, column, definition
+                )
+        # Issue #399 (review finding): the parent review, recorded separately
+        # from the human approval (#304). Additive and never backfilled -- a
+        # package created before this existed carries NULL, which says "no
+        # parent has reviewed this", and the establishment gate refuses it
+        # (`parent_review_missing`) rather than reading the existing
+        # `approved_by` as if it had also been the parent's endorsement.
+        stabilization_cols = _columns(conn, "stabilization_package")
+        if stabilization_cols:
+            for column, definition in (
+                ("parent_reviewed_by", "TEXT"),
+                ("parent_reviewed_at", "REAL"),
+                (
+                    "parent_review_disposition",
+                    "TEXT CHECK (parent_review_disposition IS NULL OR "
+                    "parent_review_disposition IN ('endorsed', 'declined'))",
+                ),
+                ("parent_review_note", "TEXT"),
+            ):
+                _add_column_if_missing(
+                    conn, "stabilization_package", stabilization_cols,
+                    column, definition,
                 )
         _migrate_alignment_manual_recheck_targets(conn)
         _ensure_legacy_system(conn)
