@@ -498,6 +498,32 @@ def propose_decomposition(
         nodes: List[ProposedNode] = []
         seen_node_keys: set = set()
         for raw_node in raw_candidate.nodes:
+            # Mirror Phase 1's own empty-after-strip rules (`create_node`
+            # rejects a blank node_key, `add_version` a blank mission).
+            # `min_length=1` passes " ", so without these a candidate could
+            # be STORED that adoption can never materialise -- and a retry
+            # after the partial failure would 409 on the key collision
+            # forever.
+            if not raw_node.node_key.strip():
+                return DecompositionResult(
+                    provider=config.provider,
+                    model=config.model,
+                    is_mock=False,
+                    error=(
+                        "Model returned a whitespace-only node_key in candidate "
+                        f"{raw_candidate.candidate_key!r}"
+                    ),
+                )
+            if not raw_node.mission.strip():
+                return DecompositionResult(
+                    provider=config.provider,
+                    model=config.model,
+                    is_mock=False,
+                    error=(
+                        "Model returned a whitespace-only mission for node "
+                        f"{raw_node.node_key!r}"
+                    ),
+                )
             if raw_node.side_effect_class not in evolution_node.SIDE_EFFECT_CLASSES:
                 return DecompositionResult(
                     provider=config.provider,
@@ -711,21 +737,53 @@ def decide_candidate(
     # `create_node` and `add_version` each run their own BEGIN/COMMIT, so the
     # adoption cannot be wrapped in one outer transaction here. The
     # pre-flight below is therefore load-bearing: it refuses the whole
-    # adoption BEFORE anything is written, which is what keeps a colliding
-    # key from leaving half a decomposition behind.
+    # adoption BEFORE anything is written. Besides the key collision, it
+    # re-applies every rule Phase 1's `create_node`/`add_version` would
+    # enforce mid-loop -- checked here against the exact values the creation
+    # loop will pass, because a stored-but-invalid node failing on the
+    # second iteration would leave the first node behind, keep the candidate
+    # `pending`, and make every retry 409 on the now-existing key: a dead
+    # end the developer cannot leave.
+    seen_node_keys: set = set()
     for proposed in proposed_nodes:
         node_key = (proposed.get("node_key") or "").strip()
         if not node_key:
             raise NodeDesignValidationError(
                 "A proposed node has no node_key; the candidate cannot be adopted"
             )
+        raw_key = proposed.get("node_key")
+        if raw_key in seen_node_keys:
+            raise NodeDesignValidationError(
+                f"node_key {raw_key!r} appears twice in this candidate; "
+                "the candidate cannot be adopted"
+            )
+        seen_node_keys.add(raw_key)
+        if not (proposed.get("mission") or "").strip():
+            raise NodeDesignValidationError(
+                f"Proposed node {node_key!r} has an empty mission; "
+                "the candidate cannot be adopted"
+            )
+        side_effect_class = proposed.get("side_effect_class") or "read_only"
+        if side_effect_class not in evolution_node.SIDE_EFFECT_CLASSES:
+            raise NodeDesignValidationError(
+                f"Proposed node {node_key!r} has an invalid side_effect_class "
+                f"{side_effect_class!r}; the candidate cannot be adopted"
+            )
+        trust_boundary = proposed.get("trust_boundary") or "internal"
+        if trust_boundary not in evolution_node.TRUST_BOUNDARIES:
+            raise NodeDesignValidationError(
+                f"Proposed node {node_key!r} has an invalid trust_boundary "
+                f"{trust_boundary!r}; the candidate cannot be adopted"
+            )
+        # The collision check uses the RAW key -- it is what the creation
+        # loop below passes to `create_node`, so it is what would collide.
         existing = conn.execute(
             "SELECT id FROM evolution_node WHERE system_id = ? AND node_key = ?",
-            (system_id, node_key),
+            (system_id, raw_key),
         ).fetchone()
         if existing is not None:
             raise NodeDesignConflictError(
-                f"node_key {node_key!r} already exists in this System; "
+                f"node_key {raw_key!r} already exists in this System; "
                 "adopting this candidate would only partially apply"
             )
 

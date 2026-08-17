@@ -136,6 +136,28 @@ def _node_payload(key="normalize", **overrides):
     return payload
 
 
+def _insert_raw_candidate(conn, system_id, nodes, candidate_key="cut-raw"):
+    """Store a candidate row directly, bypassing `propose_decomposition`'s
+    parse-time validation -- the stored-but-invalid shape the adoption
+    pre-flight must refuse with zero writes."""
+    now = time.time()
+    cur = conn.execute(
+        """INSERT INTO node_decomposition_proposal
+               (system_id, scope_summary, status, created_at)
+           VALUES (?, 's', 'proposed', ?)""",
+        (system_id, now),
+    )
+    proposal_id = cur.lastrowid
+    cur = conn.execute(
+        """INSERT INTO node_decomposition_candidate
+               (proposal_id, system_id, candidate_key, summary, nodes_json,
+                created_at)
+           VALUES (?, ?, ?, 's', ?, ?)""",
+        (proposal_id, system_id, candidate_key, json.dumps(nodes), now),
+    )
+    return cur.lastrowid
+
+
 def _good_response(nodes=None, candidate_key="cut-a"):
     return json.dumps(
         {
@@ -325,6 +347,57 @@ class TestDecompositionFailClosed:
         assert "dup" in (result.error or "")
         assert result.candidates == ()
 
+    def test_duplicate_candidate_key_rejects_the_whole_response(self):
+        """Two candidates under one key are not two comparable cuts -- the
+        developer could not say which one they decided on."""
+        # `_good_response` always appends a fixed "cut-b" candidate, so
+        # naming the first one "cut-b" too makes the keys collide.
+        result = propose_decomposition(
+            _StubClient(_good_response(candidate_key="cut-b")),
+            REASONING_CONFIG,
+            scope_summary="s",
+        )
+        assert "cut-b" in (result.error or "")
+        assert result.candidates == ()
+
+    @pytest.mark.parametrize(
+        "field_name,blank",
+        [("mission", "   "), ("node_key", "   ")],
+    )
+    def test_whitespace_only_required_field_rejects_the_whole_response(
+        self, field_name, blank
+    ):
+        """`min_length=1` passes " ", but Phase 1's `create_node`/
+        `add_version` reject a blank-after-strip key/mission -- so without
+        this gate a candidate could be STORED that adoption can never
+        materialise (the half-adopted dead end of finding #3)."""
+        body = _good_response(nodes=[_node_payload(**{field_name: blank})])
+        result = propose_decomposition(
+            _StubClient(body), REASONING_CONFIG, scope_summary="s"
+        )
+        assert result.error is not None
+        assert "whitespace-only" in result.error
+        assert result.candidates == ()
+
+    def test_whitespace_only_field_persists_as_a_failed_run(self, admin_client):
+        """Consistent with the other fail-closed paths: the failure is a
+        persisted fact, and zero candidates are stored."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-BlankPersist")
+        result = propose_decomposition(
+            _StubClient(_good_response(nodes=[_node_payload(mission="   ")])),
+            REASONING_CONFIG,
+            scope_summary="s",
+        )
+        with get_conn() as conn:
+            proposal, candidates = persist_decomposition(
+                conn, system_id=system_id, result=result, scope_summary="s",
+            )
+        assert proposal["status"] == "failed"
+        assert candidates == []
+
     def test_valid_response_produces_comparable_candidates(self):
         result = propose_decomposition(
             _StubClient(_good_response()), REASONING_CONFIG, scope_summary="s"
@@ -460,6 +533,85 @@ class TestAdoption:
             assert conn.execute(
                 "SELECT decision FROM node_decomposition_candidate WHERE id = ?",
                 (candidates[0]["id"],),
+            ).fetchone()["decision"] == "pending"
+
+    def test_adopting_a_stored_invalid_candidate_aborts_with_zero_writes(
+        self, admin_client
+    ):
+        """The reviewer's reproduction: a 2-node cut whose second node has a
+        whitespace-only mission. Without the pre-flight, the first node was
+        created fully, the second was left version-less, the candidate stayed
+        'pending', and every retry 409ed on the key collision -- a dead end
+        the developer could not leave."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-StoredInvalid")
+        with get_conn() as conn:
+            candidate_id = _insert_raw_candidate(
+                conn, system_id,
+                [_node_payload("first"), _node_payload("second", mission="   ")],
+            )
+            with pytest.raises(NodeDesignValidationError):
+                decide_candidate(
+                    conn, system_id=system_id, candidate_id=candidate_id,
+                    decision="adopted", decided_by="alice",
+                )
+            # Zero writes: no node rows, no version rows, candidate pending.
+            assert conn.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node WHERE system_id = ?",
+                (system_id,),
+            ).fetchone()["n"] == 0
+            assert conn.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node_version "
+                "WHERE system_id = ?",
+                (system_id,),
+            ).fetchone()["n"] == 0
+            assert conn.execute(
+                "SELECT decision FROM node_decomposition_candidate WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()["decision"] == "pending"
+            # A retry hits the SAME validation error, not a key-collision
+            # dead end left behind by a partial first attempt.
+            with pytest.raises(NodeDesignValidationError):
+                decide_candidate(
+                    conn, system_id=system_id, candidate_id=candidate_id,
+                    decision="adopted", decided_by="alice",
+                )
+
+    @pytest.mark.parametrize(
+        "nodes",
+        [
+            # Each is a payload `create_node`/`add_version` would reject --
+            # the pre-flight must reach the same verdict BEFORE any write
+            # (parity with Phase 1's own validators).
+            [_node_payload("ok"), _node_payload("blank-key", node_key="   ")],
+            [_node_payload("ok"), _node_payload("bad-sec", side_effect_class="mostly_pure")],
+            [_node_payload("ok"), _node_payload("bad-tb", trust_boundary="sort_of_internal")],
+            [_node_payload("ok"), _node_payload("ok")],  # in-candidate duplicate
+        ],
+    )
+    def test_any_candidate_node_phase1_would_reject_aborts_before_any_write(
+        self, admin_client, nodes
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-Parity")
+        with get_conn() as conn:
+            candidate_id = _insert_raw_candidate(conn, system_id, nodes)
+            with pytest.raises(NodeDesignValidationError):
+                decide_candidate(
+                    conn, system_id=system_id, candidate_id=candidate_id,
+                    decision="adopted", decided_by="alice",
+                )
+            assert conn.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node WHERE system_id = ?",
+                (system_id,),
+            ).fetchone()["n"] == 0
+            assert conn.execute(
+                "SELECT decision FROM node_decomposition_candidate WHERE id = ?",
+                (candidate_id,),
             ).fetchone()["decision"] == "pending"
 
     def test_rejecting_creates_nothing_but_is_recorded(self, admin_client):
@@ -816,6 +968,120 @@ class TestApi:
         body = r.json()
         assert body["status"] == "failed"
         assert body["candidates"] == []
+
+    def test_adopting_a_stored_invalid_candidate_is_422_over_http(
+        self, admin_client
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ApiInvalid")
+        with get_conn() as conn:
+            candidate_id = _insert_raw_candidate(
+                conn, system_id, [_node_payload("only", mission="   ")]
+            )
+        r = admin_client.post(
+            f"/node-design/decomposition-candidates/{candidate_id}/decision",
+            json={"decision": "adopted"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 422, r.text
+
+    def test_a_phase1_validation_error_maps_to_422_not_500(
+        self, admin_client, monkeypatch
+    ):
+        """Adoption calls into Phase 1's `create_node`/`add_version`; a rule
+        enforced there but missed by the pre-flight must surface as a client
+        error, never a 500."""
+        from app import evolution_node
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ApiEscape")
+        monkeypatch.setattr(
+            node_design,
+            "decide_candidate",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                evolution_node.EvolutionNodeValidationError("mission must not be empty")
+            ),
+        )
+        r = admin_client.post(
+            "/node-design/decomposition-candidates/1/decision",
+            json={"decision": "adopted"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 422, r.text
+
+    def test_failed_run_persists_an_auditable_intelligence_run(self, admin_client):
+        """Principle 7: provider / model / prompt & schema versions /
+        decision_method are persisted for the failure too."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ApiRunAudit")
+        r = admin_client.post(
+            "/node-design/decompositions",
+            json={"scope_summary": "normalize an address"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 502, r.text
+
+        with get_conn() as conn:
+            row = conn.execute(
+                """SELECT * FROM intelligence_runs
+                       WHERE system_id = ? AND run_type = 'node_decomposition'
+                       ORDER BY id DESC LIMIT 1""",
+                (system_id,),
+            ).fetchone()
+        assert row is not None
+        assert row["status"] == "failed"
+        assert row["decision_method"] == "reasoning_llm"
+        assert row["provider"] == "mock"
+        assert row["model"]
+        assert row["prompt_version"] == node_design.DECOMPOSITION_PROMPT_VERSION
+        assert row["schema_version"] == node_design.DECOMPOSITION_SCHEMA_VERSION
+        assert row["is_mock"] == 1
+        assert row["error_details"]
+
+    def test_successful_run_persists_an_auditable_intelligence_run(
+        self, admin_client, monkeypatch
+    ):
+        from app.db import get_conn
+        from app.routes import node_design as node_design_routes
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ApiRunOk")
+
+        class _ConfigShim:
+            @staticmethod
+            def intelligence_from_env():
+                return REASONING_CONFIG
+
+        monkeypatch.setattr(node_design_routes, "LLMConfig", _ConfigShim)
+        monkeypatch.setattr(
+            node_design_routes,
+            "create_llm_client",
+            lambda config: _StubClient(_good_response()),
+        )
+        r = admin_client.post(
+            "/node-design/decompositions",
+            json={"scope_summary": "normalize an address"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 201, r.text
+        run_id = r.json()["intelligence_run_id"]
+
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        assert row["status"] == "completed"
+        assert row["decision_method"] == "reasoning_llm"
+        assert row["provider"] == REASONING_CONFIG.provider
+        assert row["model"] == REASONING_CONFIG.model
+        assert row["prompt_version"] == node_design.DECOMPOSITION_PROMPT_VERSION
+        assert row["schema_version"] == node_design.DECOMPOSITION_SCHEMA_VERSION
+        assert row["is_mock"] == 0
+        assert row["error_details"] is None
 
     def test_evaluation_policies_are_grouped_over_http(self, admin_client):
         token = _login(admin_client)

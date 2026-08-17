@@ -203,6 +203,36 @@ def _require_variant(
     return row
 
 
+def _require_open_run(
+    conn: sqlite3.Connection, system_id: int, run_id: int, action: str
+) -> sqlite3.Row:
+    """A completed run is exactly what #399's establishment gate reads as
+    evidence, so its variants and measurements must be immutable from the
+    moment it closes -- otherwise the numbers a human completed against could
+    be silently rewritten afterwards."""
+    run = _require_run(conn, system_id, run_id)
+    if run["status"] != "open":
+        raise ExplorationConflictError(
+            f"Exploration run {run_id} is {run['status']}; {action} is only "
+            "possible while it is open"
+        )
+    return run
+
+
+def _direction(dimension: str) -> bool:
+    """Fail-closed direction lookup. A dimension with no entry in
+    `HIGHER_IS_BETTER` has no comparison direction, and defaulting one would
+    silently decide better/worse by a guess -- the exact inversion risk the
+    table exists to prevent."""
+    try:
+        return HIGHER_IS_BETTER[dimension]
+    except KeyError:
+        raise ExplorationValidationError(
+            f"dimension {dimension!r} has no entry in HIGHER_IS_BETTER; a "
+            "dimension without an explicit direction cannot be compared"
+        ) from None
+
+
 # ---------------------------------------------------------------------------
 # Runs and variants
 # ---------------------------------------------------------------------------
@@ -325,12 +355,7 @@ def add_variant(
     if not (variant_key or "").strip():
         raise ExplorationValidationError("variant_key must not be empty")
 
-    run = _require_run(conn, system_id, run_id)
-    if run["status"] != "open":
-        raise ExplorationConflictError(
-            f"Exploration run {run_id} is {run['status']}; variants can only be "
-            "added while it is open"
-        )
+    run = _require_open_run(conn, system_id, run_id, "adding a variant")
 
     if implementation_id is not None:
         implementation = conn.execute(
@@ -434,6 +459,7 @@ def attach_execution(
     """
     _check_membership(execution_state, EXECUTION_STATES, "execution_state")
     variant = _require_variant(conn, system_id, variant_id)
+    _require_open_run(conn, system_id, variant["run_id"], "attaching an execution")
 
     if execution_state == "executed":
         if execution_ref_kind is None or execution_ref_id is None:
@@ -449,12 +475,24 @@ def attach_execution(
             "experiment": "experiments",
         }[execution_ref_kind]
         row = conn.execute(
-            f"SELECT id FROM {table} WHERE id = ? AND system_id = ?",
+            f"SELECT id, status FROM {table} WHERE id = ? AND system_id = ?",
             (execution_ref_id, system_id),
         ).fetchone()
         if row is None:
             raise ExplorationNotFoundError(
                 f"{execution_ref_kind} {execution_ref_id} not found in this System"
+            )
+        # §6.1: the cited id must point at an existing COMPLETED run.
+        # 'completed' is the one terminal successful state in all three
+        # status vocabularies (replay_runs / replay_variants:
+        # running|completed|failed; experiments: draft|running|completed|
+        # failed). A draft, running or failed run has no numbers to stand
+        # behind, so accepting it would let unmeasured numbers enter a
+        # comparison under an "executed" label.
+        if row["status"] != "completed":
+            raise ExplorationConflictError(
+                f"{execution_ref_kind} {execution_ref_id} is {row['status']!r}; "
+                "only a completed run can back execution_state 'executed'"
             )
     elif execution_ref_kind is not None or execution_ref_id is not None:
         raise ExplorationValidationError(
@@ -505,6 +543,10 @@ def record_measurement(
     _check_membership(value_state, VALUE_STATES, "value_state")
     _check_membership(source, MEASUREMENT_SOURCES, "source")
     variant = _require_variant(conn, system_id, variant_id)
+    # The upsert below can OVERWRITE an existing reading, so the open-run
+    # gate is what keeps a completed run's numbers immutable -- they are the
+    # evidence #399's establishment gate reads.
+    _require_open_run(conn, system_id, variant["run_id"], "recording a measurement")
 
     if value_state == "measured" and numeric_value is None:
         raise ExplorationValidationError(
@@ -699,7 +741,7 @@ def compare_variants(
         delta = variant_value - baseline_value
         if delta == 0:
             verdict = "equal"
-        elif HIGHER_IS_BETTER.get(dimension, True):
+        elif _direction(dimension):
             verdict = "better" if delta > 0 else "worse"
         else:
             verdict = "better" if delta < 0 else "worse"
@@ -723,8 +765,10 @@ def compare_variants(
 
 
 def rank_by_dimension(
-    variants: Sequence[Mapping[str, Any]], dimension: str
-) -> List[Dict[str, Any]]:
+    variants: Sequence[Mapping[str, Any]],
+    dimension: str,
+    metric_name: Optional[str] = None,
+) -> Dict[str, Any]:
     """Order variants by ONE named dimension.
 
     The dimension is a required argument, and there is no overall ranking
@@ -732,15 +776,48 @@ def rank_by_dimension(
     shape: a caller that wants an order has to say what it is ordering by,
     so a latency ranking can never be presented as "the best variant".
 
-    Variants whose reading is not `measured` are returned in a separate
-    `unranked` group rather than sorted to the bottom -- sorting them last
-    would read as "worst", which is precisely the rounding this module
-    forbids.
+    A reading is identified by (dimension, metric_name) -- the same key
+    `compare_variants` uses -- so a baseline measured on one metric can
+    never be ranked against a candidate measured on another. When the
+    variants carry more than one metric_name for the dimension, the caller
+    must name the one to rank by; picking one silently would present a
+    ranking across different metrics under a single heading.
+
+    Coverage follows `compare_variants`' rule too: two numbers computed
+    over different case sets are not comparable. The basis is the baseline
+    variant's coverage when a measured baseline exists; without one, every
+    measured reading must share a single coverage, and if they disagree
+    nothing is ranked -- there is no deterministic way to decide which
+    group is "the" ranking.
+
+    Variants whose reading is not `measured`, measured under a different
+    metric, or measured at a different coverage are returned in a separate
+    `unranked` group with an explicit `reason`, rather than sorted to the
+    bottom or dropped -- sorting them last would read as "worst", and
+    dropping them would hide exactly what a reader must see.
     """
     _check_membership(dimension, MEASUREMENT_DIMENSIONS, "dimension")
-    higher_is_better = HIGHER_IS_BETTER.get(dimension, True)
+    higher_is_better = _direction(dimension)
 
-    ranked: List[Dict[str, Any]] = []
+    metric_names = sorted(
+        {
+            measurement["metric_name"] or ""
+            for variant in variants
+            for measurement in variant.get("measurements", [])
+            if measurement["dimension"] == dimension
+        }
+    )
+    if metric_name is None:
+        if len(metric_names) > 1:
+            raise ExplorationValidationError(
+                f"dimension {dimension!r} was measured under multiple metrics "
+                f"({', '.join(repr(name) for name in metric_names)}); name the "
+                "metric_name to rank by -- an order across different metrics is "
+                "not a ranking"
+            )
+        metric_name = metric_names[0] if metric_names else ""
+
+    measured: List[Tuple[Optional[Tuple[int, int]], bool, Dict[str, Any]]] = []
     unranked: List[Dict[str, Any]] = []
     for variant in variants:
         reading = next(
@@ -748,6 +825,7 @@ def rank_by_dimension(
                 m
                 for m in variant.get("measurements", [])
                 if m["dimension"] == dimension
+                and (m["metric_name"] or "") == metric_name
             ),
             None,
         )
@@ -757,14 +835,66 @@ def rank_by_dimension(
             "modality": variant["modality"],
             "value": reading["numeric_value"] if reading else None,
             "value_state": reading["value_state"] if reading else "not_measured",
+            "reason": "",
         }
-        if reading is not None and reading["value_state"] == "measured":
-            ranked.append(entry)
-        else:
+        if reading is None:
+            other_metrics = sorted(
+                {
+                    m["metric_name"] or ""
+                    for m in variant.get("measurements", [])
+                    if m["dimension"] == dimension
+                }
+            )
+            if other_metrics:
+                entry["reason"] = (
+                    f"measured under {', '.join(repr(n) for n in other_metrics)}, "
+                    f"not {metric_name!r}; different metrics are never ranked "
+                    "against each other"
+                )
+            else:
+                entry["reason"] = f"no {dimension} measurement"
             unranked.append(entry)
+        elif reading["value_state"] != "measured":
+            entry["reason"] = f"value_state is {reading['value_state']}"
+            unranked.append(entry)
+        else:
+            measured.append(
+                (_coverage(reading), bool(variant.get("is_baseline")), entry)
+            )
+
+    coverages = {coverage for coverage, _, _ in measured}
+    baseline_coverages = [
+        coverage for coverage, is_baseline, _ in measured if is_baseline
+    ]
+    ranked: List[Dict[str, Any]] = []
+    if baseline_coverages:
+        basis: Optional[Tuple[int, int]] = baseline_coverages[0]
+        basis_known = True
+    elif len(coverages) <= 1:
+        basis = next(iter(coverages), None)
+        basis_known = True
+    else:
+        basis = None
+        basis_known = False
+
+    for coverage, _, entry in measured:
+        if not basis_known or coverage != basis:
+            entry["reason"] = (
+                "coverage differs across the measured readings "
+                f"({coverage} vs basis {basis if basis_known else 'undecidable'}); "
+                "numbers over different case sets are reported, not ranked"
+            )
+            unranked.append(entry)
+        else:
+            ranked.append(entry)
 
     ranked.sort(key=lambda e: e["value"], reverse=higher_is_better)
-    return [{"ranked": ranked, "unranked": unranked, "dimension": dimension}][0]
+    return {
+        "ranked": ranked,
+        "unranked": unranked,
+        "dimension": dimension,
+        "metric_name": metric_name,
+    }
 
 
 # ---------------------------------------------------------------------------

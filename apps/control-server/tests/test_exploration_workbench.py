@@ -103,6 +103,60 @@ def _measurement(dimension, value, state="measured", covered=None, total=None, n
     }
 
 
+def _insert_snapshot(conn, system_id):
+    cur = conn.execute(
+        """INSERT INTO repository_snapshots
+               (system_id, repo_path, commit_sha, status, file_count,
+                total_size, indexed_size, created_at, completed_at)
+           VALUES (?, '', 'deadbeef', 'ready', 0, 0, 0, ?, NULL)""",
+        (system_id, time.time()),
+    )
+    return cur.lastrowid
+
+
+def _insert_experiment(conn, system_id, snapshot_id, status):
+    cur = conn.execute(
+        """INSERT INTO experiments
+               (system_id, feature_id, objective, snapshot_id, baseline_commit,
+                config_revision, execution_config, status, created_at)
+           VALUES (?, 'feat-1', 'obj', ?, 'deadbeef', 'v1', '{}', ?, ?)""",
+        (system_id, snapshot_id, status, time.time()),
+    )
+    return cur.lastrowid
+
+
+def _insert_replay_run(conn, system_id, snapshot_id, status):
+    now = time.time()
+    cur = conn.execute(
+        """INSERT INTO replay_sets (system_id, component_id, created_at)
+           VALUES (?, 'comp-1', ?)""",
+        (system_id, now),
+    )
+    replay_set_id = cur.lastrowid
+    cur = conn.execute(
+        """INSERT INTO replay_runs
+               (system_id, replay_set_id, component_id, snapshot_id, commit_sha,
+                symbol_path, symbol_qualified_name, status, trace_set_hash,
+                created_at)
+           VALUES (?, ?, 'comp-1', ?, 'deadbeef', 'a.py', 'mod.fn', ?, 'hash', ?)""",
+        (system_id, replay_set_id, snapshot_id, status, now),
+    )
+    return cur.lastrowid
+
+
+def _run_with_variant(conn, system_id, *, node_key="explored", is_baseline=False):
+    node, version = _node_with_version(conn, system_id, node_key=node_key)
+    run = create_run(
+        conn, system_id=system_id, node_id=node["id"],
+        node_version_id=version["id"],
+    )
+    variant = add_variant(
+        conn, system_id=system_id, run_id=run["id"], variant_key="v",
+        modality="rule", is_baseline=is_baseline,
+    )
+    return run, variant
+
+
 # ---------------------------------------------------------------------------
 # 1. What must be held constant lives on the run
 # ---------------------------------------------------------------------------
@@ -303,6 +357,84 @@ class TestComparisonNeverRounds:
         assert [e["variant_key"] for e in ranking["ranked"]] == ["rule", "llm"]
         assert [e["variant_key"] for e in ranking["unranked"]] == ["manual"]
 
+    def test_an_unknown_dimension_has_no_direction_and_fails_closed(self):
+        """`HIGHER_IS_BETTER.get(dimension, True)` would silently treat an
+        unknown dimension as higher-is-better -- a guessed direction is the
+        inversion risk the explicit table exists to prevent."""
+        with pytest.raises(ExplorationValidationError):
+            compare_variants(
+                [_measurement("vibes", 1.0)], [_measurement("vibes", 2.0)]
+            )
+
+    def test_mixed_metric_names_require_the_caller_to_disambiguate(self):
+        """A baseline measured on one metric must never rank against a
+        candidate measured on another -- the same (dimension, metric_name)
+        keying `compare_variants` uses."""
+        variants = [
+            {
+                "id": 1, "variant_key": "base", "modality": "reasoning_llm",
+                "is_baseline": True,
+                "measurements": [_measurement("latency", 120.0, name="p50")],
+            },
+            {
+                "id": 2, "variant_key": "rule", "modality": "rule",
+                "measurements": [_measurement("latency", 12.0, name="p95")],
+            },
+        ]
+        with pytest.raises(ExplorationValidationError):
+            rank_by_dimension(variants, "latency")
+
+        ranking = rank_by_dimension(variants, "latency", "p50")
+        assert ranking["metric_name"] == "p50"
+        assert [e["variant_key"] for e in ranking["ranked"]] == ["base"]
+        assert [e["variant_key"] for e in ranking["unranked"]] == ["rule"]
+        # Excluded with an explicit reason, never silently dropped.
+        assert "p95" in ranking["unranked"][0]["reason"]
+
+    def test_a_reading_at_a_different_coverage_is_unranked_not_compared(self):
+        variants = [
+            {
+                "id": 1, "variant_key": "base", "modality": "reasoning_llm",
+                "is_baseline": True,
+                "measurements": [
+                    _measurement("output_quality", 0.9, covered=50, total=50)
+                ],
+            },
+            {
+                "id": 2, "variant_key": "rule", "modality": "rule",
+                "measurements": [
+                    _measurement("output_quality", 0.95, covered=20, total=50)
+                ],
+            },
+        ]
+        ranking = rank_by_dimension(variants, "output_quality")
+        assert [e["variant_key"] for e in ranking["ranked"]] == ["base"]
+        assert [e["variant_key"] for e in ranking["unranked"]] == ["rule"]
+        assert "coverage" in ranking["unranked"][0]["reason"]
+
+    def test_disagreeing_coverage_with_no_baseline_ranks_nothing(self):
+        """Without a baseline to anchor the basis there is no deterministic
+        way to decide which coverage group is "the" ranking -- so none is."""
+        variants = [
+            {
+                "id": 1, "variant_key": "a", "modality": "rule",
+                "measurements": [
+                    _measurement("output_quality", 0.9, covered=50, total=50)
+                ],
+            },
+            {
+                "id": 2, "variant_key": "b", "modality": "manual",
+                "measurements": [
+                    _measurement("output_quality", 0.95, covered=20, total=50)
+                ],
+            },
+        ]
+        ranking = rank_by_dimension(variants, "output_quality")
+        assert ranking["ranked"] == []
+        assert {e["variant_key"] for e in ranking["unranked"]} == {"a", "b"}
+        for entry in ranking["unranked"]:
+            assert entry["reason"]
+
     def test_no_composite_field_exists_on_the_projection(self, admin_client):
         from app.db import get_conn
 
@@ -478,6 +610,125 @@ class TestMeasurementIntegrity:
         assert set(ExplorationVariantCreateIn.model_fields).isdisjoint(
             {"source", "patch", "patch_text", "command", "code", "script"}
         )
+
+
+class TestExecutionRefMustBeCompleted:
+    """§6.1: the cited id must point at an existing COMPLETED run. A draft,
+    running or failed run has no numbers to stand behind, so accepting it
+    would let unmeasured numbers enter a comparison under an 'executed'
+    label."""
+
+    def test_a_draft_experiment_cannot_back_executed(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-DraftExp")
+        with get_conn() as conn:
+            snapshot_id = _insert_snapshot(conn, system_id)
+            experiment_id = _insert_experiment(conn, system_id, snapshot_id, "draft")
+            _, variant = _run_with_variant(conn, system_id)
+            with pytest.raises(ExplorationConflictError):
+                attach_execution(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    execution_state="executed", execution_ref_kind="experiment",
+                    execution_ref_id=experiment_id,
+                )
+
+    @pytest.mark.parametrize("status", ["running", "failed"])
+    def test_a_non_completed_replay_run_is_refused(self, admin_client, status):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, f"EX-Replay-{status}")
+        with get_conn() as conn:
+            snapshot_id = _insert_snapshot(conn, system_id)
+            replay_run_id = _insert_replay_run(conn, system_id, snapshot_id, status)
+            _, variant = _run_with_variant(conn, system_id)
+            with pytest.raises(ExplorationConflictError):
+                attach_execution(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    execution_state="executed", execution_ref_kind="replay_run",
+                    execution_ref_id=replay_run_id,
+                )
+
+    def test_a_completed_reference_is_accepted(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-CompletedRef")
+        with get_conn() as conn:
+            snapshot_id = _insert_snapshot(conn, system_id)
+            replay_run_id = _insert_replay_run(
+                conn, system_id, snapshot_id, "completed"
+            )
+            experiment_id = _insert_experiment(
+                conn, system_id, snapshot_id, "completed"
+            )
+            _, variant = _run_with_variant(conn, system_id)
+            row = attach_execution(
+                conn, system_id=system_id, variant_id=variant["id"],
+                execution_state="executed", execution_ref_kind="replay_run",
+                execution_ref_id=replay_run_id,
+            )
+            assert row["execution_state"] == "executed"
+            assert row["execution_ref_id"] == replay_run_id
+
+            _, variant_2 = _run_with_variant(conn, system_id, node_key="explored-2")
+            row = attach_execution(
+                conn, system_id=system_id, variant_id=variant_2["id"],
+                execution_state="executed", execution_ref_kind="experiment",
+                execution_ref_id=experiment_id,
+            )
+            assert row["execution_ref_id"] == experiment_id
+
+
+class TestCompletedRunIsImmutable:
+    """A completed run is exactly what #399's establishment gate reads as
+    evidence, so its variants' measurements and execution records must not be
+    silently rewritable afterwards."""
+
+    def _completed_run(self, conn, system_id):
+        run, variant = _run_with_variant(conn, system_id, is_baseline=True)
+        record_measurement(
+            conn, system_id=system_id, variant_id=variant["id"],
+            dimension="latency", numeric_value=100.0,
+        )
+        complete_run(conn, system_id=system_id, run_id=run["id"])
+        return run, variant
+
+    def test_a_measurement_cannot_be_overwritten_after_completion(
+        self, admin_client
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-Tamper")
+        with get_conn() as conn:
+            run, variant = self._completed_run(conn, system_id)
+            with pytest.raises(ExplorationConflictError):
+                record_measurement(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    dimension="latency", numeric_value=1.0,
+                )
+            stored = conn.execute(
+                """SELECT numeric_value FROM exploration_measurement
+                       WHERE variant_id = ? AND dimension = 'latency'""",
+                (variant["id"],),
+            ).fetchone()
+        assert stored["numeric_value"] == 100.0
+
+    def test_an_execution_cannot_be_attached_after_completion(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EX-TamperExec")
+        with get_conn() as conn:
+            run, variant = self._completed_run(conn, system_id)
+            with pytest.raises(ExplorationConflictError):
+                attach_execution(
+                    conn, system_id=system_id, variant_id=variant["id"],
+                    execution_state="not_executable",
+                )
 
 
 # ---------------------------------------------------------------------------

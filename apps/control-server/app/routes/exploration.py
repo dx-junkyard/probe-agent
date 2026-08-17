@@ -25,6 +25,8 @@ probe-agent:
 
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .. import exploration_workbench as workbench
@@ -215,6 +217,7 @@ def record_variant_measurement(
 def rank_exploration_run(
     run_id: int,
     dimension: str = Query(...),
+    metric_name: Optional[str] = Query(default=None),
     system_id: int = Depends(get_system_id),
     _principal: Principal = Depends(require_user),
 ) -> ExplorationRankingOut:
@@ -223,7 +226,9 @@ def rank_exploration_run(
     `dimension` is required, and there is deliberately no endpoint that
     ranks overall. A caller that wants an order has to say what it is
     ordering by, so a latency ranking can never be presented as "the best
-    variant" (#398).
+    variant" (#398). When the dimension was measured under more than one
+    metric_name, `metric_name` is required too -- an order across different
+    metrics is not a ranking.
     """
     if dimension not in workbench.MEASUREMENT_DIMENSIONS:
         raise HTTPException(
@@ -241,7 +246,12 @@ def rank_exploration_run(
             )
         except workbench.ExplorationError as exc:
             _raise_domain_error(exc)
-    ranking = workbench.rank_by_dimension(projection["variants"], dimension)
+    try:
+        ranking = workbench.rank_by_dimension(
+            projection["variants"], dimension, metric_name
+        )
+    except workbench.ExplorationError as exc:
+        _raise_domain_error(exc)
     return ExplorationRankingOut(**ranking)
 
 
