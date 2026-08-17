@@ -1309,6 +1309,98 @@ creating incomplete persistence or execution paths for later phases.
     `decision_method: manual`. See the Issue #387 section in
     `docs/project-intelligence.md` and the contract in `docs/purpose-chain.md`.
 
+24. Issue #394 (subs #395-#401) — probe-agent を進化型パイプラインの制御基盤
+    (evolution control plane) へ再設計する Epic。probe-agent はすでに
+    Purpose Chain / System Understanding / Component / Probe Cell / Trace /
+    Replay / Shadow / Experiment / Cell Improvement / Drift / human approval
+    gate を持つが、それらが「分からない処理を探索する → 実データで検証する →
+    分かった処理を安定した実装へ定着させる → 低コストで監視する → 前提が
+    崩れた箇所だけ再探索へ戻す」という一つのライフサイクルとして接続されて
+    いない。この Epic はその接続を作る。`docs/evolutionary-pipeline.md` が
+    canonical contract で、§0 を読んでからこの領域に触ること。Phase は
+    #395 → #396 → (#397 ∥ #398) → #399 → #400 → #401 の依存順で実装する。
+    - **Evolution Node は新しい正本エンティティであり、Probe Cell 契約の
+      version up ではない** (ADR-1)。Cell (#297-#304) は*実行役割*(Role
+      Card / orchestration / quality sampling / improvement attempt) を持ち、
+      Node は*進化する処理単位*(業務 I/O 契約 / 実装方式 / maturity /
+      固定化条件 / 再探索条件 / rollback pin) を持つ。一つの行に二つの
+      identity owner を置くと「Node maturity ≠ Cell Improvement status」と
+      いう本 Epic の中心的分離が表現できなくなる。Cell は変更せず、Node が
+      Cell を LINK する。Node は Probe Point がまだ存在しない設計段階
+      (Phase 2) にも存在するので、Cell を前提にはできない。
+    - **Node identity は `(system_id, node_key)`** (ADR-2)。`node_key` は
+      開発者が与える安定 slug で、`component_id` からは決して導出しない —
+      Node は Component より先に設計され、複数の Component にまたがること
+      があり、Component のリネームを越えて生き延びなければならない。既存
+      資産への接続は append-only の `evolution_node_link` (`link_kind` は
+      有限: `component` / `probe_point` / `cell_binding` / `capability` /
+      `flow` / `purpose_element` / `feature`)。
+    - **契約 version と実装 version は別テーブル** (ADR-3)。
+      `evolution_node_version` が「その Node が何を約束するか」、
+      `evolution_node_implementation` が「今どうやってその約束を守って
+      いるか」。一つの契約 version に複数の実装がぶら下がる。これは Epic の
+      核心で、「同じ Node の同じ評価条件で LLM 実装と rule 実装を比較する」は
+      約束と実装が別々に versioned でなければ表現できない。provider/model
+      名は binding の identity に決して含めず、versioned config/provenance
+      にのみ置く (#298 の model alias 規則と同じ)。
+    - **maturity は node 行に持つが、append-only の `evolution_node_event`
+      を畳み込んだ結果と常に一致しなければならない** (ADR-4)。#337 / #338 /
+      #349 と同じ規律 — 保存された lifecycle 値はそれが記述する行から drift
+      しうるが、ログがあれば drift を検出できる。
+    - **`established` と `monitoring` は別状態** (ADR-5)。`established` は
+      「固定化判断が承認され stable implementation が pin された」、
+      `monitoring` は「established かつ監視契約が実際に観測している」。この
+      二つは独立に壊れる — telemetry が止まっても固定化判断が誤りになる
+      わけではなく、それこそ Phase 5 が表示できなければならない状態である。
+      統合すると telemetry が死んだ Node と健全に観測されている Node が
+      区別できなくなり、#366 の「一つの表示語が二つの事実を運ぶ」欠陥に
+      なる。`reopened` は stable implementation の pin を決して外さない —
+      本番は established 実装を動かし続けたまま探索する。`suspended` は
+      どの状態からも到達できる安全保留であり、maturity の達成度ではない。
+    - **四つの軸は決して互いから導出しない** (ADR-6): Node maturity /
+      Cell Improvement status (#304) / SDK policy mode (`off`/`trace`/
+      `shadow`) / Dashboard user workflow phase (#237/#256/#349)。API は
+      四つを別フィールドで返す。`null` は「リンクされた対象がない」で
+      あって「進行中のものがない」ではない。
+    - **評価は Node / Flow・Capability / UX・Outcome の三契約に分かれ、
+      単一の weighted total score に合成しない** (ADR-7)。固定化条件
+      (到達すべきもの) と保護 floor (割ってはいけないもの) も別概念。
+    - **この Epic の初期 Phase では何も削除しない** (ADR-8)。migration
+      inventory が全項目を `keep_canonical` / `adapt_behind_projection` /
+      `migrate` / `deprecate` / `remove_after_gate` に分類し、それぞれに
+      移行先・互換期間・rollback・検証方法を持たせる。互換 projection が
+      Node の Component/Cell 形の view を返し、既存 consumer を壊さない。
+    - **maturity の自動遷移は存在しない** (ADR-9)。すべての遷移は
+      (a) deterministic gate 通過 + 明示的な人間承認 (`decision_method:
+      manual`)、または (b) 明示的に列挙された少数の system-recorded 観測
+      遷移 (Phase 1 では `established ↔ monitoring` のみ) のいずれか。LLM が
+      canonical state を出力することはなく、reasoning 呼び出しの失敗が
+      heuristic state へ fallback することもない (Principle 6)。
+    既存の human gate は一切緩めない: 理解の確認 / Alignment 項目の確定 /
+    提案の承認・編集・却下 / 差分の適用 / 観測の開始 / 採否の記録 / publish /
+    Replay approval、および本 Epic が追加する固定化承認・reopen 承認も
+    すべて `decision_method: manual`。SDK の非ブロッキング・bounded capture・
+    redaction (Principle 9)、network-off の隔離 worktree sandbox、
+    Principle 5 の「target repo へ直接書かない」境界も不変。
+
+    **実装状況 (2026-08-16 時点)。** Phase 0〜5 (#395-#400) は実装・検証済み
+    で、各 Phase の設計判断は `docs/project-intelligence.md` の該当セクションに
+    記録してある。実装された正本モジュールは順に `app/evolution_node.py`
+    (Node 契約 / 12 個の有限拒否コードを持つ純粋な遷移 evaluator /
+    append-only lineage)、`app/node_design.py` (Purpose-to-Node lineage /
+    decomposition / 3 つの評価契約 / Phase 3 への handoff)、
+    `app/exploration_workbench.py` (modality 横断比較。合成なし、
+    `incomparable` / `coverage_mismatch` を持つ)、`app/stabilization.py`
+    (17 個の有限拒否コードを持つ固定化ゲート)、`app/node_operations.py`
+    (監視契約 / drift 観測 / anomaly taxonomy / 局所 reopen)。
+    **#401 Phase 6 (lifecycle UX 統合 / migration 完了 / dogfooding) は
+    未着手。** Phase 5 の operations cockpit API・画面も #401 の統合対象と
+    して残してある — 4 つ目の孤立したページを作らず、既存 Overview /
+    Components / Cell Fabric と合わせて再配置するため。なお #401 の受け入れ
+    条件は「dogfooding を agent の自己評価だけで完了扱いしない」ことを明示的な
+    非目標としているので、**実際の開発者による dogfooding 記録なしに #401 を
+    完了とみなしてはならない**。
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

@@ -22,6 +22,8 @@ import type {
   WorkspaceOut, WorkspaceDetailOut, WorkspaceContextItemOut,
   WorkspaceContextPack, WorkspaceAgentTurnOut, WorkspaceProposalOut,
   WorkspaceProposalDraftOut,
+  EvolutionNodesListOut, EvolutionNodeSummary, EvolutionNodeProjectionOut,
+  EvolutionNodeEventsOut, EvolutionNodeTransitionOut, EvolutionMaturityState,
   InterviewSessionOut, InterviewSessionDetailOut, InterviewContextPack,
   InterviewCapabilityGraphOut, InterviewConfirmUnderstandingRequest,
   InterviewDialogueTurnOut, InterviewProposalDecisionOut,
@@ -3667,6 +3669,72 @@ export function useCreateVerificationConcept(sessionId: number | null) {
       }),
     onSuccess: () => {
       _invalidatePurposeVerification(qc, sessionId);
+    },
+  });
+}
+
+// --- Evolution Node (Epic #394 Phase 1, Issue #396) -------------------------
+
+export function useEvolutionNodes() {
+  const systemId = getSystemId();
+  return useQuery<EvolutionNodesListOut>({
+    queryKey: ["evolution-nodes", systemId],
+    queryFn: () => api.get<EvolutionNodesListOut>("/evolution-nodes"),
+  });
+}
+
+export function useEvolutionNode(nodeId: number | null) {
+  const systemId = getSystemId();
+  return useQuery<EvolutionNodeProjectionOut>({
+    queryKey: ["evolution-node", systemId, nodeId],
+    queryFn: () => api.get<EvolutionNodeProjectionOut>(`/evolution-nodes/${nodeId}`),
+    enabled: nodeId !== null,
+  });
+}
+
+export function useEvolutionNodeEvents(nodeId: number | null) {
+  const systemId = getSystemId();
+  return useQuery<EvolutionNodeEventsOut>({
+    queryKey: ["evolution-node-events", systemId, nodeId],
+    queryFn: () => api.get<EvolutionNodeEventsOut>(`/evolution-nodes/${nodeId}/events`),
+    enabled: nodeId !== null,
+  });
+}
+
+export function useCreateEvolutionNode() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { node_key: string; display_name?: string }) =>
+      api.post<EvolutionNodeSummary>("/evolution-nodes", body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["evolution-nodes"] });
+    },
+  });
+}
+
+/** Requests a maturity transition.
+ *
+ * A REJECTED transition arrives as an `ApiError` whose `code` is the server's
+ * own finite rejection code; the caller shows that code plus the server's
+ * message. The client never decides whether a transition is legal -- it has
+ * no copy of the transition table, on purpose. */
+export function useTransitionEvolutionNode(nodeId: number | null) {
+  const qc = useQueryClient();
+  const systemId = getSystemId();
+  return useMutation({
+    mutationFn: (body: {
+      to_state: EvolutionMaturityState;
+      decision_method: "manual" | "deterministic" | "reasoning_llm";
+      reason?: string;
+      evidence_refs?: string[];
+      idempotency_key?: string;
+    }) => api.post<EvolutionNodeTransitionOut>(
+      `/evolution-nodes/${nodeId}/transitions`, body,
+    ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["evolution-nodes"] });
+      qc.invalidateQueries({ queryKey: ["evolution-node", systemId, nodeId] });
+      qc.invalidateQueries({ queryKey: ["evolution-node-events", systemId, nodeId] });
     },
   });
 }

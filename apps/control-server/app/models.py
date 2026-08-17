@@ -8632,3 +8632,804 @@ class PurposeOutcomeUnavailableRequest(BaseModel):
     source: PurposeOutcomeEvidenceSource
     state: Literal["not_observed", "not_computed"]
     reason: str
+
+
+# ---------------------------------------------------------------------------
+# Evolution Node (Epic #394 Phase 1, Issue #396)
+#
+# The finite vocabularies below are mirrored from `app/evolution_node.py`,
+# which owns them. They are re-declared here as `Literal` aliases rather than
+# imported so FastAPI puts a real enum in the OpenAPI schema and the
+# Dashboard's TypeScript unions cannot silently drift from the server -- the
+# same discipline `PurposeElementKind` and the #351 Brief vocabularies use.
+# `test_evolution_node_api.py` asserts the two definitions stay identical.
+# ---------------------------------------------------------------------------
+
+EvolutionMaturityState = Literal[
+    "exploring", "validating", "established", "monitoring", "reopened", "suspended"
+]
+EvolutionImplementationModality = Literal[
+    "reasoning_llm", "lm_program", "retrieval", "router", "small_model",
+    "rule", "deterministic_code", "workflow", "manual", "hybrid",
+]
+EvolutionLinkKind = Literal[
+    "component", "probe_point", "cell_binding", "capability", "flow",
+    "purpose_element", "feature",
+]
+EvolutionSideEffectClass = Literal[
+    "pure", "read_only", "local_write", "external_write", "irreversible"
+]
+EvolutionTrustBoundary = Literal[
+    "internal", "external_input", "external_output", "third_party"
+]
+EvolutionActorKind = Literal["developer", "system"]
+
+
+class EvolutionNodeCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_key: str
+    display_name: str = ""
+
+
+class EvolutionNodeVersionCreateIn(BaseModel):
+    """The Node's CONTRACT -- what it promises, not how it currently keeps
+    that promise (ADR-3). `evaluation_policy_refs` are refs, never inline
+    criteria: Phase 2 (#397) owns the three evaluation contracts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mission: str
+    input_contract: Optional[Dict[str, Any]] = None
+    output_contract: Optional[Dict[str, Any]] = None
+    side_effect_class: EvolutionSideEffectClass
+    trust_boundary: EvolutionTrustBoundary
+    scope: str = ""
+    out_of_scope: str = ""
+    establishment_criteria: List[str] = Field(default_factory=list)
+    reopen_criteria: List[str] = Field(default_factory=list)
+    evaluation_policy_refs: List[str] = Field(default_factory=list)
+
+
+class EvolutionNodeImplementationCreateIn(BaseModel):
+    """How the Node currently keeps its contract's promise (ADR-3).
+
+    Provider/model names belong inside `config` / `provenance` and never in a
+    field that participates in the implementation's identity -- the same rule
+    #298's Agent Role Card applies to model aliases. `modality` is the axis
+    that makes an LLM implementation and a rule implementation of the SAME
+    contract comparable.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_version_id: int
+    modality: EvolutionImplementationModality
+    config: Optional[Dict[str, Any]] = None
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    environment_ref: Optional[str] = None
+    provenance: Optional[Dict[str, Any]] = None
+
+
+class EvolutionNodeLinkCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    link_kind: EvolutionLinkKind
+    target_ref: str
+    target_row_id: Optional[int] = None
+    note: str = ""
+
+
+class EvolutionNodeStablePinIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    implementation_id: int
+    reason: str = ""
+
+
+class EvolutionNodeTransitionIn(BaseModel):
+    """A maturity transition request.
+
+    `decision_method` is deliberately NOT defaulted to `manual`: which of the
+    three it is decides whether a human stands behind this transition, and a
+    default would let a caller record a human decision by omission. The
+    domain layer rejects `reasoning_llm` outright -- an LLM never emits a
+    canonical state (Principle 6).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    to_state: EvolutionMaturityState
+    decision_method: Literal["deterministic", "reasoning_llm", "manual"]
+    actor: Optional[str] = None
+    actor_kind: EvolutionActorKind = "developer"
+    reason: str = ""
+    reason_code: str = ""
+    evidence_refs: List[str] = Field(default_factory=list)
+    idempotency_key: str = ""
+
+
+class EvolutionNodeSummaryOut(BaseModel):
+    id: int
+    system_id: int
+    node_key: str
+    display_name: str
+    maturity: EvolutionMaturityState
+    current_version_id: Optional[int] = None
+    current_implementation_id: Optional[int] = None
+    stable_implementation_id: Optional[int] = None
+    rollback_implementation_id: Optional[int] = None
+    monitoring_contract_ref: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class EvolutionNodesListOut(BaseModel):
+    nodes: List[EvolutionNodeSummaryOut]
+
+
+class EvolutionNodeVersionOut(BaseModel):
+    id: int
+    version_number: int
+    mission: str
+    scope: str
+    out_of_scope: str
+    input_contract: Dict[str, Any]
+    output_contract: Dict[str, Any]
+    side_effect_class: str
+    trust_boundary: str
+    establishment_criteria: List[str]
+    reopen_criteria: List[str]
+    evaluation_policy_refs: List[str]
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class EvolutionNodeImplementationOut(BaseModel):
+    id: int
+    implementation_number: int
+    node_version_id: int
+    modality: str
+    config: Dict[str, Any]
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    environment_ref: Optional[str] = None
+    provenance: Dict[str, Any]
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class EvolutionNodeLinkOut(BaseModel):
+    id: int
+    link_kind: str
+    target_ref: str
+    target_row_id: Optional[int] = None
+    note: str
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class EvolutionNodeEventOut(BaseModel):
+    id: int
+    event_kind: str
+    from_state: Optional[str] = None
+    to_state: Optional[str] = None
+    from_version_id: Optional[int] = None
+    to_version_id: Optional[int] = None
+    from_implementation_id: Optional[int] = None
+    to_implementation_id: Optional[int] = None
+    actor: Optional[str] = None
+    actor_kind: str
+    decision_method: str
+    reason_code: str
+    reason: str
+    # Named `evidence` (not `evidence_refs`) to match the domain layer's own
+    # event document: the stored value is a list of refs, and renaming it at
+    # the boundary would leave the API and the projection describing the
+    # same column under two names.
+    evidence: List[str]
+    # NULL for a request that opted out of idempotency entirely. An empty
+    # string is deliberately not used: the partial unique index excludes it,
+    # so "no key" and "the empty key" are not the same fact.
+    idempotency_key: Optional[str] = None
+    created_at: float
+
+
+class EvolutionNodeEventsOut(BaseModel):
+    node_id: int
+    events: List[EvolutionNodeEventOut]
+
+
+class EvolutionNodeProjectionOut(BaseModel):
+    """The canonical Node document.
+
+    `maturity`, `improvement_status` and `policy_mode` are three INDEPENDENT
+    axes and no consumer may combine them into one label (ADR-6). A `null`
+    on either of the latter two means "nothing of that kind is linked to
+    this Node" -- never "none is in progress". The fourth axis
+    (`workflow_phase`) is deliberately absent from the document rather than
+    `null`; Phase 6 (#401) wires it.
+
+    `availability[k] is False` means that block could not be read at all.
+    Paired with a `null` value it is a different fact from a `null` with
+    `availability[k] is True`, which is a genuine absence (#380).
+    """
+
+    schema_version: str
+    system_id: int
+    node_id: int
+    node_key: str
+    display_name: str
+    maturity: EvolutionMaturityState
+    current_version: Optional[EvolutionNodeVersionOut] = None
+    current_implementation: Optional[EvolutionNodeImplementationOut] = None
+    stable_implementation: Optional[EvolutionNodeImplementationOut] = None
+    rollback_implementation: Optional[EvolutionNodeImplementationOut] = None
+    links: List[EvolutionNodeLinkOut]
+    events: List[EvolutionNodeEventOut]
+    improvement_status: Optional[str] = None
+    policy_mode: Optional[str] = None
+    availability: Dict[str, bool]
+    updated_at: float
+
+
+class EvolutionNodeLegacyProjectionOut(BaseModel):
+    """ADR-8 compatibility view. Not a second canonical projection."""
+
+    schema_version: str
+    compatibility_projection: bool
+    system_id: int
+    node_id: int
+    node_key: str
+    component_id: Optional[str] = None
+    probe_point_ref: Optional[str] = None
+    cell_id: Optional[str] = None
+    maturity: EvolutionMaturityState
+
+
+class EvolutionNodeTransitionOut(BaseModel):
+    """`applied` and `duplicate` are separate booleans on purpose: a retry
+    that changed nothing is a success, not a failure, and the caller has to
+    be able to tell the two apart. A REJECTED transition never reaches this
+    model -- it is a 422 carrying the domain layer's own finite reason code.
+    """
+
+    applied: bool
+    duplicate: bool
+    maturity: EvolutionMaturityState
+    event: Optional[EvolutionNodeEventOut] = None
+
+
+# ---------------------------------------------------------------------------
+# Design Studio (Epic #394 Phase 2, Issue #397)
+#
+# Note what is NOT here: there is no score, weight, or total field on any
+# evaluation model. ADR-7 forbids compositing the three levels into one
+# number, and the reliable way to enforce that is to give the number nowhere
+# to live -- in the schema as well as in the table.
+# ---------------------------------------------------------------------------
+
+EvolutionEvaluationLevel = Literal["node", "flow_capability", "ux_outcome"]
+DecompositionDecisionKind = Literal["adopted", "held", "rejected"]
+
+
+class DecompositionProposeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_summary: str
+    context: str = ""
+    session_id: Optional[int] = None
+    capability_ref: str = ""
+    flow_ref: str = ""
+
+
+class DecompositionCandidateOut(BaseModel):
+    id: int
+    proposal_id: int
+    candidate_key: str
+    summary: str
+    rationale: str
+    nodes: List[Dict[str, Any]]
+    open_questions: List[str]
+    decision: Literal["pending", "adopted", "held", "rejected"]
+    decision_note: str
+    decided_by: Optional[str] = None
+    decided_at: Optional[float] = None
+    adopted_node_ids: List[int]
+    created_at: float
+
+
+class DecompositionProposalOut(BaseModel):
+    id: int
+    system_id: int
+    session_id: Optional[int] = None
+    scope_summary: str
+    capability_ref: str
+    flow_ref: str
+    snapshot_id: Optional[int] = None
+    intelligence_run_id: Optional[int] = None
+    status: Literal["proposed", "failed"]
+    error_details: str
+    is_mock: bool
+    created_by: Optional[str] = None
+    created_at: float
+    candidates: List[DecompositionCandidateOut]
+
+
+class DecompositionDecisionIn(BaseModel):
+    """`pending` is deliberately not accepted: it is the initial state, not a
+    decision a developer can record."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: DecompositionDecisionKind
+    note: str = ""
+
+
+class DecompositionDecisionOut(BaseModel):
+    candidate: DecompositionCandidateOut
+    created_nodes: List[Dict[str, Any]]
+
+
+class EvaluationCriterionIn(BaseModel):
+    """One thing that must be REACHED before establishing.
+
+    Separate from a floor on purpose (ADR-7): the two are consumed at
+    different moments, and a single list with a flag makes "we met the bar"
+    and "we did not regress" indistinguishable in storage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    measure: str
+    target: str = ""
+    note: str = ""
+
+
+class EvaluationFloorIn(BaseModel):
+    """One property that must not REGRESS. Never traded off against a
+    criterion -- there is no weight field to trade with."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    measure: str
+    minimum: str = ""
+    note: str = ""
+
+
+class EvaluationUnmeasuredIn(BaseModel):
+    """Something this contract cannot currently measure, WITH its reason.
+
+    Recorded rather than omitted: an omitted criterion reads as "nothing to
+    check here", which is the #391 rule about never inferring an Outcome."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    reason: str
+
+
+class EvaluationPolicyCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    policy_key: str
+    level: EvolutionEvaluationLevel
+    title: str = ""
+    subject_ref: str = ""
+    criteria: List[EvaluationCriterionIn] = Field(default_factory=list)
+    floors: List[EvaluationFloorIn] = Field(default_factory=list)
+    unmeasured: List[EvaluationUnmeasuredIn] = Field(default_factory=list)
+
+
+class EvaluationPolicyOut(BaseModel):
+    id: int
+    policy_key: str
+    level: EvolutionEvaluationLevel
+    version_number: int
+    title: str
+    subject_ref: str
+    criteria: List[Dict[str, Any]]
+    floors: List[Dict[str, Any]]
+    unmeasured: List[Dict[str, Any]]
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class EvaluationPoliciesOut(BaseModel):
+    """Grouped by level, never merged into one list -- the ADR-7 separation
+    made structural rather than only documented."""
+
+    node: List[EvaluationPolicyOut]
+    flow_capability: List[EvaluationPolicyOut]
+    ux_outcome: List[EvaluationPolicyOut]
+
+
+class NodeLineageRelationOut(BaseModel):
+    """One design relation.
+
+    `relation_status` (was this relation proposed by AI or confirmed by the
+    developer) and `element_state` (is the Purpose element it points at
+    itself confirmed) are two independent axes. A confirmed relation to an
+    unconfirmed element is a real and common state, and collapsing the two
+    would hide it."""
+
+    link_id: int
+    link_kind: str
+    target_ref: str
+    target_name: Optional[str] = None
+    relation_status: Optional[str] = None
+    relation_decision_method: str
+    element_state: str
+    note: str
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class NodeLineageOut(BaseModel):
+    system_id: int
+    node_id: int
+    node_key: str
+    maturity: str
+    relations: List[NodeLineageRelationOut]
+    confirmed_relation_count: int
+    proposed_relation_count: int
+    purpose_frame_supplied: bool
+
+
+class NodeDesignHandoffCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_ids: List[int]
+    evaluation_policy_ids: List[int] = Field(default_factory=list)
+    dataset_refs: List[str] = Field(default_factory=list)
+    probe_plan_id: Optional[int] = None
+    establishment_criteria_draft: List[str] = Field(default_factory=list)
+    reopen_criteria_draft: List[str] = Field(default_factory=list)
+    exploration_brief: str = ""
+
+
+class NodeDesignHandoffOut(BaseModel):
+    """References are resolved at READ time, so a Node deleted or a policy
+    superseded after assembly shows up as it actually is now."""
+
+    id: int
+    system_id: int
+    session_id: Optional[int] = None
+    nodes: List[Dict[str, Any]]
+    evaluation_policies: List[Dict[str, Any]]
+    dataset_refs: List[str]
+    probe_plan_id: Optional[int] = None
+    establishment_criteria_draft: List[str]
+    reopen_criteria_draft: List[str]
+    exploration_brief: str
+    assembly_state: Literal["complete", "incomplete"]
+    missing_refs: List[str]
+    created_by: Optional[str] = None
+    created_at: float
+
+
+# ---------------------------------------------------------------------------
+# Exploration Workbench (Epic #394 Phase 3, Issue #398)
+#
+# Note what is absent, deliberately: no source, patch, or command field on any
+# variant model. A variant references an implementation and the existing run
+# that executed it. Accepting executable content at this boundary would let a
+# caller run code outside the pinned-snapshot, network-off sandbox that Replay
+# and Experiments enforce (Principle 8).
+#
+# Also absent: any score, weight, or total. #398 forbids compositing quality /
+# latency / cost / safety, and the reliable enforcement is to give the
+# combined number nowhere to live -- in the schema as well as in the table.
+# ---------------------------------------------------------------------------
+
+ExplorationDimension = Literal[
+    "output_quality", "error_rate", "latency", "cost", "resource", "safety", "coverage"
+]
+ExplorationValueState = Literal[
+    "measured", "not_applicable", "not_measured", "unsupported"
+]
+ExplorationExecutionState = Literal[
+    "not_executed", "executed", "not_executable", "unsupported"
+]
+ExplorationRefKind = Literal["replay_run", "replay_variant", "experiment"]
+ExplorationGenerator = Literal["manual", "reasoning_llm", "existing_implementation"]
+ExplorationDatasetKind = Literal["replay_set", "golden_set", "edge_cases", "mixed"]
+ExplorationVerdict = Literal[
+    "better", "worse", "equal", "incomparable", "coverage_mismatch"
+]
+
+
+class ExplorationRunCreateIn(BaseModel):
+    """Everything held CONSTANT across the run's variants lives here, so two
+    variants cannot have been measured against different datasets while still
+    looking like a comparison."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: int
+    node_version_id: int
+    objective: str = ""
+    dataset_kind: ExplorationDatasetKind = "replay_set"
+    dataset_ref: str = ""
+    snapshot_id: Optional[int] = None
+    commit_sha: str = ""
+    environment_ref: str = ""
+    evaluation_policy_ids: List[int] = Field(default_factory=list)
+    handoff_id: Optional[int] = None
+
+
+class ExplorationVariantCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    variant_key: str
+    modality: EvolutionImplementationModality
+    label: str = ""
+    is_baseline: bool = False
+    implementation_id: Optional[int] = None
+    config: Dict[str, Any] = Field(default_factory=dict)
+    provenance: Dict[str, Any] = Field(default_factory=dict)
+    generator: ExplorationGenerator = "manual"
+    applicability_envelope: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExplorationExecutionIn(BaseModel):
+    """`not_executable` and `unsupported` are first-class outcomes here, not
+    failures: a rule variant that cannot express a case has not lost on it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution_state: ExplorationExecutionState
+    execution_ref_kind: Optional[ExplorationRefKind] = None
+    execution_ref_id: Optional[int] = None
+    note: str = ""
+
+
+class ExplorationMeasurementIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dimension: ExplorationDimension
+    metric_name: str = ""
+    value_state: ExplorationValueState = "measured"
+    numeric_value: Optional[float] = None
+    unit: str = ""
+    covered_case_count: Optional[int] = None
+    total_case_count: Optional[int] = None
+    source: Literal["deterministic", "reasoning_llm", "manual"] = "deterministic"
+    note: str = ""
+
+
+class ExplorationMeasurementOut(BaseModel):
+    id: int
+    dimension: ExplorationDimension
+    metric_name: str
+    value_state: ExplorationValueState
+    numeric_value: Optional[float] = None
+    unit: str
+    covered_case_count: Optional[int] = None
+    total_case_count: Optional[int] = None
+    source: str
+    note: str
+
+
+class ExplorationVariantOut(BaseModel):
+    id: int
+    variant_key: str
+    label: str
+    is_baseline: bool
+    modality: EvolutionImplementationModality
+    implementation_id: Optional[int] = None
+    config: Dict[str, Any]
+    provenance: Dict[str, Any]
+    generator: ExplorationGenerator
+    applicability_envelope: Dict[str, Any]
+    execution_state: ExplorationExecutionState
+    execution_ref_kind: Optional[ExplorationRefKind] = None
+    execution_ref_id: Optional[int] = None
+    execution_note: str
+    created_by: Optional[str] = None
+    created_at: float
+    measurements: List[ExplorationMeasurementOut]
+
+
+class ExplorationComparisonOut(BaseModel):
+    """One dimension of one variant against the baseline.
+
+    `incomparable` and `coverage_mismatch` are verdicts, not errors. They are
+    what stops "this variant has no token cost" from displaying identically to
+    "this variant's token cost is zero"."""
+
+    dimension: ExplorationDimension
+    metric_name: str
+    verdict: ExplorationVerdict
+    baseline_state: ExplorationValueState
+    variant_state: ExplorationValueState
+    baseline_value: Optional[float] = None
+    variant_value: Optional[float] = None
+    delta: Optional[float] = None
+    baseline_coverage: Optional[List[int]] = None
+    variant_coverage: Optional[List[int]] = None
+    reason: str
+
+
+class ExplorationRunOut(BaseModel):
+    """The whole comparison. Carries no ranking and no overall verdict --
+    which dimension matters is the developer's judgement, and at
+    establishment time it is #399's gate, not this projection's."""
+
+    id: int
+    system_id: int
+    node_id: int
+    node_version_id: int
+    handoff_id: Optional[int] = None
+    objective: str
+    dataset_kind: ExplorationDatasetKind
+    dataset_ref: str
+    snapshot_id: Optional[int] = None
+    commit_sha: str
+    environment_ref: str
+    evaluation_policy_ids: List[int]
+    status: Literal["open", "completed", "abandoned"]
+    conclusion_note: str
+    baseline_variant_id: Optional[int] = None
+    comparable: bool
+    variants: List[ExplorationVariantOut]
+    comparisons: Dict[str, List[ExplorationComparisonOut]]
+    created_by: Optional[str] = None
+    created_at: float
+    completed_at: Optional[float] = None
+
+
+class ExplorationRunCompleteIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conclusion_note: str = ""
+
+
+class ExplorationRankingEntryOut(BaseModel):
+    variant_id: int
+    variant_key: str
+    modality: EvolutionImplementationModality
+    value: Optional[float] = None
+    value_state: ExplorationValueState
+
+
+class ExplorationRankingOut(BaseModel):
+    """Ranked by ONE named dimension. There is no overall ranking endpoint:
+    a caller that wants an order must say what it is ordering by, so a latency
+    ranking can never be presented as "the best variant".
+
+    `unranked` is a separate group rather than the tail of `ranked` --
+    sorting an unmeasured variant last would read as "worst"."""
+
+    dimension: ExplorationDimension
+    ranked: List[ExplorationRankingEntryOut]
+    unranked: List[ExplorationRankingEntryOut]
+
+
+# ---------------------------------------------------------------------------
+# Stabilization Evidence Package (Epic #394 Phase 4, Issue #399)
+#
+# `approved_by` is never a request field: establishment is a named human's
+# decision, taken from the authenticated principal at the route (#337's
+# provenance rule). And as in Phase 3, there is no score anywhere -- every
+# criterion and floor is judged individually (ADR-7).
+# ---------------------------------------------------------------------------
+
+StabilizationEvidenceLevel = Literal["node", "flow_capability", "ux_outcome"]
+StabilizationEvidenceKind = Literal[
+    "criterion", "floor", "downstream_impact", "outcome", "stability"
+]
+StabilizationVerdict = Literal[
+    "met", "not_met", "held", "violated", "unmeasured", "not_applicable"
+]
+StabilizationRefKind = Literal[
+    "exploration_run", "exploration_variant", "replay_run", "experiment",
+    "evaluation_policy",
+]
+StabilizationStatus = Literal[
+    "draft", "under_review", "approved", "rejected", "superseded"
+]
+
+
+class StabilizationPackageCreateIn(BaseModel):
+    """The node version, baseline and rollback target are deliberately NOT
+    accepted here -- they are read from the Node's own current state, because
+    letting a caller assert them would let a package claim a rollback target
+    the Node does not have."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: int
+    candidate_implementation_id: int
+    exploration_run_id: Optional[int] = None
+    applicability_envelope: Dict[str, Any] = Field(default_factory=dict)
+    known_limitations: List[str] = Field(default_factory=list)
+    residual_risks: List[str] = Field(default_factory=list)
+    required_case_count: int = 0
+    stability_window_seconds: float = 0.0
+    observed_case_count: Optional[int] = None
+    observed_window_seconds: Optional[float] = None
+    outcome_unmeasured_reason: str = ""
+    rollback_plan: str = ""
+
+
+class StabilizationEvidenceIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_level: StabilizationEvidenceLevel
+    evidence_kind: StabilizationEvidenceKind
+    name: str
+    verdict: StabilizationVerdict
+    ref_kind: Optional[StabilizationRefKind] = None
+    ref_id: Optional[int] = None
+    evaluation_policy_id: Optional[int] = None
+    detail: str = ""
+    is_mock: bool = False
+    source: Literal["deterministic", "reasoning_llm", "manual"] = "deterministic"
+
+
+class StabilizationEvidenceOut(BaseModel):
+    id: int
+    evidence_kind: StabilizationEvidenceKind
+    name: str
+    verdict: StabilizationVerdict
+    ref_kind: Optional[StabilizationRefKind] = None
+    ref_id: Optional[int] = None
+    evaluation_policy_id: Optional[int] = None
+    detail: str
+    is_mock: bool
+    source: str
+
+
+class StabilizationGateOut(BaseModel):
+    """Recomputed on every read, never stored: a stored verdict drifts from
+    the evidence it describes."""
+
+    allowed: bool
+    reason_code: str
+    message: str
+    failing_evidence: List[str]
+
+
+class StabilizationPackageOut(BaseModel):
+    id: int
+    system_id: int
+    node_id: int
+    node_version_id: int
+    candidate_implementation_id: int
+    baseline_implementation_id: Optional[int] = None
+    rollback_implementation_id: Optional[int] = None
+    rollback_plan: str
+    exploration_run_id: Optional[int] = None
+    applicability_envelope: Dict[str, Any]
+    known_limitations: List[str]
+    residual_risks: List[str]
+    required_case_count: int
+    observed_case_count: Optional[int] = None
+    stability_window_seconds: float
+    observed_window_seconds: Optional[float] = None
+    outcome_unmeasured_reason: str
+    status: StabilizationStatus
+    approved_by: Optional[str] = None
+    approved_at: Optional[float] = None
+    decision_note: str
+    # Grouped by level, never merged: a Node-level win is not evidence that
+    # the Flow it sits in improved (ADR-7).
+    evidence: Dict[str, List[StabilizationEvidenceOut]]
+    gate: StabilizationGateOut
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class StabilizationDecisionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = ""

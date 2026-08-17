@@ -4788,6 +4788,954 @@ CREATE INDEX IF NOT EXISTS idx_purpose_outcome_criterion_session
 
 CREATE INDEX IF NOT EXISTS idx_purpose_outcome_criterion_target
     ON purpose_outcome_criterion (system_id, session_id, target_kind, target_id);
+
+-- ---------------------------------------------------------------------------
+-- Evolution Node Fabric (Epic #394 Phase 1, Issue #396). See app/evolution_node.py
+-- for the pure finite-transition evaluator and the persistence/projection
+-- layer built on these five tables, and the "Evolution Node" section of
+-- docs/evolutionary-pipeline.md for the full design.
+--
+-- An Evolution Node is a NEW canonical entity, deliberately NOT a version-up
+-- of the Probe Cell (cell_definitions/cell_bindings, Issue #297/#299): the
+-- Cell owns the EXECUTION role (Role Card, orchestration, quality sampling);
+-- the Node owns the UNIT OF PROCESSING THAT EVOLVES -- its business I/O
+-- contract, its implementation modality, its maturity, its establishment/
+-- reopen criteria, and its rollback pin. A Node LINKS to a Cell Binding (and
+-- to a Component, a Probe Point, ...) through evolution_node_link below; it
+-- never duplicates or supersedes cell_bindings/cell_definitions rows.
+--
+-- evolution_node: one row per Node. Identity is (system_id, node_key) --
+-- node_key is a DEVELOPER-SUPPLIED stable slug, deliberately never derived
+-- from component_id: a Node is designed before instrumentation exists
+-- (Phase 2 of this Epic), may span several Components over its life, and
+-- must survive a Component rename without losing its own identity. The four
+-- *_implementation_id / current_version_id pointers are denormalized
+-- "current state" columns kept in sync by app/evolution_node.py's
+-- persistence functions inside the same transaction as the append-only row
+-- they point at (create_node/add_version/add_implementation/
+-- pin_stable_implementation) -- they are never written by a bare UPDATE
+-- outside that module, which is what keeps them from drifting out of sync
+-- with the append-only history in evolution_node_version/_implementation.
+-- monitoring_contract_ref is nullable and unused until Issue #400 (this
+-- Epic's Phase 5) wires a real monitoring contract; a NULL here is "no
+-- contract wired yet", never "monitoring failed".
+CREATE TABLE IF NOT EXISTS evolution_node (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    node_key                    TEXT NOT NULL,
+    display_name                TEXT NOT NULL DEFAULT '',
+    maturity                    TEXT NOT NULL DEFAULT 'exploring'
+                                    CHECK (maturity IN
+                                        ('exploring', 'validating', 'established',
+                                         'monitoring', 'reopened', 'suspended')),
+    current_version_id          INTEGER,
+    current_implementation_id   INTEGER,
+    stable_implementation_id    INTEGER,
+    rollback_implementation_id  INTEGER,
+    monitoring_contract_ref     TEXT,
+    schema_version               TEXT NOT NULL DEFAULT 'evolution-node-v1',
+    created_at                  REAL NOT NULL,
+    updated_at                  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (current_version_id) REFERENCES evolution_node_version (id) ON DELETE SET NULL,
+    FOREIGN KEY (current_implementation_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    FOREIGN KEY (stable_implementation_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    FOREIGN KEY (rollback_implementation_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    UNIQUE (system_id, node_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_node_system
+    ON evolution_node (system_id, id DESC);
+
+-- evolution_node_version: the Node's CONTRACT -- its business I/O shape, its
+-- side-effect/trust classification, and the criteria that decide when it may
+-- move to 'established'/'monitoring' or must move to 'reopened'. Append-only,
+-- the same discipline as cell_bindings: a correction inserts a NEW row with
+-- version_number = max+1 and sets the prior current row's superseded_by_id;
+-- app/evolution_node.py never UPDATEs mission/input_contract/etc in place,
+-- because a version is what an establishment/reopen decision was made
+-- AGAINST and that history must survive later edits.
+--
+-- mission/scope/out_of_scope are free-text (not JSON) -- they are read as
+-- prose, unlike input_contract/output_contract/establishment_criteria/
+-- reopen_criteria/evaluation_policy_refs, which ARE TEXT JSON because each is
+-- a structured list/object the pure evaluator and the projection need to
+-- walk programmatically. decision_method records who AUTHORED this contract
+-- version (deterministic/reasoning_llm/manual are all legitimate HERE,
+-- unlike a maturity transition -- see evaluate_transition's
+-- llm_state_not_allowed check in app/evolution_node.py, which is what keeps
+-- an LLM-authored contract DRAFT from ever becoming a maturity decision by
+-- itself).
+CREATE TABLE IF NOT EXISTS evolution_node_version (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id                     INTEGER NOT NULL,
+    system_id                   INTEGER NOT NULL,
+    version_number              INTEGER NOT NULL,
+    mission                     TEXT NOT NULL DEFAULT '',
+    scope                       TEXT NOT NULL DEFAULT '',
+    out_of_scope                TEXT NOT NULL DEFAULT '',
+    input_contract               TEXT NOT NULL DEFAULT '{}',
+    output_contract              TEXT NOT NULL DEFAULT '{}',
+    side_effect_class            TEXT NOT NULL
+                                    CHECK (side_effect_class IN
+                                        ('pure', 'read_only', 'local_write',
+                                         'external_write', 'irreversible')),
+    trust_boundary                TEXT NOT NULL
+                                    CHECK (trust_boundary IN
+                                        ('internal', 'external_input',
+                                         'external_output', 'third_party')),
+    establishment_criteria       TEXT NOT NULL DEFAULT '[]',
+    reopen_criteria               TEXT NOT NULL DEFAULT '[]',
+    evaluation_policy_refs        TEXT NOT NULL DEFAULT '[]',
+    decision_method               TEXT NOT NULL DEFAULT 'manual'
+                                    CHECK (decision_method IN
+                                        ('deterministic', 'reasoning_llm', 'manual')),
+    created_by                    TEXT,
+    created_at                    REAL NOT NULL,
+    superseded_by_id              INTEGER,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES evolution_node_version (id) ON DELETE SET NULL,
+    UNIQUE (node_id, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_node_version_node
+    ON evolution_node_version (node_id, version_number DESC);
+
+-- evolution_node_implementation: HOW the Node currently keeps its contract's
+-- promise. Append-only, same discipline as evolution_node_version --
+-- swapping implementations (e.g. moving from a reasoning_llm draft to a
+-- deterministic_code rewrite) inserts a new row rather than mutating the
+-- old one, because the establishment/monitoring history needs to say which
+-- exact implementation the evidence was gathered against.
+--
+-- node_version_id records which CONTRACT this implementation claims to
+-- satisfy; app/evolution_node.py's stale_implementation transition check
+-- compares it against the Node's current_version_id, so a contract edit
+-- that leaves an old implementation behind is caught structurally rather
+-- than silently let through. snapshot_id is nullable and ON DELETE SET NULL
+-- (not RESTRICT): a deleted repository snapshot must not block deleting
+-- unrelated snapshot history, and losing the snapshot pointer here still
+-- leaves commit_sha as the durable provenance fact (Principle 5).
+--
+-- config_json / provenance_json are the ONLY place a real provider/model
+-- name may appear for this implementation (Issue #298's Role Card
+-- model-alias rule, applied here): no other column on this table may
+-- participate in identity or a CHECK based on a literal provider/model
+-- name, so switching providers is a config-blob edit, never a schema or
+-- constraint change.
+CREATE TABLE IF NOT EXISTS evolution_node_implementation (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id               INTEGER NOT NULL,
+    system_id             INTEGER NOT NULL,
+    implementation_number INTEGER NOT NULL,
+    node_version_id       INTEGER NOT NULL,
+    modality              TEXT NOT NULL
+                              CHECK (modality IN
+                                  ('reasoning_llm', 'lm_program', 'retrieval', 'router',
+                                   'small_model', 'rule', 'deterministic_code', 'workflow',
+                                   'manual', 'hybrid')),
+    config_json           TEXT NOT NULL DEFAULT '{}',
+    snapshot_id            INTEGER,
+    commit_sha             TEXT,
+    environment_ref         TEXT,
+    provenance_json         TEXT NOT NULL DEFAULT '{}',
+    created_by              TEXT,
+    decision_method          TEXT NOT NULL DEFAULT 'manual'
+                                CHECK (decision_method IN
+                                    ('deterministic', 'reasoning_llm', 'manual')),
+    created_at               REAL NOT NULL,
+    superseded_by_id          INTEGER,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_version_id) REFERENCES evolution_node_version (id) ON DELETE RESTRICT,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    UNIQUE (node_id, implementation_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_node_implementation_node
+    ON evolution_node_implementation (node_id, implementation_number DESC);
+
+-- evolution_node_link: append-only links from a Node to an EXISTING asset
+-- (a Component, a Probe Point, a Cell Binding, a Capability, a Flow, a
+-- Purpose Chain element, a Feature). target_ref is always the STABLE STRING
+-- id of the target (a component_id, a stable Capability/Purpose-element id,
+-- ...) so a link keeps meaning even for a target whose row identity is
+-- itself recomputed on every read (the same discipline
+-- purpose_relation_decision uses above); target_row_id is the OPTIONAL row
+-- id for a target that does have one (a probe_points.id, a cell_bindings.id)
+-- and exists purely as a join shortcut -- app/evolution_node.py never trusts
+-- target_row_id alone without also checking target_ref/link_kind, so a
+-- caller cannot point a link at another System's row by id alone. Multiple
+-- concurrent links of the same kind are legitimate (a Node may span more
+-- than one Component), so a new link never automatically supersedes an
+-- older one of the same kind -- superseded_by_id exists for a future
+-- explicit "this link was corrected" operation, deliberately unused by
+-- Phase 1's add_link.
+CREATE TABLE IF NOT EXISTS evolution_node_link (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id           INTEGER NOT NULL,
+    system_id         INTEGER NOT NULL,
+    link_kind         TEXT NOT NULL
+                          CHECK (link_kind IN
+                              ('component', 'probe_point', 'cell_binding', 'capability',
+                               'flow', 'purpose_element', 'feature')),
+    target_ref        TEXT NOT NULL,
+    target_row_id     INTEGER,
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method    TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN
+                              ('deterministic', 'reasoning_llm', 'manual')),
+    created_by         TEXT,
+    created_at         REAL NOT NULL,
+    superseded_by_id   INTEGER,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES evolution_node_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_node_link_lookup
+    ON evolution_node_link (node_id, link_kind, id DESC);
+
+-- evolution_node_event: append-only lineage of everything that happened to a
+-- Node. This is what makes a drifted STORED evolution_node.maturity value
+-- detectable: app/evolution_node.py's fold_events() replays every
+-- event_kind='transition' row in id order and must reproduce the stored
+-- maturity, exactly as ADR-4 (docs/evolutionary-pipeline.md) requires -- a
+-- table that only stored the current maturity would have no way to notice
+-- a bad UPDATE outside the module ever happened.
+--
+-- from_state/to_state are only ever non-NULL together on a 'transition'
+-- event; every other event_kind uses the matching from_*_id/to_*_id pair
+-- instead (version_created -> from_version_id/to_version_id,
+-- implementation_created -> from_implementation_id/to_implementation_id,
+-- stable_pinned/rollback_pinned -> from_implementation_id/
+-- to_implementation_id), so a reader can tell what kind of pointer moved
+-- without inspecting reason_code.
+--
+-- idempotency_key + the partial unique index below are what let
+-- apply_transition() be safely retried: a client that resends the same
+-- transition request after a timeout must get back the SAME event row, not
+-- a second one that silently double-applies a state change the caller
+-- already believes happened. An empty idempotency_key ('') means "the
+-- caller did not ask for idempotency" and is deliberately excluded from the
+-- uniqueness constraint (via the partial index's WHERE clause), since many
+-- legitimate events share that empty value.
+--
+-- evidence_json holds ONLY REFS (never raw evidence content) -- the same
+-- discipline cell_improvements.canary_evidence_json already uses -- so an
+-- audit reader always resolves the evidence against its owning system of
+-- record instead of trusting a copy that could drift from it.
+CREATE TABLE IF NOT EXISTS evolution_node_event (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id                   INTEGER NOT NULL,
+    system_id                 INTEGER NOT NULL,
+    event_kind                TEXT NOT NULL
+                                  CHECK (event_kind IN
+                                      ('transition', 'version_created', 'implementation_created',
+                                       'link_created', 'stable_pinned', 'rollback_pinned')),
+    from_state                TEXT
+                                  CHECK (from_state IS NULL OR from_state IN
+                                      ('exploring', 'validating', 'established',
+                                       'monitoring', 'reopened', 'suspended')),
+    to_state                  TEXT
+                                  CHECK (to_state IS NULL OR to_state IN
+                                      ('exploring', 'validating', 'established',
+                                       'monitoring', 'reopened', 'suspended')),
+    from_version_id           INTEGER,
+    to_version_id             INTEGER,
+    from_implementation_id    INTEGER,
+    to_implementation_id      INTEGER,
+    actor                     TEXT,
+    actor_kind                TEXT NOT NULL DEFAULT 'developer'
+                                  CHECK (actor_kind IN ('developer', 'system')),
+    decision_method            TEXT NOT NULL DEFAULT 'manual'
+                                  CHECK (decision_method IN
+                                      ('deterministic', 'reasoning_llm', 'manual')),
+    reason_code                TEXT NOT NULL DEFAULT '',
+    reason                     TEXT NOT NULL DEFAULT '',
+    evidence_json               TEXT NOT NULL DEFAULT '[]',
+    idempotency_key             TEXT NOT NULL DEFAULT '',
+    created_at                  REAL NOT NULL,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (from_version_id) REFERENCES evolution_node_version (id) ON DELETE SET NULL,
+    FOREIGN KEY (to_version_id) REFERENCES evolution_node_version (id) ON DELETE SET NULL,
+    FOREIGN KEY (from_implementation_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    FOREIGN KEY (to_implementation_id) REFERENCES evolution_node_implementation (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_node_event_node
+    ON evolution_node_event (node_id, id DESC);
+
+-- A retried apply_transition() call must resolve to the SAME event, never a
+-- second row that double-applies the transition -- see the table comment
+-- above. The WHERE clause is what keeps ordinary events (idempotency_key='')
+-- from colliding with each other under this constraint.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_evolution_node_event_idempotency
+    ON evolution_node_event (node_id, idempotency_key) WHERE idempotency_key != '';
+
+-- ---------------------------------------------------------------------------
+-- Design Studio (Epic #394 Phase 2, Issue #397, app/node_design.py)
+--
+-- Phase 2 turns Vision -> Outcome -> Capability -> Flow into testable Node
+-- hypotheses. It creates NO second Vision/Purpose model: the Purpose Frame
+-- stays a projection recomputed by app/purpose_chain.py from existing rows,
+-- and the connection between it and a Node is an ordinary
+-- evolution_node_link (link_kind='purpose_element'/'capability'/'flow')
+-- whose decision_method already distinguishes an AI PROPOSAL
+-- ('reasoning_llm') from a developer's CONFIRMATION ('manual'). No new
+-- column is needed for that distinction, and adding one would create a
+-- second place for the two to disagree.
+--
+-- What Phase 2 does have to persist is the three things that cannot be
+-- re-derived: a decomposition proposal and the developer's decision on each
+-- candidate, the three evaluation contracts, and the handoff bundle.
+-- ---------------------------------------------------------------------------
+
+-- node_decomposition_proposal: ONE reasoning run that proposed one or more
+-- ways to cut a scope into Nodes. Persisting the run (not just its output)
+-- is what makes the proposal auditable under Principle 7 -- intelligence_run_id
+-- resolves to the provider/model/prompt version/schema version that produced
+-- it. A failed run is recorded with status='failed' and produces NO
+-- candidates: a heuristic decomposition must never be saved as if a
+-- reasoning model had produced it (Principle 6).
+CREATE TABLE IF NOT EXISTS node_decomposition_proposal (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    session_id          INTEGER,
+    scope_summary       TEXT NOT NULL DEFAULT '',
+    capability_ref      TEXT NOT NULL DEFAULT '',
+    flow_ref            TEXT NOT NULL DEFAULT '',
+    snapshot_id         INTEGER,
+    intelligence_run_id INTEGER,
+    status              TEXT NOT NULL DEFAULT 'proposed'
+                            CHECK (status IN ('proposed', 'failed')),
+    error_details       TEXT NOT NULL DEFAULT '',
+    is_mock             INTEGER NOT NULL DEFAULT 0,
+    decision_method     TEXT NOT NULL DEFAULT 'reasoning_llm'
+                            CHECK (decision_method = 'reasoning_llm'),
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE SET NULL,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_decomposition_proposal_system
+    ON node_decomposition_proposal (system_id, id DESC);
+
+-- node_decomposition_candidate: ONE way of cutting the scope, as a set of
+-- proposed nodes carried in nodes_json. #397 requires several cuts to be
+-- COMPARED, so a candidate is a whole decomposition, not a single node --
+-- comparing individual nodes across cuts would lose the only thing that
+-- distinguishes the cuts from each other.
+--
+-- `decision` is the developer's judgement and is the ONLY way a candidate
+-- becomes real. `adopted_node_ids_json` records which evolution_node rows
+-- the adoption created, so the audit trail runs proposal -> candidate ->
+-- Node without a System-wide guess about which nodes came from where.
+-- decision_method is CHECKed to 'manual': an LLM proposes cuts, a human
+-- adopts one (Principle 7, and #397's "Node 作成・relation 確認は人間操作").
+-- open_questions_json is kept as its own column rather than folded into the
+-- prose: #397 requires 未確定事項 to be visible, and a paragraph that
+-- mentions uncertainty reads as a completed answer.
+CREATE TABLE IF NOT EXISTS node_decomposition_candidate (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id           INTEGER NOT NULL,
+    system_id             INTEGER NOT NULL,
+    candidate_key         TEXT NOT NULL,
+    summary               TEXT NOT NULL DEFAULT '',
+    rationale             TEXT NOT NULL DEFAULT '',
+    nodes_json            TEXT NOT NULL DEFAULT '[]',
+    open_questions_json   TEXT NOT NULL DEFAULT '[]',
+    decision              TEXT NOT NULL DEFAULT 'pending'
+                              CHECK (decision IN ('pending', 'adopted', 'held', 'rejected')),
+    decision_note         TEXT NOT NULL DEFAULT '',
+    decision_method       TEXT NOT NULL DEFAULT 'manual'
+                              CHECK (decision_method = 'manual'),
+    decided_by            TEXT,
+    decided_at            REAL,
+    adopted_node_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES node_decomposition_proposal (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (proposal_id, candidate_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_decomposition_candidate_proposal
+    ON node_decomposition_candidate (proposal_id, id);
+
+-- evolution_evaluation_policy: the three evaluation contracts of ADR-7, kept
+-- in one table with a finite `level` discriminator rather than three tables,
+-- because they share every structural column and differ only in what they
+-- judge. What must NOT be shared is their MEANING, so:
+--
+-- * there is no score, weight, or total column anywhere in this table. A
+--   single weighted total is what ADR-7 forbids: a latency win must not be
+--   able to pay for a safety regression, and the only way to guarantee that
+--   is to have nowhere to write the combined number.
+-- * `criteria_json` (what must be REACHED to establish) and `floors_json`
+--   (what must not be BROKEN) are separate columns, not one list with a
+--   flag. They are consumed at different moments -- a criterion is read by
+--   the Phase 4 establishment gate, a floor is read there AND by Phase 5
+--   monitoring -- and merging them makes "we met the bar" and "we did not
+--   regress" indistinguishable in storage.
+--
+-- Append-only per (system_id, level, policy_key): a correction inserts a new
+-- version_number and supersedes the prior row, because a policy is what an
+-- establishment decision was made against and must survive later edits.
+CREATE TABLE IF NOT EXISTS evolution_evaluation_policy (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    policy_key       TEXT NOT NULL,
+    level            TEXT NOT NULL
+                         CHECK (level IN ('node', 'flow_capability', 'ux_outcome')),
+    version_number   INTEGER NOT NULL DEFAULT 1,
+    title            TEXT NOT NULL DEFAULT '',
+    subject_ref      TEXT NOT NULL DEFAULT '',
+    criteria_json    TEXT NOT NULL DEFAULT '[]',
+    floors_json      TEXT NOT NULL DEFAULT '[]',
+    unmeasured_json  TEXT NOT NULL DEFAULT '[]',
+    decision_method  TEXT NOT NULL DEFAULT 'manual'
+                         CHECK (decision_method IN ('deterministic', 'reasoning_llm', 'manual')),
+    created_by       TEXT,
+    created_at       REAL NOT NULL,
+    superseded_by_id INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES evolution_evaluation_policy (id) ON DELETE SET NULL,
+    UNIQUE (system_id, policy_key, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_evaluation_policy_lookup
+    ON evolution_evaluation_policy (system_id, level, id DESC);
+
+-- evolution_design_handoff: the bundle Phase 2 hands to Phase 3, assembled
+-- deterministically from rows that already exist. It stores REFERENCES, never
+-- copies: a copied criterion would keep reading as current after the policy
+-- it came from was superseded, which is the staleness class #337/#369 both
+-- had to fix elsewhere. `assembly_state` distinguishes a handoff that is
+-- complete from one assembled while something it points at was missing --
+-- 'incomplete' is a real, readable state, not an error to be smoothed over.
+CREATE TABLE IF NOT EXISTS evolution_design_handoff (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id              INTEGER NOT NULL,
+    session_id             INTEGER,
+    node_ids_json          TEXT NOT NULL DEFAULT '[]',
+    evaluation_policy_ids_json TEXT NOT NULL DEFAULT '[]',
+    dataset_refs_json      TEXT NOT NULL DEFAULT '[]',
+    probe_plan_id          INTEGER,
+    establishment_criteria_draft_json TEXT NOT NULL DEFAULT '[]',
+    reopen_criteria_draft_json TEXT NOT NULL DEFAULT '[]',
+    exploration_brief      TEXT NOT NULL DEFAULT '',
+    assembly_state         TEXT NOT NULL DEFAULT 'complete'
+                               CHECK (assembly_state IN ('complete', 'incomplete')),
+    missing_refs_json      TEXT NOT NULL DEFAULT '[]',
+    decision_method        TEXT NOT NULL DEFAULT 'manual'
+                               CHECK (decision_method = 'manual'),
+    created_by             TEXT,
+    created_at             REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE SET NULL,
+    FOREIGN KEY (probe_plan_id) REFERENCES probe_plans (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_design_handoff_system
+    ON evolution_design_handoff (system_id, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- Exploration Workbench (Epic #394 Phase 3, Issue #398,
+-- app/exploration_workbench.py)
+--
+-- Phase 3's question is NOT "which LLM candidate is best" -- it is "for the
+-- SAME Node contract and the SAME evaluation refs, how do an LLM
+-- implementation, a rule implementation and a deterministic-code
+-- implementation compare". That is only expressible because ADR-3 versioned
+-- the contract separately from the implementation.
+--
+-- This is a RECORD of comparisons, not a second execution engine. Replay
+-- (#242-#246), Experiments (#26) and the offline shadow sandbox stay the
+-- only things that run code; an exploration variant REFERENCES the run that
+-- produced its numbers (`replay_run_id` / `replay_variant_id` /
+-- `experiment_id`) rather than re-implementing execution. That is why there
+-- is no source/patch/command column anywhere here: accepting free-form code
+-- through this API would bypass the pinned-snapshot, pinned-command,
+-- network-off sandbox those features already enforce (Principle 8).
+-- ---------------------------------------------------------------------------
+
+-- exploration_run: one comparison. Everything that must be held constant
+-- across the variants lives HERE, not on the variants, so it is structurally
+-- impossible for two variants in one run to have been measured against
+-- different datasets or different evaluation contracts -- which would make
+-- their numbers incomparable while still looking like a comparison.
+--
+-- `baseline_variant_id` is nullable only between INSERT and the baseline's
+-- own insert; a completed run without one is `invalid`, because a difference
+-- measured against nothing is not a difference.
+CREATE TABLE IF NOT EXISTS exploration_run (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                INTEGER NOT NULL,
+    node_id                  INTEGER NOT NULL,
+    node_version_id          INTEGER NOT NULL,
+    handoff_id               INTEGER,
+    objective                TEXT NOT NULL DEFAULT '',
+    dataset_kind             TEXT NOT NULL DEFAULT 'replay_set'
+                                 CHECK (dataset_kind IN
+                                     ('replay_set', 'golden_set', 'edge_cases', 'mixed')),
+    dataset_ref              TEXT NOT NULL DEFAULT '',
+    snapshot_id              INTEGER,
+    commit_sha               TEXT NOT NULL DEFAULT '',
+    environment_ref          TEXT NOT NULL DEFAULT '',
+    evaluation_policy_ids_json TEXT NOT NULL DEFAULT '[]',
+    baseline_variant_id      INTEGER,
+    status                   TEXT NOT NULL DEFAULT 'open'
+                                 CHECK (status IN ('open', 'completed', 'abandoned')),
+    conclusion_note          TEXT NOT NULL DEFAULT '',
+    created_by               TEXT,
+    created_at               REAL NOT NULL,
+    completed_at             REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_version_id) REFERENCES evolution_node_version (id) ON DELETE CASCADE,
+    FOREIGN KEY (handoff_id) REFERENCES evolution_design_handoff (id) ON DELETE SET NULL,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_exploration_run_node
+    ON exploration_run (system_id, node_id, id DESC);
+
+-- exploration_variant: one implementation measured in that run.
+--
+-- `modality` is the whole point: an exploration is comparable across
+-- modalities only because the contract (evolution_node_version) is the same
+-- row for every variant in the run. Provider/model names live in
+-- `config_json` / `provenance_json`, never in a column that participates in
+-- identity (#298's model-alias rule).
+--
+-- `applicability_envelope_json` records the inputs a variant CLAIMS to
+-- handle. It exists so a win can never be generalised past what was
+-- measured -- #399's establishment gate reads it, and "it worked on the
+-- cases it was built for" is otherwise indistinguishable from "it worked".
+--
+-- `execution_ref_kind` / `execution_ref_id` point at the run that actually
+-- executed this variant. NULL means the variant was registered but never
+-- executed, which is a real state (`not_executed`) and NOT a loss.
+CREATE TABLE IF NOT EXISTS exploration_variant (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                      INTEGER NOT NULL,
+    system_id                   INTEGER NOT NULL,
+    variant_key                 TEXT NOT NULL,
+    label                       TEXT NOT NULL DEFAULT '',
+    is_baseline                 INTEGER NOT NULL DEFAULT 0,
+    modality                    TEXT NOT NULL
+                                    CHECK (modality IN
+                                        ('reasoning_llm', 'lm_program', 'retrieval', 'router',
+                                         'small_model', 'rule', 'deterministic_code',
+                                         'workflow', 'manual', 'hybrid')),
+    implementation_id           INTEGER,
+    config_json                 TEXT NOT NULL DEFAULT '{}',
+    provenance_json             TEXT NOT NULL DEFAULT '{}',
+    generator                   TEXT NOT NULL DEFAULT 'manual'
+                                    CHECK (generator IN ('manual', 'reasoning_llm', 'existing_implementation')),
+    applicability_envelope_json TEXT NOT NULL DEFAULT '{}',
+    execution_ref_kind          TEXT
+                                    CHECK (execution_ref_kind IS NULL OR execution_ref_kind IN
+                                        ('replay_run', 'replay_variant', 'experiment')),
+    execution_ref_id            INTEGER,
+    execution_state             TEXT NOT NULL DEFAULT 'not_executed'
+                                    CHECK (execution_state IN
+                                        ('not_executed', 'executed', 'not_executable', 'unsupported')),
+    execution_note              TEXT NOT NULL DEFAULT '',
+    created_by                  TEXT,
+    created_at                  REAL NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES exploration_run (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (implementation_id)
+        REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    UNIQUE (run_id, variant_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exploration_variant_run
+    ON exploration_variant (run_id, id);
+
+-- exploration_measurement: ONE dimension of ONE variant. One row per
+-- dimension, deliberately -- not a metrics blob and not a score column.
+--
+-- #398 forbids composing quality / latency / cost / safety into a single
+-- number, and the reliable enforcement is structural: each dimension is its
+-- own row with its own coverage, and there is nowhere to write a total. A
+-- consumer that wants a ranking has to state which dimension it is ranking
+-- by.
+--
+-- `value_state` separates the four things a missing number can mean, which a
+-- NULL alone cannot: `measured` (a real reading), `not_applicable` (this
+-- dimension does not apply to this modality -- a `manual` variant has no
+-- token cost), `not_measured` (nothing measured it yet) and `unsupported`
+-- (the harness cannot measure it here). Rolling these into "0" or "-" is the
+-- #366 one-word-two-facts defect applied to a metric.
+--
+-- `covered_case_count` / `total_case_count` are per dimension because
+-- coverage genuinely differs between them -- a latency reading may cover
+-- every case while a quality judgement covers only the labelled ones, and
+-- comparing two variants at different coverage without saying so is the
+-- failure #398's "coverage 差を敗北や成功へ丸めない" names.
+CREATE TABLE IF NOT EXISTS exploration_measurement (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    variant_id         INTEGER NOT NULL,
+    run_id             INTEGER NOT NULL,
+    system_id          INTEGER NOT NULL,
+    dimension          TEXT NOT NULL
+                           CHECK (dimension IN
+                               ('output_quality', 'error_rate', 'latency', 'cost',
+                                'resource', 'safety', 'coverage')),
+    metric_name        TEXT NOT NULL DEFAULT '',
+    value_state        TEXT NOT NULL DEFAULT 'measured'
+                           CHECK (value_state IN
+                               ('measured', 'not_applicable', 'not_measured', 'unsupported')),
+    numeric_value      REAL,
+    unit               TEXT NOT NULL DEFAULT '',
+    covered_case_count INTEGER,
+    total_case_count   INTEGER,
+    -- Deterministic facts and a reasoning model's interpretation are kept
+    -- apart (CLAUDE.md: "Keep raw deterministic facts separate from LLM
+    -- interpretations in storage"). A judge model's opinion is never the
+    -- adoption basis on its own (#398).
+    source             TEXT NOT NULL DEFAULT 'deterministic'
+                           CHECK (source IN ('deterministic', 'reasoning_llm', 'manual')),
+    note               TEXT NOT NULL DEFAULT '',
+    created_at         REAL NOT NULL,
+    FOREIGN KEY (variant_id) REFERENCES exploration_variant (id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id) REFERENCES exploration_run (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (variant_id, dimension, metric_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exploration_measurement_variant
+    ON exploration_measurement (variant_id, dimension);
+
+-- ---------------------------------------------------------------------------
+-- Stabilization Evidence Package (Epic #394 Phase 4, Issue #399,
+-- app/stabilization.py)
+--
+-- The record of WHY a Node was judged stable enough to establish. Fixation is
+-- explicitly NOT "we removed the LLM": it is "the conditions under which this
+-- processing works are now understood well enough to pin a reproducible,
+-- rollback-able implementation" -- an LLM implementation can be established
+-- exactly as legitimately as a rule one.
+--
+-- The package stores REFERENCES to evidence that already exists (exploration
+-- runs, replay runs, experiments, evaluation policies), never copies of their
+-- numbers. A copied number keeps reading as current after the run it came
+-- from is superseded or its dataset changes, which is the staleness class
+-- #337/#369 both had to fix elsewhere. Currency is therefore evaluated at
+-- GATE time, not at build time.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS stabilization_package (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                 INTEGER NOT NULL,
+    node_id                   INTEGER NOT NULL,
+    node_version_id           INTEGER NOT NULL,
+    -- The implementation this package argues should become the stable pin.
+    candidate_implementation_id INTEGER NOT NULL,
+    -- The implementation it is argued against. NULL only for a Node that has
+    -- never had a stable pin; the gate treats that as a first establishment
+    -- and says so, rather than silently comparing against nothing.
+    baseline_implementation_id INTEGER,
+    exploration_run_id        INTEGER,
+    -- What the package CLAIMS the candidate handles. The gate refuses an
+    -- empty envelope: "it worked on the cases it was built for" and "it
+    -- worked" are different claims, and only the first is ever demonstrated.
+    applicability_envelope_json TEXT NOT NULL DEFAULT '{}',
+    known_limitations_json    TEXT NOT NULL DEFAULT '[]',
+    residual_risks_json       TEXT NOT NULL DEFAULT '[]',
+    -- The package's own declaration of how much evidence it considers
+    -- sufficient. Stored per package rather than as a global constant
+    -- because #399 forbids a single fixed threshold across all domains --
+    -- but it is declared BEFORE the gate runs, so it cannot be lowered to
+    -- fit the result that came back.
+    required_case_count       INTEGER NOT NULL DEFAULT 0,
+    stability_window_seconds  REAL NOT NULL DEFAULT 0,
+    observed_case_count       INTEGER,
+    observed_window_seconds   REAL,
+    -- An unmeasured Outcome is recorded WITH the reason it could not be
+    -- measured. The gate accepts that; what it refuses is silence (#391's
+    -- rule: never infer an Outcome, never omit the fact that it is unknown).
+    outcome_unmeasured_reason TEXT NOT NULL DEFAULT '',
+    rollback_implementation_id INTEGER,
+    rollback_plan             TEXT NOT NULL DEFAULT '',
+    status                    TEXT NOT NULL DEFAULT 'draft'
+                                  CHECK (status IN
+                                      ('draft', 'under_review', 'approved',
+                                       'rejected', 'superseded')),
+    -- Approval is a person, always. `approved_by` is written from the
+    -- authenticated principal, never from a request body -- the #337
+    -- provenance rule.
+    approved_by               TEXT,
+    approved_at               REAL,
+    decision_note             TEXT NOT NULL DEFAULT '',
+    decision_method           TEXT NOT NULL DEFAULT 'manual'
+                                  CHECK (decision_method = 'manual'),
+    superseded_by_id          INTEGER,
+    created_by                TEXT,
+    created_at                REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_version_id) REFERENCES evolution_node_version (id) ON DELETE CASCADE,
+    FOREIGN KEY (candidate_implementation_id)
+        REFERENCES evolution_node_implementation (id) ON DELETE CASCADE,
+    FOREIGN KEY (baseline_implementation_id)
+        REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    FOREIGN KEY (rollback_implementation_id)
+        REFERENCES evolution_node_implementation (id) ON DELETE SET NULL,
+    FOREIGN KEY (exploration_run_id) REFERENCES exploration_run (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES stabilization_package (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stabilization_package_node
+    ON stabilization_package (system_id, node_id, id DESC);
+
+-- stabilization_evidence: one referenced result, with its own level and
+-- currency. `evidence_level` mirrors ADR-7's three contracts so Node,
+-- Flow/Capability and UX/Outcome evidence can never be counted as
+-- interchangeable -- a Node-level win is not evidence that the Flow it sits
+-- in improved.
+--
+-- `verdict` is the deterministic reading of that evidence, and `unmeasured`
+-- / `not_applicable` are real values rather than an absence: the gate needs
+-- to distinguish "the floor held" from "nobody measured the floor", and only
+-- the first may establish.
+--
+-- `is_mock` is carried explicitly because mock LLM output is test data
+-- (Principle 7) and must never become establishment evidence. It is a column
+-- rather than something inferred at gate time so the refusal is auditable
+-- after the fact.
+CREATE TABLE IF NOT EXISTS stabilization_evidence (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id       INTEGER NOT NULL,
+    system_id        INTEGER NOT NULL,
+    evidence_level   TEXT NOT NULL
+                         CHECK (evidence_level IN ('node', 'flow_capability', 'ux_outcome')),
+    evidence_kind    TEXT NOT NULL
+                         CHECK (evidence_kind IN
+                             ('criterion', 'floor', 'downstream_impact',
+                              'outcome', 'stability')),
+    name             TEXT NOT NULL,
+    verdict          TEXT NOT NULL
+                         CHECK (verdict IN
+                             ('met', 'not_met', 'held', 'violated',
+                              'unmeasured', 'not_applicable')),
+    ref_kind         TEXT
+                         CHECK (ref_kind IS NULL OR ref_kind IN
+                             ('exploration_run', 'exploration_variant', 'replay_run',
+                              'experiment', 'evaluation_policy')),
+    ref_id           INTEGER,
+    evaluation_policy_id INTEGER,
+    detail           TEXT NOT NULL DEFAULT '',
+    is_mock          INTEGER NOT NULL DEFAULT 0,
+    source           TEXT NOT NULL DEFAULT 'deterministic'
+                         CHECK (source IN ('deterministic', 'reasoning_llm', 'manual')),
+    created_at       REAL NOT NULL,
+    FOREIGN KEY (package_id) REFERENCES stabilization_package (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (evaluation_policy_id)
+        REFERENCES evolution_evaluation_policy (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stabilization_evidence_package
+    ON stabilization_evidence (package_id, evidence_level, id);
+
+-- ---------------------------------------------------------------------------
+-- Operations: monitoring, drift and local reopen
+-- (Epic #394 Phase 5, Issue #400, app/node_operations.py)
+--
+-- ADR-5's separation is what this whole area exists to express: `established`
+-- (the fixation decision is approved and a stable implementation is pinned)
+-- and `monitoring` (that Node is ALSO actually being observed) fail
+-- independently. Telemetry stopping does not make the fixation decision
+-- wrong, and a Node whose telemetry died must stay distinguishable from one
+-- under healthy observation -- collapsing them is the #366 one-word-two-facts
+-- defect.
+-- ---------------------------------------------------------------------------
+
+-- node_monitoring_contract: what "we are watching this" means for ONE Node,
+-- versioned. Append-only per node: a contract is what a monitoring judgement
+-- was made against, so it must survive later edits.
+--
+-- Every threshold lives here rather than as a global constant, for the same
+-- reason #399 refuses one establishment threshold: what counts as a drift
+-- differs per Node, and a number invented centrally would be applied to
+-- Nodes nobody looked at.
+--
+-- `observed_environment_ref` / `deployed_commit_sha` are separate from the
+-- Node's pinned snapshot on purpose: what is DEPLOYED and what was ANALYSED
+-- are different facts, and a drift report that conflated them would blame
+-- the code for an environment change.
+CREATE TABLE IF NOT EXISTS node_monitoring_contract (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                  INTEGER NOT NULL,
+    node_id                    INTEGER NOT NULL,
+    version_number             INTEGER NOT NULL DEFAULT 1,
+    observed_environment_ref   TEXT NOT NULL DEFAULT '',
+    deployed_commit_sha        TEXT NOT NULL DEFAULT '',
+    sampling_note              TEXT NOT NULL DEFAULT '',
+    -- The freshness budget: how long observation may be silent before the
+    -- Node reads as unobserved rather than healthy. Silence is never treated
+    -- as "fine" (#400: 未観測を正常扱いしない).
+    freshness_budget_seconds   REAL NOT NULL DEFAULT 0,
+    minimum_sample_count       INTEGER NOT NULL DEFAULT 0,
+    indicators_json            TEXT NOT NULL DEFAULT '[]',
+    reopen_conditions_json     TEXT NOT NULL DEFAULT '[]',
+    escalation_owner           TEXT NOT NULL DEFAULT '',
+    active                     INTEGER NOT NULL DEFAULT 1,
+    decision_method            TEXT NOT NULL DEFAULT 'manual'
+                                   CHECK (decision_method = 'manual'),
+    created_by                 TEXT,
+    created_at                 REAL NOT NULL,
+    superseded_by_id           INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES node_monitoring_contract (id) ON DELETE SET NULL,
+    UNIQUE (node_id, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_monitoring_contract_node
+    ON node_monitoring_contract (system_id, node_id, id DESC);
+
+-- node_drift_observation: a DETERMINISTIC reading against the contract. No
+-- interpretation lives here -- that is node_anomaly below, and the two are
+-- separate tables precisely so a structural fact and a reasoning model's
+-- reading of it can never be confused (CLAUDE.md: keep raw deterministic
+-- facts separate from LLM interpretations in storage).
+--
+-- `observation_state` distinguishes the three things a non-drifting reading
+-- can mean, which a boolean cannot: `within_budget` (measured, fine),
+-- `drift_detected` (measured, moved), `insufficient_sample` (measured too
+-- little to say) and `unobserved` (nothing arrived at all). The last two are
+-- never rolled into "fine".
+CREATE TABLE IF NOT EXISTS node_drift_observation (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    node_id               INTEGER NOT NULL,
+    contract_id           INTEGER NOT NULL,
+    indicator             TEXT NOT NULL,
+    indicator_kind        TEXT NOT NULL
+                              CHECK (indicator_kind IN
+                                  ('input_distribution', 'output_quality', 'error_rate',
+                                   'latency', 'cost', 'flow_success', 'outcome',
+                                   'human_correction', 'compatibility')),
+    observation_state     TEXT NOT NULL
+                              CHECK (observation_state IN
+                                  ('within_budget', 'drift_detected',
+                                   'insufficient_sample', 'unobserved')),
+    observed_value        REAL,
+    reference_value       REAL,
+    sample_count          INTEGER,
+    window_seconds        REAL,
+    last_observed_at      REAL,
+    detail                TEXT NOT NULL DEFAULT '',
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (contract_id)
+        REFERENCES node_monitoring_contract (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_drift_observation_node
+    ON node_drift_observation (system_id, node_id, id DESC);
+
+-- node_anomaly: the INTERPRETATION of one or more drift observations, in the
+-- finite taxonomy #400 enumerates.
+--
+-- `classification` is never produced by a heuristic fallback: a reasoning
+-- classification that fails leaves `unknown` with the failure recorded, and
+-- `unknown` is a real, actionable state rather than a placeholder. The point
+-- of the taxonomy is the distinction between a DEFECT and a
+-- frame-breaking signal (`new_use_case_signal`,
+-- `purpose_or_vision_reconsideration`): the first is fixed, the second means
+-- the design was aimed at the wrong thing, and treating the second as the
+-- first is how a system optimises its way further from its purpose.
+--
+-- `dedupe_key` is what stops one continuing condition producing a new reopen
+-- every polling cycle.
+CREATE TABLE IF NOT EXISTS node_anomaly (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    node_id             INTEGER NOT NULL,
+    contract_id         INTEGER,
+    classification      TEXT NOT NULL
+                            CHECK (classification IN
+                                ('implementation_defect', 'input_or_environment_drift',
+                                 'upstream_downstream_mismatch', 'evaluation_gap',
+                                 'new_use_case_signal',
+                                 'purpose_or_vision_reconsideration', 'unknown')),
+    severity            TEXT NOT NULL DEFAULT 'attention'
+                            CHECK (severity IN ('blocking', 'attention', 'informational')),
+    summary             TEXT NOT NULL DEFAULT '',
+    observation_ids_json TEXT NOT NULL DEFAULT '[]',
+    -- Which path produced the classification, and its provenance. A
+    -- reasoning failure is recorded rather than replaced (Principle 6).
+    decision_method     TEXT NOT NULL DEFAULT 'deterministic'
+                            CHECK (decision_method IN
+                                ('deterministic', 'reasoning_llm', 'manual')),
+    intelligence_run_id INTEGER,
+    classification_error TEXT NOT NULL DEFAULT '',
+    dedupe_key          TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open', 'acknowledged', 'resolved', 'superseded')),
+    created_at          REAL NOT NULL,
+    resolved_at         REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (contract_id) REFERENCES node_monitoring_contract (id) ON DELETE SET NULL,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_anomaly_node
+    ON node_anomaly (system_id, node_id, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_node_anomaly_dedupe
+    ON node_anomaly (node_id, dedupe_key)
+    WHERE dedupe_key != '' AND status IN ('open', 'acknowledged');
+
+-- node_reopen_plan: which Nodes a reopen would touch, and why.
+--
+-- The scope is proposed deterministically from the Node graph and then
+-- APPROVED by a human -- reopening is a maturity transition, and ADR-9
+-- allows no automatic ones. `stable_implementation_retained` is stored as an
+-- explicit assertion rather than assumed, because ADR-5's promise that
+-- production keeps running the established implementation during
+-- re-exploration is the property most likely to be quietly broken later.
+CREATE TABLE IF NOT EXISTS node_reopen_plan (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    origin_node_id              INTEGER NOT NULL,
+    anomaly_id                  INTEGER,
+    scope_node_ids_json         TEXT NOT NULL DEFAULT '[]',
+    scope_rationale_json        TEXT NOT NULL DEFAULT '[]',
+    excluded_node_ids_json      TEXT NOT NULL DEFAULT '[]',
+    reason                      TEXT NOT NULL DEFAULT '',
+    budget_note                 TEXT NOT NULL DEFAULT '',
+    stable_implementation_retained INTEGER NOT NULL DEFAULT 1,
+    status                      TEXT NOT NULL DEFAULT 'proposed'
+                                    CHECK (status IN
+                                        ('proposed', 'approved', 'rejected', 'completed')),
+    decision_method             TEXT NOT NULL DEFAULT 'manual'
+                                    CHECK (decision_method = 'manual'),
+    approved_by                 TEXT,
+    approved_at                 REAL,
+    decision_note               TEXT NOT NULL DEFAULT '',
+    created_by                  TEXT,
+    created_at                  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (origin_node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (anomaly_id) REFERENCES node_anomaly (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_reopen_plan_origin
+    ON node_reopen_plan (system_id, origin_node_id, id DESC);
 """
 
 

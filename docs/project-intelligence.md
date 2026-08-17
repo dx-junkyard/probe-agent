@@ -6682,3 +6682,407 @@ Overview Level 0 / Interview Level 1 双方の状態別レンダリング(loadin
 質問なし / 質問 1 件 / 部分失敗 / relation 不明で決定不可 / 矛盾 /
 stale / deferred / system_researchable のルーティング表示 / セッション
 未選択)を検証する。
+
+## Issue #394 / #395 — 進化型パイプライン制御基盤
+
+### 何が問題だったか
+
+Component の policy mode、Probe Cell の Improvement status(#297〜#304)、
+Candidate Studio / Replay / Experiment(#242〜#252)、System Interview の
+状態駆動ワークフロー(#349)、Overview の意思決定プロジェクション(#380)は、
+いずれも「AI が生成したものを人間が承認し、運用しながら評価する」という
+同じ形の作業を、機能ごとに独立した語彙・ID・projection で実装してきた。
+これ以上同じ形を機能ごとに増やす前に、進化する処理単位そのもの
+(Evolution Node)を横断的な正本として導入する準備が要る。
+
+### 何を作ったか(Phase 0、Issue #395)
+
+`docs/evolutionary-pipeline.md` が正本。**この Phase ではコードを一切
+変更していない**(DB / API / UI いずれも無変更)——ADR・concept map・
+migration inventory・pilot 定義のみの設計文書。
+
+主要な ADR(全 9 件、根拠・却下案・検証方法は同文書 §4 に記載):
+
+- **ADR-1**: Evolution Node は Probe Cell 契約のバージョンアップではなく
+  新しい正本エンティティ。Cell は実行ロール、Node は進化する処理単位
+  そのものを所有し、既存 Cell のテーブル・schema は無変更のまま Node が
+  参照するだけ。
+- **ADR-2**: Node identity は `(system_id, node_key)`。`component_id`
+  からは導出しない。既存資産(component/probe_point/cell_binding/
+  capability/flow/purpose_element/feature)への参照は追記専用の
+  `evolution_node_link` で持つ。
+- **ADR-3**: contract version(`evolution_node_version`)と implementation
+  (`evolution_node_implementation`)を分離。1 つの契約に複数の実装が
+  ありうる。provider/model 名は identity に含めない(#298 と同じ規律)。
+- **ADR-4**: maturity は保存されるが、append-only の `evolution_node_event`
+  ログと常に整合する(#337/#338/#349 と同じ discipline)。
+- **ADR-5**: `established`(固定決定)と `monitoring`(実際に観測中)は
+  別状態。`reopened` は本番の pin implementation を外さない。`suspended`
+  はどこからでも到達する安全停止であり成熟の達成ではない。
+- **ADR-6**: Node maturity / Cell Improvement status / SDK policy mode /
+  Dashboard user phase(`derive_user_phase`)の 4 軸は互いから導出しない。
+  API は 4 つの独立フィールドを返す。
+- **ADR-7**: 評価は Node / Flow-Capability / UX-Outcome の 3 契約に分離し、
+  単一の重み付き score へ合成しない。floor(下回ってはならない)と
+  criterion(到達すべき)は別概念。
+- **ADR-8**: この Epic の初期 Phase では何も削除しない。既存資産は
+  `keep_canonical` | `adapt_behind_projection` | `migrate` | `deprecate`
+  | `remove_after_gate` に分類し、削除・データ移行を伴う分類は今回
+  存在しない。
+- **ADR-9**: maturity 遷移を自動化しない。決定的ゲート+人間承認、または
+  列挙済みの system-recorded observation transition のみ。LLM が
+  canonical state を直接出力すること、失敗時のヒューリスティック
+  フォールバックはいずれも禁止(Principle 6)。
+
+Migration inventory(同文書 §6)は DB table / API route / Dashboard
+route / domain module / docs を横断して分類した。**大半が
+`keep_canonical`** であり、これは意図した結果——何を消してよいかの
+証拠は Phase 1〜6 の実装と実運用を経て初めて揃う(ADR-8)。
+
+Pilot(同文書 §7)はいずれも現時点で Probe Point/Component/Cell の
+いずれにも紐づいていないことを確認済み(`@probe(` decorator は 3 つの
+モジュールいずれにも実際には付与されていない):
+
+1. `app/question_router.py`(genuinely ambiguous、LLM-appropriate の
+   参照例)
+2. `app/interview_workflow.py::evaluate_candidate_state`(既に
+   `established`+`deterministic_code` へ到達した参照例。実装後 2 回の
+   レビューで見つかった 9 件の不変条件違反は、いずれも「決定的コードが
+   自動で maturity を進めたことは一度もない」という ADR-9 の実例)
+3. `app/understanding_translator.py`(external boundary で LLM が
+   居続けるべき参照例)
+
+### 後から変えるときに守ること
+
+**Phase 1〜6(#396〜#401)は `docs/evolutionary-pipeline.md` が確定した
+語彙・境界の内側でのみ実装する。** ADR-1〜9 は再検討の対象ではなく、
+実装の前提として扱う——再検討したい場合は、この文書自体の改訂を先に
+行う(§0.1 の位置づけ通り)。
+
+**4 軸(ADR-6)を 1 つのバッジ・1 つの色・1 つの合成値へまとめない。**
+CLAUDE.md #366 が定式化した「1 つの表示語が 2 つの事実を兼ねる」欠陥を、
+この Epic で 4 つに拡張して再現しないための規律である。
+
+**既存の人間承認ゲート・SDK isolation・sandbox・redaction は一切
+緩和しない**(同文書 §9)。Evolution Node の maturity 遷移(ADR-9)は
+既存の `decision_method: manual` 規律をそのまま踏襲し、新しい自動承認
+経路を作らない。
+
+**未決事項(同文書 §10、3 件)に先回りして答えを作らない。** 特に
+`monitoring` の sub-state(#1)と Flow-level evaluation の参照方式(#2)
+は、実データが無い段階で決めると ADR-5/ADR-7 が禁じる「早すぎる合成」を
+設計レベルで先取りしてしまう。
+
+### 検証
+
+Phase 0 は DB/API/UI を変更していないため、既存のテストスイートは
+無変更のまま通る。`docs/evolutionary-pipeline.md` 自体が Issue #395 の
+受け入れ条件(product thesis の確定、主要概念の identity owner の一意性、
+4 軸の非混同、Vision→Node runtime evidence の lineage 定義、migration
+inventory、compatibility seam と rollback、既存安全境界の維持明記、
+Phase 1〜6 の入力・出力・完了ゲート、AI型/固定処理型を含む pilot 選定、
+owner・期限付きの未決事項)を満たす。
+
+## Issue #396 — Phase 1: Evolution Node 契約と canonical lifecycle
+
+`docs/evolutionary-pipeline.md` の ADR-1〜ADR-9 をコードにした Phase。
+新規テーブル 5 つ、pure evaluator 1 つ、API 1 本、読み取り中心の
+inspector 1 画面。**既存の Component / Probe Cell / Cell Improvement /
+Cell Binding は 1 行も変更していない** — 読むだけで、書かない。
+
+### 何を作ったか
+
+- `app/evolution_node.py` — `evaluate_transition` は純関数(時計もDBも
+  client 状態も見ない)の first-match 表で、有限な 12 個の拒否コードを
+  返す。うち 2 つがこの Epic の中心規則:`llm_state_not_allowed` は
+  無条件で最初に評価され(LLM は canonical state を出力しない、
+  Principle 6)、`manual_approval_required` は system-recorded 遷移を
+  `established ↔ monitoring` の 2 つだけに限定し、それ以外は必ず名前の
+  ある人間を要求する(ADR-9)。
+- `reopened` は stable implementation の pin を要求も解除もしない。本番は
+  established 実装を動かし続けたまま探索する — 局所再探索が安全である
+  理由そのもので、テストで直接 assert している。
+- `fold_events` は append-only ログを畳み込んで maturity を再現する
+  (ADR-4)。保存された lifecycle 値は記述対象の行から drift しうるが、
+  ログがあれば drift を検出できる。だから projection の末尾としてだけで
+  なく専用エンドポイントとしても公開する。
+- `build_node_projection` は maturity / improvement_status / policy_mode を
+  3 つの正本から独立に読む。食い違っていてもそのまま返す。4 つめの軸は
+  `null` ではなく**ドキュメントから欠落**させる — `null` は「評価した
+  結果それが無かった」と読めてしまう。`interview_workflow.
+  evaluate_session_workflow` は checkpoint を永続化するので呼ばない
+  (読み取りが書き込んではならない、#380 の規則)。
+- `availability` は「読めなかった」を「既定値」と区別する(#380)。
+
+### 境界での規則
+
+拒否された遷移は 422 で、`detail.code` はドメイン層の有限コードをその
+まま返す — 言い換えると Dashboard が散文で分岐することになる。
+重複した `idempotency_key` は 409 ではなく 200 の `duplicate`:何も
+変えなかった再送は成功であり、409 にすると通常のネットワーク再送が
+開発者の解決すべき衝突に見える。actor は認証済み `Principal` から取り、
+body からは取らない(#337 の provenance 規則)。
+
+### 検証
+
+domain 49 + API 20 + dashboard 5。拒否コードは 1 つずつ個別のテストを
+持ち、3 軸の独立性は「Improvement が `adopted` かつ Component が
+`shadow` かつ Node は `validating`」という食い違う状態で assert する。
+
+## Issue #397 — Phase 2: Design Studio
+
+Vision → Outcome → Capability → Flow を検証可能な Node 仮説へ落とす層。
+**新しい Vision/Purpose 正本は作らない** — Purpose Frame は
+`app/purpose_chain.py` が既存行から都度導出する projection のままで、
+Node との接続はただの `evolution_node_link` である。
+
+### 4 つの構成要素
+
+1. **Purpose-to-Node lineage** (`derive_node_lineage`)。link の
+   `decision_method` が既に「AI の提案」と「開発者の確認」を区別して
+   いるので、新しい列は足さない — 足せば両者が食い違える場所が 1 つ
+   増えるだけ。`relation_status`(その関係を誰が決めたか)と
+   `element_state`(指している Purpose 要素自体が確定しているか)は
+   独立の 2 軸で、「確定した関係が未確定の要素を指している」という
+   実在する状態を潰さない。`component`/`probe_point`/`cell_binding` は
+   実装事実であって設計関係ではないので lineage から除外する。
+2. **Node decomposition**。reasoning model は 1 つの scope に対して
+   複数の**切り方全体**を提案する — 切り方をまたいで個々の node を
+   比較すると、切り方どうしを区別している唯一のものが失われる。
+   採用は別の `decision_method: manual` 記録で、Phase 1 の
+   `create_node`/`add_version` を通して本物の Node を作る。**モデルは
+   Node を作らない。** 失敗した run は失敗として保存され、候補は
+   0 件になる(Principle 6:heuristic fallback を作らない)。部分的に
+   妥当な応答は全体を拒否する — 壊れた候補だけ黙って落とすと、3 通りの
+   比較が最初から 2 通りだったかのように見える。
+3. **3 つの評価契約** (ADR-7)。score/weight/total 列はどこにも無い。
+   latency の改善が safety の劣化を買えないようにする確実な方法は、
+   合成した数値を書く場所を用意しないことである。`criteria`(到達すべき
+   もの)と `floors`(割ってはいけないもの)は別の列 — 読まれる時点が
+   違い、混ぜると「基準を満たした」と「劣化していない」が区別できなく
+   なる。`unmeasured` は理由付きで記録する(#391 の規則)。
+   API は level ごとに**グループ化して**返す。ADR-7 の分離を文書では
+   なく構造にしている。
+4. **Phase 3 への handoff**。参照だけを保存し、内容はコピーしない —
+   コピーした criterion は元の policy が superseded された後も current
+   として読めてしまう。解決できない参照は名前付きで残り bundle を
+   `incomplete` にする。黙って落とすと、失敗データセットを失った
+   handoff と最初から持っていなかった handoff が区別できない。
+
+### 接続規律
+
+`propose_decomposition` は**接続を一切取らない**。route は
+「読む → 閉じる → モデルを呼ぶ → 開き直して保存する」の順で動く。
+`get_conn()` を LLM 往復の間保持すると、lock は process-wide で
+非再帰なのでサーバ全体が再起動まで停止する。
+
+### 検証
+
+39 テスト。fail-closed は 7 通り(mock client / API エラー / 解析不能 /
+語彙外の side_effect_class / 語彙外の trust_boundary / out_of_scope 欠落 /
+候補内の node_key 重複)を個別に検証し、いずれも候補 0 件になることを
+assert する。採用は「提案だけでは Node が 0 件のまま」「二重採用は 409」
+「node_key 衝突は採用全体を中止し、半分だけ作らない」を含む。
+
+## Issue #398 — Phase 3: Exploration Workbench
+
+Phase 3 の問いは「どの LLM 候補が良いか」ではない。**同じ Node 契約・同じ
+評価条件に対して、LLM 実装と rule 実装と deterministic code 実装がどう
+比較されるか**である。この問いが表現できるのは、ADR-3 が「その Node が
+何を約束するか」と「今どうやってその約束を守っているか」を別々に
+versioned にしたからに他ならない。
+
+### 4 つの規則(いずれも構造で強制している)
+
+1. **これは比較の記録であって、2 つめの実行エンジンではない。** コードを
+   走らせるのは Replay(#242〜#246)/ Experiment(#26)/ offline shadow
+   sandbox のままで、variant は数値を出した run を**参照する**だけ。
+   source / patch / command の列も引数もどこにも無い — API からそれらを
+   受け取れば、既存機能が強制している pinned-snapshot・pinned-command・
+   network-off の sandbox を迂回できてしまう(Principle 8)。
+   `test_the_variant_contract_accepts_no_executable_content` がこれを
+   signature レベルで assert する。
+2. **一定に保つべきものは variant ではなく run に置く。** dataset /
+   snapshot / environment / evaluation policy 参照は `exploration_run` の
+   列なので、同一 run の 2 つの variant が別のデータセットで測られること
+   が**構造的に起こり得ない**。起きれば、比較に見えるのに比較になって
+   いない数値が残る。契約 version が違う implementation も拒否する —
+   別の約束どうしを比べることになる。
+3. **何も合成しない。** 各 dimension は自分の coverage を持つ独立した行で、
+   score / weight / total はどこにも無い。順位付けは
+   `rank_by_dimension(variants, dimension)` のように **dimension を必須
+   引数**にしてあり、「総合的に一番良い variant」を返す関数は存在しない。
+   方向(高い方が良いか)は `HIGHER_IS_BETTER` の明示表で、metric 名から
+   推測しない — 推測すると名前が一致しない metric で判定が黙って反転する。
+4. **欠測を勝ち負けに丸めない。** `value_state` は
+   `measured`/`not_applicable`/`not_measured`/`unsupported` の 4 値で、
+   両者の測定可能性が食い違う dimension は `incomparable` になる。
+   これが無いと「この variant に token cost は無い」と「この variant の
+   token cost は 0 だ」が同じ表示になり、**測られなかった方が勝つ**。
+   coverage が違えば `coverage_mismatch`(数値は見せるが比較はしない)。
+   未測定の variant は `ranked` の末尾ではなく `unranked` に分ける —
+   末尾に置けば「最下位」と読める。
+
+### 比較の判定順
+
+`compare_variants` は純関数の first-match 表で、行の順序が契約:
+(1) どちらかが `measured` でなければ `incomparable`(**算術より先**)、
+(2) coverage が違えば `coverage_mismatch`、(3) 等しければ `equal`、
+(4) それ以外は `HIGHER_IS_BETTER` に従って `better`/`worse`。
+片側にしか無い dimension は落とさず報告する — 候補側の safety 測定が
+無いことは、読み手が最も見なければならない事実である。
+
+### 完了は採用ではない
+
+`complete_run` は Node の maturity を変えず、implementation を pin せず、
+何も承認しない。採用は #399 の固定化ゲート + 人間承認(ADR-9)であり、
+比較が勝者を黙って昇格させたら、それこそこの Epic が禁じている自動採用に
+なる。baseline の無い run は完了できない(基準点の無い差分は差分ではない)。
+
+### 検証
+
+35 テスト。`incomparable` / `coverage_mismatch` / 片側欠測 / 方向表の
+網羅性 / `unranked` / composite 列の不在 / 実行参照の解決 / 契約 version
+不一致 / baseline 重複 / System 分離を個別に assert する。
+
+## Issue #399 — Phase 4: Stabilization Evidence Package と固定化ゲート
+
+Epic 全体が向かってきた判断 —「この Node の処理は、安定した実装を pin して
+よいだけ理解できたか」— を明示的な契約にする Phase。
+
+**固定化は「LLM をやめること」ではない。** 「この処理がどの条件下で動くかが
+分かったので、再現可能で rollback 可能な実装として定着させる」ことである。
+modality が `reasoning_llm` のままの実装も、`rule` の実装とまったく同じ
+正当性で established になれる。**ゲートは modality を読まない** —
+`GateFacts` に modality フィールドは無く、`evaluate_establishment_gate` の
+ソースに `modality` の文字列すら現れないことをテストが assert する。#399 の
+非目標は「LLM 利用の最小化を目的化すること」であり、modality を読めるゲートは
+その選好を埋め込めるゲートである。
+
+### ゲートの 3 つの性質
+
+1. **失敗だけでなく「不在」でも閉じる。** `floor_unmeasured` は
+   `floor_violated` と同じ強さで拒否する。「floor は守られた」と
+   「誰も floor を測っていない」は別の事実で、establish してよいのは前者
+   だけである。後者を通すのが、ゲートが黙って飾りになる経路そのもの。
+   Phase 3 の `incomparable` と同じ規律を、比較ではなく判断に適用している。
+2. **何も合成しない。** dimension をまたぐ算術は存在せず、criterion と
+   floor は 1 つずつ評価される。latency の改善が safety の劣化を買えない
+   (ADR-7)。テストは「latency も accuracy も cost も met、safety だけ
+   violated」で `floor_violated` になることを assert する。
+3. **ゲート通過は承認ではない。** 通過は package を*適格*にするだけで、
+   `approve_package` は名前のある人間を必須とし、`validating → established`
+   遷移は Phase 1 の evaluator を `decision_method: manual` で通す。
+   ゲート通過が source 適用・policy 変更・deploy・publish を行うことは無い
+   — それぞれ既存の別ゲートのまま(Principle 5/8)。
+
+### そのほかの規則
+
+- **証拠は参照であって複製ではなく、currency は gate 実行時に評価する。**
+  複製した数値は、元の run が superseded された後も current として読める。
+- **Outcome は「未計測でよいが、黙ってはいけない」。** 未計測の Outcome が
+  あって理由が記録されていなければ `outcome_unmeasured_unacknowledged` で
+  拒否する。Outcome 無しの establish は許すが、無言の establish は許さない
+  (#391)。
+- **applicability envelope が無ければ拒否する。** envelope が無いと成功が
+  全入力へ既定で一般化する。「作られたケースでは動いた」と「動いた」は別の
+  主張で、実証されたのは前者だけである。
+- **初回の establish は rollback 先を要求しない。** 一度も stable pin を
+  持ったことが無い Node には戻る先が無く、それは欠落ではなく正当な状態。
+  2 回目以降は必ず戻り先を名指しさせる。
+- **安定性の要件は package 自身が宣言する。** 全領域共通の固定 threshold は
+  #399 が禁じている。ただし宣言は gate 実行より前なので、返ってきた結果に
+  合わせて下げることはできない。
+- **構造的前提を証拠チェックより先に評価する。** candidate implementation が
+  消えている package に「safety floor が未計測です」と返すと、開発者を
+  間違った修正へ送ってしまう。
+- `approved_by` は認証済み principal から取り、request body には存在しない
+  (#337 の provenance 規則)。rollback 先も caller ではなく Node の現在の
+  stable pin から読む — caller に言わせると、Node が持っていない rollback
+  先を package が主張できてしまう。
+- reject は記録であって降格ではない。Node の maturity は動かない。
+- gate verdict は読むたびに再計算し、保存しない(保存した判定は記述対象の
+  証拠から drift する。#337/#338/#349 と同じ規律)。
+
+### Phase 1 との接続
+
+`load_node_facts` の `known_evidence_refs` に、その Node 自身の
+Stabilization Package (`stabilization_package:<id>`) を加えた。Phase 1 の
+`foreign_evidence` 規則の目的は「他の Node・他の System の証拠を拒否する」
+ことであり、それは維持されている — 問い合わせは node_id と system_id で
+絞られているので、別 Node の package は今も拒否される。テストが直接
+assert する。テーブルが存在しない DB でも Phase 1 が動き続けるよう、
+問い合わせは防御的に行う(テーブル欠如は「package 無し」であって、
+全遷移を止めるエラーではない)。
+
+### 検証
+
+36 テスト。17 個の refusal code すべてに個別のテストがあり、
+「code がテストに現れること」をソース走査で強制している(誰も出せない
+code は誰も強制していない規則である)。承認は Phase 1 の event log に
+`manual` で記録されること、gate は承認時に再評価されること(読んだ時点の
+PASS を信じない)、reject が Node を動かさないこと、rollback 先が
+Node から読まれることを含む。
+
+## Issue #400 — Phase 5: 運用 drift と局所再探索
+
+ADR-5 の分離を実際に表現する層。`established`(固定化判断が承認され安定実装が
+pin されている)と `monitoring`(その Node が実際に観測されている)は**独立に
+壊れる**。telemetry が止まっても固定化判断が誤りになるわけではなく、
+telemetry が死んだ Node は健全に観測されている Node と区別され続けなければ
+ならない。統合すると #366 の「一つの表示語が二つの事実を運ぶ」欠陥になる。
+
+### 4 つの規則
+
+1. **沈黙は健全ではない。** `evaluate_observation_health` は `unobserved` /
+   `insufficient_sample` を独立の状態として返し、「budget 内」へ丸めない。
+   判定順も契約で、`unobserved` が最初に来る — データが止まった Node は
+   drift した/しなかったのどちらとも判定できない。判定材料が無いのだから。
+   under-sample も drift 判定より先に評価する:データが少なすぎることは
+   「drift した」を否定する根拠にも肯定する根拠にもならない。
+2. **決定的事実と、その解釈は別の行。** `node_drift_observation` は測定値、
+   `node_anomaly` は結論。reasoning による分類が失敗したときは
+   `unknown` + `classification_error` を記録し、heuristic の当て推量へ
+   fallback しない(Principle 6)。「システムは何かを見たが、それが何かは
+   言えなかった」は実在する actionable な状態である。具体的な分類と
+   error を同時に持つことは拒否する — それこそが禁じられている fallback。
+3. **defect と frame-breaking signal は別の答え。** taxonomy の要点は、
+   `implementation_defect` は直すものだが `new_use_case_signal` /
+   `purpose_or_vision_reconsideration` は「設計が狙う先を間違えていた」の
+   合図だということ。後者を前者として扱うと、システムは自分の目的から
+   さらに遠ざかる方向へ最適化されていく。projection は
+   `frame_breaking` を明示する。
+4. **reopen は局所的で、承認制で、本番を落とさない。**
+   `propose_reopen_scope` は Node graph を決定的にたどる — 「同じ
+   Component / Probe Point / Capability / Flow に紐づいている」という
+   構造的事実であって、類似度判定ではない(Principle 6)。無関係な Node は
+   黙って省かず `excluded_node_ids` に**明示**する:読み手が「無関係な
+   Node は reopen されていない」を確認できる唯一の方法だから。承認は
+   名前のある人間(ADR-9)、そして**安定実装の pin は外れない** —
+   本番は established 実装を動かし続ける。それこそが再探索を安全に
+   始められる理由である。
+
+### そのほか
+
+- 同一条件の繰り返しは `dedupe_key` で 1 件に畳まれる。polling のたびに
+  新しい anomaly が生まれ、そのたびに reopen が生まれることを防ぐ。
+- 監視契約の閾値はすべて契約ごと。#399 が単一の固定 threshold を禁じるのと
+  同じ理由で、中央で決めた数値は誰も見ていない Node にも適用されてしまう。
+- `observed_environment_ref` / `deployed_commit_sha` は Node の pinned
+  snapshot と別に持つ。「何がデプロイされているか」と「何を解析したか」は
+  別の事実で、混ぜた drift 報告は環境変化をコードのせいにする。
+- 一括 reopen で遷移できない Node は強制せず結果を報告する。gate を黙って
+  無視する一括操作は、存在しない gate と同じ。
+
+### 検証
+
+26 テスト。fixture 自体が `established` に到達したことを assert する —
+到達していなければ、以降のテストが黙って `validating` の Node を検証して
+しまうため。
+
+### この Phase の範囲
+
+本コミットは domain 層(監視契約・drift 観測・anomaly taxonomy・reopen
+scope)とそのテストまで。operations cockpit の API/画面は Phase 6(#401)の
+統合対象であり、そこで既存 Overview / Components / Cell Fabric と合わせて
+配置する。

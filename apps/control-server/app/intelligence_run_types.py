@@ -32,6 +32,10 @@ class IntelligenceRunType(str, Enum):
     JOINT_INVESTIGATION = "joint_investigation"
     JOINT_TRANSLATION = "joint_translation"
     NL_CHANGE_SET = "nl_change_set"
+    # Epic #394 Phase 2 (#397): a reasoning run that proposes ways to cut a
+    # scope into Evolution Nodes. It proposes only -- adopting a cut is a
+    # separate `decision_method: manual` record (node_decomposition_candidate).
+    NODE_DECOMPOSITION = "node_decomposition"
     PATTERN_INVESTIGATE = "pattern_investigate"
     PATTERN_RECONCILE = "pattern_reconcile"
     PROBE_PLAN = "probe_plan"

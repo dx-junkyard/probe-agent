@@ -122,6 +122,10 @@ const NAV_GROUPS: NavGroup[] = [
         to: "/cell-fabric", icon: Layers, label: "Cell Fabric",
         subtitle: "Probe Cell群の統合ダイジェストとAsk対応",
       },
+      {
+        to: "/evolution-nodes", icon: Layers, label: "Evolution Node",
+        subtitle: "処理単位の契約・実装方式・成熟度",
+      },
     ],
   },
   {
