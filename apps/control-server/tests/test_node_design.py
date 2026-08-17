@@ -27,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import node_design
+from app.capability_graph import confirm_capability_graph
 from app.evolution_node import add_link, create_node
 from app.llm import LLMConfig, LLMError, MockLLMClient
 from app.node_design import (
@@ -134,6 +135,106 @@ def _node_payload(key="normalize", **overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def _snapshot_and_session(conn, system_id):
+    """A ready snapshot + interview session, the two FK anchors the
+    Capability Graph's confirmation rows require."""
+    now = time.time()
+    cur = conn.execute(
+        """INSERT INTO repository_snapshots
+               (system_id, repo_path, commit_sha, status, created_at, completed_at)
+           VALUES (?, '/tmp/repo', 'abc123', 'ready', ?, ?)""",
+        (system_id, now, now),
+    )
+    snapshot_id = cur.lastrowid
+    cur = conn.execute(
+        """INSERT INTO interview_session
+               (system_id, snapshot_id, title, focus, status, stage,
+                created_at, updated_at)
+           VALUES (?, ?, '', '', 'open', 'purpose_confirmation', ?, ?)""",
+        (system_id, snapshot_id, now, now),
+    )
+    return snapshot_id, cur.lastrowid
+
+
+def _confirm_capability_graph(conn, system_id, names=("Checkout",)):
+    """Confirm a Capability composition through #312's own writer, so the
+    entity ids under test are the real stable identities."""
+    snapshot_id, session_id = _snapshot_and_session(conn, system_id)
+    understanding = {
+        "core_capabilities": [
+            {"name": name, "summary": f"{name} summary", "children": []}
+            for name in names
+        ],
+        "capability_elements": [],
+        "supporting_elements": [],
+        "api_boundaries": [],
+    }
+    now = time.time()
+    cur = conn.execute(
+        """INSERT INTO understanding_revision
+               (session_id, system_id, snapshot_id, intelligence_run_id,
+                current_understanding, gap_analysis, created_at)
+           VALUES (?, ?, ?, NULL, ?, NULL, ?)""",
+        (session_id, system_id, snapshot_id, json.dumps(understanding), now),
+    )
+    revision_id = cur.lastrowid
+    graph = confirm_capability_graph(
+        conn,
+        system_id=system_id,
+        session_id=session_id,
+        revision_id=revision_id,
+        revision_created_at=now,
+        current_understanding=understanding,
+        actor="alice",
+        now=now + 0.1,
+    )
+    return graph, snapshot_id, session_id
+
+
+def _insert_feature_draft(conn, system_id, snapshot_id, feature_id, name):
+    now = time.time()
+    cur = conn.execute(
+        """INSERT INTO intelligence_runs
+               (system_id, snapshot_id, run_type, provider, model, prompt_version,
+                schema_version, decision_method, status, started_at)
+           VALUES (?, ?, 'repository_drafts', 'anthropic', 'm', 'p', 's',
+                   'reasoning_llm', 'completed', ?)""",
+        (system_id, snapshot_id, now),
+    )
+    run_id = cur.lastrowid
+    conn.execute(
+        """INSERT INTO feature_drafts
+               (system_id, intelligence_run_id, snapshot_id, feature_id, name,
+                created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (system_id, run_id, snapshot_id, feature_id, name, now),
+    )
+
+
+def _insert_trace_span(conn, system_id, flow_id, trace_id="t-1"):
+    conn.execute(
+        """INSERT INTO trace_spans
+               (system_id, trace_id, component_id, flow_id, timestamp)
+           VALUES (?, ?, 'svc', ?, ?)""",
+        (system_id, trace_id, flow_id, time.time()),
+    )
+
+
+def _persist_scoped_proposal(conn, system_id, *, capability_ref="", flow_ref=""):
+    """A real proposal + candidates, scoped to a Capability and/or a Flow."""
+    result = propose_decomposition(
+        _StubClient(_good_response()), REASONING_CONFIG, scope_summary="s"
+    )
+    return persist_decomposition(
+        conn,
+        system_id=system_id,
+        result=result,
+        scope_summary="s",
+        capability_ref=capability_ref,
+        flow_ref=flow_ref,
+    )
 
 
 def _insert_raw_candidate(conn, system_id, nodes, candidate_key="cut-raw"):
@@ -277,6 +378,262 @@ class TestLineageProvenance:
             )
             lineage = derive_node_lineage(conn, system_id=system_id, node_id=node["id"])
         assert lineage["relations"] == []
+
+
+class TestLineageTargetResolution:
+    """Every link kind resolves against ITS OWN canonical source.
+
+    Before this, a `capability` / `flow` / `feature` link was looked up in
+    the caller's Purpose Frame map, so it could only resolve when its
+    `target_ref` happened to collide with a Purpose element id -- a target
+    that plainly exists still read as `unresolved` with no name.
+    """
+
+    def test_a_capability_link_resolves_to_the_confirmed_entity(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-CapResolve")
+        with get_conn() as conn:
+            graph, _, _ = _confirm_capability_graph(conn, system_id)
+            entity_id = graph["nodes"][0]["entity_id"]
+            node = create_node(conn, system_id=system_id, node_key="cap-resolve")
+            add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="capability", target_ref=str(entity_id), created_by="alice",
+            )
+            lineage = derive_node_lineage(
+                conn, system_id=system_id, node_id=node["id"]
+            )
+
+        relation = lineage["relations"][0]
+        assert relation["target_resolution"] == "resolved"
+        assert relation["target_source"] == "capability_graph"
+        assert relation["target_name"] == "Checkout"
+        # The entity's OWN state: it is part of the current confirmed
+        # composition. Independent of the link having been confirmed.
+        assert relation["element_state"] == "confirmed"
+        assert relation["relation_status"] == "confirmed"
+        # The Purpose Frame was never consulted for this kind.
+        assert lineage["purpose_frame_supplied"] is False
+
+    def test_a_capability_dropped_by_a_later_confirmation_reads_superseded(
+        self, admin_client
+    ):
+        """Existing-but-no-longer-composed is a real third answer: neither
+        `confirmed` nor `unresolved`."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-CapSuperseded")
+        with get_conn() as conn:
+            graph, snapshot_id, session_id = _confirm_capability_graph(
+                conn, system_id, names=("Checkout", "Refund")
+            )
+            refund_id = next(
+                n["entity_id"] for n in graph["nodes"] if n["name"] == "Refund"
+            )
+            # A second confirmation of the same session drops "Refund".
+            now = time.time()
+            understanding = {
+                "core_capabilities": [
+                    {"name": "Checkout", "summary": "Checkout summary", "children": []}
+                ],
+                "capability_elements": [],
+                "supporting_elements": [],
+                "api_boundaries": [],
+            }
+            cur = conn.execute(
+                """INSERT INTO understanding_revision
+                       (session_id, system_id, snapshot_id, intelligence_run_id,
+                        current_understanding, gap_analysis, created_at)
+                   VALUES (?, ?, ?, NULL, ?, NULL, ?)""",
+                (session_id, system_id, snapshot_id, json.dumps(understanding), now),
+            )
+            confirm_capability_graph(
+                conn, system_id=system_id, session_id=session_id,
+                revision_id=cur.lastrowid, revision_created_at=now,
+                current_understanding=understanding, actor="alice", now=now + 0.1,
+            )
+
+            node = create_node(conn, system_id=system_id, node_key="cap-superseded")
+            add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="capability", target_ref=str(refund_id), created_by="alice",
+            )
+            lineage = derive_node_lineage(conn, system_id=system_id, node_id=node["id"])
+
+        relation = lineage["relations"][0]
+        assert relation["target_resolution"] == "resolved"
+        assert relation["element_state"] == "superseded"
+        assert relation["target_name"] == "Refund"
+
+    def test_a_capability_ref_is_never_matched_by_display_name(self, admin_client):
+        """#312: names never determine identity. A ref that is not the
+        stable entity id is `unresolved` -- never fuzzy-matched to a
+        similarly named Capability (Principle 6)."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-CapByName")
+        with get_conn() as conn:
+            _confirm_capability_graph(conn, system_id)
+            node = create_node(conn, system_id=system_id, node_key="cap-by-name")
+            add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="capability", target_ref="Checkout", created_by="alice",
+            )
+            lineage = derive_node_lineage(conn, system_id=system_id, node_id=node["id"])
+
+        relation = lineage["relations"][0]
+        assert relation["target_resolution"] == "unresolved"
+        assert relation["element_state"] == "unresolved"
+        assert relation["target_name"] is None
+
+    def test_a_flow_link_resolves_to_an_observed_flow(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-FlowResolve")
+        with get_conn() as conn:
+            _insert_trace_span(conn, system_id, "checkout-flow")
+            node = create_node(conn, system_id=system_id, node_key="flow-resolve")
+            add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="flow", target_ref="checkout-flow", created_by="alice",
+            )
+            add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="flow", target_ref="never-seen", created_by="alice",
+            )
+            lineage = derive_node_lineage(conn, system_id=system_id, node_id=node["id"])
+
+        by_ref = {r["target_ref"]: r for r in lineage["relations"]}
+        assert by_ref["checkout-flow"]["target_resolution"] == "resolved"
+        assert by_ref["checkout-flow"]["target_source"] == "flow_lineage"
+        assert by_ref["checkout-flow"]["element_state"] == "observed"
+        assert by_ref["never-seen"]["target_resolution"] == "unresolved"
+        assert by_ref["never-seen"]["element_state"] == "unresolved"
+
+    def test_a_feature_link_resolves_to_the_feature_map(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-FeatureResolve")
+        with get_conn() as conn:
+            snapshot_id, _ = _snapshot_and_session(conn, system_id)
+            _insert_feature_draft(
+                conn, system_id, snapshot_id, "feat-checkout", "Checkout feature"
+            )
+            node = create_node(conn, system_id=system_id, node_key="feature-resolve")
+            add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="feature", target_ref="feat-checkout", created_by="alice",
+            )
+            lineage = derive_node_lineage(conn, system_id=system_id, node_id=node["id"])
+
+        relation = lineage["relations"][0]
+        assert relation["target_resolution"] == "resolved"
+        assert relation["target_source"] == "feature_map"
+        assert relation["target_name"] == "Checkout feature"
+        # The Feature Map records no finite confirmation state for a
+        # Feature; saying `unresolved` for something that demonstrably
+        # exists would be a different, false claim.
+        assert relation["element_state"] == "not_applicable"
+
+    def test_a_target_of_another_system_never_resolves(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        sys_a = _create_system(admin_client, token, "ND-ResolveIsoA")
+        sys_b = _create_system(admin_client, token, "ND-ResolveIsoB")
+        with get_conn() as conn:
+            graph, snapshot_id, _ = _confirm_capability_graph(conn, sys_a)
+            entity_id = graph["nodes"][0]["entity_id"]
+            _insert_trace_span(conn, sys_a, "a-flow")
+            _insert_feature_draft(conn, sys_a, snapshot_id, "feat-a", "A feature")
+
+            node_b = create_node(conn, system_id=sys_b, node_key="cross-system")
+            for link_kind, ref in (
+                ("capability", str(entity_id)),
+                ("flow", "a-flow"),
+                ("feature", "feat-a"),
+            ):
+                add_link(
+                    conn, system_id=sys_b, node_id=node_b["id"],
+                    link_kind=link_kind, target_ref=ref, created_by="mallory",
+                )
+            lineage = derive_node_lineage(conn, system_id=sys_b, node_id=node_b["id"])
+
+        assert {r["target_resolution"] for r in lineage["relations"]} == {"unresolved"}
+        assert all(r["target_name"] is None for r in lineage["relations"])
+
+    def test_an_unsupplied_purpose_frame_is_unavailable_not_unresolved(
+        self, admin_client
+    ):
+        """`unavailable` (the source was never consulted) and `unresolved`
+        (it was, and the target is not there) are different answers."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-PurposeUnavailable")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="purpose-unavail")
+            add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="purpose_element", target_ref="desired_change",
+                created_by="alice",
+            )
+            without_frame = derive_node_lineage(
+                conn, system_id=system_id, node_id=node["id"]
+            )
+            with_frame = derive_node_lineage(
+                conn, system_id=system_id, node_id=node["id"],
+                purpose_elements={"beneficiary_problem": {"state": "confirmed"}},
+            )
+            resolved = derive_node_lineage(
+                conn, system_id=system_id, node_id=node["id"],
+                purpose_elements={
+                    "desired_change": {"state": "hypothesis", "name": "V"}
+                },
+            )
+
+        assert without_frame["relations"][0]["target_resolution"] == "unavailable"
+        assert with_frame["relations"][0]["target_resolution"] == "unresolved"
+        assert resolved["relations"][0]["target_resolution"] == "resolved"
+        assert resolved["relations"][0]["target_source"] == "purpose_frame"
+        assert resolved["relations"][0]["element_state"] == "hypothesis"
+
+    def test_lineage_endpoint_reports_resolved_targets(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ApiResolve")
+        with get_conn() as conn:
+            graph, _, _ = _confirm_capability_graph(conn, system_id)
+            entity_id = graph["nodes"][0]["entity_id"]
+            _insert_trace_span(conn, system_id, "api-flow")
+            node = create_node(conn, system_id=system_id, node_key="api-resolve")
+            add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="capability", target_ref=str(entity_id), created_by="alice",
+            )
+            add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="flow", target_ref="api-flow", created_by="alice",
+            )
+
+        r = admin_client.get(
+            f"/node-design/nodes/{node['id']}/lineage",
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 200, r.text
+        by_kind = {rel["link_kind"]: rel for rel in r.json()["relations"]}
+        assert by_kind["capability"]["target_name"] == "Checkout"
+        assert by_kind["capability"]["element_state"] == "confirmed"
+        assert by_kind["capability"]["target_resolution"] == "resolved"
+        assert by_kind["flow"]["element_state"] == "observed"
+        assert by_kind["flow"]["target_resolution"] == "resolved"
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +1011,313 @@ class TestAdoption:
                     conn, system_id=system_id, candidate_id=candidates[0]["id"],
                     decision="maybe",
                 )
+
+
+class TestAdoptionCarriesTheScopeForward:
+    """The decomposition's Capability/Flow scope must survive adoption.
+
+    `node_decomposition_proposal` records the scope a cut was proposed
+    against, but adoption used to create only the Node and its contract
+    version -- so an adopted Node could not be traced back to the Capability
+    or Flow it came out of, and the lineage projection had nothing to show.
+    """
+
+    def test_adoption_writes_capability_and_flow_links_with_manual_provenance(
+        self, admin_client
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ScopeLinks")
+        with get_conn() as conn:
+            graph, _, _ = _confirm_capability_graph(conn, system_id)
+            entity_id = graph["nodes"][0]["entity_id"]
+            _insert_trace_span(conn, system_id, "checkout-flow")
+            _, candidates = _persist_scoped_proposal(
+                conn, system_id,
+                capability_ref=str(entity_id), flow_ref="checkout-flow",
+            )
+            candidate_id = candidates[0]["id"]
+            _, created = decide_candidate(
+                conn, system_id=system_id, candidate_id=candidate_id,
+                decision="adopted", decided_by="alice",
+            )
+            assert len(created) == 1
+            links = conn.execute(
+                """SELECT * FROM evolution_node_link
+                       WHERE node_id = ? AND system_id = ? ORDER BY id""",
+                (created[0]["id"], system_id),
+            ).fetchall()
+
+        by_kind = {row["link_kind"]: row for row in links}
+        assert set(by_kind) == {"capability", "flow"}
+        for row in links:
+            # Adoption is the developer's judgement, so the link records
+            # exactly that -- never the model's `reasoning_llm`.
+            assert row["decision_method"] == "manual"
+            assert row["created_by"] == "alice"
+            # The note names the candidate, so the provenance is auditable
+            # from the link row alone.
+            assert f"candidate {candidate_id}" in row["note"]
+        assert by_kind["capability"]["target_ref"] == str(entity_id)
+        assert by_kind["flow"]["target_ref"] == "checkout-flow"
+
+    def test_adoption_without_scope_refs_writes_no_scope_links(self, admin_client):
+        """An unscoped proposal creates no link. An empty ref is the absence
+        of a scope, not a link to nothing."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-NoScopeLinks")
+        with get_conn() as conn:
+            _, candidates = _persist_scoped_proposal(conn, system_id)
+            _, created = decide_candidate(
+                conn, system_id=system_id, candidate_id=candidates[0]["id"],
+                decision="adopted", decided_by="alice",
+            )
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node_link WHERE node_id = ?",
+                (created[0]["id"],),
+            ).fetchone()["n"]
+        assert count == 0
+
+    def test_a_blank_ref_is_absent_and_never_a_link_to_nothing(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-BlankScope")
+        with get_conn() as conn:
+            _, candidates = _persist_scoped_proposal(
+                conn, system_id, capability_ref="   ", flow_ref="flow-x"
+            )
+            _, created = decide_candidate(
+                conn, system_id=system_id, candidate_id=candidates[0]["id"],
+                decision="adopted", decided_by="alice",
+            )
+            kinds = [
+                row["link_kind"]
+                for row in conn.execute(
+                    "SELECT link_kind FROM evolution_node_link WHERE node_id = ?",
+                    (created[0]["id"],),
+                )
+            ]
+        assert kinds == ["flow"]
+
+    def test_every_adopted_node_of_a_multi_node_cut_gets_the_scope(
+        self, admin_client
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ScopeAllNodes")
+        result = propose_decomposition(
+            _StubClient(
+                _good_response(nodes=[_node_payload("parse"), _node_payload("lookup")])
+            ),
+            REASONING_CONFIG,
+            scope_summary="s",
+        )
+        with get_conn() as conn:
+            _, candidates = persist_decomposition(
+                conn, system_id=system_id, result=result, scope_summary="s",
+                capability_ref="7", flow_ref="checkout-flow",
+            )
+            _, created = decide_candidate(
+                conn, system_id=system_id, candidate_id=candidates[0]["id"],
+                decision="adopted", decided_by="alice",
+            )
+            assert len(created) == 2
+            for node in created:
+                kinds = {
+                    row["link_kind"]
+                    for row in conn.execute(
+                        "SELECT link_kind FROM evolution_node_link WHERE node_id = ?",
+                        (node["id"],),
+                    )
+                }
+                assert kinds == {"capability", "flow"}
+
+    def test_the_adopted_scope_shows_up_in_the_lineage_projection(self, admin_client):
+        """The whole point of writing the links: `derive_node_lineage` walks
+        `evolution_node_link`, so the adopted Node now reports the
+        Capability and Flow it was cut out of."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ScopeLineage")
+        with get_conn() as conn:
+            graph, _, _ = _confirm_capability_graph(conn, system_id)
+            entity_id = graph["nodes"][0]["entity_id"]
+            _insert_trace_span(conn, system_id, "checkout-flow")
+            _, candidates = _persist_scoped_proposal(
+                conn, system_id,
+                capability_ref=str(entity_id), flow_ref="checkout-flow",
+            )
+            _, created = decide_candidate(
+                conn, system_id=system_id, candidate_id=candidates[0]["id"],
+                decision="adopted", decided_by="alice",
+            )
+            lineage = derive_node_lineage(
+                conn, system_id=system_id, node_id=created[0]["id"]
+            )
+
+        by_kind = {r["link_kind"]: r for r in lineage["relations"]}
+        assert set(by_kind) == {"capability", "flow"}
+        assert lineage["confirmed_relation_count"] == 2
+        assert by_kind["capability"]["target_name"] == "Checkout"
+        assert by_kind["capability"]["element_state"] == "confirmed"
+        assert by_kind["flow"]["element_state"] == "observed"
+
+    def test_a_rejected_candidate_writes_no_links(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ScopeRejected")
+        with get_conn() as conn:
+            _, candidates = _persist_scoped_proposal(
+                conn, system_id, capability_ref="7", flow_ref="f"
+            )
+            decide_candidate(
+                conn, system_id=system_id, candidate_id=candidates[0]["id"],
+                decision="rejected", decided_by="alice",
+            )
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node_link WHERE system_id = ?",
+                (system_id,),
+            ).fetchone()["n"]
+        assert count == 0
+
+    def test_an_aborted_adoption_writes_no_links(self, admin_client):
+        """The pre-flight refuses BEFORE any write, links included."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ScopeAborted")
+        with get_conn() as conn:
+            candidate_id = _insert_raw_candidate(
+                conn, system_id,
+                [_node_payload("first"), _node_payload("second", mission="   ")],
+            )
+            conn.execute(
+                "UPDATE node_decomposition_proposal SET capability_ref = '7' "
+                "WHERE id = (SELECT proposal_id FROM node_decomposition_candidate "
+                "WHERE id = ?)",
+                (candidate_id,),
+            )
+            with pytest.raises(NodeDesignValidationError):
+                decide_candidate(
+                    conn, system_id=system_id, candidate_id=candidate_id,
+                    decision="adopted", decided_by="alice",
+                )
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node_link WHERE system_id = ?",
+                (system_id,),
+            ).fetchone()["n"]
+        assert count == 0
+
+    def test_the_handoff_carries_the_adopted_nodes_design_lineage(self, admin_client):
+        """The design handoff references Nodes by id; without their links
+        Phase 3 receives a Node with no way back to the Capability/Flow it
+        was designed for. The links are resolved at READ time, never copied
+        into the handoff row."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-HandoffLineage")
+        with get_conn() as conn:
+            graph, _, _ = _confirm_capability_graph(conn, system_id)
+            entity_id = graph["nodes"][0]["entity_id"]
+            _, candidates = _persist_scoped_proposal(
+                conn, system_id,
+                capability_ref=str(entity_id), flow_ref="checkout-flow",
+            )
+            _, created = decide_candidate(
+                conn, system_id=system_id, candidate_id=candidates[0]["id"],
+                decision="adopted", decided_by="alice",
+            )
+            row = assemble_handoff(
+                conn, system_id=system_id,
+                node_ids=[created[0]["id"], 999999],
+                exploration_brief="compare rule vs llm",
+            )
+            handoff = get_handoff(conn, system_id=system_id, handoff_id=row["id"])
+
+        assert [n["id"] for n in handoff["nodes"]] == [created[0]["id"]]
+        design_links = handoff["nodes"][0]["design_links"]
+        assert {link["link_kind"] for link in design_links} == {"capability", "flow"}
+        assert {link["target_ref"] for link in design_links} == {
+            str(entity_id), "checkout-flow"
+        }
+        assert {link["relation_status"] for link in design_links} == {"confirmed"}
+
+    def test_an_unresolved_handoff_node_reports_null_links_not_an_empty_list(
+        self, admin_client
+    ):
+        """`None`, not `[]`: an unresolved Node's links were never read,
+        which is not the same fact as "it has none"."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-HandoffMissingLinks")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="present")
+            row = assemble_handoff(
+                conn, system_id=system_id, node_ids=[node["id"], 999999]
+            )
+            # The missing node is dropped from `nodes` but named in
+            # `missing_refs`; force the unresolved branch by deleting the
+            # node the bundle DID resolve.
+            conn.execute("DELETE FROM evolution_node WHERE id = ?", (node["id"],))
+            handoff = get_handoff(conn, system_id=system_id, handoff_id=row["id"])
+
+        assert handoff["nodes"][0]["resolved"] is False
+        assert handoff["nodes"][0]["design_links"] is None
+
+    def test_implementation_links_never_enter_the_handoff_lineage(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-HandoffImplLinks")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="impl-handoff")
+            add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="component", target_ref="svc-a", created_by="alice",
+            )
+            row = assemble_handoff(conn, system_id=system_id, node_ids=[node["id"]])
+            handoff = get_handoff(conn, system_id=system_id, handoff_id=row["id"])
+
+        assert handoff["nodes"][0]["design_links"] == []
+
+    def test_adoption_over_http_writes_the_scope_links(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ND-ScopeApi")
+        with get_conn() as conn:
+            _, candidates = _persist_scoped_proposal(
+                conn, system_id, capability_ref="7", flow_ref="checkout-flow"
+            )
+            candidate_id = candidates[0]["id"]
+
+        r = admin_client.post(
+            f"/node-design/decomposition-candidates/{candidate_id}/decision",
+            json={"decision": "adopted"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 200, r.text
+        node_id = r.json()["created_nodes"][0]["id"]
+
+        r = admin_client.get(
+            f"/node-design/nodes/{node_id}/lineage",
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 200, r.text
+        relations = r.json()["relations"]
+        assert {rel["link_kind"] for rel in relations} == {"capability", "flow"}
+        # The adopting principal is what the link records.
+        assert {rel["created_by"] for rel in relations} == {"root"}
+        assert {rel["relation_status"] for rel in relations} == {"confirmed"}
 
 
 # ---------------------------------------------------------------------------

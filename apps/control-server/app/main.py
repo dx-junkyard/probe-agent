@@ -38,6 +38,7 @@ from .routes import (
     interview_workflow,
     joint_understanding,
     node_design,
+    node_operations,
     overview,
     probe_patterns,
     project_intelligence,
@@ -115,6 +116,7 @@ def create_app() -> FastAPI:
     app.include_router(node_design.router, dependencies=_auth)
     app.include_router(exploration.router, dependencies=_auth)
     app.include_router(stabilization.router, dependencies=_auth)
+    app.include_router(node_operations.router, dependencies=_auth)
     app.include_router(generation.router, dependencies=_auth)
     app.include_router(replay.router, dependencies=_auth)
     app.include_router(candidate_studio.router, dependencies=_auth)

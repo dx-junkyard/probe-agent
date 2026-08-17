@@ -2,11 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://probe-agent.dev/schemas/evolution_node.json",
   "title": "EvolutionNodeProjection",
-  "description": "The canonical read projection of one Evolution Node (Epic #394 Phase 1, Issue #396), built deterministically at read time by app/evolution_node.py's build_node_projection from evolution_node / evolution_node_version / evolution_node_implementation / evolution_node_link / evolution_node_event -- it is never a separately cached document. An Evolution Node is a NEW entity distinct from a Probe Cell (cell_state.schema.json): the Cell owns the execution role, the Node owns the unit of processing that evolves (its business I/O contract, implementation modality, maturity, and rollback pin). `maturity` / `improvement_status` / `policy_mode` are three deliberately independent axes, each read from its own canonical source (this module's own event log, cell_improvements, components) and never derived from one another; a `workflow_phase` axis is intentionally NOT a property of this document in Phase 1 -- it is added only once Phase 6 of this Epic wires a canonical workflow-phase source. `availability` marks any block that could not be genuinely read as unavailable rather than substituting a default for it -- a `null` value paired with `availability.<key> = true` means the fact is genuinely absent, while `availability.<key> = false` means it could not be determined.",
+  "description": "The canonical read projection of one Evolution Node (Epic #394 Phase 1, Issue #396), built deterministically at read time by app/evolution_node.py's build_node_projection from evolution_node / evolution_node_version / evolution_node_implementation / evolution_node_link / evolution_node_event -- it is never a separately cached document. An Evolution Node is a NEW entity distinct from a Probe Cell (cell_state.schema.json): the Cell owns the execution role, the Node owns the unit of processing that evolves (its business I/O contract, implementation modality, maturity, and rollback pin). `maturity` / `improvement_status` / `policy_mode` are three deliberately independent axes, each read from its own canonical source (this module's own event log, cell_improvements, components) and never derived from one another; a `workflow_phase` axis is intentionally NOT a property of this document in Phase 1 -- it is added only once Phase 6 of this Epic wires a canonical workflow-phase source. `maturity` is the stored column and `folded_maturity` is what the Node's own append-only transition events fold to (ADR-4: the log is the authority, the column is its cache); `maturity_consistent` reports whether they agree, so a drifted cache is visible to every reader of this document rather than only to an auditor who refolds the log by hand. `availability` marks any block that could not be genuinely read as unavailable rather than substituting a default for it -- a `null` value paired with `availability.<key> = true` means the fact is genuinely absent, while `availability.<key> = false` means it could not be determined.",
   "type": "object",
   "required": [
     "schema_version", "system_id", "node_id", "node_key", "display_name",
-    "maturity", "current_version", "current_implementation",
+    "maturity", "folded_maturity", "maturity_consistent",
+    "current_version", "current_implementation",
     "stable_implementation", "rollback_implementation", "links", "events",
     "improvement_status", "policy_mode", "availability", "updated_at"
   ],
@@ -22,6 +23,14 @@
     },
     "display_name": { "type": "string" },
     "maturity": { "$ref": "#/$defs/maturity_state" },
+    "folded_maturity": {
+      "description": "The maturity obtained by folding ALL of this Node's transition events (never the bounded `events` page above). ADR-4 makes the event log the authority and `maturity` its cache, so both are reported. null means either the Node has never transitioned -- consistent with the stored creation state 'exploring' -- or the log could not be read, which availability.maturity_lineage distinguishes.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/maturity_state" }]
+    },
+    "maturity_consistent": {
+      "description": "Whether `maturity` equals `folded_maturity` (a null fold paired with stored 'exploring' is consistent). null ONLY when availability.maturity_lineage is false: an unread log proves neither agreement nor drift.",
+      "type": ["boolean", "null"]
+    },
     "current_version": {
       "description": "The Node's current business I/O contract, or null when none has been recorded yet.",
       "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/version" }]
@@ -207,7 +216,7 @@
       "type": "object",
       "required": [
         "version", "implementation", "stable_implementation", "rollback_implementation",
-        "links", "events", "improvement_status", "policy_mode"
+        "links", "events", "maturity_lineage", "improvement_status", "policy_mode"
       ],
       "additionalProperties": false,
       "properties": {
@@ -217,6 +226,7 @@
         "rollback_implementation": { "type": "boolean" },
         "links": { "type": "boolean" },
         "events": { "type": "boolean" },
+        "maturity_lineage": { "type": "boolean" },
         "improvement_status": { "type": "boolean" },
         "policy_mode": { "type": "boolean" }
       }

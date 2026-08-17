@@ -241,6 +241,17 @@ SYSTEM_RECORDED_TRANSITIONS: FrozenSet[Tuple[str, str]] = frozenset({
     ("monitoring", "established"),
 })
 
+#: The states in which the contract is FROZEN: a Node whose fixation
+#: decision has been approved (`established`, and `monitoring` on top of it)
+#: promises what its pinned stable implementation actually does. Publishing a
+#: new current contract version under it would leave the pin implementing a
+#: superseded promise while the Node kept displaying established/monitoring
+#: -- and ADR-9 forbids `add_version` from repairing that by moving the
+#: maturity itself, because no maturity transition is ever automatic. So the
+#: refusal IS the design: the developer reopens or suspends first
+#: (`decision_method: manual`), and only then revises the contract.
+_CONTRACT_FROZEN_MATURITIES: FrozenSet[str] = frozenset({"established", "monitoring"})
+
 #: Backward transitions: leaving `established`/`monitoring` for anything
 #: other than the other one of that pair. A backward move and `suspended`
 #: are the two cases `evaluate_transition`'s `reason_required` check demands
@@ -259,6 +270,16 @@ class NodeFacts:
     influence the decision -- no client-only value and no wall clock, the
     same discipline `app/interview_workflow.py`'s `WorkflowFacts` follows.
 
+    `monitoring_contract_ref` and `monitoring_contract_valid` are two
+    separate facts on purpose: the first is what the Node's row CLAIMS,
+    the second is whether that claim resolves to a real, active,
+    non-superseded `node_monitoring_contract` row of THIS Node. A ref alone
+    is a string; only the resolution is evidence that observation is
+    actually declared, which is what `established -> monitoring` asserts
+    (ADR-5). `load_node_facts` computes the second fail-closed: an
+    unparseable ref, a missing table, a missing/foreign row, an inactive or
+    superseded contract all yield `False`.
+
     `known_evidence_refs` is the set of evidence refs `evaluate_transition`
     accepts as genuinely belonging to THIS Node: `load_node_facts` populates
     it as ``f"{link_kind}:{target_ref}"`` for every currently-linked
@@ -274,6 +295,7 @@ class NodeFacts:
     has_implementation: bool = False
     has_stable_implementation: bool = False
     monitoring_contract_ref: Optional[str] = None
+    monitoring_contract_valid: bool = False
     implementation_stale: bool = False
     known_evidence_refs: FrozenSet[str] = frozenset()
 
@@ -313,6 +335,7 @@ TRANSITION_REJECTION_CODES: Tuple[str, ...] = (
     "implementation_missing",
     "stable_implementation_missing",
     "monitoring_contract_missing",
+    "monitoring_contract_invalid",
     "evidence_missing",
     "foreign_evidence",
     "stale_implementation",
@@ -320,7 +343,7 @@ TRANSITION_REJECTION_CODES: Tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# The pure evaluator: a 12-row first-match rejection table
+# The pure evaluator: a 13-row first-match rejection table
 # ---------------------------------------------------------------------------
 
 
@@ -437,12 +460,23 @@ def evaluate_transition(facts: NodeFacts, request: TransitionRequest) -> Transit
             f"target state {to_state!r} requires a pinned stable implementation",
         )
 
-    # 9: monitoring needs a monitoring contract wired.
-    if to_state == "monitoring" and not facts.monitoring_contract_ref:
-        return TransitionDecision(
-            False, "monitoring_contract_missing",
-            "target state 'monitoring' requires monitoring_contract_ref to be set",
-        )
+    # 9: monitoring needs a monitoring contract wired, AND that contract must
+    # actually resolve (see NodeFacts.monitoring_contract_valid). The two
+    # codes are deliberately distinct: "none is wired" and "the one that is
+    # wired cannot be verified" are different facts with different fixes, and
+    # an unverifiable claim never passes a gate.
+    if to_state == "monitoring":
+        if not facts.monitoring_contract_ref:
+            return TransitionDecision(
+                False, "monitoring_contract_missing",
+                "target state 'monitoring' requires monitoring_contract_ref to be set",
+            )
+        if not facts.monitoring_contract_valid:
+            return TransitionDecision(
+                False, "monitoring_contract_invalid",
+                "monitoring_contract_ref does not resolve to an active, "
+                "non-superseded monitoring contract of this Node",
+            )
 
     # 10/11: established/monitoring need evidence, and every cited ref must
     # genuinely be this Node's own (see NodeFacts.known_evidence_refs).
@@ -626,8 +660,24 @@ def add_version(
 ) -> sqlite3.Row:
     """Append the next `evolution_node_version` for a Node and make it
     current. Never mutates a prior version's content -- see the table's DDL
-    comment in `app/db.py`."""
+    comment in `app/db.py`.
+
+    Refused for an `established`/`monitoring` Node (see
+    `_CONTRACT_FROZEN_MATURITIES`): the stable implementation is pinned to
+    the CURRENT contract, so making a new one current would silently leave
+    the pin implementing a superseded promise. The maturity is never moved
+    here to compensate (ADR-9: no automatic maturity transition), so the
+    developer's explicit reopen or suspend comes first.
+    """
     node = _require_node(conn, system_id, node_id)
+    if node["maturity"] in _CONTRACT_FROZEN_MATURITIES:
+        raise EvolutionNodeConflictError(
+            f"Node {node_id} is {node['maturity']!r}: its contract is frozen "
+            "while a stable implementation is pinned to it. Transition the "
+            "Node to 'reopened' or 'suspended' first (an explicit human "
+            "decision, decision_method='manual'), then add the new contract "
+            "version."
+        )
     _check_membership(side_effect_class, SIDE_EFFECT_CLASSES, "side_effect_class")
     _check_membership(trust_boundary, TRUST_BOUNDARIES, "trust_boundary")
     _check_membership(decision_method, DECISION_METHODS, "decision_method")
@@ -945,6 +995,46 @@ def pin_stable_implementation(
     return row
 
 
+#: The one format `app/node_operations.py::create_monitoring_contract`
+#: writes into `evolution_node.monitoring_contract_ref`. Parsing it here is a
+#: structural check against a finite format (Principle 6), not a guess: a ref
+#: in any other shape names nothing this server can verify.
+_MONITORING_CONTRACT_REF_PREFIX = "node_monitoring_contract:"
+
+
+def _monitoring_contract_resolves(
+    conn, *, system_id: int, node_id: int, ref: Optional[str]
+) -> bool:
+    """Does `ref` name an ACTIVE, non-superseded monitoring contract of this
+    Node? Fail-closed: every failure to verify is `False`.
+
+    Phase 5's table may not exist yet in a database migrated only to Phase 1.
+    Unlike `stabilization_package` above -- where a missing table legitimately
+    means "no packages exist" and simply contributes no evidence refs -- a
+    missing table here cannot mean "the contract is fine": a ref IS set and
+    cannot be checked, so the gate refuses (`monitoring_contract_invalid`).
+    """
+    if not (ref or "").strip():
+        return False
+    if not ref.startswith(_MONITORING_CONTRACT_REF_PREFIX):
+        return False
+    try:
+        contract_id = int(ref[len(_MONITORING_CONTRACT_REF_PREFIX):])
+    except ValueError:
+        return False
+    try:
+        row = conn.execute(
+            """SELECT active, superseded_by_id FROM node_monitoring_contract
+                   WHERE id = ? AND node_id = ? AND system_id = ?""",
+            (contract_id, node_id, system_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    if row is None:
+        return False
+    return bool(row["active"]) and row["superseded_by_id"] is None
+
+
 def load_node_facts(conn, *, system_id: int, node_id: int) -> NodeFacts:
     """Read every persisted fact `evaluate_transition` needs, for one Node."""
     node = _require_node(conn, system_id, node_id)
@@ -999,9 +1089,57 @@ def load_node_facts(conn, *, system_id: int, node_id: int) -> NodeFacts:
         has_implementation=has_implementation,
         has_stable_implementation=has_stable,
         monitoring_contract_ref=node["monitoring_contract_ref"],
+        monitoring_contract_valid=_monitoring_contract_resolves(
+            conn, system_id=system_id, node_id=node_id,
+            ref=node["monitoring_contract_ref"],
+        ),
         implementation_stale=implementation_stale,
         known_evidence_refs=known_evidence_refs,
     )
+
+
+def _lookup_idempotent_event(
+    conn, *, system_id: int, node_id: int, idempotency_key: str
+) -> Optional[sqlite3.Row]:
+    """The single definition of "has this exact request already been
+    recorded?". `apply_transition` asks three times -- before the
+    transaction, inside it, and while recovering from a unique-index
+    violation -- and all three must ask the same question of the same rows.
+    """
+    return conn.execute(
+        """SELECT * FROM evolution_node_event
+               WHERE node_id = ? AND system_id = ? AND idempotency_key = ?""",
+        (node_id, system_id, idempotency_key),
+    ).fetchone()
+
+
+def _duplicate_result(event: Mapping[str, Any], node: Mapping[str, Any]) -> "TransitionApplyResult":
+    return TransitionApplyResult(
+        decision=TransitionDecision(
+            True, "ok", "Duplicate request; the original transition is unchanged.",
+        ),
+        applied=False,
+        duplicate=True,
+        event=event,
+        node=node,
+    )
+
+
+class _MaturityChangedUnderRequest(Exception):
+    """Internal signal: the compare-and-set UPDATE matched no row, so the
+    Node's maturity is no longer the one the decision was made against.
+
+    Deliberately NOT an `EvolutionNodeError`: it must never escape
+    `apply_transition`, which converts it into an
+    `EvolutionNodeConflictError` after rolling back. Raising the public error
+    directly inside the transaction would be caught by the generic
+    `except Exception` handler and rolled back there, which is correct but
+    hides why the request failed behind a shared branch.
+    """
+
+    def __init__(self, expected_maturity: str) -> None:
+        super().__init__(expected_maturity)
+        self.expected_maturity = expected_maturity
 
 
 @dataclass(frozen=True)
@@ -1036,29 +1174,33 @@ def apply_transition(
     does not care about idempotency passes `idempotency_key=""`, which is
     excluded from the uniqueness check entirely (see the partial unique
     index in `app/db.py`).
+
+    The facts are read and evaluated INSIDE the write transaction, which is
+    opened with `BEGIN IMMEDIATE` so the write lock is taken BEFORE the read.
+    Two concurrent requests carrying different idempotency keys (which the
+    unique index therefore does not separate) would otherwise both read the
+    same old maturity on their own connections and both commit, leaving the
+    event log's `from_state` chain broken -- and ADR-4 makes that log the
+    authority the stored column is checked against.
+
+    The maturity UPDATE is additionally a compare-and-set on the maturity the
+    decision was made against, verified by `rowcount`. That is belt and
+    suspenders on top of the lock: it makes the invariant "no transition ever
+    commits whose `from_state` differs from the row's maturity at commit
+    time" hold structurally, independent of which isolation the caller's
+    connection happens to provide.
     """
     node = _require_node(conn, system_id, node_id)
     evidence_refs_t = tuple(evidence_refs or ())
     idem = (idempotency_key or "").strip()
 
     if idem:
-        existing_event = conn.execute(
-            """SELECT * FROM evolution_node_event
-                   WHERE node_id = ? AND system_id = ? AND idempotency_key = ?""",
-            (node_id, system_id, idem),
-        ).fetchone()
+        existing_event = _lookup_idempotent_event(
+            conn, system_id=system_id, node_id=node_id, idempotency_key=idem
+        )
         if existing_event is not None:
-            return TransitionApplyResult(
-                decision=TransitionDecision(
-                    True, "ok", "Duplicate request; the original transition is unchanged.",
-                ),
-                applied=False,
-                duplicate=True,
-                event=existing_event,
-                node=node,
-            )
+            return _duplicate_result(existing_event, node)
 
-    facts = load_node_facts(conn, system_id=system_id, node_id=node_id)
     request = TransitionRequest(
         to_state=to_state,
         decision_method=decision_method,
@@ -1068,15 +1210,34 @@ def apply_transition(
         reason_code=reason_code,
         evidence_refs=evidence_refs_t,
     )
-    decision = evaluate_transition(facts, request)
-    if not decision.allowed:
-        return TransitionApplyResult(
-            decision=decision, applied=False, duplicate=False, event=None, node=node,
-        )
 
     now = time.time()
-    conn.execute("BEGIN")
+    # BEGIN IMMEDIATE takes the write lock before the facts below are read,
+    # so a concurrent transition cannot decide against the same from-state.
+    conn.execute("BEGIN IMMEDIATE")
     try:
+        node = _require_node(conn, system_id, node_id)
+        # The same duplicate check again, now under the write lock. A winner
+        # that committed between the pre-check above and this transaction has
+        # ALREADY moved the maturity, so without this a raced retry of an
+        # applied request would be answered with a rejection
+        # (`illegal_transition`) instead of the duplicate it is.
+        if idem:
+            existing_event = _lookup_idempotent_event(
+                conn, system_id=system_id, node_id=node_id, idempotency_key=idem
+            )
+            if existing_event is not None:
+                conn.execute("ROLLBACK")
+                return _duplicate_result(existing_event, node)
+
+        facts = load_node_facts(conn, system_id=system_id, node_id=node_id)
+        decision = evaluate_transition(facts, request)
+        if not decision.allowed:
+            conn.execute("ROLLBACK")
+            return TransitionApplyResult(
+                decision=decision, applied=False, duplicate=False, event=None, node=node,
+            )
+
         event = _insert_event(
             conn, node_id=node_id, system_id=system_id, event_kind="transition",
             from_state=facts.maturity, to_state=to_state,
@@ -1085,43 +1246,44 @@ def apply_transition(
             evidence_json=json.dumps(list(evidence_refs_t)),
             idempotency_key=idem, created_at=now,
         )
-        conn.execute(
-            "UPDATE evolution_node SET maturity = ?, updated_at = ? WHERE id = ?",
-            (to_state, now, node_id),
+        cur = conn.execute(
+            "UPDATE evolution_node SET maturity = ?, updated_at = ? "
+            "WHERE id = ? AND maturity = ?",
+            (to_state, now, node_id, facts.maturity),
         )
+        if cur.rowcount != 1:
+            raise _MaturityChangedUnderRequest(facts.maturity)
         updated_node = conn.execute(
             "SELECT * FROM evolution_node WHERE id = ?", (node_id,)
         ).fetchone()
         conn.execute("COMMIT")
+    except _MaturityChangedUnderRequest as exc:
+        conn.execute("ROLLBACK")
+        raise EvolutionNodeConflictError(
+            f"Node {node_id}'s maturity changed while this transition was "
+            f"being applied (it was no longer {exc.expected_maturity!r}); "
+            "nothing was recorded. Re-read the Node and request again."
+        ) from exc
     except sqlite3.IntegrityError:
-        # A concurrent request with the SAME idempotency_key won the
-        # SELECT-then-INSERT race: its event landed between our duplicate
-        # check above and our insert, so the partial unique index refused
-        # ours. That retry is the situation idempotency exists for -- resolve
-        # to the winner's event exactly as the sequential-retry path does.
-        # Any other integrity violation re-raises unchanged: the re-select
-        # below is the discriminator, not the exception type.
+        # A concurrent request with the SAME idempotency_key won the race and
+        # its event was refused entry by the partial unique index rather than
+        # being seen by either duplicate check above. Under a serializing
+        # connection the in-transaction check makes this unreachable, but it
+        # stays as the last line of the same defence: a retry is the
+        # situation idempotency exists for, so resolve to the winner's event
+        # exactly as the sequential-retry path does. Any other integrity
+        # violation re-raises unchanged -- the re-select below is the
+        # discriminator, not the exception type.
         conn.execute("ROLLBACK")
         if idem:
-            existing_event = conn.execute(
-                """SELECT * FROM evolution_node_event
-                       WHERE node_id = ? AND system_id = ? AND idempotency_key = ?""",
-                (node_id, system_id, idem),
-            ).fetchone()
+            existing_event = _lookup_idempotent_event(
+                conn, system_id=system_id, node_id=node_id, idempotency_key=idem
+            )
             if existing_event is not None:
                 current_node = conn.execute(
                     "SELECT * FROM evolution_node WHERE id = ?", (node_id,)
                 ).fetchone()
-                return TransitionApplyResult(
-                    decision=TransitionDecision(
-                        True, "ok",
-                        "Duplicate request; the original transition is unchanged.",
-                    ),
-                    applied=False,
-                    duplicate=True,
-                    event=existing_event,
-                    node=current_node,
-                )
+                return _duplicate_result(existing_event, current_node)
         raise
     except Exception:
         conn.execute("ROLLBACK")
@@ -1360,11 +1522,22 @@ def build_node_projection(
     `components` -- three independent reads, three independent answers, even
     when they disagree with each other.
 
+    `maturity` is the stored column and `folded_maturity` is what this
+    Node's own transition events fold to (ADR-4: the log is the authority,
+    the column is its cache). Both are reported, plus `maturity_consistent`
+    -- returning only the column would make the very drift the log exists to
+    expose invisible to every reader of the canonical projection. A Node
+    with no transition yet folds to `null`, which is CONSISTENT with the
+    stored creation state `exploring`.
+
     `availability` marks any block that could not be genuinely read as
     unavailable rather than substituting a default value for it (the #380
     "an unreadable fact is never a fact's default value" rule): a `None`
     value paired with `availability[<key>] = True` means "genuinely absent",
     while `availability[<key>] = False` means "could not be determined".
+    `availability["maturity_lineage"] = False` therefore leaves BOTH
+    reconciliation fields `null`: an unread log proves neither agreement nor
+    drift.
     """
     node = _require_node(conn, system_id, node_id)
     availability: Dict[str, bool] = {}
@@ -1405,6 +1578,40 @@ def build_node_projection(
     ).fetchall()
     availability["events"] = True
 
+    # ADR-4's reconciliation, actually performed rather than asserted: the
+    # stored `maturity` column is a cache of the event log's fold, so the
+    # projection reports BOTH and whether they agree. This is a dedicated,
+    # UNBOUNDED query over the transition events -- folding the bounded
+    # `events` page above would reconcile against a truncated history and
+    # report a healthy Node as drifted.
+    folded_maturity: Optional[str] = None
+    maturity_consistent: Optional[bool] = None
+    try:
+        transition_rows = conn.execute(
+            """SELECT id, event_kind, to_state FROM evolution_node_event
+                   WHERE node_id = ? AND system_id = ? AND event_kind = 'transition'
+                   ORDER BY id""",
+            (node_id, system_id),
+        ).fetchall()
+    except sqlite3.Error:
+        availability["maturity_lineage"] = False
+    else:
+        availability["maturity_lineage"] = True
+        folded_maturity = fold_events(
+            [
+                {"id": row["id"], "event_kind": row["event_kind"], "to_state": row["to_state"]}
+                for row in transition_rows
+            ]
+        )
+        # A Node that has never transitioned folds to None, and its stored
+        # maturity must then be the creation state 'exploring' -- that pair
+        # is CONSISTENT, not a missing lineage.
+        maturity_consistent = (
+            node["maturity"] == "exploring"
+            if folded_maturity is None
+            else folded_maturity == node["maturity"]
+        )
+
     improvement_status, improvement_available = _resolve_improvement_status(
         conn, system_id, links
     )
@@ -1420,6 +1627,8 @@ def build_node_projection(
         "node_key": node["node_key"],
         "display_name": node["display_name"],
         "maturity": node["maturity"],
+        "folded_maturity": folded_maturity,
+        "maturity_consistent": maturity_consistent,
         "current_version": _version_doc(version_row) if version_row is not None else None,
         "current_implementation": (
             _implementation_doc(implementation_row) if implementation_row is not None else None

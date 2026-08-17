@@ -7201,11 +7201,12 @@ projection、fail-closed 推論、3 評価契約の非合成、欠測の非丸�
   以外の画面は #401 の再配置対象(既存記載どおり)。
 - **`exploration_run.status='abandoned'` の設定経路**: 語彙には存在するが
   setter が無い(gate の `evidence_ref_stale` は defensive に判定済み)。
-- **monitoring contract の「actually active」**: `established→monitoring`
-  の要求は `monitoring_contract_ref` 非 NULL のみで、参照先 contract 行の
-  解決・`active` 列の読み取りは行わない(deactivate API も未実装)。
-  §10 未決事項 #1(coverage sub-state)と同じ設計判断領域なので、#400 の
-  運用データを得てから #401 で決める。
+- **monitoring contract の deactivate API**: 検証ラウンド2で
+  `established→monitoring` は参照先 contract 行の解決・`active`・
+  `superseded_by_id` を fail-closed に検証するようになった
+  (`monitoring_contract_invalid`、下記参照)が、contract を明示的に
+  deactivate する API は依然として無い。§10 未決事項 #1(coverage
+  sub-state)とあわせて #401 で決める。
 - **#400 実装内容のうち**: notification/cooldown(dedupe のみ実装)、
   realistic drift fixtures / long-running simulations、
   replay→offline shadow→approved live shadow の順序を使う handoff の
@@ -7221,4 +7222,135 @@ projection、fail-closed 推論、3 評価契約の非合成、欠測の非丸�
 - **Phase 1 ドメイン層の残余**: `stale_implementation` は current
   implementation のみを見る(stable pin が旧契約の実装のままでも通る)。
   公開 API 側は establishment 迂回閉鎖 + gate の `contract_version_moved`
-  で塞がっており、ドメイン単体の強化は #401 で判断する。
+  で塞がっており、検証ラウンド2の contract freeze(established/monitoring
+  中は `add_version` 自体を拒否)で「pin が旧契約に取り残される」入口も
+  閉じた。ドメイン単体のさらなる強化は #401 で判断する。
+
+## Epic #394 検証ラウンド2(2026-08-17, 外部レビュー指摘対応)
+
+Phase 1〜5 の実装レビュー(#396〜#400 不合格判定)で指摘された欠陥の
+うち、コードレベルで妥当と確認できたものをすべて修正した。いずれも
+「記録された事実が後段の判断の入力になる」という Epic 自身の規律に
+対する破れであり、個別の再現/回帰テストを伴う。UI・pilot・dogfooding・
+既存導線 consolidation 系の指摘は上記「明示的な残件」どおり #401 の
+scope であり、本ラウンドの対象外(実装欠陥ではなく scope の記録)。
+
+### 修正(#396 Phase 1)
+
+- **contract freeze**: `add_version` は maturity が
+  `established`/`monitoring` の Node を 409 で拒否する
+  (`_CONTRACT_FROZEN_MATURITIES`)。stable pin が旧契約の約束を実装した
+  まま Node が established 表示を続ける穴を入口で閉じる。ADR-9 により
+  `add_version` が maturity を自動遷移させて補うことは許されないので、
+  拒否こそが設計——開発者が先に reopen / suspend(manual)する。
+- **transition の原子性**: `apply_transition` は `BEGIN IMMEDIATE` で
+  write lock を取ってから facts 読取り + `evaluate_transition` を
+  transaction 内で行い、maturity 更新は
+  `UPDATE ... WHERE id = ? AND maturity = ?` の CAS(rowcount 検証、
+  失敗は rollback + 409)。異なる idempotency key の並行リクエストが
+  同じ旧 state を読んで双方 commit し、event log の from-state 連続性が
+  壊れる競合を閉じた。idempotency の duplicate 判定は transaction 内で
+  再実行される(勝者が pre-check と transaction の間に commit した場合、
+  再検査なしでは applied 済みリクエストの retry が `illegal_transition`
+  になってしまう)。実 2 connection の競合テストを追加。
+- **projection の lineage 照合**(ADR-4): `build_node_projection` が
+  transition event 全量(`event_limit` ページではない専用クエリ)を
+  `fold_events` で畳み込み、`folded_maturity` / `maturity_consistent` を
+  返す。stored column は log の cache だという主張を、実際に照合して
+  読者に見せる。transition 未発生の fold `null` + stored `exploring` は
+  整合。schema は `evolution_node.schema.json` に追記(additive)。
+
+### 修正(#397 Phase 2)
+
+- **採用時の Capability/Flow lineage 継承**: `decide_candidate` の
+  adoption が、親 proposal の `capability_ref` / `flow_ref` を作成した
+  全 Node へ `evolution_node_link`(kind `capability` / `flow`、
+  `decision_method='manual'`、候補 id を note に記録)として書く。
+  handoff は Node 側の links を読取り時に参照する `design_links` で
+  lineage を運ぶ(コピーではなく参照——handoff テーブルに列は増やさ
+  ない)。
+- **lineage の per-kind 解決**: `derive_node_lineage` が link kind ごとに
+  正本ソースで解決する(`_LINK_KIND_TARGET_SOURCE`): `purpose_element`
+  は従来どおり呼出元の Purpose Frame、`capability` は #312 の
+  `understanding_capability_entity.id`(canonical head 照合で
+  confirmed/superseded)、`flow` は `trace_spans.flow_id`(observed)、
+  `feature` は `feature_drafts.feature_id`(確認 lifecycle が無いので
+  `not_applicable`——存在するものを unresolved と偽らない)。全て
+  存在 + 完全一致 id 照合のみ(Principle 6)。`target_resolution`
+  (`resolved`/`unresolved`/`unavailable`)と `target_source` を relation
+  に追加(additive)。
+
+### 修正(#398 Phase 3)
+
+- **complete_run の完了要件**: first-match の有限
+  `COMPLETION_REFUSAL_REASONS` で拒否——`missing_baseline` /
+  `no_candidate_variant`(非 baseline variant ゼロ)/
+  `execution_unresolved`(`not_executed` の variant が残存;
+  `not_executable`/`unsupported` は記録済みの一級 outcome であり
+  ブロックしない)/ `executed_without_measurement` /
+  `measured_without_execution`。≥2 modality は要求しない——§8.3 の
+  cross-modality は Phase の能力要件であり、同一 modality の 2 変種
+  比較も正当な探索である(docstring に明記)。
+- **measured 値の実行裏付け**: `record_measurement` は
+  `value_state='measured'` を `execution_state='executed'` の variant に
+  しか受理しない(手入力数値の自己申告経路の閉鎖)。順序は
+  `attach_execution` → `record_measurement` となり、完了時ゲートが
+  同じ不変条件を再検査する。
+- **pinned inputs との照合**: `attach_execution` が参照先の実行
+  (replay_run / replay_variant は親 run、experiment)の
+  snapshot_id / commit_sha(git 略記規則対応)/ replay_set / 実装側の
+  snapshot・commit を run の固定条件と照合し、矛盾は
+  `pinned_input_mismatch`(どの fact かを名指し)。両側が記録している
+  fact のみ比較——片側にしか無い fact は不一致ではない(記録されて
+  いないものは検証できず、拒否すればゲートが使用不能になる;記録済みの
+  矛盾こそが欠陥)。
+
+### 修正(#399 Phase 4)
+
+- **自己申告 evidence の閉鎖**: asserting verdict(`met`/`held`)の
+  `criterion`/`floor`/`stability` evidence は `EXECUTION_REF_KINDS`
+  (exploration_run/exploration_variant/replay_run/experiment)の解決可能な
+  実行参照を必須とする(add 時 422 + gate 時 `evidence_ref_missing`——
+  旧データも fail-closed)。`evaluation_policy` は「何が要求されたか」で
+  あって「何が観測されたか」ではないので実行参照として不可。
+  `not_met`/`violated` は ref 不要(負の自己申告は block しかできない;
+  拒否を確立より難しくしない)。`node_evidence_missing` は node-level の
+  **asserted** result を要求するよう強化。exploration 系 ref は package の
+  Node への帰属も検証(cross-Node は `foreign_evidence`)。
+- **stability 宣言の必須化**: gate は `required_case_count <= 0` または
+  `stability_window_seconds <= 0` を `stability_declaration_missing` で
+  拒否。閾値の大きさは per-package のまま(全域固定 threshold の禁止は
+  不変)——正の宣言だけが必須。draft 作成時の default 0 は許容。
+- **parent / human 承認の分離**: `stabilization_package` に
+  `parent_reviewed_by` / `parent_reviewed_at` /
+  `parent_review_disposition`(endorsed/declined)/ `parent_review_note`
+  を additive migration で追加。`POST /stabilization/packages/{id}/
+  parent-review`(Principal 由来の実名、draft/under_review のみ、
+  append-only)。gate は `endorsed` を要求
+  (`parent_review_missing` / `parent_review_declined`)、
+  `approve_package` は parent reviewer と approver の同一人物を
+  `parent_approver_identical` で拒否(gate とは別の有限
+  `APPROVAL_REFUSAL_CODES`——gate は読取り毎再計算で approver が
+  存在しないため)。reject / supersede は parent review 不要(拒否は
+  常に可能でなければならない)。gate 語彙は 22 拒否コード + `ok`。
+
+### 修正(#400 Phase 5)
+
+- **monitoring contract の実解決検証**: `established→monitoring` は
+  `monitoring_contract_ref` が `node_monitoring_contract:<id>` 形式で
+  解決し、当該 Node/System の行が `active=1` かつ非 superseded である
+  ことを要求(`NodeFacts.monitoring_contract_valid`、fail-closed——
+  テーブル欠如や他 Node の contract も拒否)。拒否コード
+  `monitoring_contract_invalid` を追加し、Phase 1 evaluator は 13 行の
+  first-match 表になった(`monitoring_contract_missing` とは別コード——
+  「未配線」と「配線済みだが検証不能」は別の事実)。
+- **Operations API の公開**: `app/routes/node_operations.py` を新設し
+  `main.py` に配線(`/node-operations` 配下 7 エンドポイント:
+  monitoring contract 作成 / observation 記録 / anomaly 記録(dedupe は
+  200 + `created:false`)/ reopen-scope 取得 / reopen plan 作成 / plan
+  approve / operations projection)。承認者は Principal 由来で body から
+  受けない(#337)。anomaly の `decision_method` は route が `manual` を
+  強制——HTTP 呼出元は人間駆動クライアントであり、body が
+  `deterministic`/`reasoning_llm` を名乗れると intelligence run の裏付け
+  なく system/model 産の分類を偽造できる。fail-closed の reasoning 経路は
+  ドメイン層直呼びのまま。Dashboard 画面は従来どおり #401 の統合対象。
