@@ -937,3 +937,35 @@ Dashboard 上で独立したフィールドとして表示され、1 つのバ�
 answer を先取りしない——特に #1・#2 は、実データが無い段階で決めると
 ADR-7/ADR-5 が禁じている「早すぎる合成」を設計レベルで先取りしてしまう
 リスクがある。
+
+---
+
+## 11. 実装追記(Phase 1〜5 実装後の正誤、2026-08-17)
+
+この文書は Phase 0 で凍結された設計契約であり、ADR-1〜9 と §1〜§10 の
+内容は変更しない。ただし Phase 1〜5(#396〜#400)の実装が §6/§8 の
+文字通りの記述と異なった点を、正本の側から追認する。実装判断の詳細は
+`docs/project-intelligence.md` の Issue #396〜#400 節と検証ラウンド節が
+正本である。
+
+- **モジュール名**: §6.2/§6.4 が仮置きした `routes/evolution.py` は
+  `routes/evolution_nodes.py` として、`evolution_lifecycle.py` は独立
+  モジュールを作らず `app/evolution_node.py` 1 本に統合して実装された。
+  Dashboard route は §6.3 の `/evolution` ではなく `/evolution-nodes`。
+  いずれも命名のみの差分で、責務の配置は §6 の分類どおり。
+- **Phase 1 inspector の操作範囲**: §8.1 の「read-only inspector」に
+  対し、実装は Node 作成と手動遷移要求の 2 操作を持つ(いずれも #396
+  自身の成果物である create/transition API の呼び出しで、判定は常に
+  サーバー側。client は maturity・遷移可否を一切導出しない)。
+- **4 軸の返し方**: §2.3/§8.1 の「4 軸を別フィールドで返す」は、
+  実装では maturity / improvement_status / policy_mode の 3 フィールド +
+  user phase 軸の**意図的な欠落**として実現された。理由は #380 の
+  「読み取りが書き込んではならない」規則(`evaluate_session_workflow`
+  は checkpoint を永続化する)。`docs/project-intelligence.md` #396 節に
+  記録済み。
+- **検証ラウンド(2026-08-17)**: Phase 0〜5 の実装を本文書・各 Issue
+  受け入れ条件に対して照合し、ADR-2(未承認 Probe Point リンクの拒否)、
+  ADR-4(承認の原子性)、ADR-9(provenance の偽装不能性、固定化ゲートの
+  迂回不能性)、§6.1 の「完了済み run のみを引用する」等の実装漏れを
+  修正した。一覧は `docs/project-intelligence.md` の「Epic #394 検証
+  ラウンド」節。

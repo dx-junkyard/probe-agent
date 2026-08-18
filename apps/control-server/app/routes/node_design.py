@@ -35,7 +35,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .. import node_design, purpose_chain
+from .. import evolution_node, node_design, purpose_chain
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from ..llm import LLMConfig, create_llm_client
@@ -59,10 +59,16 @@ _ERROR_STATUS = {
     node_design.NodeDesignNotFoundError: 404,
     node_design.NodeDesignConflictError: 409,
     node_design.NodeDesignValidationError: 422,
+    # Adoption calls into Phase 1's `create_node`/`add_version`. Their
+    # domain errors are mapped too, so a rule enforced there but missed by
+    # the adoption pre-flight surfaces as a client error instead of a 500.
+    evolution_node.EvolutionNodeNotFoundError: 404,
+    evolution_node.EvolutionNodeConflictError: 409,
+    evolution_node.EvolutionNodeValidationError: 422,
 }
 
 
-def _raise_domain_error(exc: node_design.NodeDesignError) -> None:
+def _raise_domain_error(exc: ValueError) -> None:
     for exc_type, status_code in _ERROR_STATUS.items():
         if isinstance(exc, exc_type):
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
@@ -300,7 +306,7 @@ def decide_decomposition_candidate(
                 decided_by=principal.username,
                 note=payload.note,
             )
-        except node_design.NodeDesignError as exc:
+        except (node_design.NodeDesignError, evolution_node.EvolutionNodeError) as exc:
             _raise_domain_error(exc)
         created = [
             {"id": node["id"], "node_key": node["node_key"], "maturity": node["maturity"]}

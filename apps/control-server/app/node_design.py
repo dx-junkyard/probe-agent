@@ -15,6 +15,12 @@ evaluation hierarchy, §8.2 for this phase's gate). Four things live here:
    and a Purpose element's own `confirmed`/`hypothesis`/`unknown` state is
    carried through unchanged -- confirming the Node's link says nothing
    about whether the Purpose element it points at was ever confirmed.
+   A THIRD axis is whether the link's target exists at all, and every link
+   kind is resolved against its OWN canonical source for it
+   (`_LINK_KIND_TARGET_SOURCE`): the caller's Purpose Frame, Issue #312's
+   Capability Graph, the System's observed flow ids, the Feature Map.
+   `unresolved` (the source was read; the target is not in it) and
+   `unavailable` (the source was never supplied) stay distinct.
 
 2. **Node decomposition** (`propose_decomposition`, `decide_candidate`). A
    reasoning model proposes whole CUTS of a scope, several at a time, so
@@ -23,7 +29,11 @@ evaluation hierarchy, §8.2 for this phase's gate). Four things live here:
    `decision_method: manual` record that creates the real Nodes through
    Phase 1's own `create_node`/`add_version`. The model never creates a
    Node, and a failed reasoning call stores nothing but the failure
-   (Principle 6: no heuristic fallback).
+   (Principle 6: no heuristic fallback). Adoption also carries the
+   proposal's Capability/Flow scope onto every created Node as an
+   `evolution_node_link` -- otherwise the scope the cut was made against
+   lived only on the proposal row and the adopted Node had no lineage back
+   to it.
 
 3. **The three evaluation contracts** (`create_evaluation_policy`). ADR-7:
    Node, Flow/Capability and UX/Outcome are separate contracts connected by
@@ -40,7 +50,9 @@ evaluation hierarchy, §8.2 for this phase's gate). Four things live here:
    after the policy it came from was superseded. A reference that cannot be
    resolved makes the bundle `incomplete` and is listed by name; it is never
    silently dropped, because a handoff that quietly lost its edge cases is
-   indistinguishable from one that never had any.
+   indistinguishable from one that never had any. Each resolved Node's
+   design links are read back with it, so Phase 3 receives the
+   Capability/Flow the Node was cut out of and not just a Node id.
 
 Connection discipline (CLAUDE.md Implementation Constraints): every function
 here takes an already-open `conn`, except `propose_decomposition`, which
@@ -75,6 +87,9 @@ __all__ = [
     "EVALUATION_LEVELS",
     "CANDIDATE_DECISIONS",
     "RELATION_STATUSES",
+    "TARGET_RESOLUTIONS",
+    "TARGET_SOURCES",
+    "LINEAGE_ELEMENT_STATES",
     "ASSEMBLY_STATES",
     "DECOMPOSITION_PROMPT_VERSION",
     "DECOMPOSITION_SCHEMA_VERSION",
@@ -118,10 +133,51 @@ ASSEMBLY_STATES: Tuple[str, ...] = get_args(AssemblyState)
 DECOMPOSITION_PROMPT_VERSION = "node-decomposition-v1"
 DECOMPOSITION_SCHEMA_VERSION = "node-decomposition-schema-v1"
 
-# The link kinds that carry design lineage. A `component`/`probe_point`/
-# `cell_binding` link is an implementation fact, not a design relation, and
-# is deliberately excluded from the lineage projection.
-_LINEAGE_LINK_KINDS: Tuple[str, ...] = ("purpose_element", "capability", "flow", "feature")
+# Whether the link's TARGET could be found in its own canonical source. This
+# is a third axis, independent of `relation_status` (who decided the link) and
+# of the target's own state: `unresolved` means the source was read and the
+# target is not in it, while `unavailable` means the source was not supplied
+# to this call at all. Collapsing those two would report "this Purpose element
+# does not exist" for a caller that simply did not pass a Purpose Frame
+# (the #380 rule: an unreadable fact is never a fact's default value).
+TargetResolution = Literal["resolved", "unresolved", "unavailable"]
+TARGET_RESOLUTIONS: Tuple[str, ...] = get_args(TargetResolution)
+
+# Which canonical source decides a link kind's target. Each kind is resolved
+# against ITS OWN source -- routing every kind through the Purpose Frame made
+# a `capability`/`flow`/`feature` link resolvable only when its target_ref
+# happened to collide with a Purpose element id.
+TargetSource = Literal["purpose_frame", "capability_graph", "flow_lineage", "feature_map"]
+TARGET_SOURCES: Tuple[str, ...] = get_args(TargetSource)
+
+# The link kinds that carry design lineage, each mapped to the canonical
+# source that owns its identity. A `component`/`probe_point`/`cell_binding`
+# link is an implementation fact, not a design relation, and is deliberately
+# excluded from the lineage projection.
+_LINK_KIND_TARGET_SOURCE: Dict[str, str] = {
+    # `purpose_chain.derive_purpose_chain` element ids, supplied by the caller.
+    "purpose_element": "purpose_frame",
+    # Issue #312's stable Capability identity: `understanding_capability_entity.id`.
+    "capability": "capability_graph",
+    # The System-scoped runtime flow identity carried on `trace_spans.flow_id`.
+    "flow": "flow_lineage",
+    # The Feature Map's stable `feature_drafts.feature_id`.
+    "feature": "feature_map",
+}
+_LINEAGE_LINK_KINDS: Tuple[str, ...] = tuple(_LINK_KIND_TARGET_SOURCE)
+
+#: The element states this module itself can REPORT. A `purpose_element`
+#: carries the Purpose Chain's own state verbatim instead (it is that
+#: projection's vocabulary, not this module's), so these are the values used
+#: for every other kind plus the two shared "we could not say" readings.
+#:
+#: `not_applicable` is deliberate rather than a blank: the Feature Map records
+#: no finite confirmation state for a Feature, and reporting `unresolved` for
+#: a Feature that demonstrably exists would be a different, false claim.
+LineageElementState = Literal[
+    "unresolved", "confirmed", "superseded", "observed", "not_applicable"
+]
+LINEAGE_ELEMENT_STATES: Tuple[str, ...] = get_args(LineageElementState)
 
 _DECISION_METHOD_TO_RELATION_STATUS: Dict[str, str] = {
     "manual": "confirmed",
@@ -174,6 +230,207 @@ def _json_or_default(text: Optional[str], default: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _ResolvedTarget:
+    """What ONE link's target resolved to in its own canonical source."""
+
+    resolution: str
+    name: Optional[str] = None
+    state: str = "unresolved"
+
+
+#: The verdict for a target its source was read for and does not contain.
+#: Never a guess: no name matching, no similarity, no "closest" candidate
+#: (Principle 6) -- an unresolvable ref is reported as unresolvable.
+_UNRESOLVED = _ResolvedTarget(resolution="unresolved")
+
+
+def _resolve_purpose_element(
+    purpose_elements: Optional[Mapping[str, Mapping[str, Any]]], target_ref: str
+) -> _ResolvedTarget:
+    """Resolve against the caller-supplied Purpose Frame, unchanged.
+
+    A `None` map is `unavailable`, not `unresolved`: the Purpose Frame was
+    never consulted, so nothing was found to be missing.
+    """
+    if purpose_elements is None:
+        return _ResolvedTarget(resolution="unavailable")
+    element = purpose_elements.get(target_ref)
+    if element is None:
+        return _UNRESOLVED
+    return _ResolvedTarget(
+        resolution="resolved",
+        name=element.get("name"),
+        # The Purpose Chain's OWN state vocabulary, carried through verbatim.
+        state=element.get("state", "unresolved"),
+    )
+
+
+def _resolve_capability(
+    conn: sqlite3.Connection, system_id: int, target_ref: str
+) -> _ResolvedTarget:
+    """Resolve against Issue #312's canonical Capability identity.
+
+    A Capability's stable id is `understanding_capability_entity.id` -- an
+    integer, rendered here as the decimal string the `evolution_node_link`
+    DDL calls "a stable Capability id". A ref in any other shape is
+    `unresolved`; matching on the DISPLAY NAME instead is precisely what
+    #312 forbids ("names never determine identity across a rename").
+
+    `confirmed` vs `superseded` is the entity's own finite state: whether it
+    is part of the System's CURRENT confirmed composition, or exists only in
+    an earlier confirmation because a later one dropped it.
+    """
+    ref = (target_ref or "").strip()
+    if not ref.isdigit():
+        return _UNRESOLVED
+    entity_id = int(ref)
+    entity = conn.execute(
+        "SELECT id FROM understanding_capability_entity WHERE id = ? AND system_id = ?",
+        (entity_id, system_id),
+    ).fetchone()
+    if entity is None:
+        return _UNRESOLVED
+
+    # The System-wide canonical head (#312 / #312's `latest_system_confirmed_graph`
+    # rule): the newest confirmation regardless of which session produced it.
+    head = conn.execute(
+        """SELECT id FROM understanding_capability_confirmation
+               WHERE system_id = ? ORDER BY id DESC LIMIT 1""",
+        (system_id,),
+    ).fetchone()
+    name_row = None
+    if head is not None:
+        name_row = conn.execute(
+            """SELECT name FROM understanding_capability_entity_version
+                   WHERE system_id = ? AND confirmation_id = ? AND entity_id = ?""",
+            (system_id, head["id"], entity_id),
+        ).fetchone()
+    if name_row is not None:
+        return _ResolvedTarget(
+            resolution="resolved", name=name_row["name"], state="confirmed"
+        )
+    # Still a real, resolvable entity -- it just is not in the current
+    # composition any more. Its last confirmed name is what the developer
+    # will recognise it by.
+    last_row = conn.execute(
+        """SELECT name FROM understanding_capability_entity_version
+               WHERE system_id = ? AND entity_id = ?
+               ORDER BY confirmation_id DESC LIMIT 1""",
+        (system_id, entity_id),
+    ).fetchone()
+    return _ResolvedTarget(
+        resolution="resolved",
+        name=last_row["name"] if last_row is not None else None,
+        state="superseded",
+    )
+
+
+def _resolve_flow(
+    conn: sqlite3.Connection, system_id: int, target_ref: str
+) -> _ResolvedTarget:
+    """Resolve against the System's observed flow identities (`trace_spans`).
+
+    `flow_graph.py`'s candidate paths are recomputed per entrypoint and
+    numbered `flow-1`, `flow-2`, ... within one derivation, so they are not
+    an identity a link could point at. The runtime `flow_id` the SDK
+    correlates spans under IS System-scoped and stable, which is what makes
+    existence checkable here.
+
+    `observed` is the only finite state a flow has: it carries no
+    confirmation lifecycle, and there is no display name to report.
+    """
+    ref = (target_ref or "").strip()
+    if not ref:
+        return _UNRESOLVED
+    row = conn.execute(
+        "SELECT 1 FROM trace_spans WHERE system_id = ? AND flow_id = ? LIMIT 1",
+        (system_id, ref),
+    ).fetchone()
+    if row is None:
+        return _UNRESOLVED
+    return _ResolvedTarget(resolution="resolved", name=None, state="observed")
+
+
+def _resolve_feature(
+    conn: sqlite3.Connection, system_id: int, target_ref: str
+) -> _ResolvedTarget:
+    """Resolve against the Feature Map's stable `feature_drafts.feature_id`.
+
+    The newest draft supplies the display name (a Feature is re-drafted per
+    snapshot under the same id). The Feature Map records no finite
+    confirmation state for a Feature, so the state is `not_applicable`
+    rather than an invented one.
+    """
+    ref = (target_ref or "").strip()
+    if not ref:
+        return _UNRESOLVED
+    row = conn.execute(
+        """SELECT name FROM feature_drafts
+               WHERE system_id = ? AND feature_id = ? ORDER BY id DESC LIMIT 1""",
+        (system_id, ref),
+    ).fetchone()
+    if row is None:
+        return _UNRESOLVED
+    return _ResolvedTarget(
+        resolution="resolved", name=row["name"], state="not_applicable"
+    )
+
+
+def _resolve_link_target(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    link_kind: str,
+    target_ref: str,
+    purpose_elements: Optional[Mapping[str, Mapping[str, Any]]],
+) -> _ResolvedTarget:
+    """Dispatch ONE link to the canonical source that owns its kind."""
+    if link_kind == "purpose_element":
+        return _resolve_purpose_element(purpose_elements, target_ref)
+    if link_kind == "capability":
+        return _resolve_capability(conn, system_id, target_ref)
+    if link_kind == "flow":
+        return _resolve_flow(conn, system_id, target_ref)
+    if link_kind == "feature":
+        return _resolve_feature(conn, system_id, target_ref)
+    # Unreachable while `_LINK_KIND_TARGET_SOURCE` and this dispatch stay in
+    # sync; reported honestly rather than guessed if they ever drift.
+    return _UNRESOLVED
+
+
+def _design_links_for_node(
+    conn: sqlite3.Connection, *, system_id: int, node_id: int
+) -> List[Dict[str, Any]]:
+    """The current design-lineage links of one Node, as REFERENCES.
+
+    Used by `get_handoff` so an adopted Node's Capability/Flow lineage
+    travels with the bundle instead of stopping at the Node id. Resolved at
+    read time and never copied into the handoff row -- a copied ref keeps
+    reading as current after the link it came from was superseded.
+    """
+    rows = conn.execute(
+        """SELECT id, link_kind, target_ref, decision_method
+               FROM evolution_node_link
+               WHERE node_id = ? AND system_id = ? AND superseded_by_id IS NULL
+               ORDER BY id DESC""",
+        (node_id, system_id),
+    ).fetchall()
+    return [
+        {
+            "link_id": row["id"],
+            "link_kind": row["link_kind"],
+            "target_ref": row["target_ref"],
+            "relation_status": _DECISION_METHOD_TO_RELATION_STATUS.get(
+                row["decision_method"]
+            ),
+            "relation_decision_method": row["decision_method"],
+        }
+        for row in rows
+        if row["link_kind"] in _LINEAGE_LINK_KINDS
+    ]
+
+
 def derive_node_lineage(
     conn: sqlite3.Connection,
     *,
@@ -194,6 +451,15 @@ def derive_node_lineage(
     Every hop keeps its own status. A `confirmed` link to an element whose
     own state is `unknown` is reported as exactly that -- a confirmed
     relation to an unconfirmed element -- and never collapsed into one word.
+
+    Each link kind is resolved against ITS OWN canonical source
+    (`_LINK_KIND_TARGET_SOURCE`): the supplied Purpose Frame for
+    `purpose_element`, the #312 Capability Graph for `capability`, the
+    System's observed flow identities for `flow`, the Feature Map for
+    `feature`. Routing every kind through `purpose_elements` made a
+    Capability/Flow/Feature link resolvable only when its `target_ref`
+    happened to collide with a Purpose element id, so a link to a target
+    that genuinely exists still read as `unresolved` with no name.
     """
     node = conn.execute(
         "SELECT * FROM evolution_node WHERE id = ? AND system_id = ?",
@@ -218,23 +484,29 @@ def derive_node_lineage(
         # `confirmed`: guessing here would let an unrecognised provenance
         # read as a developer's judgement.
         relation_status = _DECISION_METHOD_TO_RELATION_STATUS.get(row["decision_method"])
-        element_state = "unresolved"
-        element_name = None
-        if purpose_elements is not None:
-            element = purpose_elements.get(row["target_ref"])
-            if element is not None:
-                element_state = element.get("state", "unresolved")
-                element_name = element.get("name")
+        resolved = _resolve_link_target(
+            conn,
+            system_id=system_id,
+            link_kind=row["link_kind"],
+            target_ref=row["target_ref"],
+            purpose_elements=purpose_elements,
+        )
         relations.append(
             {
                 "link_id": row["id"],
                 "link_kind": row["link_kind"],
                 "target_ref": row["target_ref"],
-                "target_name": element_name,
+                "target_name": resolved.name,
                 "relation_status": relation_status,
                 "relation_decision_method": row["decision_method"],
                 # The element's OWN state, independent of the relation's.
-                "element_state": element_state,
+                "element_state": resolved.state,
+                # Whether the target was found in its own canonical source,
+                # and which source that was -- a third axis again, so
+                # "nobody confirmed this element" and "this ref points at
+                # nothing" never share one word.
+                "target_resolution": resolved.resolution,
+                "target_source": _LINK_KIND_TARGET_SOURCE.get(row["link_kind"]),
                 "note": row["note"],
                 "created_by": row["created_by"],
                 "created_at": row["created_at"],
@@ -498,6 +770,32 @@ def propose_decomposition(
         nodes: List[ProposedNode] = []
         seen_node_keys: set = set()
         for raw_node in raw_candidate.nodes:
+            # Mirror Phase 1's own empty-after-strip rules (`create_node`
+            # rejects a blank node_key, `add_version` a blank mission).
+            # `min_length=1` passes " ", so without these a candidate could
+            # be STORED that adoption can never materialise -- and a retry
+            # after the partial failure would 409 on the key collision
+            # forever.
+            if not raw_node.node_key.strip():
+                return DecompositionResult(
+                    provider=config.provider,
+                    model=config.model,
+                    is_mock=False,
+                    error=(
+                        "Model returned a whitespace-only node_key in candidate "
+                        f"{raw_candidate.candidate_key!r}"
+                    ),
+                )
+            if not raw_node.mission.strip():
+                return DecompositionResult(
+                    provider=config.provider,
+                    model=config.model,
+                    is_mock=False,
+                    error=(
+                        "Model returned a whitespace-only mission for node "
+                        f"{raw_node.node_key!r}"
+                    ),
+                )
             if raw_node.side_effect_class not in evolution_node.SIDE_EFFECT_CLASSES:
                 return DecompositionResult(
                     provider=config.provider,
@@ -662,6 +960,17 @@ def decide_candidate(
     adoption. Adopting a cut partially would leave the developer with some
     of one decomposition and some of another, which is not a decomposition
     they ever compared.
+
+    Adoption also carries the proposal's SCOPE forward: a non-empty
+    `capability_ref` / `flow_ref` on the parent proposal becomes an
+    `evolution_node_link` on every created Node, written through Phase 1's
+    own `add_link`. Without it the scope the decomposition was performed
+    against was recorded only on the proposal row, so an adopted Node could
+    not be traced back to the Capability/Flow it was cut out of. The link is
+    `decision_method: manual` with `created_by = decided_by`, because the
+    adoption IS the developer's judgement -- the model proposed the cut, not
+    the relation to a scope the developer chose -- and its note names the
+    candidate so the provenance is auditable from the link alone.
     """
     _check_membership(decision, CANDIDATE_DECISIONS, "decision")
     if decision == "pending":
@@ -708,24 +1017,78 @@ def decide_candidate(
             f"Candidate {candidate_id} carries no proposed nodes to adopt"
         )
 
+    # The scope this cut was proposed against. Read from the parent proposal
+    # (System-scoped, so a candidate can never pick up another System's
+    # scope) and resolved BEFORE anything is written, alongside the rest of
+    # the pre-flight. A ref that is blank after stripping is simply absent --
+    # the proposal was not scoped to a Capability/Flow -- and creates no
+    # link, which is different from a ref that names something unresolvable
+    # (that link IS created and the lineage reports it `unresolved`).
+    proposal = conn.execute(
+        "SELECT id, capability_ref, flow_ref FROM node_decomposition_proposal "
+        "WHERE id = ? AND system_id = ?",
+        (candidate["proposal_id"], system_id),
+    ).fetchone()
+    scope_links: List[Tuple[str, str]] = []
+    if proposal is not None:
+        for link_kind, ref in (
+            ("capability", proposal["capability_ref"]),
+            ("flow", proposal["flow_ref"]),
+        ):
+            stripped = (ref or "").strip()
+            if stripped:
+                scope_links.append((link_kind, stripped))
+
     # `create_node` and `add_version` each run their own BEGIN/COMMIT, so the
     # adoption cannot be wrapped in one outer transaction here. The
     # pre-flight below is therefore load-bearing: it refuses the whole
-    # adoption BEFORE anything is written, which is what keeps a colliding
-    # key from leaving half a decomposition behind.
+    # adoption BEFORE anything is written. Besides the key collision, it
+    # re-applies every rule Phase 1's `create_node`/`add_version` would
+    # enforce mid-loop -- checked here against the exact values the creation
+    # loop will pass, because a stored-but-invalid node failing on the
+    # second iteration would leave the first node behind, keep the candidate
+    # `pending`, and make every retry 409 on the now-existing key: a dead
+    # end the developer cannot leave.
+    seen_node_keys: set = set()
     for proposed in proposed_nodes:
         node_key = (proposed.get("node_key") or "").strip()
         if not node_key:
             raise NodeDesignValidationError(
                 "A proposed node has no node_key; the candidate cannot be adopted"
             )
+        raw_key = proposed.get("node_key")
+        if raw_key in seen_node_keys:
+            raise NodeDesignValidationError(
+                f"node_key {raw_key!r} appears twice in this candidate; "
+                "the candidate cannot be adopted"
+            )
+        seen_node_keys.add(raw_key)
+        if not (proposed.get("mission") or "").strip():
+            raise NodeDesignValidationError(
+                f"Proposed node {node_key!r} has an empty mission; "
+                "the candidate cannot be adopted"
+            )
+        side_effect_class = proposed.get("side_effect_class") or "read_only"
+        if side_effect_class not in evolution_node.SIDE_EFFECT_CLASSES:
+            raise NodeDesignValidationError(
+                f"Proposed node {node_key!r} has an invalid side_effect_class "
+                f"{side_effect_class!r}; the candidate cannot be adopted"
+            )
+        trust_boundary = proposed.get("trust_boundary") or "internal"
+        if trust_boundary not in evolution_node.TRUST_BOUNDARIES:
+            raise NodeDesignValidationError(
+                f"Proposed node {node_key!r} has an invalid trust_boundary "
+                f"{trust_boundary!r}; the candidate cannot be adopted"
+            )
+        # The collision check uses the RAW key -- it is what the creation
+        # loop below passes to `create_node`, so it is what would collide.
         existing = conn.execute(
             "SELECT id FROM evolution_node WHERE system_id = ? AND node_key = ?",
-            (system_id, node_key),
+            (system_id, raw_key),
         ).fetchone()
         if existing is not None:
             raise NodeDesignConflictError(
-                f"node_key {node_key!r} already exists in this System; "
+                f"node_key {raw_key!r} already exists in this System; "
                 "adopting this candidate would only partially apply"
             )
 
@@ -755,6 +1118,21 @@ def decide_candidate(
             decision_method="manual",
             created_by=decided_by,
         )
+        for link_kind, target_ref in scope_links:
+            evolution_node.add_link(
+                conn,
+                system_id=system_id,
+                node_id=node["id"],
+                link_kind=link_kind,
+                target_ref=target_ref,
+                note=(
+                    "adopted from decomposition candidate "
+                    f"{candidate_id} (proposal {proposal['id']})"
+                ),
+                decision_method="manual",
+                created_by=decided_by,
+                actor_kind="developer",
+            )
         created_nodes.append(node)
 
     conn.execute(
@@ -1041,9 +1419,22 @@ def get_handoff(
             (node_id, system_id),
         ).fetchone()
         nodes.append(
-            {"id": node_id, "resolved": node_row is not None,
-             "node_key": node_row["node_key"] if node_row else None,
-             "maturity": node_row["maturity"] if node_row else None}
+            {
+                "id": node_id,
+                "resolved": node_row is not None,
+                "node_key": node_row["node_key"] if node_row else None,
+                "maturity": node_row["maturity"] if node_row else None,
+                # The Node's design lineage travels with the bundle, so
+                # Phase 3 can still say which Capability/Flow the Node was
+                # cut out of. `None` (not `[]`) for an unresolved Node: its
+                # links were never read, which is not the same fact as
+                # "it has none" (#380).
+                "design_links": (
+                    _design_links_for_node(conn, system_id=system_id, node_id=node_id)
+                    if node_row is not None
+                    else None
+                ),
+            }
         )
 
     policies: List[Dict[str, Any]] = []

@@ -8731,10 +8731,16 @@ class EvolutionNodeStablePinIn(BaseModel):
 class EvolutionNodeTransitionIn(BaseModel):
     """A maturity transition request.
 
-    `decision_method` is deliberately NOT defaulted to `manual`: which of the
-    three it is decides whether a human stands behind this transition, and a
-    default would let a caller record a human decision by omission. The
-    domain layer rejects `reasoning_llm` outright -- an LLM never emits a
+    Provenance fields (`actor`, `actor_kind`) are deliberately ABSENT: the
+    route derives both from the authenticated `Principal` (#337's rule,
+    ADR-9), so a caller can never record a transition as someone else's --
+    or as the system's -- decision. `decision_method` is deliberately NOT
+    defaulted to `manual`: which one it is decides whether a human stands
+    behind this transition, and a default would let a caller record a human
+    decision by omission. The full three-value Literal is kept so the route
+    can refuse `deterministic` with its own finite code
+    (`deterministic_via_api_not_allowed`) and let the domain layer refuse
+    `reasoning_llm` with `llm_state_not_allowed` -- an LLM never emits a
     canonical state (Principle 6).
     """
 
@@ -8742,8 +8748,6 @@ class EvolutionNodeTransitionIn(BaseModel):
 
     to_state: EvolutionMaturityState
     decision_method: Literal["deterministic", "reasoning_llm", "manual"]
-    actor: Optional[str] = None
-    actor_kind: EvolutionActorKind = "developer"
     reason: str = ""
     reason_code: str = ""
     evidence_refs: List[str] = Field(default_factory=list)
@@ -8859,6 +8863,12 @@ class EvolutionNodeProjectionOut(BaseModel):
     `availability[k] is False` means that block could not be read at all.
     Paired with a `null` value it is a different fact from a `null` with
     `availability[k] is True`, which is a genuine absence (#380).
+
+    `maturity` is the stored column; `folded_maturity` is what this Node's
+    transition events fold to (ADR-4) and `maturity_consistent` whether the
+    two agree. A `null` fold with stored `exploring` is consistent (the Node
+    has never transitioned); both are `null` only when
+    `availability["maturity_lineage"]` is False.
     """
 
     schema_version: str
@@ -8867,6 +8877,8 @@ class EvolutionNodeProjectionOut(BaseModel):
     node_key: str
     display_name: str
     maturity: EvolutionMaturityState
+    folded_maturity: Optional[EvolutionMaturityState] = None
+    maturity_consistent: Optional[bool] = None
     current_version: Optional[EvolutionNodeVersionOut] = None
     current_implementation: Optional[EvolutionNodeImplementationOut] = None
     stable_implementation: Optional[EvolutionNodeImplementationOut] = None
@@ -9056,10 +9068,17 @@ class NodeLineageRelationOut(BaseModel):
     """One design relation.
 
     `relation_status` (was this relation proposed by AI or confirmed by the
-    developer) and `element_state` (is the Purpose element it points at
-    itself confirmed) are two independent axes. A confirmed relation to an
-    unconfirmed element is a real and common state, and collapsing the two
-    would hide it."""
+    developer), `element_state` (is the target itself confirmed) and
+    `target_resolution` (does the target exist in its own canonical source)
+    are three independent axes. A confirmed relation to an unconfirmed
+    element is a real and common state, and so is a confirmed relation to a
+    ref that resolves to nothing; collapsing any two of them would hide one.
+
+    `target_source` names WHICH canonical source decided the resolution --
+    the Purpose Frame for `purpose_element`, the #312 Capability Graph for
+    `capability`, the System's observed flow ids for `flow`, the Feature Map
+    for `feature`. The finite vocabularies live in `app/node_design.py`
+    (`TARGET_RESOLUTIONS` / `TARGET_SOURCES` / `LINEAGE_ELEMENT_STATES`)."""
 
     link_id: int
     link_kind: str
@@ -9068,6 +9087,8 @@ class NodeLineageRelationOut(BaseModel):
     relation_status: Optional[str] = None
     relation_decision_method: str
     element_state: str
+    target_resolution: str = "unresolved"
+    target_source: Optional[str] = None
     note: str
     created_by: Optional[str] = None
     created_at: float
@@ -9299,6 +9320,10 @@ class ExplorationRankingEntryOut(BaseModel):
     modality: EvolutionImplementationModality
     value: Optional[float] = None
     value_state: ExplorationValueState
+    # Why an unranked variant is unranked (different metric_name, different
+    # coverage, nothing measured). Dropping this would leave the reader with
+    # a bare exclusion they cannot audit.
+    reason: str = ""
 
 
 class ExplorationRankingOut(BaseModel):
@@ -9310,6 +9335,9 @@ class ExplorationRankingOut(BaseModel):
     sorting an unmeasured variant last would read as "worst"."""
 
     dimension: ExplorationDimension
+    # The single metric this ranking was computed over -- readings under a
+    # different metric_name are in `unranked`, never silently mixed in.
+    metric_name: str = ""
     ranked: List[ExplorationRankingEntryOut]
     unranked: List[ExplorationRankingEntryOut]
 
@@ -9337,6 +9365,7 @@ StabilizationRefKind = Literal[
 StabilizationStatus = Literal[
     "draft", "under_review", "approved", "rejected", "superseded"
 ]
+StabilizationParentReviewDisposition = Literal["endorsed", "declined"]
 
 
 class StabilizationPackageCreateIn(BaseModel):
@@ -9418,6 +9447,15 @@ class StabilizationPackageOut(BaseModel):
     observed_window_seconds: Optional[float] = None
     outcome_unmeasured_reason: str
     status: StabilizationStatus
+    # Which package to establish from instead, when status='superseded'.
+    superseded_by_id: Optional[int] = None
+    # The parent review and the human approval are two separate records with
+    # their own who/when (#304). A NULL disposition means no parent has
+    # reviewed the package yet -- never that they had nothing to say.
+    parent_reviewed_by: Optional[str] = None
+    parent_reviewed_at: Optional[float] = None
+    parent_review_disposition: Optional[StabilizationParentReviewDisposition] = None
+    parent_review_note: str = ""
     approved_by: Optional[str] = None
     approved_at: Optional[float] = None
     decision_note: str
@@ -9433,3 +9471,434 @@ class StabilizationDecisionIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     note: str = ""
+
+
+class StabilizationParentReviewIn(BaseModel):
+    """The parent's own record, distinct from the human approval (#304).
+
+    The disposition and the note are the caller's assertions; WHO reviewed
+    comes from the authenticated principal, never the body (#337). There is
+    deliberately no way to withdraw or overwrite one: a changed mind
+    supersedes the package, so both judgements stay readable."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    disposition: StabilizationParentReviewDisposition
+    note: str = ""
+
+
+class StabilizationSupersedeIn(BaseModel):
+    """The successor package id is the one assertion the caller makes; who
+    decided comes from the authenticated principal, never the body (#337)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    successor_package_id: int
+    note: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Operations: monitoring, drift and local reopen
+# (Epic #394 Phase 5, Issue #400)
+#
+# The finite vocabularies are mirrored from `app/node_operations.py`, which
+# owns them, for the same reason the Phase 1 aliases above are: FastAPI then
+# puts a real enum in the OpenAPI schema instead of a bare string, so a
+# Dashboard union cannot silently drift from the server. `_check_membership`
+# in the domain layer stays the authority; `test_node_operations_api.py`
+# asserts the two definitions have not diverged.
+#
+# ADR-5's separation is visible in `NodeOperationsProjectionOut`: `maturity`
+# and `observation` are two independent readings and are never merged into one
+# label. An `established` Node whose telemetry stopped reads as exactly that.
+#
+# `approved_by` is never a request field. Approving a reopen is a named
+# human's decision and the name comes from the authenticated principal at the
+# route (#337's provenance rule, ADR-9).
+# ---------------------------------------------------------------------------
+
+OperationsIndicatorKind = Literal[
+    "input_distribution", "output_quality", "error_rate", "latency", "cost",
+    "flow_success", "outcome", "human_correction", "compatibility",
+]
+OperationsObservationState = Literal[
+    "within_budget", "drift_detected", "insufficient_sample", "unobserved"
+]
+OperationsAnomalyClassification = Literal[
+    "implementation_defect",
+    "input_or_environment_drift",
+    "upstream_downstream_mismatch",
+    "evaluation_gap",
+    "new_use_case_signal",
+    "purpose_or_vision_reconsideration",
+    "unknown",
+]
+OperationsAnomalySeverity = Literal["blocking", "attention", "informational"]
+OperationsReopenStatus = Literal["proposed", "approved", "rejected", "completed"]
+OperationsNotificationKind = Literal[
+    "anomaly_detected", "reopen_approved", "handoff_ready", "handoff_blocked"
+]
+OperationsHandoffStage = Literal[
+    "awaiting_replay", "awaiting_offline_shadow",
+    "awaiting_live_shadow_approval", "ready",
+]
+OperationsHandoffEvidenceKind = Literal[
+    "replay_run", "offline_shadow_result", "live_shadow_approval"
+]
+
+
+class NodeMonitoringIndicatorIn(BaseModel):
+    """One indicator this contract watches.
+
+    Only `kind` is a domain-validated finite value; the rest describes the
+    reading in the contract author's own terms. Thresholds live per contract,
+    never as a global constant -- a number invented centrally would be applied
+    to Nodes nobody looked at.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: OperationsIndicatorKind
+    name: str = ""
+    reference_value: Optional[float] = None
+    threshold: Optional[float] = None
+    note: str = ""
+
+
+class NodeMonitoringContractCreateIn(BaseModel):
+    """`node_id` comes from the path and `created_by` from the principal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observed_environment_ref: str = ""
+    deployed_commit_sha: str = ""
+    sampling_note: str = ""
+    # How long observation may be silent before the Node reads as `unobserved`
+    # rather than healthy. Silence is never treated as health.
+    freshness_budget_seconds: float = 0.0
+    minimum_sample_count: int = 0
+    indicators: List[NodeMonitoringIndicatorIn] = Field(default_factory=list)
+    reopen_conditions: List[str] = Field(default_factory=list)
+    escalation_owner: str = ""
+
+
+class NodeMonitoringContractOut(BaseModel):
+    id: int
+    system_id: int
+    node_id: int
+    version_number: int
+    observed_environment_ref: str
+    deployed_commit_sha: str
+    sampling_note: str
+    freshness_budget_seconds: float
+    minimum_sample_count: int
+    indicators: List[Dict[str, Any]]
+    reopen_conditions: List[str]
+    escalation_owner: str
+    active: bool
+    decision_method: str
+    created_by: Optional[str] = None
+    created_at: float
+    # Which contract replaced this one; NULL means this is the current version.
+    superseded_by_id: Optional[int] = None
+
+
+class NodeDriftObservationIn(BaseModel):
+    """ONE deterministic reading. No interpretation belongs here -- that is an
+    anomaly, and the two are separate records on purpose."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    indicator: str
+    indicator_kind: OperationsIndicatorKind
+    observation_state: OperationsObservationState
+    observed_value: Optional[float] = None
+    reference_value: Optional[float] = None
+    sample_count: Optional[int] = None
+    window_seconds: Optional[float] = None
+    last_observed_at: Optional[float] = None
+    detail: str = ""
+
+
+class NodeDriftObservationOut(BaseModel):
+    id: int
+    system_id: int
+    node_id: int
+    contract_id: int
+    indicator: str
+    indicator_kind: OperationsIndicatorKind
+    observation_state: OperationsObservationState
+    observed_value: Optional[float] = None
+    reference_value: Optional[float] = None
+    sample_count: Optional[int] = None
+    window_seconds: Optional[float] = None
+    last_observed_at: Optional[float] = None
+    detail: str
+    created_at: float
+
+
+class NodeAnomalyRecordIn(BaseModel):
+    """`decision_method` is deliberately absent.
+
+    It records WHICH PATH produced the classification, so it cannot be
+    claimed by a request body (#337): an HTTP caller is a human-driven client
+    and the route records `manual`. A reasoning-model classification is
+    produced by server-side code, which calls the domain layer directly and
+    carries its own `intelligence_runs` provenance.
+
+    `classification_error` may only accompany `classification='unknown'`; the
+    domain layer refuses the pairing otherwise, because a specific
+    classification recorded alongside a failure is exactly the heuristic
+    fallback Principle 6 forbids.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    classification: OperationsAnomalyClassification
+    summary: str = ""
+    severity: OperationsAnomalySeverity = "attention"
+    contract_id: Optional[int] = None
+    observation_ids: List[int] = Field(default_factory=list)
+    classification_error: str = ""
+    # What stops one continuing condition producing a new anomaly -- and then
+    # a new reopen -- on every polling cycle.
+    dedupe_key: str = ""
+
+
+class NodeAnomalyOut(BaseModel):
+    id: int
+    system_id: int
+    node_id: int
+    contract_id: Optional[int] = None
+    classification: OperationsAnomalyClassification
+    severity: OperationsAnomalySeverity
+    summary: str
+    observation_ids: List[int]
+    decision_method: str
+    intelligence_run_id: Optional[int] = None
+    classification_error: str
+    dedupe_key: str
+    # `open | acknowledged | resolved | superseded` -- owned by the table's
+    # CHECK constraint, not by `app/node_operations.py`, so it is not mirrored
+    # as a Literal here (there is no domain constant to keep it honest).
+    status: str
+    # Whether this says the design was aimed at the wrong thing, as opposed to
+    # the implementation being wrong. The next action differs completely.
+    frame_breaking: bool
+    created_at: float
+    resolved_at: Optional[float] = None
+
+
+class NodeAnomalyRecordOut(BaseModel):
+    """`created=False` means an equal, still-open anomaly already existed and
+    nothing changed -- a 200, never a conflict: a repeated observation of one
+    continuing condition is a normal poll, not an error."""
+
+    anomaly: NodeAnomalyOut
+    created: bool
+
+
+class NodeReopenScopeRationaleOut(BaseModel):
+    node_id: int
+    reason: str
+    # The concrete link targets shared with the origin -- a structural fact,
+    # never a similarity judgement (Principle 6).
+    shared: List[str] = Field(default_factory=list)
+
+
+class NodeReopenScopeOut(BaseModel):
+    origin_node_id: int
+    scope_node_ids: List[int]
+    rationale: List[NodeReopenScopeRationaleOut]
+    # Every other Node in the System, listed rather than silently omitted: the
+    # only way a reader can check that unrelated Nodes were left out.
+    excluded_node_ids: List[int]
+
+
+class NodeReopenPlanCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+    anomaly_id: Optional[int] = None
+    budget_note: str = ""
+    include_neighbours: bool = True
+
+
+class NodeReopenPlanOut(BaseModel):
+    id: int
+    system_id: int
+    origin_node_id: int
+    anomaly_id: Optional[int] = None
+    scope_node_ids: List[int]
+    scope_rationale: List[NodeReopenScopeRationaleOut]
+    excluded_node_ids: List[int]
+    reason: str
+    budget_note: str
+    # ADR-5's promise that production keeps running the established
+    # implementation during re-exploration, asserted explicitly rather than
+    # assumed.
+    stable_implementation_retained: bool
+    status: OperationsReopenStatus
+    decision_method: str
+    approved_by: Optional[str] = None
+    approved_at: Optional[float] = None
+    decision_note: str
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class NodeReopenDecisionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = ""
+
+
+class NodeReopenTransitionResultOut(BaseModel):
+    """One in-scope Node's outcome. A Node that cannot legally transition is
+    REPORTED with its refusal code, never forced and never silently dropped --
+    a bulk action that ignores a gate is a gate that does not exist."""
+
+    node_id: int
+    applied: bool
+    duplicate: bool
+    reason_code: str
+    message: str
+
+
+class NodeReopenApprovalOut(BaseModel):
+    plan: NodeReopenPlanOut
+    results: List[NodeReopenTransitionResultOut]
+
+
+class NodeNotificationEmitIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    notification_kind: OperationsNotificationKind
+    recipient: str = ""
+    summary: str = ""
+    dedupe_key: str
+    anomaly_id: Optional[int] = None
+    reopen_plan_id: Optional[int] = None
+    cooldown_seconds: float = 3600.0
+
+
+class NodeNotificationAcknowledgeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = ""
+
+
+class NodeNotificationOut(BaseModel):
+    id: int
+    system_id: int
+    node_id: int
+    anomaly_id: Optional[int] = None
+    reopen_plan_id: Optional[int] = None
+    notification_kind: OperationsNotificationKind
+    recipient: str
+    summary: str
+    dedupe_key: str
+    status: str
+    cooldown_seconds: float
+    last_emitted_at: float
+    cooldown_until: float
+    occurrence_count: int
+    suppressed_count: int
+    acknowledged_by: Optional[str] = None
+    acknowledged_at: Optional[float] = None
+    created_at: float
+    updated_at: float
+
+
+class NodeNotificationEmitOut(BaseModel):
+    notification: NodeNotificationOut
+    queued: bool
+    suppressed: bool
+
+
+class NodeReopenHandoffCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: int
+
+
+class NodeReopenHandoffAdvanceIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_kind: OperationsHandoffEvidenceKind
+    evidence_id: int
+
+
+class NodeReopenHandoffOut(BaseModel):
+    id: int
+    system_id: int
+    reopen_plan_id: int
+    node_id: int
+    stage: OperationsHandoffStage
+    replay_run_id: Optional[int] = None
+    offline_shadow_result_id: Optional[int] = None
+    live_shadow_approval_id: Optional[int] = None
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class NodeReopenHandoffCreateOut(BaseModel):
+    handoff: NodeReopenHandoffOut
+    created: bool
+
+
+class NodeObservationHealthOut(BaseModel):
+    """`unobserved` and `insufficient_sample` are their own states and are
+    never rolled into "within budget" -- silence is not health."""
+
+    state: OperationsObservationState
+    reason: str
+    elapsed_seconds: Optional[float] = None
+    sample_count: Optional[int] = None
+
+
+class NodeDriftObservationSummaryOut(BaseModel):
+    id: int
+    indicator: str
+    indicator_kind: OperationsIndicatorKind
+    observation_state: OperationsObservationState
+    observed_value: Optional[float] = None
+    reference_value: Optional[float] = None
+    sample_count: Optional[int] = None
+    last_observed_at: Optional[float] = None
+    detail: str
+
+
+class NodeAnomalySummaryOut(BaseModel):
+    id: int
+    classification: OperationsAnomalyClassification
+    severity: OperationsAnomalySeverity
+    summary: str
+    status: str
+    decision_method: str
+    classification_error: str
+    frame_breaking: bool
+    created_at: float
+
+
+class NodeOperationsProjectionOut(BaseModel):
+    """One Node's operational picture.
+
+    `maturity` and `observation` are two independent readings and are never
+    merged (ADR-5): an `established` Node with dead telemetry reads as
+    `maturity='established'` alongside `observation.state='unobserved'`, which
+    is precisely the state Phase 5 exists to make visible.
+    """
+
+    system_id: int
+    node_id: int
+    node_key: str
+    maturity: EvolutionMaturityState
+    # `null` means no contract is wired, never "monitoring failed" -- the two
+    # are different answers.
+    observation: Optional[NodeObservationHealthOut] = None
+    monitoring_contract_id: Optional[int] = None
+    monitoring_contract_declared: bool
+    observations: List[NodeDriftObservationSummaryOut]
+    anomalies: List[NodeAnomalySummaryOut]

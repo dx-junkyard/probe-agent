@@ -1383,20 +1383,36 @@ creating incomplete persistence or execution paths for later phases.
     redaction (Principle 9)、network-off の隔離 worktree sandbox、
     Principle 5 の「target repo へ直接書かない」境界も不変。
 
-    **実装状況 (2026-08-16 時点)。** Phase 0〜5 (#395-#400) は実装・検証済み
+    **実装状況 (2026-08-17 時点)。** Phase 0〜5 (#395-#400) は実装・検証済み
     で、各 Phase の設計判断は `docs/project-intelligence.md` の該当セクションに
     記録してある。実装された正本モジュールは順に `app/evolution_node.py`
-    (Node 契約 / 12 個の有限拒否コードを持つ純粋な遷移 evaluator /
+    (Node 契約 / 13 個の有限拒否コードを持つ純粋な遷移 evaluator /
     append-only lineage)、`app/node_design.py` (Purpose-to-Node lineage /
     decomposition / 3 つの評価契約 / Phase 3 への handoff)、
     `app/exploration_workbench.py` (modality 横断比較。合成なし、
     `incomparable` / `coverage_mismatch` を持つ)、`app/stabilization.py`
-    (17 個の有限拒否コードを持つ固定化ゲート)、`app/node_operations.py`
-    (監視契約 / drift 観測 / anomaly taxonomy / 局所 reopen)。
+    (22 個の有限拒否コード + `ok` の verdict 語彙を持つ固定化ゲート、
+    parent review と human approval は別記録)、`app/node_operations.py`
+    (監視契約 / drift 観測 / anomaly taxonomy / 局所 reopen。
+    `app/routes/node_operations.py` で API 公開済み)。
+    2026-08-17 の検証ラウンドで、実行参照の完了状態検証・承認の原子性・
+    gate currency (`contract_version_moved` / `evidence_ref_stale`)・
+    provenance の偽装不能化・固定化ゲートの API 迂回閉鎖・採用の
+    all-or-nothing 化などを修正済み。続く検証ラウンド2 (外部レビュー指摘
+    対応) で、established/monitoring 中の contract freeze・transition の
+    トランザクション内再評価 + CAS・projection の event fold 照合・採用時の
+    Capability/Flow lineage 継承・lineage の per-kind 正本解決・
+    complete_run の完了要件と pinned-inputs 照合・自己申告 evidence の閉鎖
+    (asserting verdict は実行参照必須 + stability 宣言必須)・
+    parent/human 承認の分離・monitoring contract の実解決検証
+    (`monitoring_contract_invalid`)・Operations API 公開を修正済み。
+    修正一覧と #401 が引き継ぐ明示的な残件は
+    `docs/project-intelligence.md` の「Epic #394 検証ラウンド」
+    「Epic #394 検証ラウンド2」節が正本。
     **#401 Phase 6 (lifecycle UX 統合 / migration 完了 / dogfooding) は
-    未着手。** Phase 5 の operations cockpit API・画面も #401 の統合対象と
-    して残してある — 4 つ目の孤立したページを作らず、既存 Overview /
-    Components / Cell Fabric と合わせて再配置するため。なお #401 の受け入れ
+    未着手。** Phase 5 の operations cockpit 画面 (API は公開済み) も #401
+    の統合対象として残してある — 4 つ目の孤立したページを作らず、既存
+    Overview / Components / Cell Fabric と合わせて再配置するため。なお #401 の受け入れ
     条件は「dogfooding を agent の自己評価だけで完了扱いしない」ことを明示的な
     非目標としているので、**実際の開発者による dogfooding 記録なしに #401 を
     完了とみなしてはならない**。

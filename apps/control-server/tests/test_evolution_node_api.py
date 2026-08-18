@@ -132,6 +132,59 @@ def _transition(client, token, system_id, node_id, **overrides):
     )
 
 
+def _drive_to_monitoring(client, token, system_id, node_key):
+    """Bring a fresh node to `monitoring` for deactivation tests.
+
+    `validating -> established` goes through the DOMAIN layer here (the
+    API's own establishment path is the Stabilization gate this file
+    tests), and `established -> monitoring` is system-recorded, so both
+    legs use `evolution_node.apply_transition` directly."""
+    from app.db import get_conn
+    from app.node_operations import create_monitoring_contract
+
+    node = _create_node(client, token, system_id, node_key)
+    version = _add_version(client, token, system_id, node["id"])
+    implementation = _add_implementation(
+        client, token, system_id, node["id"], version["id"]
+    )
+    r = client.post(
+        f"/evolution-nodes/{node['id']}/stable-implementation",
+        json={"implementation_id": implementation["id"]},
+        headers=_headers(token, system_id),
+    )
+    assert r.status_code == 200, r.text
+    r = client.post(
+        f"/evolution-nodes/{node['id']}/links",
+        json={"link_kind": "capability", "target_ref": f"cap-{node_key}"},
+        headers=_headers(token, system_id),
+    )
+    assert r.status_code == 201, r.text
+    r = _transition(client, token, system_id, node["id"], to_state="validating")
+    assert r.status_code == 200, r.text
+
+    with get_conn() as conn:
+        result = evolution_node.apply_transition(
+            conn, system_id=system_id, node_id=node["id"], to_state="established",
+            decision_method="manual", actor="fixture",
+            evidence_refs=[f"capability:cap-{node_key}"],
+        )
+        assert result.applied, result.decision
+        # A REAL monitoring contract: the gate now refuses a ref that does
+        # not resolve to an active, non-superseded contract of this Node, so
+        # a hand-written string here would make the fixture unreachable.
+        create_monitoring_contract(
+            conn, system_id=system_id, node_id=node["id"],
+            freshness_budget_seconds=60.0, minimum_sample_count=1,
+        )
+        result = evolution_node.apply_transition(
+            conn, system_id=system_id, node_id=node["id"], to_state="monitoring",
+            decision_method="deterministic", actor_kind="system",
+            evidence_refs=[f"capability:cap-{node_key}"],
+        )
+        assert result.applied, result.decision
+    return node["id"]
+
+
 # ---------------------------------------------------------------------------
 # 1. Lifecycle over HTTP
 # ---------------------------------------------------------------------------
@@ -233,6 +286,51 @@ class TestLifecycle:
             headers=_headers(token, system_id),
         )
         assert r.status_code == 422, r.text
+        r = admin_client.get(
+            f"/evolution-nodes/{node['id']}/events?offset=-1",
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 422, r.text
+
+    def test_events_offset_pages_through_the_full_log(self, admin_client):
+        """ADR-4: the fold is only meaningful over the FULL log, so a log
+        longer than one bounded page must be readable page by page and
+        reassemble into exactly the unpaged sequence."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-Paging")
+        node = _create_node(admin_client, token, system_id, "paged")
+        version = _add_version(admin_client, token, system_id, node["id"])
+        _add_implementation(admin_client, token, system_id, node["id"], version["id"])
+        # Build up a log: validating <-> exploring round trips.
+        states = ["validating", "exploring", "validating", "exploring", "validating"]
+        for to_state in states:
+            r = _transition(admin_client, token, system_id, node["id"], to_state=to_state)
+            assert r.status_code == 200, r.text
+
+        r = admin_client.get(
+            f"/evolution-nodes/{node['id']}/events?limit=200",
+            headers=_headers(token, system_id),
+        )
+        full_log = r.json()["events"]
+        assert len(full_log) > 3
+
+        paged = []
+        offset = 0
+        while True:
+            r = admin_client.get(
+                f"/evolution-nodes/{node['id']}/events?limit=3&offset={offset}",
+                headers=_headers(token, system_id),
+            )
+            assert r.status_code == 200, r.text
+            page = r.json()["events"]
+            if not page:
+                break
+            paged.extend(page)
+            offset += 3
+
+        assert [e["id"] for e in paged] == [e["id"] for e in full_log]
+        # And the paged, reassembled log folds to the stored maturity.
+        assert evolution_node.fold_events(list(reversed(paged))) == "validating"
 
 
 # ---------------------------------------------------------------------------
@@ -284,9 +382,107 @@ class TestRejectionCodes:
         assert r.json()["detail"]["code"] == "llm_state_not_allowed"
 
     def test_established_without_evidence_is_refused(self, admin_client):
+        """The domain's `evidence_missing` stays reachable over HTTP through
+        the one establishment the route still accepts directly:
+        `monitoring -> established` (see TestEstablishmentGate)."""
         token = _login(admin_client)
         system_id = _create_system(admin_client, token, "EN-API-Evidence")
-        node = _create_node(admin_client, token, system_id, "needs-evidence")
+        node_id = _drive_to_monitoring(admin_client, token, system_id, "needs-evidence")
+
+        r = _transition(
+            admin_client, token, system_id, node_id,
+            to_state="established", evidence_refs=[],
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "evidence_missing"
+
+
+# ---------------------------------------------------------------------------
+# 2b. Provenance cannot be claimed by the caller (ADR-9, #337's rule)
+# ---------------------------------------------------------------------------
+
+
+class TestTransitionProvenance:
+    def test_deterministic_decision_method_is_refused_with_a_finite_code(
+        self, admin_client
+    ):
+        """`deterministic` marks a system-recorded observation transition;
+        accepting it from a request body would let any human POST forge one."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-Determ")
+        node = _create_node(admin_client, token, system_id, "no-forgery")
+        version = _add_version(admin_client, token, system_id, node["id"])
+        _add_implementation(admin_client, token, system_id, node["id"], version["id"])
+
+        r = _transition(
+            admin_client, token, system_id, node["id"],
+            to_state="validating", decision_method="deterministic",
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "deterministic_via_api_not_allowed"
+
+        # The route's own codes stay a finite vocabulary of their own and
+        # never collide with the domain evaluator's.
+        from app.routes.evolution_nodes import ROUTE_TRANSITION_REJECTION_CODES
+
+        assert "deterministic_via_api_not_allowed" in ROUTE_TRANSITION_REJECTION_CODES
+        assert not (
+            set(ROUTE_TRANSITION_REJECTION_CODES)
+            & set(evolution_node.TRANSITION_REJECTION_CODES)
+        )
+
+        # And no event was written by the refused request.
+        r = admin_client.get(
+            f"/evolution-nodes/{node['id']}/events", headers=_headers(token, system_id)
+        )
+        assert all(e["event_kind"] != "transition" for e in r.json()["events"])
+
+    def test_body_supplied_actor_and_actor_kind_are_rejected_outright(
+        self, admin_client
+    ):
+        """The fields no longer exist on the request model (extra='forbid'):
+        provenance comes from the route and the Principal, never the body."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-ActorBody")
+        node = _create_node(admin_client, token, system_id, "no-actor-body")
+
+        for forbidden_field in ({"actor": "someone-else"}, {"actor_kind": "system"}):
+            r = _transition(
+                admin_client, token, system_id, node["id"],
+                to_state="validating", **forbidden_field,
+            )
+            assert r.status_code == 422, r.text
+
+    def test_recorded_event_carries_the_principal_as_developer(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-Principal")
+        node = _create_node(admin_client, token, system_id, "principal")
+        version = _add_version(admin_client, token, system_id, node["id"])
+        _add_implementation(admin_client, token, system_id, node["id"], version["id"])
+
+        r = _transition(admin_client, token, system_id, node["id"], to_state="validating")
+        assert r.status_code == 200, r.text
+        event = r.json()["event"]
+        assert event["actor"] == "root"
+        assert event["actor_kind"] == "developer"
+        assert event["decision_method"] == "manual"
+
+
+# ---------------------------------------------------------------------------
+# 2c. Establishment goes through the Stabilization gate (#399)
+# ---------------------------------------------------------------------------
+
+
+class TestEstablishmentGate:
+    def test_validating_to_established_is_refused_toward_the_stabilization_path(
+        self, admin_client
+    ):
+        """Even a request that satisfies every DOMAIN precondition (stable
+        pin, linked evidence) may not establish through this endpoint: the
+        sanctioned path is POST /stabilization-packages/{id}/approve."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-EstGate")
+        node = _create_node(admin_client, token, system_id, "gate")
         version = _add_version(admin_client, token, system_id, node["id"])
         implementation = _add_implementation(
             admin_client, token, system_id, node["id"], version["id"]
@@ -296,13 +492,132 @@ class TestRejectionCodes:
             json={"implementation_id": implementation["id"]},
             headers=_headers(token, system_id),
         )
+        r = admin_client.post(
+            f"/evolution-nodes/{node['id']}/links",
+            json={"link_kind": "capability", "target_ref": "cap-gate"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 201, r.text
         _transition(admin_client, token, system_id, node["id"], to_state="validating")
 
         r = _transition(
             admin_client, token, system_id, node["id"], to_state="established",
+            evidence_refs=["capability:cap-gate"],
         )
         assert r.status_code == 422, r.text
-        assert r.json()["detail"]["code"] == "evidence_missing"
+        detail = r.json()["detail"]
+        assert detail["code"] == "establishment_via_stabilization_required"
+        assert "/stabilization-packages/" in detail["message"]
+
+        from app.routes.evolution_nodes import ROUTE_TRANSITION_REJECTION_CODES
+
+        assert detail["code"] in ROUTE_TRANSITION_REJECTION_CODES
+
+        # The node did not move.
+        r = admin_client.get(
+            f"/evolution-nodes/{node['id']}", headers=_headers(token, system_id)
+        )
+        assert r.json()["maturity"] == "validating"
+
+    def test_monitoring_to_established_stays_a_manual_api_operation(self, admin_client):
+        """Recording that observation STOPPED is a deactivation, not an
+        establishment judgement, so it keeps its direct manual path."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-Deact")
+        node_id = _drive_to_monitoring(admin_client, token, system_id, "deactivate")
+
+        r = _transition(
+            admin_client, token, system_id, node_id, to_state="established",
+            evidence_refs=["capability:cap-deactivate"],
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["applied"] is True
+        assert body["maturity"] == "established"
+        assert body["event"]["actor_kind"] == "developer"
+        assert body["event"]["decision_method"] == "manual"
+
+    def test_retry_of_an_applied_deactivation_stays_a_duplicate(self, admin_client):
+        """The gate must not break idempotency: once monitoring->established
+        applied, the maturity is no longer 'monitoring', but a retry with the
+        same key is still a 200 duplicate, not a gate refusal."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-DeactRetry")
+        node_id = _drive_to_monitoring(admin_client, token, system_id, "deact-retry")
+
+        first = _transition(
+            admin_client, token, system_id, node_id, to_state="established",
+            evidence_refs=["capability:cap-deact-retry"], idempotency_key="deact-1",
+        )
+        assert first.status_code == 200, first.text
+        retry = _transition(
+            admin_client, token, system_id, node_id, to_state="established",
+            evidence_refs=["capability:cap-deact-retry"], idempotency_key="deact-1",
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["duplicate"] is True
+        assert retry.json()["event"]["id"] == first.json()["event"]["id"]
+
+
+# ---------------------------------------------------------------------------
+# 2d. probe_point links resolve to an approved probe point (ADR-2)
+# ---------------------------------------------------------------------------
+
+
+class TestProbePointLinkApi:
+    def _insert_probe_point(self, system_id, status):
+        from app.db import get_conn
+
+        from tests.test_evolution_node import _insert_probe_point_chain
+
+        with get_conn() as conn:
+            return _insert_probe_point_chain(conn, system_id, status=status)
+
+    def _link(self, client, token, system_id, node_id, target_ref):
+        return client.post(
+            f"/evolution-nodes/{node_id}/links",
+            json={"link_kind": "probe_point", "target_ref": target_ref},
+            headers=_headers(token, system_id),
+        )
+
+    def test_approved_probe_point_link_is_created(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-PP-OK")
+        node = _create_node(admin_client, token, system_id, "pp-ok")
+        point_id = self._insert_probe_point(system_id, "approved")
+
+        r = self._link(admin_client, token, system_id, node["id"], str(point_id))
+        assert r.status_code == 201, r.text
+        assert r.json()["target_ref"] == str(point_id)
+
+    def test_nonexistent_probe_point_is_404(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-PP-Missing")
+        node = _create_node(admin_client, token, system_id, "pp-missing")
+
+        r = self._link(admin_client, token, system_id, node["id"], "999999")
+        assert r.status_code == 404, r.text
+
+    def test_unapproved_probe_point_is_409(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-PP-Unapproved")
+        node = _create_node(admin_client, token, system_id, "pp-unapproved")
+        point_id = self._insert_probe_point(system_id, "proposed")
+
+        r = self._link(admin_client, token, system_id, node["id"], str(point_id))
+        assert r.status_code == 409, r.text
+
+    def test_cross_system_probe_point_is_indistinguishable_from_missing(
+        self, admin_client
+    ):
+        token = _login(admin_client)
+        sys_a = _create_system(admin_client, token, "EN-API-PP-CrossA")
+        sys_b = _create_system(admin_client, token, "EN-API-PP-CrossB")
+        point_id = self._insert_probe_point(sys_a, "approved")
+        node_b = _create_node(admin_client, token, sys_b, "pp-cross")
+
+        r = self._link(admin_client, token, sys_b, node_b["id"], str(point_id))
+        assert r.status_code == 404, r.text
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +797,95 @@ class TestFiniteFieldValidation:
             headers=_headers(token, system_id),
         )
         assert r.status_code == 422, r.text
+
+
+# ---------------------------------------------------------------------------
+# 5b. A frozen contract and the maturity-lineage reconciliation
+# ---------------------------------------------------------------------------
+
+
+class TestFrozenContractApi:
+    def test_new_version_on_an_established_node_is_409(self, admin_client):
+        """The domain's conflict surfaces as 409, and its message names the
+        way out (reopen/suspend) rather than dead-ending the developer."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-Frozen")
+        node_id = _drive_to_monitoring(admin_client, token, system_id, "frozen-api")
+
+        # monitoring -> established (recording that observation stopped) is
+        # the one establishment this endpoint accepts directly.
+        r = _transition(
+            admin_client, token, system_id, node_id, to_state="established",
+            evidence_refs=["capability:cap-frozen-api"],
+        )
+        assert r.status_code == 200, r.text
+
+        r = admin_client.post(
+            f"/evolution-nodes/{node_id}/versions",
+            json={
+                "mission": "revised",
+                "input_contract": {},
+                "output_contract": {},
+                "side_effect_class": "pure",
+                "trust_boundary": "internal",
+            },
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        assert "reopened" in detail and "suspended" in detail
+
+        # Still exactly one version, still current.
+        r = admin_client.get(
+            f"/evolution-nodes/{node_id}", headers=_headers(token, system_id)
+        )
+        assert r.json()["current_version"]["version_number"] == 1
+
+    def test_projection_reports_the_folded_maturity_and_its_consistency(
+        self, admin_client
+    ):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-Fold")
+        node = _create_node(admin_client, token, system_id, "fold-api")
+        version = _add_version(admin_client, token, system_id, node["id"])
+        _add_implementation(admin_client, token, system_id, node["id"], version["id"])
+        _transition(admin_client, token, system_id, node["id"], to_state="validating")
+
+        r = admin_client.get(
+            f"/evolution-nodes/{node['id']}", headers=_headers(token, system_id)
+        )
+        projection = r.json()
+        assert projection["maturity"] == "validating"
+        assert projection["folded_maturity"] == "validating"
+        assert projection["maturity_consistent"] is True
+        assert projection["availability"]["maturity_lineage"] is True
+
+    def test_a_drifted_stored_maturity_is_visible_over_http(self, admin_client):
+        """ADR-4 makes the event log the authority; a reader of the canonical
+        projection must be able to SEE a drifted cache, not just an auditor
+        refolding the log by hand."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-API-Drift")
+        node = _create_node(admin_client, token, system_id, "drift-api")
+        version = _add_version(admin_client, token, system_id, node["id"])
+        _add_implementation(admin_client, token, system_id, node["id"], version["id"])
+        _transition(admin_client, token, system_id, node["id"], to_state="validating")
+
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE evolution_node SET maturity = 'suspended' WHERE id = ?",
+                (node["id"],),
+            )
+
+        r = admin_client.get(
+            f"/evolution-nodes/{node['id']}", headers=_headers(token, system_id)
+        )
+        projection = r.json()
+        assert projection["maturity"] == "suspended"
+        assert projection["folded_maturity"] == "validating"
+        assert projection["maturity_consistent"] is False
 
 
 # ---------------------------------------------------------------------------

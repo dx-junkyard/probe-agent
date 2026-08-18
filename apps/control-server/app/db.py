@@ -5470,9 +5470,24 @@ CREATE TABLE IF NOT EXISTS stabilization_package (
                                   CHECK (status IN
                                       ('draft', 'under_review', 'approved',
                                        'rejected', 'superseded')),
+    -- The PARENT's review, which is not the approval (#304: parent approval
+    -- and human approval are separate records that must not be conflated).
+    -- NULL disposition means "no parent has reviewed this yet" -- never "the
+    -- parent had nothing to say". Written from the authenticated principal,
+    -- never from a request body, and append-only: a recorded disposition is
+    -- not overwritten, a changed mind supersedes the package.
+    parent_reviewed_by        TEXT,
+    parent_reviewed_at        REAL,
+    parent_review_disposition TEXT
+                                  CHECK (parent_review_disposition IS NULL OR
+                                         parent_review_disposition IN
+                                             ('endorsed', 'declined')),
+    parent_review_note        TEXT,
     -- Approval is a person, always. `approved_by` is written from the
     -- authenticated principal, never from a request body -- the #337
-    -- provenance rule.
+    -- provenance rule. `approve_package` additionally refuses when this is
+    -- the same person as `parent_reviewed_by`: one person holding both roles
+    -- is the conflation the separation exists to prevent.
     approved_by               TEXT,
     approved_at               REAL,
     decision_note             TEXT NOT NULL DEFAULT '',
@@ -5736,6 +5751,117 @@ CREATE TABLE IF NOT EXISTS node_reopen_plan (
 
 CREATE INDEX IF NOT EXISTS idx_node_reopen_plan_origin
     ON node_reopen_plan (system_id, origin_node_id, id DESC);
+
+-- Notification outbox for operational signals.  One logical notification is
+-- retained per Node/kind/dedupe key; repeated emissions during the cooldown
+-- append a `suppressed_cooldown` event instead of producing another delivery.
+-- This is deliberately an outbox, not an SMTP/webhook implementation: the
+-- delivery adapter may fail or retry without losing the operational decision
+-- or forging a second anomaly/reopen.
+CREATE TABLE IF NOT EXISTS node_operation_notification (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    node_id             INTEGER NOT NULL,
+    anomaly_id          INTEGER,
+    reopen_plan_id      INTEGER,
+    notification_kind   TEXT NOT NULL
+                            CHECK (notification_kind IN
+                                ('anomaly_detected', 'reopen_approved',
+                                 'handoff_ready', 'handoff_blocked')),
+    recipient           TEXT NOT NULL DEFAULT '',
+    summary             TEXT NOT NULL DEFAULT '',
+    dedupe_key          TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending', 'acknowledged')),
+    cooldown_seconds    REAL NOT NULL DEFAULT 3600,
+    last_emitted_at     REAL NOT NULL,
+    cooldown_until      REAL NOT NULL,
+    occurrence_count    INTEGER NOT NULL DEFAULT 1,
+    suppressed_count    INTEGER NOT NULL DEFAULT 0,
+    acknowledged_by     TEXT,
+    acknowledged_at     REAL,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (anomaly_id) REFERENCES node_anomaly (id) ON DELETE SET NULL,
+    FOREIGN KEY (reopen_plan_id) REFERENCES node_reopen_plan (id) ON DELETE SET NULL,
+    UNIQUE (node_id, notification_kind, dedupe_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_operation_notification_node
+    ON node_operation_notification (system_id, node_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS node_operation_notification_event (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    notification_id  INTEGER NOT NULL,
+    event_type        TEXT NOT NULL
+                          CHECK (event_type IN
+                              ('queued', 'suppressed_cooldown', 'acknowledged')),
+    actor             TEXT,
+    detail            TEXT NOT NULL DEFAULT '',
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (notification_id)
+        REFERENCES node_operation_notification (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_operation_notification_event
+    ON node_operation_notification_event (notification_id, id ASC);
+
+-- Staged local-reopen handoff.  This row never creates or approves a replay
+-- or shadow action: it only binds already-persisted evidence in the required
+-- order.  In particular, live_shadow_approval_id must reference the separate
+-- human-approved gate in cell_shadow_decisions.
+CREATE TABLE IF NOT EXISTS node_reopen_handoff (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                  INTEGER NOT NULL,
+    reopen_plan_id             INTEGER NOT NULL,
+    node_id                    INTEGER NOT NULL,
+    stage                      TEXT NOT NULL DEFAULT 'awaiting_replay'
+                                   CHECK (stage IN
+                                       ('awaiting_replay', 'awaiting_offline_shadow',
+                                        'awaiting_live_shadow_approval', 'ready')),
+    replay_run_id              INTEGER,
+    offline_shadow_result_id   INTEGER,
+    live_shadow_approval_id    INTEGER,
+    created_by                 TEXT,
+    created_at                 REAL NOT NULL,
+    updated_at                 REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (reopen_plan_id) REFERENCES node_reopen_plan (id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES evolution_node (id) ON DELETE CASCADE,
+    FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE SET NULL,
+    FOREIGN KEY (offline_shadow_result_id) REFERENCES shadow_results (id) ON DELETE SET NULL,
+    FOREIGN KEY (live_shadow_approval_id) REFERENCES cell_shadow_decisions (id) ON DELETE SET NULL,
+    UNIQUE (reopen_plan_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_reopen_handoff_node
+    ON node_reopen_handoff (system_id, node_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS node_reopen_handoff_event (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id      INTEGER NOT NULL,
+    handoff_id     INTEGER NOT NULL,
+    stage          TEXT NOT NULL
+                       CHECK (stage IN
+                           ('awaiting_replay', 'awaiting_offline_shadow',
+                            'awaiting_live_shadow_approval', 'ready')),
+    evidence_kind  TEXT NOT NULL
+                       CHECK (evidence_kind IN
+                           ('created', 'replay_run', 'offline_shadow_result',
+                            'live_shadow_approval')),
+    evidence_id    INTEGER,
+    actor          TEXT,
+    created_at     REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (handoff_id) REFERENCES node_reopen_handoff (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_reopen_handoff_event
+    ON node_reopen_handoff_event (handoff_id, id ASC);
 """
 
 
@@ -6867,6 +6993,28 @@ def init_db() -> None:
             ):
                 _add_column_if_missing(
                     conn, "purpose_outcome_criterion", outcome_columns, column, definition
+                )
+        # Issue #399 (review finding): the parent review, recorded separately
+        # from the human approval (#304). Additive and never backfilled -- a
+        # package created before this existed carries NULL, which says "no
+        # parent has reviewed this", and the establishment gate refuses it
+        # (`parent_review_missing`) rather than reading the existing
+        # `approved_by` as if it had also been the parent's endorsement.
+        stabilization_cols = _columns(conn, "stabilization_package")
+        if stabilization_cols:
+            for column, definition in (
+                ("parent_reviewed_by", "TEXT"),
+                ("parent_reviewed_at", "REAL"),
+                (
+                    "parent_review_disposition",
+                    "TEXT CHECK (parent_review_disposition IS NULL OR "
+                    "parent_review_disposition IN ('endorsed', 'declined'))",
+                ),
+                ("parent_review_note", "TEXT"),
+            ):
+                _add_column_if_missing(
+                    conn, "stabilization_package", stabilization_cols,
+                    column, definition,
                 )
         _migrate_alignment_manual_recheck_targets(conn)
         _ensure_legacy_system(conn)

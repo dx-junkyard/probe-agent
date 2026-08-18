@@ -3,7 +3,7 @@ contract.
 
 Covers `app/evolution_node.py`:
 
-1. The pure evaluator (`evaluate_transition`): every one of the 12
+1. The pure evaluator (`evaluate_transition`): every one of the 13
    first-match rejection codes in isolation, the full legal transition
    table, a representative sample of illegal transitions, and that
    `reasoning_llm` is refused for a maturity transition unconditionally.
@@ -23,6 +23,7 @@ Covers `app/evolution_node.py`:
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -138,6 +139,47 @@ def _insert_cell_improvement(conn, system_id, cell_definition_id, status):
     )
 
 
+def _insert_probe_point_chain(conn, system_id, status="approved"):
+    """Minimal snapshot -> intelligence run -> probe plan -> probe point
+    chain (the FK spine `probe_points` requires), inserted directly --
+    mirrors `tests/test_cell_binding.py`'s fixture builders."""
+    now = time.time()
+    cur = conn.execute(
+        """INSERT INTO repository_snapshots
+               (system_id, repo_path, commit_sha, status, created_at, completed_at)
+           VALUES (?, '/tmp/repo', 'abc123', 'ready', ?, ?)""",
+        (system_id, now, now),
+    )
+    snapshot_id = cur.lastrowid
+    cur = conn.execute(
+        """INSERT INTO intelligence_runs
+               (system_id, snapshot_id, run_type, provider, model, prompt_version,
+                schema_version, decision_method, status, is_mock, started_at, completed_at)
+           VALUES (?, ?, 'probe_plan', 'mock', 'mock-model', 'v1', 'v1',
+                   'reasoning_llm', 'completed', 1, ?, ?)""",
+        (system_id, snapshot_id, now, now),
+    )
+    run_id = cur.lastrowid
+    cur = conn.execute(
+        """INSERT INTO probe_plans
+               (system_id, snapshot_id, intelligence_run_id, feature_id, objective,
+                status, origin, created_at, updated_at)
+           VALUES (?, ?, ?, 'feat-1', 'objective', 'approved', 'manual', ?, ?)""",
+        (system_id, snapshot_id, run_id, now, now),
+    )
+    plan_id = cur.lastrowid
+    cur = conn.execute(
+        """INSERT INTO probe_points
+               (plan_id, system_id, component_id, feature_id, path, symbol,
+                line_start, line_end, reason, recommended_mode, side_effect_risk,
+                replayability, denylist_hit, status, created_at, updated_at)
+           VALUES (?, ?, 'svc-probe', 'feat-1', 'app/x.py', 'do_x', 1, 10,
+                   'reason', 'trace', 'low', 'replayable', NULL, ?, ?, ?)""",
+        (plan_id, system_id, status, now, now),
+    )
+    return cur.lastrowid
+
+
 # ---------------------------------------------------------------------------
 # Part 1: the pure evaluator
 # ---------------------------------------------------------------------------
@@ -149,7 +191,8 @@ def _facts(**overrides):
         has_version=True,
         has_implementation=True,
         has_stable_implementation=True,
-        monitoring_contract_ref="contract-1",
+        monitoring_contract_ref="node_monitoring_contract:1",
+        monitoring_contract_valid=True,
         implementation_stale=False,
         known_evidence_refs=frozenset({"component:x"}),
     )
@@ -176,8 +219,8 @@ class TestRejectionCodes:
 
     def test_all_codes_covered(self):
         # Sanity: the table this class is organized around has exactly the
-        # 12 codes the brief enumerates, and "ok" is not one of them.
-        assert len(TRANSITION_REJECTION_CODES) == 12
+        # 13 codes the brief enumerates, and "ok" is not one of them.
+        assert len(TRANSITION_REJECTION_CODES) == 13
         assert "ok" not in TRANSITION_REJECTION_CODES
 
     def test_unknown_target_state(self):
@@ -193,6 +236,17 @@ class TestRejectionCodes:
             _request(to_state="validating", decision_method="reasoning_llm"),
         )
         assert decision.reason_code == "llm_state_not_allowed"
+
+    def test_llm_state_not_allowed_outranks_unknown_target_state(self):
+        # "Unconditionally first" means literally first: even an UNKNOWN
+        # target state does not get to answer before the reasoning_llm
+        # refusal -- the caller's provenance is wrong before its payload is.
+        decision = evaluate_transition(
+            _facts(),
+            _request(to_state="not_a_state", decision_method="reasoning_llm"),
+        )
+        assert decision.reason_code == "llm_state_not_allowed"
+        assert TRANSITION_REJECTION_CODES[0] == "llm_state_not_allowed"
 
     def test_illegal_transition(self):
         decision = evaluate_transition(
@@ -262,6 +316,37 @@ class TestRejectionCodes:
     def test_monitoring_contract_missing(self):
         decision = evaluate_transition(
             _facts(maturity="established", monitoring_contract_ref=None),
+            _request(
+                to_state="monitoring", decision_method="deterministic", actor_kind="system",
+                actor=None,
+            ),
+        )
+        assert decision.reason_code == "monitoring_contract_missing"
+
+    def test_monitoring_contract_invalid(self):
+        # A ref is SET but does not resolve to an active contract. This is a
+        # different fact from "none is wired" and gets its own code: an
+        # unverifiable claim never passes the gate.
+        decision = evaluate_transition(
+            _facts(
+                maturity="established",
+                monitoring_contract_ref="node_monitoring_contract:1",
+                monitoring_contract_valid=False,
+            ),
+            _request(
+                to_state="monitoring", decision_method="deterministic", actor_kind="system",
+                actor=None,
+            ),
+        )
+        assert decision.reason_code == "monitoring_contract_invalid"
+
+    def test_missing_outranks_invalid_when_no_ref_is_set(self):
+        decision = evaluate_transition(
+            _facts(
+                maturity="established",
+                monitoring_contract_ref=None,
+                monitoring_contract_valid=False,
+            ),
             _request(
                 to_state="monitoring", decision_method="deterministic", actor_kind="system",
                 actor=None,
@@ -344,6 +429,32 @@ class TestTransitionTable:
         )
         assert not decision.allowed
         assert decision.reason_code == "illegal_transition"
+
+    def test_monitoring_to_established_manual_deactivation_is_allowed(self):
+        # The system-recorded pair is asymmetric for a human: recording that
+        # observation STOPPED is a legitimate manual operations decision.
+        decision = evaluate_transition(
+            _facts(maturity="monitoring"),
+            _request(to_state="established"),
+        )
+        assert decision.allowed, decision
+
+    def test_monitoring_to_established_manual_still_requires_a_named_actor(self):
+        decision = evaluate_transition(
+            _facts(maturity="monitoring"),
+            _request(to_state="established", actor=None),
+        )
+        assert decision.reason_code == "manual_approval_required"
+
+    def test_established_to_monitoring_manual_activation_stays_refused(self):
+        # The other direction never opens to a human: a click claiming
+        # observation is RUNNING would masquerade as the monitoring
+        # evaluation's own reading.
+        decision = evaluate_transition(
+            _facts(maturity="established"),
+            _request(to_state="monitoring", reason="wishful"),
+        )
+        assert decision.reason_code == "manual_approval_required"
 
     def test_reopened_target_does_not_require_stable_implementation(self):
         # Row 8 gates only established/monitoring -- 'reopened' must be
@@ -511,6 +622,116 @@ class TestPersistenceLifecycle:
                 )
 
 
+class TestProbePointLinkGate:
+    """ADR-2's verification rule: `link_kind='probe_point'` may only name an
+    existing APPROVED probe point of the same System -- the same gate
+    `app/cell_binding.py` applies for Cell Bindings (#299)."""
+
+    def test_approved_probe_point_link_is_created(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-Approved")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-ok")
+            point_id = _insert_probe_point_chain(conn, system_id, status="approved")
+            link = add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="probe_point", target_ref=str(point_id),
+                target_row_id=point_id,
+            )
+            assert link["target_ref"] == str(point_id)
+            facts = load_node_facts(conn, system_id=system_id, node_id=node["id"])
+            assert f"probe_point:{point_id}" in facts.known_evidence_refs
+
+    def test_nonexistent_probe_point_is_refused(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-Missing")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-missing")
+            with pytest.raises(EvolutionNodeNotFoundError):
+                add_link(
+                    conn, system_id=system_id, node_id=node["id"],
+                    link_kind="probe_point", target_ref="999999",
+                )
+
+    def test_unapproved_probe_point_is_refused(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-Unapproved")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-unapproved")
+            point_id = _insert_probe_point_chain(conn, system_id, status="proposed")
+            with pytest.raises(EvolutionNodeConflictError):
+                add_link(
+                    conn, system_id=system_id, node_id=node["id"],
+                    link_kind="probe_point", target_ref=str(point_id),
+                )
+
+    def test_another_systems_probe_point_is_indistinguishable_from_missing(
+        self, admin_client
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        sys_a = _create_system(admin_client, token, "EN-PP-CrossA")
+        sys_b = _create_system(admin_client, token, "EN-PP-CrossB")
+        with get_conn() as conn:
+            point_id = _insert_probe_point_chain(conn, sys_a, status="approved")
+            node_b = create_node(conn, system_id=sys_b, node_key="pp-cross")
+            with pytest.raises(EvolutionNodeNotFoundError):
+                add_link(
+                    conn, system_id=sys_b, node_id=node_b["id"],
+                    link_kind="probe_point", target_ref=str(point_id),
+                )
+
+    def test_non_numeric_target_ref_is_a_validation_error(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-BadRef")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-badref")
+            with pytest.raises(EvolutionNodeValidationError):
+                add_link(
+                    conn, system_id=system_id, node_id=node["id"],
+                    link_kind="probe_point", target_ref="app/x.py:do_x",
+                )
+
+    def test_mismatched_target_row_id_is_a_validation_error(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-Mismatch")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-mismatch")
+            point_id = _insert_probe_point_chain(conn, system_id, status="approved")
+            with pytest.raises(EvolutionNodeValidationError):
+                add_link(
+                    conn, system_id=system_id, node_id=node["id"],
+                    link_kind="probe_point", target_ref=str(point_id),
+                    target_row_id=point_id + 1,
+                )
+
+    def test_other_link_kinds_do_not_consult_probe_points(self, admin_client):
+        # A component link with a free-form ref stays legal -- the gate is
+        # probe_point-specific.
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-PP-Others")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="pp-others")
+            link = add_link(
+                conn, system_id=system_id, node_id=node["id"],
+                link_kind="component", target_ref="svc-anything",
+            )
+            assert link["link_kind"] == "component"
+
+
 class TestIdempotency:
     def test_repeated_idempotency_key_applies_exactly_once(self, admin_client):
         from app.db import get_conn
@@ -583,6 +804,107 @@ class TestIdempotency:
                 idempotency_key="",
             )
             assert second.applied and not second.duplicate
+
+    def test_unique_violation_recovery_resolves_to_the_winner_event(
+        self, admin_client, monkeypatch
+    ):
+        """The last-resort recovery path: a winner's event exists but NEITHER
+        duplicate check saw it, so the partial unique index is what refuses
+        our insert. The violation must resolve to the winner's event with
+        `duplicate=True` -- the same shape the sequential-retry path returns
+        -- never surface as an IntegrityError.
+
+        Both checks are made to miss (they return None for the first two
+        calls) while the row genuinely exists, so the IntegrityError below is
+        raised by the real index, not simulated. The winner recorded a
+        DIFFERENT target state, which is what leaves our own request legal
+        far enough to reach the insert at all."""
+        import app.evolution_node as en
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Idem-Race")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="idem-race")
+            version = add_version(
+                conn, system_id=system_id, node_id=node["id"], mission="m",
+                input_contract={}, output_contract={}, side_effect_class="pure",
+                trust_boundary="internal",
+            )
+            add_implementation(
+                conn, system_id=system_id, node_id=node["id"],
+                node_version_id=version["id"], modality="rule", created_by="alice",
+            )
+
+            winner = en._insert_event(
+                conn, node_id=node["id"], system_id=system_id,
+                event_kind="transition", from_state="exploring",
+                to_state="suspended", actor="rival", actor_kind="developer",
+                decision_method="manual", reason="pausing", idempotency_key="race-1",
+            )
+            conn.execute(
+                "UPDATE evolution_node SET maturity = 'suspended' WHERE id = ?",
+                (node["id"],),
+            )
+
+            real_lookup = en._lookup_idempotent_event
+            state = {"calls": 0}
+
+            def blind_lookup(conn_, **kwargs):
+                state["calls"] += 1
+                if state["calls"] <= 2:  # the pre-check and the in-transaction check
+                    return None
+                return real_lookup(conn_, **kwargs)
+
+            monkeypatch.setattr(en, "_lookup_idempotent_event", blind_lookup)
+            result = apply_transition(
+                conn, system_id=system_id, node_id=node["id"], to_state="validating",
+                decision_method="manual", actor="alice", idempotency_key="race-1",
+            )
+            monkeypatch.undo()
+            assert result.duplicate and not result.applied
+            assert result.event["id"] == winner["id"]
+            assert result.node["maturity"] == "suspended"
+
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node_event WHERE idempotency_key = ?",
+                ("race-1",),
+            ).fetchone()["n"]
+            assert count == 1
+
+    def test_unrelated_integrity_error_still_raises(self, admin_client, monkeypatch):
+        """Only a resolvable idempotency collision is downgraded to a
+        duplicate; any other unique violation re-raises unchanged (the
+        re-select is the discriminator)."""
+        import sqlite3 as sqlite3_module
+
+        import app.evolution_node as en
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Idem-OtherIE")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="idem-other")
+            version = add_version(
+                conn, system_id=system_id, node_id=node["id"], mission="m",
+                input_contract={}, output_contract={}, side_effect_class="pure",
+                trust_boundary="internal",
+            )
+            add_implementation(
+                conn, system_id=system_id, node_id=node["id"],
+                node_version_id=version["id"], modality="rule", created_by="alice",
+            )
+
+            def failing_insert_event(*args, **kwargs):
+                raise sqlite3_module.IntegrityError("CHECK constraint failed: elsewhere")
+
+            monkeypatch.setattr(en, "_insert_event", failing_insert_event)
+            with pytest.raises(sqlite3_module.IntegrityError):
+                apply_transition(
+                    conn, system_id=system_id, node_id=node["id"],
+                    to_state="validating", decision_method="manual", actor="alice",
+                    idempotency_key="no-such-winner",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +1046,593 @@ class TestMigration:
 
 
 # ---------------------------------------------------------------------------
+# The contract is frozen while a stable implementation is pinned to it
+# ---------------------------------------------------------------------------
+
+
+class TestContractFreeze:
+    """`add_version` is refused for an `established`/`monitoring` Node.
+
+    The stable implementation is pinned to the CURRENT contract, so making a
+    new contract current would leave production implementing a superseded
+    promise while the Node kept displaying established/monitoring. ADR-9
+    forbids repairing that by moving the maturity automatically, so the
+    refusal IS the design: the developer reopens or suspends first.
+    """
+
+    def test_new_version_is_refused_for_an_established_node(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Freeze-Established")
+        with get_conn() as conn:
+            node, version, _impl = _build_established_node(conn, system_id, "frozen")
+            with pytest.raises(EvolutionNodeConflictError) as excinfo:
+                add_version(
+                    conn, system_id=system_id, node_id=node["id"], mission="revised",
+                    input_contract={}, output_contract={}, side_effect_class="pure",
+                    trust_boundary="internal",
+                )
+            message = str(excinfo.value)
+            # The refusal has to name the way OUT of it, or it is a dead end.
+            assert "reopened" in message and "suspended" in message
+
+            # Nothing was written: the current version pointer is untouched
+            # and no second version row exists.
+            row = conn.execute(
+                "SELECT current_version_id FROM evolution_node WHERE id = ?", (node["id"],)
+            ).fetchone()
+            assert row["current_version_id"] == version["id"]
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node_version WHERE node_id = ?",
+                (node["id"],),
+            ).fetchone()["n"]
+            assert count == 1
+
+    def test_new_version_is_refused_for_a_monitoring_node(self, admin_client):
+        from app.db import get_conn
+        from app.node_operations import create_monitoring_contract
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Freeze-Monitoring")
+        with get_conn() as conn:
+            node, _version, _impl = _build_established_node(conn, system_id, "watched")
+            create_monitoring_contract(
+                conn, system_id=system_id, node_id=node["id"],
+                freshness_budget_seconds=60.0, minimum_sample_count=1,
+            )
+            result = apply_transition(
+                conn, system_id=system_id, node_id=node["id"], to_state="monitoring",
+                decision_method="deterministic", actor_kind="system",
+                evidence_refs=("component:svc-a",),
+            )
+            assert result.applied, result.decision
+            with pytest.raises(EvolutionNodeConflictError):
+                add_version(
+                    conn, system_id=system_id, node_id=node["id"], mission="revised",
+                    input_contract={}, output_contract={}, side_effect_class="pure",
+                    trust_boundary="internal",
+                )
+
+    def test_reopening_first_makes_the_new_version_possible(self, admin_client):
+        """The refusal is a sequencing rule, not a wall: an explicit human
+        reopen (`decision_method: manual`) unfreezes the contract, and the
+        stable pin deliberately stays in place while it does (ADR-5)."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Freeze-Reopen")
+        with get_conn() as conn:
+            node, version, implementation = _build_established_node(conn, system_id, "unfreeze")
+            reopened = apply_transition(
+                conn, system_id=system_id, node_id=node["id"], to_state="reopened",
+                decision_method="manual", actor="alice",
+                reason="the contract needs a new output field",
+            )
+            assert reopened.applied, reopened.decision
+
+            new_version = add_version(
+                conn, system_id=system_id, node_id=node["id"], mission="revised",
+                input_contract={}, output_contract={"summary": "string", "score": "float"},
+                side_effect_class="pure", trust_boundary="internal", created_by="alice",
+            )
+            assert new_version["version_number"] == 2
+            row = conn.execute(
+                "SELECT current_version_id, stable_implementation_id "
+                "FROM evolution_node WHERE id = ?",
+                (node["id"],),
+            ).fetchone()
+            assert row["current_version_id"] == new_version["id"]
+            # Reopening never clears the pin, and neither does revising the
+            # contract -- production keeps running the established
+            # implementation while exploration proceeds.
+            assert row["stable_implementation_id"] == implementation["id"]
+            superseded = conn.execute(
+                "SELECT superseded_by_id FROM evolution_node_version WHERE id = ?",
+                (version["id"],),
+            ).fetchone()["superseded_by_id"]
+            assert superseded == new_version["id"]
+
+    def test_exploring_and_validating_nodes_may_still_add_versions(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Freeze-Open")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="open-node")
+            first = add_version(
+                conn, system_id=system_id, node_id=node["id"], mission="m1",
+                input_contract={}, output_contract={}, side_effect_class="pure",
+                trust_boundary="internal",
+            )
+            add_implementation(
+                conn, system_id=system_id, node_id=node["id"],
+                node_version_id=first["id"], modality="rule",
+            )
+            apply_transition(
+                conn, system_id=system_id, node_id=node["id"], to_state="validating",
+                decision_method="manual", actor="alice",
+            )
+            second = add_version(
+                conn, system_id=system_id, node_id=node["id"], mission="m2",
+                input_contract={}, output_contract={}, side_effect_class="pure",
+                trust_boundary="internal",
+            )
+            assert second["version_number"] == 2
+
+
+# ---------------------------------------------------------------------------
+# The monitoring contract must actually resolve (Phase 5's own rows)
+# ---------------------------------------------------------------------------
+
+
+class TestMonitoringContractResolution:
+    """`established -> monitoring` asserts that observation is declared, so a
+    ref that names nothing verifiable can never satisfy it. Every failure to
+    verify is fail-closed `monitoring_contract_invalid`, which stays distinct
+    from `monitoring_contract_missing` (no ref at all)."""
+
+    def _established(self, conn, system_id, node_key="watched"):
+        return _build_established_node(conn, system_id, node_key)
+
+    def test_a_real_active_contract_allows_the_transition(self, admin_client):
+        from app.db import get_conn
+        from app.node_operations import create_monitoring_contract
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-MC-Valid")
+        with get_conn() as conn:
+            node, _v, _i = self._established(conn, system_id)
+            create_monitoring_contract(
+                conn, system_id=system_id, node_id=node["id"],
+                freshness_budget_seconds=60.0, minimum_sample_count=1,
+            )
+            facts = load_node_facts(conn, system_id=system_id, node_id=node["id"])
+            assert facts.monitoring_contract_valid is True
+
+            result = apply_transition(
+                conn, system_id=system_id, node_id=node["id"], to_state="monitoring",
+                decision_method="deterministic", actor_kind="system",
+                evidence_refs=("component:svc-a",),
+            )
+            assert result.applied, result.decision
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "contract-1",                      # free-form junk
+            "node_monitoring_contract:",       # prefix with no id
+            "node_monitoring_contract:abc",    # unparseable id
+            "node_monitoring_contract:999999",  # no such row
+        ],
+    )
+    def test_an_unresolvable_ref_is_invalid_not_missing(self, admin_client, ref):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, f"EN-MC-Junk-{abs(hash(ref)) % 10000}")
+        with get_conn() as conn:
+            node, _v, _i = self._established(conn, system_id)
+            conn.execute(
+                "UPDATE evolution_node SET monitoring_contract_ref = ? WHERE id = ?",
+                (ref, node["id"]),
+            )
+            facts = load_node_facts(conn, system_id=system_id, node_id=node["id"])
+            assert facts.monitoring_contract_ref == ref
+            assert facts.monitoring_contract_valid is False
+
+            result = apply_transition(
+                conn, system_id=system_id, node_id=node["id"], to_state="monitoring",
+                decision_method="deterministic", actor_kind="system",
+                evidence_refs=("component:svc-a",),
+            )
+            assert not result.applied
+            assert result.decision.reason_code == "monitoring_contract_invalid"
+
+    def test_an_inactive_contract_is_invalid(self, admin_client):
+        from app.db import get_conn
+        from app.node_operations import create_monitoring_contract
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-MC-Inactive")
+        with get_conn() as conn:
+            node, _v, _i = self._established(conn, system_id)
+            contract = create_monitoring_contract(
+                conn, system_id=system_id, node_id=node["id"],
+                freshness_budget_seconds=60.0,
+            )
+            conn.execute(
+                "UPDATE node_monitoring_contract SET active = 0 WHERE id = ?",
+                (contract["id"],),
+            )
+            facts = load_node_facts(conn, system_id=system_id, node_id=node["id"])
+            assert facts.monitoring_contract_valid is False
+
+            result = apply_transition(
+                conn, system_id=system_id, node_id=node["id"], to_state="monitoring",
+                decision_method="deterministic", actor_kind="system",
+                evidence_refs=("component:svc-a",),
+            )
+            assert result.decision.reason_code == "monitoring_contract_invalid"
+
+    def test_a_superseded_contract_is_invalid_while_its_successor_is_not(
+        self, admin_client
+    ):
+        """A second contract version supersedes the first AND repoints the
+        Node's ref. Pointing the ref back at the superseded row must not
+        pass: the judgement would be made against a contract that is no
+        longer what watching this Node means."""
+        from app.db import get_conn
+        from app.node_operations import create_monitoring_contract
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-MC-Superseded")
+        with get_conn() as conn:
+            node, _v, _i = self._established(conn, system_id)
+            first = create_monitoring_contract(
+                conn, system_id=system_id, node_id=node["id"], freshness_budget_seconds=60.0,
+            )
+            second = create_monitoring_contract(
+                conn, system_id=system_id, node_id=node["id"], freshness_budget_seconds=30.0,
+            )
+            # The successor (what create_monitoring_contract left pointed to).
+            facts = load_node_facts(conn, system_id=system_id, node_id=node["id"])
+            assert facts.monitoring_contract_ref == f"node_monitoring_contract:{second['id']}"
+            assert facts.monitoring_contract_valid is True
+
+            conn.execute(
+                "UPDATE evolution_node SET monitoring_contract_ref = ? WHERE id = ?",
+                (f"node_monitoring_contract:{first['id']}", node["id"]),
+            )
+            stale_facts = load_node_facts(conn, system_id=system_id, node_id=node["id"])
+            assert stale_facts.monitoring_contract_valid is False
+
+    def test_another_nodes_contract_does_not_count(self, admin_client):
+        from app.db import get_conn
+        from app.node_operations import create_monitoring_contract
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-MC-OtherNode")
+        with get_conn() as conn:
+            owner, _v, _i = self._established(conn, system_id, node_key="owner")
+            borrower, _v2, _i2 = self._established(
+                conn, system_id, node_key="borrower"
+            )
+            contract = create_monitoring_contract(
+                conn, system_id=system_id, node_id=owner["id"], freshness_budget_seconds=60.0,
+            )
+            conn.execute(
+                "UPDATE evolution_node SET monitoring_contract_ref = ? WHERE id = ?",
+                (f"node_monitoring_contract:{contract['id']}", borrower["id"]),
+            )
+            facts = load_node_facts(conn, system_id=system_id, node_id=borrower["id"])
+            assert facts.monitoring_contract_valid is False
+
+    def test_another_systems_contract_does_not_count(self, admin_client):
+        from app.db import get_conn
+        from app.node_operations import create_monitoring_contract
+
+        token = _login(admin_client)
+        sys_a = _create_system(admin_client, token, "EN-MC-CrossA")
+        sys_b = _create_system(admin_client, token, "EN-MC-CrossB")
+        with get_conn() as conn:
+            node_a, _v, _i = self._established(conn, sys_a, node_key="cross-a")
+            node_b, _v2, _i2 = self._established(conn, sys_b, node_key="cross-b")
+            contract = create_monitoring_contract(
+                conn, system_id=sys_a, node_id=node_a["id"], freshness_budget_seconds=60.0,
+            )
+            conn.execute(
+                "UPDATE evolution_node SET monitoring_contract_ref = ? WHERE id = ?",
+                (f"node_monitoring_contract:{contract['id']}", node_b["id"]),
+            )
+            facts = load_node_facts(conn, system_id=sys_b, node_id=node_b["id"])
+            assert facts.monitoring_contract_valid is False
+
+    def test_a_missing_phase_five_table_fails_closed(self, admin_client):
+        """A database migrated only to Phase 1 has no
+        `node_monitoring_contract` table. That cannot mean "the contract is
+        fine": a ref IS set and cannot be checked, so the gate refuses.
+
+        The Phase-1-only database is simulated with a connection proxy that
+        delegates everything EXCEPT that one table -- which is precisely what
+        an unmigrated database looks like to this code path."""
+        from app.db import get_conn
+
+        class _Phase1OnlyConn:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args, **kwargs):
+                if "node_monitoring_contract" in sql:
+                    raise sqlite3.OperationalError(
+                        "no such table: node_monitoring_contract"
+                    )
+                return self._real.execute(sql, *args, **kwargs)
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-MC-NoTable")
+        with get_conn() as conn:
+            node, _v, _i = self._established(conn, system_id)
+            conn.execute(
+                "UPDATE evolution_node SET monitoring_contract_ref = ? WHERE id = ?",
+                ("node_monitoring_contract:1", node["id"]),
+            )
+            facts = load_node_facts(
+                _Phase1OnlyConn(conn), system_id=system_id, node_id=node["id"]
+            )
+
+        assert facts.monitoring_contract_ref == "node_monitoring_contract:1"
+        assert facts.monitoring_contract_valid is False
+        decision = evaluate_transition(
+            facts,
+            TransitionRequest(
+                to_state="monitoring", decision_method="deterministic",
+                actor_kind="system", evidence_refs=("component:svc-a",),
+            ),
+        )
+        assert decision.reason_code == "monitoring_contract_invalid"
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: a transition never commits against a stale from_state
+# ---------------------------------------------------------------------------
+
+
+def _raw_conn():
+    """A second, INDEPENDENT connection to the test database.
+
+    `db.get_conn()` holds a process-wide lock, so it can never produce two
+    concurrent connections -- which is exactly why a test about two racing
+    writers has to open its own, mirroring `db._connect()`'s settings plus a
+    busy timeout so the loser waits for the write lock instead of failing
+    instantly with SQLITE_BUSY.
+    """
+    from app import db
+
+    conn = sqlite3.connect(db.db_path(), check_same_thread=False, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def _ready_node(conn, system_id, node_key="racer"):
+    """An `exploring` Node with a version and an implementation, i.e. one
+    for which `exploring -> validating` satisfies every earlier rule."""
+    node = create_node(conn, system_id=system_id, node_key=node_key)
+    version = add_version(
+        conn, system_id=system_id, node_id=node["id"], mission="m",
+        input_contract={}, output_contract={}, side_effect_class="pure",
+        trust_boundary="internal",
+    )
+    add_implementation(
+        conn, system_id=system_id, node_id=node["id"],
+        node_version_id=version["id"], modality="rule",
+    )
+    return node
+
+
+class TestTransitionConcurrency:
+    def test_two_connections_cannot_both_apply_from_the_same_from_state(
+        self, admin_client
+    ):
+        """A genuine two-connection race with DIFFERENT idempotency keys --
+        the case the unique index does not separate at all.
+
+        Connection A holds the write lock while B calls `apply_transition`.
+        B must not have read the maturity yet (it is still blocked), so when
+        A commits its own transition, B decides against the state A left
+        behind. One applies, the other is refused."""
+        import threading
+
+        from app.db import get_conn
+        import app.evolution_node as en
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Race-TwoConns")
+        with get_conn() as conn:
+            node = _ready_node(conn, system_id)
+        node_id = node["id"]
+
+        conn_a = _raw_conn()
+        conn_b = _raw_conn()
+        outcome = {}
+        try:
+            # A is mid-transition: it already holds the write lock.
+            conn_a.execute("BEGIN IMMEDIATE")
+
+            def run_b():
+                try:
+                    outcome["result"] = apply_transition(
+                        conn_b, system_id=system_id, node_id=node_id,
+                        to_state="validating", decision_method="manual", actor="bob",
+                        idempotency_key="key-b",
+                    )
+                except Exception as exc:  # pragma: no cover - reported below
+                    outcome["error"] = exc
+
+            thread = threading.Thread(target=run_b)
+            thread.start()
+            thread.join(0.5)
+            # B cannot have decided anything yet: it is waiting for the write
+            # lock, which is the whole point of taking it before reading.
+            assert thread.is_alive(), outcome
+
+            en._insert_event(
+                conn_a, node_id=node_id, system_id=system_id, event_kind="transition",
+                from_state="exploring", to_state="validating", actor="alice",
+                actor_kind="developer", decision_method="manual",
+                idempotency_key="key-a",
+            )
+            conn_a.execute(
+                "UPDATE evolution_node SET maturity = 'validating' WHERE id = ?",
+                (node_id,),
+            )
+            conn_a.execute("COMMIT")
+
+            thread.join(10)
+            assert not thread.is_alive()
+            assert "error" not in outcome, outcome.get("error")
+            result = outcome["result"]
+            assert not result.applied
+            # B read A's committed state, so `exploring -> validating` is no
+            # longer on the table at all.
+            assert result.decision.reason_code == "illegal_transition"
+
+            rows = conn_a.execute(
+                "SELECT from_state, to_state FROM evolution_node_event "
+                "WHERE node_id = ? AND event_kind = 'transition' ORDER BY id",
+                (node_id,),
+            ).fetchall()
+            assert [(r["from_state"], r["to_state"]) for r in rows] == [
+                ("exploring", "validating")
+            ]
+            maturity = conn_a.execute(
+                "SELECT maturity FROM evolution_node WHERE id = ?", (node_id,)
+            ).fetchone()["maturity"]
+            assert maturity == "validating"
+        finally:
+            conn_a.close()
+            conn_b.close()
+
+    def test_a_raced_retry_of_the_same_key_is_still_a_duplicate(self, admin_client):
+        """The other half of the same race: the SAME idempotency key. The
+        winner commits between the caller's pre-check and its transaction, so
+        the in-transaction re-check is what keeps the retry a duplicate
+        instead of an `illegal_transition` rejection."""
+        import app.evolution_node as en
+
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Race-SameKey")
+        with get_conn() as conn:
+            node = _ready_node(conn, system_id, node_key="same-key-racer")
+        node_id = node["id"]
+
+        conn_a = _raw_conn()
+        conn_b = _raw_conn()
+        try:
+            real_lookup = en._lookup_idempotent_event
+            state = {"calls": 0}
+
+            def lookup_with_a_racing_winner(conn_, **kwargs):
+                state["calls"] += 1
+                if state["calls"] == 1:
+                    # The pre-check misses; the winner then commits on the
+                    # OTHER connection, before B takes the write lock.
+                    result = real_lookup(conn_, **kwargs)
+                    conn_a.execute("BEGIN IMMEDIATE")
+                    en._insert_event(
+                        conn_a, node_id=node_id, system_id=system_id,
+                        event_kind="transition", from_state="exploring",
+                        to_state="validating", actor="alice", actor_kind="developer",
+                        decision_method="manual", idempotency_key="shared-key",
+                    )
+                    conn_a.execute(
+                        "UPDATE evolution_node SET maturity = 'validating' WHERE id = ?",
+                        (node_id,),
+                    )
+                    conn_a.execute("COMMIT")
+                    return result
+                return real_lookup(conn_, **kwargs)
+
+            en._lookup_idempotent_event = lookup_with_a_racing_winner
+            try:
+                result = apply_transition(
+                    conn_b, system_id=system_id, node_id=node_id, to_state="validating",
+                    decision_method="manual", actor="bob", idempotency_key="shared-key",
+                )
+            finally:
+                en._lookup_idempotent_event = real_lookup
+
+            assert result.duplicate and not result.applied
+            assert result.node["maturity"] == "validating"
+            count = conn_b.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node_event "
+                "WHERE node_id = ? AND event_kind = 'transition'",
+                (node_id,),
+            ).fetchone()["n"]
+            assert count == 1
+        finally:
+            conn_a.close()
+            conn_b.close()
+
+    def test_compare_and_set_refuses_a_from_state_that_moved_under_the_request(
+        self, admin_client, monkeypatch
+    ):
+        """Belt and suspenders on top of the write lock: if the maturity ever
+        moves between the decision and the UPDATE, the UPDATE matches no row
+        and the whole transition is rolled back rather than committed against
+        a from_state that is no longer true."""
+        import app.evolution_node as en
+
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Race-CAS")
+        with get_conn() as conn:
+            node = _ready_node(conn, system_id, node_key="cas")
+            real_evaluate = en.evaluate_transition
+            moved = {"done": False}
+
+            def evaluate_then_move_the_row(facts, request):
+                decision = real_evaluate(facts, request)
+                if not moved["done"]:
+                    moved["done"] = True
+                    # The lost update the CAS exists to catch: the row is no
+                    # longer in the state the decision was made against.
+                    conn.execute(
+                        "UPDATE evolution_node SET maturity = 'suspended' WHERE id = ?",
+                        (node["id"],),
+                    )
+                return decision
+
+            monkeypatch.setattr(en, "evaluate_transition", evaluate_then_move_the_row)
+            with pytest.raises(EvolutionNodeConflictError) as excinfo:
+                apply_transition(
+                    conn, system_id=system_id, node_id=node["id"], to_state="validating",
+                    decision_method="manual", actor="alice", idempotency_key="cas-1",
+                )
+            monkeypatch.undo()
+            assert "maturity changed" in str(excinfo.value)
+
+            # Nothing was recorded, and the injected move was rolled back
+            # with it: a refused transition leaves no trace at all.
+            row = conn.execute(
+                "SELECT maturity FROM evolution_node WHERE id = ?", (node["id"],)
+            ).fetchone()
+            assert row["maturity"] == "exploring"
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM evolution_node_event "
+                "WHERE node_id = ? AND event_kind = 'transition'",
+                (node["id"],),
+            ).fetchone()["n"]
+            assert count == 0
+
+
+# ---------------------------------------------------------------------------
 # Projection
 # ---------------------------------------------------------------------------
 
@@ -845,6 +1754,84 @@ class TestProjection:
         assert legacy["compatibility_projection"] is True
         assert legacy["component_id"] == "svc-schema"
         assert legacy["maturity"] == "established"
+
+    def test_projection_folds_the_event_log_and_reports_agreement(self, admin_client):
+        """ADR-4's reconciliation, performed rather than asserted: the
+        projection reports both the stored column and the log's fold."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Fold-Consistent")
+        with get_conn() as conn:
+            node, _v, _i = _build_established_node(conn, system_id, "folded")
+            projection = build_node_projection(conn, system_id=system_id, node_id=node["id"])
+
+        assert projection["maturity"] == "established"
+        assert projection["folded_maturity"] == "established"
+        assert projection["maturity_consistent"] is True
+        assert projection["availability"]["maturity_lineage"] is True
+
+    def test_a_never_transitioned_node_folds_to_none_and_is_consistent(self, admin_client):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Fold-Fresh")
+        with get_conn() as conn:
+            node = create_node(conn, system_id=system_id, node_key="never-moved")
+            projection = build_node_projection(conn, system_id=system_id, node_id=node["id"])
+
+        # No transition event at all folds to None, which is CONSISTENT with
+        # the stored creation state -- not a missing lineage.
+        assert projection["folded_maturity"] is None
+        assert projection["maturity"] == "exploring"
+        assert projection["maturity_consistent"] is True
+
+    def test_a_drifted_stored_maturity_is_reported_as_inconsistent(self, admin_client):
+        """The drift the log exists to expose. Only a direct column UPDATE
+        can produce it -- this module's own persistence never does -- and the
+        projection must SHOW it rather than echo the column."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Fold-Drift")
+        with get_conn() as conn:
+            node, _v, _i = _build_established_node(conn, system_id, "drifted")
+            conn.execute(
+                "UPDATE evolution_node SET maturity = 'monitoring' WHERE id = ?",
+                (node["id"],),
+            )
+            projection = build_node_projection(conn, system_id=system_id, node_id=node["id"])
+
+        assert projection["maturity"] == "monitoring"
+        assert projection["folded_maturity"] == "established"
+        assert projection["maturity_consistent"] is False
+        assert projection["availability"]["maturity_lineage"] is True
+
+    def test_the_fold_is_not_bounded_by_the_event_page_limit(self, admin_client):
+        """A log longer than `event_limit` must still reconcile against its
+        WHOLE history -- folding the bounded page would report a healthy Node
+        as drifted."""
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "EN-Fold-Bounded")
+        with get_conn() as conn:
+            node, version, _impl = _build_established_node(conn, system_id, "long-log")
+            # Add more events than the page limit used below, without moving
+            # the maturity: the newest page therefore contains NO transition.
+            for _ in range(5):
+                add_link(
+                    conn, system_id=system_id, node_id=node["id"],
+                    link_kind="capability", target_ref=f"cap-{_}",
+                )
+            projection = build_node_projection(
+                conn, system_id=system_id, node_id=node["id"], event_limit=2
+            )
+
+        assert len(projection["events"]) == 2
+        assert all(event["event_kind"] != "transition" for event in projection["events"])
+        assert projection["folded_maturity"] == "established"
+        assert projection["maturity_consistent"] is True
 
     def test_projection_omits_workflow_phase_entirely(self, admin_client):
         from app.db import get_conn
