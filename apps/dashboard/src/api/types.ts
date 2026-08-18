@@ -5798,3 +5798,659 @@ export interface EvolutionNodeTransitionOut {
   maturity: EvolutionMaturityState;
   event: EvolutionNodeEventOut | null;
 }
+
+// --- UX Design Lineage (Epic #405, Issues #407/#408) --------------------------
+//
+// TypeScript mirror of app/models.py's "UX Design Lineage" section. See
+// docs/ux-design-lineage.md for the contract. Journey / Requirement /
+// Solution Design are the two new PERSISTED design layers this Epic adds;
+// every derived axis (design_status, option_status, link_state, ...) is
+// computed server-side and rendered here, never recomputed by the
+// Dashboard (§0 invariant 9).
+
+export type UxJourneyPerspective = "as_is" | "to_be";
+
+export type UxJourneyBaselineMode = "linked" | "greenfield" | "undecided";
+
+export type UxJourneyBaselineState = "linked" | "unresolved" | "absent" | "not_applicable";
+
+export type UxDesignAuthorshipKind = "developer" | "reasoning_model";
+
+export type UxEvidenceSourceKind =
+  | "runtime_trace"
+  | "human_report"
+  | "external_analytics"
+  | "none";
+
+export type UxRequirementKind = "functional" | "non_functional" | "constraint" | "out_of_scope";
+
+export type UxVerificationMethod =
+  | "manual_review"
+  | "replay"
+  | "experiment"
+  | "runtime_observation"
+  | "not_verifiable";
+
+export type UxDesignStatus = "proposed" | "confirmed" | "rejected" | "retired";
+
+export type UxDesignDecisionKind = "confirm" | "reject" | "retire" | "reinstate";
+
+export type UxDesignRecheckState = "current" | "stale";
+
+export type UxRevisionState = "current" | "superseded";
+
+export type UxRefKind = "purpose_element" | "purpose_relation" | "capability_entity";
+
+export type UxRefRelationStatus = "confirmed" | "proposed" | "derived";
+
+export type UxRefTargetResolution = "resolved" | "unresolved" | "unavailable";
+
+export type UxRefRecheckState = "current" | "stale" | "not_captured";
+
+export type UxArtifactKind =
+  | "wireframe"
+  | "adr"
+  | "spec"
+  | "diagram"
+  | "research_note"
+  | "other";
+
+export type UxArtifactVerificationState = "verified" | "unverified" | "unreachable";
+
+export type UxArtifactSubjectKind =
+  | "journey"
+  | "journey_step"
+  | "requirement"
+  | "solution_design"
+  | "design_option";
+
+export type UxDesignSubjectKind =
+  | "journey"
+  | "requirement"
+  | "requirement_step_link"
+  | "journey_upstream_ref"
+  | "artifact_reference";
+
+export type UxDiffChangeKind = "added" | "removed" | "changed" | "unchanged";
+
+export type UxDiffState = "available" | "not_applicable" | "unavailable";
+
+export type UxChangeOrigin =
+  | "purpose"
+  | "capability"
+  | "journey"
+  | "requirement"
+  | "solution_design"
+  | "implementation_target"
+  | "snapshot";
+
+export type SolutionDesignOptionDecision = "adopt" | "hold" | "reject" | "withdraw";
+
+export type SolutionDesignOptionStatus =
+  | "draft"
+  | "adopted"
+  | "held"
+  | "rejected"
+  | "withdrawn";
+
+export type SolutionTargetKind =
+  | "capability"
+  | "static_flow"
+  | "runtime_flow"
+  | "evolution_node"
+  | "component"
+  | "cell_definition"
+  | "cell_binding"
+  | "probe_point";
+
+export type SolutionLinkState = "current" | "stale" | "unresolved" | "unavailable";
+
+export type SolutionLinkStaleReason =
+  | "requirement_changed"
+  | "design_changed"
+  | "target_changed"
+  | "snapshot_changed"
+  | "upstream_changed";
+
+export type SolutionHandoffState = "complete" | "incomplete" | "unavailable";
+
+export interface UxJourneyStepOut {
+  id: number;
+  step_key: string;
+  step_order: number;
+  user_intent: string;
+  system_response: string;
+  success_criteria: string;
+  failure_mode: string;
+  recovery_path: string;
+  evidence_expectation: string;
+  evidence_source_kind: UxEvidenceSourceKind;
+  content_digest: string;
+}
+
+export interface UxJourneyRevisionOut {
+  id: number;
+  journey_id: number;
+  revision_number: number;
+  title: string;
+  beneficiary: string;
+  usage_context: string;
+  entry_trigger: string;
+  value_arrival: string;
+  summary: string;
+  content_digest: string;
+  authored_by_kind: UxDesignAuthorshipKind;
+  decision_method: "manual" | "reasoning_llm";
+  intelligence_run_id: number | null;
+  change_note: string;
+  created_by: string | null;
+  created_at: number;
+  revision_state: UxRevisionState;
+  superseded_by_id: number | null;
+  steps: UxJourneyStepOut[];
+}
+
+export interface UxJourneyUpstreamRefOut {
+  id: number;
+  journey_id: number;
+  ref_kind: UxRefKind;
+  target_ref: string;
+  target_row_id: number | null;
+  target_name: string | null;
+  relation_status: UxRefRelationStatus;
+  target_state: string;
+  target_resolution: UxRefTargetResolution;
+  recheck_state: UxRefRecheckState;
+  captured_digest: string;
+  captured_session_id: number | null;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface UxArtifactReferenceOut {
+  id: number;
+  subject_kind: UxArtifactSubjectKind;
+  subject_key: string;
+  artifact_kind: UxArtifactKind;
+  title: string;
+  uri: string;
+  media_type: string;
+  content_hash: string;
+  hash_algorithm: "sha256";
+  byte_size: number | null;
+  verification_state: UxArtifactVerificationState;
+  verified_snapshot_id: number | null;
+  verified_commit_sha: string | null;
+  verified_at: number | null;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface UxDesignDecisionOut {
+  id: number;
+  subject_kind: UxDesignSubjectKind;
+  subject_key: string;
+  subject_row_id: number | null;
+  decision: UxDesignDecisionKind;
+  rationale: string;
+  captured_digest: string;
+  captured_revision_id: number | null;
+  decision_method: "manual";
+  decided_by: string | null;
+  superseded_by_id: number | null;
+  created_at: number;
+}
+
+export interface UxJourneyOut {
+  id: number;
+  system_id: number;
+  journey_key: string;
+  perspective: UxJourneyPerspective;
+  baseline_mode: UxJourneyBaselineMode;
+  baseline_journey_id: number | null;
+  baseline_journey_key: string | null;
+  baseline_state: UxJourneyBaselineState;
+  current_revision_id: number | null;
+  current_revision_number: number | null;
+  title: string;
+  design_status: UxDesignStatus;
+  recheck_state: UxDesignRecheckState;
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface UxJourneyDetailOut extends UxJourneyOut {
+  current_revision: UxJourneyRevisionOut | null;
+  upstream_refs: UxJourneyUpstreamRefOut[];
+  artifact_references: UxArtifactReferenceOut[];
+  decisions: UxDesignDecisionOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface UxJourneyListOut {
+  system_id: number;
+  generated_at: number;
+  journeys: UxJourneyOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface UxJourneyRevisionListOut {
+  system_id: number;
+  journey_id: number;
+  journey_key: string;
+  generated_at: number;
+  revisions: UxJourneyRevisionOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface UxJourneyStepDiffEntryOut {
+  step_key: string;
+  change_kind: UxDiffChangeKind;
+  from_step: UxJourneyStepOut | null;
+  to_step: UxJourneyStepOut | null;
+}
+
+export interface UxJourneyDiffOut {
+  system_id: number;
+  journey_id: number;
+  journey_key: string;
+  generated_at: number;
+  diff_state: UxDiffState;
+  from_revision_id: number | null;
+  from_revision_number: number | null;
+  to_revision_id: number | null;
+  to_revision_number: number | null;
+  steps: UxJourneyStepDiffEntryOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface UxAcceptanceCriterionOut {
+  id: number;
+  criterion_key: string;
+  criterion_order: number;
+  statement: string;
+  verification_method: UxVerificationMethod;
+  verification_note: string;
+  content_digest: string;
+}
+
+export interface UxRequirementRevisionOut {
+  id: number;
+  requirement_id: number;
+  revision_number: number;
+  requirement_kind: UxRequirementKind;
+  statement: string;
+  rationale: string;
+  constraint_text: string;
+  out_of_scope_note: string;
+  content_digest: string;
+  authored_by_kind: UxDesignAuthorshipKind;
+  decision_method: "manual" | "reasoning_llm";
+  intelligence_run_id: number | null;
+  change_note: string;
+  created_by: string | null;
+  created_at: number;
+  revision_state: UxRevisionState;
+  superseded_by_id: number | null;
+  acceptance_criteria: UxAcceptanceCriterionOut[];
+}
+
+export interface UxRequirementStepLinkOut {
+  id: number;
+  requirement_id: number;
+  journey_id: number;
+  journey_key: string | null;
+  step_key: string;
+  step_label: string | null;
+  captured_journey_revision_id: number | null;
+  captured_step_digest: string;
+  target_resolution: UxRefTargetResolution;
+  recheck_state: UxRefRecheckState;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface UxRequirementOut {
+  id: number;
+  system_id: number;
+  requirement_key: string;
+  requirement_kind: UxRequirementKind;
+  current_revision_id: number | null;
+  current_revision_number: number | null;
+  statement: string;
+  design_status: UxDesignStatus;
+  recheck_state: UxDesignRecheckState;
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface UxRequirementDetailOut extends UxRequirementOut {
+  current_revision: UxRequirementRevisionOut | null;
+  step_links: UxRequirementStepLinkOut[];
+  artifact_references: UxArtifactReferenceOut[];
+  decisions: UxDesignDecisionOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface UxRequirementListOut {
+  system_id: number;
+  generated_at: number;
+  requirements: UxRequirementOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface UxRequirementRevisionListOut {
+  system_id: number;
+  requirement_id: number;
+  requirement_key: string;
+  generated_at: number;
+  revisions: UxRequirementRevisionOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface UxRequirementCriterionDiffEntryOut {
+  criterion_key: string;
+  change_kind: UxDiffChangeKind;
+  from_criterion: UxAcceptanceCriterionOut | null;
+  to_criterion: UxAcceptanceCriterionOut | null;
+}
+
+export interface UxRequirementDiffOut {
+  system_id: number;
+  requirement_id: number;
+  requirement_key: string;
+  generated_at: number;
+  diff_state: UxDiffState;
+  from_revision_id: number | null;
+  from_revision_number: number | null;
+  to_revision_id: number | null;
+  to_revision_number: number | null;
+  criteria: UxRequirementCriterionDiffEntryOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+// --- #407 write requests -------------------------------------------------
+
+export interface UxJourneyCreateRequest {
+  journey_key: string;
+  perspective: UxJourneyPerspective;
+  baseline_mode?: UxJourneyBaselineMode;
+  baseline_journey_id?: number | null;
+}
+
+export interface UxJourneyStepInput {
+  step_key: string;
+  step_order: number;
+  user_intent?: string;
+  system_response?: string;
+  success_criteria?: string;
+  failure_mode?: string;
+  recovery_path?: string;
+  evidence_expectation?: string;
+  evidence_source_kind?: UxEvidenceSourceKind;
+}
+
+export interface UxJourneyRevisionCreateRequest {
+  title?: string;
+  beneficiary?: string;
+  usage_context?: string;
+  entry_trigger?: string;
+  value_arrival?: string;
+  summary?: string;
+  change_note?: string;
+  steps?: UxJourneyStepInput[];
+}
+
+export interface UxJourneyUpstreamRefCreateRequest {
+  ref_kind: UxRefKind;
+  target_ref: string;
+  note?: string;
+}
+
+export interface UxRequirementCreateRequest {
+  requirement_key: string;
+  requirement_kind: UxRequirementKind;
+}
+
+export interface UxAcceptanceCriterionInput {
+  criterion_key: string;
+  criterion_order: number;
+  statement?: string;
+  verification_method?: UxVerificationMethod;
+  verification_note?: string;
+}
+
+export interface UxRequirementRevisionCreateRequest {
+  statement?: string;
+  rationale?: string;
+  constraint_text?: string;
+  out_of_scope_note?: string;
+  change_note?: string;
+  acceptance_criteria?: UxAcceptanceCriterionInput[];
+}
+
+export interface UxRequirementStepLinkCreateRequest {
+  journey_key: string;
+  step_key: string;
+  note?: string;
+}
+
+export interface UxArtifactReferenceCreateRequest {
+  subject_kind: UxArtifactSubjectKind;
+  subject_key: string;
+  artifact_kind: UxArtifactKind;
+  title?: string;
+  uri: string;
+  media_type?: string;
+  content_hash: string;
+  byte_size?: number | null;
+}
+
+export interface UxDesignDecisionCreateRequest {
+  subject_kind: UxDesignSubjectKind;
+  subject_key: string;
+  decision: UxDesignDecisionKind;
+  rationale?: string;
+  captured_digest?: string;
+}
+
+// --- Solution Design (Issue #408) -----------------------------------------
+
+export interface SolutionDesignOptionOut {
+  id: number;
+  solution_design_id: number;
+  option_key: string;
+  option_order: number;
+  title: string;
+  approach: string;
+  tradeoffs: string;
+  risks: string;
+  content_digest: string;
+  authored_by_kind: UxDesignAuthorshipKind;
+  decision_method: "manual" | "reasoning_llm";
+  intelligence_run_id: number | null;
+  option_status: SolutionDesignOptionStatus;
+  created_by: string | null;
+  created_at: number;
+  revision_state: UxRevisionState;
+  superseded_by_id: number | null;
+}
+
+export interface SolutionDesignRequirementLinkOut {
+  id: number;
+  solution_design_id: number;
+  requirement_id: number;
+  requirement_key: string | null;
+  captured_requirement_revision_id: number | null;
+  captured_digest: string;
+  link_state: SolutionLinkState;
+  stale_reason: SolutionLinkStaleReason | null;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface SolutionDesignTargetLinkOut {
+  id: number;
+  solution_design_id: number;
+  option_id: number;
+  option_key: string | null;
+  target_kind: SolutionTargetKind;
+  target_ref: string;
+  target_row_id: number | null;
+  target_name: string | null;
+  captured_digest: string;
+  captured_snapshot_id: number | null;
+  link_state: SolutionLinkState;
+  stale_reason: SolutionLinkStaleReason | null;
+  review_required: boolean;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface SolutionDesignDecisionOut {
+  id: number;
+  solution_design_id: number;
+  option_id: number;
+  option_key: string;
+  decision: SolutionDesignOptionDecision;
+  rationale: string;
+  captured_digest: string;
+  decision_method: "manual";
+  decided_by: string | null;
+  superseded_by_id: number | null;
+  created_at: number;
+}
+
+export interface SolutionDesignOut {
+  id: number;
+  system_id: number;
+  design_key: string;
+  title: string;
+  summary: string;
+  adopted_option_key: string | null;
+  option_count: number;
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface SolutionDesignDetailOut extends SolutionDesignOut {
+  options: SolutionDesignOptionOut[];
+  requirement_links: SolutionDesignRequirementLinkOut[];
+  target_links: SolutionDesignTargetLinkOut[];
+  decisions: SolutionDesignDecisionOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface SolutionDesignListOut {
+  system_id: number;
+  generated_at: number;
+  designs: SolutionDesignOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface SolutionDesignChangeOriginEntryOut {
+  origin: UxChangeOrigin;
+  link_id: number;
+  link_kind: "requirement_link" | "target_link";
+  target_kind: SolutionTargetKind | null;
+  target_ref: string | null;
+  requirement_key: string | null;
+  stale_reason: SolutionLinkStaleReason | null;
+  detail: string;
+}
+
+export interface SolutionDesignChangeOriginsOut {
+  system_id: number;
+  solution_design_id: number;
+  design_key: string;
+  generated_at: number;
+  origins: SolutionDesignChangeOriginEntryOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface SolutionDesignHandoffUnresolvedRefOut {
+  kind: string;
+  ref: string;
+  reason: string;
+}
+
+export interface SolutionDesignHandoffOut {
+  system_id: number;
+  solution_design_id: number;
+  design_key: string;
+  generated_at: number;
+  handoff_state: SolutionHandoffState;
+  adopted_option: SolutionDesignOptionOut | null;
+  target_links: SolutionDesignTargetLinkOut[];
+  requirements: UxRequirementDetailOut[];
+  node_decomposition_refs: Record<string, unknown>[];
+  probe_plan_refs: Record<string, unknown>[];
+  evaluation_policy_refs: Record<string, Record<string, unknown>[]>;
+  unresolved_references: SolutionDesignHandoffUnresolvedRefOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+// --- #408 write requests -------------------------------------------------
+
+export interface SolutionDesignCreateRequest {
+  design_key: string;
+  title?: string;
+  summary?: string;
+}
+
+export interface SolutionDesignOptionCreateRequest {
+  option_key: string;
+  option_order: number;
+  title?: string;
+  approach?: string;
+  tradeoffs?: string;
+  risks?: string;
+}
+
+export interface SolutionDesignRequirementLinkCreateRequest {
+  requirement_key: string;
+  note?: string;
+}
+
+export interface SolutionDesignTargetLinkCreateRequest {
+  option_key: string;
+  target_kind: SolutionTargetKind;
+  target_ref: string;
+  captured_snapshot_id?: number | null;
+  note?: string;
+}
+
+export interface SolutionDesignOptionDecisionCreateRequest {
+  option_key: string;
+  decision: SolutionDesignOptionDecision;
+  rationale?: string;
+}

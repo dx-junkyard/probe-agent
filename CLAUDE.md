@@ -1417,6 +1417,86 @@ creating incomplete persistence or execution paths for later phases.
     非目標としているので、**実際の開発者による dogfooding 記録なしに #401 を
     完了とみなしてはならない**。
 
+25. Issue #405 (subs #406-#409) — UX Design Lineage。Purpose Chain は
+    「対象者と課題 → Vision → Purpose → Capability」を保持できるが、その
+    Capability を **誰がどの経路でどう使い、何が満たされていれば良いのか**
+    を追跡可能な設計成果物として保存する正本が無かった。UX の価値仮説は
+    `purpose_experience_hypothesis` の一文に、実行経路は Flow Explorer の
+    都度計算に、処理単位の契約は `evolution_node_version` に分かれており、
+    どれも「この体験を実現するための要件と実現案」ではない。この Epic は
+    Purpose Chain の下流に `UX Journey / Journey Step → Requirement →
+    Solution Design → Flow / Evolution Node / Component / Probe Cell` の
+    一層だけを足す。`docs/ux-design-lineage.md` が canonical contract で、
+    §0 を読んでからこの領域に触ること。依存順に #406 (契約) → #407
+    (Journey/Step/Requirement/Artifact の永続化と API) → #408 (Solution
+    Design と実装対象への link) → #409 (UX Design Studio と E2E)。
+    後から変えるときに守ること:
+    - **新しい理解モデルを作らない。** Purpose / Vision / Capability /
+      Flow / Node / Component / Cell の正本は既存のまま。この層が持つのは
+      新しく著述される設計成果物と、上下への参照 (ref / link) だけ。上流の
+      内容を列へコピーしない — コピーした Capability 名は元が superseded
+      された後も current として読めてしまう (#397 handoff が踏んだ轍)。
+    - **Purpose Chain と違い、この層は行を保存する。** Journey /
+      Requirement / Solution Design はどの既存行からも導出できない、新しく
+      著述される内容だからである。その代わり上流・下流の内容は保存せず、
+      参照 + 捕捉 digest だけを持ち、解決は読み取り時に kind ごとの正本
+      1 つに対して行う (`node_design._LINK_KIND_TARGET_SOURCE` と同じ)。
+    - **identity は `(system_id, <kind>_key)` の開発者指定 slug。** Purpose
+      要素 id (`core_capability:<sha256(name)>`) からも行 id からも導出
+      しない (Evolution Node ADR-2 / #380 と同じ理由: 名前を言い直しただけ
+      で履歴が切れる、再構築で行 id が振り直される)。
+    - **as-is / to-be は identity の属性で、revision の属性ではない。**
+      revision に持たせると 1 つの Journey が現状の記述から目標の記述へ
+      変わり得て、その履歴は 2 つの別主題の記録になる。`to_be` 側が
+      `baseline_journey_id` で as-is を指し、`baseline_mode`
+      (`linked`/`greenfield`/`undecided`) が「新規だと宣言した」と
+      「まだ決めていない」を区別する。
+    - **状態は独立した 4 軸**: `design_status` (決定台帳から導出、列に
+      保存しない) / `recheck_state` (digest 比較。stale でも `confirmed`
+      のまま — 確定を取り消さず再確認を促す) / `revision_state`
+      (`superseded_by_id IS NULL`) / `authored_by_kind` (誰の声か)。
+      AI が書いた revision が `confirmed` になるのは「AI の文を人が確認
+      した」であって、執筆者が developer に変わるのではない。
+    - **`unknown` / `unavailable` / `not_applicable` を丸めない。**
+      決めていない / 読めなかった / 構造上不要 は 3 つの別の答え。
+    - **Capability 参照は `understanding_capability_entity.id`** (#312 の
+      System-scoped で安定な identity)。`capability_hierarchy_nodes.id`
+      (snapshot ごとに再生成) でも Purpose Chain の名前 hash id でもない。
+    - **`static_flow` と `runtime_flow` を 1 語にまとめない。** 前者は
+      `(system_id, snapshot_id, entrypoint_ref)` の静的経路、後者は
+      `trace_spans.flow_id` の実行時 correlation。**恒久的な Flow ID を
+      捏造しない** — `flow_graph` の `flow-{i}` は 1 回の導出内でしか
+      安定しない。
+    - **設計案の採用は実装ではない。** Option の `adopt` は Node maturity /
+      Cell Improvement / SDK policy mode / patch 適用 / publish のどれも
+      変えない (Evolution Node ADR-9 と同じ境界を設計層から守る)。既に
+      採用済みの案があるとき別案の採用は 409 で拒否し、自動で前案を
+      `withdraw` しない — システムが人間の名前で決定を捏造しないため。
+    - **artifact は本文を保存せず、任意の URI を fetch しない。** 本文の列
+      は存在しない (構造で禁じる)。`verified` に到達できるのは pin された
+      snapshot 上で `git show` として解決できる `repo:<path>` だけで、
+      外部 URI は常に `unverified` (hash は開発者の申告値)。
+    - **変更伝播は下流方向のみ。** Requirement を直しても Journey は stale
+      にならない (#388 と同じ)。
+    - **合成 score を作らない。** 設計の完成度・充足率・confidence
+      percentage を返さない。Node / Flow-Capability / UX-Outcome 評価は
+      `evolution_evaluation_policy` の 3 level のまま別々に読む (ADR-7)。
+    - **runtime trace だけから利用者の成功を推論しない。** Journey Step の
+      `evidence_source_kind` は「何が観測できれば成功と言えるか」という
+      期待の宣言であって成果ではない。成果の正本は
+      `purpose_outcome_criterion` のまま。
+    - **既存正本へ一切書き込まない。** `interview_*` / `purpose_*` /
+      `understanding_*` / `evolution_node*` / `cell_*` / `components` /
+      `probe_points` のどの行も UPDATE / INSERT しない (#329 と同じ境界)。
+    - 用語注意: 既存の #397「Phase 2: Design Studio」は Evolution Node の
+      設計層を指す。#409 の画面は **UX Design Studio**
+      (`/ux-design-studio`) と呼び、混同しない。
+    既存の human gate は一切緩めない: 理解の確認 / Alignment 項目の確定 /
+    提案の承認・編集・却下 / 差分の適用 / 観測の開始 / 採否の記録 /
+    publish / Replay approval / 固定化承認 / reopen 承認、および本 Epic が
+    追加する Journey・Requirement の確定と Design Option の採用もすべて
+    `decision_method: manual`。
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

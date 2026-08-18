@@ -926,3 +926,47 @@ Overview は稼働メトリクス画面ではない。`GET /overview` が返す 
   「読めなかった」と「読めたが中身がない/矛盾している」という別々の事実が
   同じ表示になる(`docs/purpose-chain.md` §0 invariant 6 の Dashboard 側の
   適用)。
+
+## UX Design Studio (issue #409, Epic #405)
+
+`docs/ux-design-lineage.md` §4 is the contract. Dashboard-only: it adds no
+endpoint, no mutation the server does not already expose, and no permission
+change.
+
+- **The page is `/ux-design-studio`**, registered in `src/App.tsx` and given
+  ONE nav item inside an existing sidebar phase group. Do not create a fourth
+  isolated design page. Naming note: #397's "Design Studio" is the Evolution
+  Node design layer; this screen is the **UX Design Studio** and the two must
+  not be conflated in copy or in route names.
+- **The client re-derives nothing.** `design_status`, `recheck_state`,
+  `revision_state`, every ref/link state, the diffs, and the change-origin
+  classification all arrive decided from `GET /ux-design/...` and
+  `GET /solution-designs/...`. The only client-side tables allowed are
+  display order and fixed labels (the `components/purpose-chain/model.ts`
+  precedent).
+- **Six display states, six different sentences**: `as_is`, `to_be`,
+  `changed`, `stale`, `unavailable`, `not_applicable`. Never share copy
+  between them, and never signal them with colour alone — pair every colour
+  with a text marker (#358 / #387 accessibility rule). In particular a
+  `baseline-diff` whose `diff_state` is `not_applicable` must NOT render as
+  「差分なし」; it renders 「比較対象の現状 Journey がありません」, worded
+  differently for `baseline_mode` `greenfield` vs `undecided`.
+- **One decision at a time, and unreached operations are not shown disabled**
+  (#342 原則 P3). Guidance about how to fix an item may stay visible with its
+  reason (the #356 exception) — that governs guidance, not a state's primary
+  action.
+- **Evaluation is shown related, never summed.** Journey Step acceptance
+  criteria, Flow-Capability evaluation, UX-Outcome criteria and Node
+  evaluation appear side by side with their relations; the three
+  `evolution_evaluation_policy` levels stay in separate groups. No composite
+  score, no completion percentage. `purpose_outcome_criterion`'s
+  `not_observed` / `not_computed` render with those meanings intact.
+- **A runtime trace is never displayed as UX success.** A Journey Step's
+  `evidence_source_kind: runtime_trace` says what would have to be observed,
+  not that it was.
+- Navigation into the studio comes from Overview's Purpose Frame, Interview,
+  Capability Map, Flow Explorer and Evolution Nodes; every one of those leads
+  NAVIGATES and never executes (#358).
+- UI copy follows the Issue #266 Japanese convention. `System`, `Trace`,
+  `Snapshot`, `Capability`, `Flow`, `Evolution Node`, `Probe Cell`,
+  `UX Journey`, `Requirement`, `Solution Design` stay in canonical form.

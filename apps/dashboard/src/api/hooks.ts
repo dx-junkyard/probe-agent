@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueries, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, getSystemId } from "./client";
 import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
@@ -24,6 +24,21 @@ import type {
   WorkspaceProposalDraftOut,
   EvolutionNodesListOut, EvolutionNodeSummary, EvolutionNodeProjectionOut,
   EvolutionNodeEventsOut, EvolutionNodeTransitionOut, EvolutionMaturityState,
+  UxJourneyListOut, UxJourneyOut, UxJourneyDetailOut, UxJourneyDiffOut,
+  UxJourneyRevisionListOut, UxRequirementRevisionListOut, UxRequirementDiffOut,
+  UxJourneyCreateRequest, UxJourneyRevisionCreateRequest, UxJourneyUpstreamRefCreateRequest,
+  UxJourneyUpstreamRefOut,
+  UxRequirementListOut, UxRequirementOut, UxRequirementDetailOut,
+  UxRequirementCreateRequest, UxRequirementRevisionCreateRequest,
+  UxRequirementStepLinkCreateRequest, UxRequirementStepLinkOut,
+  UxArtifactReferenceCreateRequest, UxArtifactReferenceOut,
+  UxDesignDecisionCreateRequest, UxDesignDecisionOut,
+  SolutionDesignListOut, SolutionDesignOut, SolutionDesignDetailOut,
+  SolutionDesignCreateRequest, SolutionDesignOptionCreateRequest, SolutionDesignOptionOut,
+  SolutionDesignRequirementLinkCreateRequest, SolutionDesignRequirementLinkOut,
+  SolutionDesignTargetLinkCreateRequest, SolutionDesignTargetLinkOut,
+  SolutionDesignOptionDecisionCreateRequest, SolutionDesignDecisionOut,
+  SolutionDesignChangeOriginsOut, SolutionDesignHandoffOut,
   InterviewSessionOut, InterviewSessionDetailOut, InterviewContextPack,
   InterviewCapabilityGraphOut, InterviewConfirmUnderstandingRequest,
   InterviewDialogueTurnOut, InterviewProposalDecisionOut,
@@ -3736,5 +3751,352 @@ export function useTransitionEvolutionNode(nodeId: number | null) {
       qc.invalidateQueries({ queryKey: ["evolution-node", systemId, nodeId] });
       qc.invalidateQueries({ queryKey: ["evolution-node-events", systemId, nodeId] });
     },
+  });
+}
+
+// --- UX Design Lineage (Epic #405, Issues #407/#408/#409) --------------------
+//
+// `docs/ux-design-lineage.md` §0 invariant 9: the client re-derives no
+// state. Every `Ux*Out` / `SolutionDesign*Out` field below (design_status,
+// recheck_state, revision_state, every ref/link state, diffs, and the
+// change-origin classification) arrives already decided by these endpoints;
+// `components/ux-design/model.ts` only orders and labels what is returned.
+//
+// Mutations invalidate broadly across the whole UX Design Lineage query
+// namespace rather than only the single row a write touched. A Journey
+// revision can make an unrelated Requirement's step link `stale`, and a
+// Requirement revision can make an unrelated Solution Design's requirement
+// link `stale` (§2.9 downstream-only propagation) -- narrower invalidation
+// would let those staleness reads go undetected until an unrelated refetch.
+
+const UX_DESIGN_QUERY_BASES = [
+  "ux-journeys", "ux-journey", "ux-journey-baseline-diff",
+  "ux-journey-revisions", "ux-journey-diff",
+  "ux-requirement-revisions", "ux-requirement-diff",
+  "ux-requirements", "ux-requirement",
+  "solution-designs", "solution-design",
+  "solution-design-change-origins", "solution-design-handoff",
+] as const;
+
+function invalidateUxDesign(qc: ReturnType<typeof useQueryClient>) {
+  for (const base of UX_DESIGN_QUERY_BASES) {
+    qc.invalidateQueries({ queryKey: [base] });
+  }
+}
+
+// --- Journey ------------------------------------------------------------
+
+export function useUxJourneys() {
+  return useQuery<UxJourneyListOut>({
+    queryKey: sysKey("ux-journeys"),
+    queryFn: () => api.get<UxJourneyListOut>("/ux-design/journeys"),
+  });
+}
+
+export function useUxJourneyDetail(journeyKey: string | null) {
+  return useQuery<UxJourneyDetailOut>({
+    queryKey: [...sysKey("ux-journey"), journeyKey],
+    queryFn: () => api.get<UxJourneyDetailOut>(`/ux-design/journeys/${encodeURIComponent(journeyKey ?? "")}`),
+    enabled: journeyKey !== null,
+  });
+}
+
+/** `GET /ux-design/journeys/{key}/baseline-diff`. `diff_state` is
+ * `not_applicable` (never an empty diff) when the Journey has no linked
+ * as-is baseline -- §2.10 / §4.3. */
+export function useUxJourneyBaselineDiff(journeyKey: string | null) {
+  return useQuery<UxJourneyDiffOut>({
+    queryKey: [...sysKey("ux-journey-baseline-diff"), journeyKey],
+    queryFn: () =>
+      api.get<UxJourneyDiffOut>(`/ux-design/journeys/${encodeURIComponent(journeyKey ?? "")}/baseline-diff`),
+    enabled: journeyKey !== null,
+  });
+}
+
+/** `GET /ux-design/journeys/{key}/revisions` -- the append-only history.
+ * A correction never overwrites its predecessor (contract §2.5), so the
+ * older revisions stay readable here with their own `revision_state`. */
+export function useUxJourneyRevisions(journeyKey: string | null) {
+  return useQuery<UxJourneyRevisionListOut>({
+    queryKey: [...sysKey("ux-journey-revisions"), journeyKey],
+    queryFn: () =>
+      api.get<UxJourneyRevisionListOut>(
+        `/ux-design/journeys/${encodeURIComponent(journeyKey ?? "")}/revisions`,
+      ),
+    enabled: journeyKey !== null,
+  });
+}
+
+/** `GET /ux-design/journeys/{key}/diff` -- one revision against another of the
+ * SAME Journey, which is a different question from `baseline-diff`'s as-is vs
+ * to-be. Steps are matched on exact `step_key` equality by the server. */
+export function useUxJourneyRevisionDiff(
+  journeyKey: string | null, fromRevision: number | null, toRevision: number | null,
+) {
+  return useQuery<UxJourneyDiffOut>({
+    queryKey: [...sysKey("ux-journey-diff"), journeyKey, fromRevision, toRevision],
+    queryFn: () =>
+      api.get<UxJourneyDiffOut>(
+        `/ux-design/journeys/${encodeURIComponent(journeyKey ?? "")}/diff`
+        + `?from_revision=${fromRevision}&to_revision=${toRevision}`,
+      ),
+    enabled: journeyKey !== null && fromRevision !== null && toRevision !== null,
+  });
+}
+
+/** `GET /ux-design/requirements/{key}/revisions`. */
+export function useUxRequirementRevisions(requirementKey: string | null) {
+  return useQuery<UxRequirementRevisionListOut>({
+    queryKey: [...sysKey("ux-requirement-revisions"), requirementKey],
+    queryFn: () =>
+      api.get<UxRequirementRevisionListOut>(
+        `/ux-design/requirements/${encodeURIComponent(requirementKey ?? "")}/revisions`,
+      ),
+    enabled: requirementKey !== null,
+  });
+}
+
+/** `GET /ux-design/requirements/{key}/diff` -- acceptance criteria matched on
+ * exact `criterion_key` equality by the server. */
+export function useUxRequirementRevisionDiff(
+  requirementKey: string | null, fromRevision: number | null, toRevision: number | null,
+) {
+  return useQuery<UxRequirementDiffOut>({
+    queryKey: [...sysKey("ux-requirement-diff"), requirementKey, fromRevision, toRevision],
+    queryFn: () =>
+      api.get<UxRequirementDiffOut>(
+        `/ux-design/requirements/${encodeURIComponent(requirementKey ?? "")}/diff`
+        + `?from_revision=${fromRevision}&to_revision=${toRevision}`,
+      ),
+    enabled: requirementKey !== null && fromRevision !== null && toRevision !== null,
+  });
+}
+
+export function useCreateUxJourney() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UxJourneyCreateRequest) => api.post<UxJourneyOut>("/ux-design/journeys", body),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+export function useAddUxJourneyRevision(journeyKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UxJourneyRevisionCreateRequest) =>
+      api.post<UxJourneyDetailOut>(
+        `/ux-design/journeys/${encodeURIComponent(journeyKey ?? "")}/revisions`, body,
+      ),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+export function useAddUxJourneyUpstreamRef(journeyKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UxJourneyUpstreamRefCreateRequest) =>
+      api.post<UxJourneyUpstreamRefOut>(
+        `/ux-design/journeys/${encodeURIComponent(journeyKey ?? "")}/upstream-refs`, body,
+      ),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+// --- Requirement ----------------------------------------------------------
+
+export function useUxRequirements() {
+  return useQuery<UxRequirementListOut>({
+    queryKey: sysKey("ux-requirements"),
+    queryFn: () => api.get<UxRequirementListOut>("/ux-design/requirements"),
+  });
+}
+
+export function useUxRequirementDetail(requirementKey: string | null) {
+  return useQuery<UxRequirementDetailOut>({
+    queryKey: [...sysKey("ux-requirement"), requirementKey],
+    queryFn: () =>
+      api.get<UxRequirementDetailOut>(`/ux-design/requirements/${encodeURIComponent(requirementKey ?? "")}`),
+    enabled: requirementKey !== null,
+  });
+}
+
+/**
+ * The batched read behind "Requirements linked to a Step" (§4.2 level 3):
+ * there is no reverse `GET` from a Step to its Requirements, so the Studio
+ * reads every Requirement's own detail (each individually cached and
+ * reused by `components/ux-design/model.ts`'s `requirementsForStep`, a pure
+ * structural join over the results -- no state is re-derived here).
+ */
+export function useUxRequirementDetailsBatch(keys: readonly string[]) {
+  return useQueries({
+    queries: keys.map((key) => ({
+      queryKey: [...sysKey("ux-requirement"), key],
+      queryFn: () => api.get<UxRequirementDetailOut>(`/ux-design/requirements/${encodeURIComponent(key)}`),
+    })),
+  });
+}
+
+export function useCreateUxRequirement() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UxRequirementCreateRequest) =>
+      api.post<UxRequirementOut>("/ux-design/requirements", body),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+export function useAddUxRequirementRevision(requirementKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UxRequirementRevisionCreateRequest) =>
+      api.post<UxRequirementDetailOut>(
+        `/ux-design/requirements/${encodeURIComponent(requirementKey ?? "")}/revisions`, body,
+      ),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+export function useAddUxRequirementStepLink(requirementKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UxRequirementStepLinkCreateRequest) =>
+      api.post<UxRequirementStepLinkOut>(
+        `/ux-design/requirements/${encodeURIComponent(requirementKey ?? "")}/step-links`, body,
+      ),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+// --- Artifact reference / decision (shared by Journey and Requirement) ----
+
+export function useCreateUxArtifactReference() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UxArtifactReferenceCreateRequest) =>
+      api.post<UxArtifactReferenceOut>("/ux-design/artifact-references", body),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+/** Records a `confirm` / `reject` / `retire` / `reinstate` decision on a
+ * Journey or a Requirement. `decision_method` is not part of the request
+ * body -- the server derives it from the authenticated Principal (§2.10). */
+export function useRecordUxDesignDecision() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UxDesignDecisionCreateRequest) =>
+      api.post<UxDesignDecisionOut>("/ux-design/decisions", body),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+// --- Solution Design (Issue #408) ------------------------------------------
+
+export function useSolutionDesigns() {
+  return useQuery<SolutionDesignListOut>({
+    queryKey: sysKey("solution-designs"),
+    queryFn: () => api.get<SolutionDesignListOut>("/solution-designs"),
+  });
+}
+
+export function useSolutionDesignDetail(designKey: string | null) {
+  return useQuery<SolutionDesignDetailOut>({
+    queryKey: [...sysKey("solution-design"), designKey],
+    queryFn: () => api.get<SolutionDesignDetailOut>(`/solution-designs/${encodeURIComponent(designKey ?? "")}`),
+    enabled: designKey !== null,
+  });
+}
+
+/** The batched read behind "which Solution Design targets this
+ * Requirement" (§4.2 level 4's entry point) -- same discipline as
+ * `useUxRequirementDetailsBatch`: no reverse `GET` exists, so every design's
+ * own detail is read and joined client-side by
+ * `model.ts`'s `solutionDesignsForRequirement`. */
+export function useSolutionDesignDetailsBatch(keys: readonly string[]) {
+  return useQueries({
+    queries: keys.map((key) => ({
+      queryKey: [...sysKey("solution-design"), key],
+      queryFn: () => api.get<SolutionDesignDetailOut>(`/solution-designs/${encodeURIComponent(key)}`),
+    })),
+  });
+}
+
+export function useCreateSolutionDesign() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: SolutionDesignCreateRequest) =>
+      api.post<SolutionDesignOut>("/solution-designs", body),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+export function useAddSolutionDesignOption(designKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: SolutionDesignOptionCreateRequest) =>
+      api.post<SolutionDesignOptionOut>(
+        `/solution-designs/${encodeURIComponent(designKey ?? "")}/options`, body,
+      ),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+export function useAddSolutionDesignRequirementLink(designKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: SolutionDesignRequirementLinkCreateRequest) =>
+      api.post<SolutionDesignRequirementLinkOut>(
+        `/solution-designs/${encodeURIComponent(designKey ?? "")}/requirement-links`, body,
+      ),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+export function useAddSolutionDesignTargetLink(designKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: SolutionDesignTargetLinkCreateRequest) =>
+      api.post<SolutionDesignTargetLinkOut>(
+        `/solution-designs/${encodeURIComponent(designKey ?? "")}/target-links`, body,
+      ),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+/** Records `adopt` / `hold` / `reject` / `withdraw` for one Option. §3.6: a
+ * successful `adopt` mutates nothing outside `solution_design_decision` and
+ * that Option's own `option_status` -- the Studio's copy for it must not
+ * imply anything was applied, deployed, or approved for execution. */
+export function useRecordSolutionDesignDecision(designKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: SolutionDesignOptionDecisionCreateRequest) =>
+      api.post<SolutionDesignDecisionOut>(
+        `/solution-designs/${encodeURIComponent(designKey ?? "")}/decisions`, body,
+      ),
+    onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+export function useSolutionDesignChangeOrigins(designKey: string | null) {
+  return useQuery<SolutionDesignChangeOriginsOut>({
+    queryKey: [...sysKey("solution-design-change-origins"), designKey],
+    queryFn: () =>
+      api.get<SolutionDesignChangeOriginsOut>(
+        `/solution-designs/${encodeURIComponent(designKey ?? "")}/change-origins`,
+      ),
+    enabled: designKey !== null,
+  });
+}
+
+/** `GET /solution-designs/{key}/handoff` -- the adopted Option, its target
+ * links, linked Requirements, and evaluation policy refs GROUPED BY LEVEL
+ * (§3.7). Read-only; never composes a score. */
+export function useSolutionDesignHandoff(designKey: string | null) {
+  return useQuery<SolutionDesignHandoffOut>({
+    queryKey: [...sysKey("solution-design-handoff"), designKey],
+    queryFn: () =>
+      api.get<SolutionDesignHandoffOut>(`/solution-designs/${encodeURIComponent(designKey ?? "")}/handoff`),
+    enabled: designKey !== null,
   });
 }

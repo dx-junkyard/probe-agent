@@ -997,6 +997,88 @@ discipline: a new row is inserted and the prior current row's
   connection that has no real content yet would record a judgement about
   something that does not exist.
 
+## UX Design Lineage (Epic #405, issues #406-#409)
+
+`docs/ux-design-lineage.md` is the design contract; read §0 before touching
+`app/ux_design.py` (#407) or `app/solution_design.py` (#408). Both stay
+strictly deterministic — no LLM call in either module (Principle 6). This
+layer sits BETWEEN Purpose Chain and the implementation entities, and it is
+the first design layer in the repo that PERSISTS its own content.
+
+- **It persists content because nothing can derive it.** Purpose Chain is a
+  pure projection over `interview_intent_item` / `current_understanding`;
+  a Journey / Requirement / Solution Design is newly authored text with no
+  existing source row. The compensating discipline is that UPSTREAM
+  (Purpose element / relation / Capability entity) and DOWNSTREAM (Flow /
+  Node / Component / Cell) content is NEVER copied into a column — only a
+  `target_ref` + a captured digest, resolved fresh at read time against one
+  canonical source per kind (`node_design._LINK_KIND_TARGET_SOURCE`'s shape).
+  A copied Capability name still reads as current after the original is
+  superseded; that is the bug #397's handoff already had to fix.
+- **Identity is `(system_id, <kind>_key)`, a developer-given slug.** Never
+  derive it from a Purpose element id (`core_capability:<sha256(name)>` moves
+  when the claim is reworded) and never from a row id (an Understanding
+  rebuild renumbers `alignment_item` / `understanding_revision`). Same rule
+  as Evolution Node ADR-2's `node_key`.
+- **`perspective` (`as_is`/`to_be`) lives on the identity row, not the
+  revision.** A revision-level perspective would let one Journey change from
+  describing reality to describing a target, and its history would then be a
+  record of two different subjects. A `to_be` Journey points at its baseline
+  through `baseline_journey_id`, and `baseline_mode`
+  (`linked`/`greenfield`/`undecided`) keeps "the developer declared this is
+  greenfield" distinct from "nobody has decided yet".
+- **Four independent axes, never merged into one word:** `design_status`
+  (DERIVED from the `ux_design_decision` ledger — no status column exists, so
+  a stored value cannot drift from the rows it describes), `recheck_state`
+  (digest comparison — a `stale` confirmed item stays `confirmed`; the
+  decision row is never deleted, exactly as `purpose_relation_decision`
+  behaves), `revision_state` (`superseded_by_id IS NULL`), and
+  `authored_by_kind` (whose voice). An AI-authored revision CAN be
+  `confirmed` — that means a human approved AI-written text, not that the
+  author changed.
+- **Capability references use `understanding_capability_entity.id`** (#312:
+  System-scoped, versioned per confirmation), never
+  `capability_hierarchy_nodes.id` (regenerated per snapshot) and never the
+  Purpose Chain name-hash id. `node_design._resolve_capability` already picks
+  the same anchor.
+- **`static_flow` and `runtime_flow` are two `SolutionTargetKind` values, not
+  one.** There is no persistent flow table: the static path is
+  `(system_id, snapshot_id, entrypoint_ref)` and `flow_graph`'s `flow-{i}` is
+  stable only WITHIN one derivation, while `trace_spans.flow_id` is a runtime
+  correlation string. A `static_flow` link without `captured_snapshot_id` is
+  refused (422 `flow_target_requires_snapshot`). Never mint a permanent flow
+  id.
+- **Adopting a Solution Design option changes nothing downstream.** It must
+  not move `evolution_node.maturity`, Cell Improvement state,
+  `components.mode`, any patch/worktree/publish path, or Probe Plan approval —
+  five assertions the tests make explicitly (Evolution Node ADR-9's boundary,
+  defended from the design side). Adoption exclusivity is enforced by
+  REFUSING a second adopt (409 `solution_design_option_already_adopted`);
+  never auto-`withdraw` the previous option, which would fabricate a human
+  decision under that human's name.
+- **Requirement `confirm` and option `adopt` are deliberately different
+  ledgers** (`ux_design_decision` vs `solution_design_decision`): confirming
+  a statement is non-exclusive, choosing one of N options is exclusive. One
+  shared table would leave the exclusivity expressed nowhere.
+- **Artifacts store no body and fetch no URI.** There is no content column —
+  structural, not conventional. `verification_state='verified'` is reachable
+  only for a `repo:<path>` URI that resolves via `git show <sha>:<path>` on
+  the pinned snapshot (Principle 5); every external URI stays `unverified`
+  because its hash is the developer's assertion, and probe-agent does not
+  make outbound requests for it (SSRF). A repo path that used to verify and
+  no longer resolves is `unreachable` — a third, distinct state.
+- **Propagation is downstream only** (a Requirement edit never marks its
+  Journey stale — #388's rule), and `unknown` / `unavailable` /
+  `not_applicable` stay three different answers.
+- **No composite score.** No design completion rate, no confidence
+  percentage. The three `evolution_evaluation_policy` levels stay separate
+  (ADR-7) and the handoff returns them GROUPED BY LEVEL. Counts are fine.
+- **This layer writes to no existing canonical table.** `interview_*`,
+  `purpose_*`, `understanding_*`, `evolution_node*`, `cell_*`, `components`,
+  `probe_points` are read-only here, and a test enforces it (#329's boundary).
+- Vocabulary note: #397's "Design Studio" is the Evolution Node design layer.
+  #409's screen is the **UX Design Studio** (`/ux-design-studio`).
+
 ## Rules
 
 - Validate incoming payloads.
