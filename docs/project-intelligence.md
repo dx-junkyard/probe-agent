@@ -7354,3 +7354,147 @@ scope であり、本ラウンドの対象外(実装欠陥ではなく scope の
   `deterministic`/`reasoning_llm` を名乗れると intelligence run の裏付け
   なく system/model 産の分類を偽造できる。fail-closed の reasoning 経路は
   ドメイン層直呼びのまま。Dashboard 画面は従来どおり #401 の統合対象。
+
+## UX Design Lineage(Epic #405, sub #406-#409)
+
+### 何が問題だったか
+
+Purpose Chain(#387-#391)は「対象者と課題 → Vision → Purpose → Capability」を
+追跡可能な因果連鎖として持てるようになった。Evolution Node(#394-#400)は
+「進化する処理単位」の契約・実装方式・成熟度を持てるようになった。しかし
+その二つの**間**が空いていた —「その Capability を、誰が、どの経路で、どう
+使うのか」「それを実現するために何が満たされていれば良いのか」「どの実現案を
+選んだのか」を保存する正本がどこにも無い。
+
+近いものは全部あるが、どれも違うものだった:
+
+| 既存 | それが答えるもの | 答えないもの |
+| --- | --- | --- |
+| `purpose_experience_hypothesis` | 成功体験の短い**価値仮説** | 具体的な利用経路、失敗と回復 |
+| `purpose_outcome_criterion` | 成果の**測定基準と証拠** | どう使われるか、何を作るか |
+| `capability_hierarchy_nodes` | snapshot 単位の Capability **理解** | 体験・要件・実現案 |
+| Flow Explorer | snapshot + entrypoint からの**実行経路** | 意図された利用経路 |
+| `evolution_node_version` | 処理単位の**技術契約** | それが誰のどの体験を支えるか |
+| Agent Role Card | Probe Cell の**実行役割** | 同上 |
+
+結果として、既存システムの改善で「現状はこう使われている → ここを変えたい →
+この案で実現する → だからこの Node と Flow が影響する」という一本の線が
+引けず、新規システムでは「実装も観測点も無い段階で設計を確定する」場所が
+無かった。
+
+### 何を作ったか
+
+`docs/ux-design-lineage.md` が正本の設計契約。実装は依存順に #406(契約)→
+#407(Journey / Step / Requirement / Artifact の永続化と API)→ #408(Solution
+Design と実装対象への link)→ #409(UX Design Studio と E2E)。
+
+### Purpose Chain と違い「保存する」理由
+
+これが Epic 全体で一番効いている判断である。Purpose Chain は行を保存しない
+projection だった —— 要素は `interview_intent_item` と `current_understanding`
+という既存正本から毎回導出でき、保存したのは「システムでは再導出できない
+人間の判断」の 2 テーブルだけだった。
+
+UX Design Lineage は逆で、**Journey / Requirement / Solution Design は
+どの既存行からも導出できない、新しく著述される内容**である。だからこの層は
+内容そのものを保存する。その代わり非対称を徹底した:
+
+* **上流(Purpose / Capability)の内容は保存しない。** 参照 + 捕捉 digest だけ。
+* **下流(Flow / Node / Component / Cell)の内容も保存しない。** 参照 + 捕捉
+  digest だけで、解決は読み取り時に kind ごとの正本 1 つに対して行う
+  (`node_design._LINK_KIND_TARGET_SOURCE` と同じ設計)。
+
+この非対称が、この Epic が「Purpose Chain の複製」ではない理由である。内容を
+コピーしていたら、元の Capability が superseded された後もコピーが current
+として読めてしまう —— #397 の handoff が既に踏んだ轍で、そこでは
+「参照だけを保存し、内容はコピーしない」で解決している。
+
+### 後から変えるときに守ること
+
+**identity を上流から導出しない。** `journey_key` / `requirement_key` /
+`design_key` は開発者が与える安定 slug である。Purpose 要素の id
+(`core_capability:<sha256(name)[:16]>`)は claim の**名前の hash** なので、
+Capability を言い直しただけで別 id になり、それを identity にすると Journey の
+履歴が切れる。行 id からも導出しない —— Understanding の再構築は
+`alignment_item` / `understanding_revision` を振り直す(#380)。これは
+Evolution Node ADR-2 が `node_key` を `component_id` から導出しないと決めたのと
+同じ判断である。
+
+**as-is / to-be は identity の属性であり、revision の属性ではない。** revision
+に `perspective` を持たせると、1 つの Journey が「現状の記述」から「目標の
+記述」へ変わり得ることになり、その revision 履歴は 2 つの別の主題の記録に
+なってしまう。現状と目標は**別の Journey** で、`to_be` 側が
+`baseline_journey_id` で as-is を指す。そして `baseline_mode` が
+`linked` / `greenfield` / `undecided` の 3 値なのは、「新規システムなので現状は
+無いと開発者が宣言した」と「まだ決めていない」を区別するためである。片方に
+畳むと、`baseline_state` が `not_applicable` なのか `absent` なのか言えなくなる。
+
+**状態は 4 つの独立した軸で、1 語に畳まない。** `design_status`(決定台帳から
+**導出**する。列に保存しない —— 保存した lifecycle 値はそれが記述する行から
+drift しうるが、導出した値はしえない。#337 / #338 / #349 と同じ規律)、
+`recheck_state`(digest 比較。**stale でも `design_status` は `confirmed` の
+まま** —— 確定を取り消すのではなく、「あの内容に対して人が確定した」事実を
+残したまま再確認を促す。#388 と同じ)、`revision_state`
+(`superseded_by_id IS NULL` かどうか。内容の版であって判断の状態ではない)、
+`authored_by_kind`(誰の声か)。`reasoning_model` が書いた revision が
+`confirmed` になることはあり得る —— それは「AI が書いた文を人が確認した」で
+あって、執筆者が `developer` に変わるのではない(#337 の
+`origin_role` / `producer_kind` / `actor_kind` を 3 軸に分けたのと同じ理由)。
+
+**Capability 参照は `understanding_capability_entity.id`。** コードベースには
+Capability が 2 系統ある: `capability_hierarchy_nodes`(#56、snapshot ごとに
+再生成される。snapshot を跨いで残るのは docstring 由来の自由文字列
+`capability_key` だけ)と `understanding_capability_entity`(#312、System-scoped
+の整数 id で、確認ごとに `understanding_capability_entity_version` として
+版が付く)。数か月生きる Journey の参照先として耐えるのは後者だけであり、
+`node_design._resolve_capability` も既に後者を使っている。Purpose Chain の
+`core_capability:<sha>` id を参照することも `ref_kind` 上は可能だが、その弱さは
+`target_resolution` に正直に出る(名前が動けば `unresolved`)。
+
+**`static_flow` と `runtime_flow` を 1 語にまとめない。** Flow には永続テーブルが
+無い。静的な経路は `(system_id, snapshot_id, entrypoint_ref)` から毎回計算され、
+`flow_graph` が振る `flow-{i}` は**1 回の導出内でしか安定しない**(link の
+target にならない)。実行時の `trace_spans.flow_id` は SDK が付けた correlation
+文字列で、こちらは System-scoped に安定だが「意図された経路」ではない。片方が
+current でももう片方は何も言っていないので、1 つの表示語に 2 つの事実を持たせ
+ない(#366)。`static_flow` の link は `captured_snapshot_id` 無しでは作れない。
+
+**設計案の採用は実装ではない。** Option の `adopt` が変えないものを 5 つ、
+テストで明示的に assert する: `evolution_node.maturity`、Cell Improvement の
+状態、`components.mode`(SDK policy)、patch の生成・適用と publish job、
+Probe Plan / Pattern の承認。これは Evolution Node ADR-9(自動 maturity 遷移は
+存在しない)と同じ境界を、設計層の側から守るものである。
+
+**採用の排他性は拒否で表現し、自動 withdraw をしない。** 既に `adopted` の
+option があるとき別 option の `adopt` は 409 で拒否する。自動で前案を
+`withdraw` すると、システムが人間の名前で「取り下げた」という決定を捏造する
+ことになる。開発者が明示的に withdraw してから採用する。同じ理由で、要件の
+`confirm`(非排他)と案の `adopt`(N 案から 1 つを選ぶ排他)は**別テーブルの
+別語彙**にしてある —— 同じ台帳に入れると排他性がどこにも表現されない。
+
+**artifact は本文を持たず、任意の URI を fetch しない。** 本文の列は存在
+しない(規約ではなく構造で禁じる。#397 が score 列を作らないことで合成 score を
+禁じたのと同じ手法)。`verification_state='verified'` に到達できるのは、
+pin された snapshot 上で `git show <sha>:<path>` として解決できる `repo:<path>`
+だけである。外部 URI(社内 Wiki、Figma、任意の http(s))は**取りに行かない** ——
+SSRF であり、「対象リポジトリは Git から読む」という Principle 5 の境界でも
+ある。したがって外部 artifact の hash は常に**開発者の申告値**で、
+`unverified` として表示する。一度 verified だった repo path が解決しなくなったら
+`unreachable` で、`unverified` とは別の事実である。
+
+**変更伝播は下流方向のみ。** Requirement を直しても Journey は stale に
+ならない。ここを対称にすると、下流の作業が上流の確定を勝手に無効化する
+(#388 が同じ理由で下流限定にしている)。
+
+**`unknown` / `unavailable` / `not_applicable` を丸めない。** 決めていない /
+読めなかった / 構造上不要 は 3 つの別の答えで、別の文言で表示する。
+
+**runtime trace だけから利用者の成功を推論しない。** Journey Step の
+`evidence_source_kind` は「何が観測できれば成功と言えるか」という**期待の
+宣言**であって、成果ではない。`runtime_trace` を選んでも、trace が出たことを
+成功として表示してはならない。成果の正本は `purpose_outcome_criterion` の
+ままで、この層は 2 つ目を作らない(#391 の規律)。
+
+**用語**: 既存の「Issue #397 — Phase 2: Design Studio」は Evolution Node の
+設計層を指す。#409 の画面は **UX Design Studio**(`/ux-design-studio`)であり、
+別物である。
