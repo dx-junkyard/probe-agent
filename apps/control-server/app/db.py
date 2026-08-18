@@ -5862,6 +5862,654 @@ CREATE TABLE IF NOT EXISTS node_reopen_handoff_event (
 
 CREATE INDEX IF NOT EXISTS idx_node_reopen_handoff_event
     ON node_reopen_handoff_event (handoff_id, id ASC);
+
+-- =============================================================================
+-- UX Design Lineage (Epic #405). See docs/ux-design-lineage.md for the full
+-- contract; this comment block only orients a reader of the schema itself.
+--
+-- Issue #407 (Journey / Requirement / Artifact, 10 tables below) and Issue
+-- #408 (Solution Design, 5 tables further down) are the only new canonical
+-- entities this Epic adds. Everything above/below them in this file --
+-- Purpose Chain, Capability, Flow, Evolution Node, Component, Probe Cell --
+-- is READ, never copied: `docs/ux-design-lineage.md` §0 invariant 1 forbids
+-- a second understanding model, and §1 explains why THIS layer nonetheless
+-- stores content while Purpose Chain does not -- Journey / Requirement /
+-- Solution Design text cannot be re-derived from any existing row, so it has
+-- to be authored and kept somewhere durable. What it does NOT store is
+-- upstream (Purpose/Capability) or downstream (Flow/Node/Component/Cell)
+-- CONTENT -- only a reference plus a captured digest, resolved against each
+-- kind's single canonical source at read time (§1, §2.7, §3.3 -- the same
+-- `_LINK_KIND_TARGET_SOURCE` discipline `node_design.py` already uses for
+-- Evolution Node links).
+--
+-- House rules that recur on every table below and are not repeated per-table:
+--   * `system_id INTEGER NOT NULL` + `FOREIGN KEY ... REFERENCES systems (id)
+--     ON DELETE CASCADE` on every single table, including join/link tables,
+--     so a System delete can never leave an orphaned UX Design row visible to
+--     a different System (§0 has no exception for this layer).
+--   * Every finite-vocabulary column carries `CHECK (col IN (...))` mirroring
+--     the `Literal` alias of the same name in `app/models.py` byte-for-byte
+--     (`test_interview_type_parity.py`'s `FINITE_TYPE_NAMES` then binds that
+--     Python Literal to its TypeScript union, closing the loop).
+--   * Append-only / revision tables never get an UPDATE path for their
+--     content columns -- correction is INSERT a new row + set the prior row's
+--     `superseded_by_id`. This is §0 invariant 4, applied uniformly: a
+--     Journey/Requirement revision, an upstream ref, a step link, an artifact
+--     reference, and every decision ledger row are all append-only for the
+--     same reason `purpose_relation_decision` is -- "a human judged THIS
+--     exact content at THIS time" must survive every later edit.
+--   * No table in this section has a column that stores rendered/derived
+--     STATUS (`design_status`, `link_state`, `recheck_state`, ...). Those are
+--     computed at read time by folding the append-only decision/reference
+--     rows (§2.5, §3.4) -- the same "derived, never stored" discipline #337 /
+--     #338 / #349 use for Node maturity and Interview workflow state, so a
+--     stored lifecycle value can never drift from the rows that describe it.
+--   * No table has a column for artifact/design BODY content. `content_hash`
+--     plus a `uri` reference is the only way a wireframe/ADR/spec is
+--     represented (§2.8) -- the absence of a body column is a structural
+--     guarantee, not a review convention, mirroring how #397 leaves out a
+--     composite score column to make compositing physically impossible.
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- ux_journey: identity row for one UX Journey. Identity is
+-- `(system_id, journey_key)`, a DEVELOPER-SUPPLIED stable slug -- never
+-- derived from a Purpose element id (which hashes a claim's NAME and changes
+-- when the claim is reworded, §2.2) and never derived from a row id (which
+-- Understanding rebuilds reassign, #380's rule). `perspective` lives HERE,
+-- on the identity row, not on `ux_journey_revision`: if a revision could
+-- change `perspective`, one Journey's revision history would silently splice
+-- together the record of two different subjects -- "how the system works
+-- today" and "how it should work" are different journeys by construction,
+-- and a `to_be` Journey names its `as_is` counterpart (if any) through
+-- `baseline_journey_id` rather than by becoming it (§2.3).
+--
+-- `baseline_journey_id` may only point at an `as_is` Journey in the SAME
+-- System (write-time check; `journey_baseline_not_as_is` / cross-System 404).
+-- `baseline_mode` is the developer's own declaration of whether a baseline
+-- SHOULD exist (`linked` / `greenfield` / `undecided`); `baseline_state`
+-- (`app/models.py`) is derived at read time from `baseline_mode` +
+-- `perspective` + whether `baseline_journey_id` currently resolves, and is
+-- therefore not a column here -- the same "derived, never stored" rule as
+-- `design_status` below. `current_revision_id` is a denormalized pointer,
+-- written only inside the same transaction that inserts the revision it
+-- points at (never by a bare UPDATE elsewhere), the same discipline
+-- `evolution_node.current_version_id` uses.
+CREATE TABLE IF NOT EXISTS ux_journey (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    journey_key         TEXT NOT NULL,
+    perspective         TEXT NOT NULL CHECK (perspective IN ('as_is', 'to_be')),
+    baseline_mode       TEXT NOT NULL DEFAULT 'undecided'
+                            CHECK (baseline_mode IN ('linked', 'greenfield', 'undecided')),
+    baseline_journey_id INTEGER,
+    current_revision_id INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'ux-journey-v1',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (baseline_journey_id) REFERENCES ux_journey (id) ON DELETE SET NULL,
+    FOREIGN KEY (current_revision_id) REFERENCES ux_journey_revision (id) ON DELETE SET NULL,
+    UNIQUE (system_id, journey_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_journey_system
+    ON ux_journey (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ux_journey_baseline
+    ON ux_journey (system_id, baseline_journey_id);
+
+-- ux_journey_revision: the Journey's CONTENT, append-only exactly like
+-- `evolution_node_version` -- a correction inserts `revision_number = max+1`
+-- and sets the prior current row's `superseded_by_id`; nothing here is ever
+-- UPDATEd in place, because a later Solution Design or a `ux_design_decision`
+-- confirmation is a judgement made AGAINST one specific revision's content
+-- and that history must remain readable.
+--
+-- `content_digest` is `sha256` over the meaning-bearing fields ONLY --
+-- `title, beneficiary, usage_context, entry_trigger, value_arrival, summary`
+-- plus every Step's own `(step_key, step_order, content_digest)` (§2.6).
+-- `created_by` / `created_at` / `revision_number` / `change_note` are
+-- deliberately excluded from the digest for the same reason #308 excludes
+-- `confirmation_id` and #337 excludes Intent's `status`: a recheck must fire
+-- on a MEANING change, never on the mere existence of a new record.
+-- `authored_by_kind` and `decision_method` are two of the layer's three
+-- independent axes (§0 invariant 3 / §2.5's fourth axis) -- an AI-authored
+-- revision (`authored_by_kind='reasoning_model'`) can still be
+-- `decision_method='manual'` if a human typed the confirming edit, and an
+-- AI-authored revision becoming `design_status='confirmed'` in
+-- `ux_design_decision` later is "a human confirmed AI-written text", never
+-- "AI confirmed its own text" -- the CHECK on `ux_design_decision.
+-- decision_method` (always `manual`) is what enforces that.
+CREATE TABLE IF NOT EXISTS ux_journey_revision (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    journey_id        INTEGER NOT NULL,
+    system_id         INTEGER NOT NULL,
+    revision_number   INTEGER NOT NULL,
+    title             TEXT NOT NULL DEFAULT '',
+    beneficiary       TEXT NOT NULL DEFAULT '',   -- 対象者
+    usage_context     TEXT NOT NULL DEFAULT '',   -- 文脈
+    entry_trigger     TEXT NOT NULL DEFAULT '',   -- トリガー
+    value_arrival     TEXT NOT NULL DEFAULT '',   -- 価値到達
+    summary           TEXT NOT NULL DEFAULT '',
+    content_digest    TEXT NOT NULL,
+    authored_by_kind  TEXT NOT NULL DEFAULT 'developer'
+                          CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id INTEGER,
+    change_note       TEXT NOT NULL DEFAULT '',
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    schema_version    TEXT NOT NULL DEFAULT 'ux-journey-revision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES ux_journey_revision (id) ON DELETE SET NULL,
+    UNIQUE (journey_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_journey_revision_journey
+    ON ux_journey_revision (journey_id, revision_number DESC);
+
+-- ux_journey_step: the Journey revision's ORDERED content, not an
+-- independently-versioned entity (§2.4). Steps intentionally have no
+-- `superseded_by_id` chain of their own: the sequence of Steps IS the
+-- Journey's meaning, and letting Steps version independently of their
+-- revision would turn "what did this Journey look like at time T" into a
+-- join across two separate histories. `step_key` stays stable ACROSS
+-- revisions of the same Journey (unlike `id`), which is what lets diffing
+-- (`GET /ux-design/journeys/{key}/diff`) and `ux_requirement_step_link` match
+-- by exact key equality rather than by position or text similarity -- the
+-- same `understanding_diff` discipline, never embeddings (§0 invariant 9).
+--
+-- `evidence_source_kind` records only an EXPECTATION ("if this Step
+-- succeeds, here is where you would look for confirmation"), never an
+-- observed outcome -- §0 invariant 6 keeps this layer out of the business of
+-- inferring user success from a trace; `purpose_outcome_criterion` remains
+-- the one place an outcome verdict is recorded.
+CREATE TABLE IF NOT EXISTS ux_journey_step (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    journey_revision_id   INTEGER NOT NULL,
+    journey_id            INTEGER NOT NULL,
+    system_id             INTEGER NOT NULL,
+    step_key              TEXT NOT NULL,
+    step_order            INTEGER NOT NULL,
+    user_intent           TEXT NOT NULL DEFAULT '',
+    system_response       TEXT NOT NULL DEFAULT '',
+    success_criteria      TEXT NOT NULL DEFAULT '',
+    failure_mode          TEXT NOT NULL DEFAULT '',
+    recovery_path         TEXT NOT NULL DEFAULT '',
+    evidence_expectation  TEXT NOT NULL DEFAULT '',
+    evidence_source_kind  TEXT NOT NULL DEFAULT 'none'
+                              CHECK (evidence_source_kind IN
+                                  ('runtime_trace', 'human_report', 'external_analytics', 'none')),
+    content_digest        TEXT NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_revision_id) REFERENCES ux_journey_revision (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    UNIQUE (journey_revision_id, step_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_journey_step_revision
+    ON ux_journey_step (journey_revision_id, step_order);
+
+CREATE INDEX IF NOT EXISTS idx_ux_journey_step_journey
+    ON ux_journey_step (journey_id, step_key);
+
+-- ux_journey_upstream_ref: a Journey's reference to a Purpose element,
+-- Purpose relation, or Capability entity -- NEVER a copy of that thing's
+-- content (§0 invariant 1's "コピーした Capability 名は元の Capability が
+-- superseded された後も current として読めてしまう"). `ref_kind` fixes which
+-- of the three canonical sources resolves `target_ref` at read time
+-- (`app/models.py`'s `UxRefKind`; §2.7's table). `captured_digest` is the
+-- source's digest AT THE TIME the reference was made, so staleness
+-- (`UxRefRecheckState`) can be detected without ever mutating the reference
+-- itself -- exactly `purpose_relation_decision`'s `source_digest` /
+-- `target_digest` pattern, applied to a reference instead of a decision.
+-- `decision_method` records who ASSERTED the reference (`manual` /
+-- `reasoning_llm` / `deterministic`), which `UxRefRelationStatus` maps
+-- through a fixed table (`confirmed` / `proposed` / `derived`) -- the same
+-- `node_design._DECISION_METHOD_TO_RELATION_STATUS` translation, never a
+-- second stored status column.
+CREATE TABLE IF NOT EXISTS ux_journey_upstream_ref (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id          INTEGER NOT NULL,
+    journey_id         INTEGER NOT NULL,
+    ref_kind           TEXT NOT NULL CHECK (ref_kind IN
+                           ('purpose_element', 'purpose_relation', 'capability_entity')),
+    target_ref         TEXT NOT NULL,
+    target_row_id      INTEGER,
+    captured_digest    TEXT NOT NULL DEFAULT '',
+    captured_session_id INTEGER,
+    note               TEXT NOT NULL DEFAULT '',
+    decision_method    TEXT NOT NULL DEFAULT 'manual'
+                           CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by         TEXT,
+    created_at         REAL NOT NULL,
+    superseded_by_id   INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES ux_journey_upstream_ref (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_journey_upstream_ref_journey
+    ON ux_journey_upstream_ref (system_id, journey_id, id DESC);
+
+-- ux_requirement: identity row for one Requirement, `(system_id,
+-- requirement_key)` UNIQUE -- the same developer-supplied-slug identity
+-- rule as `ux_journey`, for the same reason (survives rewording, never
+-- derived from a row id). `requirement_kind` includes `out_of_scope`
+-- alongside `functional` / `non_functional` / `constraint` DELIBERATELY:
+-- "we decided not to do this" is itself a requirement worth keeping a
+-- traceable record of, which is why `out_of_scope` rows live in the same
+-- table rather than being silently dropped -- and why the acceptance
+-- criterion table below refuses to attach criteria to one (§2.11 item 8):
+-- a thing declared out of scope cannot also have a condition for verifying
+-- it was done.
+CREATE TABLE IF NOT EXISTS ux_requirement (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    requirement_key     TEXT NOT NULL,
+    requirement_kind    TEXT NOT NULL CHECK (requirement_kind IN
+                            ('functional', 'non_functional', 'constraint', 'out_of_scope')),
+    current_revision_id INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'ux-requirement-v1',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (current_revision_id) REFERENCES ux_requirement_revision (id) ON DELETE SET NULL,
+    UNIQUE (system_id, requirement_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_requirement_system
+    ON ux_requirement (system_id, id DESC);
+
+-- ux_requirement_revision: append-only content, same discipline as
+-- `ux_journey_revision` above and for the same reason -- a Solution Design's
+-- `solution_design_requirement_link` captures a specific revision id and
+-- digest, so that link's later staleness detection depends on this row's
+-- content never being mutated in place.
+CREATE TABLE IF NOT EXISTS ux_requirement_revision (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    requirement_id    INTEGER NOT NULL,
+    system_id         INTEGER NOT NULL,
+    revision_number   INTEGER NOT NULL,
+    statement         TEXT NOT NULL DEFAULT '',
+    rationale         TEXT NOT NULL DEFAULT '',
+    constraint_text   TEXT NOT NULL DEFAULT '',
+    out_of_scope_note TEXT NOT NULL DEFAULT '',
+    content_digest    TEXT NOT NULL,
+    authored_by_kind  TEXT NOT NULL DEFAULT 'developer'
+                          CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id INTEGER,
+    change_note       TEXT NOT NULL DEFAULT '',
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    schema_version    TEXT NOT NULL DEFAULT 'ux-requirement-revision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (requirement_id) REFERENCES ux_requirement (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES ux_requirement_revision (id) ON DELETE SET NULL,
+    UNIQUE (requirement_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_requirement_revision_requirement
+    ON ux_requirement_revision (requirement_id, revision_number DESC);
+
+-- ux_requirement_acceptance_criterion: like `ux_journey_step`, content OF a
+-- revision rather than an independently-versioned entity, for the identical
+-- reason -- "what did satisfying this Requirement mean at time T" must not
+-- become a two-history join. `verification_method` is deliberately a finite
+-- classification of HOW a criterion COULD be checked (`manual_review` /
+-- `replay` / `experiment` / `runtime_observation` / `not_verifiable`), never
+-- a record that it WAS checked -- verification itself happens in each named
+-- existing system (Replay, Experiments), not here.
+CREATE TABLE IF NOT EXISTS ux_requirement_acceptance_criterion (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    requirement_revision_id INTEGER NOT NULL,
+    requirement_id          INTEGER NOT NULL,
+    system_id               INTEGER NOT NULL,
+    criterion_key           TEXT NOT NULL,
+    criterion_order         INTEGER NOT NULL,
+    statement               TEXT NOT NULL DEFAULT '',
+    verification_method     TEXT NOT NULL DEFAULT 'manual_review'
+                                CHECK (verification_method IN
+                                    ('manual_review', 'replay', 'experiment',
+                                     'runtime_observation', 'not_verifiable')),
+    verification_note       TEXT NOT NULL DEFAULT '',
+    content_digest          TEXT NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (requirement_revision_id) REFERENCES ux_requirement_revision (id) ON DELETE CASCADE,
+    FOREIGN KEY (requirement_id) REFERENCES ux_requirement (id) ON DELETE CASCADE,
+    UNIQUE (requirement_revision_id, criterion_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_requirement_acceptance_criterion_revision
+    ON ux_requirement_acceptance_criterion (requirement_revision_id, criterion_order);
+
+-- ux_requirement_step_link: the many-to-many bridge from a Requirement to
+-- the Journey Step(s) it addresses. There is no FK straight to
+-- `ux_journey_step.id` -- Steps live inside a specific revision, and a link
+-- needs to survive the Journey moving to a NEW revision so it can report
+-- `stale` / `unresolved` rather than silently vanishing (§2.9's "Journey
+-- revision が動く -> その Step を指す ux_requirement_step_link が stale" /
+-- "Journey Step が消える -> unresolved"). It therefore stores `step_key`
+-- (stable across revisions) plus `captured_journey_revision_id` +
+-- `captured_step_digest` (the revision and digest AT LINK TIME), and
+-- resolves against the Journey's CURRENT revision at read time.
+CREATE TABLE IF NOT EXISTS ux_requirement_step_link (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    requirement_id              INTEGER NOT NULL,
+    journey_id                  INTEGER NOT NULL,
+    step_key                    TEXT NOT NULL,
+    captured_journey_revision_id INTEGER,
+    captured_step_digest        TEXT NOT NULL DEFAULT '',
+    note                        TEXT NOT NULL DEFAULT '',
+    decision_method             TEXT NOT NULL DEFAULT 'manual'
+                                    CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by                  TEXT,
+    created_at                  REAL NOT NULL,
+    superseded_by_id            INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (requirement_id) REFERENCES ux_requirement (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    FOREIGN KEY (captured_journey_revision_id) REFERENCES ux_journey_revision (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES ux_requirement_step_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_requirement_step_link_requirement
+    ON ux_requirement_step_link (system_id, requirement_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ux_requirement_step_link_journey
+    ON ux_requirement_step_link (journey_id, step_key);
+
+-- ux_design_artifact_reference: a pointer to a wireframe / ADR / spec /
+-- diagram / research note, NEVER its content (§2.8 -- no body column exists
+-- by construction, matching this file's banner comment above). `content_hash`
+-- is always `sha256`; `verification_state` distinguishes a hash the SYSTEM
+-- itself confirmed (`verified` -- reachable ONLY for a `repo:<path>` URI that
+-- resolves via `git show <sha>:<path>` on a pinned snapshot, per Principle 5
+-- -- probe-agent fetches no external URI) from a hash the DEVELOPER merely
+-- typed in (`unverified`, the only reachable state for any external URL,
+-- Wiki, or Figma link) from a repo path that used to resolve and no longer
+-- does (`unreachable`). Collapsing any two of these into one state would
+-- claim a stronger guarantee than the system actually checked.
+CREATE TABLE IF NOT EXISTS ux_design_artifact_reference (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    subject_kind        TEXT NOT NULL CHECK (subject_kind IN
+                            ('journey', 'journey_step', 'requirement',
+                             'solution_design', 'design_option')),
+    subject_key         TEXT NOT NULL,
+    artifact_kind       TEXT NOT NULL CHECK (artifact_kind IN
+                            ('wireframe', 'adr', 'spec', 'diagram', 'research_note', 'other')),
+    title               TEXT NOT NULL DEFAULT '',
+    uri                 TEXT NOT NULL,
+    media_type          TEXT NOT NULL DEFAULT '',
+    content_hash        TEXT NOT NULL,
+    hash_algorithm      TEXT NOT NULL DEFAULT 'sha256' CHECK (hash_algorithm = 'sha256'),
+    byte_size           INTEGER,
+    verification_state  TEXT NOT NULL DEFAULT 'unverified'
+                            CHECK (verification_state IN ('verified', 'unverified', 'unreachable')),
+    verified_snapshot_id INTEGER,
+    verified_commit_sha TEXT,
+    verified_at         REAL,
+    decision_method     TEXT NOT NULL DEFAULT 'manual'
+                            CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    superseded_by_id    INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES ux_design_artifact_reference (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_design_artifact_reference_subject
+    ON ux_design_artifact_reference (system_id, subject_kind, subject_key, id DESC);
+
+-- ux_design_decision: the ONE decision ledger for #407's own confirm / reject
+-- / retire / reinstate lifecycle (`UxDesignDecisionKind`), covering Journeys,
+-- Requirements, and their references/links (`UxDesignSubjectKind`).
+-- DELIBERATELY has no `status` column anywhere in this table OR on
+-- `ux_journey`/`ux_requirement` -- `design_status` (`app/models.py`'s
+-- `UxDesignStatus`) is derived at read time from the latest non-superseded
+-- row here for `(system_id, subject_kind, subject_key)`, exactly the way
+-- Evolution Node maturity is derived by folding `evolution_node_event`
+-- (#337 / #338 / #349's "a stored lifecycle value can drift from the rows it
+-- describes, a derived one cannot"). `decision_method` is CHECKed to the
+-- single literal `'manual'` -- unlike `ux_journey_upstream_ref` /
+-- `ux_requirement_step_link`, which may be `reasoning_llm`/`deterministic`
+-- because a REFERENCE can be proposed by the system, a CONFIRM/REJECT/RETIRE/
+-- REINSTATE decision about that reference can only ever be a human's (§0
+-- invariant 3). `captured_digest` / `captured_revision_id` are the content a
+-- human judged AT DECISION TIME, which is what lets a later content change
+-- degrade the SEPARATE `recheck_state` axis to `stale` without touching
+-- `design_status` or this row (§2.5's "確定を取り消すのではなく...再確認を
+-- 促す").
+CREATE TABLE IF NOT EXISTS ux_design_decision (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    subject_kind      TEXT NOT NULL CHECK (subject_kind IN
+                          ('journey', 'requirement', 'requirement_step_link',
+                           'journey_upstream_ref', 'artifact_reference')),
+    subject_key       TEXT NOT NULL,
+    subject_row_id    INTEGER,
+    decision          TEXT NOT NULL CHECK (decision IN
+                          ('confirm', 'reject', 'retire', 'reinstate')),
+    rationale         TEXT NOT NULL DEFAULT '',
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    captured_revision_id INTEGER,
+    decision_method   TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    decided_by        TEXT,
+    superseded_by_id  INTEGER,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES ux_design_decision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_design_decision_subject
+    ON ux_design_decision (system_id, subject_kind, subject_key, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- Solution Design (Epic #405, Issue #408). See docs/ux-design-lineage.md §3.
+--
+-- Requirement -> Solution Design -> {Capability, static_flow, runtime_flow,
+-- Evolution Node, Component, Cell, Probe Point} is the second half of this
+-- Epic's chain (§0 diagram). Like the #407 tables above, this section stores
+-- new authored content (the design options themselves) but never copies
+-- upstream Requirement text or downstream target content -- only references
+-- plus captured digests, resolved at read time against one canonical source
+-- per `target_kind` (§3.3's table, the same discipline as §2.7).
+-- ---------------------------------------------------------------------------
+
+-- solution_design: identity row, `(system_id, design_key)` UNIQUE -- the same
+-- developer-supplied-slug rule as `ux_journey` / `ux_requirement`. Carries no
+-- "current option" or "status" column: which option (if any) is adopted is
+-- derived by folding `solution_design_decision` for each `option_key`, the
+-- identical "derived, never stored" rule `ux_design_decision` uses for
+-- `design_status` just above -- and it is intentional that a design can
+-- exist, and be worked on, before any option has been decided.
+CREATE TABLE IF NOT EXISTS solution_design (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    design_key      TEXT NOT NULL,
+    title           TEXT NOT NULL DEFAULT '',
+    summary         TEXT NOT NULL DEFAULT '',
+    schema_version  TEXT NOT NULL DEFAULT 'solution-design-v1',
+    created_by      TEXT,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (system_id, design_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_solution_design_system
+    ON solution_design (system_id, id DESC);
+
+-- solution_design_option: one candidate approach for a Solution Design,
+-- append-only (a correction supersedes rather than mutates, same as
+-- `ux_journey_revision`). `authored_by_kind` may legitimately be
+-- `reasoning_model` -- an AI-drafted option is exactly the kind of proposal
+-- this Epic exists to support (§0 invariant 3) -- but `solution_design_
+-- decision` below is CHECKed to `decision_method = 'manual'` regardless of
+-- who wrote the option text, so an AI's own draft can never adopt itself.
+CREATE TABLE IF NOT EXISTS solution_design_option (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    solution_design_id   INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    option_key           TEXT NOT NULL,
+    option_order         INTEGER NOT NULL,
+    title                TEXT NOT NULL DEFAULT '',
+    approach             TEXT NOT NULL DEFAULT '',
+    tradeoffs            TEXT NOT NULL DEFAULT '',
+    risks                TEXT NOT NULL DEFAULT '',
+    content_digest       TEXT NOT NULL,
+    authored_by_kind     TEXT NOT NULL DEFAULT 'developer'
+                             CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method      TEXT NOT NULL DEFAULT 'manual'
+                             CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id  INTEGER,
+    created_by           TEXT,
+    created_at           REAL NOT NULL,
+    superseded_by_id     INTEGER,
+    schema_version       TEXT NOT NULL DEFAULT 'solution-design-option-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (solution_design_id) REFERENCES solution_design (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES solution_design_option (id) ON DELETE SET NULL,
+    UNIQUE (solution_design_id, option_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_solution_design_option_design
+    ON solution_design_option (solution_design_id, option_order);
+
+-- solution_design_requirement_link: MANY-TO-MANY on purpose. There is no FK
+-- from `solution_design` straight to one Requirement, because one design
+-- legitimately satisfies several Requirements and one Requirement is
+-- legitimately satisfied by several competing designs (#408 acceptance
+-- condition 1) -- forcing a single FK would mean duplicating the design row
+-- per Requirement, which would fracture option comparison across the
+-- duplicates. Append-only like every link table in this Epic;
+-- `captured_requirement_revision_id` + `captured_digest` are what the design
+-- was written AGAINST, and a later Requirement revision degrades this link's
+-- read-time `link_state` to `stale` (§2.9 / §3.4) without altering the link
+-- row or the design.
+CREATE TABLE IF NOT EXISTS solution_design_requirement_link (
+    id                               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                        INTEGER NOT NULL,
+    solution_design_id               INTEGER NOT NULL,
+    requirement_id                   INTEGER NOT NULL,
+    captured_requirement_revision_id INTEGER,
+    captured_digest                  TEXT NOT NULL DEFAULT '',
+    note                             TEXT NOT NULL DEFAULT '',
+    decision_method                  TEXT NOT NULL DEFAULT 'manual'
+                                         CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by                       TEXT,
+    created_at                       REAL NOT NULL,
+    superseded_by_id                 INTEGER,
+    schema_version                   TEXT NOT NULL DEFAULT 'solution-design-requirement-link-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (solution_design_id) REFERENCES solution_design (id) ON DELETE CASCADE,
+    FOREIGN KEY (requirement_id) REFERENCES ux_requirement (id) ON DELETE CASCADE,
+    FOREIGN KEY (captured_requirement_revision_id) REFERENCES ux_requirement_revision (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES solution_design_requirement_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_solution_design_requirement_link_design
+    ON solution_design_requirement_link (system_id, solution_design_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_solution_design_requirement_link_requirement
+    ON solution_design_requirement_link (requirement_id, id DESC);
+
+-- solution_design_decision: the EXCLUSIVE-CHOICE ledger, kept separate from
+-- `ux_design_decision` on purpose (§3.2): confirming a Requirement is a
+-- non-exclusive judgement ("this statement is correct"), while adopting an
+-- Option is an exclusive judgement among N competing options ("this one, not
+-- the others") -- folding the two into one decision vocabulary would leave
+-- that exclusivity unrepresented anywhere in the schema. The exclusivity
+-- itself is enforced at the SERVICE layer (an `adopt` while another option of
+-- the same design is already `adopted` is refused with 409
+-- `solution_design_option_already_adopted`, never an automatic `withdraw` of
+-- the prior one -- §3.2's "システムが人間の名前で「取り下げた」という決定を
+-- 捏造することになる"), which is why this table itself carries no UNIQUE
+-- constraint forcing at-most-one-adopted -- the append-only history must
+-- still be able to show an option that was adopted and later withdrawn.
+-- `decision_method` is CHECKed to the single literal `'manual'`, same
+-- reasoning as `ux_design_decision` (§3.6: adoption is never automatic).
+CREATE TABLE IF NOT EXISTS solution_design_decision (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    solution_design_id  INTEGER NOT NULL,
+    option_id           INTEGER NOT NULL,
+    option_key          TEXT NOT NULL,
+    decision            TEXT NOT NULL CHECK (decision IN ('adopt', 'hold', 'reject', 'withdraw')),
+    rationale           TEXT NOT NULL DEFAULT '',
+    captured_digest     TEXT NOT NULL DEFAULT '',
+    decision_method     TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    decided_by          TEXT,
+    superseded_by_id    INTEGER,
+    created_at          REAL NOT NULL,
+    schema_version      TEXT NOT NULL DEFAULT 'solution-design-decision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (solution_design_id) REFERENCES solution_design (id) ON DELETE CASCADE,
+    FOREIGN KEY (option_id) REFERENCES solution_design_option (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES solution_design_decision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_solution_design_decision_design
+    ON solution_design_decision (system_id, solution_design_id, option_key, id DESC);
+
+-- solution_design_target_link: the bridge from an adopted (or still-being-
+-- evaluated) Option to an existing implementation target, shaped exactly
+-- like `evolution_node_link` (`target_kind` CHECK enumeration, `target_ref`
+-- the stable string identity of the target's OWN canonical source,
+-- `target_row_id` a join shortcut that is NEVER trusted alone). `static_flow`
+-- and `runtime_flow` are kept as two separate `target_kind` values rather
+-- than one "flow" value because they name genuinely different facts -- a
+-- statically computed entry-point path fixed to one snapshot versus a live
+-- SDK-assigned execution correlation id -- and §3.3 forbids folding them into
+-- one displayed word (#366's rule). A `static_flow` link cannot be created
+-- without `captured_snapshot_id` (422 `flow_target_requires_snapshot`),
+-- because an entry-point path with no pinned snapshot has no stable meaning
+-- to capture. `probe_point` links are validated at WRITE time against
+-- `evolution_node._require_approved_probe_point` (unapproved -> 409, foreign
+-- System -> 404); every other `target_kind` is resolved only at READ time,
+-- the same asymmetry Evolution Node Phase 1 already uses for its links.
+CREATE TABLE IF NOT EXISTS solution_design_target_link (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    solution_design_id    INTEGER NOT NULL,
+    option_id             INTEGER NOT NULL,
+    target_kind           TEXT NOT NULL CHECK (target_kind IN
+                              ('capability', 'static_flow', 'runtime_flow', 'evolution_node',
+                               'component', 'cell_definition', 'cell_binding', 'probe_point')),
+    target_ref            TEXT NOT NULL,
+    target_row_id         INTEGER,
+    captured_digest       TEXT NOT NULL DEFAULT '',
+    captured_snapshot_id  INTEGER,
+    note                  TEXT NOT NULL DEFAULT '',
+    decision_method       TEXT NOT NULL DEFAULT 'manual'
+                              CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by            TEXT,
+    created_at            REAL NOT NULL,
+    superseded_by_id      INTEGER,
+    schema_version        TEXT NOT NULL DEFAULT 'solution-design-target-link-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (solution_design_id) REFERENCES solution_design (id) ON DELETE CASCADE,
+    FOREIGN KEY (option_id) REFERENCES solution_design_option (id) ON DELETE CASCADE,
+    FOREIGN KEY (captured_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES solution_design_target_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_solution_design_target_link_design
+    ON solution_design_target_link (system_id, solution_design_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_solution_design_target_link_target
+    ON solution_design_target_link (target_kind, target_ref);
 """
 
 
