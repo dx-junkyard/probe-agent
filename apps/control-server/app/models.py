@@ -1,9816 +1,1473 @@
-from typing import Any, Dict, List, Literal, Optional, get_args
-
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-from .intelligence_run_types import IntelligenceRunType
-
-Mode = Literal["off", "trace", "shadow"]
-Evaluation = Literal["better", "worse", "same", "unknown"]
-GenerationVerdict = Literal["better", "worse", "same", "unsafe", "error", "unknown"]
-
-
-EntityRole = Literal["source", "derived", "related"]
-# Projection phases: input/output (Issue #146); shadow_* added in Issue #150.
-ProjectionPhase = Literal["input", "output", "shadow_current", "shadow_candidate"]
-
-# Replay capture (Issue #242 Phase A / #243): deterministic structural
-# classification of whether a trace's structured input capture can
-# mechanically restore the call inputs. Finite sets shared with
-# shared/schemas/trace_event.schema.json and the SDK's replay_capture module.
-Replayability = Literal["replayable", "partial", "unreplayable"]
-ReplayReason = Literal[
-    "unsupported_type",
-    "redacted",
-    "depth_limit_exceeded",
-    "size_limit_exceeded",
-    "round_trip_failed",
-    "capture_failed",
-    "redaction_blocked",
-]
-
-
-class TraceEntity(BaseModel):
-    type: str
-    id: str
-    role: EntityRole = "related"
-
-
-class TraceProjectionIn(BaseModel):
-    """A projection extraction result attached to a trace (Issue #146)."""
-
-    projection_name: str
-    phase: ProjectionPhase = "output"
-    fields: Dict[str, Any] = Field(default_factory=dict)
-    metrics: Dict[str, Any] = Field(default_factory=dict)
-    samples: Dict[str, Any] = Field(default_factory=dict)
-    data_hash: Optional[str] = None
-    truncated: bool = False
-    error: Optional[str] = None
-
-
-class SDKTransportSummary(BaseModel):
-    """Bounded SDK queue/breaker loss summary emitted by Issue #272."""
-
-    dropped_count: int = Field(ge=0, le=9_223_372_036_854_775_807)
-    failure_count: int = Field(ge=0, le=9_223_372_036_854_775_807)
-    state: Literal["closed", "open", "half_open"]
-
-
-class TraceEvent(BaseModel):
-    trace_id: str
-    component_id: str
-    mode: Optional[str] = None
-    input: Optional[Any] = None
-    output: Optional[str] = None
-    error: Optional[str] = None
-    duration_ms: float = 0.0
-    timestamp: float
-    # Phase 1 lineage (Issue #145) â€” all optional, backward compatible.
-    span_id: Optional[str] = None
-    parent_span_id: Optional[str] = None
-    flow_id: Optional[str] = None
-    correlation_id: Optional[str] = None
-    entities: Optional[List[TraceEntity]] = None
-    # Phase 2 projections (Issue #146) â€” optional extraction results.
-    projections: Optional[List[TraceProjectionIn]] = None
-    # Replay capture (Issue #242 Phase A / #243) â€” all optional, additive.
-    # input_capture is the canonical JSON-encoded {"args": [...], "kwargs":
-    # {...}} structure (see trace_event.schema.json for the "__probe__"
-    # marker encoding); replayability/replay_reasons are enum-validated so
-    # unknown values are rejected with 422.
-    input_capture: Optional[Any] = None
-    replayability: Optional[Replayability] = None
-    replay_reasons: Optional[List[ReplayReason]] = None
-    sdk_transport: Optional[SDKTransportSummary] = None
-    # Issue #290 Finding 5: optional deployment provenance reported by the
-    # SDK (PROBE_ENVIRONMENT / PROBE_GIT_SHA). Both additive/backward
-    # compatible; None on every trace predating this capability. Feeds
-    # app/runtime_reality.py's provenance envelope -- never fabricated here.
-    environment: Optional[str] = None
-    git_sha: Optional[str] = None
-
-
-class ProjectionOut(BaseModel):
-    trace_id: str
-    component_id: str
-    projection_name: str
-    phase: str
-    fields: Dict[str, Any] = Field(default_factory=dict)
-    metrics: Dict[str, Any] = Field(default_factory=dict)
-    samples: Dict[str, Any] = Field(default_factory=dict)
-    data_hash: Optional[str] = None
-    truncated: bool = False
-    error: Optional[str] = None
-    created_at: float
-
-
-class LineageEntityOut(BaseModel):
-    type: str
-    id: str
-    role: str = "related"
-
-
-class LineageProjectionOut(BaseModel):
-    projection_name: str
-    phase: str
-    fields: Dict[str, Any] = Field(default_factory=dict)
-    metrics: Dict[str, Any] = Field(default_factory=dict)
-    samples: Dict[str, Any] = Field(default_factory=dict)
-    data_hash: Optional[str] = None
-    truncated: bool = False
-    error: Optional[str] = None
-
-
-class LineageStepOut(BaseModel):
-    trace_id: str
-    component_id: str
-    mode: Optional[str] = None
-    span_id: Optional[str] = None
-    parent_span_id: Optional[str] = None
-    flow_id: Optional[str] = None
-    correlation_id: Optional[str] = None
-    duration_ms: Optional[float] = None
-    timestamp: float
-    output: Optional[str] = None
-    error: Optional[str] = None
-    replayability: Optional[Replayability] = None
-    replay_reasons: List[ReplayReason] = Field(default_factory=list)
-    entities: List[LineageEntityOut] = Field(default_factory=list)
-    projections: List[LineageProjectionOut] = Field(default_factory=list)
-
-
-class LineageOut(BaseModel):
-    query: Dict[str, Any] = Field(default_factory=dict)
-    steps: List[LineageStepOut] = Field(default_factory=list)
-
-
-# --- Trace analyzers (Issue #148) ------------------------------------------
-
-AnalyzerReviewStatus = Literal["proposed", "approved", "rejected"]
-
-
-class TraceAnalyzerCreate(BaseModel):
-    name: str = ""
-    intent: str = ""
-    spec: Dict[str, Any]
-
-
-class AnalyzerReviewUpdate(BaseModel):
-    review_status: Literal["approved", "rejected"]
-
-
-class AnalyzerProposeRequest(BaseModel):
-    intent: str = Field(..., min_length=1)
-    name: str = ""
-
-
-class TraceAnalyzerOut(BaseModel):
-    id: int
-    name: str = ""
-    intent: str = ""
-    spec: Dict[str, Any] = Field(default_factory=dict)
-    source: str = "trace_projections"
-    review_status: str = "proposed"
-    decision_method: str = "manual"
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    prompt_version: Optional[str] = None
-    schema_version: Optional[str] = None
-    is_mock: bool = False
-    # Audit of the human review decision (Principle 7): set on approve/reject.
-    # Always 'manual' when set â€” approval never comes from the LLM.
-    reviewed_at: Optional[float] = None
-    review_decision_method: Optional[str] = None
-    created_at: float
-    updated_at: float
-
-
-class AnalyzerEntityOut(BaseModel):
-    entity_type: str
-    entity_id: str
-
-
-class AnalyzerContextOut(BaseModel):
-    """Candidate values for the Trace Analyzer builder (Issue #157).
-
-    Deterministic, read-only projection of the identifiers a declarative
-    analyzer spec may reference, so the dashboard can offer them as choices
-    instead of asking the user to hand-write JSON. Sourced from the same
-    finite sets the LLM proposal context uses (Principle 6).
-    """
-
-    components: List[str] = Field(default_factory=list)
-    entity_types: List[str] = Field(default_factory=list)
-    entities: List[AnalyzerEntityOut] = Field(default_factory=list)
-    projection_names: List[str] = Field(default_factory=list)
-    field_names: List[str] = Field(default_factory=list)
-    phases: List[str] = Field(default_factory=list)
-    entities_truncated: bool = False
-
-
-class AnalysisRunOut(BaseModel):
-    id: int
-    analyzer_id: int
-    status: str
-    result: Optional[Dict[str, Any]] = None
-    error_details: Optional[str] = None
-    row_count: Optional[int] = None
-    started_at: float
-    completed_at: Optional[float] = None
-    # Issue #152: set when a retention policy may have pruned the projection
-    # data this run referenced (no reference counting; conservative by age).
-    data_expired: bool = False
-    data_expired_note: Optional[str] = None
-
-
-RetentionTarget = Literal[
-    "trace_spans", "trace_entities", "trace_projections", "trace_analysis_runs"
-]
-
-
-class RetentionPolicyIn(BaseModel):
-    target_table: RetentionTarget
-    max_age_days: Optional[float] = Field(default=None, ge=0)
-    max_count: Optional[int] = Field(default=None, ge=0)
-
-
-class RetentionPoliciesUpdate(BaseModel):
-    policies: List[RetentionPolicyIn] = Field(default_factory=list)
-
-
-class RetentionPolicyOut(BaseModel):
-    target_table: str
-    max_age_days: Optional[float] = None
-    max_count: Optional[int] = None
-    updated_at: float
-
-
-class RetentionApplyResult(BaseModel):
-    target_table: str
-    deleted_count: int
-
-
-class RetentionApplyOut(BaseModel):
-    executed_at: float
-    results: List[RetentionApplyResult] = Field(default_factory=list)
-
-
-class RetentionAuditOut(BaseModel):
-    id: int
-    target_table: str
-    deleted_count: int
-    reason: str
-    executed_at: float
-
-
-class ShadowResult(BaseModel):
-    trace_id: str
-    component_id: str
-    current_output: Optional[str] = None
-    candidate_output: Optional[str] = None
-    candidate_error: Optional[str] = None
-    candidate_duration_ms: float = 0.0
-    timestamp: float
-    # Phase 5 shadow projections (Issue #150): shadow_current / shadow_candidate.
-    projections: Optional[List["TraceProjectionIn"]] = None
-
-
-class Policy(BaseModel):
-    mode: Mode = "trace"
-
-
-class PolicyUpdate(BaseModel):
-    mode: Mode
-
-
-class ComponentSummary(BaseModel):
-    component_id: str
-    mode: Mode
-    trace_count: int = 0
-    last_seen: Optional[float] = None
-
-
-class EvaluationUpdate(BaseModel):
-    evaluation: Evaluation = Field(..., description="manual verdict")
-
-
-CriterionType = Literal[
-    "natural_language",
-    "exact_match",
-    "json_equal",
-    "required_keys",
-    "contains",
-    "regex",
-]
-EvaluationStatus = Literal["ok", "ng", "needs_review"]
-
-
-class SystemProfile(BaseModel):
-    name: str = ""
-    purpose: str = ""
-    target_users: List[str] = Field(default_factory=list)
-    stakeholder_value: str = ""
-    constraints: List[str] = Field(default_factory=list)
-    success_criteria: List[str] = Field(default_factory=list)
-    created_at: Optional[float] = None
-    updated_at: Optional[float] = None
-
-
-class SystemProfileUpdate(BaseModel):
-    name: str = ""
-    purpose: str = ""
-    target_users: List[str] = Field(default_factory=list)
-    stakeholder_value: str = ""
-    constraints: List[str] = Field(default_factory=list)
-    success_criteria: List[str] = Field(default_factory=list)
-
-
-class SystemCreate(BaseModel):
-    name: str = Field(..., min_length=1)
-    environment: str = ""
-    description: str = ""
-
-
-class SystemUpdate(BaseModel):
-    name: str = Field(..., min_length=1)
-    environment: str = ""
-    description: str = ""
-
-
-class SystemOut(BaseModel):
-    id: int
-    name: str
-    environment: str = ""
-    description: str = ""
-    owner_user_id: Optional[int] = None
-    created_at: float
-    updated_at: float
-    component_count: int = 0
-    trace_count: int = 0
-    last_seen: Optional[float] = None
-
-
-# Issue #165: deterministic signal-reception facts for the connectivity
-# warning badge and the setup-guide page. `state` is a finite classification;
-# smoke traces are recognized by exact component_id match against the
-# documented convention (Principle 6: explicit finite set, no heuristics).
-SMOKE_CHECK_COMPONENT_ID = "probe-smoke-check"
-
-ConnectivityState = Literal["no_signal", "smoke_only", "receiving"]
-
-# Issue #370: freshness is a SECOND, independent axis. ConnectivityState above
-# is a cumulative lifecycle milestone -- "this system has connected at least
-# once" -- and never expires. ConnectivityFreshness answers "is it receiving
-# right now", which does. Rendering the milestone as the live status is the
-# bug this type exists to prevent.
-ConnectivityFreshness = Literal[
-    "never_received", "receiving_now", "delayed", "stale"
-]
-
-
-class ConnectivityStatusOut(BaseModel):
-    system_id: int
-    state: ConnectivityState
-    total_trace_count: int
-    smoke_trace_count: int
-    real_trace_count: int
-    first_trace_at: Optional[float] = None
-    last_trace_at: Optional[float] = None
-    last_trace_component_id: Optional[str] = None
-    smoke_component_id: str = SMOKE_CHECK_COMPONENT_ID
-    materialized_session_ids: List[int] = Field(default_factory=list)
-    # --- Issue #370: live reception, separate from the milestone above -------
-    #: Workload freshness, classified from the newest NON-smoke trace. A smoke
-    #: check proves the transport, not that the instrumented workload runs.
-    freshness: ConnectivityFreshness = "never_received"
-    #: Transport freshness, classified from the newest trace of any kind.
-    #: Reported separately so "the smoke check still gets through" stays
-    #: visible rather than being read as workload health.
-    transport_freshness: ConnectivityFreshness = "never_received"
-    #: Newest non-smoke trace; None when only smoke traces have arrived.
-    last_real_trace_at: Optional[float] = None
-    #: Seconds since the newest non-smoke trace â€” the same event `freshness`
-    #: judged, so the label and the relative time cannot disagree.
-    seconds_since_last_trace: Optional[float] = None
-    #: Seconds since the newest trace of any kind.
-    seconds_since_last_any_trace: Optional[float] = None
-    #: The server clock this reading was taken against, so the client can show
-    #: a relative time that does not drift with its own clock.
-    evaluated_at: float = 0.0
-    #: Positive when the newest trace is timestamped ahead of the server.
-    clock_skew_seconds: float = 0.0
-    #: Windowed real-workload counts (smoke traces excluded).
-    real_trace_count_5m: int = 0
-    real_trace_count_1h: int = 0
-    real_trace_count_24h: int = 0
-    #: The thresholds this reading used, always returned so the displayed
-    #: state is explainable without consulting the source.
-    delayed_after_seconds: float = 0.0
-    stale_after_seconds: float = 0.0
-    #: True when the thresholds came from a System-specific policy row.
-    thresholds_customized: bool = False
-
-
-class ConnectivityFreshnessPolicyOut(BaseModel):
-    system_id: int
-    delayed_after_seconds: float
-    stale_after_seconds: float
-    customized: bool
-    updated_at: Optional[float] = None
-
-
-class ConnectivityFreshnessPolicyUpdate(BaseModel):
-    delayed_after_seconds: float = Field(gt=0)
-    stale_after_seconds: float = Field(gt=0)
-
-
-class ComponentProfile(BaseModel):
-    component_id: str
-    purpose: str = ""
-    responsibility: str = ""
-    expected_input: str = ""
-    expected_output: str = ""
-    failure_impact: str = ""
-    notes: str = ""
-    created_at: Optional[float] = None
-    updated_at: Optional[float] = None
-
-
-class ComponentProfileUpdate(BaseModel):
-    purpose: str = ""
-    responsibility: str = ""
-    expected_input: str = ""
-    expected_output: str = ""
-    failure_impact: str = ""
-    notes: str = ""
-
-
-class EvaluationCriterion(BaseModel):
-    id: int
-    component_id: str
-    name: str
-    description: str = ""
-    criterion_type: CriterionType
-    expected_value: Optional[str] = None
-    weight: float = 1.0
-    enabled: bool = True
-    created_at: float
-    updated_at: float
-
-
-class CriterionCreate(BaseModel):
-    name: str = Field(..., min_length=1)
-    description: str = ""
-    criterion_type: CriterionType
-    expected_value: Optional[str] = None
-    weight: float = 1.0
-    enabled: bool = True
-
-
-class CriterionUpdate(BaseModel):
-    name: str = Field(..., min_length=1)
-    description: str = ""
-    criterion_type: CriterionType
-    expected_value: Optional[str] = None
-    weight: float = 1.0
-    enabled: bool = True
-
-
-class EvaluationResult(BaseModel):
-    id: int
-    trace_id: str
-    component_id: str
-    criterion_id: int
-    status: EvaluationStatus
-    score: Optional[float] = None
-    reason: str = ""
-    actual_output: Optional[str] = None
-    expected_value: Optional[str] = None
-    created_at: float
-
-
-class GenerationRunCreate(BaseModel):
-    component_id: str = Field(..., min_length=1)
-    trace_id: str = Field(..., min_length=1)
-    objective: str = Field(..., min_length=1)
-
-
-class GenerationRun(BaseModel):
-    id: int
-    system_id: int
-    component_id: str
-    trace_id: str
-    objective: str
-    input_json: Optional[Any] = None
-    current_output: Optional[str] = None
-    generated_code: str = ""
-    generation_notes: str = ""
-    candidate_output: Optional[str] = None
-    execution_error: Optional[str] = None
-    llm_verdict: GenerationVerdict = "unknown"
-    llm_reason: str = ""
-    llm_risks: str = ""
-    llm_recommendation: str = ""
-    created_at: float
-
-
-class RepositorySnapshot(BaseModel):
-    repo_path: str
-    commit_sha: str
-    included_paths: List[str] = Field(default_factory=list)
-    excluded_paths: List[str] = Field(default_factory=list)
-    read_policy: Literal["committed_files_only"] = "committed_files_only"
-    status: Literal["not_configured", "ready", "indexing", "failed"] = "not_configured"
-
-
-SourceType = Literal["documentation", "source", "test", "configuration"]
-InclusionStatus = Literal[
-    "indexed", "metadata_only", "too_large", "binary", "excluded", "unsupported"
-]
-SnapshotStatus = Literal["not_configured", "indexing", "ready", "failed"]
-# Issue #369: freshness is a SECOND, independent axis over the same snapshot.
-# `SnapshotStatus` answers "did the analysis finish" (`ready`); this answers
-# "does the pinned commit still equal HEAD" (`current`). Rendering one as the
-# other is the bug this issue fixes -- never collapse them.
-SnapshotFreshnessState = Literal["current", "stale", "unknown"]
-SnapshotPreflightCheckId = Literal[
-    "snapshot_processing",
-    "commit_pinned",
-    "freshness",
-    "symbol_index",
-    "understanding",
-]
-SnapshotPreflightCheckStatus = Literal["ok", "attention", "blocking", "unknown"]
-SnapshotPreflightVerdict = Literal["ready", "attention", "blocked"]
-IntelligenceRunStatus = Literal["pending", "completed", "failed"]
-DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
-# How a single hierarchy claim was produced. Kept distinct from the audit
-# DecisionMethod so source-authored facts stay visibly separate from
-# reasoning-model interpretations (Issue #56).
-ProvenanceKind = Literal["source_authored", "structural", "reasoning_llm", "manual"]
-
-
-class RepositoryConfigUpdate(BaseModel):
-    repo_path: str = Field(..., min_length=1)
-    include_patterns: List[str] = Field(default_factory=lambda: ["README.md", "docs/**", "src/**", "tests/**"])
-    exclude_patterns: List[str] = Field(default_factory=lambda: [".env", "secrets/**", "data/**", "*.pem", "*.key", "credentials.*"])
-
-
-class RepositoryCandidateOut(BaseModel):
-    name: str
-    path: str
-
-
-class RepositoryConfigOut(BaseModel):
-    system_id: int
-    repo_path: str
-    include_patterns: List[str]
-    exclude_patterns: List[str]
-    created_at: float
-    updated_at: float
-
-
-class SnapshotFileOut(BaseModel):
-    path: str
-    source_type: SourceType
-    size_bytes: int
-    inclusion_status: InclusionStatus = "indexed"
-    exclusion_reason: str = ""
-
-
-class SnapshotOut(BaseModel):
-    id: int
-    system_id: int
-    repo_path: str
-    commit_sha: str
-    status: SnapshotStatus
-    file_count: int
-    total_size: int
-    indexed_size: int = 0
-    metadata_only_count: int = 0
-    warnings: List[str] = Field(default_factory=list)
-    error_summary: Optional[str] = None
-    created_at: float
-    completed_at: Optional[float] = None
-    files: List[SnapshotFileOut] = Field(default_factory=list)
-    # Issue #369: the freshness axis, independent of `status`. Populated by the
-    # list endpoint (which resolves HEAD once); `None` means "not evaluated in
-    # this response", never "current".
-    freshness: Optional[SnapshotFreshnessState] = None
-    # Exactly one snapshot per System is the recommended one (the latest ready
-    # snapshot). Every other snapshot is a reproduction-only choice.
-    is_recommended: bool = False
-
-
-class SnapshotRefOut(BaseModel):
-    id: int
-    commit_sha: str
-    status: str
-    created_at: float
-    freshness: Optional[SnapshotFreshnessState] = None
-
-
-class SnapshotPreflightCheckOut(BaseModel):
-    """One finite preflight check result (Issue #369)."""
-
-    check_id: SnapshotPreflightCheckId
-    status: SnapshotPreflightCheckStatus
-    summary: str
-    detail: str
-    remediation: str = ""
-
-
-class SnapshotPreflightOut(BaseModel):
-    """Shared preflight for candidate generation / Replay / Experiment.
-
-    One server evaluation rendered by every surface, so the three cannot
-    disagree about whether a snapshot may be used.
-    """
-
-    snapshot_id: Optional[int] = None
-    # "Did the analysis finish" -- the existing snapshot status vocabulary.
-    processing_state: Optional[SnapshotStatus] = None
-    # "Does the pinned commit still equal HEAD" -- a separate axis.
-    freshness: SnapshotFreshnessState = "unknown"
-    commit_sha: Optional[str] = None
-    head_sha: Optional[str] = None
-    head_relation: Literal["same", "behind", "diverged", "unknown"] = "unknown"
-    commits_behind: Optional[int] = None
-    verdict: SnapshotPreflightVerdict = "blocked"
-    checks: List[SnapshotPreflightCheckOut] = Field(default_factory=list)
-    recommended_snapshot_id: Optional[int] = None
-    recommended_snapshot_commit_sha: Optional[str] = None
-    recommended_snapshot_freshness: SnapshotFreshnessState = "unknown"
-    is_recommended: bool = False
-    requires_stale_acknowledgement: bool = False
-    stale_continuation_note: Optional[str] = None
-
-
-# Issue #372: Replay readiness, evaluated before a candidate is generated.
-ReplayReadinessStatus = Literal["ok", "attention", "blocking"]
-ReplayReadinessVerdict = Literal["ready", "attention", "blocked"]
-
-
-class ReplayReadinessCountsOut(BaseModel):
-    """How a set of traces splits across the finite replayability values.
-
-    `not_captured` (the component never opted into `replay_capture`) is kept
-    separate from `unreplayable` (capture was attempted and failed): the
-    remediation differs, so merging them would give the wrong instruction.
-    """
-
-    total: int
-    replayable: int
-    partial: int
-    unreplayable: int
-    not_captured: int
-    #: replayable + partial â€” the traces that can produce a comparison at all.
-    usable: int
-
-
-class ReplayReadinessCheckOut(BaseModel):
-    check_id: str
-    status: ReplayReadinessStatus
-    summary: str
-    detail: str
-    remediation: str
-
-
-class ReplayTraceReadinessOut(BaseModel):
-    trace_id: str
-    replayability: Literal["replayable", "partial", "unreplayable", "not_captured"]
-    primary_reason: Optional[str] = None
-
-
-class ReplayReadinessOut(BaseModel):
-    component_id: str
-    snapshot_id: Optional[int] = None
-    #: Every trace of the component.
-    counts: ReplayReadinessCountsOut
-    #: Only the traces a run would actually use (the auto-selected window, or
-    #: the explicitly chosen ids).
-    selected: ReplayReadinessCountsOut
-    selection_limit: int
-    selection_is_automatic: bool
-    verdict: ReplayReadinessVerdict
-    checks: List[ReplayReadinessCheckOut] = Field(default_factory=list)
-    traces: List[ReplayTraceReadinessOut] = Field(default_factory=list)
-
-
-class StaleSnapshotAck(BaseModel):
-    """The developer's explicit decision to continue on a stale snapshot.
-
-    ``decision_method: manual`` -- an LLM or heuristic never supplies this.
-    The reason is persisted on the record that consumes the snapshot.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str = Field(..., min_length=1, max_length=1000)
-
-
-class RepositoryStatusOut(BaseModel):
-    """Repository refresh hub state (Issue #158).
-
-    Read-only summary that lets the dashboard show, in one place, whether the
-    latest analysis is stale relative to the repository's current HEAD and what
-    step to take next. Reading HEAD / working-tree status never mutates the
-    target repository (Principle 5).
-    """
-
-    configured: bool
-    repo_path: Optional[str] = None
-    # Current committed HEAD of the configured repository (read-only rev-parse).
-    current_head: Optional[str] = None
-    head_error: Optional[str] = None
-    working_tree_dirty: Optional[bool] = None
-    dirty_file_count: int = 0
-    dirty_sample: List[str] = Field(default_factory=list)
-    # Newest snapshot regardless of index/build state.
-    latest_snapshot: Optional[SnapshotRefOut] = None
-    # Newest snapshot that also has a completed symbol index.
-    latest_indexed_snapshot: Optional[SnapshotRefOut] = None
-    # Snapshot the most recent System Understanding build ran against.
-    understanding_snapshot_id: Optional[int] = None
-    understanding_status: Optional[str] = None
-    # True when the latest snapshot's commit differs from current HEAD, so a new
-    # snapshot should be created before generating new analysis/patches.
-    snapshot_stale: bool = False
-    # Finite relationship of the latest ready snapshot to HEAD. A lag count is
-    # available only for same/behind; failures and missing commits are unknown.
-    head_relation: Literal["same", "behind", "diverged", "unknown"] = "unknown"
-    commits_behind: Optional[int] = None
-    # True when a ready snapshot exists but has no completed symbol index.
-    symbols_stale: bool = False
-    next_actions: List[str] = Field(default_factory=list)
-
-
-RepositoryResyncStatus = Literal[
-    "queued",
-    "snapshotting",
-    "indexing",
-    "completed",
-    "snapshot_failed",
-    "index_failed",
-]
-
-
-class RepositoryResyncJobOut(BaseModel):
-    id: int
-    system_id: int
-    snapshot_id: Optional[int] = None
-    status: RepositoryResyncStatus
-    error: Optional[str] = None
-    stale_capability_count: int = 0
-    created_at: float
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-
-
-class IntelligenceRunOut(BaseModel):
-    id: int
-    system_id: int
-    snapshot_id: Optional[int]
-    run_type: IntelligenceRunType
-    provider: str
-    model: str
-    prompt_version: str
-    schema_version: str
-    decision_method: DecisionMethod
-    status: IntelligenceRunStatus
-    error_details: Optional[str] = None
-    is_mock: bool = False
-    started_at: float
-    completed_at: Optional[float] = None
-    # Issue #286: budget usage for run_type="investigation" rows only (the
-    # read-only Investigation Agent's deterministic budget accounting).
-    # None for every other run_type.
-    budget_files_read: Optional[int] = None
-    budget_chars_read: Optional[int] = None
-    budget_llm_calls: Optional[int] = None
-    budget_elapsed_seconds: Optional[float] = None
-
-
-class FeatureEvidence(BaseModel):
-    path: str
-    start_line: int = 0
-    end_line: int = 0
-    summary: str = ""
-
-
-class FeatureCodeLink(BaseModel):
-    path: str
-    symbol: str
-    kind: str = "function"
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    decision_method: Literal["deterministic", "reasoning_llm", "manual"] = "manual"
-
-
-class FeatureProfile(BaseModel):
-    feature_id: str
-    name: str
-    summary: str
-    user_value: str
-    success_criteria: List[str] = Field(default_factory=list)
-    risks: List[str] = Field(default_factory=list)
-    evidence: List[FeatureEvidence] = Field(default_factory=list)
-    code_links: List[FeatureCodeLink] = Field(default_factory=list)
-    decision_method: Literal["deterministic", "reasoning_llm", "manual"] = "manual"
-
-
-class ProbePoint(BaseModel):
-    component_id: str
-    feature_id: str
-    path: str
-    symbol: str
-    reason: str
-    recommended_mode: Mode = "trace"
-    side_effect_risk: Literal["low", "medium", "high"] = "low"
-    status: Literal["proposed", "approved", "rejected"] = "proposed"
-
-
-class ProbePlan(BaseModel):
-    feature_id: str
-    objective: str
-    probe_points: List[ProbePoint] = Field(default_factory=list)
-    avoid_probe_points: List[str] = Field(default_factory=list)
-    decision_method: Literal["deterministic", "reasoning_llm", "manual"] = "manual"
-
-
-class ExperimentVariant(BaseModel):
-    variant_id: str
-    label: str
-    status: Literal["planned", "running", "completed", "failed"] = "planned"
-    patch_summary: Optional[str] = None
-
-
-class ExperimentSummary(BaseModel):
-    experiment_id: str
-    feature_id: str
-    objective: str
-    baseline_commit: str
-    status: Literal["draft", "running", "completed", "failed"] = "draft"
-    variants: List[ExperimentVariant] = Field(default_factory=list)
-    metrics: List[str] = Field(default_factory=list)
-    interpretation_method: Literal["deterministic", "reasoning_llm", "manual"] = "manual"
-
-
-ExperimentStatus = Literal["draft", "running", "completed", "failed"]
-ExperimentVariantStatus = Literal[
-    "planned", "running", "completed", "failed", "invalid_patch", "timed_out"
-]
-ExperimentAnalysisStatus = Literal[
-    "pending", "completed", "analysis_failed", "not_requested"
-]
-
-
-class ExperimentExecutionConfig(BaseModel):
-    install_commands: List[str] = Field(default_factory=list)
-    test_commands: List[str] = Field(..., min_length=1)
-    smoke_commands: List[str] = Field(default_factory=list)
-    workload_commands: List[str] = Field(default_factory=list)
-    timeout_seconds: int = Field(default=60, ge=1, le=300)
-    network: Literal[False] = False
-    env: dict[str, str] = Field(default_factory=dict)
-    result_artifact_path: str = ".probe-agent/experiment-result.json"
-    artifact_retention_seconds: int = Field(default=86400, ge=0)
-
-
-class ExperimentVariantCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    label: str = Field(..., min_length=1, max_length=200)
-    patch_text: str = Field(..., min_length=1, max_length=1_000_000)
-    source: str = Field(default="manual", max_length=100)
-    risk_note: str = Field(default="", max_length=2000)
-
-
-class ExperimentCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    feature_id: str = Field(..., min_length=1, max_length=200)
-    objective: str = Field(..., min_length=1, max_length=5000)
-    snapshot_id: int
-    variants: List[ExperimentVariantCreate] = Field(
-        ..., min_length=2, max_length=10
-    )
-    # Issue #369: required when the chosen snapshot is definitively behind
-    # HEAD. Continuing on an older snapshot is legitimate (reproduction runs),
-    # but it is the developer's decision, so it is recorded on the experiment
-    # rather than inferred. `decision_method: manual`.
-    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
-
-
-class ExperimentCommandOut(BaseModel):
-    id: int
-    phase: str
-    command: str
-    exit_code: int
-    duration_ms: float
-    stdout: str = ""
-    stderr: str = ""
-    stdout_truncated: bool = False
-    stderr_truncated: bool = False
-    timed_out: bool = False
-
-
-class ExperimentVariantResultOut(BaseModel):
-    id: int
-    variant_key: str
-    label: str
-    is_baseline: bool
-    patch_text: str = ""
-    patch_hash: str
-    source: str
-    risk_note: str = ""
-    status: ExperimentVariantStatus
-    error: Optional[str] = None
-    workspace_path: Optional[str] = None
-    cleanup_state: str = "not_attempted"
-    cleanup_error: Optional[str] = None
-    metrics: dict[str, Any] = Field(default_factory=dict)
-    artifacts: dict[str, Any] = Field(default_factory=dict)
-    commands: List[ExperimentCommandOut] = Field(default_factory=list)
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-
-
-class ExperimentAnalysisOut(BaseModel):
-    status: ExperimentAnalysisStatus
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    prompt_version: Optional[str] = None
-    schema_version: Optional[str] = None
-    decision_method: Optional[DecisionMethod] = None
-    narrative: Optional[str] = None
-    recommendation_variant_key: Optional[str] = None
-    recommendation_reason: Optional[str] = None
-    risks: List[str] = Field(default_factory=list)
-    error: Optional[str] = None
-    created_at: Optional[float] = None
-
-
-class ExperimentDecisionUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: Literal["adopted", "rejected", "needs_more_data", "undecided"]
-    variant_key: Optional[str] = Field(default=None, max_length=100)
-    note: str = ""
-
-
-class ExperimentOut(BaseModel):
-    id: int
-    system_id: int
-    feature_id: str
-    objective: str
-    snapshot_id: int
-    baseline_commit: str
-    config_revision: str
-    execution: ExperimentExecutionConfig
-    status: ExperimentStatus
-    error: Optional[str] = None
-    human_decision: str = "undecided"
-    human_decision_variant_key: Optional[str] = None
-    human_decision_note: str = ""
-    variants: List[ExperimentVariantResultOut] = Field(default_factory=list)
-    comparison: dict[str, Any] = Field(default_factory=dict)
-    analysis: ExperimentAnalysisOut
-    created_at: float
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-
-
-class SystemProfileDraftOut(BaseModel):
-    id: int
-    system_id: int
-    intelligence_run_id: int
-    snapshot_id: int
-    name: str = ""
-    purpose: str = ""
-    target_users: List[str] = Field(default_factory=list)
-    stakeholder_value: str = ""
-    constraints: List[str] = Field(default_factory=list)
-    success_criteria: List[str] = Field(default_factory=list)
-    evidence: List[FeatureEvidence] = Field(default_factory=list)
-    is_mock: bool = False
-    created_at: float
-
-
-class FeatureDraftOut(BaseModel):
-    id: int
-    system_id: int
-    intelligence_run_id: int
-    snapshot_id: int
-    feature_id: str
-    name: str
-    summary: str
-    user_value: str
-    success_criteria: List[str] = Field(default_factory=list)
-    risks: List[str] = Field(default_factory=list)
-    evidence: List[FeatureEvidence] = Field(default_factory=list)
-    decision_method: DecisionMethod = "reasoning_llm"
-    is_mock: bool = False
-    created_at: float
-
-
-class DraftGenerationResult(BaseModel):
-    intelligence_run: IntelligenceRunOut
-    system_profile_draft: Optional[SystemProfileDraftOut] = None
-    feature_drafts: List[FeatureDraftOut] = Field(default_factory=list)
-
-
-class LatestDraftsOut(BaseModel):
-    system_id: int
-    snapshot: Optional[SnapshotOut] = None
-    intelligence_run: Optional[IntelligenceRunOut] = None
-    system_profile_draft: Optional[SystemProfileDraftOut] = None
-    feature_drafts: List[FeatureDraftOut] = Field(default_factory=list)
-
-
-SymbolKind = Literal["module", "class", "function", "async_function"]
-LinkSource = Literal["reasoning_llm", "manual"]
-LinkReviewStatus = Literal["proposed", "accepted", "rejected"]
-
-
-SourceMetadataElementType = Literal[
-    "system", "core", "capability", "element", "supporting", "boundary"
-]
-SourceMetadataOperationKind = Literal[
-    "analysis", "read", "write", "mutation", "io", "orchestration",
-    "validation", "other",
-]
-
-
-class SourceMetadataOut(BaseModel):
-    """Author-written, source-anchored explanation copied from a docstring.
-
-    These facts are deterministic / source-authored and are kept separate from
-    reasoning-model interpretations.  ``origin`` is always ``source_authored``.
-    """
-
-    start_line: int
-    end_line: int
-    raw_block: str
-    role: Optional[str] = None
-    capability: Optional[str] = None
-    element_type: Optional[SourceMetadataElementType] = None
-    system_purpose: Optional[str] = None
-    operation_kind: Optional[SourceMetadataOperationKind] = None
-    consumers: List[str] = Field(default_factory=list)
-    state_effects: List[str] = Field(default_factory=list)
-    probe_value: Optional[str] = None
-    origin: Literal["source_authored"] = "source_authored"
-    # sha256 of the extracted explanation block (Issue #55); change signal only.
-    explanation_hash: Optional[str] = None
-
-
-class CodeSymbolOut(BaseModel):
-    id: int
-    snapshot_id: int
-    system_id: int
-    path: str
-    qualified_name: str
-    kind: SymbolKind
-    start_line: int
-    end_line: int
-    decorators: List[str] = Field(default_factory=list)
-    imports: List[str] = Field(default_factory=list)
-    docstring: Optional[str] = None
-    is_test: bool = False
-    is_pydantic_model: bool = False
-    route_path: Optional[str] = None
-    route_method: Optional[str] = None
-    component_id: Optional[str] = None
-    source_metadata: Optional[SourceMetadataOut] = None
-    # Source-hash provenance (Issue #55). All computed from the pinned snapshot;
-    # equality is only a change signal, not semantic equivalence.
-    file_content_hash: Optional[str] = None
-    symbol_source_hash: Optional[str] = None
-    symbol_body_hash: Optional[str] = None
-
-
-class ExplanationAnchorOut(BaseModel):
-    """A single source anchor an explanation depends on (Issue #55).
-
-    Bundles the deterministic provenance (file, symbol span, and hash types)
-    that downstream drift features compare against a newer snapshot.
-    """
-
-    id: int
-    snapshot_id: int
-    system_id: int
-    metadata_id: int
-    symbol_id: int
-    path: str
-    qualified_name: str
-    start_line: int
-    end_line: int
-    file_content_hash: Optional[str] = None
-    symbol_source_hash: Optional[str] = None
-    symbol_body_hash: Optional[str] = None
-    explanation_hash: Optional[str] = None
-
-
-class ExplanationAnchorsOut(BaseModel):
-    system_id: int
-    snapshot_id: int
-    anchor_count: int
-    anchors: List[ExplanationAnchorOut] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Source-backed capability hierarchy (Issue #56)
-# ---------------------------------------------------------------------------
-
-
-class HierarchyProvenanceOut(BaseModel):
-    """Provenance for a single hierarchy claim.
-
-    ``provenance_kind`` distinguishes source-authored explanation, deterministic
-    structural fact, and reasoning-model interpretation. ``decision_method`` is
-    the audit enum. Hashes tie the claim to the pinned snapshot (#55).
-    """
-
-    provenance_kind: ProvenanceKind
-    decision_method: DecisionMethod
-    path: Optional[str] = None
-    qualified_name: Optional[str] = None
-    start_line: Optional[int] = None
-    end_line: Optional[int] = None
-    file_content_hash: Optional[str] = None
-    symbol_source_hash: Optional[str] = None
-    explanation_hash: Optional[str] = None
-    symbol_id: Optional[int] = None
-    entrypoint_id: Optional[int] = None
-    # Stable logical entrypoint reference (#62). ``entrypoint_id`` above is the
-    # snapshot-local DB row id and is not safe for cross-snapshot linking. These
-    # carry the logical (type, id) so the dashboard can open the entrypoint in
-    # Flow Explorer without re-resolving the DB id.
-    entrypoint_type: Optional[str] = None
-    entrypoint_ref: Optional[str] = None
-    feature_id: Optional[str] = None
-    system_profile_draft_id: Optional[int] = None
-    provider: Optional[str] = None
-    model: Optional[str] = None
-
-
-class SupportingElementOut(BaseModel):
-    id: int
-    name: str
-    summary: str = ""
-    supporting_kind: Optional[str] = None
-    provenance: HierarchyProvenanceOut
-
-
-class CapabilityElementOut(BaseModel):
-    id: int
-    name: str
-    summary: str = ""
-    element_role: Optional[str] = None
-    operation_kind: Optional[str] = None
-    probe_value: Optional[str] = None
-    classification: Optional[str] = None  # classified | unclassified
-    provenance: HierarchyProvenanceOut
-
-
-class CapabilityOut(BaseModel):
-    id: int
-    capability_key: Optional[str] = None
-    name: str
-    summary: str = ""
-    provenance: HierarchyProvenanceOut
-    elements: List[CapabilityElementOut] = Field(default_factory=list)
-    supporting_elements: List[SupportingElementOut] = Field(default_factory=list)
-
-
-class CapabilityPurposeOut(BaseModel):
-    id: int
-    name: str
-    summary: str = ""
-    provenance: HierarchyProvenanceOut
-
-
-class CapabilityHierarchyOut(BaseModel):
-    system_id: int
-    snapshot_id: int
-    intelligence_run: Optional[IntelligenceRunOut] = None
-    purpose: Optional[CapabilityPurposeOut] = None
-    capabilities: List[CapabilityOut] = Field(default_factory=list)
-    unclassified_elements: List[CapabilityElementOut] = Field(default_factory=list)
-    unattached_supporting: List[SupportingElementOut] = Field(default_factory=list)
-    is_mock: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Explanation drift (Issue #57)
-# ---------------------------------------------------------------------------
-
-# Anchor-level uses fresh/stale/missing_source/unknown; aggregate levels add
-# partially_stale. Hash drift is a review trigger, not a correctness verdict.
-DriftStatus = Literal[
-    "fresh", "partially_stale", "stale", "missing_source", "unknown"
-]
-
-
-class AnchorDriftOut(BaseModel):
-    node_id: int
-    node_type: str
-    name: str
-    path: Optional[str] = None
-    qualified_name: Optional[str] = None
-    entrypoint_id: Optional[int] = None
-    status: DriftStatus
-    changed_hashes: List[str] = Field(default_factory=list)
-    captured_file_content_hash: Optional[str] = None
-    captured_symbol_source_hash: Optional[str] = None
-    captured_explanation_hash: Optional[str] = None
-    current_file_content_hash: Optional[str] = None
-    current_symbol_source_hash: Optional[str] = None
-    current_explanation_hash: Optional[str] = None
-
-
-class DriftCountsOut(BaseModel):
-    total: int = 0
-    fresh: int = 0
-    stale: int = 0
-    missing: int = 0
-    unknown: int = 0
-    symbol_deps_total: int = 0
-    symbol_deps_changed: int = 0
-    file_deps_total: int = 0
-    file_deps_changed: int = 0
-    explanation_blocks_total: int = 0
-    explanation_blocks_changed: int = 0
-    missing_anchors: int = 0
-    mismatch_ratio: float = 0.0
-
-
-class CapabilityDriftOut(BaseModel):
-    capability_id: int
-    capability_key: Optional[str] = None
-    name: str
-    status: DriftStatus
-    counts: DriftCountsOut
-    elements: List[AnchorDriftOut] = Field(default_factory=list)
-    supporting_elements: List[AnchorDriftOut] = Field(default_factory=list)
-
-
-class CapabilityHierarchyDriftOut(BaseModel):
-    system_id: int
-    base_snapshot_id: int
-    target_snapshot_id: int
-    intelligence_run: Optional[IntelligenceRunOut] = None
-    status: DriftStatus
-    counts: DriftCountsOut
-    target_indexed: bool = True
-    purpose: Optional[AnchorDriftOut] = None
-    capabilities: List[CapabilityDriftOut] = Field(default_factory=list)
-    unclassified_elements: List[AnchorDriftOut] = Field(default_factory=list)
-    unattached_supporting: List[AnchorDriftOut] = Field(default_factory=list)
-    is_review_recommended: bool = False
-    review_note: Optional[str] = None
-
-
-class SymbolIndexWarningOut(BaseModel):
-    path: str
-    message: str
-
-
-class SymbolIndexOut(BaseModel):
-    snapshot_id: int
-    system_id: int
-    symbol_count: int
-    warning_count: int
-    symbols: List[CodeSymbolOut] = Field(default_factory=list)
-    warnings: List[SymbolIndexWarningOut] = Field(default_factory=list)
-    intelligence_run: Optional[IntelligenceRunOut] = None
-
-
-class FeatureCodeLinkOut(BaseModel):
-    id: int
-    system_id: int
-    snapshot_id: int
-    intelligence_run_id: int
-    feature_id: str
-    symbol: CodeSymbolOut
-    relation_reason: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    source: LinkSource
-    review_status: LinkReviewStatus
-    provider: str
-    model: str
-    prompt_version: str
-    schema_version: str
-    is_stale: bool = False
-    created_at: float
-    updated_at: float
-
-
-class FeatureCodeLinksOut(BaseModel):
-    system_id: int
-    snapshot_id: Optional[int] = None
-    intelligence_run: Optional[IntelligenceRunOut] = None
-    links: List[FeatureCodeLinkOut] = Field(default_factory=list)
-    is_mock: bool = False
-
-
-class LinkReviewUpdate(BaseModel):
-    review_status: LinkReviewStatus
-
-
-ProbePointStatus = Literal["proposed", "approved", "rejected"]
-ProbePlanStatus = Literal["proposed", "approved", "rejected"]
-
-
-class ProbePointOut(BaseModel):
-    id: int
-    plan_id: int
-    system_id: int
-    component_id: str
-    feature_id: str
-    path: str
-    symbol: str
-    line_start: int
-    line_end: int
-    reason: str
-    recommended_mode: str
-    side_effect_risk: Literal["low", "medium", "high"]
-    replayability: str
-    denylist_hit: Optional[str] = None
-    status: ProbePointStatus = "proposed"
-    created_at: float
-    updated_at: float
-
-
-class ProbePlanOut(BaseModel):
-    id: int
-    system_id: int
-    snapshot_id: int
-    intelligence_run_id: int
-    feature_id: str
-    objective: str
-    status: ProbePlanStatus
-    origin: str = "manual"
-    avoid_reasons: List[str] = Field(default_factory=list)
-    probe_points: List[ProbePointOut] = Field(default_factory=list)
-    intelligence_run: Optional[IntelligenceRunOut] = None
-    is_mock: bool = False
-    created_at: float
-    updated_at: float
-
-
-class ProbePointStatusUpdate(BaseModel):
-    status: ProbePointStatus
-
-
-class ProbePatchApplyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    confirmed: Literal[True]
-    expected_commit_sha: str = Field(..., min_length=7, max_length=64)
-
-
-class ValidationCommandOut(BaseModel):
-    id: int
-    command: str
-    exit_code: int
-    duration_ms: float
-    stdout: str
-    stderr: str
-    stdout_truncated: bool = False
-    stderr_truncated: bool = False
-    timed_out: bool = False
-
-
-class ValidationRunOut(BaseModel):
-    id: int
-    patch_id: int
-    system_id: int
-    variant: str
-    worktree_path: str
-    overall_success: bool
-    total_duration_ms: float
-    trace_received: Optional[bool] = None
-    trace_status: str = "not_checked"
-    network_isolation: str = "not_requested"
-    cleanup_state: str = "not_attempted"
-    cleanup_error: Optional[str] = None
-    commands: List[ValidationCommandOut] = Field(default_factory=list)
-    error: Optional[str] = None
-    created_at: float
-
-
-class ProbePatchOut(BaseModel):
-    id: int
-    plan_id: int
-    system_id: int
-    snapshot_id: int
-    commit_sha: str
-    diff: str
-    worktree_path: str = ""
-    skipped: List[str] = Field(default_factory=list)
-    status: str
-    error: Optional[str] = None
-    cleanup_state: str = "not_attempted"
-    cleanup_error: Optional[str] = None
-    apply_status: str = "not_applied"
-    apply_error: Optional[str] = None
-    applied_at: Optional[float] = None
-    applied_by_user_id: Optional[int] = None
-    validation_runs: List[ValidationRunOut] = Field(default_factory=list)
-    created_at: float
-
-
-class ProbePlansListOut(BaseModel):
-    system_id: int
-    plans: List[ProbePlanOut] = Field(default_factory=list)
-    is_mock: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Probe Pattern lifecycle (Issue #168)
-# ---------------------------------------------------------------------------
-
-ProbePatternStatus = Literal["active", "stale", "archived", "superseded"]
-ProbePatternOrigin = Literal["scan", "probe_plan", "manual"]
-ReconcileClassification = Literal[
-    "exact_match", "moved_match", "changed_signature",
-    "split_or_merged", "missing", "unsafe",
-]
-ReconcileUserDecision = Literal["pending", "accepted", "rejected"]
-
-
-class InstrumentedProbeOut(BaseModel):
-    path: str
-    symbol: str
-    line_start: int
-    line_end: int
-    component_id: Optional[str] = None
-    docstring: Optional[str] = None
-    linked_plan_id: Optional[int] = None
-    linked_feature_id: Optional[str] = None
-    linked_objective: Optional[str] = None
-    linked_reason: Optional[str] = None
-    linked_recommended_mode: Optional[str] = None
-    pattern_ids: List[int] = Field(default_factory=list)
-
-
-class InstrumentationScanOut(BaseModel):
-    system_id: int
-    snapshot_id: int
-    commit_sha: str
-    probes: List[InstrumentedProbeOut] = Field(default_factory=list)
-
-
-class ProbePatternPointIn(BaseModel):
-    path: str
-    symbol: str
-    component_id: str = ""
-    reason: str = ""
-    recommended_mode: str = "trace"
-    side_effect_risk: Literal["low", "medium", "high"] = "low"
-    replayability: str = ""
-
-
-class ProbePatternCreateRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
-    feature_id: str = ""
-    capability: str = ""
-    objective: str = ""
-    description: str = ""
-    origin: ProbePatternOrigin = "manual"
-    source_plan_id: Optional[int] = None
-    points: List[ProbePatternPointIn] = Field(..., min_length=1)
-
-
-class ProbePatternUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: Optional[str] = Field(None, min_length=1, max_length=200)
-    feature_id: Optional[str] = None
-    capability: Optional[str] = None
-    objective: Optional[str] = None
-    description: Optional[str] = None
-    status: Optional[Literal["active", "archived"]] = None
-
-
-class ProbePatternPointOut(BaseModel):
-    id: int
-    pattern_id: int
-    system_id: int
-    component_id: str
-    path: str
-    symbol: str
-    line_start: int
-    line_end: int
-    reason: str
-    recommended_mode: str
-    side_effect_risk: str
-    replayability: str
-    signature: str = ""
-    symbol_source_hash: Optional[str] = None
-    symbol_body_hash: Optional[str] = None
-    docstring: Optional[str] = None
-    status: str = "saved"
-    removed_at: Optional[float] = None
-    created_at: float
-    updated_at: float
-
-
-class ProbePatternEventOut(BaseModel):
-    id: int
-    pattern_id: int
-    event_type: str
-    detail: dict = Field(default_factory=dict)
-    created_at: float
-
-
-class ReconcileEvidenceOut(BaseModel):
-    path: str
-    start_line: int
-    end_line: int
-    summary: str = ""
-
-
-class PatternInvestigationOut(BaseModel):
-    summary: str
-    recommendation: str
-    proposed_target_path: Optional[str] = None
-    proposed_target_symbol: Optional[str] = None
-    evidence: List[ReconcileEvidenceOut] = Field(default_factory=list)
-    is_mock: bool = False
-    created_at: float
-
-
-class ReconcilePointOut(BaseModel):
-    id: int
-    reconciliation_id: int
-    pattern_point_id: int
-    classification: ReconcileClassification
-    decision_method: Literal["deterministic", "reasoning_llm"]
-    target_path: Optional[str] = None
-    target_symbol: Optional[str] = None
-    target_line_start: Optional[int] = None
-    target_line_end: Optional[int] = None
-    confidence: float = 0.0
-    explanation: str = ""
-    hypothesis: str = ""
-    question: str = ""
-    evidence: List[ReconcileEvidenceOut] = Field(default_factory=list)
-    denylist_hit: Optional[str] = None
-    body_changed: bool = False
-    user_decision: ReconcileUserDecision = "pending"
-    decided_at: Optional[float] = None
-    investigation: Optional[PatternInvestigationOut] = None
-    created_at: float
-    updated_at: float
-
-
-class ProbePatternReconciliationOut(BaseModel):
-    id: int
-    pattern_id: int
-    system_id: int
-    snapshot_id: int
-    commit_sha: str
-    intelligence_run_id: Optional[int] = None
-    status: str
-    error: Optional[str] = None
-    summary: Dict[str, int] = Field(default_factory=dict)
-    points: List[ReconcilePointOut] = Field(default_factory=list)
-    intelligence_run: Optional[IntelligenceRunOut] = None
-    is_mock: bool = False
-    created_at: float
-
-
-class ProbeRemovalPatchOut(BaseModel):
-    id: int
-    pattern_id: int
-    system_id: int
-    snapshot_id: int
-    commit_sha: str
-    diff: str
-    skipped: List[str] = Field(default_factory=list)
-    status: str
-    error: Optional[str] = None
-    cleanup_state: str = "not_attempted"
-    cleanup_error: Optional[str] = None
-    apply_status: str = "not_applied"
-    apply_error: Optional[str] = None
-    applied_at: Optional[float] = None
-    applied_by_user_id: Optional[int] = None
-    created_at: float
-
-
-class ProbeRemovalPatchCreateRequest(BaseModel):
-    point_ids: Optional[List[int]] = None
-
-
-class ProbeRemovalPatchApplyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    confirmed: Literal[True]
-    expected_commit_sha: str = Field(..., min_length=7, max_length=64)
-
-
-class ReconcileDecisionRequest(BaseModel):
-    decision: Literal["accepted", "rejected"]
-
-
-class CreatePlanFromReconcileRequest(BaseModel):
-    objective: Optional[str] = None
-
-
-class ProbePatternOut(BaseModel):
-    id: int
-    system_id: int
-    name: str
-    feature_id: str = ""
-    capability: str = ""
-    objective: str = ""
-    description: str = ""
-    status: ProbePatternStatus = "active"
-    origin: ProbePatternOrigin = "manual"
-    source_plan_id: Optional[int] = None
-    source_snapshot_id: Optional[int] = None
-    source_commit_sha: str = ""
-    superseded_by_id: Optional[int] = None
-    last_used_at: Optional[float] = None
-    last_reconciled_at: Optional[float] = None
-    point_count: int = 0
-    removed_point_count: int = 0
-    points: List[ProbePatternPointOut] = Field(default_factory=list)
-    events: List[ProbePatternEventOut] = Field(default_factory=list)
-    latest_reconciliation: Optional[ProbePatternReconciliationOut] = None
-    pending_decision_count: int = 0
-    created_at: float
-    updated_at: float
-
-
-class ProbePatternsListOut(BaseModel):
-    system_id: int
-    patterns: List[ProbePatternOut] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Flow graph explorer (Issue #43)
-# ---------------------------------------------------------------------------
-
-
-# Dispatch types accepted by the flow-graph builder, plus the category aliases
-# (api/function) the API normalises for convenience (Issue #48).
-FlowEntrypointType = Literal[
-    "http_route", "public_function", "message_queue", "scheduled_job", "cli",
-    "api", "function",
-]
-FlowEntrypointCategory = Literal[
-    "api", "message_queue", "scheduled_job", "cli", "function",
-]
-FlowEdgeResolution = Literal["resolved", "inferred", "unresolved"]
-
-
-class EvidenceRefOut(BaseModel):
-    path: str
-    start_line: int
-    end_line: int
-    summary: str = ""
-
-
-class ProbePreviewOut(BaseModel):
-    recommended_mode: str
-    captured_data: List[str] = Field(default_factory=list)
-    redaction: List[str] = Field(default_factory=list)
-    replayability: str = ""
-    estimated_event_volume: str = ""
-    side_effect_risk: Literal["low", "medium", "high"] = "low"
-    denylist_hit: Optional[str] = None
-
-
-class FlowEntrypointOut(BaseModel):
-    entrypoint_type: FlowEntrypointType
-    entrypoint_id: str
-    label: str
-    path: str
-    qualified_name: str
-    line_start: int
-    line_end: int
-    component_id: Optional[str] = None
-    route_method: Optional[str] = None
-    route_path: Optional[str] = None
-    # Issue #48: backend-entrypoint classification metadata.
-    category: FlowEntrypointCategory = "function"
-    framework: Optional[str] = None
-    operation: Optional[str] = None
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-    evidence: List[EvidenceRefOut] = Field(default_factory=list)
-    # "deterministic" (AST) or "reasoning_llm" (extracted via an LLM-generated
-    # regex from "Scan API definitions").
-    source: str = "deterministic"
-
-
-class EntrypointCountsOut(BaseModel):
-    api: int = 0
-    message_queue: int = 0
-    scheduled_job: int = 0
-    cli: int = 0
-    function: int = 0
-
-
-class FlowEntrypointsOut(BaseModel):
-    system_id: int
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-    # Issue #51: Flow Explorer is backend-entrypoint-first. ``entrypoints``
-    # carries only backend entrypoints (api/message_queue/scheduled_job/cli);
-    # the public-function fallback is returned separately in ``functions`` and
-    # is only populated when explicitly requested (Advanced). ``total`` is the
-    # backend entrypoint count before any category/q filtering ("N of M").
-    total: int = 0
-    entrypoints: List[FlowEntrypointOut] = Field(default_factory=list)
-    functions: List[FlowEntrypointOut] = Field(default_factory=list)
-    counts: EntrypointCountsOut = Field(default_factory=EntrypointCountsOut)
-    indexed_function_count: int = 0
-    has_backend_entrypoints: bool = False
-    frameworks: List[str] = Field(default_factory=list)
-    # Deterministic reasons surfaced when backend discovery is thin, so the UI
-    # never silently dumps a giant raw-function list as the intended UX.
-    diagnostics: List[str] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# API role cards (Issue #58) â€” Flow Explorer developer context.
-# Consumes the #56 capability hierarchy and #57 drift; invents no new semantics.
-# ---------------------------------------------------------------------------
-
-
-class ApiRoleCardOut(BaseModel):
-    # Identity: joins to FlowEntrypointOut by (entrypoint_type, entrypoint_id).
-    entrypoint_type: str
-    entrypoint_id: str
-    label: str
-    category: FlowEntrypointCategory = "function"
-    route_method: Optional[str] = None
-    route_path: Optional[str] = None
-    operation: Optional[str] = None
-    framework: Optional[str] = None
-    source: str = "deterministic"  # deterministic (AST) | reasoning_llm (scan)
-    # Whether a handler symbol resolved -> whether an executable flow graph is
-    # supported. LLM-scan entries without a handler must not imply graph support.
-    handler_resolved: bool = False
-    classification: Literal["classified", "unclassified", "unknown"] = "unknown"
-    capability_key: Optional[str] = None
-    capability_name: Optional[str] = None
-    element_type: Optional[str] = None  # core | element | supporting (from #54)
-    role: Optional[str] = None
-    operation_kind: Optional[str] = None
-    probe_value: Optional[str] = None
-    consumers: List[str] = Field(default_factory=list)
-    state_effects: List[str] = Field(default_factory=list)
-    boundaries: List[str] = Field(default_factory=list)
-    flows_through: List[str] = Field(default_factory=list)
-    # Distinct provenance kinds backing the card, e.g. ["source_authored",
-    # "structural"] or ["reasoning_llm", "structural"].
-    provenance_kinds: List[ProvenanceKind] = Field(default_factory=list)
-    # Drift (#57). Capability-level for classified cards, node-level otherwise.
-    drift_status: Optional[
-        Literal["fresh", "partially_stale", "stale", "missing_source", "unknown"]
-    ] = None
-    drift_changed_anchors: int = 0
-    drift_total_anchors: int = 0
-    drift_review_recommended: bool = False
-    # Review attention for the card itself (distinct from freshness): set when
-    # an LLM-scan entry has no resolved handler/flow.
-    review_needed: bool = False
-    review_reason: Optional[str] = None
-    node_id: Optional[int] = None
-
-
-class ApiRoleCardsOut(BaseModel):
-    system_id: int
-    snapshot_id: Optional[int] = None
-    hierarchy_run: Optional[IntelligenceRunOut] = None
-    base_snapshot_id: Optional[int] = None
-    target_snapshot_id: Optional[int] = None
-    drift_available: bool = False
-    cards: List[ApiRoleCardOut] = Field(default_factory=list)
-
-
-class RefreshProposalRequest(BaseModel):
-    """Identify the stale hierarchy node / API role card to refresh.
-
-    Provide either ``node_id`` (a capability hierarchy node) or the logical
-    ``(entrypoint_type, entrypoint_id)`` of an API role card.
-    """
-
-    node_id: Optional[int] = None
-    entrypoint_type: Optional[str] = None
-    entrypoint_id: Optional[str] = None
-    target_snapshot_id: Optional[int] = None
-
-
-class ExplanationRefreshProposalOut(BaseModel):
-    id: Optional[int] = None
-    node_id: Optional[int] = None
-    node_type: str = ""
-    name: str = ""
-    entrypoint_type: Optional[str] = None
-    entrypoint_id: Optional[str] = None
-    path: Optional[str] = None
-    qualified_name: Optional[str] = None
-    drift_status: DriftStatus = "unknown"
-    drift_reason: str = ""
-    changed_hashes: List[str] = Field(default_factory=list)
-    # Source-authored explanation as it exists in the target repo (unchanged).
-    old_explanation: str = ""
-    # Reasoning-model suggestion. Never written to the target repository.
-    proposed_explanation: Optional[str] = None
-    proposed_metadata: Optional[Dict[str, Any]] = None
-    summary_of_changes: Optional[str] = None
-    confidence: Optional[float] = None
-    captured_file_content_hash: Optional[str] = None
-    captured_symbol_source_hash: Optional[str] = None
-    captured_explanation_hash: Optional[str] = None
-    current_file_content_hash: Optional[str] = None
-    current_symbol_source_hash: Optional[str] = None
-    current_explanation_hash: Optional[str] = None
-    status: Literal["proposed", "failed"] = "proposed"
-    is_mock: bool = False
-    provider: str = ""
-    model: str = ""
-    decision_method: str = "reasoning_llm"
-    created_at: Optional[float] = None
-
-
-class ExplanationRefreshOut(BaseModel):
-    system_id: int
-    base_snapshot_id: Optional[int] = None
-    target_snapshot_id: Optional[int] = None
-    intelligence_run: Optional[IntelligenceRunOut] = None
-    status: Literal["proposed", "failed"] = "proposed"
-    error: Optional[str] = None
-    # Always true for proposals: a developer must review and apply to source.
-    review_required: bool = True
-    review_note: str = ""
-    proposal: Optional[ExplanationRefreshProposalOut] = None
-
-
-class ExplanationRefreshListOut(BaseModel):
-    system_id: int
-    review_note: str = ""
-    proposals: List[ExplanationRefreshProposalOut] = Field(default_factory=list)
-
-
-class ApiScanRequest(BaseModel):
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-
-
-class ApiScanPatternOut(BaseModel):
-    id: Optional[int] = None
-    file_glob: str
-    regex: str
-    method_group: Optional[str] = None
-    path_group: Optional[str] = None
-    method_constant: Optional[str] = None
-    framework: str
-    language: str
-    reason: str
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    match_count: int = 0
-    examples: List[EvidenceRefOut] = Field(default_factory=list)
-
-
-class ApiScanResultOut(BaseModel):
-    system_id: int
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-    run_id: Optional[int] = None
-    status: str = "completed"
-    decision_method: str = "reasoning_llm"
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    is_mock: bool = False
-    error: Optional[str] = None
-    # Reviewable LLM-generated regexes and the entrypoints they extracted.
-    patterns: List[ApiScanPatternOut] = Field(default_factory=list)
-    extracted_count: int = 0
-    frameworks: List[str] = Field(default_factory=list)
-    diagnostics: List[str] = Field(default_factory=list)
-
-
-class FlowNodeOut(BaseModel):
-    node_id: str
-    node_type: str
-    symbol_id: Optional[int] = None
-    qualified_name: str
-    path: str
-    line_start: int
-    line_end: int
-    component_id: Optional[str] = None
-    probe_capabilities: List[str] = Field(default_factory=list)
-    risk: Literal["low", "medium", "high"] = "low"
-    denylist_hit: Optional[str] = None
-    evidence: List[EvidenceRefOut] = Field(default_factory=list)
-    # Phase 2: external boundary classification.
-    boundary_kind: Optional[str] = None
-    is_external: bool = False
-    # Phase 2/3: runtime overlay from real traces.
-    trace_count: int = 0
-    error_count: int = 0
-    evaluation_pass: int = 0
-    evaluation_fail: int = 0
-    observed: bool = False
-    # Issue #46: pre-selection preview metadata (None for external nodes).
-    preview: Optional[ProbePreviewOut] = None
-
-
-class FlowEdgeOut(BaseModel):
-    edge_id: str
-    source_node_id: str
-    target_node_id: Optional[str] = None
-    edge_type: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    resolution: FlowEdgeResolution
-    callee_name: str
-    line: int
-    evidence: List[EvidenceRefOut] = Field(default_factory=list)
-    # Issue #46: pre-selection preview for observing this call boundary.
-    preview: Optional[ProbePreviewOut] = None
-
-
-class CandidateFlowOut(BaseModel):
-    flow_id: str
-    title: str
-    summary: str
-    entrypoint_node_id: str
-    node_ids: List[str] = Field(default_factory=list)
-    node_count: int
-    max_depth: int
-    confidence: float = Field(ge=0.0, le=1.0)
-    unresolved_edge_count: int
-    external_boundary_count: int = 0
-    observed_node_count: int = 0
-    unobserved_node_ids: List[str] = Field(default_factory=list)
-
-
-class FlowGraphOut(BaseModel):
-    system_id: int
-    snapshot_id: int
-    commit_sha: str
-    entrypoint: FlowEntrypointOut
-    nodes: List[FlowNodeOut] = Field(default_factory=list)
-    edges: List[FlowEdgeOut] = Field(default_factory=list)
-    candidate_paths: List[CandidateFlowOut] = Field(default_factory=list)
-    diagnostics: List[str] = Field(default_factory=list)
-    truncated: bool = False
-
-
-class FlowGraphRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    entrypoint_type: FlowEntrypointType
-    entrypoint_id: str = Field(..., min_length=1)
-    max_depth: int = Field(default=8, ge=1, le=32)
-    max_nodes: int = Field(default=100, ge=1, le=500)
-    # Issue #46: optional pinning. When provided they must match the latest
-    # ready snapshot or the request is rejected as stale (409).
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-
-
-class FlowOverlaySelection(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    kind: Literal["entity", "correlation", "flow", "analyzer"]
-    entity_type: Optional[str] = None
-    entity_id: Optional[str] = None
-    correlation_id: Optional[str] = None
-    flow_id: Optional[str] = None
-    analyzer_id: Optional[int] = None
-
-
-class FlowOverlayRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    entrypoint_type: FlowEntrypointType
-    entrypoint_id: str = Field(..., min_length=1)
-    max_depth: int = Field(default=8, ge=1, le=32)
-    max_nodes: int = Field(default=100, ge=1, le=500)
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-    selection: FlowOverlaySelection
-
-
-class FlowOverlayNode(BaseModel):
-    node_id: str
-    component_id: Optional[str] = None
-    observable: bool  # has a component_id (an instrumented probe point)
-    observed: bool
-    observation_count: int = 0
-    last_observed_at: Optional[float] = None
-
-
-class FlowOverlayEdge(BaseModel):
-    edge_id: str
-    source_node_id: str
-    target_node_id: Optional[str] = None
-    source_component_id: Optional[str] = None
-    target_component_id: Optional[str] = None
-    observed_transition: bool = False
-
-
-class FlowDivergence(BaseModel):
-    source_component_id: str
-    target_component_id: str
-    count: int
-
-
-class FlowOverlayOut(BaseModel):
-    selection: Dict[str, Any] = Field(default_factory=dict)
-    nodes: List[FlowOverlayNode] = Field(default_factory=list)
-    edges: List[FlowOverlayEdge] = Field(default_factory=list)
-    divergences: List[FlowDivergence] = Field(default_factory=list)
-    observed_component_ids: List[str] = Field(default_factory=list)
-    unmatched_component_ids: List[str] = Field(default_factory=list)
-    observed_trace_count: int = 0
-
-
-class FlowProbeSelection(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    # Issue #46: node selections instrument a symbol; edge selections observe
-    # a call boundary on the in-repo caller.
-    target_type: Literal["node", "edge"] = "node"
-    node_id: Optional[str] = None
-    edge_id: Optional[str] = None
-    observation: Literal["input", "output", "boundary"] = "output"
-    mode_preference: Literal["trace", "shadow", "off"] = "trace"
-
-    @model_validator(mode="after")
-    def _check_target(self) -> "FlowProbeSelection":
-        if self.target_type == "node" and not self.node_id:
-            raise ValueError("node_id is required for node selections")
-        if self.target_type == "edge" and not self.edge_id:
-            raise ValueError("edge_id is required for edge selections")
-        return self
-
-
-class ProbePlanFromFlowRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    entrypoint_type: FlowEntrypointType
-    entrypoint_id: str = Field(..., min_length=1)
-    objective: str = ""
-    selections: List[FlowProbeSelection] = Field(..., min_length=1)
-    max_depth: int = Field(default=8, ge=1, le=32)
-    max_nodes: int = Field(default=100, ge=1, le=500)
-    # Issue #46: pin the plan to the graph the user actually reviewed.
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-
-
-Role = Literal["admin", "user"]
-TokenKind = Literal["session", "api"]
-# Issue #368: a token's lifecycle status is a finite set decided server-side
-# from `revoked` + `expires_at` + the current clock (`app/token_status.py`).
-# The Dashboard renders it and never re-derives it.
-TokenStatus = Literal["active", "expiring_soon", "expired", "revoked"]
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class TokenResponse(BaseModel):
-    expires_at: Optional[float] = None
-
-
-class UserCreate(BaseModel):
-    username: str = Field(..., min_length=1)
-    password: str = Field(..., min_length=1)
-    role: Role = "user"
-
-
-class UserOut(BaseModel):
-    id: int
-    username: str
-    role: Role
-    is_active: bool
-    created_at: float
-
-
-class MeResponse(BaseModel):
-    user: Optional[UserOut] = None
-    auth: str = Field(..., description="token | legacy_api_key | anonymous")
-    system_id: Optional[int] = None
-    transport: str = Field(
-        ..., description="authorization | x_api_key | cookie | legacy_api_key | anonymous"
-    )
-
-
-class BootstrapStatusOut(BaseModel):
-    """Issue #265: deterministic pre-login / pre-System "phase 0" facts.
-
-    Callable without auth and without a System. Carries no secrets --
-    booleans/finite tokens only, never a username, key value, path, or
-    hostname.
-    """
-
-    admin_exists: bool
-    auth_mode: str = Field(..., description="anonymous | user")
-    llm_configured: bool
-    environment: str = Field(..., description="development | production")
-
-
-class TokenCreate(BaseModel):
-    name: Optional[str] = None
-    system_id: Optional[int] = None
-    user_id: Optional[int] = Field(
-        default=None, description="owner of the token; defaults to the caller"
-    )
-    expires_in_days: Optional[int] = Field(default=None, ge=1)
-
-
-class SelfTokenCreate(BaseModel):
-    """Token issuance for the caller's own account (no user_id override)."""
-
-    name: Optional[str] = None
-    system_id: Optional[int] = None
-    expires_in_days: Optional[int] = Field(default=None, ge=1)
-
-
-class PasswordResetRequest(BaseModel):
-    password: str = Field(..., min_length=1)
-
-
-class RoleUpdate(BaseModel):
-    role: Role
-
-
-class TokenOut(BaseModel):
-    id: int
-    name: Optional[str] = None
-    kind: TokenKind
-    user_id: int
-    system_id: Optional[int] = None
-    revoked: bool
-    created_at: float
-    expires_at: Optional[float] = None
-    status: TokenStatus = Field(
-        ...,
-        description=(
-            "active | expiring_soon | expired | revoked -- Issue #368. Decided "
-            "server-side by app/token_status.classify_token_status against the "
-            "response's own clock; never re-derive it client-side."
-        ),
-    )
-    expires_in_seconds: Optional[float] = Field(
-        default=None,
-        description=(
-            "Seconds until expiry at the moment `status` was decided, clamped "
-            "at 0; None when the token has no expiry."
-        ),
-    )
-
-
-class TokenCreateResponse(TokenOut):
-    token: str = Field(..., description="raw token, shown only once")
-
-
-WorkspaceMessageRole = Literal["user", "assistant", "system"]
-WorkspaceContextItemType = Literal[
-    "feature", "component", "trace", "experiment", "probe_plan", "analyzer_run"
-]
-WorkspaceProposalStatus = Literal[
-    "proposed", "accepted", "rejected", "deferred", "superseded"
-]
-WorkspaceDecisionType = Literal["accepted", "rejected", "deferred"]
-
-
-class WorkspaceCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str = Field(..., min_length=1, max_length=200)
-    focus: str = Field(default="", max_length=500)
-    summary: str = Field(default="", max_length=5000)
-
-
-class WorkspaceOut(BaseModel):
-    id: int
-    system_id: int
-    title: str
-    focus: str
-    status: str
-    summary: str
-    created_at: float
-    updated_at: float
-
-
-class WorkspaceContextItemCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    item_type: WorkspaceContextItemType
-    item_id: str = Field(..., min_length=1, max_length=200)
-    label: str = Field(default="", max_length=300)
-
-
-class WorkspaceContextItemOut(BaseModel):
-    id: int
-    workspace_id: int
-    item_type: str
-    item_id: str
-    label: str
-    created_at: float
-
-
-class WorkspaceProposalInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    proposal_type: str = Field(..., min_length=1, max_length=100)
-    title: str = Field(default="", max_length=300)
-    body: dict[str, Any] = Field(default_factory=dict)
-
-
-class WorkspaceMessageCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    role: WorkspaceMessageRole
-    content: str = Field(..., min_length=1, max_length=20_000)
-    context_metadata: dict[str, Any] = Field(default_factory=dict)
-    proposals: List[WorkspaceProposalInput] = Field(default_factory=list)
-
-
-class WorkspaceMessageOut(BaseModel):
-    id: int
-    workspace_id: int
-    role: str
-    content: str
-    context_metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: float
-
-
-class WorkspaceDecisionOut(BaseModel):
-    id: int
-    proposal_id: int
-    decision: WorkspaceDecisionType
-    reason: str
-    decided_by_user_id: Optional[int] = None
-    created_at: float
-
-
-class WorkspaceProposalOut(BaseModel):
-    id: int
-    workspace_id: int
-    message_id: Optional[int] = None
-    proposal_type: str
-    title: str
-    body: dict[str, Any] = Field(default_factory=dict)
-    status: WorkspaceProposalStatus
-    decisions: List[WorkspaceDecisionOut] = Field(default_factory=list)
-    created_at: float
-    updated_at: float
-
-
-class WorkspaceProposalUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: Optional[str] = Field(default=None, max_length=300)
-    body: Optional[dict[str, Any]] = None
-
-
-class WorkspaceDecisionCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str = Field(default="", max_length=2000)
-
-
-class WorkspaceDetailOut(WorkspaceOut):
-    messages: List[WorkspaceMessageOut] = Field(default_factory=list)
-    context_items: List[WorkspaceContextItemOut] = Field(default_factory=list)
-    proposals: List[WorkspaceProposalOut] = Field(default_factory=list)
-
-
-# --- Decision Workspace Context Pack (Issue #36) ---------------------------
-#
-# Deterministic, no-LLM digests of existing data, scoped to the workspace's
-# pinned context items. Every digest carries enough source identifiers to
-# trace a finding back to its origin row.
-
-WorkspaceEvidenceSourceType = Literal[
-    "feature_draft",
-    "feature_code_link",
-    "component_profile",
-    "trace",
-    "evaluation_result",
-    "probe_point",
-    "experiment_variant",
-]
-
-
-class WorkspaceEvidenceRef(BaseModel):
-    source_type: WorkspaceEvidenceSourceType
-    source_id: str
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-    path: Optional[str] = None
-    start_line: Optional[int] = None
-    end_line: Optional[int] = None
-    summary: str = ""
-
-
-class WorkspaceSystemSummary(BaseModel):
-    system_id: int
-    name: str = ""
-    environment: str = ""
-    purpose: str = ""
-    target_users: str = ""
-
-
-class WorkspaceFocusSummary(BaseModel):
-    title: str = ""
-    focus: str = ""
-    summary: str = ""
-
-
-class WorkspaceRepositorySummary(BaseModel):
-    snapshot_id: int
-    commit_sha: str
-    repo_path: str
-    file_count: int
-    status: str
-
-
-class WorkspaceFeatureDigest(BaseModel):
-    feature_id: str
-    name: str = ""
-    summary: str = ""
-    user_value: str = ""
-    success_criteria: List[str] = Field(default_factory=list)
-    risks: List[str] = Field(default_factory=list)
-    accepted_code_link_count: int = 0
-    decision_method: DecisionMethod = "reasoning_llm"
-    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
-
-
-class WorkspaceComponentDigest(BaseModel):
-    component_id: str
-    purpose: str = ""
-    responsibility: str = ""
-    expected_input: str = ""
-    expected_output: str = ""
-    failure_impact: str = ""
-    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
-
-
-class WorkspaceTraceDigest(BaseModel):
-    component_id: str
-    trace_count: int = 0
-    period_start: Optional[float] = None
-    period_end: Optional[float] = None
-    error_count: int = 0
-    eval_failed_count: int = 0
-    representative_input: Optional[str] = None
-    representative_output: Optional[str] = None
-    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
-
-
-class WorkspaceEvaluationDigest(BaseModel):
-    component_id: str
-    criterion_count: int = 0
-    passed_count: int = 0
-    failed_count: int = 0
-    top_failure_reasons: List[str] = Field(default_factory=list)
-    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
-
-
-class WorkspaceProbePointSummary(BaseModel):
-    component_id: str
-    symbol: str
-    path: str
-    recommended_mode: str
-    side_effect_risk: str
-    status: str
-
-
-class WorkspaceProbePlanSummary(BaseModel):
-    plan_id: int
-    feature_id: str
-    objective: str = ""
-    status: str = ""
-    probe_points: List[WorkspaceProbePointSummary] = Field(default_factory=list)
-    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
-
-
-class WorkspaceExperimentVariantSummary(BaseModel):
-    variant_key: str
-    label: str
-    is_baseline: bool
-    status: str
-    metrics: dict[str, Any] = Field(default_factory=dict)
-
-
-class WorkspaceExperimentDigest(BaseModel):
-    experiment_id: int
-    feature_id: str
-    objective: str = ""
-    baseline_commit: str = ""
-    status: str = ""
-    variants: List[WorkspaceExperimentVariantSummary] = Field(default_factory=list)
-    analysis_status: str = "not_requested"
-    analysis_narrative: Optional[str] = None
-    analysis_recommendation_variant_key: Optional[str] = None
-    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
-
-
-class WorkspaceHumanDecisionDigest(BaseModel):
-    source_type: Literal["experiment"] = "experiment"
-    source_id: str
-    decision: str
-    variant_key: Optional[str] = None
-    note: str = ""
-
-
-class WorkspaceContextPack(BaseModel):
-    system: WorkspaceSystemSummary
-    focus: Optional[WorkspaceFocusSummary] = None
-    repository: Optional[WorkspaceRepositorySummary] = None
-    features: List[WorkspaceFeatureDigest] = Field(default_factory=list)
-    components: List[WorkspaceComponentDigest] = Field(default_factory=list)
-    traces: List[WorkspaceTraceDigest] = Field(default_factory=list)
-    evaluations: List[WorkspaceEvaluationDigest] = Field(default_factory=list)
-    probe_plans: List[WorkspaceProbePlanSummary] = Field(default_factory=list)
-    experiments: List[WorkspaceExperimentDigest] = Field(default_factory=list)
-    human_decisions: List[WorkspaceHumanDecisionDigest] = Field(default_factory=list)
-    evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
-    missing_information: List[str] = Field(default_factory=list)
-
-
-# --- Decision Workspace structured agent turn (Issue #37) ------------------
-
-
-class WorkspaceContextRef(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: WorkspaceContextItemType
-    id: str = Field(..., min_length=1, max_length=200)
-
-
-class WorkspaceAgentTurnCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    message: str = Field(..., min_length=1, max_length=20_000)
-    context_refs: List[WorkspaceContextRef] = Field(default_factory=list, max_length=20)
-
-
-class WorkspaceAgentTurnOut(BaseModel):
-    user_message: WorkspaceMessageOut
-    assistant_message: Optional[WorkspaceMessageOut] = None
-    proposals: List[WorkspaceProposalOut] = Field(default_factory=list)
-    error: Optional[str] = None
-
-
-# --- Proposal-to-draft handoff (Issue #39) ----------------------------------
-#
-# Converts an *accepted* proposal into a deterministic prefill payload for an
-# existing screen (Probe Planner or Experiments). This never creates a probe
-# plan, probe point, or experiment itself -- only a small tracked record the
-# destination screen reads to prefill its existing, user-driven create flow.
-
-WorkspaceProposalDraftType = Literal["probe_plan_draft", "experiment_draft"]
-
-
-class WorkspaceProposalDraftOut(BaseModel):
-    id: int
-    workspace_id: int
-    proposal_id: int
-    system_id: int
-    draft_type: WorkspaceProposalDraftType
-    target_screen: str
-    payload: dict[str, Any] = Field(default_factory=dict)
-    missing_fields: List[str] = Field(default_factory=list)
-    created_at: float
-
-
-# --- System-understanding interview persistence (Issue #67) -----------------
-#
-# A pure persistence + CRUD contract for the #66 conversational metadata/probe
-# authoring flow. No LLM call and no worktree write happen here; later sibling
-# issues build dialogue, approval transitions, materialization, and the UI on
-# top of these models. The combined per-symbol proposal carries both the
-# proposed `probe-agent:` docstring metadata block (#54 vocabulary) and the
-# associated probe-plan fields (#25 model).
-
-InterviewSessionStatus = Literal["open", "proposals_ready", "materialized", "closed"]
-InterviewMessageRole = Literal["user", "assistant", "system"]
-
-# Issue #291: answerable knowledge areas / handoff finite sets. Defined here
-# (ahead of InterviewSessionOut/InterviewQaOut which reference KnowledgeArea)
-# rather than down by the rest of the Issue #291 models further below.
-KnowledgeArea = Literal[
-    "product_intent", "domain_rule", "operations", "implementation", "security",
-]
-HandoffOriginKind = Literal["qa", "review_item"]
-HandoffPriority = Literal["low", "normal", "high"]
-HandoffStatus = Literal["pending", "answered", "returned", "cancelled"]
-
-InterviewStage = Literal[
-    "understanding_initialized",
-    "purpose_confirmation",
-    "capability_confirmation",
-    "element_classification",
-    "api_boundary_mapping",
-    "probe_flow_selection",
-    "proposal_generation",
-]
-InterviewProposalApprovalState = Literal[
-    "proposed", "approved", "rejected", "edited", "needs_review"
-]
-# Finite #54 vocabulary for a single state_effects entry.
-SourceMetadataStateEffect = Literal[
-    "none",
-    "database-read",
-    "database-write",
-    "network",
-    "filesystem",
-    "cache",
-    "external-api",
-    "queue",
-]
-ProbeRecommendedMode = Literal["trace", "shadow"]
-ProbeSideEffectRisk = Literal["none", "low", "medium", "high"]
-ProbeReplayability = Literal["safe", "caution", "unsafe"]
-
-
-class InterviewSessionCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    snapshot_id: int
-    title: str = Field(default="", max_length=200)
-    focus: str = Field(default="", max_length=500)
-
-
-class InterviewSessionOut(BaseModel):
-    id: int
-    system_id: int
-    snapshot_id: int
-    snapshot_commit_sha: Optional[str] = None
-    title: str
-    focus: str
-    status: InterviewSessionStatus
-    stage: Optional[InterviewStage] = "understanding_initialized"
-    current_understanding: Optional[Dict[str, Any]] = None
-    gap_analysis: Optional[List[Dict[str, Any]]] = None
-    open_questions: Optional[List[Dict[str, Any]]] = None
-    user_intent: Optional[str] = None
-    last_error: Optional[str] = None
-    understanding_confirmed_at: Optional[float] = None
-    understanding_confirmed_by: Optional[str] = None
-    # Issue #312: a later Understanding revision must be manually confirmed
-    # into the canonical capability graph before it can drive scoped
-    # Alignment carry-over.
-    capability_graph_confirmed_revision_id: Optional[int] = None
-    capability_graph_confirmation_required: bool = False
-    # Issue #129: set when an answered interview_qa question is corrected.
-    # Never cleared automatically by the revision itself â€” only a successful
-    # understanding rebuild (update-understanding) clears it.
-    answers_revised_at: Optional[float] = None
-    # Issue #229/#263: deterministic mirror of the update-understanding 409
-    # gate (`routes.interview._understanding_update_blocked`) â€” the single
-    # source of truth for both. The Dashboard uses this instead of
-    # re-deriving the confirmed-proposal-stage rebuild condition locally, so
-    # UI availability can never drift from what the API will actually allow.
-    understanding_update_available: bool = True
-    materialization_diff: Optional[str] = None
-    materialization_ref: Optional[str] = None
-    materialized_at: Optional[float] = None
-    # Issue #291: which knowledge areas the developer can answer RIGHT NOW
-    # (no role inference). Empty means no filtering -- the pre-#291 default
-    # of showing every question, never "every area selected".
-    answerable_areas: List[KnowledgeArea] = Field(default_factory=list)
-    created_at: float
-    updated_at: float
-
-
-class InterviewMessageCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    role: InterviewMessageRole
-    content: str = Field(..., min_length=1, max_length=20_000)
-    intelligence_run_id: Optional[int] = None
-
-
-class InterviewMessageOut(BaseModel):
-    id: int
-    session_id: int
-    role: InterviewMessageRole
-    content: str
-    intelligence_run_id: Optional[int] = None
-    created_at: float
-
-
-class InterviewProposalMetadataBlock(BaseModel):
-    """Proposed `probe-agent:` docstring metadata block for one symbol.
-
-    Finite fields (``element_type`` / ``operation_kind`` / ``state_effects``)
-    are validated against #54's vocabulary; the rest are free text per #54.
-    This is an LLM-authored *proposal*, so unlike ``SourceMetadataOut`` it
-    carries no ``origin``/``explanation_hash``.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    role: Optional[str] = Field(default=None, max_length=2000)
-    capability: Optional[str] = Field(default=None, max_length=2000)
-    system_purpose: Optional[str] = Field(default=None, max_length=2000)
-    probe_value: Optional[str] = Field(default=None, max_length=2000)
-    element_type: Optional[SourceMetadataElementType] = None
-    operation_kind: Optional[SourceMetadataOperationKind] = None
-    consumers: List[str] = Field(default_factory=list)
-    state_effects: List[SourceMetadataStateEffect] = Field(default_factory=list)
-
-
-class InterviewProposalProbePlan(BaseModel):
-    """Proposed probe-plan fields for the same symbol (#25 model)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    feature_id: str = Field(default="", max_length=200)
-    objective: str = Field(default="", max_length=2000)
-    reason: str = Field(default="", max_length=2000)
-    recommended_mode: ProbeRecommendedMode = "trace"
-    side_effect_risk: ProbeSideEffectRisk = "low"
-    replayability: ProbeReplayability = "safe"
-
-
-class InterviewProposalItem(BaseModel):
-    """One combined per-symbol proposal in a create request."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    path: str = Field(..., min_length=1, max_length=500)
-    qualified_name: str = Field(..., min_length=1, max_length=500)
-    symbol_id: Optional[int] = None
-    metadata: InterviewProposalMetadataBlock
-    probe_plan: InterviewProposalProbePlan
-    graph_node_id: Optional[str] = None
-    capability_name: Optional[str] = None
-    evidence_summary: Optional[str] = None
-    proposal_confidence: Optional[float] = None
-
-
-class InterviewRunAudit(BaseModel):
-    """Reasoning-run audit metadata for a batch of proposals.
-
-    Persisted as an ``intelligence_runs`` row (the shared audit store) and
-    linked from each proposal. ``decision_method`` is fixed to ``reasoning_llm``
-    for this issue; ``manual`` is set only by the later approval issue.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    provider: str = Field(..., min_length=1, max_length=200)
-    model: str = Field(..., min_length=1, max_length=200)
-    prompt_version: str = Field(..., min_length=1, max_length=100)
-    schema_version: str = Field(..., min_length=1, max_length=100)
-    is_mock: bool = False
-
-
-class InterviewProposalsCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    audit: InterviewRunAudit
-    message_id: Optional[int] = None
-    proposals: List[InterviewProposalItem] = Field(..., min_length=1)
-
-
-class InterviewProposalOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    snapshot_id: int
-    message_id: Optional[int] = None
-    intelligence_run_id: int
-    symbol_id: Optional[int] = None
-    path: str
-    qualified_name: str
-    metadata: InterviewProposalMetadataBlock
-    probe_plan: InterviewProposalProbePlan
-    decision_method: DecisionMethod
-    graph_node_id: Optional[str] = None
-    capability_name: Optional[str] = None
-    evidence_summary: Optional[str] = None
-    proposal_confidence: Optional[float] = None
-    approval_state: InterviewProposalApprovalState
-    is_mock: bool = False
-    intelligence_run: Optional[IntelligenceRunOut] = None
-    created_at: float
-    updated_at: float
-
-
-class InterviewSessionDetailOut(InterviewSessionOut):
-    messages: List[InterviewMessageOut] = Field(default_factory=list)
-    proposals: List[InterviewProposalOut] = Field(default_factory=list)
-
-
-class InterviewSnapshotRebaseRequest(BaseModel):
-    """Move an existing Interview session to a newer snapshot.
-
-    The operation preserves Q&A and understanding text, but reconciles proposal
-    review state against source anchors before any later materialization.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    target_snapshot_id: Optional[int] = None
-    actor: str = Field(default="dashboard", max_length=200)
-
-
-class InterviewSnapshotRebaseOut(BaseModel):
-    session_id: int
-    system_id: int
-    from_snapshot_id: int
-    to_snapshot_id: int
-    proposals_preserved: int = 0
-    proposals_marked_needs_review: int = 0
-    proposals_missing_source: int = 0
-    proposals_changed_source: int = 0
-    message: str = ""
-    session: InterviewSessionOut
-
-
-# --- Interview Context Pack (Issue #68) -------------------------------------
-#
-# Deterministic, no-LLM context assembly for the system-understanding
-# interview. Reads indexed symbols, entrypoints, existing probe-agent:
-# metadata, and capability hierarchy classification from a pinned snapshot
-# and flags which items are already classified vs. unclassified (blank-page).
-# Every item carries a snapshot-relative evidence location. Output respects
-# an LLM context budget independent of snapshot storage.
-
-InterviewSymbolClassification = Literal["classified", "unclassified"]
-
-
-class InterviewEvidenceLocation(BaseModel):
-    snapshot_id: int
-    path: str
-    qualified_name: str
-    start_line: int
-    end_line: int
-
-
-class InterviewSymbolItem(BaseModel):
-    symbol_id: int
-    path: str
-    qualified_name: str
-    kind: str
-    start_line: int
-    end_line: int
-    classification: InterviewSymbolClassification
-    has_metadata: bool = False
-    element_type: Optional[str] = None
-    role: Optional[str] = None
-    capability: Optional[str] = None
-    operation_kind: Optional[str] = None
-    probe_value: Optional[str] = None
-    evidence: InterviewEvidenceLocation
-
-
-class InterviewEntrypointItem(BaseModel):
-    entrypoint_id: int
-    entrypoint_type: str
-    category: str
-    label: str
-    handler_path: str
-    handler_qualified_name: str
-    line_start: int
-    line_end: int
-    classification: InterviewSymbolClassification
-    has_metadata: bool = False
-    evidence: InterviewEvidenceLocation
-
-
-class InterviewContextPack(BaseModel):
-    system_id: int
-    snapshot_id: int
-    total_symbols: int
-    total_entrypoints: int
-    classified_count: int
-    unclassified_count: int
-    budget_max_chars: int
-    budget_used_chars: int
-    truncated: bool = False
-    symbols: List[InterviewSymbolItem] = Field(default_factory=list)
-    entrypoints: List[InterviewEntrypointItem] = Field(default_factory=list)
-    omission_notes: List[str] = Field(default_factory=list)
-
-
-# --- Interview Dialogue Turn (Issue #69) -------------------------------------
-#
-# Request/response models for the reasoning-model dialogue endpoint. The
-# endpoint generates a structured assistant turn grounded in #68's context
-# pack, optionally producing per-symbol combined proposals validated against
-# #54 vocabulary and the safety denylist from probe_planner.py.
-
-
-class InterviewDialogueTurnRequest(BaseModel):
-    """Request body for a single interview dialogue turn."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    user_message: str = Field(..., min_length=1, max_length=20_000)
-    budget: Optional[int] = Field(default=None, ge=1000, le=500_000)
-    generate_proposals: bool = False
-    # Issue #123: the open question the user is answering with this turn.
-    # The server removes it from the session's open_questions (exact match)
-    # so the UI never re-asks an already-answered question.
-    # Superseded by answered_qa_id (Issue #129); still accepted during the
-    # migration period and applied in addition to it, never instead of it.
-    answered_question: Optional[str] = Field(default=None, max_length=2000)
-    # Issue #129: ID of the interview_qa row this turn answers. Preferred
-    # over answered_question because it survives question rewording and
-    # cannot silently match the wrong question.
-    answered_qa_id: Optional[int] = None
-    actor: str = Field(default="dashboard", min_length=1, max_length=200)
-    # Issue #142: the developer answered "I don't know" (ã€Œã‚ã‹ã‚Šã¾ã›ã‚“ã€/ä¸æ˜Ž).
-    # The turn is NOT an error: the answered Q&A row is recorded as
-    # 'unconfirmed' rather than 'answered', and the reasoning model is asked to
-    # form an evidence-grounded hypothesis and re-confirm it, so the interview
-    # continues instead of stopping.
-    answer_unknown: bool = False
-
-
-CapabilityEntityKind = Literal[
-    "core_capability", "capability_element", "supporting_element", "api_boundary",
-]
-
-
-class InterviewCapabilityIdentityBinding(BaseModel):
-    """Explicitly keep one canonical identity across a display-name rename."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    entity_kind: CapabilityEntityKind
-    current_name: str = Field(min_length=1, max_length=500)
-    entity_id: int = Field(gt=0)
-
-
-class InterviewCapabilityRelationConfirmation(BaseModel):
-    """One manually confirmed many-to-many support relation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    supported_kind: CapabilityEntityKind
-    supported_name: str = Field(min_length=1, max_length=500)
-    supporting_kind: CapabilityEntityKind
-    supporting_name: str = Field(min_length=1, max_length=500)
-    role: str = Field(default="", max_length=1_000)
-    scope: str = Field(default="", max_length=2_000)
-
-
-class InterviewCapabilityNodeOut(BaseModel):
-    entity_id: int
-    entity_kind: CapabilityEntityKind
-    name: str
-    summary: str = ""
-    semantic_digest: str
-    payload: Dict[str, Any] = Field(default_factory=dict)
-
-
-class InterviewCapabilityRelationOut(BaseModel):
-    relation_id: int
-    supported_entity_id: int
-    supporting_entity_id: int
-    relation_kind: Literal["supports"]
-    role: str = ""
-    scope: str = ""
-    semantic_digest: str
-
-
-class InterviewCapabilityGraphOut(BaseModel):
-    confirmation_id: int
-    system_id: int
-    session_id: int
-    base_confirmation_id: Optional[int] = None
-    source_revision_id: Optional[int] = None
-    source_revision_at: Optional[float] = None
-    composition_digest: str
-    decided_by: str
-    decided_by_user_id: Optional[int] = None
-    decision_method: Literal["manual"]
-    created_at: float
-    nodes: List[InterviewCapabilityNodeOut] = Field(default_factory=list)
-    relations: List[InterviewCapabilityRelationOut] = Field(default_factory=list)
-
-
-class InterviewConfirmUnderstandingRequest(BaseModel):
-    """Manual confirmation that the gathered interview context is sufficient.
-
-    Issue #123: in the zero-base fallback (no structured understanding could
-    be built), the developer explicitly confirms that the conversation
-    contains enough context to move to proposal generation. This is a manual
-    decision record, not an LLM output.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    actor: str = Field(min_length=1, max_length=200)
-    # Optimistic lock for the System-wide canonical head. Required by the
-    # API whenever a new confirmation builds on an existing head.
-    capability_base_confirmation_id: Optional[int] = Field(default=None, gt=0)
-    # Issue #312: absent means derive exact relations from the current
-    # understanding's ``children`` lists.  An explicitly empty list confirms
-    # a graph with no support relations.
-    capability_relations: Optional[
-        List[InterviewCapabilityRelationConfirmation]
-    ] = Field(default=None, max_length=200)
-    # Exact, human-supplied rename identity.  No fuzzy/name-similarity
-    # inference is performed when this list omits a renamed node.
-    capability_identity_bindings: List[
-        InterviewCapabilityIdentityBinding
-    ] = Field(default_factory=list, max_length=100)
-
-
-class InterviewQuestionEvidenceRef(BaseModel):
-    """Snapshot-relative code reference backing an interview question (Issue #128).
-
-    Paths and line ranges are validated deterministically against the
-    context pack / stored understanding before the turn is accepted; refs
-    the model invented fail the turn closed.
-    """
-
-    path: str
-    start_line: int = 0
-    end_line: int = 0
-
-
-class InterviewStructuredQuestion(BaseModel):
-    """Hypothesis-first interview question (Issue #128).
-
-    The model states its current hypothesis with evidence, then asks a
-    focused confirmation question. Plain-string questions are still accepted
-    from older prompt versions and normalized to this shape (question_text
-    only) â€” a structural conversion, not an interpretation.
-    """
-
-    question_text: str
-    hypothesis: Optional[str] = None
-    evidence_refs: List[InterviewQuestionEvidenceRef] = Field(default_factory=list)
-    answer_options: List[str] = Field(default_factory=list)
-
-
-class InterviewDialogueProposalOut(BaseModel):
-    """A single combined proposal from a dialogue turn, before persistence."""
-
-    path: str
-    qualified_name: str
-    symbol_id: Optional[int] = None
-    metadata: InterviewProposalMetadataBlock
-    probe_plan: InterviewProposalProbePlan
-    graph_node_id: Optional[str] = None
-    capability_name: Optional[str] = None
-    evidence_summary: Optional[str] = None
-    proposal_confidence: Optional[float] = None
-    denylist_hit: Optional[str] = None
-
-
-class InterviewDialogueTurnOut(BaseModel):
-    """Response from a single interview dialogue turn.
-
-    Contains the structured assistant message, any generated proposals, and
-    the reasoning-run audit metadata. If error is set, the turn failed closed
-    and no proposals should be stored.
-    """
-
-    assistant_message: str = ""
-    proposals: List[InterviewDialogueProposalOut] = Field(default_factory=list)
-    # Whether this turn asked the reasoning model for proposals (the Issue
-    # #83/#123 gate passed with generate_proposals set). True with an empty
-    # proposals list means the model needs narrowing answers first and
-    # returned next_questions instead â€” the dashboard must not present that
-    # as a plain successful reply.
-    proposals_requested: bool = False
-    next_questions: List[InterviewStructuredQuestion] = Field(default_factory=list)
-    intelligence_run: Optional[IntelligenceRunOut] = None
-    error: Optional[str] = None
-    stage: Optional[InterviewStage] = None
-    current_understanding: Optional[Dict[str, Any]] = None
-    gap_analysis: Optional[List[Dict[str, Any]]] = None
-    open_questions_structured: Optional[List[Dict[str, Any]]] = None
-    # Issue #129: the structured Q&A rows created from next_questions, so the
-    # caller can navigate straight to them without re-fetching the list.
-    created_qa_ids: List[int] = Field(default_factory=list)
-    # Issue #130: audit of the pass-1 evidence-selection run, when it ran.
-    evidence_run: Optional[IntelligenceRunOut] = None
-    evidence_used: List["InterviewQaEvidenceRefOut"] = Field(default_factory=list)
-    # Issue #137: the persisted intelligence_run_evidence rows for this
-    # turn's evidence-selection run â€” every snippet actually read, whether
-    # or not a question cited it. evidence_used above is unchanged.
-    evidence_reads: List["IntelligenceRunEvidenceOut"] = Field(default_factory=list)
-    # Issue #142: how many question evidence_refs were dropped as unverifiable
-    # (not contained in any known snapshot span). A dropped ref is a graceful
-    # fallback â€” the question is still asked â€” so this is surfaced for operator
-    # visibility, not an error.
-    evidence_refs_dropped: int = 0
-
-
-# --- Evidence read audit (Issue #137) -----------------------------------------
-#
-# Persists every snippet pass 1 of the interview dialogue turn actually read
-# from the pinned snapshot, linked to the interview_evidence_selection
-# intelligence_runs row â€” independent of whether the resulting question
-# cited it. Snippet content is never stored (Principle 5/size).
-
-
-class IntelligenceRunEvidenceOut(BaseModel):
-    id: int
-    system_id: int
-    intelligence_run_id: int
-    path: str
-    start_line: int
-    end_line: int
-    char_count: int
-    truncated: bool
-    created_at: float
-
-
-class IntelligenceRunEvidenceListOut(BaseModel):
-    intelligence_run_id: int
-    system_id: int
-    items: List[IntelligenceRunEvidenceOut] = Field(default_factory=list)
-
-
-# --- Structured Interview Q&A (Issue #129) ------------------------------------
-#
-# Question/answer pairs as ID-addressable rows, replacing exact-text matching
-# against the interview_session.open_questions JSON blob. Correcting an
-# answer never overwrites the row; it inserts a new revision and links the
-# old row forward via superseded_by_id, so every prior answer stays
-# auditable (Principle 7). question_category/question_source/status are
-# explicit finite sets (Principle 6).
-
-InterviewQaCategory = Literal["purpose", "capability", "api", "probe_flow", "general"]
-# Issue #135: "runtime" questions are generated by reconciling approved
-# metadata/probe plans against deterministic runtime trace aggregates,
-# distinct from the dialogue/reviewer/zero_base sources above.
-InterviewQaSource = Literal["reviewer", "dialogue", "zero_base", "runtime"]
-# Issue #142: "unconfirmed" records that the developer explicitly could not
-# confirm the answer ("I don't know" / ã€Œã‚ã‹ã‚Šã¾ã›ã‚“ã€). It is a valid input,
-# not an error: the row is kept, its answer text stored, and it is fed back to
-# the reasoning model as an open hypothesis to re-confirm â€” never counted as a
-# confirmed/answered fact.
-InterviewQaStatus = Literal["open", "answered", "revised", "skipped", "unconfirmed"]
-
-
-class InterviewQaEvidenceRefOut(BaseModel):
-    """Snapshot-relative code reference, optionally with what was actually read.
-
-    ``char_count`` is populated only for evidence that Issue #130's
-    evidence-gathering step read from the pinned snapshot; it is a raw fact
-    about what was fetched, kept separate from any LLM interpretation of it.
-    """
-
-    path: str
-    start_line: int = 0
-    end_line: int = 0
-    char_count: Optional[int] = None
-
-
-class InterviewQaCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    question_text: str = Field(..., min_length=1, max_length=2_000)
-    question_category: InterviewQaCategory = "general"
-    question_source: InterviewQaSource = "dialogue"
-    hypothesis: Optional[str] = Field(default=None, max_length=4_000)
-    evidence_refs: List[InterviewQaEvidenceRefOut] = Field(default_factory=list, max_length=10)
-
-
-class InterviewQaActorRequest(BaseModel):
-    """Actor for a skip/resume action (Principle 7: manual decisions record who/when)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    actor: str = Field(..., min_length=1, max_length=200)
-
-
-class InterviewQaAnswerRequest(BaseModel):
-    """Answer or correct a question.
-
-    If the current row is 'open' or 'skipped', the answer is recorded on that
-    same row (first answer â€” nothing to supersede). If the current row is
-    'answered', this is a correction: a new row is inserted with the new
-    answer and the old row is marked 'revised' with superseded_by_id set.
-
-    Issue #142: when ``answer_unknown`` is set, the developer explicitly could
-    not confirm the answer. The row is recorded with status 'unconfirmed'
-    rather than 'answered', ``answer_text`` may be blank, and the interview
-    continues (the reasoning model re-confirms via a hypothesis question).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    # min_length is 0 so an "I don't know" answer can be blank; a validator
-    # below still requires non-empty text for a normal (confirmed) answer.
-    answer_text: str = Field(default="", max_length=20_000)
-    actor: str = Field(..., min_length=1, max_length=200)
-    answer_unknown: bool = False
-    # Issue #291: set when this answer is the original user's EXPLICIT
-    # confirmation of a returned handoff's assignee answer (optionally
-    # prefilled client-side from QuestionHandoffOut.answer_text). The
-    # handoff's own answer_text/answered_by are never written here directly
-    # -- the developer still submits their own answer_text/actor; this only
-    # links the provenance (routes/interview.py validates the handoff
-    # exists, belongs to this question, and is status='returned').
-    handoff_id: Optional[int] = None
-
-    @model_validator(mode="after")
-    def _require_answer_or_unknown(self) -> "InterviewQaAnswerRequest":
-        if not self.answer_unknown and not self.answer_text.strip():
-            raise ValueError("answer_text is required unless answer_unknown is set")
-        return self
-
-
-class InterviewQaInvestigationEvidenceOut(BaseModel):
-    path: str
-    start_line: int
-    end_line: int
-    summary: str = ""
-
-
-class InterviewQaInvestigationOut(BaseModel):
-    """A persisted Investigation Agent result for a normal-flow question.
-
-    Issue #286 review fix (Finding 1): populated by
-    ``POST /interview/sessions/{session_id}/qa/route-and-investigate`` from
-    the same ``InvestigationResult`` shape the Inquiry flow already composes
-    (``app/investigation_agent.py``). Never written by anything else --
-    answering/correcting a question never fabricates or edits this field,
-    and this field itself never confirms an answer (#286/#284: an AI
-    proposal/finding never auto-confirms).
-    """
-
-    run_id: int
-    status: str  # completed | unresolved
-    conclusion: str = ""
-    key_points: List[str] = Field(default_factory=list)
-    evidence: List[InterviewQaInvestigationEvidenceOut] = Field(default_factory=list)
-    uncertainty: str = ""
-    confidence: str = "uncertain"
-    decision_question: Optional[str] = None
-
-
-class InterviewQaOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    question_text: str
-    question_category: InterviewQaCategory
-    question_source: InterviewQaSource
-    hypothesis: Optional[str] = None
-    evidence_refs: List[InterviewQaEvidenceRefOut] = Field(default_factory=list)
-    # Issue #135: raw aggregated trace facts + declared-metadata provenance
-    # for question_source == "runtime" rows. Kept separate from
-    # evidence_refs (code line ranges) because runtime evidence is numeric
-    # aggregation, not a source-code span. Null for all other sources.
-    runtime_evidence: Optional[Dict[str, Any]] = None
-    answer_text: Optional[str] = None
-    # Issue #309: explicit measurement provenance. None means unanswered or
-    # legacy history whose unknown/known action cannot be recovered exactly.
-    answer_unknown: Optional[bool] = None
-    status: InterviewQaStatus
-    answered_by: Optional[str] = None
-    superseded_by_id: Optional[int] = None
-    created_at: float
-    answered_at: Optional[float] = None
-    # Issue #286: Question Router classification for this question, set only
-    # via POST /interview/qa/{qa_id}/route (never automatically for
-    # dialogue-turn questions). None until routed.
-    route_category: Optional[str] = None
-    route_run_id: Optional[int] = None
-    # Issue #291: knowledge area assigned by the same Question Router call
-    # (question-router-v2); null until routed or when no area clearly fits.
-    # Never inferred deterministically. Used only to group out-of-area
-    # questions -- it never hides a question from the full list.
-    knowledge_area: Optional[KnowledgeArea] = None
-    # Issue #291: set when this question has been handed off to an assignee
-    # (question_handoff.id). The origin row's own `status` is left
-    # untouched by a handoff (Principle 2/6 -- see db.py's table docstring).
-    handoff_id: Optional[int] = None
-    # Issue #286 review fix (Finding 1): the Investigation Agent result for
-    # this question, populated only via the batch route-and-investigate
-    # endpoint. None until investigated (or for human_only/failed runs,
-    # which never populate it -- see the endpoint docstring).
-    investigation: Optional[InterviewQaInvestigationOut] = None
-
-
-class InterviewQaAnswerOut(BaseModel):
-    qa: InterviewQaOut
-    previous: Optional[InterviewQaOut] = None
-    # True when this session already has generated proposals, so the
-    # dashboard can surface "regeneration recommended" without probe-agent
-    # ever auto-invalidating or regenerating the approved/proposed set.
-    regeneration_recommended: bool = False
-
-
-class InterviewQaListOut(BaseModel):
-    session_id: int
-    system_id: int
-    items: List[InterviewQaOut] = Field(default_factory=list)
-    open_count: int = 0
-    high_priority_open_count: int = 0
-    answers_revised_at: Optional[float] = None
-
-
-# --- Interview UX metrics (Issue #309) --------------------------------------
-
-InterviewMetricEventType = Literal[
-    "review_started",
-    "review_completed",
-    "review_abandoned",
-    "evidence_available",
-    "evidence_expanded",
-    "unchanged_item_presented",
-    "unchanged_item_reconfirmed",
-    "question_presented",
-]
-InterviewMetricTargetKind = Literal[
-    "session", "qa", "alignment_item", "inquiry_message",
-]
-# Issue #334: joint_understanding metrics are a SEPARATE category on purpose --
-# they measure whether shared understanding improved, and must never be read
-# as, or averaged with, the efficiency numbers in the other categories.
-InterviewMetricCategory = Literal[
-    "user_burden", "accuracy", "ux_quality", "joint_understanding",
-    # Issue #338: the existing `joint_understanding` category counts
-    # UTILIZATION and close labels -- how much the feature was used and what it
-    # said about itself. These two answer different questions and must not be
-    # averaged with it or with each other:
-    #   joint_understanding_quality -- did understanding actually improve
-    #     (gaps closed, hypotheses that held, decisions that stuck)
-    #   joint_understanding_burden  -- what it cost the developer
-    # Keeping them apart is the point: an efficiency gain must never be
-    # displayed as a quality gain.
-    "joint_understanding_quality", "joint_understanding_burden",
-]
-InterviewMetricStatus = Literal["measured", "unmeasured"]
-InterviewMetricUnit = Literal[
-    "ratio", "answers_per_update", "operations_per_inquiry",
-    # Issue #338: per-session burden counts. A rate would hide the thing being
-    # measured -- "how much work did one conversation cost" is not a ratio.
-    "per_session",
-]
-InterviewMetricKey = Literal[
-    "answers_per_understanding_update",
-    "unknown_answer_rate",
-    "review_abandonment_rate",
-    "evidence_detail_expansion_rate",
-    "operations_per_inquiry",
-    "corrected_confirmed_intent_rate",
-    "incorrect_answer_confirmation_rate",
-    "runtime_contradiction_rate",
-    "understanding_revision_recorrection_rate",
-    "post_approval_rejection_rate",
-    "post_approval_rollback_rate",
-    "post_approval_rejection_or_rollback_rate",
-    "repeated_question_rate",
-    "unchanged_item_reconfirmation_rate",
-    "inquiry_resolution_rate",
-    "post_inquiry_confirmation_rate",
-    "implementation_question_transfer_rate",
-    # Epic #328 Phase F (#334): joint-understanding quality.
-    "joint_understanding_from_unknown_rate",
-    "joint_understanding_conclusion_rate",
-    "joint_understanding_provisional_outcome_rate",
-    "joint_understanding_stale_premise_close_rate",
-    "joint_understanding_unknown_finding_rate",
-    "joint_understanding_reflux_rate",
-    "joint_understanding_investigation_answered_rate",
-    "joint_understanding_developer_question_rate",
-    # Issue #338: outcome-lineage quality. Every one is derived from the finite
-    # lineage events (app/joint_lineage.py), never from a close label.
-    "joint_understanding_unknown_resolution_rate",
-    "joint_understanding_hypothesis_reversal_rate",
-    "joint_understanding_hypothesis_correction_rate",
-    "joint_understanding_adoption_reconfirmation_rate",
-    "joint_understanding_decision_undo_rate",
-    "joint_understanding_classification_correction_rate",
-    # Issue #338: developer burden, per session.
-    "joint_understanding_rounds_per_session",
-    "joint_understanding_developer_actions_per_session",
-    "joint_understanding_developer_findings_per_session",
-    "joint_understanding_question_reask_rate",
-]
-# The same finite key set as a plain tuple, so the external attention policy
-# (Issue #341) can be validated for terminal coverage at load time.
-INTERVIEW_METRIC_KEYS: tuple = get_args(InterviewMetricKey)
-
-# --- Interview metric è¦ç¢ºèªåˆ¤å®š (Issue #341) --------------------------------
-#
-# ``guardrail`` above only designates which metrics are worth watching. Whether
-# a metric is *currently* in a bad state is a separate, evaluated judgement so
-# "å€¤ãŒæ‚ªã„" and "ã¾ã åˆ¤æ–­ã§ããªã„" never collapse into one warning state.
-InterviewMetricAttentionState = Literal[
-    "attention",         # é–¾å€¤ã‚’è¶…ãˆã¦ãŠã‚Šè¦ç¢ºèª
-    "ok",                # åˆ¤å®šå¯èƒ½ã§ã€è¦ç¢ºèªæ¡ä»¶ã«è©²å½“ã—ãªã„
-    "insufficient_data",  # æ¯æ•°ä¸è¶³ã€ã¾ãŸã¯ã¾ã è¦³æ¸¬ãŒç„¡ã„
-    "not_measurable",    # å…ƒã¨ãªã‚‹äº‹å®ŸãŒè¨˜éŒ²ã•ã‚Œã¦ãŠã‚‰ãšç®—å‡ºæ‰‹æ®µãŒç„¡ã„
-    "criterion_unset",   # ç›£è¦–å¯¾è±¡ã ãŒé–¾å€¤ãŒæœªè¨­å®š
-    "observation_only",  # é€šçŸ¥å¯¾è±¡ã§ã¯ãªã„å®šæœŸè¦³æ¸¬æŒ‡æ¨™
-]
-InterviewMetricAttentionReason = Literal[
-    "threshold_breached",
-    "within_threshold",
-    "sample_below_minimum",
-    "no_observations_yet",
-    "not_recorded",
-    "threshold_not_configured",
-    "not_a_notification_target",
-]
-# v1 vocabularies. See ``interview_metric_attention`` for why bounded windows,
-# sustained triggers, and manual acknowledgement are deliberately absent.
-ATTENTION_DIRECTIONS = ("high_is_bad", "low_is_bad")
-ATTENTION_WINDOWS = ("all_time",)
-ATTENTION_TRIGGERS = ("single_breach",)
-ATTENTION_CLEAR_CONDITIONS = ("value_within_threshold",)
-InterviewMetricAttentionDirection = Literal["high_is_bad", "low_is_bad"]
-InterviewMetricAttentionWindow = Literal["all_time"]
-InterviewMetricAttentionTrigger = Literal["single_breach"]
-InterviewMetricAttentionClear = Literal["value_within_threshold"]
-# The entry point's å–å¾—å¤±æ•— state is client-side only: a server that cannot
-# answer cannot report its own failure.
-InterviewMetricsAttentionState = Literal["normal", "attention", "insufficient_data"]
-
-
-class InterviewMetricAttentionOut(BaseModel):
-    """One metric's evaluated è¦ç¢ºèª state plus the criterion it was judged by."""
-
-    state: InterviewMetricAttentionState
-    watched: bool = False
-    reason: InterviewMetricAttentionReason
-    direction: Optional[InterviewMetricAttentionDirection] = None
-    threshold: Optional[float] = None
-    min_sample: int = 0
-    window: Optional[InterviewMetricAttentionWindow] = None
-    trigger: Optional[InterviewMetricAttentionTrigger] = None
-    clear_condition: Optional[InterviewMetricAttentionClear] = None
-
-
-class InterviewMetricsAttentionSummaryOut(BaseModel):
-    """The entry point's state, derived only from watched metrics."""
-
-    state: InterviewMetricsAttentionState
-    attention_count: int = 0
-    insufficient_data_count: int = 0
-    not_measurable_count: int = 0
-    watched_count: int = 0
-    policy_version: str
-    policy_digest: str
-
-
-class InterviewMetricEventCreate(BaseModel):
-    """One bounded, content-free UI measurement event.
-
-    ``event_key`` is generated by the client and unique within a System so a
-    retry is idempotent. The route validates the finite event/target pairing
-    and target ownership; arbitrary attributes and free-text analytics
-    payloads are intentionally unsupported.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: Literal["interview-metric-event-v1"] = "interview-metric-event-v1"
-    event_key: str = Field(..., min_length=1, max_length=128)
-    session_id: int = Field(..., ge=1)
-    event_type: InterviewMetricEventType
-    target_kind: InterviewMetricTargetKind
-    target_id: int = Field(..., ge=1)
-
-
-class InterviewMetricEventOut(BaseModel):
-    id: int
-    schema_version: Literal["interview-metric-event-v1"] = "interview-metric-event-v1"
-    event_key: str
-    system_id: int
-    session_id: int
-    event_type: InterviewMetricEventType
-    target_kind: InterviewMetricTargetKind
-    target_id: int
-    recorded_at: float
-
-
-class InterviewMetricOut(BaseModel):
-    key: InterviewMetricKey
-    category: InterviewMetricCategory
-    # ç›£è¦–å¯¾è±¡ã¨ã—ã¦ã®æŒ‡å®šã€‚å®Ÿéš›ã«è¦ç¢ºèªã‹ã©ã†ã‹ã¯ ``attention`` ãŒæŒã¤ã€‚
-    guardrail: bool = False
-    description: str
-    formula: str
-    sources: List[str] = Field(default_factory=list)
-    status: InterviewMetricStatus
-    value: Optional[float] = None
-    unit: InterviewMetricUnit
-    numerator: Optional[int] = None
-    denominator: Optional[int] = None
-    sample_size: int = 0
-    unmeasured_reason: Optional[str] = None
-    # Evaluated after the value exists, so it is nullable during construction
-    # only. ``build_interview_metrics`` always populates it before returning,
-    # and the ``interview-metrics-v2`` response contract guarantees it.
-    attention: Optional[InterviewMetricAttentionOut] = None
-
-
-class InterviewMetricsOut(BaseModel):
-    system_id: int
-    schema_version: Literal["interview-metrics-v2"] = "interview-metrics-v2"
-    generated_at: float
-    sessions_observed: int = 0
-    events_observed: int = 0
-    attention: InterviewMetricsAttentionSummaryOut
-    metrics: List[InterviewMetricOut] = Field(default_factory=list)
-
-
-# --- Batch route-and-investigate (Issue #286 review fix, Finding 1) ----------
-#
-# Wires Question Router / Investigation Agent into the NORMAL Q&A flow (they
-# were previously reachable only inside the Inquiry side-conversation and via
-# the single-question POST .../qa/{qa_id}/route, which never investigates).
-# This never writes answer_text/status/answered_by -- investigation is a
-# finding to review, never an auto-confirmation (Principle 2/7; #286 AC).
-
-
-class InterviewQaRouteInvestigateItemOut(BaseModel):
-    qa_id: int
-    route_category: Optional[str] = None
-    knowledge_area: Optional[KnowledgeArea] = None
-    # completed | unresolved | failed | None (not attempted this call, e.g.
-    # human_only or a route failure that left the question unrouted).
-    investigation_status: Optional[str] = None
-    error: Optional[str] = None
-
-
-class InterviewQaRouteInvestigateCountsOut(BaseModel):
-    routed: int = 0
-    investigated: int = 0
-    failed: int = 0
-    skipped_cap: int = 0
-
-
-class InterviewQaRouteInvestigateBatchOut(BaseModel):
-    session_id: int
-    system_id: int
-    results: List[InterviewQaRouteInvestigateItemOut] = Field(default_factory=list)
-    counts: InterviewQaRouteInvestigateCountsOut = Field(
-        default_factory=InterviewQaRouteInvestigateCountsOut
-    )
-
-
-# Review fix (PR #296, Finding 4): an optional, explicit subset of question
-# ids to route+investigate, so a single card's ã€Œã‚ã‹ã‚‰ãªã„ã€ action can
-# target just that one question instead of always triggering the whole
-# session's batch selection (up to MAX_BATCH_QUESTIONS LLM investigations
-# per call). Omitting qa_ids (or sending null) keeps the prior all-eligible
-# behavior (backward compatible). A qa_id that does not exist, or belongs to
-# a different session, is a per-question error in the response -- never a
-# reason to fail or silently drop the rest of the batch (same fail-closed-
-# per-question policy the existing batch endpoint already uses).
-class InterviewQaRouteInvestigateBatchRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    qa_ids: Optional[List[int]] = None
-
-
-# --- Intent Brief (Issue #284) ------------------------------------------------
-#
-# Structured user intent, kept separate from implementation-fact
-# understanding: only the user can decide these values. ai_proposed items
-# are drafts the reasoning model grounds in the conversation; they never
-# become 'confirmed' except through the explicit confirm/correct endpoints
-# (decision_method stays 'manual' for every user-driven transition,
-# Principle 2). 'undecided' and 'not_applicable' are first-class answers
-# ("ç¾çŠ¶æŠŠæ¡ã ã‘ãŒç›®çš„" / "ã¾ã è§£æ±ºç­–ã‚’æ±ºã‚ã¦ã„ãªã„" / ã€Œå¯¾è±¡å¤–ã€), not errors.
-
-InterviewIntentField = Literal[
-    "goal", "pain", "success_criteria", "priority", "constraints", "non_goals"
-]
-InterviewIntentStatus = Literal[
-    "proposed", "confirmed", "needs_review", "undecided", "not_applicable"
-]
-# Statuses a user may set directly when creating an item. 'proposed' and
-# 'needs_review' are system/AI states, never user-chosen at creation time.
-InterviewIntentUserStatus = Literal["confirmed", "undecided", "not_applicable"]
-InterviewIntentOrigin = Literal["user", "ai_proposed"]
-
-
-class InterviewIntentItemOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    field: InterviewIntentField
-    value_text: str
-    status: InterviewIntentStatus
-    origin: InterviewIntentOrigin
-    source_statement: Optional[str] = None
-    decision_method: DecisionMethod
-    intelligence_run_id: Optional[int] = None
-    is_mock: bool = False
-    superseded_by_id: Optional[int] = None
-    created_at: float
-    updated_at: float
-
-
-class InterviewIntentItemCreate(BaseModel):
-    """User-authored intent item. Always origin='user', decision_method='manual'."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    field: InterviewIntentField
-    value_text: str = Field(..., min_length=1, max_length=4_000)
-    status: InterviewIntentUserStatus = "confirmed"
-
-
-class InterviewIntentCorrectRequest(BaseModel):
-    """Correct an ai_proposed (or previously confirmed) item's value.
-
-    Never overwrites: the caller inserts a new 'confirmed'/'user' row and
-    marks the prior row's superseded_by_id, mirroring interview_qa's
-    answer/correction pattern.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    value_text: str = Field(..., min_length=1, max_length=4_000)
-
-
-class InterviewIntentListOut(BaseModel):
-    session_id: int
-    system_id: int
-    items_by_field: Dict[str, List[InterviewIntentItemOut]] = Field(default_factory=dict)
-
-
-# --- Inquiry lifecycle (Issue #285) -------------------------------------------
-#
-# A doubt about a confirmation item (Q&A question, Intent Brief item, or --
-# from Issue #287 -- a review item) is held pending while a separate Inquiry
-# conversation resolves it. Resolving an Inquiry never changes the origin
-# item's own state (Principle 2's "explicit user action" boundary applies to
-# the origin item's own endpoint, not to closing the Inquiry).
-
-InterviewInquiryOriginKind = Literal["qa", "intent", "review_item"]
-# 'superseded' (Issue #308 / #323) is a TERMINAL, system-only status: the
-# premise the conversation was answered against no longer exists, so the
-# history stays readable but is never reused as current justification. It is
-# not "wrong" and not "unresolved"; only the premise evaluation inside an
-# Alignment rebuild ever writes it, never a user endpoint.
-InterviewInquiryStatus = Literal[
-    "open", "resolved", "unresolved", "cancelled", "held", "superseded"
-]
-# Derived (never stored) description of how comparable an Inquiry's premise
-# is -- see app/inquiry_premise.py's PREMISE_TRACKING_STATES.
-InquiryPremiseTrackingState = Literal["not_applicable", "untrackable", "tracked"]
-# Result of the last premise evaluation; null until a rebuild evaluated it.
-InquiryPremiseEvaluation = Literal["unchanged", "changed", "removed", "ambiguous"]
-InterviewInquiryMessageRole = Literal["user", "assistant"]
-
-
-class InterviewInquiryEvidenceOut(BaseModel):
-    path: str
-    start_line: int
-    end_line: int
-    summary: str = ""
-
-
-class InterviewInquiryMessageDetailOut(BaseModel):
-    """Progressive-disclosure detail for an assistant Inquiry message.
-
-    The message's own ``content`` is always the short conclusion, shown
-    first; ``detail`` is the "æ ¹æ‹ ã‚’è¦‹ã‚‹" (show evidence) expansion.
-    """
-
-    key_points: List[str] = Field(default_factory=list)
-    evidence: List[InterviewInquiryEvidenceOut] = Field(default_factory=list)
-    uncertainty: str = ""
-    # Issue #286: which Question Router category produced this answer, and
-    # (for "hybrid") the decision question the developer still needs to
-    # answer themselves. Both None for messages predating Issue #286.
-    route_category: Optional[str] = None
-    decision_question: Optional[str] = None
-    # Issue #290: runtime_fact evidence entries (provenance + finite
-    # runtime_check), always in this detail layer -- never in the message's
-    # short ``content`` -- so the initial answer stays conclusion-first and
-    # raw trace/provenance data only appears in the collapsible detail
-    # expansion (progressive disclosure).
-    runtime_evidence: List["InterviewInquiryRuntimeEvidenceOut"] = Field(default_factory=list)
-    # A deterministic hint (never LLM free text) that a runtime_fact came
-    # back unobserved/stale -- the developer can turn this into an actual
-    # POST .../observation-proposals call if they want new observation;
-    # this hint alone never creates a proposal row (Principle 5/8).
-    suggested_observation_proposal: Optional["SuggestedObservationProposalOut"] = None
-
-
-class InterviewInquiryMessageOut(BaseModel):
-    id: int
-    inquiry_id: int
-    system_id: int
-    role: InterviewInquiryMessageRole
-    content: str
-    detail: Optional[InterviewInquiryMessageDetailOut] = None
-    intelligence_run_id: Optional[int] = None
-    is_mock: bool = False
-    created_at: float
-
-
-class InterviewInquiryOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    origin_kind: InterviewInquiryOriginKind
-    origin_id: int
-    held_draft: Optional[str] = None
-    status: InterviewInquiryStatus
-    status_reason: Optional[str] = None
-    # Issue #308 / #320: the immutable premise this conversation was
-    # answered against, captured at creation and never rebased onto a newer
-    # session snapshot. snapshot/revision are audit references (they may go
-    # NULL under retention); the hash/digest columns are what the premise
-    # evaluation actually compares. All null for Inquiries created before
-    # this migration and, apart from the snapshot/version/captured_at trio,
-    # for the qa/intent origins v1 does not auto-track.
-    premise_snapshot_id: Optional[int] = None
-    premise_revision_id: Optional[int] = None
-    premise_review_subject_id: Optional[str] = None
-    premise_content_hash: Optional[str] = None
-    premise_capability_digest: Optional[str] = None
-    premise_intent_digest: Optional[str] = None
-    premise_tracking_version: Optional[str] = None
-    premise_captured_at: Optional[float] = None
-    # Derived from the bundle above, so the UI never has to re-derive
-    # "can this premise be compared at all?" from null checks.
-    premise_tracking_state: InquiryPremiseTrackingState = "not_applicable"
-    # Issue #323: the last premise verdict, the unique current successor
-    # review item (only ever set when exactly one exists -- an ambiguous
-    # successor is never guessed), and the moment this Inquiry became
-    # 'superseded'. superseded_at is separate from closed_at, which keeps
-    # meaning "the developer closed this conversation": a resolved Inquiry
-    # keeps its exact resolved moment, and one the system expires while it
-    # was still open/held keeps closed_at NULL rather than gaining a
-    # resolved-looking timestamp.
-    premise_evaluation: Optional[InquiryPremiseEvaluation] = None
-    premise_successor_item_id: Optional[int] = None
-    superseded_at: Optional[float] = None
-    created_at: float
-    updated_at: float
-    closed_at: Optional[float] = None
-
-
-class InterviewInquiryDetailOut(BaseModel):
-    inquiry: InterviewInquiryOut
-    messages: List[InterviewInquiryMessageOut] = Field(default_factory=list)
-
-
-class InterviewInquiryListOut(BaseModel):
-    session_id: int
-    system_id: int
-    items: List[InterviewInquiryOut] = Field(default_factory=list)
-
-
-class InterviewInquiryCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    origin_kind: InterviewInquiryOriginKind
-    origin_id: int
-    question_text: str = Field(..., min_length=1, max_length=2_000)
-    # Opaque to the server: the user's unconfirmed answer draft on the origin
-    # item at the moment they opened the Inquiry, round-tripped back verbatim
-    # via GET/resolve so the dashboard can restore it into the input without
-    # the server ever interpreting or submitting it as an answer.
-    held_draft: Optional[str] = Field(default=None, max_length=20_000)
-
-
-class InterviewInquiryMessageCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    content: str = Field(..., min_length=1, max_length=2_000)
-
-
-class InterviewInquiryTransitionRequest(BaseModel):
-    """Optional audit fields for a hold/cancel/unresolved status change."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    status_reason: Optional[str] = Field(default=None, max_length=500)
-    actor: Optional[str] = Field(default=None, max_length=200)
-
-
-# --- Joint Understanding session (Epic #328 Phase A / Issue #329) -------------
-#
-# What ã€Œã‚ã‹ã‚‰ãªã„ã€ STARTS instead of ending. The three provenances
-# (investigation / translation / developer) stay separate rows with separate
-# rules -- see app/joint_understanding.py for the finite vocabularies these
-# Literals mirror and shared/schemas/joint_understanding.schema.json for the
-# contract itself. Nothing in this feature writes the origin confirmation
-# item: ã€Œã‚ã‹ã‚‰ãªã„ã€ is an entry point into a shared investigation, never a
-# recorded developer intent.
-
-# Issue #389 adds a fifth origin: a Purpose Chain need (`app/purpose_needs.py`)
-# whose developer response was 'unknown'/'investigate'. Its `origin_id` is a
-# `purpose_need_response.id` -- not a row in any of the four original origin
-# tables, because a need's target (an element or a relation) is a computed
-# projection with a stable STRING id, not a database row `POST
-# /purpose-chain/needs/{need_id}/respond` is the only writer of
-# `trigger='purpose_need'`, mirroring the 'unknown_answer' rule immediately
-# below: `trigger` records WHICH PATH opened the session, never a request
-# body's claim.
-JointUnderstandingOriginKind = Literal["qa", "intent", "review_item", "inquiry", "purpose_need"]
-JointUnderstandingTrigger = Literal["unknown_answer", "explicit_request", "purpose_need"]
-JointUnderstandingStatus = Literal["open", "held", "closed"]
-# hypothesis_adopted is explicitly PROVISIONAL (never a fact); decided is the
-# only final human value judgement. See SESSION_OUTCOMES.
-JointUnderstandingOutcome = Literal[
-    "understood", "doubt_resolved", "hypothesis_adopted", "decided",
-    "handed_off", "abandoned",
-]
-JointUnderstandingClaimKind = Literal[
-    "fact", "inference", "hypothesis", "unknown", "conflict"
-]
-JointUnderstandingOriginRole = Literal["investigation", "translation", "developer"]
-JointUnderstandingActionKind = Literal[
-    "request_investigation", "explain_reasoning", "compare_options",
-    "adopt_hypothesis", "revise_intent", "hold", "handoff", "decide",
-]
-JointUnderstandingDecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
-JointUnderstandingRuntimeCheck = Literal["match", "mismatch", "unobserved", "stale"]
-# Issue #337: whether the premise this session was investigated against still
-# holds, evaluated from the shared Issue #308 premise bundle rather than from
-# the snapshot id alone. Only 'current' permits hypothesis_adopted / decided /
-# reflux. 'missing' (the premise disappeared) and 'invalid' (no comparable
-# bundle was ever captured) both used to report as 'fresh' -- a premise that
-# cannot be found is not a premise that still holds.
-JointUnderstandingPremiseState = Literal["current", "stale", "missing", "invalid"]
-# The same set plus the pre-#337 value, for a premise verdict READ back from a
-# row that was closed before this contract existed. Never produced anew.
-JointUnderstandingRecordedPremiseState = Literal[
-    "current", "stale", "missing", "invalid", "fresh",
-]
-# Issue #337: the single finite reason behind a non-'current' verdict. Split by
-# recovery path -- stale can be re-investigated, missing cannot.
-JointUnderstandingPremiseReason = Literal[
-    "premise_not_captured", "premise_incomplete",
-    "pinned_snapshot_removed", "origin_removed",
-    "origin_superseded", "pinned_commit_changed", "origin_content_changed",
-    "capability_scope_changed", "linked_intent_changed",
-]
-# Issue #337: WHICH code path produced a finding, as distinct from whose voice
-# it speaks in (origin_role). 'legacy' is read-only -- what a row written
-# before provenance was recorded reports.
-JointUnderstandingProducerKind = Literal[
-    "investigation_loop", "translator", "developer_api", "legacy",
-]
-# Issue #337: whether an authenticated human stands behind the row. Resolved
-# from the request's Principal, never from its body.
-JointUnderstandingActorKind = Literal["user", "system", "legacy"]
-# Issue #337: the derived state of one provisionally adopted hypothesis.
-JointUnderstandingAdoptionState = Literal[
-    "provisional", "reconfirmation_required", "basis_withdrawn",
-]
-JointUnderstandingRefluxTargetKind = Literal["qa_investigation", "session_ledger"]
-# Issue #336: the existing formal operation an action leads to. The three
-# `*_correct` / `*_create` / `*_answer` values name an endpoint OUTSIDE this
-# feature, and only that endpoint's own manual record completes them.
-JointUnderstandingFormalOperation = Literal[
-    "joint_investigate", "joint_translate", "joint_hold",
-    "joint_close_provisional", "joint_close_decided",
-    "intent_correct", "question_handoff_create", "origin_item_answer",
-]
-
-
-class JointUnderstandingEvidenceIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    path: str = Field(..., min_length=1, max_length=500)
-    start_line: int = Field(..., ge=1)
-    end_line: int = Field(..., ge=1)
-    summary: str = Field(default="", max_length=1_000)
-
-
-class JointUnderstandingEvidenceOut(BaseModel):
-    path: str
-    start_line: int
-    end_line: int
-    summary: str = ""
-
-
-class JointUnderstandingRuntimeEvidenceIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    component_id: str = Field(..., min_length=1, max_length=500)
-    runtime_check: JointUnderstandingRuntimeCheck
-    summary: str = Field(default="", max_length=1_000)
-
-
-class JointUnderstandingRuntimeEvidenceOut(BaseModel):
-    component_id: str
-    runtime_check: JointUnderstandingRuntimeCheck
-    summary: str = ""
-
-
-class JointUnderstandingFindingOut(BaseModel):
-    id: int
-    joint_understanding_id: int
-    system_id: int
-    origin_role: JointUnderstandingOriginRole
-    claim_kind: JointUnderstandingClaimKind
-    statement: str
-    evidence: List[JointUnderstandingEvidenceOut] = Field(default_factory=list)
-    runtime_evidence: List[JointUnderstandingRuntimeEvidenceOut] = Field(default_factory=list)
-    supports_finding_ids: List[int] = Field(default_factory=list)
-    competing_explanations: List[str] = Field(default_factory=list)
-    refutation_conditions: List[str] = Field(default_factory=list)
-    next_investigation: Optional[str] = None
-    uncertainty: str = ""
-    supersedes_finding_id: Optional[int] = None
-    decision_method: JointUnderstandingDecisionMethod
-    intelligence_run_id: Optional[int] = None
-    is_mock: bool = False
-    # Issue #337: provenance on two independent axes. producer_kind is which
-    # code path wrote the row; actor_kind is whether an authenticated human
-    # stands behind it. Both are 'legacy' on rows written before the contract
-    # existed -- unknown, and never assumed to be a human.
-    producer_kind: JointUnderstandingProducerKind = "legacy"
-    actor_kind: JointUnderstandingActorKind = "legacy"
-    actor_username: Optional[str] = None
-    created_at: float
-
-
-class JointUnderstandingFindingCreate(BaseModel):
-    """Append one DEVELOPER finding.
-
-    Issue #337 made this endpoint developer-only. ``investigation`` and
-    ``translation`` findings are written exclusively by their internal
-    producers (``/investigate``, ``/translate``), which validate their evidence
-    and their reasoning run against the pinned snapshot; accepting them here
-    let a caller post an unverifiable "fact" with fabricated citations, and
-    accepting ``developer`` from any caller let a request body record a
-    sentence as the human's own judgement. ``origin_role`` is kept in the
-    payload so the rejection is explicit rather than a silent reinterpretation.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    origin_role: JointUnderstandingOriginRole
-    claim_kind: JointUnderstandingClaimKind
-    statement: str = Field(..., min_length=1, max_length=4_000)
-    evidence: List[JointUnderstandingEvidenceIn] = Field(default_factory=list, max_length=20)
-    runtime_evidence: List[JointUnderstandingRuntimeEvidenceIn] = Field(
-        default_factory=list, max_length=20,
-    )
-    supports_finding_ids: List[int] = Field(default_factory=list, max_length=20)
-    competing_explanations: List[str] = Field(default_factory=list, max_length=10)
-    refutation_conditions: List[str] = Field(default_factory=list, max_length=10)
-    next_investigation: Optional[str] = Field(default=None, max_length=2_000)
-    uncertainty: str = Field(default="", max_length=2_000)
-    supersedes_finding_id: Optional[int] = None
-    decision_method: JointUnderstandingDecisionMethod
-    intelligence_run_id: Optional[int] = None
-    is_mock: bool = False
-
-
-class JointUnderstandingActionOut(BaseModel):
-    id: int
-    joint_understanding_id: int
-    system_id: int
-    action_kind: JointUnderstandingActionKind
-    # Display label only. Issue #337: `actor_kind`/`actor_username` are the
-    # authenticated identity, resolved from the request's Principal.
-    actor: Optional[str] = None
-    actor_kind: JointUnderstandingActorKind = "legacy"
-    actor_username: Optional[str] = None
-    note: Optional[str] = None
-    decision_method: Literal["manual"] = "manual"
-    created_at: float
-
-
-class JointUnderstandingActionCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    action_kind: JointUnderstandingActionKind
-    # A caller-supplied label (e.g. a team name). Issue #337: it is NOT the
-    # identity -- the recorded actor comes from the authenticated Principal, so
-    # this can no longer be used to attribute an action to someone else.
-    actor: Optional[str] = Field(default=None, max_length=200)
-    note: Optional[str] = Field(default=None, max_length=2_000)
-
-
-class JointUnderstandingOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    origin_kind: JointUnderstandingOriginKind
-    origin_id: int
-    trigger: JointUnderstandingTrigger
-    question_text: str
-    status: JointUnderstandingStatus
-    outcome: Optional[JointUnderstandingOutcome] = None
-    # Derived, never stored: true exactly for outcome='hypothesis_adopted'.
-    # A provisional outcome must not be presented or reused as a fact.
-    outcome_is_provisional: bool = False
-    outcome_reason: Optional[str] = None
-    # Issue #332: the findings the recorded outcome rests on, the premise
-    # verdict evaluated when it was recorded, and the CURRENT verdict --
-    # 'stale' means the interview session has moved to a newer snapshot than
-    # this session pinned, so adopt/decide are refused until re-investigation.
-    outcome_finding_ids: List[int] = Field(default_factory=list)
-    outcome_premise_state: Optional[JointUnderstandingRecordedPremiseState] = None
-    outcome_premise_reason: Optional[JointUnderstandingPremiseReason] = None
-    # Issue #337: who closed the session, recorded from the authenticated
-    # Principal. A close is a manual decision; an outcome whose decider cannot
-    # be recovered after a reload is not an audit record.
-    closed_by_actor_kind: Optional[JointUnderstandingActorKind] = None
-    closed_by_username: Optional[str] = None
-    # Issue #336: the origin row that is CURRENT today. For `qa` and `intent`,
-    # corrections are additive -- the pinned `origin_id` becomes a superseded row
-    # the moment the developer revises it -- so a consumer matching a session to
-    # the live item must use this, not `origin_id`. Reported rather than
-    # substituted: the session keeps pointing at the row the conversation
-    # started from.
-    current_origin_id: Optional[int] = None
-    premise_state: JointUnderstandingPremiseState = "invalid"
-    premise_reason: Optional[JointUnderstandingPremiseReason] = None
-    # Issue #337: the shared Issue #308 premise bundle as captured at creation.
-    # premise_commit_sha (not the snapshot id) is what decides staleness: the
-    # same commit re-pinned under a new snapshot row is the same premise.
-    premise_snapshot_id: Optional[int] = None
-    premise_commit_sha: Optional[str] = None
-    premise_revision_id: Optional[int] = None
-    premise_tracking_version: Optional[str] = None
-    premise_captured_at: Optional[float] = None
-    schema_version: str
-    created_at: float
-    updated_at: float
-    closed_at: Optional[float] = None
-
-
-class JointUnderstandingAdoptionOut(BaseModel):
-    """One provisionally adopted hypothesis (Issue #337).
-
-    ``state`` is derived at read time from the captured premise versus the
-    current one, so it can never claim `provisional` for an adoption whose
-    ground has since moved.
-    """
-
-    id: int
-    joint_understanding_id: int
-    system_id: int
-    finding_id: int
-    state: JointUnderstandingAdoptionState
-    adopted_by_actor_kind: JointUnderstandingActorKind
-    adopted_by_username: Optional[str] = None
-    adoption_reason: str = ""
-    premise_snapshot_id: Optional[int] = None
-    premise_commit_sha: Optional[str] = None
-    premise_revision_id: Optional[int] = None
-    decision_method: Literal["manual"] = "manual"
-    adopted_at: float
-
-
-class JointUnderstandingDetailOut(BaseModel):
-    session: JointUnderstandingOut
-    findings: List[JointUnderstandingFindingOut] = Field(default_factory=list)
-    actions: List[JointUnderstandingActionOut] = Field(default_factory=list)
-    # Issue #330: the per-round investigation audit (what each round read,
-    # what it left unread, why the loop stopped). Forward-referenced because
-    # the Phase B models are defined below; resolved by the model_rebuild()
-    # call at the end of that block.
-    investigation_rounds: List["JointUnderstandingRoundOut"] = Field(default_factory=list)
-    # Issue #331: every translation pass, oldest first. The translated
-    # sentences themselves are also in `findings` as origin_role='translation'
-    # rows; this carries the summary/options/unknowns around them.
-    translations: List["JointUnderstandingTranslationOut"] = Field(default_factory=list)
-    # Issue #332: system-verified facts attached to the understanding surface
-    # WITHOUT being recorded as anyone's answer.
-    reflux: List["JointUnderstandingRefluxOut"] = Field(default_factory=list)
-    # Issue #337: every provisionally adopted hypothesis, with its derived
-    # re-confirmation state. This is what keeps a provisional adoption from
-    # aging silently into something indistinguishable from a fact.
-    hypothesis_adoptions: List[JointUnderstandingAdoptionOut] = Field(default_factory=list)
-    # The finite next-action menu for the session's current status,
-    # deterministically ordered (empty once closed/held).
-    available_actions: List[JointUnderstandingActionKind] = Field(default_factory=list)
-
-
-class JointUnderstandingListOut(BaseModel):
-    session_id: int
-    system_id: int
-    items: List[JointUnderstandingOut] = Field(default_factory=list)
-
-
-class JointUnderstandingCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    origin_kind: JointUnderstandingOriginKind
-    origin_id: int
-    trigger: JointUnderstandingTrigger
-    question_text: str = Field(..., min_length=1, max_length=2_000)
-
-
-class JointUnderstandingCloseRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    outcome: JointUnderstandingOutcome
-    # Issue #337: the developer's stated judgement, now REQUIRED. A close is
-    # the manual decision record of this conversation; "what was decided" with
-    # no text is an outcome label, not a decision anyone can audit later.
-    outcome_reason: str = Field(..., min_length=1, max_length=2_000)
-    # Issue #332: which findings the outcome rests on. Required for
-    # 'hypothesis_adopted' and 'decided' -- an adoption or a decision that
-    # cannot name its basis is not auditable. Issue #337 additionally rejects a
-    # superseded, mock, or (for an adoption) non-hypothesis basis.
-    outcome_finding_ids: List[int] = Field(default_factory=list, max_length=50)
-
-
-class JointUnderstandingHoldRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reason: Optional[str] = Field(default=None, max_length=500)
-
-
-# --- Iterative investigation (Epic #328 Phase B / Issue #330) -----------------
-
-JointUnderstandingStopReason = Literal[
-    "answered", "budget_exhausted", "no_new_evidence", "unresolved", "failed",
-]
-JointUnderstandingRoundStatus = Literal["completed", "unresolved", "failed"]
-# Issue #339: the finite outcome class, so a caller never has to inspect
-# `stop_reason` and guess which side of the limitation/failure split it is on.
-JointUnderstandingOutcomeClass = Literal[
-    "answered", "research_limitation", "execution_failure",
-]
-# Issue #339: WHERE an execution failure broke, because the recovery differs --
-# configuration and a missing snapshot are not retries, an API/schema/timeout
-# failure is.
-JointUnderstandingFailureClass = Literal[
-    "config_invalid", "snapshot_unavailable", "api_failure", "schema_invalid",
-    "timeout",
-]
-# Issue #339: the finite exploration sources. The first four are Epic #328's;
-# the last four are the structural breadth this issue adds.
-JointUnderstandingExplorationSourceKind = Literal[
-    "path_name", "symbol_index", "entrypoint_index", "file_content",
-    "dependency", "call_graph", "git_history", "runtime_facts",
-]
-
-
-class JointUnderstandingExplorationSourceOut(BaseModel):
-    """One exploration source's contribution to one round (Issue #339)."""
-
-    id: int
-    round_id: int
-    system_id: int
-    source_kind: JointUnderstandingExplorationSourceKind
-    # The pinned commit for git history, the snapshot id for the index /
-    # content / runtime sources.
-    revision: str
-    candidates_found: int = 0
-    queries_run: int = 0
-    elapsed_seconds: float = 0.0
-    truncated: bool = False
-    # A failed source is recorded and skipped: it never fails the round, and it
-    # is never replaced by an unbounded fallback search.
-    error_details: Optional[str] = None
-    created_at: float
-
-
-class JointUnderstandingRoundOut(BaseModel):
-    """Audit of one investigation round: what it read, what it left, why."""
-
-    id: int
-    joint_understanding_id: int
-    system_id: int
-    round_index: int
-    status: JointUnderstandingRoundStatus
-    # Only the round that ended the loop carries a stop reason.
-    stop_reason: Optional[JointUnderstandingStopReason] = None
-    conclusion: str = ""
-    # The state carried into the next round and restored on a retry.
-    search_leads: List[str] = Field(default_factory=list)
-    open_hypotheses: List[str] = Field(default_factory=list)
-    missing_evidence: List[str] = Field(default_factory=list)
-    read_paths: List[str] = Field(default_factory=list)
-    # Candidates this round selected but could not read within budget --
-    # "not looked at" stays distinguishable from "not there".
-    unread_candidates: List[str] = Field(default_factory=list)
-    pruned_findings: int = 0
-    files_read: int = 0
-    chars_read: int = 0
-    llm_calls: int = 0
-    elapsed_seconds: float = 0.0
-    intelligence_run_id: Optional[int] = None
-    error_details: Optional[str] = None
-    # Issue #339: set ONLY for an execution failure. A research limitation
-    # (budget_exhausted / no_new_evidence / unresolved) is a real,
-    # evidence-backed result and leaves this NULL -- "the system looked and
-    # could not tell" must stay distinguishable from "the system could not
-    # look".
-    failure_class: Optional[JointUnderstandingFailureClass] = None
-    outcome_class: JointUnderstandingOutcomeClass = "research_limitation"
-    # One entry per exploration source this round used, each with its own
-    # revision and budget consumption. Per source because "the round only read
-    # the pinned revision" is a claim about each source separately.
-    sources: List["JointUnderstandingExplorationSourceOut"] = Field(
-        default_factory=list,
-    )
-    created_at: float
-
-
-class JointUnderstandingInvestigateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    # Optional narrowing hints; both only affect deterministic candidate
-    # retrieval, never the conclusion.
-    research_focus: Optional[str] = Field(default=None, max_length=1_000)
-    search_keywords: Optional[List[str]] = Field(default=None, max_length=20)
-    max_rounds: Optional[int] = Field(default=None, ge=1, le=5)
-
-
-class JointUnderstandingInvestigateOut(BaseModel):
-    joint_understanding_id: int
-    system_id: int
-    stop_reason: JointUnderstandingStopReason
-    rounds: List[JointUnderstandingRoundOut] = Field(default_factory=list)
-    # The findings this call appended (origin_role='investigation').
-    findings: List[JointUnderstandingFindingOut] = Field(default_factory=list)
-    error: Optional[str] = None
-
-
-
-# --- Translation (Epic #328 Phase C / Issue #331) -----------------------------
-
-JointUnderstandingStatementLayer = Literal[
-    "purpose", "impact", "gap", "consistency", "decision"
-]
-
-
-class JointUnderstandingStatementOut(BaseModel):
-    """One translated sentence plus the traceability it must never lose."""
-
-    layer: JointUnderstandingStatementLayer
-    claim_kind: JointUnderstandingClaimKind
-    text: str
-    # The investigation findings this sentence was derived from, and the
-    # translation finding row that persists it. Both are always present:
-    # a generalized explanation must always resolve back to the technical
-    # claim and its evidence.
-    supports_finding_ids: List[int] = Field(default_factory=list)
-    finding_id: int
-
-
-class JointUnderstandingOptionOut(BaseModel):
-    label: str
-    what_changes: str
-    tradeoffs: str = ""
-    supports_finding_ids: List[int] = Field(default_factory=list)
-
-
-class JointUnderstandingActionMenuEntryOut(BaseModel):
-    """A finite next action plus what choosing it actually changes.
-
-    Assembled deterministically from the fixed server catalog -- never
-    generated text, and identical for identical session state.
-    """
-
-    action_kind: JointUnderstandingActionKind
-    label: str
-    what_changes: str
-    # Issue #336: which existing formal operation this action leads to, and
-    # whether that operation is performed by an endpoint OUTSIDE this feature.
-    # Recording the action never completes it -- the distinction previously had
-    # no machine-readable form, so a conversation could accumulate actions that
-    # never became anything.
-    formal_operation: JointUnderstandingFormalOperation
-    completes_outside_session: bool = False
-
-
-class JointUnderstandingTranslationOut(BaseModel):
-    id: int
-    joint_understanding_id: int
-    system_id: int
-    purpose_summary: str
-    statements: List[JointUnderstandingStatementOut] = Field(default_factory=list)
-    options: List[JointUnderstandingOptionOut] = Field(default_factory=list)
-    open_unknowns: List[str] = Field(default_factory=list)
-    decision_question: Optional[str] = None
-    # Deterministic gate: true only when the remaining question really is a
-    # value judgement AND the developer has material to decide with.
-    ask_developer: bool = False
-    intelligence_run_id: Optional[int] = None
-    is_mock: bool = False
-    created_at: float
-
-
-class JointUnderstandingTranslateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    # Optional context about the developer's own goal. Never invented by the
-    # server and never recorded as a developer finding.
-    goal_hint: Optional[str] = Field(default=None, max_length=2_000)
-
-
-class JointUnderstandingTranslateOut(BaseModel):
-    translation: JointUnderstandingTranslationOut
-    # The finite next-action menu that accompanies the explanation.
-    action_menu: List[JointUnderstandingActionMenuEntryOut] = Field(default_factory=list)
-
-
-# --- Reflux (Epic #328 Phase D / Issue #332) ---------------------------------
-
-
-class JointUnderstandingRefluxOut(BaseModel):
-    """One system-verified fact attached to the understanding surface.
-
-    ``decision_method`` is always ``reasoning_llm``: a refluxed fact is what
-    the system established, never what the developer answered. No reflux row
-    corresponds to a write of an answer, an intent value, or a decision.
-    """
-
-    id: int
-    joint_understanding_id: int
-    system_id: int
-    finding_id: int
-    target_kind: JointUnderstandingRefluxTargetKind
-    target_id: Optional[int] = None
-    statement: str
-    evidence: List[JointUnderstandingEvidenceOut] = Field(default_factory=list)
-    runtime_evidence: List[JointUnderstandingRuntimeEvidenceOut] = Field(default_factory=list)
-    decision_method: Literal["reasoning_llm"] = "reasoning_llm"
-    intelligence_run_id: Optional[int] = None
-    premise_snapshot_id: Optional[int] = None
-    created_at: float
-
-
-# Issue #338: the finite lineage vocabularies. Mirrored here from
-# app/joint_lineage.py so an out-of-set value is not representable in the API.
-JointUnderstandingLineageEventKind = Literal[
-    "unknown_created", "unknown_resolved", "unknown_remained",
-    "hypothesis_created", "hypothesis_confirmed", "hypothesis_reversed",
-    "hypothesis_corrected", "hypothesis_superseded",
-    "question_asked", "question_reasked", "question_withdrawn",
-    "decision_proposed", "decision_adopted", "decision_rejected",
-    "decision_undone",
-    "classification_corrected",
-]
-JointUnderstandingLineageSubjectKind = Literal[
-    "unknown", "hypothesis", "question", "decision", "classification",
-]
-# Issue #338: `threshold_unset` is neither a pass nor a failure. The criterion
-# is measured; what counts as enough is a decision nobody has made yet, and
-# inventing a number here would be the self-reported readiness score this issue
-# forbids (the same discipline #341 applies to its metric thresholds).
-JointUnderstandingBulkApprovalVerdict = Literal["unmeasured", "threshold_unset"]
-
-
-class JointUnderstandingLineageEventOut(BaseModel):
-    event_kind: JointUnderstandingLineageEventKind
-    subject_kind: JointUnderstandingLineageSubjectKind
-    # A finding id for an unknown/hypothesis; a Joint Understanding session id
-    # for a question/decision/classification.
-    subject_id: int
-    session_id: int
-    joint_understanding_id: int
-    at: float
-    # The successor that closed this subject's lineage, where there is one. This
-    # is what makes an unknown's creation and its resolution ONE lineage rather
-    # than two unrelated counts.
-    supersedes_subject_id: Optional[int] = None
-    detail: str = ""
-
-
-class JointUnderstandingSessionBurdenOut(BaseModel):
-    joint_understanding_id: int
-    session_id: int
-    rounds: int = 0
-    developer_actions: int = 0
-    developer_findings: int = 0
-    questions_asked: int = 0
-    reasks: int = 0
-
-
-class JointUnderstandingBulkApprovalCriterionOut(BaseModel):
-    """One observed count behind Issue #311's start condition."""
-
-    key: Literal["observed_sessions", "misclassification_cases", "undo_cases"]
-    observed: int
-    verdict: JointUnderstandingBulkApprovalVerdict
-    note: str
-
-
-class JointUnderstandingLineageOut(BaseModel):
-    system_id: int
-    schema_version: Literal["joint-understanding-lineage-v1"] = (
-        "joint-understanding-lineage-v1"
-    )
-    generated_at: float
-    events: List[JointUnderstandingLineageEventOut] = Field(default_factory=list)
-    burdens: List[JointUnderstandingSessionBurdenOut] = Field(default_factory=list)
-    # Observation only. Deliberately NOT a go/no-go for Issue #311.
-    bulk_approval_readiness: List[JointUnderstandingBulkApprovalCriterionOut] = Field(
-        default_factory=list,
-    )
-
-
-class JointUnderstandingRefluxResultOut(BaseModel):
-    joint_understanding_id: int
-    system_id: int
-    target_kind: JointUnderstandingRefluxTargetKind
-    premise_state: JointUnderstandingPremiseState
-    # Newly attached this call; already-attached facts are not duplicated.
-    refluxed: List[JointUnderstandingRefluxOut] = Field(default_factory=list)
-    already_refluxed: int = 0
-    # Findings that stayed inside the conversation because they are not
-    # system-established facts (inference / hypothesis / unknown / conflict).
-    skipped_not_fact: int = 0
-    skipped_unverified: int = 0
-
-
-# Issue #336: the single ã€Œã‚ã‹ã‚‰ãªã„ã€ entry point's finite next step. The
-# internal route names (system_researchable / hybrid / human_only) deliberately
-# do not appear here -- the Dashboard maps these to its own copy, and an
-# internal classification name is not a developer-facing label.
-# The Question Router's finite classification, mirrored here because this
-# response is a new contract and an out-of-set value must not be representable.
-# The router owns the canonical set (app/question_router.ROUTE_CATEGORIES).
-JointUnderstandingRouteCategory = Literal[
-    "human_only", "system_researchable", "hybrid",
-]
-JointUnderstandingUnknownNextStep = Literal[
-    # A joint investigation ran and produced findings; the conversation has
-    # material to show.
-    "joint_investigation_started",
-    # A session is open (investigation skipped, failed, or found nothing new).
-    # The conversation is retryable and nothing was lost.
-    "joint_understanding_opened",
-    # Only the developer can answer this. The normal answer / handoff path is
-    # what comes next; no session was opened.
-    "developer_answer_required",
-    # The classification itself could not be made (configuration or API
-    # failure). Fail-closed: no session, no guess, and the recorded unknown
-    # answer stands.
-    "routing_unavailable",
-]
-
-
-class InterviewQaUnknownRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    # ã€Œã‚ã‹ã‚‰ãªã„ã€ with an optional note. Never becomes a developer finding
-    # (Epic #328): "I don't know" is not a statement about the system.
-    answer_text: str = Field(default="", max_length=20_000)
-    actor: str = Field(..., min_length=1, max_length=200)
-    # Off only for callers that want to open the session and drive the
-    # investigation themselves (the JU panel's own retry does this).
-    investigate: bool = True
-
-
-class InterviewQaUnknownOut(BaseModel):
-    session_id: int
-    system_id: int
-    # The question row as recorded -- committed before routing runs, so it is
-    # present on every outcome including the failure ones.
-    qa: "InterviewQaOut"
-    route_category: Optional[JointUnderstandingRouteCategory] = None
-    knowledge_area: Optional[KnowledgeArea] = None
-    joint_understanding_id: Optional[int] = None
-    next_step: JointUnderstandingUnknownNextStep
-    investigation_stop_reason: Optional[JointUnderstandingStopReason] = None
-    error: Optional[str] = None
-
-
-JointUnderstandingDetailOut.model_rebuild()
-
-
-# --- Alignment Review / Review Queue (Issue #287) -----------------------------
-#
-# Contrasts confirmed/proposed Intent Brief items against the evidence-backed
-# Current System understanding to produce alignment items with a
-# deterministic review classification (review_category/reason_code -- see
-# app/alignment.py's rule table). Only review_category IN (must_review,
-# batch_reviewable) ever surfaces as an action-required Review Queue card.
-
-# Issue #290: defined here (ahead of the Runtime Reality Check section
-# further down) because AlignmentItemOut.runtime_check needs
-# RuntimeCheckState. See that section for the full provenance envelope
-# model these finite sets belong to.
-RuntimeFactFreshness = Literal["fresh", "stale", "unobserved"]
-RuntimeCheckState = Literal["match", "mismatch", "unobserved", "stale"]
-
-AlignmentState = Literal["aligned", "gap", "unknown", "conflict", "not_applicable"]
-AlignmentRiskFlag = Literal["security", "high_risk", "core_intent"]
-AlignmentConfidence = Literal["confirmed", "likely", "uncertain", "conflicting"]
-AlignmentReviewCategory = Literal[
-    "must_review", "batch_reviewable", "no_review_required", "unchanged", "informational",
-]
-AlignmentReasonCode = Literal[
-    "security_related", "high_risk", "core_intent", "conflict_detected",
-    "low_confidence", "runtime_mismatch", "routine_update", "no_change",
-    "informational_only", "core_capability_changed",
-    "unchanged_since_confirmation",
-]
-# Item-level user progress. 'inquiry' is set while an Inquiry
-# (origin_kind='review_item') is open on this item, and reset to 'open'
-# (never 'answered') when that Inquiry closes -- the developer must still
-# explicitly answer via this item's own endpoint (Principle 2).
-AlignmentItemStatus = Literal["open", "answered", "corrected", "held", "inquiry"]
-# Issue #321: how one freshly built row relates to the previous generation of
-# the same discussion point -- see app/inquiry_premise.py's SUBJECT_STATES.
-# 'removed' is deliberately absent: a subject with no row in the current
-# build is a premise-evaluation result (#323), not a property of a row.
-AlignmentSubjectState = Literal[
-    "new", "unchanged", "changed", "ambiguous", "untrackable"
-]
-# The three decisions POST /answer accepts as request input.
-AlignmentDecisionAction = Literal["accept_current", "needs_change", "reject_interpretation"]
-# The full set of actions that may appear in a persisted user_decision.action
-# -- a superset of AlignmentDecisionAction covering what /correct and /hold
-# each record (Principle 7: every manual write path leaves an audit action).
-AlignmentUserDecisionAction = Literal[
-    "accept_current", "needs_change", "reject_interpretation", "corrected", "held",
-]
-
-
-class AlignmentEvidenceOut(BaseModel):
-    path: str
-    start_line: int
-    end_line: int
-    summary: str = ""
-
-
-class AlignmentUserDecisionOut(BaseModel):
-    action: AlignmentUserDecisionAction
-    note: Optional[str] = None
-    decided_at: float
-    decided_by: Optional[str] = None
-
-
-class AlignmentCapabilityDependencyOut(BaseModel):
-    """Human-reviewable canonical scope attached to one Alignment item."""
-
-    target_kind: Literal["entity", "relation"]
-    entity_id: Optional[int] = None
-    relation_id: Optional[int] = None
-    entity_kind: Optional[CapabilityEntityKind] = None
-    entity_name: Optional[str] = None
-    supported_entity_id: Optional[int] = None
-    supported_entity_name: Optional[str] = None
-    supporting_entity_id: Optional[int] = None
-    supporting_entity_name: Optional[str] = None
-
-
-class AlignmentItemOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    revision_id: Optional[int] = None
-    snapshot_id: int
-    intent_item_id: Optional[int] = None
-    intent_summary: Optional[str] = None
-    current_claim: str
-    current_evidence: List[AlignmentEvidenceOut] = Field(default_factory=list)
-    gap_summary: Optional[str] = None
-    proposed_interpretation: Optional[str] = None
-    alignment_state: AlignmentState
-    risk_flags: List[AlignmentRiskFlag] = Field(default_factory=list)
-    confidence: AlignmentConfidence
-    review_category: AlignmentReviewCategory
-    reason_code: AlignmentReasonCode
-    user_reason: str
-    # Issue #312: these exact canonical dependencies are visible to the
-    # reviewer; accept_current confirms the claim and this scope together.
-    capability_confirmation_id: Optional[int] = None
-    capability_dependencies: List[AlignmentCapabilityDependencyOut] = Field(
-        default_factory=list
-    )
-    # Issue #290: deterministic Runtime Reality Check match state, set only
-    # when this item's evidence deterministically maps to a component_id
-    # with runtime trace facts; null when no deterministic mapping exists
-    # (never guessed from free text -- app/runtime_alignment.py).
-    runtime_check: Optional[RuntimeCheckState] = None
-    status: AlignmentItemStatus
-    user_decision: Optional[AlignmentUserDecisionOut] = None
-    # Issue #291: set when this review item has been handed off to an
-    # assignee (question_handoff.id, origin_kind='review_item'). Creating
-    # the handoff sets status='held' (the same value /hold already uses)
-    # alongside this column.
-    handoff_id: Optional[int] = None
-    # Review-finding fix (Finding 4): true when a later rebuild produced a
-    # fresh replacement row for the same contrast point while this row was
-    # already answered/corrected. Superseded rows are history only -- never
-    # an action card -- and are additionally excluded from
-    # GET .../review-queue. Additive column; defaults False so pre-migration
-    # rows and any DB row missing the column still validate.
-    superseded: bool = False
-    # Issue #295: realizes Issue #287's reserved 'unchanged' review_category.
-    # content_hash is the deterministic sha256 (app/alignment.py's
-    # compute_content_hash) over this item's identity-bearing fields, set on
-    # every build; NULL only for rows written before this migration.
-    # carried_over_from is the id of the immediately-preceding build's
-    # terminal (answered/corrected) row this item's content exactly matched,
-    # set only when review_category == 'unchanged'; NULL otherwise
-    # (audit-only -- never a live FK join for decision-making).
-    content_hash: Optional[str] = None
-    carried_over_from: Optional[int] = None
-    # Issue #313: every freshly classified row carries the reviewed external
-    # policy version and the SHA-256 of that exact YAML artifact. Legacy rows
-    # retain an explicit legacy version and no digest rather than pretending
-    # they were classified by the external policy.
-    policy_version: str = "legacy-code-v1"
-    policy_digest: Optional[str] = None
-    # Exact first-match YAML rule that produced the category/reason pair.
-    # Legacy and carried-over rows may not have one.
-    policy_rule_id: Optional[str] = None
-    # Issue #310: the deterministic category/reason_code remains unchanged.
-    # This flag only exposes an explicit human request to recheck this exact
-    # item in the normal Review Queue.
-    manual_recheck_required: bool = False
-    # Issue #321: stable discussion-point identity and physical lineage.
-    # review_subject_id is a deterministic digest over structural anchors
-    # only (Intent field + confirmed Capability entity/relation ids); it is
-    # null for legacy rows and for items with no stable anchor, which are
-    # reported subject_state='untrackable'. replaces_item_id is set only
-    # when exactly one predecessor generation row carried the same subject
-    # -- a split/merge is reported 'ambiguous' and left unbound rather than
-    # guessed.
-    review_subject_id: Optional[str] = None
-    subject_state: Optional[AlignmentSubjectState] = None
-    replaces_item_id: Optional[int] = None
-    intelligence_run_id: int
-    is_mock: bool = False
-    created_at: float
-    updated_at: float
-
-
-class AlignmentBuildOut(BaseModel):
-    session_id: int
-    system_id: int
-    revision_id: Optional[int] = None
-    intelligence_run_id: int
-    is_mock: bool = False
-    items: List[AlignmentItemOut] = Field(default_factory=list)
-
-
-class AlignmentListOut(BaseModel):
-    session_id: int
-    system_id: int
-    items_by_category: Dict[str, List[AlignmentItemOut]] = Field(default_factory=dict)
-    counts: Dict[str, int] = Field(default_factory=dict)
-    # 2nd review round (PR #296, Finding 3): `counts` still includes current
-    # rows in a terminal status (answered/corrected, superseded=0) -- e.g.
-    # right after answering a must_review item and before the next rebuild
-    # marks it superseded=1, counts.must_review still counts it even though
-    # GET .../review-queue no longer does. `outstanding_counts` applies the
-    # EXACT SAME predicate get_review_queue uses (superseded=0 AND status NOT
-    # IN ('answered','corrected')) to every category consistently, so a
-    # client that wants "how many of these still need action" always agrees
-    # with the Review Queue's own count. Additive; `counts` keeps its
-    # original meaning ("current rows of this category") for compatibility.
-    outstanding_counts: Dict[str, int] = Field(default_factory=dict)
-    # Review fix (PR #296, Finding 3): superseded=1 rows (history -- a later
-    # rebuild already produced a fresh replacement row for the same contrast
-    # point) are additive-only here, kept fully visible for audit but split
-    # out of items_by_category/counts so those two fields only ever reflect
-    # CURRENT rows (superseded=0). Never used to drive Review Queue counts.
-    superseded_items: List[AlignmentItemOut] = Field(default_factory=list)
-
-
-class AlignmentReviewQueueOut(BaseModel):
-    session_id: int
-    system_id: int
-    items: List[AlignmentItemOut] = Field(default_factory=list)
-
-
-class AlignmentRuleObjectionOut(BaseModel):
-    """Deterministic, System-scoped aggregation of sample objections."""
-
-    reason_code: AlignmentReasonCode
-    policy_version: str
-    policy_digest: Optional[str] = None
-    policy_rule_id: str
-    objection_count: int
-    pending_recheck_count: int
-
-
-class AlignmentRuleObjectionListOut(BaseModel):
-    system_id: int
-    rules: List[AlignmentRuleObjectionOut] = Field(default_factory=list)
-
-
-class AlignmentRuleRecheckRequest(BaseModel):
-    """Exact reviewed rule provenance selected by the human."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    policy_version: str = Field(..., min_length=1, max_length=200)
-    policy_digest: Optional[str] = Field(default=None, max_length=128)
-    policy_rule_id: str = Field(..., min_length=1, max_length=200)
-
-
-class AlignmentRuleRecheckOut(BaseModel):
-    system_id: int
-    reason_code: AlignmentReasonCode
-    policy_version: str
-    policy_digest: Optional[str] = None
-    policy_rule_id: str
-    decision_method: Literal["manual"] = "manual"
-    requested_by_user_id: int
-    recheck_target_count: int
-
-
-class AlignmentAnswerRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: AlignmentDecisionAction
-    note: Optional[str] = Field(default=None, max_length=2_000)
-
-
-class AlignmentCorrectRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    corrected_interpretation: str = Field(..., min_length=1, max_length=2_000)
-
-
-# --- Batch answer (PR #296 review fix, Finding 5) ----------------------------
-#
-# One review batch (the developer clears several Review Queue cards at once)
-# previously fired one Issue #288 request_refresh call PER item answered --
-# de-duplicated down to at most "1 running + 1 queued" by
-# interview_refresh._enqueue, but still up to 2 rebuilds for what is
-# conceptually a single batch, or as many as the item count under an eager
-# refresh policy. This endpoint answers every item in one request and calls
-# request_refresh exactly once, only after at least one item's answer is
-# durably committed.
-#
-# Same fields as AlignmentAnswerRequest, plus item_id so one entry can target
-# any alignment_item in the session. MAX_BATCH_ANSWERS mirrors the existing
-# deterministic per-call cap pattern (Issue #286's MAX_BATCH_QUESTIONS,
-# app/routes/question_router.py) -- a finite, explicit bound (Principle 6),
-# not a heuristic one.
-MAX_BATCH_ANSWERS = 50
-
-
-class AlignmentBatchAnswerItemRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    item_id: int
-    decision: AlignmentDecisionAction
-    note: Optional[str] = Field(default=None, max_length=2_000)
-    # 2nd review round (PR #296, Finding 2): optional staleness guard. When
-    # given, it must match the item's CURRENT alignment_item.content_hash or
-    # the entry is rejected as a per-item error (the item changed -- e.g. a
-    # rebuild carried it over to a new row, or another reviewer/tab already
-    # answered it -- since the client staged this answer). Omitting it keeps
-    # pre-fix behavior (no staleness check) for backward compatibility.
-    content_hash: Optional[str] = Field(default=None, max_length=64)
-
-
-class AlignmentBatchAnswerRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    answers: List[AlignmentBatchAnswerItemRequest] = Field(
-        default_factory=list, max_length=MAX_BATCH_ANSWERS,
-    )
-
-
-class AlignmentBatchAnswerItemResult(BaseModel):
-    item_id: int
-    success: bool
-    # Populated only when success is True; the full updated item, exactly
-    # like the single-item POST .../answer response, so the caller never
-    # needs a follow-up GET for the items that saved cleanly.
-    item: Optional[AlignmentItemOut] = None
-    # Populated only when success is False -- a concise, structural reason
-    # (not found / wrong session / Inquiry-locked / duplicate item_id in this
-    # batch), never LLM free text.
-    error: Optional[str] = None
-
-
-class AlignmentBatchAnswerOut(BaseModel):
-    session_id: int
-    system_id: int
-    results: List[AlignmentBatchAnswerItemResult] = Field(default_factory=list)
-    # True iff at least one item in this batch was durably saved and
-    # request_refresh was therefore called exactly once for the whole batch;
-    # False when every item failed (refresh is never called on a total miss).
-    refreshed: bool = False
-
-
-# --- Answerable knowledge areas / handoff (Issue #291) ------------------------
-#
-# A developer picks which knowledge areas they can answer NOW (no role
-# inference, Principle 6). KnowledgeArea (defined earlier, alongside
-# InterviewSessionStatus) is the same finite set the Question Router
-# (app/question_router.py question-router-v2) tags a question with; empty
-# session.answerable_areas means "no filtering" (unchanged default
-# behavior), never "all areas explicitly selected".
-
-
-class AnswerableAreasUpdateRequest(BaseModel):
-    """Replace the session's answerable-areas selection. Changeable anytime."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    areas: List[KnowledgeArea] = Field(default_factory=list, max_length=5)
-
-
-class QuestionHandoffEvidenceRef(BaseModel):
-    path: str = Field(..., min_length=1, max_length=500)
-    start_line: int = 0
-    end_line: int = 0
-    summary: str = Field(default="", max_length=2_000)
-
-
-class QuestionHandoffCreate(BaseModel):
-    """Hand an out-of-area (or otherwise deferred) item off to an assignee.
-
-    ``assignee`` is a free-text name/address -- no org auth system exists
-    yet (same convention as ``understanding_confirmed_by`` /
-    ``interview_qa.answered_by``).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    origin_kind: HandoffOriginKind
-    origin_id: int
-    assignee: str = Field(..., min_length=1, max_length=200)
-    background: str = Field(..., min_length=1, max_length=4_000)
-    needed_decision: str = Field(..., min_length=1, max_length=2_000)
-    evidence: Optional[List[QuestionHandoffEvidenceRef]] = Field(default=None, max_length=10)
-    due_note: Optional[str] = Field(default=None, max_length=500)
-    priority: HandoffPriority = "normal"
-    created_by: Optional[str] = Field(default=None, max_length=200)
-
-
-class QuestionHandoffOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    origin_kind: HandoffOriginKind
-    origin_id: int
-    assignee: str
-    background: str
-    needed_decision: str
-    evidence: Optional[List[QuestionHandoffEvidenceRef]] = None
-    due_note: Optional[str] = None
-    priority: HandoffPriority
-    status: HandoffStatus
-    answer_text: Optional[str] = None
-    answered_by: Optional[str] = None
-    answered_at: Optional[float] = None
-    created_by: Optional[str] = None
-    created_at: float
-    updated_at: float
-
-
-class QuestionHandoffListOut(BaseModel):
-    session_id: int
-    system_id: int
-    items: List[QuestionHandoffOut] = Field(default_factory=list)
-
-
-class QuestionHandoffAnswerRequest(BaseModel):
-    """The assignee's own answer.
-
-    Never written into the origin qa/alignment row -- see the
-    ``question_handoff`` table docstring in ``db.py``. The original user
-    must still explicitly confirm it via ``/return`` and the origin item's
-    own answer endpoint (Principle 2).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    answer_text: str = Field(..., min_length=1, max_length=20_000)
-    answered_by: str = Field(..., min_length=1, max_length=200)
-
-
-# --- Automatic refresh after an answer batch (Issue #288) --------------------
-#
-# app/interview_refresh.py's request_refresh()/run_refresh_job() keep
-# affected Understanding / Alignment / Review Queue state current after a Q&A
-# answer, Intent confirm/correct, Alignment answer/correct, or applied change
-# set, without the manual ã€Œç†è§£ã‚’æ›´æ–°ã€ action. trigger_kind/status are
-# explicit finite sets (Principle 6).
-
-RefreshTriggerKind = Literal[
-    "qa_answer", "intent_update", "alignment_answer", "nl_change_set",
-]
-RefreshJobStatus = Literal["pending", "updating", "updated", "failed", "stale"]
-
-
-class RefreshJobOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    trigger_kind: RefreshTriggerKind
-    status: RefreshJobStatus
-    error: Optional[str] = None
-    intelligence_run_id: Optional[int] = None
-    result_revision_id: Optional[int] = None
-    created_at: float
-    started_at: Optional[float] = None
-    finished_at: Optional[float] = None
-
-
-class RefreshStatusOut(BaseModel):
-    session_id: int
-    system_id: int
-    latest_job: Optional[RefreshJobOut] = None
-    pending_count: int = 0
-
-
-# --- Natural-language bulk correction -> structured change set (Issue #289) --
-#
-# app/change_sets.py turns a developer's free-text correction into a
-# structured, previewed, selectively-applied change set -- NL is never
-# applied to state directly (Principle 2/6). target_kind/resolution_state
-# are explicit finite sets; 'forbidden' means the (target_kind, field) pair
-# is outside the whitelist (app/change_sets.py's ALLOWED_TARGET_FIELDS),
-# not merely unresolved.
-
-ChangeSetStatus = Literal[
-    "proposed", "previewed", "partially_applied", "applied", "discarded", "failed",
-]
-ChangeTargetKind = Literal["intent_item", "understanding_claim"]
-ChangeResolutionState = Literal["resolved", "ambiguous", "conflict", "stale", "forbidden"]
-
-
-class ChangeSetCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    text: str = Field(..., min_length=1, max_length=8_000)
-
-
-class ChangeSetOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    base_revision_id: Optional[int] = None
-    source_text: str
-    status: ChangeSetStatus
-    intelligence_run_id: int
-    is_mock: bool = False
-    created_at: float
-    updated_at: float
-
-
-class ChangeSetAffectedItemOut(BaseModel):
-    """One alignment/review item a change item's edit would touch,
-    determined by a deterministic structural match (Principle 6) -- never a
-    reasoning decision. See ``routes/interview_change_sets.py``'s
-    ``_affected_alignment_items``."""
-
-    alignment_item_id: int
-    current_claim: str
-    review_category: str
-
-
-class ChangeSetItemOut(BaseModel):
-    id: int
-    change_set_id: int
-    system_id: int
-    target_kind: ChangeTargetKind
-    target_ref: Dict[str, Any] = Field(default_factory=dict)
-    field: str
-    before_value: Optional[str] = None
-    after_value: str
-    reason: str
-    resolution_state: ChangeResolutionState
-    applied: bool = False
-    applied_at: Optional[float] = None
-    created_at: float
-    affected_items: List[ChangeSetAffectedItemOut] = Field(default_factory=list)
-
-
-class ChangeSetDetailOut(BaseModel):
-    change_set: ChangeSetOut
-    items: List[ChangeSetItemOut] = Field(default_factory=list)
-    rebuild_note: str
-
-
-class ChangeSetApplyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    item_ids: List[int] = Field(..., min_length=1, max_length=100)
-
-
-class ChangeSetSkippedItemOut(BaseModel):
-    item_id: int
-    resolution_state: ChangeResolutionState
-    message: str
-
-
-class ChangeSetApplyResultOut(BaseModel):
-    change_set: ChangeSetOut
-    applied_item_ids: List[int] = Field(default_factory=list)
-    skipped: List[ChangeSetSkippedItemOut] = Field(default_factory=list)
-    result_revision_id: Optional[int] = None
-
-
-# --- Runtime Reality Check (Issue #135) --------------------------------------
-#
-# Reconciles approved interview metadata/probe plans (role, probe_value,
-# state_effects, recommended_mode) against deterministic runtime trace
-# aggregates for the same component_id, and asks the developer to confirm or
-# correct any surprising mismatch. Aggregation is numeric-only (Principle 6,
-# decision_method deterministic); which mismatches are worth a question, and
-# the question text/hypothesis, are reasoning_llm output persisted as
-# question_source "runtime" interview_qa rows.
-
-
-class RuntimeTraceFactsOut(BaseModel):
-    """Deterministic trace aggregates for one component_id over a window.
-
-    ``has_traces`` is false (and the numeric fields are null) when the
-    component has an approved probe plan but zero recorded traces â€” the
-    "0 traces" signal called out in the issue. This is a raw fact; whether
-    it is worth a question is decided by the reasoning step, never here.
-    """
-
-    component_id: str
-    window_days: int
-    call_count: int = 0
-    error_count: int = 0
-    error_rate: Optional[float] = None
-    duration_p50_ms: Optional[float] = None
-    duration_p90_ms: Optional[float] = None
-    duration_p99_ms: Optional[float] = None
-    # Issue #290: earliest trace timestamp inside the aggregation window
-    # (None when has_traces is False), used by the provenance envelope's
-    # observed_at.first alongside last_observed_at's observed_at.last.
-    first_observed_at: Optional[float] = None
-    last_observed_at: Optional[float] = None
-    has_traces: bool = False
-    # Issue #290 Finding 5: the most recent non-empty traces.environment /
-    # traces.git_sha value observed for this component in the aggregation
-    # window (deterministic "latest by timestamp" pick â€” never a semantic
-    # choice). None when no trace in the window carried the field, which is
-    # the honest "unknown" signal build_provenance() relies on instead of
-    # inventing a value from the caller's pinned snapshot.
-    observed_environment: Optional[str] = None
-    observed_git_sha: Optional[str] = None
-
-
-# --- Runtime fact provenance / match state (Issue #290) ----------------------
-#
-# Wraps RuntimeTraceFactsOut with WHERE the facts came from and HOW current
-# they are, so a fact is never silently presented as current/authoritative
-# once it has gone stale (Principle 5 stale guard). ``environment`` is only
-# ever populated from actual trace metadata (``RuntimeTraceFactsOut.
-# observed_environment``, Issue #290 Finding 5's SDK-reported
-# PROBE_ENVIRONMENT) -- never invented, and never the caller's pinned
-# snapshot or expected environment. ``snapshot_ref`` follows the same rule:
-# it is derived only from ``observed_git_sha`` (an actually-observed trace
-# tag, resolved against ``repository_snapshots`` by exact commit-sha match
-# when possible), never from the analysis session's pinned snapshot --
-# fabricating it from the pinned snapshot was Finding 5(b) of the Issue
-# #290 review. ``freshness`` and ``runtime_check`` are both finite sets
-# (Principle 6): freshness is a pure function of RUNTIME_FACT_FRESH_SECONDS
-# vs last_observed_at (app/runtime_reality.py); runtime_check is
-# app/runtime_alignment.py's compare_claim_to_runtime result. NOTE:
-# RuntimeFactFreshness/RuntimeCheckState themselves are defined earlier in
-# this module (just above the Alignment Review section) because
-# AlignmentItemOut needs RuntimeCheckState.
-
-
-class RuntimeFactSnapshotRefOut(BaseModel):
-    # None when the observed git_sha does not match any known
-    # repository_snapshots row for the System (Issue #290 Finding 5) -- the
-    # raw sha is still carried in git_sha even when it cannot be resolved.
-    snapshot_id: Optional[int] = None
-    git_sha: Optional[str] = None
-
-
-class RuntimeFactProvenanceOut(BaseModel):
-    environment: Optional[str] = None
-    first_observed_at: Optional[float] = None
-    last_observed_at: Optional[float] = None
-    snapshot_ref: Optional[RuntimeFactSnapshotRefOut] = None
-    source: Literal["trace_aggregation"] = "trace_aggregation"
-    freshness: RuntimeFactFreshness
-
-
-class RuntimeRealityCheckItemOut(BaseModel):
-    """One approved element's declared understanding paired with its facts."""
-
-    proposal_id: int
-    decision_id: int
-    path: str
-    qualified_name: str
-    component_id: str
-    role: Optional[str] = None
-    probe_value: Optional[str] = None
-    state_effects: List[str] = Field(default_factory=list)
-    recommended_mode: str = "trace"
-    facts: RuntimeTraceFactsOut
-
-
-class RuntimeRealityFactsOut(BaseModel):
-    """Response for the deterministic-only facts endpoint (no LLM call)."""
-
-    session_id: int
-    system_id: int
-    snapshot_id: int
-    window_days: int
-    items: List[RuntimeRealityCheckItemOut] = Field(default_factory=list)
-
-
-class RuntimeRealityCheckRunOut(BaseModel):
-    """Response for triggering the reasoning reconciliation run.
-
-    ``skipped`` is true when generation was suppressed because unanswered
-    runtime questions already exist for this session (noise control from the
-    issue notes); in that case no intelligence_runs row is created.
-    """
-
-    session_id: int
-    system_id: int
-    snapshot_id: int
-    intelligence_run: Optional[IntelligenceRunOut] = None
-    items_considered: int = 0
-    created_qa_ids: List[int] = Field(default_factory=list)
-    skipped: bool = False
-    skipped_reason: Optional[str] = None
-    error: Optional[str] = None
-
-
-# --- Investigation Agent runtime_fact evidence (Issue #290) ------------------
-#
-# Extends Issue #286's Investigation Agent with a second evidence kind
-# alongside code citations: a runtime_fact entry cites a component_id (never
-# invented -- must be one of the components deterministically offered to the
-# model, mirroring how code evidence must cite an actually-read path) plus
-# its provenance envelope and the finite runtime_check state. When the
-# deterministic freshness is 'unobserved'/'stale' the persisted
-# ``runtime_check`` always matches that deterministic value regardless of
-# what the model said (Principle 5 stale guard); only when facts are fresh
-# does the model's own match/mismatch judgement (a semantic call, Principle
-# 6) get recorded as-is.
-
-
-class InvestigationRuntimeEvidenceOut(BaseModel):
-    kind: Literal["runtime_fact"] = "runtime_fact"
-    component_id: str
-    provenance: RuntimeFactProvenanceOut
-    runtime_check: RuntimeCheckState
-    summary: str = ""
-
-
-class InterviewInquiryRuntimeEvidenceOut(InvestigationRuntimeEvidenceOut):
-    pass
-
-
-class SuggestedObservationProposalOut(BaseModel):
-    target_component: str
-    reason: Literal["unobserved", "stale"]
-
-
-# --- Observation proposal (Issue #290) ---------------------------------------
-#
-# A developer's request to start capturing NEW runtime observation (as
-# opposed to reading facts that already exist) is never auto-started
-# (Principle 5/8): POST .../observation-proposals only ever records a
-# proposal row; approving it (decision_method='manual') does NOT itself
-# start anything -- the response only points back at the existing
-# PUT /components/{component_id}/policy endpoint that already sets a
-# component's trace/shadow mode.
-
-RuntimeObservationProposalStatus = Literal["proposed", "approved", "rejected", "expired"]
-
-
-class RuntimeObservationProposalCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    target_component: str = Field(..., min_length=1, max_length=500)
-    purpose: str = Field(..., min_length=1, max_length=2_000)
-    expected_cost: Optional[str] = Field(default=None, max_length=500)
-    risk_note: Optional[str] = Field(default=None, max_length=2_000)
-    retention_note: Optional[str] = Field(default=None, max_length=2_000)
-    origin_inquiry_id: Optional[int] = None
-    origin_alignment_item_id: Optional[int] = None
-
-
-class RuntimeObservationProposalOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    origin_inquiry_id: Optional[int] = None
-    origin_alignment_item_id: Optional[int] = None
-    target_component: str
-    purpose: str
-    expected_cost: Optional[str] = None
-    risk_note: Optional[str] = None
-    retention_note: Optional[str] = None
-    status: RuntimeObservationProposalStatus
-    decision_by: Optional[str] = None
-    decision_at: Optional[float] = None
-    created_at: float
-    # Deterministic, fixed (never LLM free text): only present once
-    # status='approved', pointing at the existing policy endpoint that
-    # actually starts trace/shadow capture (this proposal never does).
-    policy_pointer: Optional[str] = None
-
-
-class RuntimeObservationProposalDecisionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision_by: Optional[str] = Field(default=None, max_length=200)
-
-
-# --- Understanding Revisions (Issue #136) ------------------------------------
-#
-# Each successful update-understanding call appends one row (never
-# overwritten) so the Dashboard can show what changed since the previous
-# revision. Diffing is deterministic (exact-name matching only, Principle 6)
-# and computed on demand â€” no diff result is persisted.
-
-
-class UnderstandingRevisionOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    snapshot_id: int
-    intelligence_run_id: Optional[int] = None
-    current_understanding: Optional[Dict[str, Any]] = None
-    gap_analysis: Optional[List[Dict[str, Any]]] = None
-    created_at: float
-
-
-class UnderstandingRevisionListOut(BaseModel):
-    session_id: int
-    system_id: int
-    items: List[UnderstandingRevisionOut] = Field(default_factory=list)
-
-
-class UnderstandingDiffConfidenceChange(BaseModel):
-    name: str
-    before: Optional[str] = None
-    after: Optional[str] = None
-
-
-class UnderstandingDiffSectionOut(BaseModel):
-    section: str
-    added: List[str] = Field(default_factory=list)
-    removed: List[str] = Field(default_factory=list)
-    confidence_changed: List[UnderstandingDiffConfidenceChange] = Field(default_factory=list)
-    summary_changed: List[str] = Field(default_factory=list)
-
-
-class UnderstandingDiffOut(BaseModel):
-    """Structural diff between two understanding revisions.
-
-    ``has_previous`` is false when ``to_revision_id`` is the session's first
-    revision (or no revisions exist yet); ``sections`` is then empty and the
-    caller must show "no comparison target" rather than an all-added diff.
-    """
-
-    session_id: int
-    system_id: int
-    from_revision_id: Optional[int] = None
-    to_revision_id: Optional[int] = None
-    has_previous: bool = False
-    sections: List[UnderstandingDiffSectionOut] = Field(default_factory=list)
-
-
-# --- Interview Proposal Approval (Issue #70) ----------------------------------
-#
-# Per-item approval gate: a developer can approve, reject, or edit each
-# proposed { docstring_metadata, probe_plan } item. Decisions are persisted
-# as decision_method='manual' records that reference â€” but do not overwrite â€”
-# the original reasoning_llm proposal.
-
-InterviewDecisionAction = Literal["approved", "rejected", "edited"]
-
-
-class InterviewProposalApproveRequest(BaseModel):
-    """Approve a proposal as-is."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    actor: str = Field(min_length=1, max_length=200)
-
-
-class InterviewProposalRejectRequest(BaseModel):
-    """Reject a proposal."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    actor: str = Field(min_length=1, max_length=200)
-
-
-class InterviewProposalEditRequest(BaseModel):
-    """Edit and approve a proposal with corrected values."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    actor: str = Field(min_length=1, max_length=200)
-    metadata: InterviewProposalMetadataBlock
-    probe_plan: InterviewProposalProbePlan
-
-
-class InterviewProposalDecisionOut(BaseModel):
-    """A persisted manual decision on a proposal."""
-
-    id: int
-    proposal_id: int
-    session_id: int
-    system_id: int
-    decision: InterviewDecisionAction
-    decision_method: DecisionMethod
-    actor: str
-    edited_metadata: Optional[InterviewProposalMetadataBlock] = None
-    edited_probe_plan: Optional[InterviewProposalProbePlan] = None
-    denylist_hit: Optional[str] = None
-    decided_at: float
-
-
-class InterviewApprovedItemOut(BaseModel):
-    """An item from the approved set, ready for materialization.
-
-    Contains the effective metadata/probe_plan: the edited values if the
-    decision was 'edited', or the original proposal values if 'approved'.
-    """
-
-    proposal_id: int
-    path: str
-    qualified_name: str
-    symbol_id: Optional[int] = None
-    metadata: InterviewProposalMetadataBlock
-    probe_plan: InterviewProposalProbePlan
-    decision: InterviewDecisionAction
-    decision_id: int
-    actor: str
-    decided_at: float
-
-
-class InterviewApprovedSetOut(BaseModel):
-    """The approved set for a session: items eligible for materialization."""
-
-    session_id: int
-    system_id: int
-    snapshot_id: int
-    items: List[InterviewApprovedItemOut] = Field(default_factory=list)
-    total_proposals: int = 0
-    approved_count: int = 0
-    rejected_count: int = 0
-    pending_count: int = 0
-
-
-# --- Interview Materialization (Issue #71) ------------------------------------
-#
-# Materializes approved docstring metadata + probe instrumentation into a
-# single reviewable diff from an isolated worktree. The target repo's
-# tracked branches are never written to.
-
-
-class InterviewMaterializeRequest(BaseModel):
-    """Request to materialize the approved set into a reviewable diff."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    worktree_base: Optional[str] = Field(
-        default=None,
-        description="Base directory for the temporary worktree. "
-        "Defaults to system temp if not provided.",
-    )
-
-
-class InterviewMaterializeOut(BaseModel):
-    """Result of materializing approved proposals into a diff."""
-
-    session_id: int
-    system_id: int
-    snapshot_id: int
-    commit_sha: Optional[str] = None
-    diff: str
-    files_changed: int
-    items_materialized: int
-    skipped: List[str] = Field(default_factory=list)
-    materialized_at: float
-    error: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# System Understanding (Issue #86)
-# ---------------------------------------------------------------------------
-
-PipelineStepStatus = Literal["complete", "missing", "warning", "blocked", "failed"]
-
-
-class SystemUnderstandingPipelineStepOut(BaseModel):
-    step: str
-    status: PipelineStepStatus
-    detail: Optional[str] = None
-    label: str = ""
-
-
-class SystemUnderstandingGapSummaryOut(BaseModel):
-    gap_type: str
-    count: int
-
-
-class SystemUnderstandingMetadataCoverageOut(BaseModel):
-    symbol_count: int = 0
-    symbols_with_source_metadata: int = 0
-    entrypoint_count: int = 0
-    entrypoints_with_capability_link: int = 0
-
-
-class SystemUnderstandingCapabilitySummaryOut(BaseModel):
-    name: str
-    summary: Optional[str] = None
-    provenance_kind: Optional[str] = None
-
-
-class SystemUnderstandingEntrypointSummaryOut(BaseModel):
-    entrypoint_type: str
-    entrypoint_id: str
-    category: Optional[str] = None
-    label: Optional[str] = None
-
-
-class SystemUnderstandingSymbolSummaryOut(BaseModel):
-    path: str
-    qualified_name: str
-    kind: Optional[str] = None
-    route_path: Optional[str] = None
-    route_method: Optional[str] = None
-    component_id: Optional[str] = None
-
-
-class SystemUnderstandingPurposeOut(BaseModel):
-    name: str
-    summary: Optional[str] = None
-    provenance_kind: Optional[str] = None
-
-
-# Issue #94/#275: the manual system_profile purpose surfaced as a parallel
-# provenance view next to the AI/source-derived purpose. `source` is a finite
-# set (Principle 6): "system_profile" is the human-entered PUT /system-profile
-# record; "capability_hierarchy" / "system_profile_draft" are the two
-# AI/structural sources `_load_purpose` already reads, kept distinguishable so
-# the Dashboard can label them separately.
-SystemUnderstandingPurposeViewSource = Literal[
-    "system_profile", "capability_hierarchy", "system_profile_draft"
-]
-
-
-class SystemUnderstandingPurposeViewOut(BaseModel):
-    source: SystemUnderstandingPurposeViewSource
-    provenance_kind: str
-    name: str
-    summary: Optional[str] = None
-    updated_at: Optional[float] = None
-
-
-# Finite stale reasons for a purpose confirmation, computed structurally at
-# read time (Principle 6): the manual/AI sides are compared against their
-# current persisted values, never inferred.
-SystemUnderstandingPurposeConfirmationStaleReason = Literal[
-    "profile_updated", "snapshot_changed", "ai_updated"
-]
-
-
-class SystemUnderstandingPurposeConfirmationOut(BaseModel):
-    id: int
-    snapshot_id: int
-    understanding_build_id: Optional[int] = None
-    decided_by_user_id: Optional[int] = None
-    decision_method: str
-    manual_purpose: str
-    ai_purpose_name: Optional[str] = None
-    ai_purpose_summary: Optional[str] = None
-    ai_source: Optional[str] = None
-    ai_provenance_kind: Optional[str] = None
-    note: Optional[str] = None
-    created_at: float
-    stale: bool = False
-    stale_reason: Optional[SystemUnderstandingPurposeConfirmationStaleReason] = None
-
-
-class SystemUnderstandingPurposeConfirmationCreate(BaseModel):
-    """Record a human 'confirmed' decision between the manual system_profile
-    purpose and the current AI/source-derived purpose view.
-
-    Both ids are optional only for wire-level backward compatibility. The
-    endpoint fail-closes with 409 unless `snapshot_id` matches the latest
-    ready snapshot and `understanding_build_id` matches its latest completed
-    build, so a confirmation cannot race a rebuild after the view was read.
-    """
-
-    snapshot_id: Optional[int] = None
-    understanding_build_id: Optional[int] = None
-    note: Optional[str] = Field(default=None, max_length=2000)
-
-
-class SystemUnderstandingGapNextActionOut(BaseModel):
-    action: str
-    link: Optional[str] = None
-
-
-class SystemUnderstandingGapDocRef(BaseModel):
-    path: str
-    start_line: Optional[int] = None
-    end_line: Optional[int] = None
-
-
-class SystemUnderstandingGapSymbolRef(BaseModel):
-    path: Optional[str] = None
-    qualified_name: Optional[str] = None
-
-
-class SystemUnderstandingGapEntrypointRef(BaseModel):
-    entrypoint_type: Optional[str] = None
-    entrypoint_ref: Optional[str] = None
-
-
-class IssueDraftRefOut(BaseModel):
-    """Lightweight reference to an issue draft, embedded next to its gap."""
-
-    id: int
-    status: str
-    external_url: Optional[str] = None
-    title: str
-
-
-GapTriageStatus = Literal["open", "acknowledged", "dismissed", "resolved"]
-GapTriageDecisionMethod = Literal["manual", "deterministic"]
-GapTriageReopenReason = Literal["content_changed", "resolved_gap_reappeared"]
-
-
-class GapTriageDecisionOut(BaseModel):
-    id: int
-    system_id: int
-    snapshot_id: Optional[int] = None
-    gap_key: str
-    content_fingerprint: str
-    status: GapTriageStatus
-    decided_by_user_id: Optional[int] = None
-    decision_method: GapTriageDecisionMethod
-    note: Optional[str] = None
-    created_at: float
-
-
-class GapTriageUpdateRequest(BaseModel):
-    gap_key: str = Field(min_length=1, max_length=4000)
-    content_fingerprint: str = Field(
-        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
-    )
-    status: GapTriageStatus
-    note: Optional[str] = Field(default=None, max_length=1000)
-
-
-class SystemUnderstandingGapOut(BaseModel):
-    gap_type: Optional[str] = None
-    severity: str = "info"
-    title: Optional[str] = None
-    node_name: Optional[str] = None
-    notes: Optional[str] = None
-    capability_key: Optional[str] = None
-    doc_refs: List[SystemUnderstandingGapDocRef] = Field(default_factory=list)
-    symbol_refs: List[SystemUnderstandingGapSymbolRef] = Field(default_factory=list)
-    entrypoint_refs: List[SystemUnderstandingGapEntrypointRef] = Field(default_factory=list)
-    code_refs: List[Dict[str, Any]] = Field(default_factory=list)
-    next_actions: List[SystemUnderstandingGapNextActionOut] = Field(default_factory=list)
-    # Issue #107: stable identity for matching drafts back to this gap, plus any
-    # issue drafts already generated for it (with registered external URLs).
-    # source_id is a stable per-gap identifier (graph node id / entrypoint
-    # identity) folded into source_key; it round-trips so a draft created from a
-    # POSTed gap resolves to the same key the display computed.
-    source_id: Optional[str] = None
-    source_key: Optional[str] = None
-    issue_drafts: List[IssueDraftRefOut] = Field(default_factory=list)
-    # Issue #276: human-readable, snapshot-stable locator and a separate
-    # semantic content fingerprint. ``triage_status`` is the effective state;
-    # it becomes open when a dismissed gap's fingerprint changes even before
-    # the deterministic reopen audit row is materialized by the next action.
-    # Optional on the shared model for backward compatibility with the
-    # existing POST /issue-drafts payload, which accepts caller-supplied gaps
-    # created before Issue #276. Server-generated System Understanding gaps
-    # always populate both fields in `_system_understanding_to_out`.
-    gap_key: Optional[str] = None
-    content_fingerprint: Optional[str] = None
-    triage_status: GapTriageStatus = "open"
-    triage_decision: Optional[GapTriageDecisionOut] = None
-    triage_reopen_reason: Optional[GapTriageReopenReason] = None
-
-
-# Issue #202: finite stage completion status shown as a badge in the Hub.
-# Derived purely from persisted state (system_understanding_service.
-# _derive_stage_statuses); no reasoning model involved (Principle 6).
-SystemUnderstandingStageStatusValue = Literal[
-    "not_started", "in_progress", "blocked", "complete"
-]
-
-
-class SystemUnderstandingStageStatusOut(BaseModel):
-    stage: str
-    status: str
-    counts: Dict[str, int] = Field(default_factory=dict)
-    # Issue #240: server-supplied Japanese display copy (optional so existing
-    # dashboard contract tests that build this object without them stay valid;
-    # the Dashboard prefers these over its local STAGE_LABELS fallback).
-    label: str = ""
-    description: str = ""
-
-
-# Issue #203: deterministic before/after comparison of gap counts between the
-# two most recent settled (completed/partial) builds of the same system,
-# read back from system_understanding_gap_history. A gap_type present in
-# only one of the two builds has 0 on the side where it did not appear.
-class SystemUnderstandingGapTrendOut(BaseModel):
-    gap_type: str
-    current: int
-    previous: int
-
-
-class SystemUnderstandingOut(BaseModel):
-    system_id: int
-    snapshot_id: Optional[int] = None
-    understanding_build_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-    pipeline: List[SystemUnderstandingPipelineStepOut] = Field(default_factory=list)
-    purpose: Optional[SystemUnderstandingPurposeOut] = None
-    capabilities: List[SystemUnderstandingCapabilitySummaryOut] = Field(default_factory=list)
-    entrypoints: List[SystemUnderstandingEntrypointSummaryOut] = Field(default_factory=list)
-    major_symbols: List[SystemUnderstandingSymbolSummaryOut] = Field(default_factory=list)
-    gaps: List[SystemUnderstandingGapOut] = Field(default_factory=list)
-    gap_summary: List[SystemUnderstandingGapSummaryOut] = Field(default_factory=list)
-    metadata_coverage: Optional[SystemUnderstandingMetadataCoverageOut] = None
-    # Issue #202: deterministic completion status + counts for each of the 4
-    # Hub stages (understand / observe / instrument / evaluate).
-    stages: List[SystemUnderstandingStageStatusOut] = Field(default_factory=list)
-    # Issue #203: gap-count trend across the last two settled builds (empty
-    # until 2 builds have recorded history).
-    gap_trend: List[SystemUnderstandingGapTrendOut] = Field(default_factory=list)
-    # Issue #201's `primary_action`, Issue #174's `next_actions`, and Issue
-    # #203's `understanding_refresh_recommended` were removed in Issue #239.
-    # The canonical "what should the user do next" projection is now
-    # `GET /system-state`'s `primary_item` / `page_items` (Issue #238).
-    # Issue #240: server-supplied Japanese summary shown when the whole
-    # pipeline is complete (None otherwise); replaces the Dashboard's
-    # client-assembled English success string.
-    success_summary: Optional[str] = None
-    # Issue #94/#275: manual system_profile purpose surfaced as a parallel
-    # provenance view next to the AI/source-derived purpose (`purpose` above
-    # keeps its exact existing semantics unchanged). Manual view is
-    # snapshot-independent; the AI view is included only when a ready
-    # snapshot exists.
-    purpose_views: List[SystemUnderstandingPurposeViewOut] = Field(default_factory=list)
-    # The latest human "confirmed" record reconciling the manual and AI
-    # purpose views, or None if never confirmed.
-    purpose_confirmation: Optional[SystemUnderstandingPurposeConfirmationOut] = None
-
-
-class CapabilityContextProbePlanOut(BaseModel):
-    """Issue #175: lightweight Probe Plan reference for the capability context API."""
-
-    id: int
-    feature_id: str
-    objective: str
-    status: ProbePlanStatus
-    created_at: float
-    updated_at: float
-
-
-class CapabilityContextExperimentOut(BaseModel):
-    """Issue #175: lightweight Experiment reference, with decision state, for the
-    capability context API."""
-
-    id: int
-    feature_id: str
-    objective: str
-    status: str
-    human_decision: str
-    human_decision_variant_key: Optional[str] = None
-    created_at: float
-
-
-class CapabilityContextOut(BaseModel):
-    """Issue #175: gaps / probe plans / experiments explicitly linked to one
-    capability_key, for the Capability detail panel. Every item here is joined
-    by an exact key match (capability_key or feature_id) â€” never a guess."""
-
-    capability_key: str
-    gaps: List[SystemUnderstandingGapOut] = Field(default_factory=list)
-    probe_plans: List[CapabilityContextProbePlanOut] = Field(default_factory=list)
-    experiments: List[CapabilityContextExperimentOut] = Field(default_factory=list)
-
-
-class SystemUnderstandingBuildStepOut(BaseModel):
-    """One orchestrated step of a System Understanding build job (Issue #109)."""
-
-    id: int
-    step: str
-    status: str  # pending, running, completed, failed, blocked, cancelled
-    depends_on: List[str] = Field(default_factory=list)
-    reused_existing: bool = False
-    cancel_requested: bool = False
-    error: Optional[str] = None
-    artifact_provenance: Dict[str, Any] = Field(default_factory=dict)
-    duration_ms: Optional[float] = None
-    heartbeat_at: Optional[float] = None
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-
-
-class SystemUnderstandingLlmTaskSummaryOut(BaseModel):
-    """Aggregate counts of chunk-level LLM tasks for a build job."""
-
-    total: int = 0
-    pending: int = 0
-    running: int = 0
-    completed: int = 0
-    failed: int = 0
-    cancelled: int = 0
-    reused: int = 0
-
-
-class SystemUnderstandingArtifactCountsOut(BaseModel):
-    """Deterministic persisted artifact counts for the job's snapshot."""
-
-    symbols: int = 0
-    entrypoints: int = 0
-    understanding_graph_claims: int = 0
-    capability_hierarchy_nodes: int = 0
-
-
-class SystemUnderstandingBuildOut(BaseModel):
-    id: int
-    job_id: int
-    # Latest execution (initial enqueue or retry) of this job. None only for
-    # legacy rows created before run tracking existed.
-    run_id: Optional[int] = None
-    system_id: int
-    snapshot_id: Optional[int] = None
-    # completed only when every step completed; blocked/cancelled/failed
-    # steps yield partial (or failed when no step completed).
-    status: str  # queued, running, completed, partial, failed, cancelled
-    current_step: Optional[str] = None
-    error: Optional[str] = None
-    cancel_requested: bool = False
-    is_stuck: bool = False
-    heartbeat_at: Optional[float] = None
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    created_at: float
-    steps: List[SystemUnderstandingBuildStepOut] = Field(default_factory=list)
-    llm_tasks: Optional[SystemUnderstandingLlmTaskSummaryOut] = None
-    artifact_counts: Optional[SystemUnderstandingArtifactCountsOut] = None
-
-
-class SystemUnderstandingJobRetryIn(BaseModel):
-    """Optional step name to retry only that step (plus its dependents)."""
-
-    step: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Issue drafts (Issue #107)
-# ---------------------------------------------------------------------------
-
-
-class IssueDraftCreateRequest(BaseModel):
-    """Generate an issue draft from a System Understanding gap.
-
-    The server renders the Markdown body deterministically and pins the current
-    snapshot id / commit sha, so callers only supply the gap they are looking at.
-    """
-
-    source_type: Literal[
-        "system_understanding_gap", "interview", "probe_proposal"
-    ] = "system_understanding_gap"
-    gap: SystemUnderstandingGapOut
-    # The snapshot the gap was displayed against. When provided, the server
-    # rejects the request (409) if a newer snapshot has since become ready, so a
-    # draft never embeds a snapshot id / commit sha that disagrees with the gap
-    # evidence the caller was looking at.
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-
-
-class IssueDraftUpdateRequest(BaseModel):
-    """Partial update of an issue draft.
-
-    Any field left unset is preserved. `external_url` uses the model's set-ness
-    (exclude_unset) so passing `""` clears a previously registered URL while
-    omitting it leaves the current value untouched.
-    """
-
-    title: Optional[str] = None
-    body_markdown: Optional[str] = None
-    status: Optional[
-        Literal["draft", "copied", "external_created", "closed", "rejected"]
-    ] = None
-    external_url: Optional[str] = None
-
-
-class IssueDraftOut(BaseModel):
-    id: int
-    system_id: int
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-    source_type: str
-    source_key: Optional[str] = None
-    gap_type: Optional[str] = None
-    severity: Optional[str] = None
-    node_name: Optional[str] = None
-    title: str
-    body_markdown: str
-    status: str
-    external_url: Optional[str] = None
-    # Issue #158: True when the draft's originating snapshot/commit no longer
-    # matches the latest ready snapshot, so the analysis behind it may be out of
-    # date. Computed at read time; never persisted.
-    stale: bool = False
-    created_at: float
-    updated_at: float
-
-
-class GitHubIssueStatusOut(BaseModel):
-    """Whether GitHub issue creation is available for the current system's
-    configured repository (Issue #158 External Issue Loop)."""
-
-    available: bool
-    owner: Optional[str] = None
-    repo: Optional[str] = None
-    reason: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# System diagnostics (Issue #101)
-# ---------------------------------------------------------------------------
-
-DiagnosticSeverity = Literal["ok", "warning", "error", "blocked", "unknown"]
-
-
-class DiagnosticLastObservedErrorOut(BaseModel):
-    source: str
-    status: str
-    error: Optional[str] = None
-    observed_at: Optional[float] = None
-
-
-class SystemDiagnosticCheckOut(BaseModel):
-    check_id: str
-    category: str
-    title: str
-    severity: DiagnosticSeverity
-    detail: str
-    impact: str = ""
-    remediation: str = ""
-    related_env: List[str] = Field(default_factory=list)
-    related_paths: List[str] = Field(default_factory=list)
-    related_pages: List[str] = Field(default_factory=list)
-    related_pipeline_steps: List[str] = Field(default_factory=list)
-    last_observed_error: Optional[DiagnosticLastObservedErrorOut] = None
-    decision_method: Literal["deterministic"] = "deterministic"
-    # Issue #115: where the user fixes the problem.
-    fix_kind: Literal["navigate", "dialog"] = "dialog"
-    fix_page: Optional[str] = None
-    fix_anchor: Optional[str] = None
-
-
-class SystemDiagnosticsOut(BaseModel):
-    system_id: int
-    generated_at: float
-    overall_severity: DiagnosticSeverity
-    severity_counts: Dict[str, int] = Field(default_factory=dict)
-    checks: List[SystemDiagnosticCheckOut] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Per-screen assistant (Issue #102)
-# ---------------------------------------------------------------------------
-
-
-class SettingMetadataOut(BaseModel):
-    key: str
-    display_name: str
-    category: str
-    requiredness: Literal["required", "conditional", "optional"]
-    description: str
-    impact: str
-    remediation: str
-    valid_values: Optional[List[str]] = None
-    validation_rule: str = ""
-    related_checks: List[str] = Field(default_factory=list)
-    related_pages: List[str] = Field(default_factory=list)
-    related_pipeline_steps: List[str] = Field(default_factory=list)
-    docs_link: str = ""
-    # Settings explanations are static code-managed metadata, never LLM output.
-    decision_method: Literal["deterministic"] = "deterministic"
-
-
-class SettingsMetadataOut(BaseModel):
-    settings: List[SettingMetadataOut] = Field(default_factory=list)
-
-
-class AssistantSuggestedQuestionOut(BaseModel):
-    question: str
-    source: Literal["diagnostics", "static"]
-    check_id: str = ""
-
-
-class AssistantScreenContextOut(BaseModel):
-    screen_id: str
-    title: str
-    route: str
-    purpose: str
-    primary_data_sources: List[str] = Field(default_factory=list)
-    visible_sections: List[str] = Field(default_factory=list)
-    common_questions: List[str] = Field(default_factory=list)
-    related_settings: List[str] = Field(default_factory=list)
-    related_checks: List[str] = Field(default_factory=list)
-    related_pipeline_steps: List[str] = Field(default_factory=list)
-    related_endpoints: List[str] = Field(default_factory=list)
-    # Current deterministic state for this screen (diagnostics subset).
-    state_severity: DiagnosticSeverity = "ok"
-    screen_checks: List[SystemDiagnosticCheckOut] = Field(default_factory=list)
-    suggested_questions: List[AssistantSuggestedQuestionOut] = Field(default_factory=list)
-
-
-class AssistantAskRequest(BaseModel):
-    screen_id: str = Field(..., min_length=1, max_length=100)
-    question: str = Field(..., min_length=1, max_length=4000)
-    route_params: Dict[str, str] = Field(default_factory=dict)
-    visible_check_ids: List[str] = Field(default_factory=list, max_length=50)
-    visible_state_ids: List[str] = Field(default_factory=list, max_length=50)
-    focused_state_id: Optional[str] = Field(default=None, max_length=200)
-
-
-# ---------------------------------------------------------------------------
-# System State Assessment (Issue #193)
-# ---------------------------------------------------------------------------
-
-StateSeverity = Literal["ok", "info", "warning", "blocked", "error"]
-StateStatus = Literal[
-    "satisfied", "missing", "unconfirmed", "stale", "impacted",
-    "blocked", "running", "failed", "ready",
-]
-StateUserActionKind = Literal[
-    "none", "configure", "create_snapshot", "build", "confirm",
-    "review", "rerun", "inspect", "wait",
-]
-StateInterventionTiming = Literal["now", "before_next_step", "optional", "after_build", "none"]
-StateGroup = Literal[
-    "repository", "snapshot", "pipeline", "understanding", "interview",
-    "runtime", "proposal", "configuration",
-]
-# User phase (Issue #237; extended to the full 6-step improvement flow by
-# Issue #256): setup -> preparation -> instrumentation -> observation ->
-# evaluation -> publish (terminal display phase).
-UserPhase = Literal[
-    "setup", "preparation", "instrumentation", "observation", "evaluation", "publish",
-]
-
-
-class SystemStateTargetUiOut(BaseModel):
-    route: str
-    anchor: Optional[str] = None
-    action_label: str = ""
-
-
-class SystemStateItemOut(BaseModel):
-    state_id: str
-    state_group: StateGroup
-    severity: StateSeverity
-    status: StateStatus
-    user_action_kind: StateUserActionKind
-    intervention_timing: StateInterventionTiming
-    subject: str
-    summary: str
-    detail: str
-    impact: str = ""
-    remediation: str = ""
-    evidence: Dict[str, Any] = Field(default_factory=dict)
-    target_ui: Optional[SystemStateTargetUiOut] = None
-    display_routes: List[str] = Field(default_factory=list)
-    related_checks: List[str] = Field(default_factory=list)
-    related_pipeline_steps: List[str] = Field(default_factory=list)
-    source: str = "system_state"
-    dedupe_key: str = ""
-    scope: str = "global"
-    # System State Assessment is deterministic and LLM-free (Issue #193 Phase 1).
-    decision_method: Literal["deterministic"] = "deterministic"
-    # Fixed state_group -> phase mapping plus a small explicit per-item
-    # override list (Issue #237); see system_state._phase_for_item. Default
-    # is the terminal display phase (Issue #256), matching
-    # system_state._phase_for_item's own fallback default.
-    phase: UserPhase = "publish"
-
-
-class SystemStatePhaseCompletionOut(BaseModel):
-    phase: UserPhase
-    complete: bool
-    label: str = ""
-
-
-class SystemStateAssessmentOut(BaseModel):
-    system_id: int
-    generated_at: float
-    overall_severity: StateSeverity
-    severity_counts: Dict[str, int] = Field(default_factory=dict)
-    items: List[SystemStateItemOut] = Field(default_factory=list)
-    primary_item: Optional[SystemStateItemOut] = None
-    notification_items: List[SystemStateItemOut] = Field(default_factory=list)
-    page_items: Dict[str, List[SystemStateItemOut]] = Field(default_factory=dict)
-    # User phase (Issue #237): the current phase plus each phase's
-    # completion condition. Additive; existing fields above are unchanged.
-    user_phase: UserPhase = "setup"
-    phases: List[SystemStatePhaseCompletionOut] = Field(default_factory=list)
-
-
-class AssistantActionOut(BaseModel):
-    label: str
-    kind: Literal["navigate", "configure", "operate"]
-    target: str
-    detail: str = ""
-
-
-class AssistantCitationOut(BaseModel):
-    type: Literal["setting", "diagnostic_check", "pipeline_step", "state_item"]
-    id: str
-    title: str = ""
-    detail: str = ""
-
-
-# GitHub App publish workflow (Issue #216, sub-task 1): connection
-# persistence models. `status` is a finite set enforced in the route layer;
-# no field here ever carries an installation token or private key material
-# (Principle 5/8 -- tokens are brokered per-call and never stored).
-GithubConnectionStatus = Literal["pending", "connected", "error", "disconnected"]
-
-
-class GithubAppStatusOut(BaseModel):
-    configured: bool
-    app_id: Optional[str] = None
-    api_base_url: str
-    web_base_url: str
-    allowed_organization: Optional[str] = None
-
-
-GithubInstallationStatus = Literal["active", "disabled"]
-
-
-class GithubInstallationRegister(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    installation_id: int = Field(..., gt=0)
-
-
-class GithubInstallationOut(BaseModel):
-    installation_id: int
-    github_account_login: str
-    github_account_type: str
-    status: GithubInstallationStatus
-    registered_by_user_id: Optional[int] = None
-    verified_at: str
-    disabled_by_user_id: Optional[int] = None
-    disabled_at: Optional[str] = None
-    created_at: str
-    updated_at: str
-    assigned_system_ids: List[int] = Field(default_factory=list)
-
-
-class GithubConnectionCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    owner: str = Field(..., min_length=1)
-    repo: str = Field(..., min_length=1)
-    installation_id: int
-
-
-class GithubConnectionOut(BaseModel):
-    id: int
-    system_id: int
-    api_base_url: str
-    web_base_url: str
-    owner: str
-    repo: str
-    clone_url: str
-    installation_id: int
-    default_branch: Optional[str] = None
-    credential_type: str
-    status: GithubConnectionStatus
-    last_error: Optional[str] = None
-    last_synced_at: Optional[str] = None
-    last_synced_commit_sha: Optional[str] = None
-    created_by_user_id: Optional[int] = None
-    updated_by_user_id: Optional[int] = None
-    created_at: str
-    updated_at: str
-
-
-# Repository manager status (Issue #216, sub-task 2). `mirror_path` is
-# root-relative (never the absolute host path) so it is safe to return to a
-# Dashboard client.
-class GithubRepositoryStatusOut(BaseModel):
-    connection_id: int
-    mirror_exists: bool
-    mirror_path: Optional[str] = None
-    default_branch: Optional[str] = None
-    last_synced_at: Optional[str] = None
-    last_synced_commit_sha: Optional[str] = None
-
-
-# Read-only installation repository listing (Issue #216, sub-task 4) -- used by
-# the Dashboard's connection-creation form to let the developer pick a repo
-# instead of typing owner/repo by hand. Never carries a token.
-class GithubInstallationRepositoryOut(BaseModel):
-    owner: str
-    name: str
-    default_branch: Optional[str] = None
-    private: bool
-
-
-# Publish job state machine (Issue #216, sub-task 3). `status` is the finite
-# ordered set enforced by app/publish_job.py; no field here ever carries an
-# installation token (Principle 5/8 -- `error` is always sanitized before
-# persistence, so it is safe to return verbatim).
-PublishJobStatus = Literal[
-    "pending",
-    "authenticating",
-    "fetching",
-    "checking_out",
-    "applying_patch",
-    "validating",
-    "awaiting_approval",
-    "committing",
-    "pushing",
-    "creating_pr",
-    "completed",
-    "failed",
-    "cancelled",
-    # Issue #226: resting/active states a publish-phase failure or a retry
-    # can land in. `retryable_failed` / `manual_intervention_required` are
-    # not terminal -- only retry/cancel/disconnect move a job out of them.
-    "retryable_failed",
-    "reconciling",
-    "manual_intervention_required",
-]
-
-
-class PublishJobCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    patch_id: int
-
-
-class PublishJobOut(BaseModel):
-    id: int
-    system_id: int
-    connection_id: int
-    patch_id: int
-    snapshot_id: int
-    base_branch: str
-    base_commit_sha: Optional[str] = None
-    branch_name: Optional[str] = None
-    commit_sha: Optional[str] = None
-    pr_url: Optional[str] = None
-    pr_number: Optional[int] = None
-    status: PublishJobStatus
-    error: Optional[str] = None
-    validation_summary: Optional[Dict[str, Any]] = None
-    requested_by_user_id: Optional[int] = None
-    approved_by_user_id: Optional[int] = None
-    cleanup_state: str = "not_attempted"
-    cleanup_error: Optional[str] = None
-    created_at: float
-    updated_at: float
-    approved_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    heartbeat_at: Optional[float] = None
-    retry_count: int = 0
-    last_attempt_at: Optional[float] = None
-
-
-# Append-only audit trail entry for the GitHub publish workflow (Issues
-# #227/#226) -- `detail` is parsed JSON (or None), never a raw token/path
-# (Principle 5/8; `publish_audit.record_publish_audit_event` already
-# enforces that at write time).
-class PublishAuditEventOut(BaseModel):
-    id: int
-    job_id: Optional[int] = None
-    connection_id: Optional[int] = None
-    event_type: str
-    actor_user_id: Optional[int] = None
-    detail: Optional[Dict[str, Any]] = None
-    created_at: float
-
-
-class AssistantAskOut(BaseModel):
-    screen_id: str
-    answer: str
-    suggested_actions: List[AssistantActionOut] = Field(default_factory=list)
-    citations: List[AssistantCitationOut] = Field(default_factory=list)
-    used_fallback: bool
-    fallback_reason: Optional[str] = None
-    decision_method: Literal["deterministic", "reasoning_llm"]
-    provider: str
-    model: str
-    prompt_version: str
-    schema_version: str
-    generated_at: float
-
-
-# --- Replay engine (Issue #242 Phase B / #244) -------------------------------
-
-# Finite classification sets (Principle 6). Kept in sync with
-# app/replay_runner.py and the replay_case_results table comments.
-ReplayCaseStatus = Literal["match", "mismatch", "error", "skipped"]
-ReplayInputSource = Literal["structured", "repr_partial"]
-ReplaySkipReason = Literal[
-    "unreplayable_capture",
-    "repr_parse_failed",
-    "undecodable_input",
-    "trace_missing",
-]
-ReplaySetSource = Literal["manual", "analyzer_run"]
-ReplayApprovalStatus = Literal["approved", "revoked"]
-
-
-class ReplayApprovalCreate(BaseModel):
-    reason: str = Field(..., min_length=1)
-
-
-class ReplayRiskPointOut(BaseModel):
-    """A persisted probe plan point label reused as display-only risk context.
-
-    No new reasoning run and no heuristic inference: these are verbatim
-    stored labels; absent labels are returned as absent (None)."""
-
-    point_id: int
-    plan_id: int
-    side_effect_risk: Optional[str] = None
-    replayability: Optional[str] = None
-
-
-class ReplayRiskContextOut(BaseModel):
-    probe_plan_points: List[ReplayRiskPointOut] = Field(default_factory=list)
-    warning: str
-
-
-class ReplayApprovalOut(BaseModel):
-    id: int
-    system_id: int
-    component_id: str
-    status: ReplayApprovalStatus
-    reason: str = ""
-    approved_by_user_id: Optional[int] = None
-    decision_method: str = "manual"
-    risk_context: Optional[Dict[str, Any]] = None
-    created_at: float
-    revoked_at: Optional[float] = None
-    revoked_by_user_id: Optional[int] = None
-
-
-class ReplayApprovalStateOut(BaseModel):
-    component_id: str
-    active: bool
-    approval: Optional[ReplayApprovalOut] = None
-    risk_context: ReplayRiskContextOut
-
-
-class ReplaySetCreate(BaseModel):
-    component_id: str = Field(..., min_length=1)
-    name: str = ""
-    trace_ids: Optional[List[str]] = None
-    analyzer_run_id: Optional[int] = None
-
-
-class ReplaySetTraceOut(BaseModel):
-    """Per-trace replay preview: recorded replayability plus the input source
-    a replay would deterministically use (same rule as the runner)."""
-
-    trace_id: str
-    exists: bool
-    replayability: Optional[str] = None
-    replay_reasons: List[str] = Field(default_factory=list)
-    input_source: Optional[ReplayInputSource] = None
-    skip_reason: Optional[ReplaySkipReason] = None
-
-
-class ReplaySetOut(BaseModel):
-    id: int
-    system_id: int
-    component_id: str
-    name: str = ""
-    source: ReplaySetSource
-    source_analyzer_run_id: Optional[int] = None
-    trace_ids: List[str] = Field(default_factory=list)
-    traces: List[ReplaySetTraceOut] = Field(default_factory=list)
-    created_at: float
-
-
-class ReplayRunCreate(BaseModel):
-    replay_set_id: int
-    snapshot_id: Optional[int] = None
-    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
-
-
-class ReplayCaseResultOut(BaseModel):
-    id: int
-    trace_id: str
-    position: int
-    case_status: ReplayCaseStatus
-    input_source: Optional[ReplayInputSource] = None
-    skip_reason: Optional[ReplaySkipReason] = None
-    replay_output: Optional[str] = None
-    replay_error: Optional[str] = None
-    recorded_output: Optional[str] = None
-    recorded_error: Optional[str] = None
-    duration_ms: Optional[float] = None
-    output_truncated: bool = False
-    comparison_mode: str = "repr"
-    created_at: float
-
-
-class ReplayRunOut(BaseModel):
-    id: int
-    system_id: int
-    replay_set_id: int
-    component_id: str
-    snapshot_id: int
-    commit_sha: str
-    symbol_path: str
-    symbol_qualified_name: str
-    status: Literal["running", "completed", "failed"]
-    error: Optional[str] = None
-    trace_set_hash: str
-    sandbox_config: Dict[str, Any] = Field(default_factory=dict)
-    approval_id: Optional[int] = None
-    workspace_path: Optional[str] = None
-    cleanup_state: str = "not_attempted"
-    cleanup_error: Optional[str] = None
-    summary: Dict[str, int] = Field(default_factory=dict)
-    cases: List[ReplayCaseResultOut] = Field(default_factory=list)
-    created_at: float
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    snapshot_freshness: Optional[SnapshotFreshnessState] = None
-    head_sha_at_creation: Optional[str] = None
-    stale_ack_reason: Optional[str] = None
-
-
-# --- Replay variants (Issue #242 Phase C / #245) -----------------------------
-
-# Finite classification sets (Principle 6). Kept in sync with
-# app/replay_variants.py's module docstring and the replay_variant* table
-# comments in app/db.py.
-ReplayVariantCaseStatus = Literal[
-    "match",
-    "diff",
-    "candidate_error",
-    "error_to_success",
-    "error_to_same_error",
-    "error_to_different_error",
-    "skipped",
-]
-ReplayVariantComparisonMode = Literal["structured", "repr"]
-ReplayVariantSource = Literal["manual", "pasted", "llm_draft"]
-ReplayVariantApplyStatus = Literal["applied", "invalid_patch", "not_applicable"]
-ReplayVariantRunStatus = Literal["running", "completed", "failed"]
-ReplayVariantDraftStatus = Literal["proposed", "failed"]
-
-
-class ReplayVariantCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    label: str = Field(..., min_length=1, max_length=200)
-    patch_text: str = Field(..., min_length=1, max_length=1_000_000)
-    source: ReplayVariantSource = "manual"
-
-
-class ReplayVariantRunCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    replay_set_id: int
-    snapshot_id: Optional[int] = None
-    variants: List[ReplayVariantCreate] = Field(..., min_length=1, max_length=20)
-    # Issue #369: required when the resolved snapshot is definitively behind
-    # HEAD. Same manual decision the Experiment records.
-    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
-
-
-class ReplayVariantCaseResultOut(BaseModel):
-    id: int
-    trace_id: str
-    position: int
-    case_status: ReplayVariantCaseStatus
-    comparison_mode: Optional[ReplayVariantComparisonMode] = None
-    baseline_output: Optional[str] = None
-    candidate_output: Optional[str] = None
-    candidate_error: Optional[str] = None
-    recorded_error: Optional[str] = None
-    duration_ms: Optional[float] = None
-    duration_delta_ms: Optional[float] = None
-    field_diffs: List[str] = Field(default_factory=list)
-    output_truncated: bool = False
-    created_at: float
-
-
-class ReplayVariantAggregateOut(BaseModel):
-    match: int = 0
-    diff: int = 0
-    candidate_error: int = 0
-    error_to_success: int = 0
-    error_to_same_error: int = 0
-    error_to_different_error: int = 0
-    skipped: int = 0
-    total: int = 0
-    avg_duration_delta_ms: Optional[float] = None
-    examples: Dict[str, List[str]] = Field(default_factory=dict)
-
-
-class ReplayVariantOut(BaseModel):
-    id: int
-    replay_run_id: int
-    variant_key: str
-    label: str = ""
-    is_baseline: bool
-    patch_text: str = ""
-    patch_hash: str
-    source: str = "manual"
-    apply_status: ReplayVariantApplyStatus = "not_applicable"
-    apply_error: Optional[str] = None
-    status: ReplayVariantRunStatus = "running"
-    error: Optional[str] = None
-    workspace_path: Optional[str] = None
-    cleanup_state: str = "not_attempted"
-    cleanup_error: Optional[str] = None
-    aggregate: ReplayVariantAggregateOut = Field(default_factory=ReplayVariantAggregateOut)
-    cases: List[ReplayVariantCaseResultOut] = Field(default_factory=list)
-    created_at: float
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-
-
-class ReplayVariantRunOut(BaseModel):
-    id: int
-    system_id: int
-    replay_set_id: int
-    component_id: str
-    snapshot_id: int
-    commit_sha: str
-    symbol_path: str
-    symbol_qualified_name: str
-    status: ReplayVariantRunStatus
-    error: Optional[str] = None
-    trace_set_hash: str
-    sandbox_config: Dict[str, Any] = Field(default_factory=dict)
-    approval_id: Optional[int] = None
-    variants: List[ReplayVariantOut] = Field(default_factory=list)
-    created_at: float
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-
-
-class ReplayVariantDraftCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    replay_set_id: int
-    trace_id: str = Field(..., min_length=1)
-    objective: str = Field(..., min_length=1, max_length=5000)
-    snapshot_id: Optional[int] = None
-
-
-class ReplayVariantDraftOut(BaseModel):
-    id: int
-    system_id: int
-    replay_set_id: int
-    component_id: str
-    trace_id: str
-    objective: str
-    snapshot_id: int
-    symbol_path: str
-    symbol_qualified_name: str
-    generated_code: str = ""
-    patch_text: str = ""
-    patch_hash: str = ""
-    notes: str = ""
-    status: ReplayVariantDraftStatus
-    error: Optional[str] = None
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    prompt_version: Optional[str] = None
-    schema_version: Optional[str] = None
-    decision_method: Optional[DecisionMethod] = None
-    is_mock: bool = False
-    created_at: float
-
-
-class ReplayVariantExperimentPayloadOut(BaseModel):
-    """Shapes a Replay variant's patch for POST /experiments prefill
-    (Issue #245). API shape only -- this never creates an experiment;
-    the caller copies this into an ExperimentVariantCreate."""
-
-    label: str
-    patch_text: str
-    patch_hash: str
-    source: str = "replay_variant"
-    risk_note: str = ""
-    origin: Dict[str, Any] = Field(default_factory=dict)
-
-
-class ReplayRegressionScaffoldCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    replay_run_id: int
-    replay_variant_id: int
-    trace_id: str = Field(..., min_length=1)
-
-
-class ReplayRegressionScaffoldOut(BaseModel):
-    id: int
-    intelligence_run_id: int
-    replay_run_id: int
-    replay_variant_id: int
-    replay_set_id: int
-    trace_id: str
-    snapshot_id: int
-    scaffold_text: str = ""
-    status: Literal["proposed", "failed"]
-    error: Optional[str] = None
-    provider: str
-    model: str
-    prompt_version: str
-    schema_version: str
-    decision_method: Literal["reasoning_llm"] = "reasoning_llm"
-    is_mock: bool = False
-    created_at: float
-
-
-# --- Replay source & diff helpers (Issue #242 Phase D / #246) ----------------
-#
-# Two small DETERMINISTIC helpers backing the Simulation Workbench's "Direct
-# edit" flow (Principle 6 -- no judgement here, just pinned-snapshot reads and
-# structural text diffing reusing the same worktree+git-diff mechanism
-# app/replay_draft.py already uses for LLM drafts).
-
-
-class ReplaySourceOut(BaseModel):
-    """Read-only pinned-snapshot source for the resolved Replay Set symbol's
-    file. ``source`` is the full file content at the pinned commit -- never
-    the working tree (Principle 5); start_line/end_line locate the resolved
-    symbol within it so the UI can scroll to / highlight it."""
-
-    replay_set_id: int
-    component_id: str
-    snapshot_id: int
-    commit_sha: str
-    path: str
-    qualified_name: str
-    start_line: int
-    end_line: int
-    source: str
-
-
-class ReplaySourceDiffCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    replay_set_id: int
-    snapshot_id: Optional[int] = None
-    edited_source: str = Field(..., min_length=1, max_length=2_000_000)
-
-
-class ReplaySourceDiffOut(BaseModel):
-    """Deterministic unified diff between the pinned-snapshot file and a
-    developer-edited copy of it. No judgement -- pure structural text
-    diffing (the same worktree + ``git diff`` mechanism
-    ``replay_draft._diff_against_snapshot`` uses for LLM drafts)."""
-
-    patch_text: str
-    patch_hash: str
-
-
-# --- AI Candidate Studio (Issue #252) ----------------------------------------
-#
-# A conversation + versioning layer over the existing isolated-Replay stack.
-# Finite sets (Principle 6): a version's generate lifecycle terminal status,
-# its replay lifecycle status, and message roles.
-
-CandidateVersionStatus = Literal["proposed", "failed"]
-CandidateReplayStatus = Literal["not_run", "running", "completed", "failed"]
-CandidateMessageRole = Literal["user", "assistant"]
-CandidateSessionStatus = Literal["active", "archived"]
-
-
-class CandidateSessionCreate(BaseModel):
-    """Start a Studio session for a component. At most one input selection
-    may be supplied: an existing ``replay_set_id``, an explicit ``trace_ids``
-    list, or a single ``trace_id`` (the "improve from this input" entry). With
-    no selection, the component entry point uses up to 50 recent traces. When
-    trace ids are selected, a Replay Set is created for them (reusing POST
-    /replay-sets' validation). ``snapshot_id`` defaults to the latest ready
-    snapshot."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    component_id: str = Field(..., min_length=1, max_length=500)
-    replay_set_id: Optional[int] = None
-    trace_ids: Optional[List[str]] = None
-    trace_id: Optional[str] = None
-    snapshot_id: Optional[int] = None
-    objective: str = Field(default="", max_length=5000)
-    # Issue #369: required when the resolved snapshot is definitively behind
-    # HEAD. Same manual decision the Experiment records.
-    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
-
-
-class CandidateProposal(BaseModel):
-    """Structured candidate proposal (never free-form code): the reasoning
-    model returns summary / assumptions / changed_symbols / generated_code /
-    risks / suggested_tests; the patch itself is produced deterministically by
-    splicing ``generated_code`` into the resolved symbol span and diffing
-    against the pinned snapshot (app/candidate_studio.py)."""
-
-    summary: str = ""
-    assumptions: List[str] = Field(default_factory=list)
-    changed_symbols: List[str] = Field(default_factory=list)
-    risks: List[str] = Field(default_factory=list)
-    suggested_tests: List[str] = Field(default_factory=list)
-
-
-class CandidateVersionOut(BaseModel):
-    id: int
-    system_id: int
-    session_id: int
-    parent_version_id: Optional[int] = None
-    version_number: int
-    instruction: str = ""
-    status: CandidateVersionStatus
-    summary: str = ""
-    assumptions: List[str] = Field(default_factory=list)
-    changed_symbols: List[str] = Field(default_factory=list)
-    risks: List[str] = Field(default_factory=list)
-    suggested_tests: List[str] = Field(default_factory=list)
-    generated_code: str = ""
-    patch_text: str = ""
-    patch_hash: str = ""
-    error: Optional[str] = None
-    replay_status: CandidateReplayStatus = "not_run"
-    replay_run_id: Optional[int] = None
-    replay_variant_id: Optional[int] = None
-    promoted_at: Optional[float] = None
-    # Reasoning provenance (from the linked intelligence_runs row).
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    prompt_version: Optional[str] = None
-    schema_version: Optional[str] = None
-    decision_method: Optional[DecisionMethod] = None
-    is_mock: bool = False
-    created_at: float
-
-
-class CandidateMessageOut(BaseModel):
-    id: int
-    session_id: int
-    role: CandidateMessageRole
-    content: str = ""
-    version_id: Optional[int] = None
-    created_at: float
-
-
-class CandidateSessionOut(BaseModel):
-    id: int
-    system_id: int
-    component_id: str
-    snapshot_id: int
-    commit_sha: str
-    symbol_path: str
-    symbol_qualified_name: str
-    replay_set_id: int
-    objective: str = ""
-    status: CandidateSessionStatus = "active"
-    created_at: float
-    updated_at: float
-    messages: List[CandidateMessageOut] = Field(default_factory=list)
-    versions: List[CandidateVersionOut] = Field(default_factory=list)
-
-
-class CandidateMessageCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    content: str = Field(..., min_length=1, max_length=10000)
-
-
-class CandidateGenerateCreate(BaseModel):
-    """Generate the next immutable CandidateVersion. ``instruction`` is the
-    improvement goal / constraints; ``parent_version_id`` branches off a
-    selected version (None = branch off the baseline)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    instruction: str = Field(..., min_length=1, max_length=5000)
-    parent_version_id: Optional[int] = None
-
-
-class CandidateReplayCreate(BaseModel):
-    """Replay against the session's pinned snapshot.  ``snapshot_id`` remains
-    accepted for compatibility, but a different value is rejected."""
-    model_config = ConfigDict(extra="forbid")
-
-    snapshot_id: Optional[int] = None
-
-
-class CandidatePromotionOut(BaseModel):
-    """Hands a reviewed candidate patch to the existing Experiment creation
-    flow (Issue #245's variant experiment-payload shape). API shape only --
-    this never creates an experiment, auto-adopts, merges, or deploys
-    anything (Principle 7)."""
-
-    candidate_version_id: int
-    label: str
-    patch_text: str
-    patch_hash: str
-    source: str = "candidate_studio"
-    risk_note: str = ""
-    origin: Dict[str, Any] = Field(default_factory=dict)
-
-
-class CandidateEventOut(BaseModel):
-    """One entry of a session's job/status timeline (polling contract for the
-    events endpoint). Derived deterministically from persisted version state:
-    generate transitions (``context_preparing`` -> ``generating`` ->
-    ``validating_patch`` -> ``completed`` / ``failed``) collapse to the
-    version's terminal ``status``; replay transitions surface
-    ``replay_status``."""
-
-    version_id: int
-    version_number: int
-    phase: Literal[
-        "generating", "validating_patch", "completed", "failed", "replaying"
-    ]
-    status: str
-    replay_status: CandidateReplayStatus = "not_run"
-    detail: str = ""
-    created_at: float
-
-
-class CandidateEventsOut(BaseModel):
-    session_id: int
-    events: List[CandidateEventOut] = Field(default_factory=list)
-
-
-# --- Probe Cell Fabric (Issue #297), Sub 1: Cell contract / Role Card /
-# common state schema (Issue #298). Request bodies reuse the shared-schema
-# mirror models in app/cell_fabric.py directly (AgentRoleCard,
-# CellDefinitionContract) so FastAPI's own request validation enforces the
-# fail-closed unknown-field / enum / schema_version rules; these are only the
-# server-assigned "Out" projections (id, system_id, timestamps, audit
-# fields). See docs/project-intelligence.md's "Probe Cell Fabric(Issue
-# #297)" section.
-
-
-class AgentRoleCardOut(BaseModel):
-    id: int
-    system_id: int
-    role_key: str
-    version: str
-    status: str
-    mission: str
-    scope: List[str] = Field(default_factory=list)
-    out_of_scope: List[str] = Field(default_factory=list)
-    model_alias: str
-    tool_policy: Dict[str, Any] = Field(default_factory=dict)
-    acceptance_template: List[str] = Field(default_factory=list)
-    rubric_ref: Optional[str] = None
-    changelog: str
-    schema_version: str
-    decision_method: str
-    created_by: Optional[str] = None
-    created_at: float
-
-
-class AgentRoleCardsListOut(BaseModel):
-    system_id: int
-    role_cards: List[AgentRoleCardOut] = Field(default_factory=list)
-
-
-class CellDefinitionOut(BaseModel):
-    id: int
-    system_id: int
-    cell_id: str
-    roster: Optional[List[str]] = None
-    role_card_ref: Dict[str, str]
-    status: str
-    mission: str
-    created_at: float
-    updated_at: float
-
-
-class CellsListOut(BaseModel):
-    system_id: int
-    cells: List[CellDefinitionOut] = Field(default_factory=list)
-
-
-class CellDetailOut(BaseModel):
-    definition: CellDefinitionOut
-    state: Dict[str, Any]
-
-
-# ---------------------------------------------------------------------------
-# Cell Binding / Activation (Issue #299, Sub 2 of the Probe Cell Fabric epic)
-# ---------------------------------------------------------------------------
-
-
-class CellBindingCreateIn(BaseModel):
-    """Exactly one of ``probe_point_id`` / ``probe_pattern_point_id`` must be
-    given; provenance is read from that row server-side, never accepted from
-    the caller."""
-
-    probe_point_id: Optional[int] = None
-    probe_pattern_point_id: Optional[int] = None
-    feature_refs: List[str] = Field(default_factory=list)
-    capability_refs: List[str] = Field(default_factory=list)
-    entrypoint_refs: List[str] = Field(default_factory=list)
-
-
-class CellBindingOut(BaseModel):
-    id: int
-    system_id: int
-    cell_definition_id: int
-    cell_id: str
-    version: int
-    snapshot_id: int
-    commit_sha: str
-    path: str
-    qualified_symbol: str
-    component_id: str
-    probe_point_id: Optional[int] = None
-    probe_pattern_id: Optional[int] = None
-    feature_refs: List[str] = Field(default_factory=list)
-    capability_refs: List[str] = Field(default_factory=list)
-    entrypoint_refs: List[str] = Field(default_factory=list)
-    status: str
-    status_reason: str
-    created_at: float
-
-
-class CellBindingsListOut(BaseModel):
-    system_id: int
-    cell_id: str
-    bindings: List[CellBindingOut] = Field(default_factory=list)
-
-
-class CellActivationCreateIn(BaseModel):
-    window_start: Optional[float] = None
-    window_end: Optional[float] = None
-    requested_by: Optional[str] = None
-
-
-class CellActivationOut(BaseModel):
-    id: int
-    system_id: int
-    cell_definition_id: int
-    cell_id: str
-    trigger_kind: str
-    window_start: Optional[float] = None
-    window_end: Optional[float] = None
-    requested_by: Optional[str] = None
-    used_llm: bool
-    intelligence_run_id: Optional[int] = None
-    status: str
-    detail: str
-    created_at: float
-    completed_at: Optional[float] = None
-
-
-class CellActivationsListOut(BaseModel):
-    system_id: int
-    cell_id: str
-    activations: List[CellActivationOut] = Field(default_factory=list)
-
-
-class CellStateOut(BaseModel):
-    """The read-only pilot state document: Sub 1's ``cell_state`` (with the
-    health block filled in) plus the current binding and recent activations
-    as sibling fields -- the ``cell_state`` schema itself is unchanged."""
-
-    cell_id: str
-    state: Dict[str, Any]
-    binding: Optional[CellBindingOut] = None
-    recent_activations: List[CellActivationOut] = Field(default_factory=list)
-# Goal/Task ledger + delegate/report/escalate protocol (Issue #300, Sub 3 of
-# the Probe Cell Fabric epic, Issue #297). Core logic lives in
-# app/cell_tasks.py; these are the request/response shapes for
-# routes/cell_tasks.py.
-# ---------------------------------------------------------------------------
-
-
-class CellGoalCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str = Field(..., min_length=1)
-    description: str = ""
-    parent_goal_id: Optional[int] = None
-    owner_cell_id: Optional[str] = None
-
-
-class CellGoalStatusUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    status: str
-
-
-class CellGoalOut(BaseModel):
-    id: int
-    system_id: int
-    parent_goal_id: Optional[int] = None
-    title: str
-    description: str = ""
-    owner_cell_id: Optional[str] = None
-    status: str
-    created_at: float
-    updated_at: float
-
-
-class CellGoalsListOut(BaseModel):
-    system_id: int
-    goals: List[CellGoalOut] = Field(default_factory=list)
-
-
-class CellTaskDelegateCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    goal_id: int
-    owner_cell_id: str = Field(..., min_length=1)
-    delegated_by_cell_id: Optional[str] = None
-    title: str = Field(..., min_length=1)
-    acceptance: List[str] = Field(..., min_length=1)
-    context_refs: List[str] = Field(default_factory=list)
-    budget: Optional[Dict[str, Any]] = None
-    deadline: Optional[str] = None
-    priority: Optional[str] = None
-    idempotency_key: Optional[str] = None
-
-
-class CellTaskOut(BaseModel):
-    id: int
-    system_id: int
-    goal_id: int
-    owner_cell_id: str
-    delegated_by_cell_id: Optional[str] = None
-    title: str
-    acceptance: List[str] = Field(default_factory=list)
-    context_refs: List[str] = Field(default_factory=list)
-    budget: Optional[Dict[str, Any]] = None
-    deadline: Optional[str] = None
-    priority: str
-    status: str
-    retry_count: int
-    retry_limit: int
-    blocked_by: List[int] = Field(default_factory=list)
-    acceptance_met: bool
-    evidence: List[str] = Field(default_factory=list)
-    returned_to_parent: bool
-    idempotency_key: Optional[str] = None
-    created_at: float
-    updated_at: float
-
-
-class CellTasksListOut(BaseModel):
-    system_id: int
-    tasks: List[CellTaskOut] = Field(default_factory=list)
-
-
-class CellGoalDetailOut(BaseModel):
-    goal: CellGoalOut
-    tasks: List[CellTaskOut] = Field(default_factory=list)
-
-
-class CellTaskEventOut(BaseModel):
-    id: int
-    task_id: int
-    event_type: str
-    from_status: Optional[str] = None
-    to_status: Optional[str] = None
-    detail: str = ""
-    created_at: float
-
-
-class CellTaskDetailOut(BaseModel):
-    task: CellTaskOut
-    events: List[CellTaskEventOut] = Field(default_factory=list)
-
-
-class CellTaskTransitionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    new_status: str
-    acceptance_met: Optional[bool] = None
-    evidence_refs: Optional[List[str]] = None
-    blocked_by: Optional[List[int]] = None
-    detail: str = ""
-
-
-class CellTaskReturnToParentRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    detail: str = ""
-
-
-class CellReportFactItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    text: str = Field(..., min_length=1)
-    evidence_refs: List[str] = Field(default_factory=list)
-
-
-class CellReportTextItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    text: str = Field(..., min_length=1)
-
-
-class CellReportCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    cell_definition_id: str = Field(..., min_length=1)
-    task_id: Optional[int] = None
-    kind: str
-    severity: Optional[str] = None
-    fact: List[CellReportFactItem] = Field(default_factory=list)
-    interpretation: List[CellReportTextItem] = Field(default_factory=list)
-    ask: List[CellReportTextItem] = Field(default_factory=list)
-    idempotency_key: Optional[str] = None
-
-
-class CellReportOut(BaseModel):
-    id: int
-    system_id: int
-    cell_definition_id: str
-    task_id: Optional[int] = None
-    kind: str
-    severity: Optional[str] = None
-    fact: List[Dict[str, Any]] = Field(default_factory=list)
-    interpretation: List[Dict[str, Any]] = Field(default_factory=list)
-    ask: List[Dict[str, Any]] = Field(default_factory=list)
-    idempotency_key: Optional[str] = None
-    created_at: float
-    escalation_id: Optional[int] = None
-
-
-class CellReportsListOut(BaseModel):
-    system_id: int
-    reports: List[CellReportOut] = Field(default_factory=list)
-
-
-class CellEscalationOut(BaseModel):
-    id: int
-    system_id: int
-    report_id: int
-    cell_definition_id: str
-    severity: str
-    status: str
-    summary: str
-    created_at: float
-    updated_at: float
-
-
-class CellEscalationsListOut(BaseModel):
-    system_id: int
-    escalations: List[CellEscalationOut] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# é ˜åŸŸã‚ªãƒ¼ã‚±ã‚¹ãƒˆãƒ¬ãƒ¼ã‚¿ãƒ¼ / domain orchestrators (Issue #301, Sub 4 of the
-# Probe Cell Fabric epic, Issue #297). Core logic lives in
-# app/cell_orchestrator.py; these are the request/response shapes for
-# routes/cell_orchestrators.py.
-# ---------------------------------------------------------------------------
-
-
-class CellOrchestratorDigestOut(BaseModel):
-    """The deterministic digest -- ``digest`` is returned as a plain dict
-    (matching the existing ``CellStateOut.state`` / ``CellDetailOut.state``
-    pattern) rather than a rigid nested model, since its shape mirrors
-    ``app.cell_orchestrator.build_orchestrator_digest``'s return value."""
-
-    system_id: int
-    cell_id: str
-    digest: Dict[str, Any]
-
-
-class CellTriageResultOut(BaseModel):
-    id: int
-    system_id: int
-    intelligence_run_id: int
-    classification: str
-    reasoning_summary: str
-    affected_cell_ids: List[str] = Field(default_factory=list)
-    proposed_ask: str = ""
-    is_mock: bool = False
-    created_at: float
-
-
-class CellTriageResultsListOut(BaseModel):
-    system_id: int
-    cell_id: str
-    results: List[CellTriageResultOut] = Field(default_factory=list)
-
-
-class CellTriageRunOut(BaseModel):
-    """Response of ``POST /cell-fabric/orchestrators/{cell_id}/triage``. The
-    digest is always present (facts survive triage failure); ``triage`` is
-    ``None`` and ``triage_error`` is set on ANY triage failure -- there is no
-    heuristic classification fallback."""
-
-    system_id: int
-    cell_id: str
-    digest: Dict[str, Any]
-    triage: Optional[CellTriageResultOut] = None
-    triage_error: Optional[str] = None
-    is_mock: bool = False
-    intelligence_run_id: int
-
-
-class CellRosterUpdateIn(BaseModel):
-    """``roster`` is always a list here (possibly empty): this endpoint only
-    ever sets/changes an orchestrator's roster, it never converts a Cell
-    back into a roster-less worker."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    roster: List[str] = Field(default_factory=list)
-    changed_by: Optional[str] = None
-
-
-class CellRosterEventOut(BaseModel):
-    id: int
-    system_id: int
-    cell_definition_id: int
-    old_roster: Optional[List[str]] = None
-    new_roster: List[str] = Field(default_factory=list)
-    changed_by: Optional[str] = None
-    created_at: float
-
-
-# ---------------------------------------------------------------------------
-# å“è³ªã‚µãƒ³ãƒ—ãƒªãƒ³ã‚°ãƒ»ç‹¬ç«‹ç›£æŸ»ãƒ»quality floor (Issue #302, Sub 6 of the Probe
-# Cell Fabric epic, Issue #297). Core logic lives in app/cell_quality.py;
-# these are the request/response shapes for routes/cell_quality.py.
-# ---------------------------------------------------------------------------
-
-
-class CellQualityStratumIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(..., min_length=1)
-    task_type: Optional[str] = None
-    risk: Optional[str] = None
-    rare: bool = False
-
-
-class CellQualityConfigIn(BaseModel):
-    """Every field optional: an omitted field keeps its existing persisted
-    value (or the module default on first create)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    sample_rate: Optional[float] = None
-    strata: Optional[List[CellQualityStratumIn]] = None
-    audit_rate: Optional[float] = None
-    quality_floor: Optional[float] = None
-    floor_window: Optional[int] = None
-    daily_audit_budget: Optional[int] = None
-
-
-class CellQualityConfigOut(BaseModel):
-    system_id: int
-    cell_definition_id: int
-    sample_rate: float
-    strata: List[Dict[str, Any]] = Field(default_factory=list)
-    audit_rate: float
-    quality_floor: float
-    floor_window: int
-    daily_audit_budget: int
-    created_at: Optional[float] = None
-    updated_at: Optional[float] = None
-
-
-class CellQualitySampleSelectIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    window_seconds: Optional[float] = None
-
-
-class CellQualitySampleOut(BaseModel):
-    id: int
-    system_id: int
-    cell_definition_id: int
-    config_id: int
-    stratum: str = ""
-    target_kind: str
-    target_id: str
-    selection_seed: str
-    selected_at: float
-
-
-class CellQualitySamplesListOut(BaseModel):
-    system_id: int
-    cell_id: str
-    samples: List[CellQualitySampleOut] = Field(default_factory=list)
-
-
-class CellQualityAuditRequestIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    blind: bool = False
-    auditor_alias: Optional[str] = None
-
-
-class CellQualityAuditOut(BaseModel):
-    id: int
-    system_id: int
-    sample_id: int
-    auditor_model_alias: str
-    verdict: str
-    verdict_decision_method: str
-    is_blind: bool
-    failed_criteria: List[int] = Field(default_factory=list)
-    verbatim_example: str = ""
-    explanation: str = ""
-    explanation_run_id: Optional[int] = None
-    is_mock: bool = False
-    created_at: float
-
-
-class CellQualityAuditsListOut(BaseModel):
-    system_id: int
-    cell_id: str
-    counts: Dict[str, int] = Field(default_factory=dict)
-    audits: List[CellQualityAuditOut] = Field(default_factory=list)
-
-
-class CellQualityFloorEvaluateOut(BaseModel):
-    system_id: int
-    cell_id: str
-    pass_rate: Optional[float] = None
-    floor: float
-    denominator: int
-    suspended: bool
-    escalation_id: Optional[int] = None
-
-
-class CellIntakeResumeIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str = ""
-
-
-class CellIntakeStateOut(BaseModel):
-    system_id: int
-    cell_id: str
-    intake_status: str
-    reason: str = ""
-    escalation_id: Optional[int] = None
-    changed_at: Optional[float] = None
-# Root Orchestrator ã¨çµ±åˆãƒ€ã‚¤ã‚¸ã‚§ã‚¹ãƒˆ (Issue #303, Sub 5 of the Probe Cell
-# Fabric epic, Issue #297). Core logic lives in app/cell_root.py; these are
-# the request/response shapes for routes/cell_root.py.
-# ---------------------------------------------------------------------------
-
-
-class CellRootDigestOut(BaseModel):
-    """The 4-level progressive-disclosure digest -- ``digest`` is returned as
-    a plain dict (same pattern as ``CellOrchestratorDigestOut.digest``) since
-    its shape mirrors ``app.cell_root.build_root_digest``'s return value
-    verbatim."""
-
-    system_id: int
-    digest: Dict[str, Any]
-    generated_at: float
-
-
-class CellAskSyncOut(BaseModel):
-    system_id: int
-    created: int
-    deduped: int
-
-
-class CellAskOut(BaseModel):
-    id: int
-    system_id: int
-    source_kind: str
-    source_id: int
-    cell_definition_id: Optional[str] = None
-    goal_id: Optional[int] = None
-    task_id: Optional[int] = None
-    ask_text: str
-    severity: str
-    status: str
-    decision: str = ""
-    decision_note: str = ""
-    decision_method: str = ""
-    decided_by: Optional[str] = None
-    decided_at: Optional[float] = None
-    execution_approved: bool = False
-    dedupe_key: str
-    created_at: float
-
-
-class CellAsksListOut(BaseModel):
-    system_id: int
-    asks: List[CellAskOut] = Field(default_factory=list)
-
-
-class CellAskDecideRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: str
-    note: str = ""
-
-
-# ---------------------------------------------------------------------------
-# æ”¹å–„ä»®èª¬ãƒ»ã‚«ãƒŠãƒªã‚¢ãƒ»shadowå®Ÿè¡Œæ‰¿èªã‚²ãƒ¼ãƒˆ (Issue #304, Sub 7 of the Probe
-# Cell Fabric epic, Issue #297). Core logic lives in app/cell_improvement.py;
-# these are the request/response shapes for routes/cell_improvement.py.
-# ---------------------------------------------------------------------------
-
-
-class CellImprovementDraftIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    observed_facts_refs: List[str] = Field(default_factory=list)
-    target_kind: str = "role_card"
-    parent_cell_id: Optional[str] = None
-
-
-class CellImprovementCreateIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    target_kind: str
-    hypothesis: str = ""
-    expected_effect: str = ""
-    risk: str = ""
-    rollback_plan: str = ""
-    observed_facts_refs: List[str] = Field(default_factory=list)
-    parent_cell_id: Optional[str] = None
-
-
-class CellImprovementOut(BaseModel):
-    id: int
-    system_id: int
-    cell_id: str
-    status: str
-    target_kind: str
-    hypothesis: str = ""
-    expected_effect: str = ""
-    risk: str = ""
-    rollback_plan: str = ""
-    observed_facts_refs: List[str] = Field(default_factory=list)
-    proposal_run_id: Optional[int] = None
-    is_mock: bool = False
-    role_card_id: Optional[int] = None
-    proposed_role_card_version: Optional[str] = None
-    canary_evidence_refs: List[str] = Field(default_factory=list)
-    parent_cell_id: Optional[str] = None
-    parent_approved_by: Optional[str] = None
-    parent_approved_at: Optional[float] = None
-    human_approved_by: Optional[str] = None
-    human_approved_at: Optional[float] = None
-    suspended: bool = False
-    suspension_reason: str = ""
-    created_at: float
-    updated_at: float
-
-
-class CellImprovementsListOut(BaseModel):
-    system_id: int
-    cell_id: str
-    improvements: List[CellImprovementOut] = Field(default_factory=list)
-
-
-class CellImprovementEventOut(BaseModel):
-    id: int
-    system_id: int
-    improvement_id: int
-    event_type: str
-    from_status: Optional[str] = None
-    to_status: Optional[str] = None
-    actor: Optional[str] = None
-    detail: str = ""
-    created_at: float
-
-
-class CellShadowDecisionOut(BaseModel):
-    id: int
-    system_id: int
-    improvement_id: int
-    kind: str
-    status: str
-    decided_by: Optional[str] = None
-    decided_at: Optional[float] = None
-    decision_method: str = ""
-    note: str = ""
-    created_at: float
-
-
-class CellImprovementDetailOut(BaseModel):
-    improvement: CellImprovementOut
-    events: List[CellImprovementEventOut] = Field(default_factory=list)
-    shadow_decisions: List[CellShadowDecisionOut] = Field(default_factory=list)
-
-
-class CellImprovementDraftOut(BaseModel):
-    """Response of ``POST /cell-fabric/cells/{cell_id}/improvements/draft``.
-    ``improvement`` is ``None`` and ``draft_error`` is set on ANY LLM/JSON
-    failure -- there is no heuristic hypothesis fallback."""
-
-    system_id: int
-    cell_id: str
-    improvement: Optional[CellImprovementOut] = None
-    draft_error: Optional[str] = None
-    is_mock: bool = False
-    intelligence_run_id: int
-
-
-class CellImprovementTransitionIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    new_status: str
-    canary_evidence_refs: Optional[List[str]] = None
-    proposed_role_card_version: Optional[str] = None
-    allow_major_bump: bool = False
-    detail: str = ""
-    actor: Optional[str] = None
-
-
-class CellApprovalIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    actor: str
-
-
-class CellImprovementSuspendIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str = ""
-
-
-class CellImprovementRollbackIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    actor: Optional[str] = None
-
-
-class CellShadowProposalIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    note: str = ""
-    actor: Optional[str] = None
-
-
-class CellShadowRequestIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    note: str = ""
-    actor: Optional[str] = None
-
-
-class CellShadowDecideIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: str
-    decided_by: str
-    note: str = ""
-
-
-# --- State-driven System Interview workflow (Issue #349) ---------------------
-#
-# Response/request contracts for docs/system-interview-workflow-ux.md. Every
-# field is either a persisted fact or a value the canonical engine
-# (app/interview_workflow.py) derived from persisted facts -- the Dashboard
-# never re-derives a workflow state of its own (spec principle P9).
-
-
-class InterviewWorkflowFactsOut(BaseModel):
-    """The exact inputs of the 13-row first-match rule table, exposed so a
-    displayed state is explainable and testable without re-querying."""
-
-    has_snapshot: bool
-    has_session: bool
-    session_closed: bool
-    running_process_kinds: List[str] = []
-    blocking_failure_states: List[str] = []
-    understanding_unconfirmed: bool
-    open_required_questions: int
-    outstanding_alignment_items: int
-    proposals_needing_review: int
-    proposals_generatable: bool
-    approved_proposal_count: int
-    diff_matches_approval_set: bool
-    diff_review_complete: bool
-    pending_handoff_count: int
-
-
-class InterviewProcessRunOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    process_kind: str
-    status: str
-    failure_class: Optional[str] = None
-    target_state: Optional[str] = None
-    error: Optional[str] = None
-    started_at: float
-    finished_at: Optional[float] = None
-
-
-class InterviewBackRequestOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    cause_kind: str
-    candidate_state: str
-    reached_state: str
-    status: str
-    created_at: float
-
-
-class InterviewWorkflowExceptionOut(BaseModel):
-    """One currently-active exception (spec Â§5.2).
-
-    `severity` is the spec's 3-way split. Only `blocking` and `degraded` are
-    the `R5` role; `informational` exceptions are branches of the primary
-    work card and must never be rendered as a warning band.
-    """
-
-    code: str
-    severity: str
-    target_state: Optional[str] = None
-    message: str
-    detail: Optional[str] = None
-    recovery_process_kind: Optional[str] = None
-    recovery_condition: Optional[str] = None
-
-
-class InterviewWorkflowStateOut(BaseModel):
-    system_id: int
-    session_id: Optional[int] = None
-    state: str
-    candidate_state: str
-    rule_row: int
-    reached_state: Optional[str] = None
-    backward_hold: bool = False
-    pending_back_request: Optional[InterviewBackRequestOut] = None
-    terminal_kind: Optional[str] = None
-    primary_action: str
-    facts: InterviewWorkflowFactsOut
-    running_processes: List[InterviewProcessRunOut] = []
-    unresolved_failures: List[InterviewProcessRunOut] = []
-    exceptions: List[InterviewWorkflowExceptionOut] = []
-    diff_materialized_at: Optional[float] = None
-    latest_ready_snapshot_id: Optional[int] = None
-
-
-class InterviewDiffReviewIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reviewed_by: str = ""
-    note: str = ""
-
-
-class InterviewDiffReviewOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    diff_materialized_at: float
-    diff_digest: str
-    reviewed_by: str
-    decision_method: str
-    note: str
-    created_at: float
-
-
-class InterviewBackAcknowledgeIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    actor: str = ""
-
-
-class InterviewSessionCloseIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    terminal_kind: str = "suspended"
-    reason: str = ""
-    actor: str = ""
-
-
-class InterviewSessionReopenIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str = ""
-    actor: str = ""
-
-
-class InterviewSessionStatusAuditOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    action: str
-    terminal_kind: Optional[str] = None
-    reason: str
-    actor: str
-    decision_method: str
-    created_at: float
-
-
-# --- Understanding Brief / Decision Readiness (Issues #351-#354) -------------
-#
-# Every field here is a deterministic derivation persisted facts already
-# support (app/understanding_brief.py). `confirmation` and `provenance` are
-# two independent finite axes on purpose: "the developer confirmed it" and
-# "the developer wrote it" must stay distinguishable.
-#
-# The vocabularies live here as `Literal` aliases, not as bare `str` fields,
-# for two reasons: the response schema then carries the enum, and
-# `tests/test_interview_type_parity.py` can hold the Dashboard union to the
-# same set. `app/understanding_brief.py` derives its tuples from these with
-# `get_args`, so there is exactly one definition of each set.
-
-#: ç¢ºèªçŠ¶æ…‹ -- how settled a claim is.
-UnderstandingConfirmationState = Literal[
-    "confirmed",
-    "ai_hypothesis",
-    "conflicting",
-    "unknown",
-    "recheck_required",
-]
-
-#: å‡ºæ‰€ -- where the claim's content came from. Independent of the above.
-UnderstandingProvenanceKind = Literal[
-    "developer_intent",
-    "implementation_fact",
-    "runtime_observation",
-    "ai_hypothesis",
-]
-
-UnderstandingClaimKind = Literal["vision", "system_purpose", "core_capability"]
-
-UnderstandingReadinessState = Literal[
-    "not_built",
-    "building",
-    "needs_confirmation",
-    "ready",
-    "recheck_required",
-    "blocked",
-]
-
-UnderstandingReadinessSeverity = Literal["blocking", "attention", "informational"]
-
-#: Change kinds reported against the confirmed revision. The first four come
-#: from `understanding_diff`; the rest are the remaining `claim_payload`
-#: fields. Every field that can decide a recheck must appear here, or a claim
-#: becomes reportable as "changed" with nothing to show.
-UnderstandingChangeKind = Literal[
-    "added",
-    "removed",
-    "summary_changed",
-    "confidence_changed",
-    "contribution_changed",
-    "evidence_changed",
-    "related_docs_changed",
-    "related_apis_changed",
-    "composition_changed",
-]
-
-
-class UnderstandingBriefClaimOut(BaseModel):
-    kind: UnderstandingClaimKind
-    name: str
-    summary: str = ""
-    confirmation: UnderstandingConfirmationState
-    provenance: UnderstandingProvenanceKind
-    confirmation_label: str
-    provenance_label: str
-    reason: str = ""
-    contribution: str = ""
-    #: Mock LLM provenance, labelled rather than hidden (CLAUDE.md).
-    is_mock: bool = False
-    evidence: List[Dict[str, Any]] = []
-    related_docs: List[str] = []
-    related_apis: List[str] = []
-
-
-class UnderstandingReadinessReasonOut(BaseModel):
-    code: str
-    severity: UnderstandingReadinessSeverity
-    message: str
-    target_kind: str = "none"
-    target_name: str = ""
-
-
-class UnderstandingChangeOut(BaseModel):
-    change_kind: UnderstandingChangeKind
-    section: str
-    section_label: str
-    name: str
-    detail: str
-
-
-class UnderstandingBriefOut(BaseModel):
-    system_id: int
-    session_id: Optional[int] = None
-    built: bool = False
-    vision: Optional[UnderstandingBriefClaimOut] = None
-    vision_missing_information: List[str] = []
-    system_purpose: List[UnderstandingBriefClaimOut] = []
-    core_capabilities: List[UnderstandingBriefClaimOut] = []
-    #: How many Core Capabilities the initial view shows; the rest belong
-    #: behind progressive disclosure. A cap, never a pad.
-    core_capability_initial_count: int = 0
-    key_unconfirmed: List[UnderstandingBriefClaimOut] = []
-    detail_counts: Dict[str, int] = {}
-    readiness_state: UnderstandingReadinessState
-    readiness_label: str
-    readiness_description: str
-    readiness_reasons: List[UnderstandingReadinessReasonOut] = []
-    changes_since_confirmation: List[UnderstandingChangeOut] = []
-    confirmed_at: Optional[float] = None
-    confirmed_revision_id: Optional[int] = None
-    revision_id: Optional[int] = None
-    snapshot_id: Optional[int] = None
-
-
-# --- Overview / System Intelligence Brief (Issues #380-#384) -----------------
-#
-# The Overview screen's canonical projection. Every vocabulary below is a
-# finite `Literal` for the same two reasons the Understanding Brief's are
-# (#351): the response schema then carries the enum, and
-# `tests/test_interview_type_parity.py` holds the Dashboard union to the same
-# set. `app/overview_projection.py` derives its tuples from these with
-# `get_args`, so each set has exactly one definition.
-#
-# The Overview adds no new understanding model: its Brief section IS
-# `UnderstandingBriefOut` (#351-#354), its loop position IS `derive_user_phase`
-# (#237/#256), and its runtime numbers ARE the connectivity facts (#370).
-
-#: What kind of thing a ã€Œä»Šã‚ã‹ã£ãŸã“ã¨ã€ finding is. Finite by construction:
-#: every kind is produced by exactly one deterministic extractor over
-#: persisted rows, never by a model scoring what matters.
-OverviewFindingKind = Literal[
-    "claim_conflict",
-    "understanding_blocked",
-    "understanding_changed",
-    "capability_composition_stale",
-    "unconfirmed_core_claim",
-    "runtime_mismatch",
-    "runtime_unobserved",
-    "connectivity_lost",
-    "snapshot_stale",
-    "evaluation_decision_pending",
-    "improvement_candidate_ready",
-]
-
-#: How the finding bears on the developer's decision. This is the ranking
-#: gate â€” a finite ladder, not a score.
-OverviewFindingSeverity = Literal[
-    "blocker",
-    "human_decision_required",
-    "material_change",
-    "informative",
-]
-
-#: Whether the finding appeared AFTER the comparison baseline. `not_compared`
-#: is a first-class value: ã€Œæ–°ã—ã„ç™ºè¦‹ãŒãªã„ã€ and ã€Œã¾ã æ¯”è¼ƒã—ã¦ã„ãªã„ã€ are
-#: different statements and must never render the same (#382).
-OverviewFindingStatus = Literal["new", "ongoing", "not_compared"]
-
-#: Where the finding's content came from.
-#:
-#: The first four values are `UnderstandingProvenanceKind` VERBATIM, so a
-#: claim's provenance carries into a finding about it without translation.
-#: The first version of this set omitted `developer_intent`, and the mapping
-#: collapsed it to `ai_hypothesis` â€” which displayed a Vision the developer
-#: had written and confirmed as the AI's guess. That is the exact confusion
-#: #381/#382 exist to prevent, so the two vocabularies now overlap by
-#: construction rather than by a lossy map.
-#:
-#: The last three are finding-only, and each says something no claim can:
-#:
-#: * `developer_decision` â€” a record of the human's JUDGEMENT (adopt, confirm,
-#:   defer), as opposed to `developer_intent` which is what they said they
-#:   wanted. Deciding "reject this candidate" is not a statement of intent.
-#: * `system_process` â€” a fact about probe-agent's own run records, not about
-#:   the target system at all.
-#: * `mixed` â€” an aggregated finding whose sources genuinely disagree. It
-#:   exists so aggregation never has to pick one and imply the others agreed.
-OverviewFindingProvenance = Literal[
-    "developer_intent",
-    "implementation_fact",
-    "runtime_observation",
-    "ai_hypothesis",
-    "developer_decision",
-    "system_process",
-    "mixed",
-]
-
-#: The findings section as a whole. `unavailable` means the extraction itself
-#: failed â€” never rendered as ã€Œç™ºè¦‹ãªã—ã€.
-OverviewFindingsState = Literal[
-    "has_findings",
-    "no_findings",
-    "not_compared",
-    "unavailable",
-]
-
-#: Whether the ã€Œå‰å›žã€ baseline could be read at all, kept apart from whether
-#: one EXISTS. `unavailable` used to be indistinguishable from
-#: `no_baseline`, so a Brief that failed to load rendered the confident
-#: sentence ã€Œã¾ã ç†è§£ã‚’ç¢ºèªã—ã¦ã„ãªã„ãŸã‚ã€æ¯”è¼ƒã®åŸºæº–ãŒã‚ã‚Šã¾ã›ã‚“ã€ about a
-#: System whose developer may well have confirmed it yesterday.
-OverviewBaselineState = Literal["has_baseline", "no_baseline", "unavailable"]
-
-#: The single primary action. `create_system` is reachable only through the
-#: Dashboard's zero-System branch (the endpoint is System-scoped, so it cannot
-#: be evaluated server-side); it lives in this one vocabulary anyway so the
-#: screen never grows a second action taxonomy.
-OverviewActionKey = Literal[
-    "create_system",
-    "prepare_repository",
-    "build_understanding",
-    "resolve_understanding_blocker",
-    "answer_interview_questions",
-    "confirm_understanding",
-    "connect_sdk",
-    "start_observation",
-    "restore_observation",
-    "record_experiment_decision",
-    # These are deliberately distinct identities: adopted experiment
-    # artifacts versus probe-plan instrumentation patches.
-    "publish_improvement",
-    "publish_instrumentation",
-    "create_candidate",
-    "start_next_cycle",
-]
-
-#: Why there is (or is not) an action. `waiting` / `unavailable` carry no
-#: action at all â€” a disabled catalogue of operations is explicitly forbidden
-#: (#383).
-OverviewActionState = Literal["available", "waiting", "complete", "unavailable"]
-
-#: Whether the pinned understanding is reading the repository's current head.
-#: Server-decided: the Dashboard must not compare snapshot ids itself, for the
-#: same reason #369 moved the Snapshot verdict server-side â€” two definitions of
-#: "current" drift. `unavailable` is a third value on purpose: an unreadable
-#: head is not evidence that the snapshot is behind.
-OverviewSnapshotFreshness = Literal["current", "stale", "unavailable"]
-
-#: Whether Capability-level observation coverage could be computed at all.
-#: `not_computed` is the honest value today: Trace rows carry a
-#: `component_id`, and no canonical component -> Core Capability mapping is
-#: persisted, so a "coverage" built from the two would be a ratio between
-#: different entities (and could exceed 100%). See `OverviewRuntimeHealthOut`.
-OverviewCoverageState = Literal["computed", "not_computed"]
-
-#: The improvement loop's six stages, in order. These are the existing
-#: `system_state.PHASE_ORDER` values under their developer-facing names â€” the
-#: Overview never introduces a second phase model.
-OverviewLoopStage = Literal[
-    "setup",
-    "preparation",
-    "instrumentation",
-    "observation",
-    "evaluation",
-    "publish",
-]
-
-OverviewLoopStageStatus = Literal["reached", "current", "future"]
-
-#: Which composed section could not be built. A partial failure degrades one
-#: section; it never blanks the screen (#384). `purpose_question` (#390/#391)
-#: is its OWN section, separate from `purpose_chain`: a question failure
-#: must not read as the whole Purpose Frame failing, and vice versa.
-OverviewSection = Literal[
-    "brief", "findings", "next_action", "loop", "runtime", "purpose_chain", "purpose_question"
-]
-
-
-class OverviewTargetOut(BaseModel):
-    """Where a finding or an action sends the developer.
-
-    `params` carries the destination's OWN parameter names (the #371 rule),
-    so a link never navigates and then arrives with nothing selected.
-    """
-
-    route: str
-    label: str
-    params: Dict[str, str] = {}
-    anchor: Optional[str] = None
-
-
-class OverviewFindingOut(BaseModel):
-    #: Deterministic and stable across reloads: derived from the kind plus the
-    #: subject it is about, never from a row id that a rebuild would renumber.
-    id: str
-    kind: OverviewFindingKind
-    kind_label: str
-    severity: OverviewFindingSeverity
-    severity_label: str
-    status: OverviewFindingStatus
-    status_label: str
-    #: çŸ­ã„çµè«– -- what was found.
-    summary: str
-    #: ãªãœåˆ¤æ–­ã«é‡è¦ã‹ -- what it changes for the developer.
-    decision_impact: str
-    provenance: OverviewFindingProvenance
-    provenance_label: str
-    #: Which facts this finding was read against.
-    snapshot_id: Optional[int] = None
-    revision_id: Optional[int] = None
-    runtime_window_seconds: Optional[float] = None
-    first_seen: Optional[float] = None
-    last_updated: Optional[float] = None
-    target: Optional[OverviewTargetOut] = None
-    evidence: List[Dict[str, Any]] = []
-    #: How many same-cause findings this one represents (>= 1).
-    occurrence_count: int = 1
-
-
-class OverviewActionOut(BaseModel):
-    key: OverviewActionKey
-    label: str
-    #: é¸å®šç†ç”± -- which fact put this action first.
-    reason: str
-    #: å®Œäº†æ¡ä»¶ -- how the developer knows it is done.
-    completion_condition: str
-    #: å®Œäº†å¾Œã«å¾—ã‚‰ã‚Œã‚‹ä¾¡å€¤ / æ¬¡ã«é–‹ãæ®µéšŽ.
-    value: str
-    target: OverviewTargetOut
-    #: The rule-table row that produced it, for auditing the first match.
-    rule_row: int
-    #: Facts and findings this action was derived from.
-    source_state_ids: List[str] = []
-    source_finding_ids: List[str] = []
-    #: What is still missing, when the action can be started but not finished
-    #: without it. Never used to render a disabled control.
-    blockers: List[str] = []
-
-
-class OverviewLoopStageOut(BaseModel):
-    stage: OverviewLoopStage
-    label: str
-    status: OverviewLoopStageStatus
-    #: What reaching this stage means, in the developer's terms.
-    meaning: str
-    #: The next semantic milestone; only set on the current stage.
-    next_milestone: str = ""
-    complete: bool = False
-
-
-class OverviewRuntimeHealthOut(BaseModel):
-    #: Cumulative lifecycle milestone (#370). Never regresses.
-    state: ConnectivityState
-    #: The live workload reading (#370). Regresses when traffic stops.
-    freshness: ConnectivityFreshness
-    freshness_label: str
-    #: The any-kind transport axis, shown only when it disagrees.
-    transport_freshness: ConnectivityFreshness
-    last_real_trace_at: Optional[float] = None
-    seconds_since_last_trace: Optional[float] = None
-    last_trace_at: Optional[float] = None
-    seconds_since_last_any_trace: Optional[float] = None
-    evaluated_at: float
-    real_trace_count_5m: int = 0
-    real_trace_count_1h: int = 0
-    real_trace_count_24h: int = 0
-    delayed_after_seconds: float
-    stale_after_seconds: float
-    component_count: int = 0
-    #: Cumulative totals, deliberately kept out of the first view.
-    total_trace_count: int = 0
-    mode_counts: Dict[str, int] = {}
-    #: Bounded-window quality facts. `window_seconds` states the window they
-    #: were measured over, so a count is never read as a lifetime total.
-    window_seconds: float = 0
-    error_count: int = 0
-    #: Claims whose persisted #290 `runtime_check` is `mismatch`. Read as
-    #: stored -- the Overview never re-runs a Runtime Reality Check and never
-    #: invents a second definition of "the observation disagrees".
-    runtime_mismatch_count: int = 0
-    replayable_count: int = 0
-    partial_count: int = 0
-    unreplayable_count: int = 0
-    not_captured_count: int = 0
-    #: DISTINCT components that produced a trace in the window. Named for
-    #: what it counts. It was previously called `observed_capability_count`
-    #: and rendered next to `core_capability_count` as if the two formed a
-    #: coverage ratio â€” they are different entities, and the numerator could
-    #: exceed the denominator whenever one Capability had several components.
-    observed_component_count: int = 0
-    #: All components known to this System, so the count above has a
-    #: denominator of its OWN entity.
-    known_component_count: int = 0
-    core_capability_count: int = 0
-    #: Capability-level coverage is not computed today (no persisted
-    #: component -> Capability mapping). Stated rather than approximated.
-    capability_coverage_state: OverviewCoverageState = "not_computed"
-    observed_capability_count: Optional[int] = None
-    unmapped_component_count: Optional[int] = None
-
-
-class OverviewOut(BaseModel):
-    system_id: int
-    generated_at: float
-    #: The Interview session the Brief was read from (the System's newest), or
-    #: None when no session exists yet.
-    interview_session_id: Optional[int] = None
-    #: The canonical Understanding Brief (#351-#354), reused verbatim.
-    brief: Optional[UnderstandingBriefOut] = None
-    snapshot_id: Optional[int] = None
-    snapshot_commit_sha: Optional[str] = None
-    #: The System's newest ready snapshot, for ã€Œã“ã®ç†è§£ã¯ã©ã®æ–­é¢ã‹ã€.
-    latest_ready_snapshot_id: Optional[int] = None
-    #: Server-decided (never a client id comparison). See
-    #: `OverviewSnapshotFreshness`.
-    snapshot_freshness: OverviewSnapshotFreshness = "unavailable"
-    #: The Understanding revision the Brief was built from, and when the
-    #: developer last confirmed one -- both part of the first-view context, so
-    #: ã€Œã©ã®æ–­é¢ã®ã©ã®ç‰ˆã®ç†è§£ã‹ã€ is answerable without opening a disclosure.
-    understanding_revision_id: Optional[int] = None
-    understanding_confirmed_at: Optional[float] = None
-    findings: List[OverviewFindingOut] = []
-    #: How many findings the initial view shows (cap 3, never a pad).
-    findings_initial_count: int = 0
-    findings_state: OverviewFindingsState
-    #: What ã€Œå‰å›žã€ means for this System, stated rather than implied.
-    findings_baseline_state: OverviewBaselineState = "unavailable"
-    findings_baseline_label: str = ""
-    findings_baseline_at: Optional[float] = None
-    next_action: Optional[OverviewActionOut] = None
-    next_action_state: OverviewActionState
-    next_action_message: str = ""
-    loop_stages: List[OverviewLoopStageOut] = []
-    user_phase: str = "setup"
-    runtime: Optional[OverviewRuntimeHealthOut] = None
-    #: Sections whose derivation failed. The rest still render (#384).
-    degraded_sections: List[OverviewSection] = []
-    degraded_detail: Dict[str, str] = {}
-    #: The canonical Purpose Frame / Purpose Chain (#388), reused verbatim.
-    #: `None` only when its own guarded loader failed -- see `purpose_chain`
-    #: in `degraded_sections`.
-    purpose_chain: Optional["PurposeChainOut"] = None
-    #: Â§4.5/#390's single adaptive next question over `purpose_chain` above
-    #: (#391), embedded here instead of a second client query. `None` means
-    #: either "no question right now" (Â§4.5's normal render) or "could not
-    #: be derived" -- told apart by `"purpose_question" in degraded_sections`.
-    purpose_question: Optional["PurposeQuestionOut"] = None
-
-
-# --- Purpose Chain (Issue #387 Epic / #388) -----------------------------------
-#
-# docs/purpose-chain.md is the canonical design contract; Â§0 and Â§1 are the
-# specification this module implements. Two things Â§0 makes non-negotiable:
-#
-# 1. **No new understanding model.** `desired_change` IS
-#    `understanding_brief.BriefResult.vision`; `intervention` IS its
-#    `system_purpose` claims; Capabilities ARE its `core_capabilities` claims.
-#    `beneficiary_problem` is the Intent Brief `pain` field read the same way
-#    Understanding Brief already reads `goal` for Vision. Purpose Chain adds
-#    RELATION and LINEAGE on top of these existing rows -- it does not
-#    reclassify a claim's ç¢ºèªçŠ¶æ…‹/å‡ºæ‰€, which is why every element reuses
-#    `UnderstandingConfirmationState` / `UnderstandingProvenanceKind` and their
-#    existing label dicts rather than defining a second vocabulary.
-# 2. **Finite sets only, exact-name identity only.** Every vocabulary below is
-#    a `Literal` defined exactly once, mirrored into `app/purpose_chain.py`
-#    with `get_args`. No similarity/embedding/keyword join connects an element
-#    or a relation -- `understanding_diff`'s exact-name rule is the only
-#    identity rule in play.
-
-#: The four Purpose Frame element kinds. Only three (`beneficiary_problem`,
-#: `desired_change`, `intervention`) occupy the minimal Purpose Frame;
-#: `core_capability` elements hang off `intervention` via
-#: `intervention_to_capability` relations but are never part of the frame
-#: itself (Â§1.2/Â§1.6).
-PurposeElementKind = Literal[
-    "beneficiary_problem", "desired_change", "intervention", "core_capability"
-]
-
-#: Whether an element's SOURCE ROW could be read and had content. Three
-#: values, not two, for the same reason #380 split `unavailable` out of
-#: `not_built`: `unknown` (the row was read; there is nothing there yet -- a
-#: fact about the developer/system) and `unavailable` (the read itself failed
-#: -- a fact about THIS request) must never render as the same sentence.
-PurposeElementState = Literal["present", "unknown", "unavailable"]
-
-#: The three fixed relation kinds of the minimal chain (Â§0 diagram). Outcome
-#: lineage relations (#391) are a later, separate addition.
-PurposeRelationKind = Literal[
-    "problem_to_change", "change_to_intervention", "intervention_to_capability"
-]
-
-#: A relation's status, first-match over its endpoints and its current
-#: decision (`purpose_chain.derive_purpose_chain`). `unknown` is a genuine
-#: fifth value (not folded into `hypothesis`): "the connection cannot be
-#: explained because an endpoint has no content" is a different fact from "the
-#: connection is an unconfirmed guess", and #389's `relation_unknown` need
-#: depends on being able to tell them apart.
-PurposeRelationStatus = Literal["confirmed", "hypothesis", "conflicting", "unknown", "unavailable"]
-
-#: Whether a relation's DECISION still matches its endpoints' current content.
-#: Independent of `status`: a stale confirmed decision reads as `hypothesis`
-#: (status) while `recheck_state` explains *why* it can no longer be trusted
-#: as-is, and the decision row itself is never deleted or overwritten (Â§1.5).
-PurposeRecheckState = Literal["current", "stale"]
-
-#: Why a relation went stale. `upstream_changed` exists because staleness
-#: propagates exactly one direction (downstream) through the fixed chain --
-#: `snapshot_changed` is the one reason that comes from an ELEMENT's
-#: `evidence_stale` rather than from a captured decision digest comparing
-#: unequal.
-PurposeStaleReason = Literal[
-    "source_changed", "target_changed", "both_changed", "upstream_changed", "snapshot_changed"
-]
-
-#: ã€Œä»Šã®åˆ¤æ–­ã«ä½¿ãˆã‚‹ã‹ã€, first-match over an element's own settledness and its
-#: PRIMARY relation's status -- never a count, never an average (Â§1.4:
-#: `frame_resolution_level` is the 3-slot MIN, explicitly not a mean or a
-#: percentage). `L3` requires an `app/purpose_verification.py` (#391)
-#: `purpose_outcome_criterion` row that TARGETS this exact element and has
-#: all four of `measure` / `baseline_value` / `target_value` /
-#: `observation_window` filled in -- see `purpose_chain.py`'s
-#: `_resolution_level` for the exact check.
-PurposeResolutionLevel = Literal["L0", "L1", "L2", "L3"]
-
-#: Which existing table an element's content came from. `none` is a genuine
-#: value (no row exists yet), not the absence of the field.
-PurposeSourceKind = Literal["intent_item", "understanding_claim", "none"]
-
-#: The Purpose Frame's overall completeness, first-match over the 3 frame
-#: slots' `state`. `unavailable` is reserved for a guarded-loader failure
-#: while constructing a frame slot -- never for "nothing extracted yet"
-#: (that is `empty`).
-PurposeFrameState = Literal["complete", "partial", "empty", "unavailable"]
-
-#: Which composed section of the Purpose Chain failed to derive. A guarded
-#: loader records the section here and degrades ONLY that section -- the
-#: #380 discipline (Â§0 invariant 6): a relation-derivation failure must still
-#: return the frame.
-PurposeChainSection = Literal["frame", "relations", "capabilities"]
-
-
-class PurposeElementOut(BaseModel):
-    #: Stable across rebuilds: the bare kind for a frame-slot singleton
-    #: (`"desired_change"`), or `kind + ":" + sha256(name)[:16]` for a kind
-    #: that can repeat (`core_capability`, and any `intervention` claim beyond
-    #: the frame slot). Never derived from a row id -- a row id is reassigned
-    #: on every rebuild while describing the same element (#380's rule,
-    #: applied here).
-    id: str
-    kind: PurposeElementKind
-    state: PurposeElementState
-    #: Level 0's 1ã€œ2 æ–‡. The server never truncates; the Dashboard decides
-    #: how much of this to show.
-    display_statement: str = ""
-    #: The element's full text (claim name + summary, or an Intent Brief
-    #: item's `value_text`).
-    statement: str = ""
-    confirmation: UnderstandingConfirmationState
-    confirmation_label: str
-    provenance: UnderstandingProvenanceKind
-    provenance_label: str
-    resolution_level: PurposeResolutionLevel = "L0"
-    source_kind: PurposeSourceKind = "none"
-    source_ids: List[str] = []
-    intent_revision_id: Optional[int] = None
-    understanding_revision_id: Optional[int] = None
-    snapshot_id: Optional[int] = None
-    evidence: List[Dict[str, Any]] = []
-    #: Can only be `True` for a `provenance == "implementation_fact"`
-    #: element -- an Intent-sourced or AI-hypothesis element has no snapshot
-    #: pin to go stale against.
-    evidence_stale: bool = False
-    #: Fixed sentences naming what is missing, only populated when
-    #: `state == "unknown"`. Never model output (Principle 6).
-    missing_information: List[str] = []
-    is_mock: bool = False
-
-
-class PurposeRelationOut(BaseModel):
-    #: `f"{kind}:{source_id}->{target_id}"` -- stable because both endpoint
-    #: ids are themselves stable (never a row id).
-    id: str
-    kind: PurposeRelationKind
-    source_id: str
-    target_id: str
-    status: PurposeRelationStatus
-    status_label: str
-    recheck_state: PurposeRecheckState
-    stale_reason: Optional[PurposeStaleReason] = None
-    provenance: UnderstandingProvenanceKind
-    provenance_label: str
-    #: The current (non-superseded) `purpose_relation_decision` row, if any.
-    decision_id: Optional[int] = None
-    decided_at: Optional[float] = None
-    decided_by: Optional[str] = None
-    rationale: str = ""
-    #: Carried from the TARGET element's own evidence. Never invented for the
-    #: relation itself (Â§1.3: æé€ ã—ãªã„).
-    evidence: List[Dict[str, Any]] = []
-    #: Revisions captured when the current manual decision was created. They
-    #: remain fixed when an endpoint later changes, making the decision's
-    #: original scope auditable. ``None`` means this relation has no decision.
-    created_intent_revision_id: Optional[int] = None
-    created_understanding_revision_id: Optional[int] = None
-    created_snapshot_id: Optional[int] = None
-    #: Revisions of the endpoints in this freshly-derived projection. Comparing
-    #: these with the captured values above explains which generation the
-    #: relation currently describes without client-side source reconstruction.
-    current_intent_revision_id: Optional[int] = None
-    current_understanding_revision_id: Optional[int] = None
-    current_snapshot_id: Optional[int] = None
-
-
-class PurposeFrameOut(BaseModel):
-    beneficiary_problem: Optional[PurposeElementOut] = None
-    desired_change: Optional[PurposeElementOut] = None
-    intervention: Optional[PurposeElementOut] = None
-
-
-class PurposeChainOut(BaseModel):
-    system_id: int
-    session_id: Optional[int] = None
-    generated_at: float
-    frame: PurposeFrameOut
-    #: The frame's 3 elements plus any additional `intervention` claims and
-    #: every `core_capability` claim (Â§1.6).
-    elements: List[PurposeElementOut] = []
-    relations: List[PurposeRelationOut] = []
-    #: The 3 frame slots' resolution level, MIN (never mean/percentage --
-    #: Â§0 invariant 5, Â§1.4).
-    frame_resolution_level: PurposeResolutionLevel = "L0"
-    frame_state: PurposeFrameState = "empty"
-    snapshot_id: Optional[int] = None
-    understanding_revision_id: Optional[int] = None
-    understanding_confirmed_at: Optional[float] = None
-    degraded_sections: List[PurposeChainSection] = []
-    degraded_detail: Dict[str, str] = {}
-
-
-class PurposeRelationDecisionRequest(BaseModel):
-    """The one write in this module. `decision_method` is always `manual` --
-    there is no field for the caller to set it to anything else."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: int
-    decision: Literal["confirmed", "rejected"]
-    rationale: str = ""
-
-
-# --- Purpose Needs / adaptive next-question (Issue #389) ----------------------
-#
-# `docs/purpose-chain.md` Â§2 is the specification. A "need" is never "this
-# optional field is empty" -- every value below is derived deterministically
-# from the Purpose Chain projection (`app/purpose_needs.py`): an element that
-# is `unknown`, or a relation that is `unknown` / `conflicting` / `stale`.
-
-#: The 7 fixed need codes (Â§2.2). Each is a classification of an ALREADY
-#: system-generated signal into one of 7 buckets -- never a free-text
-#: question category, which is why this stays a Principle-6 finite set rather
-#: than a reasoning-model decision.
-PurposeNeedCode = Literal[
-    "frame_missing",
-    "relation_unknown",
-    "relation_conflict",
-    "capability_justification_missing",
-    "decision_criterion_missing",
-    "human_value_judgement_required",
-    "premise_recheck_required",
-]
-
-#: need_code -> answerability is a FIXED table (Â§2.3), not #286's
-#: reasoning-model Question Router: a system-generated need already has a
-#: known category by construction (Principle 6's "classification into a
-#: small explicit finite set"), unlike a developer's open-ended free-text
-#: question. `already_answered` / `unavailable` are never in the fixed table
-#: -- they are read from response history / degraded-section state at derive
-#: time (`app/purpose_needs.py.apply_response_state`).
-PurposeAnswerability = Literal[
-    "human_judgement", "system_researchable", "already_answered", "unavailable"
-]
-
-#: A need's own lifecycle given the developer's responses so far (Â§2.6/Â§2.7).
-#: `deferred` and `waiting` are both real, auditable outcomes of an explicit
-#: response -- never silently re-asked until the target's digest moves.
-PurposeNeedState = Literal["available", "waiting", "answered", "deferred", "unavailable"]
-
-#: ã€Œåˆ†ã‹ã‚‰ãªã„ã€ and ã€Œä»Šã¯ç­”ãˆãªã„ã€ are answers, not errors -- each is its own
-#: persisted, auditable fact (Â§2.6), never collapsed into a single "skipped".
-PurposeResponseKind = Literal["confirm", "correct", "unknown", "defer", "investigate"]
-
-#: Why a `need_id` deep link did not resolve to itself (Â§2.7). Never a 5th
-#: "just show something" value -- the caller always learns which of these
-#: four happened before falling back to the current question (or none).
-PurposeQuestionFallbackReason = Literal["resolved", "not_found", "other_system", "deferred"]
-
-#: What kind of Purpose Chain thing a need targets (Â§2.5). Distinct from
-#: `PurposeSourceKind` (which existing TABLE an ELEMENT's content came from).
-PurposeNeedTargetKind = Literal["element", "relation"]
-
-
-class PurposeSuggestedAnswerOut(BaseModel):
-    """An AI candidate built ONLY from an existing row's own text (Â§2.5).
-
-    Never invented, and no LLM is called to produce it -- `text` is always
-    copied verbatim from an existing element's `display_statement`, together
-    with that element's own already-computed provenance/source. Absent
-    (`None` on the parent) whenever there is no grounded candidate.
-    """
-
-    text: str
-    provenance: UnderstandingProvenanceKind
-    source_kind: PurposeSourceKind
-    source_ids: List[str] = []
-    is_mock: bool = False
-
-
-class PurposeRoutedNeedOut(BaseModel):
-    """One `system_researchable` need alongside the selected question (Â§2.4).
-
-    Informational only -- routed needs never reach the developer as a
-    question themselves; the Dashboard may use this to point at the Joint
-    Understanding investigation that is expected to answer it instead.
-    """
-
-    need_id: str
-    need_code: PurposeNeedCode
-    target_kind: PurposeNeedTargetKind
-    target_id: str
-    target_label: str
-
-
-class PurposeQuestionOut(BaseModel):
-    """Â§2.5's question contract. `None` at the endpoint level means "è³ªå•ãªã—"
-    (rule row 7) -- there is no empty/placeholder question object."""
-
-    need_id: str
-    need_code: PurposeNeedCode
-    #: The `PRIORITY_TABLE` row that chose this need (Â§2.4), 1-based.
-    #:
-    #: Every need code now carries a row, so a need derived from the current
-    #: projection always has one. The field stays `Optional` for the case the
-    #: type cannot rule out: a `need_id` deep link naming a code this server
-    #: version does not know. Reporting `None` there is honest -- inventing a
-    #: row number for a rule that did not run would forge the audit record of
-    #: which rule matched.
-    rule_row: Optional[int] = None
-    #: Fixed server copy (Principle 6/7) -- never model output.
-    prompt: str
-    why_now: str
-    blocked_decision: str
-    unlocks: str
-    defer_impact: str
-    target_kind: PurposeNeedTargetKind
-    target_id: str
-    target_label: str
-    answerability: PurposeAnswerability
-    suggested_answer: Optional[PurposeSuggestedAnswerOut] = None
-    state: PurposeNeedState
-    source_revision_ids: List[int] = []
-    #: Set only when a `need_id` deep link fell back to a different question
-    #: (or to none) -- see `PurposeQuestionFallbackReason`.
-    fallback_reason: Optional[PurposeQuestionFallbackReason] = None
-    routed_needs: List[PurposeRoutedNeedOut] = []
-
-
-class PurposeNeedRespondRequest(BaseModel):
-    """`decision_method` is always `manual` on the response row itself --
-    there is no field for the caller to set it to anything else. This is a
-    fact about WHO responded, independent of what a downstream investigation
-    (opened for `unknown`/`investigate`) later concludes with
-    `decision_method='reasoning_llm'`."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: int
-    response_kind: PurposeResponseKind
-    #: The confirm/correct value, or a free-text rationale for defer/unknown/
-    #: investigate. Optional -- a bare `confirm` needs no text.
-    value_text: str = ""
-
-
-class PurposeNeedResponseOut(BaseModel):
-    id: int
-    session_id: int
-    system_id: int
-    need_id: str
-    need_code: PurposeNeedCode
-    response_kind: PurposeResponseKind
-    value_text: str
-    target_kind: PurposeNeedTargetKind
-    target_id: str
-    #: The target's digest AT RESPONSE TIME -- what a `defer` reappears
-    #: against once it no longer matches (Â§2.6).
-    target_digest: str
-    decision_method: str
-    responded_by: Optional[str] = None
-    #: Set when `confirm`/`correct` was reused through the existing Intent
-    #: Brief confirm/correct/create implementation (never a second
-    #: revision-chain implementation, Â§2.6).
-    linked_intent_item_id: Optional[int] = None
-    #: Set when `confirm`/`correct` was reused through
-    #: `purpose_chain.record_relation_decision`.
-    linked_relation_decision_id: Optional[int] = None
-    #: Set when `unknown`/`investigate` opened a Joint Understanding session
-    #: with `trigger='purpose_need'`.
-    linked_joint_session_id: Optional[int] = None
-    superseded_by_id: Optional[int] = None
-    created_at: float
-
-
-# --- Purpose Verification / Experience-Outcome-Reuse (Issue #391) ------------
-#
-# `docs/purpose-chain.md` Â§4 is the specification. Three OPTIONAL concepts a
-# developer may attach to a Purpose Chain element or relation, by the SAME
-# stable string identity `app/purpose_chain.py` already uses -- never a row
-# id, and never required for every System (Â§4.1: "å…¨ System ã¸ä¸€å¾‹ã«è¦æ±‚ã—ãª
-# ã„"). Creation is only ever OFFERED alongside a currently-`available`
-# `app/purpose_needs.py` need whose code is in the fixed
-# `purpose_verification.CREATABLE_NEED_CODES` table; "the Purpose Frame is at
-# L1" is explicitly not a reason (Â§4.1), so there is no endpoint that lets a
-# caller create one without naming the justifying `need_id`.
-#
-# `decision_method` is hardcoded `'manual'` on every write in this area, same
-# as `purpose_chain.py` / `purpose_needs.py` -- this module calls no
-# reasoning model either (Principle 6), and an outcome's `observed` /
-# `contradicted` verdict is never inferred from a trace: it is always the
-# developer's own recorded reading of evidence they themselves curated
-# (Â§4.2).
-
-#: `experience_hypothesis` and `reuse_hypothesis` share this exact lifecycle
-#: (`docs/purpose-chain.md` Â§4.1: "state ã¯ experience ã¨åŒã˜") -- one
-#: `Literal` for both, since defining it twice would let the two drift apart
-#: for no reason.  `retired` is a manual withdrawal (the developer decided
-#: the hypothesis was wrong or no longer relevant); it is NEVER a synonym for
-#: "not yet confirmed".
-PurposeHypothesisState = Literal["proposed", "confirmed", "retired"]
-
-#: `purpose_outcome_criterion`'s own 6-value lifecycle (Â§4.1/Â§4.2).
-#: `proposed` / `confirmed` are the same manual commitment steps as a
-#: hypothesis; `observed` / `contradicted` are set ONLY together with an
-#: evidence write (`PurposeOutcomeResultRequest`) -- never derived from
-#: silence. `not_observed` ("analytics ãŒç„¡ã‘ã‚Œã°") and `not_computed`
-#: ("canonical mapping ãŒç„¡ã‘ã‚Œã°") are each their own explicit manual
-#: recording of why a verdict could not be reached, not a value the server
-#: infers from an empty column -- see `purpose_verification.py`'s module
-#: docstring for why an inferred value here would violate Â§4.2's "runtime
-#: trace ã ã‘ã§åˆ©ç”¨è€…ã®æˆåŠŸã‚’æŽ¨æ¸¬ã—ãªã„" rule one level up.
-PurposeOutcomeCriterionState = Literal[
-    "proposed", "confirmed", "observed", "contradicted", "not_observed", "not_computed"
-]
-
-#: Which of the two evidence COLUMNS a result write targets. Â§4.2 requires
-#: human-reported evidence and runtime observation to stay in separate
-#: columns, never merged into one "result" -- this is the axis that picks
-#: which column `record_outcome_result` writes to.
-PurposeOutcomeEvidenceSource = Literal["human_reported", "runtime_observed"]
-PurposeOutcomeEvidenceState = Literal[
-    "observed", "contradicted", "not_observed", "not_computed"
-]
-
-#: A recorded verdict is a judgement about the evidence, always the
-#: developer's own reading of it (never computed from the evidence text).
-PurposeOutcomeVerdict = Literal["supports", "contradicts"]
-
-#: Whether an `experiment_id` / `candidate_version_id` lineage column
-#: resolves to a real, System-scoped row right now. `unresolved` (the id was
-#: set but the row is gone) is a genuine third value -- Â§4.3: "å¯¾å¿œãŒç„¡ã‘ã‚Œ
-#: ã°ã€Œé–¢é€£ä¸æ˜Žã€ã¨è¡¨ç¤ºã™ã‚‹" -- never silently downgraded to `none`, which
-#: would erase the fact that a lineage claim was once made.
-PurposeOutcomeLineageState = Literal["none", "linked", "unresolved"]
-
-#: Which of the three concepts a verification prompt or a listing row is
-#: about. Distinct from `PurposeNeedTargetKind` (element vs relation) -- this
-#: is "what kind of verification", not "what kind of Purpose Chain node".
-PurposeVerificationConceptKind = Literal[
-    "experience_hypothesis", "outcome_criterion", "reuse_hypothesis"
-]
-
-
-class PurposeExperienceHypothesisOut(BaseModel):
-    """A minimal claim about what a real user would experience if this
-    element/relation's causal claim holds. Free text (Â§4.1) -- the developer
-    states it themselves; this module invents no wording."""
-
-    id: int
-    system_id: int
-    session_id: int
-    target_kind: PurposeNeedTargetKind
-    target_id: str
-    #: Copied from the justifying need at creation time, for display without
-    #: a second lookup.
-    target_label: str
-    #: `purpose_chain.element_digest` / the relation's own identity fields at
-    #: CREATION time. Captured for audit; #391 does not re-check it against
-    #: the current chain on every read (no staleness re-derivation here --
-    #: an explicit non-goal for this issue, see the module docstring).
-    target_digest: str
-    #: The `purpose_needs` need that made this creatable (Â§4.1). Never a
-    #: guess -- the create endpoint refuses without one.
-    source_need_id: str
-    source_need_code: PurposeNeedCode
-    statement: str
-    state: PurposeHypothesisState
-    decision_method: str = "manual"
-    created_by: Optional[str] = None
-    created_at: float
-    confirmed_by: Optional[str] = None
-    confirmed_at: Optional[float] = None
-    retired_by: Optional[str] = None
-    retired_at: Optional[float] = None
-    retirement_reason: str = ""
-
-
-class PurposeReuseHypothesisOut(BaseModel):
-    """Identical shape to `PurposeExperienceHypothesisOut` -- a separate
-    class (not a type alias) because the two are stored in separate tables
-    and are never interchangeable, even though every field matches."""
-
-    id: int
-    system_id: int
-    session_id: int
-    target_kind: PurposeNeedTargetKind
-    target_id: str
-    target_label: str
-    target_digest: str
-    source_need_id: str
-    source_need_code: PurposeNeedCode
-    statement: str
-    state: PurposeHypothesisState
-    decision_method: str = "manual"
-    created_by: Optional[str] = None
-    created_at: float
-    confirmed_by: Optional[str] = None
-    confirmed_at: Optional[float] = None
-    retired_by: Optional[str] = None
-    retired_at: Optional[float] = None
-    retirement_reason: str = ""
-
-
-class PurposeOutcomeCriterionOut(BaseModel):
-    """æˆæžœè¨¼æ‹  (Â§4.1/Â§4.2/Â§4.3/Â§4.4). `measure` / `baseline_value` /
-    `target_value` / `observation_window` are the four fields Â§4.4 checks for
-    L3 -- all plain developer-authored text, never LLM output."""
-
-    id: int
-    system_id: int
-    session_id: int
-    target_kind: PurposeNeedTargetKind
-    target_id: str
-    target_label: str
-    target_digest: str
-    source_need_id: str
-    source_need_code: PurposeNeedCode
-    measure: str = ""
-    baseline_value: str = ""
-    target_value: str = ""
-    observation_window: str = ""
-    state: PurposeOutcomeCriterionState
-    #: Â§4.3: explicit lineage columns only, never a System-wide existence
-    #: check. `lineage_state` reports whether the id (when set) still
-    #: resolves -- `unresolved` renders as ã€Œé–¢é€£ä¸æ˜Žã€, never as "no lineage".
-    experiment_id: Optional[int] = None
-    candidate_version_id: Optional[int] = None
-    lineage_state: PurposeOutcomeLineageState = "none"
-    #: Â§4.2: two SEPARATE evidence columns, never merged into one "result".
-    human_reported_evidence: Optional[str] = None
-    human_reported_verdict: Optional[PurposeOutcomeVerdict] = None
-    human_reported_at: Optional[float] = None
-    human_reported_by: Optional[str] = None
-    human_reported_state: Optional[PurposeOutcomeEvidenceState] = None
-    human_reported_is_synthetic: bool = False
-    runtime_observation_text: Optional[str] = None
-    runtime_observation_verdict: Optional[PurposeOutcomeVerdict] = None
-    runtime_observed_at: Optional[float] = None
-    runtime_observed_by: Optional[str] = None
-    runtime_observation_state: Optional[PurposeOutcomeEvidenceState] = None
-    runtime_observation_is_synthetic: bool = False
-    #: Â§4.2: "synthetic fixture ã®çµæžœã‚’å®Ÿåˆ©ç”¨è€…ã®æˆæžœã¨ã—ã¦è¡¨ç¤ºã—ãªã„" -- the
-    #: flag a result write carries, shown alongside the result, never
-    #: inferred from where the evidence came from.
-    is_synthetic: bool = False
-    decision_method: str = "manual"
-    created_by: Optional[str] = None
-    created_at: float
-    confirmed_by: Optional[str] = None
-    confirmed_at: Optional[float] = None
-
-
-class PurposeVerificationStateOut(BaseModel):
-    """`GET /purpose-chain/verification` -- every concept currently recorded
-    for one session, grouped by kind. Not paginated (Â§0 invariant 5: this
-    Epic creates no dashboard of its own; the expected count per session is
-    small, gated as it is by needs)."""
-
-    system_id: int
-    session_id: Optional[int] = None
-    experience_hypotheses: List[PurposeExperienceHypothesisOut] = []
-    outcome_criteria: List[PurposeOutcomeCriterionOut] = []
-    reuse_hypotheses: List[PurposeReuseHypothesisOut] = []
-
-
-class PurposeVerificationPromptOut(BaseModel):
-    """Â§4.5's ONE verification prompt. At most one, chosen deterministically
-    (`purpose_verification.select_verification_prompt`) -- the same
-    at-most-one discipline `PurposeQuestionOut` already applies to Purpose
-    Needs, extended to verification-concept creation. `None` at the endpoint
-    level means ã€Œæ¤œè¨¼æ¡ä»¶ã¯ã¾ã å¿…è¦ã‚ã‚Šã¾ã›ã‚“ã€ -- there is no empty
-    placeholder object."""
-
-    concept_kind: PurposeVerificationConceptKind
-    need_id: str
-    need_code: PurposeNeedCode
-    target_kind: PurposeNeedTargetKind
-    target_id: str
-    target_label: str
-    #: ä½•ã‚’æ¤œè¨¼ã™ã‚‹ã‹. Fixed server copy (Principle 6/7), never model output.
-    prompt: str
-    #: ãªãœä»Šã‹ -- reused verbatim from the justifying need's own copy
-    #: (`purpose_needs._NEED_COPY`), so this prompt and the underlying need's
-    #: own question never disagree about why now matters.
-    why_now: str
-    #: ã©ã®åˆ¤æ–­ã«åŠ¹ãã‹ -- reused verbatim from the justifying need's
-    #: `blocked_decision`.
-    blocked_decision: str
-    #: æœ€å°ã®è¦³æ¸¬æ–¹æ³• -- fixed copy naming the smallest thing worth writing
-    #: down for this concept kind (Principle 6: never model-authored).
-    observation_hint: str
-
-
-class PurposeExperienceHypothesisCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: int
-    #: The `purpose_needs` need this concept is being created FOR (Â§4.1) --
-    #: required, never inferred from the target alone.
-    need_id: str
-    statement: str
-
-
-class PurposeReuseHypothesisCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: int
-    need_id: str
-    statement: str
-
-
-class PurposeOutcomeCriterionCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: int
-    need_id: str
-    measure: str
-    baseline_value: str
-    target_value: str
-    observation_window: str
-
-
-class PurposeVerificationSessionRequest(BaseModel):
-    """The bare `session_id` body every no-extra-input verification
-    transition needs (confirm actions on either hypothesis table, and the
-    outcome criterion's own confirm)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: int
-
-
-class PurposeHypothesisRetireRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: int
-    reason: str = ""
-
-
-class PurposeOutcomeCriterionLinkRequest(BaseModel):
-    """Â§4.3: explicit lineage only. Both fields optional, but at most one may
-    be set -- an outcome criterion has at most one canonical mapping, never a
-    pair of unrelated candidate/experiment ids at once."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: int
-    experiment_id: Optional[int] = None
-    candidate_version_id: Optional[int] = None
-
-    @model_validator(mode="after")
-    def exactly_zero_or_one_lineage_target(self):
-        if self.experiment_id is not None and self.candidate_version_id is not None:
-            raise ValueError("Specify at most one of experiment_id or candidate_version_id")
-        return self
-
-
-class PurposeOutcomeResultRequest(BaseModel):
-    """Records a result against EXACTLY ONE of the two evidence columns
-    (`source` picks which), always paired with the developer's own verdict --
-    never a bare state transition with no evidence attached (Â§4.2)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: int
-    source: PurposeOutcomeEvidenceSource
-    verdict: PurposeOutcomeVerdict
-    evidence_text: str
-    is_synthetic: bool = False
-
-
-class PurposeOutcomeUnavailableRequest(BaseModel):
-    """Explicitly records why one evidence source cannot yield a verdict."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: int
-    source: PurposeOutcomeEvidenceSource
-    state: Literal["not_observed", "not_computed"]
-    reason: str
-
-
-# ---------------------------------------------------------------------------
-# Evolution Node (Epic #394 Phase 1, Issue #396)
-#
-# The finite vocabularies below are mirrored from `app/evolution_node.py`,
-# which owns them. They are re-declared here as `Literal` aliases rather than
-# imported so FastAPI puts a real enum in the OpenAPI schema and the
-# Dashboard's TypeScript unions cannot silently drift from the server -- the
-# same discipline `PurposeElementKind` and the #351 Brief vocabularies use.
-# `test_evolution_node_api.py` asserts the two definitions stay identical.
-# ---------------------------------------------------------------------------
-
-EvolutionMaturityState = Literal[
-    "exploring", "validating", "established", "monitoring", "reopened", "suspended"
-]
-EvolutionImplementationModality = Literal[
-    "reasoning_llm", "lm_program", "retrieval", "router", "small_model",
-    "rule", "deterministic_code", "workflow", "manual", "hybrid",
-]
-EvolutionLinkKind = Literal[
-    "component", "probe_point", "cell_binding", "capability", "flow",
-    "purpose_element", "feature",
-]
-EvolutionSideEffectClass = Literal[
-    "pure", "read_only", "local_write", "external_write", "irreversible"
-]
-EvolutionTrustBoundary = Literal[
-    "internal", "external_input", "external_output", "third_party"
-]
-EvolutionActorKind = Literal["developer", "system"]
-
-
-class EvolutionNodeCreateIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    node_key: str
-    display_name: str = ""
-
-
-class EvolutionNodeVersionCreateIn(BaseModel):
-    """The Node's CONTRACT -- what it promises, not how it currently keeps
-    that promise (ADR-3). `evaluation_policy_refs` are refs, never inline
-    criteria: Phase 2 (#397) owns the three evaluation contracts."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    mission: str
-    input_contract: Optional[Dict[str, Any]] = None
-    output_contract: Optional[Dict[str, Any]] = None
-    side_effect_class: EvolutionSideEffectClass
-    trust_boundary: EvolutionTrustBoundary
-    scope: str = ""
-    out_of_scope: str = ""
-    establishment_criteria: List[str] = Field(default_factory=list)
-    reopen_criteria: List[str] = Field(default_factory=list)
-    evaluation_policy_refs: List[str] = Field(default_factory=list)
-
-
-class EvolutionNodeImplementationCreateIn(BaseModel):
-    """How the Node currently keeps its contract's promise (ADR-3).
-
-    Provider/model names belong inside `config` / `provenance` and never in a
-    field that participates in the implementation's identity -- the same rule
-    #298's Agent Role Card applies to model aliases. `modality` is the axis
-    that makes an LLM implementation and a rule implementation of the SAME
-    contract comparable.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    node_version_id: int
-    modality: EvolutionImplementationModality
-    config: Optional[Dict[str, Any]] = None
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-    environment_ref: Optional[str] = None
-    provenance: Optional[Dict[str, Any]] = None
-
-
-class EvolutionNodeLinkCreateIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    link_kind: EvolutionLinkKind
-    target_ref: str
-    target_row_id: Optional[int] = None
-    note: str = ""
-
-
-class EvolutionNodeStablePinIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    implementation_id: int
-    reason: str = ""
-
-
-class EvolutionNodeTransitionIn(BaseModel):
-    """A maturity transition request.
-
-    Provenance fields (`actor`, `actor_kind`) are deliberately ABSENT: the
-    route derives both from the authenticated `Principal` (#337's rule,
-    ADR-9), so a caller can never record a transition as someone else's --
-    or as the system's -- decision. `decision_method` is deliberately NOT
-    defaulted to `manual`: which one it is decides whether a human stands
-    behind this transition, and a default would let a caller record a human
-    decision by omission. The full three-value Literal is kept so the route
-    can refuse `deterministic` with its own finite code
-    (`deterministic_via_api_not_allowed`) and let the domain layer refuse
-    `reasoning_llm` with `llm_state_not_allowed` -- an LLM never emits a
-    canonical state (Principle 6).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    to_state: EvolutionMaturityState
-    decision_method: Literal["deterministic", "reasoning_llm", "manual"]
-    reason: str = ""
-    reason_code: str = ""
-    evidence_refs: List[str] = Field(default_factory=list)
-    idempotency_key: str = ""
-
-
-class EvolutionNodeSummaryOut(BaseModel):
-    id: int
-    system_id: int
-    node_key: str
-    display_name: str
-    maturity: EvolutionMaturityState
-    current_version_id: Optional[int] = None
-    current_implementation_id: Optional[int] = None
-    stable_implementation_id: Optional[int] = None
-    rollback_implementation_id: Optional[int] = None
-    monitoring_contract_ref: Optional[str] = None
-    created_at: float
-    updated_at: float
-
-
-class EvolutionNodesListOut(BaseModel):
-    nodes: List[EvolutionNodeSummaryOut]
-
-
-class EvolutionNodeVersionOut(BaseModel):
-    id: int
-    version_number: int
-    mission: str
-    scope: str
-    out_of_scope: str
-    input_contract: Dict[str, Any]
-    output_contract: Dict[str, Any]
-    side_effect_class: str
-    trust_boundary: str
-    establishment_criteria: List[str]
-    reopen_criteria: List[str]
-    evaluation_policy_refs: List[str]
-    decision_method: str
-    created_by: Optional[str] = None
-    created_at: float
-    superseded_by_id: Optional[int] = None
-
-
-class EvolutionNodeImplementationOut(BaseModel):
-    id: int
-    implementation_number: int
-    node_version_id: int
-    modality: str
-    config: Dict[str, Any]
-    snapshot_id: Optional[int] = None
-    commit_sha: Optional[str] = None
-    environment_ref: Optional[str] = None
-    provenance: Dict[str, Any]
-    decision_method: str
-    created_by: Optional[str] = None
-    created_at: float
-    superseded_by_id: Optional[int] = None
-
-
-class EvolutionNodeLinkOut(BaseModel):
-    id: int
-    link_kind: str
-    target_ref: str
-    target_row_id: Optional[int] = None
-    note: str
-    decision_method: str
-    created_by: Optional[str] = None
-    created_at: float
-
-
-class EvolutionNodeEventOut(BaseModel):
-    id: int
-    event_kind: str
-    from_state: Optional[str] = None
-    to_state: Optional[str] = None
-    from_version_id: Optional[int] = None
-    to_version_id: Optional[int] = None
-    from_implementation_id: Optional[int] = None
-    to_implementation_id: Optional[int] = None
-    actor: Optional[str] = None
-    actor_kind: str
-    decision_method: str
-    reason_code: str
-    reason: str
-    # Named `evidence` (not `evidence_refs`) to match the domain layer's own
-    # event document: the stored value is a list of refs, and renaming it at
-    # the boundary would leave the API and the projection describing the
-    # same column under two names.
-    evidence: List[str]
-    # NULL for a request that opted out of idempotency entirely. An empty
-    # string is deliberately not used: the partial unique index excludes it,
-    # so "no key" and "the empty key" are not the same fact.
-    idempotency_key: Optional[str] = None
-    created_at: float
-
-
-class EvolutionNodeEventsOut(BaseModel):
-    node_id: int
-    events: List[EvolutionNodeEventOut]
-
-
-class EvolutionNodeProjectionOut(BaseModel):
-    """The canonical Node document.
-
-    `maturity`, `improvement_status` and `policy_mode` are three INDEPENDENT
-    axes and no consumer may combine them into one label (ADR-6). A `null`
-    on either of the latter two means "nothing of that kind is linked to
-    this Node" -- never "none is in progress". The fourth axis
-    (`workflow_phase`) is deliberately absent from the document rather than
-    `null`; Phase 6 (#401) wires it.
-
-    `availability[k] is False` means that block could not be read at all.
-    Paired with a `null` value it is a different fact from a `null` with
-    `availability[k] is True`, which is a genuine absence (#380).
-
-    `maturity` is the stored column; `folded_maturity` is what this Node's
-    transition events fold to (ADR-4) and `maturity_consistent` whether the
-    two agree. A `null` fold with stored `exploring` is consistent (the Node
-    has never transitioned); both are `null` only when
-    `availability["maturity_lineage"]` is False.
-    """
-
-    schema_version: str
-    system_id: int
-    node_id: int
-    node_key: str
-    display_name: str
-    maturity: EvolutionMaturityState
-    folded_maturity: Optional[EvolutionMaturityState] = None
-    maturity_consistent: Optional[bool] = None
-    current_version: Optional[EvolutionNodeVersionOut] = None
-    current_implementation: Optional[EvolutionNodeImplementationOut] = None
-    stable_implementation: Optional[EvolutionNodeImplementationOut] = None
-    rollback_implementation: Optional[EvolutionNodeImplementationOut] = None
-    links: List[EvolutionNodeLinkOut]
-    events: List[EvolutionNodeEventOut]
-    improvement_status: Optional[str] = None
-    policy_mode: Optional[str] = None
-    availability: Dict[str, bool]
-    updated_at: float
-
-
-class EvolutionNodeLegacyProjectionOut(BaseModel):
-    """ADR-8 compatibility view. Not a second canonical projection."""
-
-    schema_version: str
-    compatibility_projection: bool
-    system_id: int
-    node_id: int
-    node_key: str
-    component_id: Optional[str] = None
-    probe_point_ref: Optional[str] = None
-    cell_id: Optional[str] = None
-    maturity: EvolutionMaturityState
-
-
-class EvolutionNodeTransitionOut(BaseModel):
-    """`applied` and `duplicate` are separate booleans on purpose: a retry
-    that changed nothing is a success, not a failure, and the caller has to
-    be able to tell the two apart. A REJECTED transition never reaches this
-    model -- it is a 422 carrying the domain layer's own finite reason code.
-    """
-
-    applied: bool
-    duplicate: bool
-    maturity: EvolutionMaturityState
-    event: Optional[EvolutionNodeEventOut] = None
-
-
-# ---------------------------------------------------------------------------
-# Design Studio (Epic #394 Phase 2, Issue #397)
-#
-# Note what is NOT here: there is no score, weight, or total field on any
-# evaluation model. ADR-7 forbids compositing the three levels into one
-# number, and the reliable way to enforce that is to give the number nowhere
-# to live -- in the schema as well as in the table.
-# ---------------------------------------------------------------------------
-
-EvolutionEvaluationLevel = Literal["node", "flow_capability", "ux_outcome"]
-DecompositionDecisionKind = Literal["adopted", "held", "rejected"]
-
-
-class DecompositionProposeIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scope_summary: str
-    context: str = ""
-    session_id: Optional[int] = None
-    capability_ref: str = ""
-    flow_ref: str = ""
-
-
-class DecompositionCandidateOut(BaseModel):
-    id: int
-    proposal_id: int
-    candidate_key: str
-    summary: str
-    rationale: str
-    nodes: List[Dict[str, Any]]
-    open_questions: List[str]
-    decision: Literal["pending", "adopted", "held", "rejected"]
-    decision_note: str
-    decided_by: Optional[str] = None
-    decided_at: Optional[float] = None
-    adopted_node_ids: List[int]
-    created_at: float
-
-
-class DecompositionProposalOut(BaseModel):
-    id: int
-    system_id: int
-    session_id: Optional[int] = None
-    scope_summary: str
-    capability_ref: str
-    flow_ref: str
-    snapshot_id: Optional[int] = None
-    intelligence_run_id: Optional[int] = None
-    status: Literal["proposed", "failed"]
-    error_details: str
-    is_mock: bool
-    created_by: Optional[str] = None
-    created_at: float
-    candidates: List[DecompositionCandidateOut]
-
-
-class DecompositionDecisionIn(BaseModel):
-    """`pending` is deliberately not accepted: it is the initial state, not a
-    decision a developer can record."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    decision: DecompositionDecisionKind
-    note: str = ""
-
-
-class DecompositionDecisionOut(BaseModel):
-    candidate: DecompositionCandidateOut
-    created_nodes: List[Dict[str, Any]]
-
-
-class EvaluationCriterionIn(BaseModel):
-    """One thing that must be REACHED before establishing.
-
-    Separate from a floor on purpose (ADR-7): the two are consumed at
-    different moments, and a single list with a flag makes "we met the bar"
-    and "we did not regress" indistinguishable in storage."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    measure: str
-    target: str = ""
-    note: str = ""
-
-
-class EvaluationFloorIn(BaseModel):
-    """One property that must not REGRESS. Never traded off against a
-    criterion -- there is no weight field to trade with."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    measure: str
-    minimum: str = ""
-    note: str = ""
-
-
-class EvaluationUnmeasuredIn(BaseModel):
-    """Something this contract cannot currently measure, WITH its reason.
-
-    Recorded rather than omitted: an omitted criterion reads as "nothing to
-    check here", which is the #391 rule about never inferring an Outcome."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    reason: str
-
-
-class EvaluationPolicyCreateIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    policy_key: str
-    level: EvolutionEvaluationLevel
-    title: str = ""
-    subject_ref: str = ""
-    criteria: List[EvaluationCriterionIn] = Field(default_factory=list)
-    floors: List[EvaluationFloorIn] = Field(default_factory=list)
-    unmeasured: List[EvaluationUnmeasuredIn] = Field(default_factory=list)
-
-
-class EvaluationPolicyOut(BaseModel):
-    id: int
-    policy_key: str
-    level: EvolutionEvaluationLevel
-    version_number: int
-    title: str
-    subject_ref: str
-    criteria: List[Dict[str, Any]]
-    floors: List[Dict[str, Any]]
-    unmeasured: List[Dict[str, Any]]
-    decision_method: str
-    created_by: Optional[str] = None
-    created_at: float
-
-
-class EvaluationPoliciesOut(BaseModel):
-    """Grouped by level, never merged into one list -- the ADR-7 separation
-    made structural rather than only documented."""
-
-    node: List[EvaluationPolicyOut]
-    flow_capability: List[EvaluationPolicyOut]
-    ux_outcome: List[EvaluationPolicyOut]
-
-
-class NodeLineageRelationOut(BaseModel):
-    """One design relation.
-
-    `relation_status` (was this relation proposed by AI or confirmed by the
-    developer), `element_state` (is the target itself confirmed) and
-    `target_resolution` (does the target exist in its own canonical source)
-    are three independent axes. A confirmed relation to an unconfirmed
-    element is a real and common state, and so is a confirmed relation to a
-    ref that resolves to nothing; collapsing any two of them would hide one.
-
-    `target_source` names WHICH canonical source decided the resolution --
-    the Purpose Frame for `purpose_element`, the #312 Capability Graph for
-    `capability`, the System's observed flow ids for `flow`, the Feature Map
-    for `feature`. The finite vocabularies live in `app/node_design.py`
-    (`TARGET_RESOLUTIONS` / `TARGET_SOURCES` / `LINEAGE_ELEMENT_STATES`)."""
-
-    link_id: int
-    link_kind: str
-    target_ref: str
-    target_name: Optional[str] = None
-    relation_status: Optional[str] = None
-    relation_decision_method: str
-    element_state: str
-    target_resolution: str = "unresolved"
-    target_source: Optional[str] = None
-    note: str
-    created_by: Optional[str] = None
-    created_at: float
-
-
-class NodeLineageOut(BaseModel):
-    system_id: int
-    node_id: int
-    node_key: str
-    maturity: str
-    relations: List[NodeLineageRelationOut]
-    confirmed_relation_count: int
-    proposed_relation_count: int
-    purpose_frame_supplied: bool
-
-
-class NodeDesignHandoffCreateIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    node_ids: List[int]
-    evaluation_policy_ids: List[int] = Field(default_factory=list)
-    dataset_refs: List[str] = Field(default_factory=list)
-    probe_plan_id: Optional[int] = None
-    establishment_criteria_draft: List[str] = Field(default_factory=list)
-    reopen_criteria_draft: List[str] = Field(default_factory=list)
-    exploration_brief: str = ""
-
-
-class NodeDesignHandoffOut(BaseModel):
-    """References are resolved at READ time, so a Node deleted or a policy
-    superseded after assembly shows up as it actually is now."""
-
-    id: int
-    system_id: int
-    session_id: Optional[int] = None
-    nodes: List[Dict[str, Any]]
-    evaluation_policies: List[Dict[str, Any]]
-    dataset_refs: List[str]
-    probe_plan_id: Optional[int] = None
-    establishment_criteria_draft: List[str]
-    reopen_criteria_draft: List[str]
-    exploration_brief: str
-    assembly_state: Literal["complete", "incomplete"]
-    missing_refs: List[str]
-    created_by: Optional[str] = None
-    created_at: float
-
-
-# ---------------------------------------------------------------------------
-# Exploration Workbench (Epic #394 Phase 3, Issue #398)
-#
-# Note what is absent, deliberately: no source, patch, or command field on any
-# variant model. A variant references an implementation and the existing run
-# that executed it. Accepting executable content at this boundary would let a
-# caller run code outside the pinned-snapshot, network-off sandbox that Replay
-# and Experiments enforce (Principle 8).
-#
-# Also absent: any score, weight, or total. #398 forbids compositing quality /
-# latency / cost / safety, and the reliable enforcement is to give the
-# combined number nowhere to live -- in the schema as well as in the table.
-# ---------------------------------------------------------------------------
-
-ExplorationDimension = Literal[
-    "output_quality", "error_rate", "latency", "cost", "resource", "safety", "coverage"
-]
-ExplorationValueState = Literal[
-    "measured", "not_applicable", "not_measured", "unsupported"
-]
-ExplorationExecutionState = Literal[
-    "not_executed", "executed", "not_executable", "unsupported"
-]
-ExplorationRefKind = Literal["replay_run", "replay_variant", "experiment"]
-ExplorationGenerator = Literal["manual", "reasoning_llm", "existing_implementation"]
-ExplorationDatasetKind = Literal["replay_set", "golden_set", "edge_cases", "mixed"]
-ExplorationVerdict = Literal[
-    "better", "worse", "equal", "incomparable", "coverage_mismatch"
-]
-
-
-class ExplorationRunCreateIn(BaseModel):
-    """Everything held CONSTANT across the run's variants lives here, so two
-    variants cannot have been measured against different datasets while still
-    looking like a comparison."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    node_id: int
-    node_version_id: int
-    objective: str = ""
-    dataset_kind: ExplorationDatasetKind = "replay_set"
-    dataset_ref: str = ""
-    snapshot_id: Optional[int] = None
-    commit_sha: str = ""
-    environment_ref: str = ""
-    evaluation_policy_ids: List[int] = Field(default_factory=list)
-    handoff_id: Optional[int] = None
-
-
-class ExplorationVariantCreateIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    variant_key: str
-    modality: EvolutionImplementationModality
-    label: str = ""
-    is_baseline: bool = False
-    implementation_id: Optional[int] = None
-    config: Dict[str, Any] = Field(default_factory=dict)
-    provenance: Dict[str, Any] = Field(default_factory=dict)
-    generator: ExplorationGenerator = "manual"
-    applicability_envelope: Dict[str, Any] = Field(default_factory=dict)
-
-
-class ExplorationExecutionIn(BaseModel):
-    """`not_executable` and `unsupported` are first-class outcomes here, not
-    failures: a rule variant that cannot express a case has not lost on it."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    execution_state: ExplorationExecutionState
-    execution_ref_kind: Optional[ExplorationRefKind] = None
-    execution_ref_id: Optional[int] = None
-    note: str = ""
-
-
-class ExplorationMeasurementIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    dimension: ExplorationDimension
-    metric_name: str = ""
-    value_state: ExplorationValueState = "measured"
-    numeric_value: Optional[float] = None
-    unit: str = ""
-    covered_case_count: Optional[int] = None
-    total_case_count: Optional[int] = None
-    source: Literal["deterministic", "reasoning_llm", "manual"] = "deterministic"
-    note: str = ""
-
-
-class ExplorationMeasurementOut(BaseModel):
-    id: int
-    dimension: ExplorationDimension
-    metric_name: str
-    value_state: ExplorationValueState
-    numeric_value: Optional[float] = None
-    unit: str
-    covered_case_count: Optional[int] = None
-    total_case_count: Optional[int] = None
-    source: str
-    note: str
-
-
-class ExplorationVariantOut(BaseModel):
-    id: int
-    variant_key: str
-    label: str
-    is_baseline: bool
-    modality: EvolutionImplementationModality
-    implementation_id: Optional[int] = None
-    config: Dict[str, Any]
-    provenance: Dict[str, Any]
-    generator: ExplorationGenerator
-    applicability_envelope: Dict[str, Any]
-    execution_state: ExplorationExecutionState
-    execution_ref_kind: Optional[ExplorationRefKind] = None
-    execution_ref_id: Optional[int] = None
-    execution_note: str
-    created_by: Optional[str] = None
-    created_at: float
-    measurements: List[ExplorationMeasurementOut]
-
-
-class ExplorationComparisonOut(BaseModel):
-    """One dimension of one variant against the baseline.
-
-    `incomparable` and `coverage_mismatch` are verdicts, not errors. They are
-    what stops "this variant has no token cost" from displaying identically to
-    "this variant's token cost is zero"."""
-
-    dimension: ExplorationDimension
-    metric_name: str
-    verdict: ExplorationVerdict
-    baseline_state: ExplorationValueState
-    variant_state: ExplorationValueState
-    baseline_value: Optional[float] = None
-    variant_value: Optional[float] = None
-    delta: Optional[float] = None
-    baseline_coverage: Optional[List[int]] = None
-    variant_coverage: Optional[List[int]] = None
-    reason: str
-
-
-class ExplorationRunOut(BaseModel):
-    """The whole comparison. Carries no ranking and no overall verdict --
-    which dimension matters is the developer's judgement, and at
-    establishment time it is #399's gate, not this projection's."""
-
-    id: int
-    system_id: int
-    node_id: int
-    node_version_id: int
-    handoff_id: Optional[int] = None
-    objective: str
-    dataset_kind: ExplorationDatasetKind
-    dataset_ref: str
-    snapshot_id: Optional[int] = None
-    commit_sha: str
-    environment_ref: str
-    evaluation_policy_ids: List[int]
-    status: Literal["open", "completed", "abandoned"]
-    conclusion_note: str
-    baseline_variant_id: Optional[int] = None
-    comparable: bool
-    variants: List[ExplorationVariantOut]
-    comparisons: Dict[str, List[ExplorationComparisonOut]]
-    created_by: Optional[str] = None
-    created_at: float
-    completed_at: Optional[float] = None
-
-
-class ExplorationRunCompleteIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    conclusion_note: str = ""
-
-
-class ExplorationRankingEntryOut(BaseModel):
-    variant_id: int
-    variant_key: str
-    modality: EvolutionImplementationModality
-    value: Optional[float] = None
-    value_state: ExplorationValueState
-    # Why an unranked variant is unranked (different metric_name, different
-    # coverage, nothing measured). Dropping this would leave the reader with
-    # a bare exclusion they cannot audit.
-    reason: str = ""
-
-
-class ExplorationRankingOut(BaseModel):
-    """Ranked by ONE named dimension. There is no overall ranking endpoint:
-    a caller that wants an order must say what it is ordering by, so a latency
-    ranking can never be presented as "the best variant".
-
-    `unranked` is a separate group rather than the tail of `ranked` --
-    sorting an unmeasured variant last would read as "worst"."""
-
-    dimension: ExplorationDimension
-    # The single metric this ranking was computed over -- readings under a
-    # different metric_name are in `unranked`, never silently mixed in.
-    metric_name: str = ""
-    ranked: List[ExplorationRankingEntryOut]
-    unranked: List[ExplorationRankingEntryOut]
-
-
-# ---------------------------------------------------------------------------
-# Stabilization Evidence Package (Epic #394 Phase 4, Issue #399)
-#
-# `approved_by` is never a request field: establishment is a named human's
-# decision, taken from the authenticated principal at the route (#337's
-# provenance rule). And as in Phase 3, there is no score anywhere -- every
-# criterion and floor is judged individually (ADR-7).
-# ---------------------------------------------------------------------------
-
-StabilizationEvidenceLevel = Literal["node", "flow_capability", "ux_outcome"]
-StabilizationEvidenceKind = Literal[
-    "criterion", "floor", "downstream_impact", "outcome", "stability"
-]
-StabilizationVerdict = Literal[
-    "met", "not_met", "held", "violated", "unmeasured", "not_applicable"
-]
-StabilizationRefKind = Literal[
-    "exploration_run", "exploration_variant", "replay_run", "experiment",
-    "evaluation_policy",
-]
-StabilizationStatus = Literal[
-    "draft", "under_review", "approved", "rejected", "superseded"
-]
-StabilizationParentReviewDisposition = Literal["endorsed", "declined"]
-
-
-class StabilizationPackageCreateIn(BaseModel):
-    """The node version, baseline and rollback target are deliberately NOT
-    accepted here -- they are read from the Node's own current state, because
-    letting a caller assert them would let a package claim a rollback target
-    the Node does not have."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    node_id: int
-    candidate_implementation_id: int
-    exploration_run_id: Optional[int] = None
-    applicability_envelope: Dict[str, Any] = Field(default_factory=dict)
-    known_limitations: List[str] = Field(default_factory=list)
-    residual_risks: List[str] = Field(default_factory=list)
-    required_case_count: int = 0
-    stability_window_seconds: float = 0.0
-    observed_case_count: Optional[int] = None
-    observed_window_seconds: Optional[float] = None
-    outcome_unmeasured_reason: str = ""
-    rollback_plan: str = ""
-
-
-class StabilizationEvidenceIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    evidence_level: StabilizationEvidenceLevel
-    evidence_kind: StabilizationEvidenceKind
-    name: str
-    verdict: StabilizationVerdict
-    ref_kind: Optional[StabilizationRefKind] = None
-    ref_id: Optional[int] = None
-    evaluation_policy_id: Optional[int] = None
-    detail: str = ""
-    is_mock: bool = False
-    source: Literal["deterministic", "reasoning_llm", "manual"] = "deterministic"
-
-
-class StabilizationEvidenceOut(BaseModel):
-    id: int
-    evidence_kind: StabilizationEvidenceKind
-    name: str
-    verdict: StabilizationVerdict
-    ref_kind: Optional[StabilizationRefKind] = None
-    ref_id: Optional[int] = None
-    evaluation_policy_id: Optional[int] = None
-    detail: str
-    is_mock: bool
-    source: str
-
-
-class StabilizationGateOut(BaseModel):
-    """Recomputed on every read, never stored: a stored verdict drifts from
-    the evidence it describes."""
-
-    allowed: bool
-    reason_code: str
-    message: str
-    failing_evidence: List[str]
-
-
-class StabilizationPackageOut(BaseModel):
-    id: int
-    system_id: int
-    node_id: int
-    node_version_id: int
-    candidate_implementation_id: int
-    baseline_implementation_id: Optional[int] = None
-    rollback_implementation_id: Optional[int] = None
-    rollback_plan: str
-    exploration_run_id: Optional[int] = None
-    applicability_envelope: Dict[str, Any]
-    known_limitations: List[str]
-    residual_risks: List[str]
-    required_case_count: int
-    observed_case_count: Optional[int] = None
-    stability_window_seconds: float
-    observed_window_seconds: Optional[float] = None
-    outcome_unmeasured_reason: str
-    status: StabilizationStatus
-    # Which package to establish from instead, when status='superseded'.
-    superseded_by_id: Optional[int] = None
-    # The parent review and the human approval are two separate records with
-    # their own who/when (#304). A NULL disposition means no parent has
-    # reviewed the package yet -- never that they had nothing to say.
-    parent_reviewed_by: Optional[str] = None
-    parent_reviewed_at: Optional[float] = None
-    parent_review_disposition: Optional[StabilizationParentReviewDisposition] = None
-    parent_review_note: str = ""
-    approved_by: Optional[str] = None
-    approved_at: Optional[float] = None
-    decision_note: str
-    # Grouped by level, never merged: a Node-level win is not evidence that
-    # the Flow it sits in improved (ADR-7).
-    evidence: Dict[str, List[StabilizationEvidenceOut]]
-    gate: StabilizationGateOut
-    created_by: Optional[str] = None
-    created_at: float
-
-
-class StabilizationDecisionIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    note: str = ""
-
-
-class StabilizationParentReviewIn(BaseModel):
-    """The parent's own record, distinct from the human approval (#304).
-
-    The disposition and the note are the caller's assertions; WHO reviewed
-    comes from the authenticated principal, never the body (#337). There is
-    deliberately no way to withdraw or overwrite one: a changed mind
-    supersedes the package, so both judgements stay readable."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    disposition: StabilizationParentReviewDisposition
-    note: str = ""
-
-
-class StabilizationSupersedeIn(BaseModel):
-    """The successor package id is the one assertion the caller makes; who
-    decided comes from the authenticated principal, never the body (#337)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    successor_package_id: int
-    note: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Operations: monitoring, drift and local reopen
-# (Epic #394 Phase 5, Issue #400)
-#
-# The finite vocabularies are mirrored from `app/node_operations.py`, which
-# owns them, for the same reason the Phase 1 aliases above are: FastAPI then
-# puts a real enum in the OpenAPI schema instead of a bare string, so a
-# Dashboard union cannot silently drift from the server. `_check_membership`
-# in the domain layer stays the authority; `test_node_operations_api.py`
-# asserts the two definitions have not diverged.
-#
-# ADR-5's separation is visible in `NodeOperationsProjectionOut`: `maturity`
-# and `observation` are two independent readings and are never merged into one
-# label. An `established` Node whose telemetry stopped reads as exactly that.
-#
-# `approved_by` is never a request field. Approving a reopen is a named
-# human's decision and the name comes from the authenticated principal at the
-# route (#337's provenance rule, ADR-9).
-# ---------------------------------------------------------------------------
-
-OperationsIndicatorKind = Literal[
-    "input_distribution", "output_quality", "error_rate", "latency", "cost",
-    "flow_success", "outcome", "human_correction", "compatibility",
-]
-OperationsObservationState = Literal[
-    "within_budget", "drift_detected", "insufficient_sample", "unobserved"
-]
-OperationsAnomalyClassification = Literal[
-    "implementation_defect",
-    "input_or_environment_drift",
-    "upstream_downstream_mismatch",
-    "evaluation_gap",
-    "new_use_case_signal",
-    "purpose_or_vision_reconsideration",
-    "unknown",
-]
-OperationsAnomalySeverity = Literal["blocking", "attention", "informational"]
-OperationsReopenStatus = Literal["proposed", "approved", "rejected", "completed"]
-
-
-class NodeMonitoringIndicatorIn(BaseModel):
-    """One indicator this contract watches.
-
-    Only `kind` is a domain-validated finite value; the rest describes the
-    reading in the contract author's own terms. Thresholds live per contract,
-    never as a global constant -- a number invented centrally would be applied
-    to Nodes nobody looked at.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    kind: OperationsIndicatorKind
-    name: str = ""
-    reference_value: Optional[float] = None
-    threshold: Optional[float] = None
-    note: str = ""
-
-
-class NodeMonitoringContractCreateIn(BaseModel):
-    """`node_id` comes from the path and `created_by` from the principal."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    observed_environment_ref: str = ""
-    deployed_commit_sha: str = ""
-    sampling_note: str = ""
-    # How long observation may be silent before the Node reads as `unobserved`
-    # rather than healthy. Silence is never treated as health.
-    freshness_budget_seconds: float = 0.0
-    minimum_sample_count: int = 0
-    indicators: List[NodeMonitoringIndicatorIn] = Field(default_factory=list)
-    reopen_conditions: List[str] = Field(default_factory=list)
-    escalation_owner: str = ""
-
-
-class NodeMonitoringContractOut(BaseModel):
-    id: int
-    system_id: int
-    node_id: int
-    version_number: int
-    observed_environment_ref: str
-    deployed_commit_sha: str
-    sampling_note: str
-    freshness_budget_seconds: float
-    minimum_sample_count: int
-    indicators: List[Dict[str, Any]]
-    reopen_conditions: List[str]
-    escalation_owner: str
-    active: bool
-    decision_method: str
-    created_by: Optional[str] = None
-    created_at: float
-    # Which contract replaced this one; NULL means this is the current version.
-    superseded_by_id: Optional[int] = None
-
-
-class NodeDriftObservationIn(BaseModel):
-    """ONE deterministic reading. No interpretation belongs here -- that is an
-    anomaly, and the two are separate records on purpose."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    indicator: str
-    indicator_kind: OperationsIndicatorKind
-    observation_state: OperationsObservationState
-    observed_value: Optional[float] = None
-    reference_value: Optional[float] = None
-    sample_count: Optional[int] = None
-    window_seconds: Optional[float] = None
-    last_observed_at: Optional[float] = None
-    detail: str = ""
-
-
-class NodeDriftObservationOut(BaseModel):
-    id: int
-    system_id: int
-    node_id: int
-    contract_id: int
-    indicator: str
-    indicator_kind: OperationsIndicatorKind
-    observation_state: OperationsObservationState
-    observed_value: Optional[float] = None
-    reference_value: Optional[float] = None
-    sample_count: Optional[int] = None
-    window_seconds: Optional[float] = None
-    last_observed_at: Optional[float] = None
-    detail: str
-    created_at: float
-
-
-class NodeAnomalyRecordIn(BaseModel):
-    """`decision_method` is deliberately absent.
-
-    It records WHICH PATH produced the classification, so it cannot be
-    claimed by a request body (#337): an HTTP caller is a human-driven client
-    and the route records `manual`. A reasoning-model classification is
-    produced by server-side code, which calls the domain layer directly and
-    carries its own `intelligence_runs` provenance.
-
-    `classification_error` may only accompany `classification='unknown'`; the
-    domain layer refuses the pairing otherwise, because a specific
-    classification recorded alongside a failure is exactly the heuristic
-    fallback Principle 6 forbids.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    classification: OperationsAnomalyClassification
-    summary: str = ""
-    severity: OperationsAnomalySeverity = "attention"
-    contract_id: Optional[int] = None
-    observation_ids: List[int] = Field(default_factory=list)
-    classification_error: str = ""
-    # What stops one continuing condition producing a new anomaly -- and then
-    # a new reopen -- on every polling cycle.
-    dedupe_key: str = ""
-
-
-class NodeAnomalyOut(BaseModel):
-    id: int
-    system_id: int
-    node_id: int
-    contract_id: Optional[int] = None
-    classification: OperationsAnomalyClassification
-    severity: OperationsAnomalySeverity
-    summary: str
-    observation_ids: List[int]
-    decision_method: str
-    intelligence_run_id: Optional[int] = None
-    classification_error: str
-    dedupe_key: str
-    # `open | acknowledged | resolved | superseded` -- owned by the table's
-    # CHECK constraint, not by `app/node_operations.py`, so it is not mirrored
-    # as a Literal here (there is no domain constant to keep it honest).
-    status: str
-    # Whether this says the design was aimed at the wrong thing, as opposed to
-    # the implementation being wrong. The next action differs completely.
-    frame_breaking: bool
-    created_at: float
-    resolved_at: Optional[float] = None
-
-
-class NodeAnomalyRecordOut(BaseModel):
-    """`created=False` means an equal, still-open anomaly already existed and
-    nothing changed -- a 200, never a conflict: a repeated observation of one
-    continuing condition is a normal poll, not an error."""
-
-    anomaly: NodeAnomalyOut
-    created: bool
-
-
-class NodeReopenScopeRationaleOut(BaseModel):
-    node_id: int
-    reason: str
-    # The concrete link targets shared with the origin -- a structural fact,
-    # never a similarity judgement (Principle 6).
-    shared: List[str] = Field(default_factory=list)
-
-
-class NodeReopenScopeOut(BaseModel):
-    origin_node_id: int
-    scope_node_ids: List[int]
-    rationale: List[NodeReopenScopeRationaleOut]
-    # Every other Node in the System, listed rather than silently omitted: the
-    # only way a reader can check that unrelated Nodes were left out.
-    excluded_node_ids: List[int]
-
-
-class NodeReopenPlanCreateIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str
-    anomaly_id: Optional[int] = None
-    budget_note: str = ""
-    include_neighbours: bool = True
-
-
-class NodeReopenPlanOut(BaseModel):
-    id: int
-    system_id: int
-    origin_node_id: int
-    anomaly_id: Optional[int] = None
-    scope_node_ids: List[int]
-    scope_rationale: List[NodeReopenScopeRationaleOut]
-    excluded_node_ids: List[int]
-    reason: str
-    budget_note: str
-    # ADR-5's promise that production keeps running the established
-    # implementation during re-exploration, asserted explicitly rather than
-    # assumed.
-    stable_implementation_retained: bool
-    status: OperationsReopenStatus
-    decision_method: str
-    approved_by: Optional[str] = None
-    approved_at: Optional[float] = None
-    decision_note: str
-    created_by: Optional[str] = None
-    created_at: float
-
-
-class NodeReopenDecisionIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    note: str = ""
-
-
-class NodeReopenTransitionResultOut(BaseModel):
-    """One in-scope Node's outcome. A Node that cannot legally transition is
-    REPORTED with its refusal code, never forced and never silently dropped --
-    a bulk action that ignores a gate is a gate that does not exist."""
-
-    node_id: int
-    applied: bool
-    duplicate: bool
-    reason_code: str
-    message: str
-
-
-class NodeReopenApprovalOut(BaseModel):
-    plan: NodeReopenPlanOut
-    results: List[NodeReopenTransitionResultOut]
-
-
-class NodeObservationHealthOut(BaseModel):
-    """`unobserved` and `insufficient_sample` are their own states and are
-    never rolled into "within budget" -- silence is not health."""
-
-    state: OperationsObservationState
-    reason: str
-    elapsed_seconds: Optional[float] = None
-    sample_count: Optional[int] = None
-
-
-class NodeDriftObservationSummaryOut(BaseModel):
-    id: int
-    indicator: str
-    indicator_kind: OperationsIndicatorKind
-    observation_state: OperationsObservationState
-    observed_value: Optional[float] = None
-    reference_value: Optional[float] = None
-    sample_count: Optional[int] = None
-    last_observed_at: Optional[float] = None
-    detail: str
-
-
-class NodeAnomalySummaryOut(BaseModel):
-    id: int
-    classification: OperationsAnomalyClassification
-    severity: OperationsAnomalySeverity
-    summary: str
-    status: str
-    decision_method: str
-    classification_error: str
-    frame_breaking: bool
-    created_at: float
-
-
-class NodeOperationsProjectionOut(BaseModel):
-    """One Node's operational picture.
-
-    `maturity` and `observation` are two independent readings and are never
-    merged (ADR-5): an `established` Node with dead telemetry reads as
-    `maturity='established'` alongside `observation.state='unobserved'`, which
-    is precisely the state Phase 5 exists to make visible.
-    """
-
-    system_id: int
-    node_id: int
-    node_key: str
-    maturity: EvolutionMaturityState
-    # `null` means no contract is wired, never "monitoring failed" -- the two
-    # are different answers.
-    observation: Optional[NodeObservationHealthOut] = None
-    monitoring_contract_id: Optional[int] = None
-    monitoring_contract_declared: bool
-    observations: List[NodeDriftObservationSummaryOut]
-    anomalies: List[NodeAnomalySummaryOut]
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×_;ãDèµ©hºÚn¶X§zÍYœ›ÛH\[™È[\Ü[žKXÝ\Ý]\˜[Ü[Û˜[Ù]Ø\™ÜÂ‚™œ›ÛHY[XÈ[\Ü˜\ÙS[Ù[ÛÛ™šYÑXÝšY[[Ù[Ý˜[Y]Ü‚‚™œ›ÛHš[[YÙ[˜ÙWÜ[—Ý\\È[\Ü[[YÙ[˜ÙT[•\B‚“[ÙHH]\˜[È›Ù™ˆ‹˜XÙH‹œÚYÝÈ—B‘]˜[X][ÛˆH]\˜[È˜™]\ˆ‹ÛÜœÙH‹œØ[YH‹[šÛ›ÝÛˆ—B‘Ù[™\˜][Û•™\™XÝH]\˜[È˜™]\ˆ‹ÛÜœÙH‹œØ[YH‹[œØY™H‹™\œ›Üˆ‹[šÛ›ÝÛˆ—B‚‚‘[]T›ÛHH]\˜[ÈœÛÝ\˜ÙH‹™\š]™Y‹œ™[]Y—BˆÈ›Ú™XÝ[Ûˆ\Ù\Îˆ[œ]ÛÝ]]
+\ÜÝYHÌMŠNÈÚYÝ×ÊˆYY[ˆ\ÜÝYHÌML‚”›Ú™XÝ[Û”\ÙHH]\˜[Èš[œ]‹›Ý]]‹œÚYÝ×ØÝ\œ™[‹œÚYÝ×ØØ[™Y]H—B‚ˆÈ™\^HØ\\™H
+\ÜÝYHÌˆ\ÙHHÈÌÊNˆ]\›Z[š\ÝXÈÝXÝ\˜[ˆÈÛ\ÜÚYšXØ][ÛˆÙˆÚ]\ˆH˜XÙIÜÈÝXÝ\™Y[œ]Ø\\™HØ[‚ˆÈYXÚ[šXØ[H™\ÝÜ™HHØ[[œ]Ëˆš[š]HÙ]ÈÚ\™YÚ]ˆÈÚ\™YÜØÚ[X\ËÝ˜XÙWÙ]™[œØÚ[XKšœÛÛˆ[™HÑÉÜÈ™\^WØØ\\™H[Ù[K‚”™\^XXš[]HH]\˜[Èœ™\^XX›H‹œ\X[‹[œ™\^XX›H—B”™\^T™X\ÛÛˆH]\˜[Âˆ[œÝ\ÜYÝ\H‹ˆœ™YXÝY‹ˆ™\Û[Z]Ù^ÙYYY‹ˆœÚ^™WÛ[Z]Ù^ÙYYY‹ˆœ›Ý[™Ýš\Ù˜Z[Y‹ˆ˜Ø\\™WÙ˜Z[Y‹ˆœ™YXÝ[Û—Ø›ØÚÙY‹—B‚‚˜Û\ÜÈ˜XÙQ[]J˜\ÙS[Ù[
+N‚ˆ\NˆÝ‚ˆYˆÝ‚ˆ›ÛNˆ[]T›ÛHHœ™[]Y‚‚‚˜Û\ÜÈ˜XÙT›Ú™XÝ[Û’[Š˜\ÙS[Ù[
+N‚ˆˆˆH›Ú™XÝ[Ûˆ^˜XÝ[Ûˆ™\Ý[]XÚYÈH˜XÙH
+\ÜÝYHÌMŠKˆˆˆ‚‚ˆ›Ú™XÝ[Û—Û˜[YNˆÝ‚ˆ\ÙNˆ›Ú™XÝ[Û”\ÙHH›Ý]]‚ˆšY[ÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆY]šXÜÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆØ[\\ÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+Bˆ]WÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[˜Ø]Yˆ›ÛÛH˜[ÙBˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈÑÕ˜[œÜÜÝ[[X\žJ˜\ÙS[Ù[
+N‚ˆˆˆ›Ý[™YÑÈ]Y]YKØœ™XZÙ\ˆÜÜÈÝ[[X\žH[Z]YžH\ÜÝYHÌÌ‹ˆˆˆ‚‚ˆ›ÜYØÛÝ[ˆ[HšY[
+ÙOLONWÌŒŒ×ÌÍÌ—ÌÍ—ÎMÍÍÍWÎÊBˆ˜Z[\™WØÛÝ[ˆ[HšY[
+ÙOLONWÌŒŒ×ÌÍÌ—ÌÍ—ÎMÍÍÍWÎÊBˆÝ]Nˆ]\˜[È˜ÛÜÙY‹›Ü[ˆ‹š[—ÛÜ[ˆ—B‚‚˜Û\ÜÈ˜XÙQ]™[
+˜\ÙS[Ù[
+N‚ˆ˜XÙWÚYˆÝ‚ˆÛÛ\Û™[ÚYˆÝ‚ˆ[ÙNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[œ]ˆÜ[Û˜[Ð[žWHH›Û™BˆÝ]]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\˜][Û—Û\Îˆ›Ø]HŒˆ[Y\Ý[\ˆ›Ø]ˆÈ\ÙHH[™XYÙH
+\ÜÝYHÌMJH8 %[Ü[Û˜[˜XÚÝØ\™ÛÛ\]X›K‚ˆÜ[—ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\™[ÜÜ[—ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ý×ÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÜœ™[][Û—ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[]Y\ÎˆÜ[Û˜[Ó\ÝÕ˜XÙQ[]WWHH›Û™BˆÈ\ÙHˆ›Ú™XÝ[ÛœÈ
+\ÜÝYHÌMŠH8 %Ü[Û˜[^˜XÝ[Ûˆ™\Ý[Ë‚ˆ›Ú™XÝ[ÛœÎˆÜ[Û˜[Ó\ÝÕ˜XÙT›Ú™XÝ[Û’[—WHH›Û™BˆÈ™\^HØ\\™H
+\ÜÝYHÌˆ\ÙHHÈÌÊH8 %[Ü[Û˜[Y]]™K‚ˆÈ[œ]ØØ\\™H\ÈHØ[›ÛšXØ[”ÓÓ‹Y[˜ÛÙYÈ˜\™ÜÈŽˆË‹‹—KšÝØ\™ÜÈŽ‚ˆÈË‹‹Ÿ_HÝXÝ\™H
+ÙYH˜XÙWÙ]™[œØÚ[XKšœÛÛˆ›ÜˆH—×Ü›Ø™W×È‚ˆÈX\šÙ\ˆ[˜ÛÙ[™ÊNÈ™\^XXš[]KÜ™\^WÜ™X\ÛÛœÈ\™H[[K]˜[Y]YÛÂˆÈ[šÛ›ÝÛˆ˜[Y\È\™H™Z™XÝYÚ]Œ‹‚ˆ[œ]ØØ\\™NˆÜ[Û˜[Ð[žWHH›Û™Bˆ™\^XXš[]NˆÜ[Û˜[Ô™\^XXš[]WHH›Û™Bˆ™\^WÜ™X\ÛÛœÎˆÜ[Û˜[Ó\ÝÔ™\^T™X\ÛÛ—WHH›Û™BˆÙ×Ý˜[œÜÜˆÜ[Û˜[ÔÑÕ˜[œÜÜÝ[[X\žWHH›Û™BˆÈ\ÜÝYHÌŽLš[™[™ÈNˆÜ[Û˜[\Þ[Y[›Ý™[˜[˜ÙH™\ÜYžHBˆÈÑÈ
+“Ð‘WÑS•’T“Ó“QS•È“Ð‘WÑÒUÔÒJKˆ›ÝY]]™KØ˜XÚÝØ\™ˆÈÛÛ\]X›NÈ›Û™HÛˆ]™\žH˜XÙH™Y][™È\ÈØ\Xš[]Kˆ™YYÂˆÈ\Ü[[YWÜ™X[]KœIÜÈ›Ý™[˜[˜ÙH[™[ÜHKH™]™\ˆ˜XœšXØ]Y\™K‚ˆ[š\›Û›Y[ˆÜ[Û˜[ÜÝ—HH›Û™BˆÚ]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ›Ú™XÝ[Û“Ý]
+˜\ÙS[Ù[
+N‚ˆ˜XÙWÚYˆÝ‚ˆÛÛ\Û™[ÚYˆÝ‚ˆ›Ú™XÝ[Û—Û˜[YNˆÝ‚ˆ\ÙNˆÝ‚ˆšY[ÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆY]šXÜÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆØ[\\ÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+Bˆ]WÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[˜Ø]Yˆ›ÛÛH˜[ÙBˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ[™XYÙQ[]SÝ]
+˜\ÙS[Ù[
+N‚ˆ\NˆÝ‚ˆYˆÝ‚ˆ›ÛNˆÝˆHœ™[]Y‚‚‚˜Û\ÜÈ[™XYÙT›Ú™XÝ[Û“Ý]
+˜\ÙS[Ù[
+N‚ˆ›Ú™XÝ[Û—Û˜[YNˆÝ‚ˆ\ÙNˆÝ‚ˆšY[ÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆY]šXÜÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆØ[\\ÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+Bˆ]WÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[˜Ø]Yˆ›ÛÛH˜[ÙBˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ[™XYÙTÝ\Ý]
+˜\ÙS[Ù[
+N‚ˆ˜XÙWÚYˆÝ‚ˆÛÛ\Û™[ÚYˆÝ‚ˆ[ÙNˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ[—ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\™[ÜÜ[—ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ý×ÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÜœ™[][Û—ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\˜][Û—Û\ÎˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ[Y\Ý[\ˆ›Ø]ˆÝ]]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™\^XXš[]NˆÜ[Û˜[Ô™\^XXš[]WHH›Û™Bˆ™\^WÜ™X\ÛÛœÎˆ\ÝÔ™\^T™X\ÛÛ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[]Y\Îˆ\ÝÓ[™XYÙQ[]SÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ›Ú™XÝ[ÛœÎˆ\ÝÓ[™XYÙT›Ú™XÝ[Û“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ[™XYÙSÝ]
+˜\ÙS[Ù[
+N‚ˆ]Y\žNˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆÝ\Îˆ\ÝÓ[™XYÙTÝ\Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚ˆÈKKH˜XÙH[˜[^™\œÈ
+\ÜÝYHÌM
+HKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚[˜[^™\”™]šY]ÔÝ]\ÈH]\˜[Èœ›ÜÜÙY‹˜\›Ý™Y‹œ™Z™XÝY—B‚‚˜Û\ÜÈ˜XÙP[˜[^™\Ü™X]J˜\ÙS[Ù[
+N‚ˆ˜[YNˆÝˆHˆ‚ˆ[[ˆÝˆHˆ‚ˆÜXÎˆXÝÜÝ‹[žWB‚‚˜Û\ÜÈ[˜[^™\”™]šY]Õ\]J˜\ÙS[Ù[
+N‚ˆ™]šY]×ÜÝ]\Îˆ]\˜[È˜\›Ý™Y‹œ™Z™XÝY—B‚‚˜Û\ÜÈ[˜[^™\”›ÜÜÙT™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[[ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆ˜[YNˆÝˆHˆ‚‚‚˜Û\ÜÈ˜XÙP[˜[^™\“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ˜[YNˆÝˆHˆ‚ˆ[[ˆÝˆHˆ‚ˆÜXÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆÛÝ\˜ÙNˆÝˆH˜XÙWÜ›Ú™XÝ[ÛœÈ‚ˆ™]šY]×ÜÝ]\ÎˆÝˆHœ›ÜÜÙY‚ˆXÚ\Ú[Û—ÛY]ÙˆÝˆH›X[X[‚ˆ›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Û\Ý™\œÚ[ÛŽˆÜ[Û˜[ÜÝ—HH›Û™BˆØÚ[XWÝ™\œÚ[ÛŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆÈ]Y]ÙˆH[X[ˆ™]šY]ÈXÚ\Ú[Ûˆ
+š[˜Ú\HÊNˆÙ]Ûˆ\›Ý™KÜ™Z™XÝ‚ˆÈ[Ø^\È	ÛX[X[	ÈÚ[ˆÙ]8 %\›Ý˜[™]™\ˆÛÛY\Èœ›ÛHHK‚ˆ™]šY]ÙYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ™]šY]×ÙXÚ\Ú[Û—ÛY]ÙˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ[˜[^™\‘[]SÝ]
+˜\ÙS[Ù[
+N‚ˆ[]WÝ\NˆÝ‚ˆ[]WÚYˆÝ‚‚‚˜Û\ÜÈ[˜[^™\ÛÛ^Ý]
+˜\ÙS[Ù[
+N‚ˆˆˆØ[™Y]H˜[Y\È›ÜˆH˜XÙH[˜[^™\ˆZ[\ˆ
+\ÜÝYHÌMMÊK‚‚ˆ]\›Z[š\ÝXË™XY[Û›H›Ú™XÝ[ÛˆÙˆHY[YšY\œÈHXÛ\˜]]™Bˆ[˜[^™\ˆÜXÈX^H™Y™\™[˜ÙKÛÈH\Ú›Ø\™Ø[ˆÙ™™\ˆ[H\ÈÚÚXÙ\Âˆ[œÝXYÙˆ\ÚÚ[™ÈH\Ù\ˆÈ[™]Üš]H”ÓÓ‹ˆÛÝ\˜ÙYœ›ÛHHØ[YBˆš[š]HÙ]ÈHH›ÜÜØ[ÛÛ^\Ù\È
+š[˜Ú\HŠK‚ˆˆˆ‚‚ˆÛÛ\Û™[Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[]WÝ\\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[]Y\Îˆ\ÝÐ[˜[^™\‘[]SÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ›Ú™XÝ[Û—Û˜[Y\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆšY[Û˜[Y\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\Ù\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[]Y\×Ý[˜Ø]Yˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈ[˜[\Ú\Ô[“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ[˜[^™\—ÚYˆ[ˆÝ]\ÎˆÝ‚ˆ™\Ý[ˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™Bˆ\œ›Ü—Ù]Z[ÎˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ý×ØÛÝ[ˆÜ[Û˜[Ú[HH›Û™BˆÝ\YØ]ˆ›Ø]ˆÛÛ\]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÈ\ÜÝYHÌMLŽˆÙ]Ú[ˆH™][[ÛˆÛXÞHX^H]™H[™YH›Ú™XÝ[Û‚ˆÈ]H\È[ˆ™Y™\™[˜ÙY
+›È™Y™\™[˜ÙHÛÝ[[™ÎÈÛÛœÙ\˜]]™HžHYÙJK‚ˆ]WÙ^\™Yˆ›ÛÛH˜[ÙBˆ]WÙ^\™YÛ›ÝNˆÜ[Û˜[ÜÝ—HH›Û™B‚‚”™][[Û•\™Ù]H]\˜[Âˆ˜XÙWÜÜ[œÈ‹˜XÙWÙ[]Y\È‹˜XÙWÜ›Ú™XÝ[ÛœÈ‹˜XÙWØ[˜[\Ú\×Ü[œÈ‚—B‚‚˜Û\ÜÈ™][[Û”ÛXÞR[Š˜\ÙS[Ù[
+N‚ˆ\™Ù]ÝX›Nˆ™][[Û•\™Ù]ˆX^ØYÙWÙ^\ÎˆÜ[Û˜[Ù›Ø]HHšY[
+Y˜][S›Û™KÙOL
+BˆX^ØÛÝ[ˆÜ[Û˜[Ú[HHšY[
+Y˜][S›Û™KÙOL
+B‚‚˜Û\ÜÈ™][[Û”ÛXÚY\Õ\]J˜\ÙS[Ù[
+N‚ˆÛXÚY\Îˆ\ÝÔ™][[Û”ÛXÞR[—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ™][[Û”ÛXÞSÝ]
+˜\ÙS[Ù[
+N‚ˆ\™Ù]ÝX›NˆÝ‚ˆX^ØYÙWÙ^\ÎˆÜ[Û˜[Ù›Ø]HH›Û™BˆX^ØÛÝ[ˆÜ[Û˜[Ú[HH›Û™Bˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ™][[Û\T™\Ý[
+˜\ÙS[Ù[
+N‚ˆ\™Ù]ÝX›NˆÝ‚ˆ[]YØÛÝ[ˆ[‚‚˜Û\ÜÈ™][[Û\SÝ]
+˜\ÙS[Ù[
+N‚ˆ^XÝ]YØ]ˆ›Ø]ˆ™\Ý[Îˆ\ÝÔ™][[Û\T™\Ý[HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ™][[Û]Y]Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ\™Ù]ÝX›NˆÝ‚ˆ[]YØÛÝ[ˆ[ˆ™X\ÛÛŽˆÝ‚ˆ^XÝ]YØ]ˆ›Ø]‚‚˜Û\ÜÈÚYÝÔ™\Ý[
+˜\ÙS[Ù[
+N‚ˆ˜XÙWÚYˆÝ‚ˆÛÛ\Û™[ÚYˆÝ‚ˆÝ\œ™[ÛÝ]]ˆÜ[Û˜[ÜÝ—HH›Û™BˆØ[™Y]WÛÝ]]ˆÜ[Û˜[ÜÝ—HH›Û™BˆØ[™Y]WÙ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆØ[™Y]WÙ\˜][Û—Û\Îˆ›Ø]HŒˆ[Y\Ý[\ˆ›Ø]ˆÈ\ÙHHÚYÝÈ›Ú™XÝ[ÛœÈ
+\ÜÝYHÌML
+NˆÚYÝ×ØÝ\œ™[ÈÚYÝ×ØØ[™Y]K‚ˆ›Ú™XÝ[ÛœÎˆÜ[Û˜[Ó\ÝÈ•˜XÙT›Ú™XÝ[Û’[ˆ—WHH›Û™B‚‚˜Û\ÜÈÛXÞJ˜\ÙS[Ù[
+N‚ˆ[ÙNˆ[ÙHH˜XÙH‚‚‚˜Û\ÜÈÛXÞU\]J˜\ÙS[Ù[
+N‚ˆ[ÙNˆ[ÙB‚‚˜Û\ÜÈÛÛ\Û™[Ý[[X\žJ˜\ÙS[Ù[
+N‚ˆÛÛ\Û™[ÚYˆÝ‚ˆ[ÙNˆ[ÙBˆ˜XÙWØÛÝ[ˆ[Hˆ\ÝÜÙY[ŽˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ]˜[X][Û•\]J˜\ÙS[Ù[
+N‚ˆ]˜[X][ÛŽˆ]˜[X][ÛˆHšY[
+‹‹‹\ØÜš\[ÛH›X[X[™\™XÝŠB‚‚Üš]\š[Û•\HH]\˜[Âˆ›˜]\˜[Û[™ÝXYÙH‹ˆ™^XÝÛX]Ú‹ˆšœÛÛ—Ù\]X[‹ˆœ™\]Z\™YÚÙ^\È‹ˆ˜ÛÛZ[œÈ‹ˆœ™YÙ^‹—B‘]˜[X][Û”Ý]\ÈH]\˜[È›ÚÈ‹›™È‹›™YY×Ü™]šY]È—B‚‚˜Û\ÜÈÞ\Ý[T›Ùš[J˜\ÙS[Ù[
+N‚ˆ˜[YNˆÝˆHˆ‚ˆ\œÜÙNˆÝˆHˆ‚ˆ\™Ù]Ý\Ù\œÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝZÙZÛ\—Ý˜[YNˆÝˆHˆ‚ˆÛÛœÝ˜Z[Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝXØÙ\Ü×ØÜš]\šXNˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÜ™X]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ\]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈÞ\Ý[T›Ùš[U\]J˜\ÙS[Ù[
+N‚ˆ˜[YNˆÝˆHˆ‚ˆ\œÜÙNˆÝˆHˆ‚ˆ\™Ù]Ý\Ù\œÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝZÙZÛ\—Ý˜[YNˆÝˆHˆ‚ˆÛÛœÝ˜Z[Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝXØÙ\Ü×ØÜš]\šXNˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈÞ\Ý[PÜ™X]J˜\ÙS[Ù[
+N‚ˆ˜[YNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆ[š\›Û›Y[ˆÝˆHˆ‚ˆ\ØÜš\[ÛŽˆÝˆHˆ‚‚‚˜Û\ÜÈÞ\Ý[U\]J˜\ÙS[Ù[
+N‚ˆ˜[YNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆ[š\›Û›Y[ˆÝˆHˆ‚ˆ\ØÜš\[ÛŽˆÝˆHˆ‚‚‚˜Û\ÜÈÞ\Ý[SÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ˜[YNˆÝ‚ˆ[š\›Û›Y[ˆÝˆHˆ‚ˆ\ØÜš\[ÛŽˆÝˆHˆ‚ˆÝÛ™\—Ý\Ù\—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]ˆÛÛ\Û™[ØÛÝ[ˆ[Hˆ˜XÙWØÛÝ[ˆ[Hˆ\ÝÜÙY[ŽˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚ˆÈ\ÜÝYHÌMNˆ]\›Z[š\ÝXÈÚYÛ˜[\™XÙ\[Ûˆ˜XÝÈ›ÜˆHÛÛ›™XÝ]š]BˆÈØ\›š[™È˜YÙH[™HÙ]\YÝZYHYÙKˆÝ]X\ÈHš[š]HÛ\ÜÚYšXØ][ÛŽÂˆÈÛ[ÚÙH˜XÙ\È\™H™XÛÙÛš^™YžH^XÝÛÛ\Û™[ÚYX]ÚYØZ[œÝBˆÈØÝ[Y[YÛÛ™[[Ûˆ
+š[˜Ú\HŽˆ^XÚ]š[š]HÙ]›È]\š\ÝXÜÊK‚”ÓSÒÑWÐÒPÒ×ÐÓÓTÓ‘S•ÒQHœ›Ø™K\Û[ÚÙKXÚXÚÈ‚‚ÛÛ›™XÝ]š]TÝ]HH]\˜[È››×ÜÚYÛ˜[‹œÛ[ÚÙWÛÛ›H‹œ™XÙZ]š[™È—B‚ˆÈ\ÜÝYHÌÍÌˆœ™\Ú™\ÜÈ\ÈHÑPÓÓ‘[™\[™[^\ËˆÛÛ›™XÝ]š]TÝ]HX›Ý™BˆÈ\ÈHÝ[][]]™HY™XÞXÛHZ[\ÝÛ™HKH\ÈÞ\Ý[H\ÈÛÛ›™XÝY]X\ÝˆÈÛ˜ÙHˆKH[™™]™\ˆ^\™\ËˆÛÛ›™XÝ]š]Qœ™\Ú™\ÜÈ[œÝÙ\œÈš\È]™XÙZ]š[™ÂˆÈšYÚ›ÝÈ‹ÚXÚÙ\Ëˆ™[™\š[™ÈHZ[\ÝÛ™H\ÈH]™HÝ]\È\ÈBˆÈYÈ\È\H^\ÝÈÈ™]™[‚ÛÛ›™XÝ]š]Qœ™\Ú™\ÜÈH]\˜[Âˆ›™]™\—Ü™XÙZ]™Y‹œ™XÙZ]š[™×Û›ÝÈ‹™[^YY‹œÝ[H‚—B‚‚˜Û\ÜÈÛÛ›™XÝ]š]TÝ]\ÓÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÝ]NˆÛÛ›™XÝ]š]TÝ]BˆÝ[Ý˜XÙWØÛÝ[ˆ[ˆÛ[ÚÙWÝ˜XÙWØÛÝ[ˆ[ˆ™X[Ý˜XÙWØÛÝ[ˆ[ˆš\œÝÝ˜XÙWØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ\ÝÝ˜XÙWØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ\ÝÝ˜XÙWØÛÛ\Û™[ÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆÛ[ÚÙWØÛÛ\Û™[ÚYˆÝˆHÓSÒÑWÐÒPÒ×ÐÓÓTÓ‘S•ÒQˆX]\šX[^™YÜÙ\ÜÚ[Û—ÚYÎˆ\ÝÚ[HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈKKH\ÜÝYHÌÍÌˆ]™H™XÙ\[Û‹Ù\\˜]Hœ›ÛHHZ[\ÝÛ™HX›Ý™HKKKKKKBˆÎˆÛÜšÛØYœ™\Ú™\ÜËÛ\ÜÚYšYYœ›ÛHH™]Ù\Ý“Ó‹\Û[ÚÙH˜XÙKˆHÛ[ÚÙBˆÎˆÚXÚÈ›Ý™\ÈH˜[œÜÜ›Ý]H[œÝ[Y[YÛÜšÛØY[œË‚ˆœ™\Ú™\ÜÎˆÛÛ›™XÝ]š]Qœ™\Ú™\ÜÈH›™]™\—Ü™XÙZ]™Y‚ˆÎˆ˜[œÜÜœ™\Ú™\ÜËÛ\ÜÚYšYYœ›ÛHH™]Ù\Ý˜XÙHÙˆ[žHÚ[™‚ˆÎˆ™\ÜYÙ\\˜][HÛÈHÛ[ÚÙHÚXÚÈÝ[Ù]È›ÝYÚˆÝ^\ÂˆÎˆš\ÚX›H˜]\ˆ[ˆ™Z[™È™XY\ÈÛÜšÛØYX[‚ˆ˜[œÜÜÙœ™\Ú™\ÜÎˆÛÛ›™XÝ]š]Qœ™\Ú™\ÜÈH›™]™\—Ü™XÙZ]™Y‚ˆÎˆ™]Ù\Ý›Û‹\Û[ÚÙH˜XÙNÈ›Û™HÚ[ˆÛ›HÛ[ÚÙH˜XÙ\È]™H\œš]™Y‚ˆ\ÝÜ™X[Ý˜XÙWØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÎˆÙXÛÛ™ÈÚ[˜ÙHH™]Ù\Ý›Û‹\Û[ÚÙH˜XÙH8 %HØ[YH]™[œ™\Ú™\ÜØˆÎˆYÙYÛÈHX™[[™H™[]]™H[YHØ[››Ý\ØYÜ™YK‚ˆÙXÛÛ™×ÜÚ[˜ÙWÛ\ÝÝ˜XÙNˆÜ[Û˜[Ù›Ø]HH›Û™BˆÎˆÙXÛÛ™ÈÚ[˜ÙHH™]Ù\Ý˜XÙHÙˆ[žHÚ[™‚ˆÙXÛÛ™×ÜÚ[˜ÙWÛ\ÝØ[žWÝ˜XÙNˆÜ[Û˜[Ù›Ø]HH›Û™BˆÎˆHÙ\™\ˆÛØÚÈ\È™XY[™ÈØ\ÈZÙ[ˆYØZ[œÝÛÈHÛY[Ø[ˆÚÝÂˆÎˆH™[]]™H[YH]Ù\È›ÝšYÚ]]ÈÝÛˆÛØÚË‚ˆ]˜[X]YØ]ˆ›Ø]HŒˆÎˆÜÚ]]™HÚ[ˆH™]Ù\Ý˜XÙH\È[Y\Ý[\YZXYÙˆHÙ\™\‹‚ˆÛØÚ×ÜÚÙ]×ÜÙXÛÛ™Îˆ›Ø]HŒˆÎˆÚ[™ÝÙY™X[]ÛÜšÛØYÛÝ[È
+Û[ÚÙH˜XÙ\È^ÛYY
+K‚ˆ™X[Ý˜XÙWØÛÝ[Í[Nˆ[Hˆ™X[Ý˜XÙWØÛÝ[ÌZˆ[Hˆ™X[Ý˜XÙWØÛÝ[Ìˆ[HˆÎˆH™\ÚÛÈ\È™XY[™È\ÙY[Ø^\È™]\›™YÛÈH\Ü^YYˆÎˆÝ]H\È^Z[˜X›HÚ]Ý]ÛÛœÝ[[™ÈHÛÝ\˜ÙK‚ˆ[^YYØY\—ÜÙXÛÛ™Îˆ›Ø]HŒˆÝ[WØY\—ÜÙXÛÛ™Îˆ›Ø]HŒˆÎˆYHÚ[ˆH™\ÚÛÈØ[YHœ›ÛHHÞ\Ý[K\ÜXÚYšXÈÛXÞH›ÝË‚ˆ™\ÚÛ×ØÝ\ÝÛZ^™Yˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈÛÛ›™XÝ]š]Qœ™\Ú™\ÜÔÛXÞSÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆ[^YYØY\—ÜÙXÛÛ™Îˆ›Ø]ˆÝ[WØY\—ÜÙXÛÛ™Îˆ›Ø]ˆÝ\ÝÛZ^™Yˆ›ÛÛˆ\]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈÛÛ›™XÝ]š]Qœ™\Ú™\ÜÔÛXÞU\]J˜\ÙS[Ù[
+N‚ˆ[^YYØY\—ÜÙXÛÛ™Îˆ›Ø]HšY[
+ÝL
+BˆÝ[WØY\—ÜÙXÛÛ™Îˆ›Ø]HšY[
+ÝL
+B‚‚˜Û\ÜÈÛÛ\Û™[›Ùš[J˜\ÙS[Ù[
+N‚ˆÛÛ\Û™[ÚYˆÝ‚ˆ\œÜÙNˆÝˆHˆ‚ˆ™\ÜÛœÚXš[]NˆÝˆHˆ‚ˆ^XÝYÚ[œ]ˆÝˆHˆ‚ˆ^XÝYÛÝ]]ˆÝˆHˆ‚ˆ˜Z[\™WÚ[\XÝˆÝˆHˆ‚ˆ›Ý\ÎˆÝˆHˆ‚ˆÜ™X]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ\]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈÛÛ\Û™[›Ùš[U\]J˜\ÙS[Ù[
+N‚ˆ\œÜÙNˆÝˆHˆ‚ˆ™\ÜÛœÚXš[]NˆÝˆHˆ‚ˆ^XÝYÚ[œ]ˆÝˆHˆ‚ˆ^XÝYÛÝ]]ˆÝˆHˆ‚ˆ˜Z[\™WÚ[\XÝˆÝˆHˆ‚ˆ›Ý\ÎˆÝˆHˆ‚‚‚˜Û\ÜÈ]˜[X][ÛÜš]\š[ÛŠ˜\ÙS[Ù[
+N‚ˆYˆ[ˆÛÛ\Û™[ÚYˆÝ‚ˆ˜[YNˆÝ‚ˆ\ØÜš\[ÛŽˆÝˆHˆ‚ˆÜš]\š[Û—Ý\NˆÜš]\š[Û•\Bˆ^XÝYÝ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÙZYÚˆ›Ø]HKŒˆ[˜X›Yˆ›ÛÛHYBˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈÜš]\š[ÛÜ™X]J˜\ÙS[Ù[
+N‚ˆ˜[YNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆ\ØÜš\[ÛŽˆÝˆHˆ‚ˆÜš]\š[Û—Ý\NˆÜš]\š[Û•\Bˆ^XÝYÝ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÙZYÚˆ›Ø]HKŒˆ[˜X›Yˆ›ÛÛHYB‚‚˜Û\ÜÈÜš]\š[Û•\]J˜\ÙS[Ù[
+N‚ˆ˜[YNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆ\ØÜš\[ÛŽˆÝˆHˆ‚ˆÜš]\š[Û—Ý\NˆÜš]\š[Û•\Bˆ^XÝYÝ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÙZYÚˆ›Ø]HKŒˆ[˜X›Yˆ›ÛÛHYB‚‚˜Û\ÜÈ]˜[X][Û”™\Ý[
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ˜XÙWÚYˆÝ‚ˆÛÛ\Û™[ÚYˆÝ‚ˆÜš]\š[Û—ÚYˆ[ˆÝ]\Îˆ]˜[X][Û”Ý]\ÂˆØÛÜ™NˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ™X\ÛÛŽˆÝˆHˆ‚ˆXÝX[ÛÝ]]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ^XÝYÝ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈÙ[™\˜][Û”[Ü™X]J˜\ÙS[Ù[
+N‚ˆÛÛ\Û™[ÚYˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆ˜XÙWÚYˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆØš™XÝ]™NˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJB‚‚˜Û\ÜÈÙ[™\˜][Û”[Š˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆÛÛ\Û™[ÚYˆÝ‚ˆ˜XÙWÚYˆÝ‚ˆØš™XÝ]™NˆÝ‚ˆ[œ]ÚœÛÛŽˆÜ[Û˜[Ð[žWHH›Û™BˆÝ\œ™[ÛÝ]]ˆÜ[Û˜[ÜÝ—HH›Û™BˆÙ[™\˜]YØÛÙNˆÝˆHˆ‚ˆÙ[™\˜][Û—Û›Ý\ÎˆÝˆHˆ‚ˆØ[™Y]WÛÝ]]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ^XÝ][Û—Ù\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆWÝ™\™XÝˆÙ[™\˜][Û•™\™XÝH[šÛ›ÝÛˆ‚ˆWÜ™X\ÛÛŽˆÝˆHˆ‚ˆWÜš\ÚÜÎˆÝˆHˆ‚ˆWÜ™XÛÛ[Y[™][ÛŽˆÝˆHˆ‚ˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ™\ÜÚ]ÜžTÛ˜\ÚÝ
+˜\ÙS[Ù[
+N‚ˆ™\×Ü]ˆÝ‚ˆÛÛ[Z]ÜÚNˆÝ‚ˆ[˜ÛYYÜ]Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ^ÛYYÜ]Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ™XYÜÛXÞNˆ]\˜[È˜ÛÛ[Z]YÙš[\×ÛÛ›H—HH˜ÛÛ[Z]YÙš[\×ÛÛ›H‚ˆÝ]\Îˆ]\˜[È››ÝØÛÛ™šYÝ\™Y‹œ™XYH‹š[™^[™È‹™˜Z[Y—HH››ÝØÛÛ™šYÝ\™Y‚‚‚”ÛÝ\˜ÙU\HH]\˜[È™ØÝ[Y[][Ûˆ‹œÛÝ\˜ÙH‹\Ý‹˜ÛÛ™šYÝ\˜][Ûˆ—B’[˜Û\Ú[Û”Ý]\ÈH]\˜[Âˆš[™^Y‹›Y]Y]WÛÛ›H‹Û×Û\™ÙH‹˜š[˜\žH‹™^ÛYY‹[œÝ\ÜY‚—B”Û˜\ÚÝÝ]\ÈH]\˜[È››ÝØÛÛ™šYÝ\™Y‹š[™^[™È‹œ™XYH‹™˜Z[Y—BˆÈ\ÜÝYHÌÍŽNˆœ™\Ú™\ÜÈ\ÈHÑPÓÓ‘[™\[™[^\ÈÝ™\ˆHØ[YHÛ˜\ÚÝ‚ˆÈÛ˜\ÚÝÝ]\Ø[œÝÙ\œÈ™YH[˜[\Ú\Èš[š\Úˆ
+™XYX
+NÈ\È[œÝÙ\œÂˆÈ™Ù\ÈH[›™YÛÛ[Z]Ý[\]X[PQˆ
+Ý\œ™[
+Kˆ™[™\š[™ÈÛ™H\ÈBˆÈÝ\ˆ\ÈHYÈ\È\ÜÝYHš^\ÈKH™]™\ˆÛÛ\ÙH[K‚”Û˜\ÚÝœ™\Ú™\ÜÔÝ]HH]\˜[È˜Ý\œ™[‹œÝ[H‹[šÛ›ÝÛˆ—B”Û˜\ÚÝ™Y›YÚÚXÚÒYH]\˜[ÂˆœÛ˜\ÚÝÜ›ØÙ\ÜÚ[™È‹ˆ˜ÛÛ[Z]Ü[›™Y‹ˆ™œ™\Ú™\ÜÈ‹ˆœÞ[X›ÛÚ[™^‹ˆ[™\œÝ[™[™È‹—B”Û˜\ÚÝ™Y›YÚÚXÚÔÝ]\ÈH]\˜[È›ÚÈ‹˜][[Ûˆ‹˜›ØÚÚ[™È‹[šÛ›ÝÛˆ—B”Û˜\ÚÝ™Y›YÚ™\™XÝH]\˜[Èœ™XYH‹˜][[Ûˆ‹˜›ØÚÙY—B’[[YÙ[˜ÙT[”Ý]\ÈH]\˜[Èœ[™[™È‹˜ÛÛ\]Y‹™˜Z[Y—B‘XÚ\Ú[Û“Y]ÙH]\˜[È™]\›Z[š\ÝXÈ‹œ™X\ÛÛš[™×ÛH‹›X[X[—BˆÈÝÈHÚ[™ÛHY\˜\˜ÚHÛZ[HØ\È›ÙXÙYˆÙ\\Ý[˜Ýœ›ÛHH]Y]ˆÈXÚ\Ú[Û“Y]ÙÛÈÛÝ\˜ÙKX]]Ü™Y˜XÝÈÝ^Hš\ÚX›HÙ\\˜]Hœ›ÛBˆÈ™X\ÛÛš[™Ë[[Ù[[\œ™]][ÛœÈ
+\ÜÝYHÍMŠK‚”›Ý™[˜[˜ÙRÚ[™H]\˜[ÈœÛÝ\˜ÙWØ]]Ü™Y‹œÝXÝ\˜[‹œ™X\ÛÛš[™×ÛH‹›X[X[—B‚‚˜Û\ÜÈ™\ÜÚ]ÜžPÛÛ™šYÕ\]J˜\ÙS[Ù[
+N‚ˆ™\×Ü]ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆ[˜ÛYWÜ]\›œÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[[X™NˆÈ”‘PQQK›Y‹™ØÜËÊŠˆ‹œÜ˜ËÊŠˆ‹\ÝËÊŠˆ—JBˆ^ÛYWÜ]\›œÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[[X™NˆÈ‹™[ˆ‹œÙXÜ™]ËÊŠˆ‹™]KÊŠˆ‹Š‹œ[H‹Š‹šÙ^H‹˜Ü™Y[X[ËŠˆ—JB‚‚˜Û\ÜÈ™\ÜÚ]ÜžPØ[™Y]SÝ]
+˜\ÙS[Ù[
+N‚ˆ˜[YNˆÝ‚ˆ]ˆÝ‚‚‚˜Û\ÜÈ™\ÜÚ]ÜžPÛÛ™šYÓÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆ™\×Ü]ˆÝ‚ˆ[˜ÛYWÜ]\›œÎˆ\ÝÜÝ—Bˆ^ÛYWÜ]\›œÎˆ\ÝÜÝ—BˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈÛ˜\ÚÝš[SÝ]
+˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆÛÝ\˜ÙWÝ\NˆÛÝ\˜ÙU\BˆÚ^™WØž]\Îˆ[ˆ[˜Û\Ú[Û—ÜÝ]\Îˆ[˜Û\Ú[Û”Ý]\ÈHš[™^Y‚ˆ^Û\Ú[Û—Ü™X\ÛÛŽˆÝˆHˆ‚‚‚˜Û\ÜÈÛ˜\ÚÝÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆ™\×Ü]ˆÝ‚ˆÛÛ[Z]ÜÚNˆÝ‚ˆÝ]\ÎˆÛ˜\ÚÝÝ]\Âˆš[WØÛÝ[ˆ[ˆÝ[ÜÚ^™Nˆ[ˆ[™^YÜÚ^™Nˆ[HˆY]Y]WÛÛ›WØÛÝ[ˆ[HˆØ\›š[™ÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\œ›Ü—ÜÝ[[X\žNˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ™X]YØ]ˆ›Ø]ˆÛÛ\]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆš[\Îˆ\ÝÔÛ˜\ÚÝš[SÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÜÝYHÌÍŽNˆHœ™\Ú™\ÜÈ^\Ë[™\[™[ÙˆÝ]\ØˆÜ[]YžHBˆÈ\Ý[™Ú[
+ÚXÚ™\ÛÛ™\ÈPQÛ˜ÙJNÈ›Û™XYX[œÈ››Ý]˜[X]Y[‚ˆÈ\È™\ÜÛœÙH‹™]™\ˆ˜Ý\œ™[‹‚ˆœ™\Ú™\ÜÎˆÜ[Û˜[ÔÛ˜\ÚÝœ™\Ú™\ÜÔÝ]WHH›Û™BˆÈ^XÝHÛ™HÛ˜\ÚÝ\ˆÞ\Ý[H\ÈH™XÛÛ[Y[™YÛ™H
+H]\Ý™XYBˆÈÛ˜\ÚÝ
+Kˆ]™\žHÝ\ˆÛ˜\ÚÝ\ÈH™\›ÙXÝ[Û‹[Û›HÚÚXÙK‚ˆ\×Ü™XÛÛ[Y[™Yˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈÛ˜\ÚÝ™Y“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÛÛ[Z]ÜÚNˆÝ‚ˆÝ]\ÎˆÝ‚ˆÜ™X]YØ]ˆ›Ø]ˆœ™\Ú™\ÜÎˆÜ[Û˜[ÔÛ˜\ÚÝœ™\Ú™\ÜÔÝ]WHH›Û™B‚‚˜Û\ÜÈÛ˜\ÚÝ™Y›YÚÚXÚÓÝ]
+˜\ÙS[Ù[
+N‚ˆˆˆ“Û™Hš[š]H™Y›YÚÚXÚÈ™\Ý[
+\ÜÝYHÌÍŽJKˆˆˆ‚‚ˆÚXÚ×ÚYˆÛ˜\ÚÝ™Y›YÚÚXÚÒYˆÝ]\ÎˆÛ˜\ÚÝ™Y›YÚÚXÚÔÝ]\ÂˆÝ[[X\žNˆÝ‚ˆ]Z[ˆÝ‚ˆ™[YYX][ÛŽˆÝˆHˆ‚‚‚˜Û\ÜÈÛ˜\ÚÝ™Y›YÚÝ]
+˜\ÙS[Ù[
+N‚ˆˆˆ”Ú\™Y™Y›YÚ›ÜˆØ[™Y]HÙ[™\˜][ÛˆÈ™\^HÈ^\š[Y[‚‚ˆÛ™HÙ\™\ˆ]˜[X][Ûˆ™[™\™YžH]™\žHÝ\™˜XÙKÛÈH™YHØ[››Ýˆ\ØYÜ™YHX›Ý]Ú]\ˆHÛ˜\ÚÝX^H™H\ÙY‚ˆˆˆ‚‚ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÈ‘YH[˜[\Ú\Èš[š\ÚˆKHH^\Ý[™ÈÛ˜\ÚÝÝ]\È›ØØX[\žK‚ˆ›ØÙ\ÜÚ[™×ÜÝ]NˆÜ[Û˜[ÔÛ˜\ÚÝÝ]\×HH›Û™BˆÈ‘Ù\ÈH[›™YÛÛ[Z]Ý[\]X[PQˆKHHÙ\\˜]H^\Ë‚ˆœ™\Ú™\ÜÎˆÛ˜\ÚÝœ™\Ú™\ÜÔÝ]HH[šÛ›ÝÛˆ‚ˆÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™BˆXYÜÚNˆÜ[Û˜[ÜÝ—HH›Û™BˆXYÜ™[][ÛŽˆ]\˜[ÈœØ[YH‹˜™Z[™‹™]™\™ÙY‹[šÛ›ÝÛˆ—HH[šÛ›ÝÛˆ‚ˆÛÛ[Z]×Ø™Z[™ˆÜ[Û˜[Ú[HH›Û™Bˆ™\™XÝˆÛ˜\ÚÝ™Y›YÚ™\™XÝH˜›ØÚÙY‚ˆÚXÚÜÎˆ\ÝÔÛ˜\ÚÝ™Y›YÚÚXÚÓÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ™XÛÛ[Y[™YÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™Bˆ™XÛÛ[Y[™YÜÛ˜\ÚÝØÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™XÛÛ[Y[™YÜÛ˜\ÚÝÙœ™\Ú™\ÜÎˆÛ˜\ÚÝœ™\Ú™\ÜÔÝ]HH[šÛ›ÝÛˆ‚ˆ\×Ü™XÛÛ[Y[™Yˆ›ÛÛH˜[ÙBˆ™\]Z\™\×ÜÝ[WØXÚÛ›ÝÛYÙ[Y[ˆ›ÛÛH˜[ÙBˆÝ[WØÛÛ[X][Û—Û›ÝNˆÜ[Û˜[ÜÝ—HH›Û™B‚‚ˆÈ\ÜÝYHÌÍÌŽˆ™\^H™XY[™\ÜË]˜[X]Y™Y›Ü™HHØ[™Y]H\ÈÙ[™\˜]Y‚”™\^T™XY[™\ÜÔÝ]\ÈH]\˜[È›ÚÈ‹˜][[Ûˆ‹˜›ØÚÚ[™È—B”™\^T™XY[™\ÜÕ™\™XÝH]\˜[Èœ™XYH‹˜][[Ûˆ‹˜›ØÚÙY—B‚‚˜Û\ÜÈ™\^T™XY[™\ÜÐÛÝ[ÓÝ]
+˜\ÙS[Ù[
+N‚ˆˆˆ’ÝÈHÙ]Ùˆ˜XÙ\ÈÜ]ÈXÜ›ÜÜÈHš[š]H™\^XXš[]H˜[Y\Ë‚‚ˆ›ÝØØ\\™Y
+HÛÛ\Û™[™]™\ˆÜY[È™\^WØØ\\™X
+H\ÈÙ\ˆÙ\\˜]Hœ›ÛH[œ™\^XX›X
+Ø\\™HØ\È][\Y[™˜Z[Y
+NˆBˆ™[YYX][ÛˆY™™\œËÛÈY\™Ú[™È[HÛÝ[Ú]™HHÜ›Û™È[œÝXÝ[Û‹‚ˆˆˆ‚‚ˆÝ[ˆ[ˆ™\^XX›Nˆ[ˆ\X[ˆ[ˆ[œ™\^XX›Nˆ[ˆ›ÝØØ\\™Yˆ[ˆÎˆ™\^XX›H
+È\X[8 %H˜XÙ\È]Ø[ˆ›ÙXÙHHÛÛ\\š\ÛÛˆ][‚ˆ\ØX›Nˆ[‚‚˜Û\ÜÈ™\^T™XY[™\ÜÐÚXÚÓÝ]
+˜\ÙS[Ù[
+N‚ˆÚXÚ×ÚYˆÝ‚ˆÝ]\Îˆ™\^T™XY[™\ÜÔÝ]\ÂˆÝ[[X\žNˆÝ‚ˆ]Z[ˆÝ‚ˆ™[YYX][ÛŽˆÝ‚‚‚˜Û\ÜÈ™\^U˜XÙT™XY[™\ÜÓÝ]
+˜\ÙS[Ù[
+N‚ˆ˜XÙWÚYˆÝ‚ˆ™\^XXš[]Nˆ]\˜[Èœ™\^XX›H‹œ\X[‹[œ™\^XX›H‹››ÝØØ\\™Y—Bˆš[X\žWÜ™X\ÛÛŽˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ™\^T™XY[™\ÜÓÝ]
+˜\ÙS[Ù[
+N‚ˆÛÛ\Û™[ÚYˆÝ‚ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÎˆ]™\žH˜XÙHÙˆHÛÛ\Û™[‚ˆÛÝ[Îˆ™\^T™XY[™\ÜÐÛÝ[ÓÝ]ˆÎˆÛ›HH˜XÙ\ÈH[ˆÛÝ[XÝX[H\ÙH
+H]]Ë\Ù[XÝYÚ[™ÝËÜ‚ˆÎˆH^XÚ]HÚÜÙ[ˆYÊK‚ˆÙ[XÝYˆ™\^T™XY[™\ÜÐÛÝ[ÓÝ]ˆÙ[XÝ[Û—Û[Z]ˆ[ˆÙ[XÝ[Û—Ú\×Ø]]ÛX]XÎˆ›ÛÛˆ™\™XÝˆ™\^T™XY[™\ÜÕ™\™XÝˆÚXÚÜÎˆ\ÝÔ™\^T™XY[™\ÜÐÚXÚÓÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ˜XÙ\Îˆ\ÝÔ™\^U˜XÙT™XY[™\ÜÓÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈÝ[TÛ˜\ÚÝXÚÊ˜\ÙS[Ù[
+N‚ˆˆˆ•H]™[Ü\‰ÜÈ^XÚ]XÚ\Ú[ÛˆÈÛÛ[YHÛˆHÝ[HÛ˜\ÚÝ‚‚ˆXÚ\Ú[Û—ÛY]ÙˆX[X[KH[ˆHÜˆ]\š\ÝXÈ™]™\ˆÝ\Y\È\Ë‚ˆH™X\ÛÛˆ\È\œÚ\ÝYÛˆH™XÛÜ™]ÛÛœÝ[Y\ÈHÛ˜\ÚÝ‚ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ™X\ÛÛŽˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLL
+B‚‚˜Û\ÜÈ™\ÜÚ]ÜžTÝ]\ÓÝ]
+˜\ÙS[Ù[
+N‚ˆˆˆ”™\ÜÚ]ÜžH™Yœ™\ÚXˆÝ]H
+\ÜÝYHÌMN
+K‚‚ˆ™XY[Û›HÝ[[X\žH]]ÈH\Ú›Ø\™ÚÝË[ˆÛ™HXÙKÚ]\ˆBˆ]\Ý[˜[\Ú\È\ÈÝ[H™[]]™HÈH™\ÜÚ]ÜžIÜÈÝ\œ™[PQ[™Ú]ˆÝ\ÈZÙH™^ˆ™XY[™ÈPQÈÛÜšÚ[™Ë]™YHÝ]\È™]™\ˆ]]]\ÈBˆ\™Ù]™\ÜÚ]ÜžH
+š[˜Ú\HJK‚ˆˆˆ‚‚ˆÛÛ™šYÝ\™Yˆ›ÛÛˆ™\×Ü]ˆÜ[Û˜[ÜÝ—HH›Û™BˆÈÝ\œ™[ÛÛ[Z]YPQÙˆHÛÛ™šYÝ\™Y™\ÜÚ]ÜžH
+™XY[Û›H™]‹\\œÙJK‚ˆÝ\œ™[ÚXYˆÜ[Û˜[ÜÝ—HH›Û™BˆXYÙ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÜšÚ[™×Ý™YWÙ\NˆÜ[Û˜[Ø›ÛÛHH›Û™Bˆ\WÙš[WØÛÝ[ˆ[Hˆ\WÜØ[\Nˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ™]Ù\ÝÛ˜\ÚÝ™YØ\™\ÜÈÙˆ[™^ØZ[Ý]K‚ˆ]\ÝÜÛ˜\ÚÝˆÜ[Û˜[ÔÛ˜\ÚÝ™Y“Ý]HH›Û™BˆÈ™]Ù\ÝÛ˜\ÚÝ][ÛÈ\ÈHÛÛ\]YÞ[X›Û[™^‚ˆ]\ÝÚ[™^YÜÛ˜\ÚÝˆÜ[Û˜[ÔÛ˜\ÚÝ™Y“Ý]HH›Û™BˆÈÛ˜\ÚÝH[ÜÝ™XÙ[Þ\Ý[H[™\œÝ[™[™ÈZ[˜[ˆYØZ[œÝ‚ˆ[™\œÝ[™[™×ÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™Bˆ[™\œÝ[™[™×ÜÝ]\ÎˆÜ[Û˜[ÜÝ—HH›Û™BˆÈYHÚ[ˆH]\ÝÛ˜\ÚÝ	ÜÈÛÛ[Z]Y™™\œÈœ›ÛHÝ\œ™[PQÛÈH™]ÂˆÈÛ˜\ÚÝÚÝ[™HÜ™X]Y™Y›Ü™HÙ[™\˜][™È™]È[˜[\Ú\ËÜ]Ú\Ë‚ˆÛ˜\ÚÝÜÝ[Nˆ›ÛÛH˜[ÙBˆÈš[š]H™[][ÛœÚ\ÙˆH]\Ý™XYHÛ˜\ÚÝÈPQˆHYÈÛÝ[\ÂˆÈ]˜Z[X›HÛ›H›ÜˆØ[YKØ™Z[™È˜Z[\™\È[™Z\ÜÚ[™ÈÛÛ[Z]È\™H[šÛ›ÝÛ‹‚ˆXYÜ™[][ÛŽˆ]\˜[ÈœØ[YH‹˜™Z[™‹™]™\™ÙY‹[šÛ›ÝÛˆ—HH[šÛ›ÝÛˆ‚ˆÛÛ[Z]×Ø™Z[™ˆÜ[Û˜[Ú[HH›Û™BˆÈYHÚ[ˆH™XYHÛ˜\ÚÝ^\ÝÈ]\È›ÈÛÛ\]YÞ[X›Û[™^‚ˆÞ[X›Û×ÜÝ[Nˆ›ÛÛH˜[ÙBˆ™^ØXÝ[ÛœÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚”™\ÜÚ]ÜžT™\Þ[˜ÔÝ]\ÈH]\˜[Âˆœ]Y]YY‹ˆœÛ˜\ÚÝ[™È‹ˆš[™^[™È‹ˆ˜ÛÛ\]Y‹ˆœÛ˜\ÚÝÙ˜Z[Y‹ˆš[™^Ù˜Z[Y‹—B‚‚˜Û\ÜÈ™\ÜÚ]ÜžT™\Þ[˜Ò›Ø“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÝ]\Îˆ™\ÜÚ]ÜžT™\Þ[˜ÔÝ]\Âˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ[WØØ\Xš[]WØÛÝ[ˆ[HˆÜ™X]YØ]ˆ›Ø]ˆÝ\YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÛÛ\]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ[[YÙ[˜ÙT[“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[Bˆ[—Ý\Nˆ[[YÙ[˜ÙT[•\Bˆ›ÝšY\ŽˆÝ‚ˆ[Ù[ˆÝ‚ˆ›Û\Ý™\œÚ[ÛŽˆÝ‚ˆØÚ[XWÝ™\œÚ[ÛŽˆÝ‚ˆXÚ\Ú[Û—ÛY]ÙˆXÚ\Ú[Û“Y]ÙˆÝ]\Îˆ[[YÙ[˜ÙT[”Ý]\Âˆ\œ›Ü—Ù]Z[ÎˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆÝ\YØ]ˆ›Ø]ˆÛÛ\]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÈ\ÜÝYHÌŽŽˆYÙ]\ØYÙH›Üˆ[—Ý\OHš[™\ÝYØ][Ûˆˆ›ÝÜÈÛ›H
+BˆÈ™XY[Û›H[™\ÝYØ][ÛˆYÙ[	ÜÈ]\›Z[š\ÝXÈYÙ]XØÛÝ[[™ÊK‚ˆÈ›Û™H›Üˆ]™\žHÝ\ˆ[—Ý\K‚ˆYÙ]Ùš[\×Ü™XYˆÜ[Û˜[Ú[HH›Û™BˆYÙ]ØÚ\œ×Ü™XYˆÜ[Û˜[Ú[HH›Û™BˆYÙ]ÛWØØ[ÎˆÜ[Û˜[Ú[HH›Û™BˆYÙ]Ù[\ÙYÜÙXÛÛ™ÎˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ™X]\™Q]šY[˜ÙJ˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆÝ\Û[™Nˆ[Hˆ[™Û[™Nˆ[HˆÝ[[X\žNˆÝˆHˆ‚‚‚˜Û\ÜÈ™X]\™PÛÙS[šÊ˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆÞ[X›ÛˆÝ‚ˆÚ[™ˆÝˆH™[˜Ý[Ûˆ‚ˆÛÛ™šY[˜ÙNˆ›Ø]HšY[
+Y˜][LŒÙOLŒOLKŒ
+BˆXÚ\Ú[Û—ÛY]Ùˆ]\˜[È™]\›Z[š\ÝXÈ‹œ™X\ÛÛš[™×ÛH‹›X[X[—HH›X[X[‚‚‚˜Û\ÜÈ™X]\™T›Ùš[J˜\ÙS[Ù[
+N‚ˆ™X]\™WÚYˆÝ‚ˆ˜[YNˆÝ‚ˆÝ[[X\žNˆÝ‚ˆ\Ù\—Ý˜[YNˆÝ‚ˆÝXØÙ\Ü×ØÜš]\šXNˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆš\ÚÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]šY[˜ÙNˆ\ÝÑ™X]\™Q]šY[˜ÙWHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÛÙWÛ[šÜÎˆ\ÝÑ™X]\™PÛÙS[š×HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆXÚ\Ú[Û—ÛY]Ùˆ]\˜[È™]\›Z[š\ÝXÈ‹œ™X\ÛÛš[™×ÛH‹›X[X[—HH›X[X[‚‚‚˜Û\ÜÈ›Ø™TÚ[
+˜\ÙS[Ù[
+N‚ˆÛÛ\Û™[ÚYˆÝ‚ˆ™X]\™WÚYˆÝ‚ˆ]ˆÝ‚ˆÞ[X›ÛˆÝ‚ˆ™X\ÛÛŽˆÝ‚ˆ™XÛÛ[Y[™YÛ[ÙNˆ[ÙHH˜XÙH‚ˆÚYWÙY™™XÝÜš\ÚÎˆ]\˜[È›ÝÈ‹›YY][H‹šYÚ—HH›ÝÈ‚ˆÝ]\Îˆ]\˜[Èœ›ÜÜÙY‹˜\›Ý™Y‹œ™Z™XÝY—HHœ›ÜÜÙY‚‚‚˜Û\ÜÈ›Ø™T[Š˜\ÙS[Ù[
+N‚ˆ™X]\™WÚYˆÝ‚ˆØš™XÝ]™NˆÝ‚ˆ›Ø™WÜÚ[Îˆ\ÝÔ›Ø™TÚ[HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]›ÚYÜ›Ø™WÜÚ[Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆXÚ\Ú[Û—ÛY]Ùˆ]\˜[È™]\›Z[š\ÝXÈ‹œ™X\ÛÛš[™×ÛH‹›X[X[—HH›X[X[‚‚‚˜Û\ÜÈ^\š[Y[˜\šX[
+˜\ÙS[Ù[
+N‚ˆ˜\šX[ÚYˆÝ‚ˆX™[ˆÝ‚ˆÝ]\Îˆ]\˜[Èœ[›™Y‹œ[›š[™È‹˜ÛÛ\]Y‹™˜Z[Y—HHœ[›™Y‚ˆ]ÚÜÝ[[X\žNˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ^\š[Y[Ý[[X\žJ˜\ÙS[Ù[
+N‚ˆ^\š[Y[ÚYˆÝ‚ˆ™X]\™WÚYˆÝ‚ˆØš™XÝ]™NˆÝ‚ˆ˜\Ù[[™WØÛÛ[Z]ˆÝ‚ˆÝ]\Îˆ]\˜[È™˜Y‹œ[›š[™È‹˜ÛÛ\]Y‹™˜Z[Y—HH™˜Y‚ˆ˜\šX[Îˆ\ÝÑ^\š[Y[˜\šX[HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆY]šXÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[\œ™]][Û—ÛY]Ùˆ]\˜[È™]\›Z[š\ÝXÈ‹œ™X\ÛÛš[™×ÛH‹›X[X[—HH›X[X[‚‚‚‘^\š[Y[Ý]\ÈH]\˜[È™˜Y‹œ[›š[™È‹˜ÛÛ\]Y‹™˜Z[Y—B‘^\š[Y[˜\šX[Ý]\ÈH]\˜[Âˆœ[›™Y‹œ[›š[™È‹˜ÛÛ\]Y‹™˜Z[Y‹š[˜[YÜ]Ú‹[YYÛÝ]‚—B‘^\š[Y[[˜[\Ú\ÔÝ]\ÈH]\˜[Âˆœ[™[™È‹˜ÛÛ\]Y‹˜[˜[\Ú\×Ù˜Z[Y‹››ÝÜ™\]Y\ÝY‚—B‚‚˜Û\ÜÈ^\š[Y[^XÝ][ÛÛÛ™šYÊ˜\ÙS[Ù[
+N‚ˆ[œÝ[ØÛÛ[X[™Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\ÝØÛÛ[X[™Îˆ\ÝÜÝ—HHšY[
+‹‹‹Z[—Û[™ÝLJBˆÛ[ÚÙWØÛÛ[X[™Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÛÜšÛØYØÛÛ[X[™Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[Y[Ý]ÜÙXÛÛ™Îˆ[HšY[
+Y˜][MŒÙOLKOLÌ
+Bˆ™]ÛÜšÎˆ]\˜[Ñ˜[ÙWHH˜[ÙBˆ[ŽˆXÝÜÝ‹Ý—HHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+Bˆ™\Ý[Ø\Y˜XÝÜ]ˆÝˆH‹œ›Ø™KXYÙ[Ù^\š[Y[\™\Ý[šœÛÛˆ‚ˆ\Y˜XÝÜ™][[Û—ÜÙXÛÛ™Îˆ[HšY[
+Y˜][NÙOL
+B‚‚˜Û\ÜÈ^\š[Y[˜\šX[Ü™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆX™[ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+Bˆ]ÚÝ^ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLWÌÌ
+BˆÛÝ\˜ÙNˆÝˆHšY[
+Y˜][H›X[X[‹X^Û[™ÝLL
+Bˆš\Ú×Û›ÝNˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLŒ
+B‚‚˜Û\ÜÈ^\š[Y[Ü™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ™X]\™WÚYˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+BˆØš™XÝ]™NˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝML
+BˆÛ˜\ÚÝÚYˆ[ˆ˜\šX[Îˆ\ÝÑ^\š[Y[˜\šX[Ü™X]WHHšY[
+ˆ‹‹‹Z[—Û[™ÝL‹X^Û[™ÝLLˆ
+BˆÈ\ÜÝYHÌÍŽNˆ™\]Z\™YÚ[ˆHÚÜÙ[ˆÛ˜\ÚÝ\ÈYš[š]]™[H™Z[™ˆÈPQˆÛÛ[Z[™ÈÛˆ[ˆÛ\ˆÛ˜\ÚÝ\ÈYÚ][X]H
+™\›ÙXÝ[Ûˆ[œÊKˆÈ]]\ÈH]™[Ü\‰ÜÈXÚ\Ú[Û‹ÛÈ]\È™XÛÜ™YÛˆH^\š[Y[ˆÈ˜]\ˆ[ˆ[™™\œ™YˆXÚ\Ú[Û—ÛY]ÙˆX[X[‚ˆÝ[WÜÛ˜\ÚÝÜ™X\ÛÛŽˆÜ[Û˜[ÜÝ—HHšY[
+›Û™KZ[—Û[™ÝLKX^Û[™ÝLL
+B‚‚˜Û\ÜÈ^\š[Y[ÛÛ[X[™Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ\ÙNˆÝ‚ˆÛÛ[X[™ˆÝ‚ˆ^]ØÛÙNˆ[ˆ\˜][Û—Û\Îˆ›Ø]ˆÝÝ]ˆÝˆHˆ‚ˆÝ\œŽˆÝˆHˆ‚ˆÝÝ]Ý[˜Ø]Yˆ›ÛÛH˜[ÙBˆÝ\œ—Ý[˜Ø]Yˆ›ÛÛH˜[ÙBˆ[YYÛÝ]ˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈ^\š[Y[˜\šX[™\Ý[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ˜\šX[ÚÙ^NˆÝ‚ˆX™[ˆÝ‚ˆ\×Ø˜\Ù[[™Nˆ›ÛÛˆ]ÚÝ^ˆÝˆHˆ‚ˆ]ÚÚ\ÚˆÝ‚ˆÛÝ\˜ÙNˆÝ‚ˆš\Ú×Û›ÝNˆÝˆHˆ‚ˆÝ]\Îˆ^\š[Y[˜\šX[Ý]\Âˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÜšÜÜXÙWÜ]ˆÜ[Û˜[ÜÝ—HH›Û™BˆÛX[\ÜÝ]NˆÝˆH››ÝØ][\Y‚ˆÛX[\Ù\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆY]šXÜÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+Bˆ\Y˜XÝÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆÛÛ[X[™Îˆ\ÝÑ^\š[Y[ÛÛ[X[™Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ\YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÛÛ\]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ^\š[Y[[˜[\Ú\ÓÝ]
+˜\ÙS[Ù[
+N‚ˆÝ]\Îˆ^\š[Y[[˜[\Ú\ÔÝ]\Âˆ›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Û\Ý™\œÚ[ÛŽˆÜ[Û˜[ÜÝ—HH›Û™BˆØÚ[XWÝ™\œÚ[ÛŽˆÜ[Û˜[ÜÝ—HH›Û™BˆXÚ\Ú[Û—ÛY]ÙˆÜ[Û˜[ÑXÚ\Ú[Û“Y]ÙHH›Û™Bˆ˜\œ˜]]™NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™XÛÛ[Y[™][Û—Ý˜\šX[ÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™XÛÛ[Y[™][Û—Ü™X\ÛÛŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆš\ÚÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ™X]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ^\š[Y[XÚ\Ú[Û•\]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆXÚ\Ú[ÛŽˆ]\˜[È˜YÜY‹œ™Z™XÝY‹›™YY×Û[Ü™WÙ]H‹[™XÚYY—Bˆ˜\šX[ÚÙ^NˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLL
+Bˆ›ÝNˆÝˆHˆ‚‚‚˜Û\ÜÈ^\š[Y[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆ™X]\™WÚYˆÝ‚ˆØš™XÝ]™NˆÝ‚ˆÛ˜\ÚÝÚYˆ[ˆ˜\Ù[[™WØÛÛ[Z]ˆÝ‚ˆÛÛ™šY×Ü™]š\Ú[ÛŽˆÝ‚ˆ^XÝ][ÛŽˆ^\š[Y[^XÝ][ÛÛÛ™šYÂˆÝ]\Îˆ^\š[Y[Ý]\Âˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[X[—ÙXÚ\Ú[ÛŽˆÝˆH[™XÚYY‚ˆ[X[—ÙXÚ\Ú[Û—Ý˜\šX[ÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[X[—ÙXÚ\Ú[Û—Û›ÝNˆÝˆHˆ‚ˆ˜\šX[Îˆ\ÝÑ^\š[Y[˜\šX[™\Ý[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÛÛ\\š\ÛÛŽˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+Bˆ[˜[\Ú\Îˆ^\š[Y[[˜[\Ú\ÓÝ]ˆÜ™X]YØ]ˆ›Ø]ˆÝ\YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÛÛ\]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈÞ\Ý[T›Ùš[Q˜YÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆ[[YÙ[˜ÙWÜ[—ÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆ˜[YNˆÝˆHˆ‚ˆ\œÜÙNˆÝˆHˆ‚ˆ\™Ù]Ý\Ù\œÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝZÙZÛ\—Ý˜[YNˆÝˆHˆ‚ˆÛÛœÝ˜Z[Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝXØÙ\Ü×ØÜš]\šXNˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]šY[˜ÙNˆ\ÝÑ™X]\™Q]šY[˜ÙWHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ™X]\™Q˜YÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆ[[YÙ[˜ÙWÜ[—ÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆ™X]\™WÚYˆÝ‚ˆ˜[YNˆÝ‚ˆÝ[[X\žNˆÝ‚ˆ\Ù\—Ý˜[YNˆÝ‚ˆÝXØÙ\Ü×ØÜš]\šXNˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆš\ÚÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]šY[˜ÙNˆ\ÝÑ™X]\™Q]šY[˜ÙWHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆXÚ\Ú[Û—ÛY]ÙˆXÚ\Ú[Û“Y]ÙHœ™X\ÛÛš[™×ÛH‚ˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ˜YÙ[™\˜][Û”™\Ý[
+˜\ÙS[Ù[
+N‚ˆ[[YÙ[˜ÙWÜ[Žˆ[[YÙ[˜ÙT[“Ý]ˆÞ\Ý[WÜ›Ùš[WÙ˜YˆÜ[Û˜[ÔÞ\Ý[T›Ùš[Q˜YÝ]HH›Û™Bˆ™X]\™WÙ˜YÎˆ\ÝÑ™X]\™Q˜YÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ]\Ý˜YÓÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝˆÜ[Û˜[ÔÛ˜\ÚÝÝ]HH›Û™Bˆ[[YÙ[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™BˆÞ\Ý[WÜ›Ùš[WÙ˜YˆÜ[Û˜[ÔÞ\Ý[T›Ùš[Q˜YÝ]HH›Û™Bˆ™X]\™WÙ˜YÎˆ\ÝÑ™X]\™Q˜YÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚”Þ[X›ÛÚ[™H]\˜[È›[Ù[H‹˜Û\ÜÈ‹™[˜Ý[Ûˆ‹˜\Þ[˜×Ù[˜Ý[Ûˆ—B“[šÔÛÝ\˜ÙHH]\˜[Èœ™X\ÛÛš[™×ÛH‹›X[X[—B“[šÔ™]šY]ÔÝ]\ÈH]\˜[Èœ›ÜÜÙY‹˜XØÙ\Y‹œ™Z™XÝY—B‚‚”ÛÝ\˜ÙSY]Y]Q[[Y[\HH]\˜[ÂˆœÞ\Ý[H‹˜ÛÜ™H‹˜Ø\Xš[]H‹™[[Y[‹œÝ\Ü[™È‹˜›Ý[™\žH‚—B”ÛÝ\˜ÙSY]Y]SÜ\˜][Û’Ú[™H]\˜[Âˆ˜[˜[\Ú\È‹œ™XY‹Üš]H‹›]]][Ûˆ‹š[È‹›Ü˜Ú\Ý˜][Ûˆ‹ˆ˜[Y][Ûˆ‹›Ý\ˆ‹—B‚‚˜Û\ÜÈÛÝ\˜ÙSY]Y]SÝ]
+˜\ÙS[Ù[
+N‚ˆˆˆ]]Ü‹]Üš][‹ÛÝ\˜ÙKX[˜ÚÜ™Y^[˜][ÛˆÛÜYYœ›ÛHHØÜÝš[™Ë‚‚ˆ\ÙH˜XÝÈ\™H]\›Z[š\ÝXÈÈÛÝ\˜ÙKX]]Ü™Y[™\™HÙ\Ù\\˜]Hœ›ÛBˆ™X\ÛÛš[™Ë[[Ù[[\œ™]][ÛœËˆÜšYÚ[˜\È[Ø^\ÈÛÝ\˜ÙWØ]]Ü™Y‚ˆˆˆ‚‚ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[ˆ˜]×Ø›ØÚÎˆÝ‚ˆ›ÛNˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\Xš[]NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[[Y[Ý\NˆÜ[Û˜[ÔÛÝ\˜ÙSY]Y]Q[[Y[\WHH›Û™BˆÞ\Ý[WÜ\œÜÙNˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ\˜][Û—ÚÚ[™ˆÜ[Û˜[ÔÛÝ\˜ÙSY]Y]SÜ\˜][Û’Ú[™HH›Û™BˆÛÛœÝ[Y\œÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ]WÙY™™XÝÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ›Ø™WÝ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÜšYÚ[Žˆ]\˜[ÈœÛÝ\˜ÙWØ]]Ü™Y—HHœÛÝ\˜ÙWØ]]Ü™Y‚ˆÈÚLMˆÙˆH^˜XÝY^[˜][Ûˆ›ØÚÈ
+\ÜÝYHÍMJNÈÚ[™ÙHÚYÛ˜[Û›K‚ˆ^[˜][Û—Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈÛÙTÞ[X›ÛÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÛ˜\ÚÝÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ]ˆÝ‚ˆ]X[YšYYÛ˜[YNˆÝ‚ˆÚ[™ˆÞ[X›ÛÚ[™ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[ˆXÛÜ˜]ÜœÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[\ÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆØÜÝš[™ÎˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\×Ý\Ýˆ›ÛÛH˜[ÙBˆ\×ÜY[X×Û[Ù[ˆ›ÛÛH˜[ÙBˆ›Ý]WÜ]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ý]WÛY]ÙˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÛ\Û™[ÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÝ\˜ÙWÛY]Y]NˆÜ[Û˜[ÔÛÝ\˜ÙSY]Y]SÝ]HH›Û™BˆÈÛÝ\˜ÙKZ\Ú›Ý™[˜[˜ÙH
+\ÜÝYHÍMJKˆ[ÛÛ\]Yœ›ÛHH[›™YÛ˜\ÚÝÂˆÈ\]X[]H\ÈÛ›HHÚ[™ÙHÚYÛ˜[›ÝÙ[X[XÈ\]Z]˜[[˜ÙK‚ˆš[WØÛÛ[Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÞ[X›ÛÜÛÝ\˜ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÞ[X›ÛØ›ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ^[˜][Û[˜ÚÜ“Ý]
+˜\ÙS[Ù[
+N‚ˆˆˆHÚ[™ÛHÛÝ\˜ÙH[˜ÚÜˆ[ˆ^[˜][Ûˆ\[™ÈÛˆ
+\ÜÝYHÍMJK‚‚ˆ[™\ÈH]\›Z[š\ÝXÈ›Ý™[˜[˜ÙH
+š[KÞ[X›ÛÜ[‹[™\Ú\\ÊBˆ]ÝÛœÝ™X[HšY™X]\™\ÈÛÛ\\™HYØZ[œÝH™]Ù\ˆÛ˜\ÚÝ‚ˆˆˆ‚‚ˆYˆ[ˆÛ˜\ÚÝÚYˆ[ˆÞ\Ý[WÚYˆ[ˆY]Y]WÚYˆ[ˆÞ[X›ÛÚYˆ[ˆ]ˆÝ‚ˆ]X[YšYYÛ˜[YNˆÝ‚ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[ˆš[WØÛÛ[Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÞ[X›ÛÜÛÝ\˜ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÞ[X›ÛØ›ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™Bˆ^[˜][Û—Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ^[˜][Û[˜ÚÜœÓÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆ[˜ÚÜ—ØÛÝ[ˆ[ˆ[˜ÚÜœÎˆ\ÝÑ^[˜][Û[˜ÚÜ“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÈÛÝ\˜ÙKX˜XÚÙYØ\Xš[]HY\˜\˜ÚH
+\ÜÝYHÍMŠBˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚‚˜Û\ÜÈY\˜\˜ÚT›Ý™[˜[˜ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆˆˆ”›Ý™[˜[˜ÙH›ÜˆHÚ[™ÛHY\˜\˜ÚHÛZ[K‚‚ˆ›Ý™[˜[˜ÙWÚÚ[™\Ý[™ÝZ\Ú\ÈÛÝ\˜ÙKX]]Ü™Y^[˜][Û‹]\›Z[š\ÝXÂˆÝXÝ\˜[˜XÝ[™™X\ÛÛš[™Ë[[Ù[[\œ™]][Û‹ˆXÚ\Ú[Û—ÛY]Ù\ÂˆH]Y][[Kˆ\Ú\ÈYHHÛZ[HÈH[›™YÛ˜\ÚÝ
+ÍMJK‚ˆˆˆ‚‚ˆ›Ý™[˜[˜ÙWÚÚ[™ˆ›Ý™[˜[˜ÙRÚ[™ˆXÚ\Ú[Û—ÛY]ÙˆXÚ\Ú[Û“Y]Ùˆ]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]X[YšYYÛ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ\Û[™NˆÜ[Û˜[Ú[HH›Û™Bˆ[™Û[™NˆÜ[Û˜[Ú[HH›Û™Bˆš[WØÛÛ[Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÞ[X›ÛÜÛÝ\˜ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™Bˆ^[˜][Û—Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÞ[X›ÛÚYˆÜ[Û˜[Ú[HH›Û™Bˆ[ž\Ú[ÚYˆÜ[Û˜[Ú[HH›Û™BˆÈÝX›HÙÚXØ[[ž\Ú[™Y™\™[˜ÙH
+ÍŒŠKˆ[ž\Ú[ÚYX›Ý™H\ÈBˆÈÛ˜\ÚÝ[ØØ[ˆ›ÝÈY[™\È›ÝØY™H›ÜˆÜ›ÜÜË\Û˜\ÚÝ[šÚ[™Ëˆ\ÙBˆÈØ\œžHHÙÚXØ[
+\KY
+HÛÈH\Ú›Ø\™Ø[ˆÜ[ˆH[ž\Ú[[‚ˆÈ›ÝÈ^Ü™\ˆÚ]Ý]™K\™\ÛÛš[™ÈHˆY‚ˆ[ž\Ú[Ý\NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[ž\Ú[Ü™YŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™X]\™WÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆÞ\Ý[WÜ›Ùš[WÙ˜YÚYˆÜ[Û˜[Ú[HH›Û™Bˆ›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈÝ\Ü[™Ñ[[Y[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ˜[YNˆÝ‚ˆÝ[[X\žNˆÝˆHˆ‚ˆÝ\Ü[™×ÚÚ[™ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ý™[˜[˜ÙNˆY\˜\˜ÚT›Ý™[˜[˜ÙSÝ]‚‚˜Û\ÜÈØ\Xš[]Q[[Y[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ˜[YNˆÝ‚ˆÝ[[X\žNˆÝˆHˆ‚ˆ[[Y[Ü›ÛNˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ\˜][Û—ÚÚ[™ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ø™WÝ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÛ\ÜÚYšXØ][ÛŽˆÜ[Û˜[ÜÝ—HH›Û™HÈÛ\ÜÚYšYY[˜Û\ÜÚYšYYˆ›Ý™[˜[˜ÙNˆY\˜\˜ÚT›Ý™[˜[˜ÙSÝ]‚‚˜Û\ÜÈØ\Xš[]SÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆØ\Xš[]WÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ˜[YNˆÝ‚ˆÝ[[X\žNˆÝˆHˆ‚ˆ›Ý™[˜[˜ÙNˆY\˜\˜ÚT›Ý™[˜[˜ÙSÝ]ˆ[[Y[Îˆ\ÝÐØ\Xš[]Q[[Y[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ\Ü[™×Ù[[Y[Îˆ\ÝÔÝ\Ü[™Ñ[[Y[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈØ\Xš[]T\œÜÙSÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ˜[YNˆÝ‚ˆÝ[[X\žNˆÝˆHˆ‚ˆ›Ý™[˜[˜ÙNˆY\˜\˜ÚT›Ý™[˜[˜ÙSÝ]‚‚˜Û\ÜÈØ\Xš[]RY\˜\˜ÚSÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆ[[YÙ[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™Bˆ\œÜÙNˆÜ[Û˜[ÐØ\Xš[]T\œÜÙSÝ]HH›Û™BˆØ\Xš[]Y\Îˆ\ÝÐØ\Xš[]SÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[˜Û\ÜÚYšYYÙ[[Y[Îˆ\ÝÐØ\Xš[]Q[[Y[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[˜]XÚYÜÝ\Ü[™Îˆ\ÝÔÝ\Ü[™Ñ[[Y[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙB‚‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÈ^[˜][ÛˆšY
+\ÜÝYHÍMÊBˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚ˆÈ[˜ÚÜ‹[]™[\Ù\Èœ™\ÚÜÝ[KÛZ\ÜÚ[™×ÜÛÝ\˜ÙKÝ[šÛ›ÝÛŽÈYÙÜ™YØ]H]™[ÈYˆÈ\X[WÜÝ[Kˆ\ÚšY\ÈH™]šY]ÈšYÙÙ\‹›ÝHÛÜœ™XÝ™\ÜÈ™\™XÝ‚‘šYÝ]\ÈH]\˜[Âˆ™œ™\Ú‹œ\X[WÜÝ[H‹œÝ[H‹›Z\ÜÚ[™×ÜÛÝ\˜ÙH‹[šÛ›ÝÛˆ‚—B‚‚˜Û\ÜÈ[˜ÚÜ‘šYÝ]
+˜\ÙS[Ù[
+N‚ˆ›ÙWÚYˆ[ˆ›ÙWÝ\NˆÝ‚ˆ˜[YNˆÝ‚ˆ]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]X[YšYYÛ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[ž\Ú[ÚYˆÜ[Û˜[Ú[HH›Û™BˆÝ]\ÎˆšYÝ]\ÂˆÚ[™ÙYÚ\Ú\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆØ\\™YÙš[WØÛÛ[Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\\™YÜÞ[X›ÛÜÛÝ\˜ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\\™YÙ^[˜][Û—Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ\œ™[Ùš[WØÛÛ[Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ\œ™[ÜÞ[X›ÛÜÛÝ\˜ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ\œ™[Ù^[˜][Û—Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈšYÛÝ[ÓÝ]
+˜\ÙS[Ù[
+N‚ˆÝ[ˆ[Hˆœ™\Úˆ[HˆÝ[Nˆ[HˆZ\ÜÚ[™Îˆ[Hˆ[šÛ›ÝÛŽˆ[HˆÞ[X›ÛÙ\×ÝÝ[ˆ[HˆÞ[X›ÛÙ\×ØÚ[™ÙYˆ[Hˆš[WÙ\×ÝÝ[ˆ[Hˆš[WÙ\×ØÚ[™ÙYˆ[Hˆ^[˜][Û—Ø›ØÚÜ×ÝÝ[ˆ[Hˆ^[˜][Û—Ø›ØÚÜ×ØÚ[™ÙYˆ[HˆZ\ÜÚ[™×Ø[˜ÚÜœÎˆ[HˆZ\ÛX]ÚÜ˜][Îˆ›Ø]HŒ‚‚˜Û\ÜÈØ\Xš[]QšYÝ]
+˜\ÙS[Ù[
+N‚ˆØ\Xš[]WÚYˆ[ˆØ\Xš[]WÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ˜[YNˆÝ‚ˆÝ]\ÎˆšYÝ]\ÂˆÛÝ[ÎˆšYÛÝ[ÓÝ]ˆ[[Y[Îˆ\ÝÐ[˜ÚÜ‘šYÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ\Ü[™×Ù[[Y[Îˆ\ÝÐ[˜ÚÜ‘šYÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈØ\Xš[]RY\˜\˜ÚQšYÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆ˜\ÙWÜÛ˜\ÚÝÚYˆ[ˆ\™Ù]ÜÛ˜\ÚÝÚYˆ[ˆ[[YÙ[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™BˆÝ]\ÎˆšYÝ]\ÂˆÛÝ[ÎˆšYÛÝ[ÓÝ]ˆ\™Ù]Ú[™^Yˆ›ÛÛHYBˆ\œÜÙNˆÜ[Û˜[Ð[˜ÚÜ‘šYÝ]HH›Û™BˆØ\Xš[]Y\Îˆ\ÝÐØ\Xš[]QšYÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[˜Û\ÜÚYšYYÙ[[Y[Îˆ\ÝÐ[˜ÚÜ‘šYÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[˜]XÚYÜÝ\Ü[™Îˆ\ÝÐ[˜ÚÜ‘šYÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\×Ü™]šY]×Ü™XÛÛ[Y[™Yˆ›ÛÛH˜[ÙBˆ™]šY]×Û›ÝNˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈÞ[X›Û[™^Ø\›š[™ÓÝ]
+˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆY\ÜØYÙNˆÝ‚‚‚˜Û\ÜÈÞ[X›Û[™^Ý]
+˜\ÙS[Ù[
+N‚ˆÛ˜\ÚÝÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÞ[X›ÛØÛÝ[ˆ[ˆØ\›š[™×ØÛÝ[ˆ[ˆÞ[X›ÛÎˆ\ÝÐÛÙTÞ[X›ÛÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆØ\›š[™ÜÎˆ\ÝÔÞ[X›Û[™^Ø\›š[™ÓÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[[YÙ[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™B‚‚˜Û\ÜÈ™X]\™PÛÙS[šÓÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆ[[YÙ[˜ÙWÜ[—ÚYˆ[ˆ™X]\™WÚYˆÝ‚ˆÞ[X›ÛˆÛÙTÞ[X›ÛÝ]ˆ™[][Û—Ü™X\ÛÛŽˆÝ‚ˆÛÛ™šY[˜ÙNˆ›Ø]HšY[
+ÙOLŒOLKŒ
+BˆÛÝ\˜ÙNˆ[šÔÛÝ\˜ÙBˆ™]šY]×ÜÝ]\Îˆ[šÔ™]šY]ÔÝ]\Âˆ›ÝšY\ŽˆÝ‚ˆ[Ù[ˆÝ‚ˆ›Û\Ý™\œÚ[ÛŽˆÝ‚ˆØÚ[XWÝ™\œÚ[ÛŽˆÝ‚ˆ\×ÜÝ[Nˆ›ÛÛH˜[ÙBˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ™X]\™PÛÙS[šÜÓÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™Bˆ[[YÙ[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™Bˆ[šÜÎˆ\ÝÑ™X]\™PÛÙS[šÓÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈ[šÔ™]šY]Õ\]J˜\ÙS[Ù[
+N‚ˆ™]šY]×ÜÝ]\Îˆ[šÔ™]šY]ÔÝ]\Â‚‚”›Ø™TÚ[Ý]\ÈH]\˜[Èœ›ÜÜÙY‹˜\›Ý™Y‹œ™Z™XÝY—B”›Ø™T[”Ý]\ÈH]\˜[Èœ›ÜÜÙY‹˜\›Ý™Y‹œ™Z™XÝY—B‚‚˜Û\ÜÈ›Ø™TÚ[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ[—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÛÛ\Û™[ÚYˆÝ‚ˆ™X]\™WÚYˆÝ‚ˆ]ˆÝ‚ˆÞ[X›ÛˆÝ‚ˆ[™WÜÝ\ˆ[ˆ[™WÙ[™ˆ[ˆ™X\ÛÛŽˆÝ‚ˆ™XÛÛ[Y[™YÛ[ÙNˆÝ‚ˆÚYWÙY™™XÝÜš\ÚÎˆ]\˜[È›ÝÈ‹›YY][H‹šYÚ—Bˆ™\^XXš[]NˆÝ‚ˆ[ž[\ÝÚ]ˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ]\Îˆ›Ø™TÚ[Ý]\ÈHœ›ÜÜÙY‚ˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ø™T[“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆ[[YÙ[˜ÙWÜ[—ÚYˆ[ˆ™X]\™WÚYˆÝ‚ˆØš™XÝ]™NˆÝ‚ˆÝ]\Îˆ›Ø™T[”Ý]\ÂˆÜšYÚ[ŽˆÝˆH›X[X[‚ˆ]›ÚYÜ™X\ÛÛœÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ›Ø™WÜÚ[Îˆ\ÝÔ›Ø™TÚ[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[[YÙ[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ø™TÚ[Ý]\Õ\]J˜\ÙS[Ù[
+N‚ˆÝ]\Îˆ›Ø™TÚ[Ý]\Â‚‚˜Û\ÜÈ›Ø™T]Ú\T™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÛÛ™š\›YYˆ]\˜[ÕYWBˆ^XÝYØÛÛ[Z]ÜÚNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝMËX^Û[™ÝM
+B‚‚˜Û\ÜÈ˜[Y][ÛÛÛ[X[™Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÛÛ[X[™ˆÝ‚ˆ^]ØÛÙNˆ[ˆ\˜][Û—Û\Îˆ›Ø]ˆÝÝ]ˆÝ‚ˆÝ\œŽˆÝ‚ˆÝÝ]Ý[˜Ø]Yˆ›ÛÛH˜[ÙBˆÝ\œ—Ý[˜Ø]Yˆ›ÛÛH˜[ÙBˆ[YYÛÝ]ˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈ˜[Y][Û”[“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ]ÚÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ˜\šX[ˆÝ‚ˆÛÜšÝ™YWÜ]ˆÝ‚ˆÝ™\˜[ÜÝXØÙ\ÜÎˆ›ÛÛˆÝ[Ù\˜][Û—Û\Îˆ›Ø]ˆ˜XÙWÜ™XÙZ]™YˆÜ[Û˜[Ø›ÛÛHH›Û™Bˆ˜XÙWÜÝ]\ÎˆÝˆH››ÝØÚXÚÙY‚ˆ™]ÛÜš×Ú\ÛÛ][ÛŽˆÝˆH››ÝÜ™\]Y\ÝY‚ˆÛX[\ÜÝ]NˆÝˆH››ÝØ][\Y‚ˆÛX[\Ù\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÛ[X[™Îˆ\ÝÕ˜[Y][ÛÛÛ[X[™Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ø™T]ÚÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ[—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆÛÛ[Z]ÜÚNˆÝ‚ˆY™ŽˆÝ‚ˆÛÜšÝ™YWÜ]ˆÝˆHˆ‚ˆÚÚ\Yˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ]\ÎˆÝ‚ˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÛX[\ÜÝ]NˆÝˆH››ÝØ][\Y‚ˆÛX[\Ù\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\WÜÝ]\ÎˆÝˆH››ÝØ\YY‚ˆ\WÙ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\YYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ\YYØžWÝ\Ù\—ÚYˆÜ[Û˜[Ú[HH›Û™Bˆ˜[Y][Û—Ü[œÎˆ\ÝÕ˜[Y][Û”[“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ø™T[œÓ\ÝÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆ[œÎˆ\ÝÔ›Ø™T[“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙB‚‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÈ›Ø™H]\›ˆY™XÞXÛH
+\ÜÝYHÌMŽ
+BˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚”›Ø™T]\›”Ý]\ÈH]\˜[È˜XÝ]™H‹œÝ[H‹˜\˜Ú]™Y‹œÝ\\œÙYY—B”›Ø™T]\›“ÜšYÚ[ˆH]\˜[ÈœØØ[ˆ‹œ›Ø™WÜ[ˆ‹›X[X[—B”™XÛÛ˜Ú[PÛ\ÜÚYšXØ][ÛˆH]\˜[Âˆ™^XÝÛX]Ú‹›[Ý™YÛX]Ú‹˜Ú[™ÙYÜÚYÛ˜]\™H‹ˆœÜ]ÛÜ—ÛY\™ÙY‹›Z\ÜÚ[™È‹[œØY™H‹—B”™XÛÛ˜Ú[U\Ù\‘XÚ\Ú[ÛˆH]\˜[Èœ[™[™È‹˜XØÙ\Y‹œ™Z™XÝY—B‚‚˜Û\ÜÈ[œÝ[Y[Y›Ø™SÝ]
+˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆÞ[X›ÛˆÝ‚ˆ[™WÜÝ\ˆ[ˆ[™WÙ[™ˆ[ˆÛÛ\Û™[ÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆØÜÝš[™ÎˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[šÙYÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™Bˆ[šÙYÙ™X]\™WÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[šÙYÛØš™XÝ]™NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[šÙYÜ™X\ÛÛŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[šÙYÜ™XÛÛ[Y[™YÛ[ÙNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]\›—ÚYÎˆ\ÝÚ[HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ[œÝ[Y[][Û”ØØ[“Ý]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆÛÛ[Z]ÜÚNˆÝ‚ˆ›Ø™\Îˆ\ÝÒ[œÝ[Y[Y›Ø™SÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ›Ø™T]\›”Ú[[Š˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆÞ[X›ÛˆÝ‚ˆÛÛ\Û™[ÚYˆÝˆHˆ‚ˆ™X\ÛÛŽˆÝˆHˆ‚ˆ™XÛÛ[Y[™YÛ[ÙNˆÝˆH˜XÙH‚ˆÚYWÙY™™XÝÜš\ÚÎˆ]\˜[È›ÝÈ‹›YY][H‹šYÚ—HH›ÝÈ‚ˆ™\^XXš[]NˆÝˆHˆ‚‚‚˜Û\ÜÈ›Ø™T]\›Ü™X]T™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ˜[YNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+Bˆ™X]\™WÚYˆÝˆHˆ‚ˆØ\Xš[]NˆÝˆHˆ‚ˆØš™XÝ]™NˆÝˆHˆ‚ˆ\ØÜš\[ÛŽˆÝˆHˆ‚ˆÜšYÚ[Žˆ›Ø™T]\›“ÜšYÚ[ˆH›X[X[‚ˆÛÝ\˜ÙWÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÚ[Îˆ\ÝÔ›Ø™T]\›”Ú[[—HHšY[
+‹‹‹Z[—Û[™ÝLJB‚‚˜Û\ÜÈ›Ø™T]\›•\]T™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ˜[YNˆÜ[Û˜[ÜÝ—HHšY[
+›Û™KZ[—Û[™ÝLKX^Û[™ÝLŒ
+Bˆ™X]\™WÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\Xš[]NˆÜ[Û˜[ÜÝ—HH›Û™BˆØš™XÝ]™NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\ØÜš\[ÛŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ]\ÎˆÜ[Û˜[Ó]\˜[È˜XÝ]™H‹˜\˜Ú]™Y—WHH›Û™B‚‚˜Û\ÜÈ›Ø™T]\›”Ú[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ]\›—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÛÛ\Û™[ÚYˆÝ‚ˆ]ˆÝ‚ˆÞ[X›ÛˆÝ‚ˆ[™WÜÝ\ˆ[ˆ[™WÙ[™ˆ[ˆ™X\ÛÛŽˆÝ‚ˆ™XÛÛ[Y[™YÛ[ÙNˆÝ‚ˆÚYWÙY™™XÝÜš\ÚÎˆÝ‚ˆ™\^XXš[]NˆÝ‚ˆÚYÛ˜]\™NˆÝˆHˆ‚ˆÞ[X›ÛÜÛÝ\˜ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÞ[X›ÛØ›ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆØÜÝš[™ÎˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ]\ÎˆÝˆHœØ]™Y‚ˆ™[[Ý™YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ø™T]\›‘]™[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ]\›—ÚYˆ[ˆ]™[Ý\NˆÝ‚ˆ]Z[ˆXÝHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ™XÛÛ˜Ú[Q]šY[˜ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[ˆÝ[[X\žNˆÝˆHˆ‚‚‚˜Û\ÜÈ]\›’[™\ÝYØ][Û“Ý]
+˜\ÙS[Ù[
+N‚ˆÝ[[X\žNˆÝ‚ˆ™XÛÛ[Y[™][ÛŽˆÝ‚ˆ›ÜÜÙYÝ\™Ù]Ü]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›ÜÜÙYÝ\™Ù]ÜÞ[X›ÛˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]šY[˜ÙNˆ\ÝÔ™XÛÛ˜Ú[Q]šY[˜ÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ™XÛÛ˜Ú[TÚ[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ™XÛÛ˜Ú[X][Û—ÚYˆ[ˆ]\›—ÜÚ[ÚYˆ[ˆÛ\ÜÚYšXØ][ÛŽˆ™XÛÛ˜Ú[PÛ\ÜÚYšXØ][Û‚ˆXÚ\Ú[Û—ÛY]Ùˆ]\˜[È™]\›Z[š\ÝXÈ‹œ™X\ÛÛš[™×ÛH—Bˆ\™Ù]Ü]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\™Ù]ÜÞ[X›ÛˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\™Ù]Û[™WÜÝ\ˆÜ[Û˜[Ú[HH›Û™Bˆ\™Ù]Û[™WÙ[™ˆÜ[Û˜[Ú[HH›Û™BˆÛÛ™šY[˜ÙNˆ›Ø]HŒˆ^[˜][ÛŽˆÝˆHˆ‚ˆ\Ý\Ú\ÎˆÝˆHˆ‚ˆ]Y\Ý[ÛŽˆÝˆHˆ‚ˆ]šY[˜ÙNˆ\ÝÔ™XÛÛ˜Ú[Q]šY[˜ÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[ž[\ÝÚ]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›ÙWØÚ[™ÙYˆ›ÛÛH˜[ÙBˆ\Ù\—ÙXÚ\Ú[ÛŽˆ™XÛÛ˜Ú[U\Ù\‘XÚ\Ú[ÛˆHœ[™[™È‚ˆXÚYYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ[™\ÝYØ][ÛŽˆÜ[Û˜[Ô]\›’[™\ÝYØ][Û“Ý]HH›Û™BˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ø™T]\›”™XÛÛ˜Ú[X][Û“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ]\›—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆÛÛ[Z]ÜÚNˆÝ‚ˆ[[YÙ[˜ÙWÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÝ]\ÎˆÝ‚ˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ[[X\žNˆXÝÜÝ‹[HHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆÚ[Îˆ\ÝÔ™XÛÛ˜Ú[TÚ[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[[YÙ[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ø™T™[[Ý˜[]ÚÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ]\›—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆÛÛ[Z]ÜÚNˆÝ‚ˆY™ŽˆÝ‚ˆÚÚ\Yˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ]\ÎˆÝ‚ˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÛX[\ÜÝ]NˆÝˆH››ÝØ][\Y‚ˆÛX[\Ù\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\WÜÝ]\ÎˆÝˆH››ÝØ\YY‚ˆ\WÙ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\YYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ\YYØžWÝ\Ù\—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ø™T™[[Ý˜[]ÚÜ™X]T™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆÚ[ÚYÎˆÜ[Û˜[Ó\ÝÚ[WHH›Û™B‚‚˜Û\ÜÈ›Ø™T™[[Ý˜[]Ú\T™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÛÛ™š\›YYˆ]\˜[ÕYWBˆ^XÝYØÛÛ[Z]ÜÚNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝMËX^Û[™ÝM
+B‚‚˜Û\ÜÈ™XÛÛ˜Ú[QXÚ\Ú[Û”™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆXÚ\Ú[ÛŽˆ]\˜[È˜XØÙ\Y‹œ™Z™XÝY—B‚‚˜Û\ÜÈÜ™X]T[‘œ›ÛT™XÛÛ˜Ú[T™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆØš™XÝ]™NˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ›Ø™T]\›“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆ˜[YNˆÝ‚ˆ™X]\™WÚYˆÝˆHˆ‚ˆØ\Xš[]NˆÝˆHˆ‚ˆØš™XÝ]™NˆÝˆHˆ‚ˆ\ØÜš\[ÛŽˆÝˆHˆ‚ˆÝ]\Îˆ›Ø™T]\›”Ý]\ÈH˜XÝ]™H‚ˆÜšYÚ[Žˆ›Ø™T]\›“ÜšYÚ[ˆH›X[X[‚ˆÛÝ\˜ÙWÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÝ\˜ÙWÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÝ\˜ÙWØÛÛ[Z]ÜÚNˆÝˆHˆ‚ˆÝ\\œÙYYØžWÚYˆÜ[Û˜[Ú[HH›Û™Bˆ\ÝÝ\ÙYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ\ÝÜ™XÛÛ˜Ú[YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÚ[ØÛÝ[ˆ[Hˆ™[[Ý™YÜÚ[ØÛÝ[ˆ[HˆÚ[Îˆ\ÝÔ›Ø™T]\›”Ú[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]™[Îˆ\ÝÔ›Ø™T]\›‘]™[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]\ÝÜ™XÛÛ˜Ú[X][ÛŽˆÜ[Û˜[Ô›Ø™T]\›”™XÛÛ˜Ú[X][Û“Ý]HH›Û™Bˆ[™[™×ÙXÚ\Ú[Û—ØÛÝ[ˆ[HˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ø™T]\›œÓ\ÝÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆ]\›œÎˆ\ÝÔ›Ø™T]\›“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÈ›ÝÈÜ˜\^Ü™\ˆ
+\ÜÝYHÍÊBˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚‚ˆÈ\Ü]Ú\\ÈXØÙ\YžHH›ÝËYÜ˜\Z[\‹\ÈHØ]YÛÜžH[X\Ù\ÂˆÈ
+\KÙ[˜Ý[ÛŠHHTH›Ü›X[\Ù\È›ÜˆÛÛ™[šY[˜ÙH
+\ÜÝYHÍ
+K‚‘›ÝÑ[ž\Ú[\HH]\˜[ÂˆšÜ›Ý]H‹œX›X×Ù[˜Ý[Ûˆ‹›Y\ÜØYÙWÜ]Y]YH‹œØÚY[YÚ›Øˆ‹˜ÛH‹ˆ˜\H‹™[˜Ý[Ûˆ‹—B‘›ÝÑ[ž\Ú[Ø]YÛÜžHH]\˜[Âˆ˜\H‹›Y\ÜØYÙWÜ]Y]YH‹œØÚY[YÚ›Øˆ‹˜ÛH‹™[˜Ý[Ûˆ‹—B‘›ÝÑYÙT™\ÛÛ][ÛˆH]\˜[Èœ™\ÛÛ™Y‹š[™™\œ™Y‹[œ™\ÛÛ™Y—B‚‚˜Û\ÜÈ]šY[˜ÙT™Y“Ý]
+˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[ˆÝ[[X\žNˆÝˆHˆ‚‚‚˜Û\ÜÈ›Ø™T™]šY]ÓÝ]
+˜\ÙS[Ù[
+N‚ˆ™XÛÛ[Y[™YÛ[ÙNˆÝ‚ˆØ\\™YÙ]Nˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ™YXÝ[ÛŽˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ™\^XXš[]NˆÝˆHˆ‚ˆ\Ý[X]YÙ]™[Ý›Û[YNˆÝˆHˆ‚ˆÚYWÙY™™XÝÜš\ÚÎˆ]\˜[È›ÝÈ‹›YY][H‹šYÚ—HH›ÝÈ‚ˆ[ž[\ÝÚ]ˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ›ÝÑ[ž\Ú[Ý]
+˜\ÙS[Ù[
+N‚ˆ[ž\Ú[Ý\Nˆ›ÝÑ[ž\Ú[\Bˆ[ž\Ú[ÚYˆÝ‚ˆX™[ˆÝ‚ˆ]ˆÝ‚ˆ]X[YšYYÛ˜[YNˆÝ‚ˆ[™WÜÝ\ˆ[ˆ[™WÙ[™ˆ[ˆÛÛ\Û™[ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ý]WÛY]ÙˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ý]WÜ]ˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ\ÜÝYHÍˆ˜XÚÙ[™Y[ž\Ú[Û\ÜÚYšXØ][ÛˆY]Y]K‚ˆØ]YÛÜžNˆ›ÝÑ[ž\Ú[Ø]YÛÜžHH™[˜Ý[Ûˆ‚ˆœ˜[Y]ÛÜšÎˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ\˜][ÛŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÛ™šY[˜ÙNˆ›Ø]HšY[
+Y˜][LKŒÙOLŒOLKŒ
+Bˆ]šY[˜ÙNˆ\ÝÑ]šY[˜ÙT™Y“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ™]\›Z[š\ÝXÈˆ
+TÕ
+HÜˆœ™X\ÛÛš[™×ÛHˆ
+^˜XÝYšXH[ˆKYÙ[™\˜]YˆÈ™YÙ^œ›ÛH”ØØ[ˆTHYš[š][ÛœÈŠK‚ˆÛÝ\˜ÙNˆÝˆH™]\›Z[š\ÝXÈ‚‚‚˜Û\ÜÈ[ž\Ú[ÛÝ[ÓÝ]
+˜\ÙS[Ù[
+N‚ˆ\Nˆ[HˆY\ÜØYÙWÜ]Y]YNˆ[HˆØÚY[YÚ›ØŽˆ[HˆÛNˆ[Hˆ[˜Ý[ÛŽˆ[H‚‚˜Û\ÜÈ›ÝÑ[ž\Ú[ÓÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ\ÜÝYHÍLNˆ›ÝÈ^Ü™\ˆ\È˜XÚÙ[™Y[ž\Ú[Yš\œÝˆ[ž\Ú[ØˆÈØ\œšY\ÈÛ›H˜XÚÙ[™[ž\Ú[È
+\KÛY\ÜØYÙWÜ]Y]YKÜØÚY[YÚ›Ø‹ØÛJNÂˆÈHX›XËY[˜Ý[Ûˆ˜[˜XÚÈ\È™]\›™YÙ\\˜][H[ˆ[˜Ý[ÛœØ[™ˆÈ\ÈÛ›HÜ[]YÚ[ˆ^XÚ]H™\]Y\ÝY
+Y˜[˜ÙY
+KˆÝ[\ÈBˆÈ˜XÚÙ[™[ž\Ú[ÛÝ[™Y›Ü™H[žHØ]YÛÜžKÜHš[\š[™È
+“ˆÙˆHŠK‚ˆÝ[ˆ[Hˆ[ž\Ú[Îˆ\ÝÑ›ÝÑ[ž\Ú[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[˜Ý[ÛœÎˆ\ÝÑ›ÝÑ[ž\Ú[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÛÝ[Îˆ[ž\Ú[ÛÝ[ÓÝ]HšY[
+Y˜][Ù˜XÝÜžOQ[ž\Ú[ÛÝ[ÓÝ]
+Bˆ[™^YÙ[˜Ý[Û—ØÛÝ[ˆ[Hˆ\×Ø˜XÚÙ[™Ù[ž\Ú[Îˆ›ÛÛH˜[ÙBˆœ˜[Y]ÛÜšÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ]\›Z[š\ÝXÈ™X\ÛÛœÈÝ\™˜XÙYÚ[ˆ˜XÚÙ[™\ØÛÝ™\žH\È[‹ÛÈHRBˆÈ™]™\ˆÚ[[H[\ÈHÚX[˜]ËY[˜Ý[Ûˆ\Ý\ÈH[[™YV‚ˆXYÛ›ÜÝXÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÈTH›ÛHØ\™È
+\ÜÝYHÍN
+H8 %›ÝÈ^Ü™\ˆ]™[Ü\ˆÛÛ^‚ˆÈÛÛœÝ[Y\ÈHÍMˆØ\Xš[]HY\˜\˜ÚH[™ÍMÈšYÈ[™[È›È™]ÈÙ[X[XÜË‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚‚˜Û\ÜÈ\T›ÛPØ\™Ý]
+˜\ÙS[Ù[
+N‚ˆÈY[]Nˆ›Ú[œÈÈ›ÝÑ[ž\Ú[Ý]žH
+[ž\Ú[Ý\K[ž\Ú[ÚY
+K‚ˆ[ž\Ú[Ý\NˆÝ‚ˆ[ž\Ú[ÚYˆÝ‚ˆX™[ˆÝ‚ˆØ]YÛÜžNˆ›ÝÑ[ž\Ú[Ø]YÛÜžHH™[˜Ý[Ûˆ‚ˆ›Ý]WÛY]ÙˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ý]WÜ]ˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ\˜][ÛŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆœ˜[Y]ÛÜšÎˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÝ\˜ÙNˆÝˆH™]\›Z[š\ÝXÈˆÈ]\›Z[š\ÝXÈ
+TÕ
+H™X\ÛÛš[™×ÛH
+ØØ[ŠBˆÈÚ]\ˆH[™\ˆÞ[X›Û™\ÛÛ™YOˆÚ]\ˆ[ˆ^XÝ]X›H›ÝÈÜ˜\\ÂˆÈÝ\ÜYˆK\ØØ[ˆ[šY\ÈÚ]Ý]H[™\ˆ]\Ý›Ý[\HÜ˜\Ý\Ü‚ˆ[™\—Ü™\ÛÛ™Yˆ›ÛÛH˜[ÙBˆÛ\ÜÚYšXØ][ÛŽˆ]\˜[È˜Û\ÜÚYšYY‹[˜Û\ÜÚYšYY‹[šÛ›ÝÛˆ—HH[šÛ›ÝÛˆ‚ˆØ\Xš[]WÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\Xš[]WÛ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[[Y[Ý\NˆÜ[Û˜[ÜÝ—HH›Û™HÈÛÜ™H[[Y[Ý\Ü[™È
+œ›ÛHÍM
+Bˆ›ÛNˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ\˜][Û—ÚÚ[™ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ø™WÝ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÛœÝ[Y\œÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ]WÙY™™XÝÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ›Ý[™\šY\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ›ÝÜ×Ý›ÝYÚˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\Ý[˜Ý›Ý™[˜[˜ÙHÚ[™È˜XÚÚ[™ÈHØ\™K™ËˆÈœÛÝ\˜ÙWØ]]Ü™Y‹ˆÈœÝXÝ\˜[—HÜˆÈœ™X\ÛÛš[™×ÛH‹œÝXÝ\˜[—K‚ˆ›Ý™[˜[˜ÙWÚÚ[™Îˆ\ÝÔ›Ý™[˜[˜ÙRÚ[™HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈšY
+ÍMÊKˆØ\Xš[]K[]™[›ÜˆÛ\ÜÚYšYYØ\™Ë›ÙK[]™[Ý\Ú\ÙK‚ˆšYÜÝ]\ÎˆÜ[Û˜[Âˆ]\˜[È™œ™\Ú‹œ\X[WÜÝ[H‹œÝ[H‹›Z\ÜÚ[™×ÜÛÝ\˜ÙH‹[šÛ›ÝÛˆ—BˆHH›Û™BˆšYØÚ[™ÙYØ[˜ÚÜœÎˆ[HˆšYÝÝ[Ø[˜ÚÜœÎˆ[HˆšYÜ™]šY]×Ü™XÛÛ[Y[™Yˆ›ÛÛH˜[ÙBˆÈ™]šY]È][[Ûˆ›ÜˆHØ\™]Ù[ˆ
+\Ý[˜Ýœ›ÛHœ™\Ú™\ÜÊNˆÙ]Ú[‚ˆÈ[ˆK\ØØ[ˆ[žH\È›È™\ÛÛ™Y[™\‹Ù›ÝË‚ˆ™]šY]×Û™YYYˆ›ÛÛH˜[ÙBˆ™]šY]×Ü™X\ÛÛŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›ÙWÚYˆÜ[Û˜[Ú[HH›Û™B‚‚˜Û\ÜÈ\T›ÛPØ\™ÓÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆY\˜\˜ÚWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™Bˆ˜\ÙWÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™Bˆ\™Ù]ÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆšYØ]˜Z[X›Nˆ›ÛÛH˜[ÙBˆØ\™Îˆ\ÝÐ\T›ÛPØ\™Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ™Yœ™\Ú›ÜÜØ[™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆˆˆ’Y[YžHHÝ[HY\˜\˜ÚH›ÙHÈTH›ÛHØ\™È™Yœ™\Ú‚‚ˆ›ÝšYHZ]\ˆ›ÙWÚY
+HØ\Xš[]HY\˜\˜ÚH›ÙJHÜˆHÙÚXØ[ˆ
+[ž\Ú[Ý\K[ž\Ú[ÚY
+XÙˆ[ˆTH›ÛHØ\™‚ˆˆˆ‚‚ˆ›ÙWÚYˆÜ[Û˜[Ú[HH›Û™Bˆ[ž\Ú[Ý\NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[ž\Ú[ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\™Ù]ÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™B‚‚˜Û\ÜÈ^[˜][Û”™Yœ™\Ú›ÜÜØ[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆÜ[Û˜[Ú[HH›Û™Bˆ›ÙWÚYˆÜ[Û˜[Ú[HH›Û™Bˆ›ÙWÝ\NˆÝˆHˆ‚ˆ˜[YNˆÝˆHˆ‚ˆ[ž\Ú[Ý\NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[ž\Ú[ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]X[YšYYÛ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆšYÜÝ]\ÎˆšYÝ]\ÈH[šÛ›ÝÛˆ‚ˆšYÜ™X\ÛÛŽˆÝˆHˆ‚ˆÚ[™ÙYÚ\Ú\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈÛÝ\˜ÙKX]]Ü™Y^[˜][Ûˆ\È]^\ÝÈ[ˆH\™Ù]™\È
+[˜Ú[™ÙY
+K‚ˆÛÙ^[˜][ÛŽˆÝˆHˆ‚ˆÈ™X\ÛÛš[™Ë[[Ù[ÝYÙÙ\Ý[Û‹ˆ™]™\ˆÜš][ˆÈH\™Ù]™\ÜÚ]ÜžK‚ˆ›ÜÜÙYÙ^[˜][ÛŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›ÜÜÙYÛY]Y]NˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™BˆÝ[[X\žWÛÙ—ØÚ[™Ù\ÎˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÛ™šY[˜ÙNˆÜ[Û˜[Ù›Ø]HH›Û™BˆØ\\™YÙš[WØÛÛ[Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\\™YÜÞ[X›ÛÜÛÝ\˜ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\\™YÙ^[˜][Û—Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ\œ™[Ùš[WØÛÛ[Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ\œ™[ÜÞ[X›ÛÜÛÝ\˜ÙWÚ\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ\œ™[Ù^[˜][Û—Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ]\Îˆ]\˜[Èœ›ÜÜÙY‹™˜Z[Y—HHœ›ÜÜÙY‚ˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆ›ÝšY\ŽˆÝˆHˆ‚ˆ[Ù[ˆÝˆHˆ‚ˆXÚ\Ú[Û—ÛY]ÙˆÝˆHœ™X\ÛÛš[™×ÛH‚ˆÜ™X]YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ^[˜][Û”™Yœ™\ÚÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆ˜\ÙWÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™Bˆ\™Ù]ÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™Bˆ[[YÙ[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™BˆÝ]\Îˆ]\˜[Èœ›ÜÜÙY‹™˜Z[Y—HHœ›ÜÜÙY‚ˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ[Ø^\ÈYH›Üˆ›ÜÜØ[ÎˆH]™[Ü\ˆ]\Ý™]šY]È[™\HÈÛÝ\˜ÙK‚ˆ™]šY]×Ü™\]Z\™Yˆ›ÛÛHYBˆ™]šY]×Û›ÝNˆÝˆHˆ‚ˆ›ÜÜØ[ˆÜ[Û˜[Ñ^[˜][Û”™Yœ™\Ú›ÜÜØ[Ý]HH›Û™B‚‚˜Û\ÜÈ^[˜][Û”™Yœ™\Ú\ÝÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆ™]šY]×Û›ÝNˆÝˆHˆ‚ˆ›ÜÜØ[Îˆ\ÝÑ^[˜][Û”™Yœ™\Ú›ÜÜØ[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ\TØØ[”™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ\TØØ[”]\›“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆÜ[Û˜[Ú[HH›Û™Bˆš[WÙÛØŽˆÝ‚ˆ™YÙ^ˆÝ‚ˆY]ÙÙÜ›Ý\ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]ÙÜ›Ý\ˆÜ[Û˜[ÜÝ—HH›Û™BˆY]ÙØÛÛœÝ[ˆÜ[Û˜[ÜÝ—HH›Û™Bˆœ˜[Y]ÛÜšÎˆÝ‚ˆ[™ÝXYÙNˆÝ‚ˆ™X\ÛÛŽˆÝ‚ˆÛÛ™šY[˜ÙNˆ›Ø]HšY[
+Y˜][LŒÙOLŒOLKŒ
+BˆX]ÚØÛÝ[ˆ[Hˆ^[\\Îˆ\ÝÑ]šY[˜ÙT™Y“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ\TØØ[”™\Ý[Ý]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÝ]\ÎˆÝˆH˜ÛÛ\]Y‚ˆXÚ\Ú[Û—ÛY]ÙˆÝˆHœ™X\ÛÛš[™×ÛH‚ˆ›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ™]šY]ØX›HKYÙ[™\˜]Y™YÙ^\È[™H[ž\Ú[È^H^˜XÝY‚ˆ]\›œÎˆ\ÝÐ\TØØ[”]\›“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ^˜XÝYØÛÝ[ˆ[Hˆœ˜[Y]ÛÜšÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆXYÛ›ÜÝXÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ›ÝÓ›ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆ›ÙWÚYˆÝ‚ˆ›ÙWÝ\NˆÝ‚ˆÞ[X›ÛÚYˆÜ[Û˜[Ú[HH›Û™Bˆ]X[YšYYÛ˜[YNˆÝ‚ˆ]ˆÝ‚ˆ[™WÜÝ\ˆ[ˆ[™WÙ[™ˆ[ˆÛÛ\Û™[ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ø™WØØ\Xš[]Y\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆš\ÚÎˆ]\˜[È›ÝÈ‹›YY][H‹šYÚ—HH›ÝÈ‚ˆ[ž[\ÝÚ]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]šY[˜ÙNˆ\ÝÑ]šY[˜ÙT™Y“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÙHŽˆ^\›˜[›Ý[™\žHÛ\ÜÚYšXØ][Û‹‚ˆ›Ý[™\žWÚÚ[™ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\×Ù^\›˜[ˆ›ÛÛH˜[ÙBˆÈ\ÙH‹ÌÎˆ[[YHÝ™\›^Hœ›ÛH™X[˜XÙ\Ë‚ˆ˜XÙWØÛÝ[ˆ[Hˆ\œ›Ü—ØÛÝ[ˆ[Hˆ]˜[X][Û—Ü\ÜÎˆ[Hˆ]˜[X][Û—Ù˜Z[ˆ[HˆØœÙ\™Yˆ›ÛÛH˜[ÙBˆÈ\ÜÝYHÍŽˆ™K\Ù[XÝ[Ûˆ™]šY]ÈY]Y]H
+›Û™H›Üˆ^\›˜[›Ù\ÊK‚ˆ™]šY]ÎˆÜ[Û˜[Ô›Ø™T™]šY]ÓÝ]HH›Û™B‚‚˜Û\ÜÈ›ÝÑYÙSÝ]
+˜\ÙS[Ù[
+N‚ˆYÙWÚYˆÝ‚ˆÛÝ\˜ÙWÛ›ÙWÚYˆÝ‚ˆ\™Ù]Û›ÙWÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆYÙWÝ\NˆÝ‚ˆÛÛ™šY[˜ÙNˆ›Ø]HšY[
+ÙOLŒOLKŒ
+Bˆ™\ÛÛ][ÛŽˆ›ÝÑYÙT™\ÛÛ][Û‚ˆØ[YWÛ˜[YNˆÝ‚ˆ[™Nˆ[ˆ]šY[˜ÙNˆ\ÝÑ]šY[˜ÙT™Y“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÜÝYHÍŽˆ™K\Ù[XÝ[Ûˆ™]šY]È›ÜˆØœÙ\š[™È\ÈØ[›Ý[™\žK‚ˆ™]šY]ÎˆÜ[Û˜[Ô›Ø™T™]šY]ÓÝ]HH›Û™B‚‚˜Û\ÜÈØ[™Y]Q›ÝÓÝ]
+˜\ÙS[Ù[
+N‚ˆ›Ý×ÚYˆÝ‚ˆ]NˆÝ‚ˆÝ[[X\žNˆÝ‚ˆ[ž\Ú[Û›ÙWÚYˆÝ‚ˆ›ÙWÚYÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ›ÙWØÛÝ[ˆ[ˆX^Ù\ˆ[ˆÛÛ™šY[˜ÙNˆ›Ø]HšY[
+ÙOLŒOLKŒ
+Bˆ[œ™\ÛÛ™YÙYÙWØÛÝ[ˆ[ˆ^\›˜[Ø›Ý[™\žWØÛÝ[ˆ[HˆØœÙ\™YÛ›ÙWØÛÝ[ˆ[Hˆ[›ØœÙ\™YÛ›ÙWÚYÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ›ÝÑÜ˜\Ý]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆÛÛ[Z]ÜÚNˆÝ‚ˆ[ž\Ú[ˆ›ÝÑ[ž\Ú[Ý]ˆ›Ù\Îˆ\ÝÑ›ÝÓ›ÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆYÙ\Îˆ\ÝÑ›ÝÑYÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆØ[™Y]WÜ]Îˆ\ÝÐØ[™Y]Q›ÝÓÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆXYÛ›ÜÝXÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[˜Ø]Yˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈ›ÝÑÜ˜\™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ[ž\Ú[Ý\Nˆ›ÝÑ[ž\Ú[\Bˆ[ž\Ú[ÚYˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆX^Ù\ˆ[HšY[
+Y˜][NÙOLKOLÌŠBˆX^Û›Ù\Îˆ[HšY[
+Y˜][LLÙOLKOML
+BˆÈ\ÜÝYHÍŽˆÜ[Û˜[[›š[™ËˆÚ[ˆ›ÝšYY^H]\ÝX]ÚH]\ÝˆÈ™XYHÛ˜\ÚÝÜˆH™\]Y\Ý\È™Z™XÝY\ÈÝ[H
+JK‚ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ›ÝÓÝ™\›^TÙ[XÝ[ÛŠ˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÚ[™ˆ]\˜[È™[]H‹˜ÛÜœ™[][Ûˆ‹™›ÝÈ‹˜[˜[^™\ˆ—Bˆ[]WÝ\NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[]WÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÜœ™[][Û—ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ý×ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[˜[^™\—ÚYˆÜ[Û˜[Ú[HH›Û™B‚‚˜Û\ÜÈ›ÝÓÝ™\›^T™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ[ž\Ú[Ý\Nˆ›ÝÑ[ž\Ú[\Bˆ[ž\Ú[ÚYˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆX^Ù\ˆ[HšY[
+Y˜][NÙOLKOLÌŠBˆX^Û›Ù\Îˆ[HšY[
+Y˜][LLÙOLKOML
+BˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™BˆÙ[XÝ[ÛŽˆ›ÝÓÝ™\›^TÙ[XÝ[Û‚‚‚˜Û\ÜÈ›ÝÓÝ™\›^S›ÙJ˜\ÙS[Ù[
+N‚ˆ›ÙWÚYˆÝ‚ˆÛÛ\Û™[ÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆØœÙ\˜X›Nˆ›ÛÛÈ\ÈHÛÛ\Û™[ÚY
+[ˆ[œÝ[Y[Y›Ø™HÚ[
+BˆØœÙ\™Yˆ›ÛÛˆØœÙ\˜][Û—ØÛÝ[ˆ[Hˆ\ÝÛØœÙ\™YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ›ÝÓÝ™\›^QYÙJ˜\ÙS[Ù[
+N‚ˆYÙWÚYˆÝ‚ˆÛÝ\˜ÙWÛ›ÙWÚYˆÝ‚ˆ\™Ù]Û›ÙWÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆÛÝ\˜ÙWØÛÛ\Û™[ÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\™Ù]ØÛÛ\Û™[ÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆØœÙ\™YÝ˜[œÚ][ÛŽˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈ›ÝÑ]™\™Ù[˜ÙJ˜\ÙS[Ù[
+N‚ˆÛÝ\˜ÙWØÛÛ\Û™[ÚYˆÝ‚ˆ\™Ù]ØÛÛ\Û™[ÚYˆÝ‚ˆÛÝ[ˆ[‚‚˜Û\ÜÈ›ÝÓÝ™\›^SÝ]
+˜\ÙS[Ù[
+N‚ˆÙ[XÝ[ÛŽˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+Bˆ›Ù\Îˆ\ÝÑ›ÝÓÝ™\›^S›ÙWHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆYÙ\Îˆ\ÝÑ›ÝÓÝ™\›^QYÙWHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]™\™Ù[˜Ù\Îˆ\ÝÑ›ÝÑ]™\™Ù[˜ÙWHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆØœÙ\™YØÛÛ\Û™[ÚYÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[›X]ÚYØÛÛ\Û™[ÚYÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆØœÙ\™YÝ˜XÙWØÛÝ[ˆ[H‚‚˜Û\ÜÈ›ÝÔ›Ø™TÙ[XÝ[ÛŠ˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÈ\ÜÝYHÍŽˆ›ÙHÙ[XÝ[ÛœÈ[œÝ[Y[HÞ[X›ÛÈYÙHÙ[XÝ[ÛœÈØœÙ\™BˆÈHØ[›Ý[™\žHÛˆH[‹\™\ÈØ[\‹‚ˆ\™Ù]Ý\Nˆ]\˜[È››ÙH‹™YÙH—HH››ÙH‚ˆ›ÙWÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆYÙWÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆØœÙ\˜][ÛŽˆ]\˜[Èš[œ]‹›Ý]]‹˜›Ý[™\žH—HH›Ý]]‚ˆ[ÙWÜ™Y™\™[˜ÙNˆ]\˜[È˜XÙH‹œÚYÝÈ‹›Ù™ˆ—HH˜XÙH‚‚ˆ[Ù[Ý˜[Y]ÜŠ[ÙOH˜Y\ˆŠBˆYˆØÚXÚ×Ý\™Ù]
+Ù[ŠHOˆ‘›ÝÔ›Ø™TÙ[XÝ[ÛˆŽ‚ˆYˆÙ[‹\™Ù]Ý\HOH››ÙHˆ[™›ÝÙ[‹››ÙWÚY‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ››ÙWÚY\È™\]Z\™Y›Üˆ›ÙHÙ[XÝ[ÛœÈŠBˆYˆÙ[‹\™Ù]Ý\HOH™YÙHˆ[™›ÝÙ[‹™YÙWÚY‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ™YÙWÚY\È™\]Z\™Y›ÜˆYÙHÙ[XÝ[ÛœÈŠBˆ™]\›ˆÙ[‚‚‚˜Û\ÜÈ›Ø™T[‘œ›ÛQ›ÝÔ™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ[ž\Ú[Ý\Nˆ›ÝÑ[ž\Ú[\Bˆ[ž\Ú[ÚYˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆØš™XÝ]™NˆÝˆHˆ‚ˆÙ[XÝ[ÛœÎˆ\ÝÑ›ÝÔ›Ø™TÙ[XÝ[Û—HHšY[
+‹‹‹Z[—Û[™ÝLJBˆX^Ù\ˆ[HšY[
+Y˜][NÙOLKOLÌŠBˆX^Û›Ù\Îˆ[HšY[
+Y˜][LLÙOLKOML
+BˆÈ\ÜÝYHÍŽˆ[ˆH[ˆÈHÜ˜\H\Ù\ˆXÝX[H™]šY]ÙY‚ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™B‚‚”›ÛHH]\˜[È˜YZ[ˆ‹\Ù\ˆ—B•ÚÙ[’Ú[™H]\˜[ÈœÙ\ÜÚ[Ûˆ‹˜\H—BˆÈ\ÜÝYHÌÍŽˆHÚÙ[‰ÜÈY™XÞXÛHÝ]\È\ÈHš[š]HÙ]XÚYYÙ\™\‹\ÚYBˆÈœ›ÛH™]›ÚÙY
+È^\™\×Ø]
+ÈHÝ\œ™[ÛØÚÈ
+\ÝÚÙ[—ÜÝ]\ËœX
+K‚ˆÈH\Ú›Ø\™™[™\œÈ][™™]™\ˆ™KY\š]™\È]‚•ÚÙ[”Ý]\ÈH]\˜[È˜XÝ]™H‹™^\š[™×ÜÛÛÛˆ‹™^\™Y‹œ™]›ÚÙY—B‚‚˜Û\ÜÈÙÚ[”™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ\Ù\›˜[YNˆÝ‚ˆ\ÜÝÛÜ™ˆÝ‚‚‚˜Û\ÜÈÚÙ[”™\ÜÛœÙJ˜\ÙS[Ù[
+N‚ˆ^\™\×Ø]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ\Ù\Ü™X]J˜\ÙS[Ù[
+N‚ˆ\Ù\›˜[YNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆ\ÜÝÛÜ™ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJBˆ›ÛNˆ›ÛHH\Ù\ˆ‚‚‚˜Û\ÜÈ\Ù\“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ\Ù\›˜[YNˆÝ‚ˆ›ÛNˆ›ÛBˆ\×ØXÝ]™Nˆ›ÛÛˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈYT™\ÜÛœÙJ˜\ÙS[Ù[
+N‚ˆ\Ù\ŽˆÜ[Û˜[Õ\Ù\“Ý]HH›Û™Bˆ]]ˆÝˆHšY[
+‹‹‹\ØÜš\[ÛHÚÙ[ˆYØXÞWØ\WÚÙ^H[›Ûž[[Ý\ÈŠBˆÞ\Ý[WÚYˆÜ[Û˜[Ú[HH›Û™Bˆ˜[œÜÜˆÝˆHšY[
+ˆ‹‹‹\ØÜš\[ÛH˜]]Üš^˜][ÛˆØ\WÚÙ^HÛÛÚÚYHYØXÞWØ\WÚÙ^H[›Ûž[[Ý\È‚ˆ
+B‚‚˜Û\ÜÈ›ÛÝÝ˜\Ý]\ÓÝ]
+˜\ÙS[Ù[
+N‚ˆˆˆ’\ÜÝYHÌNˆ]\›Z[š\ÝXÈ™K[ÙÚ[ˆÈ™KTÞ\Ý[Hœ\ÙHˆ˜XÝË‚‚ˆØ[X›HÚ]Ý]]][™Ú]Ý]HÞ\Ý[KˆØ\œšY\È›ÈÙXÜ™]ÈKBˆ›ÛÛX[œËÙš[š]HÚÙ[œÈÛ›K™]™\ˆH\Ù\›˜[YKÙ^H˜[YK]Ü‚ˆÜÝ˜[YK‚ˆˆˆ‚‚ˆYZ[—Ù^\ÝÎˆ›ÛÛˆ]]Û[ÙNˆÝˆHšY[
+‹‹‹\ØÜš\[ÛH˜[›Ûž[[Ý\È\Ù\ˆŠBˆWØÛÛ™šYÝ\™Yˆ›ÛÛˆ[š\›Û›Y[ˆÝˆHšY[
+‹‹‹\ØÜš\[ÛH™]™[ÜY[›ÙXÝ[ÛˆŠB‚‚˜Û\ÜÈÚÙ[Ü™X]J˜\ÙS[Ù[
+N‚ˆ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÞ\Ý[WÚYˆÜ[Û˜[Ú[HH›Û™Bˆ\Ù\—ÚYˆÜ[Û˜[Ú[HHšY[
+ˆY˜][S›Û™K\ØÜš\[ÛH›ÝÛ™\ˆÙˆHÚÙ[ŽÈY˜][ÈÈHØ[\ˆ‚ˆ
+Bˆ^\™\×Ú[—Ù^\ÎˆÜ[Û˜[Ú[HHšY[
+Y˜][S›Û™KÙOLJB‚‚˜Û\ÜÈÙ[•ÚÙ[Ü™X]J˜\ÙS[Ù[
+N‚ˆˆˆ•ÚÙ[ˆ\ÜÝX[˜ÙH›ÜˆHØ[\‰ÜÈÝÛˆXØÛÝ[
+›È\Ù\—ÚYÝ™\œšYJKˆˆˆ‚‚ˆ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÞ\Ý[WÚYˆÜ[Û˜[Ú[HH›Û™Bˆ^\™\×Ú[—Ù^\ÎˆÜ[Û˜[Ú[HHšY[
+Y˜][S›Û™KÙOLJB‚‚˜Û\ÜÈ\ÜÝÛÜ™™\Ù]™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ\ÜÝÛÜ™ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLJB‚‚˜Û\ÜÈ›ÛU\]J˜\ÙS[Ù[
+N‚ˆ›ÛNˆ›ÛB‚‚˜Û\ÜÈÚÙ[“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÚ[™ˆÚÙ[’Ú[™ˆ\Ù\—ÚYˆ[ˆÞ\Ý[WÚYˆÜ[Û˜[Ú[HH›Û™Bˆ™]›ÚÙYˆ›ÛÛˆÜ™X]YØ]ˆ›Ø]ˆ^\™\×Ø]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÝ]\ÎˆÚÙ[”Ý]\ÈHšY[
+ˆ‹‹‹ˆ\ØÜš\[ÛJˆ˜XÝ]™H^\š[™×ÜÛÛÛˆ^\™Y™]›ÚÙYKH\ÜÝYHÌÍŽˆXÚYY‚ˆœÙ\™\‹\ÚYHžH\ÝÚÙ[—ÜÝ]\Ë˜Û\ÜÚYžWÝÚÙ[—ÜÝ]\ÈYØZ[œÝH‚ˆœ™\ÜÛœÙIÜÈÝÛˆÛØÚÎÈ™]™\ˆ™KY\š]™H]ÛY[\ÚYKˆ‚ˆ
+Kˆ
+Bˆ^\™\×Ú[—ÜÙXÛÛ™ÎˆÜ[Û˜[Ù›Ø]HHšY[
+ˆY˜][S›Û™Kˆ\ØÜš\[ÛJˆ”ÙXÛÛ™È[[^\žH]H[ÛY[Ý]\ØØ\ÈXÚYYÛ[\Y‚ˆ˜]È›Û™HÚ[ˆHÚÙ[ˆ\È›È^\žKˆ‚ˆ
+Kˆ
+B‚‚˜Û\ÜÈÚÙ[Ü™X]T™\ÜÛœÙJÚÙ[“Ý]
+N‚ˆÚÙ[ŽˆÝˆHšY[
+‹‹‹\ØÜš\[ÛHœ˜]ÈÚÙ[‹ÚÝÛˆÛ›HÛ˜ÙHŠB‚‚•ÛÜšÜÜXÙSY\ÜØYÙT›ÛHH]\˜[È\Ù\ˆ‹˜\ÜÚ\Ý[‹œÞ\Ý[H—B•ÛÜšÜÜXÙPÛÛ^][U\HH]\˜[Âˆ™™X]\™H‹˜ÛÛ\Û™[‹˜XÙH‹™^\š[Y[‹œ›Ø™WÜ[ˆ‹˜[˜[^™\—Ü[ˆ‚—B•ÛÜšÜÜXÙT›ÜÜØ[Ý]\ÈH]\˜[Âˆœ›ÜÜÙY‹˜XØÙ\Y‹œ™Z™XÝY‹™Y™\œ™Y‹œÝ\\œÙYY‚—B•ÛÜšÜÜXÙQXÚ\Ú[Û•\HH]\˜[È˜XØÙ\Y‹œ™Z™XÝY‹™Y™\œ™Y—B‚‚˜Û\ÜÈÛÜšÜÜXÙPÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ]NˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+Bˆ›ØÝ\ÎˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝML
+BˆÝ[[X\žNˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝML
+B‚‚˜Û\ÜÈÛÜšÜÜXÙSÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆ]NˆÝ‚ˆ›ØÝ\ÎˆÝ‚ˆÝ]\ÎˆÝ‚ˆÝ[[X\žNˆÝ‚ˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈÛÜšÜÜXÙPÛÛ^][PÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ][WÝ\NˆÛÜšÜÜXÙPÛÛ^][U\Bˆ][WÚYˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+BˆX™[ˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLÌ
+B‚‚˜Û\ÜÈÛÜšÜÜXÙPÛÛ^][SÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÛÜšÜÜXÙWÚYˆ[ˆ][WÝ\NˆÝ‚ˆ][WÚYˆÝ‚ˆX™[ˆÝ‚ˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈÛÜšÜÜXÙT›ÜÜØ[[œ]
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ›ÜÜØ[Ý\NˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLL
+Bˆ]NˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLÌ
+Bˆ›ÙNˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+B‚‚˜Û\ÜÈÛÜšÜÜXÙSY\ÜØYÙPÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ›ÛNˆÛÜšÜÜXÙSY\ÜØYÙT›ÛBˆÛÛ[ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒÌ
+BˆÛÛ^ÛY]Y]NˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+Bˆ›ÜÜØ[Îˆ\ÝÕÛÜšÜÜXÙT›ÜÜØ[[œ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈÛÜšÜÜXÙSY\ÜØYÙSÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÛÜšÜÜXÙWÚYˆ[ˆ›ÛNˆÝ‚ˆÛÛ[ˆÝ‚ˆÛÛ^ÛY]Y]NˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈÛÜšÜÜXÙQXÚ\Ú[Û“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ›ÜÜØ[ÚYˆ[ˆXÚ\Ú[ÛŽˆÛÜšÜÜXÙQXÚ\Ú[Û•\Bˆ™X\ÛÛŽˆÝ‚ˆXÚYYØžWÝ\Ù\—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈÛÜšÜÜXÙT›ÜÜØ[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÛÜšÜÜXÙWÚYˆ[ˆY\ÜØYÙWÚYˆÜ[Û˜[Ú[HH›Û™Bˆ›ÜÜØ[Ý\NˆÝ‚ˆ]NˆÝ‚ˆ›ÙNˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆÝ]\ÎˆÛÜšÜÜXÙT›ÜÜØ[Ý]\ÂˆXÚ\Ú[ÛœÎˆ\ÝÕÛÜšÜÜXÙQXÚ\Ú[Û“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈÛÜšÜÜXÙT›ÜÜØ[\]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ]NˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLÌ
+Bˆ›ÙNˆÜ[Û˜[ÙXÝÜÝ‹[žWWHH›Û™B‚‚˜Û\ÜÈÛÜšÜÜXÙQXÚ\Ú[ÛÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ™X\ÛÛŽˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLŒ
+B‚‚˜Û\ÜÈÛÜšÜÜXÙQ]Z[Ý]
+ÛÜšÜÜXÙSÝ]
+N‚ˆY\ÜØYÙ\Îˆ\ÝÕÛÜšÜÜXÙSY\ÜØYÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÛÛ^Ú][\Îˆ\ÝÕÛÜšÜÜXÙPÛÛ^][SÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ›ÜÜØ[Îˆ\ÝÕÛÜšÜÜXÙT›ÜÜØ[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚ˆÈKKHXÚ\Ú[ÛˆÛÜšÜÜXÙHÛÛ^XÚÈ
+\ÜÝYHÌÍŠHKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÂˆÈ]\›Z[š\ÝXË›ËSHYÙ\ÝÈÙˆ^\Ý[™È]KØÛÜYÈHÛÜšÜÜXÙIÜÂˆÈ[›™YÛÛ^][\Ëˆ]™\žHYÙ\ÝØ\œšY\È[›ÝYÚÛÝ\˜ÙHY[YšY\œÈÂˆÈ˜XÙHHš[™[™È˜XÚÈÈ]ÈÜšYÚ[ˆ›ÝË‚‚•ÛÜšÜÜXÙQ]šY[˜ÙTÛÝ\˜ÙU\HH]\˜[Âˆ™™X]\™WÙ˜Y‹ˆ™™X]\™WØÛÙWÛ[šÈ‹ˆ˜ÛÛ\Û™[Ü›Ùš[H‹ˆ˜XÙH‹ˆ™]˜[X][Û—Ü™\Ý[‹ˆœ›Ø™WÜÚ[‹ˆ™^\š[Y[Ý˜\šX[‹—B‚‚˜Û\ÜÈÛÜšÜÜXÙQ]šY[˜ÙT™YŠ˜\ÙS[Ù[
+N‚ˆÛÝ\˜ÙWÝ\NˆÛÜšÜÜXÙQ]šY[˜ÙTÛÝ\˜ÙU\BˆÛÝ\˜ÙWÚYˆÝ‚ˆÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]ˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ\Û[™NˆÜ[Û˜[Ú[HH›Û™Bˆ[™Û[™NˆÜ[Û˜[Ú[HH›Û™BˆÝ[[X\žNˆÝˆHˆ‚‚‚˜Û\ÜÈÛÜšÜÜXÙTÞ\Ý[TÝ[[X\žJ˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆ˜[YNˆÝˆHˆ‚ˆ[š\›Û›Y[ˆÝˆHˆ‚ˆ\œÜÙNˆÝˆHˆ‚ˆ\™Ù]Ý\Ù\œÎˆÝˆHˆ‚‚‚˜Û\ÜÈÛÜšÜÜXÙQ›ØÝ\ÔÝ[[X\žJ˜\ÙS[Ù[
+N‚ˆ]NˆÝˆHˆ‚ˆ›ØÝ\ÎˆÝˆHˆ‚ˆÝ[[X\žNˆÝˆHˆ‚‚‚˜Û\ÜÈÛÜšÜÜXÙT™\ÜÚ]ÜžTÝ[[X\žJ˜\ÙS[Ù[
+N‚ˆÛ˜\ÚÝÚYˆ[ˆÛÛ[Z]ÜÚNˆÝ‚ˆ™\×Ü]ˆÝ‚ˆš[WØÛÝ[ˆ[ˆÝ]\ÎˆÝ‚‚‚˜Û\ÜÈÛÜšÜÜXÙQ™X]\™QYÙ\Ý
+˜\ÙS[Ù[
+N‚ˆ™X]\™WÚYˆÝ‚ˆ˜[YNˆÝˆHˆ‚ˆÝ[[X\žNˆÝˆHˆ‚ˆ\Ù\—Ý˜[YNˆÝˆHˆ‚ˆÝXØÙ\Ü×ØÜš]\šXNˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆš\ÚÜÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆXØÙ\YØÛÙWÛ[š×ØÛÝ[ˆ[HˆXÚ\Ú[Û—ÛY]ÙˆXÚ\Ú[Û“Y]ÙHœ™X\ÛÛš[™×ÛH‚ˆ]šY[˜ÙNˆ\ÝÕÛÜšÜÜXÙQ]šY[˜ÙT™Y—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈÛÜšÜÜXÙPÛÛ\Û™[YÙ\Ý
+˜\ÙS[Ù[
+N‚ˆÛÛ\Û™[ÚYˆÝ‚ˆ\œÜÙNˆÝˆHˆ‚ˆ™\ÜÛœÚXš[]NˆÝˆHˆ‚ˆ^XÝYÚ[œ]ˆÝˆHˆ‚ˆ^XÝYÛÝ]]ˆÝˆHˆ‚ˆ˜Z[\™WÚ[\XÝˆÝˆHˆ‚ˆ]šY[˜ÙNˆ\ÝÕÛÜšÜÜXÙQ]šY[˜ÙT™Y—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈÛÜšÜÜXÙU˜XÙQYÙ\Ý
+˜\ÙS[Ù[
+N‚ˆÛÛ\Û™[ÚYˆÝ‚ˆ˜XÙWØÛÝ[ˆ[Hˆ\š[ÙÜÝ\ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ\š[ÙÙ[™ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ\œ›Ü—ØÛÝ[ˆ[Hˆ]˜[Ù˜Z[YØÛÝ[ˆ[Hˆ™\™\Ù[]]™WÚ[œ]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™\™\Ù[]]™WÛÝ]]ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]šY[˜ÙNˆ\ÝÕÛÜšÜÜXÙQ]šY[˜ÙT™Y—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈÛÜšÜÜXÙQ]˜[X][Û‘YÙ\Ý
+˜\ÙS[Ù[
+N‚ˆÛÛ\Û™[ÚYˆÝ‚ˆÜš]\š[Û—ØÛÝ[ˆ[Hˆ\ÜÙYØÛÝ[ˆ[Hˆ˜Z[YØÛÝ[ˆ[HˆÜÙ˜Z[\™WÜ™X\ÛÛœÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]šY[˜ÙNˆ\ÝÕÛÜšÜÜXÙQ]šY[˜ÙT™Y—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈÛÜšÜÜXÙT›Ø™TÚ[Ý[[X\žJ˜\ÙS[Ù[
+N‚ˆÛÛ\Û™[ÚYˆÝ‚ˆÞ[X›ÛˆÝ‚ˆ]ˆÝ‚ˆ™XÛÛ[Y[™YÛ[ÙNˆÝ‚ˆÚYWÙY™™XÝÜš\ÚÎˆÝ‚ˆÝ]\ÎˆÝ‚‚‚˜Û\ÜÈÛÜšÜÜXÙT›Ø™T[”Ý[[X\žJ˜\ÙS[Ù[
+N‚ˆ[—ÚYˆ[ˆ™X]\™WÚYˆÝ‚ˆØš™XÝ]™NˆÝˆHˆ‚ˆÝ]\ÎˆÝˆHˆ‚ˆ›Ø™WÜÚ[Îˆ\ÝÕÛÜšÜÜXÙT›Ø™TÚ[Ý[[X\žWHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]šY[˜ÙNˆ\ÝÕÛÜšÜÜXÙQ]šY[˜ÙT™Y—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈÛÜšÜÜXÙQ^\š[Y[˜\šX[Ý[[X\žJ˜\ÙS[Ù[
+N‚ˆ˜\šX[ÚÙ^NˆÝ‚ˆX™[ˆÝ‚ˆ\×Ø˜\Ù[[™Nˆ›ÛÛˆÝ]\ÎˆÝ‚ˆY]šXÜÎˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+B‚‚˜Û\ÜÈÛÜšÜÜXÙQ^\š[Y[YÙ\Ý
+˜\ÙS[Ù[
+N‚ˆ^\š[Y[ÚYˆ[ˆ™X]\™WÚYˆÝ‚ˆØš™XÝ]™NˆÝˆHˆ‚ˆ˜\Ù[[™WØÛÛ[Z]ˆÝˆHˆ‚ˆÝ]\ÎˆÝˆHˆ‚ˆ˜\šX[Îˆ\ÝÕÛÜšÜÜXÙQ^\š[Y[˜\šX[Ý[[X\žWHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[˜[\Ú\×ÜÝ]\ÎˆÝˆH››ÝÜ™\]Y\ÝY‚ˆ[˜[\Ú\×Û˜\œ˜]]™NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[˜[\Ú\×Ü™XÛÛ[Y[™][Û—Ý˜\šX[ÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]šY[˜ÙNˆ\ÝÕÛÜšÜÜXÙQ]šY[˜ÙT™Y—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈÛÜšÜÜXÙR[X[‘XÚ\Ú[Û‘YÙ\Ý
+˜\ÙS[Ù[
+N‚ˆÛÝ\˜ÙWÝ\Nˆ]\˜[È™^\š[Y[—HH™^\š[Y[‚ˆÛÝ\˜ÙWÚYˆÝ‚ˆXÚ\Ú[ÛŽˆÝ‚ˆ˜\šX[ÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›ÝNˆÝˆHˆ‚‚‚˜Û\ÜÈÛÜšÜÜXÙPÛÛ^XÚÊ˜\ÙS[Ù[
+N‚ˆÞ\Ý[NˆÛÜšÜÜXÙTÞ\Ý[TÝ[[X\žBˆ›ØÝ\ÎˆÜ[Û˜[ÕÛÜšÜÜXÙQ›ØÝ\ÔÝ[[X\žWHH›Û™Bˆ™\ÜÚ]ÜžNˆÜ[Û˜[ÕÛÜšÜÜXÙT™\ÜÚ]ÜžTÝ[[X\žWHH›Û™Bˆ™X]\™\Îˆ\ÝÕÛÜšÜÜXÙQ™X]\™QYÙ\ÝHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÛÛ\Û™[Îˆ\ÝÕÛÜšÜÜXÙPÛÛ\Û™[YÙ\ÝHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ˜XÙ\Îˆ\ÝÕÛÜšÜÜXÙU˜XÙQYÙ\ÝHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]˜[X][ÛœÎˆ\ÝÕÛÜšÜÜXÙQ]˜[X][Û‘YÙ\ÝHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ›Ø™WÜ[œÎˆ\ÝÕÛÜšÜÜXÙT›Ø™T[”Ý[[X\žWHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ^\š[Y[Îˆ\ÝÕÛÜšÜÜXÙQ^\š[Y[YÙ\ÝHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[X[—ÙXÚ\Ú[ÛœÎˆ\ÝÕÛÜšÜÜXÙR[X[‘XÚ\Ú[Û‘YÙ\ÝHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]šY[˜ÙNˆ\ÝÕÛÜšÜÜXÙQ]šY[˜ÙT™Y—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆZ\ÜÚ[™×Ú[™›Ü›X][ÛŽˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚ˆÈKKHXÚ\Ú[ÛˆÛÜšÜÜXÙHÝXÝ\™YYÙ[\›ˆ
+\ÜÝYHÌÍÊHKKKKKKKKKKKKKKKKKB‚‚˜Û\ÜÈÛÜšÜÜXÙPÛÛ^™YŠ˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ\NˆÛÜšÜÜXÙPÛÛ^][U\BˆYˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+B‚‚˜Û\ÜÈÛÜšÜÜXÙPYÙ[\›Ü™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆY\ÜØYÙNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒÌ
+BˆÛÛ^Ü™YœÎˆ\ÝÕÛÜšÜÜXÙPÛÛ^™Y—HHšY[
+Y˜][Ù˜XÝÜžO[\ÝX^Û[™ÝLŒ
+B‚‚˜Û\ÜÈÛÜšÜÜXÙPYÙ[\›“Ý]
+˜\ÙS[Ù[
+N‚ˆ\Ù\—ÛY\ÜØYÙNˆÛÜšÜÜXÙSY\ÜØYÙSÝ]ˆ\ÜÚ\Ý[ÛY\ÜØYÙNˆÜ[Û˜[ÕÛÜšÜÜXÙSY\ÜØYÙSÝ]HH›Û™Bˆ›ÜÜØ[Îˆ\ÝÕÛÜšÜÜXÙT›ÜÜØ[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™B‚‚ˆÈKKH›ÜÜØ[]ËY˜Y[™Ù™ˆ
+\ÜÝYHÌÎJHKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÂˆÈÛÛ™\È[ˆ
+˜XØÙ\Y
+ˆ›ÜÜØ[[ÈH]\›Z[š\ÝXÈ™Yš[^[ØY›Üˆ[‚ˆÈ^\Ý[™ÈØÜ™Y[ˆ
+›Ø™H[›™\ˆÜˆ^\š[Y[ÊKˆ\È™]™\ˆÜ™X]\ÈH›Ø™BˆÈ[‹›Ø™HÚ[Üˆ^\š[Y[]Ù[ˆKHÛ›HHÛX[˜XÚÙY™XÛÜ™BˆÈ\Ý[˜][ÛˆØÜ™Y[ˆ™XYÈÈ™Yš[]È^\Ý[™Ë\Ù\‹Yš]™[ˆÜ™X]H›ÝË‚‚•ÛÜšÜÜXÙT›ÜÜØ[˜Y\HH]\˜[Èœ›Ø™WÜ[—Ù˜Y‹™^\š[Y[Ù˜Y—B‚‚˜Û\ÜÈÛÜšÜÜXÙT›ÜÜØ[˜YÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÛÜšÜÜXÙWÚYˆ[ˆ›ÜÜØ[ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ˜YÝ\NˆÛÜšÜÜXÙT›ÜÜØ[˜Y\Bˆ\™Ù]ÜØÜ™Y[ŽˆÝ‚ˆ^[ØYˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+BˆZ\ÜÚ[™×ÙšY[Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÜ™X]YØ]ˆ›Ø]‚‚ˆÈKKHÞ\Ý[K][™\œÝ[™[™È[\šY]È\œÚ\Ý[˜ÙH
+\ÜÝYHÍÊHKKKKKKKKKKKKKKKKBˆÂˆÈH\™H\œÚ\Ý[˜ÙH
+ÈÔ•QÛÛ˜XÝ›ÜˆHÍˆÛÛ™\œØ][Û˜[Y]Y]KÜ›Ø™BˆÈ]]Üš[™È›ÝËˆ›ÈHØ[[™›ÈÛÜšÝ™YHÜš]H\[ˆ\™NÈ]\ˆÚX›[™ÂˆÈ\ÜÝY\ÈZ[X[ÙÝYK\›Ý˜[˜[œÚ][ÛœËX]\šX[^˜][Û‹[™HRHÛ‚ˆÈÜÙˆ\ÙH[Ù[ËˆHÛÛXš[™Y\‹\Þ[X›Û›ÜÜØ[Ø\œšY\È›ÝBˆÈ›ÜÜÙY›Ø™KXYÙ[˜ØÜÝš[™ÈY]Y]H›ØÚÈ
+ÍM›ØØX[\žJH[™BˆÈ\ÜÛØÚX]Y›Ø™K\[ˆšY[È
+ÌH[Ù[
+K‚‚’[\šY]ÔÙ\ÜÚ[Û”Ý]\ÈH]\˜[È›Ü[ˆ‹œ›ÜÜØ[×Ü™XYH‹›X]\šX[^™Y‹˜ÛÜÙY—B’[\šY]ÓY\ÜØYÙT›ÛHH]\˜[È\Ù\ˆ‹˜\ÜÚ\Ý[‹œÞ\Ý[H—B‚ˆÈ\ÜÝYHÌŽLNˆ[œÝÙ\˜X›HÛ›ÝÛYÙH\™X\ÈÈ[™Ù™ˆš[š]HÙ]ËˆYš[™Y\™BˆÈ
+ZXYÙˆ[\šY]ÔÙ\ÜÚ[Û“Ý]Ò[\šY]ÔXSÝ]ÚXÚ™Y™\™[˜ÙHÛ›ÝÛYÙP\™XJBˆÈ˜]\ˆ[ˆÝÛˆžHH™\ÝÙˆH\ÜÝYHÌŽLH[Ù[È\\ˆ™[ÝË‚’Û›ÝÛYÙP\™XHH]\˜[Âˆœ›ÙXÝÚ[[‹™ÛXZ[—Ü[H‹›Ü\˜][ÛœÈ‹š[\[Y[][Ûˆ‹œÙXÝ\š]H‹—B’[™Ù™“ÜšYÚ[’Ú[™H]\˜[ÈœXH‹œ™]šY]×Ú][H—B’[™Ù™”š[Üš]HH]\˜[È›ÝÈ‹››Ü›X[‹šYÚ—B’[™Ù™”Ý]\ÈH]\˜[Èœ[™[™È‹˜[œÝÙ\™Y‹œ™]\›™Y‹˜Ø[˜Ù[Y—B‚’[\šY]ÔÝYÙHH]\˜[Âˆ[™\œÝ[™[™×Ú[š]X[^™Y‹ˆœ\œÜÙWØÛÛ™š\›X][Ûˆ‹ˆ˜Ø\Xš[]WØÛÛ™š\›X][Ûˆ‹ˆ™[[Y[ØÛ\ÜÚYšXØ][Ûˆ‹ˆ˜\WØ›Ý[™\žWÛX\[™È‹ˆœ›Ø™WÙ›Ý×ÜÙ[XÝ[Ûˆ‹ˆœ›ÜÜØ[ÙÙ[™\˜][Ûˆ‹—B’[\šY]Ô›ÜÜØ[\›Ý˜[Ý]HH]\˜[Âˆœ›ÜÜÙY‹˜\›Ý™Y‹œ™Z™XÝY‹™Y]Y‹›™YY×Ü™]šY]È‚—BˆÈš[š]HÍM›ØØX[\žH›ÜˆHÚ[™ÛHÝ]WÙY™™XÝÈ[žK‚”ÛÝ\˜ÙSY]Y]TÝ]QY™™XÝH]\˜[Âˆ››Û™H‹ˆ™]X˜\ÙK\™XY‹ˆ™]X˜\ÙK]Üš]H‹ˆ›™]ÛÜšÈ‹ˆ™š[\Þ\Ý[H‹ˆ˜ØXÚH‹ˆ™^\›˜[X\H‹ˆœ]Y]YH‹—B”›Ø™T™XÛÛ[Y[™Y[ÙHH]\˜[È˜XÙH‹œÚYÝÈ—B”›Ø™TÚYQY™™XÝš\ÚÈH]\˜[È››Û™H‹›ÝÈ‹›YY][H‹šYÚ—B”›Ø™T™\^XXš[]HH]\˜[ÈœØY™H‹˜Ø]][Ûˆ‹[œØY™H—B‚‚˜Û\ÜÈ[\šY]ÔÙ\ÜÚ[ÛÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÛ˜\ÚÝÚYˆ[ˆ]NˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLŒ
+Bˆ›ØÝ\ÎˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝML
+B‚‚˜Û\ÜÈ[\šY]ÔÙ\ÜÚ[Û“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆÛ˜\ÚÝØÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]NˆÝ‚ˆ›ØÝ\ÎˆÝ‚ˆÝ]\Îˆ[\šY]ÔÙ\ÜÚ[Û”Ý]\ÂˆÝYÙNˆÜ[Û˜[Ò[\šY]ÔÝYÙWHH[™\œÝ[™[™×Ú[š]X[^™Y‚ˆÝ\œ™[Ý[™\œÝ[™[™ÎˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™BˆØ\Ø[˜[\Ú\ÎˆÜ[Û˜[Ó\ÝÑXÝÜÝ‹[žWWWHH›Û™BˆÜ[—Ü]Y\Ý[ÛœÎˆÜ[Û˜[Ó\ÝÑXÝÜÝ‹[žWWWHH›Û™Bˆ\Ù\—Ú[[ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\ÝÙ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[™\œÝ[™[™×ØÛÛ™š\›YYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ[™\œÝ[™[™×ØÛÛ™š\›YYØžNˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ\ÜÝYHÌÌLŽˆH]\ˆ[™\œÝ[™[™È™]š\Ú[Ûˆ]\Ý™HX[X[HÛÛ™š\›YYˆÈ[ÈHØ[›ÛšXØ[Ø\Xš[]HÜ˜\™Y›Ü™H]Ø[ˆš]™HØÛÜYˆÈ[YÛ›Y[Ø\œžK[Ý™\‹‚ˆØ\Xš[]WÙÜ˜\ØÛÛ™š\›YYÜ™]š\Ú[Û—ÚYˆÜ[Û˜[Ú[HH›Û™BˆØ\Xš[]WÙÜ˜\ØÛÛ™š\›X][Û—Ü™\]Z\™Yˆ›ÛÛH˜[ÙBˆÈ\ÜÝYHÌLŽNˆÙ]Ú[ˆ[ˆ[œÝÙ\™Y[\šY]×ÜXH]Y\Ý[Ûˆ\ÈÛÜœ™XÝY‚ˆÈ™]™\ˆÛX\™Y]]ÛX]XØ[HžHH™]š\Ú[Ûˆ]Ù[ˆ8 %Û›HHÝXØÙ\ÜÙ[ˆÈ[™\œÝ[™[™È™XZ[
+\]K][™\œÝ[™[™ÊHÛX\œÈ]‚ˆ[œÝÙ\œ×Ü™]š\ÙYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÈ\ÜÝYHÌŒŽKÈÌŒÎˆ]\›Z[š\ÝXÈZ\œ›ÜˆÙˆH\]K][™\œÝ[™[™ÈBˆÈØ]H
+›Ý]\Ëš[\šY]Ë—Ý[™\œÝ[™[™×Ý\]WØ›ØÚÙY
+H8 %HÚ[™ÛBˆÈÛÝ\˜ÙHÙˆ]›Üˆ›ÝˆH\Ú›Ø\™\Ù\È\È[œÝXYÙ‚ˆÈ™KY\š]š[™ÈHÛÛ™š\›YY\›ÜÜØ[\ÝYÙH™XZ[ÛÛ™][ÛˆØØ[KÛÂˆÈRH]˜Z[Xš[]HØ[ˆ™]™\ˆšYœ›ÛHÚ]HTHÚ[XÝX[H[ÝË‚ˆ[™\œÝ[™[™×Ý\]WØ]˜Z[X›Nˆ›ÛÛHYBˆX]\šX[^˜][Û—ÙY™ŽˆÜ[Û˜[ÜÝ—HH›Û™BˆX]\šX[^˜][Û—Ü™YŽˆÜ[Û˜[ÜÝ—HH›Û™BˆX]\šX[^™YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÈ\ÜÝYHÌŽLNˆÚXÚÛ›ÝÛYÙH\™X\ÈH]™[Ü\ˆØ[ˆ[œÝÙ\ˆ’QÒ“ÕÂˆÈ
+›È›ÛH[™™\™[˜ÙJKˆ[\HYX[œÈ›Èš[\š[™ÈKHH™KHÌŽLHY˜][ˆÈÙˆÚÝÚ[™È]™\žH]Y\Ý[Û‹™]™\ˆ™]™\žH\™XHÙ[XÝY‹‚ˆ[œÝÙ\˜X›WØ\™X\Îˆ\ÝÒÛ›ÝÛYÙP\™XWHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ[\šY]ÓY\ÜØYÙPÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ›ÛNˆ[\šY]ÓY\ÜØYÙT›ÛBˆÛÛ[ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒÌ
+Bˆ[[YÙ[˜ÙWÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™B‚‚˜Û\ÜÈ[\šY]ÓY\ÜØYÙSÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÙ\ÜÚ[Û—ÚYˆ[ˆ›ÛNˆ[\šY]ÓY\ÜØYÙT›ÛBˆÛÛ[ˆÝ‚ˆ[[YÙ[˜ÙWÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ[\šY]Ô›ÜÜØ[Y]Y]P›ØÚÊ˜\ÙS[Ù[
+N‚ˆˆˆ”›ÜÜÙY›Ø™KXYÙ[˜ØÜÝš[™ÈY]Y]H›ØÚÈ›ÜˆÛ™HÞ[X›Û‚‚ˆš[š]HšY[È
+[[Y[Ý\XÈÜ\˜][Û—ÚÚ[™ÈÝ]WÙY™™XÝØ
+Bˆ\™H˜[Y]YYØZ[œÝÍM	ÜÈ›ØØX[\žNÈH™\Ý\™Hœ™YH^\ˆÍM‚ˆ\È\È[ˆKX]]Ü™Y
+œ›ÜÜØ[
+‹ÛÈ[›ZÙHÛÝ\˜ÙSY]Y]SÝ]]ˆØ\œšY\È›ÈÜšYÚ[˜Ø^[˜][Û—Ú\Ú‚ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ›ÛNˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLŒ
+BˆØ\Xš[]NˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLŒ
+BˆÞ\Ý[WÜ\œÜÙNˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLŒ
+Bˆ›Ø™WÝ˜[YNˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLŒ
+Bˆ[[Y[Ý\NˆÜ[Û˜[ÔÛÝ\˜ÙSY]Y]Q[[Y[\WHH›Û™BˆÜ\˜][Û—ÚÚ[™ˆÜ[Û˜[ÔÛÝ\˜ÙSY]Y]SÜ\˜][Û’Ú[™HH›Û™BˆÛÛœÝ[Y\œÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ]WÙY™™XÝÎˆ\ÝÔÛÝ\˜ÙSY]Y]TÝ]QY™™XÝHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ[\šY]Ô›ÜÜØ[›Ø™T[Š˜\ÙS[Ù[
+N‚ˆˆˆ”›ÜÜÙY›Ø™K\[ˆšY[È›ÜˆHØ[YHÞ[X›Û
+ÌH[Ù[
+Kˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ™X]\™WÚYˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLŒ
+BˆØš™XÝ]™NˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLŒ
+Bˆ™X\ÛÛŽˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLŒ
+Bˆ™XÛÛ[Y[™YÛ[ÙNˆ›Ø™T™XÛÛ[Y[™Y[ÙHH˜XÙH‚ˆÚYWÙY™™XÝÜš\ÚÎˆ›Ø™TÚYQY™™XÝš\ÚÈH›ÝÈ‚ˆ™\^XXš[]Nˆ›Ø™T™\^XXš[]HHœØY™H‚‚‚˜Û\ÜÈ[\šY]Ô›ÜÜØ[][J˜\ÙS[Ù[
+N‚ˆˆˆ“Û™HÛÛXš[™Y\‹\Þ[X›Û›ÜÜØ[[ˆHÜ™X]H™\]Y\Ýˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ]ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝML
+Bˆ]X[YšYYÛ˜[YNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝML
+BˆÞ[X›ÛÚYˆÜ[Û˜[Ú[HH›Û™BˆY]Y]Nˆ[\šY]Ô›ÜÜØ[Y]Y]P›ØÚÂˆ›Ø™WÜ[Žˆ[\šY]Ô›ÜÜØ[›Ø™T[‚ˆÜ˜\Û›ÙWÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\Xš[]WÛ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]šY[˜ÙWÜÝ[[X\žNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›ÜÜØ[ØÛÛ™šY[˜ÙNˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ[\šY]Ô[]Y]
+˜\ÙS[Ù[
+N‚ˆˆˆ”™X\ÛÛš[™Ë\[ˆ]Y]Y]Y]H›ÜˆH˜]ÚÙˆ›ÜÜØ[Ë‚‚ˆ\œÚ\ÝY\È[ˆ[[YÙ[˜ÙWÜ[œØ›ÝÈ
+HÚ\™Y]Y]ÝÜ™JH[™ˆ[šÙYœ›ÛHXXÚ›ÜÜØ[ˆXÚ\Ú[Û—ÛY]Ù\Èš^YÈ™X\ÛÛš[™×ÛXˆ›Üˆ\È\ÜÝYNÈX[X[\ÈÙ]Û›HžHH]\ˆ\›Ý˜[\ÜÝYK‚ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ›ÝšY\ŽˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+Bˆ[Ù[ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+Bˆ›Û\Ý™\œÚ[ÛŽˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLL
+BˆØÚ[XWÝ™\œÚ[ÛŽˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLL
+Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈ[\šY]Ô›ÜÜØ[ÐÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ]Y]ˆ[\šY]Ô[]Y]ˆY\ÜØYÙWÚYˆÜ[Û˜[Ú[HH›Û™Bˆ›ÜÜØ[Îˆ\ÝÒ[\šY]Ô›ÜÜØ[][WHHšY[
+‹‹‹Z[—Û[™ÝLJB‚‚˜Û\ÜÈ[\šY]Ô›ÜÜØ[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆY\ÜØYÙWÚYˆÜ[Û˜[Ú[HH›Û™Bˆ[[YÙ[˜ÙWÜ[—ÚYˆ[ˆÞ[X›ÛÚYˆÜ[Û˜[Ú[HH›Û™Bˆ]ˆÝ‚ˆ]X[YšYYÛ˜[YNˆÝ‚ˆY]Y]Nˆ[\šY]Ô›ÜÜØ[Y]Y]P›ØÚÂˆ›Ø™WÜ[Žˆ[\šY]Ô›ÜÜØ[›Ø™T[‚ˆXÚ\Ú[Û—ÛY]ÙˆXÚ\Ú[Û“Y]ÙˆÜ˜\Û›ÙWÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\Xš[]WÛ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]šY[˜ÙWÜÝ[[X\žNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›ÜÜØ[ØÛÛ™šY[˜ÙNˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ\›Ý˜[ÜÝ]Nˆ[\šY]Ô›ÜÜØ[\›Ý˜[Ý]Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆ[[YÙ[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™BˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ[\šY]ÔÙ\ÜÚ[Û‘]Z[Ý]
+[\šY]ÔÙ\ÜÚ[Û“Ý]
+N‚ˆY\ÜØYÙ\Îˆ\ÝÒ[\šY]ÓY\ÜØYÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ›ÜÜØ[Îˆ\ÝÒ[\šY]Ô›ÜÜØ[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ[\šY]ÔÛ˜\ÚÝ™X˜\ÙT™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆˆˆ“[Ý™H[ˆ^\Ý[™È[\šY]ÈÙ\ÜÚ[ÛˆÈH™]Ù\ˆÛ˜\ÚÝ‚‚ˆHÜ\˜][Ûˆ™\Ù\™\ÈIH[™[™\œÝ[™[™È^]™XÛÛ˜Ú[\È›ÜÜØ[ˆ™]šY]ÈÝ]HYØZ[œÝÛÝ\˜ÙH[˜ÚÜœÈ™Y›Ü™H[žH]\ˆX]\šX[^˜][Û‹‚ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ\™Ù]ÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™BˆXÝÜŽˆÝˆHšY[
+Y˜][H™\Ú›Ø\™‹X^Û[™ÝLŒ
+B‚‚˜Û\ÜÈ[\šY]ÔÛ˜\ÚÝ™X˜\ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆœ›ÛWÜÛ˜\ÚÝÚYˆ[ˆ×ÜÛ˜\ÚÝÚYˆ[ˆ›ÜÜØ[×Ü™\Ù\™Yˆ[Hˆ›ÜÜØ[×ÛX\šÙYÛ™YY×Ü™]šY]Îˆ[Hˆ›ÜÜØ[×ÛZ\ÜÚ[™×ÜÛÝ\˜ÙNˆ[Hˆ›ÜÜØ[×ØÚ[™ÙYÜÛÝ\˜ÙNˆ[HˆY\ÜØYÙNˆÝˆHˆ‚ˆÙ\ÜÚ[ÛŽˆ[\šY]ÔÙ\ÜÚ[Û“Ý]‚‚ˆÈKKH[\šY]ÈÛÛ^XÚÈ
+\ÜÝYHÍŽ
+HKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÂˆÈ]\›Z[š\ÝXË›ËSHÛÛ^\ÜÙ[X›H›ÜˆHÞ\Ý[K][™\œÝ[™[™ÂˆÈ[\šY]Ëˆ™XYÈ[™^YÞ[X›ÛË[ž\Ú[Ë^\Ý[™È›Ø™KXYÙ[‚ˆÈY]Y]K[™Ø\Xš[]HY\˜\˜ÚHÛ\ÜÚYšXØ][Ûˆœ›ÛHH[›™YÛ˜\ÚÝˆÈ[™›YÜÈÚXÚ][\È\™H[™XYHÛ\ÜÚYšYYœËˆ[˜Û\ÜÚYšYY
+›[šË\YÙJK‚ˆÈ]™\žH][HØ\œšY\ÈHÛ˜\ÚÝ\™[]]™H]šY[˜ÙHØØ][Û‹ˆÝ]]™\ÜXÝÂˆÈ[ˆHÛÛ^YÙ][™\[™[ÙˆÛ˜\ÚÝÝÜ˜YÙK‚‚’[\šY]ÔÞ[X›ÛÛ\ÜÚYšXØ][ÛˆH]\˜[È˜Û\ÜÚYšYY‹[˜Û\ÜÚYšYY—B‚‚˜Û\ÜÈ[\šY]Ñ]šY[˜ÙSØØ][ÛŠ˜\ÙS[Ù[
+N‚ˆÛ˜\ÚÝÚYˆ[ˆ]ˆÝ‚ˆ]X[YšYYÛ˜[YNˆÝ‚ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[‚‚˜Û\ÜÈ[\šY]ÔÞ[X›Û][J˜\ÙS[Ù[
+N‚ˆÞ[X›ÛÚYˆ[ˆ]ˆÝ‚ˆ]X[YšYYÛ˜[YNˆÝ‚ˆÚ[™ˆÝ‚ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[ˆÛ\ÜÚYšXØ][ÛŽˆ[\šY]ÔÞ[X›ÛÛ\ÜÚYšXØ][Û‚ˆ\×ÛY]Y]Nˆ›ÛÛH˜[ÙBˆ[[Y[Ý\NˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›ÛNˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\Xš[]NˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ\˜][Û—ÚÚ[™ˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ø™WÝ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]šY[˜ÙNˆ[\šY]Ñ]šY[˜ÙSØØ][Û‚‚‚˜Û\ÜÈ[\šY]Ñ[ž\Ú[][J˜\ÙS[Ù[
+N‚ˆ[ž\Ú[ÚYˆ[ˆ[ž\Ú[Ý\NˆÝ‚ˆØ]YÛÜžNˆÝ‚ˆX™[ˆÝ‚ˆ[™\—Ü]ˆÝ‚ˆ[™\—Ü]X[YšYYÛ˜[YNˆÝ‚ˆ[™WÜÝ\ˆ[ˆ[™WÙ[™ˆ[ˆÛ\ÜÚYšXØ][ÛŽˆ[\šY]ÔÞ[X›ÛÛ\ÜÚYšXØ][Û‚ˆ\×ÛY]Y]Nˆ›ÛÛH˜[ÙBˆ]šY[˜ÙNˆ[\šY]Ñ]šY[˜ÙSØØ][Û‚‚‚˜Û\ÜÈ[\šY]ÐÛÛ^XÚÊ˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆÛ˜\ÚÝÚYˆ[ˆÝ[ÜÞ[X›ÛÎˆ[ˆÝ[Ù[ž\Ú[Îˆ[ˆÛ\ÜÚYšYYØÛÝ[ˆ[ˆ[˜Û\ÜÚYšYYØÛÝ[ˆ[ˆYÙ]ÛX^ØÚ\œÎˆ[ˆYÙ]Ý\ÙYØÚ\œÎˆ[ˆ[˜Ø]Yˆ›ÛÛH˜[ÙBˆÞ[X›ÛÎˆ\ÝÒ[\šY]ÔÞ[X›Û][WHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[ž\Ú[Îˆ\ÝÒ[\šY]Ñ[ž\Ú[][WHHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÛZ\ÜÚ[Û—Û›Ý\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚ˆÈKKH[\šY]ÈX[ÙÝYH\›ˆ
+\ÜÝYHÍŽJHKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÂˆÈ™\]Y\ÝÜ™\ÜÛœÙH[Ù[È›ÜˆH™X\ÛÛš[™Ë[[Ù[X[ÙÝYH[™Ú[ˆBˆÈ[™Ú[Ù[™\˜]\ÈHÝXÝ\™Y\ÜÚ\Ý[\›ˆÜ›Ý[™Y[ˆÍŽ	ÜÈÛÛ^ˆÈXÚËÜ[Û˜[H›ÙXÚ[™È\‹\Þ[X›ÛÛÛXš[™Y›ÜÜØ[È˜[Y]YYØZ[œÝˆÈÍM›ØØX[\žH[™HØY™]H[ž[\Ýœ›ÛH›Ø™WÜ[›™\‹œK‚‚‚˜Û\ÜÈ[\šY]ÑX[ÙÝYU\›”™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆˆˆ”™\]Y\Ý›ÙH›ÜˆHÚ[™ÛH[\šY]ÈX[ÙÝYH\›‹ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ\Ù\—ÛY\ÜØYÙNˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒÌ
+BˆYÙ]ˆÜ[Û˜[Ú[HHšY[
+Y˜][S›Û™KÙOLLOMLÌ
+BˆÙ[™\˜]WÜ›ÜÜØ[Îˆ›ÛÛH˜[ÙBˆÈ\ÜÝYHÌLŒÎˆHÜ[ˆ]Y\Ý[ÛˆH\Ù\ˆ\È[œÝÙ\š[™ÈÚ]\È\›‹‚ˆÈHÙ\™\ˆ™[[Ý™\È]œ›ÛHHÙ\ÜÚ[Û‰ÜÈÜ[—Ü]Y\Ý[ÛœÈ
+^XÝX]Ú
+BˆÈÛÈHRH™]™\ˆ™KX\ÚÜÈ[ˆ[™XYKX[œÝÙ\™Y]Y\Ý[Û‹‚ˆÈÝ\\œÙYYžH[œÝÙ\™YÜXWÚY
+\ÜÝYHÌLŽJNÈÝ[XØÙ\Y\š[™ÈBˆÈZYÜ˜][Ûˆ\š[Ù[™\YY[ˆY][ÛˆÈ]™]™\ˆ[œÝXYÙˆ]‚ˆ[œÝÙ\™YÜ]Y\Ý[ÛŽˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLŒ
+BˆÈ\ÜÝYHÌLŽNˆQÙˆH[\šY]×ÜXH›ÝÈ\È\›ˆ[œÝÙ\œËˆ™Y™\œ™YˆÈÝ™\ˆ[œÝÙ\™YÜ]Y\Ý[Ûˆ™XØ]\ÙH]Ý\š]™\È]Y\Ý[Ûˆ™]ÛÜ™[™È[™ˆÈØ[››ÝÚ[[HX]ÚHÜ›Û™È]Y\Ý[Û‹‚ˆ[œÝÙ\™YÜXWÚYˆÜ[Û˜[Ú[HH›Û™BˆXÝÜŽˆÝˆHšY[
+Y˜][H™\Ú›Ø\™‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+BˆÈ\ÜÝYHÌMŽˆH]™[Ü\ˆ[œÝÙ\™Y’HÛ‰ÝÛ›ÝÈˆ
+8à#8à£øàbøà¢¸ào¸àføà¤øà#Kù.#y¦#ŠK‚ˆÈH\›ˆ\È“Õ[ˆ\œ›ÜŽˆH[œÝÙ\™YIH›ÝÈ\È™XÛÜ™Y\ÂˆÈ	Ý[˜ÛÛ™š\›YY	È˜]\ˆ[ˆ	Ø[œÝÙ\™Y	Ë[™H™X\ÛÛš[™È[Ù[\È\ÚÙYÂˆÈ›Ü›H[ˆ]šY[˜ÙKYÜ›Ý[™Y\Ý\Ú\È[™™KXÛÛ™š\›H]ÛÈH[\šY]ÂˆÈÛÛ[Y\È[œÝXYÙˆÝÜ[™Ë‚ˆ[œÝÙ\—Ý[šÛ›ÝÛŽˆ›ÛÛH˜[ÙB‚‚Ø\Xš[]Q[]RÚ[™H]\˜[Âˆ˜ÛÜ™WØØ\Xš[]H‹˜Ø\Xš[]WÙ[[Y[‹œÝ\Ü[™×Ù[[Y[‹˜\WØ›Ý[™\žH‹—B‚‚˜Û\ÜÈ[\šY]ÐØ\Xš[]RY[]Pš[™[™Ê˜\ÙS[Ù[
+N‚ˆˆˆ‘^XÚ]HÙY\Û™HØ[›ÛšXØ[Y[]HXÜ›ÜÜÈH\Ü^K[˜[YH™[˜[YKˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ[]WÚÚ[™ˆØ\Xš[]Q[]RÚ[™ˆÝ\œ™[Û˜[YNˆÝˆHšY[
+Z[—Û[™ÝLKX^Û[™ÝML
+Bˆ[]WÚYˆ[HšY[
+ÝL
+B‚‚˜Û\ÜÈ[\šY]ÐØ\Xš[]T™[][ÛÛÛ™š\›X][ÛŠ˜\ÙS[Ù[
+N‚ˆˆˆ“Û™HX[X[HÛÛ™š\›YYX[žK]Ë[X[žHÝ\Ü™[][Û‹ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÝ\ÜYÚÚ[™ˆØ\Xš[]Q[]RÚ[™ˆÝ\ÜYÛ˜[YNˆÝˆHšY[
+Z[—Û[™ÝLKX^Û[™ÝML
+BˆÝ\Ü[™×ÚÚ[™ˆØ\Xš[]Q[]RÚ[™ˆÝ\Ü[™×Û˜[YNˆÝˆHšY[
+Z[—Û[™ÝLKX^Û[™ÝML
+Bˆ›ÛNˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLWÌ
+BˆØÛÜNˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝL—Ì
+B‚‚˜Û\ÜÈ[\šY]ÐØ\Xš[]S›ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆ[]WÚYˆ[ˆ[]WÚÚ[™ˆØ\Xš[]Q[]RÚ[™ˆ˜[YNˆÝ‚ˆÝ[[X\žNˆÝˆHˆ‚ˆÙ[X[X×ÙYÙ\ÝˆÝ‚ˆ^[ØYˆXÝÜÝ‹[žWHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+B‚‚˜Û\ÜÈ[\šY]ÐØ\Xš[]T™[][Û“Ý]
+˜\ÙS[Ù[
+N‚ˆ™[][Û—ÚYˆ[ˆÝ\ÜYÙ[]WÚYˆ[ˆÝ\Ü[™×Ù[]WÚYˆ[ˆ™[][Û—ÚÚ[™ˆ]\˜[ÈœÝ\ÜÈ—Bˆ›ÛNˆÝˆHˆ‚ˆØÛÜNˆÝˆHˆ‚ˆÙ[X[X×ÙYÙ\ÝˆÝ‚‚‚˜Û\ÜÈ[\šY]ÐØ\Xš[]QÜ˜\Ý]
+˜\ÙS[Ù[
+N‚ˆÛÛ™š\›X][Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÙ\ÜÚ[Û—ÚYˆ[ˆ˜\ÙWØÛÛ™š\›X][Û—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÝ\˜ÙWÜ™]š\Ú[Û—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÛÝ\˜ÙWÜ™]š\Ú[Û—Ø]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÛÛ\ÜÚ][Û—ÙYÙ\ÝˆÝ‚ˆXÚYYØžNˆÝ‚ˆXÚYYØžWÝ\Ù\—ÚYˆÜ[Û˜[Ú[HH›Û™BˆXÚ\Ú[Û—ÛY]Ùˆ]\˜[È›X[X[—BˆÜ™X]YØ]ˆ›Ø]ˆ›Ù\Îˆ\ÝÒ[\šY]ÐØ\Xš[]S›ÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ™[][ÛœÎˆ\ÝÒ[\šY]ÐØ\Xš[]T™[][Û“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ[\šY]ÐÛÛ™š\›U[™\œÝ[™[™Ô™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆˆˆ“X[X[ÛÛ™š\›X][Ûˆ]HØ]\™Y[\šY]ÈÛÛ^\ÈÝY™šXÚY[‚‚ˆ\ÜÝYHÌLŒÎˆ[ˆH™\›ËX˜\ÙH˜[˜XÚÈ
+›ÈÝXÝ\™Y[™\œÝ[™[™ÈÛÝ[ˆ™HZ[
+KH]™[Ü\ˆ^XÚ]HÛÛ™š\›\È]HÛÛ™\œØ][Û‚ˆÛÛZ[œÈ[›ÝYÚÛÛ^È[Ý™HÈ›ÜÜØ[Ù[™\˜][Û‹ˆ\È\ÈHX[X[ˆXÚ\Ú[Ûˆ™XÛÜ™›Ý[ˆHÝ]]‚ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆXÝÜŽˆÝˆHšY[
+Z[—Û[™ÝLKX^Û[™ÝLŒ
+BˆÈÜ[Z\ÝXÈØÚÈ›ÜˆHÞ\Ý[K]ÚYHØ[›ÛšXØ[XYˆ™\]Z\™YžHBˆÈTHÚ[™]™\ˆH™]ÈÛÛ™š\›X][ÛˆZ[ÈÛˆ[ˆ^\Ý[™ÈXY‚ˆØ\Xš[]WØ˜\ÙWØÛÛ™š\›X][Û—ÚYˆÜ[Û˜[Ú[HHšY[
+Y˜][S›Û™KÝL
+BˆÈ\ÜÝYHÌÌLŽˆXœÙ[YX[œÈ\š]™H^XÝ™[][ÛœÈœ›ÛHHÝ\œ™[ˆÈ[™\œÝ[™[™ÉÜÈÚ[™[˜\ÝËˆ[ˆ^XÚ]H[\H\ÝÛÛ™š\›\ÂˆÈHÜ˜\Ú]›ÈÝ\Ü™[][ÛœË‚ˆØ\Xš[]WÜ™[][ÛœÎˆÜ[Û˜[Âˆ\ÝÒ[\šY]ÐØ\Xš[]T™[][ÛÛÛ™š\›X][Û—BˆHHšY[
+Y˜][S›Û™KX^Û[™ÝLŒ
+BˆÈ^XÝ[X[‹\Ý\YY™[˜[YHY[]Kˆ›È^žžKÛ˜[YK\Ú[Z[\š]BˆÈ[™™\™[˜ÙH\È\™›Ü›YYÚ[ˆ\È\ÝÛZ]ÈH™[˜[YY›ÙK‚ˆØ\Xš[]WÚY[]WØš[™[™ÜÎˆ\ÝÂˆ[\šY]ÐØ\Xš[]RY[]Pš[™[™ÂˆHHšY[
+Y˜][Ù˜XÝÜžO[\ÝX^Û[™ÝLL
+B‚‚˜Û\ÜÈ[\šY]Ô]Y\Ý[Û‘]šY[˜ÙT™YŠ˜\ÙS[Ù[
+N‚ˆˆˆ”Û˜\ÚÝ\™[]]™HÛÙH™Y™\™[˜ÙH˜XÚÚ[™È[ˆ[\šY]È]Y\Ý[Ûˆ
+\ÜÝYHÌLŽ
+K‚‚ˆ]È[™[™H˜[™Ù\È\™H˜[Y]Y]\›Z[š\ÝXØ[HYØZ[œÝBˆÛÛ^XÚÈÈÝÜ™Y[™\œÝ[™[™È™Y›Ü™HH\›ˆ\ÈXØÙ\YÈ™YœÂˆH[Ù[[™[Y˜Z[H\›ˆÛÜÙY‚ˆˆˆ‚‚ˆ]ˆÝ‚ˆÝ\Û[™Nˆ[Hˆ[™Û[™Nˆ[H‚‚˜Û\ÜÈ[\šY]ÔÝXÝ\™Y]Y\Ý[ÛŠ˜\ÙS[Ù[
+N‚ˆˆˆ’\Ý\Ú\ËYš\œÝ[\šY]È]Y\Ý[Ûˆ
+\ÜÝYHÌLŽ
+K‚‚ˆH[Ù[Ý]\È]ÈÝ\œ™[\Ý\Ú\ÈÚ]]šY[˜ÙK[ˆ\ÚÜÈBˆ›ØÝ\ÙYÛÛ™š\›X][Ûˆ]Y\Ý[Û‹ˆZ[‹\Ýš[™È]Y\Ý[ÛœÈ\™HÝ[XØÙ\Yˆœ›ÛHÛ\ˆ›Û\™\œÚ[ÛœÈ[™›Ü›X[^™YÈ\ÈÚ\H
+]Y\Ý[Û—Ý^ˆÛ›JH8 %HÝXÝ\˜[ÛÛ™\œÚ[Û‹›Ý[ˆ[\œ™]][Û‹‚ˆˆˆ‚‚ˆ]Y\Ý[Û—Ý^ˆÝ‚ˆ\Ý\Ú\ÎˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]šY[˜ÙWÜ™YœÎˆ\ÝÒ[\šY]Ô]Y\Ý[Û‘]šY[˜ÙT™Y—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[œÝÙ\—ÛÜ[ÛœÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ[\šY]ÑX[ÙÝYT›ÜÜØ[Ý]
+˜\ÙS[Ù[
+N‚ˆˆˆHÚ[™ÛHÛÛXš[™Y›ÜÜØ[œ›ÛHHX[ÙÝYH\›‹™Y›Ü™H\œÚ\Ý[˜ÙKˆˆˆ‚‚ˆ]ˆÝ‚ˆ]X[YšYYÛ˜[YNˆÝ‚ˆÞ[X›ÛÚYˆÜ[Û˜[Ú[HH›Û™BˆY]Y]Nˆ[\šY]Ô›ÜÜØ[Y]Y]P›ØÚÂˆ›Ø™WÜ[Žˆ[\šY]Ô›ÜÜØ[›Ø™T[‚ˆÜ˜\Û›ÙWÚYˆÜ[Û˜[ÜÝ—HH›Û™BˆØ\Xš[]WÛ˜[YNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]šY[˜ÙWÜÝ[[X\žNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›ÜÜØ[ØÛÛ™šY[˜ÙNˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ[ž[\ÝÚ]ˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ[\šY]ÑX[ÙÝYU\›“Ý]
+˜\ÙS[Ù[
+N‚ˆˆˆ”™\ÜÛœÙHœ›ÛHHÚ[™ÛH[\šY]ÈX[ÙÝYH\›‹‚‚ˆÛÛZ[œÈHÝXÝ\™Y\ÜÚ\Ý[Y\ÜØYÙK[žHÙ[™\˜]Y›ÜÜØ[Ë[™ˆH™X\ÛÛš[™Ë\[ˆ]Y]Y]Y]KˆYˆ\œ›Üˆ\ÈÙ]H\›ˆ˜Z[YÛÜÙYˆ[™›È›ÜÜØ[ÈÚÝ[™HÝÜ™Y‚ˆˆˆ‚‚ˆ\ÜÚ\Ý[ÛY\ÜØYÙNˆÝˆHˆ‚ˆ›ÜÜØ[Îˆ\ÝÒ[\šY]ÑX[ÙÝYT›ÜÜØ[Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈÚ]\ˆ\È\›ˆ\ÚÙYH™X\ÛÛš[™È[Ù[›Üˆ›ÜÜØ[È
+H\ÜÝYBˆÈÎËÈÌLŒÈØ]H\ÜÙYÚ]Ù[™\˜]WÜ›ÜÜØ[ÈÙ]
+KˆYHÚ][ˆ[\BˆÈ›ÜÜØ[È\ÝYX[œÈH[Ù[™YYÈ˜\œ›ÝÚ[™È[œÝÙ\œÈš\œÝ[™ˆÈ™]\›™Y™^Ü]Y\Ý[ÛœÈ[œÝXY8 %H\Ú›Ø\™]\Ý›Ý™\Ù[]ˆÈ\ÈHZ[ˆÝXØÙ\ÜÙ[™\K‚ˆ›ÜÜØ[×Ü™\]Y\ÝYˆ›ÛÛH˜[ÙBˆ™^Ü]Y\Ý[ÛœÎˆ\ÝÒ[\šY]ÔÝXÝ\™Y]Y\Ý[Û—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[[YÙ[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™Bˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÝYÙNˆÜ[Û˜[Ò[\šY]ÔÝYÙWHH›Û™BˆÝ\œ™[Ý[™\œÝ[™[™ÎˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™BˆØ\Ø[˜[\Ú\ÎˆÜ[Û˜[Ó\ÝÑXÝÜÝ‹[žWWWHH›Û™BˆÜ[—Ü]Y\Ý[Ûœ×ÜÝXÝ\™YˆÜ[Û˜[Ó\ÝÑXÝÜÝ‹[žWWWHH›Û™BˆÈ\ÜÝYHÌLŽNˆHÝXÝ\™YIH›ÝÜÈÜ™X]Yœ›ÛH™^Ü]Y\Ý[ÛœËÛÈBˆÈØ[\ˆØ[ˆ˜]šYØ]HÝ˜ZYÚÈ[HÚ]Ý]™KY™]Ú[™ÈH\Ý‚ˆÜ™X]YÜXWÚYÎˆ\ÝÚ[HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÜÝYHÌLÌˆ]Y]ÙˆH\ÜËLH]šY[˜ÙK\Ù[XÝ[Ûˆ[‹Ú[ˆ]˜[‹‚ˆ]šY[˜ÙWÜ[ŽˆÜ[Û˜[Ò[[YÙ[˜ÙT[“Ý]HH›Û™Bˆ]šY[˜ÙWÝ\ÙYˆ\ÝÈ’[\šY]ÔXQ]šY[˜ÙT™Y“Ý]—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÜÝYHÌLÍÎˆH\œÚ\ÝY[[YÙ[˜ÙWÜ[—Ù]šY[˜ÙH›ÝÜÈ›Üˆ\ÂˆÈ\›‰ÜÈ]šY[˜ÙK\Ù[XÝ[Ûˆ[ˆ8 %]™\žHÛš\]XÝX[H™XYÚ]\‚ˆÈÜˆ›ÝH]Y\Ý[ÛˆÚ]Y]ˆ]šY[˜ÙWÝ\ÙYX›Ý™H\È[˜Ú[™ÙY‚ˆ]šY[˜ÙWÜ™XYÎˆ\ÝÈ’[[YÙ[˜ÙT[‘]šY[˜ÙSÝ]—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÜÝYHÌMŽˆÝÈX[žH]Y\Ý[Ûˆ]šY[˜ÙWÜ™YœÈÙ\™H›ÜY\È[™\šYšXX›BˆÈ
+›ÝÛÛZ[™Y[ˆ[žHÛ›ÝÛˆÛ˜\ÚÝÜ[ŠKˆH›ÜY™Yˆ\ÈHÜ˜XÙY[ˆÈ˜[˜XÚÈ8 %H]Y\Ý[Ûˆ\ÈÝ[\ÚÙY8 %ÛÈ\È\ÈÝ\™˜XÙY›ÜˆÜ\˜]Ü‚ˆÈš\ÚXš[]K›Ý[ˆ\œ›Ü‹‚ˆ]šY[˜ÙWÜ™Yœ×Ù›ÜYˆ[H‚‚ˆÈKKH]šY[˜ÙH™XY]Y]
+\ÜÝYHÌLÍÊHKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÂˆÈ\œÚ\ÝÈ]™\žHÛš\]\ÜÈHÙˆH[\šY]ÈX[ÙÝYH\›ˆXÝX[H™XYˆÈœ›ÛHH[›™YÛ˜\ÚÝ[šÙYÈH[\šY]×Ù]šY[˜ÙWÜÙ[XÝ[Û‚ˆÈ[[YÙ[˜ÙWÜ[œÈ›ÝÈ8 %[™\[™[ÙˆÚ]\ˆH™\Ý[[™È]Y\Ý[Û‚ˆÈÚ]Y]ˆÛš\]ÛÛ[\È™]™\ˆÝÜ™Y
+š[˜Ú\HKÜÚ^™JK‚‚‚˜Û\ÜÈ[[YÙ[˜ÙT[‘]šY[˜ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÞ\Ý[WÚYˆ[ˆ[[YÙ[˜ÙWÜ[—ÚYˆ[ˆ]ˆÝ‚ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[ˆÚ\—ØÛÝ[ˆ[ˆ[˜Ø]Yˆ›ÛÛˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ[[YÙ[˜ÙT[‘]šY[˜ÙS\ÝÝ]
+˜\ÙS[Ù[
+N‚ˆ[[YÙ[˜ÙWÜ[—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ][\Îˆ\ÝÒ[[YÙ[˜ÙT[‘]šY[˜ÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚ˆÈKKHÝXÝ\™Y[\šY]ÈIH
+\ÜÝYHÌLŽJHKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÂˆÈ]Y\Ý[Û‹Ø[œÝÙ\ˆZ\œÈ\ÈQXY™\ÜØX›H›ÝÜË™\XÚ[™È^XÝ]^X]Ú[™ÂˆÈYØZ[œÝH[\šY]×ÜÙ\ÜÚ[Û‹›Ü[—Ü]Y\Ý[ÛœÈ”ÓÓˆ›Ø‹ˆÛÜœ™XÝ[™È[‚ˆÈ[œÝÙ\ˆ™]™\ˆÝ™\Üš]\ÈH›ÝÎÈ][œÙ\ÈH™]È™]š\Ú[Ûˆ[™[šÜÈBˆÈÛ›ÝÈ›ÜØ\™šXHÝ\\œÙYYØžWÚYÛÈ]™\žHš[Üˆ[œÝÙ\ˆÝ^\ÂˆÈ]Y]X›H
+š[˜Ú\HÊKˆ]Y\Ý[Û—ØØ]YÛÜžKÜ]Y\Ý[Û—ÜÛÝ\˜ÙKÜÝ]\È\™BˆÈ^XÚ]š[š]HÙ]È
+š[˜Ú\HŠK‚‚’[\šY]ÔXPØ]YÛÜžHH]\˜[Èœ\œÜÙH‹˜Ø\Xš[]H‹˜\H‹œ›Ø™WÙ›ÝÈ‹™Ù[™\˜[—BˆÈ\ÜÝYHÌLÍNˆœ[[YHˆ]Y\Ý[ÛœÈ\™HÙ[™\˜]YžH™XÛÛ˜Ú[[™È\›Ý™YˆÈY]Y]KÜ›Ø™H[œÈYØZ[œÝ]\›Z[š\ÝXÈ[[YH˜XÙHYÙÜ™YØ]\ËˆÈ\Ý[˜Ýœ›ÛHHX[ÙÝYKÜ™]šY]Ù\‹Þ™\›×Ø˜\ÙHÛÝ\˜Ù\ÈX›Ý™K‚’[\šY]ÔXTÛÝ\˜ÙHH]\˜[Èœ™]šY]Ù\ˆ‹™X[ÙÝYH‹ž™\›×Ø˜\ÙH‹œ[[YH—BˆÈ\ÜÝYHÌMŽˆ[˜ÛÛ™š\›YYˆ™XÛÜ™È]H]™[Ü\ˆ^XÚ]HÛÝ[›ÝˆÈÛÛ™š\›HH[œÝÙ\ˆ
+’HÛ‰ÝÛ›ÝÈˆÈ8à#8à£øàbøà¢¸ào¸àføà¤øà#JKˆ]\ÈH˜[Y[œ]ˆÈ›Ý[ˆ\œ›ÜŽˆH›ÝÈ\ÈÙ\]È[œÝÙ\ˆ^ÝÜ™Y[™]\È™Y˜XÚÈÂˆÈH™X\ÛÛš[™È[Ù[\È[ˆÜ[ˆ\Ý\Ú\ÈÈ™KXÛÛ™š\›H8 %™]™\ˆÛÝ[Y\ÈBˆÈÛÛ™š\›YYØ[œÝÙ\™Y˜XÝ‚’[\šY]ÔXTÝ]\ÈH]\˜[È›Ü[ˆ‹˜[œÝÙ\™Y‹œ™]š\ÙY‹œÚÚ\Y‹[˜ÛÛ™š\›YY—B‚‚˜Û\ÜÈ[\šY]ÔXQ]šY[˜ÙT™Y“Ý]
+˜\ÙS[Ù[
+N‚ˆˆˆ”Û˜\ÚÝ\™[]]™HÛÙH™Y™\™[˜ÙKÜ[Û˜[HÚ]Ú]Ø\ÈXÝX[H™XY‚‚ˆÚ\—ØÛÝ[\ÈÜ[]YÛ›H›Üˆ]šY[˜ÙH]\ÜÝYHÌLÌ	ÜÂˆ]šY[˜ÙKYØ]\š[™ÈÝ\™XYœ›ÛHH[›™YÛ˜\ÚÝÈ]\ÈH˜]È˜XÝˆX›Ý]Ú]Ø\È™]ÚYÙ\Ù\\˜]Hœ›ÛH[žHH[\œ™]][ÛˆÙˆ]‚ˆˆˆ‚‚ˆ]ˆÝ‚ˆÝ\Û[™Nˆ[Hˆ[™Û[™Nˆ[HˆÚ\—ØÛÝ[ˆÜ[Û˜[Ú[HH›Û™B‚‚˜Û\ÜÈ[\šY]ÔXPÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ]Y\Ý[Û—Ý^ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝL—Ì
+Bˆ]Y\Ý[Û—ØØ]YÛÜžNˆ[\šY]ÔXPØ]YÛÜžHH™Ù[™\˜[‚ˆ]Y\Ý[Û—ÜÛÝ\˜ÙNˆ[\šY]ÔXTÛÝ\˜ÙHH™X[ÙÝYH‚ˆ\Ý\Ú\ÎˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝMÌ
+Bˆ]šY[˜ÙWÜ™YœÎˆ\ÝÒ[\šY]ÔXQ]šY[˜ÙT™Y“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\ÝX^Û[™ÝLL
+B‚‚˜Û\ÜÈ[\šY]ÔXPXÝÜ”™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆˆˆXÝÜˆ›ÜˆHÚÚ\Ü™\Ý[YHXÝ[Ûˆ
+š[˜Ú\HÎˆX[X[XÚ\Ú[ÛœÈ™XÛÜ™ÚËÝÚ[ŠKˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆXÝÜŽˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+B‚‚˜Û\ÜÈ[\šY]ÔXP[œÝÙ\”™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆˆˆ[œÝÙ\ˆÜˆÛÜœ™XÝH]Y\Ý[Û‹‚‚ˆYˆHÝ\œ™[›ÝÈ\È	ÛÜ[‰ÈÜˆ	ÜÚÚ\Y	ËH[œÝÙ\ˆ\È™XÛÜ™YÛˆ]ˆØ[YH›ÝÈ
+š\œÝ[œÝÙ\ˆ8 %›Ý[™ÈÈÝ\\œÙYJKˆYˆHÝ\œ™[›ÝÈ\Âˆ	Ø[œÝÙ\™Y	Ë\È\ÈHÛÜœ™XÝ[ÛŽˆH™]È›ÝÈ\È[œÙ\YÚ]H™]Âˆ[œÝÙ\ˆ[™HÛ›ÝÈ\ÈX\šÙY	Ü™]š\ÙY	ÈÚ]Ý\\œÙYYØžWÚYÙ]‚‚ˆ\ÜÝYHÌMŽˆÚ[ˆ[œÝÙ\—Ý[šÛ›ÝÛ˜\ÈÙ]H]™[Ü\ˆ^XÚ]HÛÝ[ˆ›ÝÛÛ™š\›HH[œÝÙ\‹ˆH›ÝÈ\È™XÛÜ™YÚ]Ý]\È	Ý[˜ÛÛ™š\›YY	Âˆ˜]\ˆ[ˆ	Ø[œÝÙ\™Y	Ë[œÝÙ\—Ý^X^H™H›[šË[™H[\šY]ÂˆÛÛ[Y\È
+H™X\ÛÛš[™È[Ù[™KXÛÛ™š\›\ÈšXHH\Ý\Ú\È]Y\Ý[ÛŠK‚ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÈZ[—Û[™Ý\ÈÛÈ[ˆ’HÛ‰ÝÛ›ÝÈˆ[œÝÙ\ˆØ[ˆ™H›[šÎÈH˜[Y]Ü‚ˆÈ™[ÝÈÝ[™\]Z\™\È›Û‹Y[\H^›ÜˆH›Ü›X[
+ÛÛ™š\›YY
+H[œÝÙ\‹‚ˆ[œÝÙ\—Ý^ˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLŒÌ
+BˆXÝÜŽˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLŒ
+Bˆ[œÝÙ\—Ý[šÛ›ÝÛŽˆ›ÛÛH˜[ÙBˆÈ\ÜÝYHÌŽLNˆÙ]Ú[ˆ\È[œÝÙ\ˆ\ÈHÜšYÚ[˜[\Ù\‰ÜÈVPÒUˆÈÛÛ™š\›X][ÛˆÙˆH™]\›™Y[™Ù™‰ÜÈ\ÜÚYÛ™YH[œÝÙ\ˆ
+Ü[Û˜[BˆÈ™Yš[YÛY[\ÚYHœ›ÛH]Y\Ý[Û’[™Ù™“Ý]˜[œÝÙ\—Ý^
+KˆBˆÈ[™Ù™‰ÜÈÝÛˆ[œÝÙ\—Ý^Ø[œÝÙ\™YØžH\™H™]™\ˆÜš][ˆ\™H\™XÝBˆÈKHH]™[Ü\ˆÝ[ÝX›Z]ÈZ\ˆÝÛˆ[œÝÙ\—Ý^ØXÝÜŽÈ\ÈÛ›BˆÈ[šÜÈH›Ý™[˜[˜ÙH
+›Ý]\ËÚ[\šY]ËœH˜[Y]\ÈH[™Ù™‚ˆÈ^\ÝË™[Û™ÜÈÈ\È]Y\Ý[Û‹[™\ÈÝ]\ÏIÜ™]\›™Y	ÊK‚ˆ[™Ù™—ÚYˆÜ[Û˜[Ú[HH›Û™B‚ˆ[Ù[Ý˜[Y]ÜŠ[ÙOH˜Y\ˆŠBˆYˆÜ™\]Z\™WØ[œÝÙ\—ÛÜ—Ý[šÛ›ÝÛŠÙ[ŠHOˆ’[\šY]ÔXP[œÝÙ\”™\]Y\ÝŽ‚ˆYˆ›ÝÙ[‹˜[œÝÙ\—Ý[šÛ›ÝÛˆ[™›ÝÙ[‹˜[œÝÙ\—Ý^œÝš\
+
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ˜[œÝÙ\—Ý^\È™\]Z\™Y[›\ÜÈ[œÝÙ\—Ý[šÛ›ÝÛˆ\ÈÙ]ŠBˆ™]\›ˆÙ[‚‚‚˜Û\ÜÈ[\šY]ÔXR[™\ÝYØ][Û‘]šY[˜ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[ˆÝ[[X\žNˆÝˆHˆ‚‚‚˜Û\ÜÈ[\šY]ÔXR[™\ÝYØ][Û“Ý]
+˜\ÙS[Ù[
+N‚ˆˆˆH\œÚ\ÝY[™\ÝYØ][ÛˆYÙ[™\Ý[›ÜˆH›Ü›X[Y›ÝÈ]Y\Ý[Û‹‚‚ˆ\ÜÝYHÌŽˆ™]šY]Èš^
+š[™[™ÈJNˆÜ[]YžBˆÔÕÚ[\šY]ËÜÙ\ÜÚ[ÛœËÞÜÙ\ÜÚ[Û—ÚYKÜXKÜ›Ý]KX[™Z[™\ÝYØ]Xœ›ÛBˆHØ[YH[™\ÝYØ][Û”™\Ý[Ú\HH[œ]Z\žH›ÝÈ[™XYHÛÛ\ÜÙ\Âˆ
+\Ú[™\ÝYØ][Û—ØYÙ[œX
+Kˆ™]™\ˆÜš][ˆžH[ž][™È[ÙHKBˆ[œÝÙ\š[™ËØÛÜœ™XÝ[™ÈH]Y\Ý[Ûˆ™]™\ˆ˜XœšXØ]\ÈÜˆY]È\ÈšY[ˆ[™\ÈšY[]Ù[ˆ™]™\ˆÛÛ™š\›\È[ˆ[œÝÙ\ˆ
+ÌŽ‹ÈÌŽˆ[ˆRBˆ›ÜÜØ[Ùš[™[™È™]™\ˆ]]ËXÛÛ™š\›\ÊK‚ˆˆˆ‚‚ˆ[—ÚYˆ[ˆÝ]\ÎˆÝˆÈÛÛ\]Y[œ™\ÛÛ™YˆÛÛ˜Û\Ú[ÛŽˆÝˆHˆ‚ˆÙ^WÜÚ[Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]šY[˜ÙNˆ\ÝÒ[\šY]ÔXR[™\ÝYØ][Û‘]šY[˜ÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[˜Ù\Z[NˆÝˆHˆ‚ˆÛÛ™šY[˜ÙNˆÝˆH[˜Ù\Z[ˆ‚ˆXÚ\Ú[Û—Ü]Y\Ý[ÛŽˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ[\šY]ÔXSÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ]Y\Ý[Û—Ý^ˆÝ‚ˆ]Y\Ý[Û—ØØ]YÛÜžNˆ[\šY]ÔXPØ]YÛÜžBˆ]Y\Ý[Û—ÜÛÝ\˜ÙNˆ[\šY]ÔXTÛÝ\˜ÙBˆ\Ý\Ú\ÎˆÜ[Û˜[ÜÝ—HH›Û™Bˆ]šY[˜ÙWÜ™YœÎˆ\ÝÒ[\šY]ÔXQ]šY[˜ÙT™Y“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÜÝYHÌLÍNˆ˜]ÈYÙÜ™YØ]Y˜XÙH˜XÝÈ
+ÈXÛ\™Y[Y]Y]H›Ý™[˜[˜ÙBˆÈ›Üˆ]Y\Ý[Û—ÜÛÝ\˜ÙHOHœ[[YHˆ›ÝÜËˆÙ\Ù\\˜]Hœ›ÛBˆÈ]šY[˜ÙWÜ™YœÈ
+ÛÙH[™H˜[™Ù\ÊH™XØ]\ÙH[[YH]šY[˜ÙH\È[Y\šXÂˆÈYÙÜ™YØ][Û‹›ÝHÛÝ\˜ÙKXÛÙHÜ[‹ˆ[›Üˆ[Ý\ˆÛÝ\˜Ù\Ë‚ˆ[[YWÙ]šY[˜ÙNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™Bˆ[œÝÙ\—Ý^ˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ\ÜÝYHÌÌNˆ^XÚ]YX\Ý\™[Y[›Ý™[˜[˜ÙKˆ›Û™HYX[œÈ[˜[œÝÙ\™YÜ‚ˆÈYØXÞH\ÝÜžHÚÜÙH[šÛ›ÝÛ‹ÚÛ›ÝÛˆXÝ[ÛˆØ[››Ý™H™XÛÝ™\™Y^XÝK‚ˆ[œÝÙ\—Ý[šÛ›ÝÛŽˆÜ[Û˜[Ø›ÛÛHH›Û™BˆÝ]\Îˆ[\šY]ÔXTÝ]\Âˆ[œÝÙ\™YØžNˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ\\œÙYYØžWÚYˆÜ[Û˜[Ú[HH›Û™BˆÜ™X]YØ]ˆ›Ø]ˆ[œÝÙ\™YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÈ\ÜÝYHÌŽŽˆ]Y\Ý[Ûˆ›Ý]\ˆÛ\ÜÚYšXØ][Ûˆ›Üˆ\È]Y\Ý[Û‹Ù]Û›BˆÈšXHÔÕÚ[\šY]ËÜXKÞÜXWÚYKÜ›Ý]H
+™]™\ˆ]]ÛX]XØ[H›Ü‚ˆÈX[ÙÝYK]\›ˆ]Y\Ý[ÛœÊKˆ›Û™H[[›Ý]Y‚ˆ›Ý]WØØ]YÛÜžNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›Ý]WÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÈ\ÜÝYHÌŽLNˆÛ›ÝÛYÙH\™XH\ÜÚYÛ™YžHHØ[YH]Y\Ý[Ûˆ›Ý]\ˆØ[ˆÈ
+]Y\Ý[Û‹\›Ý]\‹]ŒŠNÈ[[[›Ý]YÜˆÚ[ˆ›È\™XHÛX\›Hš]Ë‚ˆÈ™]™\ˆ[™™\œ™Y]\›Z[š\ÝXØ[Kˆ\ÙYÛ›HÈÜ›Ý\Ý][Ù‹X\™XBˆÈ]Y\Ý[ÛœÈKH]™]™\ˆY\ÈH]Y\Ý[Ûˆœ›ÛHH[\Ý‚ˆÛ›ÝÛYÙWØ\™XNˆÜ[Û˜[ÒÛ›ÝÛYÙP\™XWHH›Û™BˆÈ\ÜÝYHÌŽLNˆÙ]Ú[ˆ\È]Y\Ý[Ûˆ\È™Y[ˆ[™YÙ™ˆÈ[ˆ\ÜÚYÛ™YBˆÈ
+]Y\Ý[Û—Ú[™Ù™‹šY
+KˆHÜšYÚ[ˆ›ÝÉÜÈÝÛˆÝ]\Ø\ÈYˆÈ[ÝXÚYžHH[™Ù™ˆ
+š[˜Ú\H‹ÍˆKHÙYH‹œIÜÈX›HØÜÝš[™ÊK‚ˆ[™Ù™—ÚYˆÜ[Û˜[Ú[HH›Û™BˆÈ\ÜÝYHÌŽˆ™]šY]Èš^
+š[™[™ÈJNˆH[™\ÝYØ][ÛˆYÙ[™\Ý[›Ü‚ˆÈ\È]Y\Ý[Û‹Ü[]YÛ›HšXHH˜]Ú›Ý]KX[™Z[™\ÝYØ]BˆÈ[™Ú[ˆ›Û™H[[[™\ÝYØ]Y
+Üˆ›Üˆ[X[—ÛÛ›KÙ˜Z[Y[œËˆÈÚXÚ™]™\ˆÜ[]H]KHÙYHH[™Ú[ØÜÝš[™ÊK‚ˆ[™\ÝYØ][ÛŽˆÜ[Û˜[Ò[\šY]ÔXR[™\ÝYØ][Û“Ý]HH›Û™B‚‚˜Û\ÜÈ[\šY]ÔXP[œÝÙ\“Ý]
+˜\ÙS[Ù[
+N‚ˆXNˆ[\šY]ÔXSÝ]ˆ™]š[Ý\ÎˆÜ[Û˜[Ò[\šY]ÔXSÝ]HH›Û™BˆÈYHÚ[ˆ\ÈÙ\ÜÚ[Ûˆ[™XYH\ÈÙ[™\˜]Y›ÜÜØ[ËÛÈBˆÈ\Ú›Ø\™Ø[ˆÝ\™˜XÙHœ™YÙ[™\˜][Ûˆ™XÛÛ[Y[™YˆÚ]Ý]›Ø™KXYÙ[ˆÈ]™\ˆ]]ËZ[˜[Y][™ÈÜˆ™YÙ[™\˜][™ÈH\›Ý™YÜ›ÜÜÙYÙ]‚ˆ™YÙ[™\˜][Û—Ü™XÛÛ[Y[™Yˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈ[\šY]ÔXS\ÝÝ]
+˜\ÙS[Ù[
+N‚ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ][\Îˆ\ÝÒ[\šY]ÔXSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÜ[—ØÛÝ[ˆ[HˆYÚÜš[Üš]WÛÜ[—ØÛÝ[ˆ[Hˆ[œÝÙ\œ×Ü™]š\ÙYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚ˆÈKKH[\šY]ÈVY]šXÜÈ
+\ÜÝYHÌÌJHKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKB‚’[\šY]ÓY]šXÑ]™[\HH]\˜[Âˆœ™]šY]×ÜÝ\Y‹ˆœ™]šY]×ØÛÛ\]Y‹ˆœ™]šY]×ØX˜[™Û™Y‹ˆ™]šY[˜ÙWØ]˜Z[X›H‹ˆ™]šY[˜ÙWÙ^[™Y‹ˆ[˜Ú[™ÙYÚ][WÜ™\Ù[Y‹ˆ[˜Ú[™ÙYÚ][WÜ™XÛÛ™š\›YY‹ˆœ]Y\Ý[Û—Ü™\Ù[Y‹—B’[\šY]ÓY]šXÕ\™Ù]Ú[™H]\˜[ÂˆœÙ\ÜÚ[Ûˆ‹œXH‹˜[YÛ›Y[Ú][H‹š[œ]Z\žWÛY\ÜØYÙH‹—BˆÈ\ÜÝYHÌÌÍˆ›Ú[Ý[™\œÝ[™[™ÈY]šXÜÈ\™HHÑTTUHØ]YÛÜžHÛˆ\œÜÙHKBˆÈ^HYX\Ý\™HÚ]\ˆÚ\™Y[™\œÝ[™[™È[\›Ý™Y[™]\Ý™]™\ˆ™H™XYˆÈ\ËÜˆ]™\˜YÙYÚ]HY™šXÚY[˜ÞH[X™\œÈ[ˆHÝ\ˆØ]YÛÜšY\Ë‚’[\šY]ÓY]šXÐØ]YÛÜžHH]\˜[Âˆ\Ù\—Ø\™[ˆ‹˜XØÝ\˜XÞH‹^Ü]X[]H‹š›Ú[Ý[™\œÝ[™[™È‹ˆÈ\ÜÝYHÌÌÎˆH^\Ý[™È›Ú[Ý[™\œÝ[™[™ØØ]YÛÜžHÛÝ[ÂˆÈUSVUSÓˆ[™ÛÜÙHX™[ÈKHÝÈ]XÚH™X]\™HØ\È\ÙY[™Ú]]ˆÈØZYX›Ý]]Ù[‹ˆ\ÙHÛÈ[œÝÙ\ˆY™™\™[]Y\Ý[ÛœÈ[™]\Ý›Ý™BˆÈ]™\˜YÙYÚ]]ÜˆÚ]XXÚÝ\Ž‚ˆÈ›Ú[Ý[™\œÝ[™[™×Ü]X[]HKHY[™\œÝ[™[™ÈXÝX[H[\›Ý™BˆÈ
+Ø\ÈÛÜÙY\Ý\Ù\È][XÚ\Ú[ÛœÈ]ÝXÚÊBˆÈ›Ú[Ý[™\œÝ[™[™×Ø\™[ˆKHÚ]]ÛÜÝH]™[Ü\‚ˆÈÙY\[™È[H\\\ÈHÚ[ˆ[ˆY™šXÚY[˜ÞHØZ[ˆ]\Ý™]™\ˆ™BˆÈ\Ü^YY\ÈH]X[]HØZ[‹‚ˆš›Ú[Ý[™\œÝ[™[™×Ü]X[]H‹š›Ú[Ý[™\œÝ[™[™×Ø\™[ˆ‹—B’[\šY]ÓY]šXÔÝ]\ÈH]\˜[È›YX\Ý\™Y‹[›YX\Ý\™Y—B’[\šY]ÓY]šXÕ[š]H]\˜[Âˆœ˜][È‹˜[œÝÙ\œ×Ü\—Ý\]H‹›Ü\˜][Ûœ×Ü\—Ú[œ]Z\žH‹ˆÈ\ÜÝYHÌÌÎˆ\‹\Ù\ÜÚ[Ûˆ\™[ˆÛÝ[ËˆH˜]HÛÝ[YHH[™È™Z[™ÂˆÈYX\Ý\™YKHšÝÈ]XÚÛÜšÈYÛ™HÛÛ™\œØ][ÛˆÛÜÝˆ\È›ÝH˜][Ë‚ˆœ\—ÜÙ\ÜÚ[Ûˆ‹—B’[\šY]ÓY]šXÒÙ^HH]\˜[Âˆ˜[œÝÙ\œ×Ü\—Ý[™\œÝ[™[™×Ý\]H‹ˆ[šÛ›ÝÛ—Ø[œÝÙ\—Ü˜]H‹ˆœ™]šY]×ØX˜[™Û›Y[Ü˜]H‹ˆ™]šY[˜ÙWÙ]Z[Ù^[œÚ[Û—Ü˜]H‹ˆ›Ü\˜][Ûœ×Ü\—Ú[œ]Z\žH‹ˆ˜ÛÜœ™XÝYØÛÛ™š\›YYÚ[[Ü˜]H‹ˆš[˜ÛÜœ™XÝØ[œÝÙ\—ØÛÛ™š\›X][Û—Ü˜]H‹ˆœ[[YWØÛÛ˜YXÝ[Û—Ü˜]H‹ˆ[™\œÝ[™[™×Ü™]š\Ú[Û—Ü™XÛÜœ™XÝ[Û—Ü˜]H‹ˆœÜÝØ\›Ý˜[Ü™Z™XÝ[Û—Ü˜]H‹ˆœÜÝØ\›Ý˜[Ü›Û˜XÚ×Ü˜]H‹ˆœÜÝØ\›Ý˜[Ü™Z™XÝ[Û—ÛÜ—Ü›Û˜XÚ×Ü˜]H‹ˆœ™\X]YÜ]Y\Ý[Û—Ü˜]H‹ˆ[˜Ú[™ÙYÚ][WÜ™XÛÛ™š\›X][Û—Ü˜]H‹ˆš[œ]Z\žWÜ™\ÛÛ][Û—Ü˜]H‹ˆœÜÝÚ[œ]Z\žWØÛÛ™š\›X][Û—Ü˜]H‹ˆš[\[Y[][Û—Ü]Y\Ý[Û—Ý˜[œÙ™\—Ü˜]H‹ˆÈ\XÈÌÌŽ\ÙHˆ
+ÌÌÍ
+Nˆ›Ú[][™\œÝ[™[™È]X[]K‚ˆš›Ú[Ý[™\œÝ[™[™×Ùœ›ÛWÝ[šÛ›ÝÛ—Ü˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×ØÛÛ˜Û\Ú[Û—Ü˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×Ü›Ýš\Ú[Û˜[ÛÝ]ÛÛYWÜ˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×ÜÝ[WÜ™[Z\ÙWØÛÜÙWÜ˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×Ý[šÛ›ÝÛ—Ùš[™[™×Ü˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×Ü™Y›^Ü˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×Ú[™\ÝYØ][Û—Ø[œÝÙ\™YÜ˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×Ù]™[Ü\—Ü]Y\Ý[Û—Ü˜]H‹ˆÈ\ÜÝYHÌÌÎˆÝ]ÛÛYK[[™XYÙH]X[]Kˆ]™\žHÛ™H\È\š]™Yœ›ÛHHš[š]BˆÈ[™XYÙH]™[È
+\Ú›Ú[Û[™XYÙKœJK™]™\ˆœ›ÛHHÛÜÙHX™[‚ˆš›Ú[Ý[™\œÝ[™[™×Ý[šÛ›ÝÛ—Ü™\ÛÛ][Û—Ü˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×Ú\Ý\Ú\×Ü™]™\œØ[Ü˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×Ú\Ý\Ú\×ØÛÜœ™XÝ[Û—Ü˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×ØYÜ[Û—Ü™XÛÛ™š\›X][Û—Ü˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×ÙXÚ\Ú[Û—Ý[™×Ü˜]H‹ˆš›Ú[Ý[™\œÝ[™[™×ØÛ\ÜÚYšXØ][Û—ØÛÜœ™XÝ[Û—Ü˜]H‹ˆÈ\ÜÝYHÌÌÎˆ]™[Ü\ˆ\™[‹\ˆÙ\ÜÚ[Û‹‚ˆš›Ú[Ý[™\œÝ[™[™×Ü›Ý[™×Ü\—ÜÙ\ÜÚ[Ûˆ‹ˆš›Ú[Ý[™\œÝ[™[™×Ù]™[Ü\—ØXÝ[Ûœ×Ü\—ÜÙ\ÜÚ[Ûˆ‹ˆš›Ú[Ý[™\œÝ[™[™×Ù]™[Ü\—Ùš[™[™Ü×Ü\—ÜÙ\ÜÚ[Ûˆ‹ˆš›Ú[Ý[™\œÝ[™[™×Ü]Y\Ý[Û—Ü™X\Ú×Ü˜]H‹—BˆÈHØ[YHš[š]HÙ^HÙ]\ÈHZ[ˆ\KÛÈH^\›˜[][[ÛˆÛXÞBˆÈ
+\ÜÝYHÌÍJHØ[ˆ™H˜[Y]Y›Üˆ\›Z[˜[ÛÝ™\˜YÙH]ØY[YK‚’S•T•’QU×ÓQU’P×ÒÑVTÎˆ\HHÙ]Ø\™ÜÊ[\šY]ÓY]šXÒÙ^JB‚ˆÈKKH[\šY]ÈY]šXÈ:) yè®º*£yb)9k¦ˆ
+\ÜÝYHÌÍJHKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÂˆÈÝX\™˜Z[X›Ý™HÛ›H\ÚYÛ˜]\ÈÚXÚY]šXÜÈ\™HÛÜØ]Ú[™ËˆÚ]\‚ˆÈHY]šXÈ\È
+˜Ý\œ™[Jˆ[ˆH˜YÝ]H\ÈHÙ\\˜]K]˜[X]YYÙ[Y[ÛÂˆÈ¹`)8àc9 ª¸àaˆ[™¸ào¸àh9b)9¥«xàiøàcxàj¸àaˆ™]™\ˆÛÛ\ÙH[ÈÛ™HØ\›š[™ÈÝ]K‚’[\šY]ÓY]šXÐ][[Û”Ý]HH]\˜[Âˆ˜][[Ûˆ‹È:e¯¹`)8à¤º-¡xàb8ài¸àb¸à¢º) yè®º*£Bˆ›ÚÈ‹È9b)9k¦¹cëú ïxàiøà z) yè®º*£y§hy.í¸àjú*l¹odøàeøàj¸àaˆš[œÝY™šXÚY[Ù]H‹È9«ãy¥l9.#z-¬øà xào¸àgøàkøào¸àh:)¬ù®+8àc9á(xàaˆ››ÝÛYX\Ý\˜X›H‹È9a`øàj8àj¸à¢ù.¢ùk§øàc:*&:c,¸àexà£8ài¸àb¸à¢xàf¹ë¥ùaî¹¢bù«­xàc9á(xàaˆ˜Üš]\š[Û—Ý[œÙ]‹È9æèú)¥¹kïº,hxàh8àc:e¯¹`)8àc9§*º*+yk¦‚ˆ›ØœÙ\˜][Û—ÛÛ›H‹È:`&¹çéykïº,hxàiøàkøàj¸àa9k¦¹§'ú)¬ù®+9£!ùª&B—B’[\šY]ÓY]šXÐ][[Û”™X\ÛÛˆH]\˜[Âˆ™\ÚÛØœ™XXÚY‹ˆÚ][—Ý™\ÚÛ‹ˆœØ[\WØ™[Ý×ÛZ[š[][H‹ˆ››×ÛØœÙ\˜][Ûœ×ÞY]‹ˆ››ÝÜ™XÛÜ™Y‹ˆ™\ÚÛÛ›ÝØÛÛ™šYÝ\™Y‹ˆ››ÝØWÛ›ÝYšXØ][Û—Ý\™Ù]‹—BˆÈŒH›ØØX[\šY\ËˆÙYH[\šY]×ÛY]šX×Ø][[Û˜›ÜˆÚH›Ý[™YÚ[™ÝÜËˆÈÝ\ÝZ[™YšYÙÙ\œË[™X[X[XÚÛ›ÝÛYÙ[Y[\™H[X™\˜][HXœÙ[‚US•SÓ—ÑT‘PÕSÓ”ÈH
+šYÚÚ\×Ø˜Y‹›Ý×Ú\×Ø˜YŠBUS•SÓ—ÕÒS‘ÕÔÈH
+˜[Ý[YH‹
+BUS•SÓ—Õ’QÑÑT”ÈH
+œÚ[™ÛWØœ™XXÚ‹
+BUS•SÓ—ÐÓPT—ÐÓÓ‘USÓ”ÈH
+˜[YWÝÚ][—Ý™\ÚÛ‹
+B’[\šY]ÓY]šXÐ][[Û‘\™XÝ[ÛˆH]\˜[ÈšYÚÚ\×Ø˜Y‹›Ý×Ú\×Ø˜Y—B’[\šY]ÓY]šXÐ][[Û•Ú[™ÝÈH]\˜[È˜[Ý[YH—B’[\šY]ÓY]šXÐ][[Û•šYÙÙ\ˆH]\˜[ÈœÚ[™ÛWØœ™XXÚ—B’[\šY]ÓY]šXÐ][[ÛÛX\ˆH]\˜[È˜[YWÝÚ][—Ý™\ÚÛ—BˆÈH[žHÚ[	ÜÈ9cå¹o¥ùi,y¥eÈÝ]H\ÈÛY[\ÚYHÛ›NˆHÙ\™\ˆ]Ø[››ÝˆÈ[œÝÙ\ˆØ[››Ý™\Ü]ÈÝÛˆ˜Z[\™K‚’[\šY]ÓY]šXÜÐ][[Û”Ý]HH]\˜[È››Ü›X[‹˜][[Ûˆ‹š[œÝY™šXÚY[Ù]H—B‚‚˜Û\ÜÈ[\šY]ÓY]šXÐ][[Û“Ý]
+˜\ÙS[Ù[
+N‚ˆˆˆ“Û™HY]šXÉÜÈ]˜[X]Y:) yè®º*£HÝ]H\ÈHÜš]\š[Ûˆ]Ø\ÈYÙYžKˆˆˆ‚‚ˆÝ]Nˆ[\šY]ÓY]šXÐ][[Û”Ý]BˆØ]ÚYˆ›ÛÛH˜[ÙBˆ™X\ÛÛŽˆ[\šY]ÓY]šXÐ][[Û”™X\ÛÛ‚ˆ\™XÝ[ÛŽˆÜ[Û˜[Ò[\šY]ÓY]šXÐ][[Û‘\™XÝ[Û—HH›Û™Bˆ™\ÚÛˆÜ[Û˜[Ù›Ø]HH›Û™BˆZ[—ÜØ[\Nˆ[HˆÚ[™ÝÎˆÜ[Û˜[Ò[\šY]ÓY]šXÐ][[Û•Ú[™Ý×HH›Û™BˆšYÙÙ\ŽˆÜ[Û˜[Ò[\šY]ÓY]šXÐ][[Û•šYÙÙ\—HH›Û™BˆÛX\—ØÛÛ™][ÛŽˆÜ[Û˜[Ò[\šY]ÓY]šXÐ][[ÛÛX\—HH›Û™B‚‚˜Û\ÜÈ[\šY]ÓY]šXÜÐ][[Û”Ý[[X\žSÝ]
+˜\ÙS[Ù[
+N‚ˆˆˆ•H[žHÚ[	ÜÈÝ]K\š]™YÛ›Hœ›ÛHØ]ÚYY]šXÜËˆˆˆ‚‚ˆÝ]Nˆ[\šY]ÓY]šXÜÐ][[Û”Ý]Bˆ][[Û—ØÛÝ[ˆ[Hˆ[œÝY™šXÚY[Ù]WØÛÝ[ˆ[Hˆ›ÝÛYX\Ý\˜X›WØÛÝ[ˆ[HˆØ]ÚYØÛÝ[ˆ[HˆÛXÞWÝ™\œÚ[ÛŽˆÝ‚ˆÛXÞWÙYÙ\ÝˆÝ‚‚‚˜Û\ÜÈ[\šY]ÓY]šXÑ]™[Ü™X]J˜\ÙS[Ù[
+N‚ˆˆˆ“Û™H›Ý[™YÛÛ[Yœ™YHRHYX\Ý\™[Y[]™[‚‚ˆ]™[ÚÙ^X\ÈÙ[™\˜]YžHHÛY[[™[š\]YHÚ][ˆHÞ\Ý[HÛÈBˆ™]žH\ÈY[\Ý[ˆH›Ý]H˜[Y]\ÈHš[š]H]™[Ý\™Ù]Z\š[™Âˆ[™\™Ù]ÝÛ™\œÚ\È\˜š]˜\žH]šX]\È[™œ™YK]^[˜[]XÜÂˆ^[ØYÈ\™H[[[Û˜[H[œÝ\ÜY‚ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆØÚ[XWÝ™\œÚ[ÛŽˆ]\˜[Èš[\šY]Ë[Y]šXËY]™[]ŒH—HHš[\šY]Ë[Y]šXËY]™[]ŒH‚ˆ]™[ÚÙ^NˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝLLŽ
+BˆÙ\ÜÚ[Û—ÚYˆ[HšY[
+‹‹‹ÙOLJBˆ]™[Ý\Nˆ[\šY]ÓY]šXÑ]™[\Bˆ\™Ù]ÚÚ[™ˆ[\šY]ÓY]šXÕ\™Ù]Ú[™ˆ\™Ù]ÚYˆ[HšY[
+‹‹‹ÙOLJB‚‚˜Û\ÜÈ[\šY]ÓY]šXÑ]™[Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆØÚ[XWÝ™\œÚ[ÛŽˆ]\˜[Èš[\šY]Ë[Y]šXËY]™[]ŒH—HHš[\šY]Ë[Y]šXËY]™[]ŒH‚ˆ]™[ÚÙ^NˆÝ‚ˆÞ\Ý[WÚYˆ[ˆÙ\ÜÚ[Û—ÚYˆ[ˆ]™[Ý\Nˆ[\šY]ÓY]šXÑ]™[\Bˆ\™Ù]ÚÚ[™ˆ[\šY]ÓY]šXÕ\™Ù]Ú[™ˆ\™Ù]ÚYˆ[ˆ™XÛÜ™YØ]ˆ›Ø]‚‚˜Û\ÜÈ[\šY]ÓY]šXÓÝ]
+˜\ÙS[Ù[
+N‚ˆÙ^Nˆ[\šY]ÓY]šXÒÙ^BˆØ]YÛÜžNˆ[\šY]ÓY]šXÐØ]YÛÜžBˆÈ9æèú)¥¹kïº,hxàj8àeøài¸àk¹£!ùk¦¸à ¹k§úf¦øàjú) yè®º*£xàbøàjxàa¸àbøàkÈ][[Û˜8àc9£ xài8à ‚ˆÝX\™˜Z[ˆ›ÛÛH˜[ÙBˆ\ØÜš\[ÛŽˆÝ‚ˆ›Ü›][NˆÝ‚ˆÛÝ\˜Ù\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ]\Îˆ[\šY]ÓY]šXÔÝ]\Âˆ˜[YNˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ[š]ˆ[\šY]ÓY]šXÕ[š]ˆ[Y\˜]ÜŽˆÜ[Û˜[Ú[HH›Û™Bˆ[›ÛZ[˜]ÜŽˆÜ[Û˜[Ú[HH›Û™BˆØ[\WÜÚ^™Nˆ[Hˆ[›YX\Ý\™YÜ™X\ÛÛŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ]˜[X]YY\ˆH˜[YH^\ÝËÛÈ]\È[X›H\š[™ÈÛÛœÝXÝ[Û‚ˆÈÛ›KˆZ[Ú[\šY]×ÛY]šXÜØ[Ø^\ÈÜ[]\È]™Y›Ü™H™]\›š[™ËˆÈ[™H[\šY]Ë[Y]šXÜË]Œ˜™\ÜÛœÙHÛÛ˜XÝÝX\˜[Y\È]‚ˆ][[ÛŽˆÜ[Û˜[Ò[\šY]ÓY]šXÐ][[Û“Ý]HH›Û™B‚‚˜Û\ÜÈ[\šY]ÓY]šXÜÓÝ]
+˜\ÙS[Ù[
+N‚ˆÞ\Ý[WÚYˆ[ˆØÚ[XWÝ™\œÚ[ÛŽˆ]\˜[Èš[\šY]Ë[Y]šXÜË]Œˆ—HHš[\šY]Ë[Y]šXÜË]Œˆ‚ˆÙ[™\˜]YØ]ˆ›Ø]ˆÙ\ÜÚ[Ûœ×ÛØœÙ\™Yˆ[Hˆ]™[×ÛØœÙ\™Yˆ[Hˆ][[ÛŽˆ[\šY]ÓY]šXÜÐ][[Û”Ý[[X\žSÝ]ˆY]šXÜÎˆ\ÝÒ[\šY]ÓY]šXÓÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚ˆÈKKH˜]Ú›Ý]KX[™Z[™\ÝYØ]H
+\ÜÝYHÌŽˆ™]šY]Èš^š[™[™ÈJHKKKKKKKKKBˆÂˆÈÚ\™\È]Y\Ý[Ûˆ›Ý]\ˆÈ[™\ÝYØ][ÛˆYÙ[[ÈH“Ô“PSIH›ÝÈ
+^BˆÈÙ\™H™]š[Ý\ÛH™XXÚX›HÛ›H[œÚYHH[œ]Z\žHÚYKXÛÛ™\œØ][Ûˆ[™šXBˆÈHÚ[™ÛK\]Y\Ý[ÛˆÔÕ‹‹‹ÜXKÞÜXWÚYKÜ›Ý]KÚXÚ™]™\ˆ[™\ÝYØ]\ÊK‚ˆÈ\È™]™\ˆÜš]\È[œÝÙ\—Ý^ÜÝ]\ËØ[œÝÙ\™YØžHKH[™\ÝYØ][Ûˆ\ÈBˆÈš[™[™ÈÈ™]šY]Ë™]™\ˆ[ˆ]]ËXÛÛ™š\›X][Ûˆ
+š[˜Ú\H‹ÍÎÈÌŽˆPÊK‚‚‚˜Û\ÜÈ[\šY]ÔXT›Ý]R[™\ÝYØ]R][SÝ]
+˜\ÙS[Ù[
+N‚ˆXWÚYˆ[ˆ›Ý]WØØ]YÛÜžNˆÜ[Û˜[ÜÝ—HH›Û™BˆÛ›ÝÛYÙWØ\™XNˆÜ[Û˜[ÒÛ›ÝÛYÙP\™XWHH›Û™BˆÈÛÛ\]Y[œ™\ÛÛ™Y˜Z[Y›Û™H
+›Ý][\Y\ÈØ[K™Ë‚ˆÈ[X[—ÛÛ›HÜˆH›Ý]H˜Z[\™H]YH]Y\Ý[Ûˆ[œ›Ý]Y
+K‚ˆ[™\ÝYØ][Û—ÜÝ]\ÎˆÜ[Û˜[ÜÝ—HH›Û™Bˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™B‚‚˜Û\ÜÈ[\šY]ÔXT›Ý]R[™\ÝYØ]PÛÝ[ÓÝ]
+˜\ÙS[Ù[
+N‚ˆ›Ý]Yˆ[Hˆ[™\ÝYØ]Yˆ[Hˆ˜Z[Yˆ[HˆÚÚ\YØØ\ˆ[H‚‚˜Û\ÜÈ[\šY]ÔXT›Ý]R[™\ÝYØ]P˜]ÚÝ]
+˜\ÙS[Ù[
+N‚ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ™\Ý[Îˆ\ÝÒ[\šY]ÔXT›Ý]R[™\ÝYØ]R][SÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÛÝ[Îˆ[\šY]ÔXT›Ý]R[™\ÝYØ]PÛÝ[ÓÝ]HšY[
+ˆY˜][Ù˜XÝÜžOR[\šY]ÔXT›Ý]R[™\ÝYØ]PÛÝ[ÓÝ]ˆ
+B‚‚ˆÈ™]šY]Èš^
+ˆÌŽM‹š[™[™È
+Nˆ[ˆÜ[Û˜[^XÚ]ÝXœÙ]Ùˆ]Y\Ý[Û‚ˆÈYÈÈ›Ý]JÚ[™\ÝYØ]KÛÈHÚ[™ÛHØ\™	ÜÈ8à#8à£øàbøà¢xàj¸àa8à#HXÝ[ÛˆØ[‚ˆÈ\™Ù]\Ý]Û™H]Y\Ý[Ûˆ[œÝXYÙˆ[Ø^\ÈšYÙÙ\š[™ÈHÚÛBˆÈÙ\ÜÚ[Û‰ÜÈ˜]ÚÙ[XÝ[Ûˆ
+\ÈPVÐUÒÔUQTÕSÓ”ÈH[™\ÝYØ][ÛœÂˆÈ\ˆØ[
+KˆÛZ][™ÈXWÚYÈ
+ÜˆÙ[™[™È[
+HÙY\ÈHš[Üˆ[Y[YÚX›BˆÈ™Z]š[Üˆ
+˜XÚÝØ\™ÛÛ\]X›JKˆHXWÚY]Ù\È›Ý^\ÝÜˆ™[Û™ÜÈÂˆÈHY™™\™[Ù\ÜÚ[Û‹\ÈH\‹\]Y\Ý[Ûˆ\œ›Üˆ[ˆH™\ÜÛœÙHKH™]™\ˆBˆÈ™X\ÛÛˆÈ˜Z[ÜˆÚ[[H›ÜH™\ÝÙˆH˜]Ú
+Ø[YH˜Z[XÛÜÙYBˆÈ\‹\]Y\Ý[ÛˆÛXÞHH^\Ý[™È˜]Ú[™Ú[[™XYH\Ù\ÊK‚˜Û\ÜÈ[\šY]ÔXT›Ý]R[™\ÝYØ]P˜]Ú™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆXWÚYÎˆÜ[Û˜[Ó\ÝÚ[WHH›Û™B‚‚ˆÈKKH[[œšYYˆ
+\ÜÝYHÌŽ
+HKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÂˆÈÝXÝ\™Y\Ù\ˆ[[Ù\Ù\\˜]Hœ›ÛH[\[Y[][Û‹Y˜XÝˆÈ[™\œÝ[™[™ÎˆÛ›HH\Ù\ˆØ[ˆXÚYH\ÙH˜[Y\ËˆZWÜ›ÜÜÙY][\ÂˆÈ\™H˜YÈH™X\ÛÛš[™È[Ù[Ü›Ý[™È[ˆHÛÛ™\œØ][ÛŽÈ^H™]™\‚ˆÈ™XÛÛYH	ØÛÛ™š\›YY	È^Ù\›ÝYÚH^XÚ]ÛÛ™š\›KØÛÜœ™XÝ[™Ú[ÂˆÈ
+XÚ\Ú[Û—ÛY]ÙÝ^\È	ÛX[X[	È›Üˆ]™\žH\Ù\‹Yš]™[ˆ˜[œÚ][Û‹ˆÈš[˜Ú\HŠKˆ	Ý[™XÚYY	È[™	Û›ÝØ\XØX›IÈ\™Hš\œÝXÛ\ÜÈ[œÝÙ\œÂˆÈ
+¹ãï¹â­¹¢¢¹£èxàh8àdxàc9æë¹æ¡ˆÈ¸ào¸àh:)èù¬n¹ëe¸à¤¹¬n¸à xài¸àa8àj¸àaˆÈ8à#9kïº,hyi%¸à#JK›Ý\œ›ÜœË‚‚’[\šY]Ò[[šY[H]\˜[Âˆ™ÛØ[‹œZ[ˆ‹œÝXØÙ\Ü×ØÜš]\šXH‹œš[Üš]H‹˜ÛÛœÝ˜Z[È‹››Û—ÙÛØ[È‚—B’[\šY]Ò[[Ý]\ÈH]\˜[Âˆœ›ÜÜÙY‹˜ÛÛ™š\›YY‹›™YY×Ü™]šY]È‹[™XÚYY‹››ÝØ\XØX›H‚—BˆÈÝ]\Ù\ÈH\Ù\ˆX^HÙ]\™XÝHÚ[ˆÜ™X][™È[ˆ][Kˆ	Ü›ÜÜÙY	È[™ˆÈ	Û™YY×Ü™]šY]ÉÈ\™HÞ\Ý[KÐRHÝ]\Ë™]™\ˆ\Ù\‹XÚÜÙ[ˆ]Ü™X][Ûˆ[YK‚’[\šY]Ò[[\Ù\”Ý]\ÈH]\˜[È˜ÛÛ™š\›YY‹[™XÚYY‹››ÝØ\XØX›H—B’[\šY]Ò[[ÜšYÚ[ˆH]\˜[È\Ù\ˆ‹˜ZWÜ›ÜÜÙY—B‚‚˜Û\ÜÈ[\šY]Ò[[][SÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆšY[ˆ[\šY]Ò[[šY[ˆ˜[YWÝ^ˆÝ‚ˆÝ]\Îˆ[\šY]Ò[[Ý]\ÂˆÜšYÚ[Žˆ[\šY]Ò[[ÜšYÚ[‚ˆÛÝ\˜ÙWÜÝ][Y[ˆÜ[Û˜[ÜÝ—HH›Û™BˆXÚ\Ú[Û—ÛY]ÙˆXÚ\Ú[Û“Y]Ùˆ[[YÙ[˜ÙWÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆÝ\\œÙYYØžWÚYˆÜ[Û˜[Ú[HH›Û™BˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]‚‚˜Û\ÜÈ[\šY]Ò[[][PÜ™X]J˜\ÙS[Ù[
+N‚ˆˆˆ•\Ù\‹X]]Ü™Y[[][Kˆ[Ø^\ÈÜšYÚ[IÝ\Ù\‰ËXÚ\Ú[Û—ÛY]ÙIÛX[X[	Ëˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆšY[ˆ[\šY]Ò[[šY[ˆ˜[YWÝ^ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝMÌ
+BˆÝ]\Îˆ[\šY]Ò[[\Ù\”Ý]\ÈH˜ÛÛ™š\›YY‚‚‚˜Û\ÜÈ[\šY]Ò[[ÛÜœ™XÝ™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆˆˆÛÜœ™XÝ[ˆZWÜ›ÜÜÙY
+Üˆ™]š[Ý\ÛHÛÛ™š\›YY
+H][IÜÈ˜[YK‚‚ˆ™]™\ˆÝ™\Üš]\ÎˆHØ[\ˆ[œÙ\ÈH™]È	ØÛÛ™š\›YY	ËÉÝ\Ù\‰È›ÝÈ[™ˆX\šÜÈHš[Üˆ›ÝÉÜÈÝ\\œÙYYØžWÚYZ\œ›Üš[™È[\šY]×ÜXIÜÂˆ[œÝÙ\‹ØÛÜœ™XÝ[Ûˆ]\›‹‚ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ˜[YWÝ^ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝMÌ
+B‚‚˜Û\ÜÈ[\šY]Ò[[\ÝÝ]
+˜\ÙS[Ù[
+N‚ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ][\×ØžWÙšY[ˆXÝÜÝ‹\ÝÒ[\šY]Ò[[][SÝ]WHHšY[
+Y˜][Ù˜XÝÜžOYXÝ
+B‚‚ˆÈKKH[œ]Z\žHY™XÞXÛH
+\ÜÝYHÌŽJHKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÂˆÈHÝXX›Ý]HÛÛ™š\›X][Ûˆ][H
+IH]Y\Ý[Û‹[[œšYYˆ][KÜˆKBˆÈœ›ÛH\ÜÝYHÌŽÈKHH™]šY]È][JH\È[[™[™ÈÚ[HHÙ\\˜]H[œ]Z\žBˆÈÛÛ™\œØ][Ûˆ™\ÛÛ™\È]ˆ™\ÛÛš[™È[ˆ[œ]Z\žH™]™\ˆÚ[™Ù\ÈHÜšYÚ[‚ˆÈ][IÜÈÝÛˆÝ]H
+š[˜Ú\H‰ÜÈ™^XÚ]\Ù\ˆXÝ[Ûˆˆ›Ý[™\žH\Y\ÈÂˆÈHÜšYÚ[ˆ][IÜÈÝÛˆ[™Ú[›ÝÈÛÜÚ[™ÈH[œ]Z\žJK‚‚’[\šY]Ò[œ]Z\žSÜšYÚ[’Ú[™H]\˜[ÈœXH‹š[[‹œ™]šY]×Ú][H—BˆÈ	ÜÝ\\œÙYY	È
+\ÜÝYHÌÌÈÌÌŒÊH\ÈHT“RSSÞ\Ý[K[Û›HÝ]\ÎˆBˆÈ™[Z\ÙHHÛÛ™\œØ][ÛˆØ\È[œÝÙ\™YYØZ[œÝ›ÈÛ™Ù\ˆ^\ÝËÛÈBˆÈ\ÝÜžHÝ^\È™XYX›H]\È™]™\ˆ™]\ÙY\ÈÝ\œ™[\ÝYšXØ][Û‹ˆ]\ÂˆÈ›ÝÜ›Û™Èˆ[™›Ý[œ™\ÛÛ™YŽÈÛ›HH™[Z\ÙH]˜[X][Ûˆ[œÚYH[‚ˆÈ[YÛ›Y[™XZ[]™\ˆÜš]\È]™]™\ˆH\Ù\ˆ[™Ú[‚’[\šY]Ò[œ]Z\žTÝ]\ÈH]\˜[Âˆ›Ü[ˆ‹œ™\ÛÛ™Y‹[œ™\ÛÛ™Y‹˜Ø[˜Ù[Y‹š[‹œÝ\\œÙYY‚—BˆÈ\š]™Y
+™]™\ˆÝÜ™Y
+H\ØÜš\[ÛˆÙˆÝÈÛÛ\\˜X›H[ˆ[œ]Z\žIÜÈ™[Z\ÙBˆÈ\ÈKHÙYH\Ú[œ]Z\žWÜ™[Z\ÙKœIÜÈ‘SRTÑWÕPÒÒS‘×ÔÕUTË‚’[œ]Z\žT™[Z\ÙU˜XÚÚ[™ÔÝ]HH]\˜[È››ÝØ\XØX›H‹[˜XÚØX›H‹˜XÚÙY—BˆÈ™\Ý[ÙˆH\Ý™[Z\ÙH]˜[X][ÛŽÈ[[[H™XZ[]˜[X]Y]‚’[œ]Z\žT™[Z\ÙQ]˜[X][ÛˆH]\˜[È[˜Ú[™ÙY‹˜Ú[™ÙY‹œ™[[Ý™Y‹˜[XšYÝ[Ý\È—B’[\šY]Ò[œ]Z\žSY\ÜØYÙT›ÛHH]\˜[È\Ù\ˆ‹˜\ÜÚ\Ý[—B‚‚˜Û\ÜÈ[\šY]Ò[œ]Z\žQ]šY[˜ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[ˆÝ[[X\žNˆÝˆHˆ‚‚‚˜Û\ÜÈ[\šY]Ò[œ]Z\žSY\ÜØYÙQ]Z[Ý]
+˜\ÙS[Ù[
+N‚ˆˆˆ”›ÙÜ™\ÜÚ]™KY\ØÛÜÝ\™H]Z[›Üˆ[ˆ\ÜÚ\Ý[[œ]Z\žHY\ÜØYÙK‚‚ˆHY\ÜØYÙIÜÈÝÛˆÛÛ[\È[Ø^\ÈHÚÜÛÛ˜Û\Ú[Û‹ÚÝÛ‚ˆš\œÝÈ]Z[\ÈH¹¨.y¢è8à¤º)¢øà¢Èˆ
+ÚÝÈ]šY[˜ÙJH^[œÚ[Û‹‚ˆˆˆ‚‚ˆÙ^WÜÚ[Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ]šY[˜ÙNˆ\ÝÒ[\šY]Ò[œ]Z\žQ]šY[˜ÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[˜Ù\Z[NˆÝˆHˆ‚ˆÈ\ÜÝYHÌŽŽˆÚXÚ]Y\Ý[Ûˆ›Ý]\ˆØ]YÛÜžH›ÙXÙY\È[œÝÙ\‹[™ˆÈ
+›ÜˆšXœšYŠHHXÚ\Ú[Ûˆ]Y\Ý[ÛˆH]™[Ü\ˆÝ[™YYÈÂˆÈ[œÝÙ\ˆ[\Ù[™\Ëˆ›Ý›Û™H›ÜˆY\ÜØYÙ\È™Y][™È\ÜÝYHÌŽ‹‚ˆ›Ý]WØØ]YÛÜžNˆÜ[Û˜[ÜÝ—HH›Û™BˆXÚ\Ú[Û—Ü]Y\Ý[ÛŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ\ÜÝYHÌŽLˆ[[YWÙ˜XÝ]šY[˜ÙH[šY\È
+›Ý™[˜[˜ÙH
+Èš[š]BˆÈ[[YWØÚXÚÊK[Ø^\È[ˆ\È]Z[^Y\ˆKH™]™\ˆ[ˆHY\ÜØYÙIÜÂˆÈÚÜÛÛ[KHÛÈH[š]X[[œÝÙ\ˆÝ^\ÈÛÛ˜Û\Ú[Û‹Yš\œÝ[™ˆÈ˜]È˜XÙKÜ›Ý™[˜[˜ÙH]HÛ›H\X\œÈ[ˆHÛÛ\ÚX›H]Z[ˆÈ^[œÚ[Ûˆ
+›ÙÜ™\ÜÚ]™H\ØÛÜÝ\™JK‚ˆ[[YWÙ]šY[˜ÙNˆ\ÝÈ’[\šY]Ò[œ]Z\žT[[YQ]šY[˜ÙSÝ]—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈH]\›Z[š\ÝXÈ[
+™]™\ˆHœ™YH^
+H]H[[YWÙ˜XÝØ[YBˆÈ˜XÚÈ[›ØœÙ\™YÜÝ[HKHH]™[Ü\ˆØ[ˆ\›ˆ\È[È[ˆXÝX[ˆÈÔÕ‹‹‹ÛØœÙ\˜][Û‹\›ÜÜØ[ÈØ[Yˆ^HØ[™]ÈØœÙ\˜][ÛŽÂˆÈ\È[[Û™H™]™\ˆÜ™X]\ÈH›ÜÜØ[›ÝÈ
+š[˜Ú\HKÎ
+K‚ˆÝYÙÙ\ÝYÛØœÙ\˜][Û—Ü›ÜÜØ[ˆÜ[Û˜[È”ÝYÙÙ\ÝYØœÙ\˜][Û”›ÜÜØ[Ý]—HH›Û™B‚‚˜Û\ÜÈ[\šY]Ò[œ]Z\žSY\ÜØYÙSÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ[œ]Z\žWÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ›ÛNˆ[\šY]Ò[œ]Z\žSY\ÜØYÙT›ÛBˆÛÛ[ˆÝ‚ˆ]Z[ˆÜ[Û˜[Ò[\šY]Ò[œ]Z\žSY\ÜØYÙQ]Z[Ý]HH›Û™Bˆ[[YÙ[˜ÙWÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ[\šY]Ò[œ]Z\žSÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÜšYÚ[—ÚÚ[™ˆ[\šY]Ò[œ]Z\žSÜšYÚ[’Ú[™ˆÜšYÚ[—ÚYˆ[ˆ[Ù˜YˆÜ[Û˜[ÜÝ—HH›Û™BˆÝ]\Îˆ[\šY]Ò[œ]Z\žTÝ]\ÂˆÝ]\×Ü™X\ÛÛŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ\ÜÝYHÌÌÈÌÌŒˆH[[]]X›H™[Z\ÙH\ÈÛÛ™\œØ][ÛˆØ\ÂˆÈ[œÝÙ\™YYØZ[œÝØ\\™Y]Ü™X][Ûˆ[™™]™\ˆ™X˜\ÙYÛÈH™]Ù\‚ˆÈÙ\ÜÚ[ÛˆÛ˜\ÚÝˆÛ˜\ÚÝÜ™]š\Ú[Ûˆ\™H]Y]™Y™\™[˜Ù\È
+^HX^HÛÂˆÈ•S[™\ˆ™][[ÛŠNÈH\ÚÙYÙ\ÝÛÛ[[œÈ\™HÚ]H™[Z\ÙBˆÈ]˜[X][ÛˆXÝX[HÛÛ\\™\Ëˆ[[›Üˆ[œ]Z\šY\ÈÜ™X]Y™Y›Ü™BˆÈ\ÈZYÜ˜][Ûˆ[™\\œ›ÛHHÛ˜\ÚÝÝ™\œÚ[Û‹ØØ\\™YØ]š[ËˆÈ›ÜˆHXKÚ[[ÜšYÚ[œÈŒHÙ\È›Ý]]Ë]˜XÚË‚ˆ™[Z\ÙWÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™Bˆ™[Z\ÙWÜ™]š\Ú[Û—ÚYˆÜ[Û˜[Ú[HH›Û™Bˆ™[Z\ÙWÜ™]šY]×ÜÝXš™XÝÚYˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™[Z\ÙWØÛÛ[Ú\ÚˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™[Z\ÙWØØ\Xš[]WÙYÙ\ÝˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™[Z\ÙWÚ[[ÙYÙ\ÝˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™[Z\ÙWÝ˜XÚÚ[™×Ý™\œÚ[ÛŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™[Z\ÙWØØ\\™YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÈ\š]™Yœ›ÛHH[™HX›Ý™KÛÈHRH™]™\ˆ\ÈÈ™KY\š]™BˆÈ˜Ø[ˆ\È™[Z\ÙH™HÛÛ\\™Y][Èˆœ›ÛH[ÚXÚÜË‚ˆ™[Z\ÙWÝ˜XÚÚ[™×ÜÝ]Nˆ[œ]Z\žT™[Z\ÙU˜XÚÚ[™ÔÝ]HH››ÝØ\XØX›H‚ˆÈ\ÜÝYHÌÌŒÎˆH\Ý™[Z\ÙH™\™XÝH[š\]YHÝ\œ™[ÝXØÙ\ÜÛÜ‚ˆÈ™]šY]È][H
+Û›H]™\ˆÙ]Ú[ˆ^XÝHÛ™H^\ÝÈKH[ˆ[XšYÝ[Ý\ÂˆÈÝXØÙ\ÜÛÜˆ\È™]™\ˆÝY\ÜÙY
+K[™H[ÛY[\È[œ]Z\žH™XØ[YBˆÈ	ÜÝ\\œÙYY	ËˆÝ\\œÙYYØ]\ÈÙ\\˜]Hœ›ÛHÛÜÙYØ]ÚXÚÙY\ÂˆÈYX[š[™ÈH]™[Ü\ˆÛÜÙY\ÈÛÛ™\œØ][ÛˆŽˆH™\ÛÛ™Y[œ]Z\žBˆÈÙY\È]È^XÝ™\ÛÛ™Y[ÛY[[™Û™HHÞ\Ý[H^\™\ÈÚ[H]ˆÈØ\ÈÝ[Ü[‹Ú[ÙY\ÈÛÜÙYØ]•S˜]\ˆ[ˆØZ[š[™ÈBˆÈ™\ÛÛ™Y[ÛÚÚ[™È[Y\Ý[\‚ˆ™[Z\ÙWÙ]˜[X][ÛŽˆÜ[Û˜[Ò[œ]Z\žT™[Z\ÙQ]˜[X][Û—HH›Û™Bˆ™[Z\ÙWÜÝXØÙ\ÜÛÜ—Ú][WÚYˆÜ[Û˜[Ú[HH›Û™BˆÝ\\œÙYYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]ˆÛÜÙYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ[\šY]Ò[œ]Z\žQ]Z[Ý]
+˜\ÙS[Ù[
+N‚ˆ[œ]Z\žNˆ[\šY]Ò[œ]Z\žSÝ]ˆY\ÜØYÙ\Îˆ\ÝÒ[\šY]Ò[œ]Z\žSY\ÜØYÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ[\šY]Ò[œ]Z\žS\ÝÝ]
+˜\ÙS[Ù[
+N‚ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ][\Îˆ\ÝÒ[\šY]Ò[œ]Z\žSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ[\šY]Ò[œ]Z\žPÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÜšYÚ[—ÚÚ[™ˆ[\šY]Ò[œ]Z\žSÜšYÚ[’Ú[™ˆÜšYÚ[—ÚYˆ[ˆ]Y\Ý[Û—Ý^ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝL—Ì
+BˆÈÜ\]YHÈHÙ\™\ŽˆH\Ù\‰ÜÈ[˜ÛÛ™š\›YY[œÝÙ\ˆ˜YÛˆHÜšYÚ[‚ˆÈ][H]H[ÛY[^HÜ[™YH[œ]Z\žK›Ý[™]š\Y˜XÚÈ™\˜˜][BˆÈšXHÑUÜ™\ÛÛ™HÛÈH\Ú›Ø\™Ø[ˆ™\ÝÜ™H][ÈH[œ]Ú]Ý]ˆÈHÙ\™\ˆ]™\ˆ[\œ™][™ÈÜˆÝX›Z][™È]\È[ˆ[œÝÙ\‹‚ˆ[Ù˜YˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLŒÌ
+B‚‚˜Û\ÜÈ[\šY]Ò[œ]Z\žSY\ÜØYÙPÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÛÛ[ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝL—Ì
+B‚‚˜Û\ÜÈ[\šY]Ò[œ]Z\žU˜[œÚ][Û”™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆˆˆ“Ü[Û˜[]Y]šY[È›ÜˆHÛØØ[˜Ù[Ý[œ™\ÛÛ™YÝ]\ÈÚ[™ÙKˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÝ]\×Ü™X\ÛÛŽˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝML
+BˆXÝÜŽˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLŒ
+B‚‚ˆÈKKH›Ú[[™\œÝ[™[™ÈÙ\ÜÚ[Ûˆ
+\XÈÌÌŽ\ÙHHÈ\ÜÝYHÌÌŽJHKKKKKKKKKKKKBˆÂˆÈÚ]8à#8à£øàbøà¢xàj¸àa8à#HÕT•È[œÝXYÙˆ[™[™ËˆH™YH›Ý™[˜[˜Ù\ÂˆÈ
+[™\ÝYØ][ÛˆÈ˜[œÛ][ÛˆÈ]™[Ü\ŠHÝ^HÙ\\˜]H›ÝÜÈÚ]Ù\\˜]BˆÈ[\ÈKHÙYH\Ú›Ú[Ý[™\œÝ[™[™ËœH›ÜˆHš[š]H›ØØX[\šY\È\ÙBˆÈ]\˜[ÈZ\œ›Üˆ[™Ú\™YÜØÚ[X\ËÚ›Ú[Ý[™\œÝ[™[™ËœØÚ[XKšœÛÛˆ›ÜˆBˆÈÛÛ˜XÝ]Ù[‹ˆ›Ý[™È[ˆ\È™X]\™HÜš]\ÈHÜšYÚ[ˆÛÛ™š\›X][Û‚ˆÈ][Nˆ8à#8à£øàbøà¢xàj¸àa8à#H\È[ˆ[žHÚ[[ÈHÚ\™Y[™\ÝYØ][Û‹™]™\ˆBˆÈ™XÛÜ™Y]™[Ü\ˆ[[‚‚ˆÈ\ÜÝYHÌÎHYÈHšYÜšYÚ[ŽˆH\œÜÙHÚZ[ˆ™YY
+\Ü\œÜÙWÛ™YYËœX
+BˆÈÚÜÙH]™[Ü\ˆ™\ÜÛœÙHØ\È	Ý[šÛ›ÝÛ‰ËÉÚ[™\ÝYØ]IËˆ]ÈÜšYÚ[—ÚY\ÈBˆÈ\œÜÙWÛ™YYÜ™\ÜÛœÙKšYKH›ÝH›ÝÈ[ˆ[žHÙˆH›Ý\ˆÜšYÚ[˜[ÜšYÚ[‚ˆÈX›\Ë™XØ]\ÙHH™YY	ÜÈ\™Ù]
+[ˆ[[Y[ÜˆH™[][ÛŠH\ÈHÛÛ\]YˆÈ›Ú™XÝ[ÛˆÚ]HÝX›HÕ’S‘ÈY›ÝH]X˜\ÙH›ÝÈÔÕˆÈÜ\œÜÙKXÚZ[‹Û™YYËÞÛ™YYÚYKÜ™\ÜÛ™\ÈHÛ›HÜš]\ˆÙ‚ˆÈšYÙÙ\IÜ\œÜÙWÛ™YY	ØZ\œ›Üš[™ÈH	Ý[šÛ›ÝÛ—Ø[œÝÙ\‰È[H[[YYX][BˆÈ™[ÝÎˆšYÙÙ\˜™XÛÜ™ÈÒPÒUÜ[™YHÙ\ÜÚ[Û‹™]™\ˆH™\]Y\ÝˆÈ›ÙIÜÈÛZ[K‚’›Ú[[™\œÝ[™[™ÓÜšYÚ[’Ú[™H]\˜[ÈœXH‹š[[‹œ™]šY]×Ú][H‹š[œ]Z\žH‹œ\œÜÙWÛ™YY—B’›Ú[[™\œÝ[™[™ÕšYÙÙ\ˆH]\˜[È[šÛ›ÝÛ—Ø[œÝÙ\ˆ‹™^XÚ]Ü™\]Y\Ý‹œ\œÜÙWÛ™YY—B’›Ú[[™\œÝ[™[™ÔÝ]\ÈH]\˜[È›Ü[ˆ‹š[‹˜ÛÜÙY—BˆÈ\Ý\Ú\×ØYÜY\È^XÚ]H“Õ’TÒSÓS
+™]™\ˆH˜XÝ
+NÈXÚYY\ÈBˆÈÛ›Hš[˜[[X[ˆ˜[YHYÙ[Y[ˆÙYHÑTÔÒSÓ—ÓÕUÓÓQTË‚’›Ú[[™\œÝ[™[™ÓÝ]ÛÛYHH]\˜[Âˆ[™\œÝÛÙ‹™ÝXÜ™\ÛÛ™Y‹š\Ý\Ú\×ØYÜY‹™XÚYY‹ˆš[™YÛÙ™ˆ‹˜X˜[™Û™Y‹—B’›Ú[[™\œÝ[™[™ÐÛZ[RÚ[™H]\˜[Âˆ™˜XÝ‹š[™™\™[˜ÙH‹š\Ý\Ú\È‹[šÛ›ÝÛˆ‹˜ÛÛ™›XÝ‚—B’›Ú[[™\œÝ[™[™ÓÜšYÚ[”›ÛHH]\˜[Èš[™\ÝYØ][Ûˆ‹˜[œÛ][Ûˆ‹™]™[Ü\ˆ—B’›Ú[[™\œÝ[™[™ÐXÝ[Û’Ú[™H]\˜[Âˆœ™\]Y\ÝÚ[™\ÝYØ][Ûˆ‹™^Z[—Ü™X\ÛÛš[™È‹˜ÛÛ\\™WÛÜ[ÛœÈ‹ˆ˜YÜÚ\Ý\Ú\È‹œ™]š\ÙWÚ[[‹šÛ‹š[™Ù™ˆ‹™XÚYH‹—B’›Ú[[™\œÝ[™[™ÑXÚ\Ú[Û“Y]ÙH]\˜[È™]\›Z[š\ÝXÈ‹œ™X\ÛÛš[™×ÛH‹›X[X[—B’›Ú[[™\œÝ[™[™Ô[[YPÚXÚÈH]\˜[È›X]Ú‹›Z\ÛX]Ú‹[›ØœÙ\™Y‹œÝ[H—BˆÈ\ÜÝYHÌÌÍÎˆÚ]\ˆH™[Z\ÙH\ÈÙ\ÜÚ[ÛˆØ\È[™\ÝYØ]YYØZ[œÝÝ[ˆÈÛË]˜[X]Yœ›ÛHHÚ\™Y\ÜÝYHÌÌ™[Z\ÙH[™H˜]\ˆ[ˆœ›ÛBˆÈHÛ˜\ÚÝY[Û™KˆÛ›H	ØÝ\œ™[	È\›Z]È\Ý\Ú\×ØYÜYÈXÚYYÂˆÈ™Y›^ˆ	ÛZ\ÜÚ[™ÉÈ
+H™[Z\ÙH\Ø\X\™Y
+H[™	Ú[˜[Y	È
+›ÈÛÛ\\˜X›BˆÈ[™HØ\È]™\ˆØ\\™Y
+H›Ý\ÙYÈ™\Ü\È	Ùœ™\Ú	ÈKHH™[Z\ÙH]ˆÈØ[››Ý™H›Ý[™\È›ÝH™[Z\ÙH]Ý[ÛË‚’›Ú[[™\œÝ[™[™Ô™[Z\ÙTÝ]HH]\˜[È˜Ý\œ™[‹œÝ[H‹›Z\ÜÚ[™È‹š[˜[Y—BˆÈHØ[YHÙ]\ÈH™KHÌÌÍÈ˜[YK›ÜˆH™[Z\ÙH™\™XÝ‘PQ˜XÚÈœ›ÛHBˆÈ›ÝÈ]Ø\ÈÛÜÙY™Y›Ü™H\ÈÛÛ˜XÝ^\ÝYˆ™]™\ˆ›ÙXÙY[™]Ë‚’›Ú[[™\œÝ[™[™Ô™XÛÜ™Y™[Z\ÙTÝ]HH]\˜[Âˆ˜Ý\œ™[‹œÝ[H‹›Z\ÜÚ[™È‹š[˜[Y‹™œ™\Ú‹—BˆÈ\ÜÝYHÌÌÍÎˆHÚ[™ÛHš[š]H™X\ÛÛˆ™Z[™H›Û‹IØÝ\œ™[	È™\™XÝˆÜ]žBˆÈ™XÛÝ™\žH]KHÝ[HØ[ˆ™H™KZ[™\ÝYØ]YZ\ÜÚ[™ÈØ[››Ý‚’›Ú[[™\œÝ[™[™Ô™[Z\ÙT™X\ÛÛˆH]\˜[Âˆœ™[Z\ÙWÛ›ÝØØ\\™Y‹œ™[Z\ÙWÚ[˜ÛÛ\]H‹ˆœ[›™YÜÛ˜\ÚÝÜ™[[Ý™Y‹›ÜšYÚ[—Ü™[[Ý™Y‹ˆ›ÜšYÚ[—ÜÝ\\œÙYY‹œ[›™YØÛÛ[Z]ØÚ[™ÙY‹›ÜšYÚ[—ØÛÛ[ØÚ[™ÙY‹ˆ˜Ø\Xš[]WÜØÛÜWØÚ[™ÙY‹›[šÙYÚ[[ØÚ[™ÙY‹—BˆÈ\ÜÝYHÌÌÍÎˆÒPÒÛÙH]›ÙXÙYHš[™[™Ë\È\Ý[˜Ýœ›ÛHÚÜÙH›ÚXÙBˆÈ]ÜXZÜÈ[ˆ
+ÜšYÚ[—Ü›ÛJKˆ	ÛYØXÞIÈ\È™XY[Û›HKHÚ]H›ÝÈÜš][‚ˆÈ™Y›Ü™H›Ý™[˜[˜ÙHØ\È™XÛÜ™Y™\ÜË‚’›Ú[[™\œÝ[™[™Ô›ÙXÙ\’Ú[™H]\˜[Âˆš[™\ÝYØ][Û—ÛÛÜ‹˜[œÛ]Üˆ‹™]™[Ü\—Ø\H‹›YØXÞH‹—BˆÈ\ÜÝYHÌÌÍÎˆÚ]\ˆ[ˆ]][XØ]Y[X[ˆÝ[™È™Z[™H›ÝËˆ™\ÛÛ™YˆÈœ›ÛHH™\]Y\Ý	ÜÈš[˜Ú\[™]™\ˆœ›ÛH]È›ÙK‚’›Ú[[™\œÝ[™[™ÐXÝÜ’Ú[™H]\˜[È\Ù\ˆ‹œÞ\Ý[H‹›YØXÞH—BˆÈ\ÜÝYHÌÌÍÎˆH\š]™YÝ]HÙˆÛ™H›Ýš\Ú[Û˜[HYÜY\Ý\Ú\Ë‚’›Ú[[™\œÝ[™[™ÐYÜ[Û”Ý]HH]\˜[Âˆœ›Ýš\Ú[Û˜[‹œ™XÛÛ™š\›X][Û—Ü™\]Z\™Y‹˜˜\Ú\×ÝÚ]˜]Ûˆ‹—B’›Ú[[™\œÝ[™[™Ô™Y›^\™Ù]Ú[™H]\˜[ÈœXWÚ[™\ÝYØ][Ûˆ‹œÙ\ÜÚ[Û—ÛYÙ\ˆ—BˆÈ\ÜÝYHÌÌÍŽˆH^\Ý[™È›Ü›X[Ü\˜][Ûˆ[ˆXÝ[ÛˆXYÈËˆH™YBˆÈ
+—ØÛÜœ™XÝÈ
+—ØÜ™X]XÈ
+—Ø[œÝÙ\˜˜[Y\È˜[YH[ˆ[™Ú[ÕUÒQH\ÂˆÈ™X]\™K[™Û›H][™Ú[	ÜÈÝÛˆX[X[™XÛÜ™ÛÛ\]\È[K‚’›Ú[[™\œÝ[™[™Ñ›Ü›X[Ü\˜][ÛˆH]\˜[Âˆš›Ú[Ú[™\ÝYØ]H‹š›Ú[Ý˜[œÛ]H‹š›Ú[ÚÛ‹ˆš›Ú[ØÛÜÙWÜ›Ýš\Ú[Û˜[‹š›Ú[ØÛÜÙWÙXÚYY‹ˆš[[ØÛÜœ™XÝ‹œ]Y\Ý[Û—Ú[™Ù™—ØÜ™X]H‹›ÜšYÚ[—Ú][WØ[œÝÙ\ˆ‹—B‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ñ]šY[˜ÙR[Š˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ]ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝML
+BˆÝ\Û[™Nˆ[HšY[
+‹‹‹ÙOLJBˆ[™Û[™Nˆ[HšY[
+‹‹‹ÙOLJBˆÝ[[X\žNˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLWÌ
+B‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ñ]šY[˜ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆ]ˆÝ‚ˆÝ\Û[™Nˆ[ˆ[™Û[™Nˆ[ˆÝ[[X\žNˆÝˆHˆ‚‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ô[[YQ]šY[˜ÙR[Š˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÛÛ\Û™[ÚYˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝML
+Bˆ[[YWØÚXÚÎˆ›Ú[[™\œÝ[™[™Ô[[YPÚXÚÂˆÝ[[X\žNˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝLWÌ
+B‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ô[[YQ]šY[˜ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆÛÛ\Û™[ÚYˆÝ‚ˆ[[YWØÚXÚÎˆ›Ú[[™\œÝ[™[™Ô[[YPÚXÚÂˆÝ[[X\žNˆÝˆHˆ‚‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ñš[™[™ÓÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ›Ú[Ý[™\œÝ[™[™×ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÜšYÚ[—Ü›ÛNˆ›Ú[[™\œÝ[™[™ÓÜšYÚ[”›ÛBˆÛZ[WÚÚ[™ˆ›Ú[[™\œÝ[™[™ÐÛZ[RÚ[™ˆÝ][Y[ˆÝ‚ˆ]šY[˜ÙNˆ\ÝÒ›Ú[[™\œÝ[™[™Ñ]šY[˜ÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[[YWÙ]šY[˜ÙNˆ\ÝÒ›Ú[[™\œÝ[™[™Ô[[YQ]šY[˜ÙSÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ\Ü×Ùš[™[™×ÚYÎˆ\ÝÚ[HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÛÛ\][™×Ù^[˜][ÛœÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ™Y]][Û—ØÛÛ™][ÛœÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ™^Ú[™\ÝYØ][ÛŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ[˜Ù\Z[NˆÝˆHˆ‚ˆÝ\\œÙY\×Ùš[™[™×ÚYˆÜ[Û˜[Ú[HH›Û™BˆXÚ\Ú[Û—ÛY]Ùˆ›Ú[[™\œÝ[™[™ÑXÚ\Ú[Û“Y]Ùˆ[[YÙ[˜ÙWÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙBˆÈ\ÜÝYHÌÌÍÎˆ›Ý™[˜[˜ÙHÛˆÛÈ[™\[™[^\Ëˆ›ÙXÙ\—ÚÚ[™\ÈÚXÚˆÈÛÙH]Ü›ÝHH›ÝÎÈXÝÜ—ÚÚ[™\ÈÚ]\ˆ[ˆ]][XØ]Y[X[‚ˆÈÝ[™È™Z[™]ˆ›Ý\™H	ÛYØXÞIÈÛˆ›ÝÜÈÜš][ˆ™Y›Ü™HHÛÛ˜XÝˆÈ^\ÝYKH[šÛ›ÝÛ‹[™™]™\ˆ\ÜÝ[YYÈ™HH[X[‹‚ˆ›ÙXÙ\—ÚÚ[™ˆ›Ú[[™\œÝ[™[™Ô›ÙXÙ\’Ú[™H›YØXÞH‚ˆXÝÜ—ÚÚ[™ˆ›Ú[[™\œÝ[™[™ÐXÝÜ’Ú[™H›YØXÞH‚ˆXÝÜ—Ý\Ù\›˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ñš[™[™ÐÜ™X]J˜\ÙS[Ù[
+N‚ˆˆˆ\[™Û™HU‘SÔTˆš[™[™Ë‚‚ˆ\ÜÝYHÌÌÍÈXYH\È[™Ú[]™[Ü\‹[Û›Kˆ[™\ÝYØ][Û˜[™ˆ˜[œÛ][Û˜š[™[™ÜÈ\™HÜš][ˆ^Û\Ú]™[HžHZ\ˆ[\›˜[ˆ›ÙXÙ\œÈ
+Ú[™\ÝYØ]XÝ˜[œÛ]X
+KÚXÚ˜[Y]HZ\ˆ]šY[˜ÙBˆ[™Z\ˆ™X\ÛÛš[™È[ˆYØZ[œÝH[›™YÛ˜\ÚÝÈXØÙ\[™È[H\™Bˆ]HØ[\ˆÜÝ[ˆ[™\šYšXX›H™˜XÝˆÚ]˜XœšXØ]YÚ]][ÛœË[™ˆXØÙ\[™È]™[Ü\˜œ›ÛH[žHØ[\ˆ]H™\]Y\Ý›ÙH™XÛÜ™BˆÙ[[˜ÙH\ÈH[X[‰ÜÈÝÛˆYÙ[Y[ˆÜšYÚ[—Ü›ÛX\ÈÙ\[ˆBˆ^[ØYÛÈH™Z™XÝ[Ûˆ\È^XÚ]˜]\ˆ[ˆHÚ[[™Z[\œ™]][Û‹‚ˆˆˆ‚‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÜšYÚ[—Ü›ÛNˆ›Ú[[™\œÝ[™[™ÓÜšYÚ[”›ÛBˆÛZ[WÚÚ[™ˆ›Ú[[™\œÝ[™[™ÐÛZ[RÚ[™ˆÝ][Y[ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝMÌ
+Bˆ]šY[˜ÙNˆ\ÝÒ›Ú[[™\œÝ[™[™Ñ]šY[˜ÙR[—HHšY[
+Y˜][Ù˜XÝÜžO[\ÝX^Û[™ÝLŒ
+Bˆ[[YWÙ]šY[˜ÙNˆ\ÝÒ›Ú[[™\œÝ[™[™Ô[[YQ]šY[˜ÙR[—HHšY[
+ˆY˜][Ù˜XÝÜžO[\ÝX^Û[™ÝLŒˆ
+BˆÝ\Ü×Ùš[™[™×ÚYÎˆ\ÝÚ[HHšY[
+Y˜][Ù˜XÝÜžO[\ÝX^Û[™ÝLŒ
+BˆÛÛ\][™×Ù^[˜][ÛœÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\ÝX^Û[™ÝLL
+Bˆ™Y]][Û—ØÛÛ™][ÛœÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\ÝX^Û[™ÝLL
+Bˆ™^Ú[™\ÝYØ][ÛŽˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝL—Ì
+Bˆ[˜Ù\Z[NˆÝˆHšY[
+Y˜][Hˆ‹X^Û[™ÝL—Ì
+BˆÝ\\œÙY\×Ùš[™[™×ÚYˆÜ[Û˜[Ú[HH›Û™BˆXÚ\Ú[Û—ÛY]Ùˆ›Ú[[™\œÝ[™[™ÑXÚ\Ú[Û“Y]Ùˆ[[YÙ[˜ÙWÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™Bˆ\×Û[ØÚÎˆ›ÛÛH˜[ÙB‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™ÐXÝ[Û“Ý]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆ›Ú[Ý[™\œÝ[™[™×ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆXÝ[Û—ÚÚ[™ˆ›Ú[[™\œÝ[™[™ÐXÝ[Û’Ú[™ˆÈ\Ü^HX™[Û›Kˆ\ÜÝYHÌÌÍÎˆXÝÜ—ÚÚ[™ØXÝÜ—Ý\Ù\›˜[YX\™HBˆÈ]][XØ]YY[]K™\ÛÛ™Yœ›ÛHH™\]Y\Ý	ÜÈš[˜Ú\[‚ˆXÝÜŽˆÜ[Û˜[ÜÝ—HH›Û™BˆXÝÜ—ÚÚ[™ˆ›Ú[[™\œÝ[™[™ÐXÝÜ’Ú[™H›YØXÞH‚ˆXÝÜ—Ý\Ù\›˜[YNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ›ÝNˆÜ[Û˜[ÜÝ—HH›Û™BˆXÚ\Ú[Û—ÛY]Ùˆ]\˜[È›X[X[—HH›X[X[‚ˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™ÐXÝ[ÛÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆXÝ[Û—ÚÚ[™ˆ›Ú[[™\œÝ[™[™ÐXÝ[Û’Ú[™ˆÈHØ[\‹\Ý\YYX™[
+K™ËˆHX[H˜[YJKˆ\ÜÝYHÌÌÍÎˆ]\È“ÕBˆÈY[]HKHH™XÛÜ™YXÝÜˆÛÛY\Èœ›ÛHH]][XØ]Yš[˜Ú\[ÛÂˆÈ\ÈØ[ˆ›ÈÛ™Ù\ˆ™H\ÙYÈ]šX]H[ˆXÝ[ÛˆÈÛÛY[Û™H[ÙK‚ˆXÝÜŽˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLŒ
+Bˆ›ÝNˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝL—Ì
+B‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™ÓÝ]
+˜\ÙS[Ù[
+N‚ˆYˆ[ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÜšYÚ[—ÚÚ[™ˆ›Ú[[™\œÝ[™[™ÓÜšYÚ[’Ú[™ˆÜšYÚ[—ÚYˆ[ˆšYÙÙ\Žˆ›Ú[[™\œÝ[™[™ÕšYÙÙ\‚ˆ]Y\Ý[Û—Ý^ˆÝ‚ˆÝ]\Îˆ›Ú[[™\œÝ[™[™ÔÝ]\ÂˆÝ]ÛÛYNˆÜ[Û˜[Ò›Ú[[™\œÝ[™[™ÓÝ]ÛÛYWHH›Û™BˆÈ\š]™Y™]™\ˆÝÜ™YˆYH^XÝH›ÜˆÝ]ÛÛYOIÚ\Ý\Ú\×ØYÜY	Ë‚ˆÈH›Ýš\Ú[Û˜[Ý]ÛÛYH]\Ý›Ý™H™\Ù[YÜˆ™]\ÙY\ÈH˜XÝ‚ˆÝ]ÛÛYWÚ\×Ü›Ýš\Ú[Û˜[ˆ›ÛÛH˜[ÙBˆÝ]ÛÛYWÜ™X\ÛÛŽˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ\ÜÝYHÌÌÌŽˆHš[™[™ÜÈH™XÛÜ™YÝ]ÛÛYH™\ÝÈÛ‹H™[Z\ÙBˆÈ™\™XÝ]˜[X]YÚ[ˆ]Ø\È™XÛÜ™Y[™HÕT”‘S•™\™XÝKBˆÈ	ÜÝ[IÈYX[œÈH[\šY]ÈÙ\ÜÚ[Ûˆ\È[Ý™YÈH™]Ù\ˆÛ˜\ÚÝ[‚ˆÈ\ÈÙ\ÜÚ[Ûˆ[›™YÛÈYÜÙXÚYH\™H™Y\ÙY[[™KZ[™\ÝYØ][Û‹‚ˆÝ]ÛÛYWÙš[™[™×ÚYÎˆ\ÝÚ[HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÝ]ÛÛYWÜ™[Z\ÙWÜÝ]NˆÜ[Û˜[Ò›Ú[[™\œÝ[™[™Ô™XÛÜ™Y™[Z\ÙTÝ]WHH›Û™BˆÝ]ÛÛYWÜ™[Z\ÙWÜ™X\ÛÛŽˆÜ[Û˜[Ò›Ú[[™\œÝ[™[™Ô™[Z\ÙT™X\ÛÛ—HH›Û™BˆÈ\ÜÝYHÌÌÍÎˆÚÈÛÜÙYHÙ\ÜÚ[Û‹™XÛÜ™Yœ›ÛHH]][XØ]YˆÈš[˜Ú\[ˆHÛÜÙH\ÈHX[X[XÚ\Ú[ÛŽÈ[ˆÝ]ÛÛYHÚÜÙHXÚY\ˆØ[››ÝˆÈ™H™XÛÝ™\™YY\ˆH™[ØY\È›Ý[ˆ]Y]™XÛÜ™‚ˆÛÜÙYØžWØXÝÜ—ÚÚ[™ˆÜ[Û˜[Ò›Ú[[™\œÝ[™[™ÐXÝÜ’Ú[™HH›Û™BˆÛÜÙYØžWÝ\Ù\›˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ\ÜÝYHÌÌÍŽˆHÜšYÚ[ˆ›ÝÈ]\ÈÕT”‘S•Ù^Kˆ›ÜˆXX[™[[ˆÈÛÜœ™XÝ[ÛœÈ\™HY]]™HKHH[›™YÜšYÚ[—ÚY™XÛÛY\ÈHÝ\\œÙYY›ÝÂˆÈH[ÛY[H]™[Ü\ˆ™]š\Ù\È]KHÛÈHÛÛœÝ[Y\ˆX]Ú[™ÈHÙ\ÜÚ[ÛˆÂˆÈH]™H][H]\Ý\ÙH\Ë›ÝÜšYÚ[—ÚYˆ™\ÜY˜]\ˆ[‚ˆÈÝXœÝ]]YˆHÙ\ÜÚ[ÛˆÙY\ÈÚ[[™È]H›ÝÈHÛÛ™\œØ][Û‚ˆÈÝ\Yœ›ÛK‚ˆÝ\œ™[ÛÜšYÚ[—ÚYˆÜ[Û˜[Ú[HH›Û™Bˆ™[Z\ÙWÜÝ]Nˆ›Ú[[™\œÝ[™[™Ô™[Z\ÙTÝ]HHš[˜[Y‚ˆ™[Z\ÙWÜ™X\ÛÛŽˆÜ[Û˜[Ò›Ú[[™\œÝ[™[™Ô™[Z\ÙT™X\ÛÛ—HH›Û™BˆÈ\ÜÝYHÌÌÍÎˆHÚ\™Y\ÜÝYHÌÌ™[Z\ÙH[™H\ÈØ\\™Y]Ü™X][Û‹‚ˆÈ™[Z\ÙWØÛÛ[Z]ÜÚH
+›ÝHÛ˜\ÚÝY
+H\ÈÚ]XÚY\ÈÝ[[™\ÜÎˆBˆÈØ[YHÛÛ[Z]™K\[›™Y[™\ˆH™]ÈÛ˜\ÚÝ›ÝÈ\ÈHØ[YH™[Z\ÙK‚ˆ™[Z\ÙWÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™Bˆ™[Z\ÙWØÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™[Z\ÙWÜ™]š\Ú[Û—ÚYˆÜ[Û˜[Ú[HH›Û™Bˆ™[Z\ÙWÝ˜XÚÚ[™×Ý™\œÚ[ÛŽˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™[Z\ÙWØØ\\™YØ]ˆÜ[Û˜[Ù›Ø]HH›Û™BˆØÚ[XWÝ™\œÚ[ÛŽˆÝ‚ˆÜ™X]YØ]ˆ›Ø]ˆ\]YØ]ˆ›Ø]ˆÛÜÙYØ]ˆÜ[Û˜[Ù›Ø]HH›Û™B‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™ÐYÜ[Û“Ý]
+˜\ÙS[Ù[
+N‚ˆˆˆ“Û™H›Ýš\Ú[Û˜[HYÜY\Ý\Ú\È
+\ÜÝYHÌÌÍÊK‚‚ˆÝ]X\È\š]™Y]™XY[YHœ›ÛHHØ\\™Y™[Z\ÙH™\œÝ\ÈBˆÝ\œ™[Û™KÛÈ]Ø[ˆ™]™\ˆÛZ[H›Ýš\Ú[Û˜[›Üˆ[ˆYÜ[ÛˆÚÜÙBˆÜ›Ý[™\ÈÚ[˜ÙH[Ý™Y‚ˆˆˆ‚‚ˆYˆ[ˆ›Ú[Ý[™\œÝ[™[™×ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆš[™[™×ÚYˆ[ˆÝ]Nˆ›Ú[[™\œÝ[™[™ÐYÜ[Û”Ý]BˆYÜYØžWØXÝÜ—ÚÚ[™ˆ›Ú[[™\œÝ[™[™ÐXÝÜ’Ú[™ˆYÜYØžWÝ\Ù\›˜[YNˆÜ[Û˜[ÜÝ—HH›Û™BˆYÜ[Û—Ü™X\ÛÛŽˆÝˆHˆ‚ˆ™[Z\ÙWÜÛ˜\ÚÝÚYˆÜ[Û˜[Ú[HH›Û™Bˆ™[Z\ÙWØÛÛ[Z]ÜÚNˆÜ[Û˜[ÜÝ—HH›Û™Bˆ™[Z\ÙWÜ™]š\Ú[Û—ÚYˆÜ[Û˜[Ú[HH›Û™BˆXÚ\Ú[Û—ÛY]Ùˆ]\˜[È›X[X[—HH›X[X[‚ˆYÜYØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ñ]Z[Ý]
+˜\ÙS[Ù[
+N‚ˆÙ\ÜÚ[ÛŽˆ›Ú[[™\œÝ[™[™ÓÝ]ˆš[™[™ÜÎˆ\ÝÒ›Ú[[™\œÝ[™[™Ñš[™[™ÓÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆXÝ[ÛœÎˆ\ÝÒ›Ú[[™\œÝ[™[™ÐXÝ[Û“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÜÝYHÌÌÌˆH\‹\›Ý[™[™\ÝYØ][Ûˆ]Y]
+Ú]XXÚ›Ý[™™XYˆÈÚ]]Y[œ™XYÚHHÛÜÝÜY
+Kˆ›ÜØ\™\™Y™\™[˜ÙY™XØ]\ÙBˆÈH\ÙHˆ[Ù[È\™HYš[™Y™[ÝÎÈ™\ÛÛ™YžHH[Ù[Ü™XZ[
+
+BˆÈØ[]H[™Ùˆ]›ØÚË‚ˆ[™\ÝYØ][Û—Ü›Ý[™Îˆ\ÝÈ’›Ú[[™\œÝ[™[™Ô›Ý[™Ý]—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÜÝYHÌÌÌNˆ]™\žH˜[œÛ][Ûˆ\ÜËÛ\Ýš\œÝˆH˜[œÛ]YˆÈÙ[[˜Ù\È[\Ù[™\È\™H[ÛÈ[ˆš[™[™ÜØ\ÈÜšYÚ[—Ü›ÛOIÝ˜[œÛ][Û‰ÂˆÈ›ÝÜÎÈ\ÈØ\œšY\ÈHÝ[[X\žKÛÜ[ÛœËÝ[šÛ›ÝÛœÈ\›Ý[™[K‚ˆ˜[œÛ][ÛœÎˆ\ÝÈ’›Ú[[™\œÝ[™[™Õ˜[œÛ][Û“Ý]—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÜÝYHÌÌÌŽˆÞ\Ý[K]™\šYšYY˜XÝÈ]XÚYÈH[™\œÝ[™[™ÈÝ\™˜XÙBˆÈÒUÕU™Z[™È™XÛÜ™Y\È[ž[Û™IÜÈ[œÝÙ\‹‚ˆ™Y›^ˆ\ÝÈ’›Ú[[™\œÝ[™[™Ô™Y›^Ý]—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈ\ÜÝYHÌÌÍÎˆ]™\žH›Ýš\Ú[Û˜[HYÜY\Ý\Ú\ËÚ]]È\š]™YˆÈ™KXÛÛ™š\›X][ÛˆÝ]Kˆ\È\ÈÚ]ÙY\ÈH›Ýš\Ú[Û˜[YÜ[Ûˆœ›ÛBˆÈYÚ[™ÈÚ[[H[ÈÛÛY][™È[™\Ý[™ÝZ\ÚX›Hœ›ÛHH˜XÝ‚ˆ\Ý\Ú\×ØYÜ[ÛœÎˆ\ÝÒ›Ú[[™\œÝ[™[™ÐYÜ[Û“Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈHš[š]H™^XXÝ[ÛˆY[H›ÜˆHÙ\ÜÚ[Û‰ÜÈÝ\œ™[Ý]\ËˆÈ]\›Z[š\ÝXØ[HÜ™\™Y
+[\HÛ˜ÙHÛÜÙYÚ[
+K‚ˆ]˜Z[X›WØXÝ[ÛœÎˆ\ÝÒ›Ú[[™\œÝ[™[™ÐXÝ[Û’Ú[™HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ó\ÝÝ]
+˜\ÙS[Ù[
+N‚ˆÙ\ÜÚ[Û—ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ][\Îˆ\ÝÒ›Ú[[™\œÝ[™[™ÓÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+B‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™ÐÜ™X]J˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÜšYÚ[—ÚÚ[™ˆ›Ú[[™\œÝ[™[™ÓÜšYÚ[’Ú[™ˆÜšYÚ[—ÚYˆ[ˆšYÙÙ\Žˆ›Ú[[™\œÝ[™[™ÕšYÙÙ\‚ˆ]Y\Ý[Û—Ý^ˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝL—Ì
+B‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™ÐÛÜÙT™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÝ]ÛÛYNˆ›Ú[[™\œÝ[™[™ÓÝ]ÛÛYBˆÈ\ÜÝYHÌÌÍÎˆH]™[Ü\‰ÜÈÝ]YYÙ[Y[›ÝÈ‘TURT‘QˆHÛÜÙH\ÂˆÈHX[X[XÚ\Ú[Ûˆ™XÛÜ™Ùˆ\ÈÛÛ™\œØ][ÛŽÈÚ]Ø\ÈXÚYYˆÚ]ˆÈ›È^\È[ˆÝ]ÛÛYHX™[›ÝHXÚ\Ú[Ûˆ[ž[Û™HØ[ˆ]Y]]\‹‚ˆÝ]ÛÛYWÜ™X\ÛÛŽˆÝˆHšY[
+‹‹‹Z[—Û[™ÝLKX^Û[™ÝL—Ì
+BˆÈ\ÜÝYHÌÌÌŽˆÚXÚš[™[™ÜÈHÝ]ÛÛYH™\ÝÈÛ‹ˆ™\]Z\™Y›Ü‚ˆÈ	Ú\Ý\Ú\×ØYÜY	È[™	ÙXÚYY	ÈKH[ˆYÜ[ÛˆÜˆHXÚ\Ú[Ûˆ]ˆÈØ[››Ý˜[YH]È˜\Ú\È\È›Ý]Y]X›Kˆ\ÜÝYHÌÌÍÈY][Û˜[H™Z™XÝÈBˆÈÝ\\œÙYY[ØÚËÜˆ
+›Üˆ[ˆYÜ[ÛŠH›Û‹Z\Ý\Ú\È˜\Ú\Ë‚ˆÝ]ÛÛYWÙš[™[™×ÚYÎˆ\ÝÚ[HHšY[
+Y˜][Ù˜XÝÜžO[\ÝX^Û[™ÝML
+B‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™ÒÛ™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆ™X\ÛÛŽˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝML
+B‚‚ˆÈKKH]\˜]]™H[™\ÝYØ][Ûˆ
+\XÈÌÌŽ\ÙHˆÈ\ÜÝYHÌÌÌ
+HKKKKKKKKKKKKKKKKB‚’›Ú[[™\œÝ[™[™ÔÝÜ™X\ÛÛˆH]\˜[Âˆ˜[œÝÙ\™Y‹˜YÙ]Ù^]\ÝY‹››×Û™]×Ù]šY[˜ÙH‹[œ™\ÛÛ™Y‹™˜Z[Y‹—B’›Ú[[™\œÝ[™[™Ô›Ý[™Ý]\ÈH]\˜[È˜ÛÛ\]Y‹[œ™\ÛÛ™Y‹™˜Z[Y—BˆÈ\ÜÝYHÌÌÎNˆHš[š]HÝ]ÛÛYHÛ\ÜËÛÈHØ[\ˆ™]™\ˆ\ÈÈ[œÜXÝˆÈÝÜÜ™X\ÛÛ˜[™ÝY\ÜÈÚXÚÚYHÙˆH[Z]][Û‹Ù˜Z[\™HÜ]]\ÈÛ‹‚’›Ú[[™\œÝ[™[™ÓÝ]ÛÛYPÛ\ÜÈH]\˜[Âˆ˜[œÝÙ\™Y‹œ™\ÙX\˜ÚÛ[Z]][Ûˆ‹™^XÝ][Û—Ù˜Z[\™H‹—BˆÈ\ÜÝYHÌÌÎNˆÒT‘H[ˆ^XÝ][Ûˆ˜Z[\™Hœ›ÚÙK™XØ]\ÙHH™XÛÝ™\žHY™™\œÈKBˆÈÛÛ™šYÝ\˜][Ûˆ[™HZ\ÜÚ[™ÈÛ˜\ÚÝ\™H›Ý™]šY\Ë[ˆTKÜØÚ[XKÝ[Y[Ý]ˆÈ˜Z[\™H\Ë‚’›Ú[[™\œÝ[™[™Ñ˜Z[\™PÛ\ÜÈH]\˜[Âˆ˜ÛÛ™šY×Ú[˜[Y‹œÛ˜\ÚÝÝ[˜]˜Z[X›H‹˜\WÙ˜Z[\™H‹œØÚ[XWÚ[˜[Y‹ˆ[Y[Ý]‹—BˆÈ\ÜÝYHÌÌÎNˆHš[š]H^Ü˜][ÛˆÛÝ\˜Ù\ËˆHš\œÝ›Ý\ˆ\™H\XÈÌÌŽ	ÜÎÂˆÈH\Ý›Ý\ˆ\™HHÝXÝ\˜[œ™XY\È\ÜÝYHYË‚’›Ú[[™\œÝ[™[™Ñ^Ü˜][Û”ÛÝ\˜ÙRÚ[™H]\˜[Âˆœ]Û˜[YH‹œÞ[X›ÛÚ[™^‹™[ž\Ú[Ú[™^‹™š[WØÛÛ[‹ˆ™\[™[˜ÞH‹˜Ø[ÙÜ˜\‹™Ú]Ú\ÝÜžH‹œ[[YWÙ˜XÝÈ‹—B‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ñ^Ü˜][Û”ÛÝ\˜ÙSÝ]
+˜\ÙS[Ù[
+N‚ˆˆˆ“Û™H^Ü˜][ÛˆÛÝ\˜ÙIÜÈÛÛšX][ÛˆÈÛ™H›Ý[™
+\ÜÝYHÌÌÎJKˆˆˆ‚‚ˆYˆ[ˆ›Ý[™ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÛÝ\˜ÙWÚÚ[™ˆ›Ú[[™\œÝ[™[™Ñ^Ü˜][Û”ÛÝ\˜ÙRÚ[™ˆÈH[›™YÛÛ[Z]›ÜˆÚ]\ÝÜžKHÛ˜\ÚÝY›ÜˆH[™^ÂˆÈÛÛ[È[[YHÛÝ\˜Ù\Ë‚ˆ™]š\Ú[ÛŽˆÝ‚ˆØ[™Y]\×Ù›Ý[™ˆ[Hˆ]Y\šY\×Ü[Žˆ[Hˆ[\ÙYÜÙXÛÛ™Îˆ›Ø]HŒˆ[˜Ø]Yˆ›ÛÛH˜[ÙBˆÈH˜Z[YÛÝ\˜ÙH\È™XÛÜ™Y[™ÚÚ\Yˆ]™]™\ˆ˜Z[ÈH›Ý[™[™]ˆÈ\È™]™\ˆ™\XÙYžH[ˆ[˜›Ý[™Y˜[˜XÚÈÙX\˜Ú‚ˆ\œ›Ü—Ù]Z[ÎˆÜ[Û˜[ÜÝ—HH›Û™BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ô›Ý[™Ý]
+˜\ÙS[Ù[
+N‚ˆˆˆ]Y]ÙˆÛ™H[™\ÝYØ][Ûˆ›Ý[™ˆÚ]]™XYÚ]]YÚKˆˆˆ‚‚ˆYˆ[ˆ›Ú[Ý[™\œÝ[™[™×ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆ›Ý[™Ú[™^ˆ[ˆÝ]\Îˆ›Ú[[™\œÝ[™[™Ô›Ý[™Ý]\ÂˆÈÛ›HH›Ý[™][™YHÛÜØ\œšY\ÈHÝÜ™X\ÛÛ‹‚ˆÝÜÜ™X\ÛÛŽˆÜ[Û˜[Ò›Ú[[™\œÝ[™[™ÔÝÜ™X\ÛÛ—HH›Û™BˆÛÛ˜Û\Ú[ÛŽˆÝˆHˆ‚ˆÈHÝ]HØ\œšYY[ÈH™^›Ý[™[™™\ÝÜ™YÛˆH™]žK‚ˆÙX\˜ÚÛXYÎˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÜ[—Ú\Ý\Ù\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆZ\ÜÚ[™×Ù]šY[˜ÙNˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ™XYÜ]Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈØ[™Y]\È\È›Ý[™Ù[XÝY]ÛÝ[›Ý™XYÚ][ˆYÙ]KBˆÈ››ÝÛÚÙY]ˆÝ^\È\Ý[™ÝZ\ÚX›Hœ›ÛH››Ý\™H‹‚ˆ[œ™XYØØ[™Y]\Îˆ\ÝÜÝ—HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ[™YÙš[™[™ÜÎˆ[Hˆš[\×Ü™XYˆ[HˆÚ\œ×Ü™XYˆ[HˆWØØ[Îˆ[Hˆ[\ÙYÜÙXÛÛ™Îˆ›Ø]HŒˆ[[YÙ[˜ÙWÜ[—ÚYˆÜ[Û˜[Ú[HH›Û™Bˆ\œ›Ü—Ù]Z[ÎˆÜ[Û˜[ÜÝ—HH›Û™BˆÈ\ÜÝYHÌÌÎNˆÙ]Ó“H›Üˆ[ˆ^XÝ][Ûˆ˜Z[\™KˆH™\ÙX\˜Ú[Z]][Û‚ˆÈ
+YÙ]Ù^]\ÝYÈ›×Û™]×Ù]šY[˜ÙHÈ[œ™\ÛÛ™Y
+H\ÈH™X[ˆÈ]šY[˜ÙKX˜XÚÙY™\Ý[[™X]™\È\È•SKHHÞ\Ý[HÛÚÙY[™ˆÈÛÝ[›Ý[ˆ]\ÝÝ^H\Ý[™ÝZ\ÚX›Hœ›ÛHHÞ\Ý[HÛÝ[›ÝˆÈÛÚÈ‹‚ˆ˜Z[\™WØÛ\ÜÎˆÜ[Û˜[Ò›Ú[[™\œÝ[™[™Ñ˜Z[\™PÛ\Ü×HH›Û™BˆÝ]ÛÛYWØÛ\ÜÎˆ›Ú[[™\œÝ[™[™ÓÝ]ÛÛYPÛ\ÜÈHœ™\ÙX\˜ÚÛ[Z]][Ûˆ‚ˆÈÛ™H[žH\ˆ^Ü˜][ÛˆÛÝ\˜ÙH\È›Ý[™\ÙYXXÚÚ]]ÈÝÛ‚ˆÈ™]š\Ú[Ûˆ[™YÙ]ÛÛœÝ[\[Û‹ˆ\ˆÛÝ\˜ÙH™XØ]\ÙHH›Ý[™Û›H™XYˆÈH[›™Y™]š\Ú[Ûˆˆ\ÈHÛZ[HX›Ý]XXÚÛÝ\˜ÙHÙ\\˜][K‚ˆÛÝ\˜Ù\Îˆ\ÝÈ’›Ú[[™\œÝ[™[™Ñ^Ü˜][Û”ÛÝ\˜ÙSÝ]—HHšY[
+ˆY˜][Ù˜XÝÜžO[\Ýˆ
+BˆÜ™X]YØ]ˆ›Ø]‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ò[™\ÝYØ]T™\]Y\Ý
+˜\ÙS[Ù[
+N‚ˆ[Ù[ØÛÛ™šYÈHÛÛ™šYÑXÝ
+^˜OH™›Ü˜šYŠB‚ˆÈÜ[Û˜[˜\œ›ÝÚ[™È[ÎÈ›ÝÛ›HY™™XÝ]\›Z[š\ÝXÈØ[™Y]BˆÈ™]šY]˜[™]™\ˆHÛÛ˜Û\Ú[Û‹‚ˆ™\ÙX\˜ÚÙ›ØÝ\ÎˆÜ[Û˜[ÜÝ—HHšY[
+Y˜][S›Û™KX^Û[™ÝLWÌ
+BˆÙX\˜ÚÚÙ^]ÛÜ™ÎˆÜ[Û˜[Ó\ÝÜÝ—WHHšY[
+Y˜][S›Û™KX^Û[™ÝLŒ
+BˆX^Ü›Ý[™ÎˆÜ[Û˜[Ú[HHšY[
+Y˜][S›Û™KÙOLKOMJB‚‚˜Û\ÜÈ›Ú[[™\œÝ[™[™Ò[™\ÝYØ]SÝ]
+˜\ÙS[Ù[
+N‚ˆ›Ú[Ý[™\œÝ[™[™×ÚYˆ[ˆÞ\Ý[WÚYˆ[ˆÝÜÜ™X\ÛÛŽˆ›Ú[[™\œÝ[™[™ÔÝÜ™X\ÛÛ‚ˆ›Ý[™Îˆ\ÝÒ›Ú[[™\œÝ[™[™Ô›Ý[™Ý]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+BˆÈHš[™[™ÜÈ\ÈØ[\[™Y
+ÜšYÚ[—Ü›ÛOIÚ[™\ÝYØ][Û‰ÊK‚ˆš[™[™ÜÎˆ\ÝÒ›Ú[[™\œÝ[™[™Ñš[™[™ÓÝ]HHšY[
+Y˜][Ù˜XÝÜžO[\Ý
+Bˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™B‚‚‚ˆÈKKH˜[œÛ][Ûˆ
+\XÈÌÌŽ\ÙHÈÈ\ÜÝYuó¾4¶‰žËkºwµçB7FGW3¢7G ¢‡VÖåöFV6—6–öã¢7G ¢‡VÖåöFV6—6–öå÷f&–çEö¶W“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@  ¦6Æ726&–Æ—G”6öçFW‡D÷WB„&6TÖöFVÂ“ ¢""$—77VR3sS¢v2ò&ö&RÆç2òW‡W&–ÖVçG2W‡Æ–6—FÇ’Æ–æ¶VBFòöæP¢6&–Æ—G•ö¶W’Âf÷"F†R6&–Æ—G’FWF–ÂæVÂâWfW'’—FVÒ†W&R—2¦ö–æV@¢'’âW†7B¶W’ÖF6‚†6&–Æ—G•ö¶W’÷"fVGW&Uö–B’(	BæWfW"wVW72â""  ¢6&–Æ—G•ö¶W“¢7G ¢v3¢Æ—7Eµ7—7FVÕVæFW'7FæF–ætv÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&ö&U÷Æç3¢Æ—7E´6&–Æ—G”6öçFW‡E&ö&UÆä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢W‡W&–ÖVçG3¢Æ—7E´6&–Æ—G”6öçFW‡DW‡W&–ÖVçD÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ727—7FVÕVæFW'7FæF–æt'V–ÆE7FW÷WB„&6TÖöFVÂ“ ¢""$öæR÷&6†W7G&FVB7FWöb7—7FVÒVæFW'7FæF–ær'V–ÆB¦ö"„—77VR3’’â""  ¢–C¢–ç@¢7FW¢7G ¢7FGW3¢7G"2VæF–ærÂ'Vææ–ærÂ6ö×ÆWFVBÂf–ÆVBÂ&Æö6¶VBÂ6æ6VÆÆV@¢FWVæG5ööã¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&WW6VEöW†—7F–æs¢&ööÂÒfÇ6P¢6æ6VÅ÷&WVW7FVC¢&ööÂÒfÇ6P¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢'F–f7E÷&÷fVææ6S¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢GW&F–öåö×3¢÷F–öæÅ¶fÆöEÒÒæöæP¢†V'F&VEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢7F'FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢6ö×ÆWFVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ727—7FVÕVæFW'7FæF–ætÆÆÕF6µ7VÖÖ'”÷WB„&6TÖöFVÂ“ ¢""$vw&VvFR6÷VçG2öb6‡Væ²ÖÆWfVÂÄÄÒF6·2f÷"'V–ÆB¦ö"â""  ¢F÷FÃ¢–çBÒ ¢VæF–æs¢–çBÒ ¢'Vææ–æs¢–çBÒ ¢6ö×ÆWFVC¢–çBÒ ¢f–ÆVC¢–çBÒ ¢6æ6VÆÆVC¢–çBÒ ¢&WW6VC¢–çBÒ   ¦6Æ727—7FVÕVæFW'7FæF–æt'F–f7D6÷VçG4÷WB„&6TÖöFVÂ“ ¢""$FWFW&Ö–æ—7F–2W'6—7FVB'F–f7B6÷VçG2f÷"F†R¦ö"w26æ6†÷Bâ""  ¢7–Ö&öÇ3¢–çBÒ ¢VçG'—ö–çG3¢–çBÒ ¢VæFW'7FæF–æuöw&…ö6Æ–×3¢–çBÒ ¢6&–Æ—G•ö†–W&&6‡•öæöFW3¢–çBÒ   ¦6Æ727—7FVÕVæFW'7FæF–æt'V–ÆD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢¦ö%ö–C¢–ç@¢2ÆFW7BW†V7WF–öâ†–æ—F–ÂVçVWVR÷"&WG'’’öbF†—2¦ö"âæöæRöæÇ’f÷ ¢2ÆVv7’&÷w27&VFVB&Vf÷&R'VâG&6¶–ærW†—7FVBà¢'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7—7FVÕö–C¢–ç@¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢26ö×ÆWFVBöæÇ’v†VâWfW'’7FW6ö×ÆWFVC²&Æö6¶VBö6æ6VÆÆVBöf–ÆV@¢27FW2––VÆB'F–Â†÷"f–ÆVBv†Vâæò7FW6ö×ÆWFVB’à¢7FGW3¢7G"2VWVVBÂ'Vææ–ærÂ6ö×ÆWFVBÂ'F–ÂÂf–ÆVBÂ6æ6VÆÆV@¢7W'&VçE÷7FW¢÷F–öæÅ·7G%ÒÒæöæP¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢6æ6VÅ÷&WVW7FVC¢&ööÂÒfÇ6P¢—5÷7GV6³¢&ööÂÒfÇ6P¢†V'F&VEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢7F'FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢6ö×ÆWFVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢7&VFVEöC¢fÆö@¢7FW3¢Æ—7Eµ7—7FVÕVæFW'7FæF–æt'V–ÆE7FW÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢ÆÆÕ÷F6·3¢÷F–öæÅµ7—7FVÕVæFW'7FæF–ætÆÆÕF6µ7VÖÖ'”÷WEÒÒæöæP¢'F–f7Eö6÷VçG3¢÷F–öæÅµ7—7FVÕVæFW'7FæF–æt'F–f7D6÷VçG4÷WEÒÒæöæP  ¦6Æ727—7FVÕVæFW'7FæF–æt¦ö%&WG'”–â„&6TÖöFVÂ“ ¢""$÷F–öæÂ7FWæÖRFò&WG'’öæÇ’F†B7FW‡ÇW2—G2FWVæFVçG2’â""  ¢7FW¢÷F–öæÅ·7G%ÒÒæöæP  ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2—77VRG&gG2„—77VR3r¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ  ¦6Æ72—77VTG&gD7&VFU&WVW7B„&6TÖöFVÂ“ ¢""$vVæW&FRâ—77VRG&gBg&öÒ7—7FVÒVæFW'7FæF–ærvà ¢F†R6W'fW"&VæFW'2F†RÖ&¶F÷vâ&öG’FWFW&Ö–æ—7F–6ÆÇ’æB–ç2F†R7W'&Vç@¢6æ6†÷B–Bò6öÖÖ—B6†Â6ò6ÆÆW'2öæÇ’7WÇ’F†RvF†W’&RÆöö¶–ærBà¢""  ¢6÷W&6U÷G—S¢Æ—FW&Å°¢'7—7FVÕ÷VæFW'7FæF–æuöv"Â&–çFW'f–Wr"Â'&ö&U÷&÷÷6Â ¢ÒÒ'7—7FVÕ÷VæFW'7FæF–æuöv ¢v¢7—7FVÕVæFW'7FæF–ætv÷W@¢2F†R6æ6†÷BF†Rvv2F—7Æ–VBv–ç7Bâv†Vâ&÷f–FVBÂF†R6W'fW ¢2&V¦V7G2F†R&WVW7BƒC’’–bæWvW"6æ6†÷B†26–æ6R&V6öÖR&VG’Â6ò¢2G&gBæWfW"VÖ&VG26æ6†÷B–Bò6öÖÖ—B6†F†BF—6w&VW2v—F‚F†Rv ¢2Wf–FVæ6RF†R6ÆÆW"v2Æöö¶–ærBà¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6öÖÖ—E÷6†¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ72—77VTG&gEWFFU&WVW7B„&6TÖöFVÂ“ ¢""%'F–ÂWFFRöbâ—77VRG&gBà ¢ç’f–VÆBÆVgBVç6WB—2&W6W'fVBâW‡FW&æÅ÷W&ÆW6W2F†RÖöFVÂw26WBÖæW70¢†W†6ÇVFU÷Vç6WB’6ò76–ær"&6ÆV'2&Wf–÷W6Ç’&Vv—7FW&VBU$Âv†–ÆP¢öÖ—GF–ær—BÆVfW2F†R7W'&VçBfÇVRVçF÷V6†VBà¢""  ¢F—FÆS¢÷F–öæÅ·7G%ÒÒæöæP¢&öG•öÖ&¶F÷vã¢÷F–öæÅ·7G%ÒÒæöæP¢7FGW3¢÷F–öæÅ°¢Æ—FW&Å²&G&gB"Â&6÷–VB"Â&W‡FW&æÅö7&VFVB"Â&6Æ÷6VB"Â'&V¦V7FVB%Ð¢ÒÒæöæP¢W‡FW&æÅ÷W&Ã¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ72—77VTG&gD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6öÖÖ—E÷6†¢÷F–öæÅ·7G%ÒÒæöæP¢6÷W&6U÷G—S¢7G ¢6÷W&6Uö¶W“¢÷F–öæÅ·7G%ÒÒæöæP¢v÷G—S¢÷F–öæÅ·7G%ÒÒæöæP¢6WfW&—G“¢÷F–öæÅ·7G%ÒÒæöæP¢æöFUöæÖS¢÷F–öæÅ·7G%ÒÒæöæP¢F—FÆS¢7G ¢&öG•öÖ&¶F÷vã¢7G ¢7FGW3¢7G ¢W‡FW&æÅ÷W&Ã¢÷F–öæÅ·7G%ÒÒæöæP¢2—77VR3Sƒ¢G'VRv†VâF†RG&gBw2÷&–v–æF–ær6æ6†÷Bö6öÖÖ—BæòÆöævW ¢2ÖF6†W2F†RÆFW7B&VG’6æ6†÷BÂ6òF†RæÇ—6—2&V†–æB—BÖ’&R÷WBö`¢2FFRâ6ö×WFVBB&VBF–ÖS²æWfW"W'6—7FVBà¢7FÆS¢&ööÂÒfÇ6P¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@  ¦6Æ72v—D‡V$—77VU7FGW4÷WB„&6TÖöFVÂ“ ¢""%v†WF†W"v—D‡V"—77VR7&VF–öâ—2f–Æ&ÆRf÷"F†R7W'&VçB7—7FVÒw0¢6öæf–wW&VB&W÷6—F÷'’„—77VR3S‚W‡FW&æÂ—77VRÆö÷’â""  ¢f–Æ&ÆS¢&ööÀ¢÷væW#¢÷F–öæÅ·7G%ÒÒæöæP¢&Wó¢÷F–öæÅ·7G%ÒÒæöæP¢&V6öã¢÷F–öæÅ·7G%ÒÒæöæP  ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢27—7FVÒF–væ÷7F–72„—77VR3¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¤F–væ÷7F–56WfW&—G’ÒÆ—FW&Å²&ö²"Â'v&æ–ær"Â&W'&÷""Â&&Æö6¶VB"Â'Væ¶æ÷vâ%Ð  ¦6Æ72F–væ÷7F–4Æ7Dö'6W'fVDW'&÷$÷WB„&6TÖöFVÂ“ ¢6÷W&6S¢7G ¢7FGW3¢7G ¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢ö'6W'fVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ727—7FVÔF–væ÷7F–46†V6´÷WB„&6TÖöFVÂ“ ¢6†V6µö–C¢7G ¢6FVv÷'“¢7G ¢F—FÆS¢7G ¢6WfW&—G“¢F–væ÷7F–56WfW&—G¢FWF–Ã¢7G ¢–×7C¢7G"Ò" ¢&VÖVF–F–öã¢7G"Ò" ¢&VÆFVEöVçc¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVE÷F‡3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVE÷vW3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVE÷—VÆ–æU÷7FW3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢Æ7Eöö'6W'fVEöW'&÷#¢÷F–öæÅ´F–væ÷7F–4Æ7Dö'6W'fVDW'&÷$÷WEÒÒæöæP¢FV6—6–öåöÖWF†öC¢Æ—FW&Å²&FWFW&Ö–æ—7F–2%ÒÒ&FWFW&Ö–æ—7F–2 ¢2—77VR3S¢v†W&RF†RW6W"f—†W2F†R&ö&ÆVÒà¢f—…ö¶–æC¢Æ—FW&Å²&æf–vFR"Â&F–Æör%ÒÒ&F–Æör ¢f—…÷vS¢÷F–öæÅ·7G%ÒÒæöæP¢f—…öæ6†÷#¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ727—7FVÔF–væ÷7F–74÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢vVæW&FVEöC¢fÆö@¢÷fW&ÆÅ÷6WfW&—G“¢F–væ÷7F–56WfW&—G¢6WfW&—G•ö6÷VçG3¢F–7E·7G"Â–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢6†V6·3¢Æ—7Eµ7—7FVÔF–væ÷7F–46†V6´÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2W"×67&VVâ76—7FçB„—77VR3"¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ  ¦6Æ726WGF–ætÖWFFF÷WB„&6TÖöFVÂ“ ¢¶W“¢7G ¢F—7Æ•öæÖS¢7G ¢6FVv÷'“¢7G ¢&WV—&VFæW73¢Æ—FW&Å²'&WV—&VB"Â&6öæF—F–öæÂ"Â&÷F–öæÂ%Ð¢FW67&—F–öã¢7G ¢–×7C¢7G ¢&VÖVF–F–öã¢7G ¢fÆ–E÷fÇVW3¢÷F–öæÅ´Æ—7E·7G%ÕÒÒæöæP¢fÆ–FF–öå÷'VÆS¢7G"Ò" ¢&VÆFVEö6†V6·3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVE÷vW3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVE÷—VÆ–æU÷7FW3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢Fö75öÆ–æ³¢7G"Ò" ¢26WGF–æw2W‡ÆæF–öç2&R7FF–26öFRÖÖævVBÖWFFFÂæWfW"ÄÄÒ÷WGWBà¢FV6—6–öåöÖWF†öC¢Æ—FW&Å²&FWFW&Ö–æ—7F–2%ÒÒ&FWFW&Ö–æ—7F–2   ¦6Æ726WGF–æw4ÖWFFF÷WB„&6TÖöFVÂ“ ¢6WGF–æw3¢Æ—7Eµ6WGF–ætÖWFFF÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ7276—7FçE7VvvW7FVEVW7F–öä÷WB„&6TÖöFVÂ“ ¢VW7F–öã¢7G ¢6÷W&6S¢Æ—FW&Å²&F–væ÷7F–72"Â'7FF–2%Ð¢6†V6µö–C¢7G"Ò"   ¦6Æ7276—7FçE67&VVä6öçFW‡D÷WB„&6TÖöFVÂ“ ¢67&VVåö–C¢7G ¢F—FÆS¢7G ¢&÷WFS¢7G ¢W'÷6S¢7G ¢&–Ö'•öFF÷6÷W&6W3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢f—6–&ÆU÷6V7F–öç3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6öÖÖöå÷VW7F–öç3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVE÷6WGF–æw3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVEö6†V6·3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVE÷—VÆ–æU÷7FW3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVEöVæGö–çG3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢27W'&VçBFWFW&Ö–æ—7F–27FFRf÷"F†—267&VVâ†F–væ÷7F–727V'6WB’à¢7FFU÷6WfW&—G“¢F–væ÷7F–56WfW&—G’Ò&ö² ¢67&VVåö6†V6·3¢Æ—7Eµ7—7FVÔF–væ÷7F–46†V6´÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢7VvvW7FVE÷VW7F–öç3¢Æ—7E´76—7FçE7VvvW7FVEVW7F–öä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ7276—7FçD6µ&WVW7B„&6TÖöFVÂ“ ¢67&VVåö–C¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ¢VW7F–öã¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓC¢&÷WFU÷&×3¢F–7E·7G"Â7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢f—6–&ÆUö6†V6µö–G3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7BÂÖ…öÆVæwFƒÓS¢f—6–&ÆU÷7FFUö–G3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7BÂÖ…öÆVæwFƒÓS¢fö7W6VE÷7FFUö–C¢÷F–öæÅ·7G%ÒÒf–VÆB†FVfVÇCÔæöæRÂÖ…öÆVæwFƒÓ#  ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢27—7FVÒ7FFR76W76ÖVçB„—77VR3“2¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¥7FFU6WfW&—G’ÒÆ—FW&Å²&ö²"Â&–æfò"Â'v&æ–ær"Â&&Æö6¶VB"Â&W'&÷"%Ð¥7FFU7FGW2ÒÆ—FW&Å°¢'6F—6f–VB"Â&Ö—76–ær"Â'Væ6öæf—&ÖVB"Â'7FÆR"Â&–×7FVB"À¢&&Æö6¶VB"Â''Vææ–ær"Â&f–ÆVB"Â'&VG’"À¥Ð¥7FFUW6W$7F–öä¶–æBÒÆ—FW&Å°¢&æöæR"Â&6öæf–wW&R"Â&7&VFU÷6æ6†÷B"Â&'V–ÆB"Â&6öæf—&Ò"À¢'&Wf–Wr"Â'&W'Vâ"Â&–ç7V7B"Â'v—B"À¥Ð¥7FFT–çFW'fVçF–öåF–Ö–ærÒÆ—FW&Å²&æ÷r"Â&&Vf÷&UöæW‡E÷7FW"Â&÷F–öæÂ"Â&gFW%ö'V–ÆB"Â&æöæR%Ð¥7FFTw&÷WÒÆ—FW&Å°¢'&W÷6—F÷'’"Â'6æ6†÷B"Â'—VÆ–æR"Â'VæFW'7FæF–ær"Â&–çFW'f–Wr"À¢''VçF–ÖR"Â'&÷÷6Â"Â&6öæf–wW&F–öâ"À¥Ð¢2W6W"†6R„—77VR3#3s²W‡FVæFVBFòF†RgVÆÂb×7FW–×&÷fVÖVçBfÆ÷r'¢2—77VR3#Sb“¢6WGWÓâ&W&F–öâÓâ–ç7G'VÖVçFF–öâÓâö'6W'fF–öâÓà¢2WfÇVF–öâÓâV&Æ—6‚‡FW&Ö–æÂF—7Æ’†6R’à¥W6W%†6RÒÆ—FW&Å°¢'6WGW"Â'&W&F–öâ"Â&–ç7G'VÖVçFF–öâ"Â&ö'6W'fF–öâ"Â&WfÇVF–öâ"Â'V&Æ—6‚"À¥Ð  ¦6Æ727—7FVÕ7FFUF&vWEV”÷WB„&6TÖöFVÂ“ ¢&÷WFS¢7G ¢æ6†÷#¢÷F–öæÅ·7G%ÒÒæöæP¢7F–öåöÆ&VÃ¢7G"Ò"   ¦6Æ727—7FVÕ7FFT—FVÔ÷WB„&6TÖöFVÂ“ ¢7FFUö–C¢7G ¢7FFUöw&÷W¢7FFTw&÷W ¢6WfW&—G“¢7FFU6WfW&—G¢7FGW3¢7FFU7FGW0¢W6W%ö7F–öåö¶–æC¢7FFUW6W$7F–öä¶–æ@¢–çFW'fVçF–öå÷F–Ö–æs¢7FFT–çFW'fVçF–öåF–Ö–æp¢7V&¦V7C¢7G ¢7VÖÖ'“¢7G ¢FWF–Ã¢7G ¢–×7C¢7G"Ò" ¢&VÖVF–F–öã¢7G"Ò" ¢Wf–FVæ6S¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢F&vWE÷V“¢÷F–öæÅµ7—7FVÕ7FFUF&vWEV”÷WEÒÒæöæP¢F—7Æ•÷&÷WFW3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVEö6†V6·3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VÆFVE÷—VÆ–æU÷7FW3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6÷W&6S¢7G"Ò'7—7FVÕ÷7FFR ¢FVGWUö¶W“¢7G"Ò" ¢66÷S¢7G"Ò&vÆö&Â ¢27—7FVÒ7FFR76W76ÖVçB—2FWFW&Ö–æ—7F–2æBÄÄÒÖg&VR„—77VR3“2†6R’à¢FV6—6–öåöÖWF†öC¢Æ—FW&Å²&FWFW&Ö–æ—7F–2%ÒÒ&FWFW&Ö–æ—7F–2 ¢2f—†VB7FFUöw&÷WÓâ†6RÖ–ærÇW26ÖÆÂW‡Æ–6—BW"Ö—FVÐ¢2÷fW'&–FRÆ—7B„—77VR3#3r“²6VR7—7FVÕ÷7FFRå÷†6Uöf÷%ö—FVÒâFVfVÇ@¢2—2F†RFW&Ö–æÂF—7Æ’†6R„—77VR3#Sb’ÂÖF6†–æp¢27—7FVÕ÷7FFRå÷†6Uöf÷%ö—FVÒw2÷vâfÆÆ&6²FVfVÇBà¢†6S¢W6W%†6RÒ'V&Æ—6‚   ¦6Æ727—7FVÕ7FFU†6T6ö×ÆWF–öä÷WB„&6TÖöFVÂ“ ¢†6S¢W6W%†6P¢6ö×ÆWFS¢&ööÀ¢Æ&VÃ¢7G"Ò"   ¦6Æ727—7FVÕ7FFT76W76ÖVçD÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢vVæW&FVEöC¢fÆö@¢÷fW&ÆÅ÷6WfW&—G“¢7FFU6WfW&—G¢6WfW&—G•ö6÷VçG3¢F–7E·7G"Â–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢—FV×3¢Æ—7Eµ7—7FVÕ7FFT—FVÔ÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&–Ö'•ö—FVÓ¢÷F–öæÅµ7—7FVÕ7FFT—FVÔ÷WEÒÒæöæP¢æ÷F–f–6F–öåö—FV×3¢Æ—7Eµ7—7FVÕ7FFT—FVÔ÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢vUö—FV×3¢F–7E·7G"ÂÆ—7Eµ7—7FVÕ7FFT—FVÔ÷WEÕÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢2W6W"†6R„—77VR3#3r“¢F†R7W'&VçB†6RÇW2V6‚†6Rw0¢26ö×ÆWF–öâ6öæF—F–öââFF—F—fS²W†—7F–ærf–VÆG2&÷fR&RVæ6†ævVBà¢W6W%÷†6S¢W6W%†6RÒ'6WGW ¢†6W3¢Æ—7Eµ7—7FVÕ7FFU†6T6ö×ÆWF–öä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ7276—7FçD7F–öä÷WB„&6TÖöFVÂ“ ¢Æ&VÃ¢7G ¢¶–æC¢Æ—FW&Å²&æf–vFR"Â&6öæf–wW&R"Â&÷W&FR%Ð¢F&vWC¢7G ¢FWF–Ã¢7G"Ò"   ¦6Æ7276—7FçD6—FF–öä÷WB„&6TÖöFVÂ“ ¢G—S¢Æ—FW&Å²'6WGF–ær"Â&F–væ÷7F–5ö6†V6²"Â'—VÆ–æU÷7FW"Â'7FFUö—FVÒ%Ð¢–C¢7G ¢F—FÆS¢7G"Ò" ¢FWF–Ã¢7G"Ò"   ¢2v—D‡V"V&Æ—6‚v÷&¶fÆ÷r„—77VR3#bÂ7V"×F6²“¢6öææV7F–öà¢2W'6—7FVæ6RÖöFVÇ2â7FGW6—2f–æ—FR6WBVæf÷&6VB–âF†R&÷WFRÆ–W#°¢2æòf–VÆB†W&RWfW"6'&–W2â–ç7FÆÆF–öâFö¶Vâ÷"&—fFR¶W’ÖFW&–À¢2…&–æ6—ÆRRó‚ÒÒFö¶Vç2&R'&ö¶W&VBW"Ö6ÆÂæBæWfW"7F÷&VB’à¤v—F‡V$6öææV7F–öå7FGW2ÒÆ—FW&Å²'VæF–ær"Â&6öææV7FVB"Â&W'&÷""Â&F—66öææV7FVB%Ð  ¦6Æ72v—F‡V$7FGW4÷WB„&6TÖöFVÂ“ ¢6öæf–wW&VC¢&ööÀ¢ö–C¢÷F–öæÅ·7G%ÒÒæöæP¢•ö&6U÷W&Ã¢7G ¢vV%ö&6U÷W&Ã¢7G ¢ÆÆ÷vVEö÷&væ—¦F–öã¢÷F–öæÅ·7G%ÒÒæöæP  ¤v—F‡V$–ç7FÆÆF–öå7FGW2ÒÆ—FW&Å²&7F—fR"Â&F—6&ÆVB%Ð  ¦6Æ72v—F‡V$–ç7FÆÆF–öå&Vv—7FW"„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢–ç7FÆÆF–öåö–C¢–çBÒf–VÆB‚âââÂwCÓ  ¦6Æ72v—F‡V$–ç7FÆÆF–öä÷WB„&6TÖöFVÂ“ ¢–ç7FÆÆF–öåö–C¢–ç@¢v—F‡V%ö66÷VçEöÆöv–ã¢7G ¢v—F‡V%ö66÷VçE÷G—S¢7G ¢7FGW3¢v—F‡V$–ç7FÆÆF–öå7FGW0¢&Vv—7FW&VEö'•÷W6W%ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢fW&–f–VEöC¢7G ¢F—6&ÆVEö'•÷W6W%ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢F—6&ÆVEöC¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢7G ¢WFFVEöC¢7G ¢76–væVE÷7—7FVÕö–G3¢Æ—7E¶–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ72v—F‡V$6öææV7F–öä7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢÷væW#¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢&Wó¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢–ç7FÆÆF–öåö–C¢–ç@  ¦6Æ72v—F‡V$6öææV7F–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢•ö&6U÷W&Ã¢7G ¢vV%ö&6U÷W&Ã¢7G ¢÷væW#¢7G ¢&Wó¢7G ¢6ÆöæU÷W&Ã¢7G ¢–ç7FÆÆF–öåö–C¢–ç@¢FVfVÇEö'&æ6ƒ¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVçF–Å÷G—S¢7G ¢7FGW3¢v—F‡V$6öææV7F–öå7FGW0¢Æ7EöW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢Æ7E÷7–æ6VEöC¢÷F–öæÅ·7G%ÒÒæöæP¢Æ7E÷7–æ6VEö6öÖÖ—E÷6†¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEö'•÷W6W%ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢WFFVEö'•÷W6W%ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7&VFVEöC¢7G ¢WFFVEöC¢7G   ¢2&W÷6—F÷'’ÖævW"7FGW2„—77VR3#bÂ7V"×F6²"’âÖ—'&÷%÷F†—0¢2&ö÷B×&VÆF—fR†æWfW"F†R'6öÇWFR†÷7BF‚’6ò—B—26fRFò&WGW&âFò¢2F6†&ö&B6Æ–VçBà¦6Æ72v—F‡V%&W÷6—F÷'•7FGW4÷WB„&6TÖöFVÂ“ ¢6öææV7F–öåö–C¢–ç@¢Ö—'&÷%öW†—7G3¢&ööÀ¢Ö—'&÷%÷Fƒ¢÷F–öæÅ·7G%ÒÒæöæP¢FVfVÇEö'&æ6ƒ¢÷F–öæÅ·7G%ÒÒæöæP¢Æ7E÷7–æ6VEöC¢÷F–öæÅ·7G%ÒÒæöæP¢Æ7E÷7–æ6VEö6öÖÖ—E÷6†¢÷F–öæÅ·7G%ÒÒæöæP  ¢2&VBÖöæÇ’–ç7FÆÆF–öâ&W÷6—F÷'’Æ—7F–ær„—77VR3#bÂ7V"×F6²B’ÒÒW6VB'¢2F†RF6†&ö&Bw26öææV7F–öâÖ7&VF–öâf÷&ÒFòÆWBF†RFWfVÆ÷W"–6²&Wð¢2–ç7FVBöbG—–ær÷væW"÷&Wò'’†æBâæWfW"6'&–W2Fö¶Vâà¦6Æ72v—F‡V$–ç7FÆÆF–öå&W÷6—F÷'”÷WB„&6TÖöFVÂ“ ¢÷væW#¢7G ¢æÖS¢7G ¢FVfVÇEö'&æ6ƒ¢÷F–öæÅ·7G%ÒÒæöæP¢&—fFS¢&ööÀ  ¢2V&Æ—6‚¦ö"7FFRÖ6†–æR„—77VR3#bÂ7V"×F6²2’â7FGW6—2F†Rf–æ—FP¢2÷&FW&VB6WBVæf÷&6VB'’÷V&Æ—6…ö¦ö"ç“²æòf–VÆB†W&RWfW"6'&–W2à¢2–ç7FÆÆF–öâFö¶Vâ…&–æ6—ÆRRó‚ÒÒW'&÷&—2Çv—26æ—F—¦VB&Vf÷&P¢2W'6—7FVæ6RÂ6ò—B—26fRFò&WGW&âfW&&F–Ò’à¥V&Æ—6„¦ö%7FGW2ÒÆ—FW&Å°¢'VæF–ær"À¢&WF†VçF–6F–ær"À¢&fWF6†–ær"À¢&6†V6¶–æuö÷WB"À¢&Ç––æu÷F6‚"À¢'fÆ–FF–ær"À¢&v—F–æuö&÷fÂ"À¢&6öÖÖ—GF–ær"À¢'W6†–ær"À¢&7&VF–æu÷""À¢&6ö×ÆWFVB"À¢&f–ÆVB"À¢&6æ6VÆÆVB"À¢2—77VR3##c¢&W7F–ærö7F—fR7FFW2V&Æ—6‚×†6Rf–ÇW&R÷"&WG'¢26âÆæB–ââ&WG'–&ÆUöf–ÆVFòÖçVÅö–çFW'fVçF–öå÷&WV—&VF&P¢2æ÷BFW&Ö–æÂÒÒöæÇ’&WG'’ö6æ6VÂöF—66öææV7BÖ÷fR¦ö"÷WBöbF†VÒà¢'&WG'–&ÆUöf–ÆVB"À¢'&V6öæ6–Æ–ær"À¢&ÖçVÅö–çFW'fVçF–öå÷&WV—&VB"À¥Ð  ¦6Æ72V&Æ—6„¦ö$7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢F6…ö–C¢–ç@  ¦6Æ72V&Æ—6„¦ö$÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6öææV7F–öåö–C¢–ç@¢F6…ö–C¢–ç@¢6æ6†÷Eö–C¢–ç@¢&6Uö'&æ6ƒ¢7G ¢&6Uö6öÖÖ—E÷6†¢÷F–öæÅ·7G%ÒÒæöæP¢'&æ6…öæÖS¢÷F–öæÅ·7G%ÒÒæöæP¢6öÖÖ—E÷6†¢÷F–öæÅ·7G%ÒÒæöæP¢%÷W&Ã¢÷F–öæÅ·7G%ÒÒæöæP¢%öçVÖ&W#¢÷F–öæÅ¶–çEÒÒæöæP¢7FGW3¢V&Æ—6„¦ö%7FGW0¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢fÆ–FF–öå÷7VÖÖ'“¢÷F–öæÅ´F–7E·7G"Âç•ÕÒÒæöæP¢&WVW7FVEö'•÷W6W%ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&÷fVEö'•÷W6W%ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6ÆVçW÷7FFS¢7G"Ò&æ÷EöGFV×FVB ¢6ÆVçWöW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@¢&÷fVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢6ö×ÆWFVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢†V'F&VEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢&WG'•ö6÷VçC¢–çBÒ ¢Æ7EöGFV×EöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¢2VæBÖöæÇ’VF—BG&–ÂVçG'’f÷"F†Rv—D‡V"V&Æ—6‚v÷&¶fÆ÷r„—77VW0¢23##rò3##b’ÒÒFWF–Æ—2'6VB¥4ôâ†÷"æöæR’ÂæWfW"&rFö¶Vâ÷F€¢2…&–æ6—ÆRRóƒ²V&Æ—6…öVF—Bç&V6÷&E÷V&Æ—6…öVF—EöWfVçFÇ&VG¢2Væf÷&6W2F†BBw&—FRF–ÖR’à¦6Æ72V&Æ—6„VF—DWfVçD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢¦ö%ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6öææV7F–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢WfVçE÷G—S¢7G ¢7F÷%÷W6W%ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢FWF–Ã¢÷F–öæÅ´F–7E·7G"Âç•ÕÒÒæöæP¢7&VFVEöC¢fÆö@  ¦6Æ7276—7FçD6´÷WB„&6TÖöFVÂ“ ¢67&VVåö–C¢7G ¢ç7vW#¢7G ¢7VvvW7FVEö7F–öç3¢Æ—7E´76—7FçD7F–öä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6—FF–öç3¢Æ—7E´76—7FçD6—FF–öä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢W6VEöfÆÆ&6³¢&ööÀ¢fÆÆ&6µ÷&V6öã¢÷F–öæÅ·7G%ÒÒæöæP¢FV6—6–öåöÖWF†öC¢Æ—FW&Å²&FWFW&Ö–æ—7F–2"Â'&V6öæ–æuöÆÆÒ%Ð¢&÷f–FW#¢7G ¢ÖöFVÃ¢7G ¢&ö×E÷fW'6–öã¢7G ¢66†VÖ÷fW'6–öã¢7G ¢vVæW&FVEöC¢fÆö@  ¢2ÒÒÒ&WÆ’Væv–æR„—77VR3#C"†6R"ò3#CB’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¢2f–æ—FR6Æ76–f–6F–öâ6WG2…&–æ6—ÆRb’â¶WB–â7–æ2v—F€¢2÷&WÆ•÷'VææW"ç’æBF†R&WÆ•ö66U÷&W7VÇG2F&ÆR6öÖÖVçG2à¥&WÆ”66U7FGW2ÒÆ—FW&Å²&ÖF6‚"Â&Ö—6ÖF6‚"Â&W'&÷""Â'6¶—VB%Ð¥&WÆ”–çWE6÷W&6RÒÆ—FW&Å²'7G'V7GW&VB"Â'&W%÷'F–Â%Ð¥&WÆ•6¶—&V6öâÒÆ—FW&Å°¢'Vç&WÆ–&ÆUö6GW&R"À¢'&W%÷'6Uöf–ÆVB"À¢'VæFV6öF&ÆUö–çWB"À¢'G&6UöÖ—76–ær"À¥Ð¥&WÆ•6WE6÷W&6RÒÆ—FW&Å²&ÖçVÂ"Â&æÇ—¦W%÷'Vâ%Ð¥&WÆ”&÷fÅ7FGW2ÒÆ—FW&Å²&&÷fVB"Â'&Wfö¶VB%Ð  ¦6Æ72&WÆ”&÷fÄ7&VFR„&6TÖöFVÂ“ ¢&V6öã¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ  ¦6Æ72&WÆ•&—6µö–çD÷WB„&6TÖöFVÂ“ ¢""$W'6—7FVB&ö&RÆâö–çBÆ&VÂ&WW6VB2F—7Æ’ÖöæÇ’&—6²6öçFW‡Bà ¢æòæWr&V6öæ–ær'VâæBæò†WW&—7F–2–æfW&Væ6S¢F†W6R&RfW&&F–Ð¢7F÷&VBÆ&VÇ3²'6VçBÆ&VÇ2&R&WGW&æVB2'6VçB„æöæR’â""  ¢ö–çEö–C¢–ç@¢Æåö–C¢–ç@¢6–FUöVffV7E÷&—6³¢÷F–öæÅ·7G%ÒÒæöæP¢&WÆ–&–Æ—G“¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ72&WÆ•&—6´6öçFW‡D÷WB„&6TÖöFVÂ“ ¢&ö&U÷Æå÷ö–çG3¢Æ—7Eµ&WÆ•&—6µö–çD÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢v&æ–æs¢7G   ¦6Æ72&WÆ”&÷fÄ÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6ö×öæVçEö–C¢7G ¢7FGW3¢&WÆ”&÷fÅ7FGW0¢&V6öã¢7G"Ò" ¢&÷fVEö'•÷W6W%ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢FV6—6–öåöÖWF†öC¢7G"Ò&ÖçVÂ ¢&—6µö6öçFW‡C¢÷F–öæÅ´F–7E·7G"Âç•ÕÒÒæöæP¢7&VFVEöC¢fÆö@¢&Wfö¶VEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢&Wfö¶VEö'•÷W6W%ö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72&WÆ”&÷fÅ7FFT÷WB„&6TÖöFVÂ“ ¢6ö×öæVçEö–C¢7G ¢7F—fS¢&ööÀ¢&÷fÃ¢÷F–öæÅµ&WÆ”&÷fÄ÷WEÒÒæöæP¢&—6µö6öçFW‡C¢&WÆ•&—6´6öçFW‡D÷W@  ¦6Æ72&WÆ•6WD7&VFR„&6TÖöFVÂ“ ¢6ö×öæVçEö–C¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢æÖS¢7G"Ò" ¢G&6Uö–G3¢÷F–öæÅ´Æ—7E·7G%ÕÒÒæöæP¢æÇ—¦W%÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72&WÆ•6WEG&6T÷WB„&6TÖöFVÂ“ ¢""%W"×G&6R&WÆ’&Wf–Ws¢&V6÷&FVB&WÆ–&–Æ—G’ÇW2F†R–çWB6÷W&6P¢&WÆ’v÷VÆBFWFW&Ö–æ—7F–6ÆÇ’W6R‡6ÖR'VÆR2F†R'VææW"’â""  ¢G&6Uö–C¢7G ¢W†—7G3¢&ööÀ¢&WÆ–&–Æ—G“¢÷F–öæÅ·7G%ÒÒæöæP¢&WÆ•÷&V6öç3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢–çWE÷6÷W&6S¢÷F–öæÅµ&WÆ”–çWE6÷W&6UÒÒæöæP¢6¶—÷&V6öã¢÷F–öæÅµ&WÆ•6¶—&V6öåÒÒæöæP  ¦6Æ72&WÆ•6WD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6ö×öæVçEö–C¢7G ¢æÖS¢7G"Ò" ¢6÷W&6S¢&WÆ•6WE6÷W&6P¢6÷W&6UöæÇ—¦W%÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢G&6Uö–G3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢G&6W3¢Æ—7Eµ&WÆ•6WEG&6T÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢7&VFVEöC¢fÆö@  ¦6Æ72&WÆ•'Vä7&VFR„&6TÖöFVÂ“ ¢&WÆ•÷6WEö–C¢–ç@¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7FÆU÷6æ6†÷E÷&V6öã¢÷F–öæÅ·7G%ÒÒf–VÆB„æöæRÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ  ¦6Æ72&WÆ”66U&W7VÇD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢G&6Uö–C¢7G ¢÷6—F–öã¢–ç@¢66U÷7FGW3¢&WÆ”66U7FGW0¢–çWE÷6÷W&6S¢÷F–öæÅµ&WÆ”–çWE6÷W&6UÒÒæöæP¢6¶—÷&V6öã¢÷F–öæÅµ&WÆ•6¶—&V6öåÒÒæöæP¢&WÆ•ö÷WGWC¢÷F–öæÅ·7G%ÒÒæöæP¢&WÆ•öW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢&V6÷&FVEö÷WGWC¢÷F–öæÅ·7G%ÒÒæöæP¢&V6÷&FVEöW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢GW&F–öåö×3¢÷F–öæÅ¶fÆöEÒÒæöæP¢÷WGWE÷G'Væ6FVC¢&ööÂÒfÇ6P¢6ö×&—6öåöÖöFS¢7G"Ò'&W" ¢7&VFVEöC¢fÆö@  ¦6Æ72&WÆ•'Vä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢&WÆ•÷6WEö–C¢–ç@¢6ö×öæVçEö–C¢7G ¢6æ6†÷Eö–C¢–ç@¢6öÖÖ—E÷6†¢7G ¢7–Ö&öÅ÷Fƒ¢7G ¢7–Ö&öÅ÷VÆ–f–VEöæÖS¢7G ¢7FGW3¢Æ—FW&Å²''Vææ–ær"Â&6ö×ÆWFVB"Â&f–ÆVB%Ð¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢G&6U÷6WEö†6ƒ¢7G ¢6æF&÷…ö6öæf–s¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢&÷fÅö–C¢÷F–öæÅ¶–çEÒÒæöæP¢v÷&·76U÷Fƒ¢÷F–öæÅ·7G%ÒÒæöæP¢6ÆVçW÷7FFS¢7G"Ò&æ÷EöGFV×FVB ¢6ÆVçWöW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢7VÖÖ'“¢F–7E·7G"Â–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢66W3¢Æ—7Eµ&WÆ”66U&W7VÇD÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢7&VFVEöC¢fÆö@¢7F'FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢6ö×ÆWFVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢6æ6†÷Eög&W6†æW73¢÷F–öæÅµ6æ6†÷Dg&W6†æW757FFUÒÒæöæP¢†VE÷6†öEö7&VF–öã¢÷F–öæÅ·7G%ÒÒæöæP¢7FÆUö6µ÷&V6öã¢÷F–öæÅ·7G%ÒÒæöæP  ¢2ÒÒÒ&WÆ’f&–çG2„—77VR3#C"†6R2ò3#CR’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¢2f–æ—FR6Æ76–f–6F–öâ6WG2…&–æ6—ÆRb’â¶WB–â7–æ2v—F€¢2÷&WÆ•÷f&–çG2ç’w2ÖöGVÆRFö77G&–æræBF†R&WÆ•÷f&–çB¢F&ÆP¢26öÖÖVçG2–âöF"ç’à¥&WÆ•f&–çD66U7FGW2ÒÆ—FW&Å°¢&ÖF6‚"À¢&F–fb"À¢&6æF–FFUöW'&÷""À¢&W'&÷%÷Fõ÷7V66W72"À¢&W'&÷%÷Fõ÷6ÖUöW'&÷""À¢&W'&÷%÷FõöF–ffW&VçEöW'&÷""À¢'6¶—VB"À¥Ð¥&WÆ•f&–çD6ö×&—6öäÖöFRÒÆ—FW&Å²'7G'V7GW&VB"Â'&W"%Ð¥&WÆ•f&–çE6÷W&6RÒÆ—FW&Å²&ÖçVÂ"Â'7FVB"Â&ÆÆÕöG&gB%Ð¥&WÆ•f&–çDÇ•7FGW2ÒÆ—FW&Å²&Æ–VB"Â&–çfÆ–E÷F6‚"Â&æ÷EöÆ–6&ÆR%Ð¥&WÆ•f&–çE'Vå7FGW2ÒÆ—FW&Å²''Vææ–ær"Â&6ö×ÆWFVB"Â&f–ÆVB%Ð¥&WÆ•f&–çDG&gE7FGW2ÒÆ—FW&Å²'&÷÷6VB"Â&f–ÆVB%Ð  ¦6Æ72&WÆ•f&–çD7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢Æ&VÃ¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#¢F6…÷FW‡C¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓóó¢6÷W&6S¢&WÆ•f&–çE6÷W&6RÒ&ÖçVÂ   ¦6Æ72&WÆ•f&–çE'Vä7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&WÆ•÷6WEö–C¢–ç@¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢f&–çG3¢Æ—7Eµ&WÆ•f&–çD7&VFUÒÒf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#¢2—77VR33c“¢&WV—&VBv†VâF†R&W6öÇfVB6æ6†÷B—2FVf–æ—F—fVÇ’&V†–æ@¢2„TBâ6ÖRÖçVÂFV6—6–öâF†RW‡W&–ÖVçB&V6÷&G2à¢7FÆU÷6æ6†÷E÷&V6öã¢÷F–öæÅ·7G%ÒÒf–VÆB„æöæRÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ  ¦6Æ72&WÆ•f&–çD66U&W7VÇD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢G&6Uö–C¢7G ¢÷6—F–öã¢–ç@¢66U÷7FGW3¢&WÆ•f&–çD66U7FGW0¢6ö×&—6öåöÖöFS¢÷F–öæÅµ&WÆ•f&–çD6ö×&—6öäÖöFUÒÒæöæP¢&6VÆ–æUö÷WGWC¢÷F–öæÅ·7G%ÒÒæöæP¢6æF–FFUö÷WGWC¢÷F–öæÅ·7G%ÒÒæöæP¢6æF–FFUöW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢&V6÷&FVEöW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢GW&F–öåö×3¢÷F–öæÅ¶fÆöEÒÒæöæP¢GW&F–öåöFVÇFö×3¢÷F–öæÅ¶fÆöEÒÒæöæP¢f–VÆEöF–fg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢÷WGWE÷G'Væ6FVC¢&ööÂÒfÇ6P¢7&VFVEöC¢fÆö@  ¦6Æ72&WÆ•f&–çDvw&VvFT÷WB„&6TÖöFVÂ“ ¢ÖF6ƒ¢–çBÒ ¢F–fc¢–çBÒ ¢6æF–FFUöW'&÷#¢–çBÒ ¢W'&÷%÷Fõ÷7V66W73¢–çBÒ ¢W'&÷%÷Fõ÷6ÖUöW'&÷#¢–çBÒ ¢W'&÷%÷FõöF–ffW&VçEöW'&÷#¢–çBÒ ¢6¶—VC¢–çBÒ ¢F÷FÃ¢–çBÒ ¢fuöGW&F–öåöFVÇFö×3¢÷F–öæÅ¶fÆöEÒÒæöæP¢W†×ÆW3¢F–7E·7G"ÂÆ—7E·7G%ÕÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B  ¦6Æ72&WÆ•f&–çD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢&WÆ•÷'Våö–C¢–ç@¢f&–çEö¶W“¢7G ¢Æ&VÃ¢7G"Ò" ¢—5ö&6VÆ–æS¢&ööÀ¢F6…÷FW‡C¢7G"Ò" ¢F6…ö†6ƒ¢7G ¢6÷W&6S¢7G"Ò&ÖçVÂ ¢Ç•÷7FGW3¢&WÆ•f&–çDÇ•7FGW2Ò&æ÷EöÆ–6&ÆR ¢Ç•öW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢7FGW3¢&WÆ•f&–çE'Vå7FGW2Ò''Vææ–ær ¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢v÷&·76U÷Fƒ¢÷F–öæÅ·7G%ÒÒæöæP¢6ÆVçW÷7FFS¢7G"Ò&æ÷EöGFV×FVB ¢6ÆVçWöW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢vw&VvFS¢&WÆ•f&–çDvw&VvFT÷WBÒf–VÆB†FVfVÇEöf7F÷'“Õ&WÆ•f&–çDvw&VvFT÷WB¢66W3¢Æ—7Eµ&WÆ•f&–çD66U&W7VÇD÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢7&VFVEöC¢fÆö@¢7F'FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢6ö×ÆWFVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ72&WÆ•f&–çE'Vä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢&WÆ•÷6WEö–C¢–ç@¢6ö×öæVçEö–C¢7G ¢6æ6†÷Eö–C¢–ç@¢6öÖÖ—E÷6†¢7G ¢7–Ö&öÅ÷Fƒ¢7G ¢7–Ö&öÅ÷VÆ–f–VEöæÖS¢7G ¢7FGW3¢&WÆ•f&–çE'Vå7FGW0¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢G&6U÷6WEö†6ƒ¢7G ¢6æF&÷…ö6öæf–s¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢&÷fÅö–C¢÷F–öæÅ¶–çEÒÒæöæP¢f&–çG3¢Æ—7Eµ&WÆ•f&–çD÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢7&VFVEöC¢fÆö@¢7F'FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢6ö×ÆWFVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ72&WÆ•f&–çDG&gD7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&WÆ•÷6WEö–C¢–ç@¢G&6Uö–C¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢ö&¦V7F—fS¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓS¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72&WÆ•f&–çDG&gD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢&WÆ•÷6WEö–C¢–ç@¢6ö×öæVçEö–C¢7G ¢G&6Uö–C¢7G ¢ö&¦V7F—fS¢7G ¢6æ6†÷Eö–C¢–ç@¢7–Ö&öÅ÷Fƒ¢7G ¢7–Ö&öÅ÷VÆ–f–VEöæÖS¢7G ¢vVæW&FVEö6öFS¢7G"Ò" ¢F6…÷FW‡C¢7G"Ò" ¢F6…ö†6ƒ¢7G"Ò" ¢æ÷FW3¢7G"Ò" ¢7FGW3¢&WÆ•f&–çDG&gE7FGW0¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢&÷f–FW#¢÷F–öæÅ·7G%ÒÒæöæP¢ÖöFVÃ¢÷F–öæÅ·7G%ÒÒæöæP¢&ö×E÷fW'6–öã¢÷F–öæÅ·7G%ÒÒæöæP¢66†VÖ÷fW'6–öã¢÷F–öæÅ·7G%ÒÒæöæP¢FV6—6–öåöÖWF†öC¢÷F–öæÅ´FV6—6–öäÖWF†öEÒÒæöæP¢—5öÖö6³¢&ööÂÒfÇ6P¢7&VFVEöC¢fÆö@  ¦6Æ72&WÆ•f&–çDW‡W&–ÖVçE–ÆöD÷WB„&6TÖöFVÂ“ ¢""%6†W2&WÆ’f&–çBw2F6‚f÷"õ5BöW‡W&–ÖVçG2&Vf–ÆÀ¢„—77VR3#CR’â’6†RöæÇ’ÒÒF†—2æWfW"7&VFW2âW‡W&–ÖVçC°¢F†R6ÆÆW"6÷–W2F†—2–çFòâW‡W&–ÖVçEf&–çD7&VFRâ""  ¢Æ&VÃ¢7G ¢F6…÷FW‡C¢7G ¢F6…ö†6ƒ¢7G ¢6÷W&6S¢7G"Ò'&WÆ•÷f&–çB ¢&—6µöæ÷FS¢7G"Ò" ¢÷&–v–ã¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B  ¦6Æ72&WÆ•&Vw&W76–öå66fföÆD7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&WÆ•÷'Våö–C¢–ç@¢&WÆ•÷f&–çEö–C¢–ç@¢G&6Uö–C¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ  ¦6Æ72&WÆ•&Vw&W76–öå66fföÆD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢–çFVÆÆ–vVæ6U÷'Våö–C¢–ç@¢&WÆ•÷'Våö–C¢–ç@¢&WÆ•÷f&–çEö–C¢–ç@¢&WÆ•÷6WEö–C¢–ç@¢G&6Uö–C¢7G ¢6æ6†÷Eö–C¢–ç@¢66fföÆE÷FW‡C¢7G"Ò" ¢7FGW3¢Æ—FW&Å²'&÷÷6VB"Â&f–ÆVB%Ð¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢&÷f–FW#¢7G ¢ÖöFVÃ¢7G ¢&ö×E÷fW'6–öã¢7G ¢66†VÖ÷fW'6–öã¢7G ¢FV6—6–öåöÖWF†öC¢Æ—FW&Å²'&V6öæ–æuöÆÆÒ%ÒÒ'&V6öæ–æuöÆÆÒ ¢—5öÖö6³¢&ööÂÒfÇ6P¢7&VFVEöC¢fÆö@  ¢2ÒÒÒ&WÆ’6÷W&6RbF–fb†VÇW'2„—77VR3#C"†6RBò3#Cb’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢0¢2Gvò6ÖÆÂDUDU$Ô”ä•5D”2†VÇW'2&6¶–ærF†R6–×VÆF–öâv÷&¶&Væ6‚w2$F—&V7@¢2VF—B"fÆ÷r…&–æ6—ÆRbÒÒæò§VFvVÖVçB†W&RÂ§W7B–ææVB×6æ6†÷B&VG2æ@¢27G'V7GW&ÂFW‡BF–ff–ær&WW6–ærF†R6ÖRv÷&·G&VR¶v—BÖF–fbÖV6†æ—6Ð¢2÷&WÆ•öG&gBç’Ç&VG’W6W2f÷"ÄÄÒG&gG2’à  ¦6Æ72&WÆ•6÷W&6T÷WB„&6TÖöFVÂ“ ¢""%&VBÖöæÇ’–ææVB×6æ6†÷B6÷W&6Rf÷"F†R&W6öÇfVB&WÆ’6WB7–Ö&öÂw0¢f–ÆRâ6÷W&6V—2F†RgVÆÂf–ÆR6öçFVçBBF†R–ææVB6öÖÖ—BÒÒæWfW ¢F†Rv÷&¶–ærG&VR…&–æ6—ÆRR“²7F'EöÆ–æRöVæEöÆ–æRÆö6FRF†R&W6öÇfV@¢7–Ö&öÂv—F†–â—B6òF†RT’6â67&öÆÂFòò†–v†Æ–v‡B—Bâ""  ¢&WÆ•÷6WEö–C¢–ç@¢6ö×öæVçEö–C¢7G ¢6æ6†÷Eö–C¢–ç@¢6öÖÖ—E÷6†¢7G ¢Fƒ¢7G ¢VÆ–f–VEöæÖS¢7G ¢7F'EöÆ–æS¢–ç@¢VæEöÆ–æS¢–ç@¢6÷W&6S¢7G   ¦6Æ72&WÆ•6÷W&6TF–fd7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&WÆ•÷6WEö–C¢–ç@¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢VF—FVE÷6÷W&6S¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ%óó  ¦6Æ72&WÆ•6÷W&6TF–fd÷WB„&6TÖöFVÂ“ ¢""$FWFW&Ö–æ—7F–2Væ–f–VBF–fb&WGvVVâF†R–ææVB×6æ6†÷Bf–ÆRæB¢FWfVÆ÷W"ÖVF—FVB6÷’öb—Bâæò§VFvVÖVçBÒÒW&R7G'V7GW&ÂFW‡@¢F–ff–ær‡F†R6ÖRv÷&·G&VR²v—BF–ffÖV6†æ—6Ð¢&WÆ•öG&gBåöF–feöv–ç7E÷6æ6†÷FW6W2f÷"ÄÄÒG&gG2’â""  ¢F6…÷FW‡C¢7G ¢F6…ö†6ƒ¢7G   ¢2ÒÒÒ’6æF–FFR7GVF–ò„—77VR3#S"’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢0¢26öçfW'6F–öâ²fW'6–öæ–ærÆ–W"÷fW"F†RW†—7F–ær—6öÆFVBÕ&WÆ’7F6²à¢2f–æ—FR6WG2…&–æ6—ÆRb“¢fW'6–öâw2vVæW&FRÆ–fV7–6ÆRFW&Ö–æÂ7FGW2À¢2—G2&WÆ’Æ–fV7–6ÆR7FGW2ÂæBÖW76vR&öÆW2à ¤6æF–FFUfW'6–öå7FGW2ÒÆ—FW&Å²'&÷÷6VB"Â&f–ÆVB%Ð¤6æF–FFU&WÆ•7FGW2ÒÆ—FW&Å²&æ÷E÷'Vâ"Â''Vææ–ær"Â&6ö×ÆWFVB"Â&f–ÆVB%Ð¤6æF–FFTÖW76vU&öÆRÒÆ—FW&Å²'W6W""Â&76—7FçB%Ð¤6æF–FFU6W76–öå7FGW2ÒÆ—FW&Å²&7F—fR"Â&&6†—fVB%Ð  ¦6Æ726æF–FFU6W76–öä7&VFR„&6TÖöFVÂ“ ¢""%7F'B7GVF–ò6W76–öâf÷"6ö×öæVçBâBÖ÷7BöæR–çWB6VÆV7F–öà¢Ö’&R7WÆ–VC¢âW†—7F–ær&WÆ•÷6WEö–FÂâW‡Æ–6—BG&6Uö–G6 ¢Æ—7BÂ÷"6–ævÆRG&6Uö–F‡F†R&–×&÷fRg&öÒF†—2–çWB"VçG'’’âv—F€¢æò6VÆV7F–öâÂF†R6ö×öæVçBVçG'’ö–çBW6W2WFòS&V6VçBG&6W2âv†Và¢G&6R–G2&R6VÆV7FVBÂ&WÆ’6WB—27&VFVBf÷"F†VÒ‡&WW6–ærõ5@¢÷&WÆ’×6WG2rfÆ–FF–öâ’â6æ6†÷Eö–FFVfVÇG2FòF†RÆFW7B&VG¢6æ6†÷Bâ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6ö×öæVçEö–C¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓS¢&WÆ•÷6WEö–C¢÷F–öæÅ¶–çEÒÒæöæP¢G&6Uö–G3¢÷F–öæÅ´Æ—7E·7G%ÕÒÒæöæP¢G&6Uö–C¢÷F–öæÅ·7G%ÒÒæöæP¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢ö&¦V7F—fS¢7G"Òf–VÆB†FVfVÇCÒ""ÂÖ…öÆVæwFƒÓS¢2—77VR33c“¢&WV—&VBv†VâF†R&W6öÇfVB6æ6†÷B—2FVf–æ—F—fVÇ’&V†–æ@¢2„TBâ6ÖRÖçVÂFV6—6–öâF†RW‡W&–ÖVçB&V6÷&G2à¢7FÆU÷6æ6†÷E÷&V6öã¢÷F–öæÅ·7G%ÒÒf–VÆB„æöæRÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ  ¦6Æ726æF–FFU&÷÷6Â„&6TÖöFVÂ“ ¢""%7G'V7GW&VB6æF–FFR&÷÷6Â†æWfW"g&VRÖf÷&Ò6öFR“¢F†R&V6öæ–æp¢ÖöFVÂ&WGW&ç27VÖÖ'’ò77V×F–öç2ò6†ævVE÷7–Ö&öÇ2òvVæW&FVEö6öFRð¢&—6·2ò7VvvW7FVE÷FW7G3²F†RF6‚—G6VÆb—2&öGV6VBFWFW&Ö–æ—7F–6ÆÇ’'¢7Æ–6–ærvVæW&FVEö6öFV–çFòF†R&W6öÇfVB7–Ö&öÂ7âæBF–ff–æp¢v–ç7BF†R–ææVB6æ6†÷B†ö6æF–FFU÷7GVF–òç’’â""  ¢7VÖÖ'“¢7G"Ò" ¢77V×F–öç3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6†ævVE÷7–Ö&öÇ3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&—6·3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢7VvvW7FVE÷FW7G3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726æF–FFUfW'6–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6W76–öåö–C¢–ç@¢&VçE÷fW'6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢fW'6–öåöçVÖ&W#¢–ç@¢–ç7G'V7F–öã¢7G"Ò" ¢7FGW3¢6æF–FFUfW'6–öå7FGW0¢7VÖÖ'“¢7G"Ò" ¢77V×F–öç3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6†ævVE÷7–Ö&öÇ3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&—6·3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢7VvvW7FVE÷FW7G3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢vVæW&FVEö6öFS¢7G"Ò" ¢F6…÷FW‡C¢7G"Ò" ¢F6…ö†6ƒ¢7G"Ò" ¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢&WÆ•÷7FGW3¢6æF–FFU&WÆ•7FGW2Ò&æ÷E÷'Vâ ¢&WÆ•÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&WÆ•÷f&–çEö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&öÖ÷FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢2&V6öæ–ær&÷fVææ6R†g&öÒF†RÆ–æ¶VB–çFVÆÆ–vVæ6U÷'Vç2&÷r’à¢&÷f–FW#¢÷F–öæÅ·7G%ÒÒæöæP¢ÖöFVÃ¢÷F–öæÅ·7G%ÒÒæöæP¢&ö×E÷fW'6–öã¢÷F–öæÅ·7G%ÒÒæöæP¢66†VÖ÷fW'6–öã¢÷F–öæÅ·7G%ÒÒæöæP¢FV6—6–öåöÖWF†öC¢÷F–öæÅ´FV6—6–öäÖWF†öEÒÒæöæP¢—5öÖö6³¢&ööÂÒfÇ6P¢7&VFVEöC¢fÆö@  ¦6Æ726æF–FFTÖW76vT÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢6W76–öåö–C¢–ç@¢&öÆS¢6æF–FFTÖW76vU&öÆP¢6öçFVçC¢7G"Ò" ¢fW'6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7&VFVEöC¢fÆö@  ¦6Æ726æF–FFU6W76–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6ö×öæVçEö–C¢7G ¢6æ6†÷Eö–C¢–ç@¢6öÖÖ—E÷6†¢7G ¢7–Ö&öÅ÷Fƒ¢7G ¢7–Ö&öÅ÷VÆ–f–VEöæÖS¢7G ¢&WÆ•÷6WEö–C¢–ç@¢ö&¦V7F—fS¢7G"Ò" ¢7FGW3¢6æF–FFU6W76–öå7FGW2Ò&7F—fR ¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@¢ÖW76vW3¢Æ—7E´6æF–FFTÖW76vT÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢fW'6–öç3¢Æ—7E´6æF–FFUfW'6–öä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726æF–FFTÖW76vT7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6öçFVçC¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ  ¦6Æ726æF–FFTvVæW&FT7&VFR„&6TÖöFVÂ“ ¢""$vVæW&FRF†RæW‡B–Ö×WF&ÆR6æF–FFUfW'6–öââ–ç7G'V7F–öæ—2F†P¢–×&÷fVÖVçBvöÂò6öç7G&–çG3²&VçE÷fW'6–öåö–F'&æ6†W2öfb¢6VÆV7FVBfW'6–öâ„æöæRÒ'&æ6‚öfbF†R&6VÆ–æR’â""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢–ç7G'V7F–öã¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓS¢&VçE÷fW'6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ726æF–FFU&WÆ”7&VFR„&6TÖöFVÂ“ ¢""%&WÆ’v–ç7BF†R6W76–öâw2–ææVB6æ6†÷Bâ6æ6†÷Eö–F&VÖ–ç0¢66WFVBf÷"6ö×F–&–Æ—G’Â'WBF–ffW&VçBfÇVR—2&V¦V7FVBâ"" ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ726æF–FFU&öÖ÷F–öä÷WB„&6TÖöFVÂ“ ¢""$†æG2&Wf–WvVB6æF–FFRF6‚FòF†RW†—7F–ærW‡W&–ÖVçB7&VF–öà¢fÆ÷r„—77VR3#CRw2f&–çBW‡W&–ÖVçB×–ÆöB6†R’â’6†RöæÇ’ÒÐ¢F†—2æWfW"7&VFW2âW‡W&–ÖVçBÂWFòÖF÷G2ÂÖW&vW2Â÷"FWÆ÷—0¢ç—F†–ær…&–æ6—ÆRr’â""  ¢6æF–FFU÷fW'6–öåö–C¢–ç@¢Æ&VÃ¢7G ¢F6…÷FW‡C¢7G ¢F6…ö†6ƒ¢7G ¢6÷W&6S¢7G"Ò&6æF–FFU÷7GVF–ò ¢&—6µöæ÷FS¢7G"Ò" ¢÷&–v–ã¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B  ¦6Æ726æF–FFTWfVçD÷WB„&6TÖöFVÂ“ ¢""$öæRVçG'’öb6W76–öâw2¦ö"÷7FGW2F–ÖVÆ–æR‡öÆÆ–ær6öçG&7Bf÷"F†P¢WfVçG2VæGö–çB’âFW&—fVBFWFW&Ö–æ—7F–6ÆÇ’g&öÒW'6—7FVBfW'6–öâ7FFS ¢vVæW&FRG&ç6—F–öç2†6öçFW‡E÷&W&–ævÓâvVæW&F–ævÓà¢fÆ–FF–æu÷F6†Óâ6ö×ÆWFVFòf–ÆVF’6öÆÆ6RFòF†P¢fW'6–öâw2FW&Ö–æÂ7FGW6²&WÆ’G&ç6—F–öç27W&f6P¢&WÆ•÷7FGW6â""  ¢fW'6–öåö–C¢–ç@¢fW'6–öåöçVÖ&W#¢–ç@¢†6S¢Æ—FW&Å°¢&vVæW&F–ær"Â'fÆ–FF–æu÷F6‚"Â&6ö×ÆWFVB"Â&f–ÆVB"Â'&WÆ––ær ¢Ð¢7FGW3¢7G ¢&WÆ•÷7FGW3¢6æF–FFU&WÆ•7FGW2Ò&æ÷E÷'Vâ ¢FWF–Ã¢7G"Ò" ¢7&VFVEöC¢fÆö@  ¦6Æ726æF–FFTWfVçG4÷WB„&6TÖöFVÂ“ ¢6W76–öåö–C¢–ç@¢WfVçG3¢Æ—7E´6æF–FFTWfVçD÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¢2ÒÒÒ&ö&R6VÆÂf'&–2„—77VR3#“r’Â7V"¢6VÆÂ6öçG&7Bò&öÆR6&Bð¢26öÖÖöâ7FFR66†VÖ„—77VR3#“‚’â&WVW7B&öF–W2&WW6RF†R6†&VB×66†VÖ¢2Ö—'&÷"ÖöFVÇ2–âö6VÆÅöf'&–2ç’F—&V7FÇ’„vVçE&öÆT6&BÀ¢26VÆÄFVf–æ—F–öä6öçG&7B’6òf7D’w2÷vâ&WVW7BfÆ–FF–öâVæf÷&6W2F†P¢2f–ÂÖ6Æ÷6VBVæ¶æ÷vâÖf–VÆBòVçVÒò66†VÖ÷fW'6–öâ'VÆW3²F†W6R&RöæÇ’F†P¢26W'fW"Ö76–væVB$÷WB"&ö¦V7F–öç2†–BÂ7—7FVÕö–BÂF–ÖW7F×2ÂVF—@¢2f–VÆG2’â6VRFö72÷&ö¦V7BÖ–çFVÆÆ–vVæ6RæÖBw2%&ö&R6VÆÂf'&–2„—77VP¢23#“r’"6V7F–öâà  ¦6Æ72vVçE&öÆT6&D÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢&öÆUö¶W“¢7G ¢fW'6–öã¢7G ¢7FGW3¢7G ¢Ö—76–öã¢7G ¢66÷S¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢÷WEööe÷66÷S¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢ÖöFVÅöÆ–3¢7G ¢FööÅ÷öÆ–7“¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢66WFæ6U÷FV×ÆFS¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢'V'&–5÷&Vc¢÷F–öæÅ·7G%ÒÒæöæP¢6†ævVÆös¢7G ¢66†VÖ÷fW'6–öã¢7G ¢FV6—6–öåöÖWF†öC¢7G ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@  ¦6Æ72vVçE&öÆT6&G4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢&öÆUö6&G3¢Æ—7E´vVçE&öÆT6&D÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÄFVf–æ—F–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢&÷7FW#¢÷F–öæÅ´Æ—7E·7G%ÕÒÒæöæP¢&öÆUö6&E÷&Vc¢F–7E·7G"Â7G%Ð¢7FGW3¢7G ¢Ö—76–öã¢7G ¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@  ¦6Æ726VÆÇ4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6VÆÇ3¢Æ—7E´6VÆÄFVf–æ—F–öä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÄFWF–Ä÷WB„&6TÖöFVÂ“ ¢FVf–æ—F–öã¢6VÆÄFVf–æ—F–öä÷W@¢7FFS¢F–7E·7G"Âç•Ð  ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢26VÆÂ&–æF–ærò7F—fF–öâ„—77VR3#“’Â7V""öbF†R&ö&R6VÆÂf'&–2W–2¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ  ¦6Æ726VÆÄ&–æF–æt7&VFT–â„&6TÖöFVÂ“ ¢""$W†7FÇ’öæRöb&ö&U÷ö–çEö–Fò&ö&U÷GFW&å÷ö–çEö–F×W7B&P¢v—fVã²&÷fVææ6R—2&VBg&öÒF†B&÷r6W'fW"×6–FRÂæWfW"66WFVBg&öÐ¢F†R6ÆÆW"â""  ¢&ö&U÷ö–çEö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&ö&U÷GFW&å÷ö–çEö–C¢÷F–öæÅ¶–çEÒÒæöæP¢fVGW&U÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6&–Æ—G•÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢VçG'—ö–çE÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÄ&–æF–æt÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6VÆÅöFVf–æ—F–öåö–C¢–ç@¢6VÆÅö–C¢7G ¢fW'6–öã¢–ç@¢6æ6†÷Eö–C¢–ç@¢6öÖÖ—E÷6†¢7G ¢Fƒ¢7G ¢VÆ–f–VE÷7–Ö&öÃ¢7G ¢6ö×öæVçEö–C¢7G ¢&ö&U÷ö–çEö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&ö&U÷GFW&åö–C¢÷F–öæÅ¶–çEÒÒæöæP¢fVGW&U÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6&–Æ—G•÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢VçG'—ö–çE÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢7FGW3¢7G ¢7FGW5÷&V6öã¢7G ¢7&VFVEöC¢fÆö@  ¦6Æ726VÆÄ&–æF–æw4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢&–æF–æw3¢Æ—7E´6VÆÄ&–æF–æt÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÄ7F—fF–öä7&VFT–â„&6TÖöFVÂ“ ¢v–æF÷u÷7F'C¢÷F–öæÅ¶fÆöEÒÒæöæP¢v–æF÷uöVæC¢÷F–öæÅ¶fÆöEÒÒæöæP¢&WVW7FVEö'“¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÄ7F—fF–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6VÆÅöFVf–æ—F–öåö–C¢–ç@¢6VÆÅö–C¢7G ¢G&–vvW%ö¶–æC¢7G ¢v–æF÷u÷7F'C¢÷F–öæÅ¶fÆöEÒÒæöæP¢v–æF÷uöVæC¢÷F–öæÅ¶fÆöEÒÒæöæP¢&WVW7FVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢W6VEöÆÆÓ¢&ööÀ¢–çFVÆÆ–vVæ6U÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7FGW3¢7G ¢FWF–Ã¢7G ¢7&VFVEöC¢fÆö@¢6ö×ÆWFVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ726VÆÄ7F—fF–öç4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢7F—fF–öç3¢Æ—7E´6VÆÄ7F—fF–öä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÅ7FFT÷WB„&6TÖöFVÂ“ ¢""%F†R&VBÖöæÇ’–Æ÷B7FFRFö7VÖVçC¢7V"w26VÆÅ÷7FFV‡v—F‚F†P¢†VÇF‚&Æö6²f–ÆÆVB–â’ÇW2F†R7W'&VçB&–æF–æræB&V6VçB7F—fF–öç0¢26–&Æ–ærf–VÆG2ÒÒF†R6VÆÅ÷7FFV66†VÖ—G6VÆb—2Væ6†ævVBâ""  ¢6VÆÅö–C¢7G ¢7FFS¢F–7E·7G"Âç•Ð¢&–æF–æs¢÷F–öæÅ´6VÆÄ&–æF–æt÷WEÒÒæöæP¢&V6VçEö7F—fF–öç3¢Æ—7E´6VÆÄ7F—fF–öä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢2vöÂõF6²ÆVFvW"²FVÆVvFR÷&W÷'BöW66ÆFR&÷Fö6öÂ„—77VR33Â7V"2ö`¢2F†R&ö&R6VÆÂf'&–2W–2Â—77VR3#“r’â6÷&RÆöv–2Æ—fW2–à¢2ö6VÆÅ÷F6·2ç“²F†W6R&RF†R&WVW7B÷&W7öç6R6†W2f÷ ¢2&÷WFW2ö6VÆÅ÷F6·2ç’à¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ  ¦6Æ726VÆÄvöÄ7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢F—FÆS¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢FW67&—F–öã¢7G"Ò" ¢&VçEövöÅö–C¢÷F–öæÅ¶–çEÒÒæöæP¢÷væW%ö6VÆÅö–C¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÄvöÅ7FGW5WFFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢7FGW3¢7G   ¦6Æ726VÆÄvöÄ÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢&VçEövöÅö–C¢÷F–öæÅ¶–çEÒÒæöæP¢F—FÆS¢7G ¢FW67&—F–öã¢7G"Ò" ¢÷væW%ö6VÆÅö–C¢÷F–öæÅ·7G%ÒÒæöæP¢7FGW3¢7G ¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@  ¦6Æ726VÆÄvöÇ4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢vöÇ3¢Æ—7E´6VÆÄvöÄ÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÅF6´FVÆVvFT7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢vöÅö–C¢–ç@¢÷væW%ö6VÆÅö–C¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢FVÆVvFVEö'•ö6VÆÅö–C¢÷F–öæÅ·7G%ÒÒæöæP¢F—FÆS¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢66WFæ6S¢Æ—7E·7G%ÒÒf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢6öçFW‡E÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢'VFvWC¢÷F–öæÅ´F–7E·7G"Âç•ÕÒÒæöæP¢FVFÆ–æS¢÷F–öæÅ·7G%ÒÒæöæP¢&–÷&—G“¢÷F–öæÅ·7G%ÒÒæöæP¢–FV×÷FVæ7•ö¶W“¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÅF6´÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢vöÅö–C¢–ç@¢÷væW%ö6VÆÅö–C¢7G ¢FVÆVvFVEö'•ö6VÆÅö–C¢÷F–öæÅ·7G%ÒÒæöæP¢F—FÆS¢7G ¢66WFæ6S¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6öçFW‡E÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢'VFvWC¢÷F–öæÅ´F–7E·7G"Âç•ÕÒÒæöæP¢FVFÆ–æS¢÷F–öæÅ·7G%ÒÒæöæP¢&–÷&—G“¢7G ¢7FGW3¢7G ¢&WG'•ö6÷VçC¢–ç@¢&WG'•öÆ–Ö—C¢–ç@¢&Æö6¶VEö'“¢Æ—7E¶–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢66WFæ6UöÖWC¢&ööÀ¢Wf–FVæ6S¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&WGW&æVE÷Fõ÷&VçC¢&ööÀ¢–FV×÷FVæ7•ö¶W“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@  ¦6Æ726VÆÅF6·4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢F6·3¢Æ—7E´6VÆÅF6´÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÄvöÄFWF–Ä÷WB„&6TÖöFVÂ“ ¢vöÃ¢6VÆÄvöÄ÷W@¢F6·3¢Æ—7E´6VÆÅF6´÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÅF6´WfVçD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢F6µö–C¢–ç@¢WfVçE÷G—S¢7G ¢g&öÕ÷7FGW3¢÷F–öæÅ·7G%ÒÒæöæP¢Fõ÷7FGW3¢÷F–öæÅ·7G%ÒÒæöæP¢FWF–Ã¢7G"Ò" ¢7&VFVEöC¢fÆö@  ¦6Æ726VÆÅF6´FWF–Ä÷WB„&6TÖöFVÂ“ ¢F6³¢6VÆÅF6´÷W@¢WfVçG3¢Æ—7E´6VÆÅF6´WfVçD÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÅF6µG&ç6—F–öå&WVW7B„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æWu÷7FGW3¢7G ¢66WFæ6UöÖWC¢÷F–öæÅ¶&ööÅÒÒæöæP¢Wf–FVæ6U÷&Vg3¢÷F–öæÅ´Æ—7E·7G%ÕÒÒæöæP¢&Æö6¶VEö'“¢÷F–öæÅ´Æ—7E¶–çEÕÒÒæöæP¢FWF–Ã¢7G"Ò"   ¦6Æ726VÆÅF6µ&WGW&åFõ&VçE&WVW7B„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢FWF–Ã¢7G"Ò"   ¦6Æ726VÆÅ&W÷'Df7D—FVÒ„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢FW‡C¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢Wf–FVæ6U÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÅ&W÷'EFW‡D—FVÒ„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢FW‡C¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ  ¦6Æ726VÆÅ&W÷'D7&VFR„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6VÆÅöFVf–æ—F–öåö–C¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢F6µö–C¢÷F–öæÅ¶–çEÒÒæöæP¢¶–æC¢7G ¢6WfW&—G“¢÷F–öæÅ·7G%ÒÒæöæP¢f7C¢Æ—7E´6VÆÅ&W÷'Df7D—FVÕÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢–çFW'&WFF–öã¢Æ—7E´6VÆÅ&W÷'EFW‡D—FVÕÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6³¢Æ—7E´6VÆÅ&W÷'EFW‡D—FVÕÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢–FV×÷FVæ7•ö¶W“¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÅ&W÷'D÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6VÆÅöFVf–æ—F–öåö–C¢7G ¢F6µö–C¢÷F–öæÅ¶–çEÒÒæöæP¢¶–æC¢7G ¢6WfW&—G“¢÷F–öæÅ·7G%ÒÒæöæP¢f7C¢Æ—7E´F–7E·7G"Âç•ÕÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢–çFW'&WFF–öã¢Æ—7E´F–7E·7G"Âç•ÕÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6³¢Æ—7E´F–7E·7G"Âç•ÕÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢–FV×÷FVæ7•ö¶W“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢W66ÆF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ726VÆÅ&W÷'G4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢&W÷'G3¢Æ—7E´6VÆÅ&W÷'D÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÄW66ÆF–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢&W÷'Eö–C¢–ç@¢6VÆÅöFVf–æ—F–öåö–C¢7G ¢6WfW&—G“¢7G ¢7FGW3¢7G ¢7VÖÖ'“¢7G ¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@  ¦6Æ726VÆÄW66ÆF–öç4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢W66ÆF–öç3¢Æ—7E´6VÆÄW66ÆF–öä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2š	ŽYùþ8*®8;Î8+8+ž88Ž8:Î8;Î8+þ8;ÂòFöÖ–â÷&6†W7G&F÷'2„—77VR33Â7V"BöbF†P¢2&ö&R6VÆÂf'&–2W–2Â—77VR3#“r’â6÷&RÆöv–2Æ—fW2–à¢2ö6VÆÅö÷&6†W7G&F÷"ç“²F†W6R&RF†R&WVW7B÷&W7öç6R6†W2f÷ ¢2&÷WFW2ö6VÆÅö÷&6†W7G&F÷'2ç’à¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ  ¦6Æ726VÆÄ÷&6†W7G&F÷$F–vW7D÷WB„&6TÖöFVÂ“ ¢""%F†RFWFW&Ö–æ—7F–2F–vW7BÒÒF–vW7F—2&WGW&æVB2Æ–âF–7@¢†ÖF6†–ærF†RW†—7F–ær6VÆÅ7FFT÷WBç7FFVò6VÆÄFWF–Ä÷WBç7FFV ¢GFW&â’&F†W"F†â&–v–BæW7FVBÖöFVÂÂ6–æ6R—G26†RÖ—'&÷'0¢æ6VÆÅö÷&6†W7G&F÷"æ'V–ÆEö÷&6†W7G&F÷%öF–vW7Fw2&WGW&âfÇVRâ""  ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢F–vW7C¢F–7E·7G"Âç•Ð  ¦6Æ726VÆÅG&–vU&W7VÇD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢–çFVÆÆ–vVæ6U÷'Våö–C¢–ç@¢6Æ76–f–6F–öã¢7G ¢&V6öæ–æu÷7VÖÖ'“¢7G ¢ffV7FVEö6VÆÅö–G3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&÷÷6VEö6³¢7G"Ò" ¢—5öÖö6³¢&ööÂÒfÇ6P¢7&VFVEöC¢fÆö@  ¦6Æ726VÆÅG&–vU&W7VÇG4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢&W7VÇG3¢Æ—7E´6VÆÅG&–vU&W7VÇD÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÅG&–vU'Vä÷WB„&6TÖöFVÂ“ ¢""%&W7öç6Röbõ5Bö6VÆÂÖf'&–2ö÷&6†W7G&F÷'2÷¶6VÆÅö–GÒ÷G&–vVâF†P¢F–vW7B—2Çv—2&W6VçB†f7G27W'f—fRG&–vRf–ÇW&R“²G&–vV—0¢æöæVæBG&–vUöW'&÷&—26WBöâå’G&–vRf–ÇW&RÒÒF†W&R—2æð¢†WW&—7F–26Æ76–f–6F–öâfÆÆ&6²â""  ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢F–vW7C¢F–7E·7G"Âç•Ð¢G&–vS¢÷F–öæÅ´6VÆÅG&–vU&W7VÇD÷WEÒÒæöæP¢G&–vUöW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢—5öÖö6³¢&ööÂÒfÇ6P¢–çFVÆÆ–vVæ6U÷'Våö–C¢–ç@  ¦6Æ726VÆÅ&÷7FW%WFFT–â„&6TÖöFVÂ“ ¢""&&÷7FW&—2Çv—2Æ—7B†W&R‡÷76–&Ç’V×G’“¢F†—2VæGö–çBöæÇ¢WfW"6WG2ö6†ævW2â÷&6†W7G&F÷"w2&÷7FW"Â—BæWfW"6öçfW'G26VÆÀ¢&6²–çFò&÷7FW"ÖÆW72v÷&¶W"â""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&÷7FW#¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6†ævVEö'“¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÅ&÷7FW$WfVçD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6VÆÅöFVf–æ—F–öåö–C¢–ç@¢öÆE÷&÷7FW#¢÷F–öæÅ´Æ—7E·7G%ÕÒÒæöæP¢æWu÷&÷7FW#¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6†ævVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@  ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2Y8‹:®8+^8;>89~8:®8;>8+8;¾xºÎz¸¾yº>iû¾8;·VÆ—G’fÆö÷"„—77VR33"Â7V"böbF†R&ö&P¢26VÆÂf'&–2W–2Â—77VR3#“r’â6÷&RÆöv–2Æ—fW2–âö6VÆÅ÷VÆ—G’ç“°¢2F†W6R&RF†R&WVW7B÷&W7öç6R6†W2f÷"&÷WFW2ö6VÆÅ÷VÆ—G’ç’à¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ  ¦6Æ726VÆÅVÆ—G•7G&GVÔ–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æÖS¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓ¢F6µ÷G—S¢÷F–öæÅ·7G%ÒÒæöæP¢&—6³¢÷F–öæÅ·7G%ÒÒæöæP¢&&S¢&ööÂÒfÇ6P  ¦6Æ726VÆÅVÆ—G”6öæf–t–â„&6TÖöFVÂ“ ¢""$WfW'’f–VÆB÷F–öæÃ¢âöÖ—GFVBf–VÆB¶VW2—G2W†—7F–ærW'6—7FV@¢fÇVR†÷"F†RÖöGVÆRFVfVÇBöâf—'7B7&VFR’â""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6×ÆU÷&FS¢÷F–öæÅ¶fÆöEÒÒæöæP¢7G&F¢÷F–öæÅ´Æ—7E´6VÆÅVÆ—G•7G&GVÔ–åÕÒÒæöæP¢VF—E÷&FS¢÷F–öæÅ¶fÆöEÒÒæöæP¢VÆ—G•öfÆö÷#¢÷F–öæÅ¶fÆöEÒÒæöæP¢fÆö÷%÷v–æF÷s¢÷F–öæÅ¶–çEÒÒæöæP¢F–Ç•öVF—Eö'VFvWC¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ726VÆÅVÆ—G”6öæf–t÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6VÆÅöFVf–æ—F–öåö–C¢–ç@¢6×ÆU÷&FS¢fÆö@¢7G&F¢Æ—7E´F–7E·7G"Âç•ÕÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢VF—E÷&FS¢fÆö@¢VÆ—G•öfÆö÷#¢fÆö@¢fÆö÷%÷v–æF÷s¢–ç@¢F–Ç•öVF—Eö'VFvWC¢–ç@¢7&VFVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢WFFVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ726VÆÅVÆ—G•6×ÆU6VÆV7D–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢v–æF÷u÷6V6öæG3¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ726VÆÅVÆ—G•6×ÆT÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6VÆÅöFVf–æ—F–öåö–C¢–ç@¢6öæf–uö–C¢–ç@¢7G&GVÓ¢7G"Ò" ¢F&vWEö¶–æC¢7G ¢F&vWEö–C¢7G ¢6VÆV7F–öå÷6VVC¢7G ¢6VÆV7FVEöC¢fÆö@  ¦6Æ726VÆÅVÆ—G•6×ÆW4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢6×ÆW3¢Æ—7E´6VÆÅVÆ—G•6×ÆT÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÅVÆ—G”VF—E&WVW7D–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&Æ–æC¢&ööÂÒfÇ6P¢VF—F÷%öÆ–3¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÅVÆ—G”VF—D÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6×ÆUö–C¢–ç@¢VF—F÷%öÖöFVÅöÆ–3¢7G ¢fW&F–7C¢7G ¢fW&F–7EöFV6—6–öåöÖWF†öC¢7G ¢—5ö&Æ–æC¢&ööÀ¢f–ÆVEö7&—FW&–¢Æ—7E¶–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢fW&&F–ÕöW†×ÆS¢7G"Ò" ¢W‡ÆæF–öã¢7G"Ò" ¢W‡ÆæF–öå÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢—5öÖö6³¢&ööÂÒfÇ6P¢7&VFVEöC¢fÆö@  ¦6Æ726VÆÅVÆ—G”VF—G4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢6÷VçG3¢F–7E·7G"Â–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢VF—G3¢Æ—7E´6VÆÅVÆ—G”VF—D÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÅVÆ—G”fÆö÷$WfÇVFT÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢75÷&FS¢÷F–öæÅ¶fÆöEÒÒæöæP¢fÆö÷#¢fÆö@¢FVæöÖ–æF÷#¢–ç@¢7W7VæFVC¢&ööÀ¢W66ÆF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ726VÆÄ–çF¶U&W7VÖT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&V6öã¢7G"Ò"   ¦6Æ726VÆÄ–çF¶U7FFT÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢–çF¶U÷7FGW3¢7G ¢&V6öã¢7G"Ò" ¢W66ÆF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6†ævVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢2&ö÷B÷&6†W7G&F÷"8Ž{[YŽ888*N8+Ž8*~8+ž88‚„—77VR332Â7V"RöbF†R&ö&R6VÆÀ¢2f'&–2W–2Â—77VR3#“r’â6÷&RÆöv–2Æ—fW2–âö6VÆÅ÷&ö÷Bç“²F†W6R&P¢2F†R&WVW7B÷&W7öç6R6†W2f÷"&÷WFW2ö6VÆÅ÷&ö÷Bç’à¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ  ¦6Æ726VÆÅ&ö÷DF–vW7D÷WB„&6TÖöFVÂ“ ¢""%F†RBÖÆWfVÂ&öw&W76—fRÖF—66Æ÷7W&RF–vW7BÒÒF–vW7F—2&WGW&æVB0¢Æ–âF–7B‡6ÖRGFW&â26VÆÄ÷&6†W7G&F÷$F–vW7D÷WBæF–vW7F’6–æ6P¢—G26†RÖ—'&÷'2æ6VÆÅ÷&ö÷Bæ'V–ÆE÷&ö÷EöF–vW7Fw2&WGW&âfÇVP¢fW&&F–Òâ""  ¢7—7FVÕö–C¢–ç@¢F–vW7C¢F–7E·7G"Âç•Ð¢vVæW&FVEöC¢fÆö@  ¦6Æ726VÆÄ6µ7–æ4÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢7&VFVC¢–ç@¢FVGWVC¢–ç@  ¦6Æ726VÆÄ6´÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6÷W&6Uö¶–æC¢7G ¢6÷W&6Uö–C¢–ç@¢6VÆÅöFVf–æ—F–öåö–C¢÷F–öæÅ·7G%ÒÒæöæP¢vöÅö–C¢÷F–öæÅ¶–çEÒÒæöæP¢F6µö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6µ÷FW‡C¢7G ¢6WfW&—G“¢7G ¢7FGW3¢7G ¢FV6—6–öã¢7G"Ò" ¢FV6—6–öåöæ÷FS¢7G"Ò" ¢FV6—6–öåöÖWF†öC¢7G"Ò" ¢FV6–FVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢FV6–FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢W†V7WF–öåö&÷fVC¢&ööÂÒfÇ6P¢FVGWUö¶W“¢7G ¢7&VFVEöC¢fÆö@  ¦6Æ726VÆÄ6·4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6·3¢Æ—7E´6VÆÄ6´÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÄ6´FV6–FU&WVW7B„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢FV6—6–öã¢7G ¢æ÷FS¢7G"Ò"   ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2iKžYhNKºîŠªÎ8;¾8*¾88®8:®8*.8;·6†F÷~ZéþŠÎh›þŠ¨Þ8+.8;Î88‚„—77VR33BÂ7V"röbF†R&ö&P¢26VÆÂf'&–2W–2Â—77VR3#“r’â6÷&RÆöv–2Æ—fW2–âö6VÆÅö–×&÷fVÖVçBç“°¢2F†W6R&RF†R&WVW7B÷&W7öç6R6†W2f÷"&÷WFW2ö6VÆÅö–×&÷fVÖVçBç’à¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ  ¦6Æ726VÆÄ–×&÷fVÖVçDG&gD–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢ö'6W'fVEöf7G5÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢F&vWEö¶–æC¢7G"Ò'&öÆUö6&B ¢&VçEö6VÆÅö–C¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÄ–×&÷fVÖVçD7&VFT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢F&vWEö¶–æC¢7G ¢‡—÷F†W6—3¢7G"Ò" ¢W‡V7FVEöVffV7C¢7G"Ò" ¢&—6³¢7G"Ò" ¢&öÆÆ&6µ÷Æã¢7G"Ò" ¢ö'6W'fVEöf7G5÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VçEö6VÆÅö–C¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÄ–×&÷fVÖVçD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢7FGW3¢7G ¢F&vWEö¶–æC¢7G ¢‡—÷F†W6—3¢7G"Ò" ¢W‡V7FVEöVffV7C¢7G"Ò" ¢&—6³¢7G"Ò" ¢&öÆÆ&6µ÷Æã¢7G"Ò" ¢ö'6W'fVEöf7G5÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&÷÷6Å÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢—5öÖö6³¢&ööÂÒfÇ6P¢&öÆUö6&Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&÷÷6VE÷&öÆUö6&E÷fW'6–öã¢÷F–öæÅ·7G%ÒÒæöæP¢6æ'•öWf–FVæ6U÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&VçEö6VÆÅö–C¢÷F–öæÅ·7G%ÒÒæöæP¢&VçEö&÷fVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢&VçEö&÷fVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢‡VÖåö&÷fVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢‡VÖåö&÷fVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢7W7VæFVC¢&ööÂÒfÇ6P¢7W7Vç6–öå÷&V6öã¢7G"Ò" ¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@  ¦6Æ726VÆÄ–×&÷fVÖVçG4Æ—7D÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢–×&÷fVÖVçG3¢Æ—7E´6VÆÄ–×&÷fVÖVçD÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÄ–×&÷fVÖVçDWfVçD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢–×&÷fVÖVçEö–C¢–ç@¢WfVçE÷G—S¢7G ¢g&öÕ÷7FGW3¢÷F–öæÅ·7G%ÒÒæöæP¢Fõ÷7FGW3¢÷F–öæÅ·7G%ÒÒæöæP¢7F÷#¢÷F–öæÅ·7G%ÒÒæöæP¢FWF–Ã¢7G"Ò" ¢7&VFVEöC¢fÆö@  ¦6Æ726VÆÅ6†F÷tFV6—6–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢–×&÷fVÖVçEö–C¢–ç@¢¶–æC¢7G ¢7FGW3¢7G ¢FV6–FVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢FV6–FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢FV6—6–öåöÖWF†öC¢7G"Ò" ¢æ÷FS¢7G"Ò" ¢7&VFVEöC¢fÆö@  ¦6Æ726VÆÄ–×&÷fVÖVçDFWF–Ä÷WB„&6TÖöFVÂ“ ¢–×&÷fVÖVçC¢6VÆÄ–×&÷fVÖVçD÷W@¢WfVçG3¢Æ—7E´6VÆÄ–×&÷fVÖVçDWfVçD÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6†F÷uöFV6—6–öç3¢Æ—7E´6VÆÅ6†F÷tFV6—6–öä÷WEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ726VÆÄ–×&÷fVÖVçDG&gD÷WB„&6TÖöFVÂ“ ¢""%&W7öç6Röbõ5Bö6VÆÂÖf'&–2ö6VÆÇ2÷¶6VÆÅö–GÒö–×&÷fVÖVçG2öG&gFà¢–×&÷fVÖVçF—2æöæVæBG&gEöW'&÷&—26WBöâå’ÄÄÒô¥4ôà¢f–ÇW&RÒÒF†W&R—2æò†WW&—7F–2‡—÷F†W6—2fÆÆ&6²â""  ¢7—7FVÕö–C¢–ç@¢6VÆÅö–C¢7G ¢–×&÷fVÖVçC¢÷F–öæÅ´6VÆÄ–×&÷fVÖVçD÷WEÒÒæöæP¢G&gEöW'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢—5öÖö6³¢&ööÂÒfÇ6P¢–çFVÆÆ–vVæ6U÷'Våö–C¢–ç@  ¦6Æ726VÆÄ–×&÷fVÖVçEG&ç6—F–öä–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æWu÷7FGW3¢7G ¢6æ'•öWf–FVæ6U÷&Vg3¢÷F–öæÅ´Æ—7E·7G%ÕÒÒæöæP¢&÷÷6VE÷&öÆUö6&E÷fW'6–öã¢÷F–öæÅ·7G%ÒÒæöæP¢ÆÆ÷uöÖ¦÷%ö'V×¢&ööÂÒfÇ6P¢FWF–Ã¢7G"Ò" ¢7F÷#¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÄ&÷fÄ–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢7F÷#¢7G   ¦6Æ726VÆÄ–×&÷fVÖVçE7W7VæD–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&V6öã¢7G"Ò"   ¦6Æ726VÆÄ–×&÷fVÖVçE&öÆÆ&6´–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢7F÷#¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÅ6†F÷u&÷÷6Ä–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æ÷FS¢7G"Ò" ¢7F÷#¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÅ6†F÷u&WVW7D–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æ÷FS¢7G"Ò" ¢7F÷#¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ726VÆÅ6†F÷tFV6–FT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢FV6—6–öã¢7G ¢FV6–FVEö'“¢7G ¢æ÷FS¢7G"Ò"   ¢2ÒÒÒ7FFRÖG&—fVâ7—7FVÒ–çFW'f–Wrv÷&¶fÆ÷r„—77VR33C’’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢0¢2&W7öç6R÷&WVW7B6öçG&7G2f÷"Fö72÷7—7FVÒÖ–çFW'f–Wr×v÷&¶fÆ÷r×W‚æÖBâWfW'¢2f–VÆB—2V—F†W"W'6—7FVBf7B÷"fÇVRF†R6æöæ–6ÂVæv–æP¢2†ö–çFW'f–Wu÷v÷&¶fÆ÷rç’’FW&—fVBg&öÒW'6—7FVBf7G2ÒÒF†RF6†&ö&@¢2æWfW"&RÖFW&—fW2v÷&¶fÆ÷r7FFRöb—G2÷vâ‡7V2&–æ6—ÆR’’à  ¦6Æ72–çFW'f–Wuv÷&¶fÆ÷tf7G4÷WB„&6TÖöFVÂ“ ¢""%F†RW†7B–çWG2öbF†R2×&÷rf—'7BÖÖF6‚'VÆRF&ÆRÂW‡÷6VB6ò¢F—7Æ–VB7FFR—2W‡Æ–æ&ÆRæBFW7F&ÆRv—F†÷WB&R×VW'––ærâ""  ¢†5÷6æ6†÷C¢&ööÀ¢†5÷6W76–öã¢&ööÀ¢6W76–öåö6Æ÷6VC¢&ööÀ¢'Vææ–æu÷&ö6W75ö¶–æG3¢Æ—7E·7G%ÒÒµÐ¢&Æö6¶–æuöf–ÇW&U÷7FFW3¢Æ—7E·7G%ÒÒµÐ¢VæFW'7FæF–æu÷Væ6öæf—&ÖVC¢&ööÀ¢÷Vå÷&WV—&VE÷VW7F–öç3¢–ç@¢÷WG7FæF–æuöÆ–væÖVçEö—FV×3¢–ç@¢&÷÷6Ç5öæVVF–æu÷&Wf–Ws¢–ç@¢&÷÷6Ç5övVæW&F&ÆS¢&ööÀ¢&÷fVE÷&÷÷6Åö6÷VçC¢–ç@¢F–feöÖF6†W5ö&÷fÅ÷6WC¢&ööÀ¢F–fe÷&Wf–Wuö6ö×ÆWFS¢&ööÀ¢VæF–æuö†æFöfeö6÷VçC¢–ç@  ¦6Æ72–çFW'f–Wu&ö6W75'Vä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢6W76–öåö–C¢–ç@¢7—7FVÕö–C¢–ç@¢&ö6W75ö¶–æC¢7G ¢7FGW3¢7G ¢f–ÇW&Uö6Æ73¢÷F–öæÅ·7G%ÒÒæöæP¢F&vWE÷7FFS¢÷F–öæÅ·7G%ÒÒæöæP¢W'&÷#¢÷F–öæÅ·7G%ÒÒæöæP¢7F'FVEöC¢fÆö@¢f–æ—6†VEöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ72–çFW'f–Wt&6µ&WVW7D÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢6W76–öåö–C¢–ç@¢7—7FVÕö–C¢–ç@¢6W6Uö¶–æC¢7G ¢6æF–FFU÷7FFS¢7G ¢&V6†VE÷7FFS¢7G ¢7FGW3¢7G ¢7&VFVEöC¢fÆö@  ¦6Æ72–çFW'f–Wuv÷&¶fÆ÷tW†6WF–öä÷WB„&6TÖöFVÂ“ ¢""$öæR7W'&VçFÇ’Ö7F—fRW†6WF–öâ‡7V2*sRã"’à ¢6WfW&—G–—2F†R7V2w22×v’7Æ—BâöæÇ’&Æö6¶–ævæBFVw&FVF&P¢F†R#V&öÆS²–æf÷&ÖF–öæÆW†6WF–öç2&R'&æ6†W2öbF†R&–Ö'¢v÷&²6&BæB×W7BæWfW"&R&VæFW&VB2v&æ–ær&æBà¢""  ¢6öFS¢7G ¢6WfW&—G“¢7G ¢F&vWE÷7FFS¢÷F–öæÅ·7G%ÒÒæöæP¢ÖW76vS¢7G ¢FWF–Ã¢÷F–öæÅ·7G%ÒÒæöæP¢&V6÷fW'•÷&ö6W75ö¶–æC¢÷F–öæÅ·7G%ÒÒæöæP¢&V6÷fW'•ö6öæF—F–öã¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ72–çFW'f–Wuv÷&¶fÆ÷u7FFT÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6W76–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7FFS¢7G ¢6æF–FFU÷7FFS¢7G ¢'VÆU÷&÷s¢–ç@¢&V6†VE÷7FFS¢÷F–öæÅ·7G%ÒÒæöæP¢&6·v&Eö†öÆC¢&ööÂÒfÇ6P¢VæF–æuö&6µ÷&WVW7C¢÷F–öæÅ´–çFW'f–Wt&6µ&WVW7D÷WEÒÒæöæP¢FW&Ö–æÅö¶–æC¢÷F–öæÅ·7G%ÒÒæöæP¢&–Ö'•ö7F–öã¢7G ¢f7G3¢–çFW'f–Wuv÷&¶fÆ÷tf7G4÷W@¢'Vææ–æu÷&ö6W76W3¢Æ—7E´–çFW'f–Wu&ö6W75'Vä÷WEÒÒµÐ¢Vç&W6öÇfVEöf–ÇW&W3¢Æ—7E´–çFW'f–Wu&ö6W75'Vä÷WEÒÒµÐ¢W†6WF–öç3¢Æ—7E´–çFW'f–Wuv÷&¶fÆ÷tW†6WF–öä÷WEÒÒµÐ¢F–feöÖFW&–Æ—¦VEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢ÆFW7E÷&VG•÷6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72–çFW'f–WtF–fe&Wf–Wt–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&Wf–WvVEö'“¢7G"Ò" ¢æ÷FS¢7G"Ò"   ¦6Æ72–çFW'f–WtF–fe&Wf–Wt÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢6W76–öåö–C¢–ç@¢7—7FVÕö–C¢–ç@¢F–feöÖFW&–Æ—¦VEöC¢fÆö@¢F–feöF–vW7C¢7G ¢&Wf–WvVEö'“¢7G ¢FV6—6–öåöÖWF†öC¢7G ¢æ÷FS¢7G ¢7&VFVEöC¢fÆö@  ¦6Æ72–çFW'f–Wt&6´6¶æ÷vÆVFvT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢7F÷#¢7G"Ò"   ¦6Æ72–çFW'f–Wu6W76–öä6Æ÷6T–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢FW&Ö–æÅö¶–æC¢7G"Ò'7W7VæFVB ¢&V6öã¢7G"Ò" ¢7F÷#¢7G"Ò"   ¦6Æ72–çFW'f–Wu6W76–öå&V÷Vä–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&V6öã¢7G"Ò" ¢7F÷#¢7G"Ò"   ¦6Æ72–çFW'f–Wu6W76–öå7FGW4VF—D÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢6W76–öåö–C¢–ç@¢7—7FVÕö–C¢–ç@¢7F–öã¢7G ¢FW&Ö–æÅö¶–æC¢÷F–öæÅ·7G%ÒÒæöæP¢&V6öã¢7G ¢7F÷#¢7G ¢FV6—6–öåöÖWF†öC¢7G ¢7&VFVEöC¢fÆö@  ¢2ÒÒÒVæFW'7FæF–ær'&–VbòFV6—6–öâ&VF–æW72„—77VW233SÒ33SB’ÒÒÒÒÒÒÒÒÒÒÒÒÐ¢0¢2WfW'’f–VÆB†W&R—2FWFW&Ö–æ—7F–2FW&—fF–öâW'6—7FVBf7G2Ç&VG¢27W÷'B†÷VæFW'7FæF–æuö'&–Vbç’’â6öæf—&ÖF–öææB&÷fVææ6V&P¢2Gvò–æFWVæFVçBf–æ—FR†W2öâW'÷6S¢'F†RFWfVÆ÷W"6öæf—&ÖVB—B"æ@¢2'F†RFWfVÆ÷W"w&÷FR—B"×W7B7F’F—7F–æwV—6†&ÆRà¢0¢2F†Rfö6'VÆ&–W2Æ—fR†W&R2Æ—FW&ÆÆ–6W2Âæ÷B2&&R7G&f–VÆG2À¢2f÷"Gvò&V6öç3¢F†R&W7öç6R66†VÖF†Vâ6'&–W2F†RVçVÒÂæ@¢2FW7G2÷FW7Eö–çFW'f–Wu÷G—U÷&—G’ç–6â†öÆBF†RF6†&ö&BVæ–öâFòF†P¢26ÖR6WBâ÷VæFW'7FæF–æuö'&–Vbç–FW&—fW2—G2GWÆW2g&öÒF†W6Rv—F€¢2vWEö&w6Â6òF†W&R—2W†7FÇ’öæRFVf–æ—F–öâöbV6‚6WBà ¢3¢z+®Š¨Þx«nhX²ÒÒ†÷r6WGFÆVB6Æ–Ò—2à¥VæFW'7FæF–æt6öæf—&ÖF–öå7FFRÒÆ—FW&Å°¢&6öæf—&ÖVB"À¢&•ö‡—÷F†W6—2"À¢&6öæfÆ–7F–ær"À¢'Væ¶æ÷vâ"À¢'&V6†V6µ÷&WV—&VB"À¥Ð ¢3¢X{®h˜ÒÒv†W&RF†R6Æ–Òw26öçFVçB6ÖRg&öÒâ–æFWVæFVçBöbF†R&÷fRà¥VæFW'7FæF–æu&÷fVææ6T¶–æBÒÆ—FW&Å°¢&FWfVÆ÷W%ö–çFVçB"À¢&–×ÆVÖVçFF–öåöf7B"À¢''VçF–ÖUöö'6W'fF–öâ"À¢&•ö‡—÷F†W6—2"À¥Ð ¥VæFW'7FæF–æt6Æ–Ô¶–æBÒÆ—FW&Å²'f—6–öâ"Â'7—7FVÕ÷W'÷6R"Â&6÷&Uö6&–Æ—G’%Ð ¥VæFW'7FæF–æu&VF–æW757FFRÒÆ—FW&Å°¢&æ÷Eö'V–ÇB"À¢&'V–ÆF–ær"À¢&æVVG5ö6öæf—&ÖF–öâ"À¢'&VG’"À¢'&V6†V6µ÷&WV—&VB"À¢&&Æö6¶VB"À¥Ð ¥VæFW'7FæF–æu&VF–æW756WfW&—G’ÒÆ—FW&Å²&&Æö6¶–ær"Â&GFVçF–öâ"Â&–æf÷&ÖF–öæÂ%Ð ¢3¢6†ævR¶–æG2&W÷'FVBv–ç7BF†R6öæf—&ÖVB&Wf—6–öââF†Rf—'7Bf÷W"6öÖP¢3¢g&öÒVæFW'7FæF–æuöF–ff²F†R&W7B&RF†R&VÖ–æ–ær6Æ–Õ÷–ÆöF ¢3¢f–VÆG2âWfW'’f–VÆBF†B6âFV6–FR&V6†V6²×W7BV"†W&RÂ÷"6Æ–Ð¢3¢&V6öÖW2&W÷'F&ÆR2&6†ævVB"v—F‚æ÷F†–ærFò6†÷rà¥VæFW'7FæF–æt6†ævT¶–æBÒÆ—FW&Å°¢&FFVB"À¢'&VÖ÷fVB"À¢'7VÖÖ'•ö6†ævVB"À¢&6öæf–FVæ6Uö6†ævVB"À¢&6öçG&–'WF–öåö6†ævVB"À¢&Wf–FVæ6Uö6†ævVB"À¢'&VÆFVEöFö75ö6†ævVB"À¢'&VÆFVEö—5ö6†ævVB"À¢&6ö×÷6—F–öåö6†ævVB"À¥Ð  ¦6Æ72VæFW'7FæF–æt'&–Vd6Æ–Ô÷WB„&6TÖöFVÂ“ ¢¶–æC¢VæFW'7FæF–æt6Æ–Ô¶–æ@¢æÖS¢7G ¢7VÖÖ'“¢7G"Ò" ¢6öæf—&ÖF–öã¢VæFW'7FæF–æt6öæf—&ÖF–öå7FFP¢&÷fVææ6S¢VæFW'7FæF–æu&÷fVææ6T¶–æ@¢6öæf—&ÖF–öåöÆ&VÃ¢7G ¢&÷fVææ6UöÆ&VÃ¢7G ¢&V6öã¢7G"Ò" ¢6öçG&–'WF–öã¢7G"Ò" ¢3¢Öö6²ÄÄÒ&÷fVææ6RÂÆ&VÆÆVB&F†W"F†â†–FFVâ„4ÄTDRæÖB’à¢—5öÖö6³¢&ööÂÒfÇ6P¢Wf–FVæ6S¢Æ—7E´F–7E·7G"Âç•ÕÒÒµÐ¢&VÆFVEöFö73¢Æ—7E·7G%ÒÒµÐ¢&VÆFVEö—3¢Æ—7E·7G%ÒÒµÐ  ¦6Æ72VæFW'7FæF–æu&VF–æW75&V6öä÷WB„&6TÖöFVÂ“ ¢6öFS¢7G ¢6WfW&—G“¢VæFW'7FæF–æu&VF–æW756WfW&—G¢ÖW76vS¢7G ¢F&vWEö¶–æC¢7G"Ò&æöæR ¢F&vWEöæÖS¢7G"Ò"   ¦6Æ72VæFW'7FæF–æt6†ævT÷WB„&6TÖöFVÂ“ ¢6†ævUö¶–æC¢VæFW'7FæF–æt6†ævT¶–æ@¢6V7F–öã¢7G ¢6V7F–öåöÆ&VÃ¢7G ¢æÖS¢7G ¢FWF–Ã¢7G   ¦6Æ72VæFW'7FæF–æt'&–Vd÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6W76–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢'V–ÇC¢&ööÂÒfÇ6P¢f—6–öã¢÷F–öæÅµVæFW'7FæF–æt'&–Vd6Æ–Ô÷WEÒÒæöæP¢f—6–öåöÖ—76–æuö–æf÷&ÖF–öã¢Æ—7E·7G%ÒÒµÐ¢7—7FVÕ÷W'÷6S¢Æ—7EµVæFW'7FæF–æt'&–Vd6Æ–Ô÷WEÒÒµÐ¢6÷&Uö6&–Æ—F–W3¢Æ—7EµVæFW'7FæF–æt'&–Vd6Æ–Ô÷WEÒÒµÐ¢3¢†÷rÖç’6÷&R6&–Æ—F–W2F†R–æ—F–Âf–Wr6†÷w3²F†R&W7B&VÆöæp¢3¢&V†–æB&öw&W76—fRF—66Æ÷7W&Râ6ÂæWfW"Bà¢6÷&Uö6&–Æ—G•ö–æ—F–Åö6÷VçC¢–çBÒ ¢¶W•÷Væ6öæf—&ÖVC¢Æ—7EµVæFW'7FæF–æt'&–Vd6Æ–Ô÷WEÒÒµÐ¢FWF–Åö6÷VçG3¢F–7E·7G"Â–çEÒÒ·Ð¢&VF–æW75÷7FFS¢VæFW'7FæF–æu&VF–æW757FFP¢&VF–æW75öÆ&VÃ¢7G ¢&VF–æW75öFW67&—F–öã¢7G ¢&VF–æW75÷&V6öç3¢Æ—7EµVæFW'7FæF–æu&VF–æW75&V6öä÷WEÒÒµÐ¢6†ævW5÷6–æ6Uö6öæf—&ÖF–öã¢Æ—7EµVæFW'7FæF–æt6†ævT÷WEÒÒµÐ¢6öæf—&ÖVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢6öæf—&ÖVE÷&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¢2ÒÒÒ÷fW'f–Wrò7—7FVÒ–çFVÆÆ–vVæ6R'&–Vb„—77VW233ƒÒ33ƒB’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢0¢2F†R÷fW'f–Wr67&VVâw26æöæ–6Â&ö¦V7F–öââWfW'’fö6'VÆ'’&VÆ÷r—2¢2f–æ—FRÆ—FW&Æf÷"F†R6ÖRGvò&V6öç2F†RVæFW'7FæF–ær'&–Vbw2&P¢2‚33S“¢F†R&W7öç6R66†VÖF†Vâ6'&–W2F†RVçVÒÂæ@¢2FW7G2÷FW7Eö–çFW'f–Wu÷G—U÷&—G’ç–†öÆG2F†RF6†&ö&BVæ–öâFòF†R6ÖP¢26WBâö÷fW'f–Wu÷&ö¦V7F–öâç–FW&—fW2—G2GWÆW2g&öÒF†W6Rv—F€¢2vWEö&w6Â6òV6‚6WB†2W†7FÇ’öæRFVf–æ—F–öâà¢0¢2F†R÷fW'f–WrFG2æòæWrVæFW'7FæF–ærÖöFVÃ¢—G2'&–Vb6V7F–öâ•0¢2VæFW'7FæF–æt'&–Vd÷WF‚33SÒ33SB’Â—G2Æö÷÷6—F–öâ•2FW&—fU÷W6W%÷†6V ¢2‚3#3rò3#Sb’ÂæB—G2'VçF–ÖRçVÖ&W'2$RF†R6öææV7F—f—G’f7G2‚33s’à ¢3¢v†B¶–æBöbF†–ær8ÎK¸®8(þ8¾8>8þ8>8Ž8Òf–æF–ær—2âf–æ—FR'’6öç7G'V7F–öã ¢3¢WfW'’¶–æB—2&öGV6VB'’W†7FÇ’öæRFWFW&Ö–æ—7F–2W‡G&7F÷"÷fW ¢3¢W'6—7FVB&÷w2ÂæWfW"'’ÖöFVÂ66÷&–ærv†BÖGFW'2à¤÷fW'f–Wtf–æF–æt¶–æBÒÆ—FW&Å°¢&6Æ–Õö6öæfÆ–7B"À¢'VæFW'7FæF–æuö&Æö6¶VB"À¢'VæFW'7FæF–æuö6†ævVB"À¢&6&–Æ—G•ö6ö×÷6—F–öå÷7FÆR"À¢'Væ6öæf—&ÖVEö6÷&Uö6Æ–Ò"À¢''VçF–ÖUöÖ—6ÖF6‚"À¢''VçF–ÖU÷Væö'6W'fVB"À¢&6öææV7F—f—G•öÆ÷7B"À¢'6æ6†÷E÷7FÆR"À¢&WfÇVF–öåöFV6—6–öå÷VæF–ær"À¢&–×&÷fVÖVçEö6æF–FFU÷&VG’"À¥Ð ¢3¢†÷rF†Rf–æF–ær&V'2öâF†RFWfVÆ÷W"w2FV6—6–öââF†—2—2F†R&æ¶–æp¢3¢vFR(	Bf–æ—FRÆFFW"Âæ÷B66÷&Rà¤÷fW'f–Wtf–æF–æu6WfW&—G’ÒÆ—FW&Å°¢&&Æö6¶W""À¢&‡VÖåöFV6—6–öå÷&WV—&VB"À¢&ÖFW&–Åö6†ævR"À¢&–æf÷&ÖF—fR"À¥Ð ¢3¢v†WF†W"F†Rf–æF–ærV&VBeDU"F†R6ö×&—6öâ&6VÆ–æRâæ÷Eö6ö×&VF ¢3¢—2f—'7BÖ6Æ72fÇVS¢8Îik8~8Ny›®Šh¾8Î8®8N8ÒæB8Î8î8jùN‹È>8~8n8N8®8N8Ò&P¢3¢F–ffW&VçB7FFVÖVçG2æB×W7BæWfW"&VæFW"F†R6ÖR‚33ƒ"’à¤÷fW'f–Wtf–æF–æu7FGW2ÒÆ—FW&Å²&æWr"Â&öævö–ær"Â&æ÷Eö6ö×&VB%Ð ¢3¢v†W&RF†Rf–æF–ærw26öçFVçB6ÖRg&öÒà¢3 ¢3¢F†Rf—'7Bf÷W"fÇVW2&RVæFW'7FæF–æu&÷fVææ6T¶–æFdU$$D”ÒÂ6ò¢3¢6Æ–Òw2&÷fVææ6R6'&–W2–çFòf–æF–ær&÷WB—Bv—F†÷WBG&ç6ÆF–öâà¢3¢F†Rf—'7BfW'6–öâöbF†—26WBöÖ—GFVBFWfVÆ÷W%ö–çFVçFÂæBF†RÖ–æp¢3¢6öÆÆ6VB—BFò•ö‡—÷F†W6—6(	Bv†–6‚F—7Æ–VBf—6–öâF†RFWfVÆ÷W ¢3¢†Bw&—GFVâæB6öæf—&ÖVB2F†R’w2wVW72âF†B—2F†RW†7B6öægW6–öà¢3¢33ƒò33ƒ"W†—7BFò&WfVçBÂ6òF†RGvòfö6'VÆ&–W2æ÷r÷fW&Æ'¢3¢6öç7G'V7F–öâ&F†W"F†â'’Æ÷77’Öà¢3 ¢3¢F†RÆ7BF‡&VR&Rf–æF–ærÖöæÇ’ÂæBV6‚6—26öÖWF†–æræò6Æ–Ò6ã ¢3 ¢3¢¢FWfVÆ÷W%öFV6—6–öæ(	B&V6÷&BöbF†R‡VÖâw2¥TDtTÔTåB†F÷BÂ6öæf—&ÒÀ¢3¢FVfW"’Â2÷÷6VBFòFWfVÆ÷W%ö–çFVçFv†–6‚—2v†BF†W’6–BF†W¢3¢vçFVBâFV6–F–ær'&V¦V7BF†—26æF–FFR"—2æ÷B7FFVÖVçBöb–çFVçBà¢3¢¢7—7FVÕ÷&ö6W76(	Bf7B&÷WB&ö&RÖvVçBw2÷vâ'Vâ&V6÷&G2Âæ÷B&÷W@¢3¢F†RF&vWB7—7FVÒBÆÂà¢3¢¢Ö—†VF(	Bâvw&VvFVBf–æF–ærv†÷6R6÷W&6W2vVçV–æVÇ’F—6w&VRâ—@¢3¢W†—7G26òvw&VvF–öâæWfW"†2Fò–6²öæRæB–×Ç’F†R÷F†W'2w&VVBà¤÷fW'f–Wtf–æF–æu&÷fVææ6RÒÆ—FW&Å°¢&FWfVÆ÷W%ö–çFVçB"À¢&–×ÆVÖVçFF–öåöf7B"À¢''VçF–ÖUöö'6W'fF–öâ"À¢&•ö‡—÷F†W6—2"À¢&FWfVÆ÷W%öFV6—6–öâ"À¢'7—7FVÕ÷&ö6W72"À¢&Ö—†VB"À¥Ð ¢3¢F†Rf–æF–æw26V7F–öâ2v†öÆRâVæf–Æ&ÆVÖVç2F†RW‡G&7F–öâ—G6VÆ`¢3¢f–ÆVB(	BæWfW"&VæFW&VB28Îy›®Šh¾8®8~8Òà¤÷fW'f–Wtf–æF–æw57FFRÒÆ—FW&Å°¢&†5öf–æF–æw2"À¢&æõöf–æF–æw2"À¢&æ÷Eö6ö×&VB"À¢'Væf–Æ&ÆR"À¥Ð ¢3¢v†WF†W"F†R8ÎX˜ÞY¹î8Ò&6VÆ–æR6÷VÆB&R&VBBÆÂÂ¶WB'Bg&öÒv†WF†W ¢3¢öæRU„•5E2âVæf–Æ&ÆVW6VBFò&R–æF—7F–æwV—6†&ÆRg&öÐ¢3¢æõö&6VÆ–æVÂ6ò'&–VbF†Bf–ÆVBFòÆöB&VæFW&VBF†R6öæf–FVç@¢3¢6VçFVæ6R8Î8î8ynŠz>8).z+®Š¨Þ8~8n8N8®8N8þ8(8jùN‹È>8îYû®k©n8Î8.8(®8î8¾8)>8Ò&÷WB¢3¢7—7FVÒv†÷6RFWfVÆ÷W"Ö’vVÆÂ†fR6öæf—&ÖVB—B–W7FW&F’à¤÷fW'f–Wt&6VÆ–æU7FFRÒÆ—FW&Å²&†5ö&6VÆ–æR"Â&æõö&6VÆ–æR"Â'Væf–Æ&ÆR%Ð ¢3¢F†R6–ævÆR&–Ö'’7F–öââ7&VFU÷7—7FVÖ—2&V6†&ÆRöæÇ’F‡&÷Vv‚F†P¢3¢F6†&ö&Bw2¦W&òÕ7—7FVÒ'&æ6‚‡F†RVæGö–çB—27—7FVÒ×66÷VBÂ6ò—B6ææ÷@¢3¢&RWfÇVFVB6W'fW"×6–FR“²—BÆ—fW2–âF†—2öæRfö6'VÆ'’ç—v’6òF†P¢3¢67&VVâæWfW"w&÷w26V6öæB7F–öâF†öæö×’à¤÷fW'f–Wt7F–öä¶W’ÒÆ—FW&Å°¢&7&VFU÷7—7FVÒ"À¢'&W&U÷&W÷6—F÷'’"À¢&'V–ÆE÷VæFW'7FæF–ær"À¢'&W6öÇfU÷VæFW'7FæF–æuö&Æö6¶W""À¢&ç7vW%ö–çFW'f–Wu÷VW7F–öç2"À¢&6öæf—&Õ÷VæFW'7FæF–ær"À¢&6öææV7E÷6F²"À¢'7F'Eöö'6W'fF–öâ"À¢'&W7F÷&Uöö'6W'fF–öâ"À¢'&V6÷&EöW‡W&–ÖVçEöFV6—6–öâ"À¢2F†W6R&RFVÆ–&W&FVÇ’F—7F–æ7B–FVçF—F–W3¢F÷FVBW‡W&–ÖVç@¢2'F–f7G2fW'7W2&ö&R×Æâ–ç7G'VÖVçFF–öâF6†W2à¢'V&Æ—6…ö–×&÷fVÖVçB"À¢'V&Æ—6…ö–ç7G'VÖVçFF–öâ"À¢&7&VFUö6æF–FFR"À¢'7F'EöæW‡Eö7–6ÆR"À¥Ð ¢3¢v‡’F†W&R—2†÷"—2æ÷B’â7F–öââv—F–ævòVæf–Æ&ÆV6''’æð¢3¢7F–öâBÆÂ(	BF—6&ÆVB6FÆöwVRöb÷W&F–öç2—2W‡Æ–6—FÇ’f÷&&–FFVà¢3¢‚33ƒ2’à¤÷fW'f–Wt7F–öå7FFRÒÆ—FW&Å²&f–Æ&ÆR"Â'v—F–ær"Â&6ö×ÆWFR"Â'Væf–Æ&ÆR%Ð ¢3¢v†WF†W"F†R–ææVBVæFW'7FæF–ær—2&VF–ærF†R&W÷6—F÷'’w27W'&VçB†VBà¢3¢6W'fW"ÖFV6–FVC¢F†RF6†&ö&B×W7Bæ÷B6ö×&R6æ6†÷B–G2—G6VÆbÂf÷"F†P¢3¢6ÖR&V6öâ33c’Ö÷fVBF†R6æ6†÷BfW&F–7B6W'fW"×6–FR(	BGvòFVf–æ—F–öç2ö`¢3¢&7W'&VçB"G&–gBâVæf–Æ&ÆV—2F†—&BfÇVRöâW'÷6S¢âVç&VF&ÆP¢3¢†VB—2æ÷BWf–FVæ6RF†BF†R6æ6†÷B—2&V†–æBà¤÷fW'f–Wu6æ6†÷Dg&W6†æW72ÒÆ—FW&Å²&7W'&VçB"Â'7FÆR"Â'Væf–Æ&ÆR%Ð ¢3¢v†WF†W"6&–Æ—G’ÖÆWfVÂö'6W'fF–öâ6÷fW&vR6÷VÆB&R6ö×WFVBBÆÂà¢3¢æ÷Eö6ö×WFVF—2F†R†öæW7BfÇVRFöF“¢G&6R&÷w26''’¢3¢6ö×öæVçEö–FÂæBæò6æöæ–6Â6ö×öæVçBÓâ6÷&R6&–Æ—G’Ö–ær—0¢3¢W'6—7FVBÂ6ò&6÷fW&vR"'V–ÇBg&öÒF†RGvòv÷VÆB&R&F–ò&WGvVVà¢3¢F–ffW&VçBVçF—F–W2†æB6÷VÆBW†6VVBR’â6VR÷fW'f–Wu'VçF–ÖT†VÇF„÷WFà¤÷fW'f–Wt6÷fW&vU7FFRÒÆ—FW&Å²&6ö×WFVB"Â&æ÷Eö6ö×WFVB%Ð ¢3¢F†R–×&÷fVÖVçBÆö÷w26—‚7FvW2Â–â÷&FW"âF†W6R&RF†RW†—7F–æp¢3¢7—7FVÕ÷7FFRå„4Uôõ$DU&fÇVW2VæFW"F†V—"FWfVÆ÷W"Öf6–æræÖW2(	BF†P¢3¢÷fW'f–WræWfW"–çG&öGV6W26V6öæB†6RÖöFVÂà¤÷fW'f–WtÆö÷7FvRÒÆ—FW&Å°¢'6WGW"À¢'&W&F–öâ"À¢&–ç7G'VÖVçFF–öâ"À¢&ö'6W'fF–öâ"À¢&WfÇVF–öâ"À¢'V&Æ—6‚"À¥Ð ¤÷fW'f–WtÆö÷7FvU7FGW2ÒÆ—FW&Å²'&V6†VB"Â&7W'&VçB"Â&gWGW&R%Ð ¢3¢v†–6‚6ö×÷6VB6V7F–öâ6÷VÆBæ÷B&R'V–ÇBâ'F–Âf–ÇW&RFVw&FW2öæP¢3¢6V7F–öã²—BæWfW"&Ææ·2F†R67&VVâ‚33ƒB’âW'÷6U÷VW7F–öæ‚33“ò33“¢3¢—2—G2õtâ6V7F–öâÂ6W&FRg&öÒW'÷6Uö6†–æ¢VW7F–öâf–ÇW&P¢3¢×W7Bæ÷B&VB2F†Rv†öÆRW'÷6Rg&ÖRf–Æ–ærÂæBf–6RfW'6à¤÷fW'f–Wu6V7F–öâÒÆ—FW&Å°¢&'&–Vb"Â&f–æF–æw2"Â&æW‡Eö7F–öâ"Â&Æö÷"Â''VçF–ÖR"Â'W'÷6Uö6†–â"Â'W'÷6U÷VW7F–öâ ¥Ð  ¦6Æ72÷fW'f–WuF&vWD÷WB„&6TÖöFVÂ“ ¢""%v†W&Rf–æF–ær÷"â7F–öâ6VæG2F†RFWfVÆ÷W"à ¢&×66'&–W2F†RFW7F–æF–öâw2õtâ&ÖWFW"æÖW2‡F†R33s'VÆR’À¢6òÆ–æ²æWfW"æf–vFW2æBF†Vâ'&—fW2v—F‚æ÷F†–ær6VÆV7FVBà¢""  ¢&÷WFS¢7G ¢Æ&VÃ¢7G ¢&×3¢F–7E·7G"Â7G%ÒÒ·Ð¢æ6†÷#¢÷F–öæÅ·7G%ÒÒæöæP  ¦6Æ72÷fW'f–Wtf–æF–æt÷WB„&6TÖöFVÂ“ ¢3¢FWFW&Ö–æ—7F–2æB7F&ÆR7&÷72&VÆöG3¢FW&—fVBg&öÒF†R¶–æBÇW2F†P¢3¢7V&¦V7B—B—2&÷WBÂæWfW"g&öÒ&÷r–BF†B&V'V–ÆBv÷VÆB&VçVÖ&W"à¢–C¢7G ¢¶–æC¢÷fW'f–Wtf–æF–æt¶–æ@¢¶–æEöÆ&VÃ¢7G ¢6WfW&—G“¢÷fW'f–Wtf–æF–æu6WfW&—G¢6WfW&—G•öÆ&VÃ¢7G ¢7FGW3¢÷fW'f–Wtf–æF–æu7FGW0¢7FGW5öÆ&VÃ¢7G ¢3¢yúÞ8N{YŠ¹bÒÒv†Bv2f÷VæBà¢7VÖÖ'“¢7G ¢3¢8®8ÎXŠNijÞ8¾˜xÞŠh8²ÒÒv†B—B6†ævW2f÷"F†RFWfVÆ÷W"à¢FV6—6–öåö–×7C¢7G ¢&÷fVææ6S¢÷fW'f–Wtf–æF–æu&÷fVææ6P¢&÷fVææ6UöÆ&VÃ¢7G ¢3¢v†–6‚f7G2F†—2f–æF–ærv2&VBv–ç7Bà¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢'VçF–ÖU÷v–æF÷u÷6V6öæG3¢÷F–öæÅ¶fÆöEÒÒæöæP¢f—'7E÷6VVã¢÷F–öæÅ¶fÆöEÒÒæöæP¢Æ7E÷WFFVC¢÷F–öæÅ¶fÆöEÒÒæöæP¢F&vWC¢÷F–öæÅ´÷fW'f–WuF&vWD÷WEÒÒæöæP¢Wf–FVæ6S¢Æ—7E´F–7E·7G"Âç•ÕÒÒµÐ¢3¢†÷rÖç’6ÖRÖ6W6Rf–æF–æw2F†—2öæR&W&W6VçG2ƒãÒ’à¢ö67W'&Væ6Uö6÷VçC¢–çBÒ  ¦6Æ72÷fW'f–Wt7F–öä÷WB„&6TÖöFVÂ“ ¢¶W“¢÷fW'f–Wt7F–öä¶W¢Æ&VÃ¢7G ¢3¢˜ŽZé®ynyKÒÒv†–6‚f7BWBF†—27F–öâf—'7Bà¢&V6öã¢7G ¢3¢ZèÎK¨niÚK»bÒÒ†÷rF†RFWfVÆ÷W"¶æ÷w2—B—2FöæRà¢6ö×ÆWF–öåö6öæF—F–öã¢7G ¢3¢ZèÎK¨n[èÎ8¾[é~8(ž8(Î8(¾KêX
+BòjÊ8¾™h¾8þjë^™¨âà¢fÇVS¢7G ¢F&vWC¢÷fW'f–WuF&vWD÷W@¢3¢F†R'VÆR×F&ÆR&÷rF†B&öGV6VB—BÂf÷"VF—F–ærF†Rf—'7BÖF6‚à¢'VÆU÷&÷s¢–ç@¢3¢f7G2æBf–æF–æw2F†—27F–öâv2FW&—fVBg&öÒà¢6÷W&6U÷7FFUö–G3¢Æ—7E·7G%ÒÒµÐ¢6÷W&6Uöf–æF–æuö–G3¢Æ—7E·7G%ÒÒµÐ¢3¢v†B—27F–ÆÂÖ—76–ærÂv†VâF†R7F–öâ6â&R7F'FVB'WBæ÷Bf–æ—6†V@¢3¢v—F†÷WB—BâæWfW"W6VBFò&VæFW"F—6&ÆVB6öçG&öÂà¢&Æö6¶W'3¢Æ—7E·7G%ÒÒµÐ  ¦6Æ72÷fW'f–WtÆö÷7FvT÷WB„&6TÖöFVÂ“ ¢7FvS¢÷fW'f–WtÆö÷7FvP¢Æ&VÃ¢7G ¢7FGW3¢÷fW'f–WtÆö÷7FvU7FGW0¢3¢v†B&V6†–ærF†—27FvRÖVç2Â–âF†RFWfVÆ÷W"w2FW&×2à¢ÖVæ–æs¢7G ¢3¢F†RæW‡B6VÖçF–2Ö–ÆW7FöæS²öæÇ’6WBöâF†R7W'&VçB7FvRà¢æW‡EöÖ–ÆW7FöæS¢7G"Ò" ¢6ö×ÆWFS¢&ööÂÒfÇ6P  ¦6Æ72÷fW'f–Wu'VçF–ÖT†VÇF„÷WB„&6TÖöFVÂ“ ¢3¢7V×VÆF—fRÆ–fV7–6ÆRÖ–ÆW7FöæR‚33s’âæWfW"&Vw&W76W2à¢7FFS¢6öææV7F—f—G•7FFP¢3¢F†RÆ—fRv÷&¶ÆöB&VF–ær‚33s’â&Vw&W76W2v†VâG&ff–27F÷2à¢g&W6†æW73¢6öææV7F—f—G”g&W6†æW70¢g&W6†æW75öÆ&VÃ¢7G ¢3¢F†Rç’Ö¶–æBG&ç7÷'B†—2Â6†÷vâöæÇ’v†Vâ—BF—6w&VW2à¢G&ç7÷'Eög&W6†æW73¢6öææV7F—f—G”g&W6†æW70¢Æ7E÷&VÅ÷G&6UöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢6V6öæG5÷6–æ6UöÆ7E÷G&6S¢÷F–öæÅ¶fÆöEÒÒæöæP¢Æ7E÷G&6UöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢6V6öæG5÷6–æ6UöÆ7Eöç•÷G&6S¢÷F–öæÅ¶fÆöEÒÒæöæP¢WfÇVFVEöC¢fÆö@¢&VÅ÷G&6Uö6÷VçEóVÓ¢–çBÒ ¢&VÅ÷G&6Uö6÷VçEóƒ¢–çBÒ ¢&VÅ÷G&6Uö6÷VçEó#Fƒ¢–çBÒ ¢FVÆ–VEögFW%÷6V6öæG3¢fÆö@¢7FÆUögFW%÷6V6öæG3¢fÆö@¢6ö×öæVçEö6÷VçC¢–çBÒ ¢3¢7V×VÆF—fRF÷FÇ2ÂFVÆ–&W&FVÇ’¶WB÷WBöbF†Rf—'7Bf–Wrà¢F÷FÅ÷G&6Uö6÷VçC¢–çBÒ ¢ÖöFUö6÷VçG3¢F–7E·7G"Â–çEÒÒ·Ð¢3¢&÷VæFVB×v–æF÷rVÆ—G’f7G2âv–æF÷u÷6V6öæG67FFW2F†Rv–æF÷rF†W¢3¢vW&RÖV7W&VB÷fW"Â6ò6÷VçB—2æWfW"&VB2Æ–fWF–ÖRF÷FÂà¢v–æF÷u÷6V6öæG3¢fÆöBÒ ¢W'&÷%ö6÷VçC¢–çBÒ ¢3¢6Æ–×2v†÷6RW'6—7FVB3#“'VçF–ÖUö6†V6¶—2Ö—6ÖF6†â&VB0¢3¢7F÷&VBÒÒF†R÷fW'f–WræWfW"&R×'Vç2'VçF–ÖR&VÆ—G’6†V6²æBæWfW ¢3¢–çfVçG26V6öæBFVf–æ—F–öâöb'F†Rö'6W'fF–öâF—6w&VW2"à¢'VçF–ÖUöÖ—6ÖF6…ö6÷VçC¢–çBÒ ¢&WÆ–&ÆUö6÷VçC¢–çBÒ ¢'F–Åö6÷VçC¢–çBÒ ¢Vç&WÆ–&ÆUö6÷VçC¢–çBÒ ¢æ÷Eö6GW&VEö6÷VçC¢–çBÒ ¢3¢D•5D”ä5B6ö×öæVçG2F†B&öGV6VBG&6R–âF†Rv–æF÷râæÖVBf÷ ¢3¢v†B—B6÷VçG2â—Bv2&Wf–÷W6Ç’6ÆÆVBö'6W'fVEö6&–Æ—G•ö6÷VçF ¢3¢æB&VæFW&VBæW‡BFò6÷&Uö6&–Æ—G•ö6÷VçF2–bF†RGvòf÷&ÖVB¢3¢6÷fW&vR&F–ò(	BF†W’&RF–ffW&VçBVçF—F–W2ÂæBF†RçVÖW&F÷"6÷VÆ@¢3¢W†6VVBF†RFVæöÖ–æF÷"v†VæWfW"öæR6&–Æ—G’†B6WfW&Â6ö×öæVçG2à¢ö'6W'fVEö6ö×öæVçEö6÷VçC¢–çBÒ ¢3¢ÆÂ6ö×öæVçG2¶æ÷vâFòF†—27—7FVÒÂ6òF†R6÷VçB&÷fR†2¢3¢FVæöÖ–æF÷"öb—G2õtâVçF—G’à¢¶æ÷våö6ö×öæVçEö6÷VçC¢–çBÒ ¢6÷&Uö6&–Æ—G•ö6÷VçC¢–çBÒ ¢3¢6&–Æ—G’ÖÆWfVÂ6÷fW&vR—2æ÷B6ö×WFVBFöF’†æòW'6—7FV@¢3¢6ö×öæVçBÓâ6&–Æ—G’Ö–ær’â7FFVB&F†W"F†â&÷†–ÖFVBà¢6&–Æ—G•ö6÷fW&vU÷7FFS¢÷fW'f–Wt6÷fW&vU7FFRÒ&æ÷Eö6ö×WFVB ¢ö'6W'fVEö6&–Æ—G•ö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP¢VæÖVEö6ö×öæVçEö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72÷fW'f–Wt÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢vVæW&FVEöC¢fÆö@¢3¢F†R–çFW'f–Wr6W76–öâF†R'&–Vbv2&VBg&öÒ‡F†R7—7FVÒw2æWvW7B’Â÷ ¢3¢æöæRv†Vâæò6W76–öâW†—7G2–WBà¢–çFW'f–Wu÷6W76–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢3¢F†R6æöæ–6ÂVæFW'7FæF–ær'&–Vb‚33SÒ33SB’Â&WW6VBfW&&F–Òà¢'&–Vc¢÷F–öæÅµVæFW'7FæF–æt'&–Vd÷WEÒÒæöæP¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6æ6†÷Eö6öÖÖ—E÷6†¢÷F–öæÅ·7G%ÒÒæöæP¢3¢F†R7—7FVÒw2æWvW7B&VG’6æ6†÷BÂf÷"8Î8>8îynŠz>8þ8ž8îijÞ™Ú.8¾8Òà¢ÆFW7E÷&VG•÷6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢3¢6W'fW"ÖFV6–FVB†æWfW"6Æ–VçB–B6ö×&—6öâ’â6VP¢3¢÷fW'f–Wu6æ6†÷Dg&W6†æW76à¢6æ6†÷Eög&W6†æW73¢÷fW'f–Wu6æ6†÷Dg&W6†æW72Ò'Væf–Æ&ÆR ¢3¢F†RVæFW'7FæF–ær&Wf—6–öâF†R'&–Vbv2'V–ÇBg&öÒÂæBv†VâF†P¢3¢FWfVÆ÷W"Æ7B6öæf—&ÖVBöæRÒÒ&÷F‚'BöbF†Rf—'7B×f–Wr6öçFW‡BÂ6ð¢3¢8Î8ž8îijÞ™Ú.8î8ž8îx˜Ž8îynŠz>8¾8Ò—2ç7vW&&ÆRv—F†÷WB÷Væ–ærF—66Æ÷7W&Rà¢VæFW'7FæF–æu÷&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢VæFW'7FæF–æuö6öæf—&ÖVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢f–æF–æw3¢Æ—7E´÷fW'f–Wtf–æF–æt÷WEÒÒµÐ¢3¢†÷rÖç’f–æF–æw2F†R–æ—F–Âf–Wr6†÷w2†62ÂæWfW"B’à¢f–æF–æw5ö–æ—F–Åö6÷VçC¢–çBÒ ¢f–æF–æw5÷7FFS¢÷fW'f–Wtf–æF–æw57FFP¢3¢v†B8ÎX˜ÞY¹î8ÒÖVç2f÷"F†—27—7FVÒÂ7FFVB&F†W"F†â–×Æ–VBà¢f–æF–æw5ö&6VÆ–æU÷7FFS¢÷fW'f–Wt&6VÆ–æU7FFRÒ'Væf–Æ&ÆR ¢f–æF–æw5ö&6VÆ–æUöÆ&VÃ¢7G"Ò" ¢f–æF–æw5ö&6VÆ–æUöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢æW‡Eö7F–öã¢÷F–öæÅ´÷fW'f–Wt7F–öä÷WEÒÒæöæP¢æW‡Eö7F–öå÷7FFS¢÷fW'f–Wt7F–öå7FFP¢æW‡Eö7F–öåöÖW76vS¢7G"Ò" ¢Æö÷÷7FvW3¢Æ—7E´÷fW'f–WtÆö÷7FvT÷WEÒÒµÐ¢W6W%÷†6S¢7G"Ò'6WGW ¢'VçF–ÖS¢÷F–öæÅ´÷fW'f–Wu'VçF–ÖT†VÇF„÷WEÒÒæöæP¢3¢6V7F–öç2v†÷6RFW&—fF–öâf–ÆVBâF†R&W7B7F–ÆÂ&VæFW"‚33ƒB’à¢FVw&FVE÷6V7F–öç3¢Æ—7E´÷fW'f–Wu6V7F–öåÒÒµÐ¢FVw&FVEöFWF–Ã¢F–7E·7G"Â7G%ÒÒ·Ð¢3¢F†R6æöæ–6ÂW'÷6Rg&ÖRòW'÷6R6†–â‚33ƒ‚’Â&WW6VBfW&&F–Òà¢3¢æöæVöæÇ’v†Vâ—G2÷vâwV&FVBÆöFW"f–ÆVBÒÒ6VRW'÷6Uö6†–æ ¢3¢–âFVw&FVE÷6V7F–öç6à¢W'÷6Uö6†–ã¢÷F–öæÅ²%W'÷6T6†–ä÷WB%ÒÒæöæP¢3¢*sBãRò33“w26–ævÆRFF—fRæW‡BVW7F–öâ÷fW"W'÷6Uö6†–æ&÷fP¢3¢‚33“’ÂVÖ&VFFVB†W&R–ç7FVBöb6V6öæB6Æ–VçBVW'’âæöæVÖVç0¢3¢V—F†W"&æòVW7F–öâ&–v‡Bæ÷r"Œ*sBãRw2æ÷&ÖÂ&VæFW"’÷"&6÷VÆBæ÷@¢3¢&RFW&—fVB"ÒÒFöÆB'B'’'W'÷6U÷VW7F–öâ"–âFVw&FVE÷6V7F–öç6à¢W'÷6U÷VW7F–öã¢÷F–öæÅ²%W'÷6UVW7F–öä÷WB%ÒÒæöæP  ¢2ÒÒÒW'÷6R6†–â„—77VR33ƒrW–2ò33ƒ‚’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢0¢2Fö72÷W'÷6RÖ6†–âæÖB—2F†R6æöæ–6ÂFW6–vâ6öçG&7C²*sæB*s&RF†P¢27V6–f–6F–öâF†—2ÖöGVÆR–×ÆVÖVçG2âGvòF†–æw2*sÖ¶W2æöâÖæVv÷F–&ÆS ¢0¢2â¢¤æòæWrVæFW'7FæF–ærÖöFVÂâ¢¢FW6—&VEö6†ævV•0¢2VæFW'7FæF–æuö'&–Vbä'&–Ve&W7VÇBçf—6–öæ²–çFW'fVçF–öæ•2—G0¢27—7FVÕ÷W'÷6V6Æ–×3²6&–Æ—F–W2$R—G26÷&Uö6&–Æ—F–W66Æ–×2à¢2&VæVf–6–'•÷&ö&ÆVÖ—2F†R–çFVçB'&–Vb–æf–VÆB&VBF†R6ÖRv¢2VæFW'7FæF–ær'&–VbÇ&VG’&VG2vöÆf÷"f—6–öââW'÷6R6†–âFG0¢2$TÄD”ôâæBÄ”äTtRöâF÷öbF†W6RW†—7F–ær&÷w2ÒÒ—BFöW2æ÷@¢2&V6Æ76–g’6Æ–Òw2z+®Š¨Þx«nhX²þX{®h˜Âv†–6‚—2v‡’WfW'’VÆVÖVçB&WW6W0¢2VæFW'7FæF–æt6öæf—&ÖF–öå7FFVòVæFW'7FæF–æu&÷fVææ6T¶–æFæBF†V— ¢2W†—7F–ærÆ&VÂF–7G2&F†W"F†âFVf–æ–ær6V6öæBfö6'VÆ'’à¢2"â¢¤f–æ—FR6WG2öæÇ’ÂW†7BÖæÖR–FVçF—G’öæÇ’â¢¢WfW'’fö6'VÆ'’&VÆ÷r—0¢2Æ—FW&ÆFVf–æVBW†7FÇ’öæ6RÂÖ—'&÷&VB–çFò÷W'÷6Uö6†–âç– ¢2v—F‚vWEö&w6âæò6–Ö–Æ&—G’öVÖ&VFF–ærö¶W—v÷&B¦ö–â6öææV7G2âVÆVÖVç@¢2÷"&VÆF–öâÒÒVæFW'7FæF–æuöF–ffw2W†7BÖæÖR'VÆR—2F†RöæÇ¢2–FVçF—G’'VÆR–âÆ’à ¢3¢F†Rf÷W"W'÷6Rg&ÖRVÆVÖVçB¶–æG2âöæÇ’F‡&VR†&VæVf–6–'•÷&ö&ÆVÖÀ¢3¢FW6—&VEö6†ævVÂ–çFW'fVçF–öæ’ö67W’F†RÖ–æ–ÖÂW'÷6Rg&ÖS°¢3¢6÷&Uö6&–Æ—G–VÆVÖVçG2†æröfb–çFW'fVçF–öæf–¢3¢–çFW'fVçF–öå÷Fõö6&–Æ—G–&VÆF–öç2'WB&RæWfW"'BöbF†Rg&ÖP¢3¢—G6VÆbŒ*sã"ü*sãb’à¥W'÷6TVÆVÖVçD¶–æBÒÆ—FW&Å°¢&&VæVf–6–'•÷&ö&ÆVÒ"Â&FW6—&VEö6†ævR"Â&–çFW'fVçF–öâ"Â&6÷&Uö6&–Æ—G’ ¥Ð ¢3¢v†WF†W"âVÆVÖVçBw24õU$4R$õr6÷VÆB&R&VBæB†B6öçFVçBâF‡&VP¢3¢fÇVW2Âæ÷BGvòÂf÷"F†R6ÖR&V6öâ33ƒ7Æ—BVæf–Æ&ÆV÷WBö`¢3¢æ÷Eö'V–ÇF¢Væ¶æ÷væ‡F†R&÷rv2&VC²F†W&R—2æ÷F†–ærF†W&R–WBÒÒ¢3¢f7B&÷WBF†RFWfVÆ÷W"÷7—7FVÒ’æBVæf–Æ&ÆV‡F†R&VB—G6VÆbf–ÆV@¢3¢ÒÒf7B&÷WBD„•2&WVW7B’×W7BæWfW"&VæFW"2F†R6ÖR6VçFVæ6Rà¥W'÷6TVÆVÖVçE7FFRÒÆ—FW&Å²'&W6VçB"Â'Væ¶æ÷vâ"Â'Væf–Æ&ÆR%Ð ¢3¢F†RF‡&VRf—†VB&VÆF–öâ¶–æG2öbF†RÖ–æ–ÖÂ6†–âŒ*sF–w&Ò’â÷WF6öÖP¢3¢Æ–æVvR&VÆF–öç2‚33“’&RÆFW"Â6W&FRFF—F–öâà¥W'÷6U&VÆF–öä¶–æBÒÆ—FW&Å°¢'&ö&ÆVÕ÷Fõö6†ævR"Â&6†ævU÷Fõö–çFW'fVçF–öâ"Â&–çFW'fVçF–öå÷Fõö6&–Æ—G’ ¥Ð ¢3¢&VÆF–öâw27FGW2Âf—'7BÖÖF6‚÷fW"—G2VæGö–çG2æB—G27W'&Vç@¢3¢FV6—6–öâ†W'÷6Uö6†–âæFW&—fU÷W'÷6Uö6†–æ’âVæ¶æ÷væ—2vVçV–æP¢3¢f–gF‚fÇVR†æ÷BföÆFVB–çFò‡—÷F†W6—6“¢'F†R6öææV7F–öâ6ææ÷B&P¢3¢W‡Æ–æVB&V6W6RâVæGö–çB†2æò6öçFVçB"—2F–ffW&VçBf7Bg&öÒ'F†P¢3¢6öææV7F–öâ—2âVæ6öæf—&ÖVBwVW72"ÂæB33ƒ’w2&VÆF–öå÷Væ¶æ÷vææVV@¢3¢FWVæG2öâ&V–ær&ÆRFòFVÆÂF†VÒ'Bà¥W'÷6U&VÆF–öå7FGW2ÒÆ—FW&Å²&6öæf—&ÖVB"Â&‡—÷F†W6—2"Â&6öæfÆ–7F–ær"Â'Væ¶æ÷vâ"Â'Væf–Æ&ÆR%Ð ¢3¢v†WF†W"&VÆF–öâw2DT4•4”ôâ7F–ÆÂÖF6†W2—G2VæGö–çG2r7W'&VçB6öçFVçBà¢3¢–æFWVæFVçBöb7FGW6¢7FÆR6öæf—&ÖVBFV6—6–öâ&VG22‡—÷F†W6—6 ¢3¢‡7FGW2’v†–ÆR&V6†V6µ÷7FFVW‡Æ–ç2§v‡’¢—B6âæòÆöævW"&RG'W7FV@¢3¢2Ö—2ÂæBF†RFV6—6–öâ&÷r—G6VÆb—2æWfW"FVÆWFVB÷"÷fW'w&—GFVâŒ*sãR’à¥W'÷6U&V6†V6µ7FFRÒÆ—FW&Å²&7W'&VçB"Â'7FÆR%Ð ¢3¢v‡’&VÆF–öâvVçB7FÆRâW7G&VÕö6†ævVFW†—7G2&V6W6R7FÆVæW70¢3¢&÷vFW2W†7FÇ’öæRF—&V7F–öâ†F÷vç7G&VÒ’F‡&÷Vv‚F†Rf—†VB6†–âÒÐ¢3¢6æ6†÷Eö6†ævVF—2F†RöæR&V6öâF†B6öÖW2g&öÒâTÄTÔTåBw0¢3¢Wf–FVæ6U÷7FÆV&F†W"F†âg&öÒ6GW&VBFV6—6–öâF–vW7B6ö×&–æp¢3¢VæWVÂà¥W'÷6U7FÆU&V6öâÒÆ—FW&Å°¢'6÷W&6Uö6†ævVB"Â'F&vWEö6†ævVB"Â&&÷F…ö6†ævVB"Â'W7G&VÕö6†ævVB"Â'6æ6†÷Eö6†ævVB ¥Ð ¢3¢8ÎK¸®8îXŠNijÞ8¾KÛþ8Ž8(¾8¾8ÒÂf—'7BÖÖF6‚÷fW"âVÆVÖVçBw2÷vâ6WGFÆVFæW72æB—G0¢3¢$”Ô%’&VÆF–öâw27FGW2ÒÒæWfW"6÷VçBÂæWfW"âfW&vRŒ*sãC ¢3¢g&ÖU÷&W6öÇWF–öåöÆWfVÆ—2F†R2×6Æ÷BÔ”âÂW‡Æ–6—FÇ’æ÷BÖVâ÷"¢3¢W&6VçFvR’âÃ6&WV—&W2â÷W'÷6U÷fW&–f–6F–öâç–‚33“¢3¢W'÷6Uö÷WF6öÖUö7&—FW&–öæ&÷rF†BD$tUE2F†—2W†7BVÆVÖVçBæB†0¢3¢ÆÂf÷W"öbÖV7W&Vò&6VÆ–æU÷fÇVVòF&vWE÷fÇVVð¢3¢ö'6W'fF–öå÷v–æF÷vf–ÆÆVB–âÒÒ6VRW'÷6Uö6†–âç–w0¢3¢÷&W6öÇWF–öåöÆWfVÆf÷"F†RW†7B6†V6²à¥W'÷6U&W6öÇWF–öäÆWfVÂÒÆ—FW&Å²$Ã"Â$Ã"Â$Ã""Â$Ã2%Ð ¢3¢v†–6‚W†—7F–ærF&ÆRâVÆVÖVçBw26öçFVçB6ÖRg&öÒâæöæV—2vVçV–æP¢3¢fÇVR†æò&÷rW†—7G2–WB’Âæ÷BF†R'6Væ6RöbF†Rf–VÆBà¥W'÷6U6÷W&6T¶–æBÒÆ—FW&Å²&–çFVçEö—FVÒ"Â'VæFW'7FæF–æuö6Æ–Ò"Â&æöæR%Ð ¢3¢F†RW'÷6Rg&ÖRw2÷fW&ÆÂ6ö×ÆWFVæW72Âf—'7BÖÖF6‚÷fW"F†R2g&ÖP¢3¢6Æ÷G2r7FFVâVæf–Æ&ÆV—2&W6W'fVBf÷"wV&FVBÖÆöFW"f–ÇW&P¢3¢v†–ÆR6öç7G'V7F–ærg&ÖR6Æ÷BÒÒæWfW"f÷"&æ÷F†–ærW‡G&7FVB–WB ¢3¢‡F†B—2V×G–’à¥W'÷6Tg&ÖU7FFRÒÆ—FW&Å²&6ö×ÆWFR"Â''F–Â"Â&V×G’"Â'Væf–Æ&ÆR%Ð ¢3¢v†–6‚6ö×÷6VB6V7F–öâöbF†RW'÷6R6†–âf–ÆVBFòFW&—fRâwV&FV@¢3¢ÆöFW"&V6÷&G2F†R6V7F–öâ†W&RæBFVw&FW2ôäÅ’F†B6V7F–öâÒÒF†P¢3¢33ƒF—66—Æ–æRŒ*s–çf&–çBb“¢&VÆF–öâÖFW&—fF–öâf–ÇW&R×W7B7F–ÆÀ¢3¢&WGW&âF†Rg&ÖRà¥W'÷6T6†–å6V7F–öâÒÆ—FW&Å²&g&ÖR"Â'&VÆF–öç2"Â&6&–Æ—F–W2%Ð  ¦6Æ72W'÷6TVÆVÖVçD÷WB„&6TÖöFVÂ“ ¢3¢7F&ÆR7&÷72&V'V–ÆG3¢F†R&&R¶–æBf÷"g&ÖR×6Æ÷B6–ævÆWFöà¢3¢†&FW6—&VEö6†ævR&’Â÷"¶–æB²#¢"²6†#Sb†æÖR•³£eÖf÷"¶–æ@¢3¢F†B6â&WVB†6÷&Uö6&–Æ—G–ÂæBç’–çFW'fVçF–öæ6Æ–Ò&W–öæ@¢3¢F†Rg&ÖR6Æ÷B’âæWfW"FW&—fVBg&öÒ&÷r–BÒÒ&÷r–B—2&V76–væV@¢3¢öâWfW'’&V'V–ÆBv†–ÆRFW67&–&–ærF†R6ÖRVÆVÖVçB‚33ƒw2'VÆRÀ¢3¢Æ–VB†W&R’à¢–C¢7G ¢¶–æC¢W'÷6TVÆVÖVçD¶–æ@¢7FFS¢W'÷6TVÆVÖVçE7FFP¢3¢ÆWfVÂw28	Ã"ihrâF†R6W'fW"æWfW"G'Væ6FW3²F†RF6†&ö&BFV6–FW0¢3¢†÷r×V6‚öbF†—2Fò6†÷rà¢F—7Æ•÷7FFVÖVçC¢7G"Ò" ¢3¢F†RVÆVÖVçBw2gVÆÂFW‡B†6Æ–ÒæÖR²7VÖÖ'’Â÷"â–çFVçB'&–V`¢3¢—FVÒw2fÇVU÷FW‡F’à¢7FFVÖVçC¢7G"Ò" ¢6öæf—&ÖF–öã¢VæFW'7FæF–æt6öæf—&ÖF–öå7FFP¢6öæf—&ÖF–öåöÆ&VÃ¢7G ¢&÷fVææ6S¢VæFW'7FæF–æu&÷fVææ6T¶–æ@¢&÷fVææ6UöÆ&VÃ¢7G ¢&W6öÇWF–öåöÆWfVÃ¢W'÷6U&W6öÇWF–öäÆWfVÂÒ$Ã ¢6÷W&6Uö¶–æC¢W'÷6U6÷W&6T¶–æBÒ&æöæR ¢6÷W&6Uö–G3¢Æ—7E·7G%ÒÒµÐ¢–çFVçE÷&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢VæFW'7FæF–æu÷&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢Wf–FVæ6S¢Æ—7E´F–7E·7G"Âç•ÕÒÒµÐ¢3¢6âöæÇ’&RG'VVf÷"&÷fVææ6RÓÒ&–×ÆVÖVçFF–öåöf7B& ¢3¢VÆVÖVçBÒÒâ–çFVçB×6÷W&6VB÷"’Ö‡—÷F†W6—2VÆVÖVçB†2æò6æ6†÷@¢3¢–âFòvò7FÆRv–ç7Bà¢Wf–FVæ6U÷7FÆS¢&ööÂÒfÇ6P¢3¢f—†VB6VçFVæ6W2æÖ–ærv†B—2Ö—76–ærÂöæÇ’÷VÆFVBv†Và¢3¢7FFRÓÒ'Væ¶æ÷vâ&âæWfW"ÖöFVÂ÷WGWB…&–æ6—ÆRb’à¢Ö—76–æuö–æf÷&ÖF–öã¢Æ—7E·7G%ÒÒµÐ¢—5öÖö6³¢&ööÂÒfÇ6P  ¦6Æ72W'÷6U&VÆF–öä÷WB„&6TÖöFVÂ“ ¢3¢b'¶¶–æGÓ§·6÷W&6Uö–GÒÓç·F&vWEö–GÒ&ÒÒ7F&ÆR&V6W6R&÷F‚VæGö–ç@¢3¢–G2&RF†V×6VÇfW27F&ÆR†æWfW"&÷r–B’à¢–C¢7G ¢¶–æC¢W'÷6U&VÆF–öä¶–æ@¢6÷W&6Uö–C¢7G ¢F&vWEö–C¢7G ¢7FGW3¢W'÷6U&VÆF–öå7FGW0¢7FGW5öÆ&VÃ¢7G ¢&V6†V6µ÷7FFS¢W'÷6U&V6†V6µ7FFP¢7FÆU÷&V6öã¢÷F–öæÅµW'÷6U7FÆU&V6öåÒÒæöæP¢&÷fVææ6S¢VæFW'7FæF–æu&÷fVææ6T¶–æ@¢&÷fVææ6UöÆ&VÃ¢7G ¢3¢F†R7W'&VçB†æöâ×7WW'6VFVB’W'÷6U÷&VÆF–öåöFV6—6–öæ&÷rÂ–bç’à¢FV6—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢FV6–FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢FV6–FVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢&F–öæÆS¢7G"Ò" ¢3¢6'&–VBg&öÒF†RD$tUBVÆVÖVçBw2÷vâWf–FVæ6RâæWfW"–çfVçFVBf÷"F†P¢3¢&VÆF–öâ—G6VÆbŒ*sã3¢hØþ˜
+8~8®8B’à¢Wf–FVæ6S¢Æ—7E´F–7E·7G"Âç•ÕÒÒµÐ¢3¢&Wf—6–öç26GW&VBv†VâF†R7W'&VçBÖçVÂFV6—6–öâv27&VFVBâF†W¢3¢&VÖ–âf—†VBv†VââVæGö–çBÆFW"6†ævW2ÂÖ¶–ærF†RFV6—6–öâw0¢3¢÷&–v–æÂ66÷RVF—F&ÆRâæöæVÖVç2F†—2&VÆF–öâ†2æòFV6—6–öâà¢7&VFVEö–çFVçE÷&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7&VFVE÷VæFW'7FæF–æu÷&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7&VFVE÷6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢3¢&Wf—6–öç2öbF†RVæGö–çG2–âF†—2g&W6†Ç’ÖFW&—fVB&ö¦V7F–öââ6ö×&–æp¢3¢F†W6Rv—F‚F†R6GW&VBfÇVW2&÷fRW‡Æ–ç2v†–6‚vVæW&F–öâF†P¢3¢&VÆF–öâ7W'&VçFÇ’FW67&–&W2v—F†÷WB6Æ–VçB×6–FR6÷W&6R&V6öç7G'V7F–öâà¢7W'&VçEö–çFVçE÷&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7W'&VçE÷VæFW'7FæF–æu÷&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7W'&VçE÷6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72W'÷6Tg&ÖT÷WB„&6TÖöFVÂ“ ¢&VæVf–6–'•÷&ö&ÆVÓ¢÷F–öæÅµW'÷6TVÆVÖVçD÷WEÒÒæöæP¢FW6—&VEö6†ævS¢÷F–öæÅµW'÷6TVÆVÖVçD÷WEÒÒæöæP¢–çFW'fVçF–öã¢÷F–öæÅµW'÷6TVÆVÖVçD÷WEÒÒæöæP  ¦6Æ72W'÷6T6†–ä÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢6W76–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢vVæW&FVEöC¢fÆö@¢g&ÖS¢W'÷6Tg&ÖT÷W@¢3¢F†Rg&ÖRw22VÆVÖVçG2ÇW2ç’FF—F–öæÂ–çFW'fVçF–öæ6Æ–×2æ@¢3¢WfW'’6÷&Uö6&–Æ—G–6Æ–ÒŒ*sãb’à¢VÆVÖVçG3¢Æ—7EµW'÷6TVÆVÖVçD÷WEÒÒµÐ¢&VÆF–öç3¢Æ—7EµW'÷6U&VÆF–öä÷WEÒÒµÐ¢3¢F†R2g&ÖR6Æ÷G2r&W6öÇWF–öâÆWfVÂÂÔ”â†æWfW"ÖVâ÷W&6VçFvRÒÐ¢3¢*s–çf&–çBRÂ*sãB’à¢g&ÖU÷&W6öÇWF–öåöÆWfVÃ¢W'÷6U&W6öÇWF–öäÆWfVÂÒ$Ã ¢g&ÖU÷7FFS¢W'÷6Tg&ÖU7FFRÒ&V×G’ ¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢VæFW'7FæF–æu÷&Wf—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢VæFW'7FæF–æuö6öæf—&ÖVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢FVw&FVE÷6V7F–öç3¢Æ—7EµW'÷6T6†–å6V7F–öåÒÒµÐ¢FVw&FVEöFWF–Ã¢F–7E·7G"Â7G%ÒÒ·Ð  ¦6Æ72W'÷6U&VÆF–öäFV6—6–öå&WVW7B„&6TÖöFVÂ“ ¢""%F†RöæRw&—FR–âF†—2ÖöGVÆRâFV6—6–öåöÖWF†öF—2Çv—2ÖçVÆÒÐ¢F†W&R—2æòf–VÆBf÷"F†R6ÆÆW"Fò6WB—BFòç—F†–ærVÇ6Râ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6W76–öåö–C¢–ç@¢FV6—6–öã¢Æ—FW&Å²&6öæf—&ÖVB"Â'&V¦V7FVB%Ð¢&F–öæÆS¢7G"Ò"   ¢2ÒÒÒW'÷6RæVVG2òFF—fRæW‡B×VW7F–öâ„—77VR33ƒ’’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢0¢2Fö72÷W'÷6RÖ6†–âæÖF*s"—2F†R7V6–f–6F–öââ&æVVB"—2æWfW"'F†—0¢2÷F–öæÂf–VÆB—2V×G’"ÒÒWfW'’fÇVR&VÆ÷r—2FW&—fVBFWFW&Ö–æ—7F–6ÆÇ¢2g&öÒF†RW'÷6R6†–â&ö¦V7F–öâ†÷W'÷6UöæVVG2ç–“¢âVÆVÖVçBF†@¢2—2Væ¶æ÷væÂ÷"&VÆF–öâF†B—2Væ¶æ÷væò6öæfÆ–7F–ævò7FÆVà ¢3¢F†Rrf—†VBæVVB6öFW2Œ*s"ã"’âV6‚—26Æ76–f–6F–öâöbâÅ$TE¢3¢7—7FVÒÖvVæW&FVB6–væÂ–çFòöæRöbr'V6¶WG2ÒÒæWfW"g&VR×FW‡@¢3¢VW7F–öâ6FVv÷'’Âv†–6‚—2v‡’F†—27F—2&–æ6—ÆRÓbf–æ—FR6WB&F†W ¢3¢F†â&V6öæ–ærÖÖöFVÂFV6—6–öâà¥W'÷6TæVVD6öFRÒÆ—FW&Å°¢&g&ÖUöÖ—76–ær"À¢'&VÆF–öå÷Væ¶æ÷vâ"À¢'&VÆF–öåö6öæfÆ–7B"À¢&6&–Æ—G•ö§W7F–f–6F–öåöÖ—76–ær"À¢&FV6—6–öåö7&—FW&–öåöÖ—76–ær"À¢&‡VÖå÷fÇVUö§VFvVÖVçE÷&WV—&VB"À¢'&VÖ—6U÷&V6†V6µ÷&WV—&VB"À¥Ð ¢3¢æVVEö6öFRÓâç7vW&&–Æ—G’—2d•„TBF&ÆRŒ*s"ã2’Âæ÷B3#ƒbw0¢3¢&V6öæ–ærÖÖöFVÂVW7F–öâ&÷WFW#¢7—7FVÒÖvVæW&FVBæVVBÇ&VG’†2¢3¢¶æ÷vâ6FVv÷'’'’6öç7G'V7F–öâ…&–æ6—ÆRbw2&6Æ76–f–6F–öâ–çFò¢3¢6ÖÆÂW‡Æ–6—Bf–æ—FR6WB"’ÂVæÆ–¶RFWfVÆ÷W"w2÷VâÖVæFVBg&VR×FW‡@¢3¢VW7F–öââÇ&VG•öç7vW&VFòVæf–Æ&ÆV&RæWfW"–âF†Rf—†VBF&ÆP¢3¢ÒÒF†W’&R&VBg&öÒ&W7öç6R†—7F÷'’òFVw&FVB×6V7F–öâ7FFRBFW&—fP¢3¢F–ÖR†÷W'÷6UöæVVG2ç’æÇ•÷&W7öç6U÷7FFV’à¥W'÷6Tç7vW&&–Æ—G’ÒÆ—FW&Å°¢&‡VÖåö§VFvVÖVçB"Â'7—7FVÕ÷&W6V&6†&ÆR"Â&Ç&VG•öç7vW&VB"Â'Væf–Æ&ÆR ¥Ð ¢3¢æVVBw2÷vâÆ–fV7–6ÆRv—fVâF†RFWfVÆ÷W"w2&W7öç6W26òf"Œ*s"ãbü*s"ãr’à¢3¢FVfW'&VFæBv—F–æv&R&÷F‚&VÂÂVF—F&ÆR÷WF6öÖW2öbâW‡Æ–6—@¢3¢&W7öç6RÒÒæWfW"6–ÆVçFÇ’&RÖ6¶VBVçF–ÂF†RF&vWBw2F–vW7BÖ÷fW2à¥W'÷6TæVVE7FFRÒÆ—FW&Å²&f–Æ&ÆR"Â'v—F–ær"Â&ç7vW&VB"Â&FVfW'&VB"Â'Væf–Æ&ÆR%Ð ¢3¢8ÎXˆn8¾8(ž8®8N8ÒæB8ÎK¸®8þzÙN8Ž8®8N8Ò&Rç7vW'2Âæ÷BW'&÷'2ÒÒV6‚—2—G2÷và¢3¢W'6—7FVBÂVF—F&ÆRf7BŒ*s"ãb’ÂæWfW"6öÆÆ6VB–çFò6–ævÆR'6¶—VB"à¥W'÷6U&W7öç6T¶–æBÒÆ—FW&Å²&6öæf—&Ò"Â&6÷'&V7B"Â'Væ¶æ÷vâ"Â&FVfW""Â&–çfW7F–vFR%Ð ¢3¢v‡’æVVEö–FFVWÆ–æ²F–Bæ÷B&W6öÇfRFò—G6VÆbŒ*s"ãr’âæWfW"WF€¢3¢&§W7B6†÷r6öÖWF†–ær"fÇVRÒÒF†R6ÆÆW"Çv—2ÆV&ç2v†–6‚öbF†W6P¢3¢f÷W"†VæVB&Vf÷&RfÆÆ–ær&6²FòF†R7W'&VçBVW7F–öâ†÷"æöæR’à¥W'÷6UVW7F–öäfÆÆ&6µ&V6öâÒÆ—FW&Å²'&W6öÇfVB"Â&æ÷Eöf÷VæB"Â&÷F†W%÷7—7FVÒ"Â&FVfW'&VB%Ð ¢3¢v†B¶–æBöbW'÷6R6†–âF†–æræVVBF&vWG2Œ*s"ãR’âF—7F–æ7Bg&öÐ¢3¢W'÷6U6÷W&6T¶–æF‡v†–6‚W†—7F–ærD$ÄRâTÄTÔTåBw26öçFVçB6ÖRg&öÒ’à¥W'÷6TæVVEF&vWD¶–æBÒÆ—FW&Å²&VÆVÖVçB"Â'&VÆF–öâ%Ð  ¦6Æ72W'÷6U7VvvW7FVDç7vW$÷WB„&6TÖöFVÂ“ ¢""$â’6æF–FFR'V–ÇBôäÅ’g&öÒâW†—7F–ær&÷rw2÷vâFW‡BŒ*s"ãR’à ¢æWfW"–çfVçFVBÂæBæòÄÄÒ—26ÆÆVBFò&öGV6R—BÒÒFW‡F—2Çv—0¢6÷–VBfW&&F–Òg&öÒâW†—7F–ærVÆVÖVçBw2F—7Æ•÷7FFVÖVçFÂFövWF†W ¢v—F‚F†BVÆVÖVçBw2÷vâÇ&VG’Ö6ö×WFVB&÷fVææ6R÷6÷W&6Râ'6Vç@¢†æöæVöâF†R&VçB’v†VæWfW"F†W&R—2æòw&÷VæFVB6æF–FFRà¢""  ¢FW‡C¢7G ¢&÷fVææ6S¢VæFW'7FæF–æu&÷fVææ6T¶–æ@¢6÷W&6Uö¶–æC¢W'÷6U6÷W&6T¶–æ@¢6÷W&6Uö–G3¢Æ—7E·7G%ÒÒµÐ¢—5öÖö6³¢&ööÂÒfÇ6P  ¦6Æ72W'÷6U&÷WFVDæVVD÷WB„&6TÖöFVÂ“ ¢""$öæR7—7FVÕ÷&W6V&6†&ÆVæVVBÆöæw6–FRF†R6VÆV7FVBVW7F–öâŒ*s"ãB’à ¢–æf÷&ÖF–öæÂöæÇ’ÒÒ&÷WFVBæVVG2æWfW"&V6‚F†RFWfVÆ÷W"2¢VW7F–öâF†V×6VÇfW3²F†RF6†&ö&BÖ’W6RF†—2Fòö–çBBF†R¦ö–ç@¢VæFW'7FæF–ær–çfW7F–vF–öâF†B—2W‡V7FVBFòç7vW"—B–ç7FVBà¢""  ¢æVVEö–C¢7G ¢æVVEö6öFS¢W'÷6TæVVD6öFP¢F&vWEö¶–æC¢W'÷6TæVVEF&vWD¶–æ@¢F&vWEö–C¢7G ¢F&vWEöÆ&VÃ¢7G   ¦6Æ72W'÷6UVW7F–öä÷WB„&6TÖöFVÂ“ ¢"",*s"ãRw2VW7F–öâ6öçG&7BâæöæVBF†RVæGö–çBÆWfVÂÖVç2.‹:®YXþ8®8r ¢‡'VÆR&÷rr’ÒÒF†W&R—2æòV×G’÷Æ6V†öÆFW"VW7F–öâö&¦V7Bâ""  ¢æVVEö–C¢7G ¢æVVEö6öFS¢W'÷6TæVVD6öFP¢3¢F†R$”õ$•E•õD$ÄV&÷rF†B6†÷6RF†—2æVVBŒ*s"ãB’ÂÖ&6VBà¢3 ¢3¢WfW'’æVVB6öFRæ÷r6'&–W2&÷rÂ6òæVVBFW&—fVBg&öÒF†R7W'&Vç@¢3¢&ö¦V7F–öâÇv—2†2öæRâF†Rf–VÆB7F—2÷F–öæÆf÷"F†R66RF†P¢3¢G—R6ææ÷B'VÆR÷WC¢æVVEö–FFVWÆ–æ²æÖ–ær6öFRF†—26W'fW ¢3¢fW'6–öâFöW2æ÷B¶æ÷râ&W÷'F–æræöæVF†W&R—2†öæW7BÒÒ–çfVçF–ær¢3¢&÷rçVÖ&W"f÷"'VÆRF†BF–Bæ÷B'Vâv÷VÆBf÷&vRF†RVF—B&V6÷&Bö`¢3¢v†–6‚'VÆRÖF6†VBà¢'VÆU÷&÷s¢÷F–öæÅ¶–çEÒÒæöæP¢3¢f—†VB6W'fW"6÷’…&–æ6—ÆRbór’ÒÒæWfW"ÖöFVÂ÷WGWBà¢&ö×C¢7G ¢v‡•öæ÷s¢7G ¢&Æö6¶VEöFV6—6–öã¢7G ¢VæÆö6·3¢7G ¢FVfW%ö–×7C¢7G ¢F&vWEö¶–æC¢W'÷6TæVVEF&vWD¶–æ@¢F&vWEö–C¢7G ¢F&vWEöÆ&VÃ¢7G ¢ç7vW&&–Æ—G“¢W'÷6Tç7vW&&–Æ—G¢7VvvW7FVEöç7vW#¢÷F–öæÅµW'÷6U7VvvW7FVDç7vW$÷WEÒÒæöæP¢7FFS¢W'÷6TæVVE7FFP¢6÷W&6U÷&Wf—6–öåö–G3¢Æ—7E¶–çEÒÒµÐ¢3¢6WBöæÇ’v†VâæVVEö–FFVWÆ–æ²fVÆÂ&6²FòF–ffW&VçBVW7F–öà¢3¢†÷"FòæöæR’ÒÒ6VRW'÷6UVW7F–öäfÆÆ&6µ&V6öæà¢fÆÆ&6µ÷&V6öã¢÷F–öæÅµW'÷6UVW7F–öäfÆÆ&6µ&V6öåÒÒæöæP¢&÷WFVEöæVVG3¢Æ—7EµW'÷6U&÷WFVDæVVD÷WEÒÒµÐ  ¦6Æ72W'÷6TæVVE&W7öæE&WVW7B„&6TÖöFVÂ“ ¢""&FV6—6–öåöÖWF†öF—2Çv—2ÖçVÆöâF†R&W7öç6R&÷r—G6VÆbÒÐ¢F†W&R—2æòf–VÆBf÷"F†R6ÆÆW"Fò6WB—BFòç—F†–ærVÇ6RâF†—2—2¢f7B&÷WBt„ò&W7öæFVBÂ–æFWVæFVçBöbv†BF÷vç7G&VÒ–çfW7F–vF–öà¢†÷VæVBf÷"Væ¶æ÷væö–çfW7F–vFV’ÆFW"6öæ6ÇVFW2v—F€¢FV6—6–öåöÖWF†öCÒw&V6öæ–æuöÆÆÒvâ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6W76–öåö–C¢–ç@¢&W7öç6Uö¶–æC¢W'÷6U&W7öç6T¶–æ@¢3¢F†R6öæf—&Òö6÷'&V7BfÇVRÂ÷"g&VR×FW‡B&F–öæÆRf÷"FVfW"÷Væ¶æ÷vâð¢3¢–çfW7F–vFRâ÷F–öæÂÒÒ&&R6öæf—&ÖæVVG2æòFW‡Bà¢fÇVU÷FW‡C¢7G"Ò"   ¦6Æ72W'÷6TæVVE&W7öç6T÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢6W76–öåö–C¢–ç@¢7—7FVÕö–C¢–ç@¢æVVEö–C¢7G ¢æVVEö6öFS¢W'÷6TæVVD6öFP¢&W7öç6Uö¶–æC¢W'÷6U&W7öç6T¶–æ@¢fÇVU÷FW‡C¢7G ¢F&vWEö¶–æC¢W'÷6TæVVEF&vWD¶–æ@¢F&vWEö–C¢7G ¢3¢F†RF&vWBw2F–vW7BB$U5ôå4RD”ÔRÒÒv†BFVfW&&VV'0¢3¢v–ç7Böæ6R—BæòÆöævW"ÖF6†W2Œ*s"ãb’à¢F&vWEöF–vW7C¢7G ¢FV6—6–öåöÖWF†öC¢7G ¢&W7öæFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢3¢6WBv†Vâ6öæf—&Öö6÷'&V7Fv2&WW6VBF‡&÷Vv‚F†RW†—7F–ær–çFVç@¢3¢'&–Vb6öæf—&Òö6÷'&V7Bö7&VFR–×ÆVÖVçFF–öâ†æWfW"6V6öæ@¢3¢&Wf—6–öâÖ6†–â–×ÆVÖVçFF–öâÂ*s"ãb’à¢Æ–æ¶VEö–çFVçEö—FVÕö–C¢÷F–öæÅ¶–çEÒÒæöæP¢3¢6WBv†Vâ6öæf—&Öö6÷'&V7Fv2&WW6VBF‡&÷Vv€¢3¢W'÷6Uö6†–âç&V6÷&E÷&VÆF–öåöFV6—6–öæà¢Æ–æ¶VE÷&VÆF–öåöFV6—6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢3¢6WBv†VâVæ¶æ÷væö–çfW7F–vFV÷VæVB¦ö–çBVæFW'7FæF–ær6W76–öà¢3¢v—F‚G&–vvW#ÒwW'÷6UöæVVBvà¢Æ–æ¶VEö¦ö–çE÷6W76–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7WW'6VFVEö'•ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7&VFVEöC¢fÆö@  ¢2ÒÒÒW'÷6RfW&–f–6F–öâòW‡W&–Væ6RÔ÷WF6öÖRÕ&WW6R„—77VR33“’ÒÒÒÒÒÒÒÒÒÒÒÐ¢0¢2Fö72÷W'÷6RÖ6†–âæÖF*sB—2F†R7V6–f–6F–öââF‡&VRõD”ôäÂ6öæ6WG2¢2FWfVÆ÷W"Ö’GF6‚FòW'÷6R6†–âVÆVÖVçB÷"&VÆF–öâÂ'’F†R4ÔP¢27F&ÆR7G&–ær–FVçF—G’÷W'÷6Uö6†–âç–Ç&VG’W6W2ÒÒæWfW"&÷p¢2–BÂæBæWfW"&WV—&VBf÷"WfW'’7—7FVÒŒ*sBã¢.XZ‚7—7FVÒ8ŽKˆ[è¾8¾Šhk.8~8 ¢28B"’â7&VF–öâ—2öæÇ’WfW"ôddU$TBÆöæw6–FR7W'&VçFÇ’Öf–Æ&ÆV ¢2÷W'÷6UöæVVG2ç–æVVBv†÷6R6öFR—2–âF†Rf—†V@¢2W'÷6U÷fW&–f–6F–öâä5$TD$ÄUôäTTEô4ôDU6F&ÆS²'F†RW'÷6Rg&ÖR—2@¢2Ã"—2W‡Æ–6—FÇ’æ÷B&V6öâŒ*sBã’Â6òF†W&R—2æòVæGö–çBF†BÆWG2¢26ÆÆW"7&VFRöæRv—F†÷WBæÖ–ærF†R§W7F–g––æræVVEö–Fà¢0¢2FV6—6–öåöÖWF†öF—2†&F6öFVBvÖçVÂvöâWfW'’w&—FR–âF†—2&VÂ6ÖP¢22W'÷6Uö6†–âç–òW'÷6UöæVVG2ç–ÒÒF†—2ÖöGVÆR6ÆÇ2æð¢2&V6öæ–ærÖöFVÂV—F†W"…&–æ6—ÆRb’ÂæBâ÷WF6öÖRw2ö'6W'fVFð¢26öçG&F–7FVFfW&F–7B—2æWfW"–æfW'&VBg&öÒG&6S¢—B—2Çv—2F†P¢2FWfVÆ÷W"w2÷vâ&V6÷&FVB&VF–æröbWf–FVæ6RF†W’F†V×6VÇfW27W&FV@¢2Œ*sBã"’à ¢3¢W‡W&–Væ6Uö‡—÷F†W6—6æB&WW6Uö‡—÷F†W6—66†&RF†—2W†7BÆ–fV7–6ÆP¢3¢†Fö72÷W'÷6RÖ6†–âæÖF*sBã¢'7FFR8òW‡W&–Væ6R8ŽYÎ8‚"’ÒÒöæP¢3¢Æ—FW&Æf÷"&÷F‚Â6–æ6RFVf–æ–ær—BGv–6Rv÷VÆBÆWBF†RGvòG&–gB'@¢3¢f÷"æò&V6öââ&WF—&VF—2ÖçVÂv—F†G&vÂ‡F†RFWfVÆ÷W"FV6–FV@¢3¢F†R‡—÷F†W6—2v2w&öær÷"æòÆöævW"&VÆWfçB“²—B—2äUdU"7–æöç–Òf÷ ¢3¢&æ÷B–WB6öæf—&ÖVB"à¥W'÷6T‡—÷F†W6—57FFRÒÆ—FW&Å²'&÷÷6VB"Â&6öæf—&ÖVB"Â'&WF—&VB%Ð ¢3¢W'÷6Uö÷WF6öÖUö7&—FW&–öæw2÷vâb×fÇVRÆ–fV7–6ÆRŒ*sBãü*sBã"’à¢3¢&÷÷6VFò6öæf—&ÖVF&RF†R6ÖRÖçVÂ6öÖÖ—FÖVçB7FW22¢3¢‡—÷F†W6—3²ö'6W'fVFò6öçG&F–7FVF&R6WBôäÅ’FövWF†W"v—F‚à¢3¢Wf–FVæ6Rw&—FR†W'÷6T÷WF6öÖU&W7VÇE&WVW7F’ÒÒæWfW"FW&—fVBg&öÐ¢3¢6–ÆVæ6Râæ÷Eöö'6W'fVF‚&æÇ—F–728ÎxJ88(Î8"’æBæ÷Eö6ö×WFVF ¢3¢‚&6æöæ–6ÂÖ–ær8ÎxJ88(Î8"’&RV6‚F†V—"÷vâW‡Æ–6—BÖçVÀ¢3¢&V6÷&F–æröbv‡’fW&F–7B6÷VÆBæ÷B&R&V6†VBÂæ÷BfÇVRF†R6W'fW ¢3¢–æfW'2g&öÒâV×G’6öÇVÖâÒÒ6VRW'÷6U÷fW&–f–6F–öâç–w2ÖöGVÆP¢3¢Fö77G&–ærf÷"v‡’â–æfW'&VBfÇVR†W&Rv÷VÆBf–öÆFR*sBã"w2''VçF–ÖP¢3¢G&6R888~XŠžyJŽˆ^8îh‰X©þ8).hêŽkŠÎ8~8®8B"'VÆRöæRÆWfVÂWà¥W'÷6T÷WF6öÖT7&—FW&–öå7FFRÒÆ—FW&Å°¢'&÷÷6VB"Â&6öæf—&ÖVB"Â&ö'6W'fVB"Â&6öçG&F–7FVB"Â&æ÷Eöö'6W'fVB"Â&æ÷Eö6ö×WFVB ¥Ð ¢3¢v†–6‚öbF†RGvòWf–FVæ6R4ôÅTÔå2&W7VÇBw&—FRF&vWG2â*sBã"&WV—&W0¢3¢‡VÖâ×&W÷'FVBWf–FVæ6RæB'VçF–ÖRö'6W'fF–öâFò7F’–â6W&FP¢3¢6öÇVÖç2ÂæWfW"ÖW&vVB–çFòöæR'&W7VÇB"ÒÒF†—2—2F†R†—2F†B–6·0¢3¢v†–6‚6öÇVÖâ&V6÷&Eö÷WF6öÖU÷&W7VÇFw&—FW2Fòà¥W'÷6T÷WF6öÖTWf–FVæ6U6÷W&6RÒÆ—FW&Å²&‡VÖå÷&W÷'FVB"Â''VçF–ÖUöö'6W'fVB%Ð¥W'÷6T÷WF6öÖTWf–FVæ6U7FFRÒÆ—FW&Å°¢&ö'6W'fVB"Â&6öçG&F–7FVB"Â&æ÷Eöö'6W'fVB"Â&æ÷Eö6ö×WFVB ¥Ð ¢3¢&V6÷&FVBfW&F–7B—2§VFvVÖVçB&÷WBF†RWf–FVæ6RÂÇv—2F†P¢3¢FWfVÆ÷W"w2÷vâ&VF–æröb—B†æWfW"6ö×WFVBg&öÒF†RWf–FVæ6RFW‡B’à¥W'÷6T÷WF6öÖUfW&F–7BÒÆ—FW&Å²'7W÷'G2"Â&6öçG&F–7G2%Ð ¢3¢v†WF†W"âW‡W&–ÖVçEö–Fò6æF–FFU÷fW'6–öåö–FÆ–æVvR6öÇVÖà¢3¢&W6öÇfW2Fò&VÂÂ7—7FVÒ×66÷VB&÷r&–v‡Bæ÷râVç&W6öÇfVF‡F†R–Bv0¢3¢6WB'WBF†R&÷r—2vöæR’—2vVçV–æRF†—&BfÇVRÒÒ*sBã3¢.Zûî[ùÎ8ÎxJ88(À¢3¢88Î™j.˜
+>KˆÞiˆî8Þ8ŽŠŽzK®8ž8(²"ÒÒæWfW"6–ÆVçFÇ’F÷væw&FVBFòæöæVÂv†–6€¢3¢v÷VÆBW&6RF†Rf7BF†BÆ–æVvR6Æ–Òv2öæ6RÖFRà¥W'÷6T÷WF6öÖTÆ–æVvU7FFRÒÆ—FW&Å²&æöæR"Â&Æ–æ¶VB"Â'Vç&W6öÇfVB%Ð ¢3¢v†–6‚öbF†RF‡&VR6öæ6WG2fW&–f–6F–öâ&ö×B÷"Æ—7F–ær&÷r—0¢3¢&÷WBâF—7F–æ7Bg&öÒW'÷6TæVVEF&vWD¶–æF†VÆVÖVçBg2&VÆF–öâ’ÒÒF†—0¢3¢—2'v†B¶–æBöbfW&–f–6F–öâ"Âæ÷B'v†B¶–æBöbW'÷6R6†–âæöFR"à¥W'÷6UfW&–f–6F–öä6öæ6WD¶–æBÒÆ—FW&Å°¢&W‡W&–Væ6Uö‡—÷F†W6—2"Â&÷WF6öÖUö7&—FW&–öâ"Â'&WW6Uö‡—÷F†W6—2 ¥Ð  ¦6Æ72W'÷6TW‡W&–Væ6T‡—÷F†W6—4÷WB„&6TÖöFVÂ“ ¢""$Ö–æ–ÖÂ6Æ–Ò&÷WBv†B&VÂW6W"v÷VÆBW‡W&–Væ6R–bF†—0¢VÆVÖVçB÷&VÆF–öâw26W6Â6Æ–Ò†öÆG2âg&VRFW‡BŒ*sBã’ÒÒF†RFWfVÆ÷W ¢7FFW2—BF†V×6VÇfW3²F†—2ÖöGVÆR–çfVçG2æòv÷&F–ærâ""  ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6W76–öåö–C¢–ç@¢F&vWEö¶–æC¢W'÷6TæVVEF&vWD¶–æ@¢F&vWEö–C¢7G ¢3¢6÷–VBg&öÒF†R§W7F–g––æræVVBB7&VF–öâF–ÖRÂf÷"F—7Æ’v—F†÷W@¢3¢6V6öæBÆöö·Wà¢F&vWEöÆ&VÃ¢7G ¢3¢W'÷6Uö6†–âæVÆVÖVçEöF–vW7FòF†R&VÆF–öâw2÷vâ–FVçF—G’f–VÆG2@¢3¢5$TD”ôâF–ÖRâ6GW&VBf÷"VF—C²33“FöW2æ÷B&RÖ6†V6²—Bv–ç7@¢3¢F†R7W'&VçB6†–âöâWfW'’&VB†æò7FÆVæW72&RÖFW&—fF–öâ†W&RÒÐ¢3¢âW‡Æ–6—BæöâÖvöÂf÷"F†—2—77VRÂ6VRF†RÖöGVÆRFö77G&–ær’à¢F&vWEöF–vW7C¢7G ¢3¢F†RW'÷6UöæVVG6æVVBF†BÖFRF†—27&VF&ÆRŒ*sBã’âæWfW"¢3¢wVW72ÒÒF†R7&VFRVæGö–çB&VgW6W2v—F†÷WBöæRà¢6÷W&6UöæVVEö–C¢7G ¢6÷W&6UöæVVEö6öFS¢W'÷6TæVVD6öFP¢7FFVÖVçC¢7G ¢7FFS¢W'÷6T‡—÷F†W6—57FFP¢FV6—6–öåöÖWF†öC¢7G"Ò&ÖçVÂ ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢6öæf—&ÖVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢6öæf—&ÖVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢&WF—&VEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢&WF—&VEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢&WF—&VÖVçE÷&V6öã¢7G"Ò"   ¦6Æ72W'÷6U&WW6T‡—÷F†W6—4÷WB„&6TÖöFVÂ“ ¢""$–FVçF–6Â6†RFòW'÷6TW‡W&–Væ6T‡—÷F†W6—4÷WFÒÒ6W&FP¢6Æ72†æ÷BG—RÆ–2’&V6W6RF†RGvò&R7F÷&VB–â6W&FRF&ÆW0¢æB&RæWfW"–çFW&6†ævV&ÆRÂWfVâF†÷Vv‚WfW'’f–VÆBÖF6†W2â""  ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6W76–öåö–C¢–ç@¢F&vWEö¶–æC¢W'÷6TæVVEF&vWD¶–æ@¢F&vWEö–C¢7G ¢F&vWEöÆ&VÃ¢7G ¢F&vWEöF–vW7C¢7G ¢6÷W&6UöæVVEö–C¢7G ¢6÷W&6UöæVVEö6öFS¢W'÷6TæVVD6öFP¢7FFVÖVçC¢7G ¢7FFS¢W'÷6T‡—÷F†W6—57FFP¢FV6—6–öåöÖWF†öC¢7G"Ò&ÖçVÂ ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢6öæf—&ÖVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢6öæf—&ÖVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢&WF—&VEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢&WF—&VEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢&WF—&VÖVçE÷&V6öã¢7G"Ò"   ¦6Æ72W'÷6T÷WF6öÖT7&—FW&–öä÷WB„&6TÖöFVÂ“ ¢"".h‰iéÎŠ‹ÎhºŒ*sBãü*sBã"ü*sBã2ü*sBãB’âÖV7W&Vò&6VÆ–æU÷fÇVVð¢F&vWE÷fÇVVòö'6W'fF–öå÷v–æF÷v&RF†Rf÷W"f–VÆG2*sBãB6†V6·2f÷ ¢Ã2ÒÒÆÂÆ–âFWfVÆ÷W"ÖWF†÷&VBFW‡BÂæWfW"ÄÄÒ÷WGWBâ""  ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6W76–öåö–C¢–ç@¢F&vWEö¶–æC¢W'÷6TæVVEF&vWD¶–æ@¢F&vWEö–C¢7G ¢F&vWEöÆ&VÃ¢7G ¢F&vWEöF–vW7C¢7G ¢6÷W&6UöæVVEö–C¢7G ¢6÷W&6UöæVVEö6öFS¢W'÷6TæVVD6öFP¢ÖV7W&S¢7G"Ò" ¢&6VÆ–æU÷fÇVS¢7G"Ò" ¢F&vWE÷fÇVS¢7G"Ò" ¢ö'6W'fF–öå÷v–æF÷s¢7G"Ò" ¢7FFS¢W'÷6T÷WF6öÖT7&—FW&–öå7FFP¢3¢*sBã3¢W‡Æ–6—BÆ–æVvR6öÇVÖç2öæÇ’ÂæWfW"7—7FVÒ×v–FRW†—7FVæ6P¢3¢6†V6²âÆ–æVvU÷7FFV&W÷'G2v†WF†W"F†R–B‡v†Vâ6WB’7F–ÆÀ¢3¢&W6öÇfW2ÒÒVç&W6öÇfVF&VæFW'228Î™j.˜
+>KˆÞiˆî8ÒÂæWfW"2&æòÆ–æVvR"à¢W‡W&–ÖVçEö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6æF–FFU÷fW'6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢Æ–æVvU÷7FFS¢W'÷6T÷WF6öÖTÆ–æVvU7FFRÒ&æöæR ¢3¢*sBã#¢Gvò4U$DRWf–FVæ6R6öÇVÖç2ÂæWfW"ÖW&vVB–çFòöæR'&W7VÇB"à¢‡VÖå÷&W÷'FVEöWf–FVæ6S¢÷F–öæÅ·7G%ÒÒæöæP¢‡VÖå÷&W÷'FVE÷fW&F–7C¢÷F–öæÅµW'÷6T÷WF6öÖUfW&F–7EÒÒæöæP¢‡VÖå÷&W÷'FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢‡VÖå÷&W÷'FVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢‡VÖå÷&W÷'FVE÷7FFS¢÷F–öæÅµW'÷6T÷WF6öÖTWf–FVæ6U7FFUÒÒæöæP¢‡VÖå÷&W÷'FVEö—5÷7–çF†WF–3¢&ööÂÒfÇ6P¢'VçF–ÖUöö'6W'fF–öå÷FW‡C¢÷F–öæÅ·7G%ÒÒæöæP¢'VçF–ÖUöö'6W'fF–öå÷fW&F–7C¢÷F–öæÅµW'÷6T÷WF6öÖUfW&F–7EÒÒæöæP¢'VçF–ÖUöö'6W'fVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢'VçF–ÖUöö'6W'fVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢'VçF–ÖUöö'6W'fF–öå÷7FFS¢÷F–öæÅµW'÷6T÷WF6öÖTWf–FVæ6U7FFUÒÒæöæP¢'VçF–ÖUöö'6W'fF–öåö—5÷7–çF†WF–3¢&ööÂÒfÇ6P¢3¢*sBã#¢'7–çF†WF–2f—‡GW&R8î{YiéÎ8).ZéþXŠžyJŽˆ^8îh‰iéÎ8Ž8~8nŠŽzK®8~8®8B"ÒÒF†P¢3¢fÆr&W7VÇBw&—FR6'&–W2Â6†÷vâÆöæw6–FRF†R&W7VÇBÂæWfW ¢3¢–æfW'&VBg&öÒv†W&RF†RWf–FVæ6R6ÖRg&öÒà¢—5÷7–çF†WF–3¢&ööÂÒfÇ6P¢FV6—6–öåöÖWF†öC¢7G"Ò&ÖçVÂ ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢6öæf—&ÖVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢6öæf—&ÖVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ72W'÷6UfW&–f–6F–öå7FFT÷WB„&6TÖöFVÂ“ ¢""&tUB÷W'÷6RÖ6†–â÷fW&–f–6F–öæÒÒWfW'’6öæ6WB7W'&VçFÇ’&V6÷&FV@¢f÷"öæR6W76–öâÂw&÷WVB'’¶–æBâæ÷Bv–æFVBŒ*s–çf&–çBS¢F†—0¢W–27&VFW2æòF6†&ö&Böb—G2÷vã²F†RW‡V7FVB6÷VçBW"6W76–öâ—0¢6ÖÆÂÂvFVB2—B—2'’æVVG2’â""  ¢7—7FVÕö–C¢–ç@¢6W76–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢W‡W&–Væ6Uö‡—÷F†W6W3¢Æ—7EµW'÷6TW‡W&–Væ6T‡—÷F†W6—4÷WEÒÒµÐ¢÷WF6öÖUö7&—FW&–¢Æ—7EµW'÷6T÷WF6öÖT7&—FW&–öä÷WEÒÒµÐ¢&WW6Uö‡—÷F†W6W3¢Æ—7EµW'÷6U&WW6T‡—÷F†W6—4÷WEÒÒµÐ  ¦6Æ72W'÷6UfW&–f–6F–öå&ö×D÷WB„&6TÖöFVÂ“ ¢"",*sBãRw2ôäRfW&–f–6F–öâ&ö×BâBÖ÷7BöæRÂ6†÷6VâFWFW&Ö–æ—7F–6ÆÇ¢†W'÷6U÷fW&–f–6F–öâç6VÆV7E÷fW&–f–6F–öå÷&ö×F’ÒÒF†R6ÖP¢BÖÖ÷7BÖöæRF—66—Æ–æRW'÷6UVW7F–öä÷WFÇ&VG’Æ–W2FòW'÷6P¢æVVG2ÂW‡FVæFVBFòfW&–f–6F–öâÖ6öæ6WB7&VF–öââæöæVBF†RVæGö–ç@¢ÆWfVÂÖVç28ÎjIÎŠ‹ÎiÚK»n8þ8î8[ø^Šh8.8(®8î8¾8)>8ÒÒÒF†W&R—2æòV×G¢Æ6V†öÆFW"ö&¦V7Bâ""  ¢6öæ6WEö¶–æC¢W'÷6UfW&–f–6F–öä6öæ6WD¶–æ@¢æVVEö–C¢7G ¢æVVEö6öFS¢W'÷6TæVVD6öFP¢F&vWEö¶–æC¢W'÷6TæVVEF&vWD¶–æ@¢F&vWEö–C¢7G ¢F&vWEöÆ&VÃ¢7G ¢3¢KÙ^8).jIÎŠ‹Î8ž8(¾8²âf—†VB6W'fW"6÷’…&–æ6—ÆRbór’ÂæWfW"ÖöFVÂ÷WGWBà¢&ö×C¢7G ¢3¢8®8ÎK¸®8²ÒÒ&WW6VBfW&&F–Òg&öÒF†R§W7F–g––æræVVBw2÷vâ6÷¢3¢†W'÷6UöæVVG2åôäTTEô4õ–’Â6òF†—2&ö×BæBF†RVæFW&Ç––æræVVBw0¢3¢÷vâVW7F–öâæWfW"F—6w&VR&÷WBv‡’æ÷rÖGFW'2à¢v‡•öæ÷s¢7G ¢3¢8ž8îXŠNijÞ8¾X«ž8þ8²ÒÒ&WW6VBfW&&F–Òg&öÒF†R§W7F–g––æræVVBw0¢3¢&Æö6¶VEöFV6—6–öæà¢&Æö6¶VEöFV6—6–öã¢7G ¢3¢iÈ[þ8îŠk>kŠÎikžk9RÒÒf—†VB6÷’æÖ–ærF†R6ÖÆÆW7BF†–ærv÷'F‚w&—F–æp¢3¢F÷vâf÷"F†—26öæ6WB¶–æB…&–æ6—ÆRc¢æWfW"ÖöFVÂÖWF†÷&VB’à¢ö'6W'fF–öåö†–çC¢7G   ¦6Æ72W'÷6TW‡W&–Væ6T‡—÷F†W6—47&VFU&WVW7B„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6W76–öåö–C¢–ç@¢3¢F†RW'÷6UöæVVG6æVVBF†—26öæ6WB—2&V–ær7&VFVBdõ"Œ*sBã’ÒÐ¢3¢&WV—&VBÂæWfW"–æfW'&VBg&öÒF†RF&vWBÆöæRà¢æVVEö–C¢7G ¢7FFVÖVçC¢7G   ¦6Æ72W'÷6U&WW6T‡—÷F†W6—47&VFU&WVW7B„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6W76–öåö–C¢–ç@¢æVVEö–C¢7G ¢7FFVÖVçC¢7G   ¦6Æ72W'÷6T÷WF6öÖT7&—FW&–öä7&VFU&WVW7B„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6W76–öåö–C¢–ç@¢æVVEö–C¢7G ¢ÖV7W&S¢7G ¢&6VÆ–æU÷fÇVS¢7G ¢F&vWE÷fÇVS¢7G ¢ö'6W'fF–öå÷v–æF÷s¢7G   ¦6Æ72W'÷6UfW&–f–6F–öå6W76–öå&WVW7B„&6TÖöFVÂ“ ¢""%F†R&&R6W76–öåö–F&öG’WfW'’æòÖW‡G&Ö–çWBfW&–f–6F–öà¢G&ç6—F–öâæVVG2†6öæf—&Ò7F–öç2öâV—F†W"‡—÷F†W6—2F&ÆRÂæBF†P¢÷WF6öÖR7&—FW&–öâw2÷vâ6öæf—&Ò’â""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6W76–öåö–C¢–ç@  ¦6Æ72W'÷6T‡—÷F†W6—5&WF—&U&WVW7B„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6W76–öåö–C¢–ç@¢&V6öã¢7G"Ò"   ¦6Æ72W'÷6T÷WF6öÖT7&—FW&–öäÆ–æµ&WVW7B„&6TÖöFVÂ“ ¢"",*sBã3¢W‡Æ–6—BÆ–æVvRöæÇ’â&÷F‚f–VÆG2÷F–öæÂÂ'WBBÖ÷7BöæRÖ¢&R6WBÒÒâ÷WF6öÖR7&—FW&–öâ†2BÖ÷7BöæR6æöæ–6ÂÖ–ærÂæWfW"¢—"öbVç&VÆFVB6æF–FFRöW‡W&–ÖVçB–G2Böæ6Râ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6W76–öåö–C¢–ç@¢W‡W&–ÖVçEö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6æF–FFU÷fW'6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP ¢ÖöFVÅ÷fÆ–FF÷"†ÖöFSÒ&gFW""¢FVbW†7FÇ•÷¦W&õö÷%ööæUöÆ–æVvU÷F&vWB‡6VÆb“ ¢–b6VÆbæW‡W&–ÖVçEö–B—2æ÷BæöæRæB6VÆbæ6æF–FFU÷fW'6–öåö–B—2æ÷BæöæS ¢&—6RfÇVTW'&÷"‚%7V6–g’BÖ÷7BöæRöbW‡W&–ÖVçEö–B÷"6æF–FFU÷fW'6–öåö–B"¢&WGW&â6VÆ`  ¦6Æ72W'÷6T÷WF6öÖU&W7VÇE&WVW7B„&6TÖöFVÂ“ ¢""%&V6÷&G2&W7VÇBv–ç7BU„5DÅ’ôäRöbF†RGvòWf–FVæ6R6öÇVÖç0¢†6÷W&6V–6·2v†–6‚’ÂÇv—2—&VBv—F‚F†RFWfVÆ÷W"w2÷vâfW&F–7BÒÐ¢æWfW"&&R7FFRG&ç6—F–öâv—F‚æòWf–FVæ6RGF6†VBŒ*sBã"’â""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6W76–öåö–C¢–ç@¢6÷W&6S¢W'÷6T÷WF6öÖTWf–FVæ6U6÷W&6P¢fW&F–7C¢W'÷6T÷WF6öÖUfW&F–7@¢Wf–FVæ6U÷FW‡C¢7G ¢—5÷7–çF†WF–3¢&ööÂÒfÇ6P  ¦6Æ72W'÷6T÷WF6öÖUVæf–Æ&ÆU&WVW7B„&6TÖöFVÂ“ ¢""$W‡Æ–6—FÇ’&V6÷&G2v‡’öæRWf–FVæ6R6÷W&6R6ææ÷B––VÆBfW&F–7Bâ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6W76–öåö–C¢–ç@¢6÷W&6S¢W'÷6T÷WF6öÖTWf–FVæ6U6÷W&6P¢7FFS¢Æ—FW&Å²&æ÷Eöö'6W'fVB"Â&æ÷Eö6ö×WFVB%Ð¢&V6öã¢7G   ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2WföÇWF–öâæöFR„W–233“B†6RÂ—77VR33“b¢0¢2F†Rf–æ—FRfö6'VÆ&–W2&VÆ÷r&RÖ—'&÷&VBg&öÒöWföÇWF–öåöæöFRç–À¢2v†–6‚÷vç2F†VÒâF†W’&R&RÖFV6Æ&VB†W&R2Æ—FW&ÆÆ–6W2&F†W"F†à¢2–×÷'FVB6òf7D’WG2&VÂVçVÒ–âF†R÷Vä’66†VÖæBF†P¢2F6†&ö&Bw2G—U67&—BVæ–öç26ææ÷B6–ÆVçFÇ’G&–gBg&öÒF†R6W'fW"ÒÒF†P¢26ÖRF—66—Æ–æRW'÷6TVÆVÖVçD¶–æFæBF†R33S'&–Vbfö6'VÆ&–W2W6Rà¢2FW7EöWföÇWF–öåöæöFUö’ç–76W'G2F†RGvòFVf–æ—F–öç27F’–FVçF–6Âà¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¤WföÇWF–öäÖGW&—G•7FFRÒÆ—FW&Å°¢&W‡Æ÷&–ær"Â'fÆ–FF–ær"Â&W7F&Æ—6†VB"Â&Ööæ—F÷&–ær"Â'&V÷VæVB"Â'7W7VæFVB ¥Ð¤WföÇWF–öä–×ÆVÖVçFF–öäÖöFÆ—G’ÒÆ—FW&Å°¢'&V6öæ–æuöÆÆÒ"Â&ÆÕ÷&öw&Ò"Â'&WG&–WfÂ"Â'&÷WFW""Â'6ÖÆÅöÖöFVÂ"À¢''VÆR"Â&FWFW&Ö–æ—7F–5ö6öFR"Â'v÷&¶fÆ÷r"Â&ÖçVÂ"Â&‡–'&–B"À¥Ð¤WföÇWF–öäÆ–æ´¶–æBÒÆ—FW&Å°¢&6ö×öæVçB"Â'&ö&U÷ö–çB"Â&6VÆÅö&–æF–ær"Â&6&–Æ—G’"Â&fÆ÷r"À¢'W'÷6UöVÆVÖVçB"Â&fVGW&R"À¥Ð¤WföÇWF–öå6–FTVffV7D6Æ72ÒÆ—FW&Å°¢'W&R"Â'&VEööæÇ’"Â&Æö6Å÷w&—FR"Â&W‡FW&æÅ÷w&—FR"Â&—'&WfW'6–&ÆR ¥Ð¤WföÇWF–öåG'W7D&÷VæF'’ÒÆ—FW&Å°¢&–çFW&æÂ"Â&W‡FW&æÅö–çWB"Â&W‡FW&æÅö÷WGWB"Â'F†—&E÷'G’ ¥Ð¤WföÇWF–öä7F÷$¶–æBÒÆ—FW&Å²&FWfVÆ÷W""Â'7—7FVÒ%Ð  ¦6Æ72WföÇWF–öäæöFT7&VFT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æöFUö¶W“¢7G ¢F—7Æ•öæÖS¢7G"Ò"   ¦6Æ72WföÇWF–öäæöFUfW'6–öä7&VFT–â„&6TÖöFVÂ“ ¢""%F†RæöFRw24ôåE$5BÒÒv†B—B&öÖ—6W2Âæ÷B†÷r—B7W'&VçFÇ’¶VW0¢F†B&öÖ—6R„E"Ó2’âWfÇVF–öå÷öÆ–7•÷&Vg6&R&Vg2ÂæWfW"–æÆ–æP¢7&—FW&–¢†6R"‚33“r’÷vç2F†RF‡&VRWfÇVF–öâ6öçG&7G2â""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢Ö—76–öã¢7G ¢–çWEö6öçG&7C¢÷F–öæÅ´F–7E·7G"Âç•ÕÒÒæöæP¢÷WGWEö6öçG&7C¢÷F–öæÅ´F–7E·7G"Âç•ÕÒÒæöæP¢6–FUöVffV7Eö6Æ73¢WföÇWF–öå6–FTVffV7D6Æ70¢G'W7Eö&÷VæF'“¢WföÇWF–öåG'W7D&÷VæF'¢66÷S¢7G"Ò" ¢÷WEööe÷66÷S¢7G"Ò" ¢W7F&Æ—6†ÖVçEö7&—FW&–¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&V÷Våö7&—FW&–¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢WfÇVF–öå÷öÆ–7•÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ72WföÇWF–öäæöFT–×ÆVÖVçFF–öä7&VFT–â„&6TÖöFVÂ“ ¢""$†÷rF†RæöFR7W'&VçFÇ’¶VW2—G26öçG&7Bw2&öÖ—6R„E"Ó2’à ¢&÷f–FW"öÖöFVÂæÖW2&VÆöær–ç6–FR6öæf–vò&÷fVææ6VæBæWfW"–â¢f–VÆBF†B'F–6—FW2–âF†R–×ÆVÖVçFF–öâw2–FVçF—G’ÒÒF†R6ÖR'VÆP¢3#“‚w2vVçB&öÆR6&BÆ–W2FòÖöFVÂÆ–6W2âÖöFÆ—G–—2F†R†—0¢F†BÖ¶W2âÄÄÒ–×ÆVÖVçFF–öâæB'VÆR–×ÆVÖVçFF–öâöbF†R4ÔP¢6öçG&7B6ö×&&ÆRà¢""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æöFU÷fW'6–öåö–C¢–ç@¢ÖöFÆ—G“¢WföÇWF–öä–×ÆVÖVçFF–öäÖöFÆ—G¢6öæf–s¢÷F–öæÅ´F–7E·7G"Âç•ÕÒÒæöæP¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6öÖÖ—E÷6†¢÷F–öæÅ·7G%ÒÒæöæP¢Vçf—&öæÖVçE÷&Vc¢÷F–öæÅ·7G%ÒÒæöæP¢&÷fVææ6S¢÷F–öæÅ´F–7E·7G"Âç•ÕÒÒæöæP  ¦6Æ72WföÇWF–öäæöFTÆ–æ´7&VFT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢Æ–æµö¶–æC¢WföÇWF–öäÆ–æ´¶–æ@¢F&vWE÷&Vc¢7G ¢F&vWE÷&÷uö–C¢÷F–öæÅ¶–çEÒÒæöæP¢æ÷FS¢7G"Ò"   ¦6Æ72WföÇWF–öäæöFU7F&ÆU–ä–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢–×ÆVÖVçFF–öåö–C¢–ç@¢&V6öã¢7G"Ò"   ¦6Æ72WföÇWF–öäæöFUG&ç6—F–öä–â„&6TÖöFVÂ“ ¢""$ÖGW&—G’G&ç6—F–öâ&WVW7Bà ¢&÷fVææ6Rf–VÆG2†7F÷&Â7F÷%ö¶–æF’&RFVÆ–&W&FVÇ’%4TåC¢F†P¢&÷WFRFW&—fW2&÷F‚g&öÒF†RWF†VçF–6FVB&–æ6—Æ‚333rw2'VÆRÀ¢E"Ó’’Â6ò6ÆÆW"6âæWfW"&V6÷&BG&ç6—F–öâ26öÖVöæRVÇ6Rw2ÒÐ¢÷"2F†R7—7FVÒw2ÒÒFV6—6–öââFV6—6–öåöÖWF†öF—2FVÆ–&W&FVÇ’äõ@¢FVfVÇFVBFòÖçVÆ¢v†–6‚öæR—B—2FV6–FW2v†WF†W"‡VÖâ7FæG0¢&V†–æBF†—2G&ç6—F–öâÂæBFVfVÇBv÷VÆBÆWB6ÆÆW"&V6÷&B‡VÖà¢FV6—6–öâ'’öÖ—76–öââF†RgVÆÂF‡&VR×fÇVRÆ—FW&Â—2¶WB6òF†R&÷WFP¢6â&VgW6RFWFW&Ö–æ—7F–6v—F‚—G2÷vâf–æ—FR6öFP¢†FWFW&Ö–æ—7F–5÷f–ö•öæ÷EöÆÆ÷vVF’æBÆWBF†RFöÖ–âÆ–W"&VgW6P¢&V6öæ–æuöÆÆÖv—F‚ÆÆÕ÷7FFUöæ÷EöÆÆ÷vVFÒÒâÄÄÒæWfW"VÖ—G2¢6æöæ–6Â7FFR…&–æ6—ÆRb’à¢""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢Fõ÷7FFS¢WföÇWF–öäÖGW&—G•7FFP¢FV6—6–öåöÖWF†öC¢Æ—FW&Å²&FWFW&Ö–æ—7F–2"Â'&V6öæ–æuöÆÆÒ"Â&ÖçVÂ%Ð¢&V6öã¢7G"Ò" ¢&V6öåö6öFS¢7G"Ò" ¢Wf–FVæ6U÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢–FV×÷FVæ7•ö¶W“¢7G"Ò"   ¦6Æ72WföÇWF–öäæöFU7VÖÖ'”÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢æöFUö¶W“¢7G ¢F—7Æ•öæÖS¢7G ¢ÖGW&—G“¢WföÇWF–öäÖGW&—G•7FFP¢7W'&VçE÷fW'6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7W'&VçEö–×ÆVÖVçFF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7F&ÆUö–×ÆVÖVçFF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&öÆÆ&6µö–×ÆVÖVçFF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢Ööæ—F÷&–æuö6öçG&7E÷&Vc¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@  ¦6Æ72WföÇWF–öäæöFW4Æ—7D÷WB„&6TÖöFVÂ“ ¢æöFW3¢Æ—7E´WföÇWF–öäæöFU7VÖÖ'”÷WEÐ  ¦6Æ72WföÇWF–öäæöFUfW'6–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢fW'6–öåöçVÖ&W#¢–ç@¢Ö—76–öã¢7G ¢66÷S¢7G ¢÷WEööe÷66÷S¢7G ¢–çWEö6öçG&7C¢F–7E·7G"Âç•Ð¢÷WGWEö6öçG&7C¢F–7E·7G"Âç•Ð¢6–FUöVffV7Eö6Æ73¢7G ¢G'W7Eö&÷VæF'“¢7G ¢W7F&Æ—6†ÖVçEö7&—FW&–¢Æ—7E·7G%Ð¢&V÷Våö7&—FW&–¢Æ—7E·7G%Ð¢WfÇVF–öå÷öÆ–7•÷&Vg3¢Æ—7E·7G%Ð¢FV6—6–öåöÖWF†öC¢7G ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢7WW'6VFVEö'•ö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72WföÇWF–öäæöFT–×ÆVÖVçFF–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢–×ÆVÖVçFF–öåöçVÖ&W#¢–ç@¢æöFU÷fW'6–öåö–C¢–ç@¢ÖöFÆ—G“¢7G ¢6öæf–s¢F–7E·7G"Âç•Ð¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6öÖÖ—E÷6†¢÷F–öæÅ·7G%ÒÒæöæP¢Vçf—&öæÖVçE÷&Vc¢÷F–öæÅ·7G%ÒÒæöæP¢&÷fVææ6S¢F–7E·7G"Âç•Ð¢FV6—6–öåöÖWF†öC¢7G ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢7WW'6VFVEö'•ö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72WföÇWF–öäæöFTÆ–æ´÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢Æ–æµö¶–æC¢7G ¢F&vWE÷&Vc¢7G ¢F&vWE÷&÷uö–C¢÷F–öæÅ¶–çEÒÒæöæP¢æ÷FS¢7G ¢FV6—6–öåöÖWF†öC¢7G ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@  ¦6Æ72WföÇWF–öäæöFTWfVçD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢WfVçEö¶–æC¢7G ¢g&öÕ÷7FFS¢÷F–öæÅ·7G%ÒÒæöæP¢Fõ÷7FFS¢÷F–öæÅ·7G%ÒÒæöæP¢g&öÕ÷fW'6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢Fõ÷fW'6–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢g&öÕö–×ÆVÖVçFF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢Fõö–×ÆVÖVçFF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7F÷#¢÷F–öæÅ·7G%ÒÒæöæP¢7F÷%ö¶–æC¢7G ¢FV6—6–öåöÖWF†öC¢7G ¢&V6öåö6öFS¢7G ¢&V6öã¢7G ¢2æÖVBWf–FVæ6V†æ÷BWf–FVæ6U÷&Vg6’FòÖF6‚F†RFöÖ–âÆ–W"w2÷và¢2WfVçBFö7VÖVçC¢F†R7F÷&VBfÇVR—2Æ—7Böb&Vg2ÂæB&VæÖ–ær—B@¢2F†R&÷VæF'’v÷VÆBÆVfRF†R’æBF†R&ö¦V7F–öâFW67&–&–ærF†P¢26ÖR6öÇVÖâVæFW"GvòæÖW2à¢Wf–FVæ6S¢Æ—7E·7G%Ð¢2åTÄÂf÷"&WVW7BF†B÷FVB÷WBöb–FV×÷FVæ7’VçF—&VÇ’ââV×G¢27G&–ær—2FVÆ–&W&FVÇ’æ÷BW6VC¢F†R'F–ÂVæ—VR–æFW‚W†6ÇVFW2—BÀ¢26ò&æò¶W’"æB'F†RV×G’¶W’"&Ræ÷BF†R6ÖRf7Bà¢–FV×÷FVæ7•ö¶W“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@  ¦6Æ72WföÇWF–öäæöFTWfVçG4÷WB„&6TÖöFVÂ“ ¢æöFUö–C¢–ç@¢WfVçG3¢Æ—7E´WföÇWF–öäæöFTWfVçD÷WEÐ  ¦6Æ72WföÇWF–öäæöFU&ö¦V7F–öä÷WB„&6TÖöFVÂ“ ¢""%F†R6æöæ–6ÂæöFRFö7VÖVçBà ¢ÖGW&—G–Â–×&÷fVÖVçE÷7FGW6æBöÆ–7•öÖöFV&RF‡&VR”äDUTäDTå@¢†W2æBæò6öç7VÖW"Ö’6öÖ&–æRF†VÒ–çFòöæRÆ&VÂ„E"Ób’âçVÆÆ ¢öâV—F†W"öbF†RÆGFW"GvòÖVç2&æ÷F†–æröbF†B¶–æB—2Æ–æ¶VBFð¢F†—2æöFR"ÒÒæWfW"&æöæR—2–â&öw&W72"âF†Rf÷W'F‚†—0¢†v÷&¶fÆ÷u÷†6V’—2FVÆ–&W&FVÇ’'6VçBg&öÒF†RFö7VÖVçB&F†W"F†à¢çVÆÆ²†6Rb‚3C’v—&W2—Bà ¢f–Æ&–Æ—G•¶µÒ—2fÇ6VÖVç2F†B&Æö6²6÷VÆBæ÷B&R&VBBÆÂà¢—&VBv—F‚çVÆÆfÇVR—B—2F–ffW&VçBf7Bg&öÒçVÆÆv—F€¢f–Æ&–Æ—G•¶µÒ—2G'VVÂv†–6‚—2vVçV–æR'6Væ6R‚33ƒ’à ¢ÖGW&—G–—2F†R7F÷&VB6öÇVÖã²föÆFVEöÖGW&—G–—2v†BF†—2æöFRw0¢G&ç6—F–öâWfVçG2föÆBFò„E"ÓB’æBÖGW&—G•ö6öç6—7FVçFv†WF†W"F†P¢Gvòw&VRâçVÆÆföÆBv—F‚7F÷&VBW‡Æ÷&–æv—26öç6—7FVçB‡F†RæöFP¢†2æWfW"G&ç6—F–öæVB“²&÷F‚&RçVÆÆöæÇ’v†Và¢f–Æ&–Æ—G•²&ÖGW&—G•öÆ–æVvR%Ö—2fÇ6Rà¢""  ¢66†VÖ÷fW'6–öã¢7G ¢7—7FVÕö–C¢–ç@¢æöFUö–C¢–ç@¢æöFUö¶W“¢7G ¢F—7Æ•öæÖS¢7G ¢ÖGW&—G“¢WföÇWF–öäÖGW&—G•7FFP¢föÆFVEöÖGW&—G“¢÷F–öæÅ´WföÇWF–öäÖGW&—G•7FFUÒÒæöæP¢ÖGW&—G•ö6öç6—7FVçC¢÷F–öæÅ¶&ööÅÒÒæöæP¢7W'&VçE÷fW'6–öã¢÷F–öæÅ´WföÇWF–öäæöFUfW'6–öä÷WEÒÒæöæP¢7W'&VçEö–×ÆVÖVçFF–öã¢÷F–öæÅ´WföÇWF–öäæöFT–×ÆVÖVçFF–öä÷WEÒÒæöæP¢7F&ÆUö–×ÆVÖVçFF–öã¢÷F–öæÅ´WföÇWF–öäæöFT–×ÆVÖVçFF–öä÷WEÒÒæöæP¢&öÆÆ&6µö–×ÆVÖVçFF–öã¢÷F–öæÅ´WföÇWF–öäæöFT–×ÆVÖVçFF–öä÷WEÒÒæöæP¢Æ–æ·3¢Æ—7E´WföÇWF–öäæöFTÆ–æ´÷WEÐ¢WfVçG3¢Æ—7E´WföÇWF–öäæöFTWfVçD÷WEÐ¢–×&÷fVÖVçE÷7FGW3¢÷F–öæÅ·7G%ÒÒæöæP¢öÆ–7•öÖöFS¢÷F–öæÅ·7G%ÒÒæöæP¢f–Æ&–Æ—G“¢F–7E·7G"Â&ööÅÐ¢WFFVEöC¢fÆö@  ¦6Æ72WföÇWF–öäæöFTÆVv7•&ö¦V7F–öä÷WB„&6TÖöFVÂ“ ¢""$E"Ó‚6ö×F–&–Æ—G’f–Wrâæ÷B6V6öæB6æöæ–6Â&ö¦V7F–öââ""  ¢66†VÖ÷fW'6–öã¢7G ¢6ö×F–&–Æ—G•÷&ö¦V7F–öã¢&ööÀ¢7—7FVÕö–C¢–ç@¢æöFUö–C¢–ç@¢æöFUö¶W“¢7G ¢6ö×öæVçEö–C¢÷F–öæÅ·7G%ÒÒæöæP¢&ö&U÷ö–çE÷&Vc¢÷F–öæÅ·7G%ÒÒæöæP¢6VÆÅö–C¢÷F–öæÅ·7G%ÒÒæöæP¢ÖGW&—G“¢WföÇWF–öäÖGW&—G•7FFP  ¦6Æ72WföÇWF–öäæöFUG&ç6—F–öä÷WB„&6TÖöFVÂ“ ¢""&Æ–VFæBGWÆ–6FV&R6W&FR&ööÆVç2öâW'÷6S¢&WG'¢F†B6†ævVBæ÷F†–ær—27V66W72Âæ÷Bf–ÇW&RÂæBF†R6ÆÆW"†2Fð¢&R&ÆRFòFVÆÂF†RGvò'Bâ$T¤T5DTBG&ç6—F–öâæWfW"&V6†W2F†—0¢ÖöFVÂÒÒ—B—2C#"6''––ærF†RFöÖ–âÆ–W"w2÷vâf–æ—FR&V6öâ6öFRà¢""  ¢Æ–VC¢&ööÀ¢GWÆ–6FS¢&ööÀ¢ÖGW&—G“¢WföÇWF–öäÖGW&—G•7FFP¢WfVçC¢÷F–öæÅ´WföÇWF–öäæöFTWfVçD÷WEÒÒæöæP  ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2FW6–vâ7GVF–ò„W–233“B†6R"Â—77VR33“r¢0¢2æ÷FRv†B—2äõB†W&S¢F†W&R—2æò66÷&RÂvV–v‡BÂ÷"F÷FÂf–VÆBöâç¢2WfÇVF–öâÖöFVÂâE"Órf÷&&–G26ö×÷6—F–ærF†RF‡&VRÆWfVÇ2–çFòöæP¢2çVÖ&W"ÂæBF†R&VÆ–&ÆRv’FòVæf÷&6RF†B—2Fòv—fRF†RçVÖ&W"æ÷v†W&P¢2FòÆ—fRÒÒ–âF†R66†VÖ2vVÆÂ2–âF†RF&ÆRà¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¤WföÇWF–öäWfÇVF–öäÆWfVÂÒÆ—FW&Å²&æöFR"Â&fÆ÷uö6&–Æ—G’"Â'W…ö÷WF6öÖR%Ð¤FV6ö×÷6—F–öäFV6—6–öä¶–æBÒÆ—FW&Å²&F÷FVB"Â&†VÆB"Â'&V¦V7FVB%Ð  ¦6Æ72FV6ö×÷6—F–öå&÷÷6T–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢66÷U÷7VÖÖ'“¢7G ¢6öçFW‡C¢7G"Ò" ¢6W76–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6&–Æ—G•÷&Vc¢7G"Ò" ¢fÆ÷u÷&Vc¢7G"Ò"   ¦6Æ72FV6ö×÷6—F–öä6æF–FFT÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢&÷÷6Åö–C¢–ç@¢6æF–FFUö¶W“¢7G ¢7VÖÖ'“¢7G ¢&F–öæÆS¢7G ¢æöFW3¢Æ—7E´F–7E·7G"Âç•ÕÐ¢÷Vå÷VW7F–öç3¢Æ—7E·7G%Ð¢FV6—6–öã¢Æ—FW&Å²'VæF–ær"Â&F÷FVB"Â&†VÆB"Â'&V¦V7FVB%Ð¢FV6—6–öåöæ÷FS¢7G ¢FV6–FVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢FV6–FVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢F÷FVEöæöFUö–G3¢Æ—7E¶–çEÐ¢7&VFVEöC¢fÆö@  ¦6Æ72FV6ö×÷6—F–öå&÷÷6Ä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6W76–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢66÷U÷7VÖÖ'“¢7G ¢6&–Æ—G•÷&Vc¢7G ¢fÆ÷u÷&Vc¢7G ¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢–çFVÆÆ–vVæ6U÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7FGW3¢Æ—FW&Å²'&÷÷6VB"Â&f–ÆVB%Ð¢W'&÷%öFWF–Ç3¢7G ¢—5öÖö6³¢&ööÀ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢6æF–FFW3¢Æ—7E´FV6ö×÷6—F–öä6æF–FFT÷WEÐ  ¦6Æ72FV6ö×÷6—F–öäFV6—6–öä–â„&6TÖöFVÂ“ ¢""&VæF–æv—2FVÆ–&W&FVÇ’æ÷B66WFVC¢—B—2F†R–æ—F–Â7FFRÂæ÷B¢FV6—6–öâFWfVÆ÷W"6â&V6÷&Bâ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢FV6—6–öã¢FV6ö×÷6—F–öäFV6—6–öä¶–æ@¢æ÷FS¢7G"Ò"   ¦6Æ72FV6ö×÷6—F–öäFV6—6–öä÷WB„&6TÖöFVÂ“ ¢6æF–FFS¢FV6ö×÷6—F–öä6æF–FFT÷W@¢7&VFVEöæöFW3¢Æ—7E´F–7E·7G"Âç•ÕÐ  ¦6Æ72WfÇVF–öä7&—FW&–öä–â„&6TÖöFVÂ“ ¢""$öæRF†–ærF†B×W7B&R$T4„TB&Vf÷&RW7F&Æ—6†–ærà ¢6W&FRg&öÒfÆö÷"öâW'÷6R„E"Ór“¢F†RGvò&R6öç7VÖVB@¢F–ffW&VçBÖöÖVçG2ÂæB6–ævÆRÆ—7Bv—F‚fÆrÖ¶W2'vRÖWBF†R&" ¢æB'vRF–Bæ÷B&Vw&W72"–æF—7F–æwV—6†&ÆR–â7F÷&vRâ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æÖS¢7G ¢ÖV7W&S¢7G ¢F&vWC¢7G"Ò" ¢æ÷FS¢7G"Ò"   ¦6Æ72WfÇVF–öäfÆö÷$–â„&6TÖöFVÂ“ ¢""$öæR&÷W'G’F†B×W7Bæ÷B$Tu$U52âæWfW"G&FVBöfbv–ç7B¢7&—FW&–öâÒÒF†W&R—2æòvV–v‡Bf–VÆBFòG&FRv—F‚â""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æÖS¢7G ¢ÖV7W&S¢7G ¢Ö–æ–×VÓ¢7G"Ò" ¢æ÷FS¢7G"Ò"   ¦6Æ72WfÇVF–öåVæÖV7W&VD–â„&6TÖöFVÂ“ ¢""%6öÖWF†–ærF†—26öçG&7B6ææ÷B7W'&VçFÇ’ÖV7W&RÂt•D‚—G2&V6öâà ¢&V6÷&FVB&F†W"F†âöÖ—GFVC¢âöÖ—GFVB7&—FW&–öâ&VG22&æ÷F†–ærFð¢6†V6²†W&R"Âv†–6‚—2F†R33“'VÆR&÷WBæWfW"–æfW'&–ærâ÷WF6öÖRâ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æÖS¢7G ¢&V6öã¢7G   ¦6Æ72WfÇVF–öåöÆ–7”7&VFT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢öÆ–7•ö¶W“¢7G ¢ÆWfVÃ¢WföÇWF–öäWfÇVF–öäÆWfVÀ¢F—FÆS¢7G"Ò" ¢7V&¦V7E÷&Vc¢7G"Ò" ¢7&—FW&–¢Æ—7E´WfÇVF–öä7&—FW&–öä–åÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢fÆö÷'3¢Æ—7E´WfÇVF–öäfÆö÷$–åÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢VæÖV7W&VC¢Æ—7E´WfÇVF–öåVæÖV7W&VD–åÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ72WfÇVF–öåöÆ–7”÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢öÆ–7•ö¶W“¢7G ¢ÆWfVÃ¢WföÇWF–öäWfÇVF–öäÆWfVÀ¢fW'6–öåöçVÖ&W#¢–ç@¢F—FÆS¢7G ¢7V&¦V7E÷&Vc¢7G ¢7&—FW&–¢Æ—7E´F–7E·7G"Âç•ÕÐ¢fÆö÷'3¢Æ—7E´F–7E·7G"Âç•ÕÐ¢VæÖV7W&VC¢Æ—7E´F–7E·7G"Âç•ÕÐ¢FV6—6–öåöÖWF†öC¢7G ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@  ¦6Æ72WfÇVF–öåöÆ–6–W4÷WB„&6TÖöFVÂ“ ¢""$w&÷WVB'’ÆWfVÂÂæWfW"ÖW&vVB–çFòöæRÆ—7BÒÒF†RE"Ór6W&F–öà¢ÖFR7G'V7GW&Â&F†W"F†âöæÇ’Fö7VÖVçFVBâ""  ¢æöFS¢Æ—7E´WfÇVF–öåöÆ–7”÷WEÐ¢fÆ÷uö6&–Æ—G“¢Æ—7E´WfÇVF–öåöÆ–7”÷WEÐ¢W…ö÷WF6öÖS¢Æ—7E´WfÇVF–öåöÆ–7”÷WEÐ  ¦6Æ72æöFTÆ–æVvU&VÆF–öä÷WB„&6TÖöFVÂ“ ¢""$öæRFW6–vâ&VÆF–öâà ¢&VÆF–öå÷7FGW6‡v2F†—2&VÆF–öâ&÷÷6VB'’’÷"6öæf—&ÖVB'’F†P¢FWfVÆ÷W"’ÂVÆVÖVçE÷7FFV†—2F†RF&vWB—G6VÆb6öæf—&ÖVB’æ@¢F&vWE÷&W6öÇWF–öæ†FöW2F†RF&vWBW†—7B–â—G2÷vâ6æöæ–6Â6÷W&6R¢&RF‡&VR–æFWVæFVçB†W2â6öæf—&ÖVB&VÆF–öâFòâVæ6öæf—&ÖV@¢VÆVÖVçB—2&VÂæB6öÖÖöâ7FFRÂæB6ò—26öæf—&ÖVB&VÆF–öâFò¢&VbF†B&W6öÇfW2Fòæ÷F†–æs²6öÆÆ6–ærç’GvòöbF†VÒv÷VÆB†–FRöæRà ¢F&vWE÷6÷W&6VæÖW2t„”4‚6æöæ–6Â6÷W&6RFV6–FVBF†R&W6öÇWF–öâÒÐ¢F†RW'÷6Rg&ÖRf÷"W'÷6UöVÆVÖVçFÂF†R33"6&–Æ—G’w&‚f÷ ¢6&–Æ—G–ÂF†R7—7FVÒw2ö'6W'fVBfÆ÷r–G2f÷"fÆ÷vÂF†RfVGW&RÖ ¢f÷"fVGW&VâF†Rf–æ—FRfö6'VÆ&–W2Æ—fR–âöæöFUöFW6–vâç– ¢†D$tUEõ$U4ôÅUD”ôå6òD$tUEõ4õU$4U6òÄ”äTtUôTÄTÔTåEõ5DDU6’â""  ¢Æ–æµö–C¢–ç@¢Æ–æµö¶–æC¢7G ¢F&vWE÷&Vc¢7G ¢F&vWEöæÖS¢÷F–öæÅ·7G%ÒÒæöæP¢&VÆF–öå÷7FGW3¢÷F–öæÅ·7G%ÒÒæöæP¢&VÆF–öåöFV6—6–öåöÖWF†öC¢7G ¢VÆVÖVçE÷7FFS¢7G ¢F&vWE÷&W6öÇWF–öã¢7G"Ò'Vç&W6öÇfVB ¢F&vWE÷6÷W&6S¢÷F–öæÅ·7G%ÒÒæöæP¢æ÷FS¢7G ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@  ¦6Æ72æöFTÆ–æVvT÷WB„&6TÖöFVÂ“ ¢7—7FVÕö–C¢–ç@¢æöFUö–C¢–ç@¢æöFUö¶W“¢7G ¢ÖGW&—G“¢7G ¢&VÆF–öç3¢Æ—7E´æöFTÆ–æVvU&VÆF–öä÷WEÐ¢6öæf—&ÖVE÷&VÆF–öåö6÷VçC¢–ç@¢&÷÷6VE÷&VÆF–öåö6÷VçC¢–ç@¢W'÷6Uög&ÖU÷7WÆ–VC¢&ööÀ  ¦6Æ72æöFTFW6–vä†æFöfd7&VFT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æöFUö–G3¢Æ—7E¶–çEÐ¢WfÇVF–öå÷öÆ–7•ö–G3¢Æ—7E¶–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢FF6WE÷&Vg3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&ö&U÷Æåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢W7F&Æ—6†ÖVçEö7&—FW&–öG&gC¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&V÷Våö7&—FW&–öG&gC¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢W‡Æ÷&F–öåö'&–Vc¢7G"Ò"   ¦6Æ72æöFTFW6–vä†æFöfd÷WB„&6TÖöFVÂ“ ¢""%&VfW&Væ6W2&R&W6öÇfVBB$TBF–ÖRÂ6òæöFRFVÆWFVB÷"öÆ–7¢7WW'6VFVBgFW"76VÖ&Ç’6†÷w2W2—B7GVÆÇ’—2æ÷râ""  ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢6W76–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢æöFW3¢Æ—7E´F–7E·7G"Âç•ÕÐ¢WfÇVF–öå÷öÆ–6–W3¢Æ—7E´F–7E·7G"Âç•ÕÐ¢FF6WE÷&Vg3¢Æ—7E·7G%Ð¢&ö&U÷Æåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢W7F&Æ—6†ÖVçEö7&—FW&–öG&gC¢Æ—7E·7G%Ð¢&V÷Våö7&—FW&–öG&gC¢Æ—7E·7G%Ð¢W‡Æ÷&F–öåö'&–Vc¢7G ¢76VÖ&Ç•÷7FFS¢Æ—FW&Å²&6ö×ÆWFR"Â&–æ6ö×ÆWFR%Ð¢Ö—76–æu÷&Vg3¢Æ—7E·7G%Ð¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@  ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2W‡Æ÷&F–öâv÷&¶&Væ6‚„W–233“B†6R2Â—77VR33“‚¢0¢2æ÷FRv†B—2'6VçBÂFVÆ–&W&FVÇ“¢æò6÷W&6RÂF6‚Â÷"6öÖÖæBf–VÆBöâç¢2f&–çBÖöFVÂâf&–çB&VfW&Væ6W2â–×ÆVÖVçFF–öâæBF†RW†—7F–ær'Và¢2F†BW†V7WFVB—Bâ66WF–ærW†V7WF&ÆR6öçFVçBBF†—2&÷VæF'’v÷VÆBÆWB¢26ÆÆW"'Vâ6öFR÷WG6–FRF†R–ææVB×6æ6†÷BÂæWGv÷&²Ööfb6æF&÷‚F†B&WÆ¢2æBW‡W&–ÖVçG2Væf÷&6R…&–æ6—ÆR‚’à¢0¢2Ç6ò'6VçC¢ç’66÷&RÂvV–v‡BÂ÷"F÷FÂâ33“‚f÷&&–G26ö×÷6—F–ærVÆ—G’ð¢2ÆFVæ7’ò6÷7Bò6fWG’ÂæBF†R&VÆ–&ÆRVæf÷&6VÖVçB—2Fòv—fRF†P¢26öÖ&–æVBçVÖ&W"æ÷v†W&RFòÆ—fRÒÒ–âF†R66†VÖ2vVÆÂ2–âF†RF&ÆRà¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¤W‡Æ÷&F–öäF–ÖVç6–öâÒÆ—FW&Å°¢&÷WGWE÷VÆ—G’"Â&W'&÷%÷&FR"Â&ÆFVæ7’"Â&6÷7B"Â'&W6÷W&6R"Â'6fWG’"Â&6÷fW&vR ¥Ð¤W‡Æ÷&F–öåfÇVU7FFRÒÆ—FW&Å°¢&ÖV7W&VB"Â&æ÷EöÆ–6&ÆR"Â&æ÷EöÖV7W&VB"Â'Vç7W÷'FVB ¥Ð¤W‡Æ÷&F–öäW†V7WF–öå7FFRÒÆ—FW&Å°¢&æ÷EöW†V7WFVB"Â&W†V7WFVB"Â&æ÷EöW†V7WF&ÆR"Â'Vç7W÷'FVB ¥Ð¤W‡Æ÷&F–öå&Vd¶–æBÒÆ—FW&Å²'&WÆ•÷'Vâ"Â'&WÆ•÷f&–çB"Â&W‡W&–ÖVçB%Ð¤W‡Æ÷&F–öävVæW&F÷"ÒÆ—FW&Å²&ÖçVÂ"Â'&V6öæ–æuöÆÆÒ"Â&W†—7F–æuö–×ÆVÖVçFF–öâ%Ð¤W‡Æ÷&F–öäFF6WD¶–æBÒÆ—FW&Å²'&WÆ•÷6WB"Â&vöÆFVå÷6WB"Â&VFvUö66W2"Â&Ö—†VB%Ð¤W‡Æ÷&F–öåfW&F–7BÒÆ—FW&Å°¢&&WGFW""Â'v÷'6R"Â&WVÂ"Â&–æ6ö×&&ÆR"Â&6÷fW&vUöÖ—6ÖF6‚ ¥Ð  ¦6Æ72W‡Æ÷&F–öå'Vä7&VFT–â„&6TÖöFVÂ“ ¢""$WfW'—F†–ær†VÆB4ôå5DåB7&÷72F†R'Vâw2f&–çG2Æ—fW2†W&RÂ6òGvð¢f&–çG26ææ÷B†fR&VVâÖV7W&VBv–ç7BF–ffW&VçBFF6WG2v†–ÆR7F–ÆÀ¢Æöö¶–ærÆ–¶R6ö×&—6öââ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æöFUö–C¢–ç@¢æöFU÷fW'6–öåö–C¢–ç@¢ö&¦V7F—fS¢7G"Ò" ¢FF6WEö¶–æC¢W‡Æ÷&F–öäFF6WD¶–æBÒ'&WÆ•÷6WB ¢FF6WE÷&Vc¢7G"Ò" ¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6öÖÖ—E÷6†¢7G"Ò" ¢Vçf—&öæÖVçE÷&Vc¢7G"Ò" ¢WfÇVF–öå÷öÆ–7•ö–G3¢Æ—7E¶–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢†æFöfeö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72W‡Æ÷&F–öåf&–çD7&VFT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢f&–çEö¶W“¢7G ¢ÖöFÆ—G“¢WföÇWF–öä–×ÆVÖVçFF–öäÖöFÆ—G¢Æ&VÃ¢7G"Ò" ¢—5ö&6VÆ–æS¢&ööÂÒfÇ6P¢–×ÆVÖVçFF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6öæf–s¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢&÷fVææ6S¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢vVæW&F÷#¢W‡Æ÷&F–öävVæW&F÷"Ò&ÖçVÂ ¢Æ–6&–Æ—G•öVçfVÆ÷S¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B  ¦6Æ72W‡Æ÷&F–öäW†V7WF–öä–â„&6TÖöFVÂ“ ¢""&æ÷EöW†V7WF&ÆVæBVç7W÷'FVF&Rf—'7BÖ6Æ72÷WF6öÖW2†W&RÂæ÷@¢f–ÇW&W3¢'VÆRf&–çBF†B6ææ÷BW‡&W7266R†2æ÷BÆ÷7Böâ—Bâ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢W†V7WF–öå÷7FFS¢W‡Æ÷&F–öäW†V7WF–öå7FFP¢W†V7WF–öå÷&Veö¶–æC¢÷F–öæÅ´W‡Æ÷&F–öå&Vd¶–æEÒÒæöæP¢W†V7WF–öå÷&Veö–C¢÷F–öæÅ¶–çEÒÒæöæP¢æ÷FS¢7G"Ò"   ¦6Æ72W‡Æ÷&F–öäÖV7W&VÖVçD–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢F–ÖVç6–öã¢W‡Æ÷&F–öäF–ÖVç6–öà¢ÖWG&–5öæÖS¢7G"Ò" ¢fÇVU÷7FFS¢W‡Æ÷&F–öåfÇVU7FFRÒ&ÖV7W&VB ¢çVÖW&–5÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢Væ—C¢7G"Ò" ¢6÷fW&VEö66Uö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP¢F÷FÅö66Uö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP¢6÷W&6S¢Æ—FW&Å²&FWFW&Ö–æ—7F–2"Â'&V6öæ–æuöÆÆÒ"Â&ÖçVÂ%ÒÒ&FWFW&Ö–æ—7F–2 ¢æ÷FS¢7G"Ò"   ¦6Æ72W‡Æ÷&F–öäÖV7W&VÖVçD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢F–ÖVç6–öã¢W‡Æ÷&F–öäF–ÖVç6–öà¢ÖWG&–5öæÖS¢7G ¢fÇVU÷7FFS¢W‡Æ÷&F–öåfÇVU7FFP¢çVÖW&–5÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢Væ—C¢7G ¢6÷fW&VEö66Uö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP¢F÷FÅö66Uö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP¢6÷W&6S¢7G ¢æ÷FS¢7G   ¦6Æ72W‡Æ÷&F–öåf&–çD÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢f&–çEö¶W“¢7G ¢Æ&VÃ¢7G ¢—5ö&6VÆ–æS¢&ööÀ¢ÖöFÆ—G“¢WföÇWF–öä–×ÆVÖVçFF–öäÖöFÆ—G¢–×ÆVÖVçFF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6öæf–s¢F–7E·7G"Âç•Ð¢&÷fVææ6S¢F–7E·7G"Âç•Ð¢vVæW&F÷#¢W‡Æ÷&F–öävVæW&F÷ ¢Æ–6&–Æ—G•öVçfVÆ÷S¢F–7E·7G"Âç•Ð¢W†V7WF–öå÷7FFS¢W‡Æ÷&F–öäW†V7WF–öå7FFP¢W†V7WF–öå÷&Veö¶–æC¢÷F–öæÅ´W‡Æ÷&F–öå&Vd¶–æEÒÒæöæP¢W†V7WF–öå÷&Veö–C¢÷F–öæÅ¶–çEÒÒæöæP¢W†V7WF–öåöæ÷FS¢7G ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢ÖV7W&VÖVçG3¢Æ—7E´W‡Æ÷&F–öäÖV7W&VÖVçD÷WEÐ  ¦6Æ72W‡Æ÷&F–öä6ö×&—6öä÷WB„&6TÖöFVÂ“ ¢""$öæRF–ÖVç6–öâöböæRf&–çBv–ç7BF†R&6VÆ–æRà ¢–æ6ö×&&ÆVæB6÷fW&vUöÖ—6ÖF6†&RfW&F–7G2Âæ÷BW'&÷'2âF†W’&P¢v†B7F÷2'F†—2f&–çB†2æòFö¶Vâ6÷7B"g&öÒF—7Æ––ær–FVçF–6ÆÇ’Fð¢'F†—2f&–çBw2Fö¶Vâ6÷7B—2¦W&ò"â""  ¢F–ÖVç6–öã¢W‡Æ÷&F–öäF–ÖVç6–öà¢ÖWG&–5öæÖS¢7G ¢fW&F–7C¢W‡Æ÷&F–öåfW&F–7@¢&6VÆ–æU÷7FFS¢W‡Æ÷&F–öåfÇVU7FFP¢f&–çE÷7FFS¢W‡Æ÷&F–öåfÇVU7FFP¢&6VÆ–æU÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢f&–çE÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢FVÇF¢÷F–öæÅ¶fÆöEÒÒæöæP¢&6VÆ–æUö6÷fW&vS¢÷F–öæÅ´Æ—7E¶–çEÕÒÒæöæP¢f&–çEö6÷fW&vS¢÷F–öæÅ´Æ—7E¶–çEÕÒÒæöæP¢&V6öã¢7G   ¦6Æ72W‡Æ÷&F–öå'Vä÷WB„&6TÖöFVÂ“ ¢""%F†Rv†öÆR6ö×&—6öââ6'&–W2æò&æ¶–æræBæò÷fW&ÆÂfW&F–7BÒÐ¢v†–6‚F–ÖVç6–öâÖGFW'2—2F†RFWfVÆ÷W"w2§VFvVÖVçBÂæB@¢W7F&Æ—6†ÖVçBF–ÖR—B—233“’w2vFRÂæ÷BF†—2&ö¦V7F–öâw2â""  ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢æöFUö–C¢–ç@¢æöFU÷fW'6–öåö–C¢–ç@¢†æFöfeö–C¢÷F–öæÅ¶–çEÒÒæöæP¢ö&¦V7F—fS¢7G ¢FF6WEö¶–æC¢W‡Æ÷&F–öäFF6WD¶–æ@¢FF6WE÷&Vc¢7G ¢6æ6†÷Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6öÖÖ—E÷6†¢7G ¢Vçf—&öæÖVçE÷&Vc¢7G ¢WfÇVF–öå÷öÆ–7•ö–G3¢Æ—7E¶–çEÐ¢7FGW3¢Æ—FW&Å²&÷Vâ"Â&6ö×ÆWFVB"Â&&æFöæVB%Ð¢6öæ6ÇW6–öåöæ÷FS¢7G ¢&6VÆ–æU÷f&–çEö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6ö×&&ÆS¢&ööÀ¢f&–çG3¢Æ—7E´W‡Æ÷&F–öåf&–çD÷WEÐ¢6ö×&—6öç3¢F–7E·7G"ÂÆ—7E´W‡Æ÷&F–öä6ö×&—6öä÷WEÕÐ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢6ö×ÆWFVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ72W‡Æ÷&F–öå'Vä6ö×ÆWFT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6öæ6ÇW6–öåöæ÷FS¢7G"Ò"   ¦6Æ72W‡Æ÷&F–öå&æ¶–ætVçG'”÷WB„&6TÖöFVÂ“ ¢f&–çEö–C¢–ç@¢f&–çEö¶W“¢7G ¢ÖöFÆ—G“¢WföÇWF–öä–×ÆVÖVçFF–öäÖöFÆ—G¢fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢fÇVU÷7FFS¢W‡Æ÷&F–öåfÇVU7FFP¢2v‡’âVç&æ¶VBf&–çB—2Vç&æ¶VB†F–ffW&VçBÖWG&–5öæÖRÂF–ffW&Vç@¢26÷fW&vRÂæ÷F†–ærÖV7W&VB’âG&÷–ærF†—2v÷VÆBÆVfRF†R&VFW"v—F€¢2&&RW†6ÇW6–öâF†W’6ææ÷BVF—Bà¢&V6öã¢7G"Ò"   ¦6Æ72W‡Æ÷&F–öå&æ¶–æt÷WB„&6TÖöFVÂ“ ¢""%&æ¶VB'’ôäRæÖVBF–ÖVç6–öââF†W&R—2æò÷fW&ÆÂ&æ¶–ærVæGö–çC ¢6ÆÆW"F†BvçG2â÷&FW"×W7B6’v†B—B—2÷&FW&–ær'’Â6òÆFVæ7¢&æ¶–ær6âæWfW"&R&W6VçFVB2'F†R&W7Bf&–çB"à ¢Vç&æ¶VF—26W&FRw&÷W&F†W"F†âF†RF–Âöb&æ¶VFÒÐ¢6÷'F–ærâVæÖV7W&VBf&–çBÆ7Bv÷VÆB&VB2'v÷'7B"â""  ¢F–ÖVç6–öã¢W‡Æ÷&F–öäF–ÖVç6–öà¢2F†R6–ævÆRÖWG&–2F†—2&æ¶–ærv26ö×WFVB÷fW"ÒÒ&VF–æw2VæFW"¢2F–ffW&VçBÖWG&–5öæÖR&R–âVç&æ¶VFÂæWfW"6–ÆVçFÇ’Ö—†VB–âà¢ÖWG&–5öæÖS¢7G"Ò" ¢&æ¶VC¢Æ—7E´W‡Æ÷&F–öå&æ¶–ætVçG'”÷WEÐ¢Vç&æ¶VC¢Æ—7E´W‡Æ÷&F–öå&æ¶–ætVçG'”÷WEÐ  ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢27F&–Æ—¦F–öâWf–FVæ6R6¶vR„W–233“B†6RBÂ—77VR33“’¢0¢2&÷fVEö'–—2æWfW"&WVW7Bf–VÆC¢W7F&Æ—6†ÖVçB—2æÖVB‡VÖâw0¢2FV6—6–öâÂF¶Vâg&öÒF†RWF†VçF–6FVB&–æ6—ÂBF†R&÷WFR‚333rw0¢2&÷fVææ6R'VÆR’âæB2–â†6R2ÂF†W&R—2æò66÷&Rç—v†W&RÒÒWfW'¢27&—FW&–öâæBfÆö÷"—2§VFvVB–æF—f–GVÆÇ’„E"Ór’à¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¥7F&–Æ—¦F–öäWf–FVæ6TÆWfVÂÒÆ—FW&Å²&æöFR"Â&fÆ÷uö6&–Æ—G’"Â'W…ö÷WF6öÖR%Ð¥7F&–Æ—¦F–öäWf–FVæ6T¶–æBÒÆ—FW&Å°¢&7&—FW&–öâ"Â&fÆö÷""Â&F÷vç7G&VÕö–×7B"Â&÷WF6öÖR"Â'7F&–Æ—G’ ¥Ð¥7F&–Æ—¦F–öåfW&F–7BÒÆ—FW&Å°¢&ÖWB"Â&æ÷EöÖWB"Â&†VÆB"Â'f–öÆFVB"Â'VæÖV7W&VB"Â&æ÷EöÆ–6&ÆR ¥Ð¥7F&–Æ—¦F–öå&Vd¶–æBÒÆ—FW&Å°¢&W‡Æ÷&F–öå÷'Vâ"Â&W‡Æ÷&F–öå÷f&–çB"Â'&WÆ•÷'Vâ"Â&W‡W&–ÖVçB"À¢&WfÇVF–öå÷öÆ–7’"À¥Ð¥7F&–Æ—¦F–öå7FGW2ÒÆ—FW&Å°¢&G&gB"Â'VæFW%÷&Wf–Wr"Â&&÷fVB"Â'&V¦V7FVB"Â'7WW'6VFVB ¥Ð¥7F&–Æ—¦F–öå&VçE&Wf–WtF—7÷6—F–öâÒÆ—FW&Å²&VæF÷'6VB"Â&FV6Æ–æVB%Ð  ¦6Æ727F&–Æ—¦F–öå6¶vT7&VFT–â„&6TÖöFVÂ“ ¢""%F†RæöFRfW'6–öâÂ&6VÆ–æRæB&öÆÆ&6²F&vWB&RFVÆ–&W&FVÇ’äõ@¢66WFVB†W&RÒÒF†W’&R&VBg&öÒF†RæöFRw2÷vâ7W'&VçB7FFRÂ&V6W6P¢ÆWGF–ær6ÆÆW"76W'BF†VÒv÷VÆBÆWB6¶vR6Æ–Ò&öÆÆ&6²F&vW@¢F†RæöFRFöW2æ÷B†fRâ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æöFUö–C¢–ç@¢6æF–FFUö–×ÆVÖVçFF–öåö–C¢–ç@¢W‡Æ÷&F–öå÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢Æ–6&–Æ—G•öVçfVÆ÷S¢F–7E·7G"Âç•ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢¶æ÷våöÆ–Ö—FF–öç3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&W6–GVÅ÷&—6·3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&WV—&VEö66Uö6÷VçC¢–çBÒ ¢7F&–Æ—G•÷v–æF÷u÷6V6öæG3¢fÆöBÒã ¢ö'6W'fVEö66Uö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP¢ö'6W'fVE÷v–æF÷u÷6V6öæG3¢÷F–öæÅ¶fÆöEÒÒæöæP¢÷WF6öÖU÷VæÖV7W&VE÷&V6öã¢7G"Ò" ¢&öÆÆ&6µ÷Æã¢7G"Ò"   ¦6Æ727F&–Æ—¦F–öäWf–FVæ6T–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢Wf–FVæ6UöÆWfVÃ¢7F&–Æ—¦F–öäWf–FVæ6TÆWfVÀ¢Wf–FVæ6Uö¶–æC¢7F&–Æ—¦F–öäWf–FVæ6T¶–æ@¢æÖS¢7G ¢fW&F–7C¢7F&–Æ—¦F–öåfW&F–7@¢&Veö¶–æC¢÷F–öæÅµ7F&–Æ—¦F–öå&Vd¶–æEÒÒæöæP¢&Veö–C¢÷F–öæÅ¶–çEÒÒæöæP¢WfÇVF–öå÷öÆ–7•ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢FWF–Ã¢7G"Ò" ¢—5öÖö6³¢&ööÂÒfÇ6P¢6÷W&6S¢Æ—FW&Å²&FWFW&Ö–æ—7F–2"Â'&V6öæ–æuöÆÆÒ"Â&ÖçVÂ%ÒÒ&FWFW&Ö–æ—7F–2   ¦6Æ727F&–Æ—¦F–öäWf–FVæ6T÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢Wf–FVæ6Uö¶–æC¢7F&–Æ—¦F–öäWf–FVæ6T¶–æ@¢æÖS¢7G ¢fW&F–7C¢7F&–Æ—¦F–öåfW&F–7@¢&Veö¶–æC¢÷F–öæÅµ7F&–Æ—¦F–öå&Vd¶–æEÒÒæöæP¢&Veö–C¢÷F–öæÅ¶–çEÒÒæöæP¢WfÇVF–öå÷öÆ–7•ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢FWF–Ã¢7G ¢—5öÖö6³¢&ööÀ¢6÷W&6S¢7G   ¦6Æ727F&–Æ—¦F–öävFT÷WB„&6TÖöFVÂ“ ¢""%&V6ö×WFVBöâWfW'’&VBÂæWfW"7F÷&VC¢7F÷&VBfW&F–7BG&–gG2g&öÐ¢F†RWf–FVæ6R—BFW67&–&W2â""  ¢ÆÆ÷vVC¢&ööÀ¢&V6öåö6öFS¢7G ¢ÖW76vS¢7G ¢f–Æ–æuöWf–FVæ6S¢Æ—7E·7G%Ð  ¦6Æ727F&–Æ—¦F–öå6¶vT÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢æöFUö–C¢–ç@¢æöFU÷fW'6–öåö–C¢–ç@¢6æF–FFUö–×ÆVÖVçFF–öåö–C¢–ç@¢&6VÆ–æUö–×ÆVÖVçFF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&öÆÆ&6µö–×ÆVÖVçFF–öåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&öÆÆ&6µ÷Æã¢7G ¢W‡Æ÷&F–öå÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢Æ–6&–Æ—G•öVçfVÆ÷S¢F–7E·7G"Âç•Ð¢¶æ÷våöÆ–Ö—FF–öç3¢Æ—7E·7G%Ð¢&W6–GVÅ÷&—6·3¢Æ—7E·7G%Ð¢&WV—&VEö66Uö6÷VçC¢–ç@¢ö'6W'fVEö66Uö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP¢7F&–Æ—G•÷v–æF÷u÷6V6öæG3¢fÆö@¢ö'6W'fVE÷v–æF÷u÷6V6öæG3¢÷F–öæÅ¶fÆöEÒÒæöæP¢÷WF6öÖU÷VæÖV7W&VE÷&V6öã¢7G ¢7FGW3¢7F&–Æ—¦F–öå7FGW0¢2v†–6‚6¶vRFòW7F&Æ—6‚g&öÒ–ç7FVBÂv†Vâ7FGW3Òw7WW'6VFVBrà¢7WW'6VFVEö'•ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢2F†R&VçB&Wf–WræBF†R‡VÖâ&÷fÂ&RGvò6W&FR&V6÷&G2v—F€¢2F†V—"÷vâv†ò÷v†Vâ‚33B’âåTÄÂF—7÷6—F–öâÖVç2æò&VçB†0¢2&Wf–WvVBF†R6¶vR–WBÒÒæWfW"F†BF†W’†Bæ÷F†–ærFò6’à¢&VçE÷&Wf–WvVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢&VçE÷&Wf–WvVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢&VçE÷&Wf–WuöF—7÷6—F–öã¢÷F–öæÅµ7F&–Æ—¦F–öå&VçE&Wf–WtF—7÷6—F–öåÒÒæöæP¢&VçE÷&Wf–Wuöæ÷FS¢7G"Ò" ¢&÷fVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢&÷fVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢FV6—6–öåöæ÷FS¢7G ¢2w&÷WVB'’ÆWfVÂÂæWfW"ÖW&vVC¢æöFRÖÆWfVÂv–â—2æ÷BWf–FVæ6RF†@¢2F†RfÆ÷r—B6—G2–â–×&÷fVB„E"Ór’à¢Wf–FVæ6S¢F–7E·7G"ÂÆ—7Eµ7F&–Æ—¦F–öäWf–FVæ6T÷WEÕÐ¢vFS¢7F&–Æ—¦F–öävFT÷W@¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@  ¦6Æ727F&–Æ—¦F–öäFV6—6–öä–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æ÷FS¢7G"Ò"   ¦6Æ727F&–Æ—¦F–öå&VçE&Wf–Wt–â„&6TÖöFVÂ“ ¢""%F†R&VçBw2÷vâ&V6÷&BÂF—7F–æ7Bg&öÒF†R‡VÖâ&÷fÂ‚33B’à ¢F†RF—7÷6—F–öâæBF†Ræ÷FR&RF†R6ÆÆW"w276W'F–öç3²t„ò&Wf–WvV@¢6öÖW2g&öÒF†RWF†VçF–6FVB&–æ6—ÂÂæWfW"F†R&öG’‚333r’âF†W&R—0¢FVÆ–&W&FVÇ’æòv’Fòv—F†G&r÷"÷fW'w&—FRöæS¢6†ævVBÖ–æ@¢7WW'6VFW2F†R6¶vRÂ6ò&÷F‚§VFvVÖVçG27F’&VF&ÆRâ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢F—7÷6—F–öã¢7F&–Æ—¦F–öå&VçE&Wf–WtF—7÷6—F–öà¢æ÷FS¢7G"Ò"   ¦6Æ727F&–Æ—¦F–öå7WW'6VFT–â„&6TÖöFVÂ“ ¢""%F†R7V66W76÷"6¶vR–B—2F†RöæR76W'F–öâF†R6ÆÆW"Ö¶W3²v†ð¢FV6–FVB6öÖW2g&öÒF†RWF†VçF–6FVB&–æ6—ÂÂæWfW"F†R&öG’‚333r’â""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢7V66W76÷%÷6¶vUö–C¢–ç@¢æ÷FS¢7G"Ò"   ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2÷W&F–öç3¢Ööæ—F÷&–ærÂG&–gBæBÆö6Â&V÷Và¢2„W–233“B†6RRÂ—77VR3C¢0¢2F†Rf–æ—FRfö6'VÆ&–W2&RÖ—'&÷&VBg&öÒöæöFUö÷W&F–öç2ç–Âv†–6€¢2÷vç2F†VÒÂf÷"F†R6ÖR&V6öâF†R†6RÆ–6W2&÷fR&S¢f7D’F†Và¢2WG2&VÂVçVÒ–âF†R÷Vä’66†VÖ–ç7FVBöb&&R7G&–ærÂ6ò¢2F6†&ö&BVæ–öâ6ææ÷B6–ÆVçFÇ’G&–gBg&öÒF†R6W'fW"âö6†V6µöÖVÖ&W'6†— ¢2–âF†RFöÖ–âÆ–W"7F—2F†RWF†÷&—G“²FW7EöæöFUö÷W&F–öç5ö’ç– ¢276W'G2F†RGvòFVf–æ—F–öç2†fRæ÷BF—fW&vVBà¢0¢2E"ÓRw26W&F–öâ—2f—6–&ÆR–âæöFT÷W&F–öç5&ö¦V7F–öä÷WF¢ÖGW&—G– ¢2æBö'6W'fF–öæ&RGvò–æFWVæFVçB&VF–æw2æB&RæWfW"ÖW&vVB–çFòöæP¢2Æ&VÂââW7F&Æ—6†VFæöFRv†÷6RFVÆVÖWG'’7F÷VB&VG22W†7FÇ’F†Bà¢0¢2&÷fVEö'–—2æWfW"&WVW7Bf–VÆBâ&÷f–ær&V÷Vâ—2æÖV@¢2‡VÖâw2FV6—6–öâæBF†RæÖR6öÖW2g&öÒF†RWF†VçF–6FVB&–æ6—ÂBF†P¢2&÷WFR‚333rw2&÷fVææ6R'VÆRÂE"Ó’’à¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¤÷W&F–öç4–æF–6F÷$¶–æBÒÆ—FW&Å°¢&–çWEöF—7G&–'WF–öâ"Â&÷WGWE÷VÆ—G’"Â&W'&÷%÷&FR"Â&ÆFVæ7’"Â&6÷7B"À¢&fÆ÷u÷7V66W72"Â&÷WF6öÖR"Â&‡VÖåö6÷'&V7F–öâ"Â&6ö×F–&–Æ—G’"À¥Ð¤÷W&F–öç4ö'6W'fF–öå7FFRÒÆ—FW&Å°¢'v—F†–åö'VFvWB"Â&G&–gEöFWFV7FVB"Â&–ç7Vff–6–VçE÷6×ÆR"Â'Væö'6W'fVB ¥Ð¤÷W&F–öç4æöÖÇ”6Æ76–f–6F–öâÒÆ—FW&Å°¢&–×ÆVÖVçFF–öåöFVfV7B"À¢&–çWEö÷%öVçf—&öæÖVçEöG&–gB"À¢'W7G&VÕöF÷vç7G&VÕöÖ—6ÖF6‚"À¢&WfÇVF–öåöv"À¢&æWu÷W6Uö66U÷6–væÂ"À¢'W'÷6Uö÷%÷f—6–öå÷&V6öç6–FW&F–öâ"À¢'Væ¶æ÷vâ"À¥Ð¤÷W&F–öç4æöÖÇ•6WfW&—G’ÒÆ—FW&Å²&&Æö6¶–ær"Â&GFVçF–öâ"Â&–æf÷&ÖF–öæÂ%Ð¤÷W&F–öç5&V÷Vå7FGW2ÒÆ—FW&Å²'&÷÷6VB"Â&&÷fVB"Â'&V¦V7FVB"Â&6ö×ÆWFVB%Ð¤÷W&F–öç4æ÷F–f–6F–öä¶–æBÒÆ—FW&Å°¢&æöÖÇ•öFWFV7FVB"Â'&V÷Våö&÷fVB"Â&†æFöfe÷&VG’"Â&†æFöfeö&Æö6¶VB ¥Ð¤÷W&F–öç4†æFöfe7FvRÒÆ—FW&Å°¢&v—F–æu÷&WÆ’"Â&v—F–æuööffÆ–æU÷6†F÷r"À¢&v—F–æuöÆ—fU÷6†F÷uö&÷fÂ"Â'&VG’"À¥Ð¤÷W&F–öç4†æFöfdWf–FVæ6T¶–æBÒÆ—FW&Å°¢'&WÆ•÷'Vâ"Â&öffÆ–æU÷6†F÷u÷&W7VÇB"Â&Æ—fU÷6†F÷uö&÷fÂ ¥Ð  ¦6Æ72æöFTÖöæ—F÷&–æt–æF–6F÷$–â„&6TÖöFVÂ“ ¢""$öæR–æF–6F÷"F†—26öçG&7BvF6†W2à ¢öæÇ’¶–æF—2FöÖ–â×fÆ–FFVBf–æ—FRfÇVS²F†R&W7BFW67&–&W2F†P¢&VF–ær–âF†R6öçG&7BWF†÷"w2÷vâFW&×2âF‡&W6†öÆG2Æ—fRW"6öçG&7BÀ¢æWfW"2vÆö&Â6öç7FçBÒÒçVÖ&W"–çfVçFVB6VçG&ÆÇ’v÷VÆB&RÆ–V@¢FòæöFW2æö&öG’Æöö¶VBBà¢""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢¶–æC¢÷W&F–öç4–æF–6F÷$¶–æ@¢æÖS¢7G"Ò" ¢&VfW&Væ6U÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢F‡&W6†öÆC¢÷F–öæÅ¶fÆöEÒÒæöæP¢æ÷FS¢7G"Ò"   ¦6Æ72æöFTÖöæ—F÷&–æt6öçG&7D7&VFT–â„&6TÖöFVÂ“ ¢""&æöFUö–F6öÖW2g&öÒF†RF‚æB7&VFVEö'–g&öÒF†R&–æ6—Ââ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢ö'6W'fVEöVçf—&öæÖVçE÷&Vc¢7G"Ò" ¢FWÆ÷–VEö6öÖÖ—E÷6†¢7G"Ò" ¢6×Æ–æuöæ÷FS¢7G"Ò" ¢2†÷rÆöærö'6W'fF–öâÖ’&R6–ÆVçB&Vf÷&RF†RæöFR&VG22Væö'6W'fVF ¢2&F†W"F†â†VÇF‡’â6–ÆVæ6R—2æWfW"G&VFVB2†VÇF‚à¢g&W6†æW75ö'VFvWE÷6V6öæG3¢fÆöBÒã ¢Ö–æ–×VÕ÷6×ÆUö6÷VçC¢–çBÒ ¢–æF–6F÷'3¢Æ—7E´æöFTÖöæ—F÷&–æt–æF–6F÷$–åÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢&V÷Våö6öæF—F–öç3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢W66ÆF–öåö÷væW#¢7G"Ò"   ¦6Æ72æöFTÖöæ—F÷&–æt6öçG&7D÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢æöFUö–C¢–ç@¢fW'6–öåöçVÖ&W#¢–ç@¢ö'6W'fVEöVçf—&öæÖVçE÷&Vc¢7G ¢FWÆ÷–VEö6öÖÖ—E÷6†¢7G ¢6×Æ–æuöæ÷FS¢7G ¢g&W6†æW75ö'VFvWE÷6V6öæG3¢fÆö@¢Ö–æ–×VÕ÷6×ÆUö6÷VçC¢–ç@¢–æF–6F÷'3¢Æ—7E´F–7E·7G"Âç•ÕÐ¢&V÷Våö6öæF—F–öç3¢Æ—7E·7G%Ð¢W66ÆF–öåö÷væW#¢7G ¢7F—fS¢&ööÀ¢FV6—6–öåöÖWF†öC¢7G ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢2v†–6‚6öçG&7B&WÆ6VBF†—2öæS²åTÄÂÖVç2F†—2—2F†R7W'&VçBfW'6–öâà¢7WW'6VFVEö'•ö–C¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72æöFTG&–gDö'6W'fF–öä–â„&6TÖöFVÂ“ ¢""$ôäRFWFW&Ö–æ—7F–2&VF–ærâæò–çFW'&WFF–öâ&VÆöæw2†W&RÒÒF†B—2à¢æöÖÇ’ÂæBF†RGvò&R6W&FR&V6÷&G2öâW'÷6Râ""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢–æF–6F÷#¢7G ¢–æF–6F÷%ö¶–æC¢÷W&F–öç4–æF–6F÷$¶–æ@¢ö'6W'fF–öå÷7FFS¢÷W&F–öç4ö'6W'fF–öå7FFP¢ö'6W'fVE÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢&VfW&Væ6U÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢6×ÆUö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP¢v–æF÷u÷6V6öæG3¢÷F–öæÅ¶fÆöEÒÒæöæP¢Æ7Eöö'6W'fVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢FWF–Ã¢7G"Ò"   ¦6Æ72æöFTG&–gDö'6W'fF–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢æöFUö–C¢–ç@¢6öçG&7Eö–C¢–ç@¢–æF–6F÷#¢7G ¢–æF–6F÷%ö¶–æC¢÷W&F–öç4–æF–6F÷$¶–æ@¢ö'6W'fF–öå÷7FFS¢÷W&F–öç4ö'6W'fF–öå7FFP¢ö'6W'fVE÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢&VfW&Væ6U÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢6×ÆUö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP¢v–æF÷u÷6V6öæG3¢÷F–öæÅ¶fÆöEÒÒæöæP¢Æ7Eöö'6W'fVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢FWF–Ã¢7G ¢7&VFVEöC¢fÆö@  ¦6Æ72æöFTæöÖÇ•&V6÷&D–â„&6TÖöFVÂ“ ¢""&FV6—6–öåöÖWF†öF—2FVÆ–&W&FVÇ’'6VçBà ¢—B&V6÷&G2t„”4‚D‚&öGV6VBF†R6Æ76–f–6F–öâÂ6ò—B6ææ÷B&P¢6Æ–ÖVB'’&WVW7B&öG’‚333r“¢â…EE6ÆÆW"—2‡VÖâÖG&—fVâ6Æ–Vç@¢æBF†R&÷WFR&V6÷&G2ÖçVÆâ&V6öæ–ærÖÖöFVÂ6Æ76–f–6F–öâ—0¢&öGV6VB'’6W'fW"×6–FR6öFRÂv†–6‚6ÆÇ2F†RFöÖ–âÆ–W"F—&V7FÇ’æ@¢6'&–W2—G2÷vâ–çFVÆÆ–vVæ6U÷'Vç6&÷fVææ6Rà ¢6Æ76–f–6F–öåöW'&÷&Ö’öæÇ’66ö×ç’6Æ76–f–6F–öãÒwVæ¶æ÷vâv²F†P¢FöÖ–âÆ–W"&VgW6W2F†R—&–ær÷F†W'v—6RÂ&V6W6R7V6–f–0¢6Æ76–f–6F–öâ&V6÷&FVBÆöæw6–FRf–ÇW&R—2W†7FÇ’F†R†WW&—7F–0¢fÆÆ&6²&–æ6—ÆRbf÷&&–G2à¢""  ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢6Æ76–f–6F–öã¢÷W&F–öç4æöÖÇ”6Æ76–f–6F–öà¢7VÖÖ'“¢7G"Ò" ¢6WfW&—G“¢÷W&F–öç4æöÖÇ•6WfW&—G’Ò&GFVçF–öâ ¢6öçG&7Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢ö'6W'fF–öåö–G3¢Æ—7E¶–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢6Æ76–f–6F–öåöW'&÷#¢7G"Ò" ¢2v†B7F÷2öæR6öçF–çV–ær6öæF—F–öâ&öGV6–æræWræöÖÇ’ÒÒæBF†Và¢2æWr&V÷VâÒÒöâWfW'’öÆÆ–ær7–6ÆRà¢FVGWUö¶W“¢7G"Ò"   ¦6Æ72æöFTæöÖÇ”÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢æöFUö–C¢–ç@¢6öçG&7Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6Æ76–f–6F–öã¢÷W&F–öç4æöÖÇ”6Æ76–f–6F–öà¢6WfW&—G“¢÷W&F–öç4æöÖÇ•6WfW&—G¢7VÖÖ'“¢7G ¢ö'6W'fF–öåö–G3¢Æ—7E¶–çEÐ¢FV6—6–öåöÖWF†öC¢7G ¢–çFVÆÆ–vVæ6U÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6Æ76–f–6F–öåöW'&÷#¢7G ¢FVGWUö¶W“¢7G ¢2÷VâÂ6¶æ÷vÆVFvVBÂ&W6öÇfVBÂ7WW'6VFVFÒÒ÷væVB'’F†RF&ÆRw0¢24„T4²6öç7G&–çBÂæ÷B'’öæöFUö÷W&F–öç2ç–Â6ò—B—2æ÷BÖ—'&÷&V@¢22Æ—FW&Â†W&R‡F†W&R—2æòFöÖ–â6öç7FçBFò¶VW—B†öæW7B’à¢7FGW3¢7G ¢2v†WF†W"F†—26—2F†RFW6–vâv2–ÖVBBF†Rw&öærF†–ærÂ2÷÷6VBFð¢2F†R–×ÆVÖVçFF–öâ&V–ærw&öærâF†RæW‡B7F–öâF–ffW'26ö×ÆWFVÇ’à¢g&ÖUö'&V¶–æs¢&ööÀ¢7&VFVEöC¢fÆö@¢&W6öÇfVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP  ¦6Æ72æöFTæöÖÇ•&V6÷&D÷WB„&6TÖöFVÂ“ ¢""&7&VFVCÔfÇ6VÖVç2âWVÂÂ7F–ÆÂÖ÷VâæöÖÇ’Ç&VG’W†—7FVBæ@¢æ÷F†–ær6†ævVBÒÒ#ÂæWfW"6öæfÆ–7C¢&WVFVBö'6W'fF–öâöböæP¢6öçF–çV–ær6öæF—F–öâ—2æ÷&ÖÂöÆÂÂæ÷BâW'&÷"â""  ¢æöÖÇ“¢æöFTæöÖÇ”÷W@¢7&VFVC¢&ööÀ  ¦6Æ72æöFU&V÷Vå66÷U&F–öæÆT÷WB„&6TÖöFVÂ“ ¢æöFUö–C¢–ç@¢&V6öã¢7G ¢2F†R6öæ7&WFRÆ–æ²F&vWG26†&VBv—F‚F†R÷&–v–âÒÒ7G'V7GW&Âf7BÀ¢2æWfW"6–Ö–Æ&—G’§VFvVÖVçB…&–æ6—ÆRb’à¢6†&VC¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ72æöFU&V÷Vå66÷T÷WB„&6TÖöFVÂ“ ¢÷&–v–åöæöFUö–C¢–ç@¢66÷UöæöFUö–G3¢Æ—7E¶–çEÐ¢&F–öæÆS¢Æ—7E´æöFU&V÷Vå66÷U&F–öæÆT÷WEÐ¢2WfW'’÷F†W"æöFR–âF†R7—7FVÒÂÆ—7FVB&F†W"F†â6–ÆVçFÇ’öÖ—GFVC¢F†P¢2öæÇ’v’&VFW"6â6†V6²F†BVç&VÆFVBæöFW2vW&RÆVgB÷WBà¢W†6ÇVFVEöæöFUö–G3¢Æ—7E¶–çEÐ  ¦6Æ72æöFU&V÷VåÆä7&VFT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢&V6öã¢7G ¢æöÖÇ•ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢'VFvWEöæ÷FS¢7G"Ò" ¢–æ6ÇVFUöæV–v†&÷W'3¢&ööÂÒG'VP  ¦6Æ72æöFU&V÷VåÆä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢÷&–v–åöæöFUö–C¢–ç@¢æöÖÇ•ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢66÷UöæöFUö–G3¢Æ—7E¶–çEÐ¢66÷U÷&F–öæÆS¢Æ—7E´æöFU&V÷Vå66÷U&F–öæÆT÷WEÐ¢W†6ÇVFVEöæöFUö–G3¢Æ—7E¶–çEÐ¢&V6öã¢7G ¢'VFvWEöæ÷FS¢7G ¢2E"ÓRw2&öÖ—6RF†B&öGV7F–öâ¶VW2'Vææ–ærF†RW7F&Æ—6†V@¢2–×ÆVÖVçFF–öâGW&–ær&RÖW‡Æ÷&F–öâÂ76W'FVBW‡Æ–6—FÇ’&F†W"F†à¢277VÖVBà¢7F&ÆUö–×ÆVÖVçFF–öå÷&WF–æVC¢&ööÀ¢7FGW3¢÷W&F–öç5&V÷Vå7FGW0¢FV6—6–öåöÖWF†öC¢7G ¢&÷fVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢&÷fVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢FV6—6–öåöæ÷FS¢7G ¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@  ¦6Æ72æöFU&V÷VäFV6—6–öä–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æ÷FS¢7G"Ò"   ¦6Æ72æöFU&V÷VåG&ç6—F–öå&W7VÇD÷WB„&6TÖöFVÂ“ ¢""$öæR–â×66÷RæöFRw2÷WF6öÖRâæöFRF†B6ææ÷BÆVvÆÇ’G&ç6—F–öâ—0¢$Uõ%DTBv—F‚—G2&VgW6Â6öFRÂæWfW"f÷&6VBæBæWfW"6–ÆVçFÇ’G&÷VBÒÐ¢'VÆ²7F–öâF†B–væ÷&W2vFR—2vFRF†BFöW2æ÷BW†—7Bâ""  ¢æöFUö–C¢–ç@¢Æ–VC¢&ööÀ¢GWÆ–6FS¢&ööÀ¢&V6öåö6öFS¢7G ¢ÖW76vS¢7G   ¦6Æ72æöFU&V÷Vä&÷fÄ÷WB„&6TÖöFVÂ“ ¢Æã¢æöFU&V÷VåÆä÷W@¢&W7VÇG3¢Æ—7E´æöFU&V÷VåG&ç6—F–öå&W7VÇD÷WEÐ  ¦6Æ72æöFTæ÷F–f–6F–öäVÖ—D–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æ÷F–f–6F–öåö¶–æC¢÷W&F–öç4æ÷F–f–6F–öä¶–æ@¢&V6—–VçC¢7G"Ò" ¢7VÖÖ'“¢7G"Ò" ¢FVGWUö¶W“¢7G ¢æöÖÇ•ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&V÷Vå÷Æåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢6ööÆF÷vå÷6V6öæG3¢fÆöBÒ3cã   ¦6Æ72æöFTæ÷F–f–6F–öä6¶æ÷vÆVFvT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æ÷FS¢7G"Ò"   ¦6Æ72æöFTæ÷F–f–6F–öä÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢æöFUö–C¢–ç@¢æöÖÇ•ö–C¢÷F–öæÅ¶–çEÒÒæöæP¢&V÷Vå÷Æåö–C¢÷F–öæÅ¶–çEÒÒæöæP¢æ÷F–f–6F–öåö¶–æC¢÷W&F–öç4æ÷F–f–6F–öä¶–æ@¢&V6—–VçC¢7G ¢7VÖÖ'“¢7G ¢FVGWUö¶W“¢7G ¢7FGW3¢7G ¢6ööÆF÷vå÷6V6öæG3¢fÆö@¢Æ7EöVÖ—GFVEöC¢fÆö@¢6ööÆF÷vå÷VçF–Ã¢fÆö@¢ö67W'&Væ6Uö6÷VçC¢–ç@¢7W&W76VEö6÷VçC¢–ç@¢6¶æ÷vÆVFvVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢6¶æ÷vÆVFvVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@  ¦6Æ72æöFTæ÷F–f–6F–öäVÖ—D÷WB„&6TÖöFVÂ“ ¢æ÷F–f–6F–öã¢æöFTæ÷F–f–6F–öä÷W@¢VWVVC¢&ööÀ¢7W&W76VC¢&ööÀ  ¦6Æ72æöFU&V÷Vä†æFöfd7&VFT–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢æöFUö–C¢–ç@  ¦6Æ72æöFU&V÷Vä†æFöfdGfæ6T–â„&6TÖöFVÂ“ ¢ÖöFVÅö6öæf–rÒ6öæf–tF–7B†W‡G&Ò&f÷&&–B" ¢Wf–FVæ6Uö¶–æC¢÷W&F–öç4†æFöfdWf–FVæ6T¶–æ@¢Wf–FVæ6Uö–C¢–ç@  ¦6Æ72æöFU&V÷Vä†æFöfd÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢7—7FVÕö–C¢–ç@¢&V÷Vå÷Æåö–C¢–ç@¢æöFUö–C¢–ç@¢7FvS¢÷W&F–öç4†æFöfe7FvP¢&WÆ•÷'Våö–C¢÷F–öæÅ¶–çEÒÒæöæP¢öffÆ–æU÷6†F÷u÷&W7VÇEö–C¢÷F–öæÅ¶–çEÒÒæöæP¢Æ—fU÷6†F÷uö&÷fÅö–C¢÷F–öæÅ¶–çEÒÒæöæP¢7&VFVEö'“¢÷F–öæÅ·7G%ÒÒæöæP¢7&VFVEöC¢fÆö@¢WFFVEöC¢fÆö@  ¦6Æ72æöFU&V÷Vä†æFöfd7&VFT÷WB„&6TÖöFVÂ“ ¢†æFöfc¢æöFU&V÷Vä†æFöfd÷W@¢7&VFVC¢&ööÀ  ¦6Æ72æöFTö'6W'fF–öä†VÇF„÷WB„&6TÖöFVÂ“ ¢""&Væö'6W'fVFæB–ç7Vff–6–VçE÷6×ÆV&RF†V—"÷vâ7FFW2æB&P¢æWfW"&öÆÆVB–çFò'v—F†–â'VFvWB"ÒÒ6–ÆVæ6R—2æ÷B†VÇF‚â""  ¢7FFS¢÷W&F–öç4ö'6W'fF–öå7FFP¢&V6öã¢7G ¢VÆ6VE÷6V6öæG3¢÷F–öæÅ¶fÆöEÒÒæöæP¢6×ÆUö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP  ¦6Æ72æöFTG&–gDö'6W'fF–öå7VÖÖ'”÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢–æF–6F÷#¢7G ¢–æF–6F÷%ö¶–æC¢÷W&F–öç4–æF–6F÷$¶–æ@¢ö'6W'fF–öå÷7FFS¢÷W&F–öç4ö'6W'fF–öå7FFP¢ö'6W'fVE÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢&VfW&Væ6U÷fÇVS¢÷F–öæÅ¶fÆöEÒÒæöæP¢6×ÆUö6÷VçC¢÷F–öæÅ¶–çEÒÒæöæP¢Æ7Eöö'6W'fVEöC¢÷F–öæÅ¶fÆöEÒÒæöæP¢FWF–Ã¢7G   ¦6Æ72æöFTæöÖÇ•7VÖÖ'”÷WB„&6TÖöFVÂ“ ¢–C¢–ç@¢6Æ76–f–6F–öã¢÷W&F–öç4æöÖÇ”6Æ76–f–6F–öà¢6WfW&—G“¢÷W&F–öç4æöÖÇ•6WfW&—G¢7VÖÖ'“¢7G ¢7FGW3¢7G ¢FV6—6–öåöÖWF†öC¢7G ¢6Æ76–f–6F–öåöW'&÷#¢7G ¢g&ÖUö'&V¶–æs¢&ööÀ¢7&VFVEöC¢fÆö@  ¦6Æ72æöFT÷W&F–öç5&ö¦V7F–öä÷WB„&6TÖöFVÂ“ ¢""$öæRæöFRw2÷W&F–öæÂ–7GW&Rà ¢ÖGW&—G–æBö'6W'fF–öæ&RGvò–æFWVæFVçB&VF–æw2æB&RæWfW ¢ÖW&vVB„E"ÓR“¢âW7F&Æ—6†VFæöFRv—F‚FVBFVÆVÖWG'’&VG20¢ÖGW&—G“ÒvW7F&Æ—6†VBvÆöæw6–FRö'6W'fF–öâç7FFSÒwVæö'6W'fVBvÂv†–6€¢—2&V6—6VÇ’F†R7FFR†6RRW†—7G2FòÖ¶Rf—6–&ÆRà¢""  ¢7—7FVÕö–C¢–ç@¢æöFUö–C¢–ç@¢æöFUö¶W“¢7G ¢ÖGW&—G“¢WföÇWF–öäÖGW&—G•7FFP¢2çVÆÆÖVç2æò6öçG&7B—2v—&VBÂæWfW"&Ööæ—F÷&–ærf–ÆVB"ÒÒF†RGvð¢2&RF–ffW&VçBç7vW'2à¢ö'6W'fF–öã¢÷F–öæÅ´æöFTö'6W'fF–öä†VÇF„÷WEÒÒæöæP¢Ööæ—F÷&–æuö6öçG&7Eö–C¢÷F–öæÅ¶–çEÒÒæöæP¢Ööæ—F÷&–æuö6öçG&7EöFV6Æ&VC¢&ööÀ¢ö'6W'fF–öç3¢Æ—7E´æöFTG&–gDö'6W'fF–öå7VÖÖ'”÷WEÐ¢æöÖÆ–W3¢Æ—7E´æöFTæöÖÇ•7VÖÖ'”÷WEÐ 

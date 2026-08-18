@@ -35,10 +35,14 @@ from app.node_operations import (
     OperationsConflictError,
     OperationsNotFoundError,
     OperationsValidationError,
+    acknowledge_notification,
+    advance_reopen_handoff,
     approve_reopen_plan,
     build_operations_projection,
     create_monitoring_contract,
     create_reopen_plan,
+    create_reopen_handoff,
+    emit_notification,
     evaluate_observation_health,
     propose_reopen_scope,
     record_anomaly,
@@ -673,6 +677,180 @@ class TestReopen:
                 )
 
 
+class TestNotificationCooldown:
+    def test_duplicate_is_suppressed_and_audited_then_can_be_requeued(
+        self, admin_client
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "OP-Notify")
+        with get_conn() as conn:
+            node, _, _ = _established_node(conn, system_id)
+            first, queued, suppressed = emit_notification(
+                conn, system_id=system_id, node_id=node["id"],
+                notification_kind="anomaly_detected", recipient="on-call",
+                summary="latency drift", dedupe_key="latency:p95",
+                cooldown_seconds=60.0, now=100.0,
+            )
+            duplicate, queued_again, suppressed_again = emit_notification(
+                conn, system_id=system_id, node_id=node["id"],
+                notification_kind="anomaly_detected", recipient="on-call",
+                summary="latency drift", dedupe_key="latency:p95",
+                cooldown_seconds=60.0, now=120.0,
+            )
+            requeued, after_cooldown, not_suppressed = emit_notification(
+                conn, system_id=system_id, node_id=node["id"],
+                notification_kind="anomaly_detected", recipient="on-call",
+                summary="latency drift", dedupe_key="latency:p95",
+                cooldown_seconds=60.0, now=161.0,
+            )
+            acknowledged = acknowledge_notification(
+                conn, system_id=system_id, notification_id=first["id"],
+                acknowledged_by="alice", note="investigating",
+            )
+            events = conn.execute(
+                "SELECT event_type FROM node_operation_notification_event "
+                "WHERE notification_id = ? ORDER BY id",
+                (first["id"],),
+            ).fetchall()
+
+        assert queued is True and suppressed is False
+        assert duplicate["id"] == first["id"]
+        assert queued_again is False and suppressed_again is True
+        assert requeued["id"] == first["id"]
+        assert after_cooldown is True and not_suppressed is False
+        assert requeued["occurrence_count"] == 3
+        assert requeued["suppressed_count"] == 1
+        assert acknowledged["status"] == "acknowledged"
+        assert [row["event_type"] for row in events] == [
+            "queued", "suppressed_cooldown", "queued", "acknowledged"
+        ]
+
+
+class TestStagedHandoff:
+    def test_replay_then_offline_shadow_then_manual_live_approval(
+        self, admin_client
+    ):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "OP-Handoff")
+        now = time.time()
+        with get_conn() as conn:
+            node, _, _ = _established_node(conn, system_id)
+            plan = create_reopen_plan(
+                conn, system_id=system_id, origin_node_id=node["id"], reason="drift",
+            )
+            plan, _ = approve_reopen_plan(
+                conn, system_id=system_id, plan_id=plan["id"], approved_by="alice",
+            )
+            handoff, created = create_reopen_handoff(
+                conn, system_id=system_id, plan_id=plan["id"],
+                node_id=node["id"], created_by="alice",
+            )
+
+            # Skipping Replay is structurally impossible.
+            with pytest.raises(OperationsConflictError):
+                advance_reopen_handoff(
+                    conn, system_id=system_id, handoff_id=handoff["id"],
+                    evidence_kind="offline_shadow_result", evidence_id=1,
+                )
+
+            snapshot_id = conn.execute(
+                """INSERT INTO repository_snapshots
+                       (system_id, commit_sha, status, created_at)
+                   VALUES (?, 'abc', 'completed', ?)""",
+                (system_id, now),
+            ).lastrowid
+            replay_set_id = conn.execute(
+                """INSERT INTO replay_sets
+                       (system_id, component_id, created_at)
+                   VALUES (?, 'component-a', ?)""",
+                (system_id, now),
+            ).lastrowid
+            replay_id = conn.execute(
+                """INSERT INTO replay_runs
+                       (system_id, replay_set_id, component_id, snapshot_id,
+                        commit_sha, symbol_path, symbol_qualified_name, status,
+                        trace_set_hash, created_at, completed_at)
+                   VALUES (?, ?, 'component-a', ?, 'abc', 'a.py', 'a.f',
+                           'completed', 'hash', ?, ?)""",
+                (system_id, replay_set_id, snapshot_id, now, now),
+            ).lastrowid
+            shadow_id = conn.execute(
+                """INSERT INTO shadow_results
+                       (system_id, trace_id, component_id, timestamp)
+                   VALUES (?, 'trace-1', 'component-a', ?)""",
+                (system_id, now),
+            ).lastrowid
+
+            replay_stage = advance_reopen_handoff(
+                conn, system_id=system_id, handoff_id=handoff["id"],
+                evidence_kind="replay_run", evidence_id=replay_id, actor="alice",
+            )
+            offline_stage = advance_reopen_handoff(
+                conn, system_id=system_id, handoff_id=handoff["id"],
+                evidence_kind="offline_shadow_result", evidence_id=shadow_id,
+                actor="alice",
+            )
+
+            role_id = conn.execute(
+                """INSERT INTO agent_role_cards
+                       (system_id, role_key, version, mission, model_alias,
+                        changelog, schema_version, created_at)
+                   VALUES (?, 'reviewer', '1', 'm', 'mock', 'c', '1', ?)""",
+                (system_id, now),
+            ).lastrowid
+            cell_id = conn.execute(
+                """INSERT INTO cell_definitions
+                       (system_id, cell_id, role_card_id, created_at, updated_at)
+                   VALUES (?, 'cell-a', ?, ?, ?)""",
+                (system_id, role_id, now, now),
+            ).lastrowid
+            improvement_id = conn.execute(
+                """INSERT INTO cell_improvements
+                       (system_id, cell_definition_id, target_kind,
+                        canary_evidence_json, created_at, updated_at)
+                   VALUES (?, ?, 'candidate_patch', ?, ?, ?)""",
+                (system_id, cell_id, json.dumps([f"replay_run:{replay_id}"]), now, now),
+            ).lastrowid
+            conn.execute(
+                """INSERT INTO cell_shadow_decisions
+                       (system_id, improvement_id, kind, status, decided_by,
+                        decided_at, decision_method, created_at)
+                   VALUES (?, ?, 'shadow_proposal', 'approved', 'alice', ?,
+                           'manual', ?)""",
+                (system_id, improvement_id, now, now),
+            )
+            live_id = conn.execute(
+                """INSERT INTO cell_shadow_decisions
+                       (system_id, improvement_id, kind, status, decided_by,
+                        decided_at, decision_method, created_at)
+                   VALUES (?, ?, 'live_shadow_execution_approval', 'approved',
+                           'bob', ?, 'manual', ?)""",
+                (system_id, improvement_id, now, now),
+            ).lastrowid
+            ready = advance_reopen_handoff(
+                conn, system_id=system_id, handoff_id=handoff["id"],
+                evidence_kind="live_shadow_approval", evidence_id=live_id,
+                actor="alice",
+            )
+            events = conn.execute(
+                "SELECT evidence_kind FROM node_reopen_handoff_event "
+                "WHERE handoff_id = ? ORDER BY id",
+                (handoff["id"],),
+            ).fetchall()
+
+        assert created is True
+        assert replay_stage["stage"] == "awaiting_offline_shadow"
+        assert offline_stage["stage"] == "awaiting_live_shadow_approval"
+        assert ready["stage"] == "ready"
+        assert [row["evidence_kind"] for row in events] == [
+            "created", "replay_run", "offline_shadow_result", "live_shadow_approval"
+        ]
+
+
 class TestMigration:
     def test_new_tables_appear_via_init_db(self, admin_client):
         from app.db import get_conn
@@ -687,4 +865,6 @@ class TestMigration:
         assert {
             "node_monitoring_contract", "node_drift_observation",
             "node_anomaly", "node_reopen_plan",
+            "node_operation_notification", "node_operation_notification_event",
+            "node_reopen_handoff", "node_reopen_handoff_event",
         } <= names

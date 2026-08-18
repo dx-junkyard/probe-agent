@@ -60,6 +60,8 @@ __all__ = [
     "FRAME_BREAKING_CLASSIFICATIONS",
     "ANOMALY_SEVERITIES",
     "REOPEN_STATUSES",
+    "NOTIFICATION_KINDS",
+    "HANDOFF_STAGES",
     "OperationsError",
     "OperationsNotFoundError",
     "OperationsValidationError",
@@ -70,9 +72,13 @@ __all__ = [
     "create_monitoring_contract",
     "record_observation",
     "record_anomaly",
+    "emit_notification",
+    "acknowledge_notification",
     "propose_reopen_scope",
     "create_reopen_plan",
     "approve_reopen_plan",
+    "create_reopen_handoff",
+    "advance_reopen_handoff",
     "build_operations_projection",
 ]
 
@@ -119,6 +125,19 @@ ANOMALY_SEVERITIES: Tuple[str, ...] = get_args(AnomalySeverity)
 
 ReopenStatus = Literal["proposed", "approved", "rejected", "completed"]
 REOPEN_STATUSES: Tuple[str, ...] = get_args(ReopenStatus)
+
+NotificationKind = Literal[
+    "anomaly_detected", "reopen_approved", "handoff_ready", "handoff_blocked"
+]
+NOTIFICATION_KINDS: Tuple[str, ...] = get_args(NotificationKind)
+
+HandoffStage = Literal[
+    "awaiting_replay", "awaiting_offline_shadow",
+    "awaiting_live_shadow_approval", "ready",
+]
+HANDOFF_STAGES: Tuple[str, ...] = get_args(HandoffStage)
+
+_DEFAULT_NOTIFICATION_COOLDOWN_SECONDS = 3600.0
 
 
 class OperationsError(ValueError):
@@ -450,7 +469,180 @@ def record_anomaly(
     row = conn.execute(
         "SELECT * FROM node_anomaly WHERE id = ?", (cur.lastrowid,)
     ).fetchone()
+    contract = None
+    if contract_id is not None:
+        contract = conn.execute(
+            "SELECT escalation_owner FROM node_monitoring_contract "
+            "WHERE id = ? AND system_id = ?",
+            (contract_id, system_id),
+        ).fetchone()
+    emit_notification(
+        conn,
+        system_id=system_id,
+        node_id=node_id,
+        notification_kind="anomaly_detected",
+        recipient=contract["escalation_owner"] if contract is not None else "",
+        summary=summary or f"{classification} anomaly detected",
+        dedupe_key=f"anomaly:{dedupe_key or row['id']}",
+        anomaly_id=row["id"],
+        cooldown_seconds=_DEFAULT_NOTIFICATION_COOLDOWN_SECONDS,
+    )
     return row, True
+
+
+# ---------------------------------------------------------------------------
+# Notification outbox -- dedupe, cooldown and append-only audit
+# ---------------------------------------------------------------------------
+
+
+def emit_notification(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    node_id: int,
+    notification_kind: str,
+    recipient: str,
+    summary: str,
+    dedupe_key: str,
+    anomaly_id: Optional[int] = None,
+    reopen_plan_id: Optional[int] = None,
+    cooldown_seconds: float = _DEFAULT_NOTIFICATION_COOLDOWN_SECONDS,
+    now: Optional[float] = None,
+) -> Tuple[sqlite3.Row, bool, bool]:
+    """Queue one logical notification.
+
+    Returns ``(row, queued, suppressed)``. During cooldown the same logical
+    notification is not queued again; the occurrence and a suppression audit
+    event are still recorded. After cooldown, the same outbox row is re-queued
+    so delivery adapters cannot turn a continuing condition into unbounded
+    duplicate work.
+    """
+    _check_membership(notification_kind, NOTIFICATION_KINDS, "notification_kind")
+    _require_node(conn, system_id, node_id)
+    if not (dedupe_key or "").strip():
+        raise OperationsValidationError("notification dedupe_key is required")
+    if cooldown_seconds < 0:
+        raise OperationsValidationError("cooldown_seconds must be non-negative")
+    if anomaly_id is not None:
+        anomaly = conn.execute(
+            "SELECT id FROM node_anomaly WHERE id = ? AND system_id = ? AND node_id = ?",
+            (anomaly_id, system_id, node_id),
+        ).fetchone()
+        if anomaly is None:
+            raise OperationsNotFoundError(f"Anomaly {anomaly_id} not found")
+    if reopen_plan_id is not None:
+        plan = conn.execute(
+            "SELECT id FROM node_reopen_plan WHERE id = ? AND system_id = ? "
+            "AND origin_node_id = ?",
+            (reopen_plan_id, system_id, node_id),
+        ).fetchone()
+        if plan is None:
+            raise OperationsNotFoundError(f"Reopen plan {reopen_plan_id} not found")
+
+    clock = time.time() if now is None else now
+    existing = conn.execute(
+        """SELECT * FROM node_operation_notification
+               WHERE node_id = ? AND notification_kind = ? AND dedupe_key = ?""",
+        (node_id, notification_kind, dedupe_key),
+    ).fetchone()
+    if existing is not None and clock < existing["cooldown_until"]:
+        conn.execute(
+            """UPDATE node_operation_notification
+                   SET occurrence_count = occurrence_count + 1,
+                       suppressed_count = suppressed_count + 1, updated_at = ?
+                   WHERE id = ?""",
+            (clock, existing["id"]),
+        )
+        conn.execute(
+            """INSERT INTO node_operation_notification_event
+                   (system_id, notification_id, event_type, detail, created_at)
+               VALUES (?, ?, 'suppressed_cooldown', ?, ?)""",
+            (system_id, existing["id"], "duplicate emission within cooldown", clock),
+        )
+        row = conn.execute(
+            "SELECT * FROM node_operation_notification WHERE id = ?",
+            (existing["id"],),
+        ).fetchone()
+        return row, False, True
+
+    cooldown_until = clock + cooldown_seconds
+    if existing is None:
+        cur = conn.execute(
+            """INSERT INTO node_operation_notification
+                   (system_id, node_id, anomaly_id, reopen_plan_id,
+                    notification_kind, recipient, summary, dedupe_key,
+                    cooldown_seconds, last_emitted_at, cooldown_until,
+                    created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                system_id, node_id, anomaly_id, reopen_plan_id,
+                notification_kind, recipient or "", summary or "", dedupe_key,
+                cooldown_seconds, clock, cooldown_until, clock, clock,
+            ),
+        )
+        notification_id = cur.lastrowid
+    else:
+        notification_id = existing["id"]
+        conn.execute(
+            """UPDATE node_operation_notification
+                   SET anomaly_id = COALESCE(?, anomaly_id),
+                       reopen_plan_id = COALESCE(?, reopen_plan_id),
+                       recipient = ?, summary = ?, status = 'pending',
+                       cooldown_seconds = ?, last_emitted_at = ?,
+                       cooldown_until = ?, occurrence_count = occurrence_count + 1,
+                       acknowledged_by = NULL, acknowledged_at = NULL, updated_at = ?
+                   WHERE id = ?""",
+            (
+                anomaly_id, reopen_plan_id, recipient or "", summary or "",
+                cooldown_seconds, clock, cooldown_until, clock, notification_id,
+            ),
+        )
+    conn.execute(
+        """INSERT INTO node_operation_notification_event
+               (system_id, notification_id, event_type, detail, created_at)
+           VALUES (?, ?, 'queued', ?, ?)""",
+        (system_id, notification_id, summary or "", clock),
+    )
+    row = conn.execute(
+        "SELECT * FROM node_operation_notification WHERE id = ?", (notification_id,)
+    ).fetchone()
+    return row, True, False
+
+
+def acknowledge_notification(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    notification_id: int,
+    acknowledged_by: str,
+    note: str = "",
+) -> sqlite3.Row:
+    if not (acknowledged_by or "").strip():
+        raise OperationsValidationError("acknowledging a notification requires a person")
+    row = conn.execute(
+        "SELECT * FROM node_operation_notification WHERE id = ? AND system_id = ?",
+        (notification_id, system_id),
+    ).fetchone()
+    if row is None:
+        raise OperationsNotFoundError(f"Notification {notification_id} not found")
+    if row["status"] == "acknowledged":
+        return row
+    now = time.time()
+    conn.execute(
+        """UPDATE node_operation_notification
+               SET status = 'acknowledged', acknowledged_by = ?,
+                   acknowledged_at = ?, updated_at = ? WHERE id = ?""",
+        (acknowledged_by, now, now, notification_id),
+    )
+    conn.execute(
+        """INSERT INTO node_operation_notification_event
+               (system_id, notification_id, event_type, actor, detail, created_at)
+           VALUES (?, ?, 'acknowledged', ?, ?, ?)""",
+        (system_id, notification_id, acknowledged_by, note or "", now),
+    )
+    return conn.execute(
+        "SELECT * FROM node_operation_notification WHERE id = ?", (notification_id,)
+    ).fetchone()
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +859,212 @@ def approve_reopen_plan(
     row = conn.execute(
         "SELECT * FROM node_reopen_plan WHERE id = ?", (plan_id,)
     ).fetchone()
+    emit_notification(
+        conn,
+        system_id=system_id,
+        node_id=row["origin_node_id"],
+        notification_kind="reopen_approved",
+        recipient=approved_by,
+        summary=note or row["reason"],
+        dedupe_key=f"reopen-plan:{plan_id}",
+        reopen_plan_id=plan_id,
+    )
     return row, results
+
+
+def create_reopen_handoff(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    plan_id: int,
+    node_id: int,
+    created_by: Optional[str] = None,
+) -> Tuple[sqlite3.Row, bool]:
+    """Start (or return) the staged evidence handoff for one reopened Node."""
+    plan = conn.execute(
+        "SELECT * FROM node_reopen_plan WHERE id = ? AND system_id = ?",
+        (plan_id, system_id),
+    ).fetchone()
+    if plan is None:
+        raise OperationsNotFoundError(f"Reopen plan {plan_id} not found")
+    if plan["status"] != "approved":
+        raise OperationsConflictError("handoff requires an approved reopen plan")
+    if node_id not in _json_or_default(plan["scope_node_ids_json"], []):
+        raise OperationsValidationError(
+            f"Node {node_id} is outside reopen plan {plan_id}'s approved scope"
+        )
+    _require_node(conn, system_id, node_id)
+    existing = conn.execute(
+        "SELECT * FROM node_reopen_handoff WHERE reopen_plan_id = ? AND node_id = ?",
+        (plan_id, node_id),
+    ).fetchone()
+    if existing is not None:
+        return existing, False
+    now = time.time()
+    cur = conn.execute(
+        """INSERT INTO node_reopen_handoff
+               (system_id, reopen_plan_id, node_id, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (system_id, plan_id, node_id, created_by, now, now),
+    )
+    handoff_id = cur.lastrowid
+    conn.execute(
+        """INSERT INTO node_reopen_handoff_event
+               (system_id, handoff_id, stage, evidence_kind, actor, created_at)
+           VALUES (?, ?, 'awaiting_replay', 'created', ?, ?)""",
+        (system_id, handoff_id, created_by, now),
+    )
+    return conn.execute(
+        "SELECT * FROM node_reopen_handoff WHERE id = ?", (handoff_id,)
+    ).fetchone(), True
+
+
+def advance_reopen_handoff(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    handoff_id: int,
+    evidence_kind: str,
+    evidence_id: int,
+    actor: Optional[str] = None,
+) -> sqlite3.Row:
+    """Bind the next evidence item, enforcing the complete handoff order.
+
+    The live-shadow step accepts only a separate, already-approved manual
+    ``live_shadow_execution_approval``.  This function cannot create or decide
+    that approval and therefore cannot bypass the human gate.
+    """
+    expected = {
+        "awaiting_replay": "replay_run",
+        "awaiting_offline_shadow": "offline_shadow_result",
+        "awaiting_live_shadow_approval": "live_shadow_approval",
+    }
+    next_stage = {
+        "replay_run": "awaiting_offline_shadow",
+        "offline_shadow_result": "awaiting_live_shadow_approval",
+        "live_shadow_approval": "ready",
+    }
+    column = {
+        "replay_run": "replay_run_id",
+        "offline_shadow_result": "offline_shadow_result_id",
+        "live_shadow_approval": "live_shadow_approval_id",
+    }
+    if evidence_kind not in next_stage:
+        raise OperationsValidationError(
+            "evidence_kind must be replay_run, offline_shadow_result, or "
+            "live_shadow_approval"
+        )
+    handoff = conn.execute(
+        "SELECT * FROM node_reopen_handoff WHERE id = ? AND system_id = ?",
+        (handoff_id, system_id),
+    ).fetchone()
+    if handoff is None:
+        raise OperationsNotFoundError(f"Reopen handoff {handoff_id} not found")
+    if handoff["stage"] == "ready":
+        raise OperationsConflictError(f"Reopen handoff {handoff_id} is already ready")
+    if expected[handoff["stage"]] != evidence_kind:
+        raise OperationsConflictError(
+            f"handoff stage {handoff['stage']!r} requires "
+            f"{expected[handoff['stage']]!r}, not {evidence_kind!r}"
+        )
+
+    if evidence_kind == "replay_run":
+        evidence = conn.execute(
+            "SELECT * FROM replay_runs WHERE id = ? AND system_id = ?",
+            (evidence_id, system_id),
+        ).fetchone()
+        if evidence is None:
+            raise OperationsNotFoundError(f"Replay run {evidence_id} not found")
+        if evidence["status"] != "completed":
+            raise OperationsConflictError(
+                f"Replay run {evidence_id} is {evidence['status']!r}, not completed"
+            )
+    elif evidence_kind == "offline_shadow_result":
+        evidence = conn.execute(
+            "SELECT * FROM shadow_results WHERE id = ? AND system_id = ?",
+            (evidence_id, system_id),
+        ).fetchone()
+        if evidence is None:
+            raise OperationsNotFoundError(
+                f"Offline shadow result {evidence_id} not found"
+            )
+        replay = conn.execute(
+            "SELECT component_id FROM replay_runs WHERE id = ? AND system_id = ?",
+            (handoff["replay_run_id"], system_id),
+        ).fetchone()
+        if replay is None or evidence["component_id"] != replay["component_id"]:
+            raise OperationsConflictError(
+                "offline shadow result is not for the Replay run's component"
+            )
+    else:
+        evidence = conn.execute(
+            """SELECT d.*, i.canary_evidence_json
+                   FROM cell_shadow_decisions d
+                   JOIN cell_improvements i ON i.id = d.improvement_id
+                  WHERE d.id = ? AND d.system_id = ? AND i.system_id = ?""",
+            (evidence_id, system_id, system_id),
+        ).fetchone()
+        if evidence is None:
+            raise OperationsNotFoundError(
+                f"Live shadow approval {evidence_id} not found"
+            )
+        if (
+            evidence["kind"] != "live_shadow_execution_approval"
+            or evidence["status"] != "approved"
+            or evidence["decision_method"] != "manual"
+            or not evidence["decided_by"]
+        ):
+            raise OperationsConflictError(
+                "live shadow handoff requires a separately approved manual "
+                "live_shadow_execution_approval"
+            )
+        replay_ref = f"replay_run:{handoff['replay_run_id']}"
+        canary_refs = _json_or_default(evidence["canary_evidence_json"], [])
+        if replay_ref not in canary_refs:
+            raise OperationsConflictError(
+                "live shadow approval is not bound to this handoff's Replay run"
+            )
+        approved_offline = conn.execute(
+            """SELECT id FROM cell_shadow_decisions
+                   WHERE system_id = ? AND improvement_id = ?
+                     AND kind = 'shadow_proposal' AND status = 'approved'
+                   ORDER BY id DESC LIMIT 1""",
+            (system_id, evidence["improvement_id"]),
+        ).fetchone()
+        if approved_offline is None:
+            raise OperationsConflictError(
+                "live shadow approval has no approved offline shadow proposal"
+            )
+
+    now = time.time()
+    stage = next_stage[evidence_kind]
+    # Column is selected exclusively from the finite mapping above.
+    conn.execute(
+        f"UPDATE node_reopen_handoff SET {column[evidence_kind]} = ?, "
+        "stage = ?, updated_at = ? WHERE id = ?",
+        (evidence_id, stage, now, handoff_id),
+    )
+    conn.execute(
+        """INSERT INTO node_reopen_handoff_event
+               (system_id, handoff_id, stage, evidence_kind, evidence_id, actor, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (system_id, handoff_id, stage, evidence_kind, evidence_id, actor, now),
+    )
+    updated = conn.execute(
+        "SELECT * FROM node_reopen_handoff WHERE id = ?", (handoff_id,)
+    ).fetchone()
+    if stage == "ready":
+        emit_notification(
+            conn,
+            system_id=system_id,
+            node_id=updated["node_id"],
+            notification_kind="handoff_ready",
+            recipient=actor or "",
+            summary="Replay, offline shadow, and approved live shadow are complete",
+            dedupe_key=f"handoff:{handoff_id}:ready",
+            reopen_plan_id=updated["reopen_plan_id"],
+        )
+    return updated
 
 
 def build_operations_projection(

@@ -60,9 +60,17 @@ from ..models import (
     NodeDriftObservationOut,
     NodeMonitoringContractCreateIn,
     NodeMonitoringContractOut,
+    NodeNotificationAcknowledgeIn,
+    NodeNotificationEmitIn,
+    NodeNotificationEmitOut,
+    NodeNotificationOut,
     NodeOperationsProjectionOut,
     NodeReopenApprovalOut,
     NodeReopenDecisionIn,
+    NodeReopenHandoffAdvanceIn,
+    NodeReopenHandoffCreateIn,
+    NodeReopenHandoffCreateOut,
+    NodeReopenHandoffOut,
     NodeReopenPlanCreateIn,
     NodeReopenPlanOut,
     NodeReopenScopeOut,
@@ -187,6 +195,14 @@ def _plan_out(row) -> NodeReopenPlanOut:
         created_by=row["created_by"],
         created_at=row["created_at"],
     )
+
+
+def _notification_out(row) -> NodeNotificationOut:
+    return NodeNotificationOut(**dict(row))
+
+
+def _handoff_out(row) -> NodeReopenHandoffOut:
+    return NodeReopenHandoffOut(**dict(row))
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +449,116 @@ def approve_node_reopen_plan(
         except node_operations.OperationsError as exc:
             _raise_domain_error(exc)
     return NodeReopenApprovalOut(plan=_plan_out(row), results=results)
+
+
+# ---------------------------------------------------------------------------
+# Notification outbox and staged reopen handoff
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/nodes/{node_id}/notifications", response_model=NodeNotificationEmitOut
+)
+def emit_node_notification(
+    node_id: int,
+    payload: NodeNotificationEmitIn,
+    system_id: int = Depends(get_system_id),
+    _principal: Principal = Depends(require_user),
+) -> NodeNotificationEmitOut:
+    """Queue an auditable notification, or suppress it during cooldown."""
+    with get_conn() as conn:
+        try:
+            row, queued, suppressed = node_operations.emit_notification(
+                conn,
+                system_id=system_id,
+                node_id=node_id,
+                notification_kind=payload.notification_kind,
+                recipient=payload.recipient,
+                summary=payload.summary,
+                dedupe_key=payload.dedupe_key,
+                anomaly_id=payload.anomaly_id,
+                reopen_plan_id=payload.reopen_plan_id,
+                cooldown_seconds=payload.cooldown_seconds,
+            )
+        except node_operations.OperationsError as exc:
+            _raise_domain_error(exc)
+    return NodeNotificationEmitOut(
+        notification=_notification_out(row), queued=queued, suppressed=suppressed
+    )
+
+
+@router.post(
+    "/notifications/{notification_id}/acknowledge",
+    response_model=NodeNotificationOut,
+)
+def acknowledge_node_notification(
+    notification_id: int,
+    payload: NodeNotificationAcknowledgeIn,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> NodeNotificationOut:
+    if not principal.username:
+        raise HTTPException(status_code=403, detail="Acknowledgement requires a user")
+    with get_conn() as conn:
+        try:
+            row = node_operations.acknowledge_notification(
+                conn,
+                system_id=system_id,
+                notification_id=notification_id,
+                acknowledged_by=principal.username,
+                note=payload.note,
+            )
+        except node_operations.OperationsError as exc:
+            _raise_domain_error(exc)
+    return _notification_out(row)
+
+
+@router.post(
+    "/reopen-plans/{plan_id}/handoffs",
+    response_model=NodeReopenHandoffCreateOut,
+)
+def create_node_reopen_handoff(
+    plan_id: int,
+    payload: NodeReopenHandoffCreateIn,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> NodeReopenHandoffCreateOut:
+    with get_conn() as conn:
+        try:
+            row, created = node_operations.create_reopen_handoff(
+                conn,
+                system_id=system_id,
+                plan_id=plan_id,
+                node_id=payload.node_id,
+                created_by=principal.username,
+            )
+        except node_operations.OperationsError as exc:
+            _raise_domain_error(exc)
+    return NodeReopenHandoffCreateOut(handoff=_handoff_out(row), created=created)
+
+
+@router.post(
+    "/handoffs/{handoff_id}/advance", response_model=NodeReopenHandoffOut
+)
+def advance_node_reopen_handoff(
+    handoff_id: int,
+    payload: NodeReopenHandoffAdvanceIn,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> NodeReopenHandoffOut:
+    with get_conn() as conn:
+        try:
+            row = node_operations.advance_reopen_handoff(
+                conn,
+                system_id=system_id,
+                handoff_id=handoff_id,
+                evidence_kind=payload.evidence_kind,
+                evidence_id=payload.evidence_id,
+                actor=principal.username,
+            )
+        except node_operations.OperationsError as exc:
+            _raise_domain_error(exc)
+    return _handoff_out(row)
 
 
 # ---------------------------------------------------------------------------
