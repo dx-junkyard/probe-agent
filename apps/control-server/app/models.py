@@ -8635,6 +8635,936 @@ class PurposeOutcomeUnavailableRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# UX Design Lineage (Epic #405, Issues #407/#408). See
+# docs/ux-design-lineage.md for the full contract -- these `Literal` aliases
+# and their `*Out`/`*Request` models are re-declared here (never imported
+# from `app/ux_design.py` / `app/solution_design.py`) for the same reason
+# `EvolutionMaturityState` and the Purpose Chain vocabularies are: FastAPI
+# needs a real enum in the OpenAPI schema, and
+# `test_interview_type_parity.py`'s `FINITE_TYPE_NAMES` is what keeps the
+# Dashboard's TypeScript unions from silently drifting away from these.
+#
+# Journey / Requirement / Solution Design are the two new PERSISTED design
+# layers this Epic adds (§1: unlike Purpose Chain, this content cannot be
+# re-derived from any existing row). Every Out model that reports a status
+# computed by folding an append-only decision ledger (`design_status`,
+# `option_status`, `link_state`, ...) exposes that status as a field but the
+# UNDERLYING TABLES never store it as a column -- see the table comments in
+# `app/db.py` for why. Every Request model omits `decision_method` /
+# `decided_by` / `created_by` / `authored_by_kind`: those come from the
+# authenticated `Principal` and the route, never from the caller
+# (`routes/purpose_chain.py`'s docstring states the same rule for Purpose
+# Chain; §2.10/§3's route contracts require it here identically).
+# ---------------------------------------------------------------------------
+
+#: Whether a Journey describes the system as it stands today or as it should
+#: become. Lives on the IDENTITY row (`ux_journey`), never on a revision --
+#: §2.3: letting a revision change perspective would splice two different
+#: subjects' histories into one Journey. A `to_be` Journey names its `as_is`
+#: counterpart through `baseline_journey_id` rather than becoming it.
+UxJourneyPerspective = Literal["as_is", "to_be"]
+
+#: The developer's own declaration of whether a `to_be` Journey SHOULD have
+#: an `as_is` baseline (§2.3). `undecided` is the honest default -- distinct
+#: from `greenfield`, which is an explicit "this is genuinely new, there is
+#: no current-state Journey to compare against" statement. Confusing the two
+#: would make a new system's Journey read as if the developer forgot to link
+#: one, when in fact there is nothing to link.
+UxJourneyBaselineMode = Literal["linked", "greenfield", "undecided"]
+
+#: Derived at read time (never stored) by the first-match rule in §2.3:
+#: `as_is` Journeys and explicit `greenfield` declarations are
+#: `not_applicable`; `undecided` is `absent`; a `baseline_journey_id` that
+#: currently resolves to an `as_is` Journey in the same System is `linked`;
+#: anything else is `unresolved`. `not_applicable` is a genuine third answer
+#: (§0 invariant 8), not a synonym for `absent` -- one means "the developer
+#: said there is nothing to compare", the other means "nobody has decided".
+UxJourneyBaselineState = Literal["linked", "unresolved", "absent", "not_applicable"]
+
+#: Whose voice authored a Journey/Requirement/Solution-Design-Option
+#: revision's TEXT -- independent of `decision_method` (who chose to record
+#: it) and of the decision ledger (who later confirmed/adopted it). §0
+#: invariant 3 / §2.5: these are three separate axes, never folded into one.
+#: A `reasoning_model`-authored revision CAN later be `confirmed` -- that
+#: means a human approved AI-written text, not that authorship changed.
+UxDesignAuthorshipKind = Literal["developer", "reasoning_model"]
+
+#: A Journey Step's declared EXPECTATION of where evidence for its success
+#: would be found -- never an observed outcome (§0 invariant 6 / §2.4's
+#: comment on `ux_journey_step`). Choosing `runtime_trace` does not make a
+#: later trace count as success; `purpose_outcome_criterion` remains the only
+#: place an outcome verdict is recorded. `none` is the honest default for a
+#: Step nobody has thought through evidence for yet.
+UxEvidenceSourceKind = Literal["runtime_trace", "human_report", "external_analytics", "none"]
+
+#: A Requirement's kind. `out_of_scope` is a first-class member, not a
+#: deletion -- "we decided not to do this" is itself worth a traceable
+#: record (§2.4's comment on `ux_requirement`). An `out_of_scope` Requirement
+#: can never carry acceptance criteria (422
+#: `out_of_scope_requirement_not_verifiable`) or a Solution Design target
+#: link (422 `out_of_scope_requirement_not_implementable`) -- a thing
+#: declared out of scope having a verification/implementation target would
+#: mean the kind itself had stopped meaning anything.
+UxRequirementKind = Literal["functional", "non_functional", "constraint", "out_of_scope"]
+
+#: How an Acceptance Criterion COULD be checked -- a finite classification of
+#: method, never a record that it WAS checked. Verification itself happens in
+#: the named existing system (Replay, Experiments, a human review), never in
+#: this layer.
+UxVerificationMethod = Literal[
+    "manual_review", "replay", "experiment", "runtime_observation", "not_verifiable"
+]
+
+#: DERIVED (§2.5), never a stored column: the latest non-superseded
+#: `ux_design_decision` row for `(system_id, subject_kind, subject_key)`, or
+#: `proposed` when no such row exists. `confirm -> confirmed`, `reject ->
+#: rejected`, `retire -> retired`, `reinstate -> proposed`. A stored lifecycle
+#: value can drift from the rows it describes; a derived one cannot (#337 /
+#: #338 / #349's discipline, applied to this layer).
+UxDesignStatus = Literal["proposed", "confirmed", "rejected", "retired"]
+
+#: The finite actions recorded in `ux_design_decision`. `reinstate` is the
+#: only way back from `rejected`/`retired` to `proposed` -- there is no
+#: silent un-reject; a human decides again, and the prior decision row is
+#: never deleted (§0 invariant 4).
+UxDesignDecisionKind = Literal["confirm", "reject", "retire", "reinstate"]
+
+#: Whether the currently-effective `confirm` decision's `captured_digest`
+#: still matches the subject's current content digest. Independent of
+#: `design_status` (§2.5): a stale confirmed item STAYS `confirmed` --
+#: re-confirmation is invited, not forced, and the original decision row
+#: survives untouched (the same discipline `purpose_relation_decision` and
+#: `PurposeRecheckState` already use one layer up).
+UxDesignRecheckState = Literal["current", "stale"]
+
+#: Whether a revision row (`ux_journey_revision` / `ux_requirement_revision`
+#: / `solution_design_option`) is the current head of its append-only chain.
+#: A content axis, not a judgement axis -- orthogonal to `design_status`.
+UxRevisionState = Literal["current", "superseded"]
+
+#: Which of the three canonical upstream sources a `ux_journey_upstream_ref`
+#: resolves against (§2.7's table): the Purpose Chain's elements, the same
+#: projection's relations, or `understanding_capability_entity`'s current
+#: head. Exactly one canonical source per kind, resolved fresh at read time
+#: -- never a copy of the target's content (§1).
+UxRefKind = Literal["purpose_element", "purpose_relation", "capability_entity"]
+
+#: WHO ASSERTED an upstream/downstream reference, mapped from the
+#: reference's own `decision_method` through a fixed table (§2.7, the same
+#: `node_design._DECISION_METHOD_TO_RELATION_STATUS` translation) --
+#: `manual -> confirmed`, `reasoning_llm -> proposed`, `deterministic ->
+#: derived`. This is never a second stored status column; it is read
+#: straight off `decision_method`.
+UxRefRelationStatus = Literal["confirmed", "proposed", "derived"]
+
+#: Whether the referenced row could be found at all, kept apart from
+#: `target_state` (§2.7): `resolved` means the canonical source was read and
+#: the target exists there now; `unresolved` means the source was read but
+#: the target is gone (e.g. a superseded Capability's OLD id); `unavailable`
+#: means the canonical source itself could not be read for THIS request. An
+#: unreadable source must never render as "the target does not exist".
+UxRefTargetResolution = Literal["resolved", "unresolved", "unavailable"]
+
+#: Whether a reference's `captured_digest` still matches the target's
+#: current digest. `not_captured` is the fail-closed value for a legacy row
+#: with an empty `captured_digest` (§2.7's explicit "not `current`" rule,
+#: mirroring #337's `premise_not_captured`) -- an uncaptured digest can never
+#: be silently treated as "nothing has changed".
+UxRefRecheckState = Literal["current", "stale", "not_captured"]
+
+#: The finite kinds of design artifact this layer can reference (never
+#: store the body of, §2.8).
+UxArtifactKind = Literal["wireframe", "adr", "spec", "diagram", "research_note", "other"]
+
+#: Three DIFFERENT claims about a `content_hash`, never collapsed into two
+#: (§2.8): `verified` is reachable ONLY for a `repo:<path>` URI the system
+#: itself resolved via `git show <sha>:<path>` on a pinned snapshot and hash-
+#: matched -- probe-agent fetches no other URI (SSRF / Principle 5).
+#: `unverified` is every external URL/Wiki/Figma reference, where the hash is
+#: the developer's own assertion. `unreachable` is a repo path that used to
+#: verify and no longer resolves on the current snapshot -- a distinct fact
+#: from having never been checked.
+UxArtifactVerificationState = Literal["verified", "unverified", "unreachable"]
+
+#: What kind of thing an artifact reference or a decision-ledger row is
+#: attached to. Two separate finite sets on purpose (this one and
+#: `UxDesignSubjectKind` below): an artifact can illustrate a Design Option,
+#: but only a Journey/Requirement/reference/link can be
+#: confirmed/rejected/retired/reinstated (§2.4's tables).
+UxArtifactSubjectKind = Literal[
+    "journey", "journey_step", "requirement", "solution_design", "design_option"
+]
+
+#: What kind of thing a `ux_design_decision` row judges. Journey Steps and
+#: Requirement Acceptance Criteria are never independently decidable --
+#: their content lives inside a revision, and confirming/rejecting the
+#: revision (via `journey`/`requirement`) is the only decision that applies.
+UxDesignSubjectKind = Literal[
+    "journey", "requirement", "requirement_step_link", "journey_upstream_ref", "artifact_reference"
+]
+
+#: Diff vocabulary for step-by-step / criterion-by-criterion comparison.
+#: Matching is EXACT `step_key`/`criterion_key` equality only (§2.4's
+#: comment on `ux_journey_step`, and §0 invariant 9) -- never text
+#: similarity or embeddings.
+UxDiffChangeKind = Literal["added", "removed", "changed", "unchanged"]
+
+#: Whether a diff endpoint could produce a real comparison. `not_applicable`
+#: is the `baseline-diff` answer when the Journey has no baseline to compare
+#: against (§2.10) -- returning an empty diff there would read as "no
+#: changes" instead of "there is nothing to diff against". `unavailable` is
+#: reserved for a read failure, never for "nothing to compare" (§0
+#: invariant 8).
+UxDiffState = Literal["available", "not_applicable", "unavailable"]
+
+#: `GET /solution-designs/{design_key}/change-origins`' classification of
+#: WHERE a non-current reference/link's change originated (§3.5) -- a
+#: deterministic mapping from each link's own `stale_reason` + `ref_kind` /
+#: `target_kind`, never a guess. Telling "the Capability changed" apart from
+#: "the snapshot merely moved" is the first thing an existing-system
+#: improvement loop needs to know.
+UxChangeOrigin = Literal[
+    "purpose", "capability", "journey", "requirement",
+    "solution_design", "implementation_target", "snapshot",
+]
+
+#: The exclusive-choice ledger's finite actions (§3.2), deliberately
+#: separate from `UxDesignDecisionKind`: `adopt` is a choice AMONG N
+#: competing options, never a non-exclusive confirmation. A second `adopt`
+#: while one option is already adopted is refused (409
+#: `solution_design_option_already_adopted`) rather than auto-`withdraw`ing
+#: the first -- the system never fabricates a human's withdrawal decision.
+SolutionDesignOptionDecision = Literal["adopt", "hold", "reject", "withdraw"]
+
+#: DERIVED (never stored) by folding `solution_design_decision` for one
+#: `option_key`, the same "derived, never stored" rule `UxDesignStatus`
+#: uses. `draft` is the state before any decision row exists for that option.
+SolutionDesignOptionStatus = Literal["draft", "adopted", "held", "rejected", "withdrawn"]
+
+#: The 8 kinds of existing implementation entity a Solution Design Option
+#: can point at (§3.3's table), each resolved against exactly ONE canonical
+#: source at read time. `static_flow` (a snapshot-pinned entry-point path)
+#: and `runtime_flow` (an SDK-assigned execution correlation id) are kept
+#: separate on purpose -- one word covering both facts is exactly the #366
+#: defect this Epic is careful not to repeat.
+SolutionTargetKind = Literal[
+    "capability", "static_flow", "runtime_flow", "evolution_node",
+    "component", "cell_definition", "cell_binding", "probe_point",
+]
+
+#: A target/requirement link's read-time state, first-match over §3.4's
+#: 6-step table (unreadable source -> `unavailable`; target gone ->
+#: `unresolved`; pinned snapshot moved -> `stale`; captured digest stale ->
+#: `stale`; upstream Requirement/Journey/Purpose stale -> `stale`; else
+#: `current`). `review_required` is deliberately NOT a 5th value here --
+#: it is the finite consequence of `link_state != "current"`, reported
+#: through its own `stale_reason` axis instead of inflating this vocabulary.
+SolutionLinkState = Literal["current", "stale", "unresolved", "unavailable"]
+
+#: WHY a link went stale -- distinct reasons so `change-origins` can tell
+#: "the Requirement text changed" apart from "the pinned snapshot moved"
+#: apart from "the upstream Journey/Purpose chain went stale first" (§3.4).
+SolutionLinkStaleReason = Literal[
+    "requirement_changed", "design_changed", "target_changed",
+    "snapshot_changed", "upstream_changed",
+]
+
+#: `GET /solution-designs/{design_key}/handoff`'s top-level verdict (§3.7,
+#: the same `assembly_state` idea `NodeDesignHandoffOut` already uses under
+#: a name that fits THIS handoff's own read-only-reference discipline).
+#: `incomplete` means at least one reference named in `unresolved_references`
+#: could not be resolved -- never silently dropped.
+SolutionHandoffState = Literal["complete", "incomplete", "unavailable"]
+
+
+class UxJourneyStepOut(BaseModel):
+    """One ordered Step of a Journey revision (§2.4's `ux_journey_step`).
+    Steps have no revision chain of their own -- they ARE the content of the
+    Journey revision they belong to."""
+
+    id: int
+    step_key: str
+    step_order: int
+    user_intent: str = ""
+    system_response: str = ""
+    success_criteria: str = ""
+    failure_mode: str = ""
+    recovery_path: str = ""
+    evidence_expectation: str = ""
+    evidence_source_kind: UxEvidenceSourceKind = "none"
+    content_digest: str
+
+
+class UxJourneyRevisionOut(BaseModel):
+    """Append-only Journey content (§2.4/§2.6). `decision_method` records who
+    chose to persist this revision; `authored_by_kind` records whose words
+    it is -- the two are independent (§0 invariant 3)."""
+
+    id: int
+    journey_id: int
+    revision_number: int
+    title: str = ""
+    beneficiary: str = ""
+    usage_context: str = ""
+    entry_trigger: str = ""
+    value_arrival: str = ""
+    summary: str = ""
+    content_digest: str
+    authored_by_kind: UxDesignAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    change_note: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    revision_state: UxRevisionState = "current"
+    superseded_by_id: Optional[int] = None
+    steps: List[UxJourneyStepOut] = []
+
+
+class UxJourneyUpstreamRefOut(BaseModel):
+    """A Journey's reference to a Purpose element / relation / Capability
+    entity, carrying the 4 independent axes §2.7 requires
+    (`relation_status` / `target_state` / `target_resolution` /
+    `recheck_state`) rather than one merged status. `target_state` is the
+    target's OWN vocabulary value copied verbatim -- never translated
+    (#380's superset rule)."""
+
+    id: int
+    journey_id: int
+    ref_kind: UxRefKind
+    target_ref: str
+    target_row_id: Optional[int] = None
+    target_name: Optional[str] = None
+    relation_status: UxRefRelationStatus
+    target_state: str
+    target_resolution: UxRefTargetResolution
+    recheck_state: UxRefRecheckState
+    captured_digest: str = ""
+    captured_session_id: Optional[int] = None
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class UxArtifactReferenceOut(BaseModel):
+    """A wireframe/ADR/spec/diagram/research-note reference. No body field
+    exists anywhere on this model -- structurally, not by convention
+    (§2.8)."""
+
+    id: int
+    subject_kind: UxArtifactSubjectKind
+    subject_key: str
+    artifact_kind: UxArtifactKind
+    title: str = ""
+    uri: str
+    media_type: str = ""
+    content_hash: str
+    hash_algorithm: Literal["sha256"] = "sha256"
+    byte_size: Optional[int] = None
+    verification_state: UxArtifactVerificationState = "unverified"
+    verified_snapshot_id: Optional[int] = None
+    verified_commit_sha: Optional[str] = None
+    verified_at: Optional[float] = None
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class UxDesignDecisionOut(BaseModel):
+    """One row of the confirm/reject/retire/reinstate ledger (§2.5).
+    `decision_method` is always `manual` -- there is no path that writes
+    anything else here."""
+
+    id: int
+    subject_kind: UxDesignSubjectKind
+    subject_key: str
+    subject_row_id: Optional[int] = None
+    decision: UxDesignDecisionKind
+    rationale: str = ""
+    captured_digest: str = ""
+    captured_revision_id: Optional[int] = None
+    decision_method: Literal["manual"] = "manual"
+    decided_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+
+
+class UxJourneyOut(BaseModel):
+    """Journey summary: the identity row plus its DERIVED axes
+    (`design_status`, `recheck_state`, `baseline_state`) -- none of which
+    are columns on `ux_journey` (§2.5)."""
+
+    id: int
+    system_id: int
+    journey_key: str
+    perspective: UxJourneyPerspective
+    baseline_mode: UxJourneyBaselineMode = "undecided"
+    baseline_journey_id: Optional[int] = None
+    baseline_journey_key: Optional[str] = None
+    baseline_state: UxJourneyBaselineState
+    current_revision_id: Optional[int] = None
+    current_revision_number: Optional[int] = None
+    title: str = ""
+    design_status: UxDesignStatus = "proposed"
+    recheck_state: UxDesignRecheckState = "current"
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class UxJourneyDetailOut(UxJourneyOut):
+    """§2.10's `GET/POST /ux-design/journeys/{journey_key}` shape: the
+    summary plus the current revision's full content and every reference/
+    decision attached to it."""
+
+    current_revision: Optional[UxJourneyRevisionOut] = None
+    upstream_refs: List[UxJourneyUpstreamRefOut] = []
+    artifact_references: List[UxArtifactReferenceOut] = []
+    decisions: List[UxDesignDecisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class UxJourneyListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    journeys: List[UxJourneyOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class UxJourneyRevisionListOut(BaseModel):
+    system_id: int
+    journey_id: int
+    journey_key: str
+    generated_at: float
+    revisions: List[UxJourneyRevisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class UxJourneyStepDiffEntryOut(BaseModel):
+    """One `step_key`'s comparison between two revisions, matched by EXACT
+    key equality only (§0 invariant 9)."""
+
+    step_key: str
+    change_kind: UxDiffChangeKind
+    from_step: Optional[UxJourneyStepOut] = None
+    to_step: Optional[UxJourneyStepOut] = None
+
+
+class UxJourneyDiffOut(BaseModel):
+    """`GET .../journeys/{key}/diff` and `.../baseline-diff` share this
+    shape. `diff_state = "not_applicable"` (never an empty `steps` list) is
+    the required response when `baseline-diff` has no baseline to compare
+    against (§2.10)."""
+
+    system_id: int
+    journey_id: int
+    journey_key: str
+    generated_at: float
+    diff_state: UxDiffState = "available"
+    from_revision_id: Optional[int] = None
+    from_revision_number: Optional[int] = None
+    to_revision_id: Optional[int] = None
+    to_revision_number: Optional[int] = None
+    steps: List[UxJourneyStepDiffEntryOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class UxAcceptanceCriterionOut(BaseModel):
+    """One Acceptance Criterion of a Requirement revision (§2.4's
+    `ux_requirement_acceptance_criterion`) -- content of the revision, not
+    an independently versioned entity, mirroring `UxJourneyStepOut`."""
+
+    id: int
+    criterion_key: str
+    criterion_order: int
+    statement: str = ""
+    verification_method: UxVerificationMethod = "manual_review"
+    verification_note: str = ""
+    content_digest: str
+
+
+class UxRequirementRevisionOut(BaseModel):
+    id: int
+    requirement_id: int
+    revision_number: int
+    requirement_kind: UxRequirementKind
+    statement: str = ""
+    rationale: str = ""
+    constraint_text: str = ""
+    out_of_scope_note: str = ""
+    content_digest: str
+    authored_by_kind: UxDesignAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    change_note: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    revision_state: UxRevisionState = "current"
+    superseded_by_id: Optional[int] = None
+    acceptance_criteria: List[UxAcceptanceCriterionOut] = []
+
+
+class UxRequirementStepLinkOut(BaseModel):
+    """The many-to-many Requirement<->Journey-Step bridge (§2.4's
+    `ux_requirement_step_link`). Resolved by `step_key` against the
+    Journey's CURRENT revision at read time -- `target_resolution` /
+    `recheck_state` reuse the same two axes `UxJourneyUpstreamRefOut` uses,
+    because a step link faces the identical "did the target move / vanish"
+    question §2.7 already answers for upstream references."""
+
+    id: int
+    requirement_id: int
+    journey_id: int
+    journey_key: Optional[str] = None
+    step_key: str
+    step_label: Optional[str] = None
+    captured_journey_revision_id: Optional[int] = None
+    captured_step_digest: str = ""
+    target_resolution: UxRefTargetResolution
+    recheck_state: UxRefRecheckState
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class UxRequirementOut(BaseModel):
+    id: int
+    system_id: int
+    requirement_key: str
+    requirement_kind: UxRequirementKind
+    current_revision_id: Optional[int] = None
+    current_revision_number: Optional[int] = None
+    statement: str = ""
+    design_status: UxDesignStatus = "proposed"
+    recheck_state: UxDesignRecheckState = "current"
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class UxRequirementDetailOut(UxRequirementOut):
+    current_revision: Optional[UxRequirementRevisionOut] = None
+    step_links: List[UxRequirementStepLinkOut] = []
+    artifact_references: List[UxArtifactReferenceOut] = []
+    decisions: List[UxDesignDecisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class UxRequirementListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    requirements: List[UxRequirementOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class UxRequirementRevisionListOut(BaseModel):
+    system_id: int
+    requirement_id: int
+    requirement_key: str
+    generated_at: float
+    revisions: List[UxRequirementRevisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class UxRequirementCriterionDiffEntryOut(BaseModel):
+    """One `criterion_key`'s comparison between two Requirement revisions,
+    matched by EXACT key equality (§0 invariant 9)."""
+
+    criterion_key: str
+    change_kind: UxDiffChangeKind
+    from_criterion: Optional[UxAcceptanceCriterionOut] = None
+    to_criterion: Optional[UxAcceptanceCriterionOut] = None
+
+
+class UxRequirementDiffOut(BaseModel):
+    system_id: int
+    requirement_id: int
+    requirement_key: str
+    generated_at: float
+    diff_state: UxDiffState = "available"
+    from_revision_id: Optional[int] = None
+    from_revision_number: Optional[int] = None
+    to_revision_id: Optional[int] = None
+    to_revision_number: Optional[int] = None
+    criteria: List[UxRequirementCriterionDiffEntryOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+# --- #407 write requests -----------------------------------------------------
+# None of these accept `decision_method` / `decided_by` / `created_by` /
+# `authored_by_kind` -- the route derives all four from the `Principal` and
+# from which write path was called (§2.10).
+
+
+class UxJourneyCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    journey_key: str
+    perspective: UxJourneyPerspective
+    baseline_mode: UxJourneyBaselineMode = "undecided"
+    baseline_journey_id: Optional[int] = None
+
+
+class UxJourneyStepInput(BaseModel):
+    """One Step nested inside a `UxJourneyRevisionCreateRequest` (§2.10's
+    `POST .../revisions` takes the whole ordered Step list per revision --
+    Steps are never created independently, matching `ux_journey_step`
+    having no create endpoint of its own)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_key: str
+    step_order: int
+    user_intent: str = ""
+    system_response: str = ""
+    success_criteria: str = ""
+    failure_mode: str = ""
+    recovery_path: str = ""
+    evidence_expectation: str = ""
+    evidence_source_kind: UxEvidenceSourceKind = "none"
+
+
+class UxJourneyRevisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = ""
+    beneficiary: str = ""
+    usage_context: str = ""
+    entry_trigger: str = ""
+    value_arrival: str = ""
+    summary: str = ""
+    change_note: str = ""
+    steps: List[UxJourneyStepInput] = Field(default_factory=list)
+
+
+class UxJourneyUpstreamRefCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref_kind: UxRefKind
+    target_ref: str
+    note: str = ""
+
+
+class UxRequirementCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requirement_key: str
+    requirement_kind: UxRequirementKind
+
+
+class UxAcceptanceCriterionInput(BaseModel):
+    """One Acceptance Criterion nested inside a
+    `UxRequirementRevisionCreateRequest` -- same "no independent create
+    endpoint" rule as `UxJourneyStepInput`. `out_of_scope` Requirements
+    refuse a non-empty list here (422 `out_of_scope_requirement_not_verifiable`,
+    §2.4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    criterion_key: str
+    criterion_order: int
+    statement: str = ""
+    verification_method: UxVerificationMethod = "manual_review"
+    verification_note: str = ""
+
+
+class UxRequirementRevisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    statement: str = ""
+    rationale: str = ""
+    constraint_text: str = ""
+    out_of_scope_note: str = ""
+    change_note: str = ""
+    acceptance_criteria: List[UxAcceptanceCriterionInput] = Field(default_factory=list)
+
+
+class UxRequirementStepLinkCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    journey_key: str
+    step_key: str
+    note: str = ""
+
+
+class UxArtifactReferenceCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_kind: UxArtifactSubjectKind
+    subject_key: str
+    artifact_kind: UxArtifactKind
+    title: str = ""
+    uri: str
+    media_type: str = ""
+    content_hash: str
+    byte_size: Optional[int] = None
+
+
+class UxDesignDecisionCreateRequest(BaseModel):
+    """`POST /ux-design/decisions` -- the one write that can move
+    `design_status` (§2.5). `captured_digest` lets the caller show what
+    content it is judging; the route (422 `ux_design_decision_stale_digest`)
+    refuses a mismatch against the subject's CURRENT digest rather than
+    silently confirming different content than the developer saw."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    subject_kind: UxDesignSubjectKind
+    subject_key: str
+    decision: UxDesignDecisionKind
+    rationale: str = ""
+    captured_digest: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Solution Design (Epic #405, Issue #408). docs/ux-design-lineage.md §3.
+# ---------------------------------------------------------------------------
+
+
+class SolutionDesignOptionOut(BaseModel):
+    """One candidate approach (§3.2's `solution_design_option`).
+    `option_status` is DERIVED from `solution_design_decision`, never a
+    stored column (same discipline as `UxDesignStatus`)."""
+
+    id: int
+    solution_design_id: int
+    option_key: str
+    option_order: int
+    title: str = ""
+    approach: str = ""
+    tradeoffs: str = ""
+    risks: str = ""
+    content_digest: str
+    authored_by_kind: UxDesignAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    option_status: SolutionDesignOptionStatus = "draft"
+    created_by: Optional[str] = None
+    created_at: float
+    revision_state: UxRevisionState = "current"
+    superseded_by_id: Optional[int] = None
+
+
+class SolutionDesignRequirementLinkOut(BaseModel):
+    """A many-to-many Solution-Design<->Requirement link (§3.2).
+    `link_state` / `stale_reason` are §3.4's read-time axes; the row itself
+    never stores them."""
+
+    id: int
+    solution_design_id: int
+    requirement_id: int
+    requirement_key: Optional[str] = None
+    captured_requirement_revision_id: Optional[int] = None
+    captured_digest: str = ""
+    link_state: SolutionLinkState
+    stale_reason: Optional[SolutionLinkStaleReason] = None
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class SolutionDesignTargetLinkOut(BaseModel):
+    """An Option's link to an existing implementation target (§3.3).
+    `review_required` is the finite, derived consequence of `link_state !=
+    "current"` (§3.4) -- not a 5th `SolutionLinkState` value."""
+
+    id: int
+    solution_design_id: int
+    option_id: int
+    option_key: Optional[str] = None
+    target_kind: SolutionTargetKind
+    target_ref: str
+    target_row_id: Optional[int] = None
+    target_name: Optional[str] = None
+    captured_digest: str = ""
+    captured_snapshot_id: Optional[int] = None
+    link_state: SolutionLinkState
+    stale_reason: Optional[SolutionLinkStaleReason] = None
+    review_required: bool = False
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class SolutionDesignDecisionOut(BaseModel):
+    """One row of the exclusive-choice ledger (§3.2). `decision_method` is
+    always `manual` -- adoption is never automatic (§3.6)."""
+
+    id: int
+    solution_design_id: int
+    option_id: int
+    option_key: str
+    decision: SolutionDesignOptionDecision
+    rationale: str = ""
+    captured_digest: str = ""
+    decision_method: Literal["manual"] = "manual"
+    decided_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+
+
+class SolutionDesignOut(BaseModel):
+    """Solution Design summary. No "current option"/status column exists on
+    `solution_design` (§3.2) -- `adopted_option_key` here is derived by
+    folding the decision ledger."""
+
+    id: int
+    system_id: int
+    design_key: str
+    title: str = ""
+    summary: str = ""
+    adopted_option_key: Optional[str] = None
+    option_count: int = 0
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class SolutionDesignDetailOut(SolutionDesignOut):
+    options: List[SolutionDesignOptionOut] = []
+    requirement_links: List[SolutionDesignRequirementLinkOut] = []
+    target_links: List[SolutionDesignTargetLinkOut] = []
+    decisions: List[SolutionDesignDecisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class SolutionDesignListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    designs: List[SolutionDesignOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class SolutionDesignChangeOriginEntryOut(BaseModel):
+    """One non-current link classified by WHERE its change originated
+    (§3.5) -- a deterministic mapping from the link's own `stale_reason` +
+    `ref_kind`/`target_kind`, never a guess or a score."""
+
+    origin: UxChangeOrigin
+    link_id: int
+    link_kind: Literal["requirement_link", "target_link"]
+    target_kind: Optional[SolutionTargetKind] = None
+    target_ref: Optional[str] = None
+    requirement_key: Optional[str] = None
+    stale_reason: Optional[SolutionLinkStaleReason] = None
+    detail: str = ""
+
+
+class SolutionDesignChangeOriginsOut(BaseModel):
+    system_id: int
+    solution_design_id: int
+    design_key: str
+    generated_at: float
+    origins: List[SolutionDesignChangeOriginEntryOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class SolutionDesignHandoffUnresolvedRefOut(BaseModel):
+    """A named, un-silently-dropped reference the handoff could not resolve
+    (§3.7 / #408 acceptance condition 4)."""
+
+    kind: str
+    ref: str
+    reason: str
+
+
+class SolutionDesignHandoffOut(BaseModel):
+    """`GET /solution-designs/{design_key}/handoff` (§3.7). References are
+    resolved at READ time and never copied (`node_design.get_handoff`'s
+    discipline); `evaluation_policy_refs` is GROUPED BY LEVEL to keep ADR-7's
+    three separate evaluation contracts structurally apart -- never one flat
+    list, and never a composite score anywhere on this model."""
+
+    system_id: int
+    solution_design_id: int
+    design_key: str
+    generated_at: float
+    handoff_state: SolutionHandoffState
+    adopted_option: Optional[SolutionDesignOptionOut] = None
+    target_links: List[SolutionDesignTargetLinkOut] = []
+    requirements: List[UxRequirementDetailOut] = []
+    node_decomposition_refs: List[Dict[str, Any]] = []
+    probe_plan_refs: List[Dict[str, Any]] = []
+    evaluation_policy_refs: Dict[str, List[Dict[str, Any]]] = {}
+    unresolved_references: List[SolutionDesignHandoffUnresolvedRefOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+# --- #408 write requests -----------------------------------------------------
+# Same rule as the #407 requests above: no `decision_method` / `decided_by` /
+# `created_by` / `authored_by_kind` field anywhere here.
+
+
+class SolutionDesignCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    design_key: str
+    title: str = ""
+    summary: str = ""
+
+
+class SolutionDesignOptionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    option_key: str
+    option_order: int
+    title: str = ""
+    approach: str = ""
+    tradeoffs: str = ""
+    risks: str = ""
+
+
+class SolutionDesignRequirementLinkCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requirement_key: str
+    note: str = ""
+
+
+class SolutionDesignTargetLinkCreateRequest(BaseModel):
+    """`captured_snapshot_id` is required for `target_kind="static_flow"`
+    (422 `flow_target_requires_snapshot`, §3.3) -- an entry-point path with
+    no pinned snapshot has no stable meaning to capture."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    option_key: str
+    target_kind: SolutionTargetKind
+    target_ref: str
+    captured_snapshot_id: Optional[int] = None
+    note: str = ""
+
+
+class SolutionDesignOptionDecisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    option_key: str
+    decision: SolutionDesignOptionDecision
+    rationale: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Evolution Node (Epic #394 Phase 1, Issue #396)
 #
 # The finite vocabularies below are mirrored from `app/evolution_node.py`,

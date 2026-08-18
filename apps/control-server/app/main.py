@@ -50,12 +50,14 @@ from .routes import (
     retention,
     shadow,
     snapshot_preflight,
+    solution_design,
     stabilization,
     systems,
     system_state,
     trace_analyzers,
     trace_lineage,
     traces,
+    ux_design,
     workspaces,
 )
 
@@ -117,6 +119,8 @@ def create_app() -> FastAPI:
     app.include_router(exploration.router, dependencies=_auth)
     app.include_router(stabilization.router, dependencies=_auth)
     app.include_router(node_operations.router, dependencies=_auth)
+    app.include_router(ux_design.router, dependencies=_auth)
+    app.include_router(solution_design.router, dependencies=_auth)
     app.include_router(generation.router, dependencies=_auth)
     app.include_router(replay.router, dependencies=_auth)
     app.include_router(candidate_studio.router, dependencies=_auth)
