@@ -82,6 +82,51 @@ def get_conn() -> Iterator[sqlite3.Connection]:
             conn.close()
 
 
+_SOLUTION_DESIGN_OPTION_DDL = """
+CREATE TABLE IF NOT EXISTS solution_design_option (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    solution_design_id   INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    option_key           TEXT NOT NULL,
+    option_order         INTEGER NOT NULL,
+    title                TEXT NOT NULL DEFAULT '',
+    approach             TEXT NOT NULL DEFAULT '',
+    tradeoffs            TEXT NOT NULL DEFAULT '',
+    risks                TEXT NOT NULL DEFAULT '',
+    content_digest       TEXT NOT NULL,
+    authored_by_kind     TEXT NOT NULL DEFAULT 'developer'
+                             CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method      TEXT NOT NULL DEFAULT 'manual'
+                             CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id  INTEGER,
+    created_by           TEXT,
+    created_at           REAL NOT NULL,
+    superseded_by_id     INTEGER,
+    schema_version       TEXT NOT NULL DEFAULT 'solution-design-option-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (solution_design_id) REFERENCES solution_design (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES solution_design_option (id) ON DELETE SET NULL
+);
+
+-- The uniqueness of an option_key holds over the CURRENT row only, which is
+-- why it is a partial index here and not a table-level UNIQUE. An unqualified
+-- UNIQUE (solution_design_id, option_key) contradicts the append-only rule
+-- this table is built on: correcting an option inserts a new row and marks the
+-- old one superseded, so the second INSERT would collide with the very row it
+-- is replacing and the correction could never be recorded at all. It also took
+-- SolutionLinkStaleReason.design_changed with it -- that reason is only
+-- reachable once an option row HAS been superseded, so an unqualified
+-- constraint made a documented finite value permanently unreachable rather
+-- than merely unused. Same idiom as ux_evolution_node_event_idempotency above.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_solution_design_option_current
+    ON solution_design_option (solution_design_id, option_key)
+    WHERE superseded_by_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_solution_design_option_design
+    ON solution_design_option (solution_design_id, option_order);
+"""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6358,34 +6403,7 @@ CREATE INDEX IF NOT EXISTS idx_solution_design_system
 -- this Epic exists to support (§0 invariant 3) -- but `solution_design_
 -- decision` below is CHECKed to `decision_method = 'manual'` regardless of
 -- who wrote the option text, so an AI's own draft can never adopt itself.
-CREATE TABLE IF NOT EXISTS solution_design_option (
-    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    solution_design_id   INTEGER NOT NULL,
-    system_id            INTEGER NOT NULL,
-    option_key           TEXT NOT NULL,
-    option_order         INTEGER NOT NULL,
-    title                TEXT NOT NULL DEFAULT '',
-    approach             TEXT NOT NULL DEFAULT '',
-    tradeoffs            TEXT NOT NULL DEFAULT '',
-    risks                TEXT NOT NULL DEFAULT '',
-    content_digest       TEXT NOT NULL,
-    authored_by_kind     TEXT NOT NULL DEFAULT 'developer'
-                             CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
-    decision_method      TEXT NOT NULL DEFAULT 'manual'
-                             CHECK (decision_method IN ('manual', 'reasoning_llm')),
-    intelligence_run_id  INTEGER,
-    created_by           TEXT,
-    created_at           REAL NOT NULL,
-    superseded_by_id     INTEGER,
-    schema_version       TEXT NOT NULL DEFAULT 'solution-design-option-v1',
-    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
-    FOREIGN KEY (solution_design_id) REFERENCES solution_design (id) ON DELETE CASCADE,
-    FOREIGN KEY (superseded_by_id) REFERENCES solution_design_option (id) ON DELETE SET NULL,
-    UNIQUE (solution_design_id, option_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_solution_design_option_design
-    ON solution_design_option (solution_design_id, option_order);
+""" + _SOLUTION_DESIGN_OPTION_DDL + """
 
 -- solution_design_requirement_link: MANY-TO-MANY on purpose. There is no FK
 -- from `solution_design` straight to one Requirement, because one design
@@ -6918,10 +6936,60 @@ def _migrate_cell_ask_decision_note(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_solution_design_option_unique(conn: sqlite3.Connection) -> None:
+    """Scope the option_key uniqueness to the CURRENT row.
+
+    The table shipped its first form with a table-level
+    ``UNIQUE (solution_design_id, option_key)``, which contradicts the
+    append-only rule it is built on: correcting an option inserts a new row
+    and supersedes the old one, so the insert collided with the row it was
+    replacing and no correction could ever be recorded.
+    ``CREATE TABLE IF NOT EXISTS`` cannot repair that on a database created
+    from the earlier form, and SQLite cannot drop a table constraint in
+    place, so the table is rebuilt once, preserving every existing row.
+
+    Detection is the implicit index SQLite creates for a table-level UNIQUE
+    (``origin == 'u'``); the replacement partial index reports ``origin ==
+    'c'``, so this runs exactly once and is a no-op afterwards.
+    """
+    if not _columns(conn, "solution_design_option"):
+        return
+    origins = {
+        row["origin"]
+        for row in conn.execute("PRAGMA index_list(solution_design_option)")
+    }
+    if "u" not in origins:
+        return
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE solution_design_option RENAME TO solution_design_option_legacy;
+        -- A rename carries the table's indexes with it, so their NAMES are still
+        -- taken and the DDL's `CREATE INDEX IF NOT EXISTS` below would silently
+        -- do nothing -- leaving the rebuilt table with no constraint at all,
+        -- which is worse than the constraint being wrong. Free the names first.
+        DROP INDEX IF EXISTS ux_solution_design_option_current;
+        DROP INDEX IF EXISTS idx_solution_design_option_design;
+        """
+    )
+    conn.executescript(_SOLUTION_DESIGN_OPTION_DDL)
+    conn.execute(
+        """INSERT INTO solution_design_option
+           SELECT * FROM solution_design_option_legacy"""
+    )
+    conn.executescript(
+        """
+        DROP TABLE solution_design_option_legacy;
+        PRAGMA foreign_keys = ON;
+        """
+    )
+
+
 def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
+        _migrate_solution_design_option_unique(conn)
         _migrate_intelligence_runs_snapshot_nullable(conn)
         install_intelligence_run_type_guards(conn)
         _migrate_cell_improvement_event_types(conn)

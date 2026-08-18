@@ -409,6 +409,22 @@ def add_option(
     conn.execute("BEGIN")
     try:
         previous = _current_option_row(conn, system_id, solution_design_id, key)
+        if previous is not None:
+            # Retire the prior row BEFORE inserting its replacement. The
+            # option_key uniqueness is scoped to the current row
+            # (ux_solution_design_option_current, a partial index over
+            # superseded_by_id IS NULL), so inserting first would put two
+            # current rows with the same key in the table for the duration of
+            # the statement and the correction would be refused outright.
+            # Pointing the old row at ITSELF is what frees the key without
+            # naming a row that does not exist yet: the id is real, so the
+            # self-FK holds, and the placeholder is overwritten with the real
+            # successor id a few lines below, inside this same transaction --
+            # so a row that is its own successor is never visible to a reader.
+            conn.execute(
+                "UPDATE solution_design_option SET superseded_by_id = id WHERE id = ?",
+                (previous["id"],),
+            )
         cur = conn.execute(
             """INSERT INTO solution_design_option
                    (solution_design_id, system_id, option_key, option_order, title, approach,

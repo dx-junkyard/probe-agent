@@ -1255,6 +1255,17 @@ def _requirement_revision_out_dict(conn: sqlite3.Connection, revision_id: int) -
     d = dict(row)
     d["revision_state"] = "superseded" if d["superseded_by_id"] is not None else "current"
     d["acceptance_criteria"] = [dict(c) for c in criteria]
+    # requirement_kind lives on the ux_requirement IDENTITY row, never on the
+    # revision (contract §2.2: the kind is part of what the Requirement IS, so
+    # an out_of_scope declaration cannot quietly become a functional
+    # requirement through a content edit). The projection still has to carry it
+    # so a reader can judge the revision without a second fetch, so it is
+    # joined in here rather than duplicated into a column.
+    kind = conn.execute(
+        "SELECT requirement_kind FROM ux_requirement WHERE id = ?",
+        (d["requirement_id"],),
+    ).fetchone()
+    d["requirement_kind"] = kind["requirement_kind"] if kind is not None else None
     return d
 
 
