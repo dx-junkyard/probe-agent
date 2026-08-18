@@ -3,7 +3,7 @@ import {
   LayoutDashboard, GitBranch, Map, Crosshair, FlaskConical,
   Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight, MessageSquare,
   Workflow, Network, MessageSquareText, Brain, GitFork, Filter,
-  LifeBuoy, BookMarked, GitMerge, Beaker, Bot, Layers,
+  LifeBuoy, BookMarked, GitMerge, Beaker, Bot, Layers, PenTool,
 } from "lucide-react";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -66,6 +66,10 @@ const NAV_GROUPS: NavGroup[] = [
       { to: "/feature-map", icon: Map, label: "Feature Map" },
       { to: "/flow-explorer", icon: Workflow, label: "Flow Explorer" },
       { to: "/interview", icon: MessageSquareText, label: "Interview" },
+      {
+        to: "/ux-design-studio", icon: PenTool, label: "UX Design Studio",
+        subtitle: "Journey/Requirement/Solution Designの追跡",
+      },
     ],
   },
   {

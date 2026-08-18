@@ -25,6 +25,7 @@ import SystemUnderstandingPage from "./pages/system-understanding";
 import GithubPage from "./pages/github";
 import CellFabricPage from "./pages/cell-fabric";
 import EvolutionNodesPage from "./pages/evolution-nodes";
+import UxDesignStudioPage from "./pages/ux-design-studio";
 
 export default function App() {
   return (
@@ -53,6 +54,7 @@ export default function App() {
         <Route path="github" element={<GithubPage />} />
         <Route path="cell-fabric" element={<CellFabricPage />} />
         <Route path="evolution-nodes" element={<EvolutionNodesPage />} />
+        <Route path="ux-design-studio" element={<UxDesignStudioPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="admin" element={<AdminPage />} />
       </Route>
