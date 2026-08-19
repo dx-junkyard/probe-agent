@@ -621,7 +621,7 @@ export function SolutionDesignPanel({
         ) : (
           <Card>
             <CardContent className="p-6">
-              <SolutionDesignDetail designKey={selectedKey} />
+              <SolutionDesignDetail key={selectedKey} designKey={selectedKey} />
             </CardContent>
           </Card>
         )}

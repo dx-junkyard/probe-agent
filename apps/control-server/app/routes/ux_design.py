@@ -64,6 +64,7 @@ from ..models import (
     UxRequirementStepLinkOut,
 )
 from ..ux_design import (
+    ArtifactHashInvalid,
     ArtifactHashRequired,
     ArtifactUriInvalid,
     BaselineForeignSystem,
@@ -105,7 +106,8 @@ _MESSAGES: Dict[str, str] = {
     "out_of_scope_requirement_not_verifiable": "out_of_scope の Requirement には受入条件を設定できません。",
     "artifact_uri_invalid": "artifact の uri が不正です。",
     "artifact_hash_required": "content_hash を指定してください。",
-    "ux_design_subject_not_found": "決定の対象が見つかりません。",
+    "artifact_hash_invalid": "content_hash は64文字の16進SHA-256で指定してください。",
+    "ux_design_subject_not_found": "設計対象が見つかりません。",
     "ux_design_decision_stale_digest": "指定された digest が現在の内容と一致しません。",
     "ux_design_not_decidable": "この状態からはその決定を記録できません。",
 }
@@ -139,6 +141,8 @@ def _raise_for_ux_error(exc: Exception) -> None:
         raise _reject("artifact_uri_invalid", 422)
     if isinstance(exc, ArtifactHashRequired):
         raise _reject("artifact_hash_required", 422)
+    if isinstance(exc, ArtifactHashInvalid):
+        raise _reject("artifact_hash_invalid", 422)
     if isinstance(exc, SubjectNotFound):
         raise _reject("ux_design_subject_not_found", 404)
     if isinstance(exc, DecisionStaleDigest):

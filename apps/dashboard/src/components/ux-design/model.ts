@@ -522,7 +522,11 @@ export function decideNextDesignAction(input: {
       actionLabel: "この Journey を開く",
     };
   }
-  const staleJourney = firstByKey(journeys, (j) => j.journey_key, (j) => j.recheck_state === "stale");
+  const staleJourney = firstByKey(
+    journeys,
+    (j) => j.journey_key,
+    (j) => j.design_status === "confirmed" && j.recheck_state === "stale",
+  );
   if (staleJourney) {
     return {
       kind: "recheck_journey",
@@ -530,6 +534,15 @@ export function decideNextDesignAction(input: {
       reason: "確定したあとに内容が変わりました。確定そのものは取り消されていません。",
       target: { tab: "journeys", key: staleJourney.journey_key },
       actionLabel: "この Journey を開く",
+    };
+  }
+  if (!journeys.some((j) => j.design_status === "confirmed")) {
+    return {
+      kind: "create_journey",
+      title: "UX Journey を作成する",
+      reason: "既存の Journey は却下または廃止されており、下流設計の起点にできる確定済み Journey がありません。",
+      target: { tab: "journeys", key: null },
+      actionLabel: "UX Journey へ移動",
     };
   }
 
@@ -556,7 +569,9 @@ export function decideNextDesignAction(input: {
     };
   }
   const staleRequirement = firstByKey(
-    requirements, (r) => r.requirement_key, (r) => r.recheck_state === "stale",
+    requirements,
+    (r) => r.requirement_key,
+    (r) => r.design_status === "confirmed" && r.recheck_state === "stale",
   );
   if (staleRequirement) {
     return {
@@ -565,6 +580,15 @@ export function decideNextDesignAction(input: {
       reason: "確定したあとに内容が変わりました。確定そのものは取り消されていません。",
       target: { tab: "requirements", key: staleRequirement.requirement_key },
       actionLabel: "この Requirement を開く",
+    };
+  }
+  if (!requirements.some((r) => r.design_status === "confirmed")) {
+    return {
+      kind: "create_requirement",
+      title: "Requirement を作成する",
+      reason: "既存の Requirement は却下または廃止されており、Solution Design の起点にできる確定済み要件がありません。",
+      target: { tab: "requirements", key: null },
+      actionLabel: "Requirement へ移動",
     };
   }
 

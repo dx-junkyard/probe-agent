@@ -248,6 +248,67 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+describe("選択対象を切り替えたとき編集状態を持ち越さない", () => {
+  test("Journey の版追加フォームは別 Journey へ切り替えると閉じる", async () => {
+    const first = journeyOut({ id: 1, journey_key: "journey-a" });
+    const second = journeyOut({ id: 2, journey_key: "journey-b" });
+    mockGet({
+      "/ux-design/journeys": journeyListOut([first, second]),
+      "/ux-design/journeys/journey-a": journeyDetailOut({ id: 1, journey_key: "journey-a" }),
+      "/ux-design/journeys/journey-b": journeyDetailOut({ id: 2, journey_key: "journey-b" }),
+    });
+    await renderPage();
+
+    fireEvent.click(await screen.findByTestId("ux-journey-item-journey-a"));
+    fireEvent.click(await screen.findByRole("button", { name: "版を追加する" }));
+    expect(screen.getByTestId("ux-journey-revision-form")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("ux-journey-item-journey-b"));
+    await screen.findByTestId("ux-journey-detail");
+    expect(screen.queryByTestId("ux-journey-revision-form")).not.toBeInTheDocument();
+  });
+
+  test("Requirement の版追加フォームは別 Requirement へ切り替えると閉じる", async () => {
+    const first = requirementOut({ id: 10, requirement_key: "requirement-a" });
+    const second = requirementOut({ id: 11, requirement_key: "requirement-b" });
+    mockGet({
+      "/ux-design/requirements": requirementListOut([first, second]),
+      "/ux-design/requirements/requirement-a": requirementDetailOut({ id: 10, requirement_key: "requirement-a" }),
+      "/ux-design/requirements/requirement-b": requirementDetailOut({ id: 11, requirement_key: "requirement-b" }),
+    });
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+
+    fireEvent.click(await screen.findByTestId("ux-requirement-item-requirement-a"));
+    fireEvent.click(await screen.findByRole("button", { name: "版を追加する" }));
+    expect(screen.getByTestId("ux-requirement-revision-form")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("ux-requirement-item-requirement-b"));
+    await screen.findByTestId("ux-requirement-detail");
+    expect(screen.queryByTestId("ux-requirement-revision-form")).not.toBeInTheDocument();
+  });
+
+  test("Solution Design の追加フォームは別 Design へ切り替えると閉じる", async () => {
+    const first = solutionDesignOut({ id: 20, design_key: "design-a" });
+    const second = solutionDesignOut({ id: 21, design_key: "design-b" });
+    mockGet({
+      "/solution-designs": solutionDesignListOut([first, second]),
+      "/solution-designs/design-a": solutionDesignDetailOut({ id: 20, design_key: "design-a" }),
+      "/solution-designs/design-b": solutionDesignDetailOut({ id: 21, design_key: "design-b" }),
+    });
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-solutions"));
+
+    fireEvent.click(await screen.findByTestId("ux-solution-design-item-design-a"));
+    fireEvent.click(await screen.findByRole("button", { name: "Option を追加する" }));
+    expect(screen.getByTestId("ux-solution-design-add-option-form")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("ux-solution-design-item-design-b"));
+    await screen.findByTestId("ux-solution-design-detail");
+    expect(screen.queryByTestId("ux-solution-design-add-option-form")).not.toBeInTheDocument();
+  });
+});
+
 // --- revision history / revision-to-revision diff ---------------------------
 
 describe("版の履歴と版どうしの差分", () => {
@@ -871,6 +932,20 @@ describe("次に決めること (§4.2)", () => {
         designs: [solutionDesignOut({ option_count: 2, adopted_option_key: null })],
       }).kind,
     ).toBe("adopt_design_option");
+  });
+
+  test("却下・廃止だけの上流を確定済みとして下流へ進めない", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const rejectedJourney = journeyOut({ design_status: "rejected", recheck_state: "stale" });
+    expect(decideNextDesignAction({
+      journeys: [rejectedJourney], requirements: [], designs: [],
+    }).kind).toBe("create_journey");
+
+    const confirmedJourney = journeyOut({ design_status: "confirmed", recheck_state: "current" });
+    const retiredRequirement = requirementOut({ design_status: "retired", recheck_state: "stale" });
+    expect(decideNextDesignAction({
+      journeys: [confirmedJourney], requirements: [retiredRequirement], designs: [],
+    }).kind).toBe("create_requirement");
   });
 
   test("すべて確定済みなら「決めることはない」と言い、CTA を出さない", async () => {

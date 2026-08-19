@@ -128,7 +128,7 @@ Evolution Node ADR-2 と同じ理由で、**上流の id からは決して導�
 | Journey Step | `(journey_revision_id, step_key)` UNIQUE | `step_key` は revision を跨いで安定 |
 | Requirement | `(system_id, requirement_key)` UNIQUE | |
 | Acceptance Criterion | `(requirement_revision_id, criterion_key)` UNIQUE | |
-| Artifact Reference | `(system_id, subject_kind, subject_key, uri)` の最新非 superseded 行 | |
+| Artifact Reference | `(system_id, subject_kind, subject_key, uri)` の最新非 superseded 行 | `journey` / `requirement` / `solution_design` は stable key、親なしでは一意にならない `journey_step` / `design_option` は current row id の10進文字列 |
 
 ### 2.3 as-is / to-be は identity の属性であり、revision の属性ではない
 
@@ -579,6 +579,7 @@ POST /ux-design/decisions                             -> UxDesignDecisionOut
 | `out_of_scope_requirement_not_verifiable` | 422 | `out_of_scope` に受入条件 |
 | `artifact_uri_invalid` | 422 | traversal / 不正な `repo:` path |
 | `artifact_hash_required` | 422 | `content_hash` 未指定 |
+| `artifact_hash_invalid` | 422 | `content_hash` が64文字の16進SHA-256ではない |
 | `ux_design_subject_not_found` | 404 | 決定対象が存在しない |
 | `ux_design_decision_stale_digest` | 409 | 提示された digest と現在が不一致 |
 | `ux_design_not_decidable` | 422 | `retired` を `confirm` しようとした 等 |
@@ -824,6 +825,8 @@ Dashboard のみ。**新しい endpoint を追加せず、server の判定を再
   という **server が既に決めた値だけ**で、因果順(Journey → Requirement →
   Solution Design)に走る 11 行の first-match 表。同一条件に複数該当したときの
   tie-break は key の昇順で、score も recency ranking も使わない。
+  `rejected` / `retired` は下流設計の起点となる確定済み成果物には数えず、
+  それらだけが残る場合は新しい Journey / Requirement の作成へ戻す。
   **CTA は移動であって実行ではない**(§4.1 / #358) — tab と対象を選ぶだけで、
   操作そのものは移動先の panel が持つ primary action のままである。
   一覧が読めなかったとき(`unavailable`)と、決めることが無いとき(`settled`)は
