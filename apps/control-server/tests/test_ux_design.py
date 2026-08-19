@@ -1232,6 +1232,40 @@ class TestArtifactReferences:
             }
         assert cols.isdisjoint({"body", "content", "text", "payload"})
 
+    def test_subject_must_exist_in_the_current_system(self, admin_client, tmp_path):
+        token, system_a, _, _ = _setup(
+            admin_client, tmp_path, "System Artifact Subject A"
+        )
+        system_b = _create_system(admin_client, token, "System Artifact Subject B")
+        headers_a = _headers(token, system_a)
+        headers_b = _headers(token, system_b)
+        _create_journey(admin_client, headers_b, "foreign-journey", perspective="to_be")
+
+        for subject_kind, subject_key in (
+            ("journey", "missing-journey"),
+            ("journey", "foreign-journey"),
+            ("requirement", "missing-requirement"),
+            ("solution_design", "missing-design"),
+            ("journey_step", "999999"),
+            ("design_option", "999999"),
+        ):
+            r = admin_client.post(
+                "/ux-design/artifact-references",
+                json={
+                    "subject_kind": subject_kind,
+                    "subject_key": subject_key,
+                    "artifact_kind": "spec",
+                    "title": "",
+                    "uri": "https://example.com/design",
+                    "media_type": "",
+                    "content_hash": "a" * 64,
+                    "byte_size": None,
+                },
+                headers=headers_a,
+            )
+            assert r.status_code == 404, (subject_kind, subject_key, r.text)
+            assert r.json()["detail"]["code"] == "ux_design_subject_not_found"
+
     def test_https_uri_never_reaches_verified_and_attempts_no_network_call(
         self, admin_client, tmp_path, monkeypatch
     ):
@@ -1357,6 +1391,23 @@ class TestArtifactReferences:
         assert r.status_code == 422
         assert r.json()["detail"]["code"] == "artifact_uri_invalid"
 
+    def test_empty_uri_is_refused(self, admin_client, tmp_path):
+        token, system_id, _, _ = _setup(admin_client, tmp_path, "System Artifact Empty URI")
+        headers = _headers(token, system_id)
+        _create_journey(admin_client, headers, "j1", perspective="to_be")
+
+        r = admin_client.post(
+            "/ux-design/artifact-references",
+            json={
+                "subject_kind": "journey", "subject_key": "j1", "artifact_kind": "spec",
+                "title": "", "uri": "  ", "media_type": "",
+                "content_hash": "c" * 64, "byte_size": None,
+            },
+            headers=headers,
+        )
+        assert r.status_code == 422
+        assert r.json()["detail"]["code"] == "artifact_uri_invalid"
+
     def test_content_hash_is_required(self, admin_client, tmp_path):
         token, system_id, snapshot_id, _ = _setup(admin_client, tmp_path, "System Artifact NoHash")
         headers = _headers(token, system_id)
@@ -1373,6 +1424,32 @@ class TestArtifactReferences:
         )
         assert r.status_code == 422
         assert r.json()["detail"]["code"] == "artifact_hash_required"
+
+    def test_content_hash_must_be_a_canonical_sha256_digest(self, admin_client, tmp_path):
+        token, system_id, _, _ = _setup(
+            admin_client, tmp_path, "System Artifact Invalid Hash"
+        )
+        headers = _headers(token, system_id)
+        _create_journey(admin_client, headers, "j1", perspective="to_be")
+
+        for invalid_hash in ("short", "g" * 64):
+            r = admin_client.post(
+                "/ux-design/artifact-references",
+                json={
+                    "subject_kind": "journey", "subject_key": "j1", "artifact_kind": "spec",
+                    "title": "", "uri": "https://example.com/x", "media_type": "",
+                    "content_hash": invalid_hash, "byte_size": None,
+                },
+                headers=headers,
+            )
+            assert r.status_code == 422, r.text
+            assert r.json()["detail"]["code"] == "artifact_hash_invalid"
+
+        canonical = _create_artifact_reference(
+            admin_client, headers, subject_kind="journey", subject_key="j1",
+            uri="https://example.com/uppercase", content_hash="A" * 64,
+        )
+        assert canonical["content_hash"] == "a" * 64
 
 
 # --- §0 invariant 9 / §2.10: diffs are exact-key matches only ----------------

@@ -1497,6 +1497,23 @@ creating incomplete persistence or execution paths for later phases.
     追加する Journey・Requirement の確定と Design Option の採用もすべて
     `decision_method: manual`。
 
+    **実装状況 (2026-08-19 時点)。** #406-#409 は実装・検証済み。検証ラウンドで
+    2 つの欠陥を修正した: (a) handoff の Node decomposition 参照が
+    `adopted_node_ids_json LIKE '%<id>%'` だったため node 1 が node 11 の
+    candidate を継承していた (所属判定は parse した id 集合への完全一致へ、
+    Node の解決は保存済み `target_row_id` ではなく `node_key` からの読み取り時
+    解決へ)、(b) `degraded_sections` が非空でも `handoff_state` が `complete` を
+    返していた (first match を `degraded_sections` → `unavailable` →
+    `unresolved_references` → `incomplete` → `complete` へ)。あわせて §4.2 の
+    「今決めるべきこと」を `components/ux-design/model.ts` の
+    `decideNextDesignAction` として補った — server が決めた値だけを入力とする
+    因果順 11 行の first-match 表で、CTA は navigate であって execute ではなく、
+    `unavailable` / `settled` は CTA を持たない。`db.py` には #405 自身の
+    `solution_design_option` を 1 度だけ再構築する
+    `_migrate_solution_design_option_unique` が存在する (既存正本への変更では
+    ない)。詳細は `docs/project-intelligence.md` の
+    「Epic #405 検証ラウンド」節が正本。
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

@@ -615,7 +615,11 @@ export function JourneyPanel({
         ) : (
           <Card>
             <CardContent className="p-6">
-              <JourneyDetail journeyKey={selectedKey} onOpenRequirement={onOpenRequirement} />
+              <JourneyDetail
+                key={selectedKey}
+                journeyKey={selectedKey}
+                onOpenRequirement={onOpenRequirement}
+              />
             </CardContent>
           </Card>
         )}

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, get_args
@@ -93,6 +94,7 @@ __all__ = [
     "OutOfScopeNotVerifiable",
     "ArtifactUriInvalid",
     "ArtifactHashRequired",
+    "ArtifactHashInvalid",
     "SubjectNotFound",
     "DecisionStaleDigest",
     "NotDecidable",
@@ -248,6 +250,10 @@ class ArtifactUriInvalid(UxDesignError):
 
 class ArtifactHashRequired(UxDesignError):
     """`content_hash` was empty (422 `artifact_hash_required`)."""
+
+
+class ArtifactHashInvalid(UxDesignError):
+    """`content_hash` is not a 64-character hexadecimal SHA-256 digest."""
 
 
 class SubjectNotFound(NotFound):
@@ -1894,6 +1900,60 @@ def _verify_artifact_content(repo_path: str, commit_sha: str, path: str, content
     return hashlib.sha256(data).hexdigest() == content_hash
 
 
+def _require_artifact_subject(
+    conn: sqlite3.Connection, system_id: int, subject_kind: str, subject_key: str
+) -> None:
+    """Require the Artifact Reference's owner to exist in this System.
+
+    Stable identity kinds use their developer-supplied key.  The two nested,
+    potentially ambiguous kinds use the current row id encoded as decimal
+    text: ``step_key`` and ``option_key`` are only unique inside their parent,
+    so accepting either one by itself could attach an artifact to the wrong
+    Journey or Solution Design.
+
+    Missing and foreign-System rows deliberately share ``SubjectNotFound`` so
+    the endpoint cannot be used to probe another System's identifiers.
+    """
+    row: Optional[sqlite3.Row]
+    if subject_kind == "journey":
+        row = conn.execute(
+            "SELECT id FROM ux_journey WHERE system_id = ? AND journey_key = ?",
+            (system_id, subject_key),
+        ).fetchone()
+    elif subject_kind == "requirement":
+        row = conn.execute(
+            "SELECT id FROM ux_requirement WHERE system_id = ? AND requirement_key = ?",
+            (system_id, subject_key),
+        ).fetchone()
+    elif subject_kind == "solution_design":
+        row = conn.execute(
+            "SELECT id FROM solution_design WHERE system_id = ? AND design_key = ?",
+            (system_id, subject_key),
+        ).fetchone()
+    elif subject_kind == "journey_step" and subject_key.isdigit():
+        row = conn.execute(
+            """SELECT s.id FROM ux_journey_step s
+                   JOIN ux_journey j
+                     ON j.id = s.journey_id
+                    AND j.system_id = s.system_id
+                    AND j.current_revision_id = s.journey_revision_id
+                   WHERE s.id = ? AND s.system_id = ?""",
+            (int(subject_key), system_id),
+        ).fetchone()
+    elif subject_kind == "design_option" and subject_key.isdigit():
+        row = conn.execute(
+            """SELECT o.id FROM solution_design_option o
+                   JOIN solution_design d
+                     ON d.id = o.solution_design_id AND d.system_id = o.system_id
+                   WHERE o.id = ? AND o.system_id = ? AND o.superseded_by_id IS NULL""",
+            (int(subject_key), system_id),
+        ).fetchone()
+    else:
+        row = None
+    if row is None:
+        raise SubjectNotFound(subject_key)
+
+
 def create_artifact_reference(
     *,
     system_id: int,
@@ -1942,12 +2002,18 @@ def create_artifact_reference(
     _check_membership(artifact_kind, ARTIFACT_KINDS, "artifact_kind")
     if not content_hash:
         raise ArtifactHashRequired()
+    if re.fullmatch(r"[0-9a-fA-F]{64}", content_hash) is None:
+        raise ArtifactHashInvalid()
+    content_hash = content_hash.lower()
+    if not (uri or "").strip():
+        raise ArtifactUriInvalid(uri)
 
     path = parse_repo_artifact_uri(uri)
     if path is not None:
         _validate_repo_artifact_path(path)
 
     with get_conn() as conn:
+        _require_artifact_subject(conn, system_id, subject_kind, subject_key)
         snapshot_row = state_facts.get_latest_ready_snapshot(conn, system_id)
         snapshot = dict(snapshot_row) if snapshot_row is not None else None
         prior_row = conn.execute(
@@ -1980,8 +2046,30 @@ def create_artifact_reference(
         verification_state = "unreachable"
 
     with get_conn() as conn:
-        conn.execute("BEGIN")
+        # Serialize the identity fold. Verification happens outside the DB
+        # lock, so two requests can otherwise both observe the same prior row
+        # and leave two non-superseded references for one artifact identity.
+        conn.execute("BEGIN IMMEDIATE")
         try:
+            # Re-check inside the write transaction.  Artifact verification
+            # may run a git subprocess between the first read and this write;
+            # a subject that disappeared or was superseded in that interval
+            # must not gain an orphaned reference.
+            _require_artifact_subject(conn, system_id, subject_kind, subject_key)
+            write_prior = conn.execute(
+                """SELECT * FROM ux_design_artifact_reference
+                   WHERE system_id = ? AND subject_kind = ? AND subject_key = ? AND uri = ?
+                     AND superseded_by_id IS NULL
+                   ORDER BY id DESC LIMIT 1""",
+                (system_id, subject_kind, subject_key, uri),
+            ).fetchone()
+            if (
+                verification_state != "verified"
+                and path is not None
+                and write_prior is not None
+                and write_prior["verification_state"] == "verified"
+            ):
+                verification_state = "unreachable"
             cur = conn.execute(
                 """INSERT INTO ux_design_artifact_reference
                        (system_id, subject_kind, subject_key, artifact_kind, title, uri, media_type,
@@ -1996,10 +2084,10 @@ def create_artifact_reference(
                 ),
             )
             new_id = cur.lastrowid
-            if prior is not None:
+            if write_prior is not None:
                 conn.execute(
                     "UPDATE ux_design_artifact_reference SET superseded_by_id = ? WHERE id = ?",
-                    (new_id, prior["id"]),
+                    (new_id, write_prior["id"]),
                 )
             conn.execute("COMMIT")
         except Exception:

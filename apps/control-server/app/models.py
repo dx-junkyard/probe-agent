@@ -9310,7 +9310,7 @@ class UxArtifactReferenceCreateRequest(BaseModel):
     uri: str
     media_type: str = ""
     content_hash: str
-    byte_size: Optional[int] = None
+    byte_size: Optional[int] = Field(default=None, ge=0)
 
 
 class UxDesignDecisionCreateRequest(BaseModel):

@@ -34,6 +34,7 @@
 
 import type {
   SolutionDesignDetailOut,
+  SolutionDesignOut,
   SolutionDesignOptionDecision,
   SolutionDesignOptionStatus,
   SolutionDesignRequirementLinkOut,
@@ -430,4 +431,204 @@ export function targetLinksForAdoptedOption(
  * server already returned; does not infer scope from anything else. */
 export function requirementAcceptsTargetLink(requirement: UxRequirementOut): boolean {
   return requirement.requirement_kind !== "out_of_scope";
+}
+
+// --- §4.2's single 「今決めるべきこと」 ------------------------------------
+//
+// One decision at a time, chosen by a FIRST-MATCH table over values the
+// server already decided (`design_status` / `recheck_state` /
+// `adopted_option_key` / `option_count`) -- the same shape #380's
+// `decide_next_action` and #358's `CockpitModel.nextStep` use. Nothing here
+// re-derives a state: every input is a field read straight off a list
+// response.
+//
+// Two rules this table must keep:
+//
+//   * The CTA NAVIGATES, never executes (§4.1 / #358). It selects a tab and
+//     an entity; the operation itself still happens in that entity's own
+//     panel, so the screen never grows a second primary action.
+//   * `unavailable` and "everything is settled" carry NO action (#380 /
+//     #342 原則 P3). A list that could not be READ is not a list that is
+//     empty, and neither is answered with a disabled button -- both are a
+//     sentence.
+
+export type UxNextDecisionKind =
+  | "unavailable"
+  | "create_journey"
+  | "confirm_journey"
+  | "recheck_journey"
+  | "create_requirement"
+  | "confirm_requirement"
+  | "recheck_requirement"
+  | "create_solution_design"
+  | "add_design_option"
+  | "adopt_design_option"
+  | "settled";
+
+export interface UxNextDecision {
+  kind: UxNextDecisionKind;
+  /** What the developer is being asked to decide. */
+  title: string;
+  /** Why this one is next, in the developer's terms (#380's 選定理由). */
+  reason: string;
+  /** Where the CTA goes. `null` for the two no-action outcomes. */
+  target: { tab: "journeys" | "requirements" | "solutions"; key: string | null } | null;
+  /** CTA label. `null` when there is no action. */
+  actionLabel: string | null;
+}
+
+/** Deterministic pick: the first row by key, so the same facts always name
+ * the same entity. No scoring, no recency ranking. */
+function firstByKey<T>(rows: readonly T[], key: (row: T) => string, match: (row: T) => boolean): T | null {
+  const hits = rows.filter(match).slice().sort((a, b) => key(a).localeCompare(key(b)));
+  return hits.length > 0 ? hits[0] : null;
+}
+
+export function decideNextDesignAction(input: {
+  journeys: readonly UxJourneyOut[] | null;
+  requirements: readonly UxRequirementOut[] | null;
+  designs: readonly SolutionDesignOut[] | null;
+}): UxNextDecision {
+  const { journeys, requirements, designs } = input;
+
+  // 1. An unreadable list is never treated as an empty one.
+  if (journeys === null || requirements === null || designs === null) {
+    return {
+      kind: "unavailable",
+      title: "次に決めることを判定できませんでした",
+      reason: "設計成果物の一覧を取得できていないため、次の 1 操作を決められません。",
+      target: null,
+      actionLabel: null,
+    };
+  }
+
+  // 2-4. Journey level (the causal head of the chain).
+  if (journeys.length === 0) {
+    return {
+      kind: "create_journey",
+      title: "UX Journey を作成する",
+      reason: "この System にはまだ UX Journey がありません。要件も設計案もここから始まります。",
+      target: { tab: "journeys", key: null },
+      actionLabel: "UX Journey へ移動",
+    };
+  }
+  const proposedJourney = firstByKey(journeys, (j) => j.journey_key, (j) => j.design_status === "proposed");
+  if (proposedJourney) {
+    return {
+      kind: "confirm_journey",
+      title: `UX Journey「${proposedJourney.journey_key}」の内容を確定する`,
+      reason: "内容は記述済みですが、まだ人による確定の記録がありません。",
+      target: { tab: "journeys", key: proposedJourney.journey_key },
+      actionLabel: "この Journey を開く",
+    };
+  }
+  const staleJourney = firstByKey(
+    journeys,
+    (j) => j.journey_key,
+    (j) => j.design_status === "confirmed" && j.recheck_state === "stale",
+  );
+  if (staleJourney) {
+    return {
+      kind: "recheck_journey",
+      title: `UX Journey「${staleJourney.journey_key}」を再確認する`,
+      reason: "確定したあとに内容が変わりました。確定そのものは取り消されていません。",
+      target: { tab: "journeys", key: staleJourney.journey_key },
+      actionLabel: "この Journey を開く",
+    };
+  }
+  if (!journeys.some((j) => j.design_status === "confirmed")) {
+    return {
+      kind: "create_journey",
+      title: "UX Journey を作成する",
+      reason: "既存の Journey は却下または廃止されており、下流設計の起点にできる確定済み Journey がありません。",
+      target: { tab: "journeys", key: null },
+      actionLabel: "UX Journey へ移動",
+    };
+  }
+
+  // 5-7. Requirement level.
+  if (requirements.length === 0) {
+    return {
+      kind: "create_requirement",
+      title: "Requirement を作成する",
+      reason: "確定した Journey はありますが、それを満たすための要件がまだありません。",
+      target: { tab: "requirements", key: null },
+      actionLabel: "Requirement へ移動",
+    };
+  }
+  const proposedRequirement = firstByKey(
+    requirements, (r) => r.requirement_key, (r) => r.design_status === "proposed",
+  );
+  if (proposedRequirement) {
+    return {
+      kind: "confirm_requirement",
+      title: `Requirement「${proposedRequirement.requirement_key}」を確定する`,
+      reason: "内容は記述済みですが、まだ人による確定の記録がありません。",
+      target: { tab: "requirements", key: proposedRequirement.requirement_key },
+      actionLabel: "この Requirement を開く",
+    };
+  }
+  const staleRequirement = firstByKey(
+    requirements,
+    (r) => r.requirement_key,
+    (r) => r.design_status === "confirmed" && r.recheck_state === "stale",
+  );
+  if (staleRequirement) {
+    return {
+      kind: "recheck_requirement",
+      title: `Requirement「${staleRequirement.requirement_key}」を再確認する`,
+      reason: "確定したあとに内容が変わりました。確定そのものは取り消されていません。",
+      target: { tab: "requirements", key: staleRequirement.requirement_key },
+      actionLabel: "この Requirement を開く",
+    };
+  }
+  if (!requirements.some((r) => r.design_status === "confirmed")) {
+    return {
+      kind: "create_requirement",
+      title: "Requirement を作成する",
+      reason: "既存の Requirement は却下または廃止されており、Solution Design の起点にできる確定済み要件がありません。",
+      target: { tab: "requirements", key: null },
+      actionLabel: "Requirement へ移動",
+    };
+  }
+
+  // 8-10. Solution Design level.
+  if (designs.length === 0) {
+    return {
+      kind: "create_solution_design",
+      title: "Solution Design を作成する",
+      reason: "確定した要件はありますが、それをどう実現するかの設計案がまだありません。",
+      target: { tab: "solutions", key: null },
+      actionLabel: "Solution Design へ移動",
+    };
+  }
+  const emptyDesign = firstByKey(designs, (d) => d.design_key, (d) => d.option_count === 0);
+  if (emptyDesign) {
+    return {
+      kind: "add_design_option",
+      title: `Solution Design「${emptyDesign.design_key}」に設計案を追加する`,
+      reason: "設計はありますが、比較できる案が 1 つも登録されていません。",
+      target: { tab: "solutions", key: emptyDesign.design_key },
+      actionLabel: "この Solution Design を開く",
+    };
+  }
+  const undecidedDesign = firstByKey(designs, (d) => d.design_key, (d) => d.adopted_option_key === null);
+  if (undecidedDesign) {
+    return {
+      kind: "adopt_design_option",
+      title: `Solution Design「${undecidedDesign.design_key}」の採用案を決める`,
+      reason: "案は登録されていますが、どれを採用するかがまだ決まっていません。採用は実装の適用ではありません。",
+      target: { tab: "solutions", key: undecidedDesign.design_key },
+      actionLabel: "この Solution Design を開く",
+    };
+  }
+
+  // 11. Nothing outstanding.
+  return {
+    kind: "settled",
+    title: "いま決めるべきことはありません",
+    reason: "Journey・Requirement・Solution Design はいずれも確定済みで、再確認の必要もありません。",
+    target: null,
+    actionLabel: null,
+  };
 }

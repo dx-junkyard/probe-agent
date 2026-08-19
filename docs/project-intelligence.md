@@ -7498,3 +7498,78 @@ SSRF であり、「対象リポジトリは Git から読む」という Princi
 **用語**: 既存の「Issue #397 — Phase 2: Design Studio」は Evolution Node の
 設計層を指す。#409 の画面は **UX Design Studio**(`/ux-design-studio`)であり、
 別物である。
+
+### Epic #405 検証ラウンド(2026-08-19)
+
+実装(#406-#409)の完成後にレビューと動作検証を行い、以下を確認・修正した。
+
+**動作検証で確認できたこと。**
+
+* `test_ux_design.py` / `test_solution_design.py` / `test_interview_type_parity.py`
+  118 件、Dashboard の vitest 802 件(35 file)が通る。TypeScript の
+  `tsc -b` も clean。
+* **既存 DB への migration は無害。** #405 以前(`b455dd7`)の `db.py` で作った
+  SQLite ファイルに対して新しい `init_db()` を実行すると、テーブルは 180 →
+  195 に増え、既存行はそのまま残る。`ALTER TABLE` は既存正本に対しては 1 つも
+  発行されない。
+* **既存正本への書き込みが無い。** 新しい 4 モジュールの INSERT/UPDATE/DELETE
+  の対象を全列挙すると、すべて `ux_*` / `solution_design*` の新規テーブルで
+  ある。`interview_*` / `purpose_*` / `understanding_*` / `evolution_node*` /
+  `cell_*` / `components` / `probe_points` への書き込みは 0(§5 の境界)。
+* **provenance は request body から入らない。** #405 が追加した `*Request`
+  モデルはいずれも `created_by` / `decided_by` / `decision_method` /
+  `authored_by_kind` を持たず、`ConfigDict(extra="forbid")` を持つ。
+* **有限語彙の型 parity が完全。** #405 が追加した 28 個の `Literal` alias は
+  すべて `test_interview_type_parity.py` の `FINITE_TYPE_NAMES` に載っている。
+* `content_digest` の入力列は §2.6 の表と完全一致(`created_by` /
+  `created_at` / `revision_number` / `change_note` は除外、`step_order` は
+  Journey revision digest にのみ入る)。
+* `add_option` は**旧行を先に retire してから** 新行を insert する。
+  `ux_solution_design_option_current` は `superseded_by_id IS NULL` を条件と
+  する partial unique index なので、insert を先にすると訂正そのものが拒否
+  される。この順序は契約である。
+
+**修正した欠陥。**
+
+1. **handoff が別 Node の decomposition を継承していた。**
+   `get_handoff` は `adopted_node_ids_json LIKE '%<id>%'` で候補を引いていた。
+   これは JSON 配列に対する部分文字列一致なので、`evolution_node` 行 id が 1 の
+   Node を target にした設計の handoff が、node 11 を採用した decomposition
+   candidate を自分のものとして報告する。実際に再現し、修正後は報告されない
+   ことを確認した。LIKE は prefilter として残し、所属判定は parse した id 集合
+   への完全一致で行う(Principle 6)。あわせて Node の解決を保存済みの
+   `target_row_id` ではなく `target_ref`(`node_key`)からの読み取り時解決に
+   変えた —— §3.3 の「`target_row_id` は join の近道であって単独では信用
+   しない」に従い、削除して同じ key で作り直された Node を元の Node と取り
+   違えないため。
+2. **読めなかった section を持つ handoff が `complete` を名乗っていた。**
+   `handoff_state` の分岐が `unresolved_references` だけを見ており、
+   `degraded_sections` が非空でも `complete` を返した。`requirements` の読み
+   取りが失敗した bundle が `requirements: []` + `complete` として返るので、
+   Requirement link を 1 つも持たない設計と区別できない —— §3.7 と §0
+   invariant 8 がまさに禁じている合流である。first match を
+   `degraded_sections` → `unavailable`、`unresolved_references` →
+   `incomplete`、それ以外 → `complete` に変えた。
+
+  どちらも回帰テストを `TestHandoff` に追加し、修正前のコードに対して確実に
+  落ちることを確認済み。
+
+**補った実装。**
+
+* **§4.2 の「今決めるべきこと」が画面に無かった。** 4 階層の段階的開示は
+  実装されていたが、「1 つだけ提示する次の 1 操作」が存在しなかった。
+  `components/ux-design/model.ts` に `decideNextDesignAction` を追加した ——
+  server が既に決めた値(`design_status` / `recheck_state` /
+  `adopted_option_key` / `option_count`)だけを入力に、因果順に走る 11 行の
+  first-match 表で、tie-break は key 昇順。#358 の `CockpitModel.nextStep` と
+  同じ形であり、client 側で状態を再導出するものではない。CTA は tab と対象を
+  選ぶだけの **navigate** で、実行は移動先 panel の primary action のまま。
+  一覧が読めないとき(`unavailable`)と決めることが無いとき(`settled`)は
+  CTA を出さず文で答える(#342 原則 P3)。
+
+**契約文書の訂正。** §5 は「`ALTER TABLE` も backfill も不要」と書いていたが、
+`db._migrate_solution_design_option_unique` という #405 自身のテーブルに対する
+migration が実在する(最初の形の table-level UNIQUE が append-only 訂正を
+不可能にしていたのを、テーブル 1 度きりの再構築で直すもの)。既存正本への変更
+ではないが、文書が実装に無い不変条件を主張していたので §5 に明記した。§3.7 と
+§4.2 も上記の規則を追記してある。

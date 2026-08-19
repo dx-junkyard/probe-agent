@@ -477,7 +477,11 @@ export function RequirementPanel({
         ) : (
           <Card>
             <CardContent className="p-6">
-              <RequirementDetail requirementKey={selectedKey} onOpenSolutionDesign={onOpenSolutionDesign} />
+              <RequirementDetail
+                key={selectedKey}
+                requirementKey={selectedKey}
+                onOpenSolutionDesign={onOpenSolutionDesign}
+              />
             </CardContent>
           </Card>
         )}

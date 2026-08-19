@@ -248,6 +248,67 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+describe("選択対象を切り替えたとき編集状態を持ち越さない", () => {
+  test("Journey の版追加フォームは別 Journey へ切り替えると閉じる", async () => {
+    const first = journeyOut({ id: 1, journey_key: "journey-a" });
+    const second = journeyOut({ id: 2, journey_key: "journey-b" });
+    mockGet({
+      "/ux-design/journeys": journeyListOut([first, second]),
+      "/ux-design/journeys/journey-a": journeyDetailOut({ id: 1, journey_key: "journey-a" }),
+      "/ux-design/journeys/journey-b": journeyDetailOut({ id: 2, journey_key: "journey-b" }),
+    });
+    await renderPage();
+
+    fireEvent.click(await screen.findByTestId("ux-journey-item-journey-a"));
+    fireEvent.click(await screen.findByRole("button", { name: "版を追加する" }));
+    expect(screen.getByTestId("ux-journey-revision-form")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("ux-journey-item-journey-b"));
+    await screen.findByTestId("ux-journey-detail");
+    expect(screen.queryByTestId("ux-journey-revision-form")).not.toBeInTheDocument();
+  });
+
+  test("Requirement の版追加フォームは別 Requirement へ切り替えると閉じる", async () => {
+    const first = requirementOut({ id: 10, requirement_key: "requirement-a" });
+    const second = requirementOut({ id: 11, requirement_key: "requirement-b" });
+    mockGet({
+      "/ux-design/requirements": requirementListOut([first, second]),
+      "/ux-design/requirements/requirement-a": requirementDetailOut({ id: 10, requirement_key: "requirement-a" }),
+      "/ux-design/requirements/requirement-b": requirementDetailOut({ id: 11, requirement_key: "requirement-b" }),
+    });
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+
+    fireEvent.click(await screen.findByTestId("ux-requirement-item-requirement-a"));
+    fireEvent.click(await screen.findByRole("button", { name: "版を追加する" }));
+    expect(screen.getByTestId("ux-requirement-revision-form")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("ux-requirement-item-requirement-b"));
+    await screen.findByTestId("ux-requirement-detail");
+    expect(screen.queryByTestId("ux-requirement-revision-form")).not.toBeInTheDocument();
+  });
+
+  test("Solution Design の追加フォームは別 Design へ切り替えると閉じる", async () => {
+    const first = solutionDesignOut({ id: 20, design_key: "design-a" });
+    const second = solutionDesignOut({ id: 21, design_key: "design-b" });
+    mockGet({
+      "/solution-designs": solutionDesignListOut([first, second]),
+      "/solution-designs/design-a": solutionDesignDetailOut({ id: 20, design_key: "design-a" }),
+      "/solution-designs/design-b": solutionDesignDetailOut({ id: 21, design_key: "design-b" }),
+    });
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-solutions"));
+
+    fireEvent.click(await screen.findByTestId("ux-solution-design-item-design-a"));
+    fireEvent.click(await screen.findByRole("button", { name: "Option を追加する" }));
+    expect(screen.getByTestId("ux-solution-design-add-option-form")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("ux-solution-design-item-design-b"));
+    await screen.findByTestId("ux-solution-design-detail");
+    expect(screen.queryByTestId("ux-solution-design-add-option-form")).not.toBeInTheDocument();
+  });
+});
+
 // --- revision history / revision-to-revision diff ---------------------------
 
 describe("版の履歴と版どうしの差分", () => {
@@ -793,5 +854,131 @@ describe("components/ux-design/model.ts (pure functions)", () => {
     const { requirementAcceptsTargetLink } = await import("@/components/ux-design/model");
     expect(requirementAcceptsTargetLink(requirementOut({ requirement_kind: "functional" }))).toBe(true);
     expect(requirementAcceptsTargetLink(requirementOut({ requirement_kind: "out_of_scope" }))).toBe(false);
+  });
+});
+
+// --- §4.2: the single 「今決めるべきこと」 ----------------------------------
+
+describe("次に決めること (§4.2)", () => {
+  test("一覧が読めないときは 0 件として扱わず、CTA も出さない", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const d = decideNextDesignAction({ journeys: null, requirements: [], designs: [] });
+    expect(d.kind).toBe("unavailable");
+    expect(d.target).toBeNull();
+    expect(d.actionLabel).toBeNull();
+  });
+
+  test("因果順の first match: Journey が無ければ Journey の作成が次の 1 操作", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const d = decideNextDesignAction({
+      journeys: [],
+      requirements: [requirementOut()],
+      designs: [solutionDesignOut()],
+    });
+    expect(d.kind).toBe("create_journey");
+    expect(d.target).toEqual({ tab: "journeys", key: null });
+  });
+
+  test("確定していない Journey は stale な Journey より先に選ばれる", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const d = decideNextDesignAction({
+      journeys: [
+        journeyOut({ journey_key: "a", design_status: "confirmed", recheck_state: "stale" }),
+        journeyOut({ journey_key: "b", design_status: "proposed", recheck_state: "current" }),
+      ],
+      requirements: [],
+      designs: [],
+    });
+    expect(d.kind).toBe("confirm_journey");
+    expect(d.target).toEqual({ tab: "journeys", key: "b" });
+  });
+
+  test("同じ条件に複数該当したら key 昇順で決まる(実行のたびに変わらない)", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const rows = [
+      journeyOut({ journey_key: "z", design_status: "proposed" }),
+      journeyOut({ journey_key: "a", design_status: "proposed" }),
+    ];
+    expect(decideNextDesignAction({ journeys: rows, requirements: [], designs: [] }).target)
+      .toEqual({ tab: "journeys", key: "a" });
+    expect(decideNextDesignAction({ journeys: [...rows].reverse(), requirements: [], designs: [] }).target)
+      .toEqual({ tab: "journeys", key: "a" });
+  });
+
+  test("Journey が片付いたら Requirement 層、その次に Solution Design 層へ進む", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const settledJourney = journeyOut({ design_status: "confirmed", recheck_state: "current" });
+    const settledRequirement = requirementOut({ design_status: "confirmed", recheck_state: "current" });
+
+    expect(
+      decideNextDesignAction({ journeys: [settledJourney], requirements: [], designs: [] }).kind,
+    ).toBe("create_requirement");
+    expect(
+      decideNextDesignAction({
+        journeys: [settledJourney], requirements: [settledRequirement], designs: [],
+      }).kind,
+    ).toBe("create_solution_design");
+    expect(
+      decideNextDesignAction({
+        journeys: [settledJourney],
+        requirements: [settledRequirement],
+        designs: [solutionDesignOut({ option_count: 0, adopted_option_key: null })],
+      }).kind,
+    ).toBe("add_design_option");
+    expect(
+      decideNextDesignAction({
+        journeys: [settledJourney],
+        requirements: [settledRequirement],
+        designs: [solutionDesignOut({ option_count: 2, adopted_option_key: null })],
+      }).kind,
+    ).toBe("adopt_design_option");
+  });
+
+  test("却下・廃止だけの上流を確定済みとして下流へ進めない", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const rejectedJourney = journeyOut({ design_status: "rejected", recheck_state: "stale" });
+    expect(decideNextDesignAction({
+      journeys: [rejectedJourney], requirements: [], designs: [],
+    }).kind).toBe("create_journey");
+
+    const confirmedJourney = journeyOut({ design_status: "confirmed", recheck_state: "current" });
+    const retiredRequirement = requirementOut({ design_status: "retired", recheck_state: "stale" });
+    expect(decideNextDesignAction({
+      journeys: [confirmedJourney], requirements: [retiredRequirement], designs: [],
+    }).kind).toBe("create_requirement");
+  });
+
+  test("すべて確定済みなら「決めることはない」と言い、CTA を出さない", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const d = decideNextDesignAction({
+      journeys: [journeyOut({ design_status: "confirmed", recheck_state: "current" })],
+      requirements: [requirementOut({ design_status: "confirmed", recheck_state: "current" })],
+      designs: [solutionDesignOut({ option_count: 1, adopted_option_key: "opt-a" })],
+    });
+    expect(d.kind).toBe("settled");
+    expect(d.target).toBeNull();
+    expect(d.actionLabel).toBeNull();
+  });
+
+  test("画面には次の 1 操作だけが出て、CTA は移動であって実行ではない", async () => {
+    mockGet({
+      "/ux-design/journeys": journeyListOut([journeyOut({ journey_key: "checkout-to-be" })]),
+      "/ux-design/requirements": requirementListOut([]),
+      "/solution-designs": solutionDesignListOut([]),
+    });
+    await renderPage();
+
+    const card = await screen.findByTestId("ux-design-next-decision");
+    expect(within(card).getByTestId("ux-design-next-decision-title")).toHaveTextContent(
+      "UX Journey「checkout-to-be」の内容を確定する",
+    );
+    expect(within(card).getAllByTestId("ux-design-next-decision-cta")).toHaveLength(1);
+
+    const before = mockApi.post.mock.calls.length;
+    fireEvent.click(within(card).getByTestId("ux-design-next-decision-cta"));
+    expect(mockApi.post.mock.calls.length).toBe(before);
+    await waitFor(() =>
+      expect(screen.getByTestId("ux-design-studio-panel-journeys")).toBeInTheDocument(),
+    );
   });
 });
