@@ -756,6 +756,19 @@ GET /solution-designs/{design_key}/handoff -> SolutionDesignHandoffOut
 * **解決できない参照は名前付きで残し、bundle を `incomplete` にする。**
   黙って落とすと「参照を失った handoff」と「最初から持っていない handoff」が
   区別できない(#408 受入条件 4)。
+* **読めなかった section があるなら `handoff_state` は `unavailable`。**
+  first match は `degraded_sections` → `unavailable`、`unresolved_references`
+  → `incomplete`、それ以外 → `complete`。読み取りの失敗(`unavailable`)と参照の
+  未解決(`incomplete`)は別の事実であり、どちらも「完成した bundle」として報告
+  しない(§0 invariant 8)。`requirements` の読み取りが失敗したうえで
+  `requirements: []` を `complete` として返すと、Requirement link を 1 つも
+  持たない設計と見分けがつかなくなる。
+* **参照の同定は完全一致のみ。** 例えば Node decomposition 参照は
+  `node_decomposition_candidate.adopted_node_ids_json` を **parse した id 集合
+  への所属**で決める。JSON 配列に対する部分文字列一致では node 1 が node 11 /
+  21 / 100 の候補を継承してしまい、handoff が別 Node の decomposition を渡す
+  (Principle 6)。target は保存済みの `target_row_id` ではなく `target_ref`
+  (`node_key`)から読み取り時に解決する(§3.3 の「単独では信用しない」)。
 * 返すのは: 採用 option、その target link 群(各 `link_state` 付き)、
   紐づく Requirement とその受入条件、Node decomposition 提案への参照、
   Probe Plan への参照、`evolution_evaluation_policy` への参照
@@ -805,7 +818,17 @@ Dashboard のみ。**新しい endpoint を追加せず、server の判定を再
 ### 4.2 段階的開示
 
 * **「今決めるべきこと」は 1 つだけ**。first-match の決定表で server 側の
-  状態から選ぶ(#380 `decide_next_action` と同じ形)。
+  状態から選ぶ(#380 `decide_next_action` と同じ形)。実装は
+  `components/ux-design/model.ts` の `decideNextDesignAction`: 入力は
+  `design_status` / `recheck_state` / `adopted_option_key` / `option_count`
+  という **server が既に決めた値だけ**で、因果順(Journey → Requirement →
+  Solution Design)に走る 11 行の first-match 表。同一条件に複数該当したときの
+  tie-break は key の昇順で、score も recency ranking も使わない。
+  **CTA は移動であって実行ではない**(§4.1 / #358) — tab と対象を選ぶだけで、
+  操作そのものは移動先の panel が持つ primary action のままである。
+  一覧が読めなかったとき(`unavailable`)と、決めることが無いとき(`settled`)は
+  **どちらも CTA を持たない**。disabled のボタンではなく文で答える
+  (#342 原則 P3 / #380)。
 * **未到達の操作を disabled で露出しない**(#342 原則 P3)。前提が満たされて
   いない操作は表示しない。ただし「修正するには」のような**案内**は #356 の
   例外に従い、理由付きで表示してよい。
@@ -846,8 +869,19 @@ Node 評価を**関係付きで**並べる。**合成 score を作らない。**
 ## 5. Migration と rollback
 
 * **すべて新規テーブルであり、既存テーブルを 1 つも変更しない。** `db.py` の
-  `SCHEMA` 末尾へ `CREATE TABLE IF NOT EXISTS` を追記するだけで、`ALTER TABLE`
-  も backfill も不要(既存行に対応物が無いので、legacy 行という概念自体が無い)。
+  `SCHEMA` 末尾へ `CREATE TABLE IF NOT EXISTS` を追記するだけで、既存テーブルに
+  対する `ALTER TABLE` も backfill も不要(既存行に対応物が無いので、legacy 行と
+  いう概念自体が無い)。
+* ただし **この Epic 自身のテーブルに対する migration は 1 つ存在する**:
+  `db._migrate_solution_design_option_unique`。`solution_design_option` は最初の
+  形で table-level の `UNIQUE (solution_design_id, option_key)` を持って出荷され、
+  それが append-only 規律と矛盾していた — 訂正は新しい行を insert して旧行を
+  supersede するので、置き換えようとしている当の行と衝突し、訂正を 1 度も記録
+  できなかった。SQLite は table 制約をその場で落とせず `CREATE TABLE IF NOT
+  EXISTS` も既存 DB を直せないので、テーブルを 1 度だけ再構築して全行を保存する。
+  検出は table-level UNIQUE が作る暗黙 index(`origin == 'u'`)で、置き換え後の
+  partial index は `origin == 'c'` を報告するため 2 度目以降は no-op になる。
+  **これは #405 が自分で作ったテーブルの修復であって、既存正本への変更ではない。**
 * 例外は `captured_digest` が空文字の行で、これは将来この層の内部で
   digest 捕捉より前に作られた行にだけ現れうる。`recheck_state='not_captured'`
   として fail-closed に扱い、`current` へ昇格させない(#337)。

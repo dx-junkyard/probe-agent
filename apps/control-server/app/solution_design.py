@@ -1540,6 +1540,22 @@ def _requirement_detail_dict(conn: sqlite3.Connection, system_id: int, requireme
 # ---------------------------------------------------------------------------
 
 
+def _adopted_node_ids(raw: Optional[str]) -> Tuple[int, ...]:
+    """The `evolution_node` row ids one `node_decomposition_candidate` adopted.
+
+    A malformed or non-list payload yields an EMPTY tuple rather than a
+    guessed membership: an unreadable list is not a list that contains this
+    node (§0 invariant 8).
+    """
+    try:
+        parsed = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(v for v in parsed if isinstance(v, int) and not isinstance(v, bool))
+
+
 def get_handoff(conn: sqlite3.Connection, *, system_id: int, design_key: str) -> Dict[str, Any]:
     """Mirrors `node_design.get_handoff`'s discipline: references only,
     never copies; an unresolvable reference is named in
@@ -1619,13 +1635,28 @@ def get_handoff(conn: sqlite3.Connection, *, system_id: int, design_key: str) ->
     probe_plan_refs: List[Dict[str, Any]] = []
     try:
         for tl in target_links:
-            if tl["target_kind"] == "evolution_node" and tl["target_row_id"] is not None:
+            if tl["target_kind"] == "evolution_node":
+                # Resolve the node by its `node_key` at READ time. The stored
+                # `target_row_id` is "join の近道であって単独では信用しない"
+                # (§3.3), and matching on it alone cannot tell a deleted-and-
+                # recreated node from the original.
+                node = _resolve_evolution_node_target(conn, system_id, tl["target_ref"])
+                if node.resolution != "resolved" or node.row_id is None:
+                    continue
+                node_id = node.row_id
                 cand_rows = conn.execute(
-                    """SELECT id, proposal_id, candidate_key FROM node_decomposition_candidate
+                    """SELECT id, proposal_id, candidate_key, adopted_node_ids_json
+                           FROM node_decomposition_candidate
                            WHERE system_id = ? AND adopted_node_ids_json LIKE ?""",
-                    (system_id, f'%{tl["target_row_id"]}%'),
+                    (system_id, f"%{node_id}%"),
                 ).fetchall()
                 for c in cand_rows:
+                    # The LIKE above is only a cheap prefilter -- a substring
+                    # match on a JSON array makes node 1 inherit node 11's
+                    # decomposition. Membership is decided by exact equality
+                    # over the parsed id list (Principle 6).
+                    if node_id not in _adopted_node_ids(c["adopted_node_ids_json"]):
+                        continue
                     node_decomposition_refs.append(
                         {
                             "candidate_id": c["id"],
@@ -1651,13 +1682,17 @@ def get_handoff(conn: sqlite3.Connection, *, system_id: int, design_key: str) ->
         degraded_sections.append("evaluation_policy_refs")
         degraded_detail["evaluation_policy_refs"] = str(exc)
 
-    if degraded_sections and (adopted_option_dict is None and adopted_key is not None):
-        # A core read failed before the adopted option could even be
-        # resolved -- distinct from "resolved but incomplete" (§0 invariant
-        # 8: an unreadable fact is never a fact's default value).
+    # §3.7 / §0 invariant 8, first match. A section that could not be READ is
+    # not the same fact as a reference that did not RESOLVE, and neither may
+    # be reported as a finished bundle: a degraded `requirements` read plus an
+    # empty `requirements` list is otherwise indistinguishable from a design
+    # that genuinely has no Requirement links.
+    if degraded_sections:
         handoff_state = "unavailable"
+    elif unresolved:
+        handoff_state = "incomplete"
     else:
-        handoff_state = "incomplete" if unresolved else "complete"
+        handoff_state = "complete"
 
     return {
         "system_id": system_id,

@@ -795,3 +795,115 @@ describe("components/ux-design/model.ts (pure functions)", () => {
     expect(requirementAcceptsTargetLink(requirementOut({ requirement_kind: "out_of_scope" }))).toBe(false);
   });
 });
+
+// --- §4.2: the single 「今決めるべきこと」 ----------------------------------
+
+describe("次に決めること (§4.2)", () => {
+  test("一覧が読めないときは 0 件として扱わず、CTA も出さない", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const d = decideNextDesignAction({ journeys: null, requirements: [], designs: [] });
+    expect(d.kind).toBe("unavailable");
+    expect(d.target).toBeNull();
+    expect(d.actionLabel).toBeNull();
+  });
+
+  test("因果順の first match: Journey が無ければ Journey の作成が次の 1 操作", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const d = decideNextDesignAction({
+      journeys: [],
+      requirements: [requirementOut()],
+      designs: [solutionDesignOut()],
+    });
+    expect(d.kind).toBe("create_journey");
+    expect(d.target).toEqual({ tab: "journeys", key: null });
+  });
+
+  test("確定していない Journey は stale な Journey より先に選ばれる", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const d = decideNextDesignAction({
+      journeys: [
+        journeyOut({ journey_key: "a", design_status: "confirmed", recheck_state: "stale" }),
+        journeyOut({ journey_key: "b", design_status: "proposed", recheck_state: "current" }),
+      ],
+      requirements: [],
+      designs: [],
+    });
+    expect(d.kind).toBe("confirm_journey");
+    expect(d.target).toEqual({ tab: "journeys", key: "b" });
+  });
+
+  test("同じ条件に複数該当したら key 昇順で決まる(実行のたびに変わらない)", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const rows = [
+      journeyOut({ journey_key: "z", design_status: "proposed" }),
+      journeyOut({ journey_key: "a", design_status: "proposed" }),
+    ];
+    expect(decideNextDesignAction({ journeys: rows, requirements: [], designs: [] }).target)
+      .toEqual({ tab: "journeys", key: "a" });
+    expect(decideNextDesignAction({ journeys: [...rows].reverse(), requirements: [], designs: [] }).target)
+      .toEqual({ tab: "journeys", key: "a" });
+  });
+
+  test("Journey が片付いたら Requirement 層、その次に Solution Design 層へ進む", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const settledJourney = journeyOut({ design_status: "confirmed", recheck_state: "current" });
+    const settledRequirement = requirementOut({ design_status: "confirmed", recheck_state: "current" });
+
+    expect(
+      decideNextDesignAction({ journeys: [settledJourney], requirements: [], designs: [] }).kind,
+    ).toBe("create_requirement");
+    expect(
+      decideNextDesignAction({
+        journeys: [settledJourney], requirements: [settledRequirement], designs: [],
+      }).kind,
+    ).toBe("create_solution_design");
+    expect(
+      decideNextDesignAction({
+        journeys: [settledJourney],
+        requirements: [settledRequirement],
+        designs: [solutionDesignOut({ option_count: 0, adopted_option_key: null })],
+      }).kind,
+    ).toBe("add_design_option");
+    expect(
+      decideNextDesignAction({
+        journeys: [settledJourney],
+        requirements: [settledRequirement],
+        designs: [solutionDesignOut({ option_count: 2, adopted_option_key: null })],
+      }).kind,
+    ).toBe("adopt_design_option");
+  });
+
+  test("すべて確定済みなら「決めることはない」と言い、CTA を出さない", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const d = decideNextDesignAction({
+      journeys: [journeyOut({ design_status: "confirmed", recheck_state: "current" })],
+      requirements: [requirementOut({ design_status: "confirmed", recheck_state: "current" })],
+      designs: [solutionDesignOut({ option_count: 1, adopted_option_key: "opt-a" })],
+    });
+    expect(d.kind).toBe("settled");
+    expect(d.target).toBeNull();
+    expect(d.actionLabel).toBeNull();
+  });
+
+  test("画面には次の 1 操作だけが出て、CTA は移動であって実行ではない", async () => {
+    mockGet({
+      "/ux-design/journeys": journeyListOut([journeyOut({ journey_key: "checkout-to-be" })]),
+      "/ux-design/requirements": requirementListOut([]),
+      "/solution-designs": solutionDesignListOut([]),
+    });
+    await renderPage();
+
+    const card = await screen.findByTestId("ux-design-next-decision");
+    expect(within(card).getByTestId("ux-design-next-decision-title")).toHaveTextContent(
+      "UX Journey「checkout-to-be」の内容を確定する",
+    );
+    expect(within(card).getAllByTestId("ux-design-next-decision-cta")).toHaveLength(1);
+
+    const before = mockApi.post.mock.calls.length;
+    fireEvent.click(within(card).getByTestId("ux-design-next-decision-cta"));
+    expect(mockApi.post.mock.calls.length).toBe(before);
+    await waitFor(() =>
+      expect(screen.getByTestId("ux-design-studio-panel-journeys")).toBeInTheDocument(),
+    );
+  });
+});

@@ -18,6 +18,10 @@
 import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useSolutionDesigns, useUxJourneys, useUxRequirements } from "@/api/hooks";
+import { decideNextDesignAction } from "@/components/ux-design/model";
 import { JourneyPanel } from "@/components/ux-design/journey-panel";
 import { RequirementPanel } from "@/components/ux-design/requirement-panel";
 import { SolutionDesignPanel } from "@/components/ux-design/solution-design-panel";
@@ -26,6 +30,63 @@ type StudioTab = "journeys" | "requirements" | "solutions";
 
 function isStudioTab(v: string | null): v is StudioTab {
   return v === "journeys" || v === "requirements" || v === "solutions";
+}
+
+/** §4.2's single 「今決めるべきこと」. The decision itself is
+ * `decideNextDesignAction`'s first-match table over server-decided fields;
+ * this component only renders it, and its CTA navigates -- the operation
+ * still belongs to the destination panel (§4.1 / #358). The two no-action
+ * outcomes render as a sentence, never as a disabled button (#342 原則 P3). */
+function NextDecisionCard({
+  onGo,
+}: {
+  onGo: (tab: StudioTab, key: string | null) => void;
+}) {
+  const journeys = useUxJourneys();
+  const requirements = useUxRequirements();
+  const designs = useSolutionDesigns();
+
+  const loading = journeys.isLoading || requirements.isLoading || designs.isLoading;
+  const decision = decideNextDesignAction({
+    journeys: journeys.data?.journeys ?? null,
+    requirements: requirements.data?.requirements ?? null,
+    designs: designs.data?.designs ?? null,
+  });
+
+  return (
+    <Card data-testid="ux-design-next-decision">
+      <CardHeader>
+        <CardTitle as="h2" className="text-base">
+          次に決めること
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {loading ? (
+          <p className="text-sm text-muted-foreground" data-testid="ux-design-next-decision-loading">
+            読み込み中です。
+          </p>
+        ) : (
+          <>
+            <p className="text-sm font-medium" data-testid="ux-design-next-decision-title">
+              {decision.title}
+            </p>
+            <p className="text-xs text-muted-foreground" data-testid="ux-design-next-decision-reason">
+              {decision.reason}
+            </p>
+            {decision.target && decision.actionLabel ? (
+              <Button
+                size="sm"
+                data-testid="ux-design-next-decision-cta"
+                onClick={() => onGo(decision.target!.tab, decision.target!.key)}
+              >
+                {decision.actionLabel}
+              </Button>
+            ) : null}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
 }
 
 export default function UxDesignStudioPage() {
@@ -53,6 +114,15 @@ export default function UxDesignStudioPage() {
     goToTab("solutions");
   }
 
+  function goToNextDecision(nextTab: StudioTab, key: string | null) {
+    if (key !== null) {
+      if (nextTab === "journeys") setJourneyKey(key);
+      if (nextTab === "requirements") setRequirementKey(key);
+      if (nextTab === "solutions") setDesignKey(key);
+    }
+    goToTab(nextTab);
+  }
+
   return (
     <div className="space-y-4">
       <div>
@@ -64,6 +134,8 @@ export default function UxDesignStudioPage() {
           一切行いません。
         </p>
       </div>
+
+      <NextDecisionCard onGo={goToNextDecision} />
 
       <Tabs value={tab} onValueChange={(v) => goToTab(v as StudioTab)}>
         <TabsList data-testid="ux-design-studio-tabs">

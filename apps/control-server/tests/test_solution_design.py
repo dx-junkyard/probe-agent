@@ -20,6 +20,7 @@ exactly what the real API would produce.
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 
 import pytest
@@ -1437,6 +1438,84 @@ class TestHandoff:
         assert handoff["adopted_option"]["option_key"] == "opt-h3"
         assert len(handoff["requirements"]) == 1
         assert handoff["requirements"][0]["requirement_key"] == "req-h-complete"
+
+    def test_node_decomposition_ref_needs_exact_node_id_membership(self, admin_client):
+        """A decomposition candidate belongs to the node it actually adopted.
+
+        `adopted_node_ids_json` is a JSON array, so a substring match makes
+        node 1 inherit every candidate that adopted node 11, 21 or 100 --
+        a handoff that hands the implementer another node's decomposition
+        (§3.7 "参照だけを返す" is only worth anything if the reference is
+        the right one; Principle 6 wants exact structural matching).
+        """
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "SD-HandoffDecomposition")
+        with get_conn() as conn:
+            target = evolution_node.create_node(
+                conn, system_id=system_id, node_key="decomposition-target"
+            )
+            other_id = target["id"]
+            while other_id < int(f'{target["id"]}1'):
+                other_id = evolution_node.create_node(
+                    conn, system_id=system_id, node_key=f"filler-{other_id}"
+                )["id"]
+            # `other_id` contains `target["id"]` as a decimal substring.
+            assert str(target["id"]) in str(other_id) and other_id != target["id"]
+
+            cur = conn.execute(
+                """INSERT INTO node_decomposition_proposal
+                       (system_id, scope_summary, status, decision_method, created_at)
+                   VALUES (?, 'scope', 'proposed', 'reasoning_llm', 0)""",
+                (system_id,),
+            )
+            proposal_id = cur.lastrowid
+            for label, adopted in (("for-other", other_id), ("for-target", target["id"])):
+                conn.execute(
+                    """INSERT INTO node_decomposition_candidate
+                           (proposal_id, system_id, candidate_key, summary, rationale, nodes_json,
+                            open_questions_json, decision, adopted_node_ids_json, created_at)
+                       VALUES (?, ?, ?, '', '', '[]', '[]', 'adopted', ?, 0)""",
+                    (proposal_id, system_id, label, json.dumps([adopted])),
+                )
+
+        _create_design(admin_client, token, system_id, "design-h-decomp")
+        _add_option(admin_client, token, system_id, "design-h-decomp", "opt-decomp")
+        _add_target_link(
+            admin_client, token, system_id, "design-h-decomp", "opt-decomp",
+            "evolution_node", "decomposition-target",
+        )
+        _decide(admin_client, token, system_id, "design-h-decomp", "opt-decomp", "adopt")
+
+        handoff = _get_handoff(admin_client, token, system_id, "design-h-decomp")
+        keys = [r["candidate_key"] for r in handoff["node_decomposition_refs"]]
+        assert keys == ["for-target"], keys
+
+    def test_a_section_that_could_not_be_read_is_never_reported_complete(
+        self, admin_client, monkeypatch
+    ):
+        """`unavailable` (the read failed) is not `complete` with an empty
+        list (§3.7 / §0 invariant 8). Otherwise a degraded `requirements`
+        read is indistinguishable from a design with no Requirement links.
+        """
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "SD-HandoffDegraded")
+        with get_conn() as conn:
+            _make_requirement(conn, system_id, "req-h-degraded")
+        _create_design(admin_client, token, system_id, "design-h-degraded")
+        _add_requirement_link(
+            admin_client, token, system_id, "design-h-degraded", "req-h-degraded"
+        )
+        _add_option(admin_client, token, system_id, "design-h-degraded", "opt-degraded")
+        _decide(admin_client, token, system_id, "design-h-degraded", "opt-degraded", "adopt")
+
+        def _boom(*_args, **_kwargs):
+            raise sqlite3.OperationalError("no such table: ux_requirement")
+
+        monkeypatch.setattr(solution_design, "_requirement_detail_dict", _boom)
+        handoff = _get_handoff(admin_client, token, system_id, "design-h-degraded")
+        assert handoff["degraded_sections"] == ["requirements"]
+        assert handoff["handoff_state"] == "unavailable"
+        assert handoff["requirements"] == []
 
     def test_evaluation_policy_refs_are_grouped_by_level_never_flattened(self, admin_client):
         token = _login(admin_client)
