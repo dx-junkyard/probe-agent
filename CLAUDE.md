@@ -1552,8 +1552,11 @@ creating incomplete persistence or execution paths for later phases.
       事実なので、通常の継承が再開する。**時間の経過だけで権限が復活する
       経路は存在しない。**
     - 実効モードは `resolve_execution_mode` の 10 行 first-match 表を持つ
-      **純粋関数**で決まる。`reason` は 10 個の有限集合。ルート・Dashboard・
-      projection・orchestrator のどれもこの判定を再導出しない (#349)。
+      **純粋関数**で決まる。`reason` は 10 個の有限集合で、期限切れの 3 行は
+      `node_` / `flow_` / `system_expired_assignment` と**別コード**を持つ —
+      三つとも `fixed` へ落ちるが開発者の次の操作が別だからである (#366)。
+      ルート・Dashboard・projection・orchestrator のどれもこの判定を
+      再導出しない (#349)。
     - **`propose` は `candidate_execution` を持たない。** 提案は計画であって
       実行ではない。実行には「人間の承認」と「モードが `shadow`」という
       **2 つの独立した事実**の両方が要る。承認済みでもモードが `propose` に

@@ -204,16 +204,30 @@ append-only の連鎖ポインタであり、内容の書き換えではない �
 | --- | --- | --- | --- | --- |
 | 1 | どれかのスコープが `conflicting` | `fixed` | `none` | `conflicting_assignments` |
 | 2 | どれかのスコープが `invalid` | `fixed` | `none` | `invalid_mode_value` |
-| 3 | node が `expired` | `fixed` | `none` | `expired_assignment` |
+| 3 | node が `expired` | `fixed` | `none` | `node_expired_assignment` |
 | 4 | node が `active` | その mode | `node` | `node_assignment` |
-| 5 | flow のうち `expired` が 1 つ以上 | `fixed` | `none` | `expired_assignment` |
+| 5 | flow のうち `expired` が 1 つ以上 | `fixed` | `none` | `flow_expired_assignment` |
 | 6 | flow の `active` が複数あり mode が一致しない | `fixed` | `none` | `flow_scope_conflict` |
 | 7 | flow が `active`(全て同一 mode) | その mode | `flow` | `flow_assignment` |
-| 8 | system が `expired` | `fixed` | `none` | `expired_assignment` |
+| 8 | system が `expired` | `fixed` | `none` | `system_expired_assignment` |
 | 9 | system が `active` | その mode | `system` | `system_assignment` |
 | 10 | 上記いずれでもない | `fixed` | `default` | `no_assignment` |
 
 `REASON_CODES` はこの 10 個の有限集合であり、これ以外を返さない。
+
+行 3 / 5 / 8 は同じ `fixed` へ落ちるが、**別々のコードを持つ**。三つとも
+「期限が切れた」だが、開発者の次の操作は「Node を割り当て直す」「Flow を
+割り当て直す」「System を割り当て直す」で別々であり、一つのコードにすると
+どのスコープが切れたのかを `scope_trace` まで辿らないと分からない。
+一つの表示語が二つの事実を運ばない(#366)。
+
+行 7 で複数の flow が同じ mode で `active` のとき、`source_ref` は
+**辞書順で最小のもの**を名乗る(再現可能であるため)。該当する flow の
+全体は `scope_trace` にある。
+
+`assign` 行の `effective_from` が NULL の場合は「下限なし」として扱い、
+`pending` にはならない。`assign_mode` は常に値を書くので、NULL は旧データ
+または直接 INSERT された行にのみ現れる。
 
 ### 3.4 expired と revoked を分けること (EM-ADR-2)
 
@@ -257,8 +271,13 @@ require_capability(
 許可されない場合は `ExecutionModeDenied` を送出する。例外は有限の
 `denial_code` を持つ:
 `capability_not_permitted` / `conflicting_assignments` /
-`invalid_mode_value` / `expired_assignment` / `flow_scope_conflict` /
-`unknown_capability` / `node_not_found`。
+`invalid_mode_value` / `node_expired_assignment` /
+`flow_expired_assignment` / `system_expired_assignment` /
+`flow_scope_conflict` / `unknown_capability` / `node_not_found`。
+
+このうち `unknown_capability` と `node_not_found` は**壊れた要求**が主語で
+あってモードの読みではないので、409 の本文の `decision` は `null` になる
+(読めなかった事実に既定値を代入しない、#380)。残りは必ず decision を伴う。
 
 HTTP 境界では 409 を返し、`denial_code`・実効モード・`source_scope` を
 本文に含める。開発者が「なぜ拒否されたか」と「どこの設定が効いているか」を

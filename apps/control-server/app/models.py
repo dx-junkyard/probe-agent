@@ -10832,3 +10832,244 @@ class NodeOperationsProjectionOut(BaseModel):
     monitoring_contract_declared: bool
     observations: List[NodeDriftObservationSummaryOut]
     anomalies: List[NodeAnomalySummaryOut]
+
+
+# ---------------------------------------------------------------------------
+# Execution modes (Epic #412, Issue #413)
+#
+# Canonical contract: `docs/execution-modes.md`; the domain layer is
+# `app/execution_mode.py`, which mirrors every alias below with `get_args`.
+# The `Literal`s live here so FastAPI puts a real enum in the OpenAPI schema
+# instead of a bare string -- a Dashboard union then cannot silently drift
+# from the server (the same reason the Phase 1/Phase 5 aliases above are here).
+#
+# The execution mode is the FIFTH independent axis (#394 ADR-6). It is never
+# derived from, and never merged into, `evolution_node.maturity`,
+# `cell_improvement`, the SDK policy `components.mode`, or the Dashboard
+# workflow phase. In particular the SDK policy `shadow` and the execution
+# mode `shadow` are two different facts and are returned as separate fields.
+#
+# `actor` is never a request field on any of these models. Changing an
+# execution mode is a human decision and the name comes from the
+# authenticated principal at the route (#337's provenance rule); the
+# `decision_method` is likewise fixed to `manual` server-side.
+# ---------------------------------------------------------------------------
+
+ExecutionMode = Literal["fixed", "observe", "propose", "shadow"]
+ExecutionModeScopeKind = Literal["system", "flow", "node"]
+ExecutionModeScopeState = Literal[
+    "unset", "revoked", "pending", "expired", "invalid", "active", "conflicting"
+]
+ExecutionCapability = Literal[
+    "observation_record",
+    "llm_experiment_proposal",
+    "candidate_execution",
+    "shadow_comparison",
+]
+#: The ten reason codes of the ten-row resolution table of §3.3, one per row.
+#: The elapsed-window rows (3, 5, 8) carry a SEPARATE code per scope rather
+#: than one shared `expired_assignment`: all three clamp to `fixed`, but the
+#: developer's next action differs -- re-assign the Node, the Flow, or the
+#: System -- and a single code would make the reader walk `scope_trace` to
+#: find out which. One displayed word, one fact (#366).
+ExecutionModeReason = Literal[
+    "conflicting_assignments",
+    "invalid_mode_value",
+    "node_expired_assignment",
+    "node_assignment",
+    "flow_expired_assignment",
+    "flow_scope_conflict",
+    "flow_assignment",
+    "system_expired_assignment",
+    "system_assignment",
+    "no_assignment",
+]
+#: `default` is the fail-closed `fixed` nobody chose; `system` with reason
+#: `system_assignment` is a human who chose it. Two different facts (§4.4).
+ExecutionModeSourceScope = Literal["node", "flow", "system", "none", "default"]
+ExecutionModeDenialCode = Literal[
+    "capability_not_permitted",
+    "conflicting_assignments",
+    "invalid_mode_value",
+    "node_expired_assignment",
+    "flow_expired_assignment",
+    "system_expired_assignment",
+    "flow_scope_conflict",
+    "unknown_capability",
+    "node_not_found",
+]
+ExecutionModeDivergence = Literal["match", "divergent", "unobserved", "stale"]
+ExecutionModeRecordKind = Literal["assign", "revoke"]
+ExecutionModeObservationSource = Literal["control_server", "sdk"]
+
+
+class ExecutionModeScopeReadingOut(BaseModel):
+    """One scope's contribution to the decision.
+
+    `state` and `mode` are separate: "a row says `shadow` but its window
+    elapsed" and "there is no row" are different facts.
+    """
+
+    scope_kind: ExecutionModeScopeKind
+    scope_ref: str
+    state: ExecutionModeScopeState
+    mode: Optional[ExecutionMode] = None
+    assignment_id: Optional[int] = None
+    effective_from: Optional[float] = None
+    effective_until: Optional[float] = None
+    open_row_count: int = 0
+
+
+class ExecutionModeDecisionOut(BaseModel):
+    """The resolved mode plus the trace that explains it.
+
+    `scope_trace` lists every scope consulted, in resolution order, so a
+    reader can see which setting won and which were passed over.
+    """
+
+    mode: ExecutionMode
+    source_scope: ExecutionModeSourceScope
+    source_ref: str
+    reason: ExecutionModeReason
+    permitted_capabilities: List[ExecutionCapability]
+    scope_trace: List[ExecutionModeScopeReadingOut]
+
+
+class ExecutionModeAssignmentOut(BaseModel):
+    id: int
+    system_id: int
+    record_kind: ExecutionModeRecordKind
+    scope_kind: ExecutionModeScopeKind
+    scope_ref: str
+    # NULL on a `revoke` row: a revocation ends an assignment, it does not
+    # name a new mode.
+    mode: Optional[ExecutionMode] = None
+    # The effective mode resolved at write time, so the audit can be read
+    # without recomputing "what changed" (#337).
+    previous_mode: Optional[ExecutionMode] = None
+    effective_from: Optional[float] = None
+    effective_until: Optional[float] = None
+    reason: str
+    actor_kind: str
+    actor: Optional[str] = None
+    decision_method: str
+    supersedes_id: Optional[int] = None
+    superseded_by_id: Optional[int] = None
+    schema_version: str
+    created_at: float
+    # Only present on the projection's current rows.
+    scope_state: Optional[ExecutionModeScopeState] = None
+
+
+class ExecutionModeAssignIn(BaseModel):
+    """`actor` and `decision_method` are deliberately absent (see above)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope_kind: ExecutionModeScopeKind
+    # Empty for the `system` scope. A `flow` ref may be given bare or as
+    # `runtime_flow:<flow_id>`; it is always STORED prefixed (§2.1).
+    scope_ref: str = ""
+    mode: ExecutionMode
+    # Required: an unexplained permission change cannot be reviewed (§5.1).
+    reason: str
+    effective_from: Optional[float] = None
+    # NULL means "until a human ends it". When set, the window elapsing
+    # clamps the mode to `fixed` rather than falling through to a broader
+    # scope -- otherwise the deadline would stop nothing (EM-ADR-2).
+    effective_until: Optional[float] = None
+
+
+class ExecutionModeRevokeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+
+
+class ExecutionModeObservationIn(BaseModel):
+    """What mode a Node was ACTUALLY run under."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_key: str
+    observed_mode: ExecutionMode
+    capability: Optional[ExecutionCapability] = None
+    run_ref: Optional[str] = None
+    source: ExecutionModeObservationSource = "control_server"
+    detail: str = ""
+
+
+class ExecutionModeObservationOut(BaseModel):
+    id: int
+    system_id: int
+    node_key: str
+    observed_mode: ExecutionMode
+    capability: Optional[ExecutionCapability] = None
+    run_ref: Optional[str] = None
+    source: ExecutionModeObservationSource
+    detail: str
+    recorded_at: float
+
+
+class ExecutionModeDivergenceOut(BaseModel):
+    """`unobserved` is never reported as `match`: not having looked is not a
+    success (#380)."""
+
+    node_key: str
+    divergence: ExecutionModeDivergence
+    effective_mode: ExecutionMode
+    observed_mode: Optional[ExecutionMode] = None
+    observed_at: Optional[float] = None
+    last_assignment_at: Optional[float] = None
+
+
+class ExecutionModeDivergenceListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    nodes: List[ExecutionModeDivergenceOut]
+
+
+class ExecutionModeNodeProjectionOut(BaseModel):
+    """One Node's mode reading.
+
+    `maturity` sits beside `execution_mode` precisely because the two are
+    independent axes (ADR-6) -- neither is ever derived from the other.
+    """
+
+    node_id: int
+    node_key: str
+    maturity: EvolutionMaturityState
+    execution_mode: ExecutionMode
+    mode_source: ExecutionModeSourceScope
+    mode_reason: ExecutionModeReason
+    source_ref: str
+    flow_refs: List[str]
+    divergence: ExecutionModeDivergence
+    observed_mode: Optional[ExecutionMode] = None
+    observed_at: Optional[float] = None
+
+
+class ExecutionModeProjectionOut(BaseModel):
+    system_id: int
+    schema_version: str
+    generated_at: float
+    system_decision: ExecutionModeDecisionOut
+    assignments: List[ExecutionModeAssignmentOut]
+    nodes: List[ExecutionModeNodeProjectionOut]
+
+
+class ExecutionModeDenialOut(BaseModel):
+    """The 409 body of a refused capability gate (§4.1).
+
+    `decision` is `null` for `unknown_capability` and `node_not_found`: those
+    describe a broken request, not a mode reading, and reporting a mode for a
+    subject that could not be resolved would assert a fact about something
+    that does not exist.
+    """
+
+    denial_code: ExecutionModeDenialCode
+    message: str
+    mode: Optional[ExecutionMode] = None
+    source_scope: Optional[ExecutionModeSourceScope] = None
+    reason: Optional[ExecutionModeReason] = None
+    decision: Optional[ExecutionModeDecisionOut] = None
