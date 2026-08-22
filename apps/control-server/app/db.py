@@ -6528,6 +6528,236 @@ CREATE INDEX IF NOT EXISTS idx_solution_design_target_link_design
 
 CREATE INDEX IF NOT EXISTS idx_solution_design_target_link_target
     ON solution_design_target_link (target_kind, target_ref);
+
+-- ---------------------------------------------------------------------------
+-- Execution Modes and the Flow experiment orchestrator (Epic #412).
+-- Canonical contract: docs/execution-modes.md. Domain layers:
+-- app/execution_mode.py (#413) and app/flow_orchestration.py (#415).
+-- Issue #414's projection is derived from existing rows and adds NO table.
+--
+-- The execution mode is the FIFTH independent axis (#394 ADR-6): it is never
+-- derived from, and never merged into, Node maturity, Cell Improvement
+-- status, the SDK policy mode, or the Dashboard workflow phase. In
+-- particular the SDK policy `shadow` (does the SDK run the candidate and
+-- send `shadow_results`?) and the execution mode `shadow` (does the control
+-- plane permit candidate comparison at all?) are two different facts, and a
+-- row being one without the other is a legitimate state.
+-- ---------------------------------------------------------------------------
+
+-- execution_mode_assignment: append-only. Two record kinds, because "the
+-- window a human set has elapsed" and "a human explicitly ended this
+-- assignment" are two different answers (docs/execution-modes.md EM-ADR-2).
+-- An `expired` assign row clamps the resolved mode to `fixed` instead of
+-- letting a broader scope's `propose` take over -- otherwise the deadline the
+-- human set would stop nothing. A `revoke` row lets normal inheritance
+-- resume. There is deliberately no path by which the passage of time alone
+-- restores a permission.
+--
+-- Rows are never UPDATEd except to chain `superseded_by_id` onto the
+-- immediately preceding row of the same scope (the same append-only chain
+-- pointer used by evolution_node_version / ux_design_decision).
+--
+-- `scope_ref` always carries its prefix (`runtime_flow:<flow_id>` for the
+-- flow scope, the bare `node_key` for the node scope, '' for the system
+-- scope). `static_flow` is deliberately NOT a mode scope: knowing which
+-- Nodes lie on a static flow requires recomputing a call graph, and a
+-- fail-closed gate must not depend on a derivation that can itself fail
+-- (EM-ADR-1). It remains a display subject for Issue #414.
+--
+-- `previous_mode` is the effective mode resolved at write time, kept so the
+-- audit can be read without recomputing "what changed" (#337's rule that a
+-- decision record is an audit record).
+CREATE TABLE IF NOT EXISTS execution_mode_assignment (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    record_kind       TEXT NOT NULL
+                          CHECK (record_kind IN ('assign', 'revoke')),
+    scope_kind        TEXT NOT NULL
+                          CHECK (scope_kind IN ('system', 'flow', 'node')),
+    scope_ref         TEXT NOT NULL DEFAULT '',
+    mode              TEXT
+                          CHECK (mode IS NULL OR mode IN
+                              ('fixed', 'observe', 'propose', 'shadow')),
+    previous_mode     TEXT,
+    effective_from    REAL,
+    effective_until   REAL,
+    reason            TEXT NOT NULL,
+    actor_kind        TEXT NOT NULL DEFAULT 'user'
+                          CHECK (actor_kind IN ('user', 'system')),
+    actor             TEXT,
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN
+                              ('manual', 'reasoning_llm', 'deterministic')),
+    supersedes_id     INTEGER,
+    superseded_by_id  INTEGER,
+    schema_version    TEXT NOT NULL DEFAULT 'execution-mode-assignment-v1',
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (supersedes_id) REFERENCES execution_mode_assignment (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id) REFERENCES execution_mode_assignment (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_mode_assignment_scope
+    ON execution_mode_assignment (system_id, scope_kind, scope_ref, id DESC);
+
+-- execution_mode_observation: what mode a Node was ACTUALLY run under, so the
+-- configured value and the runtime reading can be compared. `unobserved` is
+-- never reported as `match`: not having looked is not a success (#380).
+CREATE TABLE IF NOT EXISTS execution_mode_observation (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id      INTEGER NOT NULL,
+    node_key       TEXT NOT NULL,
+    observed_mode  TEXT NOT NULL
+                       CHECK (observed_mode IN
+                           ('fixed', 'observe', 'propose', 'shadow')),
+    capability     TEXT,
+    run_ref        TEXT,
+    source         TEXT NOT NULL DEFAULT 'control_server'
+                       CHECK (source IN ('control_server', 'sdk')),
+    detail         TEXT NOT NULL DEFAULT '',
+    recorded_at    REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_mode_observation_node
+    ON execution_mode_observation (system_id, node_key, id DESC);
+
+-- flow_experiment_proposal: the IMMUTABLE content of one Flow-scoped
+-- experiment proposal. There is deliberately NO `status` column -- the
+-- lifecycle is folded from flow_experiment_event (#337/#338/#349/#405: a
+-- stored lifecycle value can drift from the rows it describes, a derived one
+-- cannot).
+--
+-- Every field the completeness gate requires is NOT NULL here so a proposal
+-- that is missing its baseline, quality floor, isolation strategy, cost cap,
+-- stop conditions or rollback plan cannot exist as a row at all. The finite
+-- rejection codes live in app/flow_orchestration.py (docs/execution-modes.md
+-- §7.1); the schema is the second line of that defence, not the first.
+CREATE TABLE IF NOT EXISTS flow_experiment_proposal (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    proposal_key          TEXT NOT NULL,
+    flow_subject_kind     TEXT NOT NULL
+                              CHECK (flow_subject_kind IN
+                                  ('runtime_flow', 'static_flow')),
+    flow_subject_ref      TEXT NOT NULL,
+    captured_snapshot_id  INTEGER,
+    comparison_scope      TEXT NOT NULL
+                              CHECK (comparison_scope IN
+                                  ('single_node', 'sub_pipeline')),
+    title                 TEXT NOT NULL,
+    purpose               TEXT NOT NULL,
+    hypothesis            TEXT NOT NULL,
+    baseline_ref          TEXT NOT NULL,
+    candidate_refs_json   TEXT NOT NULL DEFAULT '[]',
+    evaluation_axes_json  TEXT NOT NULL DEFAULT '[]',
+    quality_floor_json    TEXT NOT NULL DEFAULT '{}',
+    isolation_strategy    TEXT NOT NULL
+                              CHECK (isolation_strategy IN
+                                  ('pure', 'mock', 'dry_run',
+                                   'rollback_transaction',
+                                   'isolated_workspace', 'none')),
+    isolation_detail      TEXT NOT NULL DEFAULT '',
+    cost_cap_json         TEXT NOT NULL DEFAULT '{}',
+    stop_conditions_json  TEXT NOT NULL DEFAULT '[]',
+    rollback_plan         TEXT NOT NULL,
+    evidence_refs_json    TEXT NOT NULL DEFAULT '[]',
+    expires_at            REAL,
+    decision_method       TEXT NOT NULL DEFAULT 'manual'
+                              CHECK (decision_method IN
+                                  ('manual', 'reasoning_llm', 'deterministic')),
+    intelligence_run_id   INTEGER,
+    created_by            TEXT,
+    created_at            REAL NOT NULL,
+    schema_version        TEXT NOT NULL DEFAULT 'flow-experiment-proposal-v1',
+    UNIQUE (system_id, proposal_key),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (captured_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_experiment_proposal_system
+    ON flow_experiment_proposal (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_flow_experiment_proposal_subject
+    ON flow_experiment_proposal (system_id, flow_subject_kind, flow_subject_ref, id DESC);
+
+-- flow_experiment_target: the Nodes the proposal is about. `target_node_key`
+-- is the Evolution Node's own durable slug (#394 ADR-2), resolved at read
+-- time -- never a stored row id trusted on its own (#405).
+CREATE TABLE IF NOT EXISTS flow_experiment_target (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    proposal_id      INTEGER NOT NULL,
+    target_node_key  TEXT NOT NULL,
+    target_role      TEXT NOT NULL
+                         CHECK (target_role IN ('baseline', 'candidate_target')),
+    position         INTEGER NOT NULL DEFAULT 0,
+    note             TEXT NOT NULL DEFAULT '',
+    created_at       REAL NOT NULL,
+    UNIQUE (proposal_id, target_node_key, target_role),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_id) REFERENCES flow_experiment_proposal (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_experiment_target_proposal
+    ON flow_experiment_target (proposal_id, position, id);
+
+-- flow_experiment_event: the append-only lifecycle ledger. This is the
+-- canonical source of a proposal's status; nothing folds it into a column.
+-- `decision_method` is 'manual' for every human decision reaching this table
+-- through HTTP, and the actor comes from the authenticated principal, never
+-- from the request body (#337).
+CREATE TABLE IF NOT EXISTS flow_experiment_event (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    proposal_id      INTEGER NOT NULL,
+    event_kind       TEXT NOT NULL
+                         CHECK (event_kind IN
+                             ('proposed', 'approved', 'rejected', 'withdrawn',
+                              'expired', 'execution_recorded',
+                              'result_recorded',
+                              'promotion_candidate_recorded',
+                              'rollback_recorded')),
+    actor_kind       TEXT NOT NULL DEFAULT 'user'
+                         CHECK (actor_kind IN ('user', 'system')),
+    actor            TEXT,
+    reason           TEXT NOT NULL DEFAULT '',
+    decision_method  TEXT NOT NULL DEFAULT 'manual'
+                         CHECK (decision_method IN
+                             ('manual', 'reasoning_llm', 'deterministic')),
+    payload_json     TEXT NOT NULL DEFAULT '{}',
+    created_at       REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_id) REFERENCES flow_experiment_proposal (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_experiment_event_proposal
+    ON flow_experiment_event (proposal_id, id);
+
+-- flow_experiment_execution_ref: a REFERENCE to an execution that already
+-- has its own canonical row elsewhere (replay_runs / experiments /
+-- shadow_results). The orchestrator owns no execution of its own and writes
+-- to none of those tables; it points at them and resolves the pointer at
+-- read time.
+CREATE TABLE IF NOT EXISTS flow_experiment_execution_ref (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    proposal_id     INTEGER NOT NULL,
+    execution_kind  TEXT NOT NULL
+                        CHECK (execution_kind IN
+                            ('replay_variant_run', 'experiment',
+                             'shadow_result')),
+    execution_ref   TEXT NOT NULL,
+    note            TEXT NOT NULL DEFAULT '',
+    recorded_at     REAL NOT NULL,
+    UNIQUE (proposal_id, execution_kind, execution_ref),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_id) REFERENCES flow_experiment_proposal (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_experiment_execution_ref_proposal
+    ON flow_experiment_execution_ref (proposal_id, id);
+
 """
 
 

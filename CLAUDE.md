@@ -1514,6 +1514,81 @@ creating incomplete persistence or execution paths for later phases.
     ない)。詳細は `docs/project-intelligence.md` の
     「Epic #405 検証ラウンド」節が正本。
 
+26. Issue #412 (subs #413-#415) — 実行モード切替と説明可能なエージェント群。
+    通常運用は LLM を呼ばない固定処理として安全に動かし、実験が必要なときだけ
+    LLM に候補・比較・実験計画を**提案**させる。あわせて、関連する Evolution
+    Node を Flow / エージェント群として集約し、その目的・状態・根拠・次の提案を
+    人が追えるようにする。`docs/execution-modes.md` が canonical contract で、
+    §0 を読んでからこの領域に触ること。依存順に #413 (実行モードの正本契約と
+    fail-closed 制御) → #414 (Flow・エージェント群の説明可能な集約 projection)
+    → #415 (提案・Shadow 実験・人間承認のオーケストレーション統合)。
+    後から変えるときに守ること:
+    - **実行モードは 5 本目の独立軸である。** Node maturity / Cell Improvement
+      status / SDK policy mode (`off`/`trace`/`shadow`) / Dashboard user phase
+      の 4 軸 (#394 ADR-6) のどれからも導出せず、どれへも統合しない。とくに
+      SDK policy の `shadow` と実行モードの `shadow` は別の事実 — 前者は SDK が
+      候補を実行して送るか、後者は control plane が候補比較を許すか。片方だけが
+      `shadow` の状態は正当で、projection は 2 つの読みとして並べる (#366)。
+    - **`fixed` は「LLM を使わない設定」ではなく「到達不能」である。**
+      `app/execution_mode.py` の `build_experiment_llm_adapter` は
+      `require_capability` を**先に**呼び、通過した後で初めて
+      `LLMConfig.intelligence_from_env()` に触れる。この順序が契約であり、
+      テストは資格情報を読む行に到達しないことを直接表明する。この Epic が
+      対象とする Node に対して、この関数を迂回して `create_llm_client` を
+      呼ぶ経路を新設しない。
+    - **モードスコープは永続行だけから解決できるものに限る** (EM-ADR-1)。
+      ゲートは「読めなければ `fixed`」でなければならず、失敗しうる導出を
+      入力に置くと失敗が「停止」になり「安全側へ倒れる」にならない。だから
+      `static_flow` (`code_entrypoints`、snapshot scoped、所属を知るには
+      call graph の再計算が要る) は #414 の**表示 subject** ではあっても
+      モードスコープではない。モードスコープは `system` / `flow`
+      (`runtime_flow:<flow_id>`、所属は既存の
+      `evolution_node_link(link_kind='flow')` 1 本の indexed query) / `node`
+      (`node_key`) の 3 つ。`scope_ref` は常に前置詞付きで保存する。
+    - **`expired` と `revoked` は別の答え** (EM-ADR-2)。`effective_until` は
+      人間が設定した実験の期限なので、期限切れで上位スコープの `propose` が
+      代わりに効いてしまうとその期限は何も止めていない。期限切れは上位へ
+      継承させず `fixed` へ落とす。`revoke` は人間が明示的に終了を記録した
+      事実なので、通常の継承が再開する。**時間の経過だけで権限が復活する
+      経路は存在しない。**
+    - 実効モードは `resolve_execution_mode` の 10 行 first-match 表を持つ
+      **純粋関数**で決まる。`reason` は 10 個の有限集合。ルート・Dashboard・
+      projection・orchestrator のどれもこの判定を再導出しない (#349)。
+    - **`propose` は `candidate_execution` を持たない。** 提案は計画であって
+      実行ではない。実行には「人間の承認」と「モードが `shadow`」という
+      **2 つの独立した事実**の両方が要る。承認済みでもモードが `propose` に
+      戻っていれば実行記録は 409、モードが `shadow` でも未承認なら 409。
+    - **`mode_source: "default"` と `system_assignment` を区別する。**
+      「既定の `fixed`」と「人間が `fixed` を選んだ」は別の事実。
+      `unobserved` を `match` として扱わない。
+    - #414 は**何も書かない**読み取り専用 projection で、新しい理解モデルを
+      作らない。単一スコア・平均・完成度・confidence percentage を返さず、
+      5 軸を別フィールドで返す (ADR-7 / #353)。`missing` / `unavailable` /
+      `unmeasured` / `stale` / `not_applicable` は 5 つの別の答えで丸めない。
+      1 section の失敗は `degraded_sections` に落ち、推測値を代入しない
+      (#380)。`flow_graph` の `flow-1`/`flow-2` を恒久 ID として保存も返却も
+      しない (#405)。static flow の Node 所属は `(path, qualified_name)` の
+      完全一致のみで、類似度・キーワード・埋め込みを使わない (Principle 6)。
+    - #415 の提案 lifecycle は `flow_experiment_event` の **event fold で
+      導出**し、`status` 列を保存しない (#337/#338/#349/#405 と同じ規律)。
+      提案は §7.1 の 12 個の必須項目 + 構造検証をすべて満たさなければ
+      作成できず、欠落は有限の拒否コードで 422 になる。`single_node` と
+      `sub_pipeline` を混同せず、対象 Node 数と一致しなければ拒否する。
+      `side_effect_class` が `external_write` / `irreversible` の Node に
+      対する `none` / `pure` の隔離戦略は拒否する (Principle 4 を提案の
+      入口で構造的に効かせる)。
+    - **オーケストレーターは本番を書き換える経路を持たない。**
+      `evolution_node.maturity` / `components.mode` / patch 適用 / publish
+      job / worktree / target repo / Cell Improvement 状態のどれも変えない。
+      実行の実体は既存正本 (`replay_runs` / `experiments` /
+      `shadow_results`) で、この層は参照するだけ。参照は read 時に解決し、
+      保存した row id を単独で信用しない (#405)。昇格候補の記録は**昇格では
+      ない** — 実際の昇格は既存の Experiment 採否 / Stabilization / publish の
+      人間ゲートを通る。
+    既存の human gate は一切緩めない。この Epic が追加する実行モードの割り当てと
+    revoke、Flow 実験提案の承認・却下・撤回、昇格候補の記録もすべて
+    `decision_method: manual`。
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,
