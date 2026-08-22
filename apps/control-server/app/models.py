@@ -11076,6 +11076,253 @@ class ExecutionModeDenialOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Flow explanation projection (Epic #412, Issue #414)
+#
+# The domain layer is `app/flow_explanation.py`, which owns every vocabulary
+# below; these `Literal` aliases mirror it so FastAPI puts a real enum in the
+# OpenAPI schema (the same pairing the Execution Mode block above uses).
+#
+# Two rules are visible in the shapes themselves. First, the five axes of
+# §1.2 are five SEPARATE fields on `FlowExplanationNodeOut` -- there is no
+# combined value, no average, no completion percentage and no Flow health
+# score anywhere in this response (ADR-7 / #353); `sdk_policy_mode` and
+# `execution_mode` may both read `shadow` and still be two different facts.
+# Second, a section that could not be built is `null` AND named in
+# `degraded_sections`: an empty list means "there are none", `null` means
+# "we could not read them", and #356's 0 件 ≠ 取得できていない rule forbids
+# collapsing those into one display.
+# ---------------------------------------------------------------------------
+
+FlowSubjectKind = Literal["runtime_flow", "static_flow"]
+FlowSubjectResolution = Literal["resolved", "unresolved", "unavailable"]
+#: §6.4's five missing answers plus `present`. `present` is the absence of a
+#: missing answer, never a sixth one.
+FlowFactState = Literal[
+    "present", "missing", "unavailable", "unmeasured", "stale", "not_applicable"
+]
+#: A call graph that failed tells us nothing about the Nodes it would have
+#: named, so there is no "partially resolved" third value.
+FlowMembershipState = Literal["resolved", "unavailable"]
+FlowMembershipBasis = Literal["flow_link", "probe_point_exact_match"]
+FlowEvidenceKind = Literal[
+    "trace",
+    "anomaly",
+    "drift_observation",
+    "node_event",
+    "code_location",
+    "execution_ref",
+    "stabilization_package",
+]
+FlowOpenItemKind = Literal[
+    "anomaly",
+    "missing_fact",
+    "unmeasured_observation",
+    "mode_divergence",
+    "unresolved_membership",
+    "stale_premise",
+    "maturity_drift",
+]
+#: Which dependency reading the `responsibility` section is showing. Runtime
+#: span parentage and a pinned snapshot's call graph answer different
+#: questions and are never merged into one edge list.
+FlowEdgeSource = Literal[
+    "runtime_span_parentage", "static_call_graph", "unavailable", "not_applicable"
+]
+
+
+class FlowEvidenceOut(BaseModel):
+    """One referencable evidence item (§6.5): `id` is `"<kind>:<ref>"`."""
+
+    id: str
+    kind: FlowEvidenceKind
+    ref: str
+    label: str
+    node_key: Optional[str] = None
+    recorded_at: Optional[float] = None
+
+
+class FlowSubjectOut(BaseModel):
+    subject_kind: FlowSubjectKind
+    subject_ref: str
+    label: str
+    resolution: FlowSubjectResolution
+    #: `not_applicable` for a runtime Flow -- it carries no snapshot. That is
+    #: a different answer from `missing` (a static Flow with no snapshot).
+    snapshot_state: FlowFactState
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    detail: str = ""
+
+
+class FlowMembershipOut(BaseModel):
+    state: FlowMembershipState
+    node_keys: List[str] = Field(default_factory=list)
+    basis: Dict[str, FlowMembershipBasis] = Field(default_factory=dict)
+    detail: str = ""
+
+
+class FlowExplanationNodeOut(BaseModel):
+    """One Node, five independent axes, plus its observation coverage.
+
+    Never averaged, never combined (ADR-6). Each axis that could not be read
+    carries its own `*_state` rather than a default value (#380).
+    """
+
+    node_id: int
+    node_key: str
+    display_name: str
+    membership_basis: FlowMembershipBasis
+
+    execution_mode: ExecutionMode
+    #: `default` is the fail-closed `fixed` nobody chose; `system` with reason
+    #: `system_assignment` is a human who chose it (§4.4).
+    mode_source: ExecutionModeSourceScope
+    mode_reason: ExecutionModeReason
+    mode_source_ref: str = ""
+    mode_state: FlowFactState = "present"
+    mode_divergence: Optional[ExecutionModeDivergence] = None
+    observed_mode: Optional[ExecutionMode] = None
+
+    maturity: Optional[EvolutionMaturityState] = None
+    maturity_state: FlowFactState = "present"
+    folded_maturity: Optional[EvolutionMaturityState] = None
+    maturity_consistent: Optional[bool] = None
+
+    implementation_modality: Optional[EvolutionImplementationModality] = None
+    implementation_modality_state: FlowFactState = "missing"
+
+    improvement_status: Optional[str] = None
+    improvement_status_state: FlowFactState = "missing"
+
+    sdk_policy_mode: Optional[str] = None
+    sdk_policy_mode_state: FlowFactState = "missing"
+
+    observation: Optional[Dict[str, Any]] = None
+    observation_state: FlowFactState = "unmeasured"
+    monitoring_contract_declared: bool = False
+
+    evidence: List[FlowEvidenceOut] = Field(default_factory=list)
+    capability_refs: List[str] = Field(default_factory=list)
+    purpose_element_refs: List[str] = Field(default_factory=list)
+    feature_refs: List[str] = Field(default_factory=list)
+
+
+class FlowPurposeSectionOut(BaseModel):
+    purpose_elements: List[Dict[str, Any]] = Field(default_factory=list)
+    capabilities: List[Dict[str, Any]] = Field(default_factory=list)
+    features: List[Dict[str, Any]] = Field(default_factory=list)
+    purpose_chain_state: FlowFactState = "present"
+    detail: str = ""
+
+
+class FlowResponsibilitySectionOut(BaseModel):
+    edge_source: FlowEdgeSource = "not_applicable"
+    node_order: List[str] = Field(default_factory=list)
+    edges: List[Dict[str, Any]] = Field(default_factory=list)
+    contracts: List[Dict[str, Any]] = Field(default_factory=list)
+    external_boundaries: List[Dict[str, Any]] = Field(default_factory=list)
+    entry_ref: Optional[str] = None
+    entry_state: FlowFactState = "missing"
+    truncated: bool = False
+    diagnostics: List[str] = Field(default_factory=list)
+
+
+class FlowOpenItemOut(BaseModel):
+    id: str
+    kind: FlowOpenItemKind
+    label: str
+    detail: str = ""
+    node_key: Optional[str] = None
+    missing_state: Optional[FlowFactState] = None
+    evidence_ids: List[str] = Field(default_factory=list)
+
+
+class FlowOpenItemsSectionOut(BaseModel):
+    items: List[FlowOpenItemOut] = Field(default_factory=list)
+
+
+class FlowExperimentSummaryOut(BaseModel):
+    """One #415 proposal, summarised.
+
+    `status` is #415's own event fold (§7.4), never re-implemented here. When
+    that definition cannot be loaded the status is `null` with
+    `status_state: "unavailable"` -- a guessed status would be the second
+    lifecycle definition the fold exists to prevent.
+    """
+
+    proposal_id: int
+    proposal_key: str
+    title: str
+    comparison_scope: str
+    status: Optional[str] = None
+    status_state: FlowFactState = "unavailable"
+    target_node_keys: List[str] = Field(default_factory=list)
+    evidence_refs: List[Any] = Field(default_factory=list)
+    execution_refs: List[Dict[str, Any]] = Field(default_factory=list)
+    isolation_strategy: str = ""
+    expires_at: Optional[float] = None
+    created_at: Optional[float] = None
+
+
+class FlowExperimentsSectionOut(BaseModel):
+    proposals: List[FlowExperimentSummaryOut] = Field(default_factory=list)
+    status_source: str = "unavailable"
+
+
+class FlowNodeBaselineOut(BaseModel):
+    node_key: str
+    stable_implementation: Optional[Dict[str, Any]] = None
+    stable_state: FlowFactState = "missing"
+    rollback_implementation: Optional[Dict[str, Any]] = None
+    rollback_state: FlowFactState = "missing"
+    #: Read as its own record, never inferred from the pin's existence (#304).
+    approval: Optional[Dict[str, Any]] = None
+    approval_state: FlowFactState = "missing"
+
+
+class FlowBaselineSectionOut(BaseModel):
+    nodes: List[FlowNodeBaselineOut] = Field(default_factory=list)
+
+
+class FlowExplanationOut(BaseModel):
+    """The whole §6.3 projection.
+
+    A `null` section plus its name in `degraded_sections` means the section
+    could not be read; an empty section means there is nothing in it. Those
+    are two different answers (#356).
+    """
+
+    system_id: int
+    schema_version: str
+    generated_at: float
+    subject: FlowSubjectOut
+    membership: FlowMembershipOut
+    purpose: Optional[FlowPurposeSectionOut] = None
+    responsibility: Optional[FlowResponsibilitySectionOut] = None
+    nodes: Optional[List[FlowExplanationNodeOut]] = None
+    open_items: Optional[FlowOpenItemsSectionOut] = None
+    experiments: Optional[FlowExperimentsSectionOut] = None
+    baseline: Optional[FlowBaselineSectionOut] = None
+    drilldown: Dict[str, Any] = Field(default_factory=dict)
+    rollup: List[Dict[str, Any]] = Field(default_factory=list)
+    degraded_sections: List[str] = Field(default_factory=list)
+    degraded_detail: Dict[str, str] = Field(default_factory=dict)
+
+
+class FlowSubjectListOut(BaseModel):
+    """The Flow subjects available in this System, both kinds, kept apart."""
+
+    system_id: int
+    generated_at: float
+    runtime_flows: List[Dict[str, Any]] = Field(default_factory=list)
+    static_flows: List[Dict[str, Any]] = Field(default_factory=list)
+    snapshot_id: Optional[int] = None
+    snapshot_state: FlowFactState = "missing"
+    degraded_sections: List[str] = Field(default_factory=list)
+    degraded_detail: Dict[str, str] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
 # Flow explanation projection (Epic #412, Issue #414) -- ANCHOR-414
 # Insert the #414 request/response models directly above this line.
 # ---------------------------------------------------------------------------
