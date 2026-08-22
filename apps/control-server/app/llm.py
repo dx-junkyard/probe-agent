@@ -388,6 +388,63 @@ class MockLLMClient(LLMClient):
                     ],
                 }
             )
+        if "FLOW_EXPERIMENT_DRAFT_RESPONSE_JSON" in joined:
+            # Issue #415 §7.7. The node keys are echoed back OUT OF THE
+            # PROMPT rather than invented: `_parse_draft_response` refuses a
+            # Node outside the requested set, and a mock that fabricated one
+            # would exercise the refusal path instead of the success path.
+            node_keys = [
+                line[2:].split("/", 1)[0].strip()
+                for line in joined.splitlines()
+                if line.startswith("- ") and "/" in line
+            ]
+            node_keys = [key for key in node_keys if key]
+            return json.dumps(
+                {
+                    "title": "Mock Flow experiment draft",
+                    "purpose": (
+                        "Mock purpose: no external LLM was called; this is "
+                        "deterministic mock output."
+                    ),
+                    "hypothesis": (
+                        "Mock hypothesis: the candidate implementation keeps "
+                        "the baseline contract at lower cost."
+                    ),
+                    "comparison_scope": (
+                        "sub_pipeline" if len(node_keys) > 1 else "single_node"
+                    ),
+                    "target_node_keys": node_keys,
+                    "baseline_ref": "baseline:current_stable_implementation",
+                    "candidate_refs": ["candidate:mock-1"],
+                    "evaluation_axes": [
+                        {"level": "node", "name": "output_match", "metric": "match_rate"},
+                        {
+                            "level": "flow_capability",
+                            "name": "flow_success",
+                            "metric": "completed_flow_rate",
+                        },
+                    ],
+                    "quality_floor": {"output_match": "no regression vs baseline"},
+                    "isolation_strategy": "isolated_workspace",
+                    "isolation_detail": (
+                        "Network-off worktree sandbox; the baseline production "
+                        "path is untouched."
+                    ),
+                    "cost_cap": {"max_runs": 20},
+                    "stop_conditions": [
+                        "Any quality floor is broken.",
+                        "The cost cap is reached.",
+                    ],
+                    "rollback_plan": (
+                        "Nothing is applied: discard the candidate and keep "
+                        "the pinned stable implementation."
+                    ),
+                    "evidence_refs": ["mock:evidence-1"],
+                    "risks": [
+                        "Mock draft -- review every element before proposing it."
+                    ],
+                }
+            )
         if "CELL_TRIAGE_RESPONSE_JSON" in joined:
             return json.dumps(
                 {

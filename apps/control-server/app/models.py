@@ -11329,6 +11329,380 @@ class FlowSubjectListOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Flow experiment orchestration (Epic #412, Issue #415)
+# ---------------------------------------------------------------------------
+#
+# Canonical contract: `docs/execution-modes.md` §7 (§8.4 for persistence, §9.3
+# for the test requirements). The domain layer is `app/flow_orchestration.py`,
+# which mirrors every alias below with `get_args` -- so the API vocabulary and
+# the domain vocabulary can never disagree (the same shape #413's aliases use).
+#
+# Three boundary rules are expressed in the SHAPE of these models, not only in
+# prose:
+#
+# * **`actor` and `decision_method` are never request fields.** Approving,
+#   rejecting, withdrawing, recording an execution / result / promotion
+#   candidate / rollback are all human decisions; the name comes from the
+#   authenticated principal at the route and `decision_method` is fixed to
+#   `manual` server-side (#337, §10). A body-supplied actor would let any
+#   caller forge someone else's approval.
+#
+# * **`status` is not a request field and not a stored column.** It is folded
+#   from `flow_experiment_event` on every read (§7.4) and appears only on the
+#   response, next to the moment it was derived at.
+#
+# * **`comparison_scope` and `isolation_strategy` are plain `str` on the way
+#   IN, on purpose.** §7.1 enumerates `comparison_scope_mismatch` and
+#   `isolation_strategy_missing` as finite gate codes the developer must be
+#   able to receive; typing them as `Literal` here would make Pydantic reject
+#   the request first and those two enumerated codes would be unreachable
+#   through the API. They are `Literal` on the way OUT, where the value has
+#   already passed the gate.
+
+#: `single_node` targets exactly one Node, `sub_pipeline` two or more. The
+#: count and the declared scope must agree (§7.2).
+FlowComparisonScope = Literal["single_node", "sub_pipeline"]
+
+#: §7.3's finite isolation vocabulary. `none` and `pure` do not isolate
+#: anything, which is why a Node whose `side_effect_class` is
+#: `external_write` / `irreversible` may not use them (Principle 4).
+FlowIsolationStrategy = Literal[
+    "pure", "mock", "dry_run", "rollback_transaction", "isolated_workspace", "none"
+]
+
+#: The three evaluation contracts of ADR-7. They are held apart deliberately:
+#: no level is ever computed from another and there is no combined score.
+FlowEvaluationLevel = Literal["node", "flow_capability", "ux_outcome"]
+
+#: Why a Node is attached to a proposal. The same Node may legitimately appear
+#: as both, which is why the scope check counts DISTINCT Nodes (§7.2).
+FlowExperimentTargetRole = Literal["baseline", "candidate_target"]
+
+#: §7.4's append-only ledger vocabulary. `promotion_candidate_recorded` is a
+#: candidate, never a promotion (§7.6).
+FlowExperimentEventKind = Literal[
+    "proposed",
+    "approved",
+    "rejected",
+    "withdrawn",
+    "expired",
+    "execution_recorded",
+    "result_recorded",
+    "promotion_candidate_recorded",
+    "rollback_recorded",
+]
+
+#: The DERIVED lifecycle position (§7.4). There is no `status` column behind
+#: this value and there must never be one.
+FlowExperimentStatus = Literal[
+    "proposed", "approved", "rejected", "withdrawn", "expired", "executing", "completed"
+]
+
+#: Where an execution reference resolves. This layer runs nothing itself: the
+#: execution's canonical row already exists in `replay_variants` /
+#: `experiments` / `shadow_results` and is resolved again at read time (§7.6).
+FlowExperimentExecutionKind = Literal["replay_variant_run", "experiment", "shadow_result"]
+
+#: The three answers a reference resolution can give, never merged: the row is
+#: there and usable, it is not there at all, or it is there but its own run
+#: concluded it produced nothing usable.
+FlowExecutionRefResolution = Literal["resolved", "unresolved", "stale"]
+
+#: What a caller ASKS for. Separate from `FlowExperimentEventKind` because an
+#: action is a request and an event is a recorded fact -- a refused action
+#: writes no event at all.
+FlowExperimentActionKind = Literal[
+    "approve",
+    "reject",
+    "withdraw",
+    "record_execution",
+    "record_result",
+    "record_promotion_candidate",
+    "record_rollback",
+]
+
+
+class FlowExperimentTargetIn(BaseModel):
+    """One target Node. `node_key` is the Evolution Node's durable slug
+    (#394 ADR-2), resolved against this System at gate time."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_key: str
+    target_role: FlowExperimentTargetRole = "candidate_target"
+    position: Optional[int] = None
+    note: str = ""
+
+
+class FlowEvaluationAxisIn(BaseModel):
+    """One evaluation axis, which DECLARES the contract it belongs to.
+
+    ADR-7 forbids computing a Flow/Capability reading out of Node readings;
+    the structural guarantee against that is that every axis names its own
+    level and nothing anywhere maps one level onto another.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    level: FlowEvaluationLevel
+    name: str
+    metric: str = ""
+    detail: str = ""
+
+
+class FlowExperimentCreateIn(BaseModel):
+    """A proposal as its author writes it (§7.1).
+
+    Every element §7.1 requires is present here so an incomplete proposal is
+    refused with the finite code that names the MISSING element, instead of a
+    generic "invalid proposal" carrying twelve facts at once (#366).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    proposal_key: str
+    flow_subject_kind: FlowSubjectKind
+    flow_subject_ref: str
+    #: Mandatory for `static_flow`: an `entrypoint_id` without the snapshot it
+    #: was read from names nothing (§6.2).
+    captured_snapshot_id: Optional[int] = None
+    #: Plain `str` so `comparison_scope_mismatch` stays reachable (see above).
+    comparison_scope: str
+    title: str = ""
+    purpose: str = ""
+    hypothesis: str = ""
+    baseline_ref: str = ""
+    candidate_refs: List[str] = Field(default_factory=list)
+    targets: List[FlowExperimentTargetIn] = Field(default_factory=list)
+    evaluation_axes: List[FlowEvaluationAxisIn] = Field(default_factory=list)
+    quality_floor: Dict[str, Any] = Field(default_factory=dict)
+    #: Plain `str` so `isolation_strategy_missing` stays reachable (see above).
+    isolation_strategy: str = ""
+    isolation_detail: str = ""
+    #: Must bound something: at least one positive numeric limit (§7.1).
+    cost_cap: Dict[str, Any] = Field(default_factory=dict)
+    stop_conditions: List[str] = Field(default_factory=list)
+    rollback_plan: str = ""
+    evidence_refs: List[str] = Field(default_factory=list)
+    #: The window in which a human may approve. Elapsing expires a proposal
+    #: that is still awaiting a decision; it never unmakes an approval (§7.4).
+    expires_at: Optional[float] = None
+    reason: str = ""
+    #: Provenance of the CONTENT. `reasoning_llm` + the drafting run's id is
+    #: how a `POST /flow-experiments/draft` result is put into the queue by a
+    #: human; the `proposed` EVENT is `manual` either way (§7.7).
+    intelligence_run_id: Optional[int] = None
+
+
+class FlowExperimentDecisionIn(BaseModel):
+    """Approve / reject / withdraw. `actor` is deliberately absent (#337).
+
+    `reason` is required for a rejection and a withdrawal -- both end a plan,
+    and a decision recorded without a reason cannot be reviewed later.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = ""
+
+
+class FlowExperimentExecutionIn(BaseModel):
+    """Attach an execution that ALREADY EXISTS in its own canonical table.
+
+    This layer creates no row in `replay_variants` / `experiments` /
+    `shadow_results`; it points at one and refuses a pointer that does not
+    resolve in this System (§7.6).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution_kind: FlowExperimentExecutionKind
+    execution_ref: str
+    note: str = ""
+
+
+class FlowExperimentResultIn(BaseModel):
+    """What an execution produced. Never adopts, promotes or applies anything.
+
+    `metrics` keys are the three evaluation contracts and nothing else: what
+    was not measured stays absent, because an absent measurement and a derived
+    one are different facts (ADR-7).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    execution_kind: Optional[FlowExperimentExecutionKind] = None
+    execution_ref: Optional[str] = None
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+
+
+class FlowExperimentPromotionCandidateIn(BaseModel):
+    """Recording a CANDIDATE is not a promotion (§7.6). The real promotion
+    still goes through the existing Experiment adoption / Stabilization /
+    publish human gates."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_ref: str
+    rationale: str
+
+
+class FlowExperimentRollbackIn(BaseModel):
+    """An audit fact about work performed elsewhere: this layer can revert
+    nothing itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    detail: str
+
+
+class FlowExperimentTargetOut(BaseModel):
+    id: int
+    target_node_key: str
+    target_role: FlowExperimentTargetRole
+    position: int
+    note: str = ""
+
+
+class FlowExperimentEventOut(BaseModel):
+    """One row of the append-only ledger that IS the lifecycle (§7.4)."""
+
+    id: int
+    event_kind: FlowExperimentEventKind
+    actor_kind: str
+    actor: Optional[str] = None
+    reason: str = ""
+    decision_method: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    created_at: float
+
+
+class FlowExperimentExecutionRefOut(BaseModel):
+    id: int
+    execution_kind: FlowExperimentExecutionKind
+    execution_ref: str
+    note: str = ""
+    recorded_at: float
+    #: Recomputed on every read; a stored row id is never trusted on its own
+    #: (#405).
+    resolution: FlowExecutionRefResolution
+
+
+class FlowExperimentProposalOut(BaseModel):
+    """The immutable content, the derived status and the whole audit trail."""
+
+    schema_version: str
+    id: int
+    system_id: int
+    proposal_key: str
+    flow_subject_kind: FlowSubjectKind
+    flow_subject_ref: str
+    captured_snapshot_id: Optional[int] = None
+    comparison_scope: FlowComparisonScope
+    title: str
+    purpose: str
+    hypothesis: str
+    baseline_ref: str
+    candidate_refs: List[Any] = Field(default_factory=list)
+    evaluation_axes: List[Dict[str, Any]] = Field(default_factory=list)
+    #: The same axes grouped by their DECLARED level -- a grouping, never a
+    #: derivation, and never summed into one number (ADR-7).
+    evaluation_axes_by_level: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
+    quality_floor: Dict[str, Any] = Field(default_factory=dict)
+    isolation_strategy: FlowIsolationStrategy
+    isolation_detail: str = ""
+    cost_cap: Dict[str, Any] = Field(default_factory=dict)
+    stop_conditions: List[Any] = Field(default_factory=list)
+    rollback_plan: str
+    evidence_refs: List[Any] = Field(default_factory=list)
+    expires_at: Optional[float] = None
+    decision_method: str
+    intelligence_run_id: Optional[int] = None
+    created_by: Optional[str] = None
+    created_at: float
+    #: DERIVED by folding `events` on this read. No column backs it (§7.4).
+    status: FlowExperimentStatus
+    status_derived_at: float
+    targets: List[FlowExperimentTargetOut] = Field(default_factory=list)
+    events: List[FlowExperimentEventOut] = Field(default_factory=list)
+    executions: List[FlowExperimentExecutionRefOut] = Field(default_factory=list)
+    #: The promotion-candidate events, surfaced for readability. Each one is a
+    #: candidate record and carries `promotion_performed: false` (§7.6).
+    promotion_candidates: List[FlowExperimentEventOut] = Field(default_factory=list)
+
+
+class FlowExperimentListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    proposals: List[FlowExperimentProposalOut] = Field(default_factory=list)
+
+
+class FlowExperimentRejectionOut(BaseModel):
+    """The 422 body of a §7.1 refusal.
+
+    `code` is one of the twelve completeness codes or the seven structural
+    ones, and `detail` names the specific Nodes / levels / keys involved -- so
+    the developer reads WHICH element is the problem without re-deriving the
+    gate (the shape #413's `ExecutionModeDenialOut` uses for its own refusal).
+    """
+
+    code: str
+    message: str
+    detail: List[str] = Field(default_factory=list)
+
+
+class FlowExperimentLifecycleRejectionOut(BaseModel):
+    """The 409 body of an illegal transition (§7.4).
+
+    A mode refusal on the same endpoint is ALSO a 409, but it carries
+    `ExecutionModeDenialOut` instead: approval and execution mode are two
+    independent facts (§7.5) and the developer's next action differs, so the
+    two refusals never share a body.
+    """
+
+    code: str
+    message: str
+
+
+class FlowExperimentDraftIn(BaseModel):
+    """Ask the experiment reasoning model for a DRAFT (§7.7).
+
+    Reachable only in `propose` / `shadow`: the capability gate runs before
+    the first line that could read a credential (EM-ADR-3).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    flow_subject_kind: FlowSubjectKind
+    flow_subject_ref: str
+    node_keys: List[str] = Field(default_factory=list)
+    goal: str
+
+
+class FlowExperimentDraftOut(BaseModel):
+    """A draft is NOT a proposal.
+
+    Nothing has been persisted except the `intelligence_runs` audit row, and
+    no `proposed` event exists until a human posts the content through
+    `POST /flow-experiments`. `created_proposal` is therefore always `false`
+    -- it is stated rather than implied, because "the model produced a plan"
+    and "a plan is waiting for approval" are exactly the two facts §7.7 keeps
+    apart.
+    """
+
+    draft: Dict[str, Any]
+    intelligence_run_id: int
+    is_mock: bool
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    decision: ExecutionModeDecisionOut
+    created_proposal: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Flow experiment orchestration (Epic #412, Issue #415) -- ANCHOR-415
 # Insert the #415 request/response models directly above this line.
 # ---------------------------------------------------------------------------

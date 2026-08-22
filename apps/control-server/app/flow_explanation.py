@@ -1323,7 +1323,7 @@ def _build_experiments_section(
     section = ExperimentsSection()
 
     derive = None
-    try:  # pragma: no cover - exercised only once #415 has landed
+    try:
         from . import flow_orchestration  # type: ignore[attr-defined]
 
         derive = getattr(flow_orchestration, "derive_proposal_status", None)
@@ -1385,8 +1385,12 @@ def _build_experiments_section(
                     (row["id"], system_id),
                 ).fetchall()
             ]
-            try:  # pragma: no cover - exercised only once #415 has landed
-                summary.status = derive(events)
+            try:
+                # `expires_at` is passed because expiry is part of the
+                # fold: a proposal whose approval window elapsed reads
+                # `expired`, and omitting it would silently report it as
+                # still awaiting a decision.
+                summary.status = derive(events, expires_at=row["expires_at"])
                 summary.status_state = "present"
             except Exception:  # noqa: BLE001
                 summary.status = None

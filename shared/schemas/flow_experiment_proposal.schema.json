@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/flow_experiment_proposal.json",
+  "title": "FlowExperimentProposal",
+  "description": "The canonical read document of one Flow-scoped experiment proposal (Epic #412 Phase 3, Issue #415; contract docs/execution-modes.md §7). Built deterministically at read time by app/flow_orchestration.py from flow_experiment_proposal / _target / _event / _execution_ref -- it is never a separately cached document. Four properties are structural rather than advisory. (1) `status` is DERIVED by folding the append-only `events` ledger on every read; there is deliberately no status column on flow_experiment_proposal and there must never be one (§7.4, the discipline of #337/#338/#349/#405) -- `status_derived_at` records the moment the fold was taken, because expiry is part of it. (2) The document carries every element §7.1's completeness gate requires, each of which has its own finite rejection code, so an incomplete proposal is refused at the entrance rather than stored half-written. (3) `evaluation_axes_by_level` is a GROUPING of `evaluation_axes` by the level each axis declares -- never a derivation of one level from another and never a combined score (#394 ADR-7). (4) An entry in `executions` is a REFERENCE to a run whose canonical row already exists in replay_variants / experiments / shadow_results; this layer executes nothing and creates none of those rows, and `resolution` is recomputed on every read because a stored row id is never trusted on its own (§7.6). A `promotion_candidates` entry is a recorded candidate, never a promotion: adoption still passes the existing Experiment / Stabilization / publish human gates.",
+  "type": "object",
+  "required": [
+    "schema_version", "id", "system_id", "proposal_key",
+    "flow_subject_kind", "flow_subject_ref", "comparison_scope",
+    "title", "purpose", "hypothesis", "baseline_ref", "candidate_refs",
+    "evaluation_axes", "evaluation_axes_by_level", "quality_floor",
+    "isolation_strategy", "cost_cap", "stop_conditions", "rollback_plan",
+    "evidence_refs", "decision_method", "created_at",
+    "status", "status_derived_at", "targets", "events", "executions"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "flow-experiment-proposal-v1" },
+    "id": { "type": "integer", "minimum": 1 },
+    "system_id": { "type": "integer", "minimum": 1 },
+    "proposal_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Developer-supplied stable slug, unique per System. A second proposal reusing it is refused with `duplicate_proposal_key`."
+    },
+    "flow_subject_kind": { "$ref": "#/$defs/flow_subject_kind" },
+    "flow_subject_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A runtime flow_id (trace_spans.flow_id, §2.1) or a pinned snapshot's entrypoint_id. The two are never merged into one identifier space, and a flow_graph's derivation-local `flow-1` label is never persisted as one (#405)."
+    },
+    "captured_snapshot_id": {
+      "description": "The pinned snapshot a `static_flow` subject was read from. Mandatory for that kind -- an entrypoint_id without its snapshot names nothing (§6.2). null for a runtime Flow, which carries no snapshot.",
+      "type": ["integer", "null"]
+    },
+    "comparison_scope": { "$ref": "#/$defs/comparison_scope" },
+    "title": { "type": "string" },
+    "purpose": {
+      "type": "string",
+      "minLength": 1,
+      "description": "§7.1 required element; absent it is `purpose_missing`."
+    },
+    "hypothesis": {
+      "type": "string",
+      "minLength": 1,
+      "description": "§7.1 required element; absent it is `hypothesis_missing`."
+    },
+    "baseline_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the candidates are compared against. §7.1: `baseline_missing`."
+    },
+    "candidate_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "§7.1: `candidates_missing`."
+    },
+    "evaluation_axes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/evaluation_axis" },
+      "description": "§7.1: `evaluation_axes_missing`. Each axis DECLARES its contract level; nothing anywhere maps one level onto another (ADR-7)."
+    },
+    "evaluation_axes_by_level": {
+      "type": "object",
+      "description": "The same axes grouped by declared level. A grouping, never a derivation, and never summed into a single score.",
+      "required": ["node", "flow_capability", "ux_outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "node": { "type": "array", "items": { "$ref": "#/$defs/evaluation_axis" } },
+        "flow_capability": { "type": "array", "items": { "$ref": "#/$defs/evaluation_axis" } },
+        "ux_outcome": { "type": "array", "items": { "$ref": "#/$defs/evaluation_axis" } }
+      }
+    },
+    "quality_floor": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "What must NOT be broken, kept separate from what must be reached: the two are consumed at different moments. §7.1: `quality_floor_missing`."
+    },
+    "isolation_strategy": { "$ref": "#/$defs/isolation_strategy" },
+    "isolation_detail": { "type": "string" },
+    "cost_cap": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "Must actually bound something: at least one positive numeric limit. Prose alone is a wish, not a cap. §7.1: `cost_cap_missing`."
+    },
+    "stop_conditions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "§7.1: `stop_conditions_missing`."
+    },
+    "rollback_plan": {
+      "type": "string",
+      "minLength": 1,
+      "description": "§7.1: `rollback_plan_missing`."
+    },
+    "evidence_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "§7.1: `evidence_missing`."
+    },
+    "expires_at": {
+      "description": "The window in which a human may approve. Elapsing expires a proposal that is still awaiting a decision; it never unmakes an approval already given (§7.4). null means no deadline.",
+      "type": ["number", "null"]
+    },
+    "decision_method": {
+      "$ref": "#/$defs/decision_method",
+      "description": "Provenance of the CONTENT: `reasoning_llm` for a §7.7 draft a human posted, `manual` for one a human wrote. The `proposed` EVENT is `manual` either way -- who wrote the words and who put the proposal into the queue are two different facts (#337)."
+    },
+    "intelligence_run_id": {
+      "description": "The drafting run's audit row when the content came from the reasoning model, else null.",
+      "type": ["integer", "null"]
+    },
+    "created_by": { "type": ["string", "null"] },
+    "created_at": { "type": "number" },
+    "status": { "$ref": "#/$defs/status" },
+    "status_derived_at": {
+      "type": "number",
+      "description": "When this document's fold was taken. Present because expiry is part of the fold, so the same ledger can legitimately yield a different status later."
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/target" },
+      "description": "§7.1: `scope_missing` when empty. The scope check counts DISTINCT node_keys, because one Node may legitimately appear as both baseline and candidate_target."
+    },
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/event" },
+      "description": "The append-only ledger that IS the lifecycle. Never rewritten: a terminal verdict stops the fold, but later rows stay as audit facts."
+    },
+    "executions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/execution_ref" }
+    },
+    "promotion_candidates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/event" },
+      "description": "The promotion-candidate events, surfaced for readability. Each is a candidate record carrying `promotion_performed: false`; the real promotion goes through the existing human gates (§7.6)."
+    }
+  },
+  "$defs": {
+    "flow_subject_kind": {
+      "enum": ["runtime_flow", "static_flow"],
+      "description": "A runtime correlation and a pinned snapshot's static path answer different questions and are never merged into one word."
+    },
+    "comparison_scope": {
+      "enum": ["single_node", "sub_pipeline"],
+      "description": "`single_node` has exactly one distinct target Node, `sub_pipeline` two or more. A disagreement with the target count is `comparison_scope_mismatch`."
+    },
+    "evaluation_level": {
+      "enum": ["node", "flow_capability", "ux_outcome"],
+      "description": "The three evaluation contracts of ADR-7. No level is ever computed from another and there is no combined total."
+    },
+    "isolation_strategy": {
+      "enum": ["pure", "mock", "dry_run", "rollback_transaction", "isolated_workspace", "none"],
+      "description": "§7.3. `none` and `pure` isolate nothing, so a target Node whose side_effect_class is external_write or irreversible may not use them -- `isolation_required_for_side_effects` (Principle 4 made structural at the proposal's entrance)."
+    },
+    "target_role": { "enum": ["baseline", "candidate_target"] },
+    "status": {
+      "enum": ["proposed", "approved", "rejected", "withdrawn", "expired", "executing", "completed"],
+      "description": "DERIVED from `events`. No column backs it (§7.4)."
+    },
+    "event_kind": {
+      "enum": [
+        "proposed", "approved", "rejected", "withdrawn", "expired",
+        "execution_recorded", "result_recorded",
+        "promotion_candidate_recorded", "rollback_recorded"
+      ]
+    },
+    "execution_kind": {
+      "enum": ["replay_variant_run", "experiment", "shadow_result"],
+      "description": "Which canonical table the reference resolves in. This layer writes to none of them."
+    },
+    "execution_resolution": {
+      "enum": ["resolved", "unresolved", "stale"],
+      "description": "Three answers, never merged: the canonical row is present and usable, it is absent (gone, foreign System, or not an id at all), or it is present but its own run concluded it produced nothing usable."
+    },
+    "actor_kind": { "enum": ["user", "system"] },
+    "decision_method": { "enum": ["deterministic", "reasoning_llm", "manual"] },
+    "evaluation_axis": {
+      "type": "object",
+      "required": ["level", "name"],
+      "properties": {
+        "level": { "$ref": "#/$defs/evaluation_level" },
+        "name": { "type": "string", "minLength": 1 },
+        "metric": { "type": "string" },
+        "detail": { "type": "string" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": ["id", "target_node_key", "target_role", "position"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "target_node_key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The Evolution Node's own durable slug (#394 ADR-2), resolved against the System at read time -- never a stored row id trusted on its own."
+        },
+        "target_role": { "$ref": "#/$defs/target_role" },
+        "position": { "type": "integer", "minimum": 0 },
+        "note": { "type": "string" }
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["id", "event_kind", "actor_kind", "decision_method", "created_at"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "event_kind": { "$ref": "#/$defs/event_kind" },
+        "actor_kind": { "$ref": "#/$defs/actor_kind" },
+        "actor": {
+          "description": "The authenticated principal that performed the decision. Never taken from a request body (#337).",
+          "type": ["string", "null"]
+        },
+        "reason": { "type": "string" },
+        "decision_method": {
+          "$ref": "#/$defs/decision_method",
+          "description": "`manual` for every human decision reaching this ledger over HTTP -- approving, rejecting, withdrawing, recording an execution / result / promotion candidate / rollback (§10)."
+        },
+        "payload": { "type": "object" },
+        "created_at": { "type": "number" }
+      }
+    },
+    "execution_ref": {
+      "type": "object",
+      "required": ["id", "execution_kind", "execution_ref", "recorded_at", "resolution"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "execution_kind": { "$ref": "#/$defs/execution_kind" },
+        "execution_ref": { "type": "string", "minLength": 1 },
+        "note": { "type": "string" },
+        "recorded_at": { "type": "number" },
+        "resolution": { "$ref": "#/$defs/execution_resolution" }
+      }
+    }
+  }
+}

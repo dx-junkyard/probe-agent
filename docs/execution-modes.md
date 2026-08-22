@@ -507,6 +507,9 @@ event_kind(有限):
   `not_approved`。
 - `promotion_candidate_recorded` は `result_recorded` が 1 件以上ある場合の
   み。無ければ `no_result_recorded`。
+- 実行記録が 1 件も無い提案に対する結果・rollback の主張は
+  `no_execution_recorded`。結果は実行の観測であって、実行していないものの
+  結果は存在しない。
 - 期限切れ(`expires_at` 経過)の提案は承認できない。`proposal_expired`。
 
 ### 7.5 承認は 2 つの別記録
@@ -528,7 +531,7 @@ event_kind(有限):
 publish job の作成 / worktree への書き込み / target repo への書き込み /
 Cell Improvement 状態の変更。
 
-実行の実体は**既存の正本**(`replay_runs`、`experiments`、`shadow_results`)
+実行の実体は**既存の正本**(`replay_variants`、`experiments`、`shadow_results`)
 であり、この層は `flow_experiment_execution_ref` でそれらを**参照するだけ**
 である。参照は read 時に解決し、保存した row id を単独で信用しない
 (#405 の規律)。
