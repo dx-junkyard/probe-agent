@@ -1551,8 +1551,16 @@ creating incomplete persistence or execution paths for later phases.
       継承させず `fixed` へ落とす。`revoke` は人間が明示的に終了を記録した
       事実なので、通常の継承が再開する。**時間の経過だけで権限が復活する
       経路は存在しない。**
-    - 実効モードは `resolve_execution_mode` の 10 行 first-match 表を持つ
-      **純粋関数**で決まる。`reason` は 10 個の有限集合で、期限切れの 3 行は
+    - **caller の主張はスコープの証拠ではない** (EM-ADR-4)。`node_key` が
+      与えられているとき resolver が見る flow は、その Node が
+      `evolution_node_link(link_kind='flow')` で実際に属している flow だけで
+      ある。caller が渡した `flow_ref` は集合への追加ではなく照合される主張に
+      すぎず、属していなければ行 3 の `flow_scope_not_member` で拒否する
+      (黙って無視すると caller は権限が効いたと信じたままになり、同じ欠陥を
+      裏側から作る)。当初の実装は両者を union していたため、permissive な Flow
+      を名乗るだけで単独では `fixed` の Node が LLM に到達できた。
+    - 実効モードは `resolve_execution_mode` の 11 行 first-match 表を持つ
+      **純粋関数**で決まる。`reason` は 11 個の有限集合で、期限切れの 3 行は
       `node_` / `flow_` / `system_expired_assignment` と**別コード**を持つ —
       三つとも `fixed` へ落ちるが開発者の次の操作が別だからである (#366)。
       ルート・Dashboard・projection・orchestrator のどれもこの判定を

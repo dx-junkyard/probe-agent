@@ -204,16 +204,37 @@ append-only の連鎖ポインタであり、内容の書き換えではない �
 | --- | --- | --- | --- | --- |
 | 1 | どれかのスコープが `conflicting` | `fixed` | `none` | `conflicting_assignments` |
 | 2 | どれかのスコープが `invalid` | `fixed` | `none` | `invalid_mode_value` |
-| 3 | node が `expired` | `fixed` | `none` | `node_expired_assignment` |
-| 4 | node が `active` | その mode | `node` | `node_assignment` |
-| 5 | flow のうち `expired` が 1 つ以上 | `fixed` | `none` | `flow_expired_assignment` |
-| 6 | flow の `active` が複数あり mode が一致しない | `fixed` | `none` | `flow_scope_conflict` |
-| 7 | flow が `active`(全て同一 mode) | その mode | `flow` | `flow_assignment` |
-| 8 | system が `expired` | `fixed` | `none` | `system_expired_assignment` |
-| 9 | system が `active` | その mode | `system` | `system_assignment` |
-| 10 | 上記いずれでもない | `fixed` | `default` | `no_assignment` |
+| 3 | caller が指定した flow に node が属していない | `fixed` | `none` | `flow_scope_not_member` |
+| 4 | node が `expired` | `fixed` | `none` | `node_expired_assignment` |
+| 5 | node が `active` | その mode | `node` | `node_assignment` |
+| 6 | flow のうち `expired` が 1 つ以上 | `fixed` | `none` | `flow_expired_assignment` |
+| 7 | flow の `active` が複数あり mode が一致しない | `fixed` | `none` | `flow_scope_conflict` |
+| 8 | flow が `active`(全て同一 mode) | その mode | `flow` | `flow_assignment` |
+| 9 | system が `expired` | `fixed` | `none` | `system_expired_assignment` |
+| 10 | system が `active` | その mode | `system` | `system_assignment` |
+| 11 | 上記いずれでもない | `fixed` | `default` | `no_assignment` |
 
-`REASON_CODES` はこの 10 個の有限集合であり、これ以外を返さない。
+`REASON_CODES` はこの 11 個の有限集合であり、これ以外を返さない。
+
+### 3.3.1 caller の主張はスコープの証拠ではない (EM-ADR-4)
+
+`node_key` が与えられているとき、resolver が見る flow 集合は
+**その Node が `evolution_node_link(link_kind='flow')` で実際に属している
+flow だけ**である。caller が渡した `flow_ref` はその集合への**追加ではなく、
+照合される主張**にすぎない。
+
+当初の実装は両者を union していた。その結果、Flow A に `propose` を割り当て、
+Flow A に属さない Node B を指定して A を名乗るだけで、単独では `fixed` である
+Node B が LLM に到達できた。スコープは永続行から決まらなければならないという
+EM-ADR-1 の理由そのものに反する、fail-closed の破れである。
+
+属していない flow を名乗った場合、それは**黙って無視するのではなく行 3 で
+拒否する**。黙って落とすと、caller は「Flow A の権限が効いた」と信じたまま
+になり、同じ欠陥を裏側から作ることになる。`ModeFacts.rejected_flow_claims`
+が拒否された主張を運び、`scope_trace` からは実際に見た scope が読める。
+
+`node_key` が無い場合(純粋な flow スコープの問い合わせ)は、caller が名乗った
+flow が**主語そのもの**なので、この規則は適用されない。
 
 行 3 / 5 / 8 は同じ `fixed` へ落ちるが、**別々のコードを持つ**。三つとも
 「期限が切れた」だが、開発者の次の操作は「Node を割り当て直す」「Flow を

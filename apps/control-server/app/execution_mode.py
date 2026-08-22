@@ -205,6 +205,7 @@ EXECUTION_MODE_PROJECTION_SCHEMA_VERSION = "execution-mode-projection-v1"
 _REASON_DENIAL_CODES: FrozenSet[str] = frozenset({
     "conflicting_assignments",
     "invalid_mode_value",
+    "flow_scope_not_member",
     "node_expired_assignment",
     "flow_expired_assignment",
     "system_expired_assignment",
@@ -310,6 +311,16 @@ class ModeFacts:
     node_reading: Optional[ScopeReading] = None
     node_key: Optional[str] = None
     node_exists: Optional[bool] = None
+    #: Flow scope refs the CALLER named that the named Node does not actually
+    #: belong to. A caller's claim about scope is never evidence of scope: the
+    #: Flows that decide a Node's mode come only from
+    #: `evolution_node_link(link_kind='flow')`. Unioning the caller's refs into
+    #: the resolver's Flow set let anyone who could name a permissive Flow
+    #: reach that Flow's permission for a Node that was `fixed` on its own.
+    #: The rejected claim is CARRIED rather than dropped, because silently
+    #: ignoring it would leave the caller believing a Flow's permission applied
+    #: when it did not -- the same defect seen from the other side.
+    rejected_flow_claims: Tuple[str, ...] = ()
     now: float = 0.0
 
 
@@ -507,15 +518,15 @@ def classify_scope_state(
 
 
 def resolve_execution_mode(facts: ModeFacts) -> ExecutionModeDecision:
-    """The 10-row first-match table of §3.3. PURE.
+    """The 11-row first-match table of §3.3. PURE.
 
     This is the single canonical state engine for this axis. Routes, the
     Dashboard, the projection and any orchestrator read its output; none of
     them re-derives it (#349's "there is one canonical state engine").
 
-    Row order is the contract. In particular rows 1-2 (data inconsistency)
-    outrank every scope, and rows 3/5/8 (`expired`) clamp to `fixed` instead
-    of letting the next scope's permission take over.
+    Row order is the contract. Rows 1-3 (data inconsistency and an incoherent
+    request) outrank every scope, and rows 4/6/9 (`expired`) clamp to `fixed`
+    instead of letting the next scope's permission take over.
     """
     node = facts.node_reading
     flows = tuple(facts.flow_readings)
@@ -546,19 +557,27 @@ def resolve_execution_mode(facts: ModeFacts) -> ExecutionModeDecision:
     if any(reading.state == "invalid" for reading in scope_trace):
         return _decide(FAIL_CLOSED_MODE, "none", "", "invalid_mode_value")
 
-    # 3: the Node's own window elapsed.
+    # 3 (new): the caller named a Flow this Node does not belong to. This
+    #    outranks every scope BELOW it because the request itself is
+    #    incoherent -- answering it from the Node's real scopes would return a
+    #    mode for a question the caller did not ask, and answering it from the
+    #    claimed Flow is the privilege laundering this rule exists to stop.
+    if facts.rejected_flow_claims:
+        return _decide(FAIL_CLOSED_MODE, "none", "", "flow_scope_not_member")
+
+    # 4: the Node's own window elapsed.
     if node is not None and node.state == "expired":
         return _decide(FAIL_CLOSED_MODE, "none", "", "node_expired_assignment")
 
-    # 4: the Node's own assignment is in force -- the narrowest scope wins.
+    # 5: the Node's own assignment is in force -- the narrowest scope wins.
     if node is not None and node.state == "active" and node.mode:
         return _decide(node.mode, "node", node.scope_ref, "node_assignment")
 
-    # 5: any Flow this Node belongs to has an elapsed window.
+    # 6: any Flow this Node belongs to has an elapsed window.
     if any(reading.state == "expired" for reading in flows):
         return _decide(FAIL_CLOSED_MODE, "none", "", "flow_expired_assignment")
 
-    # 6: this Node lies on two Flows whose active assignments disagree. There
+    # 7: this Node lies on two Flows whose active assignments disagree. There
     # is no rule for choosing between two human decisions, so neither wins.
     active_flows = tuple(
         reading for reading in flows if reading.state == "active" and reading.mode
@@ -566,22 +585,22 @@ def resolve_execution_mode(facts: ModeFacts) -> ExecutionModeDecision:
     if len({reading.mode for reading in active_flows}) > 1:
         return _decide(FAIL_CLOSED_MODE, "none", "", "flow_scope_conflict")
 
-    # 7: one mode across every active Flow. `source_ref` names the
+    # 8: one mode across every active Flow. `source_ref` names the
     # lexicographically first of them so the answer is reproducible; the full
     # set is in `scope_trace`.
     if active_flows:
         chosen = min(active_flows, key=lambda reading: reading.scope_ref)
         return _decide(str(chosen.mode), "flow", chosen.scope_ref, "flow_assignment")
 
-    # 8: the System-wide window elapsed.
+    # 9: the System-wide window elapsed.
     if system.state == "expired":
         return _decide(FAIL_CLOSED_MODE, "none", "", "system_expired_assignment")
 
-    # 9: the System-wide assignment is in force.
+    # 10: the System-wide assignment is in force.
     if system.state == "active" and system.mode:
         return _decide(system.mode, "system", system.scope_ref, "system_assignment")
 
-    # 10: nobody has assigned anything applicable. `source_scope='default'`
+    # 11: nobody has assigned anything applicable. `source_scope='default'`
     # exists so a projection can distinguish the DEFAULT `fixed` from a human
     # who chose `fixed` (`system_assignment`) -- two different facts (§4.4).
     return _decide(FAIL_CLOSED_MODE, "default", "", "no_assignment")
@@ -668,21 +687,33 @@ def load_mode_facts(
     node_reading: Optional[ScopeReading] = None
     node_exists: Optional[bool] = None
     refs: List[str] = []
+    rejected: List[str] = []
 
-    if flow_refs:
-        for raw in flow_refs:
-            refs.append(normalize_flow_scope_ref(raw))
+    claimed = [normalize_flow_scope_ref(raw) for raw in (flow_refs or [])]
 
     key = (node_key or "").strip()
     if key:
         node_row = _node_row(conn, system_id, key)
         node_exists = node_row is not None
-        if node_row is not None:
-            refs.extend(_node_flow_scope_refs(conn, system_id, node_row["id"]))
+        member_refs = (
+            _node_flow_scope_refs(conn, system_id, node_row["id"])
+            if node_row is not None
+            else []
+        )
+        # With a Node named, the Flow set is EXACTLY the Node's persisted
+        # membership. A caller-supplied ref is a claim to be checked against
+        # it, never an addition to it -- see `ModeFacts.rejected_flow_claims`.
+        refs.extend(member_refs)
+        member_set = set(member_refs)
+        rejected.extend(ref for ref in claimed if ref not in member_set)
         node_reading = classify_scope_state(
             _open_rows(conn, system_id, "node", key),
             scope_kind="node", scope_ref=key, now=moment,
         )
+    else:
+        # No Node named: the caller-supplied Flow IS the subject of the
+        # query, not a claim about some other subject's scope.
+        refs.extend(claimed)
 
     flow_readings = tuple(
         classify_scope_state(
@@ -698,6 +729,7 @@ def load_mode_facts(
         node_reading=node_reading,
         node_key=key or None,
         node_exists=node_exists,
+        rejected_flow_claims=tuple(sorted(set(rejected))),
         now=moment,
     )
 

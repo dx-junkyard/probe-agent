@@ -121,13 +121,14 @@ def _reading(kind, ref, state, mode=None):
     return ScopeReading(scope_kind=kind, scope_ref=ref, state=state, mode=mode)
 
 
-def _facts(*, system=None, flows=(), node=None):
+def _facts(*, system=None, flows=(), node=None, rejected_flow_claims=()):
     return ModeFacts(
         system_reading=system or _reading("system", "", "unset"),
         flow_readings=tuple(flows),
         node_reading=node,
         node_key="n" if node is not None else None,
         node_exists=True if node is not None else None,
+        rejected_flow_claims=tuple(rejected_flow_claims),
         now=1000.0,
     )
 
@@ -1092,3 +1093,152 @@ def test_unknown_scope_kind_and_empty_refs_are_refused(admin_client):
                 conn, system_id=system_id, scope_kind="system", scope_ref="",
                 mode="turbo", reason="nope", actor="root",
             )
+
+
+# ---------------------------------------------------------------------------
+# Regression: a caller's claim about scope is never evidence of scope
+#
+# The defect: `load_mode_facts` UNIONED the caller-supplied `flow_refs` with
+# the Flows the Node actually belongs to. Anyone who could name a permissive
+# Flow therefore reached that Flow's permission for a Node that resolved to
+# `fixed` on its own -- the exact fail-closed violation EM-ADR-1 exists to
+# prevent, since a scope must be decided from persisted rows.
+# ---------------------------------------------------------------------------
+
+
+class TestFlowScopeMembership:
+    def test_a_claimed_flow_cannot_lend_its_mode_to_an_outside_node(
+        self, admin_client
+    ):
+        """The escalation itself. Node B belongs to no Flow; Flow A is
+        `propose`. Naming Flow A alongside Node B must NOT reach the LLM."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _make_node(system_id, "node-b")
+
+        with get_conn() as conn:
+            assign_mode(
+                conn, system_id=system_id, scope_kind="flow",
+                scope_ref="runtime_flow:flow-a", mode="propose",
+                reason="experiment on flow A", actor="root",
+            )
+            alone = resolve_execution_mode(
+                load_mode_facts(conn, system_id=system_id, node_key="node-b")
+            )
+            claimed = resolve_execution_mode(
+                load_mode_facts(
+                    conn, system_id=system_id, node_key="node-b",
+                    flow_refs=["runtime_flow:flow-a"],
+                )
+            )
+            assert (alone.mode, alone.reason) == ("fixed", "no_assignment")
+            # Not merely "still fixed": the request itself is refused, so the
+            # caller cannot believe Flow A's permission applied.
+            assert (claimed.mode, claimed.reason) == (
+                "fixed", "flow_scope_not_member",
+            )
+            with pytest.raises(ExecutionModeDenied) as excinfo:
+                require_capability(
+                    conn, system_id=system_id,
+                    capability="llm_experiment_proposal",
+                    node_key="node-b", flow_ref="runtime_flow:flow-a",
+                )
+        assert excinfo.value.denial_code == "flow_scope_not_member"
+
+    def test_a_real_member_still_inherits_the_flows_mode(self, admin_client):
+        """The fix must not break legitimate inheritance -- otherwise the
+        Flow scope would be useless rather than safe."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _make_node(system_id, "node-a", flow_ids=["flow-a"])
+
+        with get_conn() as conn:
+            assign_mode(
+                conn, system_id=system_id, scope_kind="flow",
+                scope_ref="runtime_flow:flow-a", mode="propose",
+                reason="experiment on flow A", actor="root",
+            )
+            decision = resolve_execution_mode(
+                load_mode_facts(
+                    conn, system_id=system_id, node_key="node-a",
+                    flow_refs=["runtime_flow:flow-a"],
+                )
+            )
+        assert (decision.mode, decision.reason) == ("propose", "flow_assignment")
+        assert decision.source_scope == "flow"
+
+    def test_membership_alone_is_enough_without_the_caller_naming_it(
+        self, admin_client
+    ):
+        """Membership comes from the link table, so the caller never has to
+        name the Flow -- which is why naming it can be treated as a claim."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _make_node(system_id, "node-a", flow_ids=["flow-a"])
+
+        with get_conn() as conn:
+            assign_mode(
+                conn, system_id=system_id, scope_kind="flow",
+                scope_ref="runtime_flow:flow-a", mode="observe",
+                reason="watch flow A", actor="root",
+            )
+            decision = resolve_execution_mode(
+                load_mode_facts(conn, system_id=system_id, node_key="node-a")
+            )
+        assert (decision.mode, decision.reason) == ("observe", "flow_assignment")
+
+    def test_a_flow_scope_query_with_no_node_still_uses_the_named_flow(
+        self, admin_client
+    ):
+        """With no Node named the caller's Flow IS the subject, not a claim
+        about some other subject's scope."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        with get_conn() as conn:
+            assign_mode(
+                conn, system_id=system_id, scope_kind="flow",
+                scope_ref="runtime_flow:flow-a", mode="propose",
+                reason="experiment on flow A", actor="root",
+            )
+            decision = resolve_execution_mode(
+                load_mode_facts(
+                    conn, system_id=system_id, flow_refs=["runtime_flow:flow-a"]
+                )
+            )
+        assert (decision.mode, decision.reason) == ("propose", "flow_assignment")
+
+    def test_the_rejected_claim_is_carried_not_dropped(self, admin_client):
+        """Silently ignoring the claim would leave the caller believing the
+        Flow's permission applied -- the same defect from the other side."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _make_node(system_id, "node-b")
+        with get_conn() as conn:
+            facts = load_mode_facts(
+                conn, system_id=system_id, node_key="node-b",
+                flow_refs=["runtime_flow:flow-a"],
+            )
+        assert facts.rejected_flow_claims == ("runtime_flow:flow-a",)
+        assert all(r.scope_ref != "runtime_flow:flow-a" for r in facts.flow_readings)
+
+    def test_membership_of_another_system_does_not_count(self, admin_client):
+        """A link in System B must not make the claim true in System A."""
+        token = _login(admin_client)
+        system_a = _create_system(admin_client, token, "sys-a")
+        system_b = _create_system(admin_client, token, "sys-b")
+        _make_node(system_a, "node-a")
+        _make_node(system_b, "node-a", flow_ids=["flow-a"])
+
+        with get_conn() as conn:
+            assign_mode(
+                conn, system_id=system_a, scope_kind="flow",
+                scope_ref="runtime_flow:flow-a", mode="shadow",
+                reason="experiment", actor="root",
+            )
+            decision = resolve_execution_mode(
+                load_mode_facts(
+                    conn, system_id=system_a, node_key="node-a",
+                    flow_refs=["runtime_flow:flow-a"],
+                )
+            )
+        assert (decision.mode, decision.reason) == ("fixed", "flow_scope_not_member")

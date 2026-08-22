@@ -156,6 +156,7 @@ export const EXECUTION_CAPABILITY_LABEL: Record<ExecutionCapability, string> = {
 export const MODE_REASON_LABEL: Record<ExecutionModeReason, string> = {
   conflicting_assignments: "同じスコープに有効な割り当てが複数あります（データ不整合）",
   invalid_mode_value: "割り当てられた mode が有限語彙にありません",
+  flow_scope_not_member: "指定された Flow に、この Node は属していません",
   node_expired_assignment: "Node の割り当ての期限が切れています",
   node_assignment: "Node に割り当てられています",
   flow_expired_assignment: "Flow の割り当ての期限が切れています",
@@ -171,6 +172,7 @@ export const MODE_REASON_LABEL: Record<ExecutionModeReason, string> = {
 export const MODE_REASON_NEXT_ACTION: Record<ExecutionModeReason, string> = {
   conflicting_assignments: "同一スコープの重複行を解消してください。安全側に倒して fixed で読んでいます。",
   invalid_mode_value: "そのスコープを割り当て直してください。安全側に倒して fixed で読んでいます。",
+  flow_scope_not_member: "所属は evolution_node_link(link_kind='flow') が正本です。所属していない Flow の権限は借りられません。Node を Flow に紐付けるか、対象 Node 自身に割り当ててください。",
   node_expired_assignment: "Node を割り当て直すか、revoke を記録してください。時間の経過だけでは復帰しません。",
   node_assignment: "この Node 自身の割り当てが効いています。",
   flow_expired_assignment: "Flow を割り当て直すか、revoke を記録してください。時間の経過だけでは復帰しません。",
@@ -284,6 +286,7 @@ export const DENIAL_CODE_LABEL: Record<ExecutionModeDenialCode, string> = {
   capability_not_permitted: "現在の実効モードではこの操作は許可されていません",
   conflicting_assignments: "同じスコープに有効な割り当てが複数あります",
   invalid_mode_value: "割り当てられた mode が有限語彙にありません",
+  flow_scope_not_member: "指定された Flow に、この Node は属していません",
   node_expired_assignment: "Node の割り当ての期限が切れています",
   flow_expired_assignment: "Flow の割り当ての期限が切れています",
   system_expired_assignment: "System の割り当ての期限が切れています",

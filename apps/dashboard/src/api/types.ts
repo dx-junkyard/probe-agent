@@ -6493,6 +6493,7 @@ export type ExecutionCapability =
 export type ExecutionModeReason =
   | "conflicting_assignments"
   | "invalid_mode_value"
+  | "flow_scope_not_member"
   | "node_expired_assignment"
   | "node_assignment"
   | "flow_expired_assignment"
@@ -6508,6 +6509,7 @@ export type ExecutionModeDenialCode =
   | "capability_not_permitted"
   | "conflicting_assignments"
   | "invalid_mode_value"
+  | "flow_scope_not_member"
   | "node_expired_assignment"
   | "flow_expired_assignment"
   | "system_expired_assignment"

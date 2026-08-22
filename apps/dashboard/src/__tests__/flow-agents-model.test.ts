@@ -274,10 +274,13 @@ describe("既定の fixed と人が選んだ fixed を区別する (§4.4)", () 
     expect(new Set(actions).size).toBe(3);
   });
 
-  it("10 個の reason が 10 個の別の文を持つ", () => {
+  it("11 個の reason が 11 個の別の文を持つ", () => {
     const reasons = Object.keys(MODE_REASON_LABEL) as ExecutionModeReason[];
-    expect(reasons).toHaveLength(10);
-    expect(new Set(reasons.map((r) => MODE_REASON_LABEL[r])).size).toBe(10);
+    expect(reasons).toHaveLength(11);
+    expect(new Set(reasons.map((r) => MODE_REASON_LABEL[r])).size).toBe(11);
+    // The next action differs per reason too: knowing WHY it is fixed and
+    // knowing WHERE to fix it are two facts.
+    expect(new Set(reasons.map((r) => MODE_REASON_NEXT_ACTION[r])).size).toBe(11);
   });
 });
 
