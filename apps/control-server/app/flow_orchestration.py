@@ -51,6 +51,29 @@ properties are the whole of its design, and none of them may be relaxed:
    human writes the `proposed` event (Principle 7: an LLM recommendation
    never enters an approval queue by itself).
 
+6. **Every reference in the ledger is BOUND to a fact, not merely non-empty.**
+   Three bindings, each fail-closed with its own finite code:
+
+   * an `evidence_ref` must be an id #414's projection actually produced for
+     this System + Flow (`load_flow_grounding`). This is checked when the
+     model drafts AND again when a human submits, because the human edits the
+     draft in between and a ref that was valid then can by now be stale,
+     cross-System or unrelated. Before this, both checks were "is it a
+     non-empty string?", so a wholly fabricated citation could be stored in a
+     canonical row -- the exact thing §7.7 and Principle 6 forbid;
+   * a RESULT must name one execution registered on THIS proposal, resolved
+     again at read time, and must carry the measurements the proposal's own
+     evaluation contract declared. The declared quality floor is evaluated and
+     RECORDED -- a verdict is an observation, never an adoption (ADR-9);
+   * a PROMOTION CANDIDATE must bind to all three of a declared candidate, a
+     resolvable canonical execution, and a result recorded for that execution.
+
+   The same discipline covers `intelligence_run_id`: it must be this feature's
+   own drafting run, on this contract version, that completed, and it may back
+   only one proposal. What is NOT yet checkable is that the run drafted THIS
+   Flow -- nothing persists the drafting subject. Adding a subject column (or
+   an audit row) to `intelligence_runs` would close that last gap.
+
 Connection discipline (CLAUDE.md Implementation Constraints): every function
 here takes an already-open `conn`, EXCEPT `propose_flow_experiment`, which
 takes none at all and owns its own connections -- it performs an LLM round
@@ -77,6 +100,7 @@ from dataclasses import dataclass, field
 from typing import (
     Any,
     Dict,
+    FrozenSet,
     List,
     Mapping,
     Optional,
@@ -114,6 +138,13 @@ __all__ = [
     "STRUCTURAL_REJECTION_CODES",
     "PROPOSAL_GATE_CODES",
     "LIFECYCLE_REJECTION_CODES",
+    "RESULT_BINDING_REJECTION_CODES",
+    "PROMOTION_BINDING_REJECTION_CODES",
+    "PROVENANCE_REJECTION_CODES",
+    "QUALITY_FLOOR_KEY_VERDICTS",
+    "QUALITY_FLOOR_VERDICTS",
+    "FlowGrounding",
+    "load_flow_grounding",
     "ACTION_EVENT_KIND",
     "FLOW_EXPERIMENT_PROPOSAL_SCHEMA_VERSION",
     "FLOW_EXPERIMENT_DRAFT_PROMPT_VERSION",
@@ -208,11 +239,82 @@ STRUCTURAL_REJECTION_CODES: Tuple[str, ...] = (
     "unknown_flow_subject",
     "unresolved_node",
     "comparison_scope_mismatch",
+    #: Membership could not be DETERMINED, which is not the same answer as
+    #: "this Node is not a member" (§6.4's five-answer discipline). A
+    #: `static_flow` subject needs the pinned snapshot's call graph, and when
+    #: that derivation fails the gate refuses rather than admitting the Node:
+    #: an unread membership is not evidence of membership (#380).
+    "flow_membership_unavailable",
     "node_not_in_flow",
     "isolation_required_for_side_effects",
     "evaluation_contract_missing",
+    #: The projection that produces the citable evidence ids could not be
+    #: read, so no citation can be verified. Fail-closed (Principle 6): an
+    #: unverifiable citation is refused, never accepted "for now".
+    "evidence_allowlist_unavailable",
+    #: A cited `evidence_ref` is not one of the ids #414's projection actually
+    #: produced for THIS System + Flow. Free text that looks like a reference
+    #: is not a reference, and storing one would let an LLM sentence enter a
+    #: canonical row as a fact (§7.7 / Principle 7).
+    "evidence_ref_unknown",
     "duplicate_proposal_key",
 )
+
+#: Why a RESULT is refused. A result is the observation of one specific
+#: execution, so it must NAME that execution and it must carry the
+#: measurements the proposal itself declared -- otherwise the ledger stops
+#: being a record of what happened, which is this Epic's whole explainability
+#: story (§7.6).
+RESULT_BINDING_REJECTION_CODES: Tuple[str, ...] = (
+    "execution_ref_missing",
+    "execution_ref_not_registered",
+    "execution_ref_unresolved",
+    "execution_ref_failed",
+    "result_metrics_missing",
+)
+
+#: Why a PROMOTION CANDIDATE is refused. It must bind to all three facts:
+#: a candidate the proposal itself declared, a canonical execution that still
+#: resolves, and a result recorded FOR that execution.
+PROMOTION_BINDING_REJECTION_CODES: Tuple[str, ...] = (
+    "candidate_ref_not_declared",
+    "execution_ref_missing",
+    "execution_ref_not_registered",
+    "execution_ref_unresolved",
+    "execution_ref_failed",
+    "no_result_for_execution",
+)
+
+#: Why an `intelligence_run_id` may not be used as LLM provenance
+#: (Principle 7: an unverified pointer is not provenance). The row must be
+#: THIS feature's drafting run, on THIS contract version, that actually
+#: completed, and it may back exactly one proposal.
+PROVENANCE_REJECTION_CODES: Tuple[str, ...] = (
+    "intelligence_run_missing",
+    "intelligence_run_not_a_draft",
+    "intelligence_run_not_completed",
+    "intelligence_run_already_used",
+)
+
+#: Per quality-floor-key verdicts. `unmeasured` (nothing was measured for this
+#: floor) and `not_comparable` (a prose floor has no deterministic ordering)
+#: are two different answers and NEITHER is a pass -- collapsing either into
+#: `within_floor` would report a floor as held that nobody checked.
+QUALITY_FLOOR_KEY_VERDICTS: Tuple[str, ...] = (
+    "within_floor",
+    "below_floor",
+    "unmeasured",
+    "not_comparable",
+)
+
+#: The recorded overall verdict. It is an OBSERVATION written into the ledger
+#: and never an action: nothing in this module adopts, rejects, promotes or
+#: applies anything on the strength of it (§7.6, ADR-9). A human still decides.
+QUALITY_FLOOR_VERDICTS: Tuple[str, ...] = ("within_floor", "below_floor", "unevaluated")
+
+#: The run type / prompt / schema this feature's own drafting call records.
+#: A run that is not all three is not this draft's provenance.
+DRAFT_RUN_TYPE = "flow_experiment_draft"
 
 # The gate's complete verdict vocabulary: `ok` plus every refusal, the shape
 # `stabilization.GATE_REFUSAL_CODES` uses. A verdict is always exactly one of
@@ -385,15 +487,56 @@ class ProposalContent:
 
 
 @dataclass(frozen=True)
+class FlowGrounding:
+    """Everything this module may treat as a FACT about one Flow.
+
+    It is #414's read-only projection (`flow_explanation.build_flow_explanation`)
+    read once, never a second aggregation: the projection already computes
+    open items, the five missing states, mode divergence, anomalies, the
+    baseline, the per-Node axes and each Node's membership, and every evidence
+    item it emits carries a referencable id (§6.3 / §6.5). Re-deriving any of
+    that here would create a second opinion that can disagree with the screen.
+
+    Two of its uses are fail-closed gates and therefore care about `state`:
+
+    * `evidence_ids` is the ALLOWLIST a proposal's `evidence_refs` are checked
+      against. A citation that is not one of these ids is free text shaped
+      like a reference, and storing it would let an LLM sentence become a
+      canonical fact (§7.7).
+    * `member_node_keys` is the `static_flow` membership the gate needs, which
+      persisted rows alone cannot answer (§6.2).
+
+    `state` is `resolved` only when the projection produced BOTH readings
+    without degrading a section that feeds them. `unavailable` is not an empty
+    allowlist: "there is no evidence" and "we could not read what evidence
+    exists" are two different answers (§6.4) and only the first is a fact.
+    """
+
+    subject_kind: str
+    subject_ref: str
+    state: str
+    detail: str = ""
+    evidence_ids: FrozenSet[str] = frozenset()
+    evidence_catalog: Tuple[Mapping[str, Any], ...] = ()
+    membership_state: str = "unavailable"
+    member_node_keys: FrozenSet[str] = frozenset()
+    #: The projection rendered as the grounded fact block a draft is given.
+    #: Built from the same objects the two gates above read, so the model can
+    #: never be shown a fact the gate would then refuse.
+    context: str = ""
+
+
+@dataclass(frozen=True)
 class TargetFact:
     """One target Node as the gate sees it.
 
     `in_flow` is a THREE-valued reading, not a boolean: `None` means
-    membership is not determinable from persisted rows alone, which is the
-    honest answer for a `static_flow` subject (§6.2 needs the snapshot's call
-    graph, a derivation that can fail -- and EM-ADR-1 forbids putting a
-    failing derivation behind a fail-closed gate). Reporting `False` there
-    would refuse a legitimate proposal for a fact nobody read.
+    membership could not be DETERMINED. For a `static_flow` subject that
+    happens when #414's pinned-snapshot call graph could not be built, and the
+    gate refuses (`flow_membership_unavailable`) rather than admitting the
+    Node -- an unread membership is not evidence of membership (#380). It is a
+    separate code from `node_not_in_flow` because the developer's next action
+    differs: re-run the snapshot analysis, versus link the Node to the Flow.
 
     `side_effect_class` is `None` when the Node has no current
     `evolution_node_version`. The gate treats that as "isolation is
@@ -412,12 +555,19 @@ class TargetFact:
 @dataclass(frozen=True)
 class ProposalFacts:
     """Every persisted fact `evaluate_completeness` reads. Nothing else may
-    reach the gate, so the gate stays a pure function of this value."""
+    reach the gate, so the gate stays a pure function of this value.
+
+    `evidence_allowlist_state` defaults to `unavailable` DELIBERATELY: a value
+    object constructed without the projection's reading must refuse, not
+    admit. A permissive default is the fail-open shape this defect had.
+    """
 
     content: ProposalContent
     targets: Tuple[TargetFact, ...]
     flow_subject_known: bool
     proposal_key_taken: bool
+    evidence_allowlist: FrozenSet[str] = frozenset()
+    evidence_allowlist_state: str = "unavailable"
 
 
 @dataclass(frozen=True)
@@ -604,7 +754,21 @@ def evaluate_completeness(facts: ProposalFacts) -> GateDecision:
             tuple(node_keys),
         )
 
-    # `in_flow is None` is skipped, never treated as False -- see TargetFact.
+    # `in_flow is None` means membership could not be DETERMINED. It is
+    # refused, never skipped: admitting a Node whose membership nobody could
+    # read is the fail-open shape this gate exists to remove, and it is its
+    # own code because the fix differs from "link the Node to the Flow".
+    undetermined = tuple(t.node_key for t in facts.targets if t.in_flow is None)
+    if undetermined:
+        return GateDecision(
+            False,
+            "flow_membership_unavailable",
+            "対象 Flow への所属を判定できませんでした。static_flow は pin した "
+            "snapshot の call graph が必要です (#414 §6.2)。判定できない所属は "
+            "所属の証拠ではありません。",
+            undetermined,
+        )
+
     outside = tuple(t.node_key for t in facts.targets if t.in_flow is False)
     if outside:
         return GateDecision(
@@ -648,6 +812,39 @@ def evaluate_completeness(facts: ProposalFacts) -> GateDecision:
             "評価契約が不足しています。必要な level: "
             f"{', '.join(required_levels)} (ADR-7 により合成しません)。",
             missing_levels,
+        )
+
+    # --- evidence must be GROUNDED, not merely non-empty --------------------
+    #
+    # §7.1's `evidence_missing` above only asks whether the author wrote
+    # something. This pair asks whether what they wrote REFERS to anything:
+    # the allowlist is exactly the ids #414's projection produced for this
+    # System + Flow. It runs at submission as well as at draft time because a
+    # human edits the draft in between, so a ref that was valid when the model
+    # wrote it can by now be stale, cross-System or simply unrelated.
+    if facts.evidence_allowlist_state != "resolved":
+        return GateDecision(
+            False,
+            "evidence_allowlist_unavailable",
+            "この Flow の evidence を読み取れなかったため、根拠の実在を検証でき"
+            "ません。検証できない根拠は受け付けません (Principle 6)。",
+        )
+    unknown_evidence = tuple(
+        sorted(
+            {
+                _text(ref)
+                for ref in content.evidence_refs
+                if _text(ref) and _text(ref) not in facts.evidence_allowlist
+            }
+        )
+    )
+    if unknown_evidence:
+        return GateDecision(
+            False,
+            "evidence_ref_unknown",
+            "この System / Flow の projection が生成していない evidence 参照が "
+            "含まれています。参照の形をした自由文は参照ではありません。",
+            unknown_evidence,
         )
 
     if facts.proposal_key_taken:
@@ -919,12 +1116,240 @@ def _flow_subject_known(
     return False
 
 
+# ---------------------------------------------------------------------------
+# #414's projection as this module's only source of Flow facts
+# ---------------------------------------------------------------------------
+
+#: The projection sections that FEED the two fail-closed readings below. If
+#: any of them degraded, the reading is `unavailable` -- a partial catalogue
+#: would refuse a legitimate citation while reporting it as fabricated.
+_GROUNDING_SECTIONS: Tuple[str, ...] = ("nodes", "open_items", "experiments", "baseline")
+
+
+def _grounding_evidence(explanation: Any) -> List[Dict[str, Any]]:
+    """Collect every referencable id the projection produced, with no new ids.
+
+    Each entry is read straight off a projection object that already carries a
+    canonical identity: a Node's `Evidence`, an `OpenItem` (whose id names the
+    unresolved fact itself, which is exactly what §7.1 wants a proposal to
+    cite), a baseline's approved `stabilization_package`, and an existing
+    proposal's execution reference. Nothing here derives an id from iteration
+    order (#380's rule that a finding's id comes from its cause).
+    """
+    catalog: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def _add(ident: str, kind: str, label: str, node_key: Optional[str]) -> None:
+        ident = _text(ident)
+        if not ident or ident in seen:
+            return
+        seen.add(ident)
+        catalog.append(
+            {"id": ident, "kind": kind, "label": _text(label), "node_key": node_key}
+        )
+
+    for entry in explanation.nodes or []:
+        for item in entry.evidence:
+            _add(item.id, item.kind, item.label, item.node_key or entry.node_key)
+
+    open_items = getattr(explanation, "open_items", None)
+    for item in (open_items.items if open_items is not None else []):
+        _add(item.id, "open_item", f"{item.kind}: {item.label}", item.node_key)
+        for ident in item.evidence_ids:
+            _add(ident, "open_item_evidence", item.label, item.node_key)
+
+    baseline = getattr(explanation, "baseline", None)
+    for node_baseline in (baseline.nodes if baseline is not None else []):
+        approval = node_baseline.approval or {}
+        package_id = approval.get("package_id")
+        if package_id is not None:
+            _add(
+                f"stabilization_package:{package_id}",
+                "stabilization_package",
+                f"{node_baseline.node_key}: 固定化承認",
+                node_baseline.node_key,
+            )
+
+    experiments = getattr(explanation, "experiments", None)
+    for summary in (experiments.proposals if experiments is not None else []):
+        for ref in summary.execution_refs:
+            _add(
+                f"execution_ref:{ref['execution_kind']}:{ref['execution_ref']}",
+                "execution_ref",
+                f"{summary.proposal_key}",
+                None,
+            )
+    return catalog
+
+
+def _grounding_context(explanation: Any, catalog: Sequence[Mapping[str, Any]]) -> str:
+    """Render the projection as the grounded fact block a draft is given.
+
+    Only lines that begin with `- ` name a target Node; every other bullet
+    uses `* `. That is a contract with the mock provider, which echoes the
+    facts back out of the prompt rather than inventing them.
+    """
+    lines: List[str] = []
+
+    lines.append("Flow state:")
+    lines.append(
+        f"* subject {explanation.subject.subject_kind}:{explanation.subject.subject_ref} "
+        f"(resolution={explanation.subject.resolution}, "
+        f"snapshot_state={explanation.subject.snapshot_state})"
+    )
+    lines.append(
+        f"* membership={explanation.membership.state} "
+        f"nodes={', '.join(explanation.membership.node_keys) or '(none)'}"
+    )
+    if explanation.degraded_sections:
+        lines.append(
+            f"* degraded sections (facts NOT read): "
+            f"{', '.join(explanation.degraded_sections)}"
+        )
+
+    lines.append("")
+    lines.append("Per-Node axes (five independent axes; never combined into a score):")
+    for entry in explanation.nodes or []:
+        lines.append(
+            f"* {entry.node_key}: execution_mode={entry.execution_mode}"
+            f"(source={entry.mode_source}, reason={entry.mode_reason})"
+            f" maturity={entry.maturity}/{entry.maturity_state}"
+            f" modality={entry.implementation_modality}/{entry.implementation_modality_state}"
+            f" improvement={entry.improvement_status}/{entry.improvement_status_state}"
+            f" sdk_policy={entry.sdk_policy_mode}/{entry.sdk_policy_mode_state}"
+            f" observation={entry.observation_state}"
+            f" divergence={entry.mode_divergence}"
+        )
+
+    open_items = getattr(explanation, "open_items", None)
+    lines.append("")
+    lines.append("Open items (anomalies, missing / stale / unmeasured facts, drift):")
+    items = open_items.items if open_items is not None else []
+    for item in items:
+        lines.append(
+            f"* [{item.id}] {item.kind} / {item.node_key or '-'} / "
+            f"{item.missing_state or 'present'} / {item.label}"
+        )
+    if not items:
+        lines.append("* (none recorded)")
+
+    baseline = getattr(explanation, "baseline", None)
+    lines.append("")
+    lines.append("Baseline and rollback targets:")
+    baseline_nodes = baseline.nodes if baseline is not None else []
+    for node_baseline in baseline_nodes:
+        lines.append(
+            f"* {node_baseline.node_key}: stable={node_baseline.stable_state}"
+            f" rollback={node_baseline.rollback_state}"
+            f" approval={node_baseline.approval_state}"
+        )
+    if not baseline_nodes:
+        lines.append("* (none recorded)")
+
+    experiments = getattr(explanation, "experiments", None)
+    lines.append("")
+    lines.append("Experiments already on this Flow:")
+    proposals = experiments.proposals if experiments is not None else []
+    for summary in proposals:
+        lines.append(
+            f"* {summary.proposal_key}: status={summary.status}/{summary.status_state}"
+            f" scope={summary.comparison_scope}"
+            f" nodes={', '.join(summary.target_node_keys) or '-'}"
+        )
+    if not proposals:
+        lines.append("* (none recorded)")
+
+    lines.append("")
+    lines.append(
+        "Evidence catalogue. `evidence_refs` MUST be drawn from these ids and "
+        "nothing else; any other value fails the run:"
+    )
+    for item in catalog:
+        lines.append(
+            f"* [{item['id']}] {item['kind']} / {item['node_key'] or '-'} / {item['label']}"
+        )
+    if not catalog:
+        lines.append("* (no citable evidence exists for this Flow)")
+    return "\n".join(lines)
+
+
+def load_flow_grounding(
+    system_id: int,
+    *,
+    subject_kind: str,
+    subject_ref: str,
+    snapshot_id: Optional[int] = None,
+    now: Optional[float] = None,
+) -> FlowGrounding:
+    """Read #414's projection once and expose it as this module's facts.
+
+    Connection discipline: `build_flow_explanation` owns its own connections
+    (and, for a `static_flow`, builds a call graph with none held), so this
+    MUST be called with no `get_conn()` block open -- the lock is
+    process-wide and non-reentrant.
+
+    Every failure lands on `state='unavailable'` with the reason in `detail`.
+    Nothing is guessed: an unreadable projection produces no allowlist and no
+    membership, and both gates that consume it then refuse (Principle 6).
+    """
+    # The ref is normalized HERE, once, so the reading and the gate that
+    # consumes it always name the same subject: a whitespace difference
+    # between the two would silently downgrade a legitimate proposal to
+    # "we could not read the evidence".
+    ref = _text(subject_ref)
+    if subject_kind not in FLOW_SUBJECT_KINDS or not ref:
+        return FlowGrounding(
+            subject_kind=subject_kind,
+            subject_ref=ref,
+            state="unavailable",
+            detail=f"unknown subject {subject_kind!r}:{ref!r}",
+        )
+
+    from .flow_explanation import build_flow_explanation
+
+    try:
+        explanation = build_flow_explanation(
+            system_id,
+            subject_kind=subject_kind,
+            subject_ref=ref,
+            snapshot_id=snapshot_id,
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable projection is a fact
+        return FlowGrounding(
+            subject_kind=subject_kind,
+            subject_ref=ref,
+            state="unavailable",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
+    degraded = [s for s in _GROUNDING_SECTIONS if s in explanation.degraded_sections]
+    catalog = _grounding_evidence(explanation)
+    membership_state = explanation.membership.state
+    state = "unavailable" if degraded else "resolved"
+    detail = (
+        f"degraded sections: {', '.join(degraded)}" if degraded else ""
+    )
+    return FlowGrounding(
+        subject_kind=subject_kind,
+        subject_ref=ref,
+        state=state,
+        detail=detail,
+        evidence_ids=frozenset(item["id"] for item in catalog),
+        evidence_catalog=tuple(catalog),
+        membership_state=membership_state,
+        member_node_keys=frozenset(explanation.membership.node_keys),
+        context=_grounding_context(explanation, catalog),
+    )
+
+
 def gather_proposal_facts(
     conn: sqlite3.Connection,
     *,
     system_id: int,
     content: ProposalContent,
     targets: Sequence[Mapping[str, Any]],
+    grounding: Optional[FlowGrounding] = None,
 ) -> ProposalFacts:
     """Read every persisted fact the gate needs. Contains NO judgement.
 
@@ -932,6 +1357,14 @@ def gather_proposal_facts(
     mode` and `stabilization.gather_gate_facts` / `evaluate_establishment_
     gate`: the reader knows how to find a fact, the evaluator knows what it
     means, and only the evaluator is a contract.
+
+    `grounding` carries the two readings a `conn` cannot produce here: #414's
+    evidence ids and its pinned-snapshot Flow membership. It is a PARAMETER
+    rather than something read inside this function because
+    `build_flow_explanation` opens its own connections, and holding this one
+    across it would deadlock the server. Omitting it is fail-closed, not
+    permissive: the allowlist reads `unavailable` and static membership stays
+    undetermined, so the gate refuses.
     """
     _require_system(conn, system_id)
 
@@ -951,11 +1384,22 @@ def gather_proposal_facts(
             in_flow = None
         elif kind == "runtime_flow":
             in_flow = _node_in_runtime_flow(conn, system_id, node_row["id"], ref)
+        elif (
+            grounding is not None
+            and grounding.subject_kind == kind
+            and grounding.subject_ref == ref
+            and grounding.membership_state == "resolved"
+        ):
+            # §6.2's static membership: #414's STRICT `(path, qualified_name)`
+            # exact match against the pinned snapshot's call graph, read from
+            # its projection rather than re-implemented here. No similarity,
+            # no keywords (Principle 6).
+            in_flow = node_key in grounding.member_node_keys
         else:
-            # static_flow membership needs the snapshot's call graph (#414
-            # §6.2). A derivation that can fail must never be a fail-closed
-            # gate's input (EM-ADR-1), so it is reported as "not determinable"
-            # rather than guessed in either direction.
+            # The call graph could not be built (or no grounding was supplied),
+            # so membership is UNDETERMINED. The gate refuses that with
+            # `flow_membership_unavailable`; it is never admitted, because an
+            # unread membership is not evidence of membership.
             in_flow = None
         facts.append(
             TargetFact(
@@ -977,6 +1421,12 @@ def gather_proposal_facts(
         (system_id, content.proposal_key),
     ).fetchone()
 
+    matches_subject = (
+        grounding is not None
+        and grounding.subject_kind == kind
+        and grounding.subject_ref == ref
+        and grounding.state == "resolved"
+    )
     return ProposalFacts(
         content=content,
         targets=tuple(facts),
@@ -984,6 +1434,10 @@ def gather_proposal_facts(
             conn, system_id, kind, ref, content.captured_snapshot_id
         ),
         proposal_key_taken=taken is not None,
+        evidence_allowlist=(
+            grounding.evidence_ids if matches_subject and grounding else frozenset()
+        ),
+        evidence_allowlist_state="resolved" if matches_subject else "unavailable",
     )
 
 
@@ -1165,6 +1619,7 @@ def list_proposals(
     *,
     system_id: int,
     status: Optional[str] = None,
+    flow_subject_kind: Optional[str] = None,
     flow_subject_ref: Optional[str] = None,
     limit: int = 100,
     now: Optional[float] = None,
@@ -1173,11 +1628,22 @@ def list_proposals(
 
     `status` filters on the DERIVED value, computed per row -- there is no
     column to filter on in SQL, and adding one is exactly what §7.4 forbids.
+
+    `flow_subject_kind` is part of the subject's IDENTITY, not decoration
+    (§6.2): a runtime `flow_id` and a pinned snapshot's `entrypoint_id` live
+    in two identifier spaces that are never merged. Filtering on the ref alone
+    mixed a runtime Flow's proposals with a same-named static Flow's --
+    #414's own `_build_experiments_section` has always keyed on both.
     """
     if status is not None:
         _check_membership(status, PROPOSAL_STATUSES, "status")
+    if flow_subject_kind is not None:
+        _check_membership(flow_subject_kind, FLOW_SUBJECT_KINDS, "flow_subject_kind")
     sql = "SELECT * FROM flow_experiment_proposal WHERE system_id = ?"
     params: List[Any] = [system_id]
+    if flow_subject_kind:
+        sql += " AND flow_subject_kind = ?"
+        params.append(flow_subject_kind)
     if flow_subject_ref:
         sql += " AND flow_subject_ref = ?"
         params.append(flow_subject_ref)
@@ -1234,6 +1700,84 @@ def _insert_event(
     ).fetchone()
 
 
+def _validate_llm_provenance(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    decision_method: str,
+    intelligence_run_id: Optional[int],
+) -> None:
+    """`decision_method='reasoning_llm'` must point at THIS feature's own run.
+
+    Principle 7: an unverified pointer is not provenance. Existing-and-in-this-
+    System was the whole of the old check, so any row -- another feature's
+    mapping run, or a run that FAILED -- could be attached and the proposal
+    would then read as reasoning-model output that a model never produced.
+
+    Four deterministic checks, each with its own code:
+
+    * the run is this feature's drafting run on this contract version
+      (`run_type` + `prompt_version` + `schema_version` + `decision_method`);
+    * it actually completed -- a `failed` run produced no draft at all, so
+      citing it claims provenance for output that does not exist;
+    * it backs at most one proposal, so a single draft cannot be spread over
+      several rows as if each had been reasoned about;
+    * and `reasoning_llm` without a run id is refused outright.
+
+    What this CANNOT yet check is that the run drafted THIS Flow: nothing
+    persists the drafting subject. See the note in the module docstring.
+    """
+    if decision_method == "reasoning_llm" and intelligence_run_id is None:
+        raise FlowExperimentRejected(
+            "intelligence_run_missing",
+            "decision_method='reasoning_llm' には根拠となる intelligence run が必要です。",
+        )
+    if intelligence_run_id is None:
+        return
+
+    run = conn.execute(
+        "SELECT * FROM intelligence_runs WHERE id = ? AND system_id = ?",
+        (intelligence_run_id, system_id),
+    ).fetchone()
+    if run is None:
+        # Indistinguishable from another System's id, deliberately.
+        raise FlowExperimentNotFoundError(
+            f"intelligence run {intelligence_run_id} not found"
+        )
+    if (
+        run["run_type"] != DRAFT_RUN_TYPE
+        or run["prompt_version"] != FLOW_EXPERIMENT_DRAFT_PROMPT_VERSION
+        or run["schema_version"] != FLOW_EXPERIMENT_DRAFT_SCHEMA_VERSION
+        or run["decision_method"] != "reasoning_llm"
+    ):
+        raise FlowExperimentRejected(
+            "intelligence_run_not_a_draft",
+            "指定された intelligence run は Flow 実験の draft 実行ではありません。",
+            (
+                f"{run['run_type']}/{run['prompt_version']}/{run['schema_version']}"
+                f"/{run['decision_method']}",
+            ),
+        )
+    if run["status"] != "completed":
+        raise FlowExperimentRejected(
+            "intelligence_run_not_completed",
+            "完了していない intelligence run は provenance になりません "
+            f"(status={run['status']})。",
+            (str(run["status"]),),
+        )
+    used = conn.execute(
+        "SELECT id FROM flow_experiment_proposal "
+        "WHERE system_id = ? AND intelligence_run_id = ? LIMIT 1",
+        (system_id, intelligence_run_id),
+    ).fetchone()
+    if used is not None:
+        raise FlowExperimentRejected(
+            "intelligence_run_already_used",
+            "この intelligence run は既に別の提案の provenance として使われています。",
+            (str(used["id"]),),
+        )
+
+
 def create_proposal(
     conn: sqlite3.Connection,
     *,
@@ -1245,6 +1789,7 @@ def create_proposal(
     reason: str = "",
     decision_method: str = "manual",
     intelligence_run_id: Optional[int] = None,
+    grounding: Optional[FlowGrounding] = None,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Create a proposal and its `proposed` event, or refuse with a finite code.
@@ -1265,21 +1810,22 @@ def create_proposal(
     )
 
     facts = gather_proposal_facts(
-        conn, system_id=system_id, content=content, targets=targets
+        conn,
+        system_id=system_id,
+        content=content,
+        targets=targets,
+        grounding=grounding,
     )
     verdict = evaluate_completeness(facts)
     if not verdict.ok:
         raise FlowExperimentRejected(verdict.code, verdict.message, verdict.detail)
 
-    if intelligence_run_id is not None:
-        run = conn.execute(
-            "SELECT id FROM intelligence_runs WHERE id = ? AND system_id = ?",
-            (intelligence_run_id, system_id),
-        ).fetchone()
-        if run is None:
-            raise FlowExperimentNotFoundError(
-                f"intelligence run {intelligence_run_id} not found"
-            )
+    _validate_llm_provenance(
+        conn,
+        system_id=system_id,
+        decision_method=decision_method,
+        intelligence_run_id=intelligence_run_id,
+    )
 
     conn.execute("BEGIN")
     try:
@@ -1565,6 +2111,184 @@ def _validate_metrics(metrics: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     return {key: metrics[key] for key in metrics}
 
 
+def _require_bound_execution(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    proposal_id: int,
+    execution_kind: Optional[str],
+    execution_ref: Optional[str],
+) -> Tuple[str, str]:
+    """The named execution must be THIS proposal's, and it must still work.
+
+    Four separate refusals, because four different things are wrong and the
+    developer's next action differs each time:
+
+    * `execution_ref_missing` -- nothing was named. A result is the
+      observation of ONE execution; "the result of this proposal" without
+      saying which run produced it cannot be audited.
+    * `execution_ref_not_registered` -- the run exists somewhere, but it was
+      never attached to this proposal. Attaching execution B's outcome to
+      proposal A is precisely how the ledger stops being a record of what
+      happened.
+    * `execution_ref_unresolved` -- resolved AT READ TIME (#405), not trusted
+      because it was accepted once: the canonical row may since have been
+      removed, or belong to another System.
+    * `execution_ref_failed` -- it resolves, but its own run concluded it
+      produced nothing usable. A failed run has no result to report.
+    """
+    kind = _text(execution_kind)
+    ref = _text(execution_ref)
+    if not kind or not ref:
+        raise FlowExperimentRejected(
+            "execution_ref_missing",
+            "結果・昇格候補は、この提案に記録済みの実行を 1 件名指しする必要が"
+            "あります (execution_kind / execution_ref)。",
+        )
+    _check_membership(kind, EXECUTION_KINDS, "execution_kind")
+
+    registered = conn.execute(
+        """SELECT id FROM flow_experiment_execution_ref
+            WHERE system_id = ? AND proposal_id = ?
+              AND execution_kind = ? AND execution_ref = ?
+            LIMIT 1""",
+        (system_id, proposal_id, kind, ref),
+    ).fetchone()
+    if registered is None:
+        raise FlowExperimentRejected(
+            "execution_ref_not_registered",
+            "この提案に記録されていない実行です。他の提案の実行に結果を"
+            "紐付けることはできません (§7.6)。",
+            (f"{kind}:{ref}",),
+        )
+
+    resolution = _execution_ref_resolution(conn, system_id, kind, ref)
+    if resolution == "unresolved":
+        raise FlowExperimentRejected(
+            "execution_ref_unresolved",
+            "実行参照が読み取り時に解決できません。保存された id を単独で"
+            "信用しません (#405)。",
+            (f"{kind}:{ref}",),
+        )
+    if resolution == "stale":
+        raise FlowExperimentRejected(
+            "execution_ref_failed",
+            "実行そのものが失敗しています。失敗した実行に報告すべき結果は"
+            "存在しません。",
+            (f"{kind}:{ref}",),
+        )
+    return kind, ref
+
+
+def _axis_metric_key(axis: Mapping[str, Any]) -> str:
+    """The key a result must report an axis under: its `metric`, else its
+    `name`. Exact equality only -- no similarity, no aliasing (Principle 6)."""
+    return _text(axis.get("metric")) or _text(axis.get("name"))
+
+
+def _require_declared_metrics(
+    row: sqlite3.Row, metrics: Mapping[str, Any]
+) -> None:
+    """The result must measure what the PROPOSAL declared (§7.1's evaluation
+    contract), not whatever the reporter happened to have.
+
+    Per declared level, and per axis inside it. A level with no declared axes
+    is not required -- ADR-7 keeps the three contracts apart, and demanding a
+    Flow/Capability number from a proposal that declared none would be
+    inventing a contract it never signed.
+    """
+    grouped = _axes_by_level(_json_or_default(row["evaluation_axes_json"], []))
+    missing: List[str] = []
+    for level in EVALUATION_LEVELS:
+        axes = grouped.get(level) or []
+        if not axes:
+            continue
+        measured = metrics.get(level)
+        for axis in axes:
+            key = _axis_metric_key(axis)
+            if not key:
+                continue
+            if not isinstance(measured, Mapping) or key not in measured:
+                missing.append(f"{level}:{key}")
+    if missing:
+        raise FlowExperimentRejected(
+            "result_metrics_missing",
+            "提案が宣言した評価軸の測定値がありません。宣言した契約で評価"
+            "されていない結果は、この提案の結果ではありません (ADR-7)。",
+            tuple(missing),
+        )
+
+
+def _numeric(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _find_measurement(metrics: Mapping[str, Any], key: str) -> Tuple[bool, Any]:
+    """Look one floor key up across the three levels. EXACT key match only."""
+    for level in EVALUATION_LEVELS:
+        measured = metrics.get(level)
+        if isinstance(measured, Mapping) and key in measured:
+            return True, measured[key]
+    return False, None
+
+
+def _evaluate_quality_floor(
+    row: sqlite3.Row, metrics: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Compare the result against the floor the proposal declared, and RECORD
+    the verdict. It decides nothing.
+
+    §7.6 / ADR-9: this module adopts, rejects and promotes nothing, so the
+    verdict is an observation written into the ledger and `auto_adopted` /
+    `auto_rejected` are stated as `false` rather than implied. A human still
+    decides, on their own screen, through their own gate.
+
+    Only a numeric floor against a numeric measurement is comparable.
+    `unmeasured` (nothing measured this floor) and `not_comparable` (a prose
+    floor has no ordering) are two different answers and NEITHER is a pass --
+    reporting either as `within_floor` would claim a floor was held that
+    nobody checked (§6.4's five-answer discipline).
+    """
+    floor = _json_or_default(row["quality_floor_json"], {})
+    keys: Dict[str, Any] = {}
+    if isinstance(floor, Mapping):
+        for key, bound in floor.items():
+            present, measured = _find_measurement(metrics, str(key))
+            if not present:
+                verdict = "unmeasured"
+            else:
+                bound_value = _numeric(bound)
+                measured_value = _numeric(measured)
+                if bound_value is None or measured_value is None:
+                    verdict = "not_comparable"
+                else:
+                    verdict = (
+                        "within_floor" if measured_value >= bound_value else "below_floor"
+                    )
+            keys[str(key)] = {
+                "verdict": verdict,
+                "floor": bound,
+                "measured": measured if present else None,
+            }
+
+    verdicts = {entry["verdict"] for entry in keys.values()}
+    if "below_floor" in verdicts:
+        overall = "below_floor"
+    elif not keys or verdicts - {"within_floor"}:
+        overall = "unevaluated"
+    else:
+        overall = "within_floor"
+    return {
+        "verdict": overall,
+        "keys": keys,
+        # Stated, never implied (§7.6): recording a verdict is not a decision.
+        "auto_adopted": False,
+        "auto_rejected": False,
+    }
+
+
 def record_result(
     conn: sqlite3.Connection,
     *,
@@ -1578,22 +2302,40 @@ def record_result(
     actor_kind: str = "user",
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Record what an execution produced. Never adopts, promotes or applies.
+    """Record what ONE named execution of THIS proposal produced.
 
-    The result is deliberately a ledger event and not a table of its own: the
-    numbers belong to the execution's canonical row, and duplicating them
-    here would create a second copy that can disagree with it (#405).
+    Never adopts, promotes or applies. The result is deliberately a ledger
+    event and not a table of its own: the numbers belong to the execution's
+    canonical row, and duplicating them here would create a second copy that
+    can disagree with it (#405).
+
+    Three bindings make it a record of what happened rather than a free-text
+    claim: it names a registered execution of this proposal that still
+    resolves, it carries the measurements the proposal's own evaluation
+    contract declared, and the declared quality floor is evaluated and
+    RECORDED. The floor verdict decides nothing -- a human still does.
     """
     if not _text(summary):
         raise FlowExperimentValidationError("summary must not be empty")
     moment = time.time() if now is None else now
     row = _proposal_row(conn, system_id, proposal_id)
     _lifecycle_gate(conn, system_id, row, "record_result", moment)
-    payload: Dict[str, Any] = {"summary": summary, "metrics": _validate_metrics(metrics)}
-    if execution_kind is not None:
-        _check_membership(execution_kind, EXECUTION_KINDS, "execution_kind")
-        payload["execution_kind"] = execution_kind
-        payload["execution_ref"] = _text(execution_ref)
+    kind, ref = _require_bound_execution(
+        conn,
+        system_id=system_id,
+        proposal_id=proposal_id,
+        execution_kind=execution_kind,
+        execution_ref=execution_ref,
+    )
+    validated = _validate_metrics(metrics)
+    _require_declared_metrics(row, validated)
+    payload: Dict[str, Any] = {
+        "summary": summary,
+        "metrics": validated,
+        "execution_kind": kind,
+        "execution_ref": ref,
+        "quality_floor_evaluation": _evaluate_quality_floor(row, validated),
+    }
     _insert_event(
         conn,
         system_id=system_id,
@@ -1617,6 +2359,8 @@ def record_promotion_candidate(
     candidate_ref: str,
     rationale: str,
     actor: Optional[str],
+    execution_kind: Optional[str] = None,
+    execution_ref: Optional[str] = None,
     actor_kind: str = "user",
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -1626,6 +2370,13 @@ def record_promotion_candidate(
     creates a publish job, or writes a line of source. The actual promotion
     still goes through the existing Experiment adoption / Stabilization
     (#399) / publish (#216) human gates, each of which keeps its own record.
+
+    It binds to THREE facts, with a finite code per failure. A candidate the
+    proposal never declared is a candidate nobody proposed; an execution that
+    does not resolve is not evidence anything ran; and an execution with no
+    recorded result is an UNEVALUATED candidate. Admitting any of the three
+    would put a candidate into the ledger that nothing ever measured -- and
+    this row is what the downstream promotion gates read.
     """
     if not _text(candidate_ref):
         raise FlowExperimentValidationError("candidate_ref must not be empty")
@@ -1634,6 +2385,46 @@ def record_promotion_candidate(
     moment = time.time() if now is None else now
     row = _proposal_row(conn, system_id, proposal_id)
     _lifecycle_gate(conn, system_id, row, "record_promotion_candidate", moment)
+
+    declared = [
+        _text(ref)
+        for ref in _json_or_default(row["candidate_refs_json"], [])
+        if _text(ref)
+    ]
+    if _text(candidate_ref) not in declared:
+        raise FlowExperimentRejected(
+            "candidate_ref_not_declared",
+            "この提案が宣言していない候補です。提案されていない候補を"
+            "昇格候補として記録することはできません。",
+            (_text(candidate_ref),),
+        )
+
+    kind, ref = _require_bound_execution(
+        conn,
+        system_id=system_id,
+        proposal_id=proposal_id,
+        execution_kind=execution_kind,
+        execution_ref=execution_ref,
+    )
+
+    # `_lifecycle_gate` above only asked whether SOME result exists (§7.4's
+    # `no_result_recorded`). This asks the binding question: was a result
+    # recorded for THIS execution? A candidate judged by another run's
+    # numbers has not been judged.
+    has_result = any(
+        doc["event_kind"] == "result_recorded"
+        and _text(doc["payload"].get("execution_kind")) == kind
+        and _text(doc["payload"].get("execution_ref")) == ref
+        for doc in (_event_doc(event) for event in _event_rows(conn, proposal_id))
+    )
+    if not has_result:
+        raise FlowExperimentRejected(
+            "no_result_for_execution",
+            "この実行に対する結果が記録されていません。評価されていない"
+            "候補は昇格候補になりません。",
+            (f"{kind}:{ref}",),
+        )
+
     _insert_event(
         conn,
         system_id=system_id,
@@ -1643,7 +2434,12 @@ def record_promotion_candidate(
         actor_kind=actor_kind,
         reason=rationale,
         decision_method="manual",
-        payload={"candidate_ref": candidate_ref, "promotion_performed": False},
+        payload={
+            "candidate_ref": _text(candidate_ref),
+            "execution_kind": kind,
+            "execution_ref": ref,
+            "promotion_performed": False,
+        },
         now=moment,
     )
     return _proposal_doc(conn, system_id, row, now=moment)
@@ -1705,6 +2501,8 @@ Improvement goal stated by the developer: {goal}
 Target Evolution Nodes (node_key / mission / side_effect_class):
 {nodes}
 
+{grounding}
+
 Return a JSON object with exactly these keys:
   "title": string
   "purpose": string  (why this experiment exists)
@@ -1720,8 +2518,14 @@ Return a JSON object with exactly these keys:
   "cost_cap": object with at least one positive numeric limit
   "stop_conditions": array of strings, at least one
   "rollback_plan": string
-  "evidence_refs": array of strings, at least one, drawn from the facts above
+  "evidence_refs": array of strings, at least one, each of which MUST be an id
+      from the evidence catalogue above, copied exactly. Any other value fails
+      the whole run -- do not invent, abbreviate or reformat an id.
   "risks": array of strings
+
+Ground the purpose, the hypothesis, the evaluation axes and the quality floor
+in the Flow state, the open items, the baseline and the evidence catalogue
+above. Those are the only facts you have; do not assert anything else.
 
 Node-level and Flow/Capability-level metrics are separate contracts: never
 derive one from the other, and never return a combined score.
@@ -1735,13 +2539,24 @@ _DRAFT_REQUIRED_KEYS: Tuple[str, ...] = (
 )
 
 
-def _parse_draft_response(raw: str, allowed_node_keys: Sequence[str]) -> Dict[str, Any]:
+def _parse_draft_response(
+    raw: str,
+    allowed_node_keys: Sequence[str],
+    allowed_evidence_ids: FrozenSet[str],
+) -> Dict[str, Any]:
     """Validate the structured output. ANY failure fails the whole run.
 
     Principle 6: there is no partial acceptance and no heuristic repair. A
     draft missing its stop conditions is not a draft with fewer fields -- it
     is a plan that cannot be reviewed, and inventing the missing part here
     would make the model's omission invisible.
+
+    `evidence_refs` is checked against the ids #414's projection actually
+    produced, for the same reason `target_node_keys` is checked against the
+    requested Nodes: a citation the model composed is a fabricated fact, and
+    "a non-empty string" was never a check that anything was cited. The gate
+    at `POST /flow-experiments` repeats this check, because a human edits the
+    draft in between and a ref valid here can be stale by then.
     """
     text = (raw or "").strip()
     if text.startswith("```"):
@@ -1801,6 +2616,21 @@ def _parse_draft_response(raw: str, allowed_node_keys: Sequence[str]) -> Dict[st
         raise FlowExperimentReasoningError(
             f"draft names Nodes outside the request: {', '.join(sorted(unknown_nodes))}"
         )
+    unknown_evidence = sorted(
+        {
+            str(ref).strip()
+            for ref in payload["evidence_refs"]
+            if str(ref).strip() not in allowed_evidence_ids
+        }
+    )
+    if unknown_evidence:
+        # Same class of failure as an invented Node, and the same answer: a
+        # citation the model composed is a fabricated fact, not a value to
+        # drop quietly (Principle 6).
+        raise FlowExperimentReasoningError(
+            "draft cites evidence the projection never produced: "
+            f"{', '.join(unknown_evidence)}"
+        )
     return payload
 
 
@@ -1811,9 +2641,20 @@ def propose_flow_experiment(
     flow_subject_ref: str,
     node_keys: Sequence[str],
     goal: str,
+    snapshot_id: Optional[int] = None,
     now: Optional[float] = None,
 ) -> DraftResult:
     """Draft a Flow experiment with the experiment reasoning model (§7.7).
+
+    **The draft is grounded in #414's projection, not in the goal alone.** The
+    model is given the Flow's real state -- per-Node axes, open items, the
+    missing / stale / unmeasured readings, mode divergence, anomalies, the
+    baseline and the existing experiments -- plus the catalogue of citable
+    evidence ids, and `evidence_refs` is validated against exactly that
+    catalogue. Before this, the prompt carried only the Flow ref, the goal and
+    each Node's mission, and "an evidence ref" meant "a non-empty string": a
+    wholly fabricated citation could reach a canonical row, which is precisely
+    what Principle 6 and §7.7 exist to prevent.
 
     **Reachable only in `propose` / `shadow`.** The client is built through
     `execution_mode.build_experiment_llm_adapter`, whose body order is the
@@ -1843,6 +2684,11 @@ def propose_flow_experiment(
         raise FlowExperimentValidationError("goal must not be empty")
 
     # --- Phase 1: read + gate (connection held, no external call) ---------
+    #
+    # The capability gate runs HERE, before anything expensive and before the
+    # first line that could read a credential (EM-ADR-3). A denied request
+    # therefore never reaches the projection read below, let alone the model.
+    flow_ref = flow_subject_ref if flow_subject_kind == "runtime_flow" else None
     with get_conn() as conn:
         _require_system(conn, system_id)
         node_facts: List[str] = []
@@ -1860,7 +2706,6 @@ def propose_flow_experiment(
                 mission = "" if version is None else version["mission"]
             node_facts.append(f"- {key} / {mission or '(mission unrecorded)'} / {side_effect}")
 
-        flow_ref = flow_subject_ref if flow_subject_kind == "runtime_flow" else None
         for key in keys:
             execution_mode.require_capability(
                 conn,
@@ -1870,6 +2715,36 @@ def propose_flow_experiment(
                 flow_ref=flow_ref,
                 now=moment,
             )
+
+    # --- Phase 1b: the grounded facts (NO connection held) ----------------
+    #
+    # `load_flow_grounding` owns its own connections and, for a static Flow,
+    # builds a call graph -- so it may not run inside the block above. Both
+    # refusals here happen BEFORE the model is called: spending the reasoning
+    # budget to produce citations the gate will then refuse is not fail-closed,
+    # it is fail-expensive.
+    grounding = load_flow_grounding(
+        system_id,
+        subject_kind=flow_subject_kind,
+        subject_ref=flow_subject_ref,
+        snapshot_id=snapshot_id,
+        now=moment,
+    )
+    if grounding.state != "resolved":
+        raise FlowExperimentRejected(
+            "evidence_allowlist_unavailable",
+            "この Flow の projection を読み取れなかったため、根拠のある提案を"
+            f"生成できません: {grounding.detail}",
+        )
+    if not grounding.evidence_ids:
+        raise FlowExperimentRejected(
+            "evidence_ref_unknown",
+            "この Flow には引用可能な evidence が 1 件もありません。根拠の無い"
+            "提案は作成しません (§7.1)。",
+        )
+
+    # --- Phase 1c: build the client (connection reopened, then closed) ----
+    with get_conn() as conn:
         client, decision = execution_mode.build_experiment_llm_adapter(
             conn,
             system_id=system_id,
@@ -1896,6 +2771,7 @@ def propose_flow_experiment(
             flow_subject_ref=flow_subject_ref,
             goal=goal,
             nodes="\n".join(node_facts),
+            grounding=grounding.context,
             isolation_strategies=", ".join(ISOLATION_STRATEGIES),
         )
         raw = client.generate_text(
@@ -1906,7 +2782,7 @@ def propose_flow_experiment(
             temperature=0.1,
             max_tokens=2048,
         )
-        draft = _parse_draft_response(raw, keys)
+        draft = _parse_draft_response(raw, keys, grounding.evidence_ids)
     except (
         FlowExperimentReasoningError,
         llm.LLMError,

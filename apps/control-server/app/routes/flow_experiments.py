@@ -75,6 +75,7 @@ from ..models import (
     FlowExperimentResultIn,
     FlowExperimentRollbackIn,
     FlowExperimentStatus,
+    FlowSubjectKind,
 )
 # `raise_execution_mode_denied` is #413's own refusal body, imported rather
 # than re-implemented so a mode denial has ONE shape everywhere (§4.1);
@@ -154,6 +155,7 @@ def draft_proposal(
             flow_subject_ref=payload.flow_subject_ref,
             node_keys=list(payload.node_keys),
             goal=payload.goal,
+            snapshot_id=payload.captured_snapshot_id,
         )
     except execution_mode.ExecutionModeDenied as exc:
         raise_execution_mode_denied(exc)
@@ -226,6 +228,19 @@ def create_flow_experiment(
         }
         for position, target in enumerate(payload.targets)
     ]
+    # #414's projection is read FIRST, with no connection open: it owns its own
+    # connections (and builds a call graph for a static Flow), so reading it
+    # inside the block below would deadlock the server. It supplies the two
+    # facts the gate cannot get from this request -- which evidence ids really
+    # exist for this System + Flow, and which Nodes the pinned snapshot's call
+    # graph puts inside a `static_flow`. An unreadable projection is not a
+    # blank one: the gate refuses (`evidence_allowlist_unavailable`).
+    grounding = flow_orchestration.load_flow_grounding(
+        system_id,
+        subject_kind=payload.flow_subject_kind,
+        subject_ref=payload.flow_subject_ref,
+        snapshot_id=payload.captured_snapshot_id,
+    )
     with get_conn() as conn:
         try:
             doc = flow_orchestration.create_proposal(
@@ -239,6 +254,7 @@ def create_flow_experiment(
                     "reasoning_llm" if payload.intelligence_run_id is not None else "manual"
                 ),
                 intelligence_run_id=payload.intelligence_run_id,
+                grounding=grounding,
             )
         except flow_orchestration.FlowOrchestrationError as exc:
             _raise_domain_error(exc)
@@ -250,6 +266,14 @@ def list_flow_experiments(
     status: Optional[FlowExperimentStatus] = Query(
         default=None,
         description="Filter on the DERIVED status. There is no status column to filter in SQL.",
+    ),
+    flow_subject_kind: Optional[FlowSubjectKind] = Query(
+        default=None,
+        description=(
+            "Part of the subject's IDENTITY, not decoration: a runtime flow_id "
+            "and a pinned snapshot's entrypoint_id live in two identifier "
+            "spaces and are never merged (§6.2)."
+        ),
     ),
     flow_subject_ref: Optional[str] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -264,6 +288,7 @@ def list_flow_experiments(
                 conn,
                 system_id=system_id,
                 status=status,
+                flow_subject_kind=flow_subject_kind,
                 flow_subject_ref=flow_subject_ref,
                 limit=limit,
                 now=now,
@@ -476,6 +501,8 @@ def record_flow_experiment_promotion_candidate(
                 candidate_ref=payload.candidate_ref,
                 rationale=payload.rationale,
                 actor=principal.username,
+                execution_kind=payload.execution_kind,
+                execution_ref=payload.execution_ref,
             )
         except flow_orchestration.FlowOrchestrationError as exc:
             _raise_domain_error(exc)

@@ -9,7 +9,7 @@ import re
 import time
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from ..auth import get_system_id
 from ..db import get_conn
@@ -25,6 +25,7 @@ from ..models import (
     ExperimentVariantResultOut,
 )
 from ..validation_runner import load_validation_config_text
+from .execution_modes import gate_execution_target
 from .snapshot_preflight import require_snapshot_preflight
 
 router = APIRouter()
@@ -577,12 +578,29 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
 def run_experiment(
     experiment_id: int,
     system_id: int = Depends(get_system_id),
+    response: Response = None,
 ) -> ExperimentOut:
     now = time.time()
     with get_conn() as conn:
         row = _get_experiment_or_404(conn, experiment_id, system_id)
         if row["status"] == "running":
             raise HTTPException(status_code=409, detail="Experiment is already running")
+        # Execution-mode gate (#412 §4.3). An Experiment runs candidate source
+        # variants in isolated worktrees, so it is `candidate_execution`. The
+        # subject is the Experiment's `feature_id`, mapped to an Evolution Node
+        # by `evolution_node_link(link_kind='feature')`. A Feature no Node links
+        # is `unmapped` and runs exactly as before -- migrating existing
+        # Features onto Nodes is an explicit Epic non-goal. The gate sits before
+        # the status/variant reset below so a refusal leaves the Experiment
+        # untouched rather than half-reset.
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="candidate_execution",
+            target_kind="feature",
+            target_ref=row["feature_id"],
+            response=response,
+        )
         snapshot = conn.execute(
             """
             SELECT * FROM repository_snapshots

@@ -399,6 +399,17 @@ class MockLLMClient(LLMClient):
                 if line.startswith("- ") and "/" in line
             ]
             node_keys = [key for key in node_keys if key]
+            # Same discipline for the evidence catalogue (#415 defect 1):
+            # `_parse_draft_response` refuses an `evidence_ref` the projection
+            # never produced, so the mock echoes real ids back OUT OF THE
+            # PROMPT. A mock that fabricated one would only ever exercise the
+            # refusal path. The catalogue lines are the `* [<id>] ...` bullets.
+            evidence_ids = [
+                line.split("[", 1)[1].split("]", 1)[0].strip()
+                for line in joined.splitlines()
+                if line.startswith("* [") and "]" in line
+            ]
+            evidence_ids = [ref for ref in evidence_ids if ref][:3]
             return json.dumps(
                 {
                     "title": "Mock Flow experiment draft",
@@ -439,7 +450,10 @@ class MockLLMClient(LLMClient):
                         "Nothing is applied: discard the candidate and keep "
                         "the pinned stable implementation."
                     ),
-                    "evidence_refs": ["mock:evidence-1"],
+                    # Deliberately falls back to a fabricated id when the
+                    # prompt carried no catalogue: that call is refused, which
+                    # is the correct outcome for an ungrounded draft.
+                    "evidence_refs": evidence_ids or ["mock:evidence-1"],
                     "risks": [
                         "Mock draft -- review every element before proposing it."
                     ],

@@ -16,7 +16,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
@@ -80,6 +80,7 @@ from ..replay_variants import (
     summarize_variant_cases,
 )
 from ..trace_analyzer import max_examples
+from .execution_modes import gate_execution_target
 from .snapshot_preflight import require_snapshot_preflight
 
 router = APIRouter(dependencies=[Depends(require_user)])
@@ -730,6 +731,7 @@ def _persist_replay_case_results(
 def create_replay_run(
     payload: ReplayRunCreate,
     system_id: int = Depends(get_system_id),
+    response: Response = None,
 ) -> ReplayRunOut:
     now = time.time()
     timeout_seconds = replay_timeout_seconds()
@@ -741,6 +743,23 @@ def create_replay_run(
     with get_conn() as conn:
         replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
         component_id = replay_set["component_id"]
+
+        # Execution-mode gate (#412 §4.3). A Replay run executes the pinned
+        # snapshot's own code against recorded inputs inside the sandbox, so
+        # `candidate_execution` is the capability that governs it. The subject
+        # is the Component, mapped to an Evolution Node by
+        # `evolution_node_link(link_kind='component')`; a Component no Node
+        # links is `unmapped` and behaves exactly as it did before this gate
+        # existed. Evaluated before the approval gate so nothing is read or
+        # written for an execution the mode already refuses.
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="candidate_execution",
+            target_kind="component",
+            target_ref=component_id,
+            response=response,
+        )
 
         # Human approval gate: a revoked approval refuses exactly like a
         # missing one (only status='approved' counts as active).
@@ -1052,6 +1071,7 @@ def _get_variant_run_or_404(conn, run_id: int, system_id: int):
 def create_replay_variant_run(
     payload: ReplayVariantRunCreate,
     system_id: int = Depends(get_system_id),
+    response: Response = None,
 ) -> ReplayVariantRunOut:
     """Run baseline + N patch variants together against the SAME Replay Set
     and SAME sandbox conditions, producing a per-trace + aggregate diff
@@ -1075,6 +1095,20 @@ def create_replay_variant_run(
     with get_conn() as conn:
         replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
         component_id = replay_set["component_id"]
+
+        # Execution-mode gate (#412 §4.3). This is the entry point §4.3 names
+        # first: baseline + N candidate patch variants are executed here. The
+        # approval and the mode are two INDEPENDENT facts (§7.4) -- an approved
+        # Replay whose Node is not in `shadow` is refused here, and a Node in
+        # `shadow` with no approval is still refused below.
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="candidate_execution",
+            target_kind="component",
+            target_ref=component_id,
+            response=response,
+        )
 
         approval = _active_approval(conn, system_id, component_id)
         if approval is None:

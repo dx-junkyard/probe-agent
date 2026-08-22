@@ -75,7 +75,7 @@ export default function FlowAgentsPage() {
   const assignments = useExecutionModeAssignments();
   const assign = useAssignExecutionMode();
   const revoke = useRevokeExecutionModeAssignment();
-  const experiments = useFlowExperiments(selected?.ref ?? null);
+  const experiments = useFlowExperiments(selected?.ref ?? null, selected?.kind ?? null);
   const decide = useFlowExperimentDecision();
 
   return (

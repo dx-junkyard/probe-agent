@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://probe-agent.dev/schemas/flow_experiment_proposal.json",
   "title": "FlowExperimentProposal",
-  "description": "The canonical read document of one Flow-scoped experiment proposal (Epic #412 Phase 3, Issue #415; contract docs/execution-modes.md §7). Built deterministically at read time by app/flow_orchestration.py from flow_experiment_proposal / _target / _event / _execution_ref -- it is never a separately cached document. Four properties are structural rather than advisory. (1) `status` is DERIVED by folding the append-only `events` ledger on every read; there is deliberately no status column on flow_experiment_proposal and there must never be one (§7.4, the discipline of #337/#338/#349/#405) -- `status_derived_at` records the moment the fold was taken, because expiry is part of it. (2) The document carries every element §7.1's completeness gate requires, each of which has its own finite rejection code, so an incomplete proposal is refused at the entrance rather than stored half-written. (3) `evaluation_axes_by_level` is a GROUPING of `evaluation_axes` by the level each axis declares -- never a derivation of one level from another and never a combined score (#394 ADR-7). (4) An entry in `executions` is a REFERENCE to a run whose canonical row already exists in replay_variants / experiments / shadow_results; this layer executes nothing and creates none of those rows, and `resolution` is recomputed on every read because a stored row id is never trusted on its own (§7.6). A `promotion_candidates` entry is a recorded candidate, never a promotion: adoption still passes the existing Experiment / Stabilization / publish human gates.",
+  "description": "The canonical read document of one Flow-scoped experiment proposal (Epic #412 Phase 3, Issue #415; contract docs/execution-modes.md §7). Built deterministically at read time by app/flow_orchestration.py from flow_experiment_proposal / _target / _event / _execution_ref -- it is never a separately cached document. Four properties are structural rather than advisory. (1) `status` is DERIVED by folding the append-only `events` ledger on every read; there is deliberately no status column on flow_experiment_proposal and there must never be one (§7.4, the discipline of #337/#338/#349/#405) -- `status_derived_at` records the moment the fold was taken, because expiry is part of it. (2) The document carries every element §7.1's completeness gate requires, each of which has its own finite rejection code, so an incomplete proposal is refused at the entrance rather than stored half-written. (3) `evaluation_axes_by_level` is a GROUPING of `evaluation_axes` by the level each axis declares -- never a derivation of one level from another and never a combined score (#394 ADR-7). (4) An entry in `executions` is a REFERENCE to a run whose canonical row already exists in replay_variants / experiments / shadow_results; this layer executes nothing and creates none of those rows, and `resolution` is recomputed on every read because a stored row id is never trusted on its own (§7.6). A `promotion_candidates` entry is a recorded candidate, never a promotion: adoption still passes the existing Experiment / Stabilization / publish human gates. (5) Every reference in the document is BOUND to a fact rather than merely non-empty: an `evidence_refs` entry must be an id #414's projection actually produced for this System + Flow, an execution reference must resolve in its own canonical table at read time, a result event must name one execution registered on THIS proposal and carry the measurements this proposal's own evaluation contract declared, and a promotion candidate must bind to a declared candidate, a resolvable execution and a result recorded for that execution. A string that looks like a reference is not a reference, and an LLM sentence never becomes a canonical fact (§7.7 / Principle 6).",
   "type": "object",
   "required": [
     "schema_version", "id", "system_id", "proposal_key",
@@ -99,8 +99,8 @@
     "evidence_refs": {
       "type": "array",
       "minItems": 1,
-      "items": { "type": "string" },
-      "description": "§7.1: `evidence_missing`."
+      "items": { "type": "string", "minLength": 1 },
+      "description": "§7.1: `evidence_missing` when empty. Each entry must ALSO be an id that #414's read-only projection (app/flow_explanation.py) actually produced for this System and this Flow -- a Node evidence id (trace / anomaly / drift_observation / node_event / code_location), an open-item id, a `stabilization_package:<id>` approval, or an `execution_ref:<kind>:<ref>`. Anything else is `evidence_ref_unknown`, and an unreadable projection is `evidence_allowlist_unavailable` (fail-closed: an unverifiable citation is refused, never accepted). The check runs when the reasoning model drafts AND again when a human submits, because the human edits the draft in between and a ref that was valid then can by now be stale, cross-System or unrelated. A non-empty string is not a reference."
     },
     "expires_at": {
       "description": "The window in which a human may approve. Elapsing expires a proposal that is still awaiting a decision; it never unmakes an approval already given (§7.4). null means no deadline.",
@@ -111,7 +111,7 @@
       "description": "Provenance of the CONTENT: `reasoning_llm` for a §7.7 draft a human posted, `manual` for one a human wrote. The `proposed` EVENT is `manual` either way -- who wrote the words and who put the proposal into the queue are two different facts (#337)."
     },
     "intelligence_run_id": {
-      "description": "The drafting run's audit row when the content came from the reasoning model, else null.",
+      "description": "The drafting run's audit row when the content came from the reasoning model, else null. It must be THIS feature's own `flow_experiment_draft` run, on this prompt/schema version, with decision_method `reasoning_llm`, that reached status `completed`, and it may back exactly one proposal (`intelligence_run_not_a_draft` / `intelligence_run_not_completed` / `intelligence_run_already_used`; `intelligence_run_missing` when decision_method is `reasoning_llm` with no run at all). Principle 7: an unverified pointer is not provenance.",
       "type": ["integer", "null"]
     },
     "created_by": { "type": ["string", "null"] },
@@ -140,7 +140,7 @@
     "promotion_candidates": {
       "type": "array",
       "items": { "$ref": "#/$defs/event" },
-      "description": "The promotion-candidate events, surfaced for readability. Each is a candidate record carrying `promotion_performed: false`; the real promotion goes through the existing human gates (§7.6)."
+      "description": "The promotion-candidate events, surfaced for readability. Each is a candidate record carrying `promotion_performed: false`; the real promotion goes through the existing human gates (§7.6). Each one binds to all three of a candidate this proposal declared (`candidate_ref_not_declared`), an execution registered on it that still resolves (`execution_ref_not_registered` / `_unresolved` / `_failed`), and a result recorded FOR that execution (`no_result_for_execution`) -- an unevaluated candidate never enters the ledger the promotion gates read."
     }
   },
   "$defs": {
@@ -225,7 +225,10 @@
           "$ref": "#/$defs/decision_method",
           "description": "`manual` for every human decision reaching this ledger over HTTP -- approving, rejecting, withdrawing, recording an execution / result / promotion candidate / rollback (§10)."
         },
-        "payload": { "type": "object" },
+        "payload": {
+          "type": "object",
+          "description": "Facts about the recorded event, never a second copy of the canonical row's own data (#405). `execution_recorded`, `result_recorded` and `promotion_candidate_recorded` all carry `execution_kind` + `execution_ref` naming ONE execution registered on this proposal; a result additionally carries `metrics` keyed by the three evaluation contracts and `quality_floor_evaluation` (an overall `within_floor` / `below_floor` / `unevaluated` verdict, a per-key verdict from within_floor / below_floor / unmeasured / not_comparable, and `auto_adopted` / `auto_rejected` stated as false -- the verdict is an observation and decides nothing, ADR-9); a promotion candidate additionally carries `candidate_ref` (which must be one the proposal itself declared) and `promotion_performed: false`."
+        },
         "created_at": { "type": "number" }
       }
     },

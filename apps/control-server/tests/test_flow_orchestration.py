@@ -163,7 +163,19 @@ def _seed(system_id, *, mode="shadow"):
                VALUES (?, 't-1', 'summarize', 's-1', NULL, ?, NULL, ?)""",
             (system_id, FLOW_ID, now),
         )
-        _add_node(conn, system_id, "node-a")
+        node_a_id = _add_node(conn, system_id, "node-a")
+        # The component link is what makes the Flow's own traces citable
+        # evidence for this Node (#414 `_attach_runtime_evidence`), so
+        # `trace:t-1` below is a real projection id rather than a string that
+        # merely looks like one.
+        add_link(
+            conn,
+            system_id=system_id,
+            node_id=node_a_id,
+            link_kind="component",
+            target_ref="summarize",
+            created_by="root",
+        )
         _add_node(conn, system_id, "node-b")
         _add_node(conn, system_id, "node-outside", flow_id=None)
         _add_node(conn, system_id, "node-writer", side_effect_class="external_write")
@@ -262,12 +274,22 @@ def _target(node_key="node-a", **overrides) -> TargetFact:
     return TargetFact(**values)
 
 
-def _facts(content=None, targets=None, *, flow_subject_known=True, proposal_key_taken=False):
+def _facts(
+    content=None,
+    targets=None,
+    *,
+    flow_subject_known=True,
+    proposal_key_taken=False,
+    evidence_allowlist=("trace:t-1",),
+    evidence_allowlist_state="resolved",
+):
     return ProposalFacts(
         content=content or _content(),
         targets=tuple(targets if targets is not None else (_target(),)),
         flow_subject_known=flow_subject_known,
         proposal_key_taken=proposal_key_taken,
+        evidence_allowlist=frozenset(evidence_allowlist),
+        evidence_allowlist_state=evidence_allowlist_state,
     )
 
 
@@ -445,12 +467,56 @@ class TestStructuralGate:
         assert verdict.code == "node_not_in_flow"
         assert verdict.detail == ("node-outside",)
 
-    def test_undeterminable_membership_is_not_a_refusal(self):
-        """`in_flow is None` means "not determinable from persisted rows"
-        (a static Flow needs the call graph). Refusing there would reject a
-        legitimate proposal for a fact nobody read (EM-ADR-1)."""
+    def test_undeterminable_membership_is_refused_not_admitted(self):
+        """`in_flow is None` means membership could not be DETERMINED.
+
+        It is refused, with its OWN code: "we could not read whether this Node
+        belongs to the Flow" is not "it belongs" (#380), and it is not
+        "it does not belong" either -- the developer's next action differs
+        (re-run the snapshot analysis, versus link the Node).
+        """
         verdict = evaluate_completeness(_facts(targets=(_target(in_flow=None),)))
-        assert verdict.ok is True
+        assert verdict.code == "flow_membership_unavailable"
+        assert verdict.detail == ("node-a",)
+
+    def test_membership_unavailable_outranks_not_a_member(self):
+        """First match: an undetermined reading is reported as undetermined
+        even when another target is definitively outside."""
+        verdict = evaluate_completeness(
+            _facts(
+                _content(comparison_scope="sub_pipeline",
+                         evaluation_axes=(
+                             {"level": "node", "name": "match"},
+                             {"level": "flow_capability", "name": "flow_success"},
+                         )),
+                targets=(
+                    _target("node-a", in_flow=None),
+                    _target("node-outside", in_flow=False, position=1),
+                ),
+            )
+        )
+        assert verdict.code == "flow_membership_unavailable"
+
+    def test_an_unreadable_evidence_allowlist_refuses(self):
+        """Fail-closed: an unverifiable citation is refused, never accepted
+        "for now" (Principle 6). `unavailable` is not an empty allowlist."""
+        verdict = evaluate_completeness(_facts(evidence_allowlist_state="unavailable"))
+        assert verdict.code == "evidence_allowlist_unavailable"
+
+    def test_a_fabricated_evidence_ref_is_refused(self):
+        verdict = evaluate_completeness(
+            _facts(_content(evidence_refs=("trace:t-1", "trace:invented")))
+        )
+        assert verdict.code == "evidence_ref_unknown"
+        assert verdict.detail == ("trace:invented",)
+
+    def test_evidence_grounding_is_checked_after_the_element_is_present(self):
+        """`evidence_missing` (nothing written) is reported before
+        `evidence_ref_unknown` (what was written refers to nothing)."""
+        verdict = evaluate_completeness(
+            _facts(_content(evidence_refs=()), evidence_allowlist_state="unavailable")
+        )
+        assert verdict.code == "evidence_missing"
 
     @pytest.mark.parametrize("side_effect", ["external_write", "irreversible"])
     @pytest.mark.parametrize("strategy", ["none", "pure"])
@@ -509,8 +575,10 @@ class TestStructuralGate:
     def test_every_structural_code_is_covered(self):
         covered = {
             "unknown_flow_subject", "unresolved_node", "comparison_scope_mismatch",
-            "node_not_in_flow", "isolation_required_for_side_effects",
-            "evaluation_contract_missing", "duplicate_proposal_key",
+            "flow_membership_unavailable", "node_not_in_flow",
+            "isolation_required_for_side_effects",
+            "evaluation_contract_missing", "evidence_allowlist_unavailable",
+            "evidence_ref_unknown", "duplicate_proposal_key",
         }
         assert covered == set(STRUCTURAL_REJECTION_CODES)
 
@@ -796,6 +864,26 @@ class TestProposalApi:
             },
             headers=headers,
         )
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/results",
+            json={
+                "summary": "候補は baseline と一致",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+                "metrics": {"node": {"match_rate": 1.0}},
+            },
+            headers=headers,
+        )
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/promotion-candidates",
+            json={
+                "candidate_ref": "candidate:rule-1",
+                "rationale": "指標を満たした",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
+            headers=headers,
+        )
         doc = admin_client.get(f"/flow-experiments/{proposal_id}", headers=headers).json()
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         jsonschema.validate(doc, schema)
@@ -930,6 +1018,8 @@ class TestExecutionAndAudit:
             f"/flow-experiments/{proposal_id}/results",
             json={
                 "summary": "候補は baseline と一致",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
                 "metrics": {
                     "node": {"match_rate": 1.0},
                     "flow_capability": {"completed_flow_rate": 1.0},
@@ -939,10 +1029,20 @@ class TestExecutionAndAudit:
         )
         assert r.status_code == 201, r.text
         assert r.json()["status"] == "completed"
+        # The declared quality floor is EVALUATED and RECORDED, and the record
+        # states that it decided nothing (§7.6 / ADR-9).
+        floor = r.json()["events"][-1]["payload"]["quality_floor_evaluation"]
+        assert floor["verdict"] in {"within_floor", "below_floor", "unevaluated"}
+        assert floor["auto_adopted"] is False and floor["auto_rejected"] is False
 
         r = admin_client.post(
             f"/flow-experiments/{proposal_id}/promotion-candidates",
-            json={"candidate_ref": "candidate:rule-1", "rationale": "指標を満たした"},
+            json={
+                "candidate_ref": "candidate:rule-1",
+                "rationale": "指標を満たした",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
             headers=headers,
         )
         assert r.status_code == 201, r.text
@@ -991,7 +1091,12 @@ class TestExecutionAndAudit:
         )
         r = admin_client.post(
             f"/flow-experiments/{proposal_id}/results",
-            json={"summary": "s", "metrics": {"overall_score": 0.9}},
+            json={
+                "summary": "s",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+                "metrics": {"overall_score": 0.9},
+            },
             headers=headers,
         )
         assert r.status_code == 422
@@ -1017,7 +1122,12 @@ class TestExecutionAndAudit:
         )
         r = admin_client.post(
             f"/flow-experiments/{proposal_id}/promotion-candidates",
-            json={"candidate_ref": "c", "rationale": "r"},
+            json={
+                "candidate_ref": "candidate:rule-1",
+                "rationale": "r",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
             headers=headers,
         )
         assert r.status_code == 409
@@ -1106,12 +1216,22 @@ class TestChangesNothingInProduction:
         )
         admin_client.post(
             f"/flow-experiments/{proposal_id}/results",
-            json={"summary": "同一"},
+            json={
+                "summary": "同一",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+                "metrics": {"node": {"match_rate": 1.0}},
+            },
             headers=headers,
         )
         admin_client.post(
             f"/flow-experiments/{proposal_id}/promotion-candidates",
-            json={"candidate_ref": "candidate:rule-1", "rationale": "指標を満たした"},
+            json={
+                "candidate_ref": "candidate:rule-1",
+                "rationale": "指標を満たした",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
             headers=headers,
         )
 
@@ -1632,3 +1752,833 @@ class TestFactGathering:
                 flow_orchestration.gather_proposal_facts(
                     conn, system_id=9999, content=_content(), targets=[]
                 )
+
+
+# ---------------------------------------------------------------------------
+# Grounding and binding: a reference must REFER to something (defects 1-5)
+# ---------------------------------------------------------------------------
+
+
+def _approved_proposal(client, headers, *, body=None):
+    """A proposal that has passed the human approval gate."""
+    proposal_id = client.post(
+        "/flow-experiments", json=body or _body(), headers=headers
+    ).json()["id"]
+    r = client.post(
+        f"/flow-experiments/{proposal_id}/approve",
+        json={"reason": "隔離戦略を確認した"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    return proposal_id
+
+
+class TestEvidenceIsGroundedInTheProjection:
+    """Defect 1. `evidence_refs` used to be checked for "non-empty string"
+    only, at both ends, so a wholly fabricated citation could be stored in a
+    canonical row -- the exact thing §7.7 and Principle 6 forbid."""
+
+    def test_a_fabricated_evidence_ref_is_refused_at_submit(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(evidence_refs=["trace:completely-invented"]),
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "evidence_ref_unknown"
+        assert r.json()["detail"]["detail"] == ["trace:completely-invented"]
+
+    def test_a_fabricated_evidence_ref_is_refused_at_draft(self, admin_client, monkeypatch):
+        """The same check runs when the model drafts. Both ends are needed: a
+        human edits the draft in between."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="propose")
+        headers = _headers(token, system_id)
+
+        from app import llm
+
+        payload = {
+            "title": "t", "purpose": "p", "hypothesis": "h",
+            "comparison_scope": "single_node",
+            "target_node_keys": ["node-a"],
+            "baseline_ref": "b", "candidate_refs": ["c"],
+            "evaluation_axes": [{"level": "node", "name": "match"}],
+            "quality_floor": {"match": 1}, "isolation_strategy": "mock",
+            "isolation_detail": "d", "cost_cap": {"max_runs": 1},
+            "stop_conditions": ["s"], "rollback_plan": "r",
+            "evidence_refs": ["trace:completely-invented"],
+        }
+        monkeypatch.setattr(
+            llm.MockLLMClient,
+            "generate_text",
+            lambda self, messages, **kwargs: json.dumps(payload),
+        )
+        r = admin_client.post(
+            "/flow-experiments/draft",
+            json={
+                "flow_subject_kind": "runtime_flow",
+                "flow_subject_ref": FLOW_ID,
+                "node_keys": ["node-a"],
+                "goal": "g",
+            },
+            headers=headers,
+        )
+        assert r.status_code == 502, r.text
+        assert "trace:completely-invented" in r.json()["detail"]
+        with get_conn() as conn:
+            run = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE run_type = 'flow_experiment_draft'"
+            ).fetchone()
+            assert conn.execute(
+                "SELECT COUNT(*) AS n FROM flow_experiment_proposal"
+            ).fetchone()["n"] == 0
+        assert run["status"] == "failed"
+
+    def test_a_ref_valid_in_another_system_is_still_refused(self, admin_client):
+        """The allowlist is per System AND per Flow: an id that resolves
+        somewhere else is not a fact about this Flow."""
+        token = _login(admin_client)
+        system_a = _create_system(admin_client, token, "sys-a")
+        system_b = _create_system(admin_client, token, "sys-b")
+        _seed(system_a, mode="shadow")
+        _seed(system_b, mode="shadow")
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO traces (system_id, trace_id, component_id, mode, timestamp) "
+                "VALUES (?, 't-only-in-a', 'summarize', 'trace', ?)",
+                (system_a, time.time()),
+            )
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(evidence_refs=["trace:t-only-in-a"]),
+            headers=_headers(token, system_b),
+        )
+        assert r.status_code == 422
+        assert r.json()["detail"]["code"] == "evidence_ref_unknown"
+
+    def test_the_draft_prompt_carries_the_projection_facts(self, admin_client, monkeypatch):
+        """The model is given the Flow's real state, not just the goal."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="propose")
+        headers = _headers(token, system_id)
+
+        from app import llm
+
+        seen = {}
+        original = llm.MockLLMClient.generate_text
+
+        def _capture(self, messages, **kwargs):
+            seen["prompt"] = "\n".join(m["content"] for m in messages)
+            return original(self, messages, **kwargs)
+
+        monkeypatch.setattr(llm.MockLLMClient, "generate_text", _capture)
+        r = admin_client.post(
+            "/flow-experiments/draft",
+            json={
+                "flow_subject_kind": "runtime_flow",
+                "flow_subject_ref": FLOW_ID,
+                "node_keys": ["node-a"],
+                "goal": "コストを下げたい",
+            },
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        prompt = seen["prompt"]
+        for expected in (
+            "Flow state:",
+            "Per-Node axes",
+            "Open items",
+            "Baseline and rollback targets:",
+            "Evidence catalogue",
+            "[trace:t-1]",
+        ):
+            assert expected in prompt, expected
+        # And the draft it produced cites only real ids.
+        refs = r.json()["draft"]["evidence_refs"]
+        assert refs
+        allowed = flow_orchestration.load_flow_grounding(
+            system_id, subject_kind="runtime_flow", subject_ref=FLOW_ID
+        ).evidence_ids
+        assert set(refs) <= allowed
+
+    def test_an_unreadable_projection_refuses_rather_than_admitting(self, admin_client, monkeypatch):
+        """Fail-closed: "we could not read what evidence exists" is not
+        "there is no evidence", and neither is a licence to store a
+        citation nobody verified."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+
+        from app import flow_explanation
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("projection unavailable")
+
+        monkeypatch.setattr(flow_explanation, "build_flow_explanation", _boom)
+        r = admin_client.post("/flow-experiments", json=_body(), headers=headers)
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "evidence_allowlist_unavailable"
+
+    def test_load_flow_grounding_writes_nothing(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        before = _table_contents()
+        flow_orchestration.load_flow_grounding(
+            system_id, subject_kind="runtime_flow", subject_ref=FLOW_ID
+        )
+        assert _table_contents() == before
+
+
+class TestResultsAreBoundToAnExecution:
+    """Defect 2a. A result used to pass if ANY execution existed, with no
+    metrics and no relation to the execution it claimed to observe."""
+
+    def test_a_result_naming_no_execution_is_refused(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        proposal_id = _approved_proposal(admin_client, headers)
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
+            headers=headers,
+        )
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/results",
+            json={"summary": "s", "metrics": {"node": {"match_rate": 1.0}}},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "execution_ref_missing"
+
+    def test_another_proposals_execution_is_refused(self, admin_client):
+        """The defect in one sentence: execution B's result could be attached
+        to proposal A."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        now = time.time()
+        with get_conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO shadow_results (system_id, trace_id, component_id, timestamp) "
+                "VALUES (?, 't-1', 'summarize', ?)",
+                (system_id, now),
+            )
+            other_shadow_id = cur.lastrowid
+
+        proposal_a = _approved_proposal(admin_client, headers)
+        proposal_b = _approved_proposal(
+            admin_client, headers, body=_body(proposal_key="exp-2")
+        )
+        admin_client.post(
+            f"/flow-experiments/{proposal_a}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
+            headers=headers,
+        )
+        admin_client.post(
+            f"/flow-experiments/{proposal_b}/executions",
+            json={"execution_kind": "shadow_result", "execution_ref": str(other_shadow_id)},
+            headers=headers,
+        )
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_a}/results",
+            json={
+                "summary": "他の提案の実行結果",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(other_shadow_id),
+                "metrics": {"node": {"match_rate": 1.0}},
+            },
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "execution_ref_not_registered"
+        assert r.json()["detail"]["detail"] == [f"shadow_result:{other_shadow_id}"]
+
+    def test_a_failed_execution_has_no_result_to_report(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        now = time.time()
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO repository_snapshots
+                       (system_id, repo_path, commit_sha, status, created_at, completed_at)
+                   VALUES (?, '/tmp/repo', 'c0ffee', 'ready', ?, ?)""",
+                (system_id, now, now),
+            )
+            snapshot_id = cur.lastrowid
+            cur = conn.execute(
+                """INSERT INTO experiments
+                       (system_id, feature_id, objective, snapshot_id, baseline_commit,
+                        config_revision, execution_config, status, created_at)
+                   VALUES (?, 'f-1', 'o', ?, 'c0ffee', 'r1', '{}', 'failed', ?)""",
+                (system_id, snapshot_id, now),
+            )
+            experiment_id = cur.lastrowid
+        proposal_id = _approved_proposal(admin_client, headers)
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={"execution_kind": "experiment", "execution_ref": str(experiment_id)},
+            headers=headers,
+        )
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/results",
+            json={
+                "summary": "s",
+                "execution_kind": "experiment",
+                "execution_ref": str(experiment_id),
+                "metrics": {"node": {"match_rate": 1.0}},
+            },
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "execution_ref_failed"
+
+    def test_a_result_must_measure_the_declared_axes(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        proposal_id = _approved_proposal(admin_client, headers)
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
+            headers=headers,
+        )
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/results",
+            json={
+                "summary": "s",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+                "metrics": {},
+            },
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "result_metrics_missing"
+        assert r.json()["detail"]["detail"] == ["node:match_rate"]
+
+    def test_the_quality_floor_verdict_is_recorded_and_decides_nothing(self, admin_client):
+        """A breached floor is RECORDED, not acted on: nothing is rejected,
+        adopted or reverted, and the proposal's own status is untouched."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        proposal_id = _approved_proposal(
+            admin_client, headers, body=_body(quality_floor={"match_rate": 0.9})
+        )
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
+            headers=headers,
+        )
+        before = _table_contents(PRODUCTION_TABLES)
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/results",
+            json={
+                "summary": "品質が落ちた",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+                "metrics": {"node": {"match_rate": 0.5}},
+            },
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        floor = r.json()["events"][-1]["payload"]["quality_floor_evaluation"]
+        assert floor["verdict"] == "below_floor"
+        assert floor["keys"]["match_rate"]["verdict"] == "below_floor"
+        assert (floor["auto_adopted"], floor["auto_rejected"]) == (False, False)
+        # The breach changed nothing: not the lifecycle, not production.
+        assert r.json()["status"] == "completed"
+        assert _table_contents(PRODUCTION_TABLES) == before
+
+    def test_a_prose_floor_is_not_comparable_and_is_not_a_pass(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        proposal_id = _approved_proposal(admin_client, headers)
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
+            headers=headers,
+        )
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/results",
+            json={
+                "summary": "s",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+                "metrics": {"node": {"match_rate": 1.0}},
+            },
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        floor = r.json()["events"][-1]["payload"]["quality_floor_evaluation"]
+        # `_body`'s floor is the prose "baseline を下回らない".
+        assert floor["keys"]["output_match"]["verdict"] == "unmeasured"
+        assert floor["verdict"] == "unevaluated"
+
+
+class TestPromotionCandidatesAreBound:
+    """Defect 2b. Any non-empty string used to be accepted, so an unevaluated
+    candidate C could be written into the ledger the promotion gates read."""
+
+    def test_a_candidate_the_proposal_never_declared_is_refused(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        proposal_id = _approved_proposal(admin_client, headers)
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
+            headers=headers,
+        )
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/results",
+            json={
+                "summary": "s",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+                "metrics": {"node": {"match_rate": 1.0}},
+            },
+            headers=headers,
+        )
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/promotion-candidates",
+            json={
+                "candidate_ref": "candidate:never-proposed",
+                "rationale": "r",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "candidate_ref_not_declared"
+        assert r.json()["detail"]["detail"] == ["candidate:never-proposed"]
+
+    def test_a_candidate_with_no_result_for_that_execution_is_refused(self, admin_client):
+        """Some result existing is §7.4's gate. This is the binding one: was
+        a result recorded for THIS execution?"""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        now = time.time()
+        with get_conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO shadow_results (system_id, trace_id, component_id, timestamp) "
+                "VALUES (?, 't-1', 'summarize', ?)",
+                (system_id, now),
+            )
+            second_shadow_id = cur.lastrowid
+        proposal_id = _approved_proposal(admin_client, headers)
+        for ref in (seeded["shadow_result_id"], second_shadow_id):
+            admin_client.post(
+                f"/flow-experiments/{proposal_id}/executions",
+                json={"execution_kind": "shadow_result", "execution_ref": str(ref)},
+                headers=headers,
+            )
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/results",
+            json={
+                "summary": "s",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+                "metrics": {"node": {"match_rate": 1.0}},
+            },
+            headers=headers,
+        )
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/promotion-candidates",
+            json={
+                "candidate_ref": "candidate:rule-1",
+                "rationale": "r",
+                "execution_kind": "shadow_result",
+                "execution_ref": str(second_shadow_id),
+            },
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "no_result_for_execution"
+
+
+class TestStaticFlowMembershipFailsClosed:
+    """Defect 3. `in_flow` was `None` for every static Flow and the gate
+    skipped it, so any Node could be proposed against any entrypoint."""
+
+    def _static_subject(self, system_id):
+        now = time.time()
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO repository_snapshots
+                       (system_id, repo_path, commit_sha, status, created_at, completed_at)
+                   VALUES (?, '/tmp/repo', 'c0ffee', 'ready', ?, ?)""",
+                (system_id, now, now),
+            )
+            snapshot_id = cur.lastrowid
+            conn.execute(
+                """INSERT INTO code_entrypoints
+                       (system_id, snapshot_id, entrypoint_type, entrypoint_id, category,
+                        label, handler_path, handler_qualified_name, line_start, line_end,
+                        created_at)
+                   VALUES (?, ?, 'http_route', 'ep-1', 'api', 'checkout',
+                           'app/checkout.py', 'handle_checkout', 1, 5, ?)""",
+                (system_id, snapshot_id, now),
+            )
+        return snapshot_id
+
+    def test_undeterminable_static_membership_is_refused(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        snapshot_id = self._static_subject(system_id)
+        headers = _headers(token, system_id)
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(
+                flow_subject_kind="static_flow",
+                flow_subject_ref="ep-1",
+                captured_snapshot_id=snapshot_id,
+            ),
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        # The snapshot has no indexed symbols, so #414's call graph cannot be
+        # built. Refused -- never admitted, and never reported as evidence the
+        # Node is outside the Flow.
+        assert r.json()["detail"]["code"] in {
+            "flow_membership_unavailable",
+            "evidence_allowlist_unavailable",
+        }
+
+    def test_gather_uses_the_projection_membership_when_it_resolves(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        snapshot_id = self._static_subject(system_id)
+        grounding = flow_orchestration.FlowGrounding(
+            subject_kind="static_flow",
+            subject_ref="ep-1",
+            state="resolved",
+            evidence_ids=frozenset({"trace:t-1"}),
+            membership_state="resolved",
+            member_node_keys=frozenset({"node-a"}),
+        )
+        content = _content(
+            flow_subject_kind="static_flow",
+            flow_subject_ref="ep-1",
+            captured_snapshot_id=snapshot_id,
+        )
+        with get_conn() as conn:
+            inside = flow_orchestration.gather_proposal_facts(
+                conn,
+                system_id=system_id,
+                content=content,
+                targets=[{"node_key": "node-a"}],
+                grounding=grounding,
+            )
+            outside = flow_orchestration.gather_proposal_facts(
+                conn,
+                system_id=system_id,
+                content=content,
+                targets=[{"node_key": "node-b"}],
+                grounding=grounding,
+            )
+        assert inside.targets[0].in_flow is True
+        assert outside.targets[0].in_flow is False
+        assert evaluate_completeness(outside).code == "node_not_in_flow"
+
+    def test_an_unavailable_membership_reading_is_not_admitted(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        snapshot_id = self._static_subject(system_id)
+        grounding = flow_orchestration.FlowGrounding(
+            subject_kind="static_flow",
+            subject_ref="ep-1",
+            state="resolved",
+            evidence_ids=frozenset({"trace:t-1"}),
+            membership_state="unavailable",
+        )
+        with get_conn() as conn:
+            facts = flow_orchestration.gather_proposal_facts(
+                conn,
+                system_id=system_id,
+                content=_content(
+                    flow_subject_kind="static_flow",
+                    flow_subject_ref="ep-1",
+                    captured_snapshot_id=snapshot_id,
+                ),
+                targets=[{"node_key": "node-a"}],
+                grounding=grounding,
+            )
+        assert facts.targets[0].in_flow is None
+        assert evaluate_completeness(facts).code == "flow_membership_unavailable"
+
+
+class TestRuntimeAndStaticFlowsAreNotConflatedWhenListing:
+    """Defect 4. The list filtered on `flow_subject_ref` alone, so a runtime
+    Flow and a same-named static Flow shared one result set."""
+
+    def test_the_listing_filters_on_the_subject_kind_too(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        admin_client.post("/flow-experiments", json=_body(), headers=headers)
+
+        now = time.time()
+        with get_conn() as conn:
+            # A static proposal whose entrypoint id happens to equal the
+            # runtime flow_id. Two identifier spaces, never merged (§6.2).
+            conn.execute(
+                """INSERT INTO flow_experiment_proposal
+                       (system_id, proposal_key, flow_subject_kind, flow_subject_ref,
+                        comparison_scope, title, purpose, hypothesis, baseline_ref,
+                        candidate_refs_json, evaluation_axes_json, quality_floor_json,
+                        isolation_strategy, isolation_detail, cost_cap_json,
+                        stop_conditions_json, rollback_plan, evidence_refs_json,
+                        decision_method, created_by, created_at, schema_version)
+                   VALUES (?, 'exp-static', 'static_flow', ?, 'single_node', 't', 'p',
+                           'h', 'b', '[]', '[]', '{}', 'mock', '', '{}', '[]', 'r',
+                           '[]', 'manual', 'root', ?, 'flow-experiment-proposal-v1')""",
+                (system_id, FLOW_ID, now),
+            )
+
+        both = admin_client.get(
+            f"/flow-experiments?flow_subject_ref={FLOW_ID}", headers=headers
+        ).json()["proposals"]
+        assert {p["proposal_key"] for p in both} == {"exp-1", "exp-static"}
+
+        runtime_only = admin_client.get(
+            f"/flow-experiments?flow_subject_kind=runtime_flow&flow_subject_ref={FLOW_ID}",
+            headers=headers,
+        ).json()["proposals"]
+        assert {p["proposal_key"] for p in runtime_only} == {"exp-1"}
+
+        static_only = admin_client.get(
+            f"/flow-experiments?flow_subject_kind=static_flow&flow_subject_ref={FLOW_ID}",
+            headers=headers,
+        ).json()["proposals"]
+        assert {p["proposal_key"] for p in static_only} == {"exp-static"}
+
+
+class TestProvenanceCannotBeForged:
+    """Defect 5. Any run of the same System could be attached as LLM
+    provenance -- another feature's, or one that FAILED."""
+
+    def _run(self, system_id, **overrides):
+        values = dict(
+            run_type="flow_experiment_draft",
+            provider="mock",
+            model="mock-model",
+            prompt_version=flow_orchestration.FLOW_EXPERIMENT_DRAFT_PROMPT_VERSION,
+            schema_version=flow_orchestration.FLOW_EXPERIMENT_DRAFT_SCHEMA_VERSION,
+            decision_method="reasoning_llm",
+            status="completed",
+        )
+        values.update(overrides)
+        now = time.time()
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method, status,
+                        is_mock, started_at, completed_at)
+                   VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                (
+                    system_id,
+                    values["run_type"],
+                    values["provider"],
+                    values["model"],
+                    values["prompt_version"],
+                    values["schema_version"],
+                    values["decision_method"],
+                    values["status"],
+                    now,
+                    now,
+                ),
+            )
+            return cur.lastrowid
+
+    def test_an_unrelated_run_type_is_refused(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        run_id = self._run(system_id, run_type="probe_plan")
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(intelligence_run_id=run_id),
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "intelligence_run_not_a_draft"
+
+    def test_a_failed_run_is_refused(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        run_id = self._run(system_id, status="failed")
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(intelligence_run_id=run_id),
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "intelligence_run_not_completed"
+
+    def test_one_run_backs_only_one_proposal(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        run_id = self._run(system_id)
+        first = admin_client.post(
+            "/flow-experiments",
+            json=_body(intelligence_run_id=run_id),
+            headers=headers,
+        )
+        assert first.status_code == 201, first.text
+        assert first.json()["decision_method"] == "reasoning_llm"
+        second = admin_client.post(
+            "/flow-experiments",
+            json=_body(proposal_key="exp-2", intelligence_run_id=run_id),
+            headers=headers,
+        )
+        assert second.status_code == 422, second.text
+        assert second.json()["detail"]["code"] == "intelligence_run_already_used"
+
+    def test_a_run_of_another_system_is_not_found(self, admin_client):
+        token = _login(admin_client)
+        system_a = _create_system(admin_client, token, "sys-a")
+        system_b = _create_system(admin_client, token, "sys-b")
+        _seed(system_a, mode="shadow")
+        _seed(system_b, mode="shadow")
+        run_id = self._run(system_a)
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(intelligence_run_id=run_id),
+            headers=_headers(token, system_b),
+        )
+        assert r.status_code == 404, r.text
+
+    def test_reasoning_llm_without_a_run_is_refused(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        with get_conn() as conn:
+            with pytest.raises(flow_orchestration.FlowExperimentRejected) as excinfo:
+                flow_orchestration.create_proposal(
+                    conn,
+                    system_id=system_id,
+                    content=_content(),
+                    targets=[{"node_key": "node-a"}],
+                    actor="root",
+                    decision_method="reasoning_llm",
+                    grounding=flow_orchestration.FlowGrounding(
+                        subject_kind="runtime_flow",
+                        subject_ref=FLOW_ID,
+                        state="resolved",
+                        evidence_ids=frozenset({"trace:t-1"}),
+                        membership_state="resolved",
+                    ),
+                )
+        assert excinfo.value.code == "intelligence_run_missing"
+
+
+class TestFlowScopeMembershipIsNotAClaim:
+    """#413's hardened `load_mode_facts` refuses a caller's Flow claim that
+    the Node's own `evolution_node_link` membership does not support. This
+    module passes `flow_ref` for every runtime-Flow subject, so a proposal
+    naming a Node outside the Flow is refused by the mode gate too -- one more
+    place where a request may not assert its own scope."""
+
+    def test_drafting_for_a_node_outside_the_named_flow_is_denied(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="propose")
+        headers = _headers(token, system_id)
+        r = admin_client.post(
+            "/flow-experiments/draft",
+            json={
+                "flow_subject_kind": "runtime_flow",
+                "flow_subject_ref": FLOW_ID,
+                # `node-outside` carries no `evolution_node_link(flow)` row.
+                "node_keys": ["node-outside"],
+                "goal": "g",
+            },
+            headers=headers,
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["denial_code"] == "flow_scope_not_member"
+
+    def test_recording_an_execution_for_a_node_outside_the_flow_is_denied(self, admin_client):
+        """The gate's subject is every TARGET Node, so a proposal that somehow
+        holds one is still refused an execution."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        now = time.time()
+        # The completeness gate refuses `node-outside` up front
+        # (`node_not_in_flow`), so the row is inserted directly to reach the
+        # mode gate on the execution path.
+        r = admin_client.post("/flow-experiments", json=_body(), headers=headers)
+        proposal_id = r.json()["id"]
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/approve", json={"reason": "ok"}, headers=headers
+        )
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO flow_experiment_target
+                       (system_id, proposal_id, target_node_key, target_role,
+                        position, note, created_at)
+                   VALUES (?, ?, 'node-outside', 'candidate_target', 1, '', ?)""",
+                (system_id, proposal_id, now),
+            )
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
+            headers=headers,
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["denial_code"] == "flow_scope_not_member"

@@ -335,13 +335,113 @@ shadow、sub-pipeline 比較の入口で `require_capability` を通す。ここ
 **承認の有無とモードは別の事実**である(§7.4): モードが `shadow` でも未承認の
 提案は実行できず、承認済みでもモードが `shadow` でなければ実行できない。
 
-### 4.4 既存経路への影響
+既存の実行入口(`component_id` / `feature_id` しか持たない)をこのゲートへ
+接続する決定的マッピングは §4.4 の `app/execution_target.py` である。
 
-未設定の既存 Node・既存 component は行 10(`no_assignment`)により `fixed` と
-して読まれる。これは**既存の実行経路を止めない**: このゲートは
-`execution_mode` を明示的に呼ぶ新しい経路(#415 の提案生成・実行記録)にのみ
-掛かる。既存の Candidate Studio / Replay / Interview の LLM 経路の意味は
-変えない(#413 の非目標「既存 SDK policy の意味変更」と同じ理由)。
+### 4.4 既存の実行入口への適用と execution target のマッピング
+
+#### 4.4.1 なぜマッピングが要るか
+
+ゲートの主語は Evolution Node(`node_key`)または runtime Flow である。一方、
+既存の実行入口 — Experiment run / Replay run / Replay variant run /
+Candidate Studio の replay・promote — は Node を知らない。持っているのは
+`component_id` か `feature_id` だけである。
+
+そのため当初、ゲートはモード照会・Flow 実験の LLM draft・**既に起きた実行の
+記録**にしか掛かっていなかった。しかし
+
+> **実行への参照を記録できないことは、実行できないことと同じではない。**
+
+実効モードが `fixed` の Node でも、既存の入口を直接叩けば候補は実行できて
+しまい、モード軸は候補実行を実際には制御していなかった。これは #413 の中心的
+受け入れ条件そのものが未達だったということである。
+
+`app/execution_target.py` がその欠落を埋める**唯一の決定的マッピング**である。
+
+#### 4.4.2 マッピングの正本
+
+```
+evolution_node_link(link_kind='component' | 'feature',
+                    target_ref = <実行対象>,
+                    superseded_by_id IS NULL)
+  JOIN evolution_node ON 同一 system_id
+```
+
+| target_kind | 実行入口 | link_kind | 正本 |
+| --- | --- | --- | --- |
+| `component` | Replay run / Replay variant run / Candidate Studio | `component` | `replay_sets.component_id` / `candidate_sessions.component_id` |
+| `feature` | Experiment run | `feature` | `experiments.feature_id` |
+
+これは既存正本 `evolution_node_link`(#396)への index 付きの完全一致 1 read で
+あり、EM-ADR-1 の条件を満たす — ゲートの入力は**永続行だけから解決できる**もの
+に限る。call graph 再計算のような**失敗しうる導出**を入口に置くと、ゲートの
+失敗が「安全側へ倒れる」ではなく「サービス停止」になる。この Epic は独自の
+マッピングテーブルを作らない。
+
+照合は**完全一致のみ**。前方一致・正規化・類似度・キーワードを使わない
+(Principle 6)。「たぶんこの Node が持ち主だろう」という推測は、EM-ADR-4 が
+resolver から取り除いた「caller の主張をスコープの証拠にする」欠陥を、一段
+上のレイヤで作り直すことに等しい。
+
+#### 4.4.3 三つの有限分類
+
+| governance | 条件 | ゲートの挙動 |
+| --- | --- | --- |
+| `governed` | ちょうど 1 つの Node が link している | `require_capability(..., node_key=<その Node>)` が判定する |
+| `unmapped` | どの Node も link していない | **ゲートは適用されない**。既存挙動のまま |
+| `ambiguous` | 2 つ以上の Node が link している | `ambiguous_target_mapping` で**fail closed** |
+
+三つであって二つではないのは、`unmapped` と `ambiguous` で安全な答えが
+**逆向き**だからである。
+
+`unmapped` が通過するのは妥協ではなく設計である。**「すべての既存
+コンポーネントの一括移行」は Epic の明示的な非目標**(§0.2)であり、実運用の
+実行の大半はまだ Node を持たない。分類できないものをすべて拒否すれば、既存の
+Replay / Experiment / Candidate Studio 利用者を全員止めることになり、塞ごうと
+している穴より悪い失敗になる。
+
+`ambiguous` が拒否するのは、どちらの Node の許可が効くかを**システムが選んで
+しまう**からである。最初の 1 つ・最新・最も permissive のどれを選んでも、それは
+EM-ADR-4 が排除した種類の推測である。Node は同一 kind の link を複数同時に
+持てる(`add_link` は自動 supersede しない)ので、2 つの Node が 1 つの
+Component を名乗る状態は破損ではなく**実在しうるモデリング状態**であり、
+開発者が link を supersede して解決する。
+
+#### 4.4.4 `unmapped` は決して黙らない
+
+「統治されていない」が「許可された」と同じ見え方をしてはならない
+(#366 の「一つの表示語が二つの事実を運ばない」を認可の答えに適用したもの)。
+したがって:
+
+- ゲートを通る全入口が `X-Execution-Governance`(`governed` / `unmapped`)を
+  返す。`governed` のときだけ `X-Execution-Mode` と `X-Execution-Node-Key` が
+  付く — `unmapped` ではモードを一度も解決していないので、モードを名乗らない
+  (#380: 読めなかった事実に既定値を代入しない)。
+- `GET /execution-modes/target-governance?target_kind=&target_ref=[&capability=]`
+  が同じ分類を**実行せずに**答える。`capability` を渡すと
+  `capability_permitted` として「今実行したら許可されるか」まで返す。Replay を
+  1 回消費して初めて分かる、という状態にしないためである。
+
+`ambiguous` の 409 本文は §4.1 と同じ形だが `denial_code` は
+`ambiguous_target_mapping` で、競合している `node_keys` を名指しする。
+`capability_not_permitted` に畳み込まない — ここではモードは拒否されておらず、
+「モードを変えろ」という指示は曖昧なのではなく**間違った指示**になる。修正は
+link の supersede である。
+
+#### 4.4.5 承認とモードは独立の 2 事実であり続ける
+
+Replay の人間承認ゲートはこのゲートに置き換えられない(§7.4)。承認済みでも
+Node が `shadow` でなければ拒否され、`shadow` でも未承認なら拒否される。
+Experiment run では、モード拒否は status/variant の reset より**前**に起きる
+ので、拒否された Experiment は半端に reset されず `draft` のまま残る。
+Candidate replay でも、拒否が不変の candidate を `running` のまま取り残さない
+順序に置く。
+
+#### 4.4.6 変えないこと
+
+`unmapped` な対象について、既存エンドポイントの意味は一切変えない
+(#413 の非目標「既存 SDK policy の意味変更」と同じ理由)。Interview 系の
+LLM 経路もこの Epic の対象外のままである。
 
 互換読み取りのために、projection は `mode_source: "default"` を
 「既定の `fixed`」として明示し、「人間が `fixed` を選んだ」(`system_assignment`)
@@ -479,7 +579,78 @@ evidence は必ず参照可能な ID(trace_id / anomaly id / run id / revision i
 さらに構造検証:
 `unknown_flow_subject` / `node_not_in_flow` / `unresolved_node` /
 `comparison_scope_mismatch` / `isolation_required_for_side_effects` /
-`evaluation_contract_missing` / `duplicate_proposal_key`。
+`evaluation_contract_missing` / `duplicate_proposal_key` /
+`flow_membership_unavailable` / `evidence_allowlist_unavailable` /
+`evidence_ref_unknown`。
+
+#### 7.1.1 evidence は許可リストとの完全一致で検証する
+
+当初の実装は `evidence_refs` の各要素が**空文字列でないこと**しか確認して
+いなかった。draft prompt に渡していた事実も Flow ref / goal / Node の mission
+と side_effect_class だけで、#415 が要求する Flow 状態・観測不足・drift・
+評価 gap・baseline が入っていなかった。それでいてモデルには「上の事実から
+`evidence_refs` を返せ」と指示していたので、**架空の evidence 参照を持つ提案が
+canonical row に保存できた**。LLM の自由文を事実の代替にしないという Epic の
+中心原則に反する。
+
+`load_flow_grounding` が #414 の `build_flow_explanation` を**1 回だけ**読み、
+(a) draft context に渡す実際の事実、(b) evidence id の許可リスト、
+(c) static Flow の所属、を同時に得る。第 2 の集約は作らない。
+`evidence_refs` は許可リストとの完全一致で検証し、これを
+`_parse_draft_response`(draft 時)と `POST /flow-experiments` の完全性ゲート
+(投稿時)の**両方**で行う。間に人間の編集が入るので、draft 時に有効だった
+参照が投稿時には stale・別 System・無関係になっていることがあるためである。
+検証失敗は run の失敗であり、修復は行わない(Principle 6)。
+
+`flow_membership_unavailable` は §7.3 の static Flow 所属が決定できない場合。
+所属が分からないものを**通さない** — 当初は `in_flow = None` をゲートが
+読み飛ばしていた。
+
+#### 7.1.2 結果と昇格候補は canonical 参照に拘束される
+
+当初は「実行 event が 1 件でもあれば」結果を記録でき、`execution_kind` /
+`execution_ref` がその提案に登録済みか・実在するか・成功したかを確認して
+いなかった。`metrics` は空でもよく、提案自身の `evaluation_axes` /
+`quality_floor` を満たす必要もなかった。昇格候補も任意の非空文字列を受け付け、
+提案が宣言した `candidate_refs` や記録済みの結果と無関係でよかった。
+その結果、**実行 A の提案へ無関係な実行 B の結果を主張し、未評価の候補 C を
+監査台帳へ記録できた**。本番変更は起きないが、この台帳は本 Epic の説明可能性
+そのものなので、起きたことの記録でなくなる。
+
+- 結果は**この提案の**登録済み `flow_experiment_execution_ref` を 1 件名指し
+  しなければならない。参照は read 時に再解決する(保存した id を単独で信用
+  しない、#405)。解決できない・失敗した実行は
+  `execution_ref_unresolved` / `execution_ref_failed` で拒否する。
+  未登録は `execution_ref_not_registered`、未指定は `execution_ref_missing`。
+- 提案が宣言した評価 level / 軸すべてに測定値が要る
+  (`result_metrics_missing`)。宣言した `quality_floor` に対する verdict を
+  **記録する**が、**自動採用も自動却下もしない** — 判断は人間が行う。
+  verdict 語彙は `within_floor` / `below_floor` / `unmeasured` /
+  `not_comparable`(キー単位)と `within_floor` / `below_floor` /
+  `unevaluated`(全体)。
+- 昇格候補は 3 つすべてに拘束される: 宣言済みの候補
+  (`candidate_ref_not_declared`)、解決可能な canonical 実行、そしてその
+  **同じ実行に対する** `result_recorded`(`no_result_for_execution`)。
+
+`record_execution` が失敗した実行の参照を**受け付ける**のは意図的である。
+「実行され、失敗した」ことの記録は事実である。拒否されるのはその実行を根拠と
+した**結果**の主張のほうである。
+
+#### 7.1.3 provenance は検証された run だけが名乗れる
+
+`intelligence_run_id` があると `decision_method` が `reasoning_llm` になるが、
+当初は同一 System に run が存在することしか確認していなかった。無関係な run や
+**失敗した run** を LLM provenance として添付できた。検証されていないポインタは
+provenance ではない(Principle 7)。run type / prompt・schema version /
+`decision_method` / `status='completed'` / 単一使用を検証し、run 無しの
+`reasoning_llm` 申告も拒否する(`intelligence_run_missing` /
+`intelligence_run_not_a_draft` / `intelligence_run_not_completed` /
+`intelligence_run_already_used`)。
+
+**既知の残存穴**: `intelligence_runs` は draft の主題(どの Flow を対象に
+生成されたか)を保存していないため、「この draft に対応する run か」までは
+検証できない。塞ぐには `subject_ref` / `input_digest` 列か
+`flow_experiment_draft` の監査行が要る。
 
 ### 7.2 single_node と sub_pipeline を混同しない
 

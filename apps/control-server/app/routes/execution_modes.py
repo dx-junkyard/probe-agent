@@ -47,7 +47,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .. import execution_mode
+from .. import execution_mode, execution_target
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from ..models import (
@@ -101,6 +101,67 @@ def raise_execution_mode_denied(exc: execution_mode.ExecutionModeDenied) -> None
         decision=_decision_out(decision) if decision is not None else None,
     )
     raise HTTPException(status_code=409, detail=body.model_dump()) from exc
+
+
+def raise_execution_target_ambiguous(
+    exc: execution_target.ExecutionTargetAmbiguous,
+) -> None:
+    """Map an undecidable target mapping onto the same 409 shape (§4.3).
+
+    Reported with its OWN finite `denial_code` rather than folded into
+    `capability_not_permitted`: no mode was refused here, and telling a
+    developer to change a mode when the fix is to supersede an
+    `evolution_node_link` would be a wrong instruction, not merely a vague
+    one. `mode` / `source_scope` / `reason` stay `None` because no mode
+    reading was taken -- an unreadable fact is never a fact's default value
+    (#380).
+    """
+    body = execution_target.ExecutionTargetDenialOut(
+        denial_code=exc.denial_code,
+        message=str(exc),
+        node_keys=list(exc.node_keys),
+    )
+    raise HTTPException(status_code=409, detail=body.model_dump()) from exc
+
+
+def gate_execution_target(
+    conn,
+    *,
+    system_id: int,
+    capability: str,
+    target_kind: str,
+    target_ref,
+    response=None,
+) -> execution_target.ExecutionTargetGate:
+    """The single HTTP-boundary form of the §4.3 candidate-execution gate.
+
+    Every pre-existing execution entry point (Experiment run, Replay run,
+    Replay variant run, Candidate Studio replay/promote) calls THIS, so a
+    refusal has one body shape and a permitted-but-`unmapped` target reports
+    itself the same way everywhere.
+
+    `unmapped` returns normally -- bulk-migrating existing Components onto
+    Evolution Nodes is an explicit Epic non-goal, so a target no Node links
+    keeps its pre-#413 behaviour exactly. It is still reported, on
+    `X-Execution-Governance`: "not governed" must never be indistinguishable
+    from "permitted".
+    """
+    try:
+        gate = execution_target.require_target_capability(
+            conn,
+            system_id=system_id,
+            capability=capability,
+            target_kind=target_kind,
+            target_ref=target_ref,
+        )
+    except execution_target.ExecutionTargetAmbiguous as exc:
+        raise_execution_target_ambiguous(exc)
+        raise  # pragma: no cover - the helper always raises
+    except execution_mode.ExecutionModeDenied as exc:
+        raise_execution_mode_denied(exc)
+        raise  # pragma: no cover - the helper always raises
+    execution_target.apply_governance_headers(response, gate)
+    return gate
 
 
 # ---------------------------------------------------------------------------
@@ -400,3 +461,41 @@ def create_observation(
             _raise_domain_error(exc)
         doc = execution_mode.observation_doc(row)
     return ExecutionModeObservationOut(**doc)
+
+
+@router.get(
+    "/target-governance",
+    response_model=execution_target.ExecutionTargetGovernanceOut,
+)
+def get_target_governance(
+    target_kind: str = Query(description="component | feature"),
+    target_ref: str = Query(description="component_id or feature_id, matched exactly"),
+    capability: Optional[str] = Query(
+        default=None,
+        description=(
+            "Optional capability to evaluate; when given, capability_permitted "
+            "reports whether an execution WOULD be allowed right now."
+        ),
+    ),
+    system_id: int = Depends(get_system_id),
+) -> execution_target.ExecutionTargetGovernanceOut:
+    """Whether an execution target is under the execution-mode contract (§4.3).
+
+    Reads only -- it resolves nothing that executing would resolve differently
+    and writes nothing. It exists so `unmapped` is inspectable BEFORE a run:
+    a developer can see that a Component is still on the legacy path (no
+    Evolution Node links it) instead of inferring it from an execution that
+    was not refused.
+    """
+    with get_conn() as conn:
+        try:
+            return execution_target.governance_out(
+                conn,
+                system_id=system_id,
+                target_kind=target_kind,
+                target_ref=target_ref,
+                capability=capability,
+            )
+        except execution_mode.ExecutionModeError as exc:
+            _raise_domain_error(exc)
+            raise  # pragma: no cover - the helper always raises

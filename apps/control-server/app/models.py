@@ -11528,7 +11528,13 @@ class FlowExperimentResultIn(BaseModel):
 
     `metrics` keys are the three evaluation contracts and nothing else: what
     was not measured stays absent, because an absent measurement and a derived
-    one are different facts (ADR-7).
+    one are different facts (ADR-7). The metrics must cover every axis the
+    proposal itself declared, and the declared quality floor is evaluated and
+    RECORDED against them -- a verdict, never a decision (§7.6).
+
+    `execution_kind` / `execution_ref` name the one execution this result
+    observes; they stay `Optional` so their absence is refused with the finite
+    code `execution_ref_missing` rather than by an anonymous pydantic 422.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -11542,12 +11548,21 @@ class FlowExperimentResultIn(BaseModel):
 class FlowExperimentPromotionCandidateIn(BaseModel):
     """Recording a CANDIDATE is not a promotion (§7.6). The real promotion
     still goes through the existing Experiment adoption / Stabilization /
-    publish human gates."""
+    publish human gates.
+
+    It binds to three facts: a candidate the proposal itself declared, an
+    execution registered on this proposal that still resolves, and a result
+    recorded FOR that execution. `execution_kind` / `execution_ref` are
+    `Optional` here only so their absence is refused with the finite code
+    `execution_ref_missing` rather than by an anonymous pydantic 422.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     candidate_ref: str
     rationale: str
+    execution_kind: Optional[FlowExperimentExecutionKind] = None
+    execution_ref: Optional[str] = None
 
 
 class FlowExperimentRollbackIn(BaseModel):
@@ -11672,12 +11687,19 @@ class FlowExperimentDraftIn(BaseModel):
 
     Reachable only in `propose` / `shadow`: the capability gate runs before
     the first line that could read a credential (EM-ADR-3).
+
+    The draft is grounded in #414's projection for this Flow, and its
+    `evidence_refs` are validated against the ids that projection actually
+    produced -- a citation the model composed is a fabricated fact (§7.7).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     flow_subject_kind: FlowSubjectKind
     flow_subject_ref: str
+    #: Mandatory for `static_flow`: the projection resolves an `entrypoint_id`
+    #: only against the snapshot it was read from (§6.2).
+    captured_snapshot_id: Optional[int] = None
     node_keys: List[str] = Field(default_factory=list)
     goal: str
 

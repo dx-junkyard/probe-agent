@@ -4211,17 +4211,30 @@ export function useRevokeExecutionModeAssignment() {
   });
 }
 
-export function useFlowExperiments(flowSubjectRef?: string | null) {
+/** `flow_subject_kind` is sent alongside the ref because a proposal's identity
+ * is the PAIR. Filtering on the ref alone let a runtime Flow and a static Flow
+ * that happen to share a ref show their proposals in one list -- the two are
+ * different subjects, and #405's rule that they are never collapsed into one
+ * word applies to filtering just as much as to display. */
+export function useFlowExperiments(
+  flowSubjectRef?: string | null,
+  flowSubjectKind?: FlowSubjectKind | null,
+) {
   return useQuery<FlowExperimentListOut>({
-    queryKey: sysKey("flow-experiments", flowSubjectRef ?? null),
-    queryFn: () =>
-      api.get<FlowExperimentListOut>(
-        `/flow-experiments${
-          flowSubjectRef
-            ? `?flow_subject_ref=${encodeURIComponent(flowSubjectRef)}`
-            : ""
-        }`,
-      ),
+    queryKey: sysKey(
+      "flow-experiments",
+      flowSubjectRef ?? null,
+      flowSubjectKind ?? null,
+    ),
+    queryFn: () => {
+      const params = new URLSearchParams();
+      if (flowSubjectRef) params.set("flow_subject_ref", flowSubjectRef);
+      if (flowSubjectKind) params.set("flow_subject_kind", flowSubjectKind);
+      const query = params.toString();
+      return api.get<FlowExperimentListOut>(
+        `/flow-experiments${query ? `?${query}` : ""}`,
+      );
+    },
   });
 }
 
