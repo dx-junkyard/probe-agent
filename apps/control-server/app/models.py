@@ -11073,3 +11073,15 @@ class ExecutionModeDenialOut(BaseModel):
     source_scope: Optional[ExecutionModeSourceScope] = None
     reason: Optional[ExecutionModeReason] = None
     decision: Optional[ExecutionModeDecisionOut] = None
+
+
+# ---------------------------------------------------------------------------
+# Flow explanation projection (Epic #412, Issue #414) -- ANCHOR-414
+# Insert the #414 request/response models directly above this line.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Flow experiment orchestration (Epic #412, Issue #415) -- ANCHOR-415
+# Insert the #415 request/response models directly above this line.
+# ---------------------------------------------------------------------------
