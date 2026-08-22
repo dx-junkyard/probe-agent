@@ -127,7 +127,6 @@ def _facts(*, system=None, flows=(), node=None, rejected_flow_claims=()):
         flow_readings=tuple(flows),
         node_reading=node,
         node_key="n" if node is not None else None,
-        node_exists=True if node is not None else None,
         rejected_flow_claims=tuple(rejected_flow_claims),
         now=1000.0,
     )
@@ -965,7 +964,9 @@ def test_http_resolve_projection_divergence_and_revoke(admin_client):
 
     r = admin_client.post(
         "/execution-modes/observations",
-        json={"node_key": "node-http", "observed_mode": "propose", "source": "sdk"},
+        # `source` is NOT a request field: the route decides it (see
+        # `test_observation_source_cannot_be_forged_over_http`).
+        json={"node_key": "node-http", "observed_mode": "propose"},
         headers=_headers(token, system_id),
     )
     assert r.status_code == 201, r.text
@@ -1242,3 +1243,122 @@ class TestFlowScopeMembership:
                 )
             )
         assert (decision.mode, decision.reason) == ("fixed", "flow_scope_not_member")
+
+
+# ---------------------------------------------------------------------------
+# P2 regressions from the external review
+# ---------------------------------------------------------------------------
+
+
+class TestObservationProvenance:
+    def test_source_cannot_be_supplied_by_the_caller(self, admin_client):
+        """An observation exists to expose a configured-vs-runtime
+        disagreement. A caller who can send `source: "sdk"` manufactures an
+        SDK-attested reading and defeats that purpose, so provenance comes
+        from the route (#337), and an attempt to supply one is refused rather
+        than silently ignored."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _make_node(system_id, "node-a")
+        headers = _headers(token, system_id)
+
+        forged = admin_client.post(
+            "/execution-modes/observations",
+            json={"node_key": "node-a", "observed_mode": "shadow", "source": "sdk"},
+            headers=headers,
+        )
+        assert forged.status_code == 422, forged.text
+
+        accepted = admin_client.post(
+            "/execution-modes/observations",
+            json={"node_key": "node-a", "observed_mode": "shadow"},
+            headers=headers,
+        )
+        assert accepted.status_code in (200, 201), accepted.text
+        assert accepted.json()["source"] == "control_server"
+
+    def test_an_unresolved_run_ref_is_reported_as_uncorroborated(
+        self, admin_client
+    ):
+        """"This row cites a run" and "this row's citation was checked" are
+        two facts. Nothing here resolves the pointer, so the response says so
+        instead of implying it was verified."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _make_node(system_id, "node-a")
+        headers = _headers(token, system_id)
+
+        without = admin_client.post(
+            "/execution-modes/observations",
+            json={"node_key": "node-a", "observed_mode": "observe"},
+            headers=headers,
+        ).json()
+        with_ref = admin_client.post(
+            "/execution-modes/observations",
+            json={
+                "node_key": "node-a", "observed_mode": "observe",
+                "run_ref": "replay_variant_run:999999",
+            },
+            headers=headers,
+        ).json()
+        assert without["run_ref_state"] == "absent"
+        assert with_ref["run_ref_state"] == "uncorroborated"
+
+
+class TestMissingNodeReadsConsistently:
+    """"There is no such Node" is not the default value of "which mode is
+    this Node in" (#380). Before this fix `resolve` and `divergence` answered
+    a nonexistent Node with the fail-closed `fixed` reading a real
+    unconfigured Node gets, while `?capability=` refused it -- one subject
+    reading differently depending on which question was asked."""
+
+    def test_resolve_refuses_an_unknown_node(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        r = admin_client.get(
+            "/execution-modes/resolve",
+            params={"node_key": "no-such-node"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 404, r.text
+
+    def test_divergence_refuses_an_unknown_node(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        r = admin_client.get(
+            "/execution-modes/divergence",
+            params={"node_key": "no-such-node"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 404, r.text
+
+    def test_capability_resolve_keeps_its_documented_409(self, admin_client):
+        """The gate's own answer shape is unchanged (§4.1)."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        r = admin_client.get(
+            "/execution-modes/resolve",
+            params={"node_key": "no-such-node", "capability": "candidate_execution"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code in (404, 409), r.text
+        if r.status_code == 409:
+            assert r.json()["detail"]["denial_code"] == "node_not_found"
+
+    def test_a_real_node_with_no_assignment_still_reads_as_default_fixed(
+        self, admin_client
+    ):
+        """The other half: a Node that EXISTS and nobody configured must keep
+        reading as the default `fixed`, distinct from `system_assignment`."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _make_node(system_id, "node-a")
+        r = admin_client.get(
+            "/execution-modes/resolve",
+            params={"node_key": "node-a"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert (body["mode"], body["reason"]) == ("fixed", "no_assignment")
+        assert body["source_scope"] == "default"

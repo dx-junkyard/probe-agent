@@ -10902,7 +10902,18 @@ ExecutionModeDenialCode = Literal[
 ]
 ExecutionModeDivergence = Literal["match", "divergent", "unobserved", "stale"]
 ExecutionModeRecordKind = Literal["assign", "revoke"]
+#: WHICH PATH produced an observation, decided by the route, never by a
+#: request body (#337). `sdk` is an SDK-attested reading and no current path
+#: can attest one, so it is unreachable over HTTP: `ExecutionModeObservationIn`
+#: has no `source` field and the route always writes `control_server`. The
+#: value stays in the vocabulary because the column already holds it and an
+#: attested path would need it -- not because a caller may select it.
 ExecutionModeObservationSource = Literal["control_server", "sdk"]
+#: The standing of an observation's `run_ref`. Derived, never stored: nothing
+#: on this path resolves the pointer against a canonical execution row, so
+#: there is no `resolved` value to report. "This row cites a run" and "this
+#: row's citation was checked" must stay distinguishable (#366 / Principle 7).
+ExecutionModeRunRefState = Literal["absent", "uncorroborated"]
 
 
 class ExecutionModeScopeReadingOut(BaseModel):
@@ -10989,7 +11000,19 @@ class ExecutionModeRevokeIn(BaseModel):
 
 
 class ExecutionModeObservationIn(BaseModel):
-    """What mode a Node was ACTUALLY run under."""
+    """What mode a Node was ACTUALLY run under.
+
+    `source` is deliberately absent. It used to be a request field, so any
+    caller could send `source: "sdk"` and manufacture an SDK-attested reading
+    -- and an observation exists precisely to expose a configured-vs-runtime
+    disagreement, which a self-reported reading defeats. Provenance comes from
+    the route (#337): the endpoint writes `control_server` unconditionally,
+    and `extra="forbid"` makes an attempt to supply one a 422 rather than a
+    silently ignored field.
+
+    `run_ref` is accepted but NOT resolved against anything, so the response
+    reports it as `uncorroborated`. It is the caller's pointer, not evidence.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -10997,17 +11020,22 @@ class ExecutionModeObservationIn(BaseModel):
     observed_mode: ExecutionMode
     capability: Optional[ExecutionCapability] = None
     run_ref: Optional[str] = None
-    source: ExecutionModeObservationSource = "control_server"
     detail: str = ""
 
 
 class ExecutionModeObservationOut(BaseModel):
+    """One recorded observation, with the standing of its own provenance said
+    out loud: `source` is the path that wrote it (an HTTP write is always
+    `control_server`), and `run_ref_state` says the pointer was never checked."""
+
     id: int
     system_id: int
     node_key: str
     observed_mode: ExecutionMode
     capability: Optional[ExecutionCapability] = None
     run_ref: Optional[str] = None
+    #: `absent` (no pointer) vs `uncorroborated` (a pointer nobody resolved).
+    run_ref_state: ExecutionModeRunRefState = "absent"
     source: ExecutionModeObservationSource
     detail: str
     recorded_at: float
@@ -11151,6 +11179,16 @@ class FlowSubjectOut(BaseModel):
     #: `not_applicable` for a runtime Flow -- it carries no snapshot. That is
     #: a different answer from `missing` (a static Flow with no snapshot).
     snapshot_state: FlowFactState
+    #: Two facts about a runtime Flow that a single `resolution` used to
+    #: carry, and which are independently true or false: `observation_state`
+    #: is whether spans have ever been observed under this `flow_id`, and
+    #: `model_state` is whether any Node is currently linked to it. A Flow
+    #: that Nodes are modelled onto but which has never run is
+    #: `missing` + `present`, and it is a real subject -- #415 has always
+    #: treated it as one. Both are `not_applicable` for a static Flow, whose
+    #: Node membership is the structural `membership` reading instead.
+    observation_state: FlowFactState = "not_applicable"
+    model_state: FlowFactState = "not_applicable"
     snapshot_id: Optional[int] = None
     commit_sha: Optional[str] = None
     detail: str = ""

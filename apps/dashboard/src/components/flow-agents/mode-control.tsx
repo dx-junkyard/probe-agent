@@ -29,7 +29,9 @@ import type {
   ExecutionModeDecisionOut,
   ExecutionModeProjectionOut,
   ExecutionModeScopeKind,
+  FlowSubjectKind,
 } from "@/api/types";
+import type { AssignScope } from "./model";
 import {
   DENIAL_CODE_LABEL,
   DIVERGENCE_DESCRIPTION,
@@ -40,9 +42,14 @@ import {
   EXECUTION_MODE_LABEL,
   EXECUTION_MODE_ORDER,
   MODE_SCOPE_KIND_LABEL,
+  SCOPE_REF_FIELD_HINT,
+  SCOPE_REF_FIELD_LABEL,
+  SCOPE_REF_FIELD_PLACEHOLDER,
   SCOPE_STATE_LABEL,
   describeAssignment,
   describeModeOrigin,
+  initialAssignScope,
+  scopeRefForKind,
   sortModeNodes,
 } from "./model";
 import {
@@ -133,11 +140,30 @@ function DecisionSummary({ decision }: { decision: ExecutionModeDecisionOut }) {
   );
 }
 
+/** The assign form.
+ *
+ * SAFETY, not cosmetics: an assignment is what grants a scope permission to
+ * reach the experiment LLM and to run a candidate (§1.3). A form whose
+ * `scope_kind` and `scope_ref` can disagree — or that keeps a ref captured
+ * when it mounted while the developer moves to another Flow — can hand that
+ * permission to a subject the developer never chose, and the server cannot
+ * detect the mistake because the submitted ref is perfectly valid for the
+ * wrong scope. Three rules therefore hold at all times:
+ *
+ *   1. The opening `scope_kind` and `scope_ref` are ONE value
+ *      (`initialAssignScope`), so the as-opened form is always coherent.
+ *   2. The form follows the selected subject. The parent re-keys this
+ *      component on `initial`, so a subject change re-derives the whole form
+ *      from props instead of keeping mount-time state (and without the
+ *      `setState`-in-effect the lint rule forbids).
+ *   3. Changing the kind re-derives the ref (`scopeRefForKind`) and never
+ *      carries the other kind's value across.
+ */
 function AssignForm({
   pending,
   onSubmit,
   refusal,
-  defaultScopeRef,
+  initial,
 }: {
   pending: boolean;
   onSubmit: (values: {
@@ -148,10 +174,10 @@ function AssignForm({
     effective_until: number | null;
   }) => void;
   refusal: { code: string; message: string } | null;
-  defaultScopeRef: string;
+  initial: AssignScope;
 }) {
-  const [scopeKind, setScopeKind] = useState<ExecutionModeScopeKind>("node");
-  const [scopeRef, setScopeRef] = useState(defaultScopeRef);
+  const [scopeKind, setScopeKind] = useState<ExecutionModeScopeKind>(initial.scopeKind);
+  const [scopeRef, setScopeRef] = useState(initial.scopeRef);
   const [mode, setMode] = useState<ExecutionMode>("propose");
   const [until, setUntil] = useState("");
   const [confirming, setConfirming] = useState(false);
@@ -171,14 +197,11 @@ function AssignForm({
             onChange={(event) => {
               const next = event.target.value as ExecutionModeScopeKind;
               setScopeKind(next);
-              // Choosing the Flow scope prefills the currently displayed
-              // runtime Flow, because that is the ref a `flow` assignment
-              // needs and retyping it is where a typo becomes a silently
-              // ineffective assignment. It only ever FILLS AN EMPTY field --
-              // it never overwrites what the developer typed.
-              if (next === "flow" && scopeRef.trim().length === 0) {
-                setScopeRef(defaultScopeRef);
-              }
+              // The ref is RE-DERIVED for the new kind, never carried over.
+              // Switching back to the subject's own kind restores its ref;
+              // every other switch clears the field, so a `node_key` can
+              // never be submitted as a Flow ref (or the reverse).
+              setScopeRef(scopeRefForKind(next, initial));
             }}
           >
             {SCOPE_KINDS.map((kind) => (
@@ -193,20 +216,21 @@ function AssignForm({
           </p>
         </div>
         <div className="space-y-1">
-          <Label htmlFor="mode-scope-ref">スコープ参照</Label>
+          {/* The label carries the kind, so the field can never be read as a
+              generic "ref" box: what belongs in it is stated where the
+              developer is typing, not in a hint below. */}
+          <Label htmlFor="mode-scope-ref">
+            スコープ参照（{SCOPE_REF_FIELD_LABEL[scopeKind]}）
+          </Label>
           <Input
             id="mode-scope-ref"
             value={scopeKind === "system" ? "" : scopeRef}
             disabled={scopeKind === "system"}
             onChange={(event) => setScopeRef(event.target.value)}
-            placeholder={
-              scopeKind === "node" ? "node_key" : "runtime_flow:<flow_id> または flow_id"
-            }
+            placeholder={SCOPE_REF_FIELD_PLACEHOLDER[scopeKind]}
           />
           <p className="text-xs text-muted-foreground">
-            {scopeKind === "system"
-              ? "System スコープは参照を取りません（空文字列）。"
-              : "Flow 参照は常に前置詞付きで保存されます。"}
+            {SCOPE_REF_FIELD_HINT[scopeKind]}
           </p>
         </div>
         <div className="space-y-1">
@@ -383,7 +407,7 @@ export function ExecutionModeControlPanel({
   onRevoke,
   assignPending,
   revokePending,
-  defaultScopeRef,
+  selectedSubject,
 }: {
   projection: ExecutionModeProjectionOut | undefined;
   isLoading: boolean;
@@ -405,9 +429,13 @@ export function ExecutionModeControlPanel({
   onRevoke: (assignmentId: number, reason: string) => void;
   assignPending: boolean;
   revokePending: boolean;
-  defaultScopeRef: string;
+  /** The subject the screen is currently showing, or `null` when none is
+   * selected. The form's opening scope is DERIVED from it — the panel never
+   * receives a bare ref whose kind it would have to guess. */
+  selectedSubject: { kind: FlowSubjectKind; ref: string } | null;
 }) {
   const [refusal, setRefusal] = useState<{ code: string; message: string } | null>(null);
+  const initialScope = initialAssignScope(selectedSubject);
 
   if (isLoading) return <Skeleton className="h-64 w-full" />;
   if (isError || !projection) {
@@ -518,13 +546,23 @@ export function ExecutionModeControlPanel({
           <CardDescription>
             割り当ても revoke も人の判断（decision_method: manual）として記録されます。
             実行者は認証されたユーザー名で、この画面からは指定できません。理由は必須です。
+            初期スコープは表示中の subject から決まります: runtime_flow を選んでいれば
+            flow スコープとその flow_id、それ以外は node スコープで参照は空欄です。
+            System 全体はこの画面で最も広い権限付与なので、既定では選ばれません。
           </CardDescription>
         </CardHeader>
         <CardContent>
+          {/* Re-keyed on the derived scope: when the developer selects a
+              different Flow the whole form is rebuilt from props, so a ref
+              captured for the previous subject can never survive into the
+              next assignment. Deriving beats an effect here — an effect that
+              wrote state would also be the `react-hooks/set-state-in-effect`
+              violation. */}
           <AssignForm
+            key={`${initialScope.scopeKind}:${initialScope.scopeRef}`}
             pending={assignPending}
             refusal={refusal}
-            defaultScopeRef={defaultScopeRef}
+            initial={initialScope}
             onSubmit={(values) => {
               setRefusal(null);
               onAssign(values, setRefusal);

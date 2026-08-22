@@ -422,3 +422,215 @@ describe("未解決事項と提案の表示規則", () => {
     expect(new Set(labels).size).toBe(7);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 割り当てフォームの初期スコープ (§4)
+//
+// 実行モードの割り当ては LLM と候補実行の権限を与える人の判断なので、
+// scope_kind と scope_ref が食い違い得るフォームは安全性の問題になる。
+// ここで固定するのは「参照は常にその種別のものである」という不変条件で、
+// 便利さの話ではない。
+// ---------------------------------------------------------------------------
+
+describe("割り当ての初期スコープは種別と参照が常に一致する (§4)", () => {
+  test("runtime_flow を選んでいるときは flow スコープ + その前置詞付き参照", () => {
+    expect(model.initialAssignScope({ kind: "runtime_flow", ref: "checkout" })).toEqual({
+      scopeKind: "flow",
+      scopeRef: "runtime_flow:checkout",
+    });
+    // 既に前置詞がある参照を二重に付けない。
+    expect(
+      model.initialAssignScope({ kind: "runtime_flow", ref: "runtime_flow:checkout" }),
+    ).toEqual({ scopeKind: "flow", scopeRef: "runtime_flow:checkout" });
+  });
+
+  test("static_flow と未選択は node スコープ + 空の参照で開く", () => {
+    // static_flow はモードスコープになれない (§2.1)。その参照を node の
+    // node_key として送れてしまう状態を、構造的に作らない。
+    expect(
+      model.initialAssignScope({ kind: "static_flow", ref: "http:POST:/orders" }),
+    ).toEqual({ scopeKind: "node", scopeRef: "" });
+    expect(model.initialAssignScope(null)).toEqual({ scopeKind: "node", scopeRef: "" });
+  });
+
+  test("system は既定にならない（画面上もっとも広い権限付与は明示的な選択に限る）", () => {
+    for (const selected of [
+      { kind: "runtime_flow" as const, ref: "checkout" },
+      { kind: "static_flow" as const, ref: "http:POST:/orders" },
+      null,
+    ]) {
+      expect(model.initialAssignScope(selected).scopeKind).not.toBe("system");
+    }
+  });
+
+  test("種別を変えると参照は持ち越されず、戻したときだけ再導出される", () => {
+    const initial = model.initialAssignScope({ kind: "runtime_flow", ref: "checkout" });
+    expect(model.scopeRefForKind("node", initial)).toBe("");
+    expect(model.scopeRefForKind("system", initial)).toBe("");
+    expect(model.scopeRefForKind("flow", initial)).toBe("runtime_flow:checkout");
+
+    const nodeInitial = model.initialAssignScope(null);
+    // node 起点なら flow へ切り替えても Flow の参照は生えてこない。
+    expect(model.scopeRefForKind("flow", nodeInitial)).toBe("");
+    expect(model.scopeRefForKind("node", nodeInitial)).toBe("");
+  });
+
+  test("どの経路でも、参照が別種別のものになることはない", () => {
+    const subjects = [
+      { kind: "runtime_flow" as const, ref: "checkout" },
+      { kind: "static_flow" as const, ref: "http:POST:/orders" },
+      null,
+    ];
+    const kinds = ["system", "flow", "node"] as const;
+    for (const subject of subjects) {
+      const initial = model.initialAssignScope(subject);
+      for (const kind of kinds) {
+        const ref = model.scopeRefForKind(kind, initial);
+        if (kind === "system") expect(ref).toBe("");
+        // Flow の参照は前置詞付き。node の欄にそれが入ることはない。
+        if (kind === "node") expect(ref.startsWith("runtime_flow:")).toBe(false);
+        if (kind === "flow" && ref !== "") {
+          expect(ref.startsWith("runtime_flow:")).toBe(true);
+        }
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 入出力境界・依存関係・外部境界 (§6.3 item 2 / #414 の受け入れ条件)
+// ---------------------------------------------------------------------------
+
+describe("依存関係と入出力境界の読み (§6.3 item 2)", () => {
+  test("edge_source ごとに、辺と外部境界を実際に読んだかどうかが分かれる", () => {
+    const runtime = model.describeDependencyReading({
+      edge_source: "runtime_span_parentage",
+    });
+    expect(runtime.edgesMeasured).toBe(true);
+    // 外部境界は pin した snapshot の call graph からしか求まらないので、
+    // 実行時の読みの空配列は「0 件」ではない。
+    expect(runtime.boundariesMeasured).toBe(false);
+    expect(runtime.boundaryUnmeasuredNote).not.toBe("");
+
+    const staticGraph = model.describeDependencyReading({
+      edge_source: "static_call_graph",
+    });
+    expect(staticGraph.edgesMeasured).toBe(true);
+    expect(staticGraph.boundariesMeasured).toBe(true);
+
+    for (const source of ["unavailable", "not_applicable"] as const) {
+      const reading = model.describeDependencyReading({ edge_source: source });
+      expect(reading.edgesMeasured).toBe(false);
+      expect(reading.boundariesMeasured).toBe(false);
+    }
+  });
+
+  test("4 つの edge_source は 4 つの別の文を持つ", () => {
+    const sentences = (
+      ["runtime_span_parentage", "static_call_graph", "unavailable", "not_applicable"] as const
+    ).map((source) => model.describeDependencyReading({ edge_source: source }));
+    const labels = sentences.map((entry) => entry.edgeSourceLabel);
+    const descriptions = sentences.map((entry) => entry.edgeSourceDescription);
+    expect(new Set(labels).size).toBe(4);
+    expect(new Set(descriptions).size).toBe(4);
+  });
+
+  test("辺はサーバーの順序のまま、位置番号だけを添えて読める形にする", () => {
+    const readings = model.flowEdgeReadings([
+      {
+        source: "create_order",
+        target: "normalize",
+        edge_kind: "call",
+        // 静的読みの追加項目。types.ts の FlowResponsibilityEdgeOut には
+        // まだ宣言が無いので、any 経由で実際のレスポンス形を渡す。
+        ...({ resolution: "resolved", callee_name: "normalize", line: 12 } as object),
+      },
+      { source: "normalize", target: "writer", edge_kind: "span_parent", trace_id: "t-9" },
+    ]);
+    expect(readings.map((edge) => edge.position)).toEqual([1, 2]);
+    expect(readings[0].source).toBe("create_order");
+    expect(readings[0].edgeKindLabel).toBe("call / 関数呼び出し");
+    expect(readings[0].detail).toContain("callee: normalize");
+    expect(readings[0].detail).toContain("line: 12");
+    expect(readings[1].edgeKindLabel).toBe("span_parent / span の親子");
+    expect(readings[1].detail).toBe("trace: t-9");
+    // 順位付けもスコアも作らない。位置は読むための番号でしかない。
+    expect(readings.every((edge) => typeof edge.position === "number")).toBe(true);
+  });
+
+  test("未知の edge_kind は勝手に言い換えず、そのまま出す", () => {
+    const [reading] = model.flowEdgeReadings([
+      { source: "a", target: "b", edge_kind: "brand_new_kind" },
+    ]);
+    expect(reading.edgeKindLabel).toBe("brand_new_kind");
+    expect(reading.detail).toBe("");
+  });
+
+  test("外部境界は記録された 3 つの項目だけを読み、欠けた種別を補完しない", () => {
+    const readings = model.externalBoundaryReadings([
+      {
+        node_id: "external::database::db",
+        boundary_kind: "database",
+        qualified_name: "db.execute",
+      },
+      { node_id: "external::unknown::x" },
+    ]);
+    expect(readings[0].boundaryKindLabel).toBe("DB");
+    expect(readings[0].qualifiedName).toBe("db.execute");
+    // 種別の記録が無い行に、それらしい種別を割り当てない。
+    expect(readings[1].boundaryKind).toBe("");
+    expect(readings[1].boundaryKindLabel).toBe("");
+  });
+
+  test("読めなかった契約は空の契約にならない（値を 1 つも持たない）", () => {
+    const readings = model.contractReadings([
+      {
+        node_key: "address-normalizer",
+        state: "present",
+        mission: "住所文字列を正規化する",
+        scope: "国内住所のみ",
+        out_of_scope: "海外住所",
+        input_contract: { raw_address: "string" },
+        output_contract: { normalized: "string" },
+        side_effect_class: "pure",
+        trust_boundary: "internal",
+      },
+      // 読めなかった契約。mission などがレスポンスに載っていても、
+      // present でない限り 1 つも表示側へ渡さない (#380)。
+      { node_key: "order-writer", state: "unavailable", mission: "書き込み" },
+    ]);
+    expect(readings[0].input).toEqual([{ name: "raw_address", value: "string" }]);
+    expect(readings[0].output).toEqual([{ name: "normalized", value: "string" }]);
+    expect(readings[0].sideEffectClass).toBe("pure");
+
+    expect(readings[1].state).toBe("unavailable");
+    expect(readings[1].mission).toBe("");
+    expect(readings[1].input).toEqual([]);
+    expect(readings[1].output).toEqual([]);
+    expect(readings[1].sideEffectClass).toBeNull();
+  });
+
+  test("契約の項目が 0 件なのと、契約が読めないのは別の答え", () => {
+    const [empty] = model.contractReadings([
+      {
+        node_key: "n",
+        state: "present",
+        mission: "",
+        scope: "",
+        out_of_scope: "",
+        input_contract: {},
+        output_contract: {},
+        side_effect_class: null,
+        trust_boundary: null,
+      },
+    ]);
+    expect(empty.state).toBe("present");
+    expect(empty.input).toEqual([]);
+
+    const [unreadable] = model.contractReadings([{ node_key: "n", state: "missing" }]);
+    expect(unreadable.state).toBe("missing");
+    expect(unreadable.input).toEqual([]);
+    // 同じ空配列でも state が別なので、表示側は別の文を出せる。
+    expect(empty.state).not.toBe(unreadable.state);
+  });
+});

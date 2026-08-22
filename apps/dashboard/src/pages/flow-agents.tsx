@@ -43,7 +43,6 @@ import {
   toRefusal,
 } from "@/components/flow-agents/mode-control";
 import { FlowSubjectSelector } from "@/components/flow-agents/subject-selector";
-import { flowScopeRef } from "@/components/flow-agents/model";
 
 export default function FlowAgentsPage() {
   const subjects = useFlowSubjects();
@@ -67,9 +66,19 @@ export default function FlowAgentsPage() {
       ? { kind: firstSubject.subject_kind as FlowSubjectKind, ref: firstSubject.subject_ref }
       : null);
 
+  // A static Flow is a PINNED snapshot's entrypoint, and the server now
+  // requires the pin rather than defaulting to the newest ready snapshot --
+  // otherwise the same URL described a different Flow after every repository
+  // update. The pin carried here is the one the subject listing was built
+  // from, so the explanation always describes the menu entry that was chosen.
+  // A runtime Flow carries no snapshot at all, so it passes null.
+  const snapshotPin =
+    selected?.kind === "static_flow" ? subjects.data?.snapshot_id ?? null : null;
+
   const explanation = useFlowExplanation(
     selected?.kind ?? null,
     selected?.ref ?? null,
+    snapshotPin,
   );
   const modeProjection = useExecutionModeProjection();
   const assignments = useExecutionModeAssignments();
@@ -135,9 +144,7 @@ export default function FlowAgentsPage() {
             onHistoryRetry={() => assignments.refetch()}
             assignPending={assign.isPending}
             revokePending={revoke.isPending}
-            defaultScopeRef={
-              selected?.kind === "runtime_flow" ? flowScopeRef(selected.ref) : ""
-            }
+            selectedSubject={selected}
             onAssign={(values, onRefusal) =>
               assign.mutate(values, {
                 onSuccess: () => toast.success("割り当てを記録しました"),

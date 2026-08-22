@@ -135,6 +135,32 @@ export function FlowSubjectSelector({
                                 ? `${item.label} / trace ${item.trace_count} 件 / 最終 ${formatTimestamp(item.last_at)} / リンク済み Node ${item.linked_node_count} 件`
                                 : `${item.label} / ${item.entrypoint_type ?? "種別不明"} / ${item.handler_path ?? "パス不明"}`}
                             </div>
+                            {/* 観測とモデル上の所属は独立した 2 つの事実で、
+                                片方だけが真である状態は正当。Node が紐付いて
+                                いるが一度も動いていない Flow は実在する対象な
+                                ので、1 語にまとめず両方を出す。 */}
+                            {isRuntime(item) && (
+                              <div className="mt-1 flex flex-wrap gap-1">
+                                {/* 古い Control Server はこの 2 つを返さない。
+                                    その場合は「読めなかった」= `unavailable`
+                                    であって「無い」= `missing` ではない。 */}
+                                {(
+                                  [
+                                    ["観測", item.observation_state],
+                                    ["モデル上の所属", item.model_state],
+                                  ] as const
+                                ).map(([label, state]) => {
+                                  const value = state ?? "unavailable";
+                                  return (
+                                    <StatusBadge
+                                      key={label}
+                                      tone={value === "present" ? "neutral" : "warning"}
+                                      text={`${label}: ${FACT_STATE_LABEL[value]}`}
+                                    />
+                                  );
+                                })}
+                              </div>
+                            )}
                           </button>
                         </li>
                       );

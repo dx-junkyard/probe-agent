@@ -52,6 +52,9 @@ import type {
   FlowMembershipState,
   FlowOpenItemKind,
   FlowOpenItemOut,
+  FlowResponsibilityContractOut,
+  FlowResponsibilityEdgeOut,
+  FlowResponsibilitySectionOut,
   FlowRuntimeSubjectOut,
   FlowStaticSubjectOut,
   FlowSubjectKind,
@@ -508,6 +511,86 @@ export function flowScopeRef(flowId: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// §4 — the assign form's opening scope
+// ---------------------------------------------------------------------------
+
+export interface AssignScope {
+  scopeKind: ExecutionModeScopeKind;
+  /** ALWAYS a ref that belongs to `scopeKind`. There is no state in which a
+   * Flow ref sits in a `node` form or vice versa. */
+  scopeRef: string;
+}
+
+/** Which scope the assign form OPENS on, from the subject the screen is
+ * showing. A deterministic two-row first-match table.
+ *
+ * This is a safety rule, not a convenience one. An assignment grants LLM and
+ * candidate-execution permission (§1.3), so a form whose `scope_kind` and
+ * `scope_ref` disagree can silently grant that permission on the WRONG
+ * subject — a Flow id submitted as a `node_key` mostly 404s, but a stale ref
+ * left over from a previously selected Flow does not: it is a valid ref for
+ * the wrong Flow, and the server has no way to know the developer meant a
+ * different one. So:
+ *
+ *   1. A runtime Flow is selected → the `flow` scope with THAT Flow's
+ *      prefixed ref. The ref is the subject the whole screen is about, so the
+ *      as-opened form is coherent and the confirm dialog names the Flow the
+ *      developer is looking at.
+ *   2. Anything else (a static Flow — which §2.1 forbids as a mode scope —
+ *      or no selection at all) → the `node` scope with an EMPTY ref. Nothing
+ *      on screen names a Node, so nothing is pre-filled, and the form cannot
+ *      be submitted until the developer types one.
+ *
+ * `system` is deliberately never the default: it is the broadest grant on the
+ * screen and must be an explicit choice, never a form the developer submitted
+ * without reading. */
+export function initialAssignScope(
+  selected: { kind: FlowSubjectKind; ref: string } | null,
+): AssignScope {
+  if (selected && selected.kind === "runtime_flow") {
+    return { scopeKind: "flow", scopeRef: flowScopeRef(selected.ref) };
+  }
+  return { scopeKind: "node", scopeRef: "" };
+}
+
+/** The ref to show after the developer CHANGES the scope kind.
+ *
+ * A ref never crosses kinds: switching away clears the field, and switching
+ * back re-derives the subject's own ref instead of resurrecting whatever was
+ * typed for the other kind. Carrying a value across is how a `node_key` ends
+ * up submitted as a Flow ref. */
+export function scopeRefForKind(
+  kind: ExecutionModeScopeKind,
+  initial: AssignScope,
+): string {
+  if (kind === "system") return "";
+  if (kind === initial.scopeKind) return initial.scopeRef;
+  return "";
+}
+
+/** What the scope-ref field IS, per kind. The field is one input whose
+ * meaning changes entirely with the kind above it, so the kind's own wording
+ * goes into the label rather than into a hint the developer may not read. */
+export const SCOPE_REF_FIELD_LABEL: Record<ExecutionModeScopeKind, string> = {
+  system: "System 全体には参照がありません",
+  flow: "runtime_flow の flow_id",
+  node: "node_key",
+};
+
+export const SCOPE_REF_FIELD_PLACEHOLDER: Record<ExecutionModeScopeKind, string> = {
+  system: "",
+  flow: "runtime_flow:<flow_id> または flow_id",
+  node: "node_key",
+};
+
+export const SCOPE_REF_FIELD_HINT: Record<ExecutionModeScopeKind, string> = {
+  system:
+    "System スコープは参照を取りません（空文字列）。System 全体への割り当てはこの画面で最も広い権限付与なので、既定では選ばれません。",
+  flow: "Flow 参照は常に前置詞付きで保存されます。表示中の Flow の flow_id が入っています。",
+  node: "Node は画面上の subject から導出できないため、node_key を入力するまで記録できません。",
+};
+
+// ---------------------------------------------------------------------------
 // §6.3 — the six sections, each degrading alone
 // ---------------------------------------------------------------------------
 
@@ -568,6 +651,281 @@ export const EDGE_SOURCE_LABEL: Record<FlowEdgeSource, string> = {
   unavailable: "依存関係を取得できませんでした",
   not_applicable: "この subject には依存関係の読みがありません",
 };
+
+/** What each dependency reading ANSWERS — deliberately separate from its
+ * label. 「どこから読んだか」 and 「その読みに何が含まれるか」 are two facts,
+ * and the second is what decides whether an empty list means 0 件 or means
+ * 「この読みでは測っていない」 below. */
+export const EDGE_SOURCE_DESCRIPTION: Record<FlowEdgeSource, string> = {
+  runtime_span_parentage:
+    "実際に流れた trace の span 親子関係です。実行された辺だけが載ります（コード上に存在する経路の一覧ではありません）。",
+  static_call_graph:
+    "pin した snapshot の call graph です。コード上の呼び出し関係で、実行された証拠ではありません。",
+  unavailable:
+    "依存関係の読み取りに失敗しました。辺が 0 件だという意味ではありません。",
+  not_applicable:
+    "この subject 種別には依存関係の読みが構造上ありません。欠落ではありません。",
+};
+
+/** Whether the section's `edges` / `external_boundaries` lists are a MEASURED
+ * result at all.
+ *
+ * `unavailable` / `not_applicable` mean the list was never produced, so an
+ * empty array there is not 「0 件」 — printing 「0 件」 would be exactly the
+ * one-word-two-facts collapse (#366). This is a lookup over the server's own
+ * finite `edge_source` vocabulary, not a judgement. */
+const EDGE_SOURCE_PRODUCES_EDGES: Record<FlowEdgeSource, boolean> = {
+  runtime_span_parentage: true,
+  static_call_graph: true,
+  unavailable: false,
+  not_applicable: false,
+};
+
+/** External boundaries are derived from the pinned snapshot's call graph
+ * ONLY (`app/flow_explanation.py` builds them from the graph's external
+ * nodes). A runtime reading never produces them, so its empty array must not
+ * be reported as 「外部境界は 0 件です」 — nothing looked for one. */
+const EDGE_SOURCE_PRODUCES_BOUNDARIES: Record<FlowEdgeSource, boolean> = {
+  runtime_span_parentage: false,
+  static_call_graph: true,
+  unavailable: false,
+  not_applicable: false,
+};
+
+const BOUNDARY_UNMEASURED_NOTE: Record<FlowEdgeSource, string> = {
+  runtime_span_parentage:
+    "実行時の span 親子関係の読みには外部境界が含まれません。外部境界は pin した snapshot の call graph からのみ求まります。0 件という意味ではありません。",
+  static_call_graph: "",
+  unavailable:
+    "依存関係を取得できなかったため、外部境界も読めていません。0 件という意味ではありません。",
+  not_applicable:
+    "この subject 種別には外部境界の読みが構造上ありません。欠落ではありません。",
+};
+
+export interface DependencyReading {
+  edgeSource: FlowEdgeSource;
+  edgeSourceLabel: string;
+  edgeSourceDescription: string;
+  /** True when this reading produces an edge list at all. False means an
+   * empty `edges` array is NOT 「0 件」. */
+  edgesMeasured: boolean;
+  /** True when this reading produces external boundaries at all. */
+  boundariesMeasured: boolean;
+  /** The sentence to show INSTEAD of a count when boundaries were never
+   * produced. Empty string when they were. */
+  boundaryUnmeasuredNote: string;
+}
+
+/** Name the dependency reading before its rows are shown (§6.3 item 2).
+ *
+ * A pure lookup over the server's `edge_source`. It decides nothing about the
+ * graph — it only says which question the rows below answer, and whether an
+ * empty list is an observed 0 or a list that was never produced. */
+export function describeDependencyReading(
+  section: Pick<FlowResponsibilitySectionOut, "edge_source">,
+): DependencyReading {
+  const source = section.edge_source;
+  return {
+    edgeSource: source,
+    edgeSourceLabel: EDGE_SOURCE_LABEL[source],
+    edgeSourceDescription: EDGE_SOURCE_DESCRIPTION[source],
+    edgesMeasured: EDGE_SOURCE_PRODUCES_EDGES[source],
+    boundariesMeasured: EDGE_SOURCE_PRODUCES_BOUNDARIES[source],
+    boundaryUnmeasuredNote: BOUNDARY_UNMEASURED_NOTE[source],
+  };
+}
+
+/** The edge kinds both readings can carry. `span_parent` is the runtime one;
+ * the rest are `app/flow_graph.py`'s call-graph edge types. An unknown kind
+ * is rendered VERBATIM (it is the server's identifier) and never guessed at
+ * — this map only glosses what is already finite. */
+export const EDGE_KIND_LABEL: Record<string, string> = {
+  span_parent: "span の親子",
+  call: "関数呼び出し",
+  await: "await 呼び出し",
+  dispatch: "非同期ディスパッチ",
+  http: "HTTP 境界",
+  database: "DB 境界",
+  filesystem: "ファイルシステム境界",
+};
+
+/** `app/flow_graph.py`'s edge resolution vocabulary. `inferred` is not
+ * `resolved`: a guess about the callee is not a verified callee. */
+export const EDGE_RESOLUTION_LABEL: Record<string, string> = {
+  resolved: "解決済み",
+  inferred: "推定（確定した呼び先ではありません）",
+  unresolved: "呼び先を解決できませんでした",
+};
+
+export interface FlowEdgeReading {
+  key: string;
+  /** 1-based position in the server's own recorded order. A number for
+   * reading the list, never a rank or a score. */
+  position: number;
+  source: string;
+  target: string;
+  edgeKind: string;
+  /** The canonical kind plus its gloss when known; the canonical kind alone
+   * otherwise. */
+  edgeKindLabel: string;
+  /** Per-reading extras (trace_id / callee / line / resolution), already
+   * stringified in a fixed order. Empty when the row carries none. */
+  detail: string;
+}
+
+function edgeExtra(edge: FlowResponsibilityEdgeOut, key: string): string {
+  const value = (edge as unknown as Record<string, unknown>)[key];
+  if (value === null || value === undefined || value === "") return "";
+  return String(value);
+}
+
+/** The `edges` array as a readable ordered list (§6.3 item 2's 依存関係).
+ *
+ * The server's order is preserved verbatim — runtime edges arrive in span
+ * timestamp order, static ones in call-graph order — so this adds a position
+ * for reading and nothing else. No re-ordering, no ranking, no grouping by a
+ * computed importance. */
+export function flowEdgeReadings(
+  edges: readonly FlowResponsibilityEdgeOut[],
+): FlowEdgeReading[] {
+  return edges.map((edge, index) => {
+    const gloss = EDGE_KIND_LABEL[edge.edge_kind];
+    const parts: string[] = [];
+    const callee = edgeExtra(edge, "callee_name");
+    const line = edgeExtra(edge, "line");
+    const resolution = edgeExtra(edge, "resolution");
+    const traceId = edgeExtra(edge, "trace_id");
+    if (callee) parts.push(`callee: ${callee}`);
+    if (line) parts.push(`line: ${line}`);
+    if (resolution) {
+      parts.push(`${resolution}（${EDGE_RESOLUTION_LABEL[resolution] ?? resolution}）`);
+    }
+    if (traceId) parts.push(`trace: ${traceId}`);
+    return {
+      key: `${index}:${edge.source}:${edge.target}:${edge.edge_kind}`,
+      position: index + 1,
+      source: edge.source,
+      target: edge.target,
+      edgeKind: edge.edge_kind,
+      edgeKindLabel: gloss ? `${edge.edge_kind} / ${gloss}` : edge.edge_kind,
+      detail: parts.join(" / "),
+    };
+  });
+}
+
+/** `app/flow_graph.py`'s four boundary kinds. An unknown kind renders
+ * verbatim, never as a guessed category. */
+export const BOUNDARY_KIND_LABEL: Record<string, string> = {
+  http: "HTTP",
+  database: "DB",
+  filesystem: "ファイルシステム",
+  dispatch: "非同期ディスパッチ",
+};
+
+export interface ExternalBoundaryReading {
+  key: string;
+  nodeId: string;
+  boundaryKind: string;
+  boundaryKindLabel: string;
+  qualifiedName: string;
+}
+
+/** `external_boundaries` is typed as an open record on the wire, so this
+ * normalizes the three keys the server writes and drops nothing else in:
+ * a row whose `boundary_kind` is absent keeps an EMPTY kind rather than
+ * being assigned a plausible one. */
+export function externalBoundaryReadings(
+  rows: readonly Record<string, unknown>[],
+): ExternalBoundaryReading[] {
+  return rows.map((row, index) => {
+    const nodeId = typeof row.node_id === "string" ? row.node_id : "";
+    const kind = typeof row.boundary_kind === "string" ? row.boundary_kind : "";
+    const qualified =
+      typeof row.qualified_name === "string" ? row.qualified_name : "";
+    return {
+      key: `${index}:${nodeId}`,
+      nodeId,
+      boundaryKind: kind,
+      boundaryKindLabel: kind ? BOUNDARY_KIND_LABEL[kind] ?? kind : "",
+      qualifiedName: qualified,
+    };
+  });
+}
+
+export interface ContractField {
+  name: string;
+  value: string;
+}
+
+export interface ContractReading {
+  nodeKey: string;
+  /** The server's own `FlowFactState` for this contract. When it is not
+   * `present` NOTHING below is populated — an unreadable contract must never
+   * render as an empty one (#380). */
+  state: FlowFactState;
+  mission: string;
+  scope: string;
+  outOfScope: string;
+  sideEffectClass: string | null;
+  trustBoundary: string | null;
+  /** The recorded `input_contract` / `output_contract` objects as ordered
+   * name/value rows, in the order they were recorded. An empty list means
+   * the version recorded no field — a 0 件 statement, never a fact state
+   * this module invented. */
+  input: ContractField[];
+  output: ContractField[];
+}
+
+function contractFields(value: unknown): ContractField[] {
+  if (value === null || value === undefined) return [];
+  if (typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.entries(value as Record<string, unknown>).map(([name, raw]) => ({
+    name,
+    value: typeof raw === "string" ? raw : JSON.stringify(raw),
+  }));
+}
+
+/** One Node's I/O boundary and responsibility, as recorded on its current
+ * `evolution_node_version` (§6.3 item 2's 入出力境界).
+ *
+ * The contract's `state` is the SERVER's; this function never derives one.
+ * When the state is not `present` every field stays empty so the display
+ * cannot print a value the server did not vouch for. */
+export function describeContract(
+  contract: FlowResponsibilityContractOut,
+): ContractReading {
+  if (contract.state !== "present") {
+    return {
+      nodeKey: contract.node_key,
+      state: contract.state,
+      mission: "",
+      scope: "",
+      outOfScope: "",
+      sideEffectClass: null,
+      trustBoundary: null,
+      input: [],
+      output: [],
+    };
+  }
+  return {
+    nodeKey: contract.node_key,
+    state: contract.state,
+    mission: contract.mission ?? "",
+    scope: contract.scope ?? "",
+    outOfScope: contract.out_of_scope ?? "",
+    sideEffectClass: contract.side_effect_class ?? null,
+    trustBoundary: contract.trust_boundary ?? null,
+    input: contractFields(contract.input_contract),
+    output: contractFields(contract.output_contract),
+  };
+}
+
+/** Every Node's contract, in the server's recorded order. */
+export function contractReadings(
+  contracts: readonly FlowResponsibilityContractOut[],
+): ContractReading[] {
+  return contracts.map(describeContract);
+}
 
 // ---------------------------------------------------------------------------
 // §6.3 item 4 — open items

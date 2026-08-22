@@ -113,6 +113,8 @@ def _explanation_out(result: flow_explanation.FlowExplanation) -> FlowExplanatio
             label=result.subject.label,
             resolution=result.subject.resolution,
             snapshot_state=result.subject.snapshot_state,
+            observation_state=result.subject.observation_state,
+            model_state=result.subject.model_state,
             snapshot_id=result.subject.snapshot_id,
             commit_sha=result.subject.commit_sha,
             detail=result.subject.detail,
@@ -238,10 +240,20 @@ def list_subjects(
 ) -> FlowSubjectListOut:
     """The Flow subjects this System can explain.
 
-    The two kinds are returned in two separate lists. A runtime Flow is an
-    observed `trace_spans.flow_id`; a static Flow is a pinned snapshot's
-    `code_entrypoints.entrypoint_id`. Merging them into one list would be
-    exactly the one-word-two-facts collapse §2.1 forbids.
+    The two kinds are returned in two separate lists. A runtime Flow is a
+    `trace_spans.flow_id` that has been observed OR that a Node currently
+    declares it belongs to (the same disjunction #415 uses to decide a Flow
+    subject is known); a static Flow is a pinned snapshot's
+    `code_entrypoints.entrypoint_id`. Merging the two KINDS into one list
+    would be exactly the one-word-two-facts collapse §2.1 forbids, and inside
+    the runtime list each entry keeps `observation_state` and `model_state`
+    apart for the same reason.
+
+    This listing is a MENU, so it may resolve the newest `ready` snapshot
+    itself when none is given -- and it says which one it used
+    (`snapshot_id` / `snapshot_state`), so the caller can pin the explanation
+    request that follows. Explaining one static Flow does not get that
+    latitude: there `snapshot_id` is required.
     """
     listing = flow_explanation.list_flow_subjects(
         system_id, snapshot_id=snapshot_id, limit=limit
@@ -272,7 +284,21 @@ def explain_flow(
     A subject that does not resolve is NOT a 404: the response still carries
     the subject's own `resolution` and the sections it could still read. "This
     Flow has no observed spans" is an answer about the Flow, not a missing
-    endpoint.
+    endpoint. For a `runtime_flow` the response separates the two facts that
+    make it known -- `observation_state` (spans have been seen) and
+    `model_state` (Nodes are linked to it) -- so a Flow that is modelled but
+    has never run is explicable without ever reading as observed.
+
+    **`snapshot_id` is REQUIRED for `static_flow`** and its absence is a 422
+    with the finite code `static_flow_snapshot_required`. It used to fall back
+    to the newest `ready` snapshot, so the same URL described a different Flow
+    after every repository update -- neither reproducible nor able to show the
+    `stale_premise` open item, since the reading silently followed HEAD. The
+    pin is demanded rather than reported-and-defaulted because the caller
+    always has one: `GET /flow-explanation/subjects` returns each static
+    subject's `snapshot_id` (and the listing's own `snapshot_id` /
+    `snapshot_state`) with the menu it was chosen from. `runtime_flow` is
+    unaffected -- it carries no snapshot at all.
     """
     if subject_kind not in flow_explanation.FLOW_SUBJECT_KINDS:
         raise HTTPException(
@@ -284,6 +310,19 @@ def explain_flow(
         )
     if not (subject_ref or "").strip():
         raise HTTPException(status_code=422, detail="subject_ref must not be empty")
+    if subject_kind == "static_flow" and snapshot_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "static_flow_snapshot_required",
+                "message": (
+                    "static_flow には snapshot_id が必要です。固定していない "
+                    "Snapshot では、同じ URL が repository の更新後に別の Flow を"
+                    "指してしまいます。GET /flow-explanation/subjects が返す "
+                    "snapshot_id を指定してください。"
+                ),
+            },
+        )
 
     result = flow_explanation.build_flow_explanation(
         system_id,

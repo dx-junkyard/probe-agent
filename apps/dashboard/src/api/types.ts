@@ -6684,6 +6684,15 @@ export interface FlowSubjectOut {
   /** `not_applicable` for a runtime Flow — it carries no snapshot. That is a
    * different answer from `missing` (a static Flow with no snapshot). */
   snapshot_state: FlowFactState;
+  /** The two independent facts behind a runtime Flow's `resolution`:
+   * `observation_state` is whether spans have ever been seen under this
+   * `flow_id`, `model_state` whether any Node is currently linked to it. A
+   * Flow modelled onto Nodes but never run is `resolved` + `missing` +
+   * `present` — never render one of the pair as the other (#366). Both are
+   * `not_applicable` for a static Flow. Optional only because an older
+   * Control Server does not send them. */
+  observation_state?: FlowFactState;
+  model_state?: FlowFactState;
   snapshot_id: number | null;
   commit_sha: string | null;
   detail: string;
@@ -6853,6 +6862,10 @@ export interface FlowExplanationOut {
   degraded_detail: Record<string, string>;
 }
 
+/** A runtime Flow is listed when spans were observed under it OR a Node
+ * currently declares it belongs to it — the same disjunction #415 uses to
+ * decide a Flow subject is known. `trace_count: 0` is NOT what says "nothing
+ * ran here"; `observation_state` is. */
 export interface FlowRuntimeSubjectOut {
   subject_kind: "runtime_flow";
   subject_ref: string;
@@ -6861,6 +6874,9 @@ export interface FlowRuntimeSubjectOut {
   first_at: number | null;
   last_at: number | null;
   linked_node_count: number;
+  /** Optional only because an older Control Server does not send them. */
+  observation_state?: FlowFactState;
+  model_state?: FlowFactState;
 }
 
 export interface FlowStaticSubjectOut {

@@ -386,7 +386,8 @@ test("モードの割り当てには確認と理由が要り、ボタンだけ�
   await settled();
 
   // node スコープには参照が要る。入力するまで送信できない。
-  fireEvent.change(screen.getByLabelText("スコープ参照"), {
+  fireEvent.change(screen.getByLabelText("スコープ種別"), { target: { value: "node" } });
+  fireEvent.change(screen.getByLabelText(/スコープ参照/), {
     target: { value: "address-normalizer" },
   });
   fireEvent.click(screen.getByText("割り当てを記録する…"));
@@ -404,6 +405,9 @@ test("モードの割り当てには確認と理由が要り、ボタンだけ�
   const [path, body] = mockApi.post.mock.calls[0];
   expect(path).toBe("/execution-modes/assignments");
   expect(body.reason).toBe("誤変換の比較を 1 週間だけ試す");
+  // 種別と参照は必ず一致する。node スコープに Flow の参照は載らない。
+  expect(body.scope_kind).toBe("node");
+  expect(body.scope_ref).toBe("address-normalizer");
   // actor / decision_method は本文に載せない（サーバーが principal から取る）。
   expect(body).not.toHaveProperty("actor");
   expect(body).not.toHaveProperty("decision_method");
@@ -465,4 +469,272 @@ test("提案の必須項目が承認前の判断材料として表示される",
   }
   // 承認は実行許可ではない、を画面が言う。
   expect(screen.getByText(/承認は実行許可ではありません/)).toBeInTheDocument();
+});
+
+// ---------------------------------------------------------------------------
+// 割り当てフォームのスコープ整合性
+//
+// 実行モードの割り当ては LLM と候補実行の権限を与える人の判断なので、種別と
+// 参照が食い違うフォームは表示上の粗ではなく安全性の問題になる。開いた時点の
+// 組み合わせ、subject を選び直したとき、種別を切り替えたときの 3 つで、
+// 参照が別の種別のものになり得ないことを固定する。
+// ---------------------------------------------------------------------------
+
+const SECOND_RUNTIME_FLOW = {
+  subject_kind: "runtime_flow",
+  subject_ref: "search",
+  label: "search",
+  trace_count: 3,
+  first_at: 1_799_000_000,
+  last_at: 1_800_000_000,
+  linked_node_count: 0,
+};
+
+test("割り当てフォームは開いた時点で種別と参照が一致している", async () => {
+  routeGet();
+  mockApi.post.mockResolvedValue({});
+  await renderPage();
+  await settled();
+
+  // 表示中の subject は runtime_flow なので flow スコープ + その flow_id。
+  // node スコープに Flow の id が入った状態では決して開かない。
+  const kind = screen.getByLabelText("スコープ種別") as HTMLSelectElement;
+  expect(kind.value).toBe("flow");
+  const ref = screen.getByLabelText(/スコープ参照/) as HTMLInputElement;
+  expect(ref.value).toBe("runtime_flow:checkout");
+
+  // そのまま記録しても、送られるのは開いている種別と一致した参照。
+  fireEvent.click(screen.getByText("割り当てを記録する…"));
+  fireEvent.change(screen.getByLabelText(/理由（必須）/), {
+    target: { value: "表示中の Flow で候補比較を試す" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "割り当てを記録する" }));
+
+  await waitFor(() => expect(mockApi.post).toHaveBeenCalled());
+  const [, body] = mockApi.post.mock.calls[0];
+  expect(body.scope_kind).toBe("flow");
+  expect(body.scope_ref).toBe("runtime_flow:checkout");
+});
+
+test("Flow を選び直すとフォームの参照も追従し、前の Flow の参照は残らない", async () => {
+  routeGet({
+    subjects: {
+      ...SUBJECTS,
+      runtime_flows: [...SUBJECTS.runtime_flows, SECOND_RUNTIME_FLOW],
+    },
+  });
+  mockApi.post.mockResolvedValue({});
+  await renderPage();
+  await settled();
+
+  expect((screen.getByLabelText(/スコープ参照/) as HTMLInputElement).value).toBe(
+    "runtime_flow:checkout",
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: /search/ }));
+
+  await waitFor(() =>
+    expect((screen.getByLabelText(/スコープ参照/) as HTMLInputElement).value).toBe(
+      "runtime_flow:search",
+    ),
+  );
+
+  fireEvent.click(screen.getByText("割り当てを記録する…"));
+  fireEvent.change(screen.getByLabelText(/理由（必須）/), {
+    target: { value: "選び直した Flow で試す" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "割り当てを記録する" }));
+
+  await waitFor(() => expect(mockApi.post).toHaveBeenCalled());
+  const [, body] = mockApi.post.mock.calls[0];
+  expect(body.scope_ref).toBe("runtime_flow:search");
+});
+
+test("スコープ種別を変えると参照は持ち越されず、入力するまで記録できない", async () => {
+  routeGet();
+  await renderPage();
+  await settled();
+
+  fireEvent.change(screen.getByLabelText("スコープ種別"), { target: { value: "node" } });
+
+  const ref = screen.getByLabelText(/スコープ参照/) as HTMLInputElement;
+  expect(ref.value).toBe("");
+  expect(screen.getByText("割り当てを記録する…")).toBeDisabled();
+  expect(
+    screen.getByText(/スコープ参照を入力するまで記録できません/),
+  ).toBeInTheDocument();
+
+  // 別種別で入力した値は、種別を戻したときに持ち越されない。
+  fireEvent.change(ref, { target: { value: "address-normalizer" } });
+  fireEvent.change(screen.getByLabelText("スコープ種別"), { target: { value: "flow" } });
+  expect((screen.getByLabelText(/スコープ参照/) as HTMLInputElement).value).toBe(
+    "runtime_flow:checkout",
+  );
+  fireEvent.change(screen.getByLabelText("スコープ種別"), { target: { value: "node" } });
+  expect((screen.getByLabelText(/スコープ参照/) as HTMLInputElement).value).toBe("");
+});
+
+test("static_flow を選ぶと node スコープ・参照空欄で開く（static_flow はスコープになれない）", async () => {
+  routeGet();
+  await renderPage();
+  await settled();
+
+  fireEvent.click(screen.getByRole("button", { name: /http:POST:\/orders/ }));
+
+  await waitFor(() =>
+    expect((screen.getByLabelText("スコープ種別") as HTMLSelectElement).value).toBe(
+      "node",
+    ),
+  );
+  expect((screen.getByLabelText(/スコープ参照/) as HTMLInputElement).value).toBe("");
+  expect(screen.getByText("割り当てを記録する…")).toBeDisabled();
+});
+
+// ---------------------------------------------------------------------------
+// 入出力境界・依存関係・外部境界（#414 の受け入れ条件）
+// ---------------------------------------------------------------------------
+
+const STATIC_RESPONSIBILITY = {
+  edge_source: "static_call_graph",
+  node_order: ["create_order", "normalize", "external::database::db"],
+  edges: [
+    {
+      source: "create_order",
+      target: "normalize",
+      edge_kind: "call",
+      resolution: "resolved",
+      callee_name: "normalize",
+      line: 12,
+    },
+    {
+      source: "normalize",
+      target: "external::database::db",
+      edge_kind: "database",
+      resolution: "inferred",
+      callee_name: "execute",
+      line: 40,
+    },
+  ],
+  contracts: [
+    {
+      node_key: "address-normalizer",
+      state: "present",
+      mission: "住所文字列を正規化する",
+      scope: "国内住所のみ",
+      out_of_scope: "海外住所",
+      input_contract: { raw_address: "string" },
+      output_contract: { normalized: "string" },
+      side_effect_class: "pure",
+      trust_boundary: "internal",
+    },
+    // 契約が読めなかった Node。空の契約として描いてはならない。
+    { node_key: "order-writer", state: "unavailable" },
+  ],
+  external_boundaries: [
+    {
+      node_id: "external::database::db",
+      boundary_kind: "database",
+      qualified_name: "db.execute",
+    },
+  ],
+  entry_ref: "create_order",
+  entry_state: "present",
+  truncated: false,
+  diagnostics: [],
+};
+
+test("依存関係の辺が表形式で並び、入出力契約と外部境界が表示される", async () => {
+  routeGet({
+    explanation: {
+      ...EXPLANATION,
+      subject: {
+        ...EXPLANATION.subject,
+        subject_kind: "static_flow",
+        subject_ref: "http:POST:/orders",
+      },
+      responsibility: STATIC_RESPONSIBILITY,
+    },
+  });
+  await renderPage();
+
+  // 依存関係は読みやすい順序付きの表。件数は行数であってスコアではない。
+  const edgeHeading = await screen.findByText("依存関係（辺 2 件）");
+  const edgeSection = edgeHeading.closest("section")!;
+  const table = within(edgeSection).getByRole("table");
+  expect(within(table).getByText("create_order")).toBeInTheDocument();
+  expect(within(table).getAllByText("normalize").length).toBeGreaterThan(0);
+  expect(within(table).getByText("call / 関数呼び出し")).toBeInTheDocument();
+  expect(within(table).getByText("database / DB 境界")).toBeInTheDocument();
+  // inferred は resolved と別の文。推定の呼び先を確定として見せない。
+  expect(
+    within(table).getByText(/inferred（推定/),
+  ).toBeInTheDocument();
+  // 横に広い表はコンテナ側でスクロールする（本文は横スクロールしない）。
+  expect(table.parentElement?.className).toContain("overflow-x-auto");
+
+  // 入出力境界は Node ごとの契約として出る。
+  const contractHeading = screen.getByText("入出力境界（Node ごとの契約）");
+  const contractSection = contractHeading.closest("section")!;
+  expect(within(contractSection).getByText("raw_address: string")).toBeInTheDocument();
+  expect(within(contractSection).getByText("normalized: string")).toBeInTheDocument();
+  expect(within(contractSection).getByText("住所文字列を正規化する")).toBeInTheDocument();
+
+  // 読めなかった契約は「取得できませんでした」で、値は 1 つも描かない。
+  const unreadable = within(contractSection)
+    .getByText("order-writer")
+    .closest("li")!;
+  expect(
+    within(unreadable).getByText(/unavailable \/ 取得できませんでした/),
+  ).toBeInTheDocument();
+  expect(within(unreadable).queryByText("入力契約")).toBeNull();
+  expect(within(unreadable).queryByText(/記録された項目が 0 件です/)).toBeNull();
+
+  // 外部境界。
+  const boundaryHeading = screen.getByText("外部境界（1 件）");
+  const boundarySection = boundaryHeading.closest("section")!;
+  expect(within(boundarySection).getByText("database / DB")).toBeInTheDocument();
+  expect(within(boundarySection).getByText("db.execute")).toBeInTheDocument();
+});
+
+test("実行時の読みでは外部境界を「0 件」と言わず、測っていないと言う", async () => {
+  routeGet();
+  await renderPage();
+  await settled();
+
+  // runtime_span_parentage の読みは外部境界を produce しない。
+  expect(
+    screen.getByText("外部境界（この読みでは測っていません）"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/実行時の span 親子関係の読みには外部境界が含まれません/),
+  ).toBeInTheDocument();
+  // 一方で辺は実際に読んだうえで 0 件なので、0 件だと言い切る。
+  expect(
+    screen.getByText(/依存関係の辺が 0 件です。（取得できなかったのではありません）/),
+  ).toBeInTheDocument();
+});
+
+test("依存関係を読めなかったときは辺も外部境界も件数を出さない", async () => {
+  routeGet({
+    explanation: {
+      ...EXPLANATION,
+      responsibility: {
+        ...EXPLANATION.responsibility,
+        edge_source: "unavailable",
+        node_order: [],
+        entry_ref: null,
+        entry_state: "unavailable",
+      },
+    },
+  });
+  await renderPage();
+
+  expect(await screen.findByText("依存関係（辺 未取得）")).toBeInTheDocument();
+  expect(
+    screen.getByText("外部境界（この読みでは測っていません）"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/依存関係を取得できなかったため、外部境界も読めていません/),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/依存関係の辺が 0 件です/)).toBeNull();
 });

@@ -75,6 +75,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .db import get_conn
+#: Imported rather than re-spelled: a second copy of the mode-scope prefix
+#: would let this module and `execution_mode` disagree about whether
+#: `runtime_flow:checkout` and `checkout` are the same Flow.
+from .execution_mode import FLOW_SCOPE_PREFIX as _FLOW_SCOPE_PREFIX
 
 __all__ = [
     "FLOW_EXPLANATION_SCHEMA_VERSION",
@@ -210,6 +214,18 @@ class FlowSubject:
     #: `not_applicable` for a runtime Flow (it carries no snapshot), `present`
     #: for a resolved static Flow. Two different answers, not one blank.
     snapshot_state: str
+    #: The two independent facts behind a runtime Flow's `resolution`.
+    #: `observation_state` is `present` when at least one span has been
+    #: correlated under this `flow_id` and `missing` when none has;
+    #: `model_state` is `present` when at least one current
+    #: `evolution_node_link(link_kind='flow')` names it. A Flow can be
+    #: modelled without ever having run, and observed without any Node being
+    #: modelled onto it -- collapsing the pair into one word is the #366
+    #: defect §6.4's five-value vocabulary exists to avoid. Both are
+    #: `not_applicable` for a static Flow, whose Node membership is the
+    #: structural `Membership` reading instead.
+    observation_state: str = "not_applicable"
+    model_state: str = "not_applicable"
     snapshot_id: Optional[int] = None
     commit_sha: Optional[str] = None
     detail: str = ""
@@ -479,17 +495,33 @@ def list_flow_subjects(
                     LIMIT ?""",
                 (system_id, bounded),
             ).fetchall()
-            linked = {
-                row["target_ref"]: row["n"]
-                for row in conn.execute(
-                    """SELECT target_ref, COUNT(*) AS n FROM evolution_node_link
-                        WHERE system_id = ? AND link_kind = 'flow'
-                          AND superseded_by_id IS NULL
-                        GROUP BY target_ref""",
-                    (system_id,),
-                ).fetchall()
-            }
-            listing.runtime_flows = [
+            # A Flow is listable when spans were observed under it OR a Node
+            # currently declares it belongs to it -- the same disjunction
+            # #415's `flow_orchestration._flow_subject_known` uses. Listing
+            # only the observed ones let an experiment be proposed against a
+            # Flow the Dashboard could not offer, select, or explain. Both
+            # spellings of the link's `target_ref` (bare and the mode-scope
+            # `runtime_flow:` form) fold onto the bare `flow_id`, which is the
+            # subject identity.
+            linked: Dict[str, int] = {}
+            for row in conn.execute(
+                """SELECT target_ref, COUNT(DISTINCT node_id) AS n
+                     FROM evolution_node_link
+                    WHERE system_id = ? AND link_kind = 'flow'
+                      AND superseded_by_id IS NULL
+                    GROUP BY target_ref""",
+                (system_id,),
+            ).fetchall():
+                ref = (row["target_ref"] or "").strip()
+                if not ref:
+                    continue
+                if ref.startswith(_FLOW_SCOPE_PREFIX):
+                    ref = ref[len(_FLOW_SCOPE_PREFIX):]
+                if not ref:
+                    continue
+                linked[ref] = linked.get(ref, 0) + int(row["n"])
+
+            observed = [
                 {
                     "subject_kind": "runtime_flow",
                     "subject_ref": row["flow_id"],
@@ -498,9 +530,37 @@ def list_flow_subjects(
                     "first_at": row["first_at"],
                     "last_at": row["last_at"],
                     "linked_node_count": linked.get(row["flow_id"], 0),
+                    # Two facts, two fields: this one HAS been observed, and
+                    # separately it may or may not have Nodes modelled onto it.
+                    "observation_state": "present",
+                    "model_state": (
+                        "present" if linked.get(row["flow_id"]) else "missing"
+                    ),
                 }
                 for row in rows
             ]
+            seen = {item["subject_ref"] for item in observed}
+            # Modelled but never observed. `trace_count: 0` alongside
+            # `observation_state: "missing"` is deliberate -- the count is not
+            # what says "nothing ran here", the state is, and a reader must
+            # not have to infer one from the other. `first_at` / `last_at`
+            # stay `None` rather than being invented.
+            modelled = [
+                {
+                    "subject_kind": "runtime_flow",
+                    "subject_ref": ref,
+                    "label": ref,
+                    "trace_count": 0,
+                    "first_at": None,
+                    "last_at": None,
+                    "linked_node_count": count,
+                    "observation_state": "missing",
+                    "model_state": "present",
+                }
+                for ref, count in sorted(linked.items())
+                if ref not in seen
+            ]
+            listing.runtime_flows = (observed + modelled)[:bounded]
         except sqlite3.Error as exc:  # pragma: no cover - defensive
             listing.degraded_sections.append("runtime_flows")
             listing.degraded_detail["runtime_flows"] = f"{type(exc).__name__}: {exc}"
@@ -563,30 +623,72 @@ def _resolve_snapshot(
 # ---------------------------------------------------------------------------
 
 
+def _runtime_flow_link_count(
+    conn: sqlite3.Connection, system_id: int, flow_id: str
+) -> int:
+    """How many Nodes currently declare they belong to this runtime Flow.
+
+    The link's `target_ref` is normally the bare `flow_id`, but the mode-scope
+    form (`runtime_flow:<flow_id>`) is accepted too, exactly as
+    `flow_orchestration._flow_subject_known` accepts both -- otherwise the two
+    modules would disagree about the same row.
+    """
+    row = conn.execute(
+        """SELECT COUNT(DISTINCT node_id) AS n FROM evolution_node_link
+            WHERE system_id = ? AND link_kind = 'flow'
+              AND superseded_by_id IS NULL AND target_ref IN (?, ?)""",
+        (system_id, flow_id, _FLOW_SCOPE_PREFIX + flow_id),
+    ).fetchone()
+    return int(row["n"]) if row is not None else 0
+
+
 def _resolve_runtime_subject(
     conn: sqlite3.Connection, system_id: int, subject_ref: str
 ) -> FlowSubject:
-    """A runtime Flow exists when a span was correlated under its `flow_id`.
+    """A runtime Flow is KNOWN when a span was correlated under its `flow_id`
+    **or** a Node currently declares it belongs to it.
 
-    Same rule as `node_design._resolve_flow`: `trace_spans.flow_id` is the
-    canonical identity, and it carries no snapshot -- so `snapshot_state` is
-    `not_applicable` rather than a blank that reads like a failure.
+    That is #415's rule verbatim (`flow_orchestration._flow_subject_known`),
+    and the two must agree: a Flow that Nodes are modelled onto but which has
+    never run could be proposed against by #415 while this projection called
+    it `unresolved`, so the Dashboard could neither select nor explain the
+    very subject an experiment named.
+
+    The two facts stay APART in the response. `resolution` says whether the
+    subject is known at all; `observation_state` says whether anything has
+    ever run under it, and `model_state` whether any Node is modelled onto it.
+    A modelled-but-never-observed Flow is `resolved` + `missing` + `present`,
+    which is not the same claim as "spans have been seen here".
+
+    `trace_spans.flow_id` remains the identity (same rule as
+    `node_design._resolve_flow`), and it carries no snapshot -- so
+    `snapshot_state` is `not_applicable` rather than a blank that reads like a
+    failure.
     """
     row = conn.execute(
         "SELECT 1 FROM trace_spans WHERE system_id = ? AND flow_id = ? LIMIT 1",
         (system_id, subject_ref),
     ).fetchone()
+    observed = row is not None
+    link_count = _runtime_flow_link_count(conn, system_id, subject_ref)
+    if observed:
+        detail = ""
+    elif link_count:
+        detail = (
+            "Node がこの Flow に紐づいていますが、この flow_id の span は"
+            "まだ観測されていません。"
+        )
+    else:
+        detail = "この flow_id の span が観測されていません。"
     return FlowSubject(
         subject_kind="runtime_flow",
         subject_ref=subject_ref,
         label=subject_ref,
-        resolution="resolved" if row is not None else "unresolved",
+        resolution="resolved" if (observed or link_count) else "unresolved",
         snapshot_state="not_applicable",
-        detail=(
-            ""
-            if row is not None
-            else "この flow_id の span が観測されていません。"
-        ),
+        observation_state="present" if observed else "missing",
+        model_state="present" if link_count else "missing",
+        detail=detail,
     )
 
 
@@ -598,10 +700,33 @@ def _resolve_static_subject(
 ) -> Tuple[FlowSubject, Optional[sqlite3.Row], Optional[sqlite3.Row]]:
     """A static Flow is `code_entrypoints.entrypoint_id` on a PINNED snapshot.
 
-    `snapshot_id` is required by §6.2; without a resolvable snapshot the
-    subject is `unavailable` (we could not look), never `unresolved` (we
-    looked and it was not there).
+    `snapshot_id` is required by §6.2 and **is not defaulted here**. It used
+    to fall back to the newest `ready` snapshot, so the same subject ref
+    described a DIFFERENT Flow after every repository update: the reading was
+    not reproducible, and `open_items` could never report the `stale_premise`
+    it exists to report, because the answer silently followed HEAD instead of
+    lagging behind it. Without an explicit pin the subject is `unavailable`
+    (we could not look), never `unresolved` (we looked and it was not there).
+    The HTTP boundary refuses the same request outright with a finite code, so
+    a developer gets an instruction rather than an empty projection.
     """
+    if snapshot_id is None:
+        return (
+            FlowSubject(
+                subject_kind="static_flow",
+                subject_ref=subject_ref,
+                label=subject_ref,
+                resolution="unavailable",
+                snapshot_state="missing",
+                detail=(
+                    "static_flow には snapshot_id の指定が必要です。"
+                    "固定していない Snapshot では、同じ URL が repository の"
+                    "更新後に別の Flow を指してしまいます。"
+                ),
+            ),
+            None,
+            None,
+        )
     snapshot = _resolve_snapshot(conn, system_id, snapshot_id)
     if snapshot is None:
         return (
@@ -610,7 +735,10 @@ def _resolve_static_subject(
                 subject_ref=subject_ref,
                 label=subject_ref,
                 resolution="unavailable",
-                snapshot_state="missing" if snapshot_id is None else "unavailable",
+                # A pin WAS given and did not resolve (deleted, or another
+                # System's): we could not look, which is not the same answer
+                # as no pin at all -- that case returned above as `missing`.
+                snapshot_state="unavailable",
                 detail="Snapshot が解決できないため static flow を特定できません。",
             ),
             None,
@@ -1214,6 +1342,30 @@ def _build_open_items(
                 label="所属 Node を判定できません",
                 detail=membership.detail,
                 missing_state="unavailable",
+            )
+        )
+
+    # A Flow that Nodes are modelled onto but which has never run. It is a
+    # real, explicable subject (#415 may propose against it), so it is listed
+    # rather than hidden -- but every observation-derived reading below it is
+    # empty for a reason the reader must be told, not left to infer from a
+    # zero.
+    if (
+        subject.subject_kind == "runtime_flow"
+        and subject.resolution == "resolved"
+        and subject.observation_state == "missing"
+    ):
+        section.items.append(
+            OpenItem(
+                id=f"flow_observation:{subject.subject_ref}",
+                kind="missing_fact",
+                label="この Flow の実行がまだ観測されていません",
+                detail=(
+                    "Node はこの Flow に紐づいていますが、この flow_id の span が"
+                    "1 件もありません。観測されていないことは、一致していることでは"
+                    "ありません。"
+                ),
+                missing_state="missing",
             )
         )
 

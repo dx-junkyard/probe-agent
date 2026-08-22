@@ -869,8 +869,21 @@ def test_subjects_lists_both_kinds_separately(admin_client):
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert [item["subject_ref"] for item in body["runtime_flows"]] == [FLOW_ID]
-    assert body["runtime_flows"][0]["linked_node_count"] == 2
+    # A Flow that Nodes are modelled onto but which has never run IS a
+    # subject: #415 has always been able to propose against it, and a
+    # Dashboard that could not select or explain it made the two features
+    # disagree about what exists. `other-flow` is exactly that case.
+    by_ref = {item["subject_ref"]: item for item in body["runtime_flows"]}
+    assert set(by_ref) == {FLOW_ID, OTHER_FLOW_ID}
+    assert by_ref[FLOW_ID]["linked_node_count"] == 2
+
+    # Observed and modelled are two independent facts, never one word: the
+    # observed Flow has both, the modelled-only Flow has spans `missing` while
+    # its Node membership is `present`.
+    assert by_ref[FLOW_ID]["observation_state"] == "present"
+    assert by_ref[FLOW_ID]["model_state"] == "present"
+    assert by_ref[OTHER_FLOW_ID]["observation_state"] == "missing"
+    assert by_ref[OTHER_FLOW_ID]["model_state"] == "present"
     assert [item["subject_ref"] for item in body["static_flows"]] == [
         static["entrypoint_id"]
     ]

@@ -23,7 +23,16 @@ over it and owns no judgement of its own. Four boundary properties matter:
   observation exists to expose a configured/runtime disagreement, and the
   disagreement that matters most is a Node that ran in a MORE permissive mode
   than it was configured for. Gating the audit write on the configured mode
-  would hide exactly that case.
+  would hide exactly that case. Its `source` is nonetheless the route's own
+  (`control_server`), never the body's: an audit that accepts a caller's claim
+  about which path produced a reading is not an audit.
+
+- **A subject that does not exist is a 404 on every path.** `resolve`,
+  `divergence` and `observations` all refuse a `node_key` that names no
+  Evolution Node, and `resolve?capability=` keeps the §4.1 409 with
+  `denial_code: node_not_found`. Answering one of them with the fail-closed
+  `fixed` / `no_assignment` reading would have made "no such Node" and "a Node
+  nobody configured" the same displayed fact (#380/#366).
 
 No reasoning-model call happens on any of these paths, so the
 `get_conn()`-across-an-external-call hazard cannot arise here -- but the
@@ -232,6 +241,15 @@ def resolve_mode(
     and gets the same 409 body the gated write paths return. Without it the
     endpoint only reports, and a refusal is expressed as the capability simply
     being absent from `permitted_capabilities`.
+
+    A `node_key` that names no Evolution Node is a **404 either way**. It used
+    to be answered with `fixed` / `default` / `no_assignment` -- the same
+    reading a real Node nobody configured gets -- while `?capability=` refused
+    it with `node_not_found`. One subject must not read differently depending
+    on which question is asked, and "there is no such Node" is not the default
+    value of "which mode is this Node in" (#380). With `capability` the
+    refusal keeps its documented 409 + `denial_code: node_not_found` (§4.1),
+    because that is the gate's own answer shape.
     """
     with get_conn() as conn:
         try:
@@ -308,7 +326,14 @@ def get_divergence(
     system_id: int = Depends(get_system_id),
     _principal: Principal = Depends(require_user),
 ) -> ExecutionModeDivergenceListOut:
-    """Configured vs actually-observed mode, per Node (§5.2). Writes nothing."""
+    """Configured vs actually-observed mode, per Node (§5.2). Writes nothing.
+
+    A `node_key` that names no Evolution Node is a 404, not `unobserved`:
+    "there is no such Node" and "this Node has never been observed" are
+    different facts, and reporting the first as the second made a typo look
+    like a monitoring gap. Without `node_key` the listing is every Node of
+    this System, so the case cannot arise.
+    """
     with get_conn() as conn:
         try:
             if node_key:
@@ -444,6 +469,25 @@ def create_observation(
     Deliberately not gated on `observation_record` -- see the module
     docstring: gating the audit write on the configured mode would hide the
     very disagreement it exists to expose.
+
+    **`source` is decided here, never by the body.** Every observation written
+    over HTTP is `control_server`, because that is the only provenance this
+    path can attest. `sdk` -- a reading the SDK itself vouched for -- is
+    therefore NOT settable over HTTP: no current path attests it, and letting
+    a caller assert it would let anyone manufacture a `match` for a Node they
+    had merely described. That is not a stricter default; it is the same rule
+    as `actor` on an assignment (#337: provenance comes from the route and the
+    principal). When an SDK-attested path exists it will write the row through
+    its own authenticated boundary, not through this one.
+
+    `run_ref` is stored but NOT resolved -- nothing here matches it against a
+    canonical execution row -- so the response reports
+    `run_ref_state: "uncorroborated"` (or `"absent"`). It is the caller's
+    pointer, and an unverified pointer is never provenance (Principle 7).
+
+    A `node_key` that names no Evolution Node is a 404, the same answer
+    `resolve` and `divergence` now give: an observation about a subject that
+    does not exist is not an observation.
     """
     with get_conn() as conn:
         try:
@@ -454,7 +498,7 @@ def create_observation(
                 observed_mode=payload.observed_mode,
                 capability=payload.capability,
                 run_ref=payload.run_ref,
-                source=payload.source,
+                source=execution_mode.HTTP_OBSERVATION_SOURCE,
                 detail=payload.detail,
             )
         except execution_mode.ExecutionModeError as exc:

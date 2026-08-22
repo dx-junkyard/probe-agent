@@ -14,13 +14,16 @@
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { FlowExplanationNodeOut, FlowExplanationOut } from "@/api/types";
+import type {
+  FlowExplanationNodeOut,
+  FlowExplanationOut,
+  FlowResponsibilitySectionOut,
+} from "@/api/types";
 import { formatTimestamp } from "@/lib/utils";
 import {
   DIVERGENCE_DESCRIPTION,
   DIVERGENCE_LABEL,
   DIVERGENCE_TONE,
-  EDGE_SOURCE_LABEL,
   EXECUTION_MODE_DESCRIPTION,
   EXECUTION_MODE_LABEL,
   FACT_STATE_DESCRIPTION,
@@ -30,8 +33,12 @@ import {
   SUBJECT_KIND_DESCRIPTION,
   SUBJECT_KIND_SHORT_LABEL,
   SUBJECT_RESOLUTION_LABEL,
+  contractReadings,
+  describeDependencyReading,
   describeModeOrigin,
   describeShadowReadings,
+  externalBoundaryReadings,
+  flowEdgeReadings,
   groupOpenItems,
   nodeAxes,
   sectionAvailability,
@@ -185,6 +192,236 @@ function NodeCard({ node }: { node: FlowExplanationNodeOut }) {
   );
 }
 
+/** The Flow's responsibility, I/O boundary and Node dependencies (§6.3 item 2).
+ *
+ * #414's acceptance criteria ask for 入出力境界・構成 Node と依存関係, so all
+ * four of the server's readings are rendered: the ordered Node list, the
+ * `edges` dependency table, each Node's recorded input/output contract, and
+ * the external boundaries. The rules the rest of the screen follows hold here
+ * too — the client classifies nothing, every fact state keeps its own
+ * sentence, no value is printed for a state that is not `present`, and an
+ * empty list is 「0 件」 ONLY when the reading actually produced one.
+ */
+function ResponsibilitySection({
+  section,
+}: {
+  section: FlowResponsibilitySectionOut;
+}) {
+  const reading = describeDependencyReading(section);
+  const edges = flowEdgeReadings(section.edges);
+  const boundaries = externalBoundaryReadings(section.external_boundaries);
+  const contracts = contractReadings(section.contracts);
+
+  return (
+    <div className="space-y-4 text-sm">
+      <div className="space-y-1">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <StatusBadge
+            tone={
+              reading.edgeSource === "unavailable"
+                ? "destructive"
+                : reading.edgeSource === "not_applicable"
+                  ? "neutral"
+                  : "success"
+            }
+            text={`${reading.edgeSource} / ${reading.edgeSourceLabel}`}
+          />
+          <span className="text-muted-foreground">入口: {section.entry_ref ?? "—"}</span>
+          <FactStateBadge state={section.entry_state} />
+          {section.truncated && (
+            <StatusBadge tone="warning" text="打ち切られています（全件ではありません）" />
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground">{reading.edgeSourceDescription}</p>
+      </div>
+
+      <section>
+        <h3 className="text-sm font-semibold">構成 Node の並び</h3>
+        {section.node_order.length === 0 ? (
+          <EmptyNote>並びの記録が 0 件です。</EmptyNote>
+        ) : (
+          <ol className="mt-1 flex flex-wrap items-center gap-1 font-mono text-xs">
+            {section.node_order.map((nodeId, index) => (
+              <li key={`${index}:${nodeId}`} className="flex items-center gap-1">
+                <span className="rounded border px-1 py-0.5">
+                  {index + 1}. {nodeId}
+                </span>
+                {index < section.node_order.length - 1 && (
+                  <span aria-hidden="true">→</span>
+                )}
+              </li>
+            ))}
+          </ol>
+        )}
+      </section>
+
+      <section>
+        <h3 className="text-sm font-semibold">
+          依存関係（辺 {reading.edgesMeasured ? `${edges.length} 件` : "未取得"}）
+        </h3>
+        {!reading.edgesMeasured ? (
+          <p className="mt-1 text-xs text-muted-foreground">
+            {reading.edgeSourceDescription}
+          </p>
+        ) : edges.length === 0 ? (
+          <EmptyNote>依存関係の辺が 0 件です。（取得できなかったのではありません）</EmptyNote>
+        ) : (
+          <div className="mt-1 overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <caption className="sr-only">
+                {reading.edgeSourceLabel}から読んだ、構成 Node 間の依存関係の一覧
+              </caption>
+              <thead>
+                <tr className="border-b">
+                  <th scope="col" className="py-2 pr-2">#</th>
+                  <th scope="col" className="py-2 pr-2">呼び出し元</th>
+                  <th scope="col" className="py-2 pr-2">呼び出し先</th>
+                  <th scope="col" className="py-2 pr-2">種別</th>
+                  <th scope="col" className="py-2 pr-2">補足</th>
+                </tr>
+              </thead>
+              <tbody>
+                {edges.map((edge) => (
+                  <tr key={edge.key} className="border-b align-top">
+                    <td className="py-2 pr-2">{edge.position}</td>
+                    <td className="py-2 pr-2 font-mono">{edge.source}</td>
+                    <td className="py-2 pr-2 font-mono">{edge.target}</td>
+                    <td className="py-2 pr-2">{edge.edgeKindLabel}</td>
+                    <td className="py-2 pr-2 text-muted-foreground">
+                      {edge.detail || "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section>
+        <h3 className="text-sm font-semibold">入出力境界（Node ごとの契約）</h3>
+        {contracts.length === 0 ? (
+          <EmptyNote>契約の記録が 0 件です。</EmptyNote>
+        ) : (
+          <ul className="mt-1 space-y-2">
+            {contracts.map((contract) => (
+              <li key={contract.nodeKey} className="rounded border p-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono">{contract.nodeKey}</span>
+                  <FactStateBadge state={contract.state} />
+                </div>
+                {contract.state !== "present" ? (
+                  // A contract that could not be read is NOT an empty
+                  // contract: no field below is rendered for it (#380).
+                  <p className="mt-1 text-muted-foreground">
+                    {FACT_STATE_DESCRIPTION[contract.state]}
+                  </p>
+                ) : (
+                  <div className="mt-2 space-y-2">
+                    <dl className="grid gap-1 sm:grid-cols-2">
+                      <div>
+                        <dt className="text-muted-foreground">責務</dt>
+                        <dd>{contract.mission || "（記録なし）"}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-muted-foreground">対象範囲</dt>
+                        <dd>{contract.scope || "（記録なし）"}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-muted-foreground">対象外</dt>
+                        <dd>{contract.outOfScope || "（記録なし）"}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-muted-foreground">
+                          side effect / trust boundary
+                        </dt>
+                        <dd className="font-mono">
+                          {contract.sideEffectClass ?? "（記録なし）"} /{" "}
+                          {contract.trustBoundary ?? "（記録なし）"}
+                        </dd>
+                      </div>
+                    </dl>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {(
+                        [
+                          ["入力契約", contract.input],
+                          ["出力契約", contract.output],
+                        ] as const
+                      ).map(([label, fields]) => (
+                        <div key={label} className="rounded border p-2">
+                          <h4 className="font-semibold">{label}</h4>
+                          {fields.length === 0 ? (
+                            <EmptyNote>記録された項目が 0 件です。</EmptyNote>
+                          ) : (
+                            <ul className="mt-1 space-y-1 font-mono">
+                              {fields.map((field) => (
+                                <li key={field.name}>
+                                  {field.name}: {field.value}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section>
+        <h3 className="text-sm font-semibold">
+          外部境界
+          {reading.boundariesMeasured ? `（${boundaries.length} 件）` : "（この読みでは測っていません）"}
+        </h3>
+        {!reading.boundariesMeasured ? (
+          // 「0 件」 would claim a measurement that never ran (#366).
+          <p className="mt-1 text-xs text-muted-foreground">
+            {reading.boundaryUnmeasuredNote}
+          </p>
+        ) : boundaries.length === 0 ? (
+          <EmptyNote>外部境界は 0 件です。（取得できなかったのではありません）</EmptyNote>
+        ) : (
+          <ul className="mt-1 space-y-1 text-xs">
+            {boundaries.map((boundary) => (
+              <li
+                key={boundary.key}
+                className="flex flex-wrap items-center gap-2 rounded border p-2"
+              >
+                {boundary.boundaryKind ? (
+                  <StatusBadge
+                    tone="warning"
+                    text={`${boundary.boundaryKind} / ${boundary.boundaryKindLabel}`}
+                  />
+                ) : (
+                  <StatusBadge tone="neutral" text="境界種別の記録がありません" />
+                )}
+                <span className="font-mono">
+                  {boundary.qualifiedName || boundary.nodeId}
+                </span>
+                {boundary.qualifiedName && boundary.nodeId && (
+                  <span className="font-mono text-muted-foreground">
+                    {boundary.nodeId}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {section.diagnostics.length > 0 && (
+        <p className="text-xs text-muted-foreground">
+          診断: {section.diagnostics.join(" / ")}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function FlowProjectionPanel({
   explanation,
   isLoading,
@@ -323,62 +560,7 @@ export function FlowProjectionPanel({
         description="責務・入出力境界・構成 Node の依存関係。どの読み（実行時の親子関係か、pin した snapshot の call graph か）かを必ず明示します。"
       >
         {explanation.responsibility ? (
-          <div className="space-y-3 text-sm">
-            <div className="flex flex-wrap items-center gap-2 text-xs">
-              <StatusBadge
-                tone={
-                  explanation.responsibility.edge_source === "unavailable"
-                    ? "destructive"
-                    : explanation.responsibility.edge_source === "not_applicable"
-                      ? "neutral"
-                      : "success"
-                }
-                text={EDGE_SOURCE_LABEL[explanation.responsibility.edge_source]}
-              />
-              <span className="text-muted-foreground">
-                入口: {explanation.responsibility.entry_ref ?? "—"}
-              </span>
-              <FactStateBadge state={explanation.responsibility.entry_state} />
-              {explanation.responsibility.truncated && (
-                <StatusBadge tone="warning" text="打ち切られています" />
-              )}
-            </div>
-            {explanation.responsibility.node_order.length > 0 && (
-              <p className="font-mono text-xs">
-                {explanation.responsibility.node_order.join(" → ")}
-              </p>
-            )}
-            {explanation.responsibility.contracts.length === 0 ? (
-              <EmptyNote>契約の記録が 0 件です。</EmptyNote>
-            ) : (
-              <ul className="space-y-1">
-                {explanation.responsibility.contracts.map((contract) => (
-                  <li key={contract.node_key} className="rounded border p-2 text-xs">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-mono">{contract.node_key}</span>
-                      <FactStateBadge state={contract.state} />
-                    </div>
-                    {contract.state === "present" && (
-                      <div className="mt-1 text-muted-foreground">
-                        {contract.mission}
-                        {contract.side_effect_class
-                          ? ` / side effect: ${contract.side_effect_class}`
-                          : ""}
-                        {contract.trust_boundary
-                          ? ` / trust boundary: ${contract.trust_boundary}`
-                          : ""}
-                      </div>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            )}
-            {explanation.responsibility.diagnostics.length > 0 && (
-              <p className="text-xs text-muted-foreground">
-                診断: {explanation.responsibility.diagnostics.join(" / ")}
-              </p>
-            )}
-          </div>
+          <ResponsibilitySection section={explanation.responsibility} />
         ) : (
           <EmptyNote>このセクションの内容はありません。</EmptyNote>
         )}

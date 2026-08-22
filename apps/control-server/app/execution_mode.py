@@ -72,6 +72,7 @@ from .models import (
     ExecutionModeObservationSource,
     ExecutionModeReason,
     ExecutionModeRecordKind,
+    ExecutionModeRunRefState,
     ExecutionModeScopeKind,
     ExecutionModeScopeState,
     ExecutionModeSourceScope,
@@ -98,6 +99,9 @@ __all__ = [
     "EXECUTION_MODE_RECORD_KINDS",
     "ExecutionModeObservationSource",
     "EXECUTION_MODE_OBSERVATION_SOURCES",
+    "ExecutionModeRunRefState",
+    "EXECUTION_MODE_RUN_REF_STATES",
+    "HTTP_OBSERVATION_SOURCE",
     "MODE_CAPABILITIES",
     "MODE_PERMISSIVENESS",
     "FAIL_CLOSED_MODE",
@@ -155,6 +159,11 @@ EXECUTION_MODE_RECORD_KINDS: Tuple[str, ...] = get_args(ExecutionModeRecordKind)
 EXECUTION_MODE_OBSERVATION_SOURCES: Tuple[str, ...] = get_args(
     ExecutionModeObservationSource
 )
+EXECUTION_MODE_RUN_REF_STATES: Tuple[str, ...] = get_args(ExecutionModeRunRefState)
+
+#: The only `source` an HTTP caller can produce. `sdk` is a claim no current
+#: path can attest, so it is not settable over the API (§5.2 / #337).
+HTTP_OBSERVATION_SOURCE: str = "control_server"
 
 #: The COMPLETE mode -> capability table of §1.3. Deliberately a total
 #: mapping rather than a first-match rule list: every mode names exactly what
@@ -303,14 +312,22 @@ class ModeFacts:
 
     `node_reading` is `None` when no Node was named -- which is different from
     a named Node that has no assignment (that is a `ScopeReading` in state
-    `unset`). `node_exists` is likewise `None` when no Node was named.
+    `unset`).
+
+    There is deliberately NO `node_exists` field. It used to be recorded here
+    and then ignored by `resolve_execution_mode`, so the same missing Node
+    read as `default` / `fixed` through `resolve` and the projection while
+    `require_capability` refused it with `node_not_found` -- one subject, two
+    answers, and the read was the more permissive of the two. A fact set is no
+    longer built for a Node that does not exist at all: `load_mode_facts`
+    raises `ExecutionModeNotFoundError`, so "no such Node" and "a Node nobody
+    configured" can never collapse into one reading (#380).
     """
 
     system_reading: ScopeReading
     flow_readings: Tuple[ScopeReading, ...] = ()
     node_reading: Optional[ScopeReading] = None
     node_key: Optional[str] = None
-    node_exists: Optional[bool] = None
     #: Flow scope refs the CALLER named that the named Node does not actually
     #: belong to. A caller's claim about scope is never evidence of scope: the
     #: Flows that decide a Node's mode come only from
@@ -672,10 +689,23 @@ def load_mode_facts(
 ) -> ModeFacts:
     """Assemble `ModeFacts` from the database. Reads only -- NO judgement.
 
-    The Flow set is the union of the Flows explicitly named by the caller and
-    the Flows the named Node currently belongs to. Both are normalized to the
-    stored `runtime_flow:<flow_id>` form, and the result is sorted so the
-    resolver's tie-breaks are reproducible.
+    With a Node named, the Flow set is EXACTLY that Node's persisted
+    `evolution_node_link(link_kind='flow')` membership; a caller-supplied
+    `flow_refs` entry is a CLAIM checked against it and reported in
+    `rejected_flow_claims`, never an addition to it (EM-ADR-4). Without a
+    Node, the caller's refs ARE the subject. Everything is normalized to the
+    stored `runtime_flow:<flow_id>` form and sorted, so the resolver's
+    tie-breaks are reproducible.
+
+    A named Node that does not exist in this System raises
+    `ExecutionModeNotFoundError` rather than producing a fact set: the
+    resolver would otherwise answer for a subject that does not exist, and its
+    answer (`default` / `fixed`) is indistinguishable from a real Node nobody
+    has configured. The gate has always refused that subject
+    (`node_not_found`); this makes the READS refuse it too, so `resolve`,
+    `divergence` and the projection cannot disagree about the same Node. A
+    Node belonging to another System is not found here either, so cross-System
+    node keys stay unprobeable.
     """
     moment = time.time() if now is None else now
 
@@ -685,7 +715,6 @@ def load_mode_facts(
     )
 
     node_reading: Optional[ScopeReading] = None
-    node_exists: Optional[bool] = None
     refs: List[str] = []
     rejected: List[str] = []
 
@@ -694,15 +723,11 @@ def load_mode_facts(
     key = (node_key or "").strip()
     if key:
         node_row = _node_row(conn, system_id, key)
-        node_exists = node_row is not None
-        member_refs = (
-            _node_flow_scope_refs(conn, system_id, node_row["id"])
-            if node_row is not None
-            else []
-        )
-        # With a Node named, the Flow set is EXACTLY the Node's persisted
-        # membership. A caller-supplied ref is a claim to be checked against
-        # it, never an addition to it -- see `ModeFacts.rejected_flow_claims`.
+        if node_row is None:
+            raise ExecutionModeNotFoundError(
+                f"Evolution Node {key!r} not found for this System"
+            )
+        member_refs = _node_flow_scope_refs(conn, system_id, node_row["id"])
         refs.extend(member_refs)
         member_set = set(member_refs)
         rejected.extend(ref for ref in claimed if ref not in member_set)
@@ -728,7 +753,6 @@ def load_mode_facts(
         flow_readings=flow_readings,
         node_reading=node_reading,
         node_key=key or None,
-        node_exists=node_exists,
         rejected_flow_claims=tuple(sorted(set(rejected))),
         now=moment,
     )
@@ -754,7 +778,12 @@ def require_capability(
 
     1. the capability itself must be in the finite vocabulary;
     2. a named Node must resolve -- a gate whose subject cannot be found
-       permits nothing;
+       permits nothing. This check stays HERE, ahead of `load_mode_facts`
+       (which now refuses the same subject with `ExecutionModeNotFoundError`),
+       because §4.1 promises the gate answers with a 409 carrying
+       `denial_code: node_not_found` and a `null` decision. Letting the loader
+       raise instead would turn a documented refusal into a 404 and hide the
+       denial code the caller branches on;
     3. the mode is resolved by the canonical resolver;
     4. a reason code that is also a denial code (§4.1) is reported verbatim,
        so "a deadline elapsed" and "two Flows disagree" are distinguishable
@@ -1140,6 +1169,23 @@ def record_observation(
     forbids observation would hide exactly the case the reading is for.
     `observation_record` gates the runtime observation work itself, not this
     audit write.
+
+    `source` says WHICH PATH produced the reading, and it is the caller's
+    identity, never a claim it may choose. `control_server` means this process
+    wrote the row; `sdk` means an SDK-attested reading. No current path can
+    attest an SDK reading, so `sdk` is unreachable over HTTP -- the route
+    passes `control_server` unconditionally and
+    `ExecutionModeObservationIn` has no `source` field (#337's "provenance
+    comes from the route and the principal, never the body"). It stayed in the
+    stored vocabulary because the column already holds it and a future
+    attested path will need it, not because a request may select it.
+
+    `run_ref` is NOT validated: this layer has no canonical execution table to
+    match it against, and inventing a resolution rule for an arbitrary string
+    would be a guess. It is therefore stored and reported as what it is -- an
+    uncorroborated caller-supplied pointer (`observation_doc`'s
+    `run_ref_state`). An unverified pointer is not provenance (Principle 7),
+    so it must never read as if the run had been checked.
     """
     key = (node_key or "").strip()
     if not key:
@@ -1205,6 +1251,13 @@ def evaluate_divergence(
     success (#380's "an unreadable fact is never a fact's default value"), and
     collapsing the two would let a Node nobody has ever observed read as
     healthy.
+
+    A Node that does not exist gets none of the four readings: `load_mode_facts`
+    raises `ExecutionModeNotFoundError` (404 at the boundary). "There is no
+    such Node" and "this Node has never been observed" are different facts,
+    and reporting the first as `unobserved` would have made a typo look like a
+    monitoring gap -- the same conflation `resolve` used to make by answering
+    `no_assignment` for it.
     """
     key = (node_key or "").strip()
     if not key:
@@ -1368,13 +1421,22 @@ def assignment_doc(row: sqlite3.Row) -> Dict[str, Any]:
 
 
 def observation_doc(row: sqlite3.Row) -> Dict[str, Any]:
+    """One observation row, with the standing of its `run_ref` stated.
+
+    `run_ref_state` is DERIVED, never stored: `absent` when no pointer was
+    supplied, `uncorroborated` when one was. There is no third value, because
+    nothing on this path resolves the pointer -- and a reader must be able to
+    tell "this row cites a run" from "this row's citation was checked" (#366).
+    """
+    run_ref = row["run_ref"]
     return {
         "id": row["id"],
         "system_id": row["system_id"],
         "node_key": row["node_key"],
         "observed_mode": row["observed_mode"],
         "capability": row["capability"],
-        "run_ref": row["run_ref"],
+        "run_ref": run_ref,
+        "run_ref_state": "absent" if not run_ref else "uncorroborated",
         "source": row["source"],
         "detail": row["detail"],
         "recorded_at": row["recorded_at"],
