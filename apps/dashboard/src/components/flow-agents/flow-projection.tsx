@@ -1,0 +1,534 @@
+// Epic #412 / #414: the read-only Flow explanation.
+//
+// Six sections (§6.3), each degrading alone (§6.4). Per Node the five axes of
+// §1.2 are rendered as FIVE SEPARATE READINGS — there is no combined badge,
+// no average, no completion rate and no health score anywhere on this screen
+// (ADR-7 / #353). When the SDK policy mode and the execution mode both read
+// "shadow", or when only one of them does, both are shown with the sentence
+// that keeps them apart: they are two different facts (§1.2).
+//
+// The client decides none of this. Every axis value, every `*_state`, the
+// membership basis, the evidence ids and `degraded_sections` arrive already
+// decided by `GET /flow-explanation`.
+
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import type { FlowExplanationNodeOut, FlowExplanationOut } from "@/api/types";
+import { formatTimestamp } from "@/lib/utils";
+import {
+  DIVERGENCE_DESCRIPTION,
+  DIVERGENCE_LABEL,
+  DIVERGENCE_TONE,
+  EDGE_SOURCE_LABEL,
+  EXECUTION_MODE_DESCRIPTION,
+  EXECUTION_MODE_LABEL,
+  FACT_STATE_DESCRIPTION,
+  MEMBERSHIP_BASIS_LABEL,
+  MEMBERSHIP_STATE_LABEL,
+  PROPOSAL_STATUS_LABEL,
+  SUBJECT_KIND_DESCRIPTION,
+  SUBJECT_KIND_SHORT_LABEL,
+  SUBJECT_RESOLUTION_LABEL,
+  describeModeOrigin,
+  describeShadowReadings,
+  groupOpenItems,
+  nodeAxes,
+  sectionAvailability,
+} from "./model";
+import {
+  EmptyNote,
+  FactStateBadge,
+  ReadFailure,
+  SectionCard,
+  StatusBadge,
+} from "./shared";
+
+function NodeCard({ node }: { node: FlowExplanationNodeOut }) {
+  const axes = nodeAxes(node);
+  const shadow = describeShadowReadings(node);
+  const origin = describeModeOrigin(node.mode_source, node.mode_reason, node.mode_source_ref);
+
+  return (
+    <li className="rounded border p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="font-mono text-sm font-semibold">{node.node_key}</h3>
+        <span className="text-sm">{node.display_name}</span>
+        <StatusBadge
+          tone="neutral"
+          text={node.membership_basis}
+          title={MEMBERSHIP_BASIS_LABEL[node.membership_basis]}
+        />
+      </div>
+
+      <h4 className="mt-3 text-xs font-semibold">5 つの軸（互いから導出しません）</h4>
+      <div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+        {axes.map((axis) => (
+          <div key={axis.key} className="rounded border p-2">
+            <div className="text-xs text-muted-foreground">{axis.label}</div>
+            <div className="mt-1 text-sm font-medium">
+              {axis.state === "present" && axis.value !== null ? (
+                <span className="font-mono">{axis.value}</span>
+              ) : (
+                <FactStateBadge state={axis.state === "present" ? "missing" : axis.state} />
+              )}
+            </div>
+            {axis.state !== "present" && (
+              <div className="mt-1 text-xs text-muted-foreground">
+                {FACT_STATE_DESCRIPTION[axis.state]}
+              </div>
+            )}
+            <div className="mt-1 text-xs text-muted-foreground">{axis.hint}</div>
+          </div>
+        ))}
+      </div>
+
+      {shadow.note && (
+        <p className="mt-2 rounded border border-dashed p-2 text-xs text-muted-foreground">
+          <span className="font-semibold">shadow が 2 か所に出ています: </span>
+          {shadow.note}
+          <span className="mt-1 block font-mono">
+            実行モード = {shadow.executionMode}（
+            {EXECUTION_MODE_LABEL[shadow.executionMode]}） / SDK policy mode ={" "}
+            {shadow.sdkPolicyMode ?? "(値なし)"}
+          </span>
+          <span className="mt-1 block">
+            {EXECUTION_MODE_DESCRIPTION[shadow.executionMode]}
+          </span>
+        </p>
+      )}
+
+      <div className="mt-3 grid gap-2 md:grid-cols-2">
+        <div className="rounded border p-2 text-xs">
+          <div className="text-muted-foreground">実行モードの出所</div>
+          <div className="mt-1">
+            <StatusBadge
+              tone={origin.chosen ? "success" : "warning"}
+              text={origin.headline}
+            />
+          </div>
+          <div className="mt-1 text-muted-foreground">
+            {origin.reasonLabel}
+            {origin.sourceRef ? `（${origin.sourceRef}）` : ""}
+          </div>
+          <div className="mt-1 text-muted-foreground">{origin.nextAction}</div>
+          <div className="mt-1 font-mono text-muted-foreground">
+            mode_source={node.mode_source} / mode_reason={node.mode_reason}
+          </div>
+        </div>
+        <div className="rounded border p-2 text-xs">
+          <div className="text-muted-foreground">設定と実行の突き合わせ</div>
+          {node.mode_divergence ? (
+            <>
+              <div className="mt-1">
+                <StatusBadge
+                  tone={DIVERGENCE_TONE[node.mode_divergence]}
+                  text={`${node.mode_divergence} / ${DIVERGENCE_LABEL[node.mode_divergence]}`}
+                />
+              </div>
+              <div className="mt-1 text-muted-foreground">
+                {DIVERGENCE_DESCRIPTION[node.mode_divergence]}
+              </div>
+              <div className="mt-1 font-mono text-muted-foreground">
+                実効 = {node.execution_mode} / 観測 = {node.observed_mode ?? "(観測なし)"}
+              </div>
+            </>
+          ) : (
+            <EmptyNote>この Node には突き合わせの読みがありません。</EmptyNote>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-3 rounded border p-2 text-xs">
+        <div className="text-muted-foreground">観測カバレッジ</div>
+        {node.observation_state === "present" && node.observation ? (
+          <div className="mt-1 font-mono">
+            state={String((node.observation as Record<string, unknown>).state ?? "")} /{" "}
+            sample={String((node.observation as Record<string, unknown>).sample_count ?? "")}
+          </div>
+        ) : (
+          <div className="mt-1 flex flex-wrap items-center gap-2">
+            <FactStateBadge state={node.observation_state} />
+            <span className="text-muted-foreground">
+              {FACT_STATE_DESCRIPTION[node.observation_state]}
+            </span>
+          </div>
+        )}
+        <div className="mt-1 text-muted-foreground">
+          監視契約:{" "}
+          {node.monitoring_contract_declared ? "宣言されています" : "宣言されていません"}
+        </div>
+      </div>
+
+      {node.evidence.length > 0 && (
+        <details className="mt-3">
+          <summary className="cursor-pointer text-xs text-muted-foreground">
+            根拠 {node.evidence.length} 件を表示
+          </summary>
+          <ul className="mt-2 space-y-1 text-xs">
+            {node.evidence.map((item) => (
+              <li key={item.id} className="flex flex-wrap items-center gap-2">
+                <Badge variant="outline">{item.kind}</Badge>
+                <span className="font-mono">{item.id}</span>
+                <span className="text-muted-foreground">{item.label}</span>
+                {item.recorded_at && (
+                  <span className="text-muted-foreground">
+                    {formatTimestamp(item.recorded_at)}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </li>
+  );
+}
+
+export function FlowProjectionPanel({
+  explanation,
+  isLoading,
+  isError,
+  onRetry,
+}: {
+  explanation: FlowExplanationOut | undefined;
+  isLoading: boolean;
+  isError: boolean;
+  onRetry: () => void;
+}) {
+  if (isLoading) return <Skeleton className="h-64 w-full" />;
+  if (isError) {
+    return (
+      <Card>
+        <CardContent className="p-6">
+          <ReadFailure what="Flow の説明" onRetry={onRetry} />
+        </CardContent>
+      </Card>
+    );
+  }
+  if (!explanation) return null;
+
+  const subject = explanation.subject;
+  const purpose = sectionAvailability(explanation, "purpose");
+  const responsibility = sectionAvailability(explanation, "responsibility");
+  const nodes = sectionAvailability(explanation, "nodes");
+  const openItems = sectionAvailability(explanation, "open_items");
+  const experiments = sectionAvailability(explanation, "experiments");
+  const baseline = sectionAvailability(explanation, "baseline");
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader>
+          <CardTitle as="h2" className="flex flex-wrap items-center gap-2 text-base">
+            <StatusBadge
+              tone="neutral"
+              text={SUBJECT_KIND_SHORT_LABEL[subject.subject_kind]}
+            />
+            <span className="font-mono">{subject.subject_ref}</span>
+          </CardTitle>
+          <CardDescription>
+            {SUBJECT_KIND_DESCRIPTION[subject.subject_kind]}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2 text-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusBadge
+              tone={subject.resolution === "resolved" ? "success" : "warning"}
+              text={`${subject.resolution} / ${SUBJECT_RESOLUTION_LABEL[subject.resolution]}`}
+            />
+            <span className="text-xs text-muted-foreground">
+              snapshot: <FactStateBadgeInline state={explanation.subject.snapshot_state} />
+              {subject.snapshot_id ? ` #${subject.snapshot_id}` : ""}
+              {subject.commit_sha ? ` / commit ${subject.commit_sha.slice(0, 8)}` : ""}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusBadge
+              tone={explanation.membership.state === "resolved" ? "success" : "destructive"}
+              text={`${explanation.membership.state} / ${MEMBERSHIP_STATE_LABEL[explanation.membership.state]}`}
+            />
+            <span className="text-xs text-muted-foreground">
+              構成 Node {explanation.membership.node_keys.length} 件
+              {explanation.membership.state === "unavailable" &&
+                "（0 件という意味ではありません）"}
+            </span>
+          </div>
+          {subject.detail && (
+            <p className="text-xs text-muted-foreground">{subject.detail}</p>
+          )}
+          {explanation.degraded_sections.length > 0 && (
+            <p className="text-xs text-muted-foreground">
+              取得できなかったセクション: {explanation.degraded_sections.join(", ")}。
+              残りのセクションはそのまま表示しています。
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      <SectionCard
+        availability={purpose}
+        headingLevel="h2"
+        description="この Flow が支えている Purpose 要素 / Capability / Feature。上位の内容は保存せず、参照を読み取り時に解決しています。"
+      >
+        {explanation.purpose ? (
+          <div className="space-y-3 text-sm">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-muted-foreground">Purpose Chain:</span>
+              <FactStateBadge state={explanation.purpose.purpose_chain_state} />
+              {explanation.purpose.detail && (
+                <span className="text-xs text-muted-foreground">
+                  {explanation.purpose.detail}
+                </span>
+              )}
+            </div>
+            {(
+              [
+                ["Purpose 要素", explanation.purpose.purpose_elements],
+                ["Capability", explanation.purpose.capabilities],
+                ["Feature", explanation.purpose.features],
+              ] as const
+            ).map(([label, refs]) => (
+              <div key={label}>
+                <h3 className="text-xs font-semibold">{label}</h3>
+                {refs.length === 0 ? (
+                  <EmptyNote>リンクされているものが 0 件です。</EmptyNote>
+                ) : (
+                  <ul className="mt-1 space-y-1 text-sm">
+                    {refs.map((ref) => (
+                      <li key={ref.ref} className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-xs">{ref.ref}</span>
+                        <span>{ref.label}</span>
+                        {ref.resolution && (
+                          <Badge variant="outline">{ref.resolution}</Badge>
+                        )}
+                        <span className="text-xs text-muted-foreground">
+                          Node: {ref.node_keys.join(", ")}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <EmptyNote>このセクションの内容はありません。</EmptyNote>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        availability={responsibility}
+        headingLevel="h2"
+        description="責務・入出力境界・構成 Node の依存関係。どの読み（実行時の親子関係か、pin した snapshot の call graph か）かを必ず明示します。"
+      >
+        {explanation.responsibility ? (
+          <div className="space-y-3 text-sm">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <StatusBadge
+                tone={
+                  explanation.responsibility.edge_source === "unavailable"
+                    ? "destructive"
+                    : explanation.responsibility.edge_source === "not_applicable"
+                      ? "neutral"
+                      : "success"
+                }
+                text={EDGE_SOURCE_LABEL[explanation.responsibility.edge_source]}
+              />
+              <span className="text-muted-foreground">
+                入口: {explanation.responsibility.entry_ref ?? "—"}
+              </span>
+              <FactStateBadge state={explanation.responsibility.entry_state} />
+              {explanation.responsibility.truncated && (
+                <StatusBadge tone="warning" text="打ち切られています" />
+              )}
+            </div>
+            {explanation.responsibility.node_order.length > 0 && (
+              <p className="font-mono text-xs">
+                {explanation.responsibility.node_order.join(" → ")}
+              </p>
+            )}
+            {explanation.responsibility.contracts.length === 0 ? (
+              <EmptyNote>契約の記録が 0 件です。</EmptyNote>
+            ) : (
+              <ul className="space-y-1">
+                {explanation.responsibility.contracts.map((contract) => (
+                  <li key={contract.node_key} className="rounded border p-2 text-xs">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono">{contract.node_key}</span>
+                      <FactStateBadge state={contract.state} />
+                    </div>
+                    {contract.state === "present" && (
+                      <div className="mt-1 text-muted-foreground">
+                        {contract.mission}
+                        {contract.side_effect_class
+                          ? ` / side effect: ${contract.side_effect_class}`
+                          : ""}
+                        {contract.trust_boundary
+                          ? ` / trust boundary: ${contract.trust_boundary}`
+                          : ""}
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {explanation.responsibility.diagnostics.length > 0 && (
+              <p className="text-xs text-muted-foreground">
+                診断: {explanation.responsibility.diagnostics.join(" / ")}
+              </p>
+            )}
+          </div>
+        ) : (
+          <EmptyNote>このセクションの内容はありません。</EmptyNote>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        availability={nodes}
+        headingLevel="h2"
+        description="Node ごとに 5 軸を別々の読みとして表示します。合計・平均・完成度は作りません。"
+      >
+        {explanation.nodes === null ? (
+          <EmptyNote>このセクションの内容はありません。</EmptyNote>
+        ) : explanation.nodes.length === 0 ? (
+          <EmptyNote>この Flow に紐づく Node が 0 件です。</EmptyNote>
+        ) : (
+          <ul className="space-y-3">
+            {explanation.nodes.map((node) => (
+              <NodeCard key={node.node_key} node={node} />
+            ))}
+          </ul>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        availability={openItems}
+        headingLevel="h2"
+        description="現在の anomaly と、missing / unavailable / unmeasured / stale / not_applicable の一覧。5 つは別々の答えです。"
+      >
+        {explanation.open_items === null ? (
+          <EmptyNote>このセクションの内容はありません。</EmptyNote>
+        ) : explanation.open_items.items.length === 0 ? (
+          <EmptyNote>未解決事項は 0 件です。（取得できなかったのではありません）</EmptyNote>
+        ) : (
+          <div className="space-y-3">
+            {groupOpenItems(explanation.open_items.items).map((group) => (
+              <section key={group.kind}>
+                <h3 className="text-sm font-semibold">
+                  {group.label}（{group.items.length} 件）
+                </h3>
+                <ul className="mt-1 space-y-1">
+                  {group.items.map((item) => (
+                    <li key={item.id} className="rounded border p-2 text-xs">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{item.label}</span>
+                        {item.node_key && (
+                          <span className="font-mono text-muted-foreground">
+                            {item.node_key}
+                          </span>
+                        )}
+                        {item.missing_state && (
+                          <FactStateBadge state={item.missing_state} />
+                        )}
+                      </div>
+                      {item.detail && (
+                        <div className="mt-1 text-muted-foreground">{item.detail}</div>
+                      )}
+                      {item.evidence_ids.length > 0 && (
+                        <div className="mt-1 font-mono text-muted-foreground">
+                          根拠: {item.evidence_ids.join(", ")}
+                        </div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ))}
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        availability={experiments}
+        headingLevel="h2"
+        description="この Flow に紐づく実験提案の要約です。status は #415 の event fold であり、画面側では導出しません。"
+      >
+        {explanation.experiments === null ? (
+          <EmptyNote>このセクションの内容はありません。</EmptyNote>
+        ) : explanation.experiments.proposals.length === 0 ? (
+          <EmptyNote>この Flow の実験提案は 0 件です。</EmptyNote>
+        ) : (
+          <ul className="space-y-1 text-sm">
+            {explanation.experiments.proposals.map((proposal) => (
+              <li
+                key={proposal.proposal_id}
+                className="flex flex-wrap items-center gap-2 rounded border p-2"
+              >
+                <span className="font-mono text-xs">{proposal.proposal_key}</span>
+                <span>{proposal.title}</span>
+                {proposal.status && proposal.status_state === "present" ? (
+                  <StatusBadge
+                    tone="neutral"
+                    text={`${proposal.status} / ${PROPOSAL_STATUS_LABEL[proposal.status]}`}
+                  />
+                ) : (
+                  <FactStateBadge state={proposal.status_state} />
+                )}
+                <span className="text-xs text-muted-foreground">
+                  対象 Node: {proposal.target_node_keys.join(", ") || "—"}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        availability={baseline}
+        headingLevel="h2"
+        description="baseline 実装・rollback 先・人間承認の状態。承認は pin の存在から推測せず、それ自身の記録として読みます。"
+      >
+        {explanation.baseline === null ? (
+          <EmptyNote>このセクションの内容はありません。</EmptyNote>
+        ) : explanation.baseline.nodes.length === 0 ? (
+          <EmptyNote>対象の Node が 0 件です。</EmptyNote>
+        ) : (
+          <ul className="space-y-2">
+            {explanation.baseline.nodes.map((entry) => (
+              <li key={entry.node_key} className="rounded border p-2 text-xs">
+                <div className="font-mono text-sm">{entry.node_key}</div>
+                <div className="mt-1 grid gap-2 sm:grid-cols-3">
+                  <div>
+                    <div className="text-muted-foreground">安定実装</div>
+                    <FactStateBadge state={entry.stable_state} />
+                  </div>
+                  <div>
+                    <div className="text-muted-foreground">rollback 先</div>
+                    <FactStateBadge state={entry.rollback_state} />
+                  </div>
+                  <div>
+                    <div className="text-muted-foreground">人間承認</div>
+                    <FactStateBadge state={entry.approval_state} />
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </SectionCard>
+    </div>
+  );
+}
+
+function FactStateBadgeInline({
+  state,
+}: {
+  state: FlowExplanationOut["subject"]["snapshot_state"];
+}) {
+  return (
+    <span className="inline-flex align-middle">
+      <FactStateBadge state={state} />
+    </span>
+  );
+}

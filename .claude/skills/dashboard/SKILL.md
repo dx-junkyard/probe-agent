@@ -970,3 +970,48 @@ change.
 - UI copy follows the Issue #266 Japanese convention. `System`, `Trace`,
   `Snapshot`, `Capability`, `Flow`, `Evolution Node`, `Probe Cell`,
   `UX Journey`, `Requirement`, `Solution Design` stay in canonical form.
+
+## Flow・エージェント群 (issues #414 / #415, Epic #412)
+
+`docs/execution-modes.md` §6 と §7 が契約。Dashboard-only: エンドポイントも
+mutation も権限も追加しない。
+
+- **ページは `/flow-agents`**、`src/App.tsx` に登録し、サイドバーの既存
+  フェーズグループに 1 つだけ nav item を置く。`/evolution-nodes` は Node
+  単体の inspector、この画面は Flow 単位の集約であり、両者を統合しない。
+- **集約・分類・並び順は `components/flow-agents/model.ts` にだけ置く**
+  (React も API client も持たない純粋モジュール。`components/ux-design/model.ts`
+  と同じ規律)。表示コンポーネントはその出力を描くだけで再導出しない。
+- **クライアントは実効モード・提案の status・section の可用性・Node の各軸を
+  決して再計算しない。** 実行モードは `app/execution_mode.py` の 10 行表、
+  status は #415 の event fold、可用性は `degraded_sections` が正本。拒否は
+  サーバーの有限コード(`denial_code` / lifecycle `code`)をそのまま出す。
+  `ApiError.denialCode` が §4.1 の 409 本文用、`ApiError.code` が #415 の
+  lifecycle 409 / 422 用で、2 つを 1 つのフィールドに畳まない。
+- **5 軸は 5 つの読み**(`nodeAxes`)。合成 badge・平均・完成度・confidence
+  percentage を作らない (ADR-7 / #353)。とくに **SDK policy の `shadow` と
+  実行モードの `shadow` は別の事実**で、片方だけが `shadow` の状態は正当。
+  `describeShadowReadings` が両方の読みと注記を返し、1 つの badge に
+  まとめない。
+- **`missing` / `unavailable` / `unmeasured` / `stale` / `not_applicable` は
+  5 つの別の文**(`FACT_STATE_LABEL` / `FACT_STATE_DESCRIPTION`)。`present`
+  を含めて 6 つの文言を共有させない。「0 件」と「取得できませんでした」も
+  別の文 (#356)。色だけで状態を示さず、必ずテキストの目印を添える。
+- **`mode_source: "default"`(既定の `fixed`)と `system_assignment`
+  (人が `fixed` を選んだ)は別の文** (§4.4)。`describeModeOrigin` が
+  「既定(誰も選んでいません)」/「明示的に選択されています」/「安全側に
+  倒した結果です」を返す。期限切れの 3 コードも別々の文・別々の次の操作。
+- **degraded section は表示を落として理由を言う**。推測値を代入せず、1 つの
+  section の失敗が他 section やページ全体を空にしない。subject 一覧も
+  `runtime_flows` / `static_flows` を種別ごとに degraded 判定する。
+- **runtime_flow と static_flow を 1 つの「Flow 一覧」にまとめない** (§2.1)。
+  実行モードのスコープになれるのは runtime_flow だけ(EM-ADR-1)であり、
+  `flow` scope の参照は常に前置詞付き(`flowScopeRef`)。
+- **人の判断を自動に見せない** (§10)。モードの割り当て・revoke、提案の
+  承認・却下・撤回はすべて確認ダイアログを挟み、API が要求する場面では理由を
+  必須にする。`actor` / `decision_method` はリクエスト本文に載せない
+  (サーバーが認証済み principal から取る)。承認は実行許可ではないことを
+  画面に明記する(承認 + 実効モードの 2 つの独立した事実)。
+- UI copy は Issue #266 の日本語規約に従う。`System` / `Trace` / `Flow` /
+  `Node` / `Capability` / `Snapshot`、実行モード名(`fixed` / `observe` /
+  `propose` / `shadow`)、capability 名、有限コード名は canonical のまま。

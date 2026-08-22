@@ -41,10 +41,20 @@ export class ApiError extends Error {
   status: number;
   detail: string;
   code?: string;
+  /** Epic #412 §4.1: a refused capability gate returns its finite code as
+   * `denial_code` (never `code`), because the same 409 status is also used by
+   * #415's lifecycle refusal, which carries `code`. The two refusals are
+   * deliberately different bodies -- approval and execution mode are
+   * independent facts (§7.5) and the developer's next action differs -- so
+   * both are surfaced here rather than merged into one field. */
+  denialCode?: string;
   nextAction?: string;
   constructor(status: number, detail: unknown) {
     const structured = detail && typeof detail === "object"
-      ? detail as { message?: unknown; code?: unknown; next_action?: unknown }
+      ? detail as {
+          message?: unknown; code?: unknown; next_action?: unknown;
+          denial_code?: unknown;
+        }
       : null;
     const message = typeof structured?.message === "string"
       ? structured.message
@@ -55,6 +65,9 @@ export class ApiError extends Error {
     this.status = status;
     this.detail = message;
     this.code = typeof structured?.code === "string" ? structured.code : undefined;
+    this.denialCode = typeof structured?.denial_code === "string"
+      ? structured.denial_code
+      : undefined;
     this.nextAction = typeof structured?.next_action === "string"
       ? structured.next_action
       : undefined;

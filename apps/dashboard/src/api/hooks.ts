@@ -39,6 +39,10 @@ import type {
   SolutionDesignTargetLinkCreateRequest, SolutionDesignTargetLinkOut,
   SolutionDesignOptionDecisionCreateRequest, SolutionDesignDecisionOut,
   SolutionDesignChangeOriginsOut, SolutionDesignHandoffOut,
+  ExecutionModeProjectionOut, ExecutionModeAssignmentOut, ExecutionModeAssignRequest,
+  ExecutionModeRevokeRequest, ExecutionModeDivergenceListOut, ExecutionModeScopeKind,
+  FlowSubjectListOut, FlowSubjectKind, FlowExplanationOut,
+  FlowExperimentListOut, FlowExperimentProposalOut, FlowExperimentDecisionRequest,
   InterviewSessionOut, InterviewSessionDetailOut, InterviewContextPack,
   InterviewCapabilityGraphOut, InterviewConfirmUnderstandingRequest,
   InterviewDialogueTurnOut, InterviewProposalDecisionOut,
@@ -4098,5 +4102,148 @@ export function useSolutionDesignHandoff(designKey: string | null) {
     queryFn: () =>
       api.get<SolutionDesignHandoffOut>(`/solution-designs/${encodeURIComponent(designKey ?? "")}/handoff`),
     enabled: designKey !== null,
+  });
+}
+
+// --- Execution modes / Flow agents (Epic #412, #413/#414/#415) --------------
+//
+// Every GET below is a read-only projection the server recomputes on each
+// call: `GET /flow-explanation`, `GET /execution-modes` and
+// `GET /flow-experiments` write nothing, so opening the screen can never
+// change a mode, a proposal's lifecycle or an Interview position (#380).
+//
+// The mutations are the human decisions of §10 (assign / revoke / approve /
+// reject / withdraw). `actor` and `decision_method` are deliberately absent
+// from every request body — the server takes the name from the authenticated
+// principal and fixes `decision_method` to `manual` (#337). A refusal comes
+// back as an `ApiError` carrying the server's own finite code
+// (`ExecutionModeDenialOut.denial_code` or #415's lifecycle code); the client
+// holds no copy of either gate and never pre-empts one.
+
+export function useFlowSubjects(snapshotId?: number | null) {
+  return useQuery<FlowSubjectListOut>({
+    queryKey: sysKey("flow-subjects", snapshotId ?? null),
+    queryFn: () =>
+      api.get<FlowSubjectListOut>(
+        `/flow-explanation/subjects${snapshotId ? `?snapshot_id=${snapshotId}` : ""}`,
+      ),
+  });
+}
+
+/** One Flow's §6.3 projection. A subject that does not resolve is NOT an
+ * error — the response still carries its `resolution` and whatever sections
+ * could be read, so the query stays successful and the page reports the
+ * subject's own state. */
+export function useFlowExplanation(
+  subjectKind: FlowSubjectKind | null,
+  subjectRef: string | null,
+  snapshotId?: number | null,
+) {
+  return useQuery<FlowExplanationOut>({
+    queryKey: sysKey("flow-explanation", subjectKind, subjectRef, snapshotId ?? null),
+    queryFn: () => {
+      const params = new URLSearchParams({
+        subject_kind: subjectKind ?? "",
+        subject_ref: subjectRef ?? "",
+      });
+      if (snapshotId) params.set("snapshot_id", String(snapshotId));
+      return api.get<FlowExplanationOut>(`/flow-explanation?${params.toString()}`);
+    },
+    enabled: subjectKind !== null && !!subjectRef,
+  });
+}
+
+export function useExecutionModeProjection() {
+  return useQuery<ExecutionModeProjectionOut>({
+    queryKey: sysKey("execution-mode-projection"),
+    queryFn: () => api.get<ExecutionModeProjectionOut>("/execution-modes"),
+  });
+}
+
+export function useExecutionModeAssignments(scopeKind?: ExecutionModeScopeKind | null) {
+  return useQuery<ExecutionModeAssignmentOut[]>({
+    queryKey: sysKey("execution-mode-assignments", scopeKind ?? null),
+    queryFn: () =>
+      api.get<ExecutionModeAssignmentOut[]>(
+        `/execution-modes/assignments${scopeKind ? `?scope_kind=${scopeKind}` : ""}`,
+      ),
+  });
+}
+
+export function useExecutionModeDivergence() {
+  return useQuery<ExecutionModeDivergenceListOut>({
+    queryKey: sysKey("execution-mode-divergence"),
+    queryFn: () => api.get<ExecutionModeDivergenceListOut>("/execution-modes/divergence"),
+  });
+}
+
+function invalidateExecutionModes(qc: ReturnType<typeof useQueryClient>) {
+  qc.invalidateQueries({ queryKey: ["execution-mode-projection"] });
+  qc.invalidateQueries({ queryKey: ["execution-mode-assignments"] });
+  qc.invalidateQueries({ queryKey: ["execution-mode-divergence"] });
+  // The Flow projection embeds every Node's effective mode, so a changed
+  // assignment makes it stale too.
+  qc.invalidateQueries({ queryKey: ["flow-explanation"] });
+}
+
+export function useAssignExecutionMode() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ExecutionModeAssignRequest) =>
+      api.post<ExecutionModeAssignmentOut>("/execution-modes/assignments", body),
+    onSuccess: () => invalidateExecutionModes(qc),
+  });
+}
+
+/** Ending an assignment explicitly. Deliberately NOT the same as letting an
+ * `effective_until` window elapse: a revocation resumes normal inheritance,
+ * an elapsed window clamps to `fixed` because nobody has decided what happens
+ * next (EM-ADR-2). */
+export function useRevokeExecutionModeAssignment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { assignmentId: number; reason: string }) =>
+      api.post<ExecutionModeAssignmentOut>(
+        `/execution-modes/assignments/${vars.assignmentId}/revoke`,
+        { reason: vars.reason } satisfies ExecutionModeRevokeRequest,
+      ),
+    onSuccess: () => invalidateExecutionModes(qc),
+  });
+}
+
+export function useFlowExperiments(flowSubjectRef?: string | null) {
+  return useQuery<FlowExperimentListOut>({
+    queryKey: sysKey("flow-experiments", flowSubjectRef ?? null),
+    queryFn: () =>
+      api.get<FlowExperimentListOut>(
+        `/flow-experiments${
+          flowSubjectRef
+            ? `?flow_subject_ref=${encodeURIComponent(flowSubjectRef)}`
+            : ""
+        }`,
+      ),
+  });
+}
+
+/** Approve / reject / withdraw — three human decisions on one endpoint shape.
+ * Approval permits nothing on its own: an execution additionally needs the
+ * target Nodes' effective mode to permit `candidate_execution`, and the two
+ * facts are never derived from each other (§7.5). */
+export function useFlowExperimentDecision() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: {
+      proposalId: number;
+      action: "approve" | "reject" | "withdraw";
+      reason: string;
+    }) =>
+      api.post<FlowExperimentProposalOut>(
+        `/flow-experiments/${vars.proposalId}/${vars.action}`,
+        { reason: vars.reason } satisfies FlowExperimentDecisionRequest,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["flow-experiments"] });
+      qc.invalidateQueries({ queryKey: ["flow-explanation"] });
+    },
   });
 }

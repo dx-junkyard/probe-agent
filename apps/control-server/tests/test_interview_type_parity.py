@@ -171,6 +171,40 @@ FINITE_TYPE_NAMES = (
     "SolutionLinkState",
     "SolutionLinkStaleReason",
     "SolutionHandoffState",
+    # Epic #412 (Issues #413/#414/#415): the execution-mode axis, the Flow
+    # projection and the experiment orchestrator. The Dashboard branches on
+    # every one of these -- the mode reason decides the next-action sentence,
+    # the fact state decides which of five distinct "we do not have this"
+    # displays renders, and the proposal status decides which human decision
+    # is offered. A member missing on one side type-checks alone and only
+    # becomes wrong at the moment it is reached.
+    "ExecutionMode",
+    "ExecutionModeScopeKind",
+    "ExecutionModeScopeState",
+    "ExecutionCapability",
+    "ExecutionModeReason",
+    "ExecutionModeSourceScope",
+    "ExecutionModeDenialCode",
+    "ExecutionModeDivergence",
+    "ExecutionModeRecordKind",
+    "ExecutionModeObservationSource",
+    "FlowSubjectKind",
+    "FlowSubjectResolution",
+    "FlowFactState",
+    "FlowMembershipState",
+    "FlowMembershipBasis",
+    "FlowEvidenceKind",
+    "FlowOpenItemKind",
+    "FlowEdgeSource",
+    "FlowComparisonScope",
+    "FlowIsolationStrategy",
+    "FlowEvaluationLevel",
+    "FlowExperimentTargetRole",
+    "FlowExperimentEventKind",
+    "FlowExperimentStatus",
+    "FlowExperimentExecutionKind",
+    "FlowExecutionRefResolution",
+    "FlowExperimentActionKind",
 )
 
 
