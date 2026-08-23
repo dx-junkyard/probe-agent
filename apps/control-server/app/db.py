@@ -7265,6 +7265,120 @@ CREATE TABLE IF NOT EXISTS stakeholder_view_preference (
 CREATE INDEX IF NOT EXISTS idx_stakeholder_view_preference_system
     ON stakeholder_view_preference (system_id, created_by);
 
+-- ---------------------------------------------------------------------------
+-- Journey Service Blueprint (Epic #418, Issue #423). docs/stakeholder-value-
+-- network.md §8.2 -- three additive link tables owned entirely by #423.
+-- Content is NEVER copied: each row stores a stable `target_ref`/key plus a
+-- `captured_digest`, resolved fresh against its one canonical source at read
+-- time (`app/journey_blueprint.py`), exactly the discipline
+-- `ux_requirement_step_link` already follows one table over. Like that
+-- table, these store the JOURNEY STEP's stable `step_key` (never a
+-- `ux_journey_step.id`), so a link survives the Journey moving to a new
+-- revision and reports stale/unresolved instead of silently vanishing.
+-- ---------------------------------------------------------------------------
+
+-- journey_step_stakeholder_link: which Stakeholder(s) act, and in which
+-- role(s), at one Journey Step (§8.1 lane 1). Several Stakeholders -- and
+-- several roles for the same Stakeholder -- on ONE Step is normal and is
+-- the point, so no uniqueness constraint narrows that.
+-- `captured_digest` is the Stakeholder's OWN `content_digest` at link time
+-- (never a copy of its content, invariant 2) so a later Stakeholder
+-- revision can degrade this row's read-time `recheck_state` without
+-- mutating the row itself (mirrors `stakeholder_role_assignment`'s own
+-- `captured_digest` one table over).
+CREATE TABLE IF NOT EXISTS journey_step_stakeholder_link (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    journey_id        INTEGER NOT NULL,
+    step_key          TEXT NOT NULL,
+    stakeholder_id    INTEGER NOT NULL,
+    stakeholder_key   TEXT NOT NULL,
+    role              TEXT NOT NULL CHECK (role IN
+                          ('actor', 'beneficiary', 'payer', 'operator',
+                           'approver', 'supplier', 'regulator', 'observer')),
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    FOREIGN KEY (stakeholder_id) REFERENCES stakeholder (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES journey_step_stakeholder_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_journey_step_stakeholder_link_step
+    ON journey_step_stakeholder_link (system_id, journey_id, step_key);
+
+CREATE INDEX IF NOT EXISTS idx_journey_step_stakeholder_link_stakeholder
+    ON journey_step_stakeholder_link (system_id, stakeholder_id, id DESC);
+
+-- journey_step_delivery_link: the frontstage/backstage/support/external
+-- delivery mechanism for one Journey Step (§8.1 lanes 3-6). `target_kind`
+-- is either the `not_applicable` sentinel -- the developer's explicit,
+-- structural "this delivery kind does not apply to this Step" fact, never
+-- auto-filled -- or one of `ux_requirement` / `stakeholder` /
+-- `value_exchange` (`app/models.py`'s `BlueprintDeliveryTargetKind`).
+-- Backstage reaches Flow/Node ONLY through the target Requirement's
+-- existing #405 Solution Design links (`app/journey_blueprint.py`); this
+-- table never stores a Flow/Node reference directly (§5.2's "no second
+-- path"). `target_ref` + `captured_digest` only -- never a copy of the
+-- target's content (invariant 2).
+CREATE TABLE IF NOT EXISTS journey_step_delivery_link (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    journey_id        INTEGER NOT NULL,
+    step_key          TEXT NOT NULL,
+    delivery_kind     TEXT NOT NULL CHECK (delivery_kind IN
+                          ('frontstage', 'backstage', 'support', 'external')),
+    target_kind       TEXT NOT NULL CHECK (target_kind IN
+                          ('ux_requirement', 'stakeholder', 'value_exchange', 'not_applicable')),
+    target_ref        TEXT NOT NULL DEFAULT '',
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES journey_step_delivery_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_journey_step_delivery_link_step
+    ON journey_step_delivery_link (system_id, journey_id, step_key, delivery_kind);
+
+-- journey_step_exchange_link: which Value Exchange one Journey Step
+-- delivers (§8.1 lane 2's touchpoint source, and lane 8's observed-evidence
+-- source). A Step may deliver more than one Exchange (e.g. an `experience`
+-- and an `information` exchange at the same interaction), so no uniqueness
+-- constraint narrows that either.
+CREATE TABLE IF NOT EXISTS journey_step_exchange_link (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    journey_id        INTEGER NOT NULL,
+    step_key          TEXT NOT NULL,
+    exchange_id       INTEGER NOT NULL,
+    exchange_key      TEXT NOT NULL,
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    FOREIGN KEY (exchange_id) REFERENCES value_exchange (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES journey_step_exchange_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_journey_step_exchange_link_step
+    ON journey_step_exchange_link (system_id, journey_id, step_key);
+
 """
 
 

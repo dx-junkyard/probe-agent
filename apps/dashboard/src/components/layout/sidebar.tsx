@@ -3,7 +3,7 @@ import {
   LayoutDashboard, GitBranch, Map, Crosshair, FlaskConical,
   Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight, MessageSquare,
   Workflow, Network, MessageSquareText, Brain, GitFork, Filter,
-  LifeBuoy, BookMarked, GitMerge, Beaker, Bot, Layers, PenTool,
+  LifeBuoy, BookMarked, GitMerge, Beaker, Bot, Layers, PenTool, Rows3,
 } from "lucide-react";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -73,6 +73,10 @@ const NAV_GROUPS: NavGroup[] = [
       {
         to: "/stakeholder-value-network", icon: Users, label: "Stakeholder Value Network",
         subtitle: "当事者とValue Exchangeの追跡",
+      },
+      {
+        to: "/journey-blueprint", icon: Rows3, label: "Journey Service Blueprint",
+        subtitle: "Step × 9レーンのサービスブループリント",
       },
     ],
   },

@@ -207,6 +207,15 @@ FINITE_TYPE_NAMES = (
     "FlowExperimentExecutionKind",
     "FlowExecutionRefResolution",
     "FlowExperimentActionKind",
+    # Epic #418 (Issue #423): the Journey Service Blueprint's finite
+    # vocabularies. Same drift risk as the families above -- the Dashboard
+    # branches on lane state and diff change kind today, but a new value
+    # would type-check on one side alone.
+    "BlueprintLaneKind",
+    "BlueprintLaneState",
+    "JourneyDeliveryKind",
+    "BlueprintDeliveryTargetKind",
+    "BlueprintDiffChangeKind",
 )
 
 
