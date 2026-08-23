@@ -6523,6 +6523,12 @@ export type ExecutionModeRecordKind = "assign" | "revoke";
 
 export type ExecutionModeObservationSource = "control_server" | "sdk";
 
+/** The standing of an observation's `run_ref`. Derived, never stored:
+ * nothing on this path resolves the pointer against a canonical execution
+ * row, so there is no `resolved` value to report. "This row cites a run" and
+ * "this row's citation was checked" must stay distinguishable (#366). */
+export type ExecutionModeRunRefState = "absent" | "uncorroborated";
+
 export interface ExecutionModeScopeReadingOut {
   scope_kind: ExecutionModeScopeKind;
   scope_ref: string;
@@ -6588,6 +6594,12 @@ export interface ExecutionModeDivergenceOut {
   observed_mode: ExecutionMode | null;
   observed_at: number | null;
   last_assignment_at: number | null;
+  /** A SEPARATE axis from `divergence`: the first says whether the reading
+   * agrees with the configuration, these say whether the reading was
+   * measured. No current path attests a runtime mode, so a `match` can be
+   * agreement with a value a human reported. Both null for `unobserved`. */
+  observation_source: ExecutionModeObservationSource | null;
+  run_ref_state: ExecutionModeRunRefState | null;
 }
 
 export interface ExecutionModeDivergenceListOut {
@@ -6608,6 +6620,8 @@ export interface ExecutionModeNodeProjectionOut {
   divergence: ExecutionModeDivergence;
   observed_mode: ExecutionMode | null;
   observed_at: number | null;
+  observation_source: ExecutionModeObservationSource | null;
+  run_ref_state: ExecutionModeRunRefState | null;
 }
 
 export interface ExecutionModeProjectionOut {
@@ -6718,6 +6732,8 @@ export interface FlowExplanationNodeOut {
   mode_state: FlowFactState;
   mode_divergence: ExecutionModeDivergence | null;
   observed_mode: ExecutionMode | null;
+  mode_observation_source: ExecutionModeObservationSource | null;
+  mode_observation_run_ref_state: ExecutionModeRunRefState | null;
 
   maturity: EvolutionMaturityState | null;
   maturity_state: FlowFactState;

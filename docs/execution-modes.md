@@ -328,6 +328,21 @@ def build_experiment_llm_adapter(
 `propose` / `shadow` 以外のモードでこの関数を回避して `create_llm_client` を
 直接呼ぶ新しい経路を、この Epic の対象 Node に対して作ってはならない。
 
+**複数 Node の draft では、全 Node を資格情報の読み取り直前に再評価する。**
+`propose_flow_experiment` は Phase 1 で全 Node をゲートしたあと接続を閉じ、
+Phase 1b で grounding(static Flow では call graph の構築)を行う。この
+関数が最も時間を使う区間であり、その間に降格された Node は「もう真では
+ない読み」で許可されたことになる。`build_experiment_llm_adapter` は自分の
+`node_key` を再評価するので単一 Node の draft はそれで足りるが、
+`sub_pipeline` では `keys[0]` しか再読しておらず、fail-closed 保証が先頭
+Node にしか成立していなかった。Phase 1c で残りの Node を先に再ゲートして
+から adapter を呼ぶ。
+
+再ゲートは **`moment` ではなく現在時刻を読む**。`moment` は Phase 1 の前に
+取った値で、grounding 中に書かれた割り当ての `effective_from` はそれより
+後になるため、`moment` で評価すると失効がまだ効いておらず結局通してしまう
+— 再ゲートが、それが存在する理由である唯一の窓を見られないことになる。
+
 ### 4.3 候補実行ゲート
 
 `candidate_execution` / `shadow_comparison` は Replay variant run、offline
@@ -481,6 +496,30 @@ LLM 経路もこの Epic の対象外のままである。
 
 `unobserved` を `match` として扱わない。「観測できていない」は成功では
 ない(#380 の「読めなかった事実は既定値ではない」)。
+
+#### 5.2.1 「一致したか」と「実測されたか」は別の軸
+
+`divergence` が答えるのは**設定と観測が一致するか**であって、**その観測が
+実測されたものか**ではない。現時点で runtime のモードを認証付きで attest
+できる経路は存在しない — HTTP で書かれた観測は必ず `source:
+control_server` で、`run_ref` は誰も解決していない
+(`run_ref_state: uncorroborated`)。したがって今日の `match` は
+**人が報告した値との一致**であって実測ではない。
+
+この 2 つを 1 語で運ばないために(#366)、`observation_source` と
+`run_ref_state` を divergence の**隣に**別フィールドとして返し、
+`GET /execution-modes/divergence`・mode projection・#414 の Flow projection
+(`mode_observation_source` / `mode_observation_run_ref_state`)・Dashboard の
+すべてに同じ値をそのまま伝える。観測が 1 件も無い `unobserved` では両方
+`null` である — 裏付けが無いことは裏付けの一種ではない(#380)。
+
+**残っている制約**: 認証付きの実測経路そのものはまだ無い。作るなら SDK か
+canonical execution からの attestation が要り、`sdk` はそのために語彙へ
+残してある(HTTP からは指定できない、§5.2 / #337)。それまでは
+`observation_source` が「これは報告値である」と明示し続けることが、
+報告値を実測として読ませないための唯一の担保である。なお、ゲート自身が
+観測を書く案は採らない — ゲートが適用したモードは実効モードそのものなので
+常に `match` になり、SDK 側の本物の乖離を覆い隠す。
 
 ---
 
@@ -647,10 +686,26 @@ provenance ではない(Principle 7)。run type / prompt・schema version /
 `intelligence_run_not_a_draft` / `intelligence_run_not_completed` /
 `intelligence_run_already_used`)。
 
-**既知の残存穴**: `intelligence_runs` は draft の主題(どの Flow を対象に
-生成されたか)を保存していないため、「この draft に対応する run か」までは
-検証できない。塞ぐには `subject_ref` / `input_digest` 列か
-`flow_experiment_draft` の監査行が要る。
+**この穴は `flow_experiment_draft` で塞いだ**。当初 `intelligence_runs` は
+draft の**主題**(どの Flow を対象に生成されたか)を保存していなかったので、
+「この draft に対応する run か」までは検証できず、Flow A の正常な draft run
+を Flow B の手書き提案へ付けて `reasoning_llm` provenance を名乗れた。
+
+drafting run 1 件につき 1 行、`flow_subject_kind` / `flow_subject_ref` /
+`captured_snapshot_id` / `node_keys_json` / `evidence_ids_json` /
+`input_digest` を持つ。**失敗した run にも書く** — 何を対象にした試みかは
+結果ではなく試み自身の事実だからである。提案作成時の検証は 3 つ:
+
+- 主題が一致しない run は `intelligence_run_subject_mismatch`
+  (Flow・snapshot の完全一致)。
+- draft が見ていない Node を target に含む提案は
+  `intelligence_run_target_not_drafted`。**部分集合は許す** — 人間は draft を
+  編集してから投稿するので Node を落とすのは普通の編集である。**足す**のは
+  違う: その Node については誰も推論していないので、名乗れる provenance が
+  無い。
+- 主題行が無い run は `intelligence_run_subject_unknown`。この表より前に
+  作られた drafting run は audit としては読めるままだが、**誰も答えを記録
+  していない検査を満たしたことにはしない**(#337 の互換性規則)。
 
 ### 7.2 single_node と sub_pipeline を混同しない
 
@@ -715,6 +770,53 @@ event_kind(有限):
 
 承認済み提案があっても、モードが `propose` に戻されていれば実行記録は
 409 で拒否される。逆にモードが `shadow` でも未承認なら 409 で拒否される。
+
+#### 7.5.1 実行参照は提案に**拘束**される
+
+実行そのものは既存の canonical 経路で起き、参照は**後から**付く。つまり
+`POST /flow-experiments/{id}/executions` に登録するという行為は、**「この
+承認があの実行を許可した」という台帳の主張**である。当初はその主張が
+caller の申告でしかなかった — 同一 System で解決できる実行であれば、
+提案が一度も名指ししていない Node の実行でも、誰も承認していない時点の
+実行でも、任意の承認済み提案へ付けられた。**caller の主張はスコープの
+証拠ではない**(EM-ADR-4)。これは台帳自身の binding にも当てはまる。
+
+決定的な 3 つの拘束を、いずれも request ではなく canonical 行から読む。
+
+- **対象**: 実行自身の対象(`experiments.feature_id` /
+  `replay_runs.component_id` / `shadow_results.component_id`)を §4.4 と
+  **同じ** `evolution_node_link` 完全一致で Node へ写像し、その 1 つ以上が
+  この提案の target Node でなければならない。link が 1 つも無ければ
+  `execution_ref_subject_unmapped`、あるが一致しなければ
+  `execution_ref_subject_mismatch`、対象そのものが読めなければ
+  `execution_ref_subject_unreadable`(読めなかったことは「一致した」こと
+  ではない、#380)。開発者の次の操作が三者三様なので同じコードに畳まない。
+  なお `ambiguous` な写像はここでは拒否しない — 曖昧なのは**誰の許可が
+  効くか**(§4.4.3)であり、それは `_require_execution_capabilities` が
+  提案自身の target に対して既に判定している。ここで問うのは link が
+  存在するかどうかだけである。
+- **順序**: 実行は承認と同時かそれ以降でなければならない
+  (`execution_ref_precedes_approval`)。承認は実行を許可する記録なので、
+  承認より前の実行は何にも許可されていない。読むのは
+  「実際に走った時刻」(`started_at`、無ければ `created_at` /
+  `shadow_results.timestamp`)であって作成時刻ではない — Experiment は
+  実行のずっと前に draft されるので、`created_at` を読むと
+  「draft する → 承認を得る → 実行する」という当たり前の順序を拒否して
+  しまう。
+- **単一性**: 1 つの canonical 実行が裏付けられる提案は 1 つだけ
+  (`execution_ref_already_bound`)。draft run に対する
+  `intelligence_run_already_used` と同じ規律である。実行とは**その提案の
+  実験を走らせたこと**なので、2 つの提案が同じ実行を名乗るなら少なくとも
+  片方は自分の実験を走らせていない。
+
+**採用しなかった案**: 「governed な対象へのすべての候補実行 request に
+`flow_experiment_proposal_id` を必須化する」。承認とモードが**独立した 2 つ
+の事実**であること(§7.5)が壊れるからである。提案を常に要求すれば
+`shadow` は単独では何も許可しないことになり、モード軸は capability の
+付与ではなくなる。加えて「既存コンポーネントの一括移行は Epic の明示的な
+非目標」(§0.2 / §4.4.3)であり、Node に link されているというだけで既存の
+Experiment / Replay 利用者を全員止めることになる。実行の時間的な上限は
+モード割り当ての `effective_until` が与える(EM-ADR-2)。
 
 ### 7.6 本番を書き換える経路を持たない
 
@@ -782,7 +884,14 @@ index: `(system_id, node_key, id DESC)`。
 
 `flow_experiment_execution_ref`: `execution_kind`
 (`replay_variant_run`|`experiment`|`shadow_result`)、`execution_ref`、
-`recorded_at`。
+`recorded_at`。行が書かれる条件は §7.5.1 の 3 拘束を満たしたときだけである。
+
+`flow_experiment_draft`: drafting run 1 件につき 1 行
+(`intelligence_run_id` は UNIQUE)。`flow_subject_kind` /
+`flow_subject_ref` / `captured_snapshot_id` / `node_keys_json` /
+`evidence_ids_json` / `input_digest` / `created_at`。`intelligence_runs` が
+「どう作ったか」を持ち、この表が「何を対象にしたか」を持つ(§7.1.3)。
+失敗した run にも書く。
 
 ---
 
@@ -800,6 +909,10 @@ index: `(system_id, node_key, id DESC)`。
 - assignment の actor が body ではなく principal から来る
 - System 分離(別 System の割り当てが漏れない)
 - 乖離 4 状態(`match`/`divergent`/`unobserved`/`stale`)
+- 乖離の読みが `observation_source` / `run_ref_state` を**別フィールドで**
+  伴い、`unobserved` では両方 `null` であること(§5.2.1)
+- 複数 Node の draft で、grounding 中に 2 番目以降の Node が `fixed` へ
+  切り替わったら**資格情報を読む前に**拒否されること(§4.2)
 
 ### 9.2 #414
 
@@ -809,6 +922,8 @@ index: `(system_id, node_key, id DESC)`。
   区別
 - 1 section の失敗が `degraded_sections` に落ち、他 section が返ること
 - `mode_source` が `default` と `system_assignment` を区別すること
+- 乖離の読みに `mode_observation_source` /
+  `mode_observation_run_ref_state` が伴い、open item の detail にも出ること
 - static flow の Node 所属が完全一致であること、flow graph 不能時に
   `unavailable` になること
 - projection が何も書かないこと(前後で全テーブルの行数が不変)
@@ -819,6 +934,13 @@ index: `(system_id, node_key, id DESC)`。
 - `comparison_scope` と対象 Node 数の不一致が拒否される
 - 副作用クラスと隔離戦略の不整合が拒否される
 - 未承認での実行記録が 409、承認済み + `propose` モードでも 409
+- 実行参照が提案に拘束されること(§7.5.1): 別 Node の実行 / どの Node にも
+  link されていない実行 / 承認より前に走った実行 / 既に別提案へ登録済みの
+  実行が、それぞれ固有の有限コードで拒否される。draft されてから承認され、
+  そのあと走った Experiment は受理される
+- LLM provenance が draft の**主題**に拘束されること(§7.1.3): 別 Flow を
+  draft した run、draft が見ていない Node を含む target、主題行の無い run が
+  拒否され、target を狭めた提案は受理される
 - status が event fold で導出され、列に保存されていないこと
 - 承認・実行・結果・昇格候補・rollback が audit から追跡できること
 - 提案の作成・承認が `components.mode` / `evolution_node.maturity` /

@@ -41,6 +41,7 @@ import {
   flowEdgeReadings,
   groupOpenItems,
   nodeAxes,
+  observationStanding,
   sectionAvailability,
 } from "./model";
 import {
@@ -139,6 +140,15 @@ function NodeCard({ node }: { node: FlowExplanationNodeOut }) {
               <div className="mt-1 font-mono text-muted-foreground">
                 実効 = {node.execution_mode} / 観測 = {node.observed_mode ?? "(観測なし)"}
               </div>
+              {/* The observation's STANDING, beside the reading and never
+                  folded into it: 「一致している」 and 「実測された」 are two
+                  facts (#366). */}
+              {observationStanding(node.mode_observation_source, node.mode_observation_run_ref_state) ? (
+                <div className="mt-1 text-muted-foreground">
+                  観測の裏付け:{" "}
+                  {observationStanding(node.mode_observation_source, node.mode_observation_run_ref_state)}
+                </div>
+              ) : null}
             </>
           ) : (
             <EmptyNote>この Node には突き合わせの読みがありません。</EmptyNote>

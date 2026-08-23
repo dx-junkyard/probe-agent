@@ -33,6 +33,7 @@ from app import flow_explanation
 from app.db import get_conn
 from app.evolution_node import add_implementation, add_link, add_version, create_node
 from app.execution_mode import assign_mode
+from app.execution_mode import record_observation as record_mode_observation
 from app.flow_explanation import build_flow_explanation, list_flow_subjects
 
 
@@ -465,6 +466,62 @@ def test_mode_source_default_is_distinct_from_a_chosen_fixed(admin_client):
         assert node.execution_mode == "fixed"
         assert node.mode_source == "system"
         assert node.mode_reason == "system_assignment"
+
+
+def test_a_divergence_reading_carries_the_observations_standing(admin_client):
+    """§6.4 / #366. `mode_divergence` says whether the reading agrees with the
+    configuration; it cannot say whether the reading was MEASURED. Nothing on
+    any current path attests a runtime mode, so a reported value and an
+    instrumented one must not look alike on the aggregation screen."""
+    token = _login(admin_client)
+    system_id = _create_system(admin_client, token, "sys-a")
+    _seed_runtime_flow(system_id)
+
+    now = time.time()
+    with get_conn() as conn:
+        assign_mode(
+            conn,
+            system_id=system_id,
+            scope_kind="system",
+            scope_ref="",
+            mode="observe",
+            reason="観測のみ",
+            actor="root",
+            now=now - 100,
+        )
+        record_mode_observation(
+            conn,
+            system_id=system_id,
+            node_key="node-summarize",
+            observed_mode="shadow",
+            run_ref="replay:7",
+            now=now,
+        )
+
+    result = build_flow_explanation(
+        system_id, subject_kind="runtime_flow", subject_ref=FLOW_ID
+    )
+    by_key = {node.node_key: node for node in result.nodes}
+
+    observed = by_key["node-summarize"]
+    assert observed.mode_divergence == "divergent"
+    assert observed.mode_observation_source == "control_server"
+    # A pointer nobody resolved never reads as a verified one.
+    assert observed.mode_observation_run_ref_state == "uncorroborated"
+
+    # No observation, so no standing to report (#380).
+    assert by_key["node-charge"].mode_divergence == "unobserved"
+    assert by_key["node-charge"].mode_observation_source is None
+
+    divergence_items = [
+        item
+        for section in [result.open_items]
+        for item in section.items
+        if item.kind == "mode_divergence" and item.node_key == "node-summarize"
+    ]
+    assert divergence_items, "the divergence must reach the open items"
+    assert "観測の出所=control_server" in divergence_items[0].detail
+    assert "実行参照=uncorroborated" in divergence_items[0].detail
 
 
 # ---------------------------------------------------------------------------

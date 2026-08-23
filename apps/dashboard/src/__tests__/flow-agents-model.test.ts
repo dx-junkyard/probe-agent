@@ -57,6 +57,8 @@ function node(overrides: Partial<FlowExplanationNodeOut> = {}): FlowExplanationN
     mode_state: "present",
     mode_divergence: "unobserved",
     observed_mode: null,
+    mode_observation_source: null,
+    mode_observation_run_ref_state: null,
     maturity: "validating",
     maturity_state: "present",
     folded_maturity: "validating",

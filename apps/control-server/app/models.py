@@ -11043,7 +11043,15 @@ class ExecutionModeObservationOut(BaseModel):
 
 class ExecutionModeDivergenceOut(BaseModel):
     """`unobserved` is never reported as `match`: not having looked is not a
-    success (#380)."""
+    success (#380).
+
+    `observation_source` / `run_ref_state` are a SEPARATE axis from
+    `divergence`. The first answers "does the reading agree with the
+    configuration?", the second "was the reading measured?" -- and no current
+    path attests a runtime mode, so a `match` can be agreement with a value a
+    human reported. One displayed word must not carry both facts (#366).
+    Both are `null` for `unobserved`, where there is no observation.
+    """
 
     node_key: str
     divergence: ExecutionModeDivergence
@@ -11051,6 +11059,8 @@ class ExecutionModeDivergenceOut(BaseModel):
     observed_mode: Optional[ExecutionMode] = None
     observed_at: Optional[float] = None
     last_assignment_at: Optional[float] = None
+    observation_source: Optional[ExecutionModeObservationSource] = None
+    run_ref_state: Optional[ExecutionModeRunRefState] = None
 
 
 class ExecutionModeDivergenceListOut(BaseModel):
@@ -11077,6 +11087,10 @@ class ExecutionModeNodeProjectionOut(BaseModel):
     divergence: ExecutionModeDivergence
     observed_mode: Optional[ExecutionMode] = None
     observed_at: Optional[float] = None
+    #: The observation's own standing, beside the divergence and never folded
+    #: into it (see `ExecutionModeDivergenceOut`).
+    observation_source: Optional[ExecutionModeObservationSource] = None
+    run_ref_state: Optional[ExecutionModeRunRefState] = None
 
 
 class ExecutionModeProjectionOut(BaseModel):
@@ -11222,6 +11236,11 @@ class FlowExplanationNodeOut(BaseModel):
     mode_state: FlowFactState = "present"
     mode_divergence: Optional[ExecutionModeDivergence] = None
     observed_mode: Optional[ExecutionMode] = None
+    #: Whether the observation behind `mode_divergence` was attested, carried
+    #: through from #413's projection and never re-derived (#366): a `match`
+    #: from a reported value must not read like a measured one.
+    mode_observation_source: Optional[ExecutionModeObservationSource] = None
+    mode_observation_run_ref_state: Optional[ExecutionModeRunRefState] = None
 
     maturity: Optional[EvolutionMaturityState] = None
     maturity_state: FlowFactState = "present"

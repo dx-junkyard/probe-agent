@@ -176,6 +176,17 @@ def _seed(system_id, *, mode="shadow"):
             target_ref="summarize",
             created_by="root",
         )
+        # §7.5's execution binding maps an Experiment's `feature_id` through
+        # `evolution_node_link(link_kind='feature')`, so the fixture's
+        # Experiment runs are on node-a rather than on nothing.
+        add_link(
+            conn,
+            system_id=system_id,
+            node_id=node_a_id,
+            link_kind="feature",
+            target_ref="f-1",
+            created_by="root",
+        )
         _add_node(conn, system_id, "node-b")
         _add_node(conn, system_id, "node-outside", flow_id=None)
         _add_node(conn, system_id, "node-writer", side_effect_class="external_write")
@@ -196,6 +207,48 @@ def _seed(system_id, *, mode="shadow"):
         )
         shadow_result_id = cur.lastrowid
     return {"shadow_result_id": shadow_result_id}
+
+
+def _seeded_execution(system_id, seeded):
+    """The fixture's shadow result, stamped as having run just now.
+
+    §7.5's execution binding refuses a run that happened before the approval
+    that authorised it, and the fixture row is created before any proposal
+    exists. Tests that cite it as this proposal's execution therefore
+    re-stamp it; the ordering rule has its own tests in
+    `TestExecutionsAreBoundToTheProposal`.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE shadow_results SET timestamp = ? WHERE system_id = ? AND id = ?",
+            (time.time(), system_id, seeded["shadow_result_id"]),
+        )
+    return str(seeded["shadow_result_id"])
+
+
+def _failed_experiment(system_id):
+    """A canonical Experiment on feature `f-1` that ran, and failed, just now.
+
+    Inserted at the current clock and AFTER the proposal is approved, because
+    §7.5's binding refuses an execution that predates its approval.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO repository_snapshots
+                   (system_id, repo_path, commit_sha, status, created_at, completed_at)
+               VALUES (?, '/tmp/repo', 'c0ffee', 'ready', ?, ?)""",
+            (system_id, now, now),
+        )
+        snapshot_id = cur.lastrowid
+        cur = conn.execute(
+            """INSERT INTO experiments
+                   (system_id, feature_id, objective, snapshot_id, baseline_commit,
+                    config_revision, execution_config, status, created_at, started_at)
+               VALUES (?, 'f-1', 'o', ?, 'c0ffee', 'r1', '{}', 'failed', ?, ?)""",
+            (system_id, snapshot_id, now, now),
+        )
+        return cur.lastrowid
 
 
 def _set_mode(system_id, mode):
@@ -860,7 +913,7 @@ class TestProposalApi:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -909,7 +962,7 @@ class TestApprovalAndModeAreIndependent:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -930,7 +983,7 @@ class TestApprovalAndModeAreIndependent:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -973,7 +1026,7 @@ class TestApprovalAndModeAreIndependent:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -1005,7 +1058,7 @@ class TestExecutionAndAudit:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
                 "note": "shadow 比較 1 件",
             },
             headers=headers,
@@ -1085,7 +1138,7 @@ class TestExecutionAndAudit:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -1116,7 +1169,7 @@ class TestExecutionAndAudit:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -1158,29 +1211,13 @@ class TestExecutionAndAudit:
         system_id = _create_system(admin_client, token, "sys-a")
         _seed(system_id, mode="shadow")
         headers = _headers(token, system_id)
-        now = time.time()
-        with get_conn() as conn:
-            cur = conn.execute(
-                """INSERT INTO repository_snapshots
-                       (system_id, repo_path, commit_sha, status, created_at, completed_at)
-                   VALUES (?, '/tmp/repo', 'c0ffee', 'ready', ?, ?)""",
-                (system_id, now, now),
-            )
-            snapshot_id = cur.lastrowid
-            cur = conn.execute(
-                """INSERT INTO experiments
-                       (system_id, feature_id, objective, snapshot_id, baseline_commit,
-                        config_revision, execution_config, status, created_at)
-                   VALUES (?, 'f-1', 'o', ?, 'c0ffee', 'r1', '{}', 'failed', ?)""",
-                (system_id, snapshot_id, now),
-            )
-            experiment_id = cur.lastrowid
         proposal_id = admin_client.post(
             "/flow-experiments", json=_body(), headers=headers
         ).json()["id"]
         admin_client.post(
             f"/flow-experiments/{proposal_id}/approve", json={"reason": "ok"}, headers=headers
         )
+        experiment_id = _failed_experiment(system_id)
         r = admin_client.post(
             f"/flow-experiments/{proposal_id}/executions",
             json={"execution_kind": "experiment", "execution_ref": str(experiment_id)},
@@ -1196,6 +1233,9 @@ class TestChangesNothingInProduction:
         system_id = _create_system(admin_client, token, "sys-a")
         seeded = _seed(system_id, mode="shadow")
         headers = _headers(token, system_id)
+        # Fixture setup, taken before the snapshots so the re-stamp is not
+        # mistaken for something this flow wrote.
+        execution_ref = _seeded_execution(system_id, seeded)
 
         before_production = _table_contents(PRODUCTION_TABLES)
         before_all = _table_contents()
@@ -1210,7 +1250,7 @@ class TestChangesNothingInProduction:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": execution_ref,
             },
             headers=headers,
         )
@@ -1219,7 +1259,7 @@ class TestChangesNothingInProduction:
             json={
                 "summary": "同一",
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": execution_ref,
                 "metrics": {"node": {"match_rate": 1.0}},
             },
             headers=headers,
@@ -1230,7 +1270,7 @@ class TestChangesNothingInProduction:
                 "candidate_ref": "candidate:rule-1",
                 "rationale": "指標を満たした",
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": execution_ref,
             },
             headers=headers,
         )
@@ -1314,7 +1354,7 @@ class TestModeWalk:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -1332,7 +1372,7 @@ class TestModeWalk:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -1345,7 +1385,7 @@ class TestModeWalk:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -1397,6 +1437,75 @@ class TestModeWalk:
         )
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["denial_code"] == "capability_not_permitted"
+
+    def test_a_second_node_revoked_during_grounding_stops_the_call(
+        self, admin_client, monkeypatch
+    ):
+        """The Phase 1c re-gate covers EVERY Node, not just `keys[0]`.
+
+        The connection is closed for the whole grounding read -- the slowest
+        step of a draft, and a call-graph build for a static Flow. A Node
+        demoted inside that window was permitted by a reading that is no
+        longer true. `build_experiment_llm_adapter` re-reads its own
+        `node_key` before touching a credential (EM-ADR-3), which covered
+        `keys[0]`; for a `sub_pipeline` draft every other Node reached the
+        model on Phase 1's stale reading.
+        """
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="propose")
+        headers = _headers(token, system_id)
+
+        from app import llm
+
+        real_grounding = flow_orchestration.load_flow_grounding
+
+        def _grounding_then_revoke(*args, **kwargs):
+            result = real_grounding(*args, **kwargs)
+            # Concurrent demotion of the SECOND Node, after Phase 1 gated it.
+            with get_conn() as conn:
+                assign_mode(
+                    conn,
+                    system_id=system_id,
+                    scope_kind="node",
+                    scope_ref="node-b",
+                    mode="fixed",
+                    reason="revoked mid-draft",
+                    actor="root",
+                )
+            return result
+
+        def _trap(*args, **kwargs):  # pragma: no cover - must never run
+            raise AssertionError("credential path was reached")
+
+        monkeypatch.setattr(
+            flow_orchestration, "load_flow_grounding", _grounding_then_revoke
+        )
+        monkeypatch.setattr(llm.LLMConfig, "intelligence_from_env", staticmethod(_trap))
+        monkeypatch.setattr(llm, "create_llm_client", _trap)
+
+        r = admin_client.post(
+            "/flow-experiments/draft",
+            json={
+                "flow_subject_kind": "runtime_flow",
+                "flow_subject_ref": FLOW_ID,
+                "node_keys": ["node-a", "node-b"],
+                "goal": "g",
+            },
+            headers=headers,
+        )
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        assert detail["denial_code"] == "capability_not_permitted"
+        # The refusal names the Node that was revoked, not the first one.
+        assert detail["source_scope"] == "node"
+        assert detail["decision"]["source_ref"] == "node-b"
+        with get_conn() as conn:
+            runs = conn.execute(
+                "SELECT COUNT(*) AS n FROM intelligence_runs "
+                "WHERE run_type = 'flow_experiment_draft'"
+            ).fetchone()["n"]
+        assert runs == 0
 
     def test_a_draft_creates_no_proposal(self, admin_client):
         token = _login(admin_client)
@@ -1951,7 +2060,7 @@ class TestResultsAreBoundToAnExecution:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -1987,7 +2096,7 @@ class TestResultsAreBoundToAnExecution:
             f"/flow-experiments/{proposal_a}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -2015,24 +2124,8 @@ class TestResultsAreBoundToAnExecution:
         system_id = _create_system(admin_client, token, "sys-a")
         _seed(system_id, mode="shadow")
         headers = _headers(token, system_id)
-        now = time.time()
-        with get_conn() as conn:
-            cur = conn.execute(
-                """INSERT INTO repository_snapshots
-                       (system_id, repo_path, commit_sha, status, created_at, completed_at)
-                   VALUES (?, '/tmp/repo', 'c0ffee', 'ready', ?, ?)""",
-                (system_id, now, now),
-            )
-            snapshot_id = cur.lastrowid
-            cur = conn.execute(
-                """INSERT INTO experiments
-                       (system_id, feature_id, objective, snapshot_id, baseline_commit,
-                        config_revision, execution_config, status, created_at)
-                   VALUES (?, 'f-1', 'o', ?, 'c0ffee', 'r1', '{}', 'failed', ?)""",
-                (system_id, snapshot_id, now),
-            )
-            experiment_id = cur.lastrowid
         proposal_id = _approved_proposal(admin_client, headers)
+        experiment_id = _failed_experiment(system_id)
         admin_client.post(
             f"/flow-experiments/{proposal_id}/executions",
             json={"execution_kind": "experiment", "execution_ref": str(experiment_id)},
@@ -2061,7 +2154,7 @@ class TestResultsAreBoundToAnExecution:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -2093,7 +2186,7 @@ class TestResultsAreBoundToAnExecution:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -2127,7 +2220,7 @@ class TestResultsAreBoundToAnExecution:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -2148,6 +2241,289 @@ class TestResultsAreBoundToAnExecution:
         assert floor["verdict"] == "unevaluated"
 
 
+class TestExecutionsAreBoundToTheProposal:
+    """§7.5. The execution happens on the canonical path and the reference is
+    attached afterwards, so registering one is the ledger's CLAIM that this
+    approval authorised that run. Until this binding existed, that claim was
+    the caller's word: any resolvable execution in the System could be
+    attached to any approved proposal -- a run on a Node the proposal never
+    named, or a run that happened before anybody approved anything. A
+    caller's claim is not evidence of scope (EM-ADR-4), and that holds for
+    the ledger's own bindings too."""
+
+    def _other_node_shadow_result(self, system_id):
+        """A shadow result on a Component linked to a DIFFERENT Node."""
+        with get_conn() as conn:
+            node_id = conn.execute(
+                "SELECT id FROM evolution_node WHERE system_id = ? AND node_key = 'node-b'",
+                (system_id,),
+            ).fetchone()["id"]
+            add_link(
+                conn,
+                system_id=system_id,
+                node_id=node_id,
+                link_kind="component",
+                target_ref="other-component",
+                created_by="root",
+            )
+            cur = conn.execute(
+                "INSERT INTO shadow_results (system_id, trace_id, component_id, timestamp) "
+                "VALUES (?, 't-1', 'other-component', ?)",
+                (system_id, time.time()),
+            )
+            return str(cur.lastrowid)
+
+    def test_an_execution_of_another_node_is_refused(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        proposal_id = _approved_proposal(admin_client, headers)  # targets node-a
+        ref = self._other_node_shadow_result(system_id)
+
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={"execution_kind": "shadow_result", "execution_ref": ref},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "execution_ref_subject_mismatch"
+        assert r.json()["detail"]["detail"] == ["node-b"]
+
+    def test_an_execution_no_node_links_is_refused(self, admin_client):
+        """"Not linked to any Node" is its own answer: the fix is to link the
+        Node, not to cite a different execution (#366)."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        proposal_id = _approved_proposal(admin_client, headers)
+        with get_conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO shadow_results (system_id, trace_id, component_id, timestamp) "
+                "VALUES (?, 't-1', 'unlinked-component', ?)",
+                (system_id, time.time()),
+            )
+            ref = str(cur.lastrowid)
+
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={"execution_kind": "shadow_result", "execution_ref": ref},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "execution_ref_subject_unmapped"
+
+    def test_an_execution_that_predates_the_approval_is_refused(self, admin_client):
+        """Approval is what AUTHORISES the run (§7.5). A run that predates it
+        was authorised by nothing, and attaching it afterwards is exactly the
+        post-hoc binding that makes the ledger unable to say which approval
+        covered which execution."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        # The fixture's shadow result was written before the proposal existed.
+        proposal_id = _approved_proposal(admin_client, headers)
+
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": str(seeded["shadow_result_id"]),
+            },
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "execution_ref_precedes_approval"
+
+        # The same row, run again after the approval, is accepted -- the rule
+        # is about ORDER, not about the identity of the row.
+        ok = admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": _seeded_execution(system_id, seeded),
+            },
+            headers=headers,
+        )
+        assert ok.status_code == 201, ok.text
+
+    def test_an_experiment_drafted_before_approval_but_run_after_is_accepted(
+        self, admin_client
+    ):
+        """An Experiment is drafted long before it runs, so the binding reads
+        `started_at` -- when the candidate actually executed -- and not
+        `created_at`. Reading `created_at` would refuse the ordinary
+        "draft it, get it approved, run it" sequence."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        drafted_at = time.time()
+        with get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO repository_snapshots
+                       (system_id, repo_path, commit_sha, status, created_at, completed_at)
+                   VALUES (?, '/tmp/repo', 'c0ffee', 'ready', ?, ?)""",
+                (system_id, drafted_at, drafted_at),
+            )
+            snapshot_id = cur.lastrowid
+            cur = conn.execute(
+                """INSERT INTO experiments
+                       (system_id, feature_id, objective, snapshot_id, baseline_commit,
+                        config_revision, execution_config, status, created_at)
+                   VALUES (?, 'f-1', 'o', ?, 'c0ffee', 'r1', '{}', 'draft', ?)""",
+                (system_id, snapshot_id, drafted_at),
+            )
+            experiment_id = cur.lastrowid
+
+        proposal_id = _approved_proposal(admin_client, headers)
+
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE experiments SET status = 'completed', started_at = ? WHERE id = ?",
+                (time.time(), experiment_id),
+            )
+
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={"execution_kind": "experiment", "execution_ref": str(experiment_id)},
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["executions"][0]["resolution"] == "resolved"
+
+    def test_a_withdrawn_proposal_accepts_no_execution(self, admin_client):
+        """The lifecycle gate answers first: a terminal proposal is not
+        awaiting anything, so the binding is never reached."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        proposal_id = _approved_proposal(admin_client, headers)
+        admin_client.post(
+            f"/flow-experiments/{proposal_id}/withdraw",
+            json={"reason": "やめた"},
+            headers=headers,
+        )
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": _seeded_execution(system_id, seeded),
+            },
+            headers=headers,
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["code"] == "not_approved"
+
+    def test_one_execution_backs_only_one_proposal(self, admin_client):
+        """The same rule a draft's `intelligence_run_id` already obeys. An
+        execution IS the running of a proposal's experiment, so two proposals
+        claiming the same run means one of them never ran its own."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        first = _approved_proposal(admin_client, headers)
+        second = _approved_proposal(
+            admin_client, headers, body=_body(proposal_key="exp-2")
+        )
+        ref = _seeded_execution(system_id, seeded)
+
+        ok = admin_client.post(
+            f"/flow-experiments/{first}/executions",
+            json={"execution_kind": "shadow_result", "execution_ref": ref},
+            headers=headers,
+        )
+        assert ok.status_code == 201, ok.text
+
+        r = admin_client.post(
+            f"/flow-experiments/{second}/executions",
+            json={"execution_kind": "shadow_result", "execution_ref": ref},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "execution_ref_already_bound"
+        assert r.json()["detail"]["detail"] == [str(first)]
+
+    def test_an_unapproved_proposal_accepts_no_execution(self, admin_client):
+        """`expires_at` bounds the window in which a human may APPROVE
+        (§7.4), and a lapsed one refuses there rather than retroactively
+        unmaking a decision that was made in time. The time bound on the
+        EXECUTION is the other axis: the mode assignment's `effective_until`
+        (EM-ADR-2), tested below."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        proposal_id = admin_client.post(
+            "/flow-experiments", json=_body(), headers=headers
+        ).json()["id"]
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE flow_experiment_proposal SET expires_at = ? WHERE id = ?",
+                (time.time() - 1, proposal_id),
+            )
+        approve = admin_client.post(
+            f"/flow-experiments/{proposal_id}/approve",
+            json={"reason": "ok"},
+            headers=headers,
+        )
+        assert approve.status_code == 409, approve.text
+        assert approve.json()["detail"]["code"] == "proposal_expired"
+
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={
+                "execution_kind": "shadow_result",
+                "execution_ref": _seeded_execution(system_id, seeded),
+            },
+            headers=headers,
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["code"] == "not_approved"
+
+    def test_a_lapsed_mode_assignment_refuses_the_execution_record(
+        self, admin_client
+    ):
+        """The two facts are independent (§7.5) and the mode is the one the
+        clock moves: an approval stays approved, but an experiment window
+        that elapsed falls back to `fixed` and the record is refused. A
+        deadline that stopped nothing would not be a deadline (EM-ADR-2)."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        seeded = _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        proposal_id = _approved_proposal(admin_client, headers)
+        ref = _seeded_execution(system_id, seeded)
+        with get_conn() as conn:
+            assign_mode(
+                conn,
+                system_id=system_id,
+                scope_kind="node",
+                scope_ref="node-a",
+                mode="shadow",
+                reason="実験ウィンドウ",
+                actor="root",
+                effective_from=time.time() - 60,
+                effective_until=time.time() - 1,
+            )
+        r = admin_client.post(
+            f"/flow-experiments/{proposal_id}/executions",
+            json={"execution_kind": "shadow_result", "execution_ref": ref},
+            headers=headers,
+        )
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        # Its OWN denial code, not the generic one: the lapse falls to
+        # `fixed` rather than letting the System's `shadow` take over, and
+        # the developer's next action is to open a new window (EM-ADR-2).
+        assert detail["denial_code"] == "node_expired_assignment"
+        assert detail["mode"] == "fixed"
+
+
 class TestPromotionCandidatesAreBound:
     """Defect 2b. Any non-empty string used to be accepted, so an unevaluated
     candidate C could be written into the ledger the promotion gates read."""
@@ -2162,7 +2538,7 @@ class TestPromotionCandidatesAreBound:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )
@@ -2197,19 +2573,19 @@ class TestPromotionCandidatesAreBound:
         system_id = _create_system(admin_client, token, "sys-a")
         seeded = _seed(system_id, mode="shadow")
         headers = _headers(token, system_id)
-        now = time.time()
+        proposal_id = _approved_proposal(admin_client, headers)
+        # Both runs happen AFTER the approval that authorises them (§7.5).
         with get_conn() as conn:
             cur = conn.execute(
                 "INSERT INTO shadow_results (system_id, trace_id, component_id, timestamp) "
                 "VALUES (?, 't-1', 'summarize', ?)",
-                (system_id, now),
+                (system_id, time.time()),
             )
             second_shadow_id = cur.lastrowid
-        proposal_id = _approved_proposal(admin_client, headers)
-        for ref in (seeded["shadow_result_id"], second_shadow_id):
+        for ref in (_seeded_execution(system_id, seeded), str(second_shadow_id)):
             admin_client.post(
                 f"/flow-experiments/{proposal_id}/executions",
-                json={"execution_kind": "shadow_result", "execution_ref": str(ref)},
+                json={"execution_kind": "shadow_result", "execution_ref": ref},
                 headers=headers,
             )
         admin_client.post(
@@ -2401,7 +2777,20 @@ class TestProvenanceCannotBeForged:
     """Defect 5. Any run of the same System could be attached as LLM
     provenance -- another feature's, or one that FAILED."""
 
-    def _run(self, system_id, **overrides):
+    def _run(
+        self,
+        system_id,
+        *,
+        subject_kind="runtime_flow",
+        subject_ref=FLOW_ID,
+        captured_snapshot_id=None,
+        node_keys=("node-a",),
+        record_subject=True,
+        **overrides,
+    ):
+        """An `intelligence_runs` row plus the `flow_experiment_draft` row the
+        real drafting path writes beside it. `record_subject=False` reproduces
+        a run from before that row existed."""
         values = dict(
             run_type="flow_experiment_draft",
             provider="mock",
@@ -2433,7 +2822,144 @@ class TestProvenanceCannotBeForged:
                     now,
                 ),
             )
-            return cur.lastrowid
+            run_id = cur.lastrowid
+            if record_subject:
+                conn.execute(
+                    """INSERT INTO flow_experiment_draft
+                           (system_id, intelligence_run_id, flow_subject_kind,
+                            flow_subject_ref, captured_snapshot_id,
+                            node_keys_json, evidence_ids_json, input_digest,
+                            created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, '[]', 'digest', ?)""",
+                    (
+                        system_id,
+                        run_id,
+                        subject_kind,
+                        subject_ref,
+                        captured_snapshot_id,
+                        json.dumps(sorted(node_keys)),
+                        now,
+                    ),
+                )
+            return run_id
+
+    def test_a_run_that_drafted_another_flow_is_refused(self, admin_client):
+        """§7.1.3. `intelligence_runs` records HOW a run was made, not what it
+        was about, so a perfectly valid draft of Flow A could be attached to a
+        hand-written proposal for Flow B -- which would then read as
+        reasoning-model output about B."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        run_id = self._run(system_id, subject_ref="another-flow")
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(intelligence_run_id=run_id),
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "intelligence_run_subject_mismatch"
+
+    def test_a_target_the_draft_never_saw_is_refused(self, admin_client):
+        """Dropping a Node before posting is ordinary editing; ADDING one is
+        not. Nothing reasoned about it, so the content concerning it has no
+        provenance to claim."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        run_id = self._run(system_id, node_keys=("node-a",))
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(
+                intelligence_run_id=run_id,
+                comparison_scope="sub_pipeline",
+                targets=[
+                    {"node_key": "node-a", "target_role": "candidate_target"},
+                    {"node_key": "node-b", "target_role": "candidate_target"},
+                ],
+                evaluation_axes=[
+                    {"level": "node", "name": "output_match", "metric": "match_rate"},
+                    {
+                        "level": "flow_capability",
+                        "name": "end_to_end",
+                        "metric": "success_rate",
+                    },
+                ],
+            ),
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "intelligence_run_target_not_drafted"
+        assert r.json()["detail"]["detail"] == ["node-b"]
+
+    def test_a_narrowed_target_set_is_accepted(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        run_id = self._run(system_id, node_keys=("node-a", "node-b"))
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(intelligence_run_id=run_id),
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["decision_method"] == "reasoning_llm"
+
+    def test_a_run_without_a_recorded_subject_is_refused(self, admin_client):
+        """#337's compatibility rule: a row from before the subject was
+        recorded stays readable as audit, but it cannot satisfy a check
+        nobody recorded the answer to."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="shadow")
+        headers = _headers(token, system_id)
+        run_id = self._run(system_id, record_subject=False)
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(intelligence_run_id=run_id),
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "intelligence_run_subject_unknown"
+
+    def test_the_drafting_path_records_its_own_subject(self, admin_client):
+        """The real path writes the row, so a draft can be posted straight
+        back without any fixture help."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _seed(system_id, mode="propose")
+        headers = _headers(token, system_id)
+        drafted = admin_client.post(
+            "/flow-experiments/draft",
+            json={
+                "flow_subject_kind": "runtime_flow",
+                "flow_subject_ref": FLOW_ID,
+                "node_keys": ["node-a"],
+                "goal": "コストを下げたい",
+            },
+            headers=headers,
+        )
+        assert drafted.status_code == 200, drafted.text
+        run_id = drafted.json()["intelligence_run_id"]
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM flow_experiment_draft WHERE intelligence_run_id = ?",
+                (run_id,),
+            ).fetchone()
+        assert row["flow_subject_kind"] == "runtime_flow"
+        assert row["flow_subject_ref"] == FLOW_ID
+        assert json.loads(row["node_keys_json"]) == ["node-a"]
+        assert row["input_digest"]
+
+        r = admin_client.post(
+            "/flow-experiments",
+            json=_body(intelligence_run_id=run_id),
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
 
     def test_an_unrelated_run_type_is_refused(self, admin_client):
         token = _login(admin_client)
@@ -2576,7 +3102,7 @@ class TestFlowScopeMembershipIsNotAClaim:
             f"/flow-experiments/{proposal_id}/executions",
             json={
                 "execution_kind": "shadow_result",
-                "execution_ref": str(seeded["shadow_result_id"]),
+                "execution_ref": _seeded_execution(system_id, seeded),
             },
             headers=headers,
         )

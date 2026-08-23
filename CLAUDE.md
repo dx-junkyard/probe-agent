@@ -1638,9 +1638,54 @@ creating incomplete persistence or execution paths for later phases.
       で、#415 が提案対象にできる実在の subject である。#414 の subject 一覧が
       span だけを見ていたため、提案できるのに選択も説明もできない Flow が
       あった。
-    - **既知の残存穴**: `intelligence_runs` は draft の主題を保存しないため、
-      「この draft に対応する run か」は検証できない。塞ぐには `subject_ref` /
-      `input_digest` 列が要る (`docs/execution-modes.md` §7.1.3)。
+    レビュー対応でさらに 4 点を締めた。いずれも「表示や記録が、確かめられて
+    いない主張を確かめられた事実のように見せていた」型の欠陥である。
+    - **実行参照は提案に拘束される** (§7.5.1)。実行は既存の canonical 経路で
+      起き参照は後から付くので、登録という行為は「この承認があの実行を許可
+      した」という台帳の主張である。当初その主張は caller の申告でしかなく、
+      提案が名指ししていない Node の実行も、誰も承認していない時点の実行も、
+      任意の承認済み提案へ付けられた。3 つの拘束を canonical 行から読む:
+      実行自身の対象が §4.4 と**同じ完全一致**でこの提案の target Node へ
+      写像されること (`execution_ref_subject_unmapped` /
+      `_subject_mismatch` / `_subject_unreadable` — 次の操作が三者三様なので
+      畳まない)、実行が**承認と同時かそれ以降**であること
+      (`execution_ref_precedes_approval`。読むのは `started_at` — Experiment は
+      実行のずっと前に draft されるので `created_at` を読むと
+      「draft→承認→実行」という当たり前の順序を拒否する)、1 つの実行が
+      裏付ける提案は 1 つだけであること (`execution_ref_already_bound`、
+      `intelligence_run_already_used` と同じ規律)。
+      **`flow_experiment_proposal_id` を全 governed 実行入口に必須化する案は
+      採らない** — 承認とモードが独立した 2 事実であること (§7.5) が壊れ、
+      `shadow` が単独では何も許可しないことになり、一括移行が非目標である
+      以上 Node に link されただけの既存利用者を全員止める。実行の時間的な
+      上限はモード割り当ての `effective_until` が与える (EM-ADR-2)。
+    - **LLM provenance は draft の主題に拘束される** (§7.1.3、旧「既知の残存
+      穴」)。`flow_experiment_draft` が drafting run 1 件につき 1 行、対象
+      Flow / snapshot / Node 集合 / evidence 許可リスト / `input_digest` を
+      持つ (**失敗した run にも書く** — 何を対象にした試みかは結果ではなく
+      試み自身の事実)。検証は `intelligence_run_subject_mismatch` /
+      `_target_not_drafted` / `_subject_unknown`。target の**部分集合は許す**
+      (人間が draft から Node を落とすのは普通の編集) が、**足すのは許さない**
+      (その Node について誰も推論していない)。主題行の無い旧 run は audit
+      としては読めるが、誰も答えを記録していない検査を満たしたことにはしない
+      (#337 の互換性規則)。
+    - **「一致したか」と「実測されたか」は別の軸** (§5.2.1)。runtime の
+      モードを attest できる経路は今のところ存在しないので、今日の `match` は
+      **人が報告した値との一致**である。`observation_source` /
+      `run_ref_state` を divergence の**隣に**別フィールドとして返し、mode
+      projection・#414 の Flow projection
+      (`mode_observation_source` / `mode_observation_run_ref_state`)・
+      Dashboard へそのまま伝える。`unobserved` では両方 `null` — 裏付けが
+      無いことは裏付けの一種ではない (#380)。**ゲート自身に観測を書かせる案は
+      採らない**: ゲートが適用したモードは実効モードそのものなので常に
+      `match` になり、SDK 側の本物の乖離を覆い隠す。
+    - **複数 Node の draft は資格情報の読み取り直前に全 Node を再ゲートする**
+      (§4.2)。`build_experiment_llm_adapter` は自分の `node_key` しか再評価
+      しないので、`sub_pipeline` では `keys[0]` 以外が grounding 中の降格を
+      見逃していた。再ゲートは **`moment` ではなく現在時刻**を読む —
+      `moment` は Phase 1 の前に取った値で、grounding 中に書かれた割り当ての
+      `effective_from` はそれより後になるため、再ゲートが唯一存在意義とする
+      窓を見られなくなる。
     既存の human gate は一切緩めない。この Epic が追加する実行モードの割り当てと
     revoke、Flow 実験提案の承認・却下・撤回、昇格候補の記録もすべて
     `decision_method: manual`。

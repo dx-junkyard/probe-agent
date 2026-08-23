@@ -264,6 +264,15 @@ class NodeExplanation:
     mode_state: str = "present"
     mode_divergence: Optional[str] = None
     observed_mode: Optional[str] = None
+    # The observation's own standing, carried through from #413's projection
+    # rather than re-derived here. `mode_divergence` answers "does the
+    # reading agree with the configuration?" and cannot answer "was the
+    # reading measured?" -- nothing on any current path attests a runtime
+    # mode, so a `match` may be agreement with a value a human reported. Two
+    # facts, two fields (§6.4 / #366). Both are `None` when there is no
+    # observation to describe.
+    mode_observation_source: Optional[str] = None
+    mode_observation_run_ref_state: Optional[str] = None
 
     # Axis 1.
     maturity: Optional[str] = None
@@ -965,6 +974,8 @@ def _build_node_rows(
             entry.mode_source_ref = mode_row.source_ref
             entry.mode_divergence = mode_row.divergence
             entry.observed_mode = mode_row.observed_mode
+            entry.mode_observation_source = mode_row.observation_source
+            entry.mode_observation_run_ref_state = mode_row.run_ref_state
 
         projection: Optional[Dict[str, Any]] = None
         try:
@@ -1435,9 +1446,7 @@ def _build_open_items(
                     id=f"divergence:{entry.node_key}",
                     kind="mode_divergence",
                     label=f"{entry.node_key}: {entry.mode_divergence}",
-                    detail=(
-                        f"設定={entry.execution_mode} 観測={entry.observed_mode}"
-                    ),
+                    detail=_divergence_detail(entry),
                     node_key=entry.node_key,
                     missing_state=(
                         "unmeasured" if entry.mode_divergence == "unobserved" else "stale"
@@ -1705,6 +1714,24 @@ def _build_lineage(
 # ---------------------------------------------------------------------------
 # The projection
 # ---------------------------------------------------------------------------
+
+
+def _divergence_detail(entry: "NodeExplanation") -> str:
+    """The divergence line, with the observation's STANDING stated.
+
+    "設定と観測が食い違う" and "その観測は誰の申告か" are two facts. No
+    current path attests a runtime mode, so an observation is a reported
+    value with a pointer nobody resolved; saying so beside the numbers is
+    what keeps a reported reading from being read as a measured one (#366).
+    An observation with no standing recorded says nothing rather than
+    claiming one (#380).
+    """
+    parts = [f"設定={entry.execution_mode} 観測={entry.observed_mode}"]
+    if entry.mode_observation_source is not None:
+        parts.append(f"観測の出所={entry.mode_observation_source}")
+    if entry.mode_observation_run_ref_state is not None:
+        parts.append(f"実行参照={entry.mode_observation_run_ref_state}")
+    return " / ".join(parts)
 
 
 def build_flow_explanation(

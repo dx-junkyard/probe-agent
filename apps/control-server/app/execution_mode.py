@@ -372,6 +372,16 @@ class DivergenceReading:
     observed_at: Optional[float] = None
     last_assignment_at: Optional[float] = None
     decision: Optional[ExecutionModeDecision] = None
+    #: WHERE the observation came from and whether its citation was checked.
+    #: The divergence value alone answers "does the reading agree with the
+    #: configuration?"; it cannot answer "was the reading measured?". Those
+    #: are two facts and one word must not carry both (#366): today every
+    #: observation written over HTTP is `control_server` with an
+    #: `uncorroborated` (or absent) `run_ref`, so a `match` is agreement with
+    #: a value a human typed -- true, but not a measurement. Both are `None`
+    #: for `unobserved`, where there is no observation to describe.
+    observation_source: Optional[str] = None
+    run_ref_state: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -395,6 +405,12 @@ class ModeProjectionNode:
     divergence: str
     observed_mode: Optional[str] = None
     observed_at: Optional[float] = None
+    #: The observation's own standing, carried through unchanged from
+    #: `DivergenceReading`. A `match` produced from a hand-reported value and
+    #: one produced from an attested reading are different facts, and the
+    #: aggregation screens must be able to tell them apart (#366).
+    observation_source: Optional[str] = None
+    run_ref_state: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1252,6 +1268,14 @@ def evaluate_divergence(
     collapsing the two would let a Node nobody has ever observed read as
     healthy.
 
+    The reading carries `observation_source` / `run_ref_state` beside the
+    divergence, because "does it agree?" and "was it measured?" are two
+    independent facts. Nothing on any current path attests a runtime reading:
+    an observation written over HTTP is `control_server` with a `run_ref`
+    nobody resolved, so a `match` means agreement with a reported value, not
+    a measured one. Reporting the divergence without its standing would let a
+    typed-in value read exactly like an instrumented one (#366).
+
     A Node that does not exist gets none of the four readings: `load_mode_facts`
     raises `ExecutionModeNotFoundError` (404 at the boundary). "There is no
     such Node" and "this Node has never been observed" are different facts,
@@ -1286,6 +1310,10 @@ def evaluate_divergence(
     changed_at = _last_assignment_change_at(conn, system_id, key, flow_refs)
     observed_at = observation["recorded_at"]
 
+    provenance = observation_doc(observation)
+    source = provenance["source"]
+    run_ref_state = provenance["run_ref_state"]
+
     if changed_at is not None and changed_at > observed_at:
         return DivergenceReading(
             node_key=key,
@@ -1295,6 +1323,8 @@ def evaluate_divergence(
             observed_at=observed_at,
             last_assignment_at=changed_at,
             decision=decision,
+            observation_source=source,
+            run_ref_state=run_ref_state,
         )
 
     matched = observation["observed_mode"] == decision.mode
@@ -1306,6 +1336,8 @@ def evaluate_divergence(
         observed_at=observed_at,
         last_assignment_at=changed_at,
         decision=decision,
+        observation_source=source,
+        run_ref_state=run_ref_state,
     )
 
 
@@ -1380,6 +1412,8 @@ def build_mode_projection(
                 divergence=reading.divergence,
                 observed_mode=reading.observed_mode,
                 observed_at=reading.observed_at,
+                observation_source=reading.observation_source,
+                run_ref_state=reading.run_ref_state,
             )
         )
 

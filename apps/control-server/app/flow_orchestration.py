@@ -93,6 +93,7 @@ probe-agent:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -138,6 +139,7 @@ __all__ = [
     "STRUCTURAL_REJECTION_CODES",
     "PROPOSAL_GATE_CODES",
     "LIFECYCLE_REJECTION_CODES",
+    "EXECUTION_BINDING_REJECTION_CODES",
     "RESULT_BINDING_REJECTION_CODES",
     "PROMOTION_BINDING_REJECTION_CODES",
     "PROVENANCE_REJECTION_CODES",
@@ -285,6 +287,26 @@ PROMOTION_BINDING_REJECTION_CODES: Tuple[str, ...] = (
     "no_result_for_execution",
 )
 
+#: Why an EXECUTION RECORD is refused even though the proposal is approved
+#: and the mode permits candidate execution. Registering a reference is the
+#: ledger's claim that THIS approval authorised THAT run, and until these
+#: checks existed the claim was the caller's word: any canonical execution in
+#: the System could be attached to any approved proposal, including one that
+#: ran on a completely different Node and one that ran before anybody
+#: approved anything. A caller's claim is not evidence of scope (EM-ADR-4),
+#: and that holds for the ledger's own bindings too.
+#:
+#: Each code is separate because the developer's next action differs: link
+#: the Node, cite a different execution, or run the experiment the approval
+#: actually authorised.
+EXECUTION_BINDING_REJECTION_CODES: Tuple[str, ...] = (
+    "execution_ref_subject_unreadable",
+    "execution_ref_subject_unmapped",
+    "execution_ref_subject_mismatch",
+    "execution_ref_precedes_approval",
+    "execution_ref_already_bound",
+)
+
 #: Why an `intelligence_run_id` may not be used as LLM provenance
 #: (Principle 7: an unverified pointer is not provenance). The row must be
 #: THIS feature's drafting run, on THIS contract version, that actually
@@ -294,6 +316,13 @@ PROVENANCE_REJECTION_CODES: Tuple[str, ...] = (
     "intelligence_run_not_a_draft",
     "intelligence_run_not_completed",
     "intelligence_run_already_used",
+    #: The run's own `flow_experiment_draft` row says which Flow, snapshot and
+    #: Nodes it was about. Without those three the run could only be shown to
+    #: be A drafting run, not THIS proposal's -- so Flow A's valid draft could
+    #: be attached to a hand-written proposal for Flow B (§7.1.3).
+    "intelligence_run_subject_unknown",
+    "intelligence_run_subject_mismatch",
+    "intelligence_run_target_not_drafted",
 )
 
 #: Per quality-floor-key verdicts. `unmeasured` (nothing was measured for this
@@ -1516,6 +1545,197 @@ def _execution_ref_resolution(
     return "resolved"
 
 
+def _execution_ref_row(
+    conn: sqlite3.Connection, system_id: int, execution_kind: str, execution_ref: str
+) -> Optional[sqlite3.Row]:
+    """The canonical row an execution reference points at, or `None`.
+
+    Same System constraint and same "an id that is not an id is unresolved"
+    rule as `_execution_ref_resolution`, which is layered on top of this.
+    """
+    table = _EXECUTION_REF_TABLES.get(execution_kind)
+    if table is None:
+        return None
+    try:
+        ref_id = int(execution_ref)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return conn.execute(
+            f"SELECT * FROM {table} WHERE id = ? AND system_id = ?", (ref_id, system_id)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def _execution_ref_subject(
+    conn: sqlite3.Connection, system_id: int, execution_kind: str, row: sqlite3.Row
+) -> Optional[Tuple[str, str]]:
+    """WHAT this execution ran against, as an `execution_target` pair.
+
+    Read from the canonical row itself, never from the request: the whole
+    point is to check the caller's claim against the execution's own subject.
+    `replay_variants` names no subject of its own -- the Component belongs to
+    the run -- so it is resolved through `replay_runs`.
+
+    `None` means the subject could not be READ, which is a different answer
+    from "it is not linked to a Node" (#380) and gets its own refusal code.
+    """
+    if execution_kind == "experiment":
+        return ("feature", str(row["feature_id"] or ""))
+    if execution_kind == "shadow_result":
+        return ("component", str(row["component_id"] or ""))
+    if execution_kind == "replay_variant_run":
+        run = conn.execute(
+            "SELECT component_id FROM replay_runs WHERE id = ? AND system_id = ?",
+            (row["replay_run_id"], system_id),
+        ).fetchone()
+        if run is None:
+            return None
+        return ("component", str(run["component_id"] or ""))
+    return None
+
+
+def _execution_ran_at(execution_kind: str, row: sqlite3.Row) -> Optional[float]:
+    """When the execution ACTUALLY RAN, not when its record was created.
+
+    An Experiment is drafted long before it is run, so `created_at` would
+    refuse a perfectly ordinary "draft it, get it approved, run it" sequence.
+    `started_at` is the moment the candidate executed, and `created_at` is
+    the fallback only for a kind that has no separate start (and for a row
+    written before that column carried a value).
+    """
+    keys = set(row.keys())
+    if execution_kind == "shadow_result":
+        return row["timestamp"] if "timestamp" in keys else None
+    started = row["started_at"] if "started_at" in keys else None
+    if started is not None:
+        return started
+    return row["created_at"] if "created_at" in keys else None
+
+
+def _approved_at(conn: sqlite3.Connection, proposal_id: int) -> Optional[float]:
+    """When this proposal was approved, from the ledger (§7.4).
+
+    The EARLIEST `approved` event: `approve` is reachable only from
+    `proposed`, so there is normally exactly one, and taking the earliest
+    means a re-approval could never retroactively widen the window.
+    """
+    row = conn.execute(
+        "SELECT MIN(created_at) AS approved_at FROM flow_experiment_event "
+        "WHERE proposal_id = ? AND event_kind = 'approved'",
+        (proposal_id,),
+    ).fetchone()
+    return None if row is None else row["approved_at"]
+
+
+def _require_execution_binding(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    proposal_id: int,
+    execution_kind: str,
+    execution_ref: str,
+    row: sqlite3.Row,
+) -> None:
+    """§7.5: the cited execution must be one THIS approval authorised.
+
+    Two independent bindings, both deterministic and both read from canonical
+    rows rather than from the request:
+
+    * **Subject.** The execution's own target (`experiments.feature_id`,
+      `replay_runs.component_id`, `shadow_results.component_id`) is mapped to
+      Evolution Nodes by `execution_target.resolve_execution_target` -- the
+      same exact-match `evolution_node_link` lookup §4.4 already uses for the
+      gate -- and at least one of them must be a target of this proposal.
+      Without it, the ledger's "this proposal was executed" could cite a run
+      of a Node the proposal never named.
+
+      An `ambiguous` mapping is NOT refused here. Ambiguity is a question
+      about whose PERMISSION governs (§4.4.3), and permission was already
+      decided by `_require_execution_capabilities` against the proposal's own
+      targets; the question here is only whether the link exists, and it
+      does.
+
+    * **Order.** The execution must have run at or after the approval.
+      Approval is what authorises the run (§7.5), so a run that predates it
+      was authorised by nothing, and letting it be attached afterwards is
+      exactly the post-hoc binding that makes the ledger unable to say which
+      approval covered which execution.
+
+    A third check has no proposal-local reading: one canonical execution may
+    back exactly ONE proposal, the same rule `intelligence_run_already_used`
+    applies to a draft. An execution IS the running of a proposal's
+    experiment, so two proposals claiming the same run means at least one of
+    them never ran its own -- and the ledger would report an experiment that
+    did not happen.
+
+    Raises `FlowExperimentRejected` with one of
+    `EXECUTION_BINDING_REJECTION_CODES`.
+    """
+    from . import execution_target  # local: keeps the module import-light
+
+    target_keys = {
+        str(target["target_node_key"]) for target in _target_rows(conn, proposal_id)
+    }
+
+    subject = _execution_ref_subject(conn, system_id, execution_kind, row)
+    if subject is None:
+        raise FlowExperimentRejected(
+            "execution_ref_subject_unreadable",
+            f"実行 {execution_kind}:{execution_ref} の対象を読み取れませんでした。"
+            "読めなかったことは「対象が一致した」ことではありません。",
+        )
+    target_kind, target_ref = subject
+    mapping = execution_target.resolve_execution_target(
+        conn, system_id=system_id, target_kind=target_kind, target_ref=target_ref
+    )
+    linked = set(mapping.node_keys)
+    if not linked:
+        raise FlowExperimentRejected(
+            "execution_ref_subject_unmapped",
+            f"実行 {execution_kind}:{execution_ref} の対象 "
+            f"({target_kind}:{target_ref}) はどの Evolution Node にも "
+            "link されていないため、この提案の対象 Node での実行であることを"
+            "確認できません。",
+            (f"{target_kind}:{target_ref}",),
+        )
+    if not (linked & target_keys):
+        raise FlowExperimentRejected(
+            "execution_ref_subject_mismatch",
+            f"実行 {execution_kind}:{execution_ref} は "
+            f"{sorted(linked)} の実行であり、この提案の対象 Node "
+            f"{sorted(target_keys)} の実行ではありません。",
+            tuple(sorted(linked)),
+        )
+
+    bound = conn.execute(
+        """SELECT proposal_id FROM flow_experiment_execution_ref
+            WHERE system_id = ? AND execution_kind = ? AND execution_ref = ?
+              AND proposal_id != ? LIMIT 1""",
+        (system_id, execution_kind, execution_ref, proposal_id),
+    ).fetchone()
+    if bound is not None:
+        raise FlowExperimentRejected(
+            "execution_ref_already_bound",
+            f"実行 {execution_kind}:{execution_ref} は既に提案 "
+            f"{bound['proposal_id']} の実行として記録されています。1 つの実行は"
+            "1 つの提案の実行です。",
+            (str(bound["proposal_id"]),),
+        )
+
+    approved_at = _approved_at(conn, proposal_id)
+    ran_at = _execution_ran_at(execution_kind, row)
+    if approved_at is not None and ran_at is not None and ran_at < approved_at:
+        raise FlowExperimentRejected(
+            "execution_ref_precedes_approval",
+            f"実行 {execution_kind}:{execution_ref} は承認より前に実行されて"
+            "います。承認は実行を許可する記録なので、承認前の実行をこの提案の"
+            "実行として記録することはできません。",
+            (f"ran_at={ran_at}", f"approved_at={approved_at}"),
+        )
+
+
 def _event_doc(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "id": row["id"],
@@ -1706,6 +1926,8 @@ def _validate_llm_provenance(
     system_id: int,
     decision_method: str,
     intelligence_run_id: Optional[int],
+    content: Optional[ProposalContent] = None,
+    target_node_keys: Sequence[str] = (),
 ) -> None:
     """`decision_method='reasoning_llm'` must point at THIS feature's own run.
 
@@ -1724,8 +1946,24 @@ def _validate_llm_provenance(
       several rows as if each had been reasoned about;
     * and `reasoning_llm` without a run id is refused outright.
 
-    What this CANNOT yet check is that the run drafted THIS Flow: nothing
-    persists the drafting subject. See the note in the module docstring.
+    And, since `flow_experiment_draft` records WHAT each run was about, two
+    more (§7.1.3):
+
+    * the run drafted THIS subject -- same `flow_subject_kind`,
+      `flow_subject_ref` and pinned snapshot. `intelligence_runs` alone
+      records only how a run was made, so Flow A's perfectly valid draft run
+      could be attached to a hand-written proposal for Flow B, which would
+      then read as reasoning-model output about B;
+    * every target Node was one the model actually saw
+      (`intelligence_run_target_not_drafted`). A SUBSET is fine: the human
+      edits the draft before posting it, and dropping a Node is ordinary
+      editing. ADDING one is not -- nothing reasoned about that Node, so the
+      content concerning it has no provenance to claim.
+
+    A run with no `flow_experiment_draft` row is refused rather than waved
+    through (`intelligence_run_subject_unknown`). A drafting run predating
+    this table stays readable as audit; what it cannot do is satisfy a check
+    nobody recorded the answer to (#337's compatibility rule).
     """
     if decision_method == "reasoning_llm" and intelligence_run_id is None:
         raise FlowExperimentRejected(
@@ -1777,6 +2015,48 @@ def _validate_llm_provenance(
             (str(used["id"]),),
         )
 
+    if content is None:
+        return
+
+    draft = conn.execute(
+        "SELECT * FROM flow_experiment_draft "
+        "WHERE system_id = ? AND intelligence_run_id = ?",
+        (system_id, intelligence_run_id),
+    ).fetchone()
+    if draft is None:
+        raise FlowExperimentRejected(
+            "intelligence_run_subject_unknown",
+            "この intelligence run は何を対象に draft されたかが記録されて"
+            "いないため、この提案の provenance として検証できません。"
+            "draft をやり直してください。",
+            (str(intelligence_run_id),),
+        )
+    if (
+        draft["flow_subject_kind"] != content.flow_subject_kind
+        or draft["flow_subject_ref"] != content.flow_subject_ref
+        or draft["captured_snapshot_id"] != content.captured_snapshot_id
+    ):
+        raise FlowExperimentRejected(
+            "intelligence_run_subject_mismatch",
+            "この intelligence run は別の Flow / snapshot を対象に draft された"
+            "ものです。別 Flow の draft run をこの提案の provenance にすることは"
+            "できません。",
+            (
+                f"{draft['flow_subject_kind']}:{draft['flow_subject_ref']}"
+                f"@{draft['captured_snapshot_id']}",
+            ),
+        )
+    drafted = set(_json_or_default(draft["node_keys_json"], []))
+    undrafted = sorted(set(target_node_keys) - drafted)
+    if undrafted:
+        raise FlowExperimentRejected(
+            "intelligence_run_target_not_drafted",
+            f"対象 Node {undrafted} は draft の対象ではありませんでした。"
+            "モデルが見ていない Node について reasoning_llm の provenance を"
+            "名乗ることはできません。",
+            tuple(undrafted),
+        )
+
 
 def create_proposal(
     conn: sqlite3.Connection,
@@ -1825,6 +2105,8 @@ def create_proposal(
         system_id=system_id,
         decision_method=decision_method,
         intelligence_run_id=intelligence_run_id,
+        content=content,
+        target_node_keys=[target.node_key for target in facts.targets],
     )
 
     conn.execute("BEGIN")
@@ -2040,6 +2322,13 @@ def record_execution(
     creates no row in `replay_variants` / `experiments` / `shadow_results` --
     it points at one that the existing canonical path already produced, and
     refuses a pointer that does not resolve.
+
+    Because the execution happens on the canonical path and the reference is
+    attached afterwards, the pointer is also BOUND to this proposal
+    (`_require_execution_binding`): the run must be on one of the proposal's
+    own target Nodes, and it must have run at or after the approval. Without
+    both, "this approved proposal was executed" is a claim the ledger cannot
+    check -- and an audit trail that cannot be checked is not one (§7.5).
     """
     _check_membership(execution_kind, EXECUTION_KINDS, "execution_kind")
     ref = _text(execution_ref)
@@ -2064,6 +2353,25 @@ def record_execution(
         raise FlowExperimentValidationError(
             f"execution_ref {execution_kind}:{ref} はこの System で解決できません。"
         )
+
+    # Existing-and-in-this-System was the whole of the check. It let any
+    # canonical execution in the System be attached to any approved proposal,
+    # so the ledger's claim that this approval authorised that run was the
+    # caller's word (EM-ADR-4). The reference must also be ON one of this
+    # proposal's target Nodes and AFTER the approval.
+    ref_row = _execution_ref_row(conn, system_id, execution_kind, ref)
+    if ref_row is None:  # pragma: no cover - `resolution` already refused it
+        raise FlowExperimentValidationError(
+            f"execution_ref {execution_kind}:{ref} はこの System で解決できません。"
+        )
+    _require_execution_binding(
+        conn,
+        system_id=system_id,
+        proposal_id=proposal_id,
+        execution_kind=execution_kind,
+        execution_ref=ref,
+        row=ref_row,
+    )
 
     conn.execute("BEGIN")
     try:
@@ -2663,10 +2971,17 @@ def propose_flow_experiment(
     `ExecutionModeDenied` without a credential ever being read (EM-ADR-3).
     Every named Node is gated, not just the first: drafting an experiment
     that spans a Node nobody permitted is still spending the reasoning budget
-    on that Node.
+    on that Node. Every named Node is gated TWICE -- once before the
+    grounding read and once immediately before the credential read -- because
+    the connection is closed for the whole of the grounding, which is the
+    slowest step here, and a mode revoked inside that window must still stop
+    the call.
 
-    **This creates NOTHING but an audit row.** No proposal, no `proposed`
-    event, no queue entry. The draft is `decision_method: reasoning_llm` and
+    **This creates NOTHING but two audit rows.** No proposal, no `proposed`
+    event, no queue entry. The rows are the `intelligence_runs` row (how the
+    run was made) and the `flow_experiment_draft` row (what it was about);
+    the second exists so a later proposal citing this run can be checked
+    against the Flow it actually drafted (§7.1.3). The draft is `decision_method: reasoning_llm` and
     a human must post it through `create_proposal` (§7.7 / Principle 7).
 
     Connection discipline: this function owns its connections and must be
@@ -2743,15 +3058,45 @@ def propose_flow_experiment(
             "提案は作成しません (§7.1)。",
         )
 
-    # --- Phase 1c: build the client (connection reopened, then closed) ----
+    # --- Phase 1c: re-gate EVERY Node, then build the client --------------
+    #
+    # Phase 1's gate ran before the grounding read, and the connection was
+    # closed for the whole of Phase 1b -- which builds a call graph for a
+    # static Flow and is the slowest thing this function does. A Node
+    # demoted to `fixed` / `observe` during that window was permitted by a
+    # reading that is no longer true.
+    #
+    # `build_experiment_llm_adapter` re-evaluates its own `node_key` before
+    # the first line that could read a credential (EM-ADR-3), so for a
+    # single-Node draft one call was enough. For a `sub_pipeline` draft it
+    # was not: only `keys[0]` was re-read, and the fail-closed guarantee
+    # that credentials are never touched for an unpermitted Node held for
+    # the first Node alone. Re-gating the REST here, before the adapter
+    # call, restores it for all of them -- a refusal on `keys[1]` raises
+    # from this loop, which runs strictly earlier than any credential read.
+    # The re-gate reads the CLOCK, not `moment`. `moment` was taken before
+    # Phase 1, and an assignment written during the grounding read carries an
+    # `effective_from` later than it -- so re-evaluating at `moment` would
+    # find the revocation not yet in force and permit the call anyway, which
+    # is a re-gate that cannot see the only window it exists to cover.
+    regate_at = time.time()
     with get_conn() as conn:
+        for key in keys[1:]:
+            execution_mode.require_capability(
+                conn,
+                system_id=system_id,
+                capability="llm_experiment_proposal",
+                node_key=key,
+                flow_ref=flow_ref,
+                now=regate_at,
+            )
         client, decision = execution_mode.build_experiment_llm_adapter(
             conn,
             system_id=system_id,
             node_key=keys[0],
             flow_ref=flow_ref,
             purpose="flow_experiment_draft",
-            now=moment,
+            now=regate_at,
         )
         config = llm.LLMConfig.intelligence_from_env()
 
@@ -2793,7 +3138,28 @@ def propose_flow_experiment(
     completed_at = time.time()
 
     # --- Phase 3: persist the audit row (connection reopened) -------------
+    #
+    # Two rows, not one. `intelligence_runs` records HOW the run was made;
+    # `flow_experiment_draft` records WHAT it was about, and without the
+    # second there is no way to answer "is this the run that drafted THIS
+    # Flow?" -- so a valid draft of one Flow could be attached as provenance
+    # to a hand-written proposal for another (§7.1.3). The subject row is
+    # written for a FAILED run too: what a run was about is a fact about the
+    # attempt, not about its outcome.
     run_status = "completed" if error is None else "failed"
+    input_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "flow_subject_kind": flow_subject_kind,
+                "flow_subject_ref": flow_subject_ref,
+                "captured_snapshot_id": snapshot_id,
+                "node_keys": sorted(keys),
+                "evidence_ids": sorted(grounding.evidence_ids),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO intelligence_runs
@@ -2816,6 +3182,24 @@ def propose_flow_experiment(
             ),
         )
         run_id = cur.lastrowid
+        conn.execute(
+            """INSERT INTO flow_experiment_draft
+                   (system_id, intelligence_run_id, flow_subject_kind,
+                    flow_subject_ref, captured_snapshot_id, node_keys_json,
+                    evidence_ids_json, input_digest, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                system_id,
+                run_id,
+                flow_subject_kind,
+                flow_subject_ref,
+                snapshot_id,
+                json.dumps(sorted(keys), ensure_ascii=False),
+                json.dumps(sorted(grounding.evidence_ids), ensure_ascii=False),
+                input_digest,
+                completed_at,
+            ),
+        )
 
     if error is not None or draft is None:
         # Fail the run (Principle 6). The audit row above is the only thing
