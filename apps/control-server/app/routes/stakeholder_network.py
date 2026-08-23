@@ -44,6 +44,7 @@ from ..models import (
     StakeholderEvidenceRefCreateRequest,
     StakeholderEvidenceRefListOut,
     StakeholderEvidenceRefOut,
+    StakeholderExchangeLineageOut,
     StakeholderListOut,
     StakeholderNeedCreateRequest,
     StakeholderNeedDetailOut,
@@ -70,6 +71,7 @@ from ..stakeholder_network import (
     ConsiderationIncomplete,
     DecisionStaleDigest,
     ImpactKindInvalid,
+    JourneyStepNotFound,
     KeyConflict,
     KeyRequired,
     NotDecidable,
@@ -109,6 +111,7 @@ _MESSAGES = {
     "exchange_validity_inverted": "valid_to は valid_from より後である必要があります。",
     "stakeholder_decision_stale_digest": "指定された digest が現在の内容と一致しません。",
     "stakeholder_not_decidable": "この状態からはその決定を記録できません。",
+    "journey_step_not_found": "指定された Journey Step が見つかりません。",
 }
 
 
@@ -128,6 +131,8 @@ def _raise_for_error(exc: Exception) -> None:
         raise _reject("stakeholder_ref_kind_invalid", 422)
     if isinstance(exc, ImpactKindInvalid):
         raise _reject("observation_impact_kind_invalid", 422)
+    if isinstance(exc, JourneyStepNotFound):
+        raise _reject("journey_step_not_found", 404)
     if isinstance(exc, TargetNotFound):
         raise _reject("stakeholder_ref_target_not_found", 404)
     if isinstance(exc, SelfLoop):
@@ -456,6 +461,22 @@ def list_exchange_revisions_endpoint(
     return ValueExchangeRevisionListOut(
         system_id=system_id, exchange_key=exchange_key, generated_at=time.time(), **result
     )
+
+
+@router.get("/exchanges/{exchange_key}/lineage", response_model=StakeholderExchangeLineageOut)
+def get_exchange_lineage_endpoint(
+    exchange_key: str, system_id: int = Depends(get_system_id)
+) -> StakeholderExchangeLineageOut:
+    """§7.1: read-only, deterministic, writes nothing. See
+    `app.stakeholder_network.get_exchange_lineage`'s docstring for the
+    guarded-loader-per-section discipline."""
+    with get_conn() as conn:
+        try:
+            result = sn.get_exchange_lineage(conn, system_id, exchange_key)
+        except Exception as exc:
+            _raise_for_error(exc)
+            raise
+    return StakeholderExchangeLineageOut(system_id=system_id, generated_at=time.time(), **result)
 
 
 # --- References + evidence + decisions -----------------------------------------------

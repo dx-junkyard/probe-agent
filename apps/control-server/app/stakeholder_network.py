@@ -1,13 +1,14 @@
 """Stakeholder Value Network: Stakeholder / Need / Environment Observation /
-Value Exchange persistence (Issue #420, Epic #418).
+Value Exchange persistence (Issue #420) plus reference resolution, staleness
+propagation, and the Exchange lineage projection (Issue #421), Epic #418.
 
 `docs/stakeholder-value-network.md` is the canonical contract; §1-§6, §10,
-§14 are this module's specification. This is a deterministic domain service
--- **no LLM call anywhere in this module** (invariant 9). Every public
-function here takes an already-open `conn` and performs no external call --
-unlike `ux_design.create_artifact_reference`, nothing in this Epic shells
-out to `git` or any other subprocess, so there is no analogous
-close-before-external-call seam to maintain.
+§14 are Issue #420's specification and §4-§5.1 are Issue #421's. This is a
+deterministic domain service -- **no LLM call anywhere in this module**
+(invariant 9). Every public function here takes an already-open `conn` and
+performs no external call -- unlike `ux_design.create_artifact_reference`,
+nothing in this Epic shells out to `git` or any other subprocess, so there
+is no analogous close-before-external-call seam to maintain.
 
 Two rules this module must never violate (§0):
 
@@ -17,16 +18,20 @@ Two rules this module must never violate (§0):
   layer does not own (`stakeholder_ref`, `environment_observation_impact`)
   never copies the target's content -- only a `target_ref` plus a
   `captured_digest`, resolved against exactly one canonical source per kind
-  at READ time. **Issue #420 persists the `stakeholder_ref` table and its
-  finite vocabulary, but full resolution against the upstream/downstream
-  kinds this layer does not itself own (`purpose_element`,
-  `purpose_relation`, `capability_entity`, `ux_journey`, `ux_journey_step`,
-  `ux_requirement`, `purpose_outcome_criterion`) is Issue #421's.**
-  `_resolve_target` below is the explicit seam: it already resolves the
-  three kinds THIS module owns (`stakeholder`, `stakeholder_need`,
-  `value_exchange`) and reports `unavailable` -- never `unresolved`, since
-  an unavailable reader must never render as "the target does not exist" --
-  for every other kind, with a docstring naming exactly what #421 must add.
+  at READ time. `_resolve_target` below resolves the three kinds THIS
+  module owns (`stakeholder`, `stakeholder_need`, `value_exchange`) inline,
+  and dispatches every other `StakeholderRefKind` member
+  (`purpose_element`, `purpose_relation`, `capability_entity`,
+  `ux_journey`, `ux_journey_step`, `ux_requirement`,
+  `purpose_outcome_criterion`) to its own owning module's canonical source
+  -- `purpose_chain.derive_purpose_chain`, `understanding_capability_entity`,
+  `ux_journey`/`ux_journey_step`, `ux_requirement`,
+  `purpose_outcome_criterion` -- the same `_LINK_KIND_TARGET_SOURCE`
+  discipline `node_design.py` and `ux_design._resolve_upstream_target` use
+  one layer over. A resolver that RAISES reports `unavailable`; a resolver
+  that ran and found nothing reports `unresolved` -- the two are never
+  merged, since an unavailable reader must never render as "the target
+  does not exist" (§5.1).
 * **`design_status` / `validity_state` are derived, never stored** (§3/
   §1.4): `design_status` is the latest non-superseded `stakeholder_decision`
   row for `(system_id, subject_kind, subject_key)`, folded through a fixed
@@ -36,14 +41,23 @@ Two rules this module must never violate (§0):
   a decision ledger instead of an event log). `validity_state` is derived
   from the clock and `valid_from`/`valid_to`, never a column.
 
+`get_exchange_lineage` (§7.1 of the issue body / #421's own deliverable) is
+the read-only `provider/receiver -> Need/Purpose -> Journey/Step ->
+Requirement/Solution Design -> Outcome/Evidence` projection. Every section
+is its own guarded loader (`_degrade`, #380's discipline): a failing section
+is dropped from the display, never guessed, never zeroed. Requirement ->
+Solution Design is reached ONLY through #405's existing
+`ux_requirement_step_link` + `solution_design_requirement_link` -- §5.2
+forbids a second path to Flow / Evolution Node / Component from this layer.
+
 probe-agent:
-  role: Deterministic Stakeholder / Need / Environment Observation / Value Exchange domain service
+  role: Deterministic Stakeholder / Need / Environment Observation / Value Exchange domain service plus reference resolution and Exchange lineage
   capability: stakeholder-value-network
   element_type: core
   consumers: [control-server, dashboard]
   operation_kind: analysis
   state_effects: [database-read, database-write]
-  probe_value: Verify every revision is append-only with a reproducible content digest, that design_status/validity_state are always derived rather than stored, that a stakeholder_ref never copies target content, and that this module never imports or calls an LLM client.
+  probe_value: Verify every revision is append-only with a reproducible content digest, that design_status/validity_state are always derived rather than stored, that a stakeholder_ref never copies target content, that unresolved and unavailable are never merged, that staleness propagates downstream only, and that this module never imports or calls an LLM client.
 """
 
 from __future__ import annotations
@@ -54,6 +68,7 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, get_args
 
+from . import purpose_chain
 from .models import (
     EnvironmentImpactKind,
     EnvironmentObservationConfidence,
@@ -91,6 +106,8 @@ __all__ = [
     "RefKindInvalid",
     "ImpactKindInvalid",
     "TargetNotFound",
+    "JourneyStepNotFound",
+    "get_exchange_lineage",
     "content_digest",
     "stakeholder_digest",
     "need_digest",
@@ -168,11 +185,6 @@ _DECISION_TO_DESIGN_STATUS: Dict[str, str] = {
     "retire": "retired",
     "reinstate": "proposed",
 }
-
-#: Kinds `_resolve_target` can resolve TODAY, against this layer's own
-#: tables. Everything else in `StakeholderRefKind` is Issue #421's.
-_LOCALLY_RESOLVABLE_REF_KINDS = ("stakeholder", "stakeholder_need", "value_exchange")
-
 
 def _check_membership(value: str, vocabulary: Tuple[str, ...], field_name: str) -> None:
     if value not in vocabulary:
@@ -268,6 +280,15 @@ class TargetNotFound(NotFound):
     A kind `_resolve_target` cannot read yet (`unavailable`, Issue #421's
     seam) is never rejected here -- an unreadable source must never render
     as "the target does not exist" (§5.1)."""
+
+
+class JourneyStepNotFound(NotFound):
+    """A `stakeholder_role_assignment` was scoped to `scope_kind=
+    'journey_step'` naming a Journey/Step pair that is not in that Journey's
+    CURRENT revision (404 `journey_step_not_found`, §5.1's item C). Unlike
+    `TargetNotFound`, this is never softened to `unavailable` -- the Journey
+    table is this layer's own read, not a kind Issue #421 has yet to wire
+    up, so a genuine miss here is always definitive."""
 
 
 def _degrade(
@@ -390,29 +411,225 @@ def observation_digest(
 # --- §5.1. Reference resolution -- the explicit #421 seam ----------------------
 
 
+def _resolve_purpose_target(
+    conn: sqlite3.Connection, system_id: int, ref_kind: str, target_ref: str
+) -> Dict[str, Any]:
+    """Resolve `purpose_element` / `purpose_relation` against
+    `purpose_chain.derive_purpose_chain`'s freshly-computed projection
+    (§5.1's table) -- the same read `ux_design._resolve_purpose_target`
+    performs one layer over. A derivation failure is `unavailable` -- the
+    source itself could not be read, never "the target does not exist"."""
+    try:
+        chain = purpose_chain.derive_purpose_chain(conn, system_id, None)
+    except Exception:  # pragma: no cover - defensive
+        return {"resolution": "unavailable", "name": None, "digest": ""}
+
+    if ref_kind == "purpose_element":
+        element = next((e for e in chain.elements if e.id == target_ref), None)
+        if element is None:
+            return {"resolution": "unresolved", "name": None, "digest": ""}
+        return {
+            "resolution": "resolved",
+            "name": element.display_statement or element.statement or None,
+            "digest": purpose_chain.element_digest(element),
+        }
+
+    # purpose_relation
+    relation = next((r for r in chain.relations if r.id == target_ref), None)
+    if relation is None:
+        return {"resolution": "unresolved", "name": None, "digest": ""}
+    return {"resolution": "resolved", "name": None, "digest": _purpose_relation_digest(relation)}
+
+
+def _purpose_relation_digest(relation: "purpose_chain.PurposeRelation") -> str:
+    """A local digest for a Purpose Chain RELATION -- `purpose_chain` exposes
+    `element_digest` for elements but no relation-level digest of its own.
+    Identical in shape to `ux_design._purpose_relation_digest`, kept local
+    rather than cross-imported (`node_design.py` duplicates its own
+    `_resolve_capability` the same way, rather than importing `ux_design`'s
+    private helper)."""
+    return content_digest(
+        {
+            "kind": relation.kind,
+            "source_id": relation.source_id,
+            "target_id": relation.target_id,
+            "status": relation.status,
+            "provenance": relation.provenance,
+        }
+    )
+
+
+def _resolve_capability_entity(conn: sqlite3.Connection, system_id: int, target_ref: str) -> Dict[str, Any]:
+    """Resolve against Issue #312's canonical, System-scoped Capability
+    identity -- **never** `capability_hierarchy_nodes.id` (regenerated per
+    snapshot) and never the Purpose Chain's hashed name id. Same read as
+    `ux_design._resolve_capability_entity` / `node_design._resolve_capability`
+    one layer over; kept local rather than cross-imported."""
+    ref = (target_ref or "").strip()
+    if not ref.isdigit():
+        return {"resolution": "unresolved", "name": None, "digest": ""}
+    entity_id = int(ref)
+    entity = conn.execute(
+        "SELECT id FROM understanding_capability_entity WHERE id = ? AND system_id = ?",
+        (entity_id, system_id),
+    ).fetchone()
+    if entity is None:
+        return {"resolution": "unresolved", "name": None, "digest": ""}
+
+    head = conn.execute(
+        "SELECT id FROM understanding_capability_confirmation WHERE system_id = ? ORDER BY id DESC LIMIT 1",
+        (system_id,),
+    ).fetchone()
+    name_row = None
+    if head is not None:
+        name_row = conn.execute(
+            """SELECT name FROM understanding_capability_entity_version
+                   WHERE system_id = ? AND confirmation_id = ? AND entity_id = ?""",
+            (system_id, head["id"], entity_id),
+        ).fetchone()
+    if name_row is not None:
+        name, state = name_row["name"], "confirmed"
+    else:
+        last_row = conn.execute(
+            """SELECT name FROM understanding_capability_entity_version
+                   WHERE system_id = ? AND entity_id = ? ORDER BY confirmation_id DESC LIMIT 1""",
+            (system_id, entity_id),
+        ).fetchone()
+        name = last_row["name"] if last_row is not None else None
+        state = "superseded"
+    digest = content_digest({"name": name, "state": state})
+    return {"resolution": "resolved", "name": name, "digest": digest}
+
+
+def _resolve_journey_target(conn: sqlite3.Connection, system_id: int, target_ref: str) -> Dict[str, Any]:
+    """Resolve `ux_journey` against `ux_journey.journey_key` + its CURRENT
+    revision (§5.1)."""
+    row = conn.execute(
+        "SELECT * FROM ux_journey WHERE system_id = ? AND journey_key = ?",
+        (system_id, target_ref),
+    ).fetchone()
+    if row is None:
+        return {"resolution": "unresolved", "name": None, "digest": ""}
+    name = None
+    digest = ""
+    if row["current_revision_id"] is not None:
+        rev = conn.execute(
+            "SELECT content_digest, title FROM ux_journey_revision WHERE id = ?",
+            (row["current_revision_id"],),
+        ).fetchone()
+        if rev is not None:
+            digest = rev["content_digest"]
+            name = rev["title"] or None
+    return {"resolution": "resolved", "name": name, "digest": digest}
+
+
+def _resolve_journey_step_target(conn: sqlite3.Connection, system_id: int, target_ref: str) -> Dict[str, Any]:
+    """Resolve `ux_journey_step` against `"<journey_key>#<step_key>"`
+    (§5.1), matched against that Journey's CURRENT revision's Steps only --
+    a Step from a superseded revision is `unresolved`, mirroring
+    `ux_design._resolve_step_target`'s "Journey Step が消える -> unresolved"
+    rule one layer over."""
+    ref = target_ref or ""
+    journey_key, sep, step_key = ref.partition("#")
+    if not sep or not journey_key or not step_key:
+        return {"resolution": "unresolved", "name": None, "digest": ""}
+    journey = conn.execute(
+        "SELECT * FROM ux_journey WHERE system_id = ? AND journey_key = ?",
+        (system_id, journey_key),
+    ).fetchone()
+    if journey is None or journey["current_revision_id"] is None:
+        return {"resolution": "unresolved", "name": None, "digest": ""}
+    step = conn.execute(
+        "SELECT * FROM ux_journey_step WHERE journey_revision_id = ? AND step_key = ?",
+        (journey["current_revision_id"], step_key),
+    ).fetchone()
+    if step is None:
+        return {"resolution": "unresolved", "name": None, "digest": ""}
+    return {"resolution": "resolved", "name": step["user_intent"] or None, "digest": step["content_digest"]}
+
+
+def _resolve_requirement_target(conn: sqlite3.Connection, system_id: int, target_ref: str) -> Dict[str, Any]:
+    """Resolve `ux_requirement` against `ux_requirement.requirement_key` +
+    its CURRENT revision (§5.1)."""
+    row = conn.execute(
+        "SELECT * FROM ux_requirement WHERE system_id = ? AND requirement_key = ?",
+        (system_id, target_ref),
+    ).fetchone()
+    if row is None:
+        return {"resolution": "unresolved", "name": None, "digest": ""}
+    digest = ""
+    if row["current_revision_id"] is not None:
+        rev = conn.execute(
+            "SELECT content_digest FROM ux_requirement_revision WHERE id = ?",
+            (row["current_revision_id"],),
+        ).fetchone()
+        digest = rev["content_digest"] if rev is not None else ""
+    return {"resolution": "resolved", "name": None, "digest": digest}
+
+
+def _resolve_outcome_criterion_target(conn: sqlite3.Connection, system_id: int, target_ref: str) -> Dict[str, Any]:
+    """Resolve `purpose_outcome_criterion` against its own row id (§5.1).
+    This entity carries no revision chain, so its "current digest" is a
+    digest over its own meaning-bearing columns computed fresh at read time
+    -- the same on-the-fly-digest approach `_resolve_capability_entity`
+    above uses for an entity with no digest column of its own."""
+    ref = (target_ref or "").strip()
+    if not ref.isdigit():
+        return {"resolution": "unresolved", "name": None, "digest": ""}
+    row = conn.execute(
+        "SELECT * FROM purpose_outcome_criterion WHERE id = ? AND system_id = ?",
+        (int(ref), system_id),
+    ).fetchone()
+    if row is None:
+        return {"resolution": "unresolved", "name": None, "digest": ""}
+    d = dict(row)
+    digest = content_digest(
+        {
+            "target_kind": d["target_kind"],
+            "target_id": d["target_id"],
+            "target_label": d["target_label"],
+            "target_digest": d["target_digest"],
+            "measure": d["measure"],
+            "baseline_value": d["baseline_value"],
+            "target_value": d["target_value"],
+            "observation_window": d["observation_window"],
+            "state": d["state"],
+        }
+    )
+    return {"resolution": "resolved", "name": d["target_label"] or None, "digest": digest}
+
+
+#: Dispatch table for the upstream/downstream kinds (everything except the
+#: three this module owns directly) -- §5.1's "one canonical source per
+#: kind", the same `_LINK_KIND_TARGET_SOURCE` discipline `node_design.py`
+#: and `ux_design._resolve_upstream_target` use one layer over. Each entry
+#: is wrapped individually in `_resolve_target` so ANY exception from a
+#: given resolver becomes `unavailable` for THAT kind only, never a crash
+#: that could be mistaken for "the target does not exist".
+_UPSTREAM_RESOLVERS = {
+    "capability_entity": _resolve_capability_entity,
+    "ux_journey": _resolve_journey_target,
+    "ux_journey_step": _resolve_journey_step_target,
+    "ux_requirement": _resolve_requirement_target,
+    "purpose_outcome_criterion": _resolve_outcome_criterion_target,
+}
+
+
 def _resolve_target(conn: sqlite3.Connection, system_id: int, ref_kind: str, target_ref: str) -> Dict[str, Any]:
     """Resolve `ref_kind`/`target_ref` against exactly one canonical source
-    (§5.1's table). **This is the explicit seam Issue #421 extends.**
+    (§5.1's table).
 
-    Issue #420 wires up the three kinds THIS module owns
-    (`stakeholder`/`stakeholder_need`/`value_exchange`) so the layer can at
-    least reference its own rows meaningfully today. Every other kind
+    The three kinds THIS module owns (`stakeholder`/`stakeholder_need`/
+    `value_exchange`) are resolved inline below. Every other kind
     (`purpose_element`, `purpose_relation`, `capability_entity`,
     `ux_journey`, `ux_journey_step`, `ux_requirement`,
-    `purpose_outcome_criterion`) is a valid member of `StakeholderRefKind`
-    (so creating a `stakeholder_ref`/impact naming one is never rejected as
-    invalid) but resolves to `unavailable` -- Issue #421 must replace that
-    branch with a real read of each kind's own canonical source
-    (`purpose_chain.derive_purpose_chain`, `understanding_capability_entity`,
-    `ux_design.get_journey_detail`/`_resolve_step_target`,
-    `ux_design.get_requirement_detail`, `purpose_outcome_criterion`), the
-    same `_LINK_KIND_TARGET_SOURCE` discipline `node_design.py` and
-    `ux_design._resolve_upstream_target` already use one layer over.
-    `unavailable` (never `unresolved`) is deliberate here: the source has
-    simply not been wired up yet, which is a fact about THIS reader, not
-    about whether the target exists (§5.1's "an unreadable source must
-    never render as the target does not exist").
-    """
+    `purpose_outcome_criterion`) is resolved against its own owning module's
+    canonical source (`purpose_chain.derive_purpose_chain`,
+    `understanding_capability_entity`, `ux_journey`/`ux_journey_step`,
+    `ux_requirement`, `purpose_outcome_criterion`) -- never a copy of that
+    source's content (invariant 2). `unavailable` is reserved for a resolver
+    that raised; a resolver that ran and found nothing returns `unresolved`
+    -- the two are never merged (§5.1)."""
     if ref_kind not in REF_KINDS:
         raise RefKindInvalid(ref_kind)
 
@@ -424,17 +641,15 @@ def _resolve_target(conn: sqlite3.Connection, system_id: int, ref_kind: str, tar
         if row is None:
             return {"resolution": "unresolved", "name": None, "digest": ""}
         digest = ""
-        if row["current_revision_id"] is not None:
-            rev = conn.execute(
-                "SELECT * FROM stakeholder_revision WHERE id = ?", (row["current_revision_id"],)
-            ).fetchone()
-            digest = rev["content_digest"] if rev is not None else ""
         name = None
         if row["current_revision_id"] is not None:
             rev = conn.execute(
-                "SELECT display_name FROM stakeholder_revision WHERE id = ?", (row["current_revision_id"],)
+                "SELECT content_digest, display_name FROM stakeholder_revision WHERE id = ?",
+                (row["current_revision_id"],),
             ).fetchone()
-            name = rev["display_name"] if rev is not None else None
+            if rev is not None:
+                digest = rev["content_digest"]
+                name = rev["display_name"]
         return {"resolution": "resolved", "name": name, "digest": digest}
 
     if ref_kind == "stakeholder_need":
@@ -469,8 +684,19 @@ def _resolve_target(conn: sqlite3.Connection, system_id: int, ref_kind: str, tar
             digest = rev["content_digest"] if rev is not None else ""
         return {"resolution": "resolved", "name": None, "digest": digest}
 
-    # Every other StakeholderRefKind member: Issue #421's to wire up.
-    return {"resolution": "unavailable", "name": None, "digest": ""}
+    if ref_kind in ("purpose_element", "purpose_relation"):
+        return _resolve_purpose_target(conn, system_id, ref_kind, target_ref)
+
+    resolver = _UPSTREAM_RESOLVERS.get(ref_kind)
+    if resolver is not None:
+        try:
+            return resolver(conn, system_id, target_ref)
+        except Exception:  # pragma: no cover - defensive
+            return {"resolution": "unavailable", "name": None, "digest": ""}
+
+    # Every member of StakeholderRefKind is handled above; unreachable given
+    # the membership check at the top of this function.
+    return {"resolution": "unavailable", "name": None, "digest": ""}  # pragma: no cover
 
 
 def _ref_recheck_state(captured_digest: str, resolution: str, current_digest: str) -> str:
@@ -683,7 +909,28 @@ def _stakeholder_revision_out_dict(conn: sqlite3.Connection, revision_id: int) -
 
 
 def _role_assignment_out_dict(conn: sqlite3.Connection, system_id: int, row: Dict[str, Any]) -> Dict[str, Any]:
+    """§4's "role assignments' captured digest" row: `recheck_state` is
+    `stale` when EITHER of two independent facts has moved -- the
+    Stakeholder's own content (`captured_digest` vs its current
+    `content_digest`), or (for `scope_kind='journey_step'` only, §4's
+    "Step -> Stakeholder role links for removed steps" row) the scoped Step
+    itself no longer resolving in the Journey's current revision. Neither
+    check stores a second digest column: the Step's own resolution IS the
+    signal -- a removed Step has nothing to compare against, so `unresolved`
+    is sufficient on its own (mirroring `_ref_recheck_state`'s
+    resolution != 'resolved' -> 'stale' branch, applied here without a
+    captured-digest comparison because this row never captured one for the
+    scope target in the first place)."""
     resolved = _resolve_target(conn, system_id, "stakeholder", row["stakeholder_key"])
+    recheck_state = _ref_recheck_state(row["captured_digest"], resolved["resolution"], resolved["digest"])
+    if recheck_state == "current" and row["scope_kind"] == "journey_step":
+        parsed = _parse_journey_step_scope_ref(row["scope_ref"])
+        if parsed is None:
+            recheck_state = "stale"
+        else:
+            step_resolved = _resolve_journey_step_target(conn, system_id, f"{parsed[0]}#{parsed[1]}")
+            if step_resolved["resolution"] != "resolved":
+                recheck_state = "stale"
     return {
         "id": row["id"],
         "stakeholder_key": row["stakeholder_key"],
@@ -691,13 +938,50 @@ def _role_assignment_out_dict(conn: sqlite3.Connection, system_id: int, row: Dic
         "scope_kind": row["scope_kind"],
         "scope_ref": row["scope_ref"],
         "captured_digest": row["captured_digest"],
-        "recheck_state": _ref_recheck_state(row["captured_digest"], resolved["resolution"], resolved["digest"]),
+        "recheck_state": recheck_state,
         "note": row["note"],
         "decision_method": row["decision_method"],
         "created_by": row["created_by"],
         "created_at": row["created_at"],
         "superseded_by_id": row["superseded_by_id"],
     }
+
+
+def _parse_journey_step_scope_ref(scope_ref: str) -> Optional[Tuple[str, str]]:
+    """Parse a `scope_kind='journey_step'` role assignment's `scope_ref`:
+    `"journey_step:<journey_key>#<step_key>"` -- the `journey_step:` prefix
+    is stored exactly as #412 requires of every mode `scope_ref` (§1.1), and
+    the `<journey_key>#<step_key>` body is §5.1's own `ux_journey_step`
+    `target_ref` format, reused rather than inventing a second spelling for
+    the same pair. Returns `None` on any structurally invalid form -- never
+    raises -- so the caller can fold "malformed" and "well-formed but not
+    found" into the same 404 `journey_step_not_found`."""
+    ref = scope_ref or ""
+    prefix = "journey_step:"
+    if not ref.startswith(prefix):
+        return None
+    body = ref[len(prefix):]
+    journey_key, sep, step_key = body.partition("#")
+    if not sep or not journey_key or not step_key:
+        return None
+    return journey_key, step_key
+
+
+def _journey_step_exists(conn: sqlite3.Connection, system_id: int, journey_key: str, step_key: str) -> bool:
+    """Whether `step_key` is in `journey_key`'s CURRENT revision (§5.1's item
+    C) -- a step from a superseded revision does not count, the same rule
+    `_resolve_journey_step_target` applies to a `stakeholder_ref`."""
+    journey = conn.execute(
+        "SELECT current_revision_id FROM ux_journey WHERE system_id = ? AND journey_key = ?",
+        (system_id, journey_key),
+    ).fetchone()
+    if journey is None or journey["current_revision_id"] is None:
+        return False
+    step = conn.execute(
+        "SELECT 1 FROM ux_journey_step WHERE journey_revision_id = ? AND step_key = ?",
+        (journey["current_revision_id"], step_key),
+    ).fetchone()
+    return step is not None
 
 
 def add_role_assignment(
@@ -722,6 +1006,15 @@ def add_role_assignment(
     `captured_digest` is the Stakeholder's OWN current `content_digest` at
     assignment time -- never a copy of any content this row itself owns,
     since a role assignment has none beyond its four identity columns.
+
+    `scope_kind='journey_step'` is validated against the Journey's CURRENT
+    revision (404 `journey_step_not_found` otherwise, §5.1's item C) -- a
+    role assignment scoped to a step is joining two entities this Epic's
+    modules both own, so unlike a `stakeholder_ref` it cannot aspirationally
+    point at nothing (the same reasoning `ux_design.add_requirement_step_link`
+    applies one layer over). Every OTHER `scope_kind` stays unvalidated here
+    -- #421 owns only the `journey_step` scope; validating `journey` /
+    `value_exchange` scope refs is not this issue's scope.
     """
     now = time.time() if now is None else now
     _check_membership(role, STAKEHOLDER_ROLES, "role")
@@ -729,6 +1022,11 @@ def add_role_assignment(
     stakeholder = _get_stakeholder_row(conn, system_id, stakeholder_key)
     if stakeholder is None:
         raise NotFound(f"Stakeholder {stakeholder_key!r} not found")
+
+    if scope_kind == "journey_step":
+        parsed = _parse_journey_step_scope_ref(scope_ref)
+        if parsed is None or not _journey_step_exists(conn, system_id, parsed[0], parsed[1]):
+            raise JourneyStepNotFound(scope_ref)
 
     resolved = _resolve_target(conn, system_id, "stakeholder", stakeholder_key)
     captured_digest = resolved["digest"] if resolved["resolution"] == "resolved" else ""
@@ -1719,6 +2017,250 @@ def list_evidence_refs(conn: sqlite3.Connection, system_id: int, subject_kind: s
         _degrade(degraded_sections, degraded_detail, "evidence_refs", exc)
     return {
         "evidence_refs": evidence_refs, "degraded_sections": degraded_sections, "degraded_detail": degraded_detail,
+    }
+
+
+# --- Issue #421: GET /stakeholder-network/exchanges/{key}/lineage ---------------
+
+
+def _lineage_ref_entry(conn: sqlite3.Connection, system_id: int, row: Dict[str, Any]) -> Dict[str, Any]:
+    """One `stakeholder_ref` row rendered for the lineage projection --
+    resolved fresh, never a copy of the target's content (invariant 2), the
+    same shape `_ref_out_dict` uses for the plain refs listing."""
+    resolved = _resolve_target(conn, system_id, row["ref_kind"], row["target_ref"])
+    current_digest = resolved["digest"] if resolved["resolution"] == "resolved" else ""
+    return {
+        "id": row["id"],
+        "ref_kind": row["ref_kind"],
+        "target_ref": row["target_ref"],
+        "target_name": resolved["name"],
+        "target_resolution": resolved["resolution"],
+        "recheck_state": _ref_recheck_state(row["captured_digest"], resolved["resolution"], current_digest),
+        "relation_status": _DECISION_METHOD_TO_RELATION_STATUS.get(row["decision_method"], "derived"),
+        "note": row["note"],
+        "created_by": row["created_by"],
+        "created_at": row["created_at"],
+    }
+
+
+def _exchange_refs(
+    conn: sqlite3.Connection, system_id: int, exchange_key: str, ref_kinds: Tuple[str, ...]
+) -> List[Dict[str, Any]]:
+    placeholders = ",".join("?" for _ in ref_kinds)
+    rows = conn.execute(
+        f"""SELECT * FROM stakeholder_ref
+            WHERE system_id = ? AND source_kind = 'value_exchange' AND source_key = ?
+              AND superseded_by_id IS NULL AND ref_kind IN ({placeholders})
+            ORDER BY id DESC""",
+        (system_id, exchange_key, *ref_kinds),
+    ).fetchall()
+    return [_lineage_ref_entry(conn, system_id, dict(r)) for r in rows]
+
+
+def _requirement_via_steps(
+    conn: sqlite3.Connection, system_id: int, journey_step_refs: List[Dict[str, Any]]
+) -> List[str]:
+    """Requirement keys reached through #405's existing
+    `ux_requirement_step_link` from a RESOLVED `ux_journey_step` reference
+    (§7.1: "Requirement -> Solution Design is reached through #405's
+    existing `ux_requirement_step_link` ... do NOT add a second path").
+    A ref whose target does not currently resolve contributes nothing --
+    there is no live Step to look up a link against."""
+    keys: List[str] = []
+    for ref in journey_step_refs:
+        if ref["target_resolution"] != "resolved":
+            continue
+        journey_key, sep, step_key = (ref["target_ref"] or "").partition("#")
+        if not sep:
+            continue
+        journey = conn.execute(
+            "SELECT id FROM ux_journey WHERE system_id = ? AND journey_key = ?",
+            (system_id, journey_key),
+        ).fetchone()
+        if journey is None:
+            continue
+        rows = conn.execute(
+            """SELECT requirement_id FROM ux_requirement_step_link
+               WHERE system_id = ? AND journey_id = ? AND step_key = ? AND superseded_by_id IS NULL""",
+            (system_id, journey["id"], step_key),
+        ).fetchall()
+        for r in rows:
+            req = conn.execute(
+                "SELECT requirement_key FROM ux_requirement WHERE id = ?", (r["requirement_id"],)
+            ).fetchone()
+            if req is not None and req["requirement_key"] not in keys:
+                keys.append(req["requirement_key"])
+    return keys
+
+
+def _requirement_lineage_entry(conn: sqlite3.Connection, system_id: int, requirement_key: str) -> Dict[str, Any]:
+    resolved = _resolve_requirement_target(conn, system_id, requirement_key)
+    return {
+        "requirement_key": requirement_key,
+        "target_resolution": resolved["resolution"],
+    }
+
+
+def _solution_designs_for_requirement(
+    conn: sqlite3.Connection, system_id: int, requirement_key: str
+) -> List[Dict[str, Any]]:
+    """The Solution Design(s) linked to one Requirement via #405's own
+    `solution_design_requirement_link`, plus which option (if any) is
+    currently `adopted` -- reusing `solution_design_decision`'s existing
+    exclusive-choice ledger rather than a second adoption concept."""
+    requirement = conn.execute(
+        "SELECT id FROM ux_requirement WHERE system_id = ? AND requirement_key = ?",
+        (system_id, requirement_key),
+    ).fetchone()
+    if requirement is None:
+        return []
+    link_rows = conn.execute(
+        """SELECT DISTINCT solution_design_id FROM solution_design_requirement_link
+           WHERE system_id = ? AND requirement_id = ? AND superseded_by_id IS NULL""",
+        (system_id, requirement["id"]),
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for link_row in link_rows:
+        design = conn.execute(
+            "SELECT * FROM solution_design WHERE id = ? AND system_id = ?",
+            (link_row["solution_design_id"], system_id),
+        ).fetchone()
+        if design is None:
+            continue
+        adopted = conn.execute(
+            """SELECT option_key FROM solution_design_decision
+               WHERE system_id = ? AND solution_design_id = ? AND decision = 'adopt'
+                 AND superseded_by_id IS NULL
+               ORDER BY id DESC LIMIT 1""",
+            (system_id, design["id"]),
+        ).fetchone()
+        out.append(
+            {
+                "design_key": design["design_key"],
+                "title": design["title"],
+                "requirement_key": requirement_key,
+                "adopted_option_key": adopted["option_key"] if adopted is not None else None,
+            }
+        )
+    return out
+
+
+def get_exchange_lineage(conn: sqlite3.Connection, system_id: int, exchange_key: str) -> Dict[str, Any]:
+    """§7.1's read-only Exchange lineage projection:
+    `provider/receiver -> Need/Purpose -> Journey/Step -> Requirement/
+    Solution Design -> Outcome/Evidence`. Deterministic, no LLM, writes
+    nothing (invariant 9 / #382's rule). Every section is its own guarded
+    loader (`_degrade`, #380's discipline): a failing section is DROPPED
+    from the display, never substituted with a guessed value and never
+    reported as `0`/empty/`missing`.
+    """
+    exchange = _get_exchange_row(conn, system_id, exchange_key)
+    if exchange is None:
+        raise NotFound(f"Exchange {exchange_key!r} not found")
+
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+    exchange_out: Optional[Dict[str, Any]] = None
+    try:
+        exchange_out = _exchange_overview(conn, system_id, exchange)
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "exchange", exc)
+
+    provider: Optional[Dict[str, Any]] = None
+    receiver: Optional[Dict[str, Any]] = None
+    if exchange_out is None:
+        # The "exchange" section already degraded above; provider/receiver
+        # depend entirely on it, so record their own degradation rather than
+        # rendering an empty section that reads as "no provider/receiver".
+        _degrade(
+            degraded_sections, degraded_detail, "stakeholders",
+            RuntimeError("exchange section unavailable"),
+        )
+    else:
+        try:
+            provider_key = exchange_out["provider_stakeholder_key"]
+            receiver_key = exchange_out["receiver_stakeholder_key"]
+            p = _resolve_target(conn, system_id, "stakeholder", provider_key)
+            r = _resolve_target(conn, system_id, "stakeholder", receiver_key)
+            provider = {"stakeholder_key": provider_key, "name": p["name"], "target_resolution": p["resolution"]}
+            receiver = {"stakeholder_key": receiver_key, "name": r["name"], "target_resolution": r["resolution"]}
+        except Exception as exc:  # pragma: no cover - defensive
+            _degrade(degraded_sections, degraded_detail, "stakeholders", exc)
+
+    needs: List[Dict[str, Any]] = []
+    try:
+        needs = _exchange_refs(conn, system_id, exchange_key, ("stakeholder_need",))
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "needs", exc)
+
+    purpose_refs: List[Dict[str, Any]] = []
+    try:
+        purpose_refs = _exchange_refs(conn, system_id, exchange_key, ("purpose_element", "purpose_relation"))
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "purpose", exc)
+
+    journey_refs: List[Dict[str, Any]] = []
+    try:
+        journey_refs = _exchange_refs(conn, system_id, exchange_key, ("ux_journey", "ux_journey_step"))
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "journey", exc)
+
+    requirement_keys: List[str] = []
+    try:
+        direct = _exchange_refs(conn, system_id, exchange_key, ("ux_requirement",))
+        for entry in direct:
+            if entry["target_ref"] not in requirement_keys:
+                requirement_keys.append(entry["target_ref"])
+        step_refs = [r for r in journey_refs if r["ref_kind"] == "ux_journey_step"]
+        for key in _requirement_via_steps(conn, system_id, step_refs):
+            if key not in requirement_keys:
+                requirement_keys.append(key)
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "requirements", exc)
+
+    requirements: List[Dict[str, Any]] = []
+    solution_designs: List[Dict[str, Any]] = []
+    try:
+        for key in requirement_keys:
+            requirements.append(_requirement_lineage_entry(conn, system_id, key))
+            solution_designs.extend(_solution_designs_for_requirement(conn, system_id, key))
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "solution_designs", exc)
+
+    outcomes: List[Dict[str, Any]] = []
+    try:
+        outcomes = _exchange_refs(conn, system_id, exchange_key, ("purpose_outcome_criterion",))
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "outcomes", exc)
+
+    evidence: List[Dict[str, Any]] = []
+    try:
+        rows = conn.execute(
+            """SELECT * FROM stakeholder_evidence_ref
+               WHERE system_id = ? AND subject_kind = 'value_exchange' AND subject_key = ?
+                 AND superseded_by_id IS NULL
+               ORDER BY id DESC""",
+            (system_id, exchange_key),
+        ).fetchall()
+        evidence = [dict(r) for r in rows]
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "evidence", exc)
+
+    return {
+        "exchange_key": exchange_key,
+        "exchange": exchange_out,
+        "provider": provider,
+        "receiver": receiver,
+        "needs": needs,
+        "purpose_refs": purpose_refs,
+        "journey_refs": journey_refs,
+        "requirements": requirements,
+        "solution_designs": solution_designs,
+        "outcomes": outcomes,
+        "evidence": evidence,
+        "degraded_sections": degraded_sections,
+        "degraded_detail": degraded_detail,
     }
 
 

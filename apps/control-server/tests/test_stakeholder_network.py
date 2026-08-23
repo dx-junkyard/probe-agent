@@ -298,6 +298,261 @@ def _create_evidence_ref(client, headers, subject_kind, subject_key, evidence_ki
     return r.json() if expect < 300 else r
 
 
+def _insert_session(system_id):
+    """A minimal `repository_snapshots` + `interview_session` row, so tests
+    that need a real `session_id` FK target (Capability confirmations,
+    Purpose Outcome criteria) do not have to spin up a git fixture repo the
+    way `test_ux_design.py`'s `_setup` does -- neither table this file
+    exercises reads the repository itself."""
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        snapshot_id = conn.execute(
+            """INSERT INTO repository_snapshots (system_id, repo_path, commit_sha, status, created_at, completed_at)
+               VALUES (?, '', 'deadbeef', 'ready', ?, ?)""",
+            (system_id, now, now),
+        ).lastrowid
+        session_id = conn.execute(
+            """INSERT INTO interview_session (system_id, snapshot_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (system_id, snapshot_id, now, now),
+        ).lastrowid
+        conn.commit()
+        return session_id
+
+
+def _insert_capability_entity(system_id, session_id, name):
+    """Same shape as `test_ux_design.py`'s helper of the same name."""
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        entity_id = conn.execute(
+            "INSERT INTO understanding_capability_entity (system_id, entity_kind, created_at) VALUES (?, 'core_capability', ?)",
+            (system_id, now),
+        ).lastrowid
+        confirmation_id = conn.execute(
+            """INSERT INTO understanding_capability_confirmation
+                   (system_id, session_id, composition_digest, decided_by, decision_method, created_at)
+               VALUES (?, ?, 'd', 'root', 'manual', ?)""",
+            (system_id, session_id, now),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO understanding_capability_entity_version
+                   (system_id, confirmation_id, entity_id, entity_kind, name, summary, semantic_digest,
+                    payload_json, created_at)
+               VALUES (?, ?, ?, 'core_capability', ?, '', 'sd', '{}', ?)""",
+            (system_id, confirmation_id, entity_id, name, now),
+        )
+        conn.commit()
+        return entity_id
+
+
+def _supersede_capability_entity(system_id, session_id):
+    """Insert a new confirmation head that renames the entity -- content
+    change, not just supersession (§4's "Capability entity change")."""
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        entity = conn.execute(
+            "SELECT id FROM understanding_capability_entity WHERE system_id = ?", (system_id,)
+        ).fetchone()
+        confirmation_id = conn.execute(
+            """INSERT INTO understanding_capability_confirmation
+                   (system_id, session_id, composition_digest, decided_by, decision_method, created_at)
+               VALUES (?, ?, 'd2', 'root', 'manual', ?)""",
+            (system_id, session_id, now),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO understanding_capability_entity_version
+                   (system_id, confirmation_id, entity_id, entity_kind, name, summary, semantic_digest,
+                    payload_json, created_at)
+               VALUES (?, ?, ?, 'core_capability', 'Billing Renamed', '', 'sd2', '{}', ?)""",
+            (system_id, confirmation_id, entity["id"], now),
+        )
+        conn.commit()
+
+
+def _insert_outcome_criterion(system_id, session_id):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        criterion_id = conn.execute(
+            """INSERT INTO purpose_outcome_criterion
+                   (system_id, session_id, target_kind, target_id, target_digest, source_need_id,
+                    source_need_code, measure, created_at)
+               VALUES (?, ?, 'element', 'beneficiary_problem', 'd', 'need1', 'code1', 'measure', ?)""",
+            (system_id, session_id, now),
+        ).lastrowid
+        conn.commit()
+        return criterion_id
+
+
+def _mutate_outcome_criterion(criterion_id, **fields):
+    from app.db import get_conn
+
+    assignments = ", ".join(f"{k} = ?" for k in fields)
+    with get_conn() as conn:
+        conn.execute(f"UPDATE purpose_outcome_criterion SET {assignments} WHERE id = ?", (*fields.values(), criterion_id))
+        conn.commit()
+
+
+def _add_need_revision_via_api(client, headers, need_key, **fields):
+    payload = {"need_kind": "unmet_need", "statement": "", "rationale": "", "stakeholder_key": "", "change_note": ""}
+    payload.update(fields)
+    r = client.post(f"/stakeholder-network/needs/{need_key}/revisions", json=payload, headers=headers)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+# --- helpers that need a real git repo + Interview session (Purpose Chain) -----
+
+
+def _pc_login(client):
+    return _login(client)
+
+
+def _pc_init_repo(tmp_path, name="repo"):
+    import os
+    import subprocess
+
+    repo = str(tmp_path / name)
+    os.makedirs(repo)
+    subprocess.run(["git", "init", repo], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "t@t.com"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "T"], check=True, capture_output=True)
+    with open(os.path.join(repo, "a.py"), "w") as f:
+        f.write("def a():\n    return 1\n")
+    subprocess.run(["git", "-C", repo, "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo, "commit", "-m", "init"], check=True, capture_output=True)
+    sha = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return repo, sha
+
+
+def _pc_insert_snapshot(system_id, repo_path, commit_sha):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO repository_snapshots
+                   (system_id, repo_path, commit_sha, status, created_at, completed_at)
+               VALUES (?, ?, ?, 'ready', ?, ?)""",
+            (system_id, repo_path, commit_sha, now, now),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def _pc_setup(client, tmp_path, name):
+    token = _pc_login(client)
+    system_id = _create_system(client, token, name)
+    repo, sha = _pc_init_repo(tmp_path, f"repo-{name.replace(' ', '-')}")
+    snapshot_id = _pc_insert_snapshot(system_id, repo, sha)
+    return token, system_id, snapshot_id
+
+
+def _pc_settle_initial_build(session_id, *, ok=True):
+    from app.db import get_conn
+    from app.interview_workflow import finish_process_run
+
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT id FROM interview_process_run
+               WHERE session_id = ? AND status = 'running' ORDER BY id LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+        if row is not None:
+            finish_process_run(conn, row["id"], ok=ok, error=None if ok else "build failed")
+
+
+def _pc_create_session(client, headers, snapshot_id):
+    r = client.post("/interview/sessions", json={"snapshot_id": snapshot_id}, headers=headers)
+    assert r.status_code == 201, r.text
+    session_id = r.json()["id"]
+    _pc_settle_initial_build(session_id)
+    return session_id
+
+
+def _pc_set_pain(client, headers, session_id, text, status="confirmed"):
+    r = client.post(
+        f"/interview/sessions/{session_id}/intent",
+        json={"field": "pain", "value_text": text, "status": status},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _create_journey_with_steps(client, headers, journey_key, steps, *, beneficiary=""):
+    r = client.post(
+        "/ux-design/journeys",
+        json={"journey_key": journey_key, "perspective": "to_be", "baseline_mode": "undecided",
+              "baseline_journey_id": None},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    r = client.post(
+        f"/ux-design/journeys/{journey_key}/revisions",
+        json={
+            "title": "", "beneficiary": beneficiary, "usage_context": "", "entry_trigger": "",
+            "value_arrival": "", "summary": "", "change_note": "", "steps": steps,
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _step(step_key, order, **overrides):
+    base = {
+        "step_key": step_key, "step_order": order, "user_intent": "intent", "system_response": "response",
+        "success_criteria": "", "failure_mode": "", "recovery_path": "", "evidence_expectation": "",
+        "evidence_source_kind": "none",
+    }
+    base.update(overrides)
+    return base
+
+
+def _create_requirement_via_api(client, headers, requirement_key):
+    r = client.post(
+        "/ux-design/requirements",
+        json={"requirement_key": requirement_key, "requirement_kind": "functional"},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _add_step_link(client, headers, requirement_key, journey_key, step_key):
+    r = client.post(
+        f"/ux-design/requirements/{requirement_key}/step-links",
+        json={"journey_key": journey_key, "step_key": step_key, "note": ""},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _ux_decide(client, headers, subject_kind, subject_key, decision, *, rationale="", captured_digest="", expect=201):
+    """`ux_design`'s own decision ledger -- `journey` / `requirement` are
+    NOT members of `StakeholderSubjectKind`, so confirming them goes through
+    `/ux-design/decisions`, not `/stakeholder-network/decisions`."""
+    r = client.post(
+        "/ux-design/decisions",
+        json={"subject_kind": subject_kind, "subject_key": subject_key, "decision": decision,
+              "rationale": rationale, "captured_digest": captured_digest},
+        headers=headers,
+    )
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
 def _decide(client, headers, subject_kind, subject_key, decision, *, rationale="", captured_digest="", expect=201):
     r = client.post(
         "/stakeholder-network/decisions",
@@ -761,17 +1016,188 @@ class TestReferencesAndEvidence:
         assert r.status_code == 404
         assert r.json()["detail"]["code"] == "stakeholder_ref_target_not_found"
 
-    def test_ref_to_a_not_yet_wired_kind_is_unavailable_never_unresolved(self, admin_client):
-        """Issue #421's explicit seam: `purpose_element` etc. are valid
-        StakeholderRefKind members but #420 has not wired a reader for them
-        yet -- `unavailable`, never `unresolved` (an unreadable source must
-        never render as "the target does not exist")."""
-        token, system_id = _setup(admin_client, "System RefSeam")
+    def test_ref_to_purpose_element_resolves_against_the_frame_slot(self, admin_client):
+        """Issue #421: `purpose_element` now resolves for real against
+        `purpose_chain.derive_purpose_chain`. `beneficiary_problem` is a
+        frame-slot element that always exists (state `unknown` with no pain
+        ever recorded), so it resolves even with no Interview session set up
+        beyond the System itself."""
+        token, system_id = _setup(admin_client, "System RefPurpose")
         headers = _headers(token, system_id)
         _create_stakeholder(admin_client, headers, "sh1")
-        ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "purpose_element", "some-purpose-id")
-        assert ref["target_resolution"] == "unavailable"
-        assert ref["recheck_state"] == "not_captured"
+        ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "purpose_element", "beneficiary_problem")
+        assert ref["target_resolution"] == "resolved"
+        assert ref["recheck_state"] == "current"
+
+    def test_ref_to_purpose_element_that_does_not_exist_is_unresolved(self, admin_client):
+        """A genuine miss against a REAL canonical source (purpose_chain's
+        projection was read fine; the id just is not in it) is `unresolved`,
+        not `unavailable` -- the two must never be merged (§5.1)."""
+        token, system_id = _setup(admin_client, "System RefPurposeMissing")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        r = admin_client.post(
+            "/stakeholder-network/refs",
+            json={"source_kind": "stakeholder", "source_key": "sh1", "ref_kind": "purpose_element",
+                  "target_ref": "core_capability:does-not-exist", "note": ""},
+            headers=headers,
+        )
+        assert r.status_code == 404
+        assert r.json()["detail"]["code"] == "stakeholder_ref_target_not_found"
+
+    def test_ref_to_purpose_element_is_unavailable_when_the_source_cannot_be_read(self, admin_client, monkeypatch):
+        """A resolver that RAISES is `unavailable`, never `unresolved` -- an
+        unreadable source must never render as "the target does not exist"
+        (§5.1), mirroring `ux_design`'s identical test one layer over."""
+        from app import stakeholder_network as sn_module
+
+        token, system_id = _setup(admin_client, "System RefPurposeUnavailable")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "purpose_element", "beneficiary_problem")
+        assert ref["target_resolution"] == "resolved"
+
+        def _boom(*a, **kw):
+            raise RuntimeError("purpose chain unreadable")
+
+        monkeypatch.setattr(sn_module.purpose_chain, "derive_purpose_chain", _boom)
+
+        listed = admin_client.get("/stakeholder-network/refs", headers=headers).json()["refs"]
+        got = next(r for r in listed if r["id"] == ref["id"])
+        assert got["target_resolution"] == "unavailable"
+        assert got["recheck_state"] == "stale"
+
+    def test_ref_to_capability_entity_resolves_against_the_312_identity(self, admin_client):
+        token, system_id = _setup(admin_client, "System RefCapability")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        session_id = _insert_session(system_id)
+
+        from app.db import get_conn
+
+        now = time.time()
+        with get_conn() as conn:
+            entity_id = conn.execute(
+                "INSERT INTO understanding_capability_entity (system_id, entity_kind, created_at) "
+                "VALUES (?, 'core_capability', ?)",
+                (system_id, now),
+            ).lastrowid
+            confirmation_id = conn.execute(
+                """INSERT INTO understanding_capability_confirmation
+                       (system_id, session_id, composition_digest, decided_by, decision_method, created_at)
+                   VALUES (?, ?, 'd', 'root', 'manual', ?)""",
+                (system_id, session_id, now),
+            ).lastrowid
+            conn.execute(
+                """INSERT INTO understanding_capability_entity_version
+                       (system_id, confirmation_id, entity_id, entity_kind, name, summary, semantic_digest,
+                        payload_json, created_at)
+                   VALUES (?, ?, ?, 'core_capability', 'Billing', '', 'sd', '{}', ?)""",
+                (system_id, confirmation_id, entity_id, now),
+            )
+            conn.commit()
+
+        ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "capability_entity", str(entity_id))
+        assert ref["target_resolution"] == "resolved"
+
+    def test_ref_to_capability_entity_that_does_not_exist_is_unresolved(self, admin_client):
+        token, system_id = _setup(admin_client, "System RefCapabilityMissing")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        r = admin_client.post(
+            "/stakeholder-network/refs",
+            json={"source_kind": "stakeholder", "source_key": "sh1", "ref_kind": "capability_entity",
+                  "target_ref": "999999", "note": ""},
+            headers=headers,
+        )
+        assert r.status_code == 404
+        assert r.json()["detail"]["code"] == "stakeholder_ref_target_not_found"
+
+    def test_ref_to_ux_journey_and_step_resolve(self, admin_client):
+        token, system_id = _setup(admin_client, "System RefJourney")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+
+        r = admin_client.post(
+            "/ux-design/journeys",
+            json={"journey_key": "j1", "perspective": "to_be", "baseline_mode": "undecided", "baseline_journey_id": None},
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        r = admin_client.post(
+            "/ux-design/journeys/j1/revisions",
+            json={
+                "title": "", "beneficiary": "", "usage_context": "", "entry_trigger": "", "value_arrival": "",
+                "summary": "", "change_note": "",
+                "steps": [
+                    {"step_key": "s1", "step_order": 0, "user_intent": "intent", "system_response": "resp",
+                     "success_criteria": "", "failure_mode": "", "recovery_path": "",
+                     "evidence_expectation": "", "evidence_source_kind": "none"},
+                ],
+            },
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+
+        journey_ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "ux_journey", "j1")
+        assert journey_ref["target_resolution"] == "resolved"
+
+        step_ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "ux_journey_step", "j1#s1")
+        assert step_ref["target_resolution"] == "resolved"
+
+        missing_step = admin_client.post(
+            "/stakeholder-network/refs",
+            json={"source_kind": "stakeholder", "source_key": "sh1", "ref_kind": "ux_journey_step",
+                  "target_ref": "j1#does-not-exist", "note": ""},
+            headers=headers,
+        )
+        assert missing_step.status_code == 404
+        assert missing_step.json()["detail"]["code"] == "stakeholder_ref_target_not_found"
+
+    def test_ref_to_ux_requirement_resolves(self, admin_client):
+        token, system_id = _setup(admin_client, "System RefRequirement")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        r = admin_client.post(
+            "/ux-design/requirements",
+            json={"requirement_key": "r1", "requirement_kind": "functional"},
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+
+        ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "ux_requirement", "r1")
+        assert ref["target_resolution"] == "resolved"
+
+    def test_ref_to_purpose_outcome_criterion_resolves(self, admin_client):
+        token, system_id = _setup(admin_client, "System RefOutcome")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        session_id = _insert_session(system_id)
+
+        from app.db import get_conn
+
+        now = time.time()
+        with get_conn() as conn:
+            criterion_id = conn.execute(
+                """INSERT INTO purpose_outcome_criterion
+                       (system_id, session_id, target_kind, target_id, target_digest, source_need_id,
+                        source_need_code, measure, created_at)
+                   VALUES (?, ?, 'element', 'beneficiary_problem', 'd', 'need1', 'code1', 'measure', ?)""",
+                (system_id, session_id, now),
+            ).lastrowid
+            conn.commit()
+
+        ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "purpose_outcome_criterion", str(criterion_id))
+        assert ref["target_resolution"] == "resolved"
+
+        missing = admin_client.post(
+            "/stakeholder-network/refs",
+            json={"source_kind": "stakeholder", "source_key": "sh1", "ref_kind": "purpose_outcome_criterion",
+                  "target_ref": "999999", "note": ""},
+            headers=headers,
+        )
+        assert missing.status_code == 404
+        assert missing.json()["detail"]["code"] == "stakeholder_ref_target_not_found"
 
     def test_ref_kind_invalid_is_rejected(self, admin_client):
         """`ref_kind` is `Literal[StakeholderRefKind]` on the request model,
@@ -1060,3 +1486,433 @@ class TestNoSyntheticScore:
             cols = [row[1].lower() for row in conn.execute(f"PRAGMA table_info({table})")]
             for col in cols:
                 assert not any(s in col for s in forbidden_substrings), f"{table}.{col} looks like a score column"
+
+
+# ---------------------------------------------------------------------------
+# Issue #421: reference resolution, journey_step role scope, staleness
+# propagation (§4), no-auto-link-from-string-match (§13), and the Exchange
+# lineage projection (§7.1).
+# ---------------------------------------------------------------------------
+
+
+class TestJourneyStepRoleScope:
+    """§5.1 item C: a role assignment scoped to `journey_step` must resolve
+    against the Journey's CURRENT revision -- unlike a `stakeholder_ref`,
+    this joins two entities the Epic's own modules both own, so it cannot
+    aspirationally point at nothing."""
+
+    def test_role_scoped_to_existing_step_succeeds(self, admin_client):
+        token, system_id = _setup(admin_client, "System RoleStep")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        _create_journey_with_steps(admin_client, headers, "j1", [_step("s1", 0)])
+
+        role = _add_role(
+            admin_client, headers, "sh1", "beneficiary",
+            scope_kind="journey_step", scope_ref="journey_step:j1#s1",
+        )
+        assert role["scope_ref"] == "journey_step:j1#s1"
+        assert role["recheck_state"] == "current"
+
+    def test_role_scoped_to_missing_step_is_journey_step_not_found(self, admin_client):
+        token, system_id = _setup(admin_client, "System RoleStepMissing")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        _create_journey_with_steps(admin_client, headers, "j1", [_step("s1", 0)])
+
+        r = admin_client.post(
+            "/stakeholder-network/stakeholders/sh1/roles",
+            json={"role": "beneficiary", "scope_kind": "journey_step",
+                  "scope_ref": "journey_step:j1#does-not-exist", "note": ""},
+            headers=headers,
+        )
+        assert r.status_code == 404
+        assert r.json()["detail"]["code"] == "journey_step_not_found"
+
+    def test_role_scoped_to_missing_journey_is_journey_step_not_found(self, admin_client):
+        token, system_id = _setup(admin_client, "System RoleJourneyMissing")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+
+        r = admin_client.post(
+            "/stakeholder-network/stakeholders/sh1/roles",
+            json={"role": "beneficiary", "scope_kind": "journey_step",
+                  "scope_ref": "journey_step:no-such-journey#s1", "note": ""},
+            headers=headers,
+        )
+        assert r.status_code == 404
+        assert r.json()["detail"]["code"] == "journey_step_not_found"
+
+    def test_malformed_scope_ref_is_journey_step_not_found(self, admin_client):
+        """No `journey_step:` prefix, or no `#` separator -- both malformed
+        forms fold into the same 404 rather than a 500 or a silent pass."""
+        token, system_id = _setup(admin_client, "System RoleMalformed")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        _create_journey_with_steps(admin_client, headers, "j1", [_step("s1", 0)])
+
+        for bad_ref in ("j1#s1", "journey_step:j1", "journey_step:#s1", "journey_step:j1#"):
+            r = admin_client.post(
+                "/stakeholder-network/stakeholders/sh1/roles",
+                json={"role": "beneficiary", "scope_kind": "journey_step", "scope_ref": bad_ref, "note": ""},
+                headers=headers,
+            )
+            assert r.status_code == 404, bad_ref
+            assert r.json()["detail"]["code"] == "journey_step_not_found", bad_ref
+
+    def test_multiple_stakeholders_and_roles_on_the_same_step(self, admin_client):
+        """Payer, beneficiary, operator, approver on ONE Step -- the whole
+        point of §1.1's separate role-assignment table."""
+        token, system_id = _setup(admin_client, "System RoleMulti")
+        headers = _headers(token, system_id)
+        roles = {"payer": "payer", "beneficiary": "beneficiary", "operator": "operator", "approver": "approver"}
+        for stakeholder_key in roles:
+            _create_stakeholder(admin_client, headers, stakeholder_key)
+        _create_journey_with_steps(admin_client, headers, "j1", [_step("s1", 0)])
+
+        for stakeholder_key, role in roles.items():
+            _add_role(
+                admin_client, headers, stakeholder_key, role,
+                scope_kind="journey_step", scope_ref="journey_step:j1#s1",
+            )
+
+        for stakeholder_key, role in roles.items():
+            detail = _get_stakeholder(admin_client, headers, stakeholder_key)
+            assert len(detail["roles"]) == 1
+            assert detail["roles"][0]["role"] == role
+            assert detail["roles"][0]["scope_ref"] == "journey_step:j1#s1"
+
+
+class TestNoAutoLinkFromStringMatch:
+    """§13: a Stakeholder whose `display_name` exactly equals a Journey's
+    `beneficiary` free-text string must produce NO automatic link. Nothing
+    in this module ever compares the two -- this is a regression guard, not
+    a behavior this module implements."""
+
+    def test_matching_display_name_and_beneficiary_produce_no_link(self, admin_client):
+        token, system_id = _setup(admin_client, "System NoAutoLink")
+        headers = _headers(token, system_id)
+        _create_journey_with_steps(admin_client, headers, "j1", [_step("s1", 0)], beneficiary="購入責任者")
+        _create_stakeholder(admin_client, headers, "sh1", display_name="購入責任者")
+
+        refs = admin_client.get("/stakeholder-network/refs", headers=headers).json()["refs"]
+        assert refs == []
+        roles = _get_stakeholder(admin_client, headers, "sh1")["roles"]
+        assert roles == []
+
+
+class TestStalenessPropagation:
+    """§4's propagation table: downstream only, one hop, through explicit
+    links. Each block below tests one row -- the subject that goes `stale`
+    AND at least one named non-subject that does not (§15 item 5)."""
+
+    def test_purpose_element_change_staleifies_the_ref_not_the_stakeholder(self, admin_client, tmp_path):
+        token, system_id, snapshot_id = _pc_setup(admin_client, tmp_path, "System Stale Purpose")
+        headers = _headers(token, system_id)
+        session_id = _pc_create_session(admin_client, headers, snapshot_id)
+        _pc_set_pain(admin_client, headers, session_id, "元の課題")
+
+        _create_stakeholder(admin_client, headers, "sh1")
+        _decide(admin_client, headers, "stakeholder", "sh1", "confirm")
+        ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "purpose_element", "beneficiary_problem")
+        assert ref["recheck_state"] == "current"
+
+        # Stakeholder's OWN subject staleness is unaffected by a purpose change.
+        before = _get_stakeholder(admin_client, headers, "sh1")
+        assert before["recheck_state"] == "current"
+
+        _pc_set_pain(admin_client, headers, session_id, "変わった課題")
+
+        refs = admin_client.get("/stakeholder-network/refs", headers=headers).json()["refs"]
+        got = next(r for r in refs if r["id"] == ref["id"])
+        assert got["recheck_state"] == "stale"
+
+        after = _get_stakeholder(admin_client, headers, "sh1")
+        assert after["recheck_state"] == "current"  # the Stakeholder itself never goes stale
+
+    def test_capability_entity_change_staleifies_the_ref_not_journey_or_requirement(self, admin_client):
+        token, system_id = _setup(admin_client, "System Stale Capability")
+        headers = _headers(token, system_id)
+        session_id = _insert_session(system_id)
+        entity_id = _insert_capability_entity(system_id, session_id, "Billing")
+
+        provider = _create_stakeholder(admin_client, headers, "provider")
+        receiver = _create_stakeholder(admin_client, headers, "receiver")
+        exchange = _create_exchange(admin_client, headers, "ex1", "provider", "receiver", "service")
+        ref = _create_ref(admin_client, headers, "value_exchange", "ex1", "capability_entity", str(entity_id))
+        assert ref["recheck_state"] == "current"
+
+        _create_journey_with_steps(admin_client, headers, "j1", [_step("s1", 0)])
+        _ux_decide(admin_client, headers, "journey", "j1", "confirm")
+        _create_requirement_via_api(admin_client, headers, "r1")
+        _ux_decide(admin_client, headers, "requirement", "r1", "confirm")
+
+        _supersede_capability_entity(system_id, session_id)
+
+        refs = admin_client.get("/stakeholder-network/refs", headers=headers).json()["refs"]
+        got = next(r for r in refs if r["id"] == ref["id"])
+        assert got["recheck_state"] == "stale"
+
+        journey_status = admin_client.get("/ux-design/journeys/j1", headers=headers).json()
+        assert journey_status["recheck_state"] == "current"
+        requirement_status = admin_client.get("/ux-design/requirements/r1", headers=headers).json()
+        assert requirement_status["recheck_state"] == "current"
+
+    def test_journey_revision_staleifies_step_refs_and_role_links_not_need_or_exchange_content(self, admin_client):
+        token, system_id = _setup(admin_client, "System Stale Journey")
+        headers = _headers(token, system_id)
+        _create_journey_with_steps(admin_client, headers, "j1", [_step("s1", 0)])
+
+        provider = _create_stakeholder(admin_client, headers, "provider")
+        receiver = _create_stakeholder(admin_client, headers, "receiver")
+        exchange = _create_exchange(admin_client, headers, "ex1", "provider", "receiver", "service")
+        journey_ref = _create_ref(admin_client, headers, "value_exchange", "ex1", "ux_journey", "j1")
+        step_ref = _create_ref(admin_client, headers, "value_exchange", "ex1", "ux_journey_step", "j1#s1")
+        role = _add_role(
+            admin_client, headers, "receiver", "beneficiary",
+            scope_kind="journey_step", scope_ref="journey_step:j1#s1",
+        )
+        assert journey_ref["recheck_state"] == "current"
+        assert step_ref["recheck_state"] == "current"
+        assert role["recheck_state"] == "current"
+
+        need = _create_need(admin_client, headers, "n1", "receiver", statement="stmt")
+        need_ref = _create_ref(admin_client, headers, "value_exchange", "ex1", "stakeholder_need", "n1")
+        exchange_before = _get_exchange(admin_client, headers, "ex1")
+
+        # A new revision that drops step s1 entirely.
+        r = admin_client.post(
+            "/ux-design/journeys/j1/revisions",
+            json={
+                "title": "renamed", "beneficiary": "", "usage_context": "", "entry_trigger": "",
+                "value_arrival": "", "summary": "", "change_note": "",
+                "steps": [_step("s2", 0)],
+            },
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+
+        refs = admin_client.get("/stakeholder-network/refs", headers=headers).json()["refs"]
+        got_journey_ref = next(x for x in refs if x["id"] == journey_ref["id"])
+        got_step_ref = next(x for x in refs if x["id"] == step_ref["id"])
+        got_need_ref = next(x for x in refs if x["id"] == need_ref["id"])
+        assert got_journey_ref["recheck_state"] == "stale"
+        assert got_step_ref["recheck_state"] == "stale"
+        assert got_step_ref["target_resolution"] == "unresolved"
+        # The Need reference is untouched by a Journey revision.
+        assert got_need_ref["recheck_state"] == "current"
+
+        receiver_detail = _get_stakeholder(admin_client, headers, "receiver")
+        got_role = next(x for x in receiver_detail["roles"] if x["id"] == role["id"])
+        assert got_role["recheck_state"] == "stale"
+
+        # The Exchange's OWN content is untouched by a Journey revision.
+        exchange_after = _get_exchange(admin_client, headers, "ex1")
+        assert exchange_after["current_revision"]["content_digest"] == exchange_before["current_revision"]["content_digest"]
+
+    def test_need_revision_staleifies_the_ref_not_the_stakeholder(self, admin_client):
+        token, system_id = _setup(admin_client, "System Stale Need")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        _decide(admin_client, headers, "stakeholder", "sh1", "confirm")
+        _create_need(admin_client, headers, "n1", "sh1", statement="stmt")
+        ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "stakeholder_need", "n1")
+        assert ref["recheck_state"] == "current"
+
+        _add_need_revision_via_api(admin_client, headers, "n1", statement="changed statement")
+
+        refs = admin_client.get("/stakeholder-network/refs", headers=headers).json()["refs"]
+        got = next(r for r in refs if r["id"] == ref["id"])
+        assert got["recheck_state"] == "stale"
+
+        stakeholder_after = _get_stakeholder(admin_client, headers, "sh1")
+        assert stakeholder_after["recheck_state"] == "current"
+
+    def test_stakeholder_revision_staleifies_role_and_naming_refs_not_purpose_or_journey(self, admin_client, tmp_path):
+        token, system_id, snapshot_id = _pc_setup(admin_client, tmp_path, "System Stale Stakeholder")
+        headers = _headers(token, system_id)
+        session_id = _pc_create_session(admin_client, headers, snapshot_id)
+
+        _create_stakeholder(admin_client, headers, "sh1", display_name="v1")
+        role = _add_role(admin_client, headers, "sh1", "beneficiary", scope_kind="system", scope_ref="")
+        # a stakeholder_ref naming this Stakeholder from an unrelated source
+        _create_need(admin_client, headers, "n1", "sh1", statement="stmt")
+        naming_ref = _create_ref(admin_client, headers, "stakeholder_need", "n1", "stakeholder", "sh1")
+        purpose_ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "purpose_element", "beneficiary_problem")
+        _create_journey_with_steps(admin_client, headers, "j1", [_step("s1", 0)])
+        journey_ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "ux_journey", "j1")
+        assert role["recheck_state"] == "current"
+        assert naming_ref["recheck_state"] == "current"
+
+        _add_stakeholder_revision(admin_client, headers, "sh1", display_name="v2")
+
+        detail = _get_stakeholder(admin_client, headers, "sh1")
+        got_role = next(x for x in detail["roles"] if x["id"] == role["id"])
+        assert got_role["recheck_state"] == "stale"
+
+        refs = admin_client.get("/stakeholder-network/refs", headers=headers).json()["refs"]
+        got_naming = next(r for r in refs if r["id"] == naming_ref["id"])
+        assert got_naming["recheck_state"] == "stale"
+
+        # Purpose / Journey refs FROM this stakeholder are untouched by its own revision.
+        got_purpose = next(r for r in refs if r["id"] == purpose_ref["id"])
+        got_journey = next(r for r in refs if r["id"] == journey_ref["id"])
+        assert got_purpose["recheck_state"] == "current"
+        assert got_journey["recheck_state"] == "current"
+
+    def test_outcome_criterion_change_staleifies_the_ref_only(self, admin_client):
+        token, system_id = _setup(admin_client, "System Stale Outcome")
+        headers = _headers(token, system_id)
+        session_id = _insert_session(system_id)
+        criterion_id = _insert_outcome_criterion(system_id, session_id)
+
+        _create_stakeholder(admin_client, headers, "sh1")
+        ref = _create_ref(admin_client, headers, "stakeholder", "sh1", "purpose_outcome_criterion", str(criterion_id))
+        assert ref["recheck_state"] == "current"
+
+        _mutate_outcome_criterion(criterion_id, measure="a different measure")
+
+        refs = admin_client.get("/stakeholder-network/refs", headers=headers).json()["refs"]
+        got = next(r for r in refs if r["id"] == ref["id"])
+        assert got["recheck_state"] == "stale"
+
+        # Everything upstream (the Stakeholder itself) is untouched.
+        stakeholder_after = _get_stakeholder(admin_client, headers, "sh1")
+        assert stakeholder_after["recheck_state"] == "current"
+
+
+class TestExchangeLineage:
+    """§7.1: `provider/receiver -> Need/Purpose -> Journey/Step ->
+    Requirement/Solution Design -> Outcome/Evidence`, read-only,
+    deterministic, per-section degradation."""
+
+    def test_lineage_chain_end_to_end(self, admin_client):
+        token, system_id = _setup(admin_client, "System Lineage E2E")
+        headers = _headers(token, system_id)
+        session_id = _insert_session(system_id)
+
+        _create_stakeholder(admin_client, headers, "provider", display_name="提供者")
+        _create_stakeholder(admin_client, headers, "receiver", display_name="利用者")
+        _create_need(admin_client, headers, "n1", "receiver", statement="困りごと")
+        _create_exchange(admin_client, headers, "ex1", "provider", "receiver", "service")
+
+        _create_ref(admin_client, headers, "value_exchange", "ex1", "stakeholder_need", "n1")
+        _create_ref(admin_client, headers, "value_exchange", "ex1", "purpose_element", "beneficiary_problem")
+
+        _create_journey_with_steps(admin_client, headers, "j1", [_step("s1", 0)])
+        _create_ref(admin_client, headers, "value_exchange", "ex1", "ux_journey", "j1")
+        _create_ref(admin_client, headers, "value_exchange", "ex1", "ux_journey_step", "j1#s1")
+
+        _create_requirement_via_api(admin_client, headers, "r1")
+        _add_step_link(admin_client, headers, "r1", "j1", "s1")
+
+        r = admin_client.post(
+            "/solution-designs", json={"design_key": "d1", "title": "Design 1", "summary": ""}, headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        r = admin_client.post(
+            "/solution-designs/d1/options",
+            json={"option_key": "opt1", "option_order": 0, "title": "", "approach": "", "tradeoffs": "", "risks": ""},
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        r = admin_client.post(
+            "/solution-designs/d1/requirement-links", json={"requirement_key": "r1", "note": ""}, headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        r = admin_client.post(
+            "/solution-designs/d1/decisions", json={"option_key": "opt1", "decision": "adopt", "rationale": ""},
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+
+        criterion_id = _insert_outcome_criterion(system_id, session_id)
+        _create_ref(admin_client, headers, "value_exchange", "ex1", "purpose_outcome_criterion", str(criterion_id))
+        _create_evidence_ref(admin_client, headers, "value_exchange", "ex1", "human_report", statement="told me so")
+
+        lineage = admin_client.get("/stakeholder-network/exchanges/ex1/lineage", headers=headers).json()
+        assert lineage["exchange"]["exchange_key"] == "ex1"
+        assert lineage["provider"]["stakeholder_key"] == "provider"
+        assert lineage["receiver"]["stakeholder_key"] == "receiver"
+        assert {n["target_ref"] for n in lineage["needs"]} == {"n1"}
+        assert any(p["ref_kind"] == "purpose_element" for p in lineage["purpose_refs"])
+        assert {j["target_ref"] for j in lineage["journey_refs"]} == {"j1", "j1#s1"}
+        assert {req["requirement_key"] for req in lineage["requirements"]} == {"r1"}
+        assert lineage["solution_designs"][0]["design_key"] == "d1"
+        assert lineage["solution_designs"][0]["adopted_option_key"] == "opt1"
+        assert {o["target_ref"] for o in lineage["outcomes"]} == {str(criterion_id)}
+        assert len(lineage["evidence"]) == 1
+        assert lineage["degraded_sections"] == []
+
+    def test_lineage_requirement_reached_only_through_step_link(self, admin_client):
+        """A Requirement reached via `ux_requirement_step_link` from a
+        linked Journey Step, with NO direct `stakeholder_ref` to it."""
+        token, system_id = _setup(admin_client, "System Lineage StepLink")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "provider")
+        _create_stakeholder(admin_client, headers, "receiver")
+        _create_exchange(admin_client, headers, "ex1", "provider", "receiver", "service")
+        _create_journey_with_steps(admin_client, headers, "j1", [_step("s1", 0)])
+        _create_ref(admin_client, headers, "value_exchange", "ex1", "ux_journey_step", "j1#s1")
+        _create_requirement_via_api(admin_client, headers, "r1")
+        _add_step_link(admin_client, headers, "r1", "j1", "s1")
+
+        lineage = admin_client.get("/stakeholder-network/exchanges/ex1/lineage", headers=headers).json()
+        assert {req["requirement_key"] for req in lineage["requirements"]} == {"r1"}
+
+    def test_lineage_missing_exchange_is_404(self, admin_client):
+        token, system_id = _setup(admin_client, "System Lineage Missing")
+        headers = _headers(token, system_id)
+        r = admin_client.get("/stakeholder-network/exchanges/does-not-exist/lineage", headers=headers)
+        assert r.status_code == 404
+        assert r.json()["detail"]["code"] == "stakeholder_not_found"
+
+    def test_lineage_system_isolation(self, admin_client):
+        token = _login(admin_client)
+        system_a = _create_system(admin_client, token, "System Lineage A")
+        system_b = _create_system(admin_client, token, "System Lineage B")
+        headers_a = _headers(token, system_a)
+        headers_b = _headers(token, system_b)
+        _create_stakeholder(admin_client, headers_a, "provider")
+        _create_stakeholder(admin_client, headers_a, "receiver")
+        _create_exchange(admin_client, headers_a, "ex1", "provider", "receiver", "service")
+
+        r = admin_client.get("/stakeholder-network/exchanges/ex1/lineage", headers=headers_b)
+        assert r.status_code == 404
+
+    def test_lineage_degrades_one_section_without_losing_the_rest(self, admin_client, monkeypatch):
+        from app import stakeholder_network as sn_module
+
+        token, system_id = _setup(admin_client, "System Lineage Degrade")
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "provider")
+        _create_stakeholder(admin_client, headers, "receiver")
+        _create_need(admin_client, headers, "n1", "receiver", statement="need")
+        _create_exchange(admin_client, headers, "ex1", "provider", "receiver", "service")
+        _create_ref(admin_client, headers, "value_exchange", "ex1", "stakeholder_need", "n1")
+
+        def _boom(*a, **kw):
+            raise RuntimeError("evidence read failed")
+
+        monkeypatch.setattr(sn_module, "list_evidence_refs", _boom)
+        # get_exchange_lineage builds evidence with its own inline query, not
+        # list_evidence_refs -- patch the actual query path instead by
+        # breaking the underlying table read via a bad subject_kind lookup
+        # is unnecessary; instead exercise the guarded loader directly by
+        # monkeypatching _exchange_refs to fail only for one ref-kind tuple.
+
+        original_exchange_refs = sn_module._exchange_refs
+
+        def _flaky_exchange_refs(conn, system_id_, exchange_key, ref_kinds):
+            if ref_kinds == ("purpose_outcome_criterion",):
+                raise RuntimeError("outcomes unavailable")
+            return original_exchange_refs(conn, system_id_, exchange_key, ref_kinds)
+
+        monkeypatch.setattr(sn_module, "_exchange_refs", _flaky_exchange_refs)
+
+        lineage = admin_client.get("/stakeholder-network/exchanges/ex1/lineage", headers=headers).json()
+        assert lineage["degraded_sections"] == ["outcomes"]
+        assert "outcomes" in lineage["degraded_detail"]
+        # every other section still rendered
+        assert lineage["exchange"]["exchange_key"] == "ex1"
+        assert {n["target_ref"] for n in lineage["needs"]} == {"n1"}

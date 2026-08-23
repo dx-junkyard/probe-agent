@@ -12327,6 +12327,106 @@ class StakeholderViewPreferenceOut(BaseModel):
     updated_at: float
 
 
+# --- #421 read-only Exchange lineage projection --------------------------------
+# `GET /stakeholder-network/exchanges/{key}/lineage` (docs/stakeholder-value-
+# network.md §7.1's "provider/receiver -> Need/Purpose -> Journey/Step ->
+# Requirement/Solution Design -> Outcome/Evidence" chain). Every list here is
+# already fully resolved by `app.stakeholder_network.get_exchange_lineage` --
+# these models carry no new finite vocabulary of their own; they reuse the
+# existing `StakeholderRefKind` / `StakeholderRefTargetResolution` /
+# `StakeholderRefRecheckState` / `StakeholderRefRelationStatus` /
+# `StakeholderEvidenceKind` aliases already declared above.
+
+
+class StakeholderLineageRefOut(BaseModel):
+    """One `stakeholder_ref` row resolved for the lineage view -- the same
+    shape `StakeholderRefOut` uses, minus the write-path-only columns
+    (`source_kind`/`source_key`/`superseded_by_id`) this READ-ONLY view has
+    no use for."""
+
+    id: int
+    ref_kind: StakeholderRefKind
+    target_ref: str
+    target_name: Optional[str] = None
+    target_resolution: StakeholderRefTargetResolution = "unavailable"
+    recheck_state: StakeholderRefRecheckState = "not_captured"
+    relation_status: StakeholderRefRelationStatus = "confirmed"
+    note: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class StakeholderLineagePartyOut(BaseModel):
+    """The Exchange's provider or receiver, resolved fresh against this
+    layer's own Stakeholder table -- never a copy of the Stakeholder's own
+    content (invariant 2)."""
+
+    stakeholder_key: str
+    name: Optional[str] = None
+    target_resolution: StakeholderRefTargetResolution = "unavailable"
+
+
+class StakeholderLineageRequirementOut(BaseModel):
+    """A Requirement reached either directly (a `stakeholder_ref` of
+    `ref_kind='ux_requirement'`) or through a linked Journey Step's
+    `ux_requirement_step_link` (#405) -- §5.2 forbids a second path to Flow /
+    Evolution Node / Component from this layer, so the chain stops here and
+    continues only through `solution_designs` below."""
+
+    requirement_key: str
+    target_resolution: StakeholderRefTargetResolution = "unavailable"
+
+
+class StakeholderLineageSolutionDesignOut(BaseModel):
+    """A Solution Design linked to one Requirement via #405's own
+    `solution_design_requirement_link`. `adopted_option_key` is `None` when
+    no option of this design currently reads `adopted` in
+    `solution_design_decision` -- never a guessed "pending" option."""
+
+    design_key: str
+    title: str = ""
+    requirement_key: str
+    adopted_option_key: Optional[str] = None
+
+
+class StakeholderLineageEvidenceOut(BaseModel):
+    id: int
+    subject_kind: Literal["stakeholder_need", "environment_observation", "value_exchange"]
+    subject_key: str
+    evidence_kind: StakeholderEvidenceKind
+    evidence_ref: str = ""
+    statement: str = ""
+    captured_digest: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class StakeholderExchangeLineageOut(BaseModel):
+    """§7.1's Exchange lineage: `provider/receiver -> Need/Purpose ->
+    Journey/Step -> Requirement/Solution Design -> Outcome/Evidence`.
+    Read-only, deterministic, no LLM (invariant 9); writes nothing (#382).
+    Every section below is its own guarded loader -- a name appearing in
+    `degraded_sections` means that section's list/value was DROPPED, never
+    that it is genuinely empty."""
+
+    system_id: int
+    exchange_key: str
+    generated_at: float
+    exchange: Optional[ValueExchangeOut] = None
+    provider: Optional[StakeholderLineagePartyOut] = None
+    receiver: Optional[StakeholderLineagePartyOut] = None
+    needs: List[StakeholderLineageRefOut] = []
+    purpose_refs: List[StakeholderLineageRefOut] = []
+    journey_refs: List[StakeholderLineageRefOut] = []
+    requirements: List[StakeholderLineageRequirementOut] = []
+    solution_designs: List[StakeholderLineageSolutionDesignOut] = []
+    outcomes: List[StakeholderLineageRefOut] = []
+    evidence: List[StakeholderLineageEvidenceOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
 # --- #420 write requests -----------------------------------------------------
 # None of these accept `decision_method` / `decided_by` / `created_by` /
 # `authored_by_kind` -- the route derives all four from the `Principal` and

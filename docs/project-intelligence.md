@@ -7635,3 +7635,58 @@ notice の価値は開発者が**見えること**であって、ツールが良
 生まれる。#412 が `flow-1` を恒久 ID として保存しないと決め、#405 が static と
 runtime の Flow identity を混同しないと決めた境界を、上流側から守るための
 制約である。
+
+### Issue #421 — 参照解決と staleness 伝播、Exchange lineage
+
+`app/stakeholder_network.py::_resolve_target` は #420 が残した明示的な seam
+だった。全ての `StakeholderRefKind` を実際に解決するようにし、`purpose_element`
+/ `purpose_relation` は `purpose_chain.derive_purpose_chain` を、
+`capability_entity` は `understanding_capability_entity` を(#312 の
+System-scoped 安定 id、`capability_hierarchy_nodes.id` ではない)、`ux_journey`
+/ `ux_journey_step` / `ux_requirement` は `ux_design.py` と同じ正本テーブルを
+直接読む。各 resolver は `node_design.py` が `_resolve_capability` を
+`ux_design._resolve_capability_entity` から独立に複製しているのと同じ流儀で
+ローカルに複製した (private helper を跨いで import しない)。resolver が
+**例外を投げた**場合のみ `unavailable`、正常に読めて見つからなかった場合は
+`unresolved` — この二つを畳まないことが §5.1 の核心。
+
+**役割割当の `journey_step` scope は #405 の Step と同じ完全一致で検証する。**
+`scope_ref` は `"journey_step:<journey_key>#<step_key>"` — `journey:`
+scope の既存の prefix 規約 (`scope_ref` は常に prefix 付きで保存する、#412 と
+同じ規則) を踏襲し、body は §5.1 の `ux_journey_step` `target_ref` 形式を
+そのまま再利用した (二つ目の綴りを発明しない)。存在しない Step / Journey /
+prefix なしの不正な形式は全て 404 `journey_step_not_found` に畳む —
+`stakeholder_ref` と違い、これは Epic 自身が両方を所有する 2 つのエンティティ
+を結びつけるリンクなので、`stakeholder_ref` のように願望的に何も無い先を
+指すことはできない。
+
+**Journey Step scope の役割割当は 2 つの独立した staleness を持つ。**
+`stakeholder_role_assignment.captured_digest` は元々 Stakeholder 自身の
+content_digest しか捉えていなかった(#420)。§4 の「Step → Stakeholder role
+links for removed steps」の行を満たすには、scope が指す Step 自体が解決
+できなくなったことも `recheck_state` に反映する必要がある — ただし Step 用の
+digest 列を新設せず、`ux_journey_step` の READ 時解決結果 (`resolved !=
+"resolved"`) だけで十分と判断した。存在しない Step には比較対象となる digest
+がそもそも無いので、resolution 自体が signal になる。
+
+**Requirement → Solution Design は #405 の既存リンクだけを通る。**
+`get_exchange_lineage` は Requirement を 2 経路で集める —
+`stakeholder_ref(ref_kind='ux_requirement')` の直接参照と、
+`ux_journey_step` 参照から `ux_requirement_step_link` を辿る間接参照 — が、
+Solution Design へはどちらの Requirement からも
+`solution_design_requirement_link` + `solution_design_decision` (最新の
+`adopt`) だけを読む。Flow / Evolution Node / Component への 2 本目の経路は
+追加していない (§5.2)。
+
+**lineage の各セクションは独立した guarded loader。** `_degrade` は
+`ux_design._degrade` / `purpose_chain._degrade` と同じ挙動 — 失敗した
+セクションは `degraded_sections` に記録され、表示から**落ちる**だけで、
+`0` や空配列や推測値には決してならない。`exchange` セクション自体が失敗した
+場合は `provider`/`receiver` も連鎖的に `degraded_sections` へ入れる —
+存在しない Exchange 内容から provider/receiver を計算し続けて「provider が
+いない」という誤った表示を作らないため。
+
+**§13 の "文字列一致からリンクを自動生成しない" は回帰テストで守る。** この
+モジュールには Stakeholder の `display_name` と Journey の `beneficiary`
+文字列を比較するコードは一行も無い — テストはその不在を確認するだけで、
+振る舞いを実装しているわけではない。
