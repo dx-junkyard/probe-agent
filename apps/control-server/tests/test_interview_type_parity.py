@@ -188,6 +188,7 @@ FINITE_TYPE_NAMES = (
     "ExecutionModeDivergence",
     "ExecutionModeRecordKind",
     "ExecutionModeObservationSource",
+    "ExecutionModeRunRefState",
     "FlowSubjectKind",
     "FlowSubjectResolution",
     "FlowFactState",

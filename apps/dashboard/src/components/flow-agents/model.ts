@@ -35,7 +35,9 @@ import type {
   ExecutionModeDenialCode,
   ExecutionModeDivergence,
   ExecutionModeNodeProjectionOut,
+  ExecutionModeObservationSource,
   ExecutionModeReason,
+  ExecutionModeRunRefState,
   ExecutionModeScopeKind,
   ExecutionModeScopeState,
   ExecutionModeSourceScope,
@@ -285,6 +287,35 @@ export const DIVERGENCE_TONE: Record<
   unobserved: "muted",
   stale: "warning",
 };
+
+/** How an observation came to exist, and whether its `run_ref` was checked.
+ * A SEPARATE axis from the divergence: that one says whether the reading
+ * agrees with the configuration, this one says whether the reading was
+ * measured. Nothing on any current path attests a runtime mode, so a `match`
+ * today means agreement with a value someone reported. One displayed word
+ * must not carry both facts (#366). */
+export const OBSERVATION_SOURCE_LABEL: Record<ExecutionModeObservationSource, string> = {
+  control_server: "Control Server への報告",
+  sdk: "SDK による実測",
+};
+
+export const RUN_REF_STATE_LABEL: Record<ExecutionModeRunRefState, string> = {
+  absent: "実行への参照なし",
+  uncorroborated: "実行への参照は未照合",
+};
+
+/** The one-line standing shown beside every divergence reading. `null` when
+ * there is no observation to describe -- an absent standing is not a
+ * standing (#380). */
+export function observationStanding(
+  source: ExecutionModeObservationSource | null | undefined,
+  runRefState: ExecutionModeRunRefState | null | undefined,
+): string | null {
+  const parts: string[] = [];
+  if (source) parts.push(OBSERVATION_SOURCE_LABEL[source]);
+  if (runRefState) parts.push(RUN_REF_STATE_LABEL[runRefState]);
+  return parts.length > 0 ? parts.join(" / ") : null;
+}
 
 export const DENIAL_CODE_LABEL: Record<ExecutionModeDenialCode, string> = {
   capability_not_permitted: "現在の実効モードではこの操作は許可されていません",

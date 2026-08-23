@@ -6758,6 +6758,45 @@ CREATE TABLE IF NOT EXISTS flow_experiment_execution_ref (
 CREATE INDEX IF NOT EXISTS idx_flow_experiment_execution_ref_proposal
     ON flow_experiment_execution_ref (proposal_id, id);
 
+-- One canonical execution backs exactly one proposal (§7.5.1), which is a
+-- lookup by the reference rather than by the proposal.
+CREATE INDEX IF NOT EXISTS idx_flow_experiment_execution_ref_target
+    ON flow_experiment_execution_ref (system_id, execution_kind, execution_ref);
+
+-- flow_experiment_draft: WHAT one reasoning-model drafting run was about.
+-- `intelligence_runs` records how a run was made (provider / model / prompt
+-- and schema version / status) but not its subject, so "is this the run that
+-- drafted THIS Flow?" had no answer: a valid, completed draft of Flow A
+-- could be attached to a hand-written proposal for Flow B and would then
+-- read as reasoning-model output about B. An unverified pointer is not
+-- provenance (Principle 7), and this is the row that makes the pointer
+-- verifiable (docs/execution-modes.md §7.1.3).
+--
+-- One row per drafting run, written for a FAILED run too: what a run was
+-- about is a fact about the attempt, not about its outcome. `input_digest`
+-- covers the subject, the pinned snapshot, the drafted Node keys and the
+-- citable evidence allowlist, so the audit can say the inputs were the ones
+-- recorded without re-deriving them.
+CREATE TABLE IF NOT EXISTS flow_experiment_draft (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    intelligence_run_id  INTEGER NOT NULL UNIQUE,
+    flow_subject_kind    TEXT NOT NULL
+                             CHECK (flow_subject_kind IN
+                                 ('runtime_flow', 'static_flow')),
+    flow_subject_ref     TEXT NOT NULL,
+    captured_snapshot_id INTEGER,
+    node_keys_json       TEXT NOT NULL DEFAULT '[]',
+    evidence_ids_json    TEXT NOT NULL DEFAULT '[]',
+    input_digest         TEXT NOT NULL,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_experiment_draft_system
+    ON flow_experiment_draft (system_id, id DESC);
+
 """
 
 

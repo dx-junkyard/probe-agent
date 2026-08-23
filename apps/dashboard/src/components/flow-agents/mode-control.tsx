@@ -49,6 +49,7 @@ import {
   describeAssignment,
   describeModeOrigin,
   initialAssignScope,
+  observationStanding,
   scopeRefForKind,
   sortModeNodes,
 } from "./model";
@@ -527,6 +528,13 @@ export function ExecutionModeControlPanel({
                           <div className="mt-1 text-muted-foreground">
                             観測: {node.observed_mode ?? "(観測なし)"}
                           </div>
+                          {/* Whether the reading was measured is a separate
+                              fact from whether it agrees (#366). */}
+                          {observationStanding(node.observation_source, node.run_ref_state) ? (
+                            <div className="mt-1 text-muted-foreground">
+                              {observationStanding(node.observation_source, node.run_ref_state)}
+                            </div>
+                          ) : null}
                         </td>
                       </tr>
                     );

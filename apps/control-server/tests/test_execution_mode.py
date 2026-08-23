@@ -740,6 +740,61 @@ def test_divergence_stale_when_the_mode_moved_after_the_last_observation(admin_c
     assert reading.last_assignment_at > reading.observed_at
 
 
+def test_a_reading_carries_the_observations_standing(admin_client):
+    """`divergence` answers "does the reading agree with the configuration?"
+    and cannot answer "was the reading measured?". Nothing on any current
+    path attests a runtime mode, so a `match` over HTTP is agreement with a
+    value a human reported -- and the aggregation screens must be able to
+    tell that from an instrumented reading (#366). Two facts, two fields."""
+    token = _login(admin_client)
+    system_id = _create_system(admin_client, token, "sys-div-standing")
+    _make_node(system_id, "node-d5")
+    _make_node(system_id, "node-d6")
+    _make_node(system_id, "node-d7")
+
+    now = time.time()
+    with get_conn() as conn:
+        assign_mode(
+            conn, system_id=system_id, scope_kind="system", scope_ref="",
+            mode="observe", reason="observe", actor="root", now=now - 100,
+        )
+        record_observation(
+            conn, system_id=system_id, node_key="node-d5",
+            observed_mode="observe", now=now,
+        )
+        record_observation(
+            conn, system_id=system_id, node_key="node-d6",
+            observed_mode="observe", run_ref="replay:12", now=now,
+        )
+        reported = evaluate_divergence(
+            conn, system_id=system_id, node_key="node-d5", now=now
+        )
+        cited = evaluate_divergence(
+            conn, system_id=system_id, node_key="node-d6", now=now
+        )
+        unobserved = evaluate_divergence(
+            conn, system_id=system_id, node_key="node-d7", now=now
+        )
+        projection = build_mode_projection(conn, system_id=system_id, now=now)
+
+    # Agreement, but with a value nobody measured.
+    assert reported.divergence == "match"
+    assert reported.observation_source == "control_server"
+    assert reported.run_ref_state == "absent"
+    # A pointer nobody resolved is `uncorroborated`, never `resolved`.
+    assert cited.run_ref_state == "uncorroborated"
+    # No observation, so no standing to report -- an absent standing is not a
+    # standing (#380).
+    assert unobserved.divergence == "unobserved"
+    assert unobserved.observation_source is None
+    assert unobserved.run_ref_state is None
+
+    by_key = {node.node_key: node for node in projection.nodes}
+    assert by_key["node-d5"].observation_source == "control_server"
+    assert by_key["node-d6"].run_ref_state == "uncorroborated"
+    assert by_key["node-d7"].observation_source is None
+
+
 def test_observation_requires_a_known_node_and_a_known_mode(admin_client):
     token = _login(admin_client)
     system_id = _create_system(admin_client, token, "sys-obs-validation")

@@ -82,6 +82,8 @@ def _node_out(node: flow_explanation.NodeExplanation) -> FlowExplanationNodeOut:
         mode_state=node.mode_state,
         mode_divergence=node.mode_divergence,
         observed_mode=node.observed_mode,
+        mode_observation_source=node.mode_observation_source,
+        mode_observation_run_ref_state=node.mode_observation_run_ref_state,
         maturity=node.maturity,
         maturity_state=node.maturity_state,
         folded_maturity=node.folded_maturity,

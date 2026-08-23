@@ -216,6 +216,8 @@ def _divergence_out(
         divergence=reading.divergence,
         effective_mode=reading.effective_mode,
         observed_mode=reading.observed_mode,
+        observation_source=reading.observation_source,
+        run_ref_state=reading.run_ref_state,
         observed_at=reading.observed_at,
         last_assignment_at=reading.last_assignment_at,
     )
@@ -313,6 +315,8 @@ def get_projection(
                 flow_refs=list(node.flow_refs),
                 divergence=node.divergence,
                 observed_mode=node.observed_mode,
+                observation_source=node.observation_source,
+                run_ref_state=node.run_ref_state,
                 observed_at=node.observed_at,
             )
             for node in projection.nodes
