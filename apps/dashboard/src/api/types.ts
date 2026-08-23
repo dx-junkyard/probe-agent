@@ -7060,3 +7060,11 @@ export interface FlowExperimentListOut {
 export interface FlowExperimentDecisionRequest {
   reason?: string;
 }
+
+
+// === Epic #418 / Issue #422 — Stakeholder Value Network types ===
+// (Issue #422 owns everything between this marker and the #423 marker below.)
+
+
+// === Epic #418 / Issue #423 — Journey Service Blueprint types ===
+// (Issue #423 owns everything below this marker.)

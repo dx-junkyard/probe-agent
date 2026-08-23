@@ -12589,3 +12589,11 @@ class StakeholderViewPreferenceUpdateRequest(BaseModel):
     filters: Dict[str, Any] = Field(default_factory=dict)
     collapsed_refs: List[str] = Field(default_factory=list)
     pinned_refs: List[str] = Field(default_factory=list)
+
+
+# === Epic #418 / Issue #422 — Stakeholder Value Network projection models ===
+# (Issue #422 owns everything between this marker and the #423 marker below.)
+
+
+# === Epic #418 / Issue #423 — Journey Service Blueprint projection models ===
+# (Issue #423 owns everything below this marker.)
