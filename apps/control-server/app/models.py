@@ -11787,3 +11787,705 @@ class FlowExperimentDraftOut(BaseModel):
 # Flow experiment orchestration (Epic #412, Issue #415) -- ANCHOR-415
 # Insert the #415 request/response models directly above this line.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Stakeholder Value Network (Epic #418, Issue #420). docs/stakeholder-value-network.md
+# is the canonical contract; this section implements exactly its §1/§2. Every
+# write request model below is `ConfigDict(extra="forbid")` and omits
+# `created_by` / `decided_by` / `decision_method` / `authored_by_kind` --
+# those come from the route and the authenticated `Principal`, never the
+# request body (§10 / #337's rule, identical to the UX Design Lineage
+# section above). Every `design_status` / `recheck_state` / `validity_state`
+# field below is DERIVED at read time (§3/§1.4) -- none of them is a stored
+# column on the underlying table; see the table comments in `app/db.py`.
+# ---------------------------------------------------------------------------
+
+#: What sort of party a Stakeholder is (§1.1). `other` is the honest
+#: overflow value -- refusing to model a party at all until its kind is
+#: perfectly categorized would block recording it in the first place.
+StakeholderKind = Literal[
+    "end_user", "customer_organization", "internal_operator",
+    "provider_team", "partner", "regulator", "other",
+]
+
+#: What a Stakeholder DOES in one scope (§1.1) -- deliberately a separate
+#: axis from `StakeholderKind`. One party is routinely a `beneficiary` in one
+#: Journey Step and a `payer` in another; a single role column on the party
+#: itself could never say that.
+StakeholderRole = Literal[
+    "actor", "beneficiary", "payer", "operator",
+    "approver", "supplier", "regulator", "observer",
+]
+
+#: The scope a role assignment applies within (§1.1). `scope_ref` is always
+#: stored WITH its prefix (`journey:<journey_key>`, `journey_step:<journey_
+#: key>#<step_key>`, `value_exchange:<exchange_key>`, or `''` for `system`),
+#: the same convention #412's `execution_mode_assignment.scope_ref` uses for
+#: its own scope axis.
+StakeholderRoleScopeKind = Literal["system", "journey", "journey_step", "value_exchange"]
+
+#: A Need/Problem/Constraint/Expectation are ONE table with a finite kind,
+#: not four tables (§1.2) -- splitting them would force a "want or pain?"
+#: judgement at creation time the developer often cannot make, and would
+#: double every downstream link kind. What actually matters -- whether
+#: anything is being done about it -- lives in the Need's references, not
+#: in a fifth table.
+StakeholderNeedKind = Literal["unmet_need", "problem", "constraint", "expectation"]
+
+#: `observation_confidence` is NOT a percentage (§1.3) -- three finite
+#: provenance values for how an Environment Observation was learned.
+#: Rendering this as a number would be exactly the confidence-percentage
+#: invariant 7 forbids.
+EnvironmentObservationConfidence = Literal["observed", "reported", "assumed"]
+
+#: What an Environment Observation DOES to its target (§1.3). Five verbs,
+#: never a signed number -- "how much" is not something this layer measures
+#: (invariant 7), only "which direction".
+EnvironmentImpactKind = Literal["creates", "worsens", "relieves", "invalidates", "constrains"]
+
+#: The seven kinds of thing that can flow between two Stakeholders (§1.4/
+#: §2.1). Each boundary is deliberate: `experience` is what the receiver
+#: UNDERGOES (fulfilled by a Journey), `service` is work done FOR them (an
+#: outcome, not an experience), `information` is the one kind whose provider
+#: and receiver may coincide (a party reporting to itself), `money` is
+#: described but never processed (§11 -- no amount column exists anywhere in
+#: this Epic), `authority` is a permission/mandate granted, `obligation` is a
+#: duty accepted, and `risk` is an exposure transferred or assumed. Folding
+#: any two of these loses the exact question this layer exists to answer.
+ValueExchangeKind = Literal[
+    "experience", "service", "information", "money", "authority", "obligation", "risk",
+]
+
+#: THREE answers, never a nullable boolean (§1.4): `present` / `none` /
+#: `unknown` are "there is a consideration", "there genuinely is none", and
+#: "nobody has recorded whether there is one yet" -- collapsing the latter
+#: two into a bare `false` would silently claim "verified: none".
+ValueExchangeConsiderationState = Literal["present", "none", "unknown"]
+
+#: How often a Value Exchange recurs (§1.4). `unknown` is the honest default
+#: for an Exchange nobody has characterized the cadence of yet -- distinct
+#: from `one_time`, which is an affirmative claim.
+ValueExchangeCadence = Literal["one_time", "recurring", "continuous", "on_demand", "unknown"]
+
+#: DERIVED at read time from `valid_from`/`valid_to` and the clock, NEVER
+#: stored (§1.4) -- a fifth axis, independent of `design_status`: an ENDED
+#: Exchange is still `confirmed` history, never demoted to `rejected`. Only
+#: expiry follows the clock; nothing here resembles a human `retire`
+#: decision (#412 EM-ADR-2's "expired and revoked are different answers",
+#: applied to this layer).
+ValueExchangeValidityState = Literal["not_started", "active", "ended", "unbounded"]
+
+#: DERIVED (§3), never a stored column: the latest non-superseded
+#: `stakeholder_decision` row for `(system_id, subject_kind, subject_key)`,
+#: or `proposed` when no such row exists. Identical fold to `UxDesignStatus`
+#: one layer over -- the same "a stored lifecycle value can drift from the
+#: rows it describes, a derived one cannot" discipline (#337/#338/#349),
+#: applied here to Stakeholder/Need/Observation/Exchange/ref/role instead of
+#: Journey/Requirement.
+StakeholderDesignStatus = Literal["proposed", "confirmed", "rejected", "retired"]
+
+#: The finite actions recorded in `stakeholder_decision` (§3). `reinstate`
+#: is the only way back from `rejected`/`retired` to `proposed` -- there is
+#: no silent un-reject, and the prior decision row is never deleted
+#: (invariant 4).
+StakeholderDecisionKind = Literal["confirm", "reject", "retire", "reinstate"]
+
+#: Whether the currently-effective `confirm` decision's `captured_digest`
+#: still matches the subject's CURRENT content digest. Independent of
+#: `design_status` (§3/invariant 4): a stale `confirmed` Exchange STAYS
+#: `confirmed` and asks to be re-confirmed -- it is never silently demoted.
+StakeholderRecheckState = Literal["current", "stale"]
+
+#: Whether a revision row (`stakeholder_revision` / `stakeholder_need_
+#: revision` / `value_exchange_revision`) is the current head of its
+#: append-only chain. A content axis, orthogonal to `design_status`
+#: (invariant 4).
+StakeholderRevisionState = Literal["current", "superseded"]
+
+#: Whose voice authored a Stakeholder/Need/Exchange revision's TEXT --
+#: independent of `decision_method` (who chose to record it) and of the
+#: decision ledger (who later confirmed/rejected it). Invariant 4/9: a
+#: `reasoning_model`-authored revision CAN later be `confirmed` -- that
+#: means a human approved AI-written text, never that authorship changed.
+StakeholderAuthorshipKind = Literal["developer", "reasoning_model"]
+
+#: What kind of thing a `stakeholder_decision` row judges (§3/§10). Journey
+#: Step/Requirement-shaped nesting does not apply here -- these six are the
+#: entities and references THIS layer itself can decide on.
+StakeholderSubjectKind = Literal[
+    "stakeholder", "stakeholder_need", "environment_observation",
+    "value_exchange", "stakeholder_ref", "stakeholder_role_assignment",
+]
+
+#: Which canonical source a `stakeholder_ref.ref_kind` resolves against at
+#: READ time (§5.1's table) -- exactly one per kind, never a copy of the
+#: target's content (invariant 2). The last three kinds resolve against
+#: THIS layer's own tables; the rest resolve against upstream/downstream
+#: canonical sources this Epic never copies from. Issue #420 persists this
+#: vocabulary and the `stakeholder_ref` table; full resolution against every
+#: kind below is Issue #421's (see `app/stakeholder_network.py`'s
+#: `_resolve_target` docstring for the explicit seam).
+StakeholderRefKind = Literal[
+    "purpose_element", "purpose_relation", "capability_entity",
+    "ux_journey", "ux_journey_step", "ux_requirement",
+    "purpose_outcome_criterion", "stakeholder", "stakeholder_need", "value_exchange",
+]
+
+#: Whether a `stakeholder_ref.target_ref` could be resolved at all (§5.1),
+#: kept apart from the target's OWN state: `resolved` means the canonical
+#: source was read and the target exists there now; `unresolved` means the
+#: source was read but the target is gone; `unavailable` means the source
+#: itself could not be read for THIS request (including: #420 has not yet
+#: wired up that kind's reader -- see `_resolve_target`). An unreadable
+#: source must never render as "the target does not exist".
+StakeholderRefTargetResolution = Literal["resolved", "unresolved", "unavailable"]
+
+#: Whether a reference's `captured_digest` still matches the target's
+#: current digest (§4). `not_captured` is the fail-closed value for an empty
+#: `captured_digest` -- mirroring #337's `premise_not_captured` -- never
+#: silently treated as "nothing has changed".
+StakeholderRefRecheckState = Literal["current", "stale", "not_captured"]
+
+#: WHO ASSERTED a `stakeholder_ref`, mapped from its own `decision_method`
+#: through the fixed table (§5.1, the same `node_design._DECISION_METHOD_TO_
+#: RELATION_STATUS` / `ux_design._DECISION_METHOD_TO_RELATION_STATUS`
+#: translation one layer over): `manual -> confirmed`, `reasoning_llm ->
+#: proposed`, `deterministic -> derived`. Never a second stored column.
+StakeholderRefRelationStatus = Literal["confirmed", "proposed", "derived"]
+
+#: DERIVED per evidence subject (§6): `available` means at least one
+#: non-superseded evidence row currently resolves; `missing` means none
+#: exists; `stale` means every resolving row's `captured_digest` has moved;
+#: `unavailable` means the evidence read ITSELF failed. `missing` and
+#: `unavailable` are never merged -- a failed read is not proof of absence
+#: (#380's rule).
+StakeholderEvidenceState = Literal["available", "missing", "stale", "unavailable"]
+
+#: The three provenances an evidence row can carry (§6), kept apart for the
+#: same reason #328 keeps investigation / translation / developer findings
+#: apart: a human interview note, a telemetry reading, and a third-party
+#: analytics figure support a claim differently and must not read as one
+#: number.
+StakeholderEvidenceKind = Literal[
+    "human_report", "document", "runtime_observation", "external_analytics",
+]
+
+
+class StakeholderRevisionOut(BaseModel):
+    """Append-only Stakeholder content (§1/§3). `decision_method` records who
+    chose to persist this revision; `authored_by_kind` records whose words it
+    is -- the two are independent axes (invariant 4)."""
+
+    id: int
+    stakeholder_id: int
+    revision_number: int
+    display_name: str = ""
+    stakeholder_kind: StakeholderKind = "other"
+    description: str = ""
+    context_note: str = ""
+    content_digest: str
+    authored_by_kind: StakeholderAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    change_note: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    revision_state: StakeholderRevisionState = "current"
+    superseded_by_id: Optional[int] = None
+
+
+class StakeholderRoleAssignmentOut(BaseModel):
+    """One `(stakeholder_key, role, scope_kind, scope_ref)` assignment
+    (§1.1). `recheck_state` compares `captured_digest` against the
+    Stakeholder's CURRENT content digest, resolved fresh at read time --
+    never a copy of the Stakeholder's own content (invariant 2)."""
+
+    id: int
+    stakeholder_key: str
+    role: StakeholderRole
+    scope_kind: StakeholderRoleScopeKind
+    scope_ref: str = ""
+    captured_digest: str = ""
+    recheck_state: StakeholderRecheckState = "current"
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class StakeholderOut(BaseModel):
+    """Stakeholder summary: the identity row plus its DERIVED axes
+    (`design_status`, `recheck_state`) -- neither is a column on
+    `stakeholder` (§3)."""
+
+    id: int
+    system_id: int
+    stakeholder_key: str
+    current_revision_id: Optional[int] = None
+    current_revision_number: Optional[int] = None
+    display_name: str = ""
+    stakeholder_kind: StakeholderKind = "other"
+    design_status: StakeholderDesignStatus = "proposed"
+    recheck_state: StakeholderRecheckState = "current"
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class StakeholderDetailOut(StakeholderOut):
+    current_revision: Optional[StakeholderRevisionOut] = None
+    roles: List[StakeholderRoleAssignmentOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class StakeholderListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    stakeholders: List[StakeholderOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class StakeholderRevisionListOut(BaseModel):
+    system_id: int
+    stakeholder_id: int
+    stakeholder_key: str
+    generated_at: float
+    revisions: List[StakeholderRevisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class StakeholderNeedRevisionOut(BaseModel):
+    id: int
+    need_id: int
+    revision_number: int
+    need_kind: StakeholderNeedKind = "unmet_need"
+    statement: str = ""
+    rationale: str = ""
+    stakeholder_key: str = ""
+    content_digest: str
+    authored_by_kind: StakeholderAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    change_note: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    revision_state: StakeholderRevisionState = "current"
+    superseded_by_id: Optional[int] = None
+
+
+class StakeholderNeedOut(BaseModel):
+    id: int
+    system_id: int
+    need_key: str
+    current_revision_id: Optional[int] = None
+    current_revision_number: Optional[int] = None
+    need_kind: StakeholderNeedKind = "unmet_need"
+    statement: str = ""
+    stakeholder_key: str = ""
+    design_status: StakeholderDesignStatus = "proposed"
+    recheck_state: StakeholderRecheckState = "current"
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class StakeholderNeedDetailOut(StakeholderNeedOut):
+    current_revision: Optional[StakeholderNeedRevisionOut] = None
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class StakeholderNeedListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    needs: List[StakeholderNeedOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class StakeholderNeedRevisionListOut(BaseModel):
+    system_id: int
+    need_id: int
+    need_key: str
+    generated_at: float
+    revisions: List[StakeholderNeedRevisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class EnvironmentObservationImpactOut(BaseModel):
+    """One `(impact_kind, target_ref)` effect of an Environment Observation
+    (§1.3). `target_ref_kind` reuses `StakeholderRefKind` (§5.2 of the
+    contract lists the same target set); resolution is Issue #421's, so
+    `target_resolution` reports `unavailable` for any kind #420 has not yet
+    wired a reader for (see `_resolve_target`)."""
+
+    id: int
+    observation_id: int
+    impact_kind: EnvironmentImpactKind
+    target_ref_kind: StakeholderRefKind
+    target_ref: str
+    target_row_id: Optional[int] = None
+    target_resolution: StakeholderRefTargetResolution = "unavailable"
+    captured_digest: str = ""
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class EnvironmentObservationOut(BaseModel):
+    """An Environment Observation has NO revision chain (§3) -- a correction
+    is a NEW observation that may declare `supersedes_observation_key`; this
+    row is never edited in place."""
+
+    id: int
+    system_id: int
+    observation_key: str
+    statement: str = ""
+    source_note: str = ""
+    observation_confidence: EnvironmentObservationConfidence = "reported"
+    observed_at: Optional[float] = None
+    supersedes_observation_key: Optional[str] = None
+    content_digest: str
+    authored_by_kind: StakeholderAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    design_status: StakeholderDesignStatus = "proposed"
+    recheck_state: StakeholderRecheckState = "current"
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class EnvironmentObservationDetailOut(EnvironmentObservationOut):
+    impacts: List[EnvironmentObservationImpactOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class EnvironmentObservationListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    observations: List[EnvironmentObservationOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class ValueExchangeRevisionOut(BaseModel):
+    id: int
+    exchange_id: int
+    revision_number: int
+    provider_stakeholder_key: str
+    receiver_stakeholder_key: str
+    exchange_kind: ValueExchangeKind
+    value_statement: str = ""
+    consideration_state: ValueExchangeConsiderationState = "unknown"
+    consideration_kind: Optional[ValueExchangeKind] = None
+    consideration_statement: str = ""
+    channel: str = ""
+    trigger: str = ""
+    cadence: ValueExchangeCadence = "unknown"
+    valid_from: Optional[float] = None
+    valid_to: Optional[float] = None
+    content_digest: str
+    authored_by_kind: StakeholderAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    change_note: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    revision_state: StakeholderRevisionState = "current"
+    superseded_by_id: Optional[int] = None
+
+
+class ValueExchangeOut(BaseModel):
+    id: int
+    system_id: int
+    exchange_key: str
+    current_revision_id: Optional[int] = None
+    current_revision_number: Optional[int] = None
+    provider_stakeholder_key: str = ""
+    receiver_stakeholder_key: str = ""
+    exchange_kind: Optional[ValueExchangeKind] = None
+    value_statement: str = ""
+    validity_state: ValueExchangeValidityState = "unbounded"
+    design_status: StakeholderDesignStatus = "proposed"
+    recheck_state: StakeholderRecheckState = "current"
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class ValueExchangeDetailOut(ValueExchangeOut):
+    current_revision: Optional[ValueExchangeRevisionOut] = None
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class ValueExchangeListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    exchanges: List[ValueExchangeOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class ValueExchangeRevisionListOut(BaseModel):
+    system_id: int
+    exchange_id: int
+    exchange_key: str
+    generated_at: float
+    revisions: List[ValueExchangeRevisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class StakeholderRefOut(BaseModel):
+    """§5.1's single reference table row. `relation_status` is the fixed
+    translation of `decision_method`, never a second stored column."""
+
+    id: int
+    source_kind: StakeholderSubjectKind
+    source_key: str
+    ref_kind: StakeholderRefKind
+    target_ref: str
+    target_row_id: Optional[int] = None
+    relation_status: StakeholderRefRelationStatus = "confirmed"
+    target_resolution: StakeholderRefTargetResolution = "unavailable"
+    recheck_state: StakeholderRefRecheckState = "not_captured"
+    captured_digest: str = ""
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class StakeholderRefListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    refs: List[StakeholderRefOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class StakeholderEvidenceRefOut(BaseModel):
+    id: int
+    subject_kind: Literal["stakeholder_need", "environment_observation", "value_exchange"]
+    subject_key: str
+    evidence_kind: StakeholderEvidenceKind
+    evidence_ref: str = ""
+    statement: str = ""
+    captured_digest: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class StakeholderEvidenceRefListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    evidence_refs: List[StakeholderEvidenceRefOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class StakeholderDecisionOut(BaseModel):
+    """One row of the confirm/reject/retire/reinstate ledger (§3).
+    `decision_method` is always `manual` -- there is no path that writes
+    anything else here."""
+
+    id: int
+    subject_kind: StakeholderSubjectKind
+    subject_key: str
+    subject_row_id: Optional[int] = None
+    decision: StakeholderDecisionKind
+    rationale: str = ""
+    captured_digest: str = ""
+    captured_revision_id: Optional[int] = None
+    decision_method: Literal["manual"] = "manual"
+    decided_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+
+
+class StakeholderViewPreferenceOut(BaseModel):
+    """§12: DISPLAY SETTINGS ONLY. No coordinate, no layout column exists on
+    this model, structurally -- invariant 10."""
+
+    system_id: int
+    created_by: str
+    active_view: str = ""
+    filters: Dict[str, Any] = {}
+    collapsed_refs: List[str] = []
+    pinned_refs: List[str] = []
+    updated_at: float
+
+
+# --- #420 write requests -----------------------------------------------------
+# None of these accept `decision_method` / `decided_by` / `created_by` /
+# `authored_by_kind` -- the route derives all four from the `Principal` and
+# from which write path was called (§10).
+
+
+class StakeholderCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stakeholder_key: str
+    display_name: str = ""
+    stakeholder_kind: StakeholderKind = "other"
+    description: str = ""
+    context_note: str = ""
+
+
+class StakeholderRevisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str = ""
+    stakeholder_kind: StakeholderKind = "other"
+    description: str = ""
+    context_note: str = ""
+    change_note: str = ""
+
+
+class StakeholderRoleAssignmentCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: StakeholderRole
+    scope_kind: StakeholderRoleScopeKind = "system"
+    scope_ref: str = ""
+    note: str = ""
+
+
+class StakeholderNeedCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    need_key: str
+    stakeholder_key: str
+    need_kind: StakeholderNeedKind = "unmet_need"
+    statement: str = ""
+    rationale: str = ""
+
+
+class StakeholderNeedRevisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    need_kind: StakeholderNeedKind = "unmet_need"
+    statement: str = ""
+    rationale: str = ""
+    stakeholder_key: str = ""
+    change_note: str = ""
+
+
+class EnvironmentObservationImpactInput(BaseModel):
+    """One impact nested inside a `EnvironmentObservationCreateRequest` --
+    Observations have no independent impact-create endpoint, mirroring
+    `UxJourneyStepInput`'s "no independent create" rule."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    impact_kind: EnvironmentImpactKind
+    target_ref_kind: StakeholderRefKind
+    target_ref: str
+    note: str = ""
+
+
+class EnvironmentObservationCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observation_key: str
+    statement: str = ""
+    source_note: str = ""
+    observation_confidence: EnvironmentObservationConfidence = "reported"
+    observed_at: Optional[float] = None
+    supersedes_observation_key: Optional[str] = None
+    impacts: List[EnvironmentObservationImpactInput] = Field(default_factory=list)
+
+
+class ValueExchangeCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    exchange_key: str
+    provider_stakeholder_key: str
+    receiver_stakeholder_key: str
+    exchange_kind: ValueExchangeKind
+    value_statement: str = ""
+    consideration_state: ValueExchangeConsiderationState = "unknown"
+    consideration_kind: Optional[ValueExchangeKind] = None
+    consideration_statement: str = ""
+    channel: str = ""
+    trigger: str = ""
+    cadence: ValueExchangeCadence = "unknown"
+    valid_from: Optional[float] = None
+    valid_to: Optional[float] = None
+
+
+class ValueExchangeRevisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_stakeholder_key: str
+    receiver_stakeholder_key: str
+    exchange_kind: ValueExchangeKind
+    value_statement: str = ""
+    consideration_state: ValueExchangeConsiderationState = "unknown"
+    consideration_kind: Optional[ValueExchangeKind] = None
+    consideration_statement: str = ""
+    channel: str = ""
+    trigger: str = ""
+    cadence: ValueExchangeCadence = "unknown"
+    valid_from: Optional[float] = None
+    valid_to: Optional[float] = None
+    change_note: str = ""
+
+
+class StakeholderRefCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_kind: StakeholderSubjectKind
+    source_key: str
+    ref_kind: StakeholderRefKind
+    target_ref: str
+    note: str = ""
+
+
+class StakeholderEvidenceRefCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_kind: Literal["stakeholder_need", "environment_observation", "value_exchange"]
+    subject_key: str
+    evidence_kind: StakeholderEvidenceKind
+    evidence_ref: str = ""
+    statement: str = ""
+
+
+class StakeholderDecisionCreateRequest(BaseModel):
+    """`POST /stakeholder-network/decisions` -- the one write that can move
+    `design_status` (§3). `captured_digest` lets the caller show what
+    content it is judging; the route (409 `stakeholder_decision_stale_
+    digest`) refuses a mismatch against the subject's CURRENT digest rather
+    than silently confirming different content than the developer saw."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    subject_kind: StakeholderSubjectKind
+    subject_key: str
+    decision: StakeholderDecisionKind
+    rationale: str = ""
+    captured_digest: str = ""
+
+
+class StakeholderViewPreferenceUpdateRequest(BaseModel):
+    """§12: display settings only. No coordinate/layout field exists here,
+    structurally (invariant 10)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    active_view: str = ""
+    filters: Dict[str, Any] = Field(default_factory=dict)
+    collapsed_refs: List[str] = Field(default_factory=list)
+    pinned_refs: List[str] = Field(default_factory=list)
