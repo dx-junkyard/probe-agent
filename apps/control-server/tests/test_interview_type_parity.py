@@ -48,6 +48,7 @@ INTERVIEW_CONTRACT_PREFIXES = (
 # ``AlignmentUserDecisionAction = AlignmentDecisionAction | ...`` and
 # ``typeof INTERVIEW_INTENT_FIELDS[number]`` recursively.
 FINITE_TYPE_NAMES = (
+    "ValueNetworkNoticeCode",
     "AlignmentConfidence",
     "AlignmentDecisionAction",
     "AlignmentItemStatus",

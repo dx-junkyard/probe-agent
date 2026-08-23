@@ -7064,7 +7064,326 @@ export interface FlowExperimentDecisionRequest {
 
 // === Epic #418 / Issue #422 — Stakeholder Value Network types ===
 // (Issue #422 owns everything between this marker and the #423 marker below.)
+//
+// `GET /stakeholder-value-network` (`docs/stakeholder-value-network.md`
+// §7.1). Read-only, deterministic, no LLM; the Dashboard renders this
+// exactly as returned and re-derives nothing (§0 invariant 9). No
+// coordinate/layout field exists on any type below (invariant 10), and no
+// score/percentage/centrality field exists either (invariant 7). These
+// types are self-contained -- Issues #420/#421 have not yet added their own
+// Dashboard-side types, so nothing here assumes or depends on one.
+
+export type ValueNetworkStakeholderKind =
+  | "end_user" | "customer_organization" | "internal_operator"
+  | "provider_team" | "partner" | "regulator" | "other";
+
+export type ValueNetworkStakeholderRole =
+  | "actor" | "beneficiary" | "payer" | "operator"
+  | "approver" | "supplier" | "regulator" | "observer";
+
+export type ValueNetworkDesignStatus = "proposed" | "confirmed" | "rejected" | "retired";
+
+export type ValueNetworkRecheckState = "current" | "stale";
+
+export type ValueNetworkAuthorshipKind = "developer" | "reasoning_model";
+
+export type ValueNetworkEvidenceState = "available" | "missing" | "stale" | "unavailable";
+
+export type ValueNetworkExchangeKind =
+  | "experience" | "service" | "information" | "money" | "authority" | "obligation" | "risk";
+
+export type ValueNetworkConsiderationState = "present" | "none" | "unknown";
+
+export type ValueNetworkCadence = "one_time" | "recurring" | "continuous" | "on_demand" | "unknown";
+
+export type ValueNetworkValidityState = "not_started" | "active" | "ended" | "unbounded";
+
+export type ValueNetworkRefKind =
+  | "purpose_element" | "purpose_relation" | "capability_entity"
+  | "ux_journey" | "ux_journey_step" | "ux_requirement"
+  | "purpose_outcome_criterion" | "stakeholder" | "stakeholder_need" | "value_exchange";
+
+export type ValueNetworkRefTargetResolution = "resolved" | "unresolved" | "unavailable";
+
+export type ValueNetworkRefRecheckState = "current" | "stale" | "not_captured";
+
+export type ValueNetworkRefRelationStatus = "confirmed" | "proposed" | "derived";
+
+/** §7.2's eleven structural notice codes -- observations about an absent
+ * link, never a judgement of importance or value. Held in parity with the
+ * server's `ValueNetworkNoticeCode` by
+ * `test_interview_type_parity.py`'s `FINITE_TYPE_NAMES`. */
+export type ValueNetworkNoticeCode =
+  | "stakeholder_without_exchange"
+  | "stakeholder_without_role"
+  | "stakeholder_without_need"
+  | "payer_differs_from_beneficiary"
+  | "exchange_without_need"
+  | "exchange_without_journey"
+  | "exchange_without_outcome"
+  | "confirmed_without_evidence"
+  | "feedback_path_missing"
+  | "stale_link"
+  | "stale_confirmation";
+
+export interface ValueNetworkRelatedRefOut {
+  id: number;
+  source_kind: string;
+  source_key: string;
+  ref_kind: ValueNetworkRefKind;
+  target_ref: string;
+  target_row_id: number | null;
+  relation_status: ValueNetworkRefRelationStatus;
+  target_resolution: ValueNetworkRefTargetResolution;
+  recheck_state: ValueNetworkRefRecheckState;
+  captured_digest: string;
+  note: string;
+  decision_method: string;
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ValueNetworkNodeOut {
+  stakeholder_key: string;
+  display_name: string;
+  stakeholder_kind: ValueNetworkStakeholderKind;
+  /** System-scope role assignments only -- a Journey/Step/Exchange-scoped
+   * role belongs to the Service Blueprint (#423), not to this graph. */
+  roles: ValueNetworkStakeholderRole[];
+  design_status: ValueNetworkDesignStatus;
+  recheck_state: ValueNetworkRecheckState;
+  authored_by_kind: ValueNetworkAuthorshipKind;
+  evidence_state: ValueNetworkEvidenceState;
+}
+
+export interface ValueNetworkConsiderationOut {
+  consideration_state: ValueNetworkConsiderationState;
+  consideration_kind: ValueNetworkExchangeKind | null;
+  consideration_statement: string;
+}
+
+export interface ValueNetworkEdgeOut {
+  exchange_key: string;
+  provider_stakeholder_key: string;
+  receiver_stakeholder_key: string;
+  exchange_kind: ValueNetworkExchangeKind | null;
+  value_statement: string;
+  consideration: ValueNetworkConsiderationOut;
+  channel: string;
+  trigger: string;
+  cadence: ValueNetworkCadence;
+  design_status: ValueNetworkDesignStatus;
+  recheck_state: ValueNetworkRecheckState;
+  validity_state: ValueNetworkValidityState;
+  evidence_state: ValueNetworkEvidenceState;
+  related_refs: ValueNetworkRelatedRefOut[];
+}
+
+export interface ValueNetworkNoticeOut {
+  code: ValueNetworkNoticeCode;
+  subject_kind: "stakeholder" | "value_exchange";
+  subject_key: string;
+}
+
+export interface ValueNetworkOut {
+  system_id: number;
+  generated_at: number;
+  nodes: ValueNetworkNodeOut[];
+  edges: ValueNetworkEdgeOut[];
+  notices: ValueNetworkNoticeOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
 
 
 // === Epic #418 / Issue #423 — Journey Service Blueprint types ===
 // (Issue #423 owns everything below this marker.)
+//
+// `GET /journey-blueprint` (`docs/stakeholder-value-network.md` §8).
+// Read-only, deterministic, no LLM; the Dashboard renders this exactly as
+// returned and re-derives nothing (§0 invariant 9). These types are
+// self-contained, mirroring the `ValueNetwork*` section above's own
+// approach of not depending on #420/#421 Dashboard types that don't exist
+// yet.
+
+export type BlueprintLaneKind =
+  | "stakeholder_action" | "touchpoint" | "frontstage" | "backstage"
+  | "support" | "external" | "requirement" | "evidence" | "failure_recovery";
+
+/** `unknown` ("nobody has described this yet") and `not_applicable` ("this
+ * lane structurally does not apply") are DISTINCT and neither is
+ * auto-filled; `unavailable` is reserved for a guarded loader's own read
+ * failure, never "nothing recorded yet" (§8.1). */
+export type BlueprintLaneState = "present" | "unknown" | "not_applicable" | "unavailable";
+
+export type JourneyDeliveryKind = "frontstage" | "backstage" | "support" | "external";
+
+export type BlueprintDeliveryTargetKind = "ux_requirement" | "stakeholder" | "value_exchange" | "not_applicable";
+
+/** §8.3's Step diff kind -- deliberately includes `reordered`, which the
+ * pre-existing `UxDiffChangeKind` above does not. */
+export type BlueprintDiffChangeKind = "added" | "removed" | "changed" | "reordered" | "unchanged";
+
+export type BlueprintStakeholderRole =
+  | "actor" | "beneficiary" | "payer" | "operator"
+  | "approver" | "supplier" | "regulator" | "observer";
+
+export type BlueprintRefTargetResolution = "resolved" | "unresolved" | "unavailable";
+
+export type BlueprintRefRecheckState = "current" | "stale" | "not_captured";
+
+export interface JourneyStepStakeholderLinkOut {
+  id: number;
+  journey_id: number;
+  journey_key: string;
+  step_key: string;
+  step_label: string | null;
+  stakeholder_key: string;
+  stakeholder_name: string | null;
+  role: BlueprintStakeholderRole;
+  target_resolution: BlueprintRefTargetResolution;
+  recheck_state: BlueprintRefRecheckState;
+  note: string;
+  decision_method: string;
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface BlueprintImplementationRefOut {
+  design_key: string;
+  title: string;
+  adopted_option_key: string | null;
+  target_kind: string | null;
+  target_ref: string | null;
+}
+
+export interface JourneyStepDeliveryLinkOut {
+  id: number;
+  journey_id: number;
+  journey_key: string;
+  step_key: string;
+  step_label: string | null;
+  delivery_kind: JourneyDeliveryKind;
+  target_kind: BlueprintDeliveryTargetKind;
+  target_ref: string;
+  target_name: string | null;
+  target_resolution: BlueprintRefTargetResolution;
+  recheck_state: BlueprintRefRecheckState;
+  /** Lane 4 (backstage) enrichment only -- resolved through #405's existing
+   * Requirement -> Solution Design chain, never a second Flow/Node
+   * reference (§5.2). */
+  implementation_refs: BlueprintImplementationRefOut[];
+  note: string;
+  decision_method: string;
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface JourneyStepExchangeLinkOut {
+  id: number;
+  journey_id: number;
+  journey_key: string;
+  step_key: string;
+  step_label: string | null;
+  exchange_key: string;
+  exchange_kind: string | null;
+  channel: string | null;
+  target_resolution: BlueprintRefTargetResolution;
+  recheck_state: BlueprintRefRecheckState;
+  note: string;
+  decision_method: string;
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface BlueprintRequirementRefOut {
+  requirement_key: string;
+  statement: string | null;
+  target_resolution: BlueprintRefTargetResolution;
+  design_status: string | null;
+}
+
+export interface BlueprintEvidenceRefOut {
+  exchange_key: string;
+  evidence_kind: string;
+  statement: string;
+  created_at: number;
+}
+
+export interface BlueprintLaneCellOut {
+  lane_kind: BlueprintLaneKind;
+  state: BlueprintLaneState;
+  summary: string;
+  stakeholder_links: JourneyStepStakeholderLinkOut[];
+  delivery_links: JourneyStepDeliveryLinkOut[];
+  exchange_links: JourneyStepExchangeLinkOut[];
+  requirement_refs: BlueprintRequirementRefOut[];
+  evidence_refs: BlueprintEvidenceRefOut[];
+}
+
+export interface BlueprintStepOut {
+  step_key: string;
+  step_order: number;
+  user_intent: string;
+  system_response: string;
+  lanes: Record<string, BlueprintLaneCellOut>;
+}
+
+export interface BlueprintOut {
+  journey_key: string;
+  perspective: UxJourneyPerspective;
+  baseline_state: UxJourneyBaselineState;
+  current_revision_number: number | null;
+  steps: BlueprintStepOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface BlueprintDiffStepEntryOut {
+  step_key: string;
+  change_kind: BlueprintDiffChangeKind;
+  from_step_order: number | null;
+  to_step_order: number | null;
+  from_content_digest: string | null;
+  to_content_digest: string | null;
+  from_user_intent: string | null;
+  to_user_intent: string | null;
+}
+
+export interface BlueprintDiffOut {
+  journey_key: string;
+  diff_state: UxDiffState;
+  from_revision_number: number | null;
+  to_revision_number: number | null;
+  steps: BlueprintDiffStepEntryOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface JourneyStepStakeholderLinkCreateRequest {
+  journey_key: string;
+  step_key: string;
+  stakeholder_key: string;
+  role: BlueprintStakeholderRole;
+  note?: string;
+}
+
+export interface JourneyStepDeliveryLinkCreateRequest {
+  journey_key: string;
+  step_key: string;
+  delivery_kind: JourneyDeliveryKind;
+  target_kind: BlueprintDeliveryTargetKind;
+  target_ref?: string;
+  note?: string;
+}
+
+export interface JourneyStepExchangeLinkCreateRequest {
+  journey_key: string;
+  step_key: string;
+  exchange_key: string;
+  note?: string;
+}

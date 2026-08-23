@@ -70,6 +70,10 @@ const NAV_GROUPS: NavGroup[] = [
         to: "/ux-design-studio", icon: PenTool, label: "UX Design Studio",
         subtitle: "Journey/Requirement/Solution Designの追跡",
       },
+      {
+        to: "/stakeholder-value-network", icon: Users, label: "Stakeholder Value Network",
+        subtitle: "当事者とValue Exchangeの追跡",
+      },
     ],
   },
   {

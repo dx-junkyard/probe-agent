@@ -12594,6 +12594,323 @@ class StakeholderViewPreferenceUpdateRequest(BaseModel):
 # === Epic #418 / Issue #422 — Stakeholder Value Network projection models ===
 # (Issue #422 owns everything between this marker and the #423 marker below.)
 
+#: §7.2's eleven structural notice codes. Each is a deterministic structural
+#: check (Principle 6) -- none of them is a judgement that a party or an
+#: Exchange is unimportant or low-value; they say a link is absent.
+#: `payer_differs_from_beneficiary` and `feedback_path_missing` are
+#: deliberately phrased as OBSERVATIONS for the same reason (§7.2's own
+#: note: "in plenty of systems the buyer is legitimately not the user").
+ValueNetworkNoticeCode = Literal[
+    "stakeholder_without_exchange",
+    "stakeholder_without_role",
+    "stakeholder_without_need",
+    "payer_differs_from_beneficiary",
+    "exchange_without_need",
+    "exchange_without_journey",
+    "exchange_without_outcome",
+    "confirmed_without_evidence",
+    "feedback_path_missing",
+    "stale_link",
+    "stale_confirmation",
+]
+
+
+class ValueNetworkNodeOut(BaseModel):
+    """One Stakeholder rendered as a Value Network node (§7.1). `roles` is
+    the SYSTEM-scope subset only -- a Journey/Step/Exchange-scoped role
+    belongs to the Service Blueprint (#423), not to this System-level graph.
+    `evidence_state` is folded from this party's Needs (see
+    `app.stakeholder_value_network`'s module docstring); no coordinate field
+    exists here, structurally (invariant 10)."""
+
+    stakeholder_key: str
+    display_name: str = ""
+    stakeholder_kind: StakeholderKind = "other"
+    roles: List[StakeholderRole] = []
+    design_status: StakeholderDesignStatus = "proposed"
+    recheck_state: StakeholderRecheckState = "current"
+    authored_by_kind: StakeholderAuthorshipKind = "developer"
+    evidence_state: StakeholderEvidenceState = "missing"
+
+
+class ValueNetworkConsiderationOut(BaseModel):
+    """§1.4/§0 invariant 6: the consideration is described SEPARATELY from
+    the value itself -- never folded into one "value" edge."""
+
+    consideration_state: ValueExchangeConsiderationState = "unknown"
+    consideration_kind: Optional[ValueExchangeKind] = None
+    consideration_statement: str = ""
+
+
+class ValueNetworkEdgeOut(BaseModel):
+    """One Value Exchange rendered as a directed Value Network edge (§7.1).
+    `related_refs` reuses `StakeholderRefOut` verbatim -- the same rows
+    `GET /stakeholder-network/refs` returns, resolved fresh, never copied
+    (invariant 2). No coordinate/layout field exists here either."""
+
+    exchange_key: str
+    provider_stakeholder_key: str
+    receiver_stakeholder_key: str
+    exchange_kind: Optional[ValueExchangeKind] = None
+    value_statement: str = ""
+    consideration: ValueNetworkConsiderationOut = ValueNetworkConsiderationOut()
+    channel: str = ""
+    trigger: str = ""
+    cadence: ValueExchangeCadence = "unknown"
+    design_status: StakeholderDesignStatus = "proposed"
+    recheck_state: StakeholderRecheckState = "current"
+    validity_state: ValueExchangeValidityState = "unbounded"
+    evidence_state: StakeholderEvidenceState = "missing"
+    related_refs: List[StakeholderRefOut] = []
+
+
+class ValueNetworkNoticeOut(BaseModel):
+    """§7.2. `subject_kind` is deliberately narrower than the general
+    `StakeholderSubjectKind` -- every notice's subject is either a
+    Stakeholder or a Value Exchange, the two entities THIS projection
+    renders as nodes/edges."""
+
+    code: ValueNetworkNoticeCode
+    subject_kind: Literal["stakeholder", "value_exchange"]
+    subject_key: str
+
+
+class ValueNetworkOut(BaseModel):
+    """`GET /stakeholder-value-network` (§7.1). Read-only, deterministic, no
+    LLM (invariant 9); writes nothing (#382). Ordering is total and stable
+    (see `app.stakeholder_value_network`'s module docstring) so the same
+    facts always render the same graph. A name in `degraded_sections` means
+    that section's list was DROPPED, never that it is genuinely empty."""
+
+    system_id: int
+    generated_at: float
+    nodes: List[ValueNetworkNodeOut] = []
+    edges: List[ValueNetworkEdgeOut] = []
+    notices: List[ValueNetworkNoticeOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
 
 # === Epic #418 / Issue #423 — Journey Service Blueprint projection models ===
 # (Issue #423 owns everything below this marker.)
+#
+# `docs/stakeholder-value-network.md` §8 is the canonical contract. This
+# module is read-only / deterministic / no-LLM (§0 invariant 9); every write
+# request model below is `ConfigDict(extra="forbid")` and omits `created_by`
+# / `decision_method` -- those come from the route and the authenticated
+# `Principal` (§10 / #337's rule, identical to every other section above).
+
+#: §8.1's nine Service Blueprint lanes, vertical axis of the projection.
+BlueprintLaneKind = Literal[
+    "stakeholder_action", "touchpoint", "frontstage", "backstage", "support",
+    "external", "requirement", "evidence", "failure_recovery",
+]
+
+#: §8's lane cell state. `unknown` ("nobody has described this yet") and
+#: `not_applicable` ("this lane structurally does not apply here") are
+#: DISTINCT and NEITHER is auto-filled -- only an explicit developer-authored
+#: fact (a recorded link, or a `not_applicable` sentinel link -- see
+#: `journey_blueprint._DELIVERY_TARGET_KINDS`) can produce `not_applicable`;
+#: its absence is always `unknown`, never guessed either way.
+#: `unavailable` is reserved for a guarded loader's own read failure
+#: (#380's discipline) and is never "nothing recorded yet".
+BlueprintLaneState = Literal["present", "unknown", "not_applicable", "unavailable"]
+
+#: §8.2's `journey_step_delivery_link.delivery_kind` -- which of lanes 3-6
+#: (frontstage/backstage/support/external) a delivery link belongs to.
+JourneyDeliveryKind = Literal["frontstage", "backstage", "support", "external"]
+
+#: `journey_step_delivery_link.target_kind` -- NOT part of §2's vocabulary
+#: table (this table is #423's own addition, not `stakeholder_ref`), scoped
+#: to exactly what a delivery link can usefully point at: a Requirement
+#: (backstage's own #405 Requirement -> Solution Design -> Flow/Node chain,
+#: §5.2 -- never a second, direct Flow/Node reference), a Stakeholder, or a
+#: Value Exchange. `not_applicable` is the ONE deliberate sentinel value
+#: this layer defines so `BlueprintLaneState.not_applicable` is reachable as
+#: an explicit, finite, developer-authored fact rather than invented from
+#: the mere absence of a link (see the module docstring in
+#: `app/journey_blueprint.py` for the full reasoning).
+BlueprintDeliveryTargetKind = Literal["ux_requirement", "stakeholder", "value_exchange", "not_applicable"]
+
+#: §8.3's as-is/to-be Step diff. Deliberately NOT `UxDiffChangeKind` (which
+#: lacks `reordered`) -- a Step whose `content_digest` is unchanged but whose
+#: `step_order` moved is a distinct, real fact `ux_design`'s diff has no way
+#: to say. Matched by exact `step_key` equality only (Principle 6 / §0
+#: invariant 9 -- no similarity, no embeddings).
+BlueprintDiffChangeKind = Literal["added", "removed", "changed", "reordered", "unchanged"]
+
+
+class JourneyStepStakeholderLinkCreateRequest(BaseModel):
+    """§8.2: several Stakeholders -- and several roles for the same
+    Stakeholder -- on ONE Step is normal and is the point, so this is always
+    a NEW row; correction is a separate decision-ledger concern, not a
+    dedup-on-POST."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    journey_key: str
+    step_key: str
+    stakeholder_key: str
+    role: StakeholderRole
+    note: str = ""
+
+
+class JourneyStepDeliveryLinkCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    journey_key: str
+    step_key: str
+    delivery_kind: JourneyDeliveryKind
+    target_kind: BlueprintDeliveryTargetKind
+    target_ref: str = ""
+    note: str = ""
+
+
+class JourneyStepExchangeLinkCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    journey_key: str
+    step_key: str
+    exchange_key: str
+    note: str = ""
+
+
+class JourneyStepStakeholderLinkOut(BaseModel):
+    id: int
+    journey_id: int
+    journey_key: str
+    step_key: str
+    step_label: Optional[str] = None
+    stakeholder_key: str
+    stakeholder_name: Optional[str] = None
+    role: StakeholderRole
+    target_resolution: StakeholderRefTargetResolution = "unavailable"
+    recheck_state: StakeholderRefRecheckState = "not_captured"
+    note: str = ""
+    decision_method: str = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class BlueprintImplementationRefOut(BaseModel):
+    """Lane 4 (backstage) enrichment ONLY -- resolved fresh at read time
+    through #405's existing Requirement -> Solution Design -> target-link
+    chain (§5.2's "no second path"); never stored on the delivery link row
+    itself."""
+
+    design_key: str
+    title: str = ""
+    adopted_option_key: Optional[str] = None
+    target_kind: Optional[str] = None
+    target_ref: Optional[str] = None
+
+
+class JourneyStepDeliveryLinkOut(BaseModel):
+    id: int
+    journey_id: int
+    journey_key: str
+    step_key: str
+    step_label: Optional[str] = None
+    delivery_kind: JourneyDeliveryKind
+    target_kind: BlueprintDeliveryTargetKind
+    target_ref: str = ""
+    target_name: Optional[str] = None
+    target_resolution: StakeholderRefTargetResolution = "unavailable"
+    recheck_state: StakeholderRefRecheckState = "not_captured"
+    implementation_refs: List[BlueprintImplementationRefOut] = []
+    note: str = ""
+    decision_method: str = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class JourneyStepExchangeLinkOut(BaseModel):
+    id: int
+    journey_id: int
+    journey_key: str
+    step_key: str
+    step_label: Optional[str] = None
+    exchange_key: str
+    exchange_kind: Optional[str] = None
+    channel: Optional[str] = None
+    target_resolution: StakeholderRefTargetResolution = "unavailable"
+    recheck_state: StakeholderRefRecheckState = "not_captured"
+    note: str = ""
+    decision_method: str = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class BlueprintRequirementRefOut(BaseModel):
+    """Lane 7 -- read through #405's existing `ux_requirement_step_link`
+    (§5.2: no second path is added for this)."""
+
+    requirement_key: str
+    statement: Optional[str] = None
+    target_resolution: StakeholderRefTargetResolution = "unavailable"
+    design_status: Optional[str] = None
+
+
+class BlueprintEvidenceRefOut(BaseModel):
+    """Lane 8's "observed evidence refs" -- evidence already attached
+    (§6) to a Value Exchange this Step delivers (via
+    `journey_step_exchange_link`); never a copy, never a new evidence
+    concept."""
+
+    exchange_key: str
+    evidence_kind: str
+    statement: str = ""
+    created_at: float
+
+
+class BlueprintLaneCellOut(BaseModel):
+    lane_kind: BlueprintLaneKind
+    state: BlueprintLaneState = "unknown"
+    summary: str = ""
+    stakeholder_links: List[JourneyStepStakeholderLinkOut] = []
+    delivery_links: List[JourneyStepDeliveryLinkOut] = []
+    exchange_links: List[JourneyStepExchangeLinkOut] = []
+    requirement_refs: List[BlueprintRequirementRefOut] = []
+    evidence_refs: List[BlueprintEvidenceRefOut] = []
+
+
+class BlueprintStepOut(BaseModel):
+    step_key: str
+    step_order: int
+    user_intent: str = ""
+    system_response: str = ""
+    lanes: Dict[str, BlueprintLaneCellOut] = {}
+
+
+class BlueprintOut(BaseModel):
+    journey_key: str
+    perspective: UxJourneyPerspective = "as_is"
+    baseline_state: UxJourneyBaselineState = "not_applicable"
+    current_revision_number: Optional[int] = None
+    steps: List[BlueprintStepOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class BlueprintDiffStepEntryOut(BaseModel):
+    step_key: str
+    change_kind: BlueprintDiffChangeKind
+    from_step_order: Optional[int] = None
+    to_step_order: Optional[int] = None
+    from_content_digest: Optional[str] = None
+    to_content_digest: Optional[str] = None
+    from_user_intent: Optional[str] = None
+    to_user_intent: Optional[str] = None
+
+
+class BlueprintDiffOut(BaseModel):
+    journey_key: str
+    diff_state: UxDiffState = "available"
+    from_revision_number: Optional[int] = None
+    to_revision_number: Optional[int] = None
+    steps: List[BlueprintDiffStepEntryOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
