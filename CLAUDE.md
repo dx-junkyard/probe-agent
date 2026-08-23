@@ -1596,6 +1596,51 @@ creating incomplete persistence or execution paths for later phases.
       保存した row id を単独で信用しない (#405)。昇格候補の記録は**昇格では
       ない** — 実際の昇格は既存の Experiment 採否 / Stabilization / publish の
       人間ゲートを通る。
+    - **実行モードのゲートは既存の実行入口にも掛かる** (`app/execution_target.py`)。
+      「実行への参照を記録できないこと」と「実行できないこと」は別であり、
+      記録側だけを塞いでも `fixed` の Node に対して既存 endpoint から候補を
+      実行できてしまう。実行対象 → Node の解決は
+      `evolution_node_link` の**完全一致**のみ (`component` / `feature`)。
+      分類は `governed` / `unmapped` / `ambiguous` の 3 値で、2 値にできない
+      のは安全な答えが**逆向き**だから — 一括移行は Epic の非目標なので
+      `unmapped` は従来どおり通し、`ambiguous` は誰の権限か推測せず fail
+      closed にする。`unmapped` は**黙らない**(header と読み取り endpoint で
+      「対象外」と「許可された」を区別する)。ゲートの**位置**も契約で、
+      experiment は status/variant reset の前、candidate replay は
+      `replay_status='running'` の前に置く — 拒否が中途半端な状態を残さない
+      ため。
+    - **提案は canonical evidence に grounded でなければならない。** draft
+      context は #414 projection の実際の事実から作り、`evidence_refs` は
+      projection が実際に出した id の許可リストとの**完全一致**で検証する。
+      検証は draft 時と投稿時の**両方**で行う — 間に人間の編集が入るので、
+      draft 時に有効だった参照が投稿時には stale・別 System・無関係になり
+      うる。検証失敗は run の失敗であり、修復しない (Principle 6)。
+    - **結果と昇格候補は canonical 参照に拘束される。** 結果は**その提案の**
+      登録済み実行参照 1 件を名指しし、宣言した評価軸すべての測定値を持ち、
+      quality floor の verdict を記録する(**自動採用も自動却下もしない**)。
+      昇格候補は宣言済み候補・解決可能な実行・**その同じ実行に対する**結果の
+      3 つに拘束される。なお `record_execution` が**失敗した**実行の参照を
+      受け付けるのは意図的 — 「実行され、失敗した」は事実である。拒否される
+      のはそれを根拠とした結果の主張のほう。
+    - **provenance は route と principal から取り、body から取らない** (#337)。
+      observation の `source` は HTTP 書き込みなら常に `control_server` で、
+      body 指定は 422。`sdk` を名乗れると「実際に動いたモード」の監査値が
+      自己申告になり、observation の存在意義そのものが消える。`run_ref` は
+      解決していないので `uncorroborated` と明示する。
+    - **存在しない Node は resolve / divergence / capability のすべてで同じ
+      答えを返す。** 「そんな Node は無い」は「誰も設定していない Node」の
+      既定値ではない (#380)。
+    - **static Flow は snapshot pin 必須** (422 `static_flow_snapshot_required`)。
+      最新 ready snapshot への暗黙追随は、同じ URL がリポジトリ更新後に別の
+      Flow を説明することを意味し、再現性と `stale` の読みを同時に壊す。
+    - **`observation_state` と `model_state` は独立した 2 つの事実。** Node が
+      紐付いているが一度も動いていない runtime Flow は `missing` + `present`
+      で、#415 が提案対象にできる実在の subject である。#414 の subject 一覧が
+      span だけを見ていたため、提案できるのに選択も説明もできない Flow が
+      あった。
+    - **既知の残存穴**: `intelligence_runs` は draft の主題を保存しないため、
+      「この draft に対応する run か」は検証できない。塞ぐには `subject_ref` /
+      `input_digest` 列が要る (`docs/execution-modes.md` §7.1.3)。
     既存の human gate は一切緩めない。この Epic が追加する実行モードの割り当てと
     revoke、Flow 実験提案の承認・却下・撤回、昇格候補の記録もすべて
     `decision_method: manual`。

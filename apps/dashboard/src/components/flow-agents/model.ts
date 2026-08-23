@@ -53,6 +53,7 @@ import type {
   FlowOpenItemKind,
   FlowOpenItemOut,
   FlowResponsibilityContractOut,
+  FlowExternalBoundaryOut,
   FlowResponsibilityEdgeOut,
   FlowResponsibilitySectionOut,
   FlowRuntimeSubjectOut,
@@ -773,8 +774,12 @@ export interface FlowEdgeReading {
   detail: string;
 }
 
-function edgeExtra(edge: FlowResponsibilityEdgeOut, key: string): string {
-  const value = (edge as unknown as Record<string, unknown>)[key];
+/** `resolution` / `callee_name` / `line` are present only on static
+ * call-graph edges, and `trace_id` only on runtime ones, so every read here
+ * is optional by design rather than by uncertainty. */
+function edgeExtra(
+  value: string | number | null | undefined,
+): string {
   if (value === null || value === undefined || value === "") return "";
   return String(value);
 }
@@ -791,10 +796,10 @@ export function flowEdgeReadings(
   return edges.map((edge, index) => {
     const gloss = EDGE_KIND_LABEL[edge.edge_kind];
     const parts: string[] = [];
-    const callee = edgeExtra(edge, "callee_name");
-    const line = edgeExtra(edge, "line");
-    const resolution = edgeExtra(edge, "resolution");
-    const traceId = edgeExtra(edge, "trace_id");
+    const callee = edgeExtra(edge.callee_name);
+    const line = edgeExtra(edge.line);
+    const resolution = edgeExtra(edge.resolution);
+    const traceId = edgeExtra(edge.trace_id);
     if (callee) parts.push(`callee: ${callee}`);
     if (line) parts.push(`line: ${line}`);
     if (resolution) {
@@ -835,19 +840,19 @@ export interface ExternalBoundaryReading {
  * a row whose `boundary_kind` is absent keeps an EMPTY kind rather than
  * being assigned a plausible one. */
 export function externalBoundaryReadings(
-  rows: readonly Record<string, unknown>[],
+  rows: readonly FlowExternalBoundaryOut[],
 ): ExternalBoundaryReading[] {
   return rows.map((row, index) => {
-    const nodeId = typeof row.node_id === "string" ? row.node_id : "";
-    const kind = typeof row.boundary_kind === "string" ? row.boundary_kind : "";
-    const qualified =
-      typeof row.qualified_name === "string" ? row.qualified_name : "";
+    const kind = row.boundary_kind ?? "";
     return {
-      key: `${index}:${nodeId}`,
-      nodeId,
+      key: `${index}:${row.node_id ?? ""}`,
+      nodeId: row.node_id ?? "",
       boundaryKind: kind,
+      // An unknown boundary kind renders verbatim rather than being dropped:
+      // the server's vocabulary may grow, and a boundary we cannot label is
+      // still a boundary the developer needs to see.
       boundaryKindLabel: kind ? BOUNDARY_KIND_LABEL[kind] ?? kind : "",
-      qualifiedName: qualified,
+      qualifiedName: row.qualified_name ?? "",
     };
   });
 }

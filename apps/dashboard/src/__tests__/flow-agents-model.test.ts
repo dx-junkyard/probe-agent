@@ -573,7 +573,9 @@ describe("依存関係と入出力境界の読み (§6.3 item 2)", () => {
         boundary_kind: "database",
         qualified_name: "db.execute",
       },
-      { node_id: "external::unknown::x" },
+      // 種別が空で届いた行。型としては 3 項目とも必須だが、空文字列は
+      // 表現可能なので「種別が記録されていない」状態はこの形で届きうる。
+      { node_id: "external::unknown::x", boundary_kind: "", qualified_name: "" },
     ]);
     expect(readings[0].boundaryKindLabel).toBe("DB");
     expect(readings[0].qualifiedName).toBe("db.execute");

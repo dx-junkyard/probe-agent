@@ -6778,6 +6778,18 @@ export interface FlowResponsibilityEdgeOut {
   target: string;
   edge_kind: string;
   trace_id?: string;
+  /** Static call-graph edges only. `resolution` keeps an INFERRED callee
+   * distinguishable from a verified one -- a guessed dependency must never
+   * read as an observed fact. Absent on runtime (trace-derived) edges. */
+  resolution?: "resolved" | "inferred" | "unresolved";
+  callee_name?: string;
+  line?: number;
+}
+
+export interface FlowExternalBoundaryOut {
+  node_id: string;
+  boundary_kind: string;
+  qualified_name: string;
 }
 
 export interface FlowResponsibilitySectionOut {
@@ -6785,7 +6797,7 @@ export interface FlowResponsibilitySectionOut {
   node_order: string[];
   edges: FlowResponsibilityEdgeOut[];
   contracts: FlowResponsibilityContractOut[];
-  external_boundaries: Record<string, unknown>[];
+  external_boundaries: FlowExternalBoundaryOut[];
   entry_ref: string | null;
   entry_state: FlowFactState;
   truncated: boolean;
