@@ -1514,6 +1514,137 @@ creating incomplete persistence or execution paths for later phases.
     ない)。詳細は `docs/project-intelligence.md` の
     「Epic #405 検証ラウンド」節が正本。
 
+26. Issue #412 (subs #413-#415) — 実行モード切替と説明可能なエージェント群。
+    通常運用は LLM を呼ばない固定処理として安全に動かし、実験が必要なときだけ
+    LLM に候補・比較・実験計画を**提案**させる。あわせて、関連する Evolution
+    Node を Flow / エージェント群として集約し、その目的・状態・根拠・次の提案を
+    人が追えるようにする。`docs/execution-modes.md` が canonical contract で、
+    §0 を読んでからこの領域に触ること。依存順に #413 (実行モードの正本契約と
+    fail-closed 制御) → #414 (Flow・エージェント群の説明可能な集約 projection)
+    → #415 (提案・Shadow 実験・人間承認のオーケストレーション統合)。
+    後から変えるときに守ること:
+    - **実行モードは 5 本目の独立軸である。** Node maturity / Cell Improvement
+      status / SDK policy mode (`off`/`trace`/`shadow`) / Dashboard user phase
+      の 4 軸 (#394 ADR-6) のどれからも導出せず、どれへも統合しない。とくに
+      SDK policy の `shadow` と実行モードの `shadow` は別の事実 — 前者は SDK が
+      候補を実行して送るか、後者は control plane が候補比較を許すか。片方だけが
+      `shadow` の状態は正当で、projection は 2 つの読みとして並べる (#366)。
+    - **`fixed` は「LLM を使わない設定」ではなく「到達不能」である。**
+      `app/execution_mode.py` の `build_experiment_llm_adapter` は
+      `require_capability` を**先に**呼び、通過した後で初めて
+      `LLMConfig.intelligence_from_env()` に触れる。この順序が契約であり、
+      テストは資格情報を読む行に到達しないことを直接表明する。この Epic が
+      対象とする Node に対して、この関数を迂回して `create_llm_client` を
+      呼ぶ経路を新設しない。
+    - **モードスコープは永続行だけから解決できるものに限る** (EM-ADR-1)。
+      ゲートは「読めなければ `fixed`」でなければならず、失敗しうる導出を
+      入力に置くと失敗が「停止」になり「安全側へ倒れる」にならない。だから
+      `static_flow` (`code_entrypoints`、snapshot scoped、所属を知るには
+      call graph の再計算が要る) は #414 の**表示 subject** ではあっても
+      モードスコープではない。モードスコープは `system` / `flow`
+      (`runtime_flow:<flow_id>`、所属は既存の
+      `evolution_node_link(link_kind='flow')` 1 本の indexed query) / `node`
+      (`node_key`) の 3 つ。`scope_ref` は常に前置詞付きで保存する。
+    - **`expired` と `revoked` は別の答え** (EM-ADR-2)。`effective_until` は
+      人間が設定した実験の期限なので、期限切れで上位スコープの `propose` が
+      代わりに効いてしまうとその期限は何も止めていない。期限切れは上位へ
+      継承させず `fixed` へ落とす。`revoke` は人間が明示的に終了を記録した
+      事実なので、通常の継承が再開する。**時間の経過だけで権限が復活する
+      経路は存在しない。**
+    - **caller の主張はスコープの証拠ではない** (EM-ADR-4)。`node_key` が
+      与えられているとき resolver が見る flow は、その Node が
+      `evolution_node_link(link_kind='flow')` で実際に属している flow だけで
+      ある。caller が渡した `flow_ref` は集合への追加ではなく照合される主張に
+      すぎず、属していなければ行 3 の `flow_scope_not_member` で拒否する
+      (黙って無視すると caller は権限が効いたと信じたままになり、同じ欠陥を
+      裏側から作る)。当初の実装は両者を union していたため、permissive な Flow
+      を名乗るだけで単独では `fixed` の Node が LLM に到達できた。
+    - 実効モードは `resolve_execution_mode` の 11 行 first-match 表を持つ
+      **純粋関数**で決まる。`reason` は 11 個の有限集合で、期限切れの 3 行は
+      `node_` / `flow_` / `system_expired_assignment` と**別コード**を持つ —
+      三つとも `fixed` へ落ちるが開発者の次の操作が別だからである (#366)。
+      ルート・Dashboard・projection・orchestrator のどれもこの判定を
+      再導出しない (#349)。
+    - **`propose` は `candidate_execution` を持たない。** 提案は計画であって
+      実行ではない。実行には「人間の承認」と「モードが `shadow`」という
+      **2 つの独立した事実**の両方が要る。承認済みでもモードが `propose` に
+      戻っていれば実行記録は 409、モードが `shadow` でも未承認なら 409。
+    - **`mode_source: "default"` と `system_assignment` を区別する。**
+      「既定の `fixed`」と「人間が `fixed` を選んだ」は別の事実。
+      `unobserved` を `match` として扱わない。
+    - #414 は**何も書かない**読み取り専用 projection で、新しい理解モデルを
+      作らない。単一スコア・平均・完成度・confidence percentage を返さず、
+      5 軸を別フィールドで返す (ADR-7 / #353)。`missing` / `unavailable` /
+      `unmeasured` / `stale` / `not_applicable` は 5 つの別の答えで丸めない。
+      1 section の失敗は `degraded_sections` に落ち、推測値を代入しない
+      (#380)。`flow_graph` の `flow-1`/`flow-2` を恒久 ID として保存も返却も
+      しない (#405)。static flow の Node 所属は `(path, qualified_name)` の
+      完全一致のみで、類似度・キーワード・埋め込みを使わない (Principle 6)。
+    - #415 の提案 lifecycle は `flow_experiment_event` の **event fold で
+      導出**し、`status` 列を保存しない (#337/#338/#349/#405 と同じ規律)。
+      提案は §7.1 の 12 個の必須項目 + 構造検証をすべて満たさなければ
+      作成できず、欠落は有限の拒否コードで 422 になる。`single_node` と
+      `sub_pipeline` を混同せず、対象 Node 数と一致しなければ拒否する。
+      `side_effect_class` が `external_write` / `irreversible` の Node に
+      対する `none` / `pure` の隔離戦略は拒否する (Principle 4 を提案の
+      入口で構造的に効かせる)。
+    - **オーケストレーターは本番を書き換える経路を持たない。**
+      `evolution_node.maturity` / `components.mode` / patch 適用 / publish
+      job / worktree / target repo / Cell Improvement 状態のどれも変えない。
+      実行の実体は既存正本 (`replay_runs` / `experiments` /
+      `shadow_results`) で、この層は参照するだけ。参照は read 時に解決し、
+      保存した row id を単独で信用しない (#405)。昇格候補の記録は**昇格では
+      ない** — 実際の昇格は既存の Experiment 採否 / Stabilization / publish の
+      人間ゲートを通る。
+    - **実行モードのゲートは既存の実行入口にも掛かる** (`app/execution_target.py`)。
+      「実行への参照を記録できないこと」と「実行できないこと」は別であり、
+      記録側だけを塞いでも `fixed` の Node に対して既存 endpoint から候補を
+      実行できてしまう。実行対象 → Node の解決は
+      `evolution_node_link` の**完全一致**のみ (`component` / `feature`)。
+      分類は `governed` / `unmapped` / `ambiguous` の 3 値で、2 値にできない
+      のは安全な答えが**逆向き**だから — 一括移行は Epic の非目標なので
+      `unmapped` は従来どおり通し、`ambiguous` は誰の権限か推測せず fail
+      closed にする。`unmapped` は**黙らない**(header と読み取り endpoint で
+      「対象外」と「許可された」を区別する)。ゲートの**位置**も契約で、
+      experiment は status/variant reset の前、candidate replay は
+      `replay_status='running'` の前に置く — 拒否が中途半端な状態を残さない
+      ため。
+    - **提案は canonical evidence に grounded でなければならない。** draft
+      context は #414 projection の実際の事実から作り、`evidence_refs` は
+      projection が実際に出した id の許可リストとの**完全一致**で検証する。
+      検証は draft 時と投稿時の**両方**で行う — 間に人間の編集が入るので、
+      draft 時に有効だった参照が投稿時には stale・別 System・無関係になり
+      うる。検証失敗は run の失敗であり、修復しない (Principle 6)。
+    - **結果と昇格候補は canonical 参照に拘束される。** 結果は**その提案の**
+      登録済み実行参照 1 件を名指しし、宣言した評価軸すべての測定値を持ち、
+      quality floor の verdict を記録する(**自動採用も自動却下もしない**)。
+      昇格候補は宣言済み候補・解決可能な実行・**その同じ実行に対する**結果の
+      3 つに拘束される。なお `record_execution` が**失敗した**実行の参照を
+      受け付けるのは意図的 — 「実行され、失敗した」は事実である。拒否される
+      のはそれを根拠とした結果の主張のほう。
+    - **provenance は route と principal から取り、body から取らない** (#337)。
+      observation の `source` は HTTP 書き込みなら常に `control_server` で、
+      body 指定は 422。`sdk` を名乗れると「実際に動いたモード」の監査値が
+      自己申告になり、observation の存在意義そのものが消える。`run_ref` は
+      解決していないので `uncorroborated` と明示する。
+    - **存在しない Node は resolve / divergence / capability のすべてで同じ
+      答えを返す。** 「そんな Node は無い」は「誰も設定していない Node」の
+      既定値ではない (#380)。
+    - **static Flow は snapshot pin 必須** (422 `static_flow_snapshot_required`)。
+      最新 ready snapshot への暗黙追随は、同じ URL がリポジトリ更新後に別の
+      Flow を説明することを意味し、再現性と `stale` の読みを同時に壊す。
+    - **`observation_state` と `model_state` は独立した 2 つの事実。** Node が
+      紐付いているが一度も動いていない runtime Flow は `missing` + `present`
+      で、#415 が提案対象にできる実在の subject である。#414 の subject 一覧が
+      span だけを見ていたため、提案できるのに選択も説明もできない Flow が
+      あった。
+    - **既知の残存穴**: `intelligence_runs` は draft の主題を保存しないため、
+      「この draft に対応する run か」は検証できない。塞ぐには `subject_ref` /
+      `input_digest` 列が要る (`docs/execution-modes.md` §7.1.3)。
+    既存の human gate は一切緩めない。この Epic が追加する実行モードの割り当てと
+    revoke、Flow 実験提案の承認・却下・撤回、昇格候補の記録もすべて
+    `decision_method: manual`。
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

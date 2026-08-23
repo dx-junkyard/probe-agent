@@ -130,6 +130,14 @@ const NAV_GROUPS: NavGroup[] = [
         to: "/evolution-nodes", icon: Layers, label: "Evolution Node",
         subtitle: "処理単位の契約・実装方式・成熟度",
       },
+      // Epic #412 (#414/#415): the Flow-level view of those same Nodes plus
+      // the execution-mode control and the experiment proposals awaiting a
+      // human decision. It sits beside Evolution Node deliberately -- the
+      // Node page is the per-Node inspector, this one is the Flow aggregate.
+      {
+        to: "/flow-agents", icon: Bot, label: "Flow・エージェント群",
+        subtitle: "Flow単位の5軸・実行モード・実験提案",
+      },
     ],
   },
   {

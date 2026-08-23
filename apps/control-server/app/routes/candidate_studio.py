@@ -26,7 +26,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from ..auth import get_system_id
 from ..candidate_studio import (
@@ -64,6 +64,7 @@ from .replay import (
     create_replay_variant_run,
     get_replay_variant_experiment_payload,
 )
+from .execution_modes import gate_execution_target
 from .replay_readiness import gather_readiness
 from .snapshot_preflight import require_snapshot_preflight
 
@@ -878,6 +879,7 @@ def replay_candidate_version(
     version_id: int,
     payload: CandidateReplayCreate,
     system_id: int = Depends(get_system_id),
+    response: Response = None,
 ) -> CandidateVersionOut:
     with get_conn() as conn:
         version = _get_version_or_404(conn, version_id, system_id)
@@ -903,6 +905,20 @@ def replay_candidate_version(
         snapshot_id = session_row["snapshot_id"]
         version_number = version["version_number"]
         patch_text = version["patch_text"]
+        # Execution-mode gate (#412 §4.3), before the candidate is marked
+        # 'running' and before a worktree is touched. Surfaced here as well as
+        # inside create_replay_variant_run for the same reason the approval
+        # gate is: a refusal must not leave the immutable candidate stranded in
+        # a 'running' state. The subject is the SESSION's Component -- the
+        # candidate is a patch against that Component's symbol.
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="candidate_execution",
+            target_kind="component",
+            target_ref=component_id,
+            response=response,
+        )
         # Surface the human replay-approval gate here too (fail closed before
         # touching a worktree); create_replay_variant_run enforces it again.
         if _active_approval(conn, system_id, component_id) is None:
@@ -991,6 +1007,7 @@ def replay_candidate_version(
 def promote_candidate_version(
     version_id: int,
     system_id: int = Depends(get_system_id),
+    response: Response = None,
 ) -> CandidatePromotionOut:
     now = time.time()
     with get_conn() as conn:
@@ -1008,6 +1025,19 @@ def promote_candidate_version(
                 status_code=422, detail="Candidate version has no evaluated variant"
             )
         session_row = _get_session_or_404(conn, version["session_id"], system_id)
+        # Execution-mode gate (#412 §4.3). Promotion carries a candidate out of
+        # the Studio and into the Experiment lane, where it is executed again;
+        # letting a Node whose mode fell back to `fixed` keep exporting
+        # candidates would move the hole one step downstream rather than close
+        # it. Promotion still adopts nothing and creates no Experiment.
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="candidate_execution",
+            target_kind="component",
+            target_ref=session_row["component_id"],
+            response=response,
+        )
         replay_run_id = version["replay_run_id"]
         replay_variant_id = version["replay_variant_id"]
 

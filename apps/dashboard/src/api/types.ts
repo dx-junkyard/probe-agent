@@ -6454,3 +6454,593 @@ export interface SolutionDesignOptionDecisionCreateRequest {
   decision: SolutionDesignOptionDecision;
   rationale?: string;
 }
+
+// --- Execution modes / Flow agents (Epic #412, Issues #413/#414/#415) -------
+//
+// These unions mirror the server's finite vocabularies verbatim
+// (`app/execution_mode.py`, `app/flow_explanation.py`,
+// `app/flow_orchestration.py`, re-declared as `Literal`s in `app/models.py`).
+// They are DISPLAY vocabulary only. The client never decides an execution
+// mode, a proposal status, a section's availability or a Node's axis value —
+// every one of those arrives already decided (#349's "one canonical state
+// engine"), and a new value appearing on the server surfaces here as a
+// compile error rather than as a silently mislabelled badge.
+//
+// Two collapses are forbidden by the shapes themselves:
+//   * `ExecutionMode` (control-plane permission) and a Component's SDK policy
+//     mode are separate fields, and both may read "shadow" while meaning two
+//     different facts (§1.2).
+//   * `mode_source: "default"` (the fail-closed `fixed` nobody chose) is a
+//     different value from `"system"` + reason `"system_assignment"` (a human
+//     who chose `fixed`) — §4.4.
+
+export type ExecutionMode = "fixed" | "observe" | "propose" | "shadow";
+
+export type ExecutionModeScopeKind = "system" | "flow" | "node";
+
+export type ExecutionModeScopeState =
+  | "unset" | "revoked" | "pending" | "expired" | "invalid" | "active" | "conflicting";
+
+export type ExecutionCapability =
+  | "observation_record"
+  | "llm_experiment_proposal"
+  | "candidate_execution"
+  | "shadow_comparison";
+
+/** The ten reason codes of §3.3's ten-row resolution table, one per row. The
+ * three elapsed-window rows carry SEPARATE codes on purpose: all clamp to
+ * `fixed`, but the developer's next action differs per scope (#366). */
+export type ExecutionModeReason =
+  | "conflicting_assignments"
+  | "invalid_mode_value"
+  | "flow_scope_not_member"
+  | "node_expired_assignment"
+  | "node_assignment"
+  | "flow_expired_assignment"
+  | "flow_scope_conflict"
+  | "flow_assignment"
+  | "system_expired_assignment"
+  | "system_assignment"
+  | "no_assignment";
+
+export type ExecutionModeSourceScope = "node" | "flow" | "system" | "none" | "default";
+
+export type ExecutionModeDenialCode =
+  | "capability_not_permitted"
+  | "conflicting_assignments"
+  | "invalid_mode_value"
+  | "flow_scope_not_member"
+  | "node_expired_assignment"
+  | "flow_expired_assignment"
+  | "system_expired_assignment"
+  | "flow_scope_conflict"
+  | "unknown_capability"
+  | "node_not_found";
+
+export type ExecutionModeDivergence = "match" | "divergent" | "unobserved" | "stale";
+
+export type ExecutionModeRecordKind = "assign" | "revoke";
+
+export type ExecutionModeObservationSource = "control_server" | "sdk";
+
+export interface ExecutionModeScopeReadingOut {
+  scope_kind: ExecutionModeScopeKind;
+  scope_ref: string;
+  state: ExecutionModeScopeState;
+  mode: ExecutionMode | null;
+  assignment_id: number | null;
+  effective_from: number | null;
+  effective_until: number | null;
+  open_row_count: number;
+}
+
+export interface ExecutionModeDecisionOut {
+  mode: ExecutionMode;
+  source_scope: ExecutionModeSourceScope;
+  source_ref: string;
+  reason: ExecutionModeReason;
+  permitted_capabilities: ExecutionCapability[];
+  scope_trace: ExecutionModeScopeReadingOut[];
+}
+
+export interface ExecutionModeAssignmentOut {
+  id: number;
+  system_id: number;
+  record_kind: ExecutionModeRecordKind;
+  scope_kind: ExecutionModeScopeKind;
+  scope_ref: string;
+  /** NULL on a `revoke` row: a revocation ends an assignment, it does not
+   * name a new mode. */
+  mode: ExecutionMode | null;
+  previous_mode: ExecutionMode | null;
+  effective_from: number | null;
+  effective_until: number | null;
+  reason: string;
+  actor_kind: string;
+  actor: string | null;
+  decision_method: string;
+  supersedes_id: number | null;
+  superseded_by_id: number | null;
+  schema_version: string;
+  created_at: number;
+  scope_state: ExecutionModeScopeState | null;
+}
+
+export interface ExecutionModeAssignRequest {
+  scope_kind: ExecutionModeScopeKind;
+  scope_ref?: string;
+  mode: ExecutionMode;
+  /** Required by the server: an unexplained permission change cannot be
+   * reviewed (§5.1). `actor` is deliberately NOT a request field. */
+  reason: string;
+  effective_from?: number | null;
+  effective_until?: number | null;
+}
+
+export interface ExecutionModeRevokeRequest {
+  reason: string;
+}
+
+export interface ExecutionModeDivergenceOut {
+  node_key: string;
+  divergence: ExecutionModeDivergence;
+  effective_mode: ExecutionMode;
+  observed_mode: ExecutionMode | null;
+  observed_at: number | null;
+  last_assignment_at: number | null;
+}
+
+export interface ExecutionModeDivergenceListOut {
+  system_id: number;
+  generated_at: number;
+  nodes: ExecutionModeDivergenceOut[];
+}
+
+export interface ExecutionModeNodeProjectionOut {
+  node_id: number;
+  node_key: string;
+  maturity: EvolutionMaturityState;
+  execution_mode: ExecutionMode;
+  mode_source: ExecutionModeSourceScope;
+  mode_reason: ExecutionModeReason;
+  source_ref: string;
+  flow_refs: string[];
+  divergence: ExecutionModeDivergence;
+  observed_mode: ExecutionMode | null;
+  observed_at: number | null;
+}
+
+export interface ExecutionModeProjectionOut {
+  system_id: number;
+  schema_version: string;
+  generated_at: number;
+  system_decision: ExecutionModeDecisionOut;
+  assignments: ExecutionModeAssignmentOut[];
+  nodes: ExecutionModeNodeProjectionOut[];
+}
+
+/** The 409 body of a refused capability gate (§4.1). `decision` is null for
+ * `unknown_capability` / `node_not_found`: those describe a broken request,
+ * not a mode reading. */
+export interface ExecutionModeDenialOut {
+  denial_code: ExecutionModeDenialCode;
+  message: string;
+  mode: ExecutionMode | null;
+  source_scope: ExecutionModeSourceScope | null;
+  reason: ExecutionModeReason | null;
+  decision: ExecutionModeDecisionOut | null;
+}
+
+// --- Flow explanation projection (Issue #414) ------------------------------
+
+export type FlowSubjectKind = "runtime_flow" | "static_flow";
+
+export type FlowSubjectResolution = "resolved" | "unresolved" | "unavailable";
+
+/** §6.4's five missing answers plus `present`. `present` is the ABSENCE of a
+ * missing answer, never a sixth one, and the five never share copy. */
+export type FlowFactState =
+  | "present" | "missing" | "unavailable" | "unmeasured" | "stale" | "not_applicable";
+
+export type FlowMembershipState = "resolved" | "unavailable";
+
+export type FlowMembershipBasis = "flow_link" | "probe_point_exact_match";
+
+export type FlowEvidenceKind =
+  | "trace"
+  | "anomaly"
+  | "drift_observation"
+  | "node_event"
+  | "code_location"
+  | "execution_ref"
+  | "stabilization_package";
+
+export type FlowOpenItemKind =
+  | "anomaly"
+  | "missing_fact"
+  | "unmeasured_observation"
+  | "mode_divergence"
+  | "unresolved_membership"
+  | "stale_premise"
+  | "maturity_drift";
+
+export type FlowEdgeSource =
+  | "runtime_span_parentage" | "static_call_graph" | "unavailable" | "not_applicable";
+
+export interface FlowEvidenceOut {
+  id: string;
+  kind: FlowEvidenceKind;
+  ref: string;
+  label: string;
+  node_key: string | null;
+  recorded_at: number | null;
+}
+
+export interface FlowSubjectOut {
+  subject_kind: FlowSubjectKind;
+  subject_ref: string;
+  label: string;
+  resolution: FlowSubjectResolution;
+  /** `not_applicable` for a runtime Flow — it carries no snapshot. That is a
+   * different answer from `missing` (a static Flow with no snapshot). */
+  snapshot_state: FlowFactState;
+  /** The two independent facts behind a runtime Flow's `resolution`:
+   * `observation_state` is whether spans have ever been seen under this
+   * `flow_id`, `model_state` whether any Node is currently linked to it. A
+   * Flow modelled onto Nodes but never run is `resolved` + `missing` +
+   * `present` — never render one of the pair as the other (#366). Both are
+   * `not_applicable` for a static Flow. Optional only because an older
+   * Control Server does not send them. */
+  observation_state?: FlowFactState;
+  model_state?: FlowFactState;
+  snapshot_id: number | null;
+  commit_sha: string | null;
+  detail: string;
+}
+
+export interface FlowMembershipOut {
+  state: FlowMembershipState;
+  node_keys: string[];
+  basis: Record<string, FlowMembershipBasis>;
+  detail: string;
+}
+
+export interface FlowExplanationNodeOut {
+  node_id: number;
+  node_key: string;
+  display_name: string;
+  membership_basis: FlowMembershipBasis;
+
+  execution_mode: ExecutionMode;
+  mode_source: ExecutionModeSourceScope;
+  mode_reason: ExecutionModeReason;
+  mode_source_ref: string;
+  mode_state: FlowFactState;
+  mode_divergence: ExecutionModeDivergence | null;
+  observed_mode: ExecutionMode | null;
+
+  maturity: EvolutionMaturityState | null;
+  maturity_state: FlowFactState;
+  folded_maturity: EvolutionMaturityState | null;
+  maturity_consistent: boolean | null;
+
+  implementation_modality: EvolutionImplementationModality | null;
+  implementation_modality_state: FlowFactState;
+
+  improvement_status: string | null;
+  improvement_status_state: FlowFactState;
+
+  /** The SDK's `off`/`trace`/`shadow` policy — a DIFFERENT fact from
+   * `execution_mode`, even when both read "shadow" (§1.2). */
+  sdk_policy_mode: string | null;
+  sdk_policy_mode_state: FlowFactState;
+
+  observation: Record<string, unknown> | null;
+  observation_state: FlowFactState;
+  monitoring_contract_declared: boolean;
+
+  evidence: FlowEvidenceOut[];
+  capability_refs: string[];
+  purpose_element_refs: string[];
+  feature_refs: string[];
+}
+
+export interface FlowPurposeRefOut {
+  ref: string;
+  label: string;
+  resolution?: string;
+  state?: string;
+  node_keys: string[];
+}
+
+export interface FlowPurposeSectionOut {
+  purpose_elements: FlowPurposeRefOut[];
+  capabilities: FlowPurposeRefOut[];
+  features: FlowPurposeRefOut[];
+  purpose_chain_state: FlowFactState;
+  detail: string;
+}
+
+export interface FlowResponsibilityContractOut {
+  node_key: string;
+  state: FlowFactState;
+  mission?: string;
+  scope?: string;
+  out_of_scope?: string;
+  input_contract?: Record<string, unknown>;
+  output_contract?: Record<string, unknown>;
+  side_effect_class?: string | null;
+  trust_boundary?: string | null;
+}
+
+export interface FlowResponsibilityEdgeOut {
+  source: string;
+  target: string;
+  edge_kind: string;
+  trace_id?: string;
+  /** Static call-graph edges only. `resolution` keeps an INFERRED callee
+   * distinguishable from a verified one -- a guessed dependency must never
+   * read as an observed fact. Absent on runtime (trace-derived) edges. */
+  resolution?: "resolved" | "inferred" | "unresolved";
+  callee_name?: string;
+  line?: number;
+}
+
+export interface FlowExternalBoundaryOut {
+  node_id: string;
+  boundary_kind: string;
+  qualified_name: string;
+}
+
+export interface FlowResponsibilitySectionOut {
+  edge_source: FlowEdgeSource;
+  node_order: string[];
+  edges: FlowResponsibilityEdgeOut[];
+  contracts: FlowResponsibilityContractOut[];
+  external_boundaries: FlowExternalBoundaryOut[];
+  entry_ref: string | null;
+  entry_state: FlowFactState;
+  truncated: boolean;
+  diagnostics: string[];
+}
+
+export interface FlowOpenItemOut {
+  id: string;
+  kind: FlowOpenItemKind;
+  label: string;
+  detail: string;
+  node_key: string | null;
+  missing_state: FlowFactState | null;
+  evidence_ids: string[];
+}
+
+export interface FlowOpenItemsSectionOut {
+  items: FlowOpenItemOut[];
+}
+
+export interface FlowExperimentSummaryOut {
+  proposal_id: number;
+  proposal_key: string;
+  title: string;
+  comparison_scope: string;
+  /** #415's own event fold, never re-implemented client-side. `null` with
+   * `status_state: "unavailable"` when that definition could not be loaded. */
+  status: FlowExperimentStatus | null;
+  status_state: FlowFactState;
+  target_node_keys: string[];
+  evidence_refs: unknown[];
+  execution_refs: Record<string, unknown>[];
+  isolation_strategy: string;
+  expires_at: number | null;
+  created_at: number | null;
+}
+
+export interface FlowExperimentsSectionOut {
+  proposals: FlowExperimentSummaryOut[];
+  status_source: string;
+}
+
+export interface FlowNodeBaselineOut {
+  node_key: string;
+  stable_implementation: Record<string, unknown> | null;
+  stable_state: FlowFactState;
+  rollback_implementation: Record<string, unknown> | null;
+  rollback_state: FlowFactState;
+  approval: Record<string, unknown> | null;
+  approval_state: FlowFactState;
+}
+
+export interface FlowBaselineSectionOut {
+  nodes: FlowNodeBaselineOut[];
+}
+
+/** A `null` section PLUS its name in `degraded_sections` means "could not be
+ * read"; an empty section means "there is nothing in it". Two answers (#356). */
+export interface FlowExplanationOut {
+  system_id: number;
+  schema_version: string;
+  generated_at: number;
+  subject: FlowSubjectOut;
+  membership: FlowMembershipOut;
+  purpose: FlowPurposeSectionOut | null;
+  responsibility: FlowResponsibilitySectionOut | null;
+  nodes: FlowExplanationNodeOut[] | null;
+  open_items: FlowOpenItemsSectionOut | null;
+  experiments: FlowExperimentsSectionOut | null;
+  baseline: FlowBaselineSectionOut | null;
+  drilldown: Record<string, unknown>;
+  rollup: Record<string, unknown>[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+/** A runtime Flow is listed when spans were observed under it OR a Node
+ * currently declares it belongs to it — the same disjunction #415 uses to
+ * decide a Flow subject is known. `trace_count: 0` is NOT what says "nothing
+ * ran here"; `observation_state` is. */
+export interface FlowRuntimeSubjectOut {
+  subject_kind: "runtime_flow";
+  subject_ref: string;
+  label: string;
+  trace_count: number;
+  first_at: number | null;
+  last_at: number | null;
+  linked_node_count: number;
+  /** Optional only because an older Control Server does not send them. */
+  observation_state?: FlowFactState;
+  model_state?: FlowFactState;
+}
+
+export interface FlowStaticSubjectOut {
+  subject_kind: "static_flow";
+  subject_ref: string;
+  label: string;
+  entrypoint_type: string | null;
+  category: string | null;
+  handler_path: string | null;
+  handler_qualified_name: string | null;
+  snapshot_id: number;
+}
+
+/** The two kinds are two lists on purpose — merging them would be exactly the
+ * one-word-two-facts collapse §2.1 forbids. */
+export interface FlowSubjectListOut {
+  system_id: number;
+  generated_at: number;
+  runtime_flows: FlowRuntimeSubjectOut[];
+  static_flows: FlowStaticSubjectOut[];
+  snapshot_id: number | null;
+  snapshot_state: FlowFactState;
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+// --- Flow experiment orchestration (Issue #415) ----------------------------
+
+export type FlowComparisonScope = "single_node" | "sub_pipeline";
+
+export type FlowIsolationStrategy =
+  | "pure" | "mock" | "dry_run" | "rollback_transaction" | "isolated_workspace" | "none";
+
+export type FlowEvaluationLevel = "node" | "flow_capability" | "ux_outcome";
+
+export type FlowExperimentTargetRole = "baseline" | "candidate_target";
+
+export type FlowExperimentEventKind =
+  | "proposed"
+  | "approved"
+  | "rejected"
+  | "withdrawn"
+  | "expired"
+  | "execution_recorded"
+  | "result_recorded"
+  | "promotion_candidate_recorded"
+  | "rollback_recorded";
+
+/** DERIVED by folding `flow_experiment_event` on every read (§7.4). There is
+ * no `status` column behind this value and the client must never compute one. */
+export type FlowExperimentStatus =
+  | "proposed" | "approved" | "rejected" | "withdrawn" | "expired" | "executing" | "completed";
+
+export type FlowExperimentExecutionKind =
+  | "replay_variant_run" | "experiment" | "shadow_result";
+
+export type FlowExecutionRefResolution = "resolved" | "unresolved" | "stale";
+
+/** What a caller ASKS for, as opposed to what gets recorded: a refused action
+ * writes no event at all. The Flow・エージェント群 screen deliberately offers
+ * only the three human decisions (`approve` / `reject` / `withdraw`) — the
+ * four recording actions belong to the paths that actually ran something. */
+export type FlowExperimentActionKind =
+  | "approve"
+  | "reject"
+  | "withdraw"
+  | "record_execution"
+  | "record_result"
+  | "record_promotion_candidate"
+  | "record_rollback";
+
+export interface FlowExperimentTargetOut {
+  id: number;
+  target_node_key: string;
+  target_role: FlowExperimentTargetRole;
+  position: number;
+  note: string;
+}
+
+export interface FlowExperimentEventOut {
+  id: number;
+  event_kind: FlowExperimentEventKind;
+  actor_kind: string;
+  actor: string | null;
+  reason: string;
+  decision_method: string;
+  payload: Record<string, unknown>;
+  created_at: number;
+}
+
+export interface FlowExperimentExecutionRefOut {
+  id: number;
+  execution_kind: FlowExperimentExecutionKind;
+  execution_ref: string;
+  note: string;
+  recorded_at: number;
+  resolution: FlowExecutionRefResolution;
+}
+
+export interface FlowEvaluationAxisOut {
+  level: FlowEvaluationLevel;
+  name: string;
+  metric?: string;
+  detail?: string;
+}
+
+export interface FlowExperimentProposalOut {
+  schema_version: string;
+  id: number;
+  system_id: number;
+  proposal_key: string;
+  flow_subject_kind: FlowSubjectKind;
+  flow_subject_ref: string;
+  captured_snapshot_id: number | null;
+  comparison_scope: FlowComparisonScope;
+  title: string;
+  purpose: string;
+  hypothesis: string;
+  baseline_ref: string;
+  candidate_refs: unknown[];
+  evaluation_axes: FlowEvaluationAxisOut[];
+  /** A GROUPING of the same axes by their declared level — never a
+   * derivation, and never summed into one number (ADR-7). */
+  evaluation_axes_by_level: Record<string, FlowEvaluationAxisOut[]>;
+  quality_floor: Record<string, unknown>;
+  isolation_strategy: FlowIsolationStrategy;
+  isolation_detail: string;
+  cost_cap: Record<string, unknown>;
+  stop_conditions: unknown[];
+  rollback_plan: string;
+  evidence_refs: unknown[];
+  expires_at: number | null;
+  decision_method: string;
+  intelligence_run_id: number | null;
+  created_by: string | null;
+  created_at: number;
+  status: FlowExperimentStatus;
+  status_derived_at: number;
+  targets: FlowExperimentTargetOut[];
+  events: FlowExperimentEventOut[];
+  executions: FlowExperimentExecutionRefOut[];
+  /** Each one is a CANDIDATE record and carries `promotion_performed: false`
+   * (§7.6). Recording a candidate is not a promotion. */
+  promotion_candidates: FlowExperimentEventOut[];
+}
+
+export interface FlowExperimentListOut {
+  system_id: number;
+  generated_at: number;
+  proposals: FlowExperimentProposalOut[];
+}
+
+export interface FlowExperimentDecisionRequest {
+  reason?: string;
+}

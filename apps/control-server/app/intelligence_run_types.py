@@ -23,6 +23,13 @@ class IntelligenceRunType(str, Enum):
     ENTRYPOINT_INDEX = "entrypoint_index"
     EXPLANATION_REFRESH = "explanation_refresh"
     FEATURE_CODE_MAPPING = "feature_code_mapping"
+    # Epic #412 Phase 3 (#415): a reasoning run that DRAFTS a Flow-scoped
+    # experiment proposal. It is reachable only through
+    # `execution_mode.build_experiment_llm_adapter` (so only in the `propose`
+    # / `shadow` execution modes), it drafts only, and the `proposed` event
+    # that puts a proposal into the approval queue is a separate
+    # `decision_method: manual` record written by a human (§7.7).
+    FLOW_EXPERIMENT_DRAFT = "flow_experiment_draft"
     INQUIRY_ANSWER = "inquiry_answer"
     INTENT_PROPOSAL = "intent_proposal"
     INTERVIEW_DIALOGUE = "interview_dialogue"
