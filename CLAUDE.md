@@ -1690,6 +1690,72 @@ creating incomplete persistence or execution paths for later phases.
     revoke、Flow 実験提案の承認・却下・撤回、昇格候補の記録もすべて
     `decision_method: manual`。
 
+27. Issue #418 (subs #419-#424) — Stakeholder Value Network と UX・機能の
+    統合可視化。#405 までで「何のためか → どんな体験か → どう動くか」は
+    追跡できるが、**当事者が誰で、それぞれが何を渡し何を受け取るか**を言えない。
+    Stakeholder は `system_profile.target_users` / `stakeholder_value` /
+    Purpose Chain の `beneficiary_problem` / `ux_journey_revision.beneficiary`
+    という 4 つの無関係な自由記述に散っており、identity が無いので同じ主体に
+    ついて 2 度言及できない ——「支払う人と受益者が違う」「提供者に feedback
+    経路が無い」「Need に対応する Journey が無い」はどれも表現不能である。
+    この Epic は #405 の 1 つ上流に Stakeholder / Need / Environment
+    Observation / Value Exchange の層だけを足す。
+    `docs/stakeholder-value-network.md` が canonical contract で、§0 を
+    読んでからこの領域に触ること。依存順に #419 (契約) → #420 (永続化と
+    API) → #421 (lineage と staleness 伝播) → #422 ∥ #423 (Value Network /
+    Service Blueprint projection と Dashboard) → #424 (Functional Lineage
+    View、Gap・Impact Overlay、E2E)。後から変えるときに守ること:
+    - **5 つ目の理解モデルを作らない。** Purpose / Capability / Journey /
+      Requirement / Solution Design / Flow / Node / Component / Cell /
+      Outcome の正本は既存のまま。この層が持つのは新しく著述される
+      Stakeholder / Need / Observation / Exchange と、上下への参照だけ。
+    - **上流・下流の本文をコピーしない。** 参照は `target_kind` + stable
+      `target_ref` + `captured_digest` だけを持ち、解決は kind ごとの正本
+      1 つに対して**読み取り時**に行う (#405 / `node_design.
+      _LINK_KIND_TARGET_SOURCE` と同じ)。コピーした Capability 名は元が
+      superseded された後も current として読めてしまう。
+    - **identity は `(system_id, <kind>_key)` の開発者指定 slug。** 行 id
+      からも表示名からも Purpose 要素の hash id
+      (`core_capability:<sha256(name)>`) からも導出しない。
+    - **4 軸を畳まない**: `design_status` (decision ledger から導出、列に
+      保存しない) / `recheck_state` (digest 比較。stale でも `confirmed` の
+      まま) / `revision_state` / `authored_by_kind`。AI が書いた行を人が
+      confirm するのは「人が AI の文を確認した」であって、執筆者が
+      developer に変わるのではない。
+    - **`unknown` / `unavailable` / `not_applicable` / `stale` は 4 つの
+      別の答え。** 丸めない (#366 / #380)。
+    - **価値提供と対価を 1 本の edge に畳まない。** Exchange は
+      provider → receiver の有向で、`exchange_kind` は
+      `experience | service | information | money | authority | obligation |
+      risk` の有限集合、対価は `consideration_state`
+      (`present`/`none`/`unknown`) + kind + 記述として**別に**持つ。
+      支払者と受益者が違うことを見えるようにするのがこの層の存在理由なので、
+      money と experience を同じ「価値」に混ぜない。
+    - **score を作らない。** 重み付き合計・完成度・confidence percentage・
+      network centrality による Stakeholder 重要度を返さない。gap 件数は
+      表示してよいが、価値や優先度の代替にしない (#353 / #394 ADR-7)。
+    - **runtime trace だけで人間の事実を確定しない。** trace の存在は
+      Exchange の完了・Need の充足・Outcome の達成のどれも意味しない。
+      Outcome の正本は `purpose_outcome_criterion` のまま (#391)。
+    - **AI は提案し、人間だけが決める。** reasoning model 由来の行は
+      `design_status='proposed'` + `authored_by_kind='reasoning_model'` で
+      保存し、`confirm`/`reject`/`retire`/`reinstate` は常に
+      `decision_method: manual`。意味的 link を類似度・埋め込み・キーワード
+      で自動確定しない (Principle 6)。**この Epic のモジュールには LLM 呼び出しが
+      1 つも存在しない。**
+    - **図を正本にしない。** 座標・自動レイアウト結果を保存せず、保存して
+      よいのは表示設定 (filter / collapsed / pinned) だけで、projection は
+      それを事実として読まない。
+    - **既存の自由記述を自動移行しない。** `beneficiary_problem` を「誰」と
+      「何」へ機械的に分割せず (#388 と同じ)、`ux_journey_revision.
+      beneficiary` は後方互換のため残したまま Stakeholder link を新しい
+      正本として並行導入する。文字列一致を identity へ昇格させない。
+    - **money は記述であって処理ではない。** 金額の集計・通貨換算・請求・
+      台帳・決済を持たず、合計できる金額列そのものを作らない。
+    既存の human gate は一切緩めない。この Epic が追加する Stakeholder /
+    Need / Observation / Exchange の確認・却下・廃止・復帰、role assignment、
+    参照の確定もすべて `decision_method: manual`。
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

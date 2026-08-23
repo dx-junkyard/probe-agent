@@ -7573,3 +7573,65 @@ migration が実在する(最初の形の table-level UNIQUE が append-only 訂
 不可能にしていたのを、テーブル 1 度きりの再構築で直すもの)。既存正本への変更
 ではないが、文書が実装に無い不変条件を主張していたので §5 に明記した。§3.7 と
 §4.2 も上記の規則を追記してある。
+
+---
+
+## Epic #418 — Stakeholder Value Network と UX・機能の統合可視化
+
+canonical contract は `docs/stakeholder-value-network.md`。§0 を読んでから
+この領域に触ること。ここには「なぜその設計にしたか」のうち、契約文書に
+書ききらなかった判断だけを残す。
+
+### なぜ #405 の一部にしなかったか
+
+#405 は「この体験を実現するための要件と実現案」を持つ層で、主語は
+**システム**である。Stakeholder Value Network の主語は**当事者**で、
+「誰が誰へ何を渡すか」は Journey が 1 本も無い段階でも成立する。同じ層に
+入れると、Journey が無い System では Stakeholder を語れず、Journey が
+複数の Stakeholder にまたがると `ux_journey_revision.beneficiary` という
+単一の自由記述に押し込むことになる。Evolution Node ADR-1 が Cell と Node を
+分けたのと同じ理由 —— 一つの行に二つの identity owner を置くと、この Epic の
+中心的分離 (支払者 ≠ 受益者) がそもそも表現できない。
+
+### なぜ Need と Problem を 1 テーブルにしたか
+
+`need_kind` の有限値で区別する。別テーブルにすると、作成時に「これは要望か
+痛みか」という開発者が往々にして決められない判断を強制し、下流の link kind が
+全部 2 倍になる。実際に効く区別は「それに対して何かが行われているか」であって、
+それは Need の**リンク**が答えることであり、テーブルの別れ方ではない。
+
+### なぜ Environment Observation に revision chain が無いか
+
+観測は「ある時点の世界についての言明」なので、訂正は編集ではなく**新しい
+観測**である (`supersedes_observation_key`)。#329 が Finding を append-only に
+したのと同じ規律で、元の観測は消さない —— 「当時そう見えていた」ことは
+後から誤りと分かっても事実である。
+
+### なぜ Stakeholder の digest に role assignment を含めないか
+
+ある Journey で役割を 1 つ足したことが、「この当事者が誰であるか」という
+確認を無効化してはならない。role assignment は自分の decision 行を持つ。
+#308 が `confirmation_id` を、#337 が Intent の `status` を digest から
+外したのと同じ「意味の変化でだけ期限切れにする」規則である。
+
+### `validity_state` を `design_status` と分けた理由
+
+期限切れの Exchange は「却下された」ではなく「終わった履歴」である。
+#412 の EM-ADR-2 が `expired` と `revoked` を分けたのと同じ —— 時間の経過で
+到達する状態と、人間が決めた状態を同じ語に載せない。`validity_state` は
+時計から**導出**し、列に保存しない。
+
+### `payer_differs_from_beneficiary` を「警告」にしなかった理由
+
+買い手と利用者が違うシステムは山ほどあり、それ自体は欠陥ではない。この
+notice の価値は開発者が**見えること**であって、ツールが良し悪しを判定する
+ことではない。§7.2 の notice は全て「link が無い」という構造的事実の陳述で
+あり、重要度や価値の判定ではない (Epic 不変条件 7)。
+
+### static Flow / Evolution Node / Component を ref kind に入れなかった理由
+
+この層はそれらへ #405 と #394 が既に持つ link を**通って**到達する。ここに
+2 本目の経路を作ると「この Node がこれを実装している」に二つの異なる答えが
+生まれる。#412 が `flow-1` を恒久 ID として保存しないと決め、#405 が static と
+runtime の Flow identity を混同しないと決めた境界を、上流側から守るための
+制約である。
