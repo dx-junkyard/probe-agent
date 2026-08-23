@@ -78,6 +78,10 @@ const NAV_GROUPS: NavGroup[] = [
         to: "/journey-blueprint", icon: Rows3, label: "Journey Service Blueprint",
         subtitle: "Step × 9レーンのサービスブループリント",
       },
+      {
+        to: "/functional-lineage", icon: GitFork, label: "Functional Lineage",
+        subtitle: "Purpose → Capability → 実装 → Outcome の追跡とGap",
+      },
     ],
   },
   {

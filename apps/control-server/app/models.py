@@ -12914,3 +12914,93 @@ class BlueprintDiffOut(BaseModel):
     steps: List[BlueprintDiffStepEntryOut] = []
     degraded_sections: List[str] = []
     degraded_detail: Dict[str, str] = {}
+
+
+# === Epic #418 / Issue #424 — Functional Lineage View + Gap/Impact Overlay ===
+# (Issue #424 owns everything below this marker: no new canonical entity,
+# only a read-only, deterministic composition of the modules above plus
+# `node_design.py` / `solution_design.py` / `ux_design.py` / `purpose_chain.py`.)
+
+#: §9.1's chain, each hop keeping its OWN identity and kind (static Flow and
+#: runtime Flow are never folded into one entity; Capability, Flow, and Node
+#: are never folded together). `acceptance_criterion` is deliberately NOT a
+#: separate kind here -- §9.2's `requirement_without_acceptance_criterion`
+#: gap is enough to say whether one exists; the criteria themselves are
+#: `ux_requirement`'s own content, read through `ux_design.py`, not a second
+#: lineage node.
+FunctionalLineageKind = Literal[
+    "stakeholder", "stakeholder_need", "purpose_element", "purpose_relation",
+    "capability", "value_exchange", "ux_journey", "ux_journey_step",
+    "ux_requirement", "solution_design", "static_flow", "runtime_flow",
+    "evolution_node", "component", "cell_definition", "cell_binding",
+    "probe_point", "purpose_outcome_criterion",
+]
+
+#: §9.2's 23 gap codes. Each carries a FIXED `LineageGapSeverity` (never
+#: computed per instance -- `app.functional_lineage._GAP_SEVERITY` is the
+#: one place that mapping lives, and `test_interview_type_parity.py` and
+#: `test_functional_lineage.py` both check every code here is reachable).
+LineageGapCode = Literal[
+    "stakeholder_without_role", "stakeholder_without_need", "need_without_purpose",
+    "need_without_exchange", "need_without_journey", "exchange_without_journey",
+    "exchange_without_outcome", "journey_step_without_requirement",
+    "requirement_without_acceptance_criterion", "requirement_without_design",
+    "adopted_design_without_implementation_target", "flow_without_node",
+    "node_without_flow", "subject_without_evaluation_policy",
+    "confirmed_without_evidence", "stale_upstream", "stale_link", "stale_evidence",
+    "conflicting_dependency", "rejected_dependency", "feedback_path_missing",
+    "unresolved_reference", "unavailable_reference",
+]
+
+#: §9.2: fixed per gap CODE, never per instance (invariant 7 -- a per-instance
+#: severity would be the importance score this Epic forbids everywhere).
+LineageGapSeverity = Literal["blocking", "attention", "informational"]
+
+
+class FunctionalLineageNodeOut(BaseModel):
+    """One entity in the chain, keeping its own `kind` (§9.1: no two kinds
+    are ever folded together). `name` is best-effort display only, resolved
+    fresh by `app.functional_lineage` -- never a copy stored anywhere."""
+
+    kind: FunctionalLineageKind
+    ref: str
+    name: Optional[str] = None
+
+
+class FunctionalLineageEdgeOut(BaseModel):
+    """One directed hop, always pointing from the UPSTREAM entity to the
+    DOWNSTREAM entity it feeds (§9.3: impact traversal is downstream only,
+    through explicit links -- this is the edge direction that makes that
+    traversal a plain forward walk with no special-casing)."""
+
+    from_kind: FunctionalLineageKind
+    from_ref: str
+    to_kind: FunctionalLineageKind
+    to_ref: str
+
+
+class FunctionalLineageGapOut(BaseModel):
+    """One §9.2 structural gap. `severity` is read from the fixed
+    code -> severity table, never computed from this specific instance
+    (invariant 7)."""
+
+    code: LineageGapCode
+    severity: LineageGapSeverity
+    subject_kind: FunctionalLineageKind
+    subject_ref: str
+
+
+class FunctionalLineageOut(BaseModel):
+    """`GET /functional-lineage` (§9). Read-only, deterministic, no LLM
+    (invariant 9); writes nothing (#382). No score, no completeness
+    percentage, no ranking field exists here, structurally (§9.3). A name in
+    `degraded_sections` means that section's traversal was DROPPED, never
+    that it is genuinely empty (invariant 5)."""
+
+    system_id: int
+    generated_at: float
+    nodes: List[FunctionalLineageNodeOut] = []
+    edges: List[FunctionalLineageEdgeOut] = []
+    gaps: List[FunctionalLineageGapOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}

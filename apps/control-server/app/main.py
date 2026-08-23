@@ -26,6 +26,7 @@ from .routes import (
     exploration,
     flow_experiments,
     flow_explanation,
+    functional_lineage,
     generation,
     github_connections,
     interview,
@@ -133,6 +134,7 @@ def create_app() -> FastAPI:
     app.include_router(stakeholder_network.router, dependencies=_auth)
     app.include_router(stakeholder_value_network.router, dependencies=_auth)
     app.include_router(journey_blueprint.router, dependencies=_auth)
+    app.include_router(functional_lineage.router, dependencies=_auth)
     app.include_router(generation.router, dependencies=_auth)
     app.include_router(replay.router, dependencies=_auth)
     app.include_router(candidate_studio.router, dependencies=_auth)

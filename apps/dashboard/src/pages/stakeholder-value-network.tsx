@@ -402,16 +402,30 @@ export default function StakeholderValueNetworkPage() {
 
   const state = displayState(data, displayedNodes);
 
+  // §9.4's cross-view navigation: the current selection (if any) carries
+  // over as Functional Lineage's own `ref_kind`/`ref` param pair, so the two
+  // screens never disagree about which entity is selected.
+  const functionalLineageHref = selectedEdgeKey
+    ? `/functional-lineage?ref_kind=value_exchange&ref=${encodeURIComponent(selectedEdgeKey)}`
+    : selectedNodeKey
+      ? `/functional-lineage?ref_kind=stakeholder&ref=${encodeURIComponent(selectedNodeKey)}`
+      : "/functional-lineage";
+
   return (
     <div className="space-y-4">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">Stakeholder Value Network</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Stakeholder(当事者)と Value Exchange(何を渡し何を受け取るか)の関係を確認します。
-          状態・staleness・気づいたことはすべてサーバーの判定をそのまま表示し、この画面では
-          再計算しません。表示位置(レイアウト)は保存されず、確定・却下などの判断もこの画面
-          からは行いません。
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">Stakeholder Value Network</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Stakeholder(当事者)と Value Exchange(何を渡し何を受け取るか)の関係を確認します。
+            状態・staleness・気づいたことはすべてサーバーの判定をそのまま表示し、この画面では
+            再計算しません。表示位置(レイアウト)は保存されず、確定・却下などの判断もこの画面
+            からは行いません。
+          </p>
+        </div>
+        <Link to={functionalLineageHref} className="text-sm text-primary underline" data-testid="value-network-to-functional-lineage">
+          Functional Lineage で見る
+        </Link>
       </div>
 
       {isLoading && <LoadingBlock />}

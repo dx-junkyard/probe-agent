@@ -216,6 +216,11 @@ FINITE_TYPE_NAMES = (
     "JourneyDeliveryKind",
     "BlueprintDeliveryTargetKind",
     "BlueprintDiffChangeKind",
+    # Epic #418 (Issue #424): the Functional Lineage View's finite
+    # vocabularies. Same drift risk as the families above.
+    "FunctionalLineageKind",
+    "LineageGapCode",
+    "LineageGapSeverity",
 )
 
 

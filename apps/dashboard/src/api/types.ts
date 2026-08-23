@@ -7387,3 +7387,71 @@ export interface JourneyStepExchangeLinkCreateRequest {
   exchange_key: string;
   note?: string;
 }
+
+
+// === Epic #418 / Issue #424 — Functional Lineage View + Gap/Impact Overlay ===
+// (Issue #424 owns everything below this marker.)
+//
+// `GET /functional-lineage` (`docs/stakeholder-value-network.md` §9).
+// Read-only, deterministic, no LLM; the Dashboard renders this exactly as
+// returned and re-derives nothing (§0 invariant 9). No score, no
+// completeness percentage, no ranking field exists here, structurally.
+
+/** §9.1's chain. Static Flow and runtime Flow are never one entity;
+ * Capability, Flow, and Node are never folded together. */
+export type FunctionalLineageKind =
+  | "stakeholder" | "stakeholder_need" | "purpose_element" | "purpose_relation"
+  | "capability" | "value_exchange" | "ux_journey" | "ux_journey_step"
+  | "ux_requirement" | "solution_design" | "static_flow" | "runtime_flow"
+  | "evolution_node" | "component" | "cell_definition" | "cell_binding"
+  | "probe_point" | "purpose_outcome_criterion";
+
+/** §9.2's 23 gap codes. Held in parity with the server's `LineageGapCode`
+ * by `test_interview_type_parity.py`'s `FINITE_TYPE_NAMES`. */
+export type LineageGapCode =
+  | "stakeholder_without_role" | "stakeholder_without_need" | "need_without_purpose"
+  | "need_without_exchange" | "need_without_journey" | "exchange_without_journey"
+  | "exchange_without_outcome" | "journey_step_without_requirement"
+  | "requirement_without_acceptance_criterion" | "requirement_without_design"
+  | "adopted_design_without_implementation_target" | "flow_without_node"
+  | "node_without_flow" | "subject_without_evaluation_policy"
+  | "confirmed_without_evidence" | "stale_upstream" | "stale_link" | "stale_evidence"
+  | "conflicting_dependency" | "rejected_dependency" | "feedback_path_missing"
+  | "unresolved_reference" | "unavailable_reference";
+
+/** §9.2: fixed per gap CODE, never per instance -- a per-instance severity
+ * would be the importance score this Epic forbids everywhere. */
+export type LineageGapSeverity = "blocking" | "attention" | "informational";
+
+export interface FunctionalLineageNodeOut {
+  kind: FunctionalLineageKind;
+  ref: string;
+  name: string | null;
+}
+
+/** Always points from the UPSTREAM entity to the DOWNSTREAM entity it
+ * feeds (§9.3: impact traversal is downstream only, through explicit
+ * links). */
+export interface FunctionalLineageEdgeOut {
+  from_kind: FunctionalLineageKind;
+  from_ref: string;
+  to_kind: FunctionalLineageKind;
+  to_ref: string;
+}
+
+export interface FunctionalLineageGapOut {
+  code: LineageGapCode;
+  severity: LineageGapSeverity;
+  subject_kind: FunctionalLineageKind;
+  subject_ref: string;
+}
+
+export interface FunctionalLineageOut {
+  system_id: number;
+  generated_at: number;
+  nodes: FunctionalLineageNodeOut[];
+  edges: FunctionalLineageEdgeOut[];
+  gaps: FunctionalLineageGapOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}

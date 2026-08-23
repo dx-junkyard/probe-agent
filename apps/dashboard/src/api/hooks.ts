@@ -106,6 +106,7 @@ import type {
   JourneyStepStakeholderLinkCreateRequest, JourneyStepStakeholderLinkOut,
   JourneyStepDeliveryLinkCreateRequest, JourneyStepDeliveryLinkOut,
   JourneyStepExchangeLinkCreateRequest, JourneyStepExchangeLinkOut,
+  FunctionalLineageOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -4338,5 +4339,18 @@ export function useAddJourneyStepExchangeLink() {
     mutationFn: (body: JourneyStepExchangeLinkCreateRequest) =>
       api.post<JourneyStepExchangeLinkOut>("/journey-blueprint/exchange-links", body),
     onSuccess: () => invalidateJourneyBlueprint(qc),
+  });
+}
+
+
+// === Epic #418 / Issue #424 — Functional Lineage View hook ===
+
+/** `GET /functional-lineage` (§9). Read-only, deterministic, no LLM; the
+ * page renders this response as-is and re-derives nothing (§0 invariant 9). */
+export function useFunctionalLineage() {
+  return useQuery<FunctionalLineageOut>({
+    queryKey: sysKey("functional-lineage"),
+    queryFn: () => api.get<FunctionalLineageOut>("/functional-lineage"),
+    enabled: !!getSystemId(),
   });
 }

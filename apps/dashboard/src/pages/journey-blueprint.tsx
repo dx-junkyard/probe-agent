@@ -76,15 +76,26 @@ export default function JourneyBlueprintPage() {
   const blueprint = useJourneyBlueprint(journeyKey);
   const diff = useJourneyBlueprintDiff(view === "diff" ? journeyKey : null);
 
+  // §9.4's cross-view navigation: the selected Journey carries over as
+  // Functional Lineage's own `ref_kind`/`ref` param pair.
+  const functionalLineageHref = journeyKey
+    ? `/functional-lineage?ref_kind=ux_journey&ref=${encodeURIComponent(journeyKey)}`
+    : "/functional-lineage";
+
   return (
     <div className="space-y-4">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">Journey Service Blueprint</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Journey の各 Step を横軸に、9 つのレーン(利用者の行動・接点・フロントステージ・
-          バックステージ・サポート業務・外部連携・要件・エビデンス・失敗と復旧)を縦軸に
-          表示します。状態はすべてサーバーの判定をそのまま表示し、この画面では再計算しません。
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">Journey Service Blueprint</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Journey の各 Step を横軸に、9 つのレーン(利用者の行動・接点・フロントステージ・
+            バックステージ・サポート業務・外部連携・要件・エビデンス・失敗と復旧)を縦軸に
+            表示します。状態はすべてサーバーの判定をそのまま表示し、この画面では再計算しません。
+          </p>
+        </div>
+        <a href={functionalLineageHref} className="text-sm text-primary underline" data-testid="blueprint-to-functional-lineage" onClick={(e) => { e.preventDefault(); navigate(functionalLineageHref); }}>
+          Functional Lineage で見る
+        </a>
       </div>
 
       <Card>
