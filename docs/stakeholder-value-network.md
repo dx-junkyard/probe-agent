@@ -529,6 +529,17 @@ Every lane carries a `BlueprintLaneState`. **`unknown` and
 process has been described" and "this step structurally has no backstage" are
 different sentences, and only the developer can say which one is true.
 
+Saying the second one needs somewhere to be written down, which the first
+draft of this section did not provide. The mechanism is exactly one sentinel:
+`journey_step_delivery_link.target_kind = 'not_applicable'`, reachable **only
+by an explicit developer write** and never inferred from an absent link — an
+absent link always reads `unknown`. A real link on the same lane outranks the
+sentinel (`present`). The sentinel exists on the four delivery lanes only
+(`frontstage` / `backstage` / `support` / `external`); the other five lanes
+report `present` / `unknown` / `unavailable` and never invent
+`not_applicable`, because none of them describes a thing a Step can
+structurally lack.
+
 ### §8.2 Added links (owned here, content never copied)
 
 - `journey_step_stakeholder_link` — `(journey_key, step_key,
