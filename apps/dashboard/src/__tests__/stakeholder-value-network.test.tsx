@@ -14,8 +14,9 @@ import { vi } from "vitest";
 import type { ReactNode } from "react";
 import type { ValueNetworkEdgeOut, ValueNetworkNodeOut, ValueNetworkNoticeOut, ValueNetworkOut } from "@/api/types";
 import {
-  EMPTY_FILTERS, applyFiltersToSearchParams, edgesForNode, filterEdges, filterNodes,
-  filtersFromSearchParams, noticeCountByCode, noticesForSubject, visibleNodeKeys,
+  EMPTY_FILTERS, EXCHANGE_KIND_DASH, applyFiltersToSearchParams, computeGraphLayout,
+  edgesForNode, filterEdges, filterNodes, filtersFromSearchParams, noticeCountByCode,
+  noticesForSubject, visibleNodeKeys,
 } from "@/components/stakeholder-network/model";
 
 const mockApi = { get: vi.fn(), post: vi.fn(), put: vi.fn(), patch: vi.fn(), delete: vi.fn() };
@@ -288,5 +289,158 @@ describe("model.ts", () => {
     const { outgoing, incoming } = edgesForNode([e1, e2], "user");
     expect(outgoing.map((e) => e.exchange_key)).toEqual(["e1"]);
     expect(incoming.map((e) => e.exchange_key)).toEqual(["e2"]);
+  });
+});
+
+// --- §7.3's directed graph ----------------------------------------------------
+//
+// The graph is the screen's primary presentation; the list + detail pane is
+// its narrow-width degradation, not a substitute for it. These tests protect
+// the two properties that make a drawn graph legitimate under invariant 10:
+// the layout is deterministic, and no coordinate ever leaves the render.
+
+describe("ValueNetworkGraph", () => {
+  beforeEach(() => {
+    mockApi.get.mockReset();
+  });
+
+  it("draws a node per Stakeholder and a directed edge per Value Exchange", async () => {
+    mockApi.get.mockResolvedValue(valueNetworkOut());
+    await renderPage();
+    await waitFor(() => expect(screen.getByTestId("value-network-graph")).toBeInTheDocument());
+
+    expect(screen.getByTestId("value-network-graph-node-user")).toBeInTheDocument();
+    expect(screen.getByTestId("value-network-graph-node-provider")).toBeInTheDocument();
+
+    const drawnEdge = screen.getByTestId("value-network-graph-edge-svc-1");
+    // Direction is carried by an arrow marker on the path, provider -> receiver.
+    const path = drawnEdge.querySelector("path");
+    expect(path?.getAttribute("marker-end")).toBe("url(#value-network-arrow)");
+  });
+
+  it("selecting a drawn node or edge opens the same detail pane as the list", async () => {
+    mockApi.get.mockResolvedValue(valueNetworkOut());
+    await renderPage();
+    await waitFor(() => expect(screen.getByTestId("value-network-graph")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("value-network-graph-edge-svc-1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("value-network-edge-detail")).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByTestId("value-network-graph-node-user"));
+    await waitFor(() =>
+      expect(screen.getByTestId("value-network-node-detail")).toBeInTheDocument(),
+    );
+  });
+
+  it("is keyboard reachable: a drawn node is focusable and activates on Enter", async () => {
+    mockApi.get.mockResolvedValue(valueNetworkOut());
+    await renderPage();
+    await waitFor(() => expect(screen.getByTestId("value-network-graph")).toBeInTheDocument());
+
+    const drawnNode = screen.getByTestId("value-network-graph-node-user");
+    expect(drawnNode).toHaveAttribute("tabindex", "0");
+    fireEvent.keyDown(drawnNode, { key: "Enter" });
+    await waitFor(() =>
+      expect(screen.getByTestId("value-network-node-detail")).toBeInTheDocument(),
+    );
+  });
+
+  it("conveys exchange kind by text and dash pattern, never by colour alone", async () => {
+    mockApi.get.mockResolvedValue(valueNetworkOut());
+    await renderPage();
+    await waitFor(() => expect(screen.getByTestId("value-network-graph")).toBeInTheDocument());
+
+    const drawnEdge = screen.getByTestId("value-network-graph-edge-svc-1");
+    // 1. a text label on the edge itself
+    expect(within(drawnEdge).getByText(/サービス/)).toBeInTheDocument();
+    // 2. a dash pattern distinct from other kinds
+    expect(drawnEdge.querySelector("path")?.getAttribute("stroke-dasharray")).toBe(
+      EXCHANGE_KIND_DASH.service,
+    );
+  });
+
+  it("marks a stale edge with text, not only a stroke change", async () => {
+    mockApi.get.mockResolvedValue(
+      valueNetworkOut({ edges: [edge({ recheck_state: "stale" })] }),
+    );
+    await renderPage();
+    await waitFor(() => expect(screen.getByTestId("value-network-graph")).toBeInTheDocument());
+
+    const drawnEdge = screen.getByTestId("value-network-graph-edge-svc-1");
+    expect(within(drawnEdge).getByText(/要再確認/)).toBeInTheDocument();
+  });
+
+  it("renders an Exchange with no current revision as 不明, never as one of the seven kinds", async () => {
+    mockApi.get.mockResolvedValue(
+      valueNetworkOut({ edges: [edge({ exchange_kind: null })] }),
+    );
+    await renderPage();
+    await waitFor(() => expect(screen.getByTestId("value-network-graph")).toBeInTheDocument());
+
+    const drawnEdge = screen.getByTestId("value-network-graph-edge-svc-1");
+    expect(within(drawnEdge).getByText(/不明/)).toBeInTheDocument();
+  });
+});
+
+describe("computeGraphLayout", () => {
+  it("is deterministic: the same facts always produce the same coordinates", () => {
+    const nodes = [node(), node({ stakeholder_key: "payer", display_name: "購入責任者" })];
+    const edges = [edge()];
+    const first = computeGraphLayout(nodes, edges);
+    const second = computeGraphLayout(nodes, edges);
+    expect(second).toEqual(first);
+  });
+
+  it("places nodes by their index in the server's ordering, never by degree", () => {
+    // `hub` is touched by two Exchanges and `lonely` by none. A layout that
+    // ranked by connection count would move `hub`; invariant 7 forbids
+    // rendering centrality as importance, so position must follow the
+    // server's ordering alone.
+    const nodes = [
+      node({ stakeholder_key: "hub", display_name: "hub" }),
+      node({ stakeholder_key: "lonely", display_name: "lonely" }),
+    ];
+    const withEdges = computeGraphLayout(nodes, [
+      edge({ exchange_key: "a", provider_stakeholder_key: "hub", receiver_stakeholder_key: "lonely" }),
+      edge({ exchange_key: "b", provider_stakeholder_key: "lonely", receiver_stakeholder_key: "hub" }),
+    ]);
+    const withoutEdges = computeGraphLayout(nodes, []);
+    expect(withEdges.nodes).toEqual(withoutEdges.nodes);
+  });
+
+  it("separates parallel edges between the same pair so neither is hidden", () => {
+    // The payer/beneficiary question §7.2 exists to surface is unreadable if
+    // the service edge and the money edge paying for it overlap exactly.
+    const nodes = [
+      node({ stakeholder_key: "provider", display_name: "提供者" }),
+      node({ stakeholder_key: "user", display_name: "利用者" }),
+    ];
+    const layout = computeGraphLayout(nodes, [
+      edge({ exchange_key: "svc", exchange_kind: "service" }),
+      edge({
+        exchange_key: "pay",
+        exchange_kind: "money",
+        provider_stakeholder_key: "user",
+        receiver_stakeholder_key: "provider",
+      }),
+    ]);
+    const [first, second] = layout.edges;
+    expect(first.curvature).not.toBe(second.curvature);
+  });
+
+  it("skips an edge whose endpoint is filtered out rather than drawing it to nowhere", () => {
+    const layout = computeGraphLayout([node({ stakeholder_key: "user" })], [edge()]);
+    expect(layout.edges).toHaveLength(0);
+  });
+
+  it("produces no field that could be persisted as layout state", () => {
+    // Invariant 10: coordinates exist for this render only. Nothing in the
+    // layout is ever sent to the server -- this asserts the shape stays a
+    // pure render product with no id/version/saved marker to round-trip.
+    const layout = computeGraphLayout([node()], []);
+    expect(Object.keys(layout).sort()).toEqual(["edges", "height", "nodes", "width"]);
+    expect(Object.keys(layout.nodes[0]).sort()).toEqual(["stakeholder_key", "x", "y"]);
   });
 });

@@ -39,6 +39,7 @@ import {
   visibleNodeKeys, type ValueNetworkFilters,
 } from "@/components/stakeholder-network/model";
 import { DegradedNote, EmptyNote, LoadErrorCard, LoadingBlock, StateBadge } from "@/components/stakeholder-network/shared";
+import { ValueNetworkGraph } from "@/components/stakeholder-network/graph";
 
 const EXCHANGE_KIND_VALUES: ValueNetworkExchangeKind[] = [
   "experience", "service", "information", "money", "authority", "obligation", "risk",
@@ -434,6 +435,30 @@ export default function StakeholderValueNetworkPage() {
             <EmptyNote testId="value-network-filtered-empty">
               絞り込み条件に一致する Stakeholder / Value Exchange がありません。
             </EmptyNote>
+          )}
+
+          {state === "ready" && (
+            <Card className="hidden md:block">
+              <CardHeader>
+                <CardTitle as="h2" className="text-base">
+                  関係図
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {/* §7.3: Stakeholder が節点、Value Exchange が方向付き edge。
+                    座標は描画のたびに算出するだけで保存しない(不変条件 10)。
+                    狭幅では下の一覧+詳細へ縮退する ——
+                    同じ内容が一覧側にもあるので情報は失われない。 */}
+                <ValueNetworkGraph
+                  nodes={displayedNodes}
+                  edges={filteredEdges}
+                  selectedNodeKey={selectedNodeKey}
+                  selectedEdgeKey={selectedEdgeKey}
+                  onSelectNode={selectNode}
+                  onSelectEdge={selectEdge}
+                />
+              </CardContent>
+            </Card>
           )}
 
           {state === "ready" && (

@@ -17,10 +17,22 @@
 //   3. URL <-> filter-state (de)serialization, so a reload or a shared link
 //      reproduces the view (§7.3).
 //
-// No coordinate/layout is computed here, ever (invariant 10) -- there is no
-// field for it to go in. No score/ranking/centrality is computed here either
-// (invariant 7); notice COUNTS are the only aggregate this module produces,
-// and they are counts, not an importance measure.
+//   4. A DETERMINISTIC graph layout, computed fresh at render time
+//      (`computeGraphLayout`). Invariant 10 forbids PERSISTING coordinates
+//      or treating a rendered graph as the record -- it does not forbid
+//      drawing one, and §7.3 requires Stakeholders as nodes and Exchanges as
+//      directed edges. The layout is a pure function of the server's own
+//      total ordering, so it is reproducible and never round-trips to the
+//      server: nothing here is written back, and no coordinate appears in
+//      any request body or in `stakeholder_view_preference`.
+//
+// No score/ranking/centrality is computed here (invariant 7); notice COUNTS
+// are the only aggregate this module produces, and they are counts, not an
+// importance measure. In particular the layout below places nodes by their
+// INDEX in the server's alphabetical ordering -- never by degree, never by
+// how many Exchanges touch them, because a position derived from connection
+// count would be exactly the centrality-as-importance display invariant 7
+// prohibits.
 
 import type {
   ValueNetworkAuthorshipKind,
@@ -376,3 +388,150 @@ export function refDeepLink(refKind: ValueNetworkRefKind, targetRef: string): st
       return null;
   }
 }
+
+// --- §7.3's directed graph: a deterministic, render-time-only layout --------
+
+/** One laid-out node. Coordinates exist only for the current render; they are
+ * never persisted, never sent to the server, and never read back as a fact
+ * (invariant 10). */
+export interface GraphNodePosition {
+  stakeholder_key: string;
+  x: number;
+  y: number;
+}
+
+/** One laid-out directed edge, provider -> receiver. `curvature` separates
+ * parallel edges between the same pair so a `service` edge and the `money`
+ * edge paying for it stay individually visible -- the payer/beneficiary
+ * question §7.2 exists to surface is unreadable if they overlap. */
+export interface GraphEdgePosition {
+  exchange_key: string;
+  provider_stakeholder_key: string;
+  receiver_stakeholder_key: string;
+  exchange_kind: ValueNetworkExchangeKind | null;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  curvature: number;
+  selfLoop: boolean;
+}
+
+export interface GraphLayout {
+  width: number;
+  height: number;
+  nodes: GraphNodePosition[];
+  edges: GraphEdgePosition[];
+}
+
+export const GRAPH_NODE_RADIUS = 46;
+
+/**
+ * Place nodes evenly on a circle in the server's own ordering.
+ *
+ * Deterministic by construction: position comes from a node's INDEX in the
+ * already-total ordering `GET /stakeholder-value-network` returns, so the
+ * same facts always draw the same graph and a poll cannot rearrange it under
+ * the reader. Never from degree or connection count -- that would render
+ * centrality as importance (invariant 7).
+ *
+ * A circle is chosen over a force-directed layout precisely because it is
+ * reproducible and carries no meaning: a force layout's clusters look like a
+ * claim about which parties belong together, which is not a claim this
+ * projection makes.
+ */
+export function computeGraphLayout(
+  nodes: readonly ValueNetworkNodeOut[],
+  edges: readonly ValueNetworkEdgeOut[],
+): GraphLayout {
+  const count = nodes.length;
+  const size = Math.max(360, Math.min(720, 220 + count * 54));
+  const cx = size / 2;
+  const cy = size / 2;
+  const radius = Math.max(90, size / 2 - GRAPH_NODE_RADIUS - 18);
+
+  const positions = new Map<string, GraphNodePosition>();
+  const laidOut: GraphNodePosition[] = nodes.map((node, index) => {
+    // Start at 12 o'clock and go clockwise, so the first node in the
+    // server's ordering is always at the top.
+    const angle = -Math.PI / 2 + (2 * Math.PI * index) / Math.max(1, count);
+    const position: GraphNodePosition = {
+      stakeholder_key: node.stakeholder_key,
+      x: count === 1 ? cx : cx + radius * Math.cos(angle),
+      y: count === 1 ? cy : cy + radius * Math.sin(angle),
+    };
+    positions.set(node.stakeholder_key, position);
+    return position;
+  });
+
+  // Parallel edges between the same unordered pair get increasing curvature
+  // so none is hidden behind another. Keyed on the UNORDERED pair so an
+  // A->B service edge and the B->A money edge paying for it also separate.
+  const seenPerPair = new Map<string, number>();
+  const laidOutEdges: GraphEdgePosition[] = [];
+  for (const edge of edges) {
+    const from = positions.get(edge.provider_stakeholder_key);
+    const to = positions.get(edge.receiver_stakeholder_key);
+    if (from === undefined || to === undefined) {
+      // A filtered-out endpoint: the edge simply is not drawable in this
+      // view. It is still listed in the edge list, never silently dropped
+      // from the data.
+      continue;
+    }
+    const pairKey = [edge.provider_stakeholder_key, edge.receiver_stakeholder_key]
+      .slice()
+      .sort()
+      .join(" ");
+    const seen = seenPerPair.get(pairKey) ?? 0;
+    seenPerPair.set(pairKey, seen + 1);
+    laidOutEdges.push({
+      exchange_key: edge.exchange_key,
+      provider_stakeholder_key: edge.provider_stakeholder_key,
+      receiver_stakeholder_key: edge.receiver_stakeholder_key,
+      exchange_kind: edge.exchange_kind,
+      x1: from.x,
+      y1: from.y,
+      x2: to.x,
+      y2: to.y,
+      curvature: seen * 26,
+      selfLoop: edge.provider_stakeholder_key === edge.receiver_stakeholder_key,
+    });
+  }
+
+  return { width: size, height: size, nodes: laidOut, edges: laidOutEdges };
+}
+
+/** The SVG path for one laid-out edge. A self-loop (only legal for
+ * `information`, §1.4) is drawn as a small arc above the node so a party
+ * genuinely reporting to itself is visible rather than a zero-length line. */
+export function graphEdgePath(edge: GraphEdgePosition): string {
+  if (edge.selfLoop) {
+    const r = 26;
+    return `M ${edge.x1} ${edge.y1 - GRAPH_NODE_RADIUS} a ${r} ${r} 0 1 1 ${r} -${r / 2}`;
+  }
+  const mx = (edge.x1 + edge.x2) / 2;
+  const my = (edge.y1 + edge.y2) / 2;
+  if (edge.curvature === 0) {
+    return `M ${edge.x1} ${edge.y1} L ${edge.x2} ${edge.y2}`;
+  }
+  // Offset the control point perpendicular to the edge.
+  const dx = edge.x2 - edge.x1;
+  const dy = edge.y2 - edge.y1;
+  const length = Math.max(1, Math.hypot(dx, dy));
+  const nx = -dy / length;
+  const ny = dx / length;
+  return `M ${edge.x1} ${edge.y1} Q ${mx + nx * edge.curvature} ${my + ny * edge.curvature} ${edge.x2} ${edge.y2}`;
+}
+
+/** SVG `stroke-dasharray` per exchange kind. Pairs with
+ * `EXCHANGE_KIND_LINE_STYLE`'s CSS border style and the always-present text
+ * label: kind is never conveyed by colour alone. */
+export const EXCHANGE_KIND_DASH: Record<ValueNetworkExchangeKind, string> = {
+  experience: "",
+  service: "10 4",
+  information: "2 4",
+  money: "14 3 2 3",
+  authority: "6 3",
+  obligation: "1 5",
+  risk: "12 4 2 4 2 4",
+};
