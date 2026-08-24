@@ -94,6 +94,7 @@ probe-agent:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import sqlite3
 import time
@@ -140,6 +141,7 @@ __all__ = [
     "PROPOSAL_GATE_CODES",
     "LIFECYCLE_REJECTION_CODES",
     "EXECUTION_BINDING_REJECTION_CODES",
+    "EXECUTION_AUTHORIZATION_REJECTION_CODES",
     "RESULT_BINDING_REJECTION_CODES",
     "PROMOTION_BINDING_REJECTION_CODES",
     "PROVENANCE_REJECTION_CODES",
@@ -172,6 +174,7 @@ __all__ = [
     "get_proposal",
     "record_decision",
     "record_execution",
+    "require_execution_authorization",
     "record_result",
     "record_promotion_candidate",
     "record_rollback",
@@ -303,8 +306,25 @@ EXECUTION_BINDING_REJECTION_CODES: Tuple[str, ...] = (
     "execution_ref_subject_unreadable",
     "execution_ref_subject_unmapped",
     "execution_ref_subject_mismatch",
+    "execution_ref_authorization_missing",
+    "execution_ref_authorization_mismatch",
+    "execution_ref_candidate_mismatch",
     "execution_ref_precedes_approval",
     "execution_ref_already_bound",
+)
+
+#: A governed candidate path may execute only when the request names the
+#: approved proposal that authorises exactly this Node/candidate/snapshot.
+#: These are execution-time refusals, not post-hoc ledger refusals.
+EXECUTION_AUTHORIZATION_REJECTION_CODES: Tuple[str, ...] = (
+    "execution_proposal_required",
+    "execution_proposal_not_approved",
+    "execution_proposal_expired",
+    "execution_target_not_authorized",
+    "execution_candidate_not_authorized",
+    "execution_snapshot_mismatch",
+    "execution_snapshot_authorization_required",
+    "execution_isolation_stale",
 )
 
 #: Why an `intelligence_run_id` may not be used as LLM provenance
@@ -321,6 +341,7 @@ PROVENANCE_REJECTION_CODES: Tuple[str, ...] = (
     #: be A drafting run, not THIS proposal's -- so Flow A's valid draft could
     #: be attached to a hand-written proposal for Flow B (§7.1.3).
     "intelligence_run_subject_unknown",
+    "intelligence_run_draft_digest_mismatch",
     "intelligence_run_subject_mismatch",
     "intelligence_run_target_not_drafted",
 )
@@ -474,6 +495,30 @@ def _json_or_default(text: Optional[str], default: Any) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return default
+
+
+def _draft_input_digest(
+    *,
+    flow_subject_kind: str,
+    flow_subject_ref: str,
+    captured_snapshot_id: Optional[int],
+    node_keys: Sequence[str],
+    evidence_ids: Sequence[str],
+) -> str:
+    """Digest the immutable subject/target/evidence envelope shown to a draft."""
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "flow_subject_kind": flow_subject_kind,
+                "flow_subject_ref": flow_subject_ref,
+                "captured_snapshot_id": captured_snapshot_id,
+                "node_keys": sorted(node_keys),
+                "evidence_ids": sorted(evidence_ids),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -924,7 +969,15 @@ def derive_proposal_status(
     moment = time.time() if now is None else now
     status = "proposed"
     for event in events:
-        kind = event["event_kind"] if isinstance(event, Mapping) else event.event_kind
+        # ``sqlite3.Row`` is key-addressable but is not registered as a
+        # ``collections.abc.Mapping``.  Lifecycle folding is shared by the
+        # DB-backed orchestrator and typed projection records, so accept both
+        # shapes explicitly instead of assuming attribute access.
+        kind = (
+            event["event_kind"]
+            if isinstance(event, Mapping) or hasattr(event, "keys")
+            else event.event_kind
+        )
         if status in TERMINAL_STATUSES:
             break
         if kind == "proposed":
@@ -1724,6 +1777,67 @@ def _require_execution_binding(
             (str(bound["proposal_id"]),),
         )
 
+    keys = set(row.keys())
+    authorized_proposal_id = (
+        row["flow_experiment_proposal_id"]
+        if "flow_experiment_proposal_id" in keys
+        else None
+    )
+    if authorized_proposal_id is None:
+        raise FlowExperimentRejected(
+            "execution_ref_authorization_missing",
+            f"実行 {execution_kind}:{execution_ref} には実行時 proposal authorization "
+            "が記録されていません。事後の付け替えは承認になりません。",
+        )
+    if int(authorized_proposal_id) != int(proposal_id):
+        raise FlowExperimentRejected(
+            "execution_ref_authorization_mismatch",
+            f"実行 {execution_kind}:{execution_ref} は proposal "
+            f"{authorized_proposal_id} により実行時承認されています。",
+            (str(authorized_proposal_id),),
+        )
+
+    if execution_kind == "experiment":
+        actual_candidates = set(
+            _json_or_default(row["flow_experiment_candidate_refs_json"], [])
+        )
+    else:
+        candidate_ref = row["flow_experiment_candidate_ref"]
+        actual_candidates = {_text(candidate_ref)} if _text(candidate_ref) else set()
+    proposal = _proposal_row(conn, system_id, proposal_id)
+    declared_candidates = set(
+        _json_or_default(proposal["candidate_refs_json"], [])
+    )
+    if actual_candidates and not actual_candidates.issubset(declared_candidates):
+        mismatch = tuple(sorted(actual_candidates - declared_candidates))
+        raise FlowExperimentRejected(
+            "execution_ref_candidate_mismatch",
+            "canonical execution の candidate はこの proposal が承認した候補では"
+            "ありません。",
+            mismatch,
+        )
+    captured_snapshot_id = proposal["captured_snapshot_id"]
+    if captured_snapshot_id is not None:
+        if execution_kind == "experiment":
+            execution_snapshot_id = row["snapshot_id"]
+        elif execution_kind == "replay_variant_run":
+            replay_run = conn.execute(
+                "SELECT snapshot_id FROM replay_runs WHERE id = ? AND system_id = ?",
+                (row["replay_run_id"], system_id),
+            ).fetchone()
+            execution_snapshot_id = (
+                replay_run["snapshot_id"] if replay_run is not None else None
+            )
+        else:
+            execution_snapshot_id = row["flow_experiment_snapshot_id"]
+        if execution_snapshot_id != captured_snapshot_id:
+            raise FlowExperimentRejected(
+                "execution_ref_authorization_mismatch",
+                "canonical execution の snapshot は proposal が承認した snapshot と"
+                "一致しません。",
+                (str(execution_snapshot_id), str(captured_snapshot_id)),
+            )
+
     approved_at = _approved_at(conn, proposal_id)
     ran_at = _execution_ran_at(execution_kind, row)
     if approved_at is not None and ran_at is not None and ran_at < approved_at:
@@ -2031,6 +2145,20 @@ def _validate_llm_provenance(
             "draft をやり直してください。",
             (str(intelligence_run_id),),
         )
+    expected_digest = _draft_input_digest(
+        flow_subject_kind=draft["flow_subject_kind"],
+        flow_subject_ref=draft["flow_subject_ref"],
+        captured_snapshot_id=draft["captured_snapshot_id"],
+        node_keys=_json_or_default(draft["node_keys_json"], []),
+        evidence_ids=_json_or_default(draft["evidence_ids_json"], []),
+    )
+    if not hmac.compare_digest(str(draft["input_digest"] or ""), expected_digest):
+        raise FlowExperimentRejected(
+            "intelligence_run_draft_digest_mismatch",
+            "draft の subject / target / evidence envelope が記録時の digest と一致"
+            "しないため provenance として利用できません。",
+            (str(intelligence_run_id),),
+        )
     if (
         draft["flow_subject_kind"] != content.flow_subject_kind
         or draft["flow_subject_ref"] != content.flow_subject_ref
@@ -2189,6 +2317,21 @@ def create_proposal(
             now=moment,
         )
         conn.execute("COMMIT")
+    except sqlite3.IntegrityError as exc:
+        conn.execute("ROLLBACK")
+        message = str(exc)
+        if "flow_experiment_proposal.intelligence_run_id" in message:
+            raise FlowExperimentRejected(
+                "intelligence_run_already_used",
+                "この intelligence run は既に別の提案の provenance として使われています。",
+            ) from exc
+        if "flow_experiment_proposal.system_id" in message:
+            raise FlowExperimentRejected(
+                "duplicate_proposal_key",
+                "同じ proposal_key の提案がこの System に既に存在します。",
+                (content.proposal_key,),
+            ) from exc
+        raise
     except Exception:
         conn.execute("ROLLBACK")
         raise
@@ -2301,7 +2444,128 @@ def _require_execution_capabilities(
     return decisions
 
 
-def record_execution(
+def require_execution_authorization(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    proposal_id: Optional[int],
+    node_key: str,
+    candidate_refs: Sequence[str] = (),
+    candidate_required: bool = False,
+    snapshot_id: Optional[int] = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Authorize one *governed* execution before it starts.
+
+    The mode gate and proposal approval are independent facts and both are
+    required.  This function deliberately runs at the real Replay / Experiment
+    / Candidate / live-shadow boundary; attaching a reference after the work
+    ran cannot retroactively authorize it.
+
+    Candidate identities are canonical patch digests (``patch_sha256:<hex>``)
+    derived by the execution route, never free text supplied as a claim by the
+    caller.  A static proposal is also pinned to its captured snapshot.
+    """
+    moment = time.time() if now is None else now
+    if proposal_id is None:
+        raise FlowExperimentRejected(
+            "execution_proposal_required",
+            "governed な候補実行には承認済み Flow proposal が必要です。",
+        )
+
+    row = _proposal_row(conn, system_id, int(proposal_id))
+    status = derive_proposal_status(_event_rows(conn, int(proposal_id)), now=moment)
+    if status not in ("approved", "executing"):
+        raise FlowExperimentRejected(
+            "execution_proposal_not_approved",
+            f"Flow proposal {proposal_id} は実行を承認されていません (status={status})。",
+            (status,),
+        )
+    if row["expires_at"] is not None and moment >= float(row["expires_at"]):
+        raise FlowExperimentRejected(
+            "execution_proposal_expired",
+            f"Flow proposal {proposal_id} は期限切れです。",
+        )
+
+    targets = {str(target["target_node_key"]) for target in _target_rows(conn, int(proposal_id))}
+    key = _text(node_key)
+    if key not in targets:
+        raise FlowExperimentRejected(
+            "execution_target_not_authorized",
+            f"Node {key!r} は Flow proposal {proposal_id} の対象ではありません。",
+            tuple(sorted(targets)),
+        )
+
+    declared = {_text(ref) for ref in _json_or_default(row["candidate_refs_json"], [])}
+    actual = {_text(ref) for ref in candidate_refs if _text(ref)}
+    if candidate_required and not actual:
+        raise FlowExperimentRejected(
+            "execution_candidate_not_authorized",
+            "実行する candidate の正本参照が無いため proposal と照合できません。",
+        )
+    unauthorized = sorted(actual - declared)
+    if unauthorized:
+        raise FlowExperimentRejected(
+            "execution_candidate_not_authorized",
+            "実行しようとしている candidate は proposal で承認されていません。",
+            tuple(unauthorized),
+        )
+
+    captured = row["captured_snapshot_id"]
+    if candidate_required and captured is None:
+        raise FlowExperimentRejected(
+            "execution_snapshot_authorization_required",
+            "candidate execution の proposal はruntime/staticを問わず baseline "
+            "snapshotをpinする必要があります。",
+        )
+    if captured is not None and snapshot_id != int(captured):
+        raise FlowExperimentRejected(
+            "execution_snapshot_mismatch",
+            f"proposal がpinしたsnapshotは {captured} ですが、実行対象は {snapshot_id} です。",
+            (str(captured), str(snapshot_id)),
+        )
+
+    # Re-evaluate every proposal target at execution time.  For runtime Flow
+    # this also proves current Flow membership; a stale caller claim is refused
+    # by execution_mode's flow_scope_not_member decision.
+    _require_execution_capabilities(
+        conn,
+        system_id=system_id,
+        proposal_id=int(proposal_id),
+        flow_subject_kind=row["flow_subject_kind"],
+        flow_subject_ref=row["flow_subject_ref"],
+        execution_kind="experiment",
+        now=moment,
+    )
+
+    # Side-effect facts can change after approval.  Re-read them before the
+    # execution rather than trusting the proposal-time classification.
+    if row["isolation_strategy"] in NON_ISOLATING_STRATEGIES:
+        unsafe: List[str] = []
+        for target_key in sorted(targets):
+            node = _node_row(conn, system_id, target_key)
+            if node is None:
+                unsafe.append(target_key)
+                continue
+            if _node_side_effect_class(conn, system_id, node) in SIDE_EFFECT_ISOLATION_REQUIRED:
+                unsafe.append(target_key)
+        if unsafe:
+            raise FlowExperimentRejected(
+                "execution_isolation_stale",
+                "承認後に副作用分類が変わり、現在のisolation strategyでは実行できません。",
+                tuple(unsafe),
+            )
+
+    return {
+        "proposal_id": int(proposal_id),
+        "node_key": key,
+        "candidate_refs": sorted(actual),
+        "snapshot_id": snapshot_id,
+        "authorized_at": moment,
+    }
+
+
+def _record_execution_locked(
     conn: sqlite3.Connection,
     *,
     system_id: int,
@@ -2373,32 +2637,64 @@ def record_execution(
         row=ref_row,
     )
 
-    conn.execute("BEGIN")
-    try:
-        conn.execute(
-            """INSERT OR IGNORE INTO flow_experiment_execution_ref
-                   (system_id, proposal_id, execution_kind, execution_ref, note,
-                    recorded_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (system_id, proposal_id, execution_kind, ref, note, moment),
-        )
-        _insert_event(
-            conn,
-            system_id=system_id,
-            proposal_id=proposal_id,
-            event_kind="execution_recorded",
-            actor=actor,
-            actor_kind=actor_kind,
-            reason=note,
-            decision_method="manual",
-            payload={"execution_kind": execution_kind, "execution_ref": ref},
-            now=moment,
-        )
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+    already = conn.execute(
+        "SELECT id FROM flow_experiment_execution_ref "
+        "WHERE system_id = ? AND proposal_id = ? AND execution_kind = ? AND execution_ref = ?",
+        (system_id, proposal_id, execution_kind, ref),
+    ).fetchone()
+    if already is not None:
+        return _proposal_doc(conn, system_id, row, now=moment)
+
+    conn.execute(
+        """INSERT INTO flow_experiment_execution_ref
+               (system_id, proposal_id, execution_kind, execution_ref, note,
+                recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (system_id, proposal_id, execution_kind, ref, note, moment),
+    )
+    _insert_event(
+        conn,
+        system_id=system_id,
+        proposal_id=proposal_id,
+        event_kind="execution_recorded",
+        actor=actor,
+        actor_kind=actor_kind,
+        reason=note,
+        decision_method="deterministic" if actor_kind == "system" else "manual",
+        payload={"execution_kind": execution_kind, "execution_ref": ref},
+        now=moment,
+    )
     return _proposal_doc(conn, system_id, row, now=moment)
+
+
+def record_execution(conn: sqlite3.Connection, **kwargs: Any) -> Dict[str, Any]:
+    """Check and bind a canonical execution in one cross-process write lock.
+
+    Callers that already opened ``BEGIN IMMEDIATE`` retain ownership of the
+    transaction, allowing the actual execution route to include its canonical
+    pin in the same atomic unit.
+    """
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        result = _record_execution_locked(conn, **kwargs)
+        if owns_transaction:
+            conn.execute("COMMIT")
+        return result
+    except sqlite3.IntegrityError as exc:
+        if owns_transaction and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        if "flow_experiment_execution_ref.system_id" in str(exc):
+            raise FlowExperimentRejected(
+                "execution_ref_already_bound",
+                "canonical execution は既に別のproposalへ拘束されています。",
+            ) from exc
+        raise
+    except Exception:
+        if owns_transaction and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def _validate_metrics(metrics: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -3147,19 +3443,13 @@ def propose_flow_experiment(
     # written for a FAILED run too: what a run was about is a fact about the
     # attempt, not about its outcome.
     run_status = "completed" if error is None else "failed"
-    input_digest = hashlib.sha256(
-        json.dumps(
-            {
-                "flow_subject_kind": flow_subject_kind,
-                "flow_subject_ref": flow_subject_ref,
-                "captured_snapshot_id": snapshot_id,
-                "node_keys": sorted(keys),
-                "evidence_ids": sorted(grounding.evidence_ids),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
+    input_digest = _draft_input_digest(
+        flow_subject_kind=flow_subject_kind,
+        flow_subject_ref=flow_subject_ref,
+        captured_snapshot_id=snapshot_id,
+        node_keys=keys,
+        evidence_ids=grounding.evidence_ids,
+    )
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO intelligence_runs

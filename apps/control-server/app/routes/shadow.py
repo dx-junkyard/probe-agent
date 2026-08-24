@@ -4,12 +4,60 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from .. import flow_orchestration
 from ..auth import get_system_id
 from ..db import get_conn
 from ..models import EvaluationUpdate, ShadowResult
 from ..trace_redaction import redact_projection, redact_shadow_outputs
+from .execution_modes import gate_execution_target, record_attested_execution_observation
 
 router = APIRouter()
+
+
+def _canonical_shadow_candidate(conn, system_id, component_id, result):
+    """Resolve the candidate digest/snapshot from a server-owned row."""
+    kind = result.flow_experiment_candidate_kind
+    candidate_id = result.flow_experiment_candidate_id
+    if kind is None or candidate_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "execution_candidate_attestation_required",
+                "message": (
+                    "Governed Shadow requires a canonical candidate_version or "
+                    "replay_variant id; free-text candidate claims are not authorization."
+                ),
+            },
+        )
+    if kind == "candidate_version":
+        row = conn.execute(
+            """SELECT v.patch_hash, s.snapshot_id, s.component_id
+                 FROM candidate_versions v
+                 JOIN candidate_sessions s ON s.id = v.session_id
+                WHERE v.id = ? AND v.system_id = ? AND s.system_id = ?
+                  AND v.status = 'proposed'""",
+            (candidate_id, system_id, system_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """SELECT v.patch_hash, r.snapshot_id, r.component_id
+                 FROM replay_variants v
+                 JOIN replay_runs r ON r.id = v.replay_run_id
+                WHERE v.id = ? AND v.system_id = ? AND r.system_id = ?
+                  AND v.is_baseline = 0""",
+            (candidate_id, system_id, system_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Canonical Shadow candidate not found")
+    if row["component_id"] != component_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "execution_candidate_target_mismatch",
+                "message": "Canonical candidate belongs to another Component.",
+            },
+        )
+    return f"patch_sha256:{row['patch_hash']}", int(row["snapshot_id"])
 
 
 def _write_shadow_projections(conn, system_id: int, result: ShadowResult) -> None:
@@ -60,6 +108,24 @@ def post_shadow_result(
         raise HTTPException(400, "component_id mismatch")
 
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        candidate_ref = result.flow_experiment_candidate_ref
+        candidate_snapshot_id = result.flow_experiment_snapshot_id
+        if result.flow_experiment_proposal_id is not None:
+            candidate_ref, candidate_snapshot_id = _canonical_shadow_candidate(
+                conn, system_id, component_id, result
+            )
+        execution_gate = gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="shadow_comparison",
+            target_kind="component",
+            target_ref=component_id,
+            flow_experiment_proposal_id=result.flow_experiment_proposal_id,
+            candidate_refs=(candidate_ref or "",),
+            candidate_required=True,
+            snapshot_id=candidate_snapshot_id,
+        )
         conn.execute(
             """
             INSERT OR IGNORE INTO components
@@ -80,8 +146,9 @@ def post_shadow_result(
             INSERT INTO shadow_results
                 (system_id, trace_id, component_id, current_output, candidate_output,
                  candidate_error, candidate_duration_ms, evaluation, timestamp,
-                 redaction_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                 redaction_json, flow_experiment_proposal_id,
+                 flow_experiment_candidate_ref, flow_experiment_snapshot_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -93,9 +160,31 @@ def post_shadow_result(
                 result.candidate_duration_ms,
                 result.timestamp,
                 json.dumps(redaction.summary(), ensure_ascii=False),
+                result.flow_experiment_proposal_id,
+                candidate_ref,
+                candidate_snapshot_id,
             ),
         )
+        if result.flow_experiment_proposal_id is not None:
+            flow_orchestration.record_execution(
+                conn,
+                system_id=system_id,
+                proposal_id=result.flow_experiment_proposal_id,
+                execution_kind="shadow_result",
+                execution_ref=str(cur.lastrowid),
+                actor="execution-gate",
+                actor_kind="system",
+                note="Recorded at the governed Shadow execution boundary.",
+                now=result.timestamp,
+            )
+        record_attested_execution_observation(
+            conn,
+            gate=execution_gate,
+            execution_kind="shadow_result",
+            execution_ref=str(cur.lastrowid),
+        )
         _write_shadow_projections(conn, system_id, result)
+        conn.execute("COMMIT")
     return {"ok": True, "id": cur.lastrowid}
 
 

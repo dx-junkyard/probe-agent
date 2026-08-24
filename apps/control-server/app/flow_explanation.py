@@ -267,10 +267,9 @@ class NodeExplanation:
     # The observation's own standing, carried through from #413's projection
     # rather than re-derived here. `mode_divergence` answers "does the
     # reading agree with the configuration?" and cannot answer "was the
-    # reading measured?" -- nothing on any current path attests a runtime
-    # mode, so a `match` may be agreement with a value a human reported. Two
-    # facts, two fields (§6.4 / #366). Both are `None` when there is no
-    # observation to describe.
+    # reading measured?" -- public reports are `uncorroborated`, while a
+    # canonical execution created behind the gate is `corroborated`. Two facts,
+    # two fields (§6.4 / #366). Both are `None` when there is no observation.
     mode_observation_source: Optional[str] = None
     mode_observation_run_ref_state: Optional[str] = None
 

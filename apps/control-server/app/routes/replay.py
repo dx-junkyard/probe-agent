@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
+from .. import flow_orchestration
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from ..experiment_runner import patch_hash
@@ -80,7 +81,7 @@ from ..replay_variants import (
     summarize_variant_cases,
 )
 from ..trace_analyzer import max_examples
-from .execution_modes import gate_execution_target
+from .execution_modes import gate_execution_target, record_attested_execution_observation
 from .snapshot_preflight import require_snapshot_preflight
 
 router = APIRouter(dependencies=[Depends(require_user)])
@@ -743,6 +744,8 @@ def create_replay_run(
     with get_conn() as conn:
         replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
         component_id = replay_set["component_id"]
+        snapshot = _resolve_snapshot(conn, system_id, payload.snapshot_id)
+        conn.execute("BEGIN IMMEDIATE")
 
         # Execution-mode gate (#412 §4.3). A Replay run executes the pinned
         # snapshot's own code against recorded inputs inside the sandbox, so
@@ -752,13 +755,15 @@ def create_replay_run(
         # links is `unmapped` and behaves exactly as it did before this gate
         # existed. Evaluated before the approval gate so nothing is read or
         # written for an execution the mode already refuses.
-        gate_execution_target(
+        execution_gate = gate_execution_target(
             conn,
             system_id=system_id,
             capability="candidate_execution",
             target_kind="component",
             target_ref=component_id,
             response=response,
+            flow_experiment_proposal_id=payload.flow_experiment_proposal_id,
+            snapshot_id=snapshot["id"],
         )
 
         # Human approval gate: a revoked approval refuses exactly like a
@@ -775,7 +780,6 @@ def create_replay_run(
                 ),
             )
 
-        snapshot = _resolve_snapshot(conn, system_id, payload.snapshot_id)
         symbol = _resolve_component_symbol(
             conn, system_id, snapshot["id"], component_id
         )
@@ -816,6 +820,12 @@ def create_replay_run(
             ),
         )
         run_id = cur.lastrowid
+        record_attested_execution_observation(
+            conn,
+            gate=execution_gate,
+            execution_kind="replay_run",
+            execution_ref=str(run_id),
+        )
         repo_path = snapshot["repo_path"]
         commit_sha = snapshot["commit_sha"]
         target = {
@@ -823,6 +833,7 @@ def create_replay_run(
             "path": symbol["path"],
             "qualified_name": symbol["qualified_name"],
         }
+        conn.execute("COMMIT")
 
     harness_cases = [
         plan.harness_case for plan in plans if plan.harness_case is not None
@@ -1095,19 +1106,28 @@ def create_replay_variant_run(
     with get_conn() as conn:
         replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
         component_id = replay_set["component_id"]
+        snapshot = _resolve_snapshot(conn, system_id, payload.snapshot_id)
+        candidate_refs = tuple(
+            f"patch_sha256:{patch_hash(variant.patch_text)}" for variant in payload.variants
+        )
+        conn.execute("BEGIN IMMEDIATE")
 
         # Execution-mode gate (#412 §4.3). This is the entry point §4.3 names
         # first: baseline + N candidate patch variants are executed here. The
         # approval and the mode are two INDEPENDENT facts (§7.4) -- an approved
         # Replay whose Node is not in `shadow` is refused here, and a Node in
         # `shadow` with no approval is still refused below.
-        gate_execution_target(
+        execution_gate = gate_execution_target(
             conn,
             system_id=system_id,
             capability="candidate_execution",
             target_kind="component",
             target_ref=component_id,
             response=response,
+            flow_experiment_proposal_id=payload.flow_experiment_proposal_id,
+            candidate_refs=candidate_refs,
+            candidate_required=True,
+            snapshot_id=snapshot["id"],
         )
 
         approval = _active_approval(conn, system_id, component_id)
@@ -1122,7 +1142,6 @@ def create_replay_variant_run(
                 ),
             )
 
-        snapshot = _resolve_snapshot(conn, system_id, payload.snapshot_id)
         symbol = _resolve_component_symbol(
             conn, system_id, snapshot["id"], component_id
         )
@@ -1194,8 +1213,9 @@ def create_replay_variant_run(
                 INSERT INTO replay_variants
                     (system_id, replay_run_id, variant_key, label, is_baseline,
                      patch_text, patch_hash, source, apply_status, status,
-                     created_at, started_at)
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 'running', ?, ?)
+                     created_at, started_at, flow_experiment_proposal_id,
+                     flow_experiment_candidate_ref)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
                 """,
                 (
                     system_id,
@@ -1208,9 +1228,32 @@ def create_replay_variant_run(
                     APPLY_NOT_APPLICABLE,
                     now,
                     now,
+                    payload.flow_experiment_proposal_id,
+                    f"patch_sha256:{patch_hash(variant.patch_text)}",
                 ),
             )
             variant_plan.append((cur.lastrowid, variant))
+
+        if payload.flow_experiment_proposal_id is not None:
+            for variant_id, _variant in variant_plan:
+                flow_orchestration.record_execution(
+                    conn,
+                    system_id=system_id,
+                    proposal_id=payload.flow_experiment_proposal_id,
+                    execution_kind="replay_variant_run",
+                    execution_ref=str(variant_id),
+                    actor="execution-gate",
+                    actor_kind="system",
+                    note="Recorded at the governed Replay execution boundary.",
+                    now=now,
+                )
+        record_attested_execution_observation(
+            conn,
+            gate=execution_gate,
+            execution_kind="replay_variant_run",
+            execution_ref=str(run_id),
+        )
+        conn.execute("COMMIT")
 
     harness_cases = [
         plan.harness_case for plan in plans if plan.harness_case is not None
@@ -1556,6 +1599,13 @@ def create_replay_regression_scaffold(
     started_at = time.time()
     with get_conn() as conn:
         run = _get_variant_run_or_404(conn, payload.replay_run_id, system_id)
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="llm_experiment_proposal",
+            target_kind="component",
+            target_ref=run["component_id"],
+        )
         variant = conn.execute(
             """
             SELECT * FROM replay_variants
@@ -1812,6 +1862,13 @@ def create_replay_variant_draft(
     with get_conn() as conn:
         replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)
         component_id = replay_set["component_id"]
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="llm_experiment_proposal",
+            target_kind="component",
+            target_ref=component_id,
+        )
         trace_ids = json.loads(replay_set["trace_ids_json"] or "[]")
         if payload.trace_id not in trace_ids:
             raise HTTPException(

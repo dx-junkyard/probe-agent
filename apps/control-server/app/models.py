@@ -271,6 +271,19 @@ class ShadowResult(BaseModel):
     candidate_error: Optional[str] = None
     candidate_duration_ms: float = 0.0
     timestamp: float
+    # Required only when this Component is governed by an Evolution Node.
+    # The route derives the candidate identity from this explicit canonical
+    # reference and verifies it against the approved Flow proposal.
+    flow_experiment_proposal_id: Optional[int] = None
+    # Governed Shadow accepts only a canonical candidate row that the server
+    # can resolve to its patch digest and pinned snapshot. The legacy free-text
+    # fields below are retained only for ungoverned compatibility.
+    flow_experiment_candidate_kind: Optional[
+        Literal["candidate_version", "replay_variant"]
+    ] = None
+    flow_experiment_candidate_id: Optional[int] = None
+    flow_experiment_candidate_ref: Optional[str] = None
+    flow_experiment_snapshot_id: Optional[int] = None
     # Phase 5 shadow projections (Issue #150): shadow_current / shadow_candidate.
     projections: Optional[List["TraceProjectionIn"]] = None
 
@@ -6211,6 +6224,7 @@ class ReplayRunCreate(BaseModel):
     replay_set_id: int
     snapshot_id: Optional[int] = None
     stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
+    flow_experiment_proposal_id: Optional[int] = None
 
 
 class ReplayCaseResultOut(BaseModel):
@@ -6295,6 +6309,7 @@ class ReplayVariantRunCreate(BaseModel):
     # Issue #369: required when the resolved snapshot is definitively behind
     # HEAD. Same manual decision the Experiment records.
     stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
+    flow_experiment_proposal_id: Optional[int] = None
 
 
 class ReplayVariantCaseResultOut(BaseModel):
@@ -6616,6 +6631,7 @@ class CandidateReplayCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     snapshot_id: Optional[int] = None
+    flow_experiment_proposal_id: Optional[int] = None
 
 
 class CandidatePromotionOut(BaseModel):
@@ -10913,7 +10929,7 @@ ExecutionModeObservationSource = Literal["control_server", "sdk"]
 #: on this path resolves the pointer against a canonical execution row, so
 #: there is no `resolved` value to report. "This row cites a run" and "this
 #: row's citation was checked" must stay distinguishable (#366 / Principle 7).
-ExecutionModeRunRefState = Literal["absent", "uncorroborated"]
+ExecutionModeRunRefState = Literal["absent", "uncorroborated", "corroborated"]
 
 
 class ExecutionModeScopeReadingOut(BaseModel):
@@ -11026,7 +11042,7 @@ class ExecutionModeObservationIn(BaseModel):
 class ExecutionModeObservationOut(BaseModel):
     """One recorded observation, with the standing of its own provenance said
     out loud: `source` is the path that wrote it (an HTTP write is always
-    `control_server`), and `run_ref_state` says the pointer was never checked."""
+    `control_server`), and `run_ref_state` says whether the pointer was checked."""
 
     id: int
     system_id: int
@@ -11034,7 +11050,7 @@ class ExecutionModeObservationOut(BaseModel):
     observed_mode: ExecutionMode
     capability: Optional[ExecutionCapability] = None
     run_ref: Optional[str] = None
-    #: `absent` (no pointer) vs `uncorroborated` (a pointer nobody resolved).
+    #: `absent`, caller-reported `uncorroborated`, or gate-attested `corroborated`.
     run_ref_state: ExecutionModeRunRefState = "absent"
     source: ExecutionModeObservationSource
     detail: str

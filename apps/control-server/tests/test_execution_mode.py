@@ -1359,6 +1359,21 @@ class TestObservationProvenance:
         assert without["run_ref_state"] == "absent"
         assert with_ref["run_ref_state"] == "uncorroborated"
 
+    def test_http_caller_cannot_forge_execution_gate_attestation(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "sys-a")
+        _make_node(system_id, "node-a")
+        response = admin_client.post(
+            "/execution-modes/observations",
+            json={
+                "node_key": "node-a",
+                "observed_mode": "shadow",
+                "run_ref": "execution_gate:experiment:1",
+            },
+            headers=_headers(token, system_id),
+        )
+        assert response.status_code == 422, response.text
+
 
 class TestMissingNodeReadsConsistently:
     """"There is no such Node" is not the default value of "which mode is
