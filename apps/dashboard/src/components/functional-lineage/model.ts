@@ -219,7 +219,7 @@ export function traceDownstreamImpact(
 ): LineageImpactEntry[] {
   const adjacency = new Map<string, LineageImpactEntry[]>();
   for (const e of edges) {
-    const key = `${e.from_kind} ${e.from_ref}`;
+    const key = `${e.from_kind}\u0000${e.from_ref}`;
     const list = adjacency.get(key) ?? [];
     list.push({ kind: e.to_kind, ref: e.to_ref });
     adjacency.set(key, list);
@@ -229,9 +229,9 @@ export function traceDownstreamImpact(
   const result: LineageImpactEntry[] = [];
   while (frontier.length > 0) {
     const current = frontier.shift()!;
-    const key = `${current.kind} ${current.ref}`;
+    const key = `${current.kind}\u0000${current.ref}`;
     for (const next of adjacency.get(key) ?? []) {
-      const nextKey = `${next.kind} ${next.ref}`;
+      const nextKey = `${next.kind}\u0000${next.ref}`;
       if (visited.has(nextKey)) continue;
       visited.add(nextKey);
       result.push(next);

@@ -273,11 +273,12 @@ def _add_requirement_link(client, headers, design_key, requirement_key, *, expec
     return r.json() if expect < 300 else r
 
 
-def _add_target_link(client, headers, design_key, option_key, target_kind, target_ref, *, expect=201):
+def _add_target_link(client, headers, design_key, option_key, target_kind, target_ref, *,
+                     captured_snapshot_id=None, expect=201):
     r = client.post(
         f"/solution-designs/{design_key}/target-links",
         json={"option_key": option_key, "target_kind": target_kind, "target_ref": target_ref,
-              "captured_snapshot_id": None, "note": ""},
+              "captured_snapshot_id": captured_snapshot_id, "note": ""},
         headers=headers,
     )
     assert r.status_code == expect, r.text
@@ -1037,3 +1038,83 @@ class TestEndToEndFixture:
         blob = str(result).lower()
         for banned in ("score", "percentage", "confidence", "ranking"):
             assert banned not in blob
+
+
+class TestStaticAndRuntimeFlowAreNeverOneEntity:
+    """§9.1: "Static Flow and runtime Flow are never one entity."
+
+    The E2E fixture exercises `runtime_flow` only (a `static_flow` needs a
+    pinned snapshot plus a `code_entrypoints` row), and both kinds share
+    `_check_flow_hop`. A shared code path is exactly the condition under
+    which two identities quietly become one, so this asserts the separation
+    directly rather than inferring it from the fixture.
+
+    The same `target_ref` is deliberately used for both: if the projection
+    keyed a Flow node on its ref alone, the two would collapse into a single
+    node and this test would fail. #405 and #412 both had to write this rule
+    down after the fact; here it is a regression test.
+    """
+
+    def test_same_ref_under_both_kinds_stays_two_distinct_nodes(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "provider1")
+        _create_stakeholder(admin_client, headers, "user1")
+        _create_exchange(admin_client, headers, "ex1", "provider1", "user1", "experience")
+        _create_journey(admin_client, headers, "j1")
+        _add_journey_revision(admin_client, headers, "j1", steps=[_step("s1", 0)])
+        _create_ref(admin_client, headers, "value_exchange", "ex1", "ux_journey_step", "j1#s1")
+        _create_requirement(admin_client, headers, "req1")
+        _add_requirement_revision(admin_client, headers, "req1", acceptance_criteria=[_criterion("c1", 0)])
+        _add_requirement_step_link(admin_client, headers, "req1", "j1", "s1")
+        _create_solution_design(admin_client, headers, "d1")
+        _add_option(admin_client, headers, "d1", "optA")
+        _add_requirement_link(admin_client, headers, "d1", "req1")
+
+        # One name, two different kinds of thing. A `static_flow` link needs
+        # a pinned snapshot (#412's `static_flow_snapshot_required`), which is
+        # itself part of why the two identities must not merge: one is pinned
+        # to a commit, the other is an observed runtime correlation.
+        from app.db import get_conn
+
+        shared_ref = "flow-main"
+        _insert_trace_span_for_flow(system_id, shared_ref)
+        with get_conn() as conn:
+            now = time.time()
+            cur = conn.execute(
+                """INSERT INTO repository_snapshots
+                       (system_id, repo_path, commit_sha, status, created_at, completed_at)
+                   VALUES (?, '/tmp/repo', 'c-flow', 'ready', ?, ?)""",
+                (system_id, now, now),
+            )
+            snapshot_id = cur.lastrowid
+            conn.execute(
+                """INSERT INTO code_entrypoints
+                       (system_id, snapshot_id, entrypoint_type, entrypoint_id, category, label,
+                        handler_path, handler_qualified_name, line_start, line_end,
+                        route_method, route_path, created_at)
+                   VALUES (?, ?, 'http_route', ?, 'api', 'Shared name',
+                           'app/x.py', 'app.x.handler', 1, 10, 'POST', '/x', ?)""",
+                (system_id, snapshot_id, shared_ref, now),
+            )
+        _add_target_link(admin_client, headers, "d1", "optA", "runtime_flow", shared_ref)
+        _add_target_link(
+            admin_client, headers, "d1", "optA", "static_flow", shared_ref,
+            captured_snapshot_id=snapshot_id,
+        )
+        _record_option_decision(admin_client, headers, "d1", "optA", "adopt")
+
+        result = _get_functional_lineage(admin_client, headers)
+        kinds_for_ref = sorted(
+            node["kind"] for node in result["nodes"] if node["ref"] == shared_ref
+        )
+        assert kinds_for_ref == ["runtime_flow", "static_flow"], (
+            "a static Flow and a runtime Flow sharing a ref must remain two "
+            "nodes; collapsing them would make the projection assert that a "
+            "code path and an observed correlation are the same entity"
+        )
+
+        # And the design reaches BOTH, rather than whichever was walked last.
+        edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
+        assert ("solution_design", "d1", "runtime_flow", shared_ref) in edges
+        assert ("solution_design", "d1", "static_flow", shared_ref) in edges
