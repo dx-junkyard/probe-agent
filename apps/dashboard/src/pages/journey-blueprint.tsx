@@ -8,7 +8,7 @@
 // so a reload or a shared link reproduces the view (§7.3's rule, applied
 // here one layer over from the Value Network screen).
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -31,20 +31,25 @@ export default function JourneyBlueprintPage() {
   const navigate = useNavigate();
   const journeys = useUxJourneys();
 
-  const [journeyKey, setJourneyKey] = useState<string | null>(searchParams.get("journey"));
+  // Whether the DEVELOPER has made a Journey choice yet, tracked separately
+  // from what that choice is. The two cannot be one value: `null` would then
+  // mean both "nothing chosen yet, auto-select the first" and "explicitly
+  // deselected, show nothing", and the auto-select would immediately undo an
+  // explicit deselection -- exactly the unreachable-unselected-state defect
+  // #349/#356 had to fix on the Interview screen.
+  const [hasChosenJourney, setHasChosenJourney] = useState(searchParams.get("journey") !== null);
+  const [chosenJourneyKey, setChosenJourneyKey] = useState<string | null>(searchParams.get("journey"));
   const [view, setView] = useState<ViewMode>(isViewMode(searchParams.get("view")) ? (searchParams.get("view") as ViewMode) : "blueprint");
   const [selected, setSelected] = useState<{ stepKey: string; cell: BlueprintLaneCellOut } | null>(null);
 
-  // Auto-select the first Journey once, on first load -- never override an
-  // explicit "no Journey selected" the developer navigated away from
-  // (#349's "re-selecting on every render makes an unselected state
-  // unreachable" rule, applied here).
-  useEffect(() => {
-    if (journeyKey === null && journeys.data && journeys.data.journeys.length > 0 && searchParams.get("journey") === null) {
-      setJourneyKey(journeys.data.journeys[0].journey_key);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [journeys.data]);
+  // Auto-select the first Journey until the developer chooses for themselves,
+  // and never afterwards. DERIVED during render rather than written back by an
+  // effect: a `setState` inside an effect body causes the cascading re-render
+  // `react-hooks/set-state-in-effect` rejects, and the "select once" intent is
+  // a plain function of (has the developer chosen?, what is available?).
+  const journeyKey = hasChosenJourney
+    ? chosenJourneyKey
+    : journeys.data?.journeys[0]?.journey_key ?? null;
 
   function updateParams(next: { journey?: string | null; view?: ViewMode }) {
     const params = new URLSearchParams(searchParams);
@@ -57,7 +62,10 @@ export default function JourneyBlueprintPage() {
   }
 
   function onSelectJourney(key: string) {
-    setJourneyKey(key || null);
+    // Any pick -- including the empty "no Journey" option -- is the
+    // developer's own choice and permanently outranks the auto-selection.
+    setHasChosenJourney(true);
+    setChosenJourneyKey(key || null);
     setSelected(null);
     updateParams({ journey: key || null });
   }

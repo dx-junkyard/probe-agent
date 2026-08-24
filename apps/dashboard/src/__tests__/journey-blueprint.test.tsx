@@ -357,3 +357,42 @@ describe("model.ts の純粋関数", () => {
     expect(changed.entries.map((e) => e.step_key)).toEqual(["b"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Journey の自動選択と明示的な選択解除
+// ---------------------------------------------------------------------------
+
+describe("Journey の自動選択", () => {
+  test("最初の Journey を自動選択する", async () => {
+    const journey = journeyOut();
+    mockGet({
+      "/ux-design/journeys": journeyListOut([journey]),
+      "/journey-blueprint?journey_key=checkout-to-be": blueprintOut(),
+    });
+    await renderPage();
+
+    const select = (await screen.findByTestId("blueprint-journey-select")) as HTMLSelectElement;
+    expect(select.value).toBe("checkout-to-be");
+  });
+
+  test("明示的に選択を解除したら自動選択で上書きしない", async () => {
+    // 自動選択は「開発者がまだ選んでいない間」だけ働く。解除を上書きすると
+    // 未選択状態へ到達できなくなる(#349 / #356 が Interview 画面で直した
+    // 欠陥と同じ)。この振る舞いは render 中の導出で成立しており、effect 内の
+    // setState には依存しない。
+    const journey = journeyOut();
+    mockGet({
+      "/ux-design/journeys": journeyListOut([journey]),
+      "/journey-blueprint?journey_key=checkout-to-be": blueprintOut(),
+    });
+    await renderPage();
+
+    const select = (await screen.findByTestId("blueprint-journey-select")) as HTMLSelectElement;
+    expect(select.value).toBe("checkout-to-be");
+
+    fireEvent.change(select, { target: { value: "" } });
+
+    expect(await screen.findByTestId("blueprint-no-journey")).toBeInTheDocument();
+    expect((screen.getByTestId("blueprint-journey-select") as HTMLSelectElement).value).toBe("");
+  });
+});
