@@ -7573,3 +7573,120 @@ migration が実在する(最初の形の table-level UNIQUE が append-only 訂
 不可能にしていたのを、テーブル 1 度きりの再構築で直すもの)。既存正本への変更
 ではないが、文書が実装に無い不変条件を主張していたので §5 に明記した。§3.7 と
 §4.2 も上記の規則を追記してある。
+
+---
+
+## Epic #418 — Stakeholder Value Network と UX・機能の統合可視化
+
+canonical contract は `docs/stakeholder-value-network.md`。§0 を読んでから
+この領域に触ること。ここには「なぜその設計にしたか」のうち、契約文書に
+書ききらなかった判断だけを残す。
+
+### なぜ #405 の一部にしなかったか
+
+#405 は「この体験を実現するための要件と実現案」を持つ層で、主語は
+**システム**である。Stakeholder Value Network の主語は**当事者**で、
+「誰が誰へ何を渡すか」は Journey が 1 本も無い段階でも成立する。同じ層に
+入れると、Journey が無い System では Stakeholder を語れず、Journey が
+複数の Stakeholder にまたがると `ux_journey_revision.beneficiary` という
+単一の自由記述に押し込むことになる。Evolution Node ADR-1 が Cell と Node を
+分けたのと同じ理由 —— 一つの行に二つの identity owner を置くと、この Epic の
+中心的分離 (支払者 ≠ 受益者) がそもそも表現できない。
+
+### なぜ Need と Problem を 1 テーブルにしたか
+
+`need_kind` の有限値で区別する。別テーブルにすると、作成時に「これは要望か
+痛みか」という開発者が往々にして決められない判断を強制し、下流の link kind が
+全部 2 倍になる。実際に効く区別は「それに対して何かが行われているか」であって、
+それは Need の**リンク**が答えることであり、テーブルの別れ方ではない。
+
+### なぜ Environment Observation に revision chain が無いか
+
+観測は「ある時点の世界についての言明」なので、訂正は編集ではなく**新しい
+観測**である (`supersedes_observation_key`)。#329 が Finding を append-only に
+したのと同じ規律で、元の観測は消さない —— 「当時そう見えていた」ことは
+後から誤りと分かっても事実である。
+
+### なぜ Stakeholder の digest に role assignment を含めないか
+
+ある Journey で役割を 1 つ足したことが、「この当事者が誰であるか」という
+確認を無効化してはならない。role assignment は自分の decision 行を持つ。
+#308 が `confirmation_id` を、#337 が Intent の `status` を digest から
+外したのと同じ「意味の変化でだけ期限切れにする」規則である。
+
+### `validity_state` を `design_status` と分けた理由
+
+期限切れの Exchange は「却下された」ではなく「終わった履歴」である。
+#412 の EM-ADR-2 が `expired` と `revoked` を分けたのと同じ —— 時間の経過で
+到達する状態と、人間が決めた状態を同じ語に載せない。`validity_state` は
+時計から**導出**し、列に保存しない。
+
+### `payer_differs_from_beneficiary` を「警告」にしなかった理由
+
+買い手と利用者が違うシステムは山ほどあり、それ自体は欠陥ではない。この
+notice の価値は開発者が**見えること**であって、ツールが良し悪しを判定する
+ことではない。§7.2 の notice は全て「link が無い」という構造的事実の陳述で
+あり、重要度や価値の判定ではない (Epic 不変条件 7)。
+
+### static Flow / Evolution Node / Component を ref kind に入れなかった理由
+
+この層はそれらへ #405 と #394 が既に持つ link を**通って**到達する。ここに
+2 本目の経路を作ると「この Node がこれを実装している」に二つの異なる答えが
+生まれる。#412 が `flow-1` を恒久 ID として保存しないと決め、#405 が static と
+runtime の Flow identity を混同しないと決めた境界を、上流側から守るための
+制約である。
+
+### Issue #421 — 参照解決と staleness 伝播、Exchange lineage
+
+`app/stakeholder_network.py::_resolve_target` は #420 が残した明示的な seam
+だった。全ての `StakeholderRefKind` を実際に解決するようにし、`purpose_element`
+/ `purpose_relation` は `purpose_chain.derive_purpose_chain` を、
+`capability_entity` は `understanding_capability_entity` を(#312 の
+System-scoped 安定 id、`capability_hierarchy_nodes.id` ではない)、`ux_journey`
+/ `ux_journey_step` / `ux_requirement` は `ux_design.py` と同じ正本テーブルを
+直接読む。各 resolver は `node_design.py` が `_resolve_capability` を
+`ux_design._resolve_capability_entity` から独立に複製しているのと同じ流儀で
+ローカルに複製した (private helper を跨いで import しない)。resolver が
+**例外を投げた**場合のみ `unavailable`、正常に読めて見つからなかった場合は
+`unresolved` — この二つを畳まないことが §5.1 の核心。
+
+**役割割当の `journey_step` scope は #405 の Step と同じ完全一致で検証する。**
+`scope_ref` は `"journey_step:<journey_key>#<step_key>"` — `journey:`
+scope の既存の prefix 規約 (`scope_ref` は常に prefix 付きで保存する、#412 と
+同じ規則) を踏襲し、body は §5.1 の `ux_journey_step` `target_ref` 形式を
+そのまま再利用した (二つ目の綴りを発明しない)。存在しない Step / Journey /
+prefix なしの不正な形式は全て 404 `journey_step_not_found` に畳む —
+`stakeholder_ref` と違い、これは Epic 自身が両方を所有する 2 つのエンティティ
+を結びつけるリンクなので、`stakeholder_ref` のように願望的に何も無い先を
+指すことはできない。
+
+**Journey Step scope の役割割当は 2 つの独立した staleness を持つ。**
+`stakeholder_role_assignment.captured_digest` は元々 Stakeholder 自身の
+content_digest しか捉えていなかった(#420)。§4 の「Step → Stakeholder role
+links for removed steps」の行を満たすには、scope が指す Step 自体が解決
+できなくなったことも `recheck_state` に反映する必要がある — ただし Step 用の
+digest 列を新設せず、`ux_journey_step` の READ 時解決結果 (`resolved !=
+"resolved"`) だけで十分と判断した。存在しない Step には比較対象となる digest
+がそもそも無いので、resolution 自体が signal になる。
+
+**Requirement → Solution Design は #405 の既存リンクだけを通る。**
+`get_exchange_lineage` は Requirement を 2 経路で集める —
+`stakeholder_ref(ref_kind='ux_requirement')` の直接参照と、
+`ux_journey_step` 参照から `ux_requirement_step_link` を辿る間接参照 — が、
+Solution Design へはどちらの Requirement からも
+`solution_design_requirement_link` + `solution_design_decision` (最新の
+`adopt`) だけを読む。Flow / Evolution Node / Component への 2 本目の経路は
+追加していない (§5.2)。
+
+**lineage の各セクションは独立した guarded loader。** `_degrade` は
+`ux_design._degrade` / `purpose_chain._degrade` と同じ挙動 — 失敗した
+セクションは `degraded_sections` に記録され、表示から**落ちる**だけで、
+`0` や空配列や推測値には決してならない。`exchange` セクション自体が失敗した
+場合は `provider`/`receiver` も連鎖的に `degraded_sections` へ入れる —
+存在しない Exchange 内容から provider/receiver を計算し続けて「provider が
+いない」という誤った表示を作らないため。
+
+**§13 の "文字列一致からリンクを自動生成しない" は回帰テストで守る。** この
+モジュールには Stakeholder の `display_name` と Journey の `beneficiary`
+文字列を比較するコードは一行も無い — テストはその不在を確認するだけで、
+振る舞いを実装しているわけではない。

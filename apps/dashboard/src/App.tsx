@@ -26,7 +26,10 @@ import GithubPage from "./pages/github";
 import CellFabricPage from "./pages/cell-fabric";
 import EvolutionNodesPage from "./pages/evolution-nodes";
 import UxDesignStudioPage from "./pages/ux-design-studio";
+import StakeholderValueNetworkPage from "./pages/stakeholder-value-network";
 import FlowAgentsPage from "./pages/flow-agents";
+import JourneyBlueprintPage from "./pages/journey-blueprint";
+import FunctionalLineagePage from "./pages/functional-lineage";
 
 export default function App() {
   return (
@@ -57,6 +60,9 @@ export default function App() {
         <Route path="evolution-nodes" element={<EvolutionNodesPage />} />
         <Route path="flow-agents" element={<FlowAgentsPage />} />
         <Route path="ux-design-studio" element={<UxDesignStudioPage />} />
+        <Route path="journey-blueprint" element={<JourneyBlueprintPage />} />
+        <Route path="stakeholder-value-network" element={<StakeholderValueNetworkPage />} />
+        <Route path="functional-lineage" element={<FunctionalLineagePage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="admin" element={<AdminPage />} />
       </Route>

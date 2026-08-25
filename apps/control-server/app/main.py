@@ -26,6 +26,7 @@ from .routes import (
     exploration,
     flow_experiments,
     flow_explanation,
+    functional_lineage,
     generation,
     github_connections,
     interview,
@@ -40,6 +41,7 @@ from .routes import (
     interview_refresh,
     interview_workflow,
     joint_understanding,
+    journey_blueprint,
     node_design,
     node_operations,
     overview,
@@ -55,6 +57,8 @@ from .routes import (
     snapshot_preflight,
     solution_design,
     stabilization,
+    stakeholder_network,
+    stakeholder_value_network,
     systems,
     system_state,
     trace_analyzers,
@@ -127,6 +131,10 @@ def create_app() -> FastAPI:
     app.include_router(flow_experiments.router, dependencies=_auth)
     app.include_router(ux_design.router, dependencies=_auth)
     app.include_router(solution_design.router, dependencies=_auth)
+    app.include_router(stakeholder_network.router, dependencies=_auth)
+    app.include_router(stakeholder_value_network.router, dependencies=_auth)
+    app.include_router(journey_blueprint.router, dependencies=_auth)
+    app.include_router(functional_lineage.router, dependencies=_auth)
     app.include_router(generation.router, dependencies=_auth)
     app.include_router(replay.router, dependencies=_auth)
     app.include_router(candidate_studio.router, dependencies=_auth)

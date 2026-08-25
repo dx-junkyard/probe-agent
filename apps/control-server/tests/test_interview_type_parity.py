@@ -48,6 +48,7 @@ INTERVIEW_CONTRACT_PREFIXES = (
 # ``AlignmentUserDecisionAction = AlignmentDecisionAction | ...`` and
 # ``typeof INTERVIEW_INTENT_FIELDS[number]`` recursively.
 FINITE_TYPE_NAMES = (
+    "ValueNetworkNoticeCode",
     "AlignmentConfidence",
     "AlignmentDecisionAction",
     "AlignmentItemStatus",
@@ -206,6 +207,20 @@ FINITE_TYPE_NAMES = (
     "FlowExperimentExecutionKind",
     "FlowExecutionRefResolution",
     "FlowExperimentActionKind",
+    # Epic #418 (Issue #423): the Journey Service Blueprint's finite
+    # vocabularies. Same drift risk as the families above -- the Dashboard
+    # branches on lane state and diff change kind today, but a new value
+    # would type-check on one side alone.
+    "BlueprintLaneKind",
+    "BlueprintLaneState",
+    "JourneyDeliveryKind",
+    "BlueprintDeliveryTargetKind",
+    "BlueprintDiffChangeKind",
+    # Epic #418 (Issue #424): the Functional Lineage View's finite
+    # vocabularies. Same drift risk as the families above.
+    "FunctionalLineageKind",
+    "LineageGapCode",
+    "LineageGapSeverity",
 )
 
 

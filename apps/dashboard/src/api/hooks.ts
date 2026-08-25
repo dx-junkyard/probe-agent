@@ -101,6 +101,12 @@ import type {
   PurposeVerificationPromptOut, PurposeVerificationConceptKind,
   PurposeExperienceHypothesisOut, PurposeReuseHypothesisOut, PurposeOutcomeCriterionOut,
   PurposeVerificationStateOut, PurposeOutcomeEvidenceSource, PurposeOutcomeVerdict,
+  ValueNetworkOut,
+  BlueprintOut, BlueprintDiffOut,
+  JourneyStepStakeholderLinkCreateRequest, JourneyStepStakeholderLinkOut,
+  JourneyStepDeliveryLinkCreateRequest, JourneyStepDeliveryLinkOut,
+  JourneyStepExchangeLinkCreateRequest, JourneyStepExchangeLinkOut,
+  FunctionalLineageOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -4258,5 +4264,93 @@ export function useFlowExperimentDecision() {
       qc.invalidateQueries({ queryKey: ["flow-experiments"] });
       qc.invalidateQueries({ queryKey: ["flow-explanation"] });
     },
+  });
+}
+
+
+// === Epic #418 / Issue #422 — Stakeholder Value Network hooks ===
+// (Issue #422 owns everything between this marker and the #423 marker below.)
+
+/** `GET /stakeholder-value-network` (§7.1). Read-only, deterministic; the
+ * page renders this response as-is and re-derives nothing. */
+export function useValueNetwork() {
+  return useQuery<ValueNetworkOut>({
+    queryKey: sysKey("stakeholder-value-network"),
+    queryFn: () => api.get<ValueNetworkOut>("/stakeholder-value-network"),
+    enabled: !!getSystemId(),
+  });
+}
+
+
+// === Epic #418 / Issue #423 — Journey Service Blueprint hooks ===
+// (Issue #423 owns everything below this marker.)
+
+const JOURNEY_BLUEPRINT_QUERY_BASES = ["journey-blueprint", "journey-blueprint-diff"] as const;
+
+function invalidateJourneyBlueprint(qc: ReturnType<typeof useQueryClient>) {
+  for (const base of JOURNEY_BLUEPRINT_QUERY_BASES) {
+    qc.invalidateQueries({ queryKey: sysKey(base) });
+  }
+}
+
+/** `GET /journey-blueprint` (§8). Read-only, deterministic, no LLM; the
+ * page renders this response as-is and re-derives nothing (§0 invariant 9). */
+export function useJourneyBlueprint(journeyKey: string | null) {
+  return useQuery<BlueprintOut>({
+    queryKey: [...sysKey("journey-blueprint"), journeyKey],
+    queryFn: () =>
+      api.get<BlueprintOut>(`/journey-blueprint?journey_key=${encodeURIComponent(journeyKey ?? "")}`),
+    enabled: journeyKey !== null,
+  });
+}
+
+/** `GET /journey-blueprint/diff` (§8.3). `diff_state` is `not_applicable`
+ * (never an empty diff) when no as-is baseline is linked. */
+export function useJourneyBlueprintDiff(journeyKey: string | null) {
+  return useQuery<BlueprintDiffOut>({
+    queryKey: [...sysKey("journey-blueprint-diff"), journeyKey],
+    queryFn: () =>
+      api.get<BlueprintDiffOut>(`/journey-blueprint/diff?journey_key=${encodeURIComponent(journeyKey ?? "")}`),
+    enabled: journeyKey !== null,
+  });
+}
+
+export function useAddJourneyStepStakeholderLink() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: JourneyStepStakeholderLinkCreateRequest) =>
+      api.post<JourneyStepStakeholderLinkOut>("/journey-blueprint/stakeholder-links", body),
+    onSuccess: () => invalidateJourneyBlueprint(qc),
+  });
+}
+
+export function useAddJourneyStepDeliveryLink() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: JourneyStepDeliveryLinkCreateRequest) =>
+      api.post<JourneyStepDeliveryLinkOut>("/journey-blueprint/delivery-links", body),
+    onSuccess: () => invalidateJourneyBlueprint(qc),
+  });
+}
+
+export function useAddJourneyStepExchangeLink() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: JourneyStepExchangeLinkCreateRequest) =>
+      api.post<JourneyStepExchangeLinkOut>("/journey-blueprint/exchange-links", body),
+    onSuccess: () => invalidateJourneyBlueprint(qc),
+  });
+}
+
+
+// === Epic #418 / Issue #424 — Functional Lineage View hook ===
+
+/** `GET /functional-lineage` (§9). Read-only, deterministic, no LLM; the
+ * page renders this response as-is and re-derives nothing (§0 invariant 9). */
+export function useFunctionalLineage() {
+  return useQuery<FunctionalLineageOut>({
+    queryKey: sysKey("functional-lineage"),
+    queryFn: () => api.get<FunctionalLineageOut>("/functional-lineage"),
+    enabled: !!getSystemId(),
   });
 }

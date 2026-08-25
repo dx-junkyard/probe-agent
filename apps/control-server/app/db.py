@@ -269,6 +269,9 @@ CREATE TABLE IF NOT EXISTS shadow_results (
     candidate_duration_ms  REAL,
     evaluation             TEXT,
     timestamp              REAL NOT NULL,
+    flow_experiment_proposal_id INTEGER,
+    flow_experiment_candidate_ref TEXT,
+    flow_experiment_snapshot_id INTEGER,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
 );
 
@@ -1100,6 +1103,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     created_at           REAL NOT NULL,
     started_at           REAL,
     completed_at         REAL,
+    flow_experiment_proposal_id INTEGER,
+    flow_experiment_candidate_refs_json TEXT,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE RESTRICT
 );
@@ -2432,6 +2437,8 @@ CREATE TABLE IF NOT EXISTS replay_variants (
     created_at     REAL NOT NULL,
     started_at     REAL,
     completed_at   REAL,
+    flow_experiment_proposal_id INTEGER,
+    flow_experiment_candidate_ref TEXT,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE CASCADE
 );
@@ -6681,6 +6688,12 @@ CREATE INDEX IF NOT EXISTS idx_flow_experiment_proposal_system
 CREATE INDEX IF NOT EXISTS idx_flow_experiment_proposal_subject
     ON flow_experiment_proposal (system_id, flow_subject_kind, flow_subject_ref, id DESC);
 
+-- One completed drafting run may be provenance for exactly one proposal.
+-- NULL manual proposals remain unrestricted by SQLite's NULL semantics.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_flow_experiment_proposal_intelligence_run
+    ON flow_experiment_proposal (intelligence_run_id)
+    WHERE intelligence_run_id IS NOT NULL;
+
 -- flow_experiment_target: the Nodes the proposal is about. `target_node_key`
 -- is the Evolution Node's own durable slug (#394 ADR-2), resolved at read
 -- time -- never a stored row id trusted on its own (#405).
@@ -6760,7 +6773,7 @@ CREATE INDEX IF NOT EXISTS idx_flow_experiment_execution_ref_proposal
 
 -- One canonical execution backs exactly one proposal (§7.5.1), which is a
 -- lookup by the reference rather than by the proposal.
-CREATE INDEX IF NOT EXISTS idx_flow_experiment_execution_ref_target
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_experiment_execution_ref_target
     ON flow_experiment_execution_ref (system_id, execution_kind, execution_ref);
 
 -- flow_experiment_draft: WHAT one reasoning-model drafting run was about.
@@ -6797,6 +6810,588 @@ CREATE TABLE IF NOT EXISTS flow_experiment_draft (
 CREATE INDEX IF NOT EXISTS idx_flow_experiment_draft_system
     ON flow_experiment_draft (system_id, id DESC);
 
+-- =============================================================================
+-- Stakeholder Value Network (Epic #418, Issue #420). See
+-- docs/stakeholder-value-network.md for the full contract; this comment
+-- block only orients a reader of the schema itself.
+--
+-- Four new canonical entities (Stakeholder / Stakeholder Need / Environment
+-- Observation / Value Exchange, §1) plus the reference/evidence/decision/
+-- view-preference tables that operate on them. Everything upstream
+-- (Purpose/Capability/Journey/Requirement/Outcome) and downstream
+-- (Flow/Node/Component/Cell) is READ ONLY through `stakeholder_ref`, never
+-- copied -- the same `_LINK_KIND_TARGET_SOURCE` discipline `node_design.py`
+-- and the UX Design Lineage section above already use.
+--
+-- Recurring house rules (not repeated per table, same as the UX Design
+-- Lineage banner above):
+--   * `system_id INTEGER NOT NULL` + `FOREIGN KEY ... REFERENCES systems (id)
+--     ON DELETE CASCADE` on every table, including bridge/link tables.
+--   * Every finite-vocabulary column carries `CHECK (col IN (...))` mirroring
+--     the `Literal` alias of the same name in `app/models.py` byte-for-byte.
+--   * Append-only content: correction is INSERT a new row + set the prior
+--     row's `superseded_by_id`, never an UPDATE of meaning-bearing columns.
+--   * No table stores a rendered/derived STATUS (`design_status`,
+--     `recheck_state`, `validity_state`, `relation_status`, ...) -- those
+--     are folded at read time from the append-only decision/reference rows
+--     (`app/stakeholder_network.py`), the same discipline #337/#338/#349
+--     use for Node maturity and Interview workflow state.
+--   * No `money` exchange has an amount/currency column anywhere (§11) --
+--     the absence is a structural guarantee, mirroring how #397 leaves out
+--     a composite score column to make compositing physically impossible.
+--   * No coordinate or layout column anywhere (§12 / invariant 10).
+-- =============================================================================
+
+-- stakeholder: identity row for one party. Identity is `(system_id,
+-- stakeholder_key)`, a DEVELOPER-SUPPLIED stable slug -- never derived from
+-- a row id (a rebuild would renumber it) and never from `display_name` (a
+-- rename would sever the history), the same rule Evolution Node ADR-2 and
+-- #405 already apply one layer over. `current_revision_id` is written only
+-- inside the same transaction that inserts the revision it points at, never
+-- by a bare UPDATE elsewhere (`evolution_node.current_version_id`'s
+-- discipline).
+CREATE TABLE IF NOT EXISTS stakeholder (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    stakeholder_key     TEXT NOT NULL,
+    current_revision_id INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'stakeholder-v1',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (current_revision_id) REFERENCES stakeholder_revision (id) ON DELETE SET NULL,
+    UNIQUE (system_id, stakeholder_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stakeholder_system
+    ON stakeholder (system_id, id DESC);
+
+-- stakeholder_revision: append-only content (§3.1's digest table: `stakeholder_
+-- key, display_name, stakeholder_kind, description, context_note`).
+-- `created_by` / `created_at` / `revision_number` / `change_note` are
+-- deliberately excluded from the digest -- a recheck must fire on a MEANING
+-- change, never on the mere existence of a new record (#308/#337/#405's
+-- rule). Role assignments are deliberately NOT part of this digest (§3.1) --
+-- adding a role in one Journey must not invalidate a confirmation of WHO
+-- this party is; role assignments carry their own `captured_digest` and
+-- their own decision rows instead.
+CREATE TABLE IF NOT EXISTS stakeholder_revision (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    stakeholder_id      INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    revision_number     INTEGER NOT NULL,
+    display_name        TEXT NOT NULL DEFAULT '',
+    stakeholder_kind    TEXT NOT NULL DEFAULT 'other'
+                            CHECK (stakeholder_kind IN
+                                ('end_user', 'customer_organization', 'internal_operator',
+                                 'provider_team', 'partner', 'regulator', 'other')),
+    description         TEXT NOT NULL DEFAULT '',
+    context_note         TEXT NOT NULL DEFAULT '',
+    content_digest       TEXT NOT NULL,
+    authored_by_kind     TEXT NOT NULL DEFAULT 'developer'
+                             CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method      TEXT NOT NULL DEFAULT 'manual'
+                             CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id  INTEGER,
+    change_note          TEXT NOT NULL DEFAULT '',
+    created_by           TEXT,
+    created_at           REAL NOT NULL,
+    superseded_by_id     INTEGER,
+    schema_version       TEXT NOT NULL DEFAULT 'stakeholder-revision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (stakeholder_id) REFERENCES stakeholder (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES stakeholder_revision (id) ON DELETE SET NULL,
+    UNIQUE (stakeholder_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stakeholder_revision_stakeholder
+    ON stakeholder_revision (stakeholder_id, revision_number DESC);
+
+-- stakeholder_role_assignment: what a party DOES in one scope (§1.1),
+-- deliberately separate from the party's own identity/kind -- one
+-- Stakeholder is routinely a `beneficiary` in one Journey Step and a
+-- `payer` in another. `scope_ref` always carries its own prefix (the same
+-- convention `execution_mode_assignment.scope_ref` uses one layer over).
+-- `captured_digest` is the Stakeholder's OWN `content_digest` at assignment
+-- time -- never the assignment's content, since the assignment has none of
+-- its own beyond the four identity columns -- so a later Stakeholder
+-- revision can degrade this row's read-time `recheck_state` to `stale`
+-- (§4's propagation table) without mutating the row itself.
+CREATE TABLE IF NOT EXISTS stakeholder_role_assignment (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    stakeholder_id    INTEGER NOT NULL,
+    stakeholder_key   TEXT NOT NULL,
+    role              TEXT NOT NULL CHECK (role IN
+                          ('actor', 'beneficiary', 'payer', 'operator',
+                           'approver', 'supplier', 'regulator', 'observer')),
+    scope_kind        TEXT NOT NULL DEFAULT 'system'
+                          CHECK (scope_kind IN ('system', 'journey', 'journey_step', 'value_exchange')),
+    scope_ref         TEXT NOT NULL DEFAULT '',
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (stakeholder_id) REFERENCES stakeholder (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES stakeholder_role_assignment (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stakeholder_role_assignment_stakeholder
+    ON stakeholder_role_assignment (system_id, stakeholder_id, id DESC);
+
+-- stakeholder_need: identity row for one Need/Problem/Constraint/Expectation
+-- (§1.2) -- ONE table with a finite `need_kind` on the revision, not four
+-- tables. `(system_id, need_key)` UNIQUE, the same developer-supplied-slug
+-- identity rule as `stakeholder`.
+CREATE TABLE IF NOT EXISTS stakeholder_need (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    need_key            TEXT NOT NULL,
+    current_revision_id INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'stakeholder-need-v1',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (current_revision_id) REFERENCES stakeholder_need_revision (id) ON DELETE SET NULL,
+    UNIQUE (system_id, need_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stakeholder_need_system
+    ON stakeholder_need (system_id, id DESC);
+
+-- stakeholder_need_revision: append-only content (§3.1's digest table:
+-- `need_key, need_kind, statement, rationale, stakeholder_key`).
+-- `stakeholder_key` lives on the REVISION (not the identity row) because
+-- which party a Need is attributed to is itself part of what the Need
+-- MEANS and can be corrected the same way its statement can -- a Need
+-- reattributed to a different Stakeholder is a meaning change, not
+-- bookkeeping. `beneficiary_problem` free text is never parsed into this
+-- table automatically (§1.2/§13) -- only a developer, or a confirmed
+-- `reasoning_model`-authored revision, creates one.
+CREATE TABLE IF NOT EXISTS stakeholder_need_revision (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    need_id             INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    revision_number     INTEGER NOT NULL,
+    need_kind           TEXT NOT NULL DEFAULT 'unmet_need'
+                            CHECK (need_kind IN ('unmet_need', 'problem', 'constraint', 'expectation')),
+    statement           TEXT NOT NULL DEFAULT '',
+    rationale           TEXT NOT NULL DEFAULT '',
+    stakeholder_key     TEXT NOT NULL DEFAULT '',
+    content_digest      TEXT NOT NULL,
+    authored_by_kind    TEXT NOT NULL DEFAULT 'developer'
+                            CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method     TEXT NOT NULL DEFAULT 'manual'
+                            CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id INTEGER,
+    change_note         TEXT NOT NULL DEFAULT '',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    superseded_by_id    INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'stakeholder-need-revision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (need_id) REFERENCES stakeholder_need (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES stakeholder_need_revision (id) ON DELETE SET NULL,
+    UNIQUE (need_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stakeholder_need_revision_need
+    ON stakeholder_need_revision (need_id, revision_number DESC);
+
+-- environment_observation: a dated statement about the WORLD OUTSIDE the
+-- system (§1.3) -- never a runtime observation (#412's mode observations
+-- and `state_facts`' freshness readings are about THIS system's own
+-- execution and must never be conflated with this table). Deliberately has
+-- NO revision chain and NO `superseded_by_id` (§3): an observation is a
+-- statement about a moment, and a correction is a NEW row that may declare
+-- `supersedes_observation_key` -- the original is never edited or deleted,
+-- the same append-only-facts reasoning #329 applies to Joint Understanding
+-- findings. `observation_confidence` is a finite provenance value, never a
+-- percentage (invariant 7).
+CREATE TABLE IF NOT EXISTS environment_observation (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    observation_key             TEXT NOT NULL,
+    statement                   TEXT NOT NULL DEFAULT '',
+    source_note                 TEXT NOT NULL DEFAULT '',
+    observation_confidence      TEXT NOT NULL DEFAULT 'reported'
+                                    CHECK (observation_confidence IN ('observed', 'reported', 'assumed')),
+    observed_at                 REAL,
+    supersedes_observation_key  TEXT,
+    content_digest              TEXT NOT NULL,
+    authored_by_kind            TEXT NOT NULL DEFAULT 'developer'
+                                    CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method             TEXT NOT NULL DEFAULT 'manual'
+                                    CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id         INTEGER,
+    created_by                  TEXT,
+    created_at                  REAL NOT NULL,
+    schema_version              TEXT NOT NULL DEFAULT 'environment-observation-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (system_id, observation_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_environment_observation_system
+    ON environment_observation (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_environment_observation_supersedes
+    ON environment_observation (system_id, supersedes_observation_key);
+
+-- environment_observation_impact: what one Observation DOES to which
+-- subject (§1.3) -- `impact_kind` is a finite verb, never a signed number
+-- (invariant 7). `target_ref_kind` reuses `StakeholderRefKind` (§5.2 lists
+-- the identical target set: Stakeholder / Need / Purpose element / Journey
+-- / Requirement / Value Exchange); resolving it against each kind's single
+-- canonical source is Issue #421's (`_resolve_target`'s explicit seam) --
+-- this table only PERSISTS the reference plus whatever digest that seam
+-- could capture at write time. Never a copy of the target's content
+-- (invariant 2).
+CREATE TABLE IF NOT EXISTS environment_observation_impact (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    observation_id    INTEGER NOT NULL,
+    impact_kind       TEXT NOT NULL CHECK (impact_kind IN
+                          ('creates', 'worsens', 'relieves', 'invalidates', 'constrains')),
+    target_ref_kind   TEXT NOT NULL CHECK (target_ref_kind IN
+                          ('purpose_element', 'purpose_relation', 'capability_entity',
+                           'ux_journey', 'ux_journey_step', 'ux_requirement',
+                           'purpose_outcome_criterion', 'stakeholder', 'stakeholder_need',
+                           'value_exchange')),
+    target_ref        TEXT NOT NULL,
+    target_row_id     INTEGER,
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (observation_id) REFERENCES environment_observation (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_environment_observation_impact_observation
+    ON environment_observation_impact (system_id, observation_id, id DESC);
+
+-- value_exchange: identity row for one directional `provider -> receiver`
+-- edge (§1.4). `(system_id, exchange_key)` UNIQUE, the same
+-- developer-supplied-slug rule as `stakeholder` / `stakeholder_need`.
+CREATE TABLE IF NOT EXISTS value_exchange (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    exchange_key         TEXT NOT NULL,
+    current_revision_id INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'value-exchange-v1',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (current_revision_id) REFERENCES value_exchange_revision (id) ON DELETE SET NULL,
+    UNIQUE (system_id, exchange_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_value_exchange_system
+    ON value_exchange (system_id, id DESC);
+
+-- value_exchange_revision: append-only content, every §1.4 field. NO
+-- amount/currency column exists anywhere on this table (§11/invariant 7) --
+-- a `money` Exchange records only that a flow exists, its direction, and a
+-- free-text `value_statement`; the absence of an amount column is
+-- structural, not a review convention, mirroring how #397 leaves out a
+-- composite score column. `consideration_kind` reuses the `ValueExchangeKind`
+-- vocabulary (§1.4's own rule) and is nullable -- required only when
+-- `consideration_state = 'present'`, enforced at the SERVICE layer
+-- (`exchange_consideration_incomplete`) rather than by a CHECK that cannot
+-- express a conditional requirement between two columns.
+CREATE TABLE IF NOT EXISTS value_exchange_revision (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    exchange_id                 INTEGER NOT NULL,
+    system_id                   INTEGER NOT NULL,
+    revision_number             INTEGER NOT NULL,
+    provider_stakeholder_key    TEXT NOT NULL,
+    receiver_stakeholder_key    TEXT NOT NULL,
+    exchange_kind               TEXT NOT NULL CHECK (exchange_kind IN
+                                    ('experience', 'service', 'information', 'money',
+                                     'authority', 'obligation', 'risk')),
+    value_statement              TEXT NOT NULL DEFAULT '',
+    consideration_state         TEXT NOT NULL DEFAULT 'unknown'
+                                    CHECK (consideration_state IN ('present', 'none', 'unknown')),
+    consideration_kind          TEXT
+                                    CHECK (consideration_kind IS NULL OR consideration_kind IN
+                                        ('experience', 'service', 'information', 'money',
+                                         'authority', 'obligation', 'risk')),
+    consideration_statement     TEXT NOT NULL DEFAULT '',
+    channel                     TEXT NOT NULL DEFAULT '',
+    trigger                     TEXT NOT NULL DEFAULT '',
+    cadence                     TEXT NOT NULL DEFAULT 'unknown'
+                                    CHECK (cadence IN
+                                        ('one_time', 'recurring', 'continuous', 'on_demand', 'unknown')),
+    valid_from                  REAL,
+    valid_to                    REAL,
+    content_digest              TEXT NOT NULL,
+    authored_by_kind            TEXT NOT NULL DEFAULT 'developer'
+                                    CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method             TEXT NOT NULL DEFAULT 'manual'
+                                    CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id         INTEGER,
+    change_note                 TEXT NOT NULL DEFAULT '',
+    created_by                  TEXT,
+    created_at                  REAL NOT NULL,
+    superseded_by_id            INTEGER,
+    schema_version              TEXT NOT NULL DEFAULT 'value-exchange-revision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (exchange_id) REFERENCES value_exchange (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES value_exchange_revision (id) ON DELETE SET NULL,
+    UNIQUE (exchange_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_value_exchange_revision_exchange
+    ON value_exchange_revision (exchange_id, revision_number DESC);
+
+-- stakeholder_ref: THE single reference table for this layer (§5.1) --
+-- `(source_kind, source_key)` names a Stakeholder / Need / Observation /
+-- Exchange / Journey-Step row this layer or #405 already owns;
+-- `(ref_kind, target_ref)` names exactly ONE canonical source to resolve
+-- against at READ time (§5.1's table) -- never a copy of the target's
+-- content (invariant 2). A `ref_kind` outside `StakeholderRefKind` never
+-- reaches this table (422 `stakeholder_ref_kind_invalid`, enforced at the
+-- service layer before the INSERT). `relation_status` is the fixed
+-- translation of `decision_method`, never a second stored column (§5.1).
+CREATE TABLE IF NOT EXISTS stakeholder_ref (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    source_kind       TEXT NOT NULL CHECK (source_kind IN
+                          ('stakeholder', 'stakeholder_need', 'environment_observation',
+                           'value_exchange', 'journey_step')),
+    source_key        TEXT NOT NULL,
+    ref_kind          TEXT NOT NULL CHECK (ref_kind IN
+                          ('purpose_element', 'purpose_relation', 'capability_entity',
+                           'ux_journey', 'ux_journey_step', 'ux_requirement',
+                           'purpose_outcome_criterion', 'stakeholder', 'stakeholder_need',
+                           'value_exchange')),
+    target_ref        TEXT NOT NULL,
+    target_row_id     INTEGER,
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES stakeholder_ref (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stakeholder_ref_source
+    ON stakeholder_ref (system_id, source_kind, source_key, id DESC);
+
+-- stakeholder_evidence_ref: attaches evidence to a Need / Observation /
+-- Exchange (§6). Three provenances kept apart on purpose (`evidence_kind`)
+-- -- a human interview note, a telemetry reading, and a third-party
+-- analytics figure support a claim differently and must not read as one
+-- number (the same reason #328 keeps investigation/translation/developer
+-- findings apart). Append-only: `superseded_by_id` lets `evidence_state`
+-- read "at least one NON-SUPERSEDED row resolves" (§6) without ever
+-- mutating a prior evidence row. A `runtime_observation` row here never
+-- changes any `design_status` and never marks an Exchange delivered
+-- (invariant 8).
+CREATE TABLE IF NOT EXISTS stakeholder_evidence_ref (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    subject_kind      TEXT NOT NULL CHECK (subject_kind IN
+                          ('stakeholder_need', 'environment_observation', 'value_exchange')),
+    subject_key       TEXT NOT NULL,
+    evidence_kind     TEXT NOT NULL CHECK (evidence_kind IN
+                          ('human_report', 'document', 'runtime_observation', 'external_analytics')),
+    evidence_ref      TEXT NOT NULL DEFAULT '',
+    statement         TEXT NOT NULL DEFAULT '',
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES stakeholder_evidence_ref (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stakeholder_evidence_ref_subject
+    ON stakeholder_evidence_ref (system_id, subject_kind, subject_key, id DESC);
+
+-- stakeholder_decision: the ONE decision ledger for this layer's confirm /
+-- reject / retire / reinstate lifecycle (`StakeholderDecisionKind`),
+-- covering every `StakeholderSubjectKind`. DELIBERATELY has no `status`
+-- column anywhere in this table or on `stakeholder` / `stakeholder_need` /
+-- `value_exchange` -- `design_status` is derived at read time from the
+-- latest non-superseded row here, the identical discipline
+-- `ux_design_decision` uses one layer over. `decision_method` is CHECKed to
+-- the single literal `'manual'` -- a REFERENCE or role assignment may be
+-- machine-proposed, but a CONFIRM/REJECT/RETIRE/REINSTATE decision about it
+-- can only ever be a human's (invariant 9).
+CREATE TABLE IF NOT EXISTS stakeholder_decision (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    subject_kind          TEXT NOT NULL CHECK (subject_kind IN
+                              ('stakeholder', 'stakeholder_need', 'environment_observation',
+                               'value_exchange', 'stakeholder_ref', 'stakeholder_role_assignment')),
+    subject_key           TEXT NOT NULL,
+    subject_row_id        INTEGER,
+    decision              TEXT NOT NULL CHECK (decision IN
+                              ('confirm', 'reject', 'retire', 'reinstate')),
+    rationale             TEXT NOT NULL DEFAULT '',
+    captured_digest       TEXT NOT NULL DEFAULT '',
+    captured_revision_id  INTEGER,
+    decision_method       TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    decided_by            TEXT,
+    superseded_by_id      INTEGER,
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES stakeholder_decision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stakeholder_decision_subject
+    ON stakeholder_decision (system_id, subject_kind, subject_key, id DESC);
+
+-- stakeholder_view_preference: §12's DISPLAY SETTINGS ONLY -- filters,
+-- collapsed refs, pinned refs, the active view. NO coordinate column, NO
+-- layout column exists anywhere on this table (invariant 10); no
+-- projection in this Epic reads this table as a fact. One row per
+-- `(system_id, created_by)`: unlike every other table in this section this
+-- is a per-viewer convenience setting, not an append-only fact, so it is
+-- the one table here a plain UPDATE is appropriate for.
+CREATE TABLE IF NOT EXISTS stakeholder_view_preference (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    created_by            TEXT NOT NULL,
+    active_view           TEXT NOT NULL DEFAULT '',
+    filters_json          TEXT NOT NULL DEFAULT '{}',
+    collapsed_refs_json   TEXT NOT NULL DEFAULT '[]',
+    pinned_refs_json      TEXT NOT NULL DEFAULT '[]',
+    updated_at            REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (system_id, created_by)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stakeholder_view_preference_system
+    ON stakeholder_view_preference (system_id, created_by);
+
+-- ---------------------------------------------------------------------------
+-- Journey Service Blueprint (Epic #418, Issue #423). docs/stakeholder-value-
+-- network.md §8.2 -- three additive link tables owned entirely by #423.
+-- Content is NEVER copied: each row stores a stable `target_ref`/key plus a
+-- `captured_digest`, resolved fresh against its one canonical source at read
+-- time (`app/journey_blueprint.py`), exactly the discipline
+-- `ux_requirement_step_link` already follows one table over. Like that
+-- table, these store the JOURNEY STEP's stable `step_key` (never a
+-- `ux_journey_step.id`), so a link survives the Journey moving to a new
+-- revision and reports stale/unresolved instead of silently vanishing.
+-- ---------------------------------------------------------------------------
+
+-- journey_step_stakeholder_link: which Stakeholder(s) act, and in which
+-- role(s), at one Journey Step (§8.1 lane 1). Several Stakeholders -- and
+-- several roles for the same Stakeholder -- on ONE Step is normal and is
+-- the point, so no uniqueness constraint narrows that.
+-- `captured_digest` is the Stakeholder's OWN `content_digest` at link time
+-- (never a copy of its content, invariant 2) so a later Stakeholder
+-- revision can degrade this row's read-time `recheck_state` without
+-- mutating the row itself (mirrors `stakeholder_role_assignment`'s own
+-- `captured_digest` one table over).
+CREATE TABLE IF NOT EXISTS journey_step_stakeholder_link (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    journey_id        INTEGER NOT NULL,
+    step_key          TEXT NOT NULL,
+    stakeholder_id    INTEGER NOT NULL,
+    stakeholder_key   TEXT NOT NULL,
+    role              TEXT NOT NULL CHECK (role IN
+                          ('actor', 'beneficiary', 'payer', 'operator',
+                           'approver', 'supplier', 'regulator', 'observer')),
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    FOREIGN KEY (stakeholder_id) REFERENCES stakeholder (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES journey_step_stakeholder_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_journey_step_stakeholder_link_step
+    ON journey_step_stakeholder_link (system_id, journey_id, step_key);
+
+CREATE INDEX IF NOT EXISTS idx_journey_step_stakeholder_link_stakeholder
+    ON journey_step_stakeholder_link (system_id, stakeholder_id, id DESC);
+
+-- journey_step_delivery_link: the frontstage/backstage/support/external
+-- delivery mechanism for one Journey Step (§8.1 lanes 3-6). `target_kind`
+-- is either the `not_applicable` sentinel -- the developer's explicit,
+-- structural "this delivery kind does not apply to this Step" fact, never
+-- auto-filled -- or one of `ux_requirement` / `stakeholder` /
+-- `value_exchange` (`app/models.py`'s `BlueprintDeliveryTargetKind`).
+-- Backstage reaches Flow/Node ONLY through the target Requirement's
+-- existing #405 Solution Design links (`app/journey_blueprint.py`); this
+-- table never stores a Flow/Node reference directly (§5.2's "no second
+-- path"). `target_ref` + `captured_digest` only -- never a copy of the
+-- target's content (invariant 2).
+CREATE TABLE IF NOT EXISTS journey_step_delivery_link (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    journey_id        INTEGER NOT NULL,
+    step_key          TEXT NOT NULL,
+    delivery_kind     TEXT NOT NULL CHECK (delivery_kind IN
+                          ('frontstage', 'backstage', 'support', 'external')),
+    target_kind       TEXT NOT NULL CHECK (target_kind IN
+                          ('ux_requirement', 'stakeholder', 'value_exchange', 'not_applicable')),
+    target_ref        TEXT NOT NULL DEFAULT '',
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES journey_step_delivery_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_journey_step_delivery_link_step
+    ON journey_step_delivery_link (system_id, journey_id, step_key, delivery_kind);
+
+-- journey_step_exchange_link: which Value Exchange one Journey Step
+-- delivers (§8.1 lane 2's touchpoint source, and lane 8's observed-evidence
+-- source). A Step may deliver more than one Exchange (e.g. an `experience`
+-- and an `information` exchange at the same interaction), so no uniqueness
+-- constraint narrows that either.
+CREATE TABLE IF NOT EXISTS journey_step_exchange_link (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    journey_id        INTEGER NOT NULL,
+    step_key          TEXT NOT NULL,
+    exchange_id       INTEGER NOT NULL,
+    exchange_key      TEXT NOT NULL,
+    captured_digest   TEXT NOT NULL DEFAULT '',
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method   TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    superseded_by_id  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    FOREIGN KEY (exchange_id) REFERENCES value_exchange (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES journey_step_exchange_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_journey_step_exchange_link_step
+    ON journey_step_exchange_link (system_id, journey_id, step_key);
+
 """
 
 
@@ -6831,6 +7426,48 @@ def _add_column_if_missing(
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     existing_columns.add(column)
+
+
+def _migrate_flow_execution_ref_uniqueness(conn: sqlite3.Connection) -> None:
+    """Make the ledger's one-execution/one-proposal rule a DB invariant.
+
+    The previous index used this name but was non-unique.  Refuse startup when
+    historical duplicates exist rather than deleting audit facts silently.
+    """
+    duplicate = conn.execute(
+        """SELECT system_id, execution_kind, execution_ref, COUNT(*) AS n
+             FROM flow_experiment_execution_ref
+            GROUP BY system_id, execution_kind, execution_ref
+           HAVING COUNT(*) > 1 LIMIT 1"""
+    ).fetchone()
+    if duplicate is not None:
+        raise RuntimeError(
+            "flow_experiment_execution_ref contains duplicate canonical bindings: "
+            f"{duplicate['execution_kind']}:{duplicate['execution_ref']}"
+        )
+    conn.execute("DROP INDEX IF EXISTS idx_flow_experiment_execution_ref_target")
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_flow_experiment_execution_ref_target "
+        "ON flow_experiment_execution_ref (system_id, execution_kind, execution_ref)"
+    )
+
+
+def _migrate_canonical_execution_authorization(conn: sqlite3.Connection) -> None:
+    """Pin the proposal/candidate authorization on each canonical run row."""
+    for table, candidate_column in (
+        ("shadow_results", "flow_experiment_candidate_ref"),
+        ("experiments", "flow_experiment_candidate_refs_json"),
+        ("replay_variants", "flow_experiment_candidate_ref"),
+    ):
+        columns = _columns(conn, table)
+        _add_column_if_missing(
+            conn, table, columns, "flow_experiment_proposal_id", "INTEGER"
+        )
+        _add_column_if_missing(conn, table, columns, candidate_column, "TEXT")
+        if table == "shadow_results":
+            _add_column_if_missing(
+                conn, table, columns, "flow_experiment_snapshot_id", "INTEGER"
+            )
 
 
 def _ensure_legacy_system(conn: sqlite3.Connection) -> int:
@@ -7258,6 +7895,8 @@ def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
+        _migrate_canonical_execution_authorization(conn)
+        _migrate_flow_execution_ref_uniqueness(conn)
         _migrate_solution_design_option_unique(conn)
         _migrate_intelligence_runs_snapshot_nullable(conn)
         install_intelligence_run_type_guards(conn)

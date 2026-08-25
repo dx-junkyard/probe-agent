@@ -165,6 +165,12 @@ EXECUTION_MODE_RUN_REF_STATES: Tuple[str, ...] = get_args(ExecutionModeRunRefSta
 #: path can attest, so it is not settable over the API (§5.2 / #337).
 HTTP_OBSERVATION_SOURCE: str = "control_server"
 
+# Reserved for observations emitted by the execution boundary itself after
+# it created the canonical execution row.  The public observation endpoint
+# rejects this prefix, so a caller cannot upgrade a self-reported pointer to
+# corroborated provenance merely by choosing a convincing string.
+ATTESTED_RUN_REF_PREFIX: str = "execution_gate:"
+
 #: The COMPLETE mode -> capability table of §1.3. Deliberately a total
 #: mapping rather than a first-match rule list: every mode names exactly what
 #: it permits, so adding a mode without deciding its capabilities is an
@@ -375,11 +381,9 @@ class DivergenceReading:
     #: WHERE the observation came from and whether its citation was checked.
     #: The divergence value alone answers "does the reading agree with the
     #: configuration?"; it cannot answer "was the reading measured?". Those
-    #: are two facts and one word must not carry both (#366): today every
-    #: observation written over HTTP is `control_server` with an
-    #: `uncorroborated` (or absent) `run_ref`, so a `match` is agreement with
-    #: a value a human typed -- true, but not a measurement. Both are `None`
-    #: for `unobserved`, where there is no observation to describe.
+    #: are two facts and one word must not carry both (#366). Publicly reported
+    #: pointers remain `uncorroborated`; an execution-boundary pointer is
+    #: `corroborated`. Both fields are `None` for `unobserved`.
     observation_source: Optional[str] = None
     run_ref_state: Optional[str] = None
 
@@ -1457,10 +1461,9 @@ def assignment_doc(row: sqlite3.Row) -> Dict[str, Any]:
 def observation_doc(row: sqlite3.Row) -> Dict[str, Any]:
     """One observation row, with the standing of its `run_ref` stated.
 
-    `run_ref_state` is DERIVED, never stored: `absent` when no pointer was
-    supplied, `uncorroborated` when one was. There is no third value, because
-    nothing on this path resolves the pointer -- and a reader must be able to
-    tell "this row cites a run" from "this row's citation was checked" (#366).
+    `run_ref_state` is DERIVED, never stored.  The execution boundary reserves
+    ``execution_gate:`` for a pointer it wrote immediately after creating the
+    canonical execution row; public callers cannot select that prefix.
     """
     run_ref = row["run_ref"]
     return {
@@ -1470,7 +1473,13 @@ def observation_doc(row: sqlite3.Row) -> Dict[str, Any]:
         "observed_mode": row["observed_mode"],
         "capability": row["capability"],
         "run_ref": run_ref,
-        "run_ref_state": "absent" if not run_ref else "uncorroborated",
+        "run_ref_state": (
+            "absent"
+            if not run_ref
+            else "corroborated"
+            if str(run_ref).startswith(ATTESTED_RUN_REF_PREFIX)
+            else "uncorroborated"
+        ),
         "source": row["source"],
         "detail": row["detail"],
         "recorded_at": row["recorded_at"],
