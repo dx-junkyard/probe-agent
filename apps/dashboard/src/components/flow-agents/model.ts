@@ -302,6 +302,7 @@ export const OBSERVATION_SOURCE_LABEL: Record<ExecutionModeObservationSource, st
 export const RUN_REF_STATE_LABEL: Record<ExecutionModeRunRefState, string> = {
   absent: "実行への参照なし",
   uncorroborated: "実行への参照は未照合",
+  corroborated: "実行への参照は照合済み",
 };
 
 /** The one-line standing shown beside every divergence reading. `null` when

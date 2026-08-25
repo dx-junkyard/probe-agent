@@ -306,8 +306,11 @@ HTTP 境界では 409 を返し、`denial_code`・実効モード・`source_scop
 
 ### 4.2 adapter 分離 (EM-ADR-3)
 
-実験用 LLM クライアントは **`build_experiment_llm_adapter` 経由でしか
-構築できない**。
+新しい Flow 実験用 LLM クライアントは
+**`build_experiment_llm_adapter` 経由でしか構築できない**。既存の
+Candidate Studio / Replay draft・regression scaffold は互換性のため各routeの
+client設定を維持するが、対象 Component を §4.4 で Node に写像し、同じ
+`llm_experiment_proposal` capability gateを**設定・資格情報の読取前**に通す。
 
 ```python
 def build_experiment_llm_adapter(
@@ -325,8 +328,8 @@ def build_experiment_llm_adapter(
 「設定で LLM を無効にしている」のではなく「資格情報を読む経路が実行されない」
 という違いがここにある。テストはこの順序を直接検証する(§9.1)。
 
-`propose` / `shadow` 以外のモードでこの関数を回避して `create_llm_client` を
-直接呼ぶ新しい経路を、この Epic の対象 Node に対して作ってはならない。
+`propose` / `shadow` 以外のモードでこのgateを回避して `create_llm_client` を
+直接呼ぶ経路を、この Epic の対象 Node に対して作ってはならない。
 
 **複数 Node の draft では、全 Node を資格情報の読み取り直前に再評価する。**
 `propose_flow_experiment` は Phase 1 で全 Node をゲートしたあと接続を閉じ、
@@ -500,11 +503,10 @@ LLM 経路もこの Epic の対象外のままである。
 #### 5.2.1 「一致したか」と「実測されたか」は別の軸
 
 `divergence` が答えるのは**設定と観測が一致するか**であって、**その観測が
-実測されたものか**ではない。現時点で runtime のモードを認証付きで attest
-できる経路は存在しない — HTTP で書かれた観測は必ず `source:
-control_server` で、`run_ref` は誰も解決していない
-(`run_ref_state: uncorroborated`)。したがって今日の `match` は
-**人が報告した値との一致**であって実測ではない。
+実測されたものか**ではない。公開 HTTP で書かれた任意の `run_ref` は
+canonical execution と照合されず `run_ref_state: uncorroborated` のままである。
+一方、実行 gate 自身が canonical execution row を作成した直後に書く観測は、
+外部入力で指定できない予約prefixを持ち `run_ref_state: corroborated` になる。
 
 この 2 つを 1 語で運ばないために(#366)、`observation_source` と
 `run_ref_state` を divergence の**隣に**別フィールドとして返し、
@@ -513,13 +515,9 @@ control_server` で、`run_ref` は誰も解決していない
 すべてに同じ値をそのまま伝える。観測が 1 件も無い `unobserved` では両方
 `null` である — 裏付けが無いことは裏付けの一種ではない(#380)。
 
-**残っている制約**: 認証付きの実測経路そのものはまだ無い。作るなら SDK か
-canonical execution からの attestation が要り、`sdk` はそのために語彙へ
-残してある(HTTP からは指定できない、§5.2 / #337)。それまでは
-`observation_source` が「これは報告値である」と明示し続けることが、
-報告値を実測として読ませないための唯一の担保である。なお、ゲート自身が
-観測を書く案は採らない — ゲートが適用したモードは実効モードそのものなので
-常に `match` になり、SDK 側の本物の乖離を覆い隠す。
+`source` は body では選べず、予約prefixも公開観測 API では拒否する。このため
+自己申告の `match` と、実際の実行入口を通過して正本 run へ結び付いた `match`
+は同じ表示にならない。後者は mode 変更後には通常どおり `stale` になる。
 
 ---
 
@@ -809,14 +807,44 @@ caller の申告でしかなかった — 同一 System で解決できる実行
   実験を走らせたこと**なので、2 つの提案が同じ実行を名乗るなら少なくとも
   片方は自分の実験を走らせていない。
 
-**採用しなかった案**: 「governed な対象へのすべての候補実行 request に
-`flow_experiment_proposal_id` を必須化する」。承認とモードが**独立した 2 つ
-の事実**であること(§7.5)が壊れるからである。提案を常に要求すれば
-`shadow` は単独では何も許可しないことになり、モード軸は capability の
-付与ではなくなる。加えて「既存コンポーネントの一括移行は Epic の明示的な
-非目標」(§0.2 / §4.4.3)であり、Node に link されているというだけで既存の
-Experiment / Replay 利用者を全員止めることになる。実行の時間的な上限は
-モード割り当ての `effective_until` が与える(EM-ADR-2)。
+さらに canonical 実行行自身(`experiments` / `replay_variants` /
+`shadow_results`)へ、実行入口で照合した `flow_experiment_proposal_id` と
+candidate ref、必要なら snapshot id を固定する。事後の execution API はこの
+固定値が無い実行を `execution_ref_authorization_missing`、別 proposal / candidate /
+snapshot の実行を mismatch として拒否する。現在の link を後から張り替えても
+この固定値は変わらず、caller の主張だけで別 Flow へ付け替えることはできない。
+
+**実行時 authorization**: governed な対象への候補実行 request は
+`flow_experiment_proposal_id` を必須とする。承認とモードは**独立した 2 つの
+事実**なので、どちらか一方ではなく両方を必要条件にする。`shadow` は候補実行
+capability を与え、承認済み proposal は「どの Flow / Node / candidate /
+snapshot を、どの isolation 契約で実行してよいか」を与える。
+
+この判定は事後の `/flow-experiments/{id}/executions` ではなく、実際に副作用が
+始まる前の Experiment / Replay variant / Candidate Studio / Shadow の各入口で行う。
+proposal が無い、未承認・withdrawn・期限切れ、target Node が違う、実行する
+patch の `patch_sha256:<hex>` が `candidate_refs` に無い、static Flow の pinned
+snapshot が違う、または承認後に side-effect / mode 条件が変わった場合は有限
+code で fail closed する。通過した実行は canonical execution row の作成時に
+`flow_experiment_execution_ref` と `execution_recorded` event へ記録するため、
+後から別 Flow の実行を付け替えて承認済みに見せることはできない。
+
+candidate executionではruntime/staticの別を問わずproposalにbaseline snapshotを
+pinする。runtime Flowでもpatch digestだけを別baselineへ流用することはできない。
+live Shadowはrequest本文のcandidate名やsnapshotを証拠にせず、Control Serverの
+`candidate_versions`または`replay_variants`正本IDからpatch digest・snapshot・
+Componentを解決する。正本IDが無い自由文claimは
+`execution_candidate_attestation_required`で拒否する。
+
+mode/lifecycle/link再検査、canonical pin、ledger insertは同じ
+`BEGIN IMMEDIATE`内で行う。SQLiteのprocess-local lockではなくDB write lockを
+使うため、複数workerのwithdraw/link変更とbindingのcheck-to-write raceも
+fail closedになる。1回実行されたgoverned Experiment rowはimmutableであり、
+別attemptは新しいExperiment rowを作る。
+
+§0.2 の一括移行非目標は維持する。Node へ link されていない `unmapped` target
+は従来互換で実行できるが、1 Node に確定した `governed` target には上記の二重
+gate を適用し、複数 Node に写る `ambiguous` target は従来どおり拒否する。
 
 ### 7.6 本番を書き換える経路を持たない
 

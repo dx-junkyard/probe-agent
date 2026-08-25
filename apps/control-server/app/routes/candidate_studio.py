@@ -26,7 +26,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from ..auth import get_system_id
 from ..candidate_studio import (
@@ -54,6 +54,7 @@ from ..models import (
     ReplayVariantRunCreate,
 )
 from ..replay_runner import replay_workspace_base
+from ..experiment_runner import patch_hash
 from ..workspace_context import _redact_and_truncate
 from .replay import (
     MAX_REPLAY_SET_SIZE,
@@ -612,6 +613,13 @@ def generate_candidate_version(
     with get_conn() as conn:
         session_row = _get_session_or_404(conn, session_id, system_id)
         component_id = session_row["component_id"]
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="llm_experiment_proposal",
+            target_kind="component",
+            target_ref=component_id,
+        )
         snapshot = _resolve_snapshot(conn, system_id, session_row["snapshot_id"])
         symbol = _resolve_component_symbol(
             conn, system_id, snapshot["id"], component_id
@@ -918,6 +926,10 @@ def replay_candidate_version(
             target_kind="component",
             target_ref=component_id,
             response=response,
+            flow_experiment_proposal_id=payload.flow_experiment_proposal_id,
+            candidate_refs=(f"patch_sha256:{patch_hash(patch_text)}",),
+            candidate_required=True,
+            snapshot_id=snapshot_id,
         )
         # Surface the human replay-approval gate here too (fail closed before
         # touching a worktree); create_replay_variant_run enforces it again.
@@ -945,6 +957,7 @@ def replay_candidate_version(
                 source="llm_draft",
             )
         ],
+        flow_experiment_proposal_id=payload.flow_experiment_proposal_id,
     )
     try:
         run = create_replay_variant_run(run_payload, system_id=system_id)
@@ -1006,6 +1019,7 @@ def replay_candidate_version(
 @router.post("/candidate-versions/{version_id}/promote", response_model=CandidatePromotionOut)
 def promote_candidate_version(
     version_id: int,
+    flow_experiment_proposal_id: Optional[int] = Query(default=None),
     system_id: int = Depends(get_system_id),
     response: Response = None,
 ) -> CandidatePromotionOut:
@@ -1037,6 +1051,10 @@ def promote_candidate_version(
             target_kind="component",
             target_ref=session_row["component_id"],
             response=response,
+            flow_experiment_proposal_id=flow_experiment_proposal_id,
+            candidate_refs=(f"patch_sha256:{version['patch_hash']}",),
+            candidate_required=True,
+            snapshot_id=session_row["snapshot_id"],
         )
         replay_run_id = version["replay_run_id"]
         replay_variant_id = version["replay_variant_id"]

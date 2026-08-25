@@ -7,10 +7,11 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
+from .. import flow_orchestration
 from ..auth import get_system_id
 from ..db import get_conn
 from ..experiment_runner import comparison_payload, execute_variant, patch_hash
@@ -25,7 +26,7 @@ from ..models import (
     ExperimentVariantResultOut,
 )
 from ..validation_runner import load_validation_config_text
-from .execution_modes import gate_execution_target
+from .execution_modes import gate_execution_target, record_attested_execution_observation
 from .snapshot_preflight import require_snapshot_preflight
 
 router = APIRouter()
@@ -577,6 +578,7 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
 @router.post("/experiments/{experiment_id}/run", response_model=ExperimentOut)
 def run_experiment(
     experiment_id: int,
+    flow_experiment_proposal_id: Optional[int] = Query(default=None),
     system_id: int = Depends(get_system_id),
     response: Response = None,
 ) -> ExperimentOut:
@@ -585,6 +587,26 @@ def run_experiment(
         row = _get_experiment_or_404(conn, experiment_id, system_id)
         if row["status"] == "running":
             raise HTTPException(status_code=409, detail="Experiment is already running")
+        if row["flow_experiment_proposal_id"] is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "experiment_execution_immutable",
+                    "message": (
+                        "A governed Experiment execution is immutable; create a new "
+                        "Experiment for another attempt."
+                    ),
+                },
+            )
+        candidate_refs = tuple(
+            f"patch_sha256:{variant['patch_hash']}"
+            for variant in conn.execute(
+                "SELECT patch_hash FROM experiment_variants "
+                "WHERE experiment_id = ? AND is_baseline = 0 ORDER BY id",
+                (experiment_id,),
+            ).fetchall()
+        )
+        conn.execute("BEGIN IMMEDIATE")
         # Execution-mode gate (#412 §4.3). An Experiment runs candidate source
         # variants in isolated worktrees, so it is `candidate_execution`. The
         # subject is the Experiment's `feature_id`, mapped to an Evolution Node
@@ -593,13 +615,17 @@ def run_experiment(
         # Features onto Nodes is an explicit Epic non-goal. The gate sits before
         # the status/variant reset below so a refusal leaves the Experiment
         # untouched rather than half-reset.
-        gate_execution_target(
+        execution_gate = gate_execution_target(
             conn,
             system_id=system_id,
             capability="candidate_execution",
             target_kind="feature",
             target_ref=row["feature_id"],
             response=response,
+            flow_experiment_proposal_id=flow_experiment_proposal_id,
+            candidate_refs=candidate_refs,
+            candidate_required=True,
+            snapshot_id=row["snapshot_id"],
         )
         snapshot = conn.execute(
             """
@@ -615,10 +641,35 @@ def run_experiment(
         conn.execute(
             """
             UPDATE experiments
-            SET status = 'running', error = NULL, started_at = ?, completed_at = NULL
+            SET status = 'running', error = NULL, started_at = ?, completed_at = NULL,
+                flow_experiment_proposal_id = ?,
+                flow_experiment_candidate_refs_json = ?
             WHERE id = ?
             """,
-            (now, experiment_id),
+            (
+                now,
+                flow_experiment_proposal_id,
+                json.dumps(candidate_refs, ensure_ascii=False),
+                experiment_id,
+            ),
+        )
+        if flow_experiment_proposal_id is not None:
+            flow_orchestration.record_execution(
+                conn,
+                system_id=system_id,
+                proposal_id=flow_experiment_proposal_id,
+                execution_kind="experiment",
+                execution_ref=str(experiment_id),
+                actor="execution-gate",
+                actor_kind="system",
+                note="Recorded at the governed Experiment execution boundary.",
+                now=now,
+            )
+        record_attested_execution_observation(
+            conn,
+            gate=execution_gate,
+            execution_kind="experiment",
+            execution_ref=str(experiment_id),
         )
         conn.execute(
             "DELETE FROM experiment_commands WHERE variant_id IN "
@@ -653,6 +704,7 @@ def run_experiment(
         execution_config = json.loads(row["execution_config"])
         repo_path = snapshot["repo_path"]
         commit_sha = row["baseline_commit"]
+        conn.execute("COMMIT")
 
     workspace_root = os.getenv("PROBE_EXPERIMENT_WORKSPACE_BASE", "/tmp/probe-experiments")
     os.makedirs(workspace_root, exist_ok=True)

@@ -269,6 +269,9 @@ CREATE TABLE IF NOT EXISTS shadow_results (
     candidate_duration_ms  REAL,
     evaluation             TEXT,
     timestamp              REAL NOT NULL,
+    flow_experiment_proposal_id INTEGER,
+    flow_experiment_candidate_ref TEXT,
+    flow_experiment_snapshot_id INTEGER,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
 );
 
@@ -1100,6 +1103,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     created_at           REAL NOT NULL,
     started_at           REAL,
     completed_at         REAL,
+    flow_experiment_proposal_id INTEGER,
+    flow_experiment_candidate_refs_json TEXT,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE RESTRICT
 );
@@ -2432,6 +2437,8 @@ CREATE TABLE IF NOT EXISTS replay_variants (
     created_at     REAL NOT NULL,
     started_at     REAL,
     completed_at   REAL,
+    flow_experiment_proposal_id INTEGER,
+    flow_experiment_candidate_ref TEXT,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
     FOREIGN KEY (replay_run_id) REFERENCES replay_runs (id) ON DELETE CASCADE
 );
@@ -6681,6 +6688,12 @@ CREATE INDEX IF NOT EXISTS idx_flow_experiment_proposal_system
 CREATE INDEX IF NOT EXISTS idx_flow_experiment_proposal_subject
     ON flow_experiment_proposal (system_id, flow_subject_kind, flow_subject_ref, id DESC);
 
+-- One completed drafting run may be provenance for exactly one proposal.
+-- NULL manual proposals remain unrestricted by SQLite's NULL semantics.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_flow_experiment_proposal_intelligence_run
+    ON flow_experiment_proposal (intelligence_run_id)
+    WHERE intelligence_run_id IS NOT NULL;
+
 -- flow_experiment_target: the Nodes the proposal is about. `target_node_key`
 -- is the Evolution Node's own durable slug (#394 ADR-2), resolved at read
 -- time -- never a stored row id trusted on its own (#405).
@@ -6760,7 +6773,7 @@ CREATE INDEX IF NOT EXISTS idx_flow_experiment_execution_ref_proposal
 
 -- One canonical execution backs exactly one proposal (§7.5.1), which is a
 -- lookup by the reference rather than by the proposal.
-CREATE INDEX IF NOT EXISTS idx_flow_experiment_execution_ref_target
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_experiment_execution_ref_target
     ON flow_experiment_execution_ref (system_id, execution_kind, execution_ref);
 
 -- flow_experiment_draft: WHAT one reasoning-model drafting run was about.
@@ -7415,6 +7428,48 @@ def _add_column_if_missing(
     existing_columns.add(column)
 
 
+def _migrate_flow_execution_ref_uniqueness(conn: sqlite3.Connection) -> None:
+    """Make the ledger's one-execution/one-proposal rule a DB invariant.
+
+    The previous index used this name but was non-unique.  Refuse startup when
+    historical duplicates exist rather than deleting audit facts silently.
+    """
+    duplicate = conn.execute(
+        """SELECT system_id, execution_kind, execution_ref, COUNT(*) AS n
+             FROM flow_experiment_execution_ref
+            GROUP BY system_id, execution_kind, execution_ref
+           HAVING COUNT(*) > 1 LIMIT 1"""
+    ).fetchone()
+    if duplicate is not None:
+        raise RuntimeError(
+            "flow_experiment_execution_ref contains duplicate canonical bindings: "
+            f"{duplicate['execution_kind']}:{duplicate['execution_ref']}"
+        )
+    conn.execute("DROP INDEX IF EXISTS idx_flow_experiment_execution_ref_target")
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_flow_experiment_execution_ref_target "
+        "ON flow_experiment_execution_ref (system_id, execution_kind, execution_ref)"
+    )
+
+
+def _migrate_canonical_execution_authorization(conn: sqlite3.Connection) -> None:
+    """Pin the proposal/candidate authorization on each canonical run row."""
+    for table, candidate_column in (
+        ("shadow_results", "flow_experiment_candidate_ref"),
+        ("experiments", "flow_experiment_candidate_refs_json"),
+        ("replay_variants", "flow_experiment_candidate_ref"),
+    ):
+        columns = _columns(conn, table)
+        _add_column_if_missing(
+            conn, table, columns, "flow_experiment_proposal_id", "INTEGER"
+        )
+        _add_column_if_missing(conn, table, columns, candidate_column, "TEXT")
+        if table == "shadow_results":
+            _add_column_if_missing(
+                conn, table, columns, "flow_experiment_snapshot_id", "INTEGER"
+            )
+
+
 def _ensure_legacy_system(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         "SELECT id FROM systems WHERE name = 'Legacy System' AND owner_user_id IS NULL"
@@ -7840,6 +7895,8 @@ def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
+        _migrate_canonical_execution_authorization(conn)
+        _migrate_flow_execution_ref_uniqueness(conn)
         _migrate_solution_design_option_unique(conn)
         _migrate_intelligence_runs_snapshot_nullable(conn)
         install_intelligence_run_type_guards(conn)

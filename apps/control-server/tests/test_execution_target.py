@@ -38,6 +38,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import execution_target
+from app.experiment_runner import patch_hash
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +271,87 @@ def _govern_component(client, headers, component_id, node_key, mode):
     _link(client, headers, node["id"], "component", component_id)
     _assign(client, headers, scope_kind="node", scope_ref=node_key, mode=mode)
     return node
+
+
+def _approved_flow_proposal(
+    system_id, node_key, candidate_refs, *, captured_snapshot_id=None
+):
+    """Create the canonical approval fact used by real execution boundaries.
+
+    This fixture intentionally seeds the ledger directly: proposal validation
+    has its own suite; these tests exercise the integration from an already
+    approved proposal into Replay / Experiment.
+    """
+    from app.db import get_conn
+
+    now = time.time()
+    flow_ref = f"execution-auth:{node_key}"
+    with get_conn() as conn:
+        node = conn.execute(
+            "SELECT id FROM evolution_node WHERE system_id = ? AND node_key = ?",
+            (system_id, node_key),
+        ).fetchone()
+        conn.execute(
+            """INSERT INTO evolution_node_link
+                   (system_id, node_id, link_kind, target_ref, created_by, created_at)
+               VALUES (?, ?, 'flow', ?, 'test', ?)""",
+            (system_id, node["id"], flow_ref, now),
+        )
+        cur = conn.execute(
+            """INSERT INTO flow_experiment_proposal
+                   (system_id, proposal_key, flow_subject_kind, flow_subject_ref,
+                    captured_snapshot_id,
+                    comparison_scope, title, purpose, hypothesis, baseline_ref,
+                    candidate_refs_json, evaluation_axes_json, quality_floor_json,
+                    isolation_strategy, isolation_detail, cost_cap_json,
+                    stop_conditions_json, rollback_plan, evidence_refs_json,
+                    decision_method, created_by, created_at)
+               VALUES (?, ?, ?, ?, ?, 'single_node', 't', 'p', 'h',
+                       'baseline:test', ?, '[{"level":"node","name":"match"}]',
+                       '{"match":1}', 'isolated_workspace', 'network-off',
+                       '{"max_runs":5}', '["stop"]', 'discard', '["test:evidence"]',
+                       'manual', 'root', ?)""",
+            (
+                system_id,
+                f"auth-{node_key}-{time.time_ns()}",
+                "static_flow" if captured_snapshot_id is not None else "runtime_flow",
+                flow_ref,
+                captured_snapshot_id,
+                json.dumps(list(candidate_refs)),
+                now,
+            ),
+        )
+        proposal_id = cur.lastrowid
+        conn.execute(
+            """INSERT INTO flow_experiment_target
+                   (system_id, proposal_id, target_node_key, target_role, position, created_at)
+               VALUES (?, ?, ?, 'candidate_target', 0, ?)""",
+            (system_id, proposal_id, node_key, now),
+        )
+        for kind in ("proposed", "approved"):
+            conn.execute(
+                """INSERT INTO flow_experiment_event
+                       (system_id, proposal_id, event_kind, actor_kind, actor,
+                        reason, decision_method, payload_json, created_at)
+                   VALUES (?, ?, ?, 'user', 'root', 'test', 'manual', '{}', ?)""",
+                (system_id, proposal_id, kind, now),
+            )
+    return proposal_id
+
+
+def _recorded_execution_refs(system_id, proposal_id):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        return [
+            (row["execution_kind"], row["execution_ref"])
+            for row in conn.execute(
+                """SELECT execution_kind, execution_ref
+                     FROM flow_experiment_execution_ref
+                    WHERE system_id = ? AND proposal_id = ? ORDER BY id""",
+                (system_id, proposal_id),
+            ).fetchall()
+        ]
 
 
 def _make_patch(repo, rel, transform):
@@ -539,6 +621,43 @@ def test_candidate_replay_refused_for_governed_node(admin_client, target_repo, m
 
 
 @pytest.mark.parametrize("mode", ["fixed", "observe"])
+def test_candidate_generation_refuses_before_llm_client_or_credentials(
+    admin_client, target_repo, monkeypatch, mode
+):
+    """The real legacy Candidate Studio entry point must share the mode gate;
+    testing only the adapter would leave its direct client construction open."""
+    _, _, headers, _ = _prepare(admin_client, target_repo)
+    _post_trace(admin_client, headers, "t1", "norm", args=("hello",), output="ok")
+    session = admin_client.post(
+        "/candidate-sessions",
+        json={"component_id": "norm", "trace_id": "t1"},
+        headers=headers,
+    )
+    assert session.status_code == 201, session.text
+    _govern_component(admin_client, headers, "norm", "norm-node", mode)
+
+    reached = False
+
+    def _credential_trap(_config):
+        nonlocal reached
+        reached = True
+        raise AssertionError("LLM credential/client path must be unreachable")
+
+    monkeypatch.setattr(
+        "app.routes.candidate_studio.create_llm_client", _credential_trap
+    )
+    response = admin_client.post(
+        f"/candidate-sessions/{session.json()['id']}/generate",
+        json={"instruction": "improve it"},
+        headers=headers,
+    )
+    detail = _denial(response)
+    assert detail["denial_code"] == "capability_not_permitted"
+    assert detail["mode"] == mode
+    assert reached is False
+
+
+@pytest.mark.parametrize("mode", ["fixed", "observe"])
 def test_candidate_promote_refused_for_governed_node(admin_client, target_repo, mode):
     """The whole candidate flow runs while the Component is still `unmapped`;
     the Node is linked and clamped afterwards. Promotion must then refuse --
@@ -610,10 +729,10 @@ def test_experiment_run_refused_for_governed_feature(admin_client, target_repo, 
 # ---------------------------------------------------------------------------
 
 
-def test_shadow_permits_the_same_governed_replay_variant_run(
+def test_shadow_requires_approved_proposal_then_permits_governed_replay_variant_run(
     admin_client, target_repo
 ):
-    _, _, headers, _ = _prepare(admin_client, target_repo)
+    _, _, headers, snapshot = _prepare(admin_client, target_repo)
     _post_trace(admin_client, headers, "t1", "norm", args=("hello",),
                 output="{'kind': 'a', 'size': 5}")
     replay_set = _create_set(admin_client, headers, ["t1"], "norm")
@@ -634,10 +753,42 @@ def test_shadow_permits_the_same_governed_replay_variant_run(
     _assign(admin_client, headers, scope_kind="node", scope_ref="norm-node",
             mode="shadow")
 
-    allowed = admin_client.post(
+    missing = admin_client.post(
         "/replay-variant-runs",
         json={"replay_set_id": replay_set["id"],
               "variants": [{"label": "c", "patch_text": patch, "source": "manual"}]},
+        headers=headers,
+    )
+    assert _denial(missing)["code"] == "execution_proposal_required"
+    wrong_proposal_id = _approved_flow_proposal(
+        int(headers["X-Probe-System-Id"]),
+        "norm-node",
+        ["patch_sha256:" + ("0" * 64)],
+        captured_snapshot_id=snapshot["id"],
+    )
+    wrong_candidate = admin_client.post(
+        "/replay-variant-runs",
+        json={
+            "replay_set_id": replay_set["id"],
+            "variants": [{"label": "c", "patch_text": patch, "source": "manual"}],
+            "flow_experiment_proposal_id": wrong_proposal_id,
+        },
+        headers=headers,
+    )
+    assert _denial(wrong_candidate)["code"] == "execution_candidate_not_authorized"
+    proposal_id = _approved_flow_proposal(
+        int(headers["X-Probe-System-Id"]),
+        "norm-node",
+        [f"patch_sha256:{patch_hash(patch)}"],
+        captured_snapshot_id=snapshot["id"],
+    )
+    allowed = admin_client.post(
+        "/replay-variant-runs",
+        json={
+            "replay_set_id": replay_set["id"],
+            "variants": [{"label": "c", "patch_text": patch, "source": "manual"}],
+            "flow_experiment_proposal_id": proposal_id,
+        },
         headers=headers,
     )
     assert allowed.status_code == 201, allowed.text
@@ -648,6 +799,31 @@ def test_shadow_permits_the_same_governed_replay_variant_run(
     assert allowed.headers[execution_target.NODE_HEADER] == "norm-node"
     candidate = next(v for v in run["variants"] if not v["is_baseline"])
     assert candidate["apply_status"] == "applied"
+    assert _recorded_execution_refs(
+        int(headers["X-Probe-System-Id"]), proposal_id
+    ) == [("replay_variant_run", str(candidate["id"]))]
+    shadow = admin_client.post(
+        "/components/norm/shadow-results",
+        json={
+            "trace_id": "shadow-canonical",
+            "component_id": "norm",
+            "current_output": "baseline",
+            "candidate_output": "candidate",
+            "candidate_duration_ms": 1.0,
+            "timestamp": time.time(),
+            "flow_experiment_proposal_id": proposal_id,
+            "flow_experiment_candidate_kind": "replay_variant",
+            "flow_experiment_candidate_id": candidate["id"],
+        },
+        headers=headers,
+    )
+    assert shadow.status_code == 201, shadow.text
+    assert _recorded_execution_refs(
+        int(headers["X-Probe-System-Id"]), proposal_id
+    ) == [
+        ("replay_variant_run", str(candidate["id"])),
+        ("shadow_result", str(shadow.json()["id"])),
+    ]
 
 
 def test_shadow_permits_the_governed_experiment_run(admin_client, target_repo):
@@ -662,13 +838,64 @@ def test_shadow_permits_the_governed_experiment_run(admin_client, target_repo):
     _assign(admin_client, headers, scope_kind="node", scope_ref="calc-node",
             mode="shadow")
 
+    missing = admin_client.post(f"/experiments/{experiment['id']}/run", headers=headers)
+    assert _denial(missing)["code"] == "execution_proposal_required"
+    other_snapshot = admin_client.post("/repository/snapshots", headers=headers)
+    assert other_snapshot.status_code == 201, other_snapshot.text
+    wrong_snapshot_proposal = _approved_flow_proposal(
+        int(headers["X-Probe-System-Id"]),
+        "calc-node",
+        [
+            f"patch_sha256:{variant['patch_hash']}"
+            for variant in experiment["variants"]
+            if not variant["is_baseline"]
+        ],
+        captured_snapshot_id=other_snapshot.json()["id"],
+    )
+    wrong_snapshot = admin_client.post(
+        f"/experiments/{experiment['id']}/run",
+        params={"flow_experiment_proposal_id": wrong_snapshot_proposal},
+        headers=headers,
+    )
+    assert _denial(wrong_snapshot)["code"] == "execution_snapshot_mismatch"
+    proposal_id = _approved_flow_proposal(
+        int(headers["X-Probe-System-Id"]),
+        "calc-node",
+        [
+            f"patch_sha256:{variant['patch_hash']}"
+            for variant in experiment["variants"]
+            if not variant["is_baseline"]
+        ],
+        captured_snapshot_id=snapshot["id"],
+    )
     response = admin_client.post(
-        f"/experiments/{experiment['id']}/run", headers=headers
+        f"/experiments/{experiment['id']}/run",
+        params={"flow_experiment_proposal_id": proposal_id},
+        headers=headers,
     )
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "completed"
     assert response.headers[execution_target.GOVERNANCE_HEADER] == "governed"
     assert response.headers[execution_target.MODE_HEADER] == "shadow"
+    assert _recorded_execution_refs(
+        int(headers["X-Probe-System-Id"]), proposal_id
+    ) == [("experiment", str(experiment["id"]))]
+    divergence = admin_client.get(
+        "/execution-modes/divergence", headers=headers
+    ).json()["nodes"]
+    calc = next(item for item in divergence if item["node_key"] == "calc-node")
+    assert calc["divergence"] == "match"
+    assert calc["run_ref_state"] == "corroborated"
+    rerun = admin_client.post(
+        f"/experiments/{experiment['id']}/run",
+        params={"flow_experiment_proposal_id": proposal_id},
+        headers=headers,
+    )
+    assert rerun.status_code == 409, rerun.text
+    assert rerun.json()["detail"]["code"] == "experiment_execution_immutable"
+    assert _recorded_execution_refs(
+        int(headers["X-Probe-System-Id"]), proposal_id
+    ) == [("experiment", str(experiment["id"]))]
 
 
 def test_system_scope_shadow_reaches_a_governed_node(admin_client, target_repo):
@@ -682,12 +909,53 @@ def test_system_scope_shadow_reaches_a_governed_node(admin_client, target_repo):
     node = _create_node(admin_client, headers, "norm-node")
     _link(admin_client, headers, node["id"], "component", "norm")
     _assign(admin_client, headers, scope_kind="system", scope_ref="", mode="shadow")
+    proposal_id = _approved_flow_proposal(
+        int(headers["X-Probe-System-Id"]), "norm-node", ["candidate:baseline-replay"]
+    )
 
     response = admin_client.post(
-        "/replay-runs", json={"replay_set_id": replay_set["id"]}, headers=headers
+        "/replay-runs",
+        json={
+            "replay_set_id": replay_set["id"],
+            "flow_experiment_proposal_id": proposal_id,
+        },
+        headers=headers,
     )
     assert response.status_code == 201, response.text
     assert response.headers[execution_target.MODE_HEADER] == "shadow"
+
+
+def test_governed_shadow_rejects_free_text_candidate_and_snapshot_claims(
+    admin_client, target_repo
+):
+    _, _, headers, snapshot = _prepare(admin_client, target_repo)
+    _govern_component(admin_client, headers, "norm", "norm-node", "shadow")
+    proposal_id = _approved_flow_proposal(
+        int(headers["X-Probe-System-Id"]),
+        "norm-node",
+        ["patch_sha256:" + ("a" * 64)],
+        captured_snapshot_id=snapshot["id"],
+    )
+    response = admin_client.post(
+        "/components/norm/shadow-results",
+        json={
+            "trace_id": "shadow-claim",
+            "component_id": "norm",
+            "current_output": "baseline",
+            "candidate_output": "unverified candidate",
+            "candidate_duration_ms": 1.0,
+            "timestamp": time.time(),
+            "flow_experiment_proposal_id": proposal_id,
+            "flow_experiment_candidate_ref": "patch_sha256:" + ("a" * 64),
+            "flow_experiment_snapshot_id": snapshot["id"],
+        },
+        headers=headers,
+    )
+    assert response.status_code == 409, response.text
+    assert (
+        response.json()["detail"]["code"]
+        == "execution_candidate_attestation_required"
+    )
 
 
 def test_expired_node_assignment_refuses_rather_than_inheriting(

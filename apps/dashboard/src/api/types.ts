@@ -6527,7 +6527,7 @@ export type ExecutionModeObservationSource = "control_server" | "sdk";
  * nothing on this path resolves the pointer against a canonical execution
  * row, so there is no `resolved` value to report. "This row cites a run" and
  * "this row's citation was checked" must stay distinguishable (#366). */
-export type ExecutionModeRunRefState = "absent" | "uncorroborated";
+export type ExecutionModeRunRefState = "absent" | "uncorroborated" | "corroborated";
 
 export interface ExecutionModeScopeReadingOut {
   scope_kind: ExecutionModeScopeKind;

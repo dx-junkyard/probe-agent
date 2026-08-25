@@ -141,6 +141,10 @@ def gate_execution_target(
     target_kind: str,
     target_ref,
     response=None,
+    flow_experiment_proposal_id: Optional[int] = None,
+    candidate_refs=(),
+    candidate_required: bool = False,
+    snapshot_id: Optional[int] = None,
 ) -> execution_target.ExecutionTargetGate:
     """The single HTTP-boundary form of the §4.3 candidate-execution gate.
 
@@ -169,8 +173,61 @@ def gate_execution_target(
     except execution_mode.ExecutionModeDenied as exc:
         raise_execution_mode_denied(exc)
         raise  # pragma: no cover - the helper always raises
+    if gate.mapping.governance == "governed" and capability in {
+        "candidate_execution",
+        "shadow_comparison",
+    }:
+        # Approval and mode are separate facts, and a governed candidate path
+        # requires both.  This check occurs at the actual execution boundary;
+        # a post-hoc ledger attachment cannot authorize work retroactively.
+        from .. import flow_orchestration
+
+        try:
+            flow_orchestration.require_execution_authorization(
+                conn,
+                system_id=system_id,
+                proposal_id=flow_experiment_proposal_id,
+                node_key=gate.mapping.node_key or "",
+                candidate_refs=tuple(candidate_refs),
+                candidate_required=candidate_required,
+                snapshot_id=snapshot_id,
+            )
+        except flow_orchestration.FlowExperimentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except flow_orchestration.FlowExperimentRejected as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": str(exc), "detail": list(exc.detail)},
+            ) from exc
+        except flow_orchestration.FlowExperimentValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     execution_target.apply_governance_headers(response, gate)
     return gate
+
+
+def record_attested_execution_observation(
+    conn,
+    *,
+    gate: execution_target.ExecutionTargetGate,
+    execution_kind: str,
+    execution_ref: str,
+) -> None:
+    """Record the mode observed by the gate against a canonical run ref."""
+    if not gate.enforced or gate.decision is None or not gate.mapping.node_key:
+        return
+    execution_mode.record_observation(
+        conn,
+        system_id=gate.mapping.system_id,
+        node_key=gate.mapping.node_key,
+        observed_mode=gate.decision.mode,
+        capability=gate.capability,
+        run_ref=(
+            f"{execution_mode.ATTESTED_RUN_REF_PREFIX}"
+            f"{execution_kind}:{execution_ref}"
+        ),
+        source=execution_mode.HTTP_OBSERVATION_SOURCE,
+        detail="Attested by the control-server execution boundary.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -484,10 +541,10 @@ def create_observation(
     principal). When an SDK-attested path exists it will write the row through
     its own authenticated boundary, not through this one.
 
-    `run_ref` is stored but NOT resolved -- nothing here matches it against a
-    canonical execution row -- so the response reports
-    `run_ref_state: "uncorroborated"` (or `"absent"`). It is the caller's
-    pointer, and an unverified pointer is never provenance (Principle 7).
+    A public `run_ref` is stored but not resolved, so it reports
+    `run_ref_state: "uncorroborated"` (or `"absent"`). The reserved
+    `execution_gate:` prefix is rejected here; only a server execution boundary
+    that just created the canonical row can produce `corroborated`.
 
     A `node_key` that names no Evolution Node is a 404, the same answer
     `resolve` and `divergence` now give: an observation about a subject that
@@ -495,6 +552,10 @@ def create_observation(
     """
     with get_conn() as conn:
         try:
+            if (payload.run_ref or "").startswith(execution_mode.ATTESTED_RUN_REF_PREFIX):
+                raise execution_mode.ExecutionModeValidationError(
+                    "run_ref uses a prefix reserved for execution-boundary attestation"
+                )
             row = execution_mode.record_observation(
                 conn,
                 system_id=system_id,
