@@ -1756,6 +1756,72 @@ creating incomplete persistence or execution paths for later phases.
     Need / Observation / Exchange の確認・却下・廃止・復帰、role assignment、
     参照の確定もすべて `decision_method: manual`。
 
+27. Issue #427(subs #428-#433)— Vision と UX の間へ **Product Objective /
+    Milestone / Gap** の正本を導入する Epic。Purpose Chain(#387-#391)は
+    Vision → Purpose → Capability を、UX Design Lineage(#405-#409)と
+    Stakeholder / Functional Lineage(#418-#424)はその下流を保持できるが、
+    **「Vision へ近づくための中間目標」「その検証可能な到達点」「現状と目標状態の
+    差」を第一級の正本として持つ層が無い**。今の「目標」と「Gap」は Intent Brief
+    `goal` / Capability / Overview `next_milestone`(静的表示文)/ `cell_goals`
+    (Cell の実行委譲用)/ System Understanding Gap / Functional Lineage Gap /
+    Journey diff / runtime mismatch へ分散しており、個別の不足は検出できても
+    「どの Vision の、どの中間目標に対する Gap で、それを解消するためにどの
+    UX・Feature・実装・評価が要るか」を一続きに説明できない。
+    `docs/product-objective-lineage.md` が canonical contract で、§0 を読んで
+    からこの領域に触ること。依存順に #428(契約)→ #429(永続化 / API)→
+    #430(既存 Gap federation)→ #431(UX / Feature lineage)→ #432(Dashboard)
+    → #433(E2E / migration / dogfooding)。後から変えるときに守ること:
+    - **新しい理解モデルを作らない。** Vision / Purpose / Capability /
+      Stakeholder / Need / Journey / Requirement / Solution Design / Flow /
+      Node / Component / Cell / Outcome の正本は既存のまま。この層が持つのは
+      Objective / Milestone / Gap / Feature という新しく著述される成果物と、
+      上下への参照 (ref / link) だけ。上流・下流の内容を列へコピーしない。
+    - **identity は `(system_id, <kind>_key)`** の開発者指定 slug。Purpose 要素 id
+      (名前 hash)からも行 id からも LLM 生成 hash からも導出しない。
+    - **Objective の親は append-only link、Milestone の所属 Objective と Gap の
+      所属 Milestone は identity 行の列。** 親は任意で再親付けが正常に起き、
+      所属は必須で変われば主題自体が変わる(`ux_journey.perspective` と同じ理由)。
+      循環は訪問済み集合を持つ反復で決定的に拒否する。
+    - **Milestone の「定義の確定」と「達成判定」は別テーブル・別軸。**
+      `design_status` は `product_milestone_decision`、`achievement` は
+      `product_milestone_assessment` から導出する。進捗率の列は存在しない。
+      `unassessed`(誰も見ていない)と `indeterminate`(人が見て判定できなかった)
+      を畳まない。
+    - **Gap は 6 軸を分ける**: 検出元 / 現在状態 / 目標状態 / 解釈 / 優先判断 /
+      解消状態。Gap に severity 列も score 列も存在しない — 構造で合成を禁じる。
+      優先度は人間が置く有限バンド (`unset`/`watch`/`next`/`now`) だけ。
+    - **既存 Gap は本文コピーで移行しない。** 14 個の有限 `source_kind` それぞれに
+      唯一の resolver を持ち、読み取り時に解決する。参照は再計算に耐えるものだけ
+      (`capability_drift` は `(path, qualified_name)`、`runtime_alignment_mismatch`
+      は #321 の `review_subject_id`。再構築で振り直される
+      `capability_hierarchy_nodes.id` / `alignment_item.id` は使わない)。
+    - **`current` / `changed` / `contradicted` / `disappeared` / `unavailable` は
+      5 つの別の答え**で、source の状態は Gap の lifecycle を一切動かさない。
+      動かせるのは読み取り時の `recheck_required` / `reopen_candidate` /
+      `close_candidate` フラグだけで、状態は人間の決定でしか動かない。
+    - **達成は伝播しない。** Milestone が全部 `met` でも Objective は自動達成せず、
+      Gap が全部 `resolved` でも Milestone の `achievement` は動かない。
+      trace / experiment / replay / Design Option 採用も何も確定しない。
+    - **`cell_goals` を Product Objective へ流用しない**(#300 は Cell の実行責任、
+      本 Epic は製品の中間目標)。**Feature を Flow / Component / Capability へ
+      畳まない**。**Gap を Issue Draft の identity にしない**(Issue Draft は Gap の
+      下流の外部化候補)。
+    - **`feature_drafts` は snapshot 束縛のまま維持**し、System-scoped stable な
+      `product_feature` と `product_feature_draft_link` で結ぶ。draft の本文は
+      コピーしない。
+    - 既存テーブルへの変更は 1 つだけ:
+      `ux_journey_upstream_ref.ref_kind` へ `product_objective` /
+      `product_milestone` / `product_gap` を足すためのテーブル再構築 migration
+      (`_migrate_solution_design_option_unique` と同じ構造的検出で冪等)。
+      Overview の `OverviewLoopStageOut.next_milestone` は canonical Milestone では
+      ないので `stage_completion_hint` へ改名する。
+    - **サイドバーへ 3 項目足さない。** 新規は `Objective Map` の 1 項目だけで、
+      Gap Workbench はその第 2 レーン (`/objective-map?view=gaps`)。
+    既存の human gate は一切緩めない。この Epic が追加する Objective /
+    Milestone / Gap / Feature の確定、Milestone 達成判定、Gap の解消・reopen・
+    優先バンド設定もすべて `decision_method: manual`。
+
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,
