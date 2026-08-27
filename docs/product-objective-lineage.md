@@ -701,6 +701,14 @@ CREATE TABLE IF NOT EXISTS product_milestone_assessment (
 | `capability_entity` | `understanding_capability_entity`(#312 の current head) | `understanding_capability_entity.id` の 10 進文字列 |
 | `stakeholder_need` | `stakeholder_network` の Need identity | `need_key` |
 
+**`vision_claim` の digest は `understanding_brief.claim_digest` を使う。**
+`claim_digest` は生の understanding item(dict)を受け取るので、resolver は
+`BriefClaim` ではなく `current_understanding['vision']`(確定 Intent `goal` 由来の
+場合は `interview_intent_item` の該当行)から digest を取る。`claim_payload` は
+**名前を除いた**意味だけを hash するので、名前の変更は「別の claim」として
+`unresolved` に、本文の変更は同じ claim の `stale` になる — これは
+`understanding_diff` / #380 が既に採っている区別で、この層で作り直さない。
+
 **Vision には行 identity が無い。** `BriefResult.vision` は
 `understanding_brief` が毎回導出する claim であり、その identity は
 `understanding_diff` と同じ **exact name equality** である。したがって
@@ -891,7 +899,7 @@ ProductGapDecisionKind = Literal[
 | `reject` | `rejected` | `open`, `acknowledged`, `deferred` |
 | `retire` | `obsolete` | `open`, `acknowledged`, `deferred` |
 | `reopen` | `open` | `resolved`, `rejected`, `obsolete`, `deferred` |
-| `prioritize` | 変化なし | 任意(`resolved`/`rejected`/`obsolete` では 422) |
+| `prioritize` | 変化なし(`priority_band` だけを動かす) | `open`, `acknowledged`, `deferred`(終端状態では 422 — 片付いた Gap に優先度を置く意味が無い) |
 
 * `rejected` — 人が「これは Gap ではない」と判断した。
 * `obsolete` — 人が「この Gap はもう問いとして成り立たない」と判断した
@@ -929,6 +937,51 @@ ProductGapPriorityBand = Literal["unset", "watch", "next", "now"]
 * **偽の URL を組み立てない。** 「画面が無い」と「リンクが壊れている」は別の
   事実で、前者は正直に表示する。
 * #401 が画面を作った時点で表を 1 行直せば済む。
+
+### 5.10 resolver の呼び出し契約
+
+`app/product_gap_sources.py` は Gap の CRUD から独立した pure な解決層である。
+`product_objective.py` はこの 1 つの関数だけを呼び、`source_kind` ごとの分岐を
+自分で持たない。
+
+```python
+SOURCE_KINDS: Tuple[str, ...]          # get_args(ProductGapSourceKind)
+SOURCE_STATES: Tuple[str, ...]         # get_args(ProductGapSourceState)
+
+@dataclass(frozen=True)
+class ResolvedSource:
+    source_state: str                  # ProductGapSourceState
+    title: str                         # 検出元が持つ見出し。無ければ code から作る
+    detail: str                        # 1-2 文の説明
+    severity: Optional[str]            # 検出元の語彙のまま。無ければ None
+    severity_vocabulary: Optional[str] # 例 "gap_triage" / "functional_lineage" / "node_anomaly"
+    current_digest: str                # captured_digest と比較する対象
+    deep_link: Optional[str]           # 画面が無ければ None
+    deep_link_state: str               # ProductDeepLinkState
+    extra: Dict[str, Any]              # kind 固有の表示用事実。判定には使わない
+
+def resolve_source(
+    conn, *, system_id: int, source_kind: str, source_ref: str,
+    captured_digest: str = "",
+    captured_snapshot_id: Optional[int] = None,
+    captured_run_id: Optional[int] = None,
+    captured_revision_id: Optional[int] = None,
+) -> ResolvedSource: ...
+```
+
+* `source_state` の決定は resolver 内で **first match**:
+  1. 正本の読み取りが例外 → `unavailable`
+  2. `source_ref` が現在の正本に無い → `disappeared`
+  3. §5.4 の表の `contradicted` 条件に当たる → `contradicted`
+  4. `captured_digest` が空でなく `current_digest` と食い違う → `changed`
+  5. それ以外 → `current`
+* **`resolve_source` は例外を外へ投げない。** 読めなかったことは
+  `source_state='unavailable'` という**結果**であり、呼び出し側の失敗ではない
+  (§5.5)。ただし `source_kind` が語彙外なら `ValueError` を投げる — それは
+  データではなくプログラムの誤りである。
+* `severity` を翻訳・正規化しない。`severity_vocabulary` を必ず添えて、
+  どの語彙の値なのかを表示側が言えるようにする(#380 superset 規則)。
+* `extra` は表示のためだけにある。**projection はここから状態を決めない。**
 
 ### 5.9 テーブル(#429 / #430)
 
@@ -1325,7 +1378,7 @@ Overview の既存 15 行 first-match 表(`overview_projection.decide_next_actio
 | # | 条件 | key |
 | --- | --- | --- |
 | 1 | Brief / Objective のどちらかが読めない | `unavailable`(action 無し) |
-| 2 | Vision が未確定 | `confirm_vision` |
+| 2 | Vision claim が無い、または `BriefClaim.confirmation` が `confirmed` 以外(`understanding_brief` の判定をそのまま読む。再導出しない) | `confirm_vision` |
 | 3 | Objective が 1 つも無い | `create_objective` |
 | 4 | `proposed` の Objective がある | `confirm_objective` |
 | 5 | `active` な Objective が無い | `activate_objective` |
