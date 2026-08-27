@@ -16,10 +16,12 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import redaction as _redaction
+
 _ALLOWED_OPS = ("len", "count", "exists", "sha256")
 _ENTITY_ROLES = ("source", "derived", "related")
 _PHASES = ("input", "output")
-_REDACTED = "██redacted██"
+_REDACTED = _redaction.REDACTION_MARKER
 
 _MISSING = object()
 
@@ -131,57 +133,13 @@ def _resolve(segments: List[tuple], root: Any) -> List[Any]:
 # redact path (over-redaction is safe; under-redaction is not).
 
 def _redact_one(node: Any, segs: List[tuple]) -> Tuple[Any, bool]:
-    """Return (new_node, blocked). ``blocked`` means the path could not be
-    applied structurally and the value may still be reachable via attributes."""
-    if not segs:
-        return _REDACTED, False
-    seg, rest = segs[0], segs[1:]
-    if seg[0] == "key":
-        if isinstance(node, dict):
-            if seg[1] in node:
-                new_val, blocked = _redact_one(node[seg[1]], rest)
-                new = dict(node)
-                new[seg[1]] = new_val
-                return new, blocked
-            return node, False  # absent in a dict — nothing to leak
-        return node, True  # attribute access could still resolve this key
-    if seg[0] == "index":
-        if isinstance(node, (list, tuple)):
-            if -len(node) <= seg[1] < len(node):
-                new = list(node)
-                new_val, blocked = _redact_one(node[seg[1]], rest)
-                new[seg[1]] = new_val
-                return new, blocked
-            return node, False
-        return node, True
-    # wildcard
-    if isinstance(node, (list, tuple)):
-        blocked = False
-        out = []
-        for v in node:
-            new_val, b = _redact_one(v, rest)
-            out.append(new_val)
-            blocked = blocked or b
-        return out, blocked
-    if isinstance(node, dict):
-        blocked = False
-        new = {}
-        for k, v in node.items():
-            new_val, b = _redact_one(v, rest)
-            new[k] = new_val
-            blocked = blocked or b
-        return new, blocked
-    return node, True
+    """Compatibility wrapper around the shared pure redaction function."""
+    return _redaction.redact_path(node, segs, marker=_REDACTED)
 
 
 def _apply_redaction(root: Any, redact_segments: List[List[tuple]]) -> Tuple[Any, List[List[tuple]]]:
     """Apply structural redaction; return (root, blocked_paths)."""
-    blocked_paths: List[List[tuple]] = []
-    for segs in redact_segments:
-        root, blocked = _redact_one(root, segs)
-        if blocked:
-            blocked_paths.append(segs)
-    return root, blocked_paths
+    return _redaction.apply_path_redactions(root, redact_segments, marker=_REDACTED)
 
 
 def _segments_overlap(a: List[tuple], b: List[tuple]) -> bool:

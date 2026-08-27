@@ -105,6 +105,138 @@ INTERVIEW_MESSAGES: dict = {
         "ja": "「{name}」({section})の根拠がドキュメント・コードから見つかりませんでした。この項目は正しいですか?",
         "en": "No evidence for {section} item: {name}. Is this item correct?",
     },
+    # Issue #352: deterministic confidence reason written onto a Vision claim
+    # the reasoning model produced without any snapshot evidence. It is a
+    # fixed sentence, never the model's own wording, and it exists so the
+    # Understanding Brief can explain WHY the Vision is shown as a hypothesis.
+    "vision_without_evidence": {
+        "ja": "ドキュメント・コード上の根拠がないため、AI の推定にとどまります。",
+        "en": "No documentation or code evidence: this remains an AI hypothesis.",
+    },
+    # Issue #285: fixed, non-LLM-fabricated message stored on an Inquiry when
+    # the reasoning model determined it cannot answer (answerable=false).
+    # Never the model's own wording -- a lookup-table sentence only.
+    "inquiry_insufficient_information": {
+        "ja": "回答に必要な情報が不足しています。「解消していない」から追加の質問をするか、「今回は保留する」を選んでください。",
+        "en": (
+            "There is not enough information to answer this. Ask a follow-up "
+            "question, or choose \"hold for now\"."
+        ),
+    },
+    # Issue #286: deterministic Response Composer templates. Never LLM
+    # output -- these are the fixed frame around a Question Router /
+    # Investigation Agent result, never the model's own free-text wording.
+    "inquiry_human_only_answer": {
+        "ja": (
+            "この点はコードから判断できるものではなく、あなたご自身の判断が必要です。\n\n"
+            "ご質問: {question}\n\n"
+            "AI 判断根拠: {reason}"
+        ),
+        "en": (
+            "This is not something the code can determine -- it needs your "
+            "own decision.\n\n"
+            "Your question: {question}\n\n"
+            "AI classification reason: {reason}"
+        ),
+    },
+    "inquiry_hybrid_unresolved_note": {
+        "ja": "コードからの調査だけでは十分な根拠が見つかりませんでした。",
+        "en": "The code investigation alone did not find enough grounding.",
+    },
+    "inquiry_hybrid_decision_heading": {
+        "ja": "確認したいこと:",
+        "en": "What we'd like you to decide:",
+    },
+    "inquiry_hybrid_default_decision_question": {
+        "ja": "この点について、あなたの判断を教えてください:「{question}」",
+        "en": "Please share your own decision on this: \"{question}\"",
+    },
+    # Issue #290: fixed, non-LLM-fabricated pointer shown once an
+    # observation proposal is approved. Approving never starts observation
+    # itself -- this only points back at the existing policy endpoint.
+    "observation_proposal_policy_hint": {
+        "ja": (
+            "この提案は承認されましたが、観測はまだ開始されていません。"
+            "「{component_id}」の実行時観測を開始するには、"
+            "既存のポリシー設定画面からこのコンポーネントの mode を "
+            "trace または shadow に変更してください。"
+        ),
+        "en": (
+            "This proposal has been approved, but observation has not started "
+            "yet. To start runtime observation for \"{component_id}\", change "
+            "this component's mode to trace or shadow from the existing "
+            "policy settings."
+        ),
+    },
+    # Epic #328 Phase C (#331): the finite next-action menu of a Joint
+    # Understanding session. Two entries per app/joint_understanding.py's
+    # ACTION_KINDS -- the button label and, per Epic #328, what choosing it
+    # actually changes ("各選択肢が何を変えるか"). Fixed templates, never LLM
+    # output, so the menu is identical for identical state.
+    "joint_action_request_investigation_label": {
+        "ja": "さらに調査する",
+        "en": "Investigate further",
+    },
+    "joint_action_request_investigation_effect": {
+        "ja": "固定したスナップショットを追加で読み、不足していた証拠を埋めます。回答は確定しません。",
+        "en": "Reads more of the pinned snapshot to fill the missing evidence. Nothing is confirmed.",
+    },
+    "joint_action_explain_reasoning_label": {
+        "ja": "判断の理由を説明してもらう",
+        "en": "Explain the reasoning",
+    },
+    "joint_action_explain_reasoning_effect": {
+        "ja": "今わかっている事実と推論のつながりを、目的への意味として説明し直します。新しい事実は増えません。",
+        "en": "Re-explains how the known facts connect to your goal. No new facts are added.",
+    },
+    "joint_action_compare_options_label": {
+        "ja": "選択肢を比較する",
+        "en": "Compare the options",
+    },
+    "joint_action_compare_options_effect": {
+        "ja": "取りうる選択肢と、それぞれで何が変わるか・何を諦めるかを並べます。選ぶのはあなたです。",
+        "en": "Lays out the available options and what each changes or costs. You still choose.",
+    },
+    "joint_action_adopt_hypothesis_label": {
+        "ja": "仮説を暫定的に採用する",
+        "en": "Adopt the hypothesis provisionally",
+    },
+    "joint_action_adopt_hypothesis_effect": {
+        "ja": "仮説を「暫定」として記録します。事実にはならず、後で再検証の対象として残ります。",
+        "en": "Records the hypothesis as PROVISIONAL. It does not become a fact and stays subject to re-verification.",
+    },
+    "joint_action_revise_intent_label": {
+        "ja": "意図を修正する",
+        "en": "Revise the intent",
+    },
+    "joint_action_revise_intent_effect": {
+        "ja": "あなたの目的や期待の記述を見直します。実装上の事実は変わりません。",
+        "en": "Revisits your own goal or expectation. The implementation facts do not change.",
+    },
+    "joint_action_hold_label": {
+        "ja": "今は保留する",
+        "en": "Hold for now",
+    },
+    "joint_action_hold_effect": {
+        "ja": "この対話を中断し、いつでも再開できるようにします。元の確認項目は未回答のまま残ります。",
+        "en": "Pauses this conversation so it can resume later. The original item stays unanswered.",
+    },
+    "joint_action_handoff_label": {
+        "ja": "他の人に引き継ぐ",
+        "en": "Hand off to someone else",
+    },
+    "joint_action_handoff_effect": {
+        "ja": "判断できる人へ引き継ぎます。引き継ぎ先の回答があなたの回答として記録されることはありません。",
+        "en": "Hands the decision to someone who can make it. Their answer is never recorded as yours.",
+    },
+    "joint_action_decide_label": {
+        "ja": "判断を確定する",
+        "en": "Record the decision",
+    },
+    "joint_action_decide_effect": {
+        "ja": "この対話での判断を確定として記録します。元の確認項目の回答は、項目ごとの操作で別途行います。",
+        "en": "Records your decision for this conversation. Answering the original item is still a separate step.",
+    },
 }
 
 # Deterministic fallback language for the fixed-text messages above only,

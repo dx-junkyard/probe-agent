@@ -11,6 +11,7 @@ export function CodeBlock({ children, lang }: { children: string; lang: string }
       <Button
         variant="ghost" size="icon" className="absolute top-2 right-2 h-7 w-7"
         onClick={() => { navigator.clipboard.writeText(children); toast.success("Copied"); }}
+        aria-label={`${lang}コードをコピー`}
         title={`Copy ${lang} code`}
       >
         <Copy className="h-3 w-3" />

@@ -1,20 +1,9 @@
 const BASE = "/api";
 
-let sessionToken: string | null = localStorage.getItem("probe_session_token");
 let currentSystemId: number | null = (() => {
   const v = localStorage.getItem("probe_system_id");
   return v ? Number(v) : null;
 })();
-
-export function setSessionToken(token: string | null) {
-  sessionToken = token;
-  if (token) localStorage.setItem("probe_session_token", token);
-  else localStorage.removeItem("probe_session_token");
-}
-
-export function getSessionToken() {
-  return sessionToken;
-}
 
 export function setSystemId(id: number | null) {
   currentSystemId = id;
@@ -26,10 +15,25 @@ export function getSystemId() {
   return currentSystemId;
 }
 
-function headers(): Record<string, string> {
+function cookieValue(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  const prefix = `${encodeURIComponent(name)}=`;
+  for (const part of document.cookie.split(";")) {
+    const candidate = part.trim();
+    if (candidate.startsWith(prefix)) {
+      return decodeURIComponent(candidate.slice(prefix.length));
+    }
+  }
+  return null;
+}
+
+function headers(method: string): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
-  if (sessionToken) h["Authorization"] = `Bearer ${sessionToken}`;
   if (currentSystemId !== null) h["X-Probe-System-Id"] = String(currentSystemId);
+  if (!["GET", "HEAD", "OPTIONS", "TRACE"].includes(method.toUpperCase())) {
+    const csrf = cookieValue("probe_csrf");
+    if (csrf) h["X-CSRF-Token"] = csrf;
+  }
   return h;
 }
 
@@ -37,10 +41,20 @@ export class ApiError extends Error {
   status: number;
   detail: string;
   code?: string;
+  /** Epic #412 §4.1: a refused capability gate returns its finite code as
+   * `denial_code` (never `code`), because the same 409 status is also used by
+   * #415's lifecycle refusal, which carries `code`. The two refusals are
+   * deliberately different bodies -- approval and execution mode are
+   * independent facts (§7.5) and the developer's next action differs -- so
+   * both are surfaced here rather than merged into one field. */
+  denialCode?: string;
   nextAction?: string;
   constructor(status: number, detail: unknown) {
     const structured = detail && typeof detail === "object"
-      ? detail as { message?: unknown; code?: unknown; next_action?: unknown }
+      ? detail as {
+          message?: unknown; code?: unknown; next_action?: unknown;
+          denial_code?: unknown;
+        }
       : null;
     const message = typeof structured?.message === "string"
       ? structured.message
@@ -51,6 +65,9 @@ export class ApiError extends Error {
     this.status = status;
     this.detail = message;
     this.code = typeof structured?.code === "string" ? structured.code : undefined;
+    this.denialCode = typeof structured?.denial_code === "string"
+      ? structured.denial_code
+      : undefined;
     this.nextAction = typeof structured?.next_action === "string"
       ? structured.next_action
       : undefined;
@@ -60,7 +77,8 @@ export class ApiError extends Error {
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: headers(),
+    headers: headers(method),
+    credentials: "include",
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (res.status === 204) return undefined as T;

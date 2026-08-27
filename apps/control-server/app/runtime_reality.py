@@ -36,7 +36,12 @@ from .interview_agent import _strip_fences, _trim_json
 from .interview_evidence import _positive_int_env
 from .interview_language import language_directive
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
-from .models import RuntimeRealityCheckItemOut, RuntimeTraceFactsOut
+from .models import (
+    RuntimeFactProvenanceOut,
+    RuntimeFactSnapshotRefOut,
+    RuntimeRealityCheckItemOut,
+    RuntimeTraceFactsOut,
+)
 
 PROMPT_VERSION = "runtime-reality-v1"
 SCHEMA_VERSION = "runtime-reality-v1"
@@ -45,6 +50,14 @@ DEFAULT_WINDOW_DAYS = 7
 DEFAULT_MAX_CHARS = 8_000
 MAX_RUNTIME_QUESTIONS = 5
 
+# Issue #290: how long a runtime fact stays 'fresh' before the provenance
+# envelope marks it 'stale'. Documented in docs/project-intelligence.md's
+# Issue #290 section. Default 7 days (matches the existing runtime-reality
+# aggregation window default, but is a separate, independently overridable
+# setting -- the aggregation window controls WHAT is aggregated, this
+# controls whether the resulting fact may still be presented as current).
+DEFAULT_FRESH_SECONDS = 7 * 86_400
+
 
 def window_days() -> int:
     return _positive_int_env("RUNTIME_REALITY_CHECK_WINDOW_DAYS", DEFAULT_WINDOW_DAYS)
@@ -52,6 +65,17 @@ def window_days() -> int:
 
 def _max_chars() -> int:
     return _positive_int_env("RUNTIME_REALITY_CHECK_MAX_CHARS", DEFAULT_MAX_CHARS)
+
+
+def fresh_seconds() -> int:
+    """Env-overridable freshness threshold (``RUNTIME_FACT_FRESH_SECONDS``).
+
+    Raises ``ValueError`` for a non-positive/non-integer override, exactly
+    like the other ``RUNTIME_REALITY_CHECK_*`` settings (Principle 6: a
+    misconfigured env var is a client-visible config error, never silently
+    ignored).
+    """
+    return _positive_int_env("RUNTIME_FACT_FRESH_SECONDS", DEFAULT_FRESH_SECONDS)
 
 
 def _percentile(sorted_values: List[float], pct: float) -> float:
@@ -90,6 +114,7 @@ def aggregate_component_facts(
         """SELECT COUNT(*) AS call_count,
                   SUM(CASE WHEN error IS NOT NULL AND error != '' THEN 1 ELSE 0 END)
                       AS error_count,
+                  MIN(timestamp) AS first_observed_at,
                   MAX(timestamp) AS last_observed_at
            FROM traces
            WHERE system_id = ? AND component_id = ? AND timestamp >= ?""",
@@ -107,8 +132,11 @@ def aggregate_component_facts(
             duration_p50_ms=None,
             duration_p90_ms=None,
             duration_p99_ms=None,
+            first_observed_at=None,
             last_observed_at=None,
             has_traces=False,
+            observed_environment=None,
+            observed_git_sha=None,
         )
 
     error_count = summary["error_count"] or 0
@@ -123,6 +151,26 @@ def aggregate_component_facts(
         )
     ]
 
+    # Issue #290 Finding 5: latest non-empty observed environment/git_sha in
+    # the same window -- deterministic "greatest timestamp with a non-null,
+    # non-empty value" pick, one bounded query per column. None when no
+    # trace in the window carried the field (most traces predate SDK
+    # PROBE_ENVIRONMENT/PROBE_GIT_SHA support, or never set them).
+    env_row = conn.execute(
+        """SELECT environment FROM traces
+           WHERE system_id = ? AND component_id = ? AND timestamp >= ?
+             AND environment IS NOT NULL AND environment != ''
+           ORDER BY timestamp DESC LIMIT 1""",
+        (system_id, component_id, since),
+    ).fetchone()
+    sha_row = conn.execute(
+        """SELECT git_sha FROM traces
+           WHERE system_id = ? AND component_id = ? AND timestamp >= ?
+             AND git_sha IS NOT NULL AND git_sha != ''
+           ORDER BY timestamp DESC LIMIT 1""",
+        (system_id, component_id, since),
+    ).fetchone()
+
     return RuntimeTraceFactsOut(
         component_id=component_id,
         window_days=days,
@@ -132,8 +180,86 @@ def aggregate_component_facts(
         duration_p50_ms=_percentile(durations, 0.50) if durations else None,
         duration_p90_ms=_percentile(durations, 0.90) if durations else None,
         duration_p99_ms=_percentile(durations, 0.99) if durations else None,
+        first_observed_at=summary["first_observed_at"],
         last_observed_at=summary["last_observed_at"],
         has_traces=True,
+        observed_environment=env_row["environment"] if env_row is not None else None,
+        observed_git_sha=sha_row["git_sha"] if sha_row is not None else None,
+    )
+
+
+# --- Provenance envelope (Issue #290) ----------------------------------------
+
+
+def freshness_for(fact: RuntimeTraceFactsOut, *, now: Optional[float] = None) -> str:
+    """Deterministic freshness classification: fresh | stale | unobserved.
+
+    'unobserved' when there is no trace data at all (``has_traces=False``);
+    otherwise 'fresh' when ``last_observed_at`` is within ``fresh_seconds()``
+    of ``now``, else 'stale'. Pure function of the fact + the env-overridable
+    threshold -- never a reasoning decision (Principle 6).
+    """
+    if not fact.has_traces or fact.last_observed_at is None:
+        return "unobserved"
+    now_value = now if now is not None else time.time()
+    age = now_value - fact.last_observed_at
+    return "fresh" if age <= fresh_seconds() else "stale"
+
+
+def build_provenance(
+    fact: RuntimeTraceFactsOut,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    system_id: Optional[int] = None,
+    now: Optional[float] = None,
+) -> RuntimeFactProvenanceOut:
+    """Wrap a deterministic fact in its provenance envelope.
+
+    ``environment`` comes only from ``fact.observed_environment`` -- the
+    latest non-empty ``traces.environment`` value actually observed for
+    this component (Issue #290 Finding 5's SDK-reported PROBE_ENVIRONMENT).
+    Never invented, and never the caller's pinned/expected environment.
+
+    ``snapshot_ref`` is derived the same way from ``fact.observed_git_sha``:
+    when no sha was ever observed on a trace, ``snapshot_ref`` is ``None``
+    -- it is NEVER the analysis session's pinned snapshot, because the
+    trace-producing deployment may be running different code than what is
+    currently pinned for analysis (this was Finding 5(b) of the Issue #290
+    review: fabricated provenance). When a sha *was* observed, this
+    resolves it against ``repository_snapshots`` for ``system_id`` by exact
+    commit-sha match -- but only when both ``conn`` and ``system_id`` are
+    given; the raw observed sha is always kept in ``snapshot_ref.git_sha``
+    even when it cannot be resolved to a known snapshot (``snapshot_id``
+    stays ``None`` in that case; this is a structural lookup, never a
+    guess).
+
+    ``source`` is always the fixed literal 'trace_aggregation' -- every
+    runtime fact in this system comes from the same deterministic
+    aggregation path, so this is a structural constant, not a per-call
+    choice.
+    """
+    snapshot_ref: Optional[RuntimeFactSnapshotRefOut] = None
+    if fact.observed_git_sha:
+        resolved_snapshot_id: Optional[int] = None
+        if conn is not None and system_id is not None:
+            row = conn.execute(
+                """SELECT id FROM repository_snapshots
+                   WHERE system_id = ? AND commit_sha = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (system_id, fact.observed_git_sha),
+            ).fetchone()
+            if row is not None:
+                resolved_snapshot_id = row["id"]
+        snapshot_ref = RuntimeFactSnapshotRefOut(
+            snapshot_id=resolved_snapshot_id, git_sha=fact.observed_git_sha,
+        )
+    return RuntimeFactProvenanceOut(
+        environment=fact.observed_environment,
+        first_observed_at=fact.first_observed_at,
+        last_observed_at=fact.last_observed_at,
+        snapshot_ref=snapshot_ref,
+        source="trace_aggregation",
+        freshness=freshness_for(fact, now=now),
     )
 
 

@@ -54,17 +54,25 @@ STATE_GROUPS = (
     "configuration",
 )
 
-# User phase (Issue #237): which of the three phases a state item belongs to.
-# ``setup`` gates repository/environment readiness, ``preparation`` gates
-# analysis + instrumentation readiness, ``diagnosis`` is the terminal
-# ongoing-operation phase. See ``derive_user_phase`` below for how the
-# *current* phase is computed; this tuple is only the display/suppression
-# ordering.
-PHASE_ORDER = ("setup", "preparation", "diagnosis")
+# User phase (Issue #237; extended to the full 6-step improvement flow by
+# Issue #256): which phase a state item belongs to. ``setup`` gates
+# repository/environment readiness, ``preparation`` gates System
+# Understanding readiness (snapshot / pipeline / Purpose / Capabilities),
+# ``instrumentation`` gates an established probe-plan/patch/connectivity
+# path, ``observation`` gates actually-receiving-traces, ``evaluation`` gates
+# a recorded experiment decision or a completed replay variant run, and
+# ``publish`` is the terminal display phase (also reached once a publish job
+# has succeeded -- see ``derive_user_phase``). See ``derive_user_phase``
+# below for how the *current* phase is computed; this tuple is only the
+# display/suppression ordering.
+PHASE_ORDER = ("setup", "preparation", "instrumentation", "observation", "evaluation", "publish")
 _PHASE_RANK = {phase: index for index, phase in enumerate(PHASE_ORDER)}
 
 # Default state_group -> phase mapping (Issue #237 issue body, table under
-# "Scope (含む)" item 3). Applied to every StateItem unless overridden below.
+# "Scope (含む)" item 3; Issue #256 remaps "runtime" / "proposal" onto the
+# new observation / evaluation phases -- they used to share the single
+# terminal "diagnosis" placeholder). Applied to every StateItem unless
+# overridden below.
 STATE_GROUP_PHASE: Dict[str, str] = {
     "repository": "setup",
     "configuration": "setup",
@@ -72,26 +80,34 @@ STATE_GROUP_PHASE: Dict[str, str] = {
     "pipeline": "preparation",
     "understanding": "preparation",
     "interview": "preparation",
-    "runtime": "diagnosis",
-    "proposal": "diagnosis",
+    "runtime": "observation",
+    "proposal": "evaluation",
 }
 
 # Explicit, finite per-state_id overrides where the state_group default above
 # would misclassify an item's role in the phase model. Kept as a small,
 # hand-enumerated map (Principle 6) -- never inferred from free text.
 STATE_ID_PHASE_OVERRIDES: Dict[str, str] = {
-    # SDK connectivity is one of the two OR'd preparation-completion signals
-    # (an approved probe plan OR non-"no_signal" connectivity -- see
-    # derive_user_phase), so tagging it "diagnosis" (the state_group=
-    # "runtime" default) would suppress it from notification_items/
-    # page_items during preparation and leave no guidance on how to finish
+    # Ingestion loss is operationally urgent in every phase, including a
+    # partially configured System that already receives SDK traffic.
+    "runtime.trace_storage.quota_exceeded": "setup",
+    # SDK connectivity is one of the three OR'd instrumentation-completion
+    # signals (an applied patch OR an approved probe plan OR non-"no_signal"
+    # connectivity -- see derive_user_phase). Issue #256 moved this
+    # completion signal out of preparation (preparation no longer has an
+    # OR-clause of its own) into instrumentation, so this item now belongs
+    # to "instrumentation", not the state_group="runtime" default of
+    # "observation" -- tagging it "observation" would suppress it from
+    # notification_items/page_items while the user is still trying to reach
+    # instrumentation completion, and leave no guidance on how to finish
     # that phase.
-    "runtime.connectivity.no_signal": "preparation",
+    "runtime.connectivity.no_signal": "instrumentation",
     # _diagnostic_state_item collapses every diagnostic category outside
     # auth/database/llm/configuration into state_group="runtime" (Issue
     # #193), so repository/pipeline/understanding diagnostics would
-    # otherwise default to "diagnosis" here too. Their real phase follows
-    # the same category grouping derive_user_phase uses for the setup and
+    # otherwise default to "observation" here too (Issue #256's new
+    # state_group="runtime" default). Their real phase follows the same
+    # category grouping derive_user_phase uses for the setup and
     # preparation completion gates (repository -> setup;
     # pipeline/understanding -> preparation) -- otherwise a genuine setup
     # blocker (e.g. an unset PROBE_REPOSITORY_ROOTS) would be silently
@@ -106,15 +122,19 @@ STATE_ID_PHASE_OVERRIDES: Dict[str, str] = {
     "diagnostic.pipeline_capability_hierarchy": "preparation",
     "diagnostic.system_purpose": "preparation",
     "diagnostic.system_capabilities": "preparation",
-    # Issue #238: reviewing/approving a proposed probe plan is one of the two
-    # ways to satisfy derive_user_phase's "an approved probe plan OR
-    # non-no_signal connectivity" preparation-completion signal -- see
-    # _probe_plan_proposed_state_item's docstring. Its sibling
-    # proposal.probe_plans.approved_without_patch is deliberately NOT listed
-    # here: an approved plan already satisfies that signal regardless of
-    # patch validation, so it stays at the state_group="proposal" default
-    # ("diagnosis").
-    "proposal.probe_plans.proposed": "preparation",
+    # Issue #238: reviewing/approving a proposed probe plan is one of the
+    # instrumentation-completion OR-clause's signals -- see
+    # _probe_plan_proposed_state_item's docstring. Issue #256: its sibling
+    # proposal.probe_plans.approved_without_patch is now ALSO listed here.
+    # It used to be deliberately excluded, back when an approved plan alone
+    # already satisfied *preparation's* own OR-clause regardless of patch
+    # status, so this item stayed at the state_group default. That
+    # OR-clause has since moved to instrumentation, and "proposal" now
+    # defaults to the later "evaluation" phase -- leaving this item at the
+    # default would misplace clearly-instrumentation work (generating and
+    # validating a probe patch) into the evaluation phase.
+    "proposal.probe_plans.proposed": "instrumentation",
+    "proposal.probe_plans.approved_without_patch": "instrumentation",
 }
 
 # Diagnostic categories (system_diagnostics.DiagnosticCheck.category) that
@@ -146,6 +166,7 @@ STATUS_VALUES = (
 )
 
 PAGE_REPOSITORY = "/repository"
+PAGE_COMPONENTS = "/components"
 PAGE_SYSTEM_UNDERSTANDING = "/system-understanding"
 PAGE_INTERVIEW = "/interview"
 
@@ -153,6 +174,11 @@ ANCHOR_SNAPSHOT_CREATE = "snapshot-create"
 ANCHOR_BUILD = "build"
 ANCHOR_INTERVIEW_PURPOSE = "interview-purpose"
 ANCHOR_INTERVIEW_CAPABILITIES = "interview-capabilities"
+# Issue #94/#275: the parallel manual/AI System Purpose provenance views on
+# the System Understanding page.
+ANCHOR_PURPOSE_VIEWS = "purpose-views"
+# Issue #276: open-only docs-code gap worklist.
+ANCHOR_GAP_WORKLIST = "gap-worklist"
 
 DOC_PATH_SUFFIXES = (".md", ".mdx", ".rst", ".txt", ".adoc")
 DOC_PATH_MARKERS = ("readme", "architecture", "design", "spec", "docs/", "doc/")
@@ -692,6 +718,63 @@ def _understanding_state_item(status: UnderstandingStatus, *, purpose: bool) -> 
     )
 
 
+def _purpose_manual_unconfirmed_item(
+    conn, system_id: int, snapshot_id: int
+) -> Optional[StateItem]:
+    """A human-entered ``system_profile`` purpose awaiting confirmation
+    against the current AI/source-derived purpose view (Issue #94/#275).
+
+    Emitted only when all of: a manual purpose is set, an AI purpose view
+    exists for the current snapshot, and there is no valid (non-stale)
+    confirmation reconciling the two. Once a confirmation is created and
+    stays valid (not stale), this item disappears -- it reappears if the
+    manual purpose, the snapshot, or the AI view later changes
+    (``state_facts.purpose_confirmation_staleness``).
+    """
+    profile = state_facts.get_system_profile_row(conn, system_id)
+    manual_purpose = (profile["purpose"] or "").strip() if profile is not None else ""
+    if not manual_purpose:
+        return None
+
+    ai_view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+    if ai_view is None:
+        return None
+
+    confirmation = state_facts.get_latest_purpose_confirmation(conn, system_id)
+    if confirmation is not None:
+        stale_reason = state_facts.purpose_confirmation_staleness(conn, system_id, snapshot_id)
+        if stale_reason is None:
+            return None
+
+    state_id = "understanding.purpose.manual_profile_unconfirmed"
+    msg = state_messages.understanding_message(state_id)
+    return StateItem(
+        state_id=state_id,
+        state_group="understanding",
+        severity="info",
+        status="unconfirmed",
+        user_action_kind="confirm",
+        intervention_timing="optional",
+        subject="System Purpose",
+        summary=msg["summary"],
+        detail=msg["detail"].format(ai_source=ai_view["source"]),
+        impact=msg["impact"],
+        remediation=msg["remediation"],
+        evidence={
+            "snapshot_id": snapshot_id,
+            "ai_source": ai_view["source"],
+            "manual_updated_at": profile["updated_at"] if profile is not None else None,
+        },
+        target_ui=TargetUi(
+            route=PAGE_SYSTEM_UNDERSTANDING,
+            anchor=ANCHOR_PURPOSE_VIEWS,
+            action_label=msg["action_label"],
+        ),
+        display_routes=[PAGE_SYSTEM_UNDERSTANDING],
+        related_checks=["system_purpose"],
+    )
+
+
 def _snapshot_missing_item(conn, system_id: int) -> Optional[StateItem]:
     latest = state_facts.get_latest_snapshot(conn, system_id)
     ready = state_facts.get_latest_ready_snapshot(conn, system_id)
@@ -1088,22 +1171,75 @@ def _docs_code_reconcile_state_item(conn, system_id: int, snapshot_id: int) -> O
     )
 
 
+def _open_gap_triage_item(conn, system_id: int, snapshot_id: int) -> Optional[StateItem]:
+    """Open-only gap work remains actionable; judged gaps are distinguished.
+
+    This uses the same identity/effective-state functions as the worklist and
+    build history, so StateItem counts cannot drift from those surfaces.
+    """
+    from .system_understanding_service import (
+        _attach_gap_triage,
+        _load_gaps_from_reconciler,
+        _open_gaps,
+    )
+
+    gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
+    _attach_gap_triage(conn, system_id, snapshot_id, gaps)
+    open_count = len(_open_gaps(gaps))
+    if open_count == 0:
+        return None
+    total_count = len(gaps)
+    triaged_count = total_count - open_count
+    msg = state_messages.state_message("understanding.gaps.open")
+    return StateItem(
+        state_id="understanding.gaps.open",
+        state_group="understanding",
+        severity="info",
+        status="unconfirmed",
+        user_action_kind="review",
+        intervention_timing="optional",
+        subject="Docs-code gap",
+        summary=msg["summary"].format(open_count=open_count),
+        detail=msg["detail"].format(
+            total_count=total_count, triaged_count=triaged_count
+        ),
+        impact=msg["impact"],
+        remediation=msg["remediation"],
+        evidence={
+            "snapshot_id": snapshot_id,
+            "open_gap_count": open_count,
+            "triaged_gap_count": triaged_count,
+            "total_gap_count": total_count,
+        },
+        target_ui=TargetUi(
+            route=PAGE_SYSTEM_UNDERSTANDING,
+            anchor=ANCHOR_GAP_WORKLIST,
+            action_label=msg["action_label"],
+        ),
+        display_routes=[PAGE_SYSTEM_UNDERSTANDING],
+        related_pipeline_steps=["docs_code_reconciled"],
+        dedupe_key="understanding.gaps.open",
+    )
+
+
 # --- runtime / proposal representative items (Issue #237) -----------------
 #
 # Phase 1 (Issue #193) intentionally left the runtime/proposal state_groups
 # declared-but-unused. Issue #237 adds one representative item per group --
-# not exhaustive coverage -- to give the preparation and diagnosis phases at
-# least one concrete, actionable item each.
+# not exhaustive coverage -- to give at least one concrete, actionable item
+# each; Issue #256 retags the instrumentation-signal items below onto the
+# new instrumentation/observation/evaluation phases as the OR-clause they
+# backstop moved from preparation to instrumentation.
 
 
 def _connectivity_state_item(connectivity_state: str, approved_probe_plan_count: int) -> Optional[StateItem]:
     """SDK instrumentation guidance when no trace has ever been received.
 
-    Tagged phase="preparation" via STATE_ID_PHASE_OVERRIDES (not the
-    state_group="runtime" default) because non-"no_signal" connectivity is
-    one of the two OR'd preparation-completion signals in
-    derive_user_phase. Severity/timing soften once an approved probe plan
-    already satisfies that OR condition through the other branch.
+    Tagged phase="instrumentation" via STATE_ID_PHASE_OVERRIDES (not the
+    state_group="runtime" default of "observation") because non-"no_signal"
+    connectivity is one of the three OR'd instrumentation-completion signals
+    in derive_user_phase. Severity/timing soften once an approved probe plan
+    already satisfies that OR condition through another branch.
     """
     if connectivity_state != "no_signal":
         return None
@@ -1169,12 +1305,12 @@ def _undecided_experiments_item(undecided_completed_experiment_count: int) -> Op
 def _probe_plan_proposed_state_item(proposed_count: int) -> Optional[StateItem]:
     """A proposed-but-not-yet-approved probe plan awaiting review.
 
-    Tagged phase="preparation" via STATE_ID_PHASE_OVERRIDES (not the
-    state_group="proposal" default of "diagnosis"): an approved probe plan
-    is one of the two OR'd preparation-completion signals in
+    Tagged phase="instrumentation" via STATE_ID_PHASE_OVERRIDES (not the
+    state_group="proposal" default of "evaluation"): an approved probe plan
+    is one of the three OR'd instrumentation-completion signals in
     derive_user_phase, and reviewing/approving a proposed plan is how a user
     reaches that signal through this path -- the same rationale
-    runtime.connectivity.no_signal already documents for the other path.
+    runtime.connectivity.no_signal already documents for another path.
     """
     if proposed_count == 0:
         return None
@@ -1199,10 +1335,19 @@ def _probe_plan_proposed_state_item(proposed_count: int) -> Optional[StateItem]:
 
 def _probe_plan_patch_pending_state_item(approved_without_patch_count: int) -> Optional[StateItem]:
     """An approved probe plan whose patch has not passed baseline+probed
-    validation yet. Stays at the state_group="proposal" default phase
-    ("diagnosis"): an approved plan already satisfies the preparation
-    instrumentation-path signal regardless of patch validation, so this item
-    is refinement work rather than a preparation blocker.
+    validation yet.
+
+    Tagged phase="instrumentation" via STATE_ID_PHASE_OVERRIDES (Issue #256;
+    not the state_group="proposal" default of "evaluation"): generating and
+    validating a probe patch is itself instrumentation work, even though an
+    approved plan alone already satisfies instrumentation_complete's
+    OR-clause regardless of patch status. (Before Issue #256 this item
+    stayed at the state_group default because that default was the plain
+    terminal "diagnosis" phase and an approved plan already satisfied
+    *preparation's* own OR-clause; now that the OR-clause has moved to
+    instrumentation and "proposal" defaults to the later "evaluation" phase,
+    leaving this item at the default would misplace clearly-instrumentation
+    work into the evaluation phase.)
     """
     if approved_without_patch_count == 0:
         return None
@@ -1293,6 +1438,55 @@ def _repository_state_items(conn, system_id: int) -> List[StateItem]:
             target_ui=TargetUi(route=PAGE_REPOSITORY, anchor=ANCHOR_SNAPSHOT_CREATE, action_label=msg["action_label"]),
             related_checks=["working_tree"], dedupe_key="repository.working_tree",
         ))
+    latest_resync = conn.execute(
+        "SELECT * FROM repository_resync_jobs WHERE system_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (system_id,),
+    ).fetchone()
+    if (
+        latest_ready is not None
+        and latest_resync is not None
+        and latest_resync["status"] == "completed"
+        and latest_resync["snapshot_id"] == latest_ready["id"]
+    ):
+        from .repository_resync_jobs import _stale_capability_count_with_conn
+
+        count = _stale_capability_count_with_conn(
+            conn,
+            system_id,
+            latest_resync["snapshot_id"],
+            require_latest_ready=True,
+        )
+    else:
+        count = 0
+    if count > 0:
+        msg = state_messages.state_message("repository.resync.capabilities_stale")
+        items.append(StateItem(
+            state_id="repository.resync.capabilities_stale",
+            state_group="pipeline",
+            severity="warning",
+            status="stale",
+            user_action_kind="build",
+            intervention_timing="after_build",
+            subject="Capability Map",
+            summary=msg["summary"].format(count=count),
+            detail=msg["detail"].format(snapshot_id=latest_ready["id"]),
+            impact=msg["impact"],
+            remediation=msg["remediation"],
+            evidence={
+                "resync_job_id": latest_resync["id"],
+                "snapshot_id": latest_ready["id"],
+                "stale_capability_count": count,
+            },
+            target_ui=TargetUi(
+                route=PAGE_SYSTEM_UNDERSTANDING,
+                anchor=ANCHOR_BUILD,
+                action_label=msg["action_label"],
+            ),
+            display_routes=[PAGE_REPOSITORY, "/capability-map"],
+            related_pipeline_steps=["capability_hierarchy_ready"],
+            dedupe_key="repository.resync.capabilities_stale",
+        ))
     return items
 
 
@@ -1305,13 +1499,14 @@ def _phase_for_item(item: StateItem) -> str:
     nothing here is inferred from item text.
     """
     return STATE_ID_PHASE_OVERRIDES.get(
-        item.state_id, STATE_GROUP_PHASE.get(item.state_group, "diagnosis"),
+        item.state_id, STATE_GROUP_PHASE.get(item.state_group, "publish"),
     )
 
 
 @dataclass(frozen=True)
 class UserPhaseFacts:
-    """Deterministic inputs to ``derive_user_phase`` (Issue #237).
+    """Deterministic inputs to ``derive_user_phase`` (Issue #237; extended to
+    the full 6-step improvement flow by Issue #256).
 
     Every field is already a finite-set/boolean/count fact -- no reasoning
     model output, no free text -- gathered by ``build_system_state`` from
@@ -1334,6 +1529,14 @@ class UserPhaseFacts:
     capabilities_satisfied: bool = False
     approved_probe_plan_count: int = 0
     connectivity_state: str = "no_signal"
+    # Issue #256 additions (instrumentation / observation / evaluation /
+    # publish milestone facts -- see state_facts.has_applied_probe_patch /
+    # has_decided_experiment / has_completed_replay_variant_run /
+    # has_succeeded_publish_job for the exact finite status values checked).
+    applied_patch_exists: bool = False
+    decided_experiment_exists: bool = False
+    completed_replay_variant_run_exists: bool = False
+    publish_job_succeeded: bool = False
 
 
 @dataclass(frozen=True)
@@ -1343,28 +1546,63 @@ class UserPhaseResult:
 
 
 def derive_user_phase(facts: UserPhaseFacts) -> UserPhaseResult:
-    """Pure deterministic derivation of the current user phase (Issue #237).
+    """Pure deterministic derivation of the current user phase (Issue #237;
+    extended to the full 6-step improvement flow -- instrumentation,
+    observation, evaluation, publish -- by Issue #256).
 
-    Phase definitions (fixed by Issue #235, not re-litigated here):
+    Phase definitions:
 
     - ``setup``: the target repository is registered, and no
       repository/database/auth/llm diagnostic is ``error``/``blocked``.
-    - ``preparation``: a ready snapshot exists, every step of the
-      deterministic 8-step Pipeline Checklist
+    - ``preparation``: setup is complete, a ready snapshot exists, every step
+      of the deterministic 8-step Pipeline Checklist
       (``system_understanding_service.compute_pipeline_steps`` --
       repository_configured, snapshot_ready, documentation_indexed,
       documentation_claims_scanned, symbols_indexed, entrypoints_discovered,
       docs_code_reconciled, capability_hierarchy_ready) is ``complete`` for
-      it, System Purpose and Core Capabilities are each ``satisfied_current``
-      or ``baseline_reusable``, and an instrumentation path is established --
-      at least one *approved* probe plan, or SDK connectivity that is not
-      ``no_signal``.
-    - ``diagnosis``: terminal; no completion condition.
+      it, and System Purpose and Core Capabilities are each
+      ``satisfied_current`` or ``baseline_reusable``. (Issue #256 removed the
+      instrumentation-path OR-clause this phase used to require -- that
+      signal now belongs to ``instrumentation`` below, so a system no longer
+      has to already have an approved probe plan or live connectivity just
+      to finish System Understanding preparation.)
+    - ``instrumentation``: preparation is complete, and an instrumentation
+      path is established -- an applied probe patch, at least one *approved*
+      probe plan, or SDK connectivity that is not ``no_signal``. This
+      preserves the exact OR-clause signal set ``preparation`` used to gate
+      on (plus the new applied-patch fact), so no system that had already
+      reached the old "diagnosis" terminal phase regresses to an earlier
+      phase under this extension.
+    - ``observation``: instrumentation is complete, and SDK connectivity is
+      actually ``receiving`` (not just non-``no_signal`` -- ``smoke_only``
+      satisfies instrumentation but not observation).
+    - ``evaluation``: observation is complete, and at least one experiment
+      has a recorded human decision, or at least one replay variant run has
+      completed.
+    - ``publish``: evaluation is complete, and a publish job has succeeded.
+      This is also the terminal *display* phase: once every completion
+      condition is met, ``user_phase`` is reported as ``"publish"`` even
+      though ``phases[-1].complete`` is only ``True`` once a publish job has
+      actually succeeded.
 
     The current phase is the first phase (in ``PHASE_ORDER``) whose
-    completion condition is not met. Because every ``UserPhaseFacts`` field
-    defaults to its "not yet satisfied" value, missing/unknown facts fall
-    back into an earlier phase rather than a later one.
+    completion condition is not met; if every phase is complete,
+    ``user_phase`` is ``"publish"`` (the terminal display phase). Because
+    every ``UserPhaseFacts`` field defaults to its "not yet satisfied"
+    value, missing/unknown facts fall back into an earlier phase rather than
+    a later one.
+
+    IMPORTANT -- monotonic milestone semantics, not "current activity":
+    each ``phases[].complete`` means "this phase's milestone fact has been
+    recorded at least once" (一度でも到達した), NOT "the system is currently
+    doing this". ``observation`` and ``evaluation`` are cyclical in practice
+    (a system keeps receiving traces and running more experiments long after
+    first reaching those milestones), but their ``complete`` flag never
+    reverts to ``False`` once the underlying fact has been observed -- it is
+    a one-way, row-existence check, not a state machine that tracks "what is
+    happening right now". ``user_phase`` is therefore a lifecycle-progress
+    pointer (the first not-yet-reached milestone), not a live "what is this
+    system doing at this instant" indicator.
     """
     setup_complete = facts.repository_configured and not facts.setup_diagnostics_blocking
     preparation_complete = (
@@ -1373,25 +1611,38 @@ def derive_user_phase(facts: UserPhaseFacts) -> UserPhaseResult:
         and facts.pipeline_all_complete
         and facts.purpose_satisfied
         and facts.capabilities_satisfied
-        and (facts.approved_probe_plan_count > 0 or facts.connectivity_state != "no_signal")
     )
+    instrumentation_complete = (
+        preparation_complete
+        and (
+            facts.applied_patch_exists
+            or facts.approved_probe_plan_count > 0
+            or facts.connectivity_state != "no_signal"
+        )
+    )
+    observation_complete = instrumentation_complete and facts.connectivity_state == "receiving"
+    evaluation_complete = observation_complete and (
+        facts.decided_experiment_exists or facts.completed_replay_variant_run_exists
+    )
+    publish_complete = evaluation_complete and facts.publish_job_succeeded
 
-    if not setup_complete:
-        user_phase = "setup"
-    elif not preparation_complete:
-        user_phase = "preparation"
-    else:
-        user_phase = "diagnosis"
+    ordered_completions = (
+        ("setup", setup_complete),
+        ("preparation", preparation_complete),
+        ("instrumentation", instrumentation_complete),
+        ("observation", observation_complete),
+        ("evaluation", evaluation_complete),
+        ("publish", publish_complete),
+    )
+    user_phase = next(
+        (phase for phase, complete in ordered_completions if not complete), "publish",
+    )
 
     return UserPhaseResult(
         user_phase=user_phase,
         phases=[
-            PhaseCompletion(phase="setup", complete=setup_complete, label=state_messages.phase_label("setup")),
-            PhaseCompletion(
-                phase="preparation", complete=preparation_complete,
-                label=state_messages.phase_label("preparation"),
-            ),
-            PhaseCompletion(phase="diagnosis", complete=False, label=state_messages.phase_label("diagnosis")),
+            PhaseCompletion(phase=phase, complete=complete, label=state_messages.phase_label(phase))
+            for phase, complete in ordered_completions
         ],
     )
 
@@ -1511,6 +1762,10 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
     capabilities_satisfied = False
     approved_probe_plan_count = 0
     connectivity_state = "no_signal"
+    applied_patch_exists = False
+    decided_experiment_exists = False
+    completed_replay_variant_run_exists = False
+    publish_job_succeeded = False
 
     with get_conn() as conn:
         items.extend(_repository_state_items(conn, system_id))
@@ -1554,6 +1809,10 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             purpose_satisfied = purpose_status.kind in ("satisfied_current", "baseline_reusable")
             capabilities_satisfied = capabilities_status.kind in ("satisfied_current", "baseline_reusable")
 
+            manual_purpose_item = _purpose_manual_unconfirmed_item(conn, system_id, snapshot_id)
+            if manual_purpose_item:
+                items.append(manual_purpose_item)
+
             symbol = _run_not_run_item(
                 conn, system_id, snapshot_id,
                 state_prefix="pipeline.symbol_index",
@@ -1594,6 +1853,10 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             docs_code_reconcile = _docs_code_reconcile_state_item(conn, system_id, snapshot_id)
             if docs_code_reconcile:
                 items.append(docs_code_reconcile)
+            else:
+                gap_triage = _open_gap_triage_item(conn, system_id, snapshot_id)
+                if gap_triage:
+                    items.append(gap_triage)
 
             # Preparation "pipeline 全ステップ complete" is derived from the SAME
             # canonical 8-step Pipeline Checklist the System Understanding page and
@@ -1613,6 +1876,14 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
             real_trace_count=connectivity_facts.real_trace_count,
             smoke_trace_count=connectivity_facts.smoke_trace_count,
         )
+        # Issue #256: instrumentation / observation / evaluation / publish
+        # milestone facts, gathered alongside the pre-existing #237 facts
+        # above so build_system_state stays the single place that reads
+        # these rows.
+        applied_patch_exists = state_facts.has_applied_probe_patch(conn, system_id)
+        decided_experiment_exists = state_facts.has_decided_experiment(conn, system_id)
+        completed_replay_variant_run_exists = state_facts.has_completed_replay_variant_run(conn, system_id)
+        publish_job_succeeded = state_facts.has_succeeded_publish_job(conn, system_id)
 
         connectivity_item = _connectivity_state_item(connectivity_state, approved_probe_plan_count)
         if connectivity_item:
@@ -1620,6 +1891,43 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
         undecided_item = _undecided_experiments_item(undecided_experiment_count)
         if undecided_item:
             items.append(undecided_item)
+
+        trace_quota = conn.execute(
+            "SELECT * FROM trace_quota_status WHERE system_id = ?",
+            (system_id,),
+        ).fetchone()
+        if trace_quota is not None and trace_quota["rejected_reason"]:
+            msg = state_messages.state_message("runtime.trace_storage.quota_exceeded")
+            items.append(StateItem(
+                state_id="runtime.trace_storage.quota_exceeded",
+                state_group="runtime",
+                severity="warning",
+                status="blocked",
+                user_action_kind="inspect",
+                intervention_timing="now",
+                subject="Trace storage",
+                summary=msg["summary"],
+                detail=msg["detail"].format(
+                    rows=trace_quota["trace_rows"],
+                    bytes=trace_quota["trace_bytes"],
+                    reason=trace_quota["rejected_reason"],
+                ),
+                impact=msg["impact"],
+                remediation=msg["remediation"],
+                evidence={
+                    "trace_rows": trace_quota["trace_rows"],
+                    "trace_bytes": trace_quota["trace_bytes"],
+                    "rejected_reason": trace_quota["rejected_reason"],
+                    "rejected_at": trace_quota["rejected_at"],
+                },
+                target_ui=TargetUi(
+                    route=PAGE_COMPONENTS,
+                    action_label=msg["action_label"],
+                ),
+                display_routes=[PAGE_COMPONENTS],
+                source="trace_quota_status",
+                dedupe_key="runtime.trace_storage.quota_exceeded",
+            ))
 
         proposed_probe_plan_count = state_facts.count_proposed_probe_plans(conn, system_id)
         approved_probe_plan_without_patch_count = (
@@ -1674,6 +1982,10 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
         capabilities_satisfied=capabilities_satisfied,
         approved_probe_plan_count=approved_probe_plan_count,
         connectivity_state=connectivity_state,
+        applied_patch_exists=applied_patch_exists,
+        decided_experiment_exists=decided_experiment_exists,
+        completed_replay_variant_run_exists=completed_replay_variant_run_exists,
+        publish_job_succeeded=publish_job_succeeded,
     ))
 
     # Phase suppression (Issue #237, parent #235's fixed withdrawal rule):

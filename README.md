@@ -7,6 +7,9 @@
 **Feature Intelligence Layer** と、source patch を隔離環境で比較する
 **Experiment Workspace Layer** を提供する。設計は
 [`docs/project-intelligence.md`](docs/project-intelligence.md) を参照。
+System Understanding が長期的に目指す状態と、現在不足している構造的な要素は
+[`docs/system-understanding-ideal-state.md`](docs/system-understanding-ideal-state.md)
+にまとめている。
 
 詳細は [issue #1](https://github.com/dx-junkyard/probe-agent/issues/1) と
 [`docs/mvp.md`](docs/mvp.md) を参照。
@@ -82,6 +85,26 @@ Caddy が Automatic HTTPS で証明書取得・更新まで行う独立構成
 `docker-compose.prod.yml` を使う。手順・前提条件・公開前チェックリストは
 [`docs/deployment-https.md`](docs/deployment-https.md) を参照。
 
+### 依存関係とコンテナイメージの固定
+
+外部レジストリから取得する `python` / `node` / `nginx` / `caddy` の各 base
+image は、可読な tag と OCI image index digest の組み合わせで固定している。
+依存解決は Dashboard では `package-lock.json` + `npm ci`、Control Server では
+hash 付きの `requirements.lock` / `requirements-dev.lock` +
+`pip install --require-hashes` を使う。CI は両アプリを build し、それぞれの
+SPDX JSON SBOM を artifact として保存する。
+
+一方、Compose の `probe-agent/control-server:latest` と
+`probe-agent/dashboard:latest` は、その場で `build:` が生成するローカル出力名
+であり、build 前には固定できる registry digest が存在しない。このため架空の
+digest は付けない。本番で再現可能な配布単位が必要な場合は、CI が build した
+image を registry へ publish し、得られた digest または immutable release tag
+を deployment manifest に記録する。
+
+Python lock と base image digest の更新手順、検証範囲と残余リスクは
+[`docs/deployment-https.md`](docs/deployment-https.md#サプライチェーン更新手順)
+を参照。
+
 ## クイックスタート (ローカル Python)
 
 ```bash
@@ -107,6 +130,12 @@ PROBE_SERVER_URL=http://localhost:8000 python main.py
 
 開発サーバーは `http://localhost:5173` で起動する。Vite の proxy 設定により
 `/api` へのリクエストは自動的に Control Server (`http://localhost:8000`) へ転送される。
+
+テストは venv を activate した状態（venv の `bin` が PATH にある状態）で
+`python -m pytest apps/control-server/tests packages/python-probe/tests` を実行する。
+実験ワークスペースのコマンドはサーバープロセスの PATH から `python` を解決するため、
+venv 非アクティブだと test_experiments が失敗する。CI（`.github/workflows/ci.yml`）も
+同じ前提で実行している。
 
 Dashboard で `summarizer` / `classifier` の mode を `shadow` に切り替えてから
 サンプルを再実行すると、候補実装との比較結果が確認できる。
@@ -433,6 +462,12 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `PROBE_POLICY_TTL` | `10` | policy キャッシュ秒数 |
 | `PROBE_HTTP_TIMEOUT` | `2` | HTTP タイムアウト秒数 |
 | `PROBE_DB_PATH` | `./probe.db` | Control Server の SQLite ファイル |
+| `PROBE_EXECUTION_BACKEND` | development: `inprocess` / production: `worker` | 検証・replay・experiment・candidate の実行backend。有限値は `inprocess` / `worker`。production は `worker` 以外を起動時拒否 |
+| `PROBE_EXECUTION_SPOOL_ROOT` | _(未設定)_ | worker backend のatomic job spool共有root。production必須。DB・secret・repository rootとは別volumeにする |
+| `PROBE_EXECUTION_WORKSPACE_ROOT` | _(未設定)_ | Control Serverとexecution workerが同じパスでmountするworktree共有root。production必須 |
+| `PROBE_WORKTREE_BASE` | `/tmp/probe-worktrees` | validation worktree base。worker利用時は共有workspace root配下が必須 |
+| `PROBE_REPLAY_WORKSPACE_BASE` | `/tmp/probe-replays` | replay/candidate worktree base。worker利用時は共有workspace root配下が必須 |
+| `PROBE_EXPERIMENT_WORKSPACE_BASE` | `/tmp/probe-experiments` | experiment worktree base。worker利用時は共有workspace root配下が必須 |
 | `PROBE_API_KEY` | _(未設定)_ | SDK が送る API キー (`X-Api-Key` ヘッダー) |
 | `CONTROL_API_KEYS` | _(未設定)_ | Control Server が受け付ける API キー（カンマ区切り複数可）。未設定時は認証なし |
 | `DASHBOARD_API_KEY` | _(未設定)_ | Dashboard が Control Server に送る API キー |

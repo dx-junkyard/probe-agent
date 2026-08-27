@@ -26,7 +26,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from ..auth import get_system_id
 from ..candidate_studio import (
@@ -54,6 +54,7 @@ from ..models import (
     ReplayVariantRunCreate,
 )
 from ..replay_runner import replay_workspace_base
+from ..experiment_runner import patch_hash
 from ..workspace_context import _redact_and_truncate
 from .replay import (
     MAX_REPLAY_SET_SIZE,
@@ -64,6 +65,9 @@ from .replay import (
     create_replay_variant_run,
     get_replay_variant_experiment_payload,
 )
+from .execution_modes import gate_execution_target
+from .replay_readiness import gather_readiness
+from .snapshot_preflight import require_snapshot_preflight
 
 router = APIRouter()
 
@@ -83,6 +87,55 @@ def _json_list(raw: Optional[str]) -> List[str]:
     except json.JSONDecodeError:
         return []
     return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _replay_readiness_error(readiness) -> HTTPException:
+    """The single 422 shape both readiness gates raise (Issue #372)."""
+    blocking = [c for c in readiness.checks if c.status == "blocking"]
+    return HTTPException(
+        status_code=422,
+        detail={
+            "code": "no_replayable_traces",
+            "message": (
+                blocking[0].detail if blocking else "Replayに使えるTraceがありません"
+            ),
+            "remediation": blocking[0].remediation if blocking else "",
+            "counts": {
+                "total": readiness.counts.total,
+                "replayable": readiness.counts.replayable,
+                "partial": readiness.counts.partial,
+                "unreplayable": readiness.counts.unreplayable,
+                "not_captured": readiness.counts.not_captured,
+            },
+        },
+    )
+
+
+def _require_replay_readiness(
+    system_id: int, component_id: str, replay_set_id: Optional[int], snapshot_id: Optional[int]
+) -> None:
+    """Refuse to spend a reasoning-model call on an unevaluable candidate.
+
+    Judges the session's OWN Replay Set, resolved fresh each time -- the set's
+    membership is what a run replays, and its traces' classifications can
+    change after the session was created.
+
+    Must be called with no ``get_conn()`` connection open: ``gather_readiness``
+    opens its own and the lock is non-reentrant.
+    """
+    trace_ids: Optional[List[str]] = None
+    if replay_set_id is not None:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT trace_ids_json FROM replay_sets WHERE id = ? AND system_id = ?",
+                (replay_set_id, system_id),
+            ).fetchone()
+        if row is not None:
+            trace_ids = _json_list(row["trace_ids_json"])
+
+    readiness = gather_readiness(system_id, component_id, trace_ids or None, snapshot_id)
+    if readiness.selected.usable == 0:
+        raise _replay_readiness_error(readiness)
 
 
 def _version_out(conn, row) -> CandidateVersionOut:
@@ -257,6 +310,12 @@ def create_candidate_session(
         symbol_qualified_name = symbol["qualified_name"]
         replay_set_id: Optional[int] = None
         trace_ids: Optional[List[str]] = None
+        # The exact set the readiness gate must judge. It is NOT the same as
+        # `trace_ids`: that one also drives Replay Set *creation*, and an
+        # existing Replay Set must not be recreated. Keeping them separate is
+        # what stops the gate from silently judging the recent-50 window while
+        # the run uses the Set's own traces.
+        evaluation_trace_ids: Optional[List[str]] = None
         if payload.replay_set_id is not None:
             replay_set = conn.execute(
                 "SELECT * FROM replay_sets WHERE id = ? AND system_id = ?",
@@ -270,6 +329,7 @@ def create_candidate_session(
                     detail="Replay set belongs to a different component",
                 )
             replay_set_id = replay_set["id"]
+            evaluation_trace_ids = _json_list(replay_set["trace_ids_json"])
         elif payload.trace_ids is not None:
             trace_ids = [str(trace_id) for trace_id in payload.trace_ids]
         elif payload.trace_id is not None:
@@ -297,6 +357,29 @@ def create_candidate_session(
                     ),
                 )
 
+    # Issue #372: refuse a session whose evaluation set cannot be replayed at
+    # all, BEFORE any reasoning-model call. The audited component had 11
+    # traces and zero usable captures, so the failure only surfaced after the
+    # cost had been paid. Evaluated outside the connection above -- it opens
+    # its own, and the lock is non-reentrant.
+    if evaluation_trace_ids is None:
+        evaluation_trace_ids = trace_ids
+    readiness = gather_readiness(
+        system_id, payload.component_id, evaluation_trace_ids or None, snapshot_id
+    )
+    if readiness.selected.usable == 0:
+        raise _replay_readiness_error(readiness)
+
+    # Issue #369 (review finding 4): the SAME shared preflight Experiment
+    # creation runs -- a Candidate Studio session anchors to a snapshot just
+    # as an Experiment does, so continuing on a stale one is the same manual
+    # decision and gets recorded on this session.
+    snapshot_freshness, head_sha_at_creation, stale_ack_reason = (
+        require_snapshot_preflight(
+            system_id, snapshot_id, payload.stale_snapshot_reason
+        )
+    )
+
     # Phase 2: create the Replay Set from trace ids (its own connection),
     # reusing POST /replay-sets validation (existence, dedupe, size cap).
     if replay_set_id is None:
@@ -318,8 +401,9 @@ def create_candidate_session(
             INSERT INTO candidate_sessions
                 (system_id, component_id, snapshot_id, commit_sha, symbol_path,
                  symbol_qualified_name, replay_set_id, objective, status,
-                 created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                 created_at, updated_at,
+                 snapshot_freshness, head_sha_at_creation, stale_ack_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -332,6 +416,9 @@ def create_candidate_session(
                 payload.objective,
                 now,
                 now,
+                snapshot_freshness,
+                head_sha_at_creation,
+                stale_ack_reason,
             ),
         )
         session_id = cur.lastrowid
@@ -526,6 +613,13 @@ def generate_candidate_version(
     with get_conn() as conn:
         session_row = _get_session_or_404(conn, session_id, system_id)
         component_id = session_row["component_id"]
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="llm_experiment_proposal",
+            target_kind="component",
+            target_ref=component_id,
+        )
         snapshot = _resolve_snapshot(conn, system_id, session_row["snapshot_id"])
         symbol = _resolve_component_symbol(
             conn, system_id, snapshot["id"], component_id
@@ -578,6 +672,15 @@ def generate_candidate_version(
         end_line = symbol["end_line"]
         symbol_path = symbol["path"]
         symbol_qualified_name = symbol["qualified_name"]
+        session_replay_set_id = session_row["replay_set_id"]
+
+    # Issue #372 (review finding 7): re-evaluate readiness immediately before
+    # the reasoning-model call, not only at session creation. Traces can be
+    # deleted, reclassified, or redacted, and approval or the sandbox can go
+    # away, between the two -- and the cost this gate exists to protect is
+    # spent on the very next line.
+    _require_replay_readiness(system_id, component_id, session_replay_set_id, snapshot_id)
+
     # Reasoning attempt (outside the DB lock). Fail closed on any config/call/
     # parse/scope/size failure -- no heuristic fallback (Principle 6).
     config = LLMConfig.from_env()
@@ -784,6 +887,7 @@ def replay_candidate_version(
     version_id: int,
     payload: CandidateReplayCreate,
     system_id: int = Depends(get_system_id),
+    response: Response = None,
 ) -> CandidateVersionOut:
     with get_conn() as conn:
         version = _get_version_or_404(conn, version_id, system_id)
@@ -809,6 +913,24 @@ def replay_candidate_version(
         snapshot_id = session_row["snapshot_id"]
         version_number = version["version_number"]
         patch_text = version["patch_text"]
+        # Execution-mode gate (#412 §4.3), before the candidate is marked
+        # 'running' and before a worktree is touched. Surfaced here as well as
+        # inside create_replay_variant_run for the same reason the approval
+        # gate is: a refusal must not leave the immutable candidate stranded in
+        # a 'running' state. The subject is the SESSION's Component -- the
+        # candidate is a patch against that Component's symbol.
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="candidate_execution",
+            target_kind="component",
+            target_ref=component_id,
+            response=response,
+            flow_experiment_proposal_id=payload.flow_experiment_proposal_id,
+            candidate_refs=(f"patch_sha256:{patch_hash(patch_text)}",),
+            candidate_required=True,
+            snapshot_id=snapshot_id,
+        )
         # Surface the human replay-approval gate here too (fail closed before
         # touching a worktree); create_replay_variant_run enforces it again.
         if _active_approval(conn, system_id, component_id) is None:
@@ -835,6 +957,7 @@ def replay_candidate_version(
                 source="llm_draft",
             )
         ],
+        flow_experiment_proposal_id=payload.flow_experiment_proposal_id,
     )
     try:
         run = create_replay_variant_run(run_payload, system_id=system_id)
@@ -896,7 +1019,9 @@ def replay_candidate_version(
 @router.post("/candidate-versions/{version_id}/promote", response_model=CandidatePromotionOut)
 def promote_candidate_version(
     version_id: int,
+    flow_experiment_proposal_id: Optional[int] = Query(default=None),
     system_id: int = Depends(get_system_id),
+    response: Response = None,
 ) -> CandidatePromotionOut:
     now = time.time()
     with get_conn() as conn:
@@ -914,6 +1039,23 @@ def promote_candidate_version(
                 status_code=422, detail="Candidate version has no evaluated variant"
             )
         session_row = _get_session_or_404(conn, version["session_id"], system_id)
+        # Execution-mode gate (#412 §4.3). Promotion carries a candidate out of
+        # the Studio and into the Experiment lane, where it is executed again;
+        # letting a Node whose mode fell back to `fixed` keep exporting
+        # candidates would move the hole one step downstream rather than close
+        # it. Promotion still adopts nothing and creates no Experiment.
+        gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="candidate_execution",
+            target_kind="component",
+            target_ref=session_row["component_id"],
+            response=response,
+            flow_experiment_proposal_id=flow_experiment_proposal_id,
+            candidate_refs=(f"patch_sha256:{version['patch_hash']}",),
+            candidate_required=True,
+            snapshot_id=session_row["snapshot_id"],
+        )
         replay_run_id = version["replay_run_id"]
         replay_variant_id = version["replay_variant_id"]
 

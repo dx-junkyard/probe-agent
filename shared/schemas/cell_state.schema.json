@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/cell_state.json",
+  "title": "CellState",
+  "description": "Common L0/L1 read-model for a Probe Cell (worker or orchestrator), Issue #298 / Probe Cell Fabric. Built deterministically at read time from existing Trace/Evaluation/Shadow Result/Replay/Experiment references and the Cell/Role Card definitions -- it is never a separately cached table. health/quality/improvement/orchestration are the additive extension blocks: Sub 1 (#298) always returns this envelope with those blocks empty/null; Sub 2 (#299) fills `health`, Sub 6 (#302) fills `quality`, Sub 7 (#304) fills `improvement`, and Sub 4 (#301) fills `orchestration` for roster-bearing Cells. Every later sub-issue only ever adds fields inside an existing block or a new schema_version -- it never introduces a new top-level key outside this fixed envelope.",
+  "type": "object",
+  "required": ["cell_id", "role_card", "mission", "tasks", "schema_version"],
+  "properties": {
+    "cell_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "role_card": {
+      "type": "object",
+      "required": ["role_key", "version", "model_alias"],
+      "properties": {
+        "role_key": { "type": "string", "minLength": 1 },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "model_alias": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "mission": {
+      "type": "string"
+    },
+    "tasks": {
+      "type": "object",
+      "required": ["counts"],
+      "properties": {
+        "counts": {
+          "type": "object",
+          "required": ["todo", "doing", "review", "done", "failed", "blocked"],
+          "properties": {
+            "todo":   { "type": "integer", "minimum": 0 },
+            "doing":  { "type": "integer", "minimum": 0 },
+            "review": { "type": "integer", "minimum": 0 },
+            "done":   { "type": "integer", "minimum": 0 },
+            "failed": { "type": "integer", "minimum": 0 },
+            "blocked":{ "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "health": {
+      "type": ["object", "null"],
+      "description": "Filled by Sub 2 (#299) from traces/evaluation_results/shadow_results/replay_runs/experiments. All fields nullable/optional; absent or null means not-yet-observed, never a guessed value.",
+      "properties": {
+        "heartbeat_at":         { "type": ["number", "null"] },
+        "last_activation_at":   { "type": ["number", "null"] },
+        "queue_length":         { "type": ["integer", "null"], "minimum": 0 },
+        "queue_oldest_age_seconds": { "type": ["number", "null"], "minimum": 0 },
+        "error_rate":           { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "latency_p50_ms":       { "type": ["number", "null"], "minimum": 0 },
+        "latency_p95_ms":       { "type": ["number", "null"], "minimum": 0 },
+        "evaluation_count":     { "type": ["integer", "null"], "minimum": 0 },
+        "evaluation_pass_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "shadow_result_count":  { "type": ["integer", "null"], "minimum": 0 },
+        "replay_run_count":     { "type": ["integer", "null"], "minimum": 0 },
+        "replay_completed_count": { "type": ["integer", "null"], "minimum": 0 },
+        "experiment_count":     { "type": ["integer", "null"], "minimum": 0 },
+        "experiment_completed_count": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "quality": {
+      "type": ["object", "null"],
+      "description": "Filled by Sub 6 (#302) from cell_quality_configs / cell_quality_audits / cell_intake_states. All fields nullable/optional; absent or null means no quality-sampling data exists yet for this Cell, never a guessed value.",
+      "properties": {
+        "pass_rate":     { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "audited_count": { "type": ["integer", "null"], "minimum": 0 },
+        "intake_status": { "type": ["string", "null"], "enum": ["accepting", "suspended", null] },
+        "sample_rate":   { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "improvement": {
+      "type": ["object", "null"],
+      "description": "Filled by Sub 7 (#304) from cell_improvements. All fields nullable/optional; absent or null means no improvement data exists yet for this Cell.",
+      "properties": {
+        "total":         { "type": ["integer", "null"], "minimum": 0 },
+        "open_count":    { "type": ["integer", "null"], "minimum": 0 },
+        "adopted_count": { "type": ["integer", "null"], "minimum": 0 },
+        "latest_status": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "orchestration": {
+      "type": ["object", "null"],
+      "description": "Filled by Sub 4 (#301) for roster-bearing (orchestrator) Cells only; absent for worker Cells.",
+      "properties": {
+        "roster":         { "type": ["array", "null"], "items": { "type": "string" } },
+        "active_count":   { "type": ["integer", "null"], "minimum": 0 },
+        "dormant_count":  { "type": ["integer", "null"], "minimum": 0 },
+        "retired_count":  { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "schema_version": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

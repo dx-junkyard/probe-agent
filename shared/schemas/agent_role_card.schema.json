@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/agent_role_card.json",
+  "title": "AgentRoleCard",
+  "description": "Versioned Cell contract (Issue #298 / Probe Cell Fabric). Declares a Cell's mission/scope/model alias/tool policy/acceptance template/rubric ref. This is NOT the API Role Card (Issue #58, a display model for an API's role in the system) -- the two are never mixed into one schema. provider/model real names are never embedded here: only model_alias, resolved server-side via CELL_MODEL_ALIAS_<UPPER_ALIAS> so a model-name change never requires a card revision. role_key rows are append-only per version; only status may change on an existing version row.",
+  "type": "object",
+  "required": [
+    "role_key",
+    "version",
+    "status",
+    "mission",
+    "scope",
+    "out_of_scope",
+    "model_alias",
+    "tool_policy",
+    "acceptance_template",
+    "changelog",
+    "schema_version"
+  ],
+  "properties": {
+    "role_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identity for this role across versions (e.g. worker-summarizer, orchestrator-checkout-ux)."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "Semver string. role_key + version is append-only: a new revision is a new row, never an overwrite."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "active", "deprecated"]
+    },
+    "mission": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scope": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "out_of_scope": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "model_alias": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Never a literal provider/model name (e.g. worker-default, auditor-default). Resolved to provider:model via env CELL_MODEL_ALIAS_<UPPER_ALIAS>, falling back to LLMConfig.intelligence_from_env()."
+    },
+    "tool_policy": {
+      "type": "object",
+      "required": ["allowed_tools", "network_allowed"],
+      "properties": {
+        "allowed_tools": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "network_allowed": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "acceptance_template": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Reusable acceptance criterion strings a delegated task's acceptance list is expected to draw from."
+    },
+    "rubric_ref": {
+      "type": ["string", "null"],
+      "description": "Reference to an externally-owned rubric (e.g. Evaluation Criteria); rubric ownership/authoring is out of scope here."
+    },
+    "changelog": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Required human-authored summary of what changed in this version."
+    },
+    "schema_version": {
+      "type": "string",
+      "description": "Contract schema version; a mismatched value is rejected fail-closed by the server contract layer."
+    }
+  },
+  "additionalProperties": false
+}

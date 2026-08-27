@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useAssistantAsk, useAssistantScreenContext } from "@/api/hooks";
 import { Badge } from "@/components/ui/badge";
@@ -10,6 +10,11 @@ import {
 } from "lucide-react";
 import type { AssistantAskOut, AssistantCitation, SystemStateItem } from "@/api/types";
 import { systemStateTarget } from "@/components/system-state";
+import { useModalSurface } from "@/lib/modal-surface";
+import {
+  OPEN_ASSISTANT_EVENT,
+  type OpenAssistantDetail,
+} from "@/lib/assistant-control";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -149,9 +154,38 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   const [threads, setThreads] = useState<Record<string, ChatMessage[]>>({});
   const messages = threads[screenId] ?? [];
   const listRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  useModalSurface({ open, onClose: () => setOpen(false), panelRef });
+
+  // 閉じたらフォーカスを開くボタンへ戻す。
+  //
+  // `useModalSurface` の既定 (開く直前にフォーカスしていた要素へ戻す) は
+  // ここでは効かない: このボタンはパネルが開いている間アンマウントされて
+  // いて、閉じたときに **別のノードとして** 描き直されるので、フックが
+  // 覚えている要素は既に DOM から外れている。戻し先はこの新しいノードで
+  // なければならない。
+  const openButtonRef = useRef<HTMLButtonElement>(null);
+  const wasOpen = useRef(false);
+  useEffect(() => {
+    if (!open && wasOpen.current) openButtonRef.current?.focus();
+    wasOpen.current = open;
+  }, [open]);
 
   const { data: ctx } = useAssistantScreenContext(screenId, open);
   const ask = useAssistantAsk();
+
+  // System Brief and other in-page review affordances can open this existing
+  // conversation surface with a contextual draft. The draft is never sent
+  // automatically: the developer still reviews and submits it explicitly.
+  useEffect(() => {
+    const handleOpen = (event: Event) => {
+      const detail = (event as CustomEvent<OpenAssistantDetail>).detail;
+      setOpen(true);
+      if (detail?.question) setQuestion(detail.question);
+    };
+    window.addEventListener(OPEN_ASSISTANT_EVENT, handleOpen);
+    return () => window.removeEventListener(OPEN_ASSISTANT_EVENT, handleOpen);
+  }, []);
 
   const failingChecks = useMemo(
     () => (ctx?.screen_checks ?? []).filter((c) => c.severity !== "ok"),
@@ -199,7 +233,12 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
 
   if (!open) {
     return (
-      <div className="fixed bottom-6 right-6 z-40 flex items-end gap-2">
+      // Issue #358 追補: 浮いているボタンは本文の上に重なるので、その分の
+      // 余白を `<main>` が `pb-24` で確保している (`app-layout.tsx`)。両者は
+      // 対で意味を持つ -- ここの `bottom-*` を大きくするなら、その余白も
+      // 一緒に増やさないと画面の主操作を覆う (#102: 主操作を隠さない)。
+      // 狭い画面では画面端へ寄せて、本文の実表示幅を削らない。
+      <div className="fixed bottom-4 right-4 z-40 flex items-end gap-2 md:bottom-6 md:right-6">
         {noticeText && (
           <button
             type="button"
@@ -213,6 +252,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           </button>
         )}
         <Button
+          ref={openButtonRef}
           size="icon"
           onClick={() => setOpen(true)}
           title="Ask the assistant about this screen"
@@ -226,10 +266,26 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   }
 
   return (
-    <div
-      className="fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col border-l bg-background shadow-xl"
-      data-testid="assistant-panel"
-    >
+    <>
+      {/* 開いているパネルは本文の上に重なるモーダルな面。とくに 390px 幅では
+          画面全体を覆うので、閉じる手段が右上のボタン 1 つだけだと逃げ場が
+          無くなる。背景クリック・Escape・フォーカストラップは、サイドバー
+          Drawer (#362) と同じ `useModalSurface` の規則で揃える。 */}
+      <div
+        className="fixed inset-0 z-40 bg-black/40"
+        onClick={() => setOpen(false)}
+        aria-hidden="true"
+        data-testid="assistant-backdrop"
+      />
+      <div
+        ref={panelRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label="画面アシスタント"
+        className="fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col border-l bg-background shadow-xl focus-visible:outline-none"
+        data-testid="assistant-panel"
+      >
       <div className="flex items-start justify-between gap-2 border-b p-4">
         <div className="flex items-start gap-2 min-w-0">
           <Bot className="h-5 w-5 mt-0.5 shrink-0" />
@@ -356,6 +412,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           <Send className="h-4 w-4" />
         </Button>
       </form>
-    </div>
+      </div>
+    </>
   );
 }

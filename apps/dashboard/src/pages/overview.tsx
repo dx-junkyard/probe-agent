@@ -1,169 +1,298 @@
-import { Link } from "react-router-dom";
-import { useComponents, useSystemState } from "@/api/hooks";
+import { useOverview } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
-import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { SystemStateBanner } from "@/components/system-state";
-import { PrerequisiteGuide } from "@/components/prerequisite-guide";
-import { Boxes, Activity, Clock, FolderCog, Compass, Plug } from "lucide-react";
+import { FindingsCard } from "@/components/overview/findings";
+import { LoopRailCard, NextActionCard } from "@/components/overview/next-action";
+import { RuntimeHealthCard } from "@/components/overview/runtime-health";
+import { SystemBriefCard } from "@/components/overview/system-brief";
+import { targetHref } from "@/components/overview/display";
+import { PurposeFrameCard } from "@/components/purpose-chain/purpose-frame-card";
 import { formatTimestamp } from "@/lib/utils";
+import type { OverviewOut, OverviewSnapshotFreshness } from "@/api/types";
 
-// Deterministic, ordered get-started steps for a brand-new System with zero
-// components (Issue #212). This is a static fallback list, not a heuristic
-// recommendation — every System needs the repository configured, System
-// Understanding built, and the SDK connected, in this order.
-const GET_STARTED_STEPS = [
-  { to: "/repository", label: "1. Configure the repository", icon: FolderCog, testId: "overview-link-repository" },
-  { to: "/system-understanding", label: "2. Build System Understanding", icon: Compass, testId: "overview-link-system-understanding" },
-  { to: "/connect-sdk", label: "3. Connect the SDK", icon: Plug, testId: "overview-link-connect-sdk" },
-] as const;
-
-const MODE_VARIANT = {
-  off: "secondary",
-  trace: "success",
-  shadow: "warning",
-} as const;
+// Issue #380: the Overview is the System Intelligence Brief / decision
+// cockpit, not a metrics screen.
+//
+// Order in the main column is contract, not styling — the same discipline
+// #358 fixed on the Interview cockpit. Reading top to bottom must answer the
+// Epic's five questions in order:
+//
+//   1. System Brief      -> 何のためのシステムで、AI はどう理解しているか
+//   2. 今わかったこと      -> 前回から何が変わり、何が分かったか
+//   3. 次にすること        -> 次の1操作と、その理由・完了条件・完了後の価値
+//   4. 改善ループの現在地   -> どこまで来ていて、次の意味的到達点は何か
+//   5. Runtime health     -> いま観測できているか（二次領域）
+//
+// The heading order and the DOM order are the same, so a screen reader gets
+// the same priority ordering as the eye.
+//
+// Everything semantic arrives already decided by `GET /overview`. This page
+// chooses layout and disclosure; it never picks a CTA, re-ranks a finding, or
+// re-derives a readiness verdict from counts (#380 UX原則 6).
 
 export default function OverviewPage() {
   const { systems, systemId } = useAuth();
-  const { data: components, isLoading } = useComponents();
-  // Canonical state projection (Issue #206); "/" carries no server-side
-  // items today (no rule targets the Overview route), so this is a cheap,
-  // optional primary item and the static ordered list below is always the
-  // deterministic fallback (Issue #212).
-  const { data: systemState } = useSystemState();
-  const primaryOverviewItem = systemState?.page_items["/"]?.[0] ?? null;
-
+  const { data: overview, isLoading, isError, refetch } = useOverview();
   const system = systems.find((s) => s.id === systemId);
-  const totalTraces = components?.reduce((s, c) => s + c.trace_count, 0) ?? 0;
-  const lastSeen = components?.reduce((max, c) =>
-    c.last_seen && (!max || c.last_seen > max) ? c.last_seen : max, null as number | null);
-  const modeCount = components?.reduce((acc, c) => {
-    acc[c.mode] = (acc[c.mode] || 0) + 1;
-    return acc;
-  }, {} as Record<string, number>) ?? {};
+
+  // Issue #391 §B: `GET /overview` now embeds the Purpose Frame's single
+  // next question (`purpose_question`) as its own guarded section, the same
+  // composition discipline the Brief and the Purpose Chain itself already
+  // follow (#380 principle 6: one composed projection, no second opinion).
+  // A prior version issued a SEPARATE `usePurposeNextQuestion` query here --
+  // that gave the question its own independent failure mode with no
+  // `degraded_sections` entry, which is exactly the thing #380 exists to
+  // prevent. `PurposeFrameCard` stays a props-only display component either
+  // way; only where its props come from changed.
+  const purposeQuestionDegraded = overview?.degraded_sections.includes("purpose_question") ?? false;
+  const purposeQuestionState: "loading" | "error" | "ready" = isLoading
+    ? "loading"
+    : purposeQuestionDegraded
+      ? "error"
+      : "ready";
+
+  // Zero Systems is not a state the System-scoped endpoint can be asked about,
+  // so it is answered here. It uses the same finite action vocabulary
+  // (`create_system`) rather than growing a second one.
+  if (systems.length === 0) {
+    return (
+      <div className="space-y-4">
+        <PageHeading system={undefined} />
+        <Card data-testid="overview-no-systems">
+          <CardHeader>
+            <CardTitle className="text-lg">次にすること</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2 text-base" data-action-key="create_system">
+            <p className="font-medium">System を作成してください。</p>
+            <p className="text-muted-foreground">
+              System は観測対象のまとまりです。ヘッダーの「System を作成」から作成すると、
+              リポジトリの登録とシステム理解の構築に進めます。
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    // A skeleton in the same shape as the loaded page, so nothing shifts when
+    // it resolves — and so 「読み込み中」 never looks like 「空」 (#384).
+    return (
+      <div className="space-y-4" data-testid="overview-loading">
+        <PageHeading system={system} />
+        <div className="grid gap-4 xl:grid-cols-3">
+          <div className="space-y-4 xl:col-span-2">
+            <Skeleton className="h-64 w-full" />
+            <Skeleton className="h-40 w-full" />
+          </div>
+          <div className="space-y-4">
+            <Skeleton className="h-40 w-full" />
+            <Skeleton className="h-56 w-full" />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (isError || !overview) {
+    return (
+      <div className="space-y-4">
+        <PageHeading system={system} />
+        <Card data-testid="overview-load-error">
+          <CardHeader>
+            <CardTitle className="text-lg">Overview を取得できませんでした</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2 text-base">
+            <p className="text-muted-foreground">
+              状態が分からないため、推測での案内は行いません。
+            </p>
+            <button
+              type="button"
+              className="rounded-md border px-3 py-1.5 text-base hover:bg-accent"
+              onClick={() => refetch()}
+            >
+              再試行
+            </button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  const interviewHref = targetHref({
+    route: "/interview",
+    label: "",
+    params: overview.interview_session_id
+      ? { session: String(overview.interview_session_id) }
+      : {},
+    anchor: null,
+  });
+  const visionHref = targetHref({
+    route: "/interview",
+    label: "",
+    params: overview.interview_session_id
+      ? { session: String(overview.interview_session_id) }
+      : {},
+    anchor: "cockpit-aux-intent",
+  });
+  const changeSetHref = targetHref({
+    route: "/interview",
+    label: "",
+    params: overview.interview_session_id
+      ? { session: String(overview.interview_session_id) }
+      : {},
+    anchor: "cockpit-aux-change-set",
+  });
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">Overview</h1>
-        {system && (
-          <p className="text-muted-foreground mt-1">
-            {system.name}{system.environment ? ` — ${system.environment}` : ""}
-          </p>
-        )}
-      </div>
+    <div className="space-y-4">
+      <PageHeading system={system} overview={overview} />
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <MetricCard
-          title="Components"
-          value={isLoading ? undefined : String(components?.length ?? 0)}
-          icon={<Boxes className="h-4 w-4 text-muted-foreground" />}
-        />
-        <MetricCard
-          title="Total Traces"
-          value={isLoading ? undefined : totalTraces.toLocaleString()}
-          icon={<Activity className="h-4 w-4 text-muted-foreground" />}
-        />
-        <MetricCard
-          title="Last Seen"
-          value={isLoading ? undefined : formatTimestamp(lastSeen)}
-          icon={<Clock className="h-4 w-4 text-muted-foreground" />}
-        />
-        <MetricCard
-          title="Active Modes"
-          value={isLoading ? undefined : Object.entries(modeCount).map(([m, n]) => `${m}: ${n}`).join(", ") || "—"}
-          icon={<Activity className="h-4 w-4 text-muted-foreground" />}
-        />
-      </div>
+      {overview.degraded_sections.length > 0 && (
+        // A partial failure names what is missing and lets the rest render.
+        // The whole screen never goes blank because one section could not be
+        // derived (#384).
+        <Card data-testid="overview-degraded">
+          <CardContent className="p-4 text-base">
+            <p className="font-medium">一部の情報を取得できませんでした。</p>
+            <p className="text-muted-foreground">
+              取得できなかった領域: {overview.degraded_sections.join(", ")}。
+              表示中の他の領域は最新の永続事実に基づいています。
+            </p>
+          </CardContent>
+        </Card>
+      )}
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Components</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {isLoading ? (
-            <div className="space-y-3">
-              {[1, 2, 3].map((i) => <Skeleton key={i} className="h-12 w-full" />)}
-            </div>
-          ) : !components?.length ? (
-            <div className="space-y-4 py-4" data-testid="overview-get-started">
-              {primaryOverviewItem && (
-                <SystemStateBanner item={primaryOverviewItem} testId="overview-primary-item" />
-              )}
-              {/* Issue #241: phase-appropriate start guide for a System that
-                  has not reached the diagnosis phase yet. It renders nothing
-                  once every prerequisite is met (terminal phase), so the
-                  ordered fallback list below is what a fully-set-up System
-                  with no components still sees. */}
-              <PrerequisiteGuide testId="overview-prerequisite-guide" />
-              <p className="text-sm text-muted-foreground text-center">
-                No components registered yet. Connect the SDK to start tracing.
-              </p>
-              <ol className="mx-auto max-w-sm space-y-2 text-sm">
-                {GET_STARTED_STEPS.map(({ to, label, icon: Icon, testId }) => (
-                  <li key={to}>
-                    <Link
-                      to={to}
-                      data-testid={testId}
-                      className="flex items-center gap-2 rounded-md border px-3 py-2 text-primary hover:bg-accent hover:underline"
-                    >
-                      <Icon className="h-4 w-4 shrink-0" />
-                      <span>{label}</span>
-                    </Link>
-                  </li>
-                ))}
-              </ol>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b text-left">
-                    <th className="pb-2 font-medium text-muted-foreground">Component ID</th>
-                    <th className="pb-2 font-medium text-muted-foreground">Mode</th>
-                    <th className="pb-2 font-medium text-muted-foreground text-right">Traces</th>
-                    <th className="pb-2 font-medium text-muted-foreground text-right">Last Seen</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {components.map((c) => (
-                    <tr key={c.component_id} className="border-b last:border-0">
-                      <td className="py-3 font-mono text-xs">{c.component_id}</td>
-                      <td className="py-3">
-                        <Badge variant={MODE_VARIANT[c.mode] ?? "secondary"}>{c.mode}</Badge>
-                      </td>
-                      <td className="py-3 text-right">{c.trace_count.toLocaleString()}</td>
-                      <td className="py-3 text-right text-muted-foreground text-xs">
-                        {formatTimestamp(c.last_seen)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      {/* Issue #390 §3.1: the Purpose Frame leads the main column, above
+          System Brief -- the Epic's question 「何のためのシステムか」 must be
+          answerable before the rest of the page. It reuses the SAME rows
+          System Brief renders (Vision/System Purpose/Core Capabilities),
+          adding relation + lineage on top, so it is not a second summary --
+          it is the causal read of the same claims. */}
+      <PurposeFrameCard
+        overview={overview}
+        question={overview.purpose_question ?? null}
+        questionState={purposeQuestionState}
+      />
+
+      {/* Desktop: the Brief holds the main area and everything else sits in the
+          ADJACENT column — the arrangement #384 explicitly allows, and the one
+          the first-view measurement forced. Stacking them under the Brief put
+          「今わかったこと」 at 824px on a 1280×720 screen: the reading order was
+          right, but two of the four things the developer must see in the first
+          view were below the fold. Source order is unchanged by the split, so
+          the single-column stack below `xl` still reads
+          Brief → findings → next action → loop → runtime.
+          `items-start` keeps the short column from stretching to the tall one. */}
+      <div className="grid items-start gap-4 xl:grid-cols-12">
+        <div className="xl:col-span-5">
+          <SystemBriefCard
+            overview={overview}
+            interviewHref={interviewHref}
+            visionHref={visionHref}
+            changeSetHref={changeSetHref}
+          />
+        </div>
+        <div className="xl:col-span-4">
+          <FindingsCard overview={overview} />
+        </div>
+        <div className="space-y-4 xl:col-span-3">
+          <NextActionCard overview={overview} />
+          <LoopRailCard overview={overview} />
+          <RuntimeHealthCard overview={overview} />
+        </div>
+      </div>
     </div>
   );
 }
 
-function MetricCard({ title, value, icon }: { title: string; value?: string; icon: React.ReactNode }) {
+const SNAPSHOT_FRESHNESS_LABEL: Record<OverviewSnapshotFreshness, string> = {
+  current: "最新の断面",
+  stale: "最新ではない断面",
+  unavailable: "断面を特定できません",
+};
+
+/**
+ * The first-view System context.
+ *
+ * Which snapshot and which understanding revision the whole page is talking
+ * about belongs HERE, not inside a disclosure: every claim, finding and CTA
+ * below is qualified by it, and a developer who cannot see it does not know
+ * what the page is describing (#381).
+ *
+ * `snapshot_freshness` is the server's verdict. The Dashboard deliberately
+ * does not compare `snapshot_id` with `latest_ready_snapshot_id` itself —
+ * that second definition of 「最新か」 is exactly the drift #369 removed.
+ */
+function PageHeading({
+  system,
+  overview,
+}: {
+  system?: { name: string; environment?: string | null };
+  overview?: OverviewOut;
+}) {
   return (
-    <Card>
-      <CardContent className="p-6">
-        <div className="flex items-center justify-between">
-          <p className="text-sm font-medium text-muted-foreground">{title}</p>
-          {icon}
-        </div>
-        {value === undefined ? (
-          <Skeleton className="mt-2 h-7 w-20" />
-        ) : (
-          <p className="mt-2 text-2xl font-bold">{value}</p>
-        )}
-      </CardContent>
-    </Card>
+    <div>
+      <h1 className="text-2xl font-bold tracking-tight">Overview</h1>
+      {system ? (
+        <p className="mt-1 text-muted-foreground">
+          {system.name}
+          {system.environment ? ` — ${system.environment}` : ""}
+        </p>
+      ) : (
+        <p className="mt-1 text-muted-foreground">
+          このシステムについて分かっていること、変わったこと、次にすることをまとめます。
+        </p>
+      )}
+      {overview && (
+        <dl
+          className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground"
+          data-testid="overview-context"
+        >
+          <div className="flex gap-1">
+            <dt>Snapshot</dt>
+            <dd className="text-foreground" data-snapshot-freshness={overview.snapshot_freshness}>
+              {overview.snapshot_id != null ? (
+                <>
+                  #{overview.snapshot_id}
+                  {overview.snapshot_commit_sha && (
+                    <code className="ml-1 font-mono">
+                      {overview.snapshot_commit_sha.slice(0, 8)}
+                    </code>
+                  )}
+                </>
+              ) : (
+                "未固定"
+              )}
+              <span className="ml-1">
+                （{SNAPSHOT_FRESHNESS_LABEL[overview.snapshot_freshness]}）
+              </span>
+            </dd>
+          </div>
+          <div className="flex gap-1">
+            <dt>理解リビジョン</dt>
+            <dd className="text-foreground">
+              {overview.understanding_revision_id != null
+                ? `#${overview.understanding_revision_id}`
+                : "未構築"}
+            </dd>
+          </div>
+          <div className="flex gap-1">
+            <dt>最後の確認</dt>
+            <dd className="text-foreground">
+              {overview.understanding_confirmed_at != null
+                ? formatTimestamp(overview.understanding_confirmed_at)
+                : "未確認"}
+              {overview.brief?.readiness_state === "recheck_required" && (
+                <span className="ml-1 text-amber-700 dark:text-amber-300">
+                  再確認が必要
+                </span>
+              )}
+            </dd>
+          </div>
+        </dl>
+      )}
+    </div>
   );
 }

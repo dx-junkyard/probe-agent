@@ -84,7 +84,9 @@ def test_every_stage_has_label_and_description():
 
 
 def test_every_phase_has_a_japanese_label():
-    for phase in ("setup", "preparation", "diagnosis"):
+    for phase in (
+        "setup", "preparation", "instrumentation", "observation", "evaluation", "publish",
+    ):
         assert _has_japanese(sm.phase_label(phase)), phase
 
 

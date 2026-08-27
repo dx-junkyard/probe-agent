@@ -14,6 +14,10 @@ from typing import Any, Dict, List, Optional
 from .interview_evidence import _positive_int_env
 
 UNDERSTANDING_SECTIONS = [
+    # Issue #352: Vision is diffed like any other section so a Vision change
+    # between revisions is a visible, deterministic fact rather than a silent
+    # replacement (Issue #353's 「理解の変更を黙って差し替えない」).
+    "vision",
     "system_purpose",
     "core_capabilities",
     "capability_elements",

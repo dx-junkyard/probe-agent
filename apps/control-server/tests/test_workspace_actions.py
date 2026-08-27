@@ -26,7 +26,7 @@ def admin_client(tmp_path, monkeypatch):
 def _login(client, username="root", password="s3cret"):
     r = client.post("/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+    return r.cookies.get("probe_session")
 
 
 def _bearer(token):
@@ -242,7 +242,7 @@ def test_probe_plan_draft_missing_fields_when_prerequisites_satisfied(admin_clie
                    (system_id, snapshot_id, run_type, provider, model,
                     prompt_version, schema_version, decision_method, status,
                     is_mock, started_at)
-               VALUES (?, ?, 'feature_drafts', 'mock', 'mock', 'v1', 'v1',
+               VALUES (?, ?, 'repository_drafts', 'mock', 'mock', 'v1', 'v1',
                        'reasoning_llm', 'completed', 1, ?)""",
             (system_id, snapshot_id, now),
         )

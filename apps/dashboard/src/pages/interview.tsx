@@ -1,20 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   AlertCircle, CheckCircle, Download, FileCode, GitPullRequest,
-  HelpCircle, Layers, LifeBuoy, Loader2, MessageSquareText, Pencil, Play, RefreshCw, Send,
+  HelpCircle, LifeBuoy, Loader2, MessageSquareText, Pencil, RefreshCw, Send,
   Sparkles, XCircle,
 } from "lucide-react";
 import {
+  useActiveInquiriesByOrigin,
+  useAlignmentList,
   useAnswerInterviewQa,
   useApproveInterviewProposal,
   useConfirmInterviewUnderstanding,
   useCreateInterviewSession,
   useEditInterviewProposal,
   useInterviewApprovedSet,
+  useInterviewCapabilityGraph,
   useInterviewContextPack,
   useInterviewDialogueTurn,
+  useInterviewIntentList,
   useInterviewQaList,
   useInterviewSession,
   useInterviewSessions,
@@ -23,15 +27,76 @@ import {
   useRebaseInterviewSnapshot,
   useRepositoryStatus,
   useRejectInterviewProposal,
+  useAnswerQaUnknown,
+  useCreateJointUnderstanding,
+  useJointUnderstandingList,
+  useResumeInterviewInquiry,
   useResumeInterviewQa,
+  useQaAutoInvestigate,
   useRunRuntimeRealityCheck,
+  useInterviewProcessRuns,
+  useInterviewWorkflowState,
+  useUnderstandingBrief,
+  useRecordDiffReview,
+  useAcknowledgeBackRequest,
+  useCloseInterviewSession,
+  useReopenInterviewSession,
+  type QaAutoInvestigateController,
   useSkipInterviewQa,
   useUnderstandingDiff,
   useUpdateInterviewUnderstanding,
+  recordInterviewMetricEventBestEffort,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { api } from "@/api/client";
 import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagnostic-fix";
+import { UnderstandingOverview } from "@/components/system-understanding/understanding-overview";
+import { UnderstandingBriefPanel } from "@/components/system-understanding/understanding-brief";
+import { IntentBriefPanel } from "@/components/system-understanding/intent-brief-panel";
+import { ReviewQueuePanel } from "@/components/system-understanding/review-queue";
+import { AnswerableAreasControl, isOutOfArea, knowledgeAreaLabel } from "@/components/system-understanding/answerable-areas";
+import { HandoffListPanel, HandoffModal } from "@/components/system-understanding/handoff-panel";
+import { ObservationProposalPanel } from "@/components/system-understanding/observation-proposal-panel";
+import { ChangeSetPanel } from "@/components/system-understanding/change-set-panel";
+import { InquiryPanel, ROUTE_CATEGORY_LABELS } from "@/components/system-understanding/inquiry-panel";
+import { JointUnderstandingPanel } from "@/components/system-understanding/joint-understanding-panel";
+import { findOpenJointSession } from "@/components/system-understanding/joint-understanding-entry";
+import { RefreshStatusChip } from "@/components/system-understanding/refresh-status-chip";
+import { InterviewMetricsPanel } from "@/components/system-understanding/interview-metrics-panel";
+import { PurposeFramePanel } from "@/components/purpose-chain/purpose-frame-panel";
+// Issue #356: インタビュー・コックピット。全体像 (完成度・理解の全体マップ・
+// 未解決事項・Q&A 進捗) と、選択項目の修正方法を 1 画面で把握できるようにする。
+// 集約と状態判定は `cockpit/model.ts` の純粋関数にあり、ここでは既存のデータ
+// 取得・mutation・権限制御をそのまま使う (新しい API は追加しない)。
+import {
+  buildCockpitModel,
+  unresolvedTargets,
+  type CockpitCategoryKey,
+  type CockpitQaFetchStatus,
+  type CockpitUnresolvedItem,
+} from "@/components/system-understanding/cockpit/model";
+import {
+  focusCockpitTarget,
+  focusFirstCockpitTarget,
+} from "@/components/system-understanding/cockpit/navigation";
+import { CockpitStatusSummary } from "@/components/system-understanding/cockpit/status-summary";
+import { UnderstandingMap } from "@/components/system-understanding/cockpit/understanding-map";
+import { CockpitDetailPanel } from "@/components/system-understanding/cockpit/detail-panel";
+import { CockpitUnresolvedItems } from "@/components/system-understanding/cockpit/unresolved-items";
+import { CockpitQaProgressCard } from "@/components/system-understanding/cockpit/qa-progress";
+import { CockpitSessionInfo } from "@/components/system-understanding/cockpit/session-info";
+import { briefLeadsMainColumn } from "@/components/system-understanding/cockpit/layout";
+import {
+  CockpitAuxiliaryPanel,
+  CockpitAuxiliarySection,
+} from "@/components/system-understanding/cockpit/auxiliary-panel";
+import {
+  BackRequestNotice,
+  PRIMARY_ACTION_LABELS,
+  PROCESS_LABELS,
+  WorkflowExceptions,
+  WorkflowLocationCard,
+} from "@/components/system-understanding/workflow-panel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -44,17 +109,24 @@ import { Textarea } from "@/components/ui/textarea";
 import { formatTimestamp } from "@/lib/utils";
 import { buildPatchFilename, downloadTextFile } from "@/lib/patch";
 import type {
+  AlignmentItemOut,
+  AlignmentListOut,
+  CapabilityEntityKind,
   CurrentUnderstanding,
-  GapItem,
   IntelligenceRunEvidenceOut,
   InterviewMaterializeOut,
+  InterviewCapabilityRelationConfirmation,
   InterviewProposalMetadataBlock,
   InterviewProposalOut,
   InterviewProposalProbePlan,
+  InquiryRouteCategory,
+  InterviewInquiryOut,
+  InterviewIntentListOut,
   InterviewQaOut,
   InterviewQuestionEvidenceRef,
   InterviewSessionDetailOut,
   InterviewStage,
+  KnowledgeArea,
   OpenQuestion,
   ProbeRecommendedMode,
   ProbeReplayability,
@@ -63,7 +135,6 @@ import type {
   SourceMetadataOperationKind,
   SourceMetadataStateEffect,
   UnderstandingDiffOut,
-  UnderstandingItem,
 } from "@/api/types";
 
 const ELEMENT_TYPES: Array<"" | SourceMetadataElementType> = [
@@ -76,36 +147,84 @@ const PROBE_MODES: ProbeRecommendedMode[] = ["trace", "shadow"];
 const RISK_LEVELS: ProbeSideEffectRisk[] = ["none", "low", "medium", "high"];
 const REPLAYABILITY: ProbeReplayability[] = ["safe", "caution", "unsafe"];
 
-const STAGE_ORDER: InterviewStage[] = [
-  "understanding_initialized",
-  "purpose_confirmation",
-  "capability_confirmation",
-  "element_classification",
-  "api_boundary_mapping",
-  "probe_flow_selection",
-  "proposal_generation",
+
+const CAPABILITY_SECTIONS: Array<[
+  keyof Pick<
+    CurrentUnderstanding,
+    "core_capabilities" | "capability_elements" | "supporting_elements" | "api_boundaries"
+  >,
+  CapabilityEntityKind,
+]> = [
+  ["core_capabilities", "core_capability"],
+  ["capability_elements", "capability_element"],
+  ["supporting_elements", "supporting_element"],
+  ["api_boundaries", "api_boundary"],
 ];
 
-// ユーザー向けの進捗表示: ステージ名ではなく「何を確認する作業か」を示す。
-const STAGE_LABELS: Record<InterviewStage, string> = {
-  understanding_initialized: "準備",
-  purpose_confirmation: "目的",
-  capability_confirmation: "主要機能",
-  element_classification: "要素分類",
-  api_boundary_mapping: "API境界",
-  probe_flow_selection: "プローブ対象フロー",
-  proposal_generation: "提案",
+const CAPABILITY_CHILD_KINDS: Record<CapabilityEntityKind, CapabilityEntityKind[]> = {
+  core_capability: ["capability_element", "supporting_element", "api_boundary"],
+  capability_element: ["supporting_element", "api_boundary"],
+  supporting_element: ["api_boundary"],
+  api_boundary: [],
 };
 
-const STAGE_WORK_DESCRIPTIONS: Record<InterviewStage, string> = {
-  understanding_initialized: "自動分析でシステム理解を構築します",
-  purpose_confirmation: "ゴールと成功基準を確認します",
-  capability_confirmation: "主要な機能領域を確認します",
-  element_classification: "構成要素の分類を確認します",
-  api_boundary_mapping: "責務の境界を確認します",
-  probe_flow_selection: "計測すべき重要な実行フローを確認します",
-  proposal_generation: "提案を生成・レビューします",
+type CapabilityProposalNode = {
+  kind: CapabilityEntityKind;
+  name: string;
+  children: string[];
 };
+
+function capabilityProposalNodes(
+  understanding: CurrentUnderstanding | null | undefined,
+): CapabilityProposalNode[] {
+  if (!understanding) return [];
+  return CAPABILITY_SECTIONS.flatMap(([section, kind]) =>
+    (understanding[section] ?? []).map(item => ({
+      kind,
+      name: item.name,
+      children: item.children ?? [],
+    })),
+  );
+}
+
+function capabilityProposalRelations(
+  nodes: CapabilityProposalNode[],
+): InterviewCapabilityRelationConfirmation[] {
+  const relations: InterviewCapabilityRelationConfirmation[] = [];
+  for (const parent of nodes) {
+    for (const childName of parent.children) {
+      for (const childKind of CAPABILITY_CHILD_KINDS[parent.kind]) {
+        if (nodes.some(node => node.kind === childKind && node.name === childName)) {
+          relations.push({
+            supported_kind: parent.kind,
+            supported_name: parent.name,
+            supporting_kind: childKind,
+            supporting_name: childName,
+          });
+        }
+      }
+    }
+  }
+  return relations;
+}
+
+function capabilityNodeKey(kind: CapabilityEntityKind, name: string): string {
+  return `${kind}\u0000${name}`;
+}
+
+function capabilityRelationKey(
+  relation: InterviewCapabilityRelationConfirmation,
+): string {
+  return [
+    relation.supported_kind,
+    relation.supported_name,
+    relation.supporting_kind,
+    relation.supporting_name,
+  ].join("\u0000");
+}
+
+// ユーザー向けの進捗表示: ステージ名ではなく「何を確認する作業か」を示す。
+
 
 // 各ステージでの既定の確認質問(open questions が無い場合に表示)。
 const STAGE_QUESTIONS: Record<InterviewStage, string> = {
@@ -138,24 +257,18 @@ type InterviewUiState =
   | "ready_for_proposals"
   | "proposal_review";
 
-const UI_STATE_LABELS: Record<InterviewUiState, string> = {
-  preparing: "理解を構築中",
-  needs_build: "理解が未構築",
-  confirm_understanding: "理解の確認",
-  fill_gaps: "不足情報の確認",
-  zero_base: "ゼロベースインタビュー",
-  ready_for_proposals: "提案の準備完了",
-  proposal_review: "提案のレビューと承認",
-};
+// Issue #349: the developer-facing state label now comes from
+// `WORKFLOW_STATE_LABELS` in components/system-understanding/workflow-panel,
+// keyed by the server's canonical workflow state. `InterviewUiState` survives
+// only as an internal content selector for the conversation surface.
 
-function stageIndex(stage: InterviewStage): number {
-  return STAGE_ORDER.indexOf(stage);
-}
 
 function hasUnderstandingContent(u: CurrentUnderstanding | null | undefined): boolean {
   if (!u) return false;
   return [
-    u.system_purpose, u.core_capabilities, u.capability_elements,
+    // Issue #352: `vision` is optional on the type (older Control Servers do
+    // not send it) but counts as content exactly like every other section.
+    u.vision, u.system_purpose, u.core_capabilities, u.capability_elements,
     u.supporting_elements, u.api_boundaries, u.probe_flow_candidates,
   ].some(items => (items ?? []).length > 0);
 }
@@ -214,6 +327,13 @@ type FocusedQuestion = {
   evidenceRefs?: InterviewQuestionEvidenceRef[];
   answerOptions?: string[];
   confirmable: boolean;
+  // Issue #295 §4.8 review fix (Finding 4): the backing interview_qa row's
+  // id, when this focused question came from an OpenQuestion carrying one
+  // (Issue #129). Used to scope route-and-investigate to qa_ids=[qaId] for
+  // this question's 「わからない」 auto-investigation. Absent for questions
+  // with no backing row (e.g. the zero-base fixed questionnaire) -- those
+  // fall back to the original #142 flow directly, never auto-investigated.
+  qaId?: number | null;
 };
 
 const QUICK_ANSWER_YES = "はい、その理解で正しいです。";
@@ -228,6 +348,7 @@ function focusedFromOpenQuestion(q: OpenQuestion): FocusedQuestion {
     answerOptions: q.answer_options ?? [],
     // 仮説付きの質問は「はい/いいえ+修正」で答えられる確認型。
     confirmable: !!q.hypothesis,
+    qaId: q.qa_id ?? null,
   };
 }
 
@@ -246,19 +367,6 @@ function approvalVariant(value: string) {
 
 function proposalReviewable(value: string) {
   return value === "proposed" || value === "needs_review";
-}
-
-function confidenceVariant(level: string) {
-  if (level === "confirmed") return "success" as const;
-  if (level === "likely") return "secondary" as const;
-  if (level === "conflicting") return "destructive" as const;
-  return "outline" as const;
-}
-
-function severityVariant(severity: string) {
-  if (severity === "high") return "destructive" as const;
-  if (severity === "medium") return "warning" as const;
-  return "outline" as const;
 }
 
 function csv(items: string[]) {
@@ -374,124 +482,92 @@ function MetadataGrid({ metadata, probe }: {
   );
 }
 
-function ProgressSteps({ current }: { current: InterviewStage }) {
-  const currentIdx = stageIndex(current);
-  return (
-    <div className="space-y-1" data-testid="stage-stepper">
-      <div className="flex items-center gap-1 flex-wrap">
-        {STAGE_ORDER.map((stage, idx) => {
-          const isCurrent = idx === currentIdx;
-          const isDone = idx < currentIdx;
-          return (
-            <Badge
-              key={stage}
-              variant={isCurrent ? "default" : isDone ? "success" : "outline"}
-              className={isCurrent ? "ring-2 ring-primary/30" : ""}
-              data-testid={`stage-${stage}`}
-            >
-              {isDone ? "✓ " : ""}{STAGE_LABELS[stage]}
-            </Badge>
-          );
-        })}
-      </div>
-      <p className="text-xs text-muted-foreground">
-        現在: {STAGE_LABELS[current]} — {STAGE_WORK_DESCRIPTIONS[current]}
-      </p>
-    </div>
-  );
-}
+// Issue #349: the 7-stage internal ProgressSteps is replaced by
+// `WorkflowProgressSteps` (W0..W7). Internal stage names are never shown to
+// the developer (spec §2.1).
 
-function NextActionBanner({ uiState, nextAction }: {
-  uiState: InterviewUiState;
-  nextAction: string;
+// Issue #349: `NextActionBanner` is replaced by `WorkflowLocationCard`
+// (`R1` 現在地, one per screen). The banner's stage badge came from the
+// client-derived `InterviewUiState`; the current location must now come from
+// the server's canonical workflow state, and 「次にやること」 must name the
+// state's single primary action, in the same card (spec §3.5, 原則 P2).
+
+// Issue #295 PR #296 review restructure (Finding: Alignment Review layout):
+// 調査結果(qa.investigation)の表示を Q&A一覧カード専用から切り出した
+// 共有コンポーネント。focused question カード(画面中央)と Q&A一覧カード
+// (サイドバー)の両方から同じ内容・同じ testid で表示できるようにする。
+// `onTranscribe` を渡した場合だけ「回答欄に転記」ボタンを出す(focused
+// question 側は会話の message 欄に、Q&A一覧側は回答ドラフトに転記する)。
+function QaInvestigationBlock({
+  qaId, investigation, routeCategory, onTranscribe,
+}: {
+  qaId: number;
+  investigation: NonNullable<InterviewQaOut["investigation"]>;
+  routeCategory?: InquiryRouteCategory | null;
+  onTranscribe?: () => void;
 }) {
+  const [showEvidence, setShowEvidence] = useState(false);
   return (
     <div
-      className="rounded-md border bg-muted/40 p-3 flex items-start gap-3"
-      data-testid="next-action"
+      className="rounded-md border p-2 text-xs space-y-1 bg-sky-500/5"
+      data-testid={`qa-investigation-${qaId}`}
     >
-      {uiState === "preparing" ? (
-        <Loader2 className="h-4 w-4 mt-0.5 shrink-0 animate-spin text-primary" />
-      ) : (
-        <Sparkles className="h-4 w-4 mt-0.5 shrink-0 text-primary" />
-      )}
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          <Badge variant="secondary">{UI_STATE_LABELS[uiState]}</Badge>
-          <span className="text-xs font-medium text-muted-foreground">次にやること</span>
-        </div>
-        <p className="text-sm mt-1">{nextAction}</p>
-      </div>
-    </div>
-  );
-}
-
-function UnderstandingItemCard({ item, category }: { item: UnderstandingItem; category: string }) {
-  return (
-    <div className="rounded-md border p-3 space-y-2">
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <div className="font-medium text-sm">{item.name}</div>
-          <div className="text-xs text-muted-foreground">{category}</div>
-        </div>
-        <Badge variant={confidenceVariant(item.confidence.level)}>
-          {item.confidence.level}
-        </Badge>
-      </div>
-      {item.summary && <p className="text-xs">{item.summary}</p>}
-      {item.why_core && <p className="text-xs text-muted-foreground italic">{item.why_core}</p>}
-      {item.evidence.length > 0 && (
-        <div className="space-y-1">
-          {item.evidence.map((e, i) => (
-            <div key={i} className="text-[10px] text-muted-foreground font-mono">
-              {e.path}:{e.start_line}-{e.end_line} — {e.summary}
-            </div>
-          ))}
-        </div>
-      )}
-      {item.related_apis.length > 0 && (
-        <div className="text-[10px] text-muted-foreground">APIs: {item.related_apis.join(", ")}</div>
-      )}
-      {item.children.length > 0 && (
-        <div className="text-[10px] text-muted-foreground">子要素: {item.children.join(", ")}</div>
-      )}
-    </div>
-  );
-}
-
-function UnderstandingPanel({ understanding }: { understanding: CurrentUnderstanding }) {
-  const sections: [string, UnderstandingItem[]][] = [
-    ["システムの目的", understanding.system_purpose],
-    ["主要機能", understanding.core_capabilities],
-    ["機能要素", understanding.capability_elements],
-    ["支援要素", understanding.supporting_elements],
-    ["API境界", understanding.api_boundaries],
-    ["プローブ対象フロー候補", understanding.probe_flow_candidates],
-  ];
-
-  const hasContent = sections.some(([, items]) => items.length > 0);
-
-  if (!hasContent) {
-    return (
-      <div className="text-sm text-muted-foreground text-center py-4">
-        理解項目が見つかりませんでした。ドキュメントの内容が不足している可能性があります。
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-4" data-testid="understanding-panel">
-      {sections.map(([label, items]) =>
-        items.length > 0 ? (
-          <div key={label}>
-            <h4 className="text-xs font-semibold uppercase text-muted-foreground mb-2">{label}</h4>
-            <div className="space-y-2">
-              {items.map((item, idx) => (
-                <UnderstandingItemCard key={idx} item={item} category={label} />
-              ))}
-            </div>
+      {investigation.status === "completed" ? (
+        <>
+          <p className="font-medium">AIの調査結果: {investigation.conclusion}</p>
+          {investigation.key_points.length > 0 && (
+            <ul className="list-disc pl-4">
+              {investigation.key_points.map((k, i) => <li key={i}>{k}</li>)}
+            </ul>
+          )}
+          {routeCategory === "hybrid" && investigation.decision_question && (
+            <p
+              className="rounded border border-amber-500/60 bg-amber-500/10 px-2 py-1 font-medium text-amber-800"
+              data-testid={`qa-investigation-decision-question-${qaId}`}
+            >
+              確認したいこと: {investigation.decision_question}
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setShowEvidence(s => !s)}
+              data-testid={`qa-investigation-show-evidence-${qaId}`}
+            >
+              {showEvidence ? "根拠を隠す" : "根拠を見る"}
+            </Button>
+            {onTranscribe && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={onTranscribe}
+                data-testid={`qa-investigation-transcribe-${qaId}`}
+              >
+                調査結果を回答欄に転記
+              </Button>
+            )}
           </div>
-        ) : null,
+          {showEvidence && (
+            <div
+              className="mt-1 space-y-1 rounded bg-background/60 p-2"
+              data-testid={`qa-investigation-evidence-${qaId}`}
+            >
+              {investigation.evidence.map((e, i) => (
+                <p key={i} className="font-mono text-[10px] text-muted-foreground">
+                  {e.path}:{e.start_line}-{e.end_line}{e.summary ? ` — ${e.summary}` : ""}
+                </p>
+              ))}
+              {investigation.uncertainty && (
+                <p className="text-muted-foreground">不確実な点: {investigation.uncertainty}</p>
+              )}
+            </div>
+          )}
+        </>
+      ) : (
+        <p className="text-muted-foreground italic" data-testid={`qa-investigation-unresolved-${qaId}`}>
+          AIの調査では特定できませんでした
+        </p>
       )}
     </div>
   );
@@ -501,18 +577,136 @@ function UnderstandingPanel({ understanding }: { understanding: CurrentUnderstan
 // 一覧・編集・スキップできる。回答の修正は新しいリビジョン行として保存され、
 // 旧回答も previous として残る(上書きしない)。
 function QaItemCard({
-  qa, onAnswer, onSkip, onResume, answering, skipping, resuming,
+  qa, sessionId, actor, existingInquiry, onAnswer, onSkip, onResume, answering,
+  skipping, resuming, outOfArea, investigate,
 }: {
   qa: InterviewQaOut;
-  onAnswer: (qaId: number, answerText: string, answerUnknown?: boolean) => Promise<void>;
+  sessionId: number;
+  // Issue #336: the 「わからない」 entry point is called from this card, so it
+  // needs the actor label the other answer paths already carry. The recorded
+  // IDENTITY is still the server's authenticated Principal, never this string.
+  actor: string;
+  // Issue #285 refresh/resume: an already-active (open/held) Inquiry for
+  // this question, rediscovered via the list endpoint so a page reload
+  // never forgets an in-progress Inquiry.
+  existingInquiry?: InterviewInquiryOut;
+  // 確定回答の保存だけ。「わからない」は #336 の専用入口(submitUnknown)が
+  // 扱うので、この経路は answer_unknown を送らない。
+  onAnswer: (qaId: number, answerText: string) => Promise<void>;
   onSkip: (qaId: number) => void;
   onResume: (qaId: number) => void;
   answering: boolean;
   skipping: boolean;
   resuming: boolean;
+  // Issue #291: rendered in the 「担当外の質問」 group -- offers a handoff
+  // action in addition to the normal answer/skip actions.
+  outOfArea?: boolean;
+  // Issue #295 §4.8 / PR #296 review fix (Finding 4): the single shared
+  // auto-investigation controller (one instance per session, created in
+  // InterviewPage and passed down through QaPanel) -- never a per-card
+  // instance, so an in-flight call from this card, another card, or the
+  // focused-question card all share the same isPending flag.
+  investigate: QaAutoInvestigateController;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(qa.answer_text ?? "");
+  const [inquiryMode, setInquiryMode] = useState(false);
+  const [hasHeldInquiry, setHasHeldInquiry] = useState(false);
+  const [attachedInquiryId, setAttachedInquiryId] = useState<number | null>(null);
+  const [handoffOpen, setHandoffOpen] = useState(false);
+  // Issue #295 §4.8: true only while THIS card's 「わからない」 auto-
+  // investigation is in flight (derived from the shared controller, not
+  // local state) -- drives the short status line.
+  const resumeInquiry = useResumeInterviewInquiry(sessionId);
+
+  // Epic #328: 「わからない」の続きとして、AI と一緒に状況を確かめる共同理解
+  // セッション。既存の #142 / #295 フローは変えない — この導線は調査結果を
+  // 見たあとの追加手段であり、開いても元の質問には一切回答しない。
+  const jointList = useJointUnderstandingList(sessionId);
+  const createJoint = useCreateJointUnderstanding(sessionId);
+  const answerUnknown = useAnswerQaUnknown(sessionId);
+  // Issue #336: 「わからない」 is one server call that records, classifies, and
+  // (where the code can help) investigates. The in-flight indicator therefore
+  // follows THAT call, not the old separate route-and-investigate controller.
+  const investigatingUnknown =
+    answerUnknown.isPending || investigate.investigatingQaId === qa.id;
+
+  const [jointId, setJointId] = useState<number | null>(null);
+  // Issue #336: one shared matching rule (see findOpenJointSession) — it has to
+  // account for `interview_qa`'s additive corrections, and two copies of that
+  // would drift.
+  const activeJoint = findOpenJointSession(jointList.data?.items, "qa", qa.id);
+  const openJointId = jointId ?? activeJoint?.id ?? null;
+
+  const startJointUnderstanding = () => {
+    if (activeJoint) {
+      setJointId(activeJoint.id);
+      return;
+    }
+    createJoint.mutate(
+      {
+        origin_kind: "qa",
+        origin_id: qa.id,
+        // Issue #336: only the 「わからない」 entry point may record
+        // 'unknown_answer'. Opening the conversation from a button is an
+        // explicit request, and claiming otherwise would make the audit
+        // distinction between the two paths meaningless.
+        trigger: "explicit_request",
+        question_text: qa.question_text,
+      },
+      {
+        onSuccess: result => setJointId(result.session.id),
+        onError: e => toast.error(String(e)),
+      },
+    );
+  };
+
+  // Raw enum values are never rendered (Issue #266) -- only a known,
+  // mapped label is shown; an unrecognized value renders no badge at all.
+  const routeCategoryLabel = qa.route_category
+    ? ROUTE_CATEGORY_LABELS[qa.route_category as InquiryRouteCategory]
+    : undefined;
+
+  useEffect(() => {
+    void recordInterviewMetricEventBestEffort({
+      schema_version: "interview-metric-event-v1",
+      event_key: `question_presented:qa:${qa.id}`,
+      session_id: sessionId,
+      event_type: "question_presented",
+      target_kind: "qa",
+      target_id: qa.id,
+    });
+  }, [qa.id, sessionId]);
+
+  const transcribeInvestigationConclusion = () => {
+    if (!qa.investigation) return;
+    setDraft(qa.investigation.conclusion);
+    setEditing(true);
+  };
+
+  const heldInquiryId = hasHeldInquiry
+    ? attachedInquiryId
+    : (existingInquiry?.status === "held" ? existingInquiry.id : null);
+  const reopenableInquiryId = existingInquiry?.status === "open" ? existingInquiry.id : null;
+
+  const handleResumeInquiry = () => {
+    const id = heldInquiryId;
+    if (!id) return;
+    resumeInquiry.mutate({ inquiryId: id }, {
+      onSuccess: () => {
+        setAttachedInquiryId(id);
+        setHasHeldInquiry(false);
+        setInquiryMode(true);
+      },
+      onError: e => toast.error(String(e)),
+    });
+  };
+
+  const openExistingInquiry = () => {
+    if (!reopenableInquiryId) return;
+    setAttachedInquiryId(reopenableInquiryId);
+    setInquiryMode(true);
+  };
 
   const submit = async () => {
     if (!draft.trim()) return;
@@ -520,11 +714,49 @@ function QaItemCard({
     setEditing(false);
   };
 
-  // Issue #142: 「わからない」を有効な入力として記録する。エラーにはせず、
-  // status=unconfirmed として保存し、以後の推論で仮説→再確認に回す。
+  // Issue #336: 「わからない」は 1 回の呼び出しになった。サーバが
+  //   1. 「わからない」を先に記録し(以降が失敗しても回答・訂正・引き継ぎの
+  //      機会は失われない)、
+  //   2. Question Router で分類し、
+  //   3. コードで確かめられる分類のときだけ共同理解セッションを開いて調査する
+  // という順序を保証する。以前はここが「route-and-investigate を呼び、失敗
+  // したら #142 の回答フローへ落とす」という無関係な 2 呼び出しで、実際の
+  // 「わからない」から共同理解が始まることは無かった。
+  //
+  // 内部の分類名(system_researchable / hybrid / human_only)は表示しない。
+  // 開発者に見せるのは「調査中/調査の限界/実行失敗/人の判断待ち」の区別。
   const submitUnknown = async () => {
-    await onAnswer(qa.id, draft.trim(), true);
-    setEditing(false);
+    if (answerUnknown.isPending) return;
+    try {
+      const result = await answerUnknown.mutateAsync({
+        qaId: qa.id,
+        answerText: draft.trim(),
+        actor,
+      });
+      setEditing(false);
+      if (result.joint_understanding_id) {
+        setJointId(result.joint_understanding_id);
+      }
+      if (result.next_step === "routing_unavailable") {
+        toast.info(
+          "「わからない」を記録しました。いまは自動調査を始められないので、"
+          + "回答の修正や引き継ぎはこのまま続けられます",
+        );
+      } else if (result.next_step === "developer_answer_required") {
+        toast.info(
+          "「わからない」を記録しました。これはコードからは確かめられない"
+          + "判断なので、あなたの回答か引き継ぎが必要です",
+        );
+      } else if (result.next_step === "joint_understanding_opened") {
+        toast.info(
+          result.error
+            ? `「わからない」を記録しました。調査は完了できませんでした(${result.error})。もう一度試せます`
+            : "「わからない」を記録し、一緒に確かめる対話を開きました",
+        );
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "「わからない」を記録できませんでした");
+    }
   };
 
   return (
@@ -539,6 +771,16 @@ function QaItemCard({
         <div className="flex gap-1 shrink-0">
           {qa.question_source === "runtime" && (
             <Badge variant="secondary" data-testid={`qa-source-runtime-${qa.id}`}>実態チェック</Badge>
+          )}
+          {outOfArea && (
+            <Badge variant="warning" data-testid={`qa-out-of-area-${qa.id}`}>
+              担当外({knowledgeAreaLabel(qa.knowledge_area)})
+            </Badge>
+          )}
+          {routeCategoryLabel && (
+            <Badge variant="secondary" data-testid={`qa-route-category-${qa.id}`}>
+              {routeCategoryLabel}
+            </Badge>
           )}
           <Badge variant="outline">{qa.question_category}</Badge>
           <Badge variant={
@@ -590,6 +832,15 @@ function QaItemCard({
         </div>
       )}
 
+      {qa.investigation && (
+        <QaInvestigationBlock
+          qaId={qa.id}
+          investigation={qa.investigation}
+          routeCategory={qa.route_category as InquiryRouteCategory}
+          onTranscribe={transcribeInvestigationConclusion}
+        />
+      )}
+
       {qa.answer_text && !editing && (
         <p className="text-sm bg-muted/40 rounded p-2 whitespace-pre-wrap break-words">
           {qa.answer_text}
@@ -601,69 +852,229 @@ function QaItemCard({
         </p>
       )}
 
-      {editing ? (
-        <div className="space-y-2">
-          <Textarea
-            value={draft}
-            onChange={e => setDraft(e.target.value)}
-            rows={3}
-            placeholder="回答を入力"
-          />
-          <div className="flex gap-2">
-            <Button size="sm" onClick={submit} disabled={answering || !draft.trim()}>
-              {answering ? "送信中..." : "保存"}
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={submitUnknown}
-              disabled={answering}
-              data-testid={`qa-answer-unknown-${qa.id}`}
-            >
-              わからない
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => setEditing(false)}>キャンセル</Button>
-          </div>
-        </div>
+      {openJointId && (
+        <JointUnderstandingPanel
+          sessionId={sessionId}
+          juId={openJointId}
+          onClosed={() => setJointId(null)}
+        />
+      )}
+
+      {inquiryMode ? (
+        <InquiryPanel
+          key={attachedInquiryId ?? "new"}
+          sessionId={sessionId}
+          originKind="qa"
+          originId={qa.id}
+          heldDraft={draft || null}
+          existingInquiryId={attachedInquiryId ?? undefined}
+          onResolved={heldDraft => {
+            setDraft(heldDraft ?? "");
+            setInquiryMode(false);
+            setHasHeldInquiry(false);
+            setAttachedInquiryId(null);
+            setEditing(true);
+          }}
+          onHeld={heldId => {
+            setInquiryMode(false);
+            setHasHeldInquiry(true);
+            setAttachedInquiryId(heldId);
+          }}
+          onCancel={() => { setInquiryMode(false); setAttachedInquiryId(null); }}
+        />
       ) : (
-        <div className="flex gap-2">
-          <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
-            <Pencil className="h-3 w-3 mr-1" />
-            {qa.status === "answered" || qa.status === "unconfirmed" ? "回答を修正" : "回答する"}
-          </Button>
-          {qa.status === "open" && (
-            <Button size="sm" variant="outline" onClick={() => onSkip(qa.id)} disabled={skipping}>
-              後で回答
-            </Button>
+        <>
+          {heldInquiryId && (
+            <div className="flex items-center gap-2" data-testid={`qa-held-inquiry-marker-${qa.id}`}>
+              <p className="text-xs text-amber-700">保留中の疑問があります</p>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleResumeInquiry}
+                disabled={resumeInquiry.isPending}
+                data-testid={`qa-inquiry-resume-${qa.id}`}
+              >
+                疑問を再開する
+              </Button>
+            </div>
           )}
-          {qa.status === "skipped" && (
-            <Button size="sm" variant="outline" onClick={() => onResume(qa.id)} disabled={resuming}>
-              再開
-            </Button>
+          {editing ? (
+            <div className="space-y-2">
+              <Textarea
+                value={draft}
+                onChange={e => setDraft(e.target.value)}
+                rows={3}
+                placeholder="回答を入力"
+              />
+              <div className="flex items-center gap-2">
+                <Button size="sm" onClick={submit} disabled={answering || !draft.trim() || investigatingUnknown}>
+                  {answering ? "送信中..." : "保存"}
+                </Button>
+                {investigatingUnknown ? (
+                  // Issue #295 §4.11: a single short Japanese status line only
+                  // -- no log stream -- while the auto-investigation runs.
+                  <p
+                    className="text-xs text-muted-foreground"
+                    data-testid={`qa-answer-unknown-investigating-${qa.id}`}
+                  >
+                    関連コードとテストを確認しています
+                  </p>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={submitUnknown}
+                    disabled={answering || answerUnknown.isPending || investigate.isPending}
+                    data-testid={`qa-answer-unknown-${qa.id}`}
+                  >
+                    わからない
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setEditing(false)}
+                  disabled={investigatingUnknown}
+                >
+                  キャンセル
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
+                <Pencil className="h-3 w-3 mr-1" />
+                {qa.status === "answered" || qa.status === "unconfirmed" ? "回答を修正" : "回答する"}
+              </Button>
+              {qa.status === "open" && (
+                <Button size="sm" variant="outline" onClick={() => onSkip(qa.id)} disabled={skipping}>
+                  後で回答
+                </Button>
+              )}
+              {qa.status === "skipped" && (
+                <Button size="sm" variant="outline" onClick={() => onResume(qa.id)} disabled={resuming}>
+                  再開
+                </Button>
+              )}
+              {outOfArea && qa.status === "open" && !qa.handoff_id && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setHandoffOpen(true)}
+                  data-testid={`qa-handoff-open-${qa.id}`}
+                >
+                  担当者へ引き継ぐ
+                </Button>
+              )}
+              {!openJointId && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={startJointUnderstanding}
+                  disabled={createJoint.isPending}
+                  data-testid={`qa-joint-understanding-${qa.id}`}
+                >
+                  一緒に確かめる
+                </Button>
+              )}
+              {reopenableInquiryId ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={openExistingInquiry}
+                  data-testid={`qa-inquiry-reopen-${qa.id}`}
+                >
+                  疑問を再開する
+                </Button>
+              ) : (
+                !heldInquiryId && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => { setAttachedInquiryId(null); setInquiryMode(true); }}
+                    data-testid={`qa-inquiry-open-${qa.id}`}
+                  >
+                    疑問がある
+                  </Button>
+                )
+              )}
+            </div>
           )}
-        </div>
+        </>
+      )}
+      {outOfArea && (
+        <HandoffModal
+          sessionId={sessionId}
+          originKind="qa"
+          originId={qa.id}
+          defaultBackground={qa.question_text}
+          defaultEvidence={qa.evidence_refs.map(e => ({
+            path: e.path, start_line: e.start_line, end_line: e.end_line, summary: "",
+          }))}
+          open={handoffOpen}
+          onOpenChange={setHandoffOpen}
+        />
       )}
     </div>
   );
 }
 
-function QaPanel({
-  sessionId, actor, approvedCount,
-}: { sessionId: number; actor: string; approvedCount: number }) {
+// Exported for focused component testing (Issue #291's out-of-area
+// grouping) without rendering the entire InterviewPage.
+export function QaPanel({
+  sessionId, actor, approvedCount, answerableAreas, investigate,
+  showRecoveryActions = false,
+}: {
+  sessionId: number;
+  actor: string;
+  approvedCount: number;
+  // Issue #291: the session's current answerable-areas selection, used only
+  // to group out-of-area questions separately -- never to hide them.
+  // Defensively accepts undefined (a stale cached/mocked session shape).
+  answerableAreas: KnowledgeArea[] | null | undefined;
+  // Issue #295 §4.8 / PR #296 review fix (Finding 4): the single shared
+  // auto-investigation controller, created once per session by the caller
+  // (InterviewPage) and also used by the focused-question card there --
+  // never instantiated locally here, so the two UI surfaces share one
+  // in-flight state (see QaAutoInvestigateController's doc comment).
+  investigate: QaAutoInvestigateController;
+  // Issue #349: true only while the auto-run process behind these controls
+  // has itself failed (`E14`). Recovery controls are never permanent.
+  showRecoveryActions?: boolean;
+}) {
   const { data: qaList } = useInterviewQaList(sessionId);
   const answer = useAnswerInterviewQa(sessionId);
   const skip = useSkipInterviewQa(sessionId);
   const resume = useResumeInterviewQa(sessionId);
   const runRealityCheck = useRunRuntimeRealityCheck(sessionId);
+  // Issue #285 refresh/resume: re-attach any still-active Inquiry to its
+  // origin card after a reload.
+  const activeInquiries = useActiveInquiriesByOrigin(sessionId);
 
-  const handleAnswer = async (qaId: number, answerText: string, answerUnknown?: boolean) => {
+  // Issue #286 review fix (Finding 1): batch-routes + investigates open
+  // questions in the normal Q&A flow instead of leaving Question Router /
+  // Investigation Agent reachable only from the Inquiry side-conversation.
+  // Unrestricted (no qa_ids) -- the whole-session batch, distinct from each
+  // card's single-question auto-investigate below.
+  const handleRouteAndInvestigate = async () => {
+    try {
+      const result = await investigate.runBulk();
+      toast.success(
+        `分類 ${result.counts.routed} 件・調査 ${result.counts.investigated} 件が完了しました`,
+      );
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  // Q&A カードの確定回答。「わからない」はここを通らない: Issue #336 の
+  // 専用入口が「先に記録 → 分類 → 必要なときだけ調査」の順序を保証する。
+  const handleAnswer = async (qaId: number, answerText: string) => {
     try {
       const result = await answer.mutateAsync({
-        qaId, answer_text: answerText, actor, answer_unknown: answerUnknown,
+        qaId, answer_text: answerText, actor,
       });
-      if (answerUnknown) {
-        toast.info("「わからない」として記録しました。仮説を立てて確認質問を続けます。");
-      } else if (result.regeneration_recommended) {
+      if (result.regeneration_recommended) {
         toast.warning("回答が変わったため、生成済みの提案の再生成を検討してください(自動では再生成されません)。");
       } else {
         toast.success("回答を保存しました");
@@ -695,7 +1106,12 @@ function QaPanel({
   // lives here, and its most useful moment is exactly before any questions
   // exist. Hide the panel only when there is nothing to show AND nothing
   // that could be run.
-  if (!qaList || (qaList.items.length === 0 && approvedCount === 0)) return null;
+  if (!qaList || qaList.items.length === 0) return null;
+
+  // Issue #291: out-of-area questions are never hidden -- only grouped
+  // separately under 「担当外の質問」, excluded from the primary list.
+  const inAreaItems = qaList.items.filter(qa => !isOutOfArea(qa.knowledge_area, answerableAreas));
+  const outOfAreaItems = qaList.items.filter(qa => isOutOfArea(qa.knowledge_area, answerableAreas));
 
   return (
     <Card data-testid="qa-panel">
@@ -707,24 +1123,40 @@ function QaPanel({
           <span>
             残質問 {qaList.open_count} 件(うち高優先度 {qaList.high_priority_open_count} 件)
           </span>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={handleRuntimeRealityCheck}
-            disabled={runRealityCheck.isPending || approvedCount === 0}
-            data-testid="run-runtime-reality-check"
-            title={approvedCount === 0 ? "先に提案を1件以上承認してください" : undefined}
-          >
-            {runRealityCheck.isPending ? "実行中..." : "実態チェックを実行"}
-          </Button>
+          {/* Issue #349: 「AIに先に調査させる」(#60) と「実態チェックを実行」
+              (#61) は `OP-S5`/`OP-S8` として自動実行される処理なので、通常時は
+              出さない。その処理そのものが失敗した (`E14`) ときにだけ、復旧
+              操作として現れる。前提未達の注記 (#62) は、ボタンを出さない以上
+              不要なので廃止した (原則 P3)。 */}
+          {showRecoveryActions && (
+            <div className="flex items-center gap-2">
+              {qaList.open_count > 0 && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleRouteAndInvestigate}
+                  disabled={investigate.isPending}
+                  data-testid="route-and-investigate-qa"
+                >
+                  {investigate.isPending ? "調査中..." : "調査をもう一度実行する"}
+                </Button>
+              )}
+              {approvedCount > 0 && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleRuntimeRealityCheck}
+                  disabled={runRealityCheck.isPending}
+                  data-testid="run-runtime-reality-check"
+                >
+                  {runRealityCheck.isPending ? "実行中..." : "実態チェックをもう一度実行する"}
+                </Button>
+              )}
+            </div>
+          )}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        {approvedCount === 0 && (
-          <p className="text-xs text-muted-foreground" data-testid="runtime-reality-prerequisite">
-            実態チェックには承認済みの提案が必要です。先に提案を確認して少なくとも1件を承認してください。
-          </p>
-        )}
         {qaList.answers_revised_at && (
           <div
             className="rounded-md border border-amber-500 bg-amber-500/10 p-3 text-sm flex items-start gap-2"
@@ -732,16 +1164,19 @@ function QaPanel({
           >
             <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-amber-600" />
             <div>
-              回答が修正されました。内容を反映するには「理解を更新」を実行してください
-              (自動では再構築されません)。
+              回答が修正されました。理解は自動で更新されます。更新状況は「現在の理解」/
+              「レビューキュー」のステータスをご確認ください(失敗時は再試行できます)。
             </div>
           </div>
         )}
         <div className="space-y-2 max-h-[26rem] overflow-y-auto pr-1">
-          {qaList.items.map(qa => (
+          {inAreaItems.map(qa => (
             <QaItemCard
               key={qa.id}
               qa={qa}
+              sessionId={sessionId}
+              actor={actor}
+              existingInquiry={activeInquiries.get(`qa:${qa.id}`)}
               onAnswer={handleAnswer}
               onSkip={qaId => skip.mutate({ qaId, actor }, {
                 onError: e => toast.error(String(e)),
@@ -752,11 +1187,80 @@ function QaPanel({
               answering={answer.isPending}
               skipping={skip.isPending}
               resuming={resume.isPending}
+              investigate={investigate}
             />
           ))}
         </div>
+
+        {outOfAreaItems.length > 0 && (
+          <div className="pt-2 border-t space-y-2" data-testid="qa-out-of-area-group">
+            <p className="text-xs font-semibold text-muted-foreground">
+              担当外の質問({outOfAreaItems.length} 件)
+            </p>
+            <div className="space-y-2 max-h-[20rem] overflow-y-auto pr-1">
+              {outOfAreaItems.map(qa => (
+                <QaItemCard
+                  key={qa.id}
+                  qa={qa}
+                  sessionId={sessionId}
+                  actor={actor}
+                  existingInquiry={activeInquiries.get(`qa:${qa.id}`)}
+                  onAnswer={handleAnswer}
+                  onSkip={qaId => skip.mutate({ qaId, actor }, {
+                    onError: e => toast.error(String(e)),
+                  })}
+                  onResume={qaId => resume.mutate({ qaId, actor }, {
+                    onError: e => toast.error(String(e)),
+                  })}
+                  answering={answer.isPending}
+                  skipping={skip.isPending}
+                  resuming={resume.isPending}
+                  investigate={investigate}
+                  outOfArea
+                />
+              ))}
+            </div>
+          </div>
+        )}
       </CardContent>
     </Card>
+  );
+}
+
+// Issue #349: システム処理の実行履歴 (`R6`)。現在の主作業をブロックして
+// いない過去の失敗は主フローに出さず (§5.3-4)、この監査入口にだけ残す。
+function ProcessRunHistory({ sessionId }: { sessionId: number }) {
+  const { data: runs } = useInterviewProcessRuns(sessionId);
+  if (!runs || runs.length === 0) {
+    return <p className="text-xs text-muted-foreground">まだありません。</p>;
+  }
+  return (
+    <div className="space-y-1">
+      {runs.slice(0, 30).map(run => (
+        <div key={run.id} className="rounded-md border p-2 text-xs" data-testid="process-run-row">
+          <div className="flex items-center justify-between gap-2">
+            <span>{PROCESS_LABELS[run.process_kind]}</span>
+            <Badge
+              variant={
+                run.status === "failed"
+                  ? "destructive"
+                  : run.status === "running"
+                    ? "secondary"
+                    : "success"
+              }
+            >
+              {run.status === "failed"
+                ? "失敗"
+                : run.status === "running"
+                  ? "実行中"
+                  : "成功"}
+            </Badge>
+          </div>
+          <div className="text-muted-foreground">{formatTimestamp(run.started_at)}</div>
+          {run.error ? <div className="break-words">{run.error}</div> : null}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -871,39 +1375,157 @@ function UnderstandingDiffPanel({
   );
 }
 
-function GapAnalysisPanel({ gaps }: { gaps: GapItem[] }) {
-  if (gaps.length === 0) return null;
+// PR #296 レビュー指摘対応(画面構造の再構成 / 指摘5a): Alignment Review の
+// 主領域上部に置く「あなたが実現したいこと / システムの現状 / ギャップ」
+// サマリ。Intent Brief 編集・現在の理解の詳細はサイドバーの既存パネルに
+// 任せ、ここでは全体量を一目で把握できる短い読み取り専用サマリだけを表示
+// する(Issue #295 §6 の推奨構成)。新しい判断ロジックは持たず、既存の
+// intent list / current understanding / alignment items をそのまま要約
+// するだけ。
+//
+// 指摘5a: 「ギャップ」を件数だけでなく、最重要 gap の名称・要約を主に表示
+// する。候補は alignment_state==='gap' の項目、または must_review 項目
+// (gap_summary があればそれを、無ければ current_claim を使う)。並び順は
+// Review Queue と同じカテゴリ優先度(must_review → batch_reviewable、
+// CATEGORY_SUMMARY と同じ固定順)+ id昇順というこのコードベース既存の
+// 決定的タイブレーク(review-queue.tsx §5.4 のサンプル抽出と同じ規則)を
+// 再利用するだけで、新しい並び替えロジックは追加しない。
+//
+// 件数には、バックエンドが返す outstanding_counts(未対応件数 = superseded
+// でなく answered/corrected でもない件数、Review Queue のカード数と一致)
+// があればそれを優先し、無ければ従来の counts(総数)にフォールバックする
+// (指摘3のフロント側整合)。
+function AlignmentSummaryHeader({
+  intentList, understanding, alignment,
+}: {
+  intentList: InterviewIntentListOut | null | undefined;
+  understanding: CurrentUnderstanding | null | undefined;
+  alignment: AlignmentListOut | null | undefined;
+}) {
+  const goalItems = intentList?.items_by_field["goal"] ?? [];
+  // Issue #295 が維持を求める「AI推定と人間確認済み情報の区別」: 確認済みの
+  // goal だけを「あなたが実現したいこと」として提示する。確認済みが無く AI
+  // 提案(未確認)しか無い場合は、それを人間のIntentとして出さず、未確認候補
+  // として明示ラベル付きで表示する(承認前の提案を確定情報に見せない)。
+  const confirmedGoal = goalItems.find(i => i.status === "confirmed");
+  const proposedGoal = confirmedGoal
+    ? undefined
+    : goalItems.find(i => i.status === "proposed" && i.origin === "ai_proposed");
+  const purposeNames = (understanding?.system_purpose ?? [])
+    .map(i => i.name)
+    .filter(Boolean)
+    .slice(0, 3);
+  const counts = alignment?.counts;
+  const outstanding = alignment?.outstanding_counts;
+  const mustReview = outstanding?.must_review ?? counts?.must_review ?? 0;
+  const batchReviewable = outstanding?.batch_reviewable ?? counts?.batch_reviewable ?? 0;
+
+  // アウトスタンディング(未対応)のギャップだけを候補にする -- 既に
+  // answered/corrected な行や superseded な行の古いギャップ文言を「最重要
+  // ギャップ」として出さないため、Review Queue が実際に action card として
+  // 出す条件(status not answered/corrected, not superseded)と同じ絞り込み
+  // を先にかける。
+  const byIdAscending = (a: AlignmentItemOut, b: AlignmentItemOut) => a.id - b.id;
+  const isOutstanding = (item: AlignmentItemOut) =>
+    item.status !== "answered" && item.status !== "corrected" && !item.superseded;
+  const mustReviewItems = [...(alignment?.items_by_category["must_review"] ?? [])]
+    .filter(isOutstanding).sort(byIdAscending);
+  const batchReviewableItems = [...(alignment?.items_by_category["batch_reviewable"] ?? [])]
+    .filter(isOutstanding).sort(byIdAscending);
+  const gapItems = [...mustReviewItems, ...batchReviewableItems]
+    .filter(item => item.alignment_state === "gap" || item.review_category === "must_review");
+  const gapTexts = gapItems.map(item => item.gap_summary || item.current_claim);
+  const topGapTexts = gapTexts.slice(0, 2);
+  const remainingGapCount = Math.max(gapTexts.length - topGapTexts.length, 0);
+
   return (
-    <div className="space-y-2" data-testid="gap-analysis-panel">
-      {gaps.map((gap, idx) => (
-        <div key={idx} className="rounded-md border p-3 flex items-start gap-3">
-          <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-amber-500" />
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-medium">{gap.name}</span>
-              <Badge variant={severityVariant(gap.severity)}>{gap.severity}</Badge>
-              <Badge variant="outline">{gap.gap_type}</Badge>
-            </div>
-            {gap.summary && <p className="text-xs text-muted-foreground mt-1">{gap.summary}</p>}
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-3" data-testid="alignment-summary-header">
+      <div className="rounded-md border p-3 space-y-1" data-testid="alignment-summary-goal">
+        <p className="text-[10px] font-semibold uppercase text-muted-foreground">あなたが実現したいこと</p>
+        {confirmedGoal ? (
+          <p className="text-sm break-words" data-testid="alignment-summary-goal-confirmed">
+            {confirmedGoal.value_text}
+          </p>
+        ) : proposedGoal ? (
+          <div className="space-y-1" data-testid="alignment-summary-goal-proposed">
+            <span className="inline-block rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800">
+              AI提案 · 未確認
+            </span>
+            <p className="text-sm break-words text-muted-foreground">{proposedGoal.value_text}</p>
+            <p className="text-[11px] text-muted-foreground">
+              まだ確認されていません。Intent Briefで確認・修正してください。
+            </p>
           </div>
-        </div>
-      ))}
+        ) : (
+          <p className="text-sm break-words text-muted-foreground">
+            未入力です(Intent Briefで入力してください)
+          </p>
+        )}
+      </div>
+      <div className="rounded-md border p-3 space-y-1" data-testid="alignment-summary-current-state">
+        <p className="text-[10px] font-semibold uppercase text-muted-foreground">システムの現状</p>
+        <p className="text-sm break-words">
+          {purposeNames.length > 0 ? purposeNames.join("、") : "現在の理解はまだ構築されていません"}
+        </p>
+      </div>
+      <div className="rounded-md border p-3 space-y-1" data-testid="alignment-summary-gap">
+        <p className="text-[10px] font-semibold uppercase text-muted-foreground">ギャップ</p>
+        {topGapTexts.length > 0 ? (
+          <div className="space-y-0.5" data-testid="alignment-summary-gap-list">
+            {topGapTexts.map((text, i) => (
+              <p key={i} className="text-sm break-words" data-testid={`alignment-summary-gap-item-${i}`}>
+                {text}
+              </p>
+            ))}
+            {remainingGapCount > 0 && (
+              <p className="text-xs text-muted-foreground">ほか {remainingGapCount}件</p>
+            )}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">未確認のギャップはありません</p>
+        )}
+        <p className="text-xs text-muted-foreground" data-testid="alignment-summary-gap-count">
+          要確認 {mustReview}件 · 一括レビュー可 {batchReviewable}件
+        </p>
+      </div>
     </div>
   );
 }
 
 export default function InterviewPage() {
+  const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const sessionParam = Number(searchParams.get("session"));
   const selectedSessionId = Number.isFinite(sessionParam) && sessionParam > 0 ? sessionParam : null;
   const { user } = useAuth();
   const actor = user?.username ?? "dashboard";
+  // 「セッション未選択」 を開発者が自分で選んだかどうか。自動選択より優先する。
+  const [sessionClearedByUser, setSessionClearedByUser] = useState(false);
 
   const { data: repositoryStatus, refetch: refetchRepositoryStatus } = useRepositoryStatus();
-  const { data: latestSnapshot, isLoading: snapshotLoading } = useLatestSnapshot();
-  const { data: sessions, isLoading: sessionsLoading } = useInterviewSessions();
+  const { data: latestSnapshot } = useLatestSnapshot();
+  // セッション一覧・詳細が取れないと画面の本文は何も描けないので、失敗と
+  // 再試行を明示する (issue #356 受け入れ条件「エラー時に適切な表示」)。
+  const {
+    data: sessions,
+    isLoading: sessionsLoading,
+    isError: sessionsFailed,
+    error: sessionsError,
+    refetch: refetchSessions,
+  } = useInterviewSessions();
   const createSession = useCreateInterviewSession();
-  const { data: session, isLoading: sessionLoading } = useInterviewSession(selectedSessionId);
+  const {
+    data: session,
+    isLoading: sessionLoading,
+    isError: sessionFailed,
+    error: sessionError,
+    refetch: refetchSession,
+  } = useInterviewSession(selectedSessionId);
+  const priorCapabilityGraphQuery = useInterviewCapabilityGraph(
+    session?.capability_graph_confirmation_required
+      ? selectedSessionId
+      : null,
+  );
   const { data: contextPack } = useInterviewContextPack(selectedSessionId);
   const { data: approvedSet } = useInterviewApprovedSet(selectedSessionId);
   const dialogueTurn = useInterviewDialogueTurn(selectedSessionId);
@@ -914,8 +1536,70 @@ export default function InterviewPage() {
   const rebaseSnapshot = useRebaseInterviewSnapshot(selectedSessionId);
   const updateUnderstanding = useUpdateInterviewUnderstanding();
   const confirmUnderstanding = useConfirmInterviewUnderstanding(selectedSessionId);
+  // Issue #349: the canonical developer-facing state. The server evaluates
+  // docs/system-interview-workflow-ux.md §2.2 (13-row first-match rule table
+  // + backward hold) over persisted facts only, and returns the state, its
+  // single primary action, and the currently-active exceptions. This page
+  // must not re-derive a workflow state from client-only values (a chosen
+  // tab, a mutation's isPending) -- those vanish on reload (spec §2.6/P9).
+  const { data: workflow } = useInterviewWorkflowState(selectedSessionId);
+  // Issue #351: 「現在のシステム理解」 と進行可否。ワークフロー状態とは別の
+  // 軸で、どちらもサーバーが永続事実から決定する。
+  const { data: understandingBrief } = useUnderstandingBrief(selectedSessionId);
+  const recordDiffReview = useRecordDiffReview(selectedSessionId);
+  const acknowledgeBack = useAcknowledgeBackRequest(selectedSessionId);
+  const closeSession = useCloseInterviewSession(selectedSessionId);
+  const reopenSession = useReopenInterviewSession(selectedSessionId);
+  // Issue #295 §4.8 / PR #296 review fix (Finding 4): one shared
+  // auto-investigation controller per session, used both by the
+  // focused-question card below and by QaPanel/QaItemCard (passed down as a
+  // prop) -- see QaAutoInvestigateController's doc comment in api/hooks.ts.
+  const qaAutoInvestigate = useQaAutoInvestigate(selectedSessionId);
+  // PR #296 review restructure: the same interview_qa list QaPanel already
+  // fetches, read here too (react-query dedups the identical queryKey) so
+  // the focused-question card can show a just-investigated question's
+  // qa.investigation in the same view instead of only inside the Q&A list.
+  // Issue #356 (再レビュー): コックピットの質問合計・未解決件数・進捗はこの
+  // 応答だけが根拠なので、取得前・取得失敗を 0 件という確定値にしない。
+  const {
+    data: qaListForFocus,
+    isLoading: qaListLoading,
+    isError: qaListFailed,
+    error: qaListError,
+    refetch: refetchQaList,
+  } = useInterviewQaList(selectedSessionId);
+  // PR #296 review restructure: Alignment Review (Intent Brief summary +
+  // Review Queue) moves into the main, tabbed content area. `alignmentFull`
+  // (same GET .../alignment ReviewQueuePanel already reads) decides whether
+  // this session has anything to review yet; `intentList` feeds the
+  // read-only "あなたが実現したいこと" summary line.
+  const { data: alignmentFull } = useAlignmentList(selectedSessionId);
+  const { data: intentList } = useInterviewIntentList(selectedSessionId);
+  const proposedCapabilityNodes = useMemo(
+    () => capabilityProposalNodes(session?.current_understanding),
+    [session?.current_understanding],
+  );
+  const proposedCapabilityRelations = useMemo(
+    () => capabilityProposalRelations(proposedCapabilityNodes),
+    [proposedCapabilityNodes],
+  );
+  const unmatchedCapabilityNodes = useMemo(() => {
+    const priorNodes = priorCapabilityGraphQuery.data?.nodes ?? [];
+    return proposedCapabilityNodes.filter(node =>
+      !priorNodes.some(
+        prior => prior.entity_kind === node.kind && prior.name === node.name,
+      ),
+    );
+  }, [priorCapabilityGraphQuery.data?.nodes, proposedCapabilityNodes]);
 
   const [message, setMessage] = useState("");
+  const [capabilityConfirmOpen, setCapabilityConfirmOpen] = useState(false);
+  const [capabilityIdentitySelections, setCapabilityIdentitySelections] = useState<
+    Record<string, string>
+  >({});
+  const [capabilityRelationSelections, setCapabilityRelationSelections] = useState<
+    Record<string, boolean>
+  >({});
   const messageInputRef = useRef<HTMLTextAreaElement | null>(null);
   const [editing, setEditing] = useState<InterviewProposalOut | null>(null);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
@@ -930,6 +1614,57 @@ export default function InterviewPage() {
   }>({ sessionId: null, items: [] });
 
   const sortedSessions = useMemo(() => sessions ?? [], [sessions]);
+
+  // Issue #356: コックピットの表示モデル。既存の応答 (理解 / gap / open
+  // questions / Q&A 一覧) だけから決定的に集約する。
+  const qaFetchStatus: CockpitQaFetchStatus = qaListFailed
+    ? "unavailable"
+    : qaListForFocus
+      ? "ready"
+      : qaListLoading
+        ? "loading"
+        : "unavailable";
+  const cockpit = useMemo(
+    () => buildCockpitModel({
+      understanding: session?.current_understanding,
+      brief: understandingBrief,
+      gaps: session?.gap_analysis,
+      openQuestions: session?.open_questions,
+      qaItems: qaListForFocus?.items,
+      qaFetchStatus,
+    }),
+    [
+      session?.current_understanding,
+      understandingBrief,
+      session?.gap_analysis,
+      session?.open_questions,
+      qaListForFocus?.items,
+      qaFetchStatus,
+    ],
+  );
+  // 選択中カテゴリ。開発者が選ぶまではモデルの既定 (未設定 → 要確認 → 先頭)。
+  const [selectedCategoryState, setSelectedCategoryState] = useState<{
+    sessionId: number | null;
+    key: CockpitCategoryKey;
+  } | null>(null);
+  const selectedCategoryKey =
+    selectedCategoryState?.sessionId === selectedSessionId
+      ? selectedCategoryState.key
+      : cockpit.defaultCategory;
+  const selectedCategory =
+    cockpit.categories.find(c => c.key === selectedCategoryKey) ?? cockpit.categories[0];
+  const selectCockpitCategory = (key: CockpitCategoryKey) =>
+    setSelectedCategoryState({ sessionId: selectedSessionId, key });
+  // 参加者 (issue §7)。サーバーはセッションに参加者一覧を持たないので、
+  // 回答者として実際に記録された値と、今この画面を見ている本人を出す。
+  const sessionParticipants = useMemo(() => {
+    const names = new Set<string>([actor]);
+    for (const qa of qaListForFocus?.items ?? []) {
+      if (qa.answered_by) names.add(qa.answered_by);
+    }
+    return [...names];
+  }, [actor, qaListForFocus?.items]);
+
   const proposals = session?.proposals ?? [];
   const pendingCount = proposals.filter(p => p.approval_state === "proposed").length;
   const approvedCount = approvedSet?.approved_count ?? 0;
@@ -945,30 +1680,119 @@ export default function InterviewPage() {
   const repositoryHeadStale = !!(session && repositoryStatus?.snapshot_stale);
 
   const building = createSession.isPending || updateUnderstanding.isPending;
-  const uiState: InterviewUiState | null = session ? deriveUiState(session, building) : null;
+  // Issue #349: `uiState` no longer decides WHICH workflow state is shown --
+  // `workflow.state` does. It now only selects the CONTENT of the
+  // conversation work surface (which question card / confirmation prompt to
+  // compose), so `building` (a mutation's isPending) is deliberately not fed
+  // into it: `W1` comes from the server's persisted running record instead.
+  const uiState: InterviewUiState | null = session ? deriveUiState(session, false) : null;
+  const wState = workflow?.state ?? null;
+  const wFacts = workflow?.facts;
+  // 状態ごとの作業面 (§3.3 のマトリクス)。1 状態・1 主作業 (原則 P1)。
+  const showUnderstandingWork = wState === "W2";
+  const showQuestionWork = wState === "W3";
+  const showAlignmentWork = wState === "W4";
+  const showProposalWork = wState === "W5";
+  const showDiffWork = wState === "W6";
+  const showTerminal = wState === "W7";
+  // 会話の作業面は W2 / W3 のみ。W1 は現在地カードが進行を示す。
+  const showConversationWork = showUnderstandingWork || showQuestionWork;
+
+  // Overview's "Vision を定義する" link targets the structured Intent Brief.
+  // Session data arrives asynchronously, so the browser's initial hash jump
+  // can run before the target exists. Reveal the details element and move
+  // focus once the selected session has rendered.
+  useEffect(() => {
+    if (!session) return;
+    const target = location.hash.slice(1);
+    if (target !== "cockpit-aux-intent" && target !== "cockpit-aux-change-set") return;
+    focusCockpitTarget(target);
+  }, [location.hash, session]);
+  // 復旧操作の常設をやめる (§5.3-1): 対応する例外が今発生しているときだけ。
+  // ブロッキング/劣化の再試行は `WorkflowExceptions` の 1 枚のカードが担う
+  // (§4.4: 失敗内容・影響・復旧条件・再試行を同じ枠に置く) ため、各パネル
+  // 側には置かない。`E14` だけは専用の例外カードを持たない (失敗した処理の
+  // 側に現れる) ので、その処理のパネル内が唯一の復旧場所になる。
+  const auxiliaryProcessFailed = (workflow?.unresolved_failures ?? []).some(
+    f => f.process_kind === "question_routing" || f.process_kind === "runtime_reality_check",
+  );
+  // Issue #361: 未処理の引き継ぎは「即時対応が必要な情報」なので、折りたたみ
+  // の中に入れず常設で出す判断に使う。
+  const pendingHandoffCount = wFacts?.pending_handoff_count ?? 0;
   const unlocked = session ? proposalsUnlocked(session) : false;
   // A confirmed proposal-stage session is already at its next workflow step.
-  // Rebuild only after a Q&A correction has marked the understanding stale.
-  const refreshBlockedUntilAnswerRevision = (
-    isProposalStage
-    && session?.understanding_confirmed_at != null
-    && !session.answers_revised_at
-  );
-  const canRefreshUnderstanding = !refreshBlockedUntilAnswerRevision;
+  // Rebuild only once new developer input (an answer correction, or a
+  // first-time / Runtime-Reality-Check Q&A answer given after confirmation)
+  // is waiting to be reflected. `understanding_update_available` is the
+  // server's own evaluation of this same condition (Issue #229/#263's
+  // shared `_understanding_update_blocked` predicate) so this flag can never
+  // drift from what `update-understanding` will actually accept.
   const purposeFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-purpose");
   const capabilitiesFixHighlight = useDiagnosticHighlight<HTMLDivElement>("interview-capabilities");
   // 提案ステージで未回答の絞り込み質問が残っている状態。提案生成を依頼しても
   // 情報不足だった場合、モデルの確認質問が open_questions に残る。
   const proposalNarrowing =
     uiState === "ready_for_proposals" && (session?.open_questions ?? []).length > 0;
+  // 「この理解を確認済みにする」ボタン(会話タブ内)がまだ有効な状態かどうか。
+  // uiState の判定より先に定義し、下の会話タブ必須アクション判定から参照する。
+  const canConfirmStructuredUnderstanding = !!(
+    session?.current_understanding
+    && (
+      session.understanding_confirmed_at == null
+      || session.capability_graph_confirmation_required === true
+    )
+  );
 
+  // PR #296 review restructure: 「build 済み(=突き合わせ項目が1件以上あ
+  // る)」を、現在の GET .../alignment レスポンスの実項目数から決定的に
+  // 判定する(サーバーに専用フラグは無い)。superseded_items は履歴だが
+  // 「一度は build された」事実には変わらないため合算する。
+
+  // 指摘3/5b のフロント側整合: 実行可能(actionable)カテゴリの件数は
+  // outstanding_counts(未対応件数)を優先し、Review Queue のカード数と一致
+  // させる。古い Control Server(outstanding_counts 未対応)では従来どおり
+  // counts(総数)にフォールバックする。
+
+  // Issue #349: the main tabs (element #12) and the 「会話タブへ移動」 lead
+  // (element #10) are abolished. They existed only because `W3` (answering
+  // questions) and `W4` (settling intent drift) were not distinct states, so
+  // the client had to guess which tab held the required action. The workflow
+  // state now decides that, so the compensating machinery
+  // (`conversationHasRequiredAction` / `manualMainTab` / the tab jump lead)
+  // is gone (spec §2.4-2, §3.2).
+
+  // Issue #349 (再レビュー #1): 自動選択は「初回ロードで URL に session が
+  // 無いとき」の 1 回だけ。以前は未選択を見つけるたびに最新セッションへ戻して
+  // いたため、開発者が 「セッション未選択」 を選んでも即座に選択が復活し、
+  // `W0-B` (= 新しいインタビューを開始する状態) に到達できなかった。既存
+  // セッションがあるシステムでは新規開始が事実上不可能になる。
+  const autoSelectedRef = useRef(false);
   useEffect(() => {
-    if (!selectedSessionId && sortedSessions.length > 0) {
+    if (autoSelectedRef.current) return;
+    if (selectedSessionId) {
+      autoSelectedRef.current = true;
+      return;
+    }
+    if (sessionsLoading) return;
+    if (sessionClearedByUser) {
+      autoSelectedRef.current = true;
+      return;
+    }
+    if (sortedSessions.length > 0) {
+      autoSelectedRef.current = true;
       const next = new URLSearchParams(searchParams);
       next.set("session", String(sortedSessions[0].id));
       setSearchParams(next, { replace: true });
     }
-  }, [selectedSessionId, sortedSessions, searchParams, setSearchParams]);
+  }, [
+    selectedSessionId,
+    sessionsLoading,
+    sessionClearedByUser,
+    sortedSessions,
+    searchParams,
+    setSearchParams,
+  ]);
+
 
   const answerRevisionReflected =
     answerRevisionReflectedState.sessionId === selectedSessionId
@@ -989,9 +1813,6 @@ export default function InterviewPage() {
   const zeroBaseComplete =
     uiState === "zero_base" &&
     (userMessageCount >= ZERO_BASE_QUESTIONS.length || isProposalStage);
-  const canConfirmStructuredUnderstanding = !!(
-    session?.current_understanding && session.understanding_confirmed_at == null
-  );
 
   // 現在ユーザーに求める「1つの質問/確認」を導出する。
   const focusedQuestion = useMemo<FocusedQuestion | null>(() => {
@@ -1047,6 +1868,55 @@ export default function InterviewPage() {
     return { text: focusedQuestion.text, qaId: open[0].qa_id ?? undefined };
   }, [uiState, session, focusedQuestion]);
 
+  // Issue #356: コックピットの CTA。既存パネルへスクロール + フォーカスする
+  // だけで、回答・編集・根拠表示の処理はそれぞれのパネルが持つ。
+  const openCockpitTarget = (testIds: string[]) => {
+    if (!focusFirstCockpitTarget(testIds)) {
+      toast.info("対象のパネルは現在の状態では表示されていません。");
+    }
+  };
+  // 未解決事項 1 件を開く。その質問の行 (`qa-item-<id>`) が描かれていれば
+  // そこへ移動する -- 作業面の先頭ボタンへ飛ばすと、質問が複数あるときに
+  // 選んだものと違う質問にフォーカスが当たる。
+  const openUnresolvedItem = (item: CockpitUnresolvedItem) => {
+    if (item.category) selectCockpitCategory(item.category);
+    focusFirstCockpitTarget(unresolvedTargets(item));
+  };
+
+  // Issue #360: Status summary の主 CTA。
+  //
+  // その状態の主操作 (完了条件を満たす操作) は作業面のボタンが唯一の実行者
+  // であり続ける (#342 原則 P1)。ここでは移動とフォーカスだけを行い、実行は
+  // しない -- 同じ操作を 2 箇所に置くと、どちらが正準か分からなくなる
+  // (原則 P7)。`W2` の主操作は Brief カードの中にあるので、そちらを先に
+  // 探してから作業面へ落とす。
+  const stateActionTargets: string[] =
+    wState === "W2"
+      ? ["understanding-confirm-block", "work-surface-W2"]
+      : wState
+        ? [`work-surface-${wState}`]
+        : [];
+  const stateActionLabel =
+    workflow && workflow.primary_action !== "none" && stateActionTargets.length > 0
+      ? PRIMARY_ACTION_LABELS[workflow.primary_action]
+      : null;
+  // 有限集合 (`CockpitNextStepKind`) の直接の対応表。ここで新しい判定はしない。
+  const nextStepActionLabel =
+    cockpit.nextStep.kind === "retry_qa"
+      ? "Q&A を再取得"
+      : (cockpit.nextStep.actionLabel ?? stateActionLabel);
+  const runNextStep = () => {
+    const step = cockpit.nextStep;
+    if (step.kind === "retry_qa") {
+      void refetchQaList();
+      return;
+    }
+    if (step.category) selectCockpitCategory(step.category);
+    const targets = step.targetTestIds.length > 0 ? step.targetTestIds : stateActionTargets;
+    if (targets.length === 0) return;
+    openCockpitTarget(targets);
+  };
+
   const ensureRepositorySnapshotFresh = async (action: string) => {
     const { data: status } = await refetchRepositoryStatus();
     if (status?.snapshot_stale) {
@@ -1060,7 +1930,7 @@ export default function InterviewPage() {
 
   const nextActionText = useMemo(() => {
     if (canConfirmStructuredUnderstanding) {
-      return "右側の「現在の理解」パネルに表示されているシステム理解を確認し、問題なければ「この理解を確認済みにする」を押してください。";
+      return "同じカード内に表示されているシステム理解が今回の対象として正しいか判断してください。";
     }
     switch (uiState) {
       case "preparing":
@@ -1081,8 +1951,8 @@ export default function InterviewPage() {
           : "「送信して提案を生成」を押すと、確認済みの理解にもとづいて提案が生成されます。";
       case "proposal_review":
         return approvedCount > 0
-          ? "承認済みの提案から「差分を生成」でレビュー用の差分を作成できます。残りの提案のレビューも続けられます。"
-          : "各提案を承認・編集・却下してください。承認した提案から差分を生成できます。";
+          ? "承認済みの提案からレビュー用の差分が自動で生成されます。残りの提案のレビューも続けられます。"
+          : "各提案を承認・編集・却下してください。承認が終わると差分は自動で生成されます。";
       default:
         return "";
     }
@@ -1100,18 +1970,13 @@ export default function InterviewPage() {
         title: `System interview ${latestSnapshot.commit_sha.slice(0, 8)}`,
         focus: "Author reviewed probe-agent metadata and probe proposals",
       });
+      setSessionClearedByUser(false);
       setSearchParams({ session: String(created.id) });
+      // Issue #349 (再レビュー #2): 初期理解の構築はセッション作成リクエスト
+      // 自身が開始する。ここから 2 本目の構築を投げると同じ処理が二重に走り、
+      // 推論モデル呼び出しも二重になる。進捗は `W1` の現在地カードが示し、
+      // 失敗すれば `E3-a` の復旧操作として再試行できる。
       toast.success("インタビューを開始しました。システム理解を自動構築しています…");
-      try {
-        const updated = await updateUnderstanding.mutateAsync(created.id);
-        if (updated.last_error) {
-          toast.error(`自動理解の構築に失敗しました: ${updated.last_error}`);
-        } else {
-          toast.success("初期理解の構築が完了しました。内容を確認してください。");
-        }
-      } catch (e) {
-        toast.error(`自動理解の構築に失敗しました: ${String(e)}`);
-      }
     } catch (e) {
       toast.error(String(e));
     }
@@ -1193,20 +2058,101 @@ export default function InterviewPage() {
   const sendUnknown = () =>
     sendText(message.trim() || "わかりません", { answerUnknown: true });
 
+  // Issue #295 §4.8 review fix (Finding 4): 画面中央の focused question の
+  // 「わからない」にも、QaItemCard 側と同じ共有コントローラ(qaAutoInvestigate)
+  // を接続する。この質問を裏付ける interview_qa 行の qa_id が分かる場合のみ
+  // qa_ids=[qaId] で自動調査を依頼する。
+  // PR #296 review restructure: 投稿された調査結果(qa.investigation)は
+  // qaListForFocus(QaPanel と同じ interview_qa 一覧、react-query がキャッ
+  // シュを共有)から同じ qa_id の行を探して、この focused question のすぐ
+  // 下に同じ QaInvestigationBlock で表示する -- もう「Q&A一覧を見に行っ
+  // て」というトースト誘導だけには頼らない。qa_id が無い(ゼロベースの固
+  // 定質問など)場合や調査が使えなかった場合は、必ず従来の #142 フロー
+  // (sendUnknown)にフォールバックする。
+  const focusedQuestionInvestigating = !!(
+    focusedQuestion?.qaId != null && qaAutoInvestigate.investigatingQaId === focusedQuestion.qaId
+  );
+  const focusedQa = focusedQuestion?.qaId != null
+    ? qaListForFocus?.items.find(qa => qa.id === focusedQuestion.qaId)
+    : undefined;
+  const handleFocusedUnknown = async () => {
+    const qaId = focusedQuestion?.qaId;
+    if (qaId == null) {
+      // 対象外(裏付けとなる質問行が無い): 従来の #142 フローへ直接進む。
+      sendUnknown();
+      return;
+    }
+    // 既に他のカードからの自動調査が進行中: 二重発火させず、ボタンが
+    // disabled になっている間はここで何もしない(#142へは進めない -- ユー
+    // ザーの操作機会は失わない。再クリックすれば良いだけ)。
+    if (qaAutoInvestigate.isPending) return;
+    const investigated = await qaAutoInvestigate.runForQuestion(qaId);
+    if (investigated) {
+      toast.info("AIが調査しました。調査結果をこの画面で確認してください。");
+      return;
+    }
+    sendUnknown();
+  };
+
   // 「いいえ」は修正内容の入力を促す: 定型の書き出しを入力欄に入れてフォーカスする。
   const startCorrection = () => {
     setMessage(QUICK_ANSWER_NO_PREFIX);
     messageInputRef.current?.focus();
   };
 
-  const doConfirmUnderstanding = async () => {
+  const submitUnderstandingConfirmation = async (includeCapabilityReview: boolean) => {
     if (!selectedSessionId) return;
     try {
-      await confirmUnderstanding.mutateAsync({ actor });
+      await confirmUnderstanding.mutateAsync({
+        actor,
+        ...(includeCapabilityReview
+          ? {
+              capability_base_confirmation_id:
+                priorCapabilityGraphQuery.data?.confirmation_id ?? null,
+              capability_relations: proposedCapabilityRelations.filter(
+                relation =>
+                  capabilityRelationSelections[capabilityRelationKey(relation)] !== false,
+              ),
+              capability_identity_bindings: unmatchedCapabilityNodes.flatMap(node => {
+                const selected = capabilityIdentitySelections[
+                  capabilityNodeKey(node.kind, node.name)
+                ];
+                return selected
+                  ? [{
+                      entity_kind: node.kind,
+                      current_name: node.name,
+                      entity_id: Number(selected),
+                    }]
+                  : [];
+              }),
+            }
+          : {}),
+      });
+      setCapabilityConfirmOpen(false);
       toast.success("内容を確定しました。提案を生成できます。");
     } catch (e) {
       toast.error(String(e));
     }
+  };
+
+  const doConfirmUnderstanding = () => {
+    if (
+      canConfirmStructuredUnderstanding
+      && session?.capability_graph_confirmation_required === true
+    ) {
+      setCapabilityIdentitySelections({});
+      setCapabilityRelationSelections(
+        Object.fromEntries(
+          proposedCapabilityRelations.map(relation => [
+            capabilityRelationKey(relation),
+            true,
+          ]),
+        ),
+      );
+      setCapabilityConfirmOpen(true);
+      return;
+    }
+    void submitUnderstandingConfirmation(false);
   };
 
   const openEdit = (proposal: InterviewProposalOut) => {
@@ -1243,6 +2189,72 @@ export default function InterviewPage() {
     }
   };
 
+  // Issue #349 `OP-S7`: 差分生成は自動 (§4.2.1)。承認が終わり、現在の承認
+  // セットに対応する差分がまだ無く、生成中でも生成に失敗してもいない
+  // ときだけ、1 回だけ起動する。失敗したときは `E12` の復旧操作
+  // (同じ処理の再試行) に委ね、ここでは自動再試行しない。
+  const autoMaterializedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!workflow || !selectedSessionId) return;
+    const f = workflow.facts;
+    const eligible =
+      workflow.state === "W5"
+      && f.proposals_needing_review === 0
+      && f.approved_proposal_count > 0
+      && !f.diff_matches_approval_set
+      && workflow.running_processes.length === 0
+      && !workflow.unresolved_failures.some(x => x.process_kind === "diff_generation");
+    if (!eligible || materialize.isPending) return;
+    const key = `${selectedSessionId}:${f.approved_proposal_count}:${workflow.diff_materialized_at ?? 0}`;
+    if (autoMaterializedRef.current === key) return;
+    autoMaterializedRef.current = key;
+    void triggerMaterialization();
+    // triggerMaterialization/materialize are stable enough for this guard;
+    // the ref key prevents re-entry for the same approval set.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workflow, selectedSessionId]);
+
+  // Issue #349 §5.3-1/§5.3-7: the ONLY recovery a blocking exception offers
+  // is "run the same process again". No heuristic alternative (Principle 6),
+  // and no bypass that would skip a human gate.
+  const retryFailedProcess = async (kind: string) => {
+    if (!selectedSessionId) return;
+    if (kind === "understanding_build" || kind === "understanding_update") {
+      await refreshUnderstanding();
+      return;
+    }
+    if (kind === "alignment_build") {
+      try {
+        await api.post(`/interview/sessions/${selectedSessionId}/alignment/build`, {});
+        toast.success("突き合わせを再実行しました");
+      } catch (e) {
+        toast.error(String(e));
+      }
+      return;
+    }
+    if (kind === "diff_generation") {
+      await triggerMaterialization();
+      return;
+    }
+    toast.error("この処理の再試行はこの画面からは行えません");
+  };
+
+  // `OP-D14` — leave safely to the suspend / handoff terminal. Records a
+  // manual audit entry; never resolves the blocking failure that led here.
+  const leaveSafely = async (terminalKind: "suspended" | "handoff") => {
+    if (!selectedSessionId) return;
+    try {
+      await closeSession.mutateAsync({ terminal_kind: terminalKind, actor });
+      toast.success(
+        terminalKind === "handoff"
+          ? "引き継ぎとして終了しました。再開すると続きから評価します。"
+          : "中断しました。確定内容は保持されます。",
+      );
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
   const downloadPatch = () => {
     if (!diff || !session) return;
     downloadTextFile(
@@ -1272,26 +2284,137 @@ export default function InterviewPage() {
     }
   };
 
+  // Issue #351 の「現在のシステム理解」。Issue #360 で **位置だけ** が状態に
+  // よって変わるようになったので、JSX を 1 つの値にして 2 箇所から使い分ける
+  // (描かれるのは常に 1 つ)。中身・表示密度・主操作の規則は #351 のまま。
+  const understandingBriefPanel = session ? (
+    <UnderstandingBriefPanel
+      brief={understandingBrief}
+      state={wState}
+      primaryAction={
+        showUnderstandingWork && canConfirmStructuredUnderstanding ? (
+          <div data-testid="understanding-confirm-block">
+            <Button
+              size="sm"
+              onClick={doConfirmUnderstanding}
+              disabled={confirmUnderstanding.isPending}
+              data-testid="confirm-understanding"
+            >
+              <CheckCircle className="h-4 w-4 mr-1" />
+              {confirmUnderstanding.isPending
+                ? "確定中..."
+                : PRIMARY_ACTION_LABELS.confirm_understanding}
+            </Button>
+          </div>
+        ) : undefined
+      }
+      fullTree={
+        session.current_understanding ? (
+          <UnderstandingOverview
+            understanding={session.current_understanding}
+            gaps={session.gap_analysis}
+            openQuestions={session.open_questions}
+            nextAction={nextActionText}
+          />
+        ) : undefined
+      }
+    />
+  ) : null;
+
+  // Issue #390 §3.2 の Purpose Chain Level 1。Brief と同じ「全体像」領域に、
+  // Brief の直後だけへ置く。
+  //
+  // 全幅で 2 カラムの外(状態サマリーの下)へ置くと、#358 が実測で詰めた
+  // 「状態ごとの主作業面を 1280x720 の初期ビューポートへ入れる」制約を
+  // その場で壊す -- 主作業面の上端がカード 1 枚ぶん押し下がるためで、
+  // これは見た目の問題ではなく、#358 が回帰として固定した測定可能な契約
+  // (roadmap 20)。Purpose Frame が読むのは Brief と同じ Vision / System
+  // Purpose / Core Capabilities の行であり、因果順に読み直したものなので、
+  // 主作業面より前ではなく全体像の一部として Brief の直後に並ぶのが正しい。
+  const purposeFramePanel = session ? (
+    <PurposeFramePanel
+      sessionId={selectedSessionId}
+      initialNeedId={searchParams.get("purpose_need")}
+    />
+  ) : null;
+
+  // 位置の判断は `cockpit/layout.ts` の純粋関数に閉じ込める (全状態ぶんを
+  // 単体で検証できるようにするため)。
+  const briefLeads = briefLeadsMainColumn(wState);
+
   return (
-    <div className="space-y-6">
+    // レビュー指摘 P1: 主作業面を初期ビューポート (1280 x 720) へ入れるため、
+    // 画面上部の縦余白を詰める。ここで稼いだぶんがそのまま主作業面の上端を
+    // 押し上げる。
+    <div className="space-y-4">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
-            <MessageSquareText className="h-6 w-6" /> システムインタビュー
+            <MessageSquareText className="h-6 w-6" /> インタビュー・コックピット
           </h1>
-          <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
-            開始すると、ドキュメントとコードの自動分析からシステム理解を構築し、
-            確認と不足情報の質問を経て提案生成へ進みます。
-          </p>
+          {/* 画面の説明はこれから始める人のためのもの。セッションが動いて
+              いる間は現在地カードと「次にやること」が同じことをより具体的に
+              言っているので出さない -- 3 行ぶんの高さは、そのまま主作業面を
+              画面外へ押し下げる代償になる (レビュー指摘 P1)。 */}
+          {!session && (
+            <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
+              理解の全体像を確認し、曖昧な箇所を順番に解消します。開始すると、
+              ドキュメントとコードの自動分析からシステム理解を構築し、確認と不足情報の
+              質問を経て提案生成へ進みます。
+            </p>
+          )}
+          {/* Issue #356 §1: セッション番号 / Snapshot 番号 / ステータス。
+              Issue #361 でここが唯一の常設表示になった (右カラムのセッション
+              情報カードからは同じ 3 つを外した)。参加者・最終更新・根拠件数・
+              保存状態は補助情報の中で、このボタンから開く。 */}
+          {session && (
+            <div className="mt-2 flex flex-wrap items-center gap-2" data-testid="cockpit-header-meta">
+              <Badge variant="outline" className="font-normal">セッション #{session.id}</Badge>
+              <Badge variant="outline" className="font-normal">Snapshot {session.snapshot_id}</Badge>
+              <Badge variant="secondary" className="font-normal">{session.status}</Badge>
+              <button
+                type="button"
+                className="text-xs font-medium underline underline-offset-4 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                onClick={() => openCockpitTarget(["cockpit-aux-session"])}
+                data-testid="cockpit-open-session-info"
+              >
+                セッション情報
+              </button>
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-2">
+          {/* 変更履歴への既存導線 (R6 の「履歴と監査情報」) を維持する。 */}
+          {session && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                const entry = document.querySelector<HTMLDetailsElement>(
+                  '[data-testid="history-audit-entry"]',
+                );
+                if (entry) entry.open = true;
+                focusCockpitTarget("history-audit-entry");
+              }}
+              data-testid="cockpit-open-history"
+            >
+              <FileCode className="h-4 w-4 mr-1" />
+              変更履歴
+            </Button>
+          )}
           <Select
             className="w-[240px]"
             value={selectedSessionId ? String(selectedSessionId) : ""}
             onChange={e => {
               const next = new URLSearchParams(searchParams);
-              if (e.target.value) next.set("session", e.target.value);
-              else next.delete("session");
+              if (e.target.value) {
+                next.set("session", e.target.value);
+                setSessionClearedByUser(false);
+              } else {
+                next.delete("session");
+                // 明示的な未選択。自動選択で上書きしない (再レビュー #1)。
+                setSessionClearedByUser(true);
+              }
               setSearchParams(next);
             }}
             disabled={!sortedSessions.length}
@@ -1304,10 +2427,10 @@ export default function InterviewPage() {
               </option>
             ))}
           </Select>
-          <Button size="sm" onClick={startSession} disabled={building || snapshotLoading || !latestSnapshot}>
-            <Sparkles className="h-4 w-4 mr-1" />
-            {building ? "分析中..." : "インタビューを開始"}
-          </Button>
+          {/* #3 「インタビューを開始」 は `W0-B` の主操作だが、ヘッダーには
+              置かない。主操作は 1 状態につき 1 箇所で、その状態の作業カード
+              の中にある (原則 P1/P2) -- ヘッダーにも同じ CTA を置くと、
+              どちらが正準か分からない重複になる (原則 P7)。 */}
         </div>
       </div>
 
@@ -1318,14 +2441,32 @@ export default function InterviewPage() {
         <DiagnosticFixCallout anchor="interview-capabilities" />
       </div>
 
-      {!latestSnapshot && !snapshotLoading && (
-        <Card>
-          <CardContent className="py-8 text-center text-sm text-muted-foreground">
-            リポジトリのスナップショットがありません。インタビューを開始する前に{" "}
-            <Link className="underline" to="/repository">リポジトリ</Link>{" "}
-            ページでスナップショットを作成してください。
-          </CardContent>
-        </Card>
+      {/* `W0-A` 開始の前提を満たす。`E1` は例外ではなくこの状態そのものなので
+          `R5` にはせず、主作業カードとして出す (§3.3)。主操作は Repository
+          画面への導線 1 つだけ。 */}
+      {wState === "W0-A" && workflow && (
+        <>
+          <WorkflowLocationCard workflow={workflow} />
+          <Card data-testid="work-surface-W0-A">
+            <CardContent className="py-8 text-center space-y-3 text-sm">
+              <p className="text-muted-foreground">
+                このリポジトリにはまだ snapshot がありません。Repository 画面で
+                snapshot を作成すると、システム理解の構築が自動で始まります。
+              </p>
+              <Link
+                className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"
+                to="/repository"
+                data-testid="w0a-primary-action"
+              >
+                {PRIMARY_ACTION_LABELS.open_repository}
+              </Link>
+            </CardContent>
+          </Card>
+          {/* Issue #354: 構築前も「現在の理解」を同じ概念で追えるようにする。
+              主操作の下に短く置き、開始条件を押し下げる大きな空カードには
+              しない。架空の Vision / Purpose はここでも表示しない。 */}
+          <UnderstandingBriefPanel brief={understandingBrief} state={wState} />
+        </>
       )}
 
       {sessionsLoading || sessionLoading ? (
@@ -1333,81 +2474,178 @@ export default function InterviewPage() {
           <Skeleton className="h-32 w-full" />
           <Skeleton className="h-64 w-full" />
         </div>
-      ) : !selectedSessionId || !session ? (
-        <Card>
-          <CardContent className="py-10 text-center space-y-3">
-            <p className="text-sm text-muted-foreground">
-              「インタビューを開始」を押すと、最新スナップショットから自動でシステム理解を構築し、
-              確認する内容を1つずつ質問します。
+      ) : sessionsFailed || sessionFailed ? (
+        /* 取得失敗。これまではここで本文が空になり、何が起きたのかも次に何を
+           すればよいのかも読めなかった。失敗した対象・サーバーからの理由・
+           再試行を 1 枠にまとめる (例外表示 §4.4 と同じ形)。 */
+        <Card data-testid="interview-load-error">
+          <CardHeader>
+            <CardTitle className="text-sm flex items-center gap-2">
+              <AlertCircle className="h-4 w-4 text-destructive" />
+              {sessionsFailed
+                ? "インタビューセッション一覧を取得できませんでした"
+                : `セッション #${selectedSessionId} を取得できませんでした`}
+            </CardTitle>
+            <CardDescription>
+              Control Server からの応答が得られないため、この画面の内容を表示できません。
+              接続を確認してから再試行してください。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p
+              className="rounded-md border p-2 text-xs font-mono break-words"
+              data-testid="interview-load-error-detail"
+            >
+              {String(
+                (sessionsFailed ? sessionsError : sessionError)?.message
+                ?? (sessionsFailed ? sessionsError : sessionError)
+                ?? "unknown error",
+              )}
             </p>
-            <Button onClick={startSession} disabled={building || snapshotLoading || !latestSnapshot}>
-              <Sparkles className="h-4 w-4 mr-1" />
-              {building ? "分析中..." : "インタビューを開始"}
+            <Button
+              size="sm"
+              variant="outline"
+              data-testid="interview-load-error-retry"
+              onClick={() => {
+                if (sessionsFailed) void refetchSessions();
+                if (sessionFailed) void refetchSession();
+              }}
+            >
+              <RefreshCw className="h-4 w-4 mr-1" />
+              再試行
             </Button>
           </CardContent>
         </Card>
+      ) : !selectedSessionId || !session ? (
+        /* `W0-B` インタビューを始める。`W0-A` のときはこのカードを出さない
+           (実行できない主操作を見せない、原則 P3)。 */
+        wState === "W0-B" && workflow ? (
+          <>
+            <WorkflowLocationCard workflow={workflow} />
+            <Card data-testid="work-surface-W0-B">
+              <CardContent className="py-10 text-center space-y-3">
+                <p className="text-sm text-muted-foreground">
+                  対象 snapshot: {workflow.latest_ready_snapshot_id ?? "-"}。
+                  開始すると、ドキュメントとコードの自動分析からシステム理解の構築が始まります。
+                </p>
+                <Button
+                  onClick={startSession}
+                  disabled={building}
+                  data-testid="w0b-primary-action"
+                >
+                  <Sparkles className="h-4 w-4 mr-1" />
+                  {building ? "分析中..." : PRIMARY_ACTION_LABELS.start_session}
+                </Button>
+              </CardContent>
+            </Card>
+            <UnderstandingBriefPanel brief={understandingBrief} state={wState} />
+          </>
+        ) : null
       ) : (
         <>
-          {repositoryHeadStale && repositoryStatus && (
-            <div
-              className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-sm text-amber-900 dark:text-amber-100 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
-              data-testid="repository-head-stale-banner"
-            >
-              <div>
-                リポジトリの HEAD が最新 snapshot より進んでいます
-                {repositoryStatus.latest_snapshot && (
+          {/* R1 — 現在地。全状態で 1 箇所のみ。「次にやること」が指す操作は
+              その状態の主操作そのもの (原則 P2)。進捗ステップも同じカードへ
+              まとめる (§3.2 #9/#11/#50/#63 の統合)。 */}
+          {workflow && (
+            <WorkflowLocationCard
+              workflow={workflow}
+              detail={nextActionText}
+              historyEntry={<RefreshStatusChip sessionId={selectedSessionId} />}
+            />
+          )}
+
+          {/* R2 の分岐 — 確認待ちの戻り (E8)。承諾するまで表示状態は
+              reached_state のまま (§2.2 第 2 段)。 */}
+          {workflow && (
+            <BackRequestNotice
+              workflow={workflow}
+              pending={acknowledgeBack.isPending}
+              onAcknowledge={requestId =>
+                acknowledgeBack
+                  .mutateAsync({ requestId, actor })
+                  .then(() => toast.success("確認が必要な状態へ移動しました"))
+                  .catch(e => toast.error(String(e)))
+              }
+            />
+          )}
+
+          {/* R5 — 現在ブロッキング中 / 劣化中の例外だけを、現在地の直下に。 */}
+          {workflow && (
+            <WorkflowExceptions
+              workflow={workflow}
+              // E2 (snapshot のズレ) は、更新操作そのものを内包した専用の
+              // バナー(#7/#8)が上で担っている。汎用の例外カードにも出すと
+              // 同じ対象の表示が 2 箇所になる (原則 P7)。
+              skipCodes={["E2"]}
+              retryPending={building || materialize.isPending}
+              onRetry={kind => void retryFailedProcess(kind)}
+              onLeaveSafely={() => void leaveSafely("suspended")}
+            />
+          )}
+
+          {/* Issue #356 §2 / Issue #360 — Interview status サマリー。
+              ファーストビューの主役は「次にやること」と 1 つの主 CTA で、
+              完成度・件数はその下の統計へ降ろした。2 カラムの外 (全幅) に
+              置くのは、狭い画面で右カラムが下へ回り込んでも位置が変わらない
+              ようにするため。 */}
+          <CockpitStatusSummary
+            model={cockpit}
+            actionLabel={nextStepActionLabel}
+            onRunNextStep={runNextStep}
+          />
+
+          {/* `items-start` が無いと、Grid の既定 stretch で右カラムのカードが
+              メインカラムの高さまで引き伸ばされる (issue #359 の実測: Q&A
+              進捗カードが約 3,416px になっていた)。 */}
+          <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-4 items-start">
+            {/* メイン: 状態ごとに 1 つの主作業面だけを描く (原則 P1/P3)。
+                タブ (#12) は廃止され、W3 と W4 が別状態になったことで
+                「どちらのタブを既定にするか」という判断自体が消えた。
+
+                Issue #360 で並び順を変えた: 主作業面が先頭で、全体像
+                (Understanding Brief / 理解の全体マップ) はその後ろの
+                「全体像」領域へ移す。#351 が Brief をメインカラム先頭に
+                置いたのは、右カラムが狭い画面で下へ回り込むと Vision /
+                Purpose / 進行可否が主作業より大幅に下がるためで、その要件は
+                メインカラム内に残したまま満たせる。 */}
+            <div className="space-y-4">
+              <>
+                {/* `W1` (構築中) と `W2` (理解の確認) では Brief 自体が判断
+                    対象で、`W2` の主操作「この理解で進む」も同じカードにある
+                    (#351 / 原則 P2)。この 2 状態でだけ Brief が主作業面の
+                    位置に立つ。 */}
+                {briefLeads && (
                   <>
-                    {" "}(snapshot {repositoryStatus.latest_snapshot.id}:{" "}
-                    <code>{shortSha(repositoryStatus.latest_snapshot.commit_sha)}</code>
-                    {" "}→ HEAD <code>{shortSha(repositoryStatus.current_head)}</code>)
+                    {understandingBriefPanel}
+                    {purposeFramePanel}
                   </>
                 )}
-                。新しい snapshot を作成してから、このインタビューを更新してください。
-              </div>
-              <Link
-                to="/repository"
-                className="inline-flex h-8 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-input bg-background px-3 text-xs font-medium shadow-sm hover:bg-accent hover:text-accent-foreground"
-              >
-                <RefreshCw className="h-4 w-4" />
-                Repository で snapshot 作成
-              </Link>
-            </div>
-          )}
 
-          {sessionSnapshotStale && latestSnapshot && (
-            <div
-              className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-sm text-amber-900 dark:text-amber-100 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
-              data-testid="interview-snapshot-stale-banner"
-            >
-              <div>
-                このインタビューは snapshot {session.snapshot_id} に固定されています。
-                最新 snapshot {latestSnapshot.id} に更新すると、既存の回答を保持し、
-                影響を受けた提案だけ再レビューに戻します。
-              </div>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={rebaseToLatestSnapshot}
-                disabled={rebaseSnapshot.isPending}
-                data-testid="rebase-interview-snapshot"
-              >
-                <RefreshCw className={`h-4 w-4 mr-1 ${rebaseSnapshot.isPending ? "animate-spin" : ""}`} />
-                {rebaseSnapshot.isPending ? "更新中..." : "最新 snapshot に更新"}
-              </Button>
-            </div>
-          )}
+                {showAlignmentWork && (
+                <div className="space-y-4" data-testid="work-surface-W4">
+                  <Card data-testid="alignment-review-panel">
+                    <CardHeader>
+                      <CardTitle className="text-sm">Alignment Review</CardTitle>
+                      <CardDescription>
+                        あなたが実現したいこと(Intent Brief)と現在の理解を突き合わせ、確認が必要な項目をまとめて判断します。
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <AlignmentSummaryHeader
+                        intentList={intentList}
+                        understanding={session.current_understanding}
+                        alignment={alignmentFull}
+                      />
+                    </CardContent>
+                  </Card>
+                  {/* 突き合わせの再試行も例外カード側の 1 箇所に集約する
+                      (§4.4 / 原則 P7)。 */}
+                  <ReviewQueuePanel sessionId={session.id} />
+                </div>
+                )}
 
-          {uiState && <NextActionBanner uiState={uiState} nextAction={nextActionText} />}
-
-          <Card>
-            <CardContent className="py-3">
-              <ProgressSteps current={currentStage} />
-            </CardContent>
-          </Card>
-
-          <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-4">
-            {/* メイン: 会話がインタビューの主要な操作領域 */}
-            <div className="space-y-4">
+                {showConversationWork && (
+                <div className="space-y-4" data-testid={showUnderstandingWork ? "work-surface-W2" : "work-surface-W3"}>
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">会話</CardTitle>
@@ -1484,8 +2722,17 @@ export default function InterviewPage() {
                           )}
                           {(focusedQuestion.confirmable || (focusedQuestion.answerOptions ?? []).length > 0 || uiState === "fill_gaps" || proposalNarrowing) && (
                             <div className="flex flex-wrap gap-2 pt-1" data-testid="quick-answers">
+                              {/* Issue #351: 理解を「正しい」と認める操作は
+                                  Understanding Brief の「この理解で進む」
+                                  1 つに寄せる。ここの「はい、正しいです」は
+                                  会話ターンを送るだけで確定ゲートを通らない
+                                  ので、確定操作が Brief に出ている状態で
+                                  並べると「どちらを押せば進むのか」が分か
+                                  らなくなる (原則 P7)。訂正の入口
+                                  (「いいえ」) は会話側の役割なので残す。 */}
                               {focusedQuestion.confirmable && (
                                 <>
+                                  {!canConfirmStructuredUnderstanding && (
                                   <Button
                                     size="sm"
                                     variant="outline"
@@ -1496,6 +2743,7 @@ export default function InterviewPage() {
                                     <CheckCircle className="h-4 w-4 mr-1 text-emerald-600" />
                                     はい、正しいです
                                   </Button>
+                                  )}
                                   <Button
                                     size="sm"
                                     variant="outline"
@@ -1521,30 +2769,55 @@ export default function InterviewPage() {
                               ))}
                               {/* Issue #142: 明示的な「わからない」入力。自由文ではなく
                                   answer_unknown フラグで送り、確定回答なしとして記録する。
-                                  提案ステージの絞り込み質問でも同様に使える。 */}
+                                  提案ステージの絞り込み質問でも同様に使える。
+                                  Issue #295 §4.8 review fix (Finding 4): まず共有の自動調査
+                                  コントローラでこの質問(qa_ids=[qaId])を調査し、投稿された
+                                  結果がなければ従来の #142 フローにフォールバックする。 */}
                               {(uiState === "fill_gaps" || proposalNarrowing) && (
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={sendUnknown}
-                                  disabled={dialogueTurn.isPending}
-                                  data-testid="quick-answer-unknown"
-                                >
-                                  <HelpCircle className="h-4 w-4 mr-1" />
-                                  わからない
-                                </Button>
+                                focusedQuestionInvestigating ? (
+                                  <p
+                                    className="text-xs text-muted-foreground self-center"
+                                    data-testid="focused-question-unknown-investigating"
+                                  >
+                                    関連コードとテストを確認しています
+                                  </p>
+                                ) : (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={handleFocusedUnknown}
+                                    disabled={dialogueTurn.isPending || qaAutoInvestigate.isPending}
+                                    data-testid="quick-answer-unknown"
+                                  >
+                                    <HelpCircle className="h-4 w-4 mr-1" />
+                                    わからない
+                                  </Button>
+                                )
                               )}
                             </div>
                           )}
+                          {/* PR #296 review restructure: qa.investigation を Q&A一覧
+                              だけでなく focused question と同じビューにも表示する
+                              (前任者の申し送り対応)。QaItemCard と同じ表示コンポー
+                              ネントを再利用し、判断ロジックは一切増やさない。 */}
+                          {focusedQa?.investigation && (
+                            <QaInvestigationBlock
+                              qaId={focusedQa.id}
+                              investigation={focusedQa.investigation}
+                              routeCategory={focusedQa.route_category as InquiryRouteCategory}
+                              onTranscribe={() => setMessage(focusedQa.investigation!.conclusion)}
+                            />
+                          )}
                         </div>
                       )}
-                      {(zeroBaseComplete || canConfirmStructuredUnderstanding) && (
-                        <div className="space-y-1">
-                          {canConfirmStructuredUnderstanding && (
-                            <p className="text-xs text-muted-foreground">
-                              対象: 右側の「現在の理解」パネルに表示されているシステム理解
-                            </p>
-                          )}
+                      {/* Issue #351: 構造化された理解がある場合の確認対象と
+                          主操作は Understanding Brief カードへ移した。会話は
+                          「理解を訂正・補足する手段」であって理解そのものより
+                          上位ではない (#354)。ここに残るのはゼロベース --
+                          構造化された理解が無く、Brief に確認対象が存在しない
+                          ため、会話内容そのものが確認対象になる場合だけ。 */}
+                      {zeroBaseComplete && !canConfirmStructuredUnderstanding && (
+                        <div className="space-y-2" data-testid="zero-base-confirm-block">
                           <Button
                             size="sm"
                             onClick={doConfirmUnderstanding}
@@ -1554,9 +2827,7 @@ export default function InterviewPage() {
                             <CheckCircle className="h-4 w-4 mr-1" />
                             {confirmUnderstanding.isPending
                               ? "確定中..."
-                              : zeroBaseComplete
-                                ? "この内容で提案生成に進む"
-                                : "この理解を確認済みにする"}
+                              : "この内容で提案生成に進む"}
                           </Button>
                         </div>
                       )}
@@ -1600,9 +2871,78 @@ export default function InterviewPage() {
                 </CardContent>
               </Card>
 
-              {/* 提案・差分は proposal_generation 到達 + ロック解除まで表示しない(Issue #123) */}
-              {isProposalStage && unlocked && (
-                <>
+                </div>
+                )}
+
+                {/* `E2` (snapshot のズレ) は §5.2 では「更新系操作に限る」
+                    ブロッキングで、表示場所は「該当操作と同じ面」。差分の生成
+                    ・再生成が関わる `W5`/`W6` の作業面の直前でだけ出す --
+                    ページ最上部の常設バナーにすると、継続できる `W2`/`W3`/`W4`
+                    まで全体がブロックされているように見える (§6.6 の確認点)。
+                    Repository HEAD のズレは「新しい snapshot を作る」導線、
+                    セッションの snapshot ズレは「このセッションを新しい
+                    snapshot へ移す」導線で、対象が違うため両方出しうるが、
+                    同時に出るのは HEAD が進み、かつ未取り込みのときだけ。 */}
+                {(showProposalWork || showDiffWork) && (
+                  <>
+          {repositoryHeadStale && repositoryStatus && (
+                    <div
+                      className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-sm text-amber-900 dark:text-amber-100 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
+                      data-testid="repository-head-stale-banner"
+                    >
+                      <div>
+                        リポジトリの HEAD が最新 snapshot より進んでいます
+                        {repositoryStatus.latest_snapshot && (
+                          <>
+                            {" "}(snapshot {repositoryStatus.latest_snapshot.id}:{" "}
+                            <code>{shortSha(repositoryStatus.latest_snapshot.commit_sha)}</code>
+                            {" "}→ HEAD <code>{shortSha(repositoryStatus.current_head)}</code>)
+                          </>
+                        )}
+                        。新しい snapshot を作成してから、このインタビューを更新してください。
+                      </div>
+                      <Link
+                        to="/repository"
+                        className="inline-flex h-8 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-input bg-background px-3 text-xs font-medium shadow-sm hover:bg-accent hover:text-accent-foreground"
+                      >
+                        <RefreshCw className="h-4 w-4" />
+                        Repository で snapshot 作成
+                      </Link>
+                    </div>
+                  )}
+
+                  {sessionSnapshotStale && latestSnapshot && (
+                    <div
+                      className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-sm text-amber-900 dark:text-amber-100 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
+                      data-testid="interview-snapshot-stale-banner"
+                    >
+                      <div>
+                        このインタビューは snapshot {session.snapshot_id} に固定されています。
+                        最新 snapshot {latestSnapshot.id} に更新すると、既存の回答を保持し、
+                        影響を受けた提案だけ再レビューに戻します。
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={rebaseToLatestSnapshot}
+                        disabled={rebaseSnapshot.isPending}
+                        data-testid="rebase-interview-snapshot"
+                      >
+                        <RefreshCw className={`h-4 w-4 mr-1 ${rebaseSnapshot.isPending ? "animate-spin" : ""}`} />
+                        {rebaseSnapshot.isPending ? "更新中..." : "最新 snapshot に更新"}
+                      </Button>
+                    </div>
+                  )}
+
+                  </>
+                )}
+
+                {/* W5 — 提案を承認する。主操作は「この提案を承認する」。
+                    差分生成 (#33「差分を生成」) は OP-S7 として自動化された
+                    ため、そのボタンと前提説明 (#34) / 未生成注記 (#35) は
+                    廃止した (§4.2.1、原則 P3)。 */}
+                {showProposalWork && (
+                <div className="space-y-4" data-testid="work-surface-W5">
                   <Card>
                     <CardHeader>
                       <div className="flex items-center justify-between gap-2">
@@ -1610,32 +2950,13 @@ export default function InterviewPage() {
                           <CardTitle className="text-sm">提案レビュー</CardTitle>
                           <CardDescription>
                             各提案(メタデータ + プローブ計画)を承認・却下・編集してください。
+                            承認が終わると、差分は自動で生成されます。
                           </CardDescription>
                         </div>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={triggerMaterialization}
-                          disabled={materialize.isPending || approvedCount === 0}
-                          title={approvedCount === 0 ? "先に提案を1件以上承認してください" : undefined}
-                        >
-                          <Play className="h-4 w-4 mr-1" />
-                          {materialize.isPending ? "生成中..." : "差分を生成"}
-                        </Button>
                       </div>
                     </CardHeader>
                     <CardContent className="space-y-3">
-                      {approvedCount === 0 && (
-                        <p className="text-xs text-muted-foreground" data-testid="materialize-prerequisite">
-                          差分を生成するには、各提案を確認して少なくとも1件を承認してください。
-                        </p>
-                      )}
-                      {proposals.length === 0 ? (
-                        <div className="text-sm text-muted-foreground" data-testid="no-proposals-yet">
-                          まだ提案はありません。会話から「送信して提案を生成」でレビュー項目を生成してください。
-                          情報が不足している場合は、AIが対象を絞り込むための確認質問を返します。
-                        </div>
-                      ) : proposals.map(proposal => (
+                      {proposals.map(proposal => (
                         <div key={proposal.id} className="rounded-md border p-4 space-y-3" data-testid="interview-proposal-card">
                           <div className="flex items-start justify-between gap-3">
                             <div className="min-w-0">
@@ -1694,7 +3015,15 @@ export default function InterviewPage() {
                       ))}
                     </CardContent>
                   </Card>
+                </div>
+                )}
 
+                {/* W6 — 差分を確認する。主操作は「この差分を確認した」という
+                    判断の記録そのもの (§4.3)。ダウンロード・差分表示・適用
+                    手順は補助操作であり、完了条件を満たさない。
+                    W7 でも差分は参照できるが、そのときは主操作ではない。 */}
+                {(showDiffWork || showTerminal) && diff && (
+                <div className="space-y-4" data-testid={showDiffWork ? "work-surface-W6" : "terminal-diff-reference"}>
                   <Card>
                     <CardHeader>
                       <div className="flex items-center justify-between gap-2">
@@ -1703,13 +3032,13 @@ export default function InterviewPage() {
                           <CardDescription>差分の生成までで停止し、適用は開発者がレビューして行います。</CardDescription>
                         </div>
                         <div className="flex items-center gap-2">
+                          {/* 補助操作 (§4.3): 差分を読むための手段であって、
+                              読んで問題ないと判断した記録ではない。 */}
                           <Button
                             size="sm"
                             variant="outline"
                             onClick={downloadPatch}
-                            disabled={!diff}
                             data-testid="download-patch-button"
-                            title={diff ? undefined : "差分が未生成のためダウンロードできません"}
                           >
                             <Download className="h-4 w-4 mr-1" />
                             .patch をダウンロード
@@ -1718,8 +3047,6 @@ export default function InterviewPage() {
                             size="sm"
                             variant="outline"
                             onClick={() => openDiff(diff, session.id)}
-                            disabled={!diff}
-                            title={diff ? undefined : "先に承認済み提案から差分を生成してください"}
                           >
                             <GitPullRequest className="h-4 w-4 mr-1" />
                             差分を開く
@@ -1728,6 +3055,33 @@ export default function InterviewPage() {
                       </div>
                     </CardHeader>
                     <CardContent className="space-y-3">
+                      {showDiffWork && (
+                        <div
+                          className="rounded-md border border-primary/40 bg-primary/5 p-3 flex flex-wrap items-center gap-3"
+                          data-testid="diff-review-primary-action"
+                        >
+                          <p className="text-sm flex-1 min-w-[16rem]">
+                            差分の内容を確認し、意図どおりであることを記録してください。
+                            この記録が「差分を確認する」の完了条件です。
+                          </p>
+                          <Button
+                            size="sm"
+                            disabled={recordDiffReview.isPending}
+                            data-testid="record-diff-review"
+                            onClick={() =>
+                              recordDiffReview
+                                .mutateAsync({ reviewed_by: actor })
+                                .then(() => toast.success("差分を確認したことを記録しました"))
+                                .catch(e => toast.error(String(e)))
+                            }
+                          >
+                            <CheckCircle className="h-4 w-4 mr-1" />
+                            {recordDiffReview.isPending
+                              ? "記録中..."
+                              : PRIMARY_ACTION_LABELS.record_diff_review}
+                          </Button>
+                        </div>
+                      )}
                       <div className="rounded-md bg-muted/50 p-3 text-xs space-y-1" data-testid="patch-provenance">
                         <p className="font-medium">この差分について</p>
                         <ul className="list-disc pl-4 space-y-0.5 text-muted-foreground">
@@ -1749,18 +3103,12 @@ export default function InterviewPage() {
                           {lastMaterialization.skipped.join("; ")}
                         </div>
                       ) : null}
-                      {diff ? (
-                        <pre className="max-h-[28rem] overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap">
-                          {diff}
-                        </pre>
-                      ) : (
-                        <div className="rounded-md border p-6 text-center text-sm text-muted-foreground">
-                          提案を1件以上承認してから「差分を生成」を押すと、まとめて1つの差分が生成されます。
-                          差分が未生成の間は .patch のダウンロードはできません。
-                        </div>
-                      )}
-                      {diff && (
-                        <>
+                      <pre className="max-h-[28rem] overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap">
+                        {diff}
+                      </pre>
+                      {/* 適用手順は R4: 既定は折りたたみ。接続セットアップ導線は
+                          W7(完了)の主操作なので、そこでのみ強調する。 */}
+                      <>
                           <details className="rounded-md border p-3 text-xs" data-testid="patch-apply-commands">
                             <summary className="cursor-pointer font-medium text-sm">
                               適用手順とコマンド例
@@ -1786,184 +3134,515 @@ git add -p
 git commit`}
                             </pre>
                           </details>
-                          <div
-                            className="rounded-md border border-primary/40 bg-primary/5 p-3 text-sm flex items-start gap-2"
-                            data-testid="setup-guide-next-action"
-                          >
-                            <LifeBuoy className="h-4 w-4 mt-0.5 shrink-0" />
-                            <div>
-                              <p className="font-medium">次のステップ: 監視対象の設定と疎通確認</p>
-                              <p className="text-xs text-muted-foreground mt-0.5">
-                                patch の適用だけでは監視は始まりません。監視対象側の環境変数・トークン・接続先の設定と、
-                                trace が届くことの確認が必要です。
-                              </p>
-                              <Link
-                                className="inline-flex items-center text-sm underline mt-1"
-                                to={`/setup-guide?session=${session.id}`}
-                              >
-                                接続セットアップガイドを開く(このセッションの文脈付き)
-                              </Link>
-                            </div>
-                          </div>
+                          {/* 完了終端の主操作「接続セットアップへ進む」は
+                              終端カードが 1 つだけ持つ (§5.4)。差分カード側に
+                              同じ導線を置いていたのを廃止した (原則 P7)。 */}
                         </>
-                      )}
-                      {session.materialization_ref && (
-                        <a className="inline-flex items-center text-sm underline" href={session.materialization_ref} target="_blank" rel="noreferrer">
-                          <FileCode className="h-4 w-4 mr-1" />
-                          Materialization リファレンスを開く
-                        </a>
-                      )}
                     </CardContent>
                   </Card>
-                </>
-              )}
-            </div>
+                </div>
+                )}
 
-            {/* サイド: 理解の内容・セッション情報(補助的な表示) */}
-            <div className="space-y-4">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm">セッション #{session.id}</CardTitle>
-                  <CardDescription>
-                    Snapshot {session.snapshot_id} · {formatTimestamp(session.updated_at)}
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-3 text-sm">
-                  <div className="grid grid-cols-3 gap-2">
-                    <div className="rounded-md border p-2">
-                      <div className="text-lg font-semibold">{proposals.length}</div>
-                      <div className="text-xs text-muted-foreground">提案</div>
-                    </div>
-                    <div className="rounded-md border p-2">
-                      <div className="text-lg font-semibold">{approvedCount}</div>
-                      <div className="text-xs text-muted-foreground">承認済み</div>
-                    </div>
-                    <div className="rounded-md border p-2">
-                      <div className="text-lg font-semibold">{pendingCount}</div>
-                      <div className="text-xs text-muted-foreground">未処理</div>
-                    </div>
-                  </div>
-                  {contextPack && (
-                    <div className="rounded-md border p-3 space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="font-medium">コンテキストパック</span>
-                        <Badge variant={contextPack.truncated ? "warning" : "secondary"}>
-                          {contextPack.budget_used_chars.toLocaleString()} chars
-                        </Badge>
-                      </div>
-                      <div className="text-xs text-muted-foreground">
-                        {contextPack.total_symbols} symbols · {contextPack.total_entrypoints} entrypoints ·{" "}
-                        {contextPack.unclassified_count} 未分類
-                      </div>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <div className="flex items-center justify-between gap-2">
-                    <div>
-                      <CardTitle className="text-sm flex items-center gap-2">
-                        <Layers className="h-4 w-4" /> 現在の理解
+                {/* W7 — 結果と残りを確認する。主操作は終端ごとに 1 つ
+                    (§5.4)。「接続セットアップへ進む」を W7 全体に置くと、
+                    中断・引き継ぎ終端で意味を成さない操作が主操作になる。 */}
+                {showTerminal && workflow && (
+                <div className="space-y-4" data-testid="work-surface-W7">
+                  <Card data-testid="terminal-card" data-terminal-kind={workflow.terminal_kind ?? ""}>
+                    <CardHeader>
+                      <CardTitle className="text-sm">
+                        {workflow.terminal_kind === "completed"
+                          ? "このセッションは完了しました"
+                          : workflow.terminal_kind === "handoff"
+                            ? "引き継ぎの回答を待っています"
+                            : "このセッションは中断しています"}
                       </CardTitle>
                       <CardDescription>
-                        ドキュメントとコード分析から構築したシステム理解。
+                        {workflow.terminal_kind === "completed"
+                          ? "生成された差分を確認済みです。適用と接続確認へ進めます。"
+                          : workflow.terminal_kind === "handoff"
+                            ? "あなた側でできることは残っていません。引き継ぎ先の回答後、確定は明示操作で行います。"
+                            : "ここまでの回答・確定・承認は保持されています。再開すると続きから評価し直します。"}
                       </CardDescription>
-                    </div>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={refreshUnderstanding}
-                      disabled={building || !canRefreshUnderstanding}
-                      title={refreshBlockedUntilAnswerRevision
-                        ? "回答を修正した場合にのみ、理解を再構築できます"
-                        : undefined}
-                    >
-                      <Sparkles className="h-4 w-4 mr-1" />
-                      {updateUnderstanding.isPending ? "分析中..." : "理解を更新"}
-                    </Button>
-                  </div>
-                  {refreshBlockedUntilAnswerRevision && (
-                    <p
-                      className="mt-2 text-xs text-muted-foreground"
-                      data-testid="understanding-refresh-blocked-reason"
-                    >
-                      理解は確認済みです。次は提案を生成またはレビューしてください。内容を変える場合は、先に回答を修正すると理解を更新できます。
-                    </p>
-                  )}
-                </CardHeader>
-                <CardContent>
-                  {session.last_error && (
-                    <div className="rounded-md border border-destructive bg-destructive/10 p-3 mb-3 text-sm text-destructive flex items-start gap-2">
-                      <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
-                      <div>
-                        <div className="font-medium">直近の処理でエラーが発生しました</div>
-                        <div className="text-xs mt-1">{session.last_error}</div>
+                    </CardHeader>
+                    <CardContent className="space-y-3 text-sm">
+                      <ul className="list-disc pl-4 space-y-0.5 text-muted-foreground text-xs">
+                        <li>承認済みの提案: {wFacts?.approved_proposal_count ?? 0} 件</li>
+                        <li>引き継ぎ待ち: {wFacts?.pending_handoff_count ?? 0} 件</li>
+                        <li>未対応の確認項目: {wFacts?.outstanding_alignment_items ?? 0} 件</li>
+                      </ul>
+                      <div className="flex flex-wrap gap-2">
+                        {workflow.terminal_kind === "completed" && (
+                          <Link
+                            className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"
+                            to={`/setup-guide?session=${session.id}`}
+                            data-testid="terminal-primary-action"
+                          >
+                            <LifeBuoy className="h-4 w-4" />
+                            {PRIMARY_ACTION_LABELS.open_connection_setup}
+                          </Link>
+                        )}
+                        {workflow.terminal_kind === "handoff" && (
+                          <Button
+                            size="sm"
+                            data-testid="terminal-primary-action"
+                            onClick={() => {
+                              document
+                                .querySelector('[data-testid="handoff-list-panel"]')
+                                ?.scrollIntoView({ behavior: "smooth", block: "center" });
+                            }}
+                          >
+                            {PRIMARY_ACTION_LABELS.view_handoff_status}
+                          </Button>
+                        )}
+                        {workflow.terminal_kind === "suspended" && (
+                          <Button
+                            size="sm"
+                            data-testid="terminal-primary-action"
+                            disabled={reopenSession.isPending || !wFacts?.session_closed}
+                            onClick={() =>
+                              reopenSession
+                                .mutateAsync({ actor })
+                                .then(() => toast.success("セッションを再開しました"))
+                                .catch(e => toast.error(String(e)))
+                            }
+                          >
+                            {PRIMARY_ACTION_LABELS.resume_session}
+                          </Button>
+                        )}
+                        {/* 補助操作: 完了 / 引き継ぎ / 中断は排他的な終端なので、
+                            まだ閉じていないセッションだけ明示的に終端へ移せる。 */}
+                        {!wFacts?.session_closed && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            data-testid="terminal-close-session"
+                            disabled={closeSession.isPending}
+                            onClick={() => void leaveSafely(
+                              (wFacts?.pending_handoff_count ?? 0) > 0 ? "handoff" : "suspended",
+                            )}
+                          >
+                            このセッションを終える
+                          </Button>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+                )}
+              </>
+
+              {/* Issue #356 §5/§6 / Issue #359 — 未解決事項と Q&A 進捗。
+                  主作業面の直下に置き、「今この状態で何を操作するか」より先に
+                  全体像が来ないようにする。未解決事項は優先度上位のグループ
+                  だけを初期表示し、残りは明示操作で開く。行のアクションは
+                  既存の回答 UI へ移動するだけ。
+
+                  `items-start` が無いと Grid の既定 stretch で Q&A 進捗カード
+                  が未解決事項カードの高さまで引き伸ばされる (issue #359)。 */}
+              <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_300px] gap-4 items-start">
+                <CockpitUnresolvedItems
+                  groups={cockpit.unresolvedGroups}
+                  totalCount={cockpit.unresolved.length}
+                  qaFetchStatus={cockpit.qaFetchStatus}
+                  onSelect={openUnresolvedItem}
+                />
+                <CockpitQaProgressCard
+                  progress={cockpit.qa}
+                  status={cockpit.qaFetchStatus}
+                  error={qaListFailed ? String(qaListError?.message ?? qaListError) : null}
+                  onRetry={() => void refetchQaList()}
+                />
+              </div>
+
+              {/* Issue #360 — 全体像。主作業面と未解決事項のあとに置く。
+                  `W1` / `W2` では Brief が主作業面の位置に立っているので、
+                  ここには全体マップだけが残る (同じカードを 2 枚描かない)。 */}
+              {!briefLeads && understandingBriefPanel}
+              {!briefLeads && purposeFramePanel}
+
+              {/* Issue #356 §3 / Issue #363 — 理解の全体マップ。カード選択は
+                  詳細・修正ペインを切り替えるだけで、ワークフロー状態には
+                  影響しない。 */}
+              <UnderstandingMap
+                categories={cockpit.categories}
+                selected={selectedCategoryKey}
+                qaFetchStatus={cockpit.qaFetchStatus}
+                onSelect={selectCockpitCategory}
+                onRetryQa={() => void refetchQaList()}
+                onGoToDetail={() => openCockpitTarget(["cockpit-detail-panel"])}
+              />
+            </div>
+
+            {/* サイド: 判断に必要な根拠 (R3) と、必要時に開く詳細 (R4)。
+                履歴・監査・診断 (R6) は §3.6 の共通入口へ集約した。
+
+                §3.3 のマトリクスどおり、各パネルは「その状態の判断に要る」
+                ときだけ描く。とくに `W1` では、現在地カードが「操作は不要」
+                と言っている横で実行中処理の入力 (Intent・Q&A・まとめて修正)
+                を書き換えられてはならない -- 走っている理解更新や突き合わせ
+                と競合するうえ、原則 P1/P3 にも反する。R6 の履歴入口だけは
+                状態に依存せず常に開ける (§3.6)。 */}
+            {/* Issue #363 (レビュー指摘 P1): sticky は **右カラムそのもの**
+                に付ける。以前は中の詳細ペインだけを sticky にしていたが、
+                sticky 要素が動ける範囲は親の内容ボックスの中までで、右カラムは
+                中身ぶんの高さ (約 875px) しか無い一方、左右 Grid の行は
+                約 2,477px あった。そのため理解マップまでスクロールする前に
+                ペインが画面外へ流れ去っていた。
+
+                Grid の直接の子を sticky にすると、動ける範囲は「行の高さいっぱい
+                の grid area」になるので、`items-start` (= 中身ぶんの高さ) の
+                ままでもマップの末尾まで追従できる。
+
+                カラムごと sticky にするのは、詳細ペインだけを sticky にすると
+                通常フローに残る補助情報の上へ重なって読めなくなるためで、
+                カラム全体が一緒に動けば重なりは起きない。中身がビューポート
+                より高いときに下端へ到達できなくならないよう、内部スクロール
+                を持たせる。xl 未満 (右カラムが下へ回り込む幅) では通常の縦積み
+                のままで、マップの「選択中のカテゴリの詳細へ」が導線になる。 */}
+            <div className="space-y-4 xl:sticky xl:top-0 xl:max-h-[calc(100vh-5rem)] xl:overflow-y-auto">
+              {/* Issue #356 §4 / Issue #363 — 選択項目の詳細・修正ペイン。
+                  全体マップの選択に追従し、この項目を「どう直すか」だけを
+                  示す。実行できない手段は理由付きで残す (issue §4) -- ここは
+                  状態の主操作ではなく修正方法の案内なので、前提未達の主操作を
+                  出さない原則 (spec P3) の対象ではない。 */}
+              {selectedCategory && (
+                <CockpitDetailPanel
+                  category={selectedCategory}
+                  state={wState}
+                  onAction={openCockpitTarget}
+                />
+              )}
+
+              {/* Issue #361: 即時対応が必要な情報は折りたたみへ入れない。
+                  引き継ぎ待ちが残っているときの一覧 (#53, R3) は、閉じた
+                  `<details>` の中にあると見失うので常設のままにする。待ちが
+                  0 件のときだけ補助情報側へ降ろす。 */}
+              {(showQuestionWork || showTerminal) && pendingHandoffCount > 0 && (
+                <HandoffListPanel sessionId={session.id} actor={actor} />
+              )}
+
+              {/* Issue #351: 右カラムの「現在の理解」カードは廃止した。
+                  #354 が求めるのは「現在の理解が右カラムの補助情報としてしか
+                  存在しない状態にはしない」ことで、Brief がメインカラムに
+                  常設された以上、ここに 2 枚目を置くと同じ対象の重複になる
+                  (原則 P7)。全文ツリー (旧 UnderstandingOverview) は Brief の
+                  折りたたみの中に R4 として残っている。
+                  ここにあった `last_error` 表示も削除した: 表示条件が
+                  「未解消の失敗がある」ことそのもので、失敗内容・影響・復旧
+                  条件・再試行を 1 枠にまとめる `WorkflowExceptions` (§4.4) と
+                  常に同時に出る重複だった。 */}
+
+              {/* Issue #361 — 補助情報。セッション管理情報・全件一覧・履歴・
+                  監査を 1 箇所へまとめ、必要なときだけ開く。どの項目を出すかは
+                  これまでどおり §3.3 のマトリクス (その状態の判断に要るか) で
+                  決める -- 折りたたみになっただけで、状態ごとの表示対象は
+                  変えていない。 */}
+              <CockpitAuxiliaryPanel>
+                {/* Issue #356 §7 / #361: セッション情報。セッション番号 /
+                    Snapshot / ステータスはヘッダーが正準なので再掲しない。 */}
+                <CockpitAuxiliarySection
+                  id="session"
+                  title="セッション情報"
+                  description="参加者・最終更新・根拠の件数・保存状態。"
+                >
+                  <CockpitSessionInfo
+                    updatedAt={session.updated_at}
+                    participants={sessionParticipants}
+                    evidenceCounts={cockpit.evidenceCounts}
+                    saving={dialogueTurn.isPending || confirmUnderstanding.isPending || building}
+                  >
+                    {/* R4 (#44): 回答可能領域は `W3` の判断にだけ関わる詳細。 */}
+                    {showQuestionWork && (
+                      <AnswerableAreasControl
+                        sessionId={session.id}
+                        answerableAreas={session.answerable_areas}
+                      />
+                    )}
+                  </CockpitSessionInfo>
+                </CockpitAuxiliarySection>
+
+                {/* Vision is developer intent and can be supplied or corrected
+                    independently of the current workflow state. Keeping this
+                    section mounted also makes Overview's direct link valid in
+                    W3/W5/W6/W7, rather than silently dropping the developer at
+                    the general interview composer. */}
+                <CockpitAuxiliarySection
+                  id="intent"
+                  title="Intent Brief"
+                  description="この改善で何を達成したいか (開発者の意図)。"
+                >
+                  <IntentBriefPanel sessionId={session.id} />
+                </CockpitAuxiliarySection>
+
+                {(showQuestionWork || showTerminal) && pendingHandoffCount === 0 && (
+                  <CockpitAuxiliarySection
+                    id="handoff"
+                    title="引き継ぎ"
+                    description="待ち項目はありません。"
+                  >
+                    <HandoffListPanel sessionId={session.id} actor={actor} />
+                  </CockpitAuxiliarySection>
+                )}
+
+                {/* 新規観測の提案 (#55): 採否は `W7` の判断 (`OP-D11`)。 */}
+                {showTerminal && (
+                  <CockpitAuxiliarySection id="observation" title="新規観測の提案">
+                    <ObservationProposalPanel sessionId={session.id} />
+                  </CockpitAuxiliarySection>
+                )}
+
+                {/* まとめて修正 (#57, R2 補助): `W2` / `W3` / `W4` の訂正手段。
+                    詳細ペインの「直接編集する」からここへ移動してくるので、
+                    `focusCockpitTarget` が祖先の `<details>` を開く。 */}
+                {(showUnderstandingWork || showQuestionWork || showAlignmentWork
+                  || showProposalWork || showDiffWork || showTerminal) && (
+                  <CockpitAuxiliarySection
+                    id="change-set"
+                    title="まとめて修正"
+                    description="AIとの確認で得た気づきや修正内容を文章で書き、変更セットとして確認してから反映します。"
+                  >
+                    <ChangeSetPanel sessionId={session.id} />
+                  </CockpitAuxiliarySection>
+                )}
+
+                {/* Q&A 一覧 (#59a, R4): 現在の 1 問は主作業カードが持つ。一覧は
+                    `W3` の詳細で、履歴 (#59b) は R6 の入口にある。処理が失敗
+                    しているときは復旧操作を隠さないよう既定で開く (#361)。 */}
+                {showQuestionWork && (
+                  <CockpitAuxiliarySection
+                    id="qa-list"
+                    title="Q&A の全一覧"
+                    description="回答済みを含む全質問。1 問ずつの回答は上の作業面で行います。"
+                    badge={cockpit.qa ? `未回答 ${cockpit.qa.open} 件` : undefined}
+                    defaultOpen={auxiliaryProcessFailed}
+                  >
+                    <QaPanel
+                      sessionId={session.id}
+                      actor={actor}
+                      approvedCount={approvedCount}
+                      answerableAreas={session.answerable_areas}
+                      investigate={qaAutoInvestigate}
+                      showRecoveryActions={auxiliaryProcessFailed}
+                    />
+                  </CockpitAuxiliarySection>
+                )}
+
+              {/* R6 — 履歴と監査情報 (§3.6)。主フローの各状態には常設せず、
+                  状態に依存しない 1 つの入口からのみ到達する。中身は固定の
+                  並び順で、Interview UX 評価指標 (#341) もこの中に置く。
+                  入口は常に開ける (前提未達でも消さない)。ヘッダーの
+                  「変更履歴」ボタンがこの `<details>` を直接開けるので、
+                  `CockpitAuxiliarySection` には置き換えていない。 */}
+              <details className="rounded-md border px-3 py-2" data-testid="history-audit-entry">
+                <summary className="cursor-pointer text-sm font-medium">
+                  履歴と監査情報
+                </summary>
+                <div className="mt-3 space-y-4">
+                  <section className="space-y-2" data-testid="history-conversation-log">
+                    <h3 className="text-xs font-semibold text-muted-foreground">会話ログ</h3>
+                    {session.messages.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">まだありません。</p>
+                    ) : (
+                      <div className="space-y-2 max-h-[20rem] overflow-y-auto pr-1">
+                        {session.messages.map(m => (
+                          <div key={m.id} className="rounded-md border p-2 text-xs">
+                            <div className="flex items-center justify-between gap-2 mb-1">
+                              <Badge variant={m.role === "assistant" ? "secondary" : "outline"}>
+                                {m.role}
+                              </Badge>
+                              <span className="text-muted-foreground">
+                                {formatTimestamp(m.created_at)}
+                              </span>
+                            </div>
+                            <p className="whitespace-pre-wrap break-words">{m.content}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+
+                  <UnderstandingDiffPanel
+                    sessionId={session.id}
+                    answerRevisionReflected={answerRevisionReflected}
+                  />
+
+                  <section className="space-y-2" data-testid="history-session-stats">
+                    <h3 className="text-xs font-semibold text-muted-foreground">
+                      セッション統計 / コンテキストパック
+                    </h3>
+                    <div className="grid grid-cols-3 gap-2">
+                      <div className="rounded-md border p-2">
+                        <div className="text-lg font-semibold">{proposals.length}</div>
+                        <div className="text-xs text-muted-foreground">提案</div>
+                      </div>
+                      <div className="rounded-md border p-2">
+                        <div className="text-lg font-semibold">{approvedCount}</div>
+                        <div className="text-xs text-muted-foreground">承認済み</div>
+                      </div>
+                      <div className="rounded-md border p-2">
+                        <div className="text-lg font-semibold">{pendingCount}</div>
+                        <div className="text-xs text-muted-foreground">未処理</div>
                       </div>
                     </div>
-                  )}
-                  {session.current_understanding ? (
-                    <UnderstandingPanel understanding={session.current_understanding} />
-                  ) : !session.last_error ? (
-                    <div className="text-sm text-muted-foreground text-center py-6" data-testid="no-understanding">
-                      まだ理解は構築されていません。
-                    </div>
-                  ) : null}
-                </CardContent>
-              </Card>
-
-              {session.open_questions && session.open_questions.length > 1 && (
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="text-sm flex items-center gap-2">
-                      <HelpCircle className="h-4 w-4" /> 残りの質問
-                    </CardTitle>
-                    <CardDescription>この後の確認で1つずつ質問されます。</CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="space-y-2" data-testid="open-questions-panel">
-                      {sortQuestions(session.open_questions).slice(1).map((q, idx) => (
-                        <div key={idx} className="rounded-md border p-3 flex items-start gap-3">
-                          <HelpCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-500" />
-                          <div className="min-w-0">
-                            <span className="text-sm">{q.question}</span>
-                            <div className="flex gap-1 mt-1">
-                              <Badge variant="outline">{q.category}</Badge>
-                              <Badge variant={q.priority === "high" ? "destructive" : q.priority === "medium" ? "warning" : "outline"}>
-                                {q.priority}
-                              </Badge>
-                            </div>
-                          </div>
+                    {contextPack ? (
+                      <div className="rounded-md border p-3 space-y-2 text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className="font-medium">コンテキストパック</span>
+                          <Badge variant={contextPack.truncated ? "warning" : "secondary"}>
+                            {contextPack.budget_used_chars.toLocaleString()} chars
+                          </Badge>
                         </div>
-                      ))}
-                    </div>
-                  </CardContent>
-                </Card>
-              )}
+                        <div className="text-muted-foreground">
+                          {contextPack.total_symbols} symbols · {contextPack.total_entrypoints} entrypoints ·{" "}
+                          {contextPack.unclassified_count} 未分類
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">まだありません。</p>
+                    )}
+                  </section>
 
-              <UnderstandingDiffPanel
-                sessionId={session.id}
-                answerRevisionReflected={answerRevisionReflected}
-              />
+                  <section className="space-y-2" data-testid="history-process-runs">
+                    <h3 className="text-xs font-semibold text-muted-foreground">
+                      システム処理の実行履歴
+                    </h3>
+                    <ProcessRunHistory sessionId={session.id} />
+                  </section>
 
-              <QaPanel sessionId={session.id} actor={actor} approvedCount={approvedCount} />
+                  <InterviewMetricsPanel />
 
-              {session.gap_analysis && session.gap_analysis.length > 0 && (
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="text-sm flex items-center gap-2">
-                      <AlertCircle className="h-4 w-4" /> ギャップ分析
-                    </CardTitle>
-                    <CardDescription>ドキュメントとコードの差分。</CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <GapAnalysisPanel gaps={session.gap_analysis} />
-                  </CardContent>
-                </Card>
-              )}
+                  <section className="space-y-2" data-testid="history-materialization-ref">
+                    <h3 className="text-xs font-semibold text-muted-foreground">
+                      Materialization リファレンス
+                    </h3>
+                    {session.materialization_ref ? (
+                      <a
+                        className="inline-flex items-center text-sm underline"
+                        href={session.materialization_ref}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        <FileCode className="h-4 w-4 mr-1" />
+                        リファレンスを開く
+                      </a>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">まだありません。</p>
+                    )}
+                  </section>
+                </div>
+              </details>
+              </CockpitAuxiliaryPanel>
             </div>
           </div>
+
+          <Dialog
+            open={capabilityConfirmOpen}
+            onOpenChange={setCapabilityConfirmOpen}
+          >
+            <DialogHeader>
+              <DialogTitle>Core Capability 構成を確認</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4 text-sm" data-testid="capability-confirm-dialog">
+              <p className="text-xs text-muted-foreground">
+                変更後の支援関係と rename の同一性を確認してください。この確定後、
+                影響する Alignment 項目だけが再確認対象になります。
+              </p>
+
+              {priorCapabilityGraphQuery.isLoading ? (
+                <p className="text-xs text-muted-foreground">前回の正準構成を読み込み中...</p>
+              ) : unmatchedCapabilityNodes.length > 0 ? (
+                <div className="space-y-2">
+                  <p className="font-semibold">名前が一致しない Capability</p>
+                  {unmatchedCapabilityNodes.map(node => {
+                    const key = capabilityNodeKey(node.kind, node.name);
+                    const candidates = (priorCapabilityGraphQuery.data?.nodes ?? []).filter(
+                      prior =>
+                        prior.entity_kind === node.kind
+                        && !proposedCapabilityNodes.some(
+                          current =>
+                            current.kind === prior.entity_kind
+                            && current.name === prior.name,
+                        ),
+                    );
+                    return (
+                      <div key={key} className="grid gap-1 md:grid-cols-2 md:items-center">
+                        <Label>{node.name}</Label>
+                        <Select
+                          value={capabilityIdentitySelections[key] ?? ""}
+                          onChange={event =>
+                            setCapabilityIdentitySelections(current => ({
+                              ...current,
+                              [key]: event.target.value,
+                            }))
+                          }
+                          data-testid={`capability-identity-${node.kind}-${node.name}`}
+                        >
+                          <option value="">新しい Capability として扱う</option>
+                          {candidates.map(candidate => (
+                            <option key={candidate.entity_id} value={candidate.entity_id}>
+                              {candidate.name} (entity #{candidate.entity_id}) を rename
+                            </option>
+                          ))}
+                        </Select>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  rename の明示指定が必要な Capability はありません。
+                </p>
+              )}
+
+              <div className="space-y-2">
+                <p className="font-semibold">確定する支援関係</p>
+                {proposedCapabilityRelations.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">支援関係はありません。</p>
+                ) : (
+                  proposedCapabilityRelations.map(relation => {
+                    const key = capabilityRelationKey(relation);
+                    return (
+                      <label key={key} className="flex items-center gap-2 text-xs">
+                        <input
+                          type="checkbox"
+                          checked={capabilityRelationSelections[key] !== false}
+                          onChange={event =>
+                            setCapabilityRelationSelections(current => ({
+                              ...current,
+                              [key]: event.target.checked,
+                            }))
+                          }
+                        />
+                        <span>
+                          {relation.supported_name} → {relation.supporting_name}
+                        </span>
+                      </label>
+                    );
+                  })
+                )}
+              </div>
+
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="outline"
+                  onClick={() => setCapabilityConfirmOpen(false)}
+                >
+                  キャンセル
+                </Button>
+                <Button
+                  onClick={() => void submitUnderstandingConfirmation(true)}
+                  disabled={
+                    confirmUnderstanding.isPending
+                    || priorCapabilityGraphQuery.isLoading
+                  }
+                  data-testid="confirm-capability-composition"
+                >
+                  {confirmUnderstanding.isPending ? "確定中..." : "この構成を確定"}
+                </Button>
+              </div>
+            </div>
+          </Dialog>
 
           <Dialog open={!!editing && !!editForm} onOpenChange={(open) => { if (!open) { setEditing(null); setEditForm(null); } }}>
             {editing && editForm && (

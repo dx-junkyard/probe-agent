@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
@@ -465,22 +465,25 @@ export default function CapabilityMapPage() {
   const { data: hierarchy, isLoading } = useCapabilityHierarchy();
   const { data: driftData } = useCapabilityHierarchyDrift();
   const generate = useGenerateCapabilityHierarchy();
-  const [selected, setSelected] = useState<SelectedNode | null>(null);
   const [searchParams] = useSearchParams();
-  const autoSelectedRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    const wantCap = searchParams.get("capability");
-    if (!wantCap || !hierarchy?.capabilities) return;
-    if (autoSelectedRef.current === wantCap) return;
+  const wantCap = searchParams.get("capability");
+  // ?capability= auto-selection is derived at render time; a manual click
+  // overrides it until the URL param changes to a different capability.
+  const autoSelected = useMemo<SelectedNode | null>(() => {
+    if (!wantCap || !hierarchy?.capabilities) return null;
     const match = hierarchy.capabilities.find(
       (c) => c.name === wantCap || c.capability_key === wantCap,
     );
-    if (match) {
-      autoSelectedRef.current = wantCap;
-      setSelected({ kind: "capability", data: match });
-    }
-  }, [searchParams, hierarchy]);
+    return match ? { kind: "capability", data: match } : null;
+  }, [wantCap, hierarchy]);
+  const [override, setOverride] = useState<{
+    forParam: string | null;
+    value: SelectedNode | null;
+  } | null>(null);
+  const selected =
+    override && override.forParam === wantCap ? override.value : autoSelected;
+  const setSelected = (value: SelectedNode | null) =>
+    setOverride({ forParam: wantCap, value });
 
   // Flatten every drift anchor to its hierarchy node id for O(1) freshness lookup.
   const driftByNode = useMemo(() => {

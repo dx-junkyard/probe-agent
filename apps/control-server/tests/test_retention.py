@@ -124,9 +124,10 @@ def admin_client(tmp_path, monkeypatch):
 
 
 def test_retention_is_system_scoped(admin_client):
-    token = admin_client.post(
+    login = admin_client.post(
         "/auth/login", json={"username": "root", "password": "s3cret"}
-    ).json()["access_token"]
+    )
+    token = login.cookies.get("probe_session")
 
     def mk(name):
         return admin_client.post("/systems", json={"name": name},

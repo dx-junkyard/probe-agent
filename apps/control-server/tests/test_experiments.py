@@ -90,7 +90,7 @@ def _login(client):
         "/auth/login", json={"username": "root", "password": "s3cret"}
     )
     assert response.status_code == 200
-    return response.json()["access_token"]
+    return response.cookies.get("probe_session")
 
 
 def _headers(token, system_id=None):
@@ -214,6 +214,34 @@ def test_runs_baseline_and_two_variants_in_isolated_workspaces(
     )
     assert decision_response.json()["analysis"]["status"] == "analysis_failed"
 
+    # Adoption atomically materializes the canonical publish lineage.  The
+    # transport patch is the selected variant's exact diff and the existing
+    # publisher's explicit approval gate remains downstream.
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        artifact = conn.execute(
+            """SELECT a.*, p.diff
+                 FROM improvement_publish_artifacts a
+                 JOIN probe_patches p ON p.id = a.patch_id
+                WHERE a.experiment_id = ?""",
+            (created["id"],),
+        ).fetchone()
+        validation = conn.execute(
+            "SELECT variant, overall_success FROM validation_runs WHERE patch_id = ? ORDER BY variant",
+            (artifact["patch_id"],),
+        ).fetchall()
+    assert artifact["variant_id"] == next(
+        item["id"] for item in result["variants"] if item["variant_key"] == "variant-1"
+    )
+    assert artifact["diff"] == next(
+        item["patch_text"] for item in result["variants"] if item["variant_key"] == "variant-1"
+    )
+    assert [(row["variant"], row["overall_success"]) for row in validation] == [
+        ("baseline", 1),
+        ("probed", 1),
+    ]
+
     cleanup_response = admin_client.post("/experiments/cleanup", headers=headers)
     assert cleanup_response.status_code == 200
     assert cleanup_response.json()["cleaned_experiments"] == 1
@@ -331,3 +359,75 @@ def test_adoption_requires_completed_non_baseline_variant(
         headers=headers,
     )
     assert baseline.status_code == 422
+
+
+# --- Issue #369: the stale-snapshot gate on creation --------------------------
+
+
+def test_creation_blocks_on_a_stale_snapshot_until_a_reason_is_given(
+    admin_client, experiment_repo, tmp_path
+):
+    """A snapshot behind HEAD is usable for reproduction -- but that is the
+    developer's call, so it must be stated and recorded, not inferred."""
+    headers, snapshot = _setup_snapshot(admin_client, experiment_repo)
+    # Move HEAD past the snapshot's pinned commit.
+    (experiment_repo / "calc.py").write_text("def value():\n    return 9\n")
+    subprocess.run(
+        ["git", "-C", str(experiment_repo), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(experiment_repo), "commit", "-m", "move head"],
+        check=True, capture_output=True,
+    )
+
+    blocked = admin_client.post(
+        "/experiments", json=_create_payload(snapshot["id"]), headers=headers
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "stale_snapshot_not_acknowledged"
+
+    payload = _create_payload(snapshot["id"])
+    payload["stale_snapshot_reason"] = "過去のバグを当時のコードで再現するため"
+    allowed = admin_client.post("/experiments", json=payload, headers=headers)
+    assert allowed.status_code == 201
+
+    # Persisted on the record that consumed the snapshot, not merely validated.
+    import sqlite3
+
+    conn = sqlite3.connect(os.environ["PROBE_DB_PATH"])
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT snapshot_freshness, stale_ack_reason, head_sha_at_creation"
+            " FROM experiments WHERE id = ?",
+            (allowed.json()["id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["snapshot_freshness"] == "stale"
+    assert row["stale_ack_reason"] == "過去のバグを当時のコードで再現するため"
+    assert row["head_sha_at_creation"]
+
+
+def test_creation_on_a_current_snapshot_records_current_and_needs_no_reason(
+    admin_client, experiment_repo
+):
+    headers, snapshot = _setup_snapshot(admin_client, experiment_repo)
+    created = admin_client.post(
+        "/experiments", json=_create_payload(snapshot["id"]), headers=headers
+    )
+    assert created.status_code == 201
+
+    import sqlite3
+
+    conn = sqlite3.connect(os.environ["PROBE_DB_PATH"])
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT snapshot_freshness, stale_ack_reason FROM experiments WHERE id = ?",
+            (created.json()["id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["snapshot_freshness"] == "current"
+    assert row["stale_ack_reason"] is None

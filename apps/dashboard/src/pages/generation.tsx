@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useComponents, useTraces, useGenerationRuns, useCreateGenerationRun } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -9,7 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
-import { Sparkles } from "lucide-react";
+import { Sparkles, Bot, ArrowRight } from "lucide-react";
 
 const VERDICT_VARIANT: Record<string, "default" | "success" | "destructive" | "secondary" | "warning"> = {
   better: "success", worse: "destructive", same: "secondary", unsafe: "warning", error: "destructive",
@@ -44,6 +45,26 @@ export default function GenerationPage() {
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-bold tracking-tight">Generate & Evaluate</h1>
+
+      {/* Issue #267 item 10: previously the only pointer to the newer AI
+          Candidate Studio was the sidebar "Legacy" badge/tooltip
+          (sidebar.tsx) -- add a visible in-page banner too. */}
+      <div
+        className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-100"
+        data-testid="generation-legacy-banner"
+      >
+        <span>
+          このページは旧世代の候補生成機能です。新しい機能開発には
+          <span className="font-medium">AI Candidate Studio</span>の利用を推奨します。
+        </span>
+        <Link
+          to="/candidate-studio"
+          className="inline-flex items-center gap-1.5 font-medium text-amber-900 hover:underline dark:text-amber-100"
+          data-testid="generation-legacy-banner-link"
+        >
+          <Bot className="h-4 w-4" /> AI Candidate Studioを開く <ArrowRight className="h-3.5 w-3.5" />
+        </Link>
+      </div>
 
       <Card>
         <CardHeader>

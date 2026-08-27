@@ -43,7 +43,7 @@ npm run test
 
 | ページ | パス | 説明 |
 | --- | --- | --- |
-| Overview | `/` | component 数、trace 数、active mode の概要 |
+| Overview | `/` | System Intelligence Brief / 意思決定コックピット。Vision・System Purpose・主要機能・Decision Readiness、今わかったこと(最大3件)、次にすること(1件)、改善ループの現在地、Runtime health。判定はすべて `GET /overview` が返す |
 | System Understanding | `/system-understanding` | pipeline checklist、System Purpose、Capabilities、metadata coverage、docs-code gap、next actions |
 | Repository | `/repository` | リポジトリ設定、snapshot 管理、symbol index、API scan |
 | Capability Map | `/capability-map` | System Purpose → Core Capability → Element のツリーとドリルダウン |

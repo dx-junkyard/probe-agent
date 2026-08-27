@@ -21,14 +21,24 @@ probe-agent:
 from __future__ import annotations
 
 import json
+import logging
+import os
 import time
+from dataclasses import dataclass
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
 
-from ..auth import get_system_id
+from ..auth import Principal, get_system_id, require_user
+from ..capability_graph import (
+    CapabilityGraphError,
+    confirm_capability_graph,
+    latest_system_confirmed_graph,
+)
 from ..db import get_conn
+from .. import interview_workflow
+from ..interview_workflow import tracked_process
 from ..interview_context import build_interview_context
 from ..interview_agent import (
     EVIDENCE_PROMPT_VERSION,
@@ -66,8 +76,10 @@ from ..understanding_diff import (
     revision_limit,
 )
 from ..models import (
+    AnswerableAreasUpdateRequest,
     InterviewApprovedItemOut,
     InterviewApprovedSetOut,
+    InterviewCapabilityGraphOut,
     InterviewConfirmUnderstandingRequest,
     InterviewContextPack,
     InterviewDialogueProposalOut,
@@ -92,6 +104,8 @@ from ..models import (
     InterviewQaAnswerRequest,
     InterviewQaCreate,
     InterviewQaEvidenceRefOut,
+    InterviewQaInvestigationEvidenceOut,
+    InterviewQaInvestigationOut,
     InterviewQaListOut,
     InterviewQaOut,
     InterviewSessionCreate,
@@ -160,6 +174,156 @@ def _review_history(rows) -> List[dict]:
     ]
 
 
+def _understanding_update_blocked(conn, session, system_id: int) -> bool:
+    """True when ``update-understanding`` would currently be rejected (409).
+
+    Single source of truth for the confirmed-proposal-stage rebuild gate
+    (Issue #229, widened by Issue #263): both the API's 409 check and the
+    session serializer's ``understanding_update_available`` flag call this
+    function so they can never disagree. Deterministic only (Principle 6):
+    a stage/timestamp/row-existence check, no reasoning model involved.
+
+    Rebuilding is blocked only when all of the following hold:
+    - the session has reached ``proposal_generation``,
+    - the understanding was manually confirmed
+      (``understanding_confirmed_at`` is set), and
+    - no developer input has arrived since the rebuild watermark: no answer
+      correction (``answers_revised_at``) and no ``interview_qa`` row
+      created or answered after the watermark (a first-time answer given
+      only through the Q&A panel, or an answer to a newly issued Runtime
+      Reality Check question, both of which never touch
+      ``answers_revised_at``).
+
+    The watermark is ``understanding_rebuilt_at`` when set, else
+    ``understanding_confirmed_at``. This fixes a once-opened-never-closes
+    bug: comparing the ``interview_qa`` rows against the original
+    confirmation timestamp alone meant that a single Q&A row created or
+    answered after confirmation kept the gate open forever, even after a
+    successful rebuild had already consumed that row's input into a new
+    understanding. ``understanding_rebuilt_at`` is set only on a
+    *successful* rebuild (never on a failed one), so a failed rebuild
+    correctly leaves the gate open, and each successful rebuild advances the
+    watermark so only genuinely new input (arriving after that rebuild)
+    reopens it.
+    """
+    if (session["stage"] or "understanding_initialized") != "proposal_generation":
+        return False
+    confirmed_at = session["understanding_confirmed_at"]
+    if confirmed_at is None:
+        return False
+    if session["answers_revised_at"] is not None:
+        return False
+    rebuilt_at = (
+        session["understanding_rebuilt_at"]
+        if "understanding_rebuilt_at" in session.keys() else None
+    )
+    watermark = max(confirmed_at, rebuilt_at) if rebuilt_at is not None else confirmed_at
+    new_qa_since_watermark = conn.execute(
+        """SELECT 1 FROM interview_qa
+           WHERE session_id = ? AND system_id = ?
+             AND (
+               created_at > ?
+               OR (answered_at IS NOT NULL AND answered_at > ?)
+             )
+           LIMIT 1""",
+        (session["id"], system_id, watermark, watermark),
+    ).fetchone()
+    return new_qa_since_watermark is None
+
+
+def _load_qa_pairs(
+    conn, session_id: int, system_id: int
+) -> tuple[Optional[List[dict]], List[dict]]:
+    """Fetch and shape the session's answered/unconfirmed interview_qa rows.
+
+    Single source of the Issue #129/#142 fetch+shaping rule, shared by the
+    conversational interview-turn route and the understanding-review rebuild
+    (Issue #263) so an answer given only through the Q&A panel reaches the
+    review the same way a conversational answer already does. Returns
+    ``(answered_qa_pairs, unconfirmed_qa_pairs)``: ``answered_qa_pairs`` is
+    ``None`` when there are none (matching the existing prompt-injection
+    convention); ``unconfirmed_qa_pairs`` is always a list so callers may
+    merge additional turn-local entries (e.g. the current turn's "I don't
+    know" answer) before use.
+    """
+    answered_qa_rows = conn.execute(
+        """SELECT question_text, answer_text FROM interview_qa
+           WHERE session_id = ? AND system_id = ?
+             AND superseded_by_id IS NULL AND status = 'answered'
+           ORDER BY id""",
+        (session_id, system_id),
+    ).fetchall()
+    answered_qa_pairs = [
+        {"question": r["question_text"], "answer": r["answer_text"]}
+        for r in answered_qa_rows
+    ] or None
+
+    unconfirmed_qa_rows = conn.execute(
+        """SELECT question_text, answer_text FROM interview_qa
+           WHERE session_id = ? AND system_id = ?
+             AND superseded_by_id IS NULL AND status = 'unconfirmed'
+           ORDER BY id""",
+        (session_id, system_id),
+    ).fetchall()
+    unconfirmed_qa_pairs = [
+        {"question": r["question_text"], "answer": r["answer_text"]}
+        for r in unconfirmed_qa_rows
+    ]
+    return answered_qa_pairs, unconfirmed_qa_pairs
+
+
+def _load_alignment_feedback(
+    conn, session_id: int, system_id: int
+) -> Optional[List[dict]]:
+    """Return explicit terminal Alignment decisions for a rebuild prompt.
+
+    Alignment rows are append-only history once terminal.  Read both current
+    and superseded rows so a later Q&A-triggered rebuild cannot regress a
+    correction that an earlier rebuild already incorporated.  ``held`` is a
+    workflow state, not substantive feedback, and therefore is excluded.
+    Newest decisions come first so the bounded prompt retains the most recent
+    human guidance if the serialized list must be trimmed.
+    """
+    rows = conn.execute(
+        """SELECT id, intent_summary, current_claim, gap_summary,
+                  proposed_interpretation, user_decision
+           FROM alignment_item
+           WHERE session_id = ? AND system_id = ?
+             AND status IN ('answered', 'corrected')
+             AND user_decision IS NOT NULL
+           ORDER BY updated_at DESC, id DESC
+           LIMIT 100""",
+        (session_id, system_id),
+    ).fetchall()
+
+    feedback: List[dict] = []
+    for row in rows:
+        try:
+            decision = json.loads(row["user_decision"])
+        except (TypeError, json.JSONDecodeError):
+            # Pre-migration/corrupt audit payloads are not reliable human
+            # evidence. Fail closed by omitting them rather than guessing.
+            continue
+        action = decision.get("action")
+        if action not in {
+            "accept_current", "needs_change", "reject_interpretation", "corrected",
+        }:
+            continue
+        feedback.append({
+            "alignment_item_id": row["id"],
+            "intent_summary": row["intent_summary"],
+            "current_claim": row["current_claim"],
+            "gap_summary": row["gap_summary"],
+            "proposed_interpretation": row["proposed_interpretation"],
+            "decision": {
+                "action": action,
+                "note": decision.get("note"),
+                "decided_at": decision.get("decided_at"),
+            },
+        })
+    return feedback or None
+
+
 def _question_entry(question) -> dict:
     """Normalize a turn question (structured object or legacy string) into
     the open_questions JSON entry shape."""
@@ -184,11 +348,36 @@ def _question_out(question) -> InterviewStructuredQuestion:
         return InterviewStructuredQuestion(question_text=question)
     return question
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 
-def _session_out(row) -> InterviewSessionOut:
+def _session_out(conn, row) -> InterviewSessionOut:
     import json as _json
+    latest_revision = conn.execute(
+        """SELECT id FROM understanding_revision
+           WHERE session_id = ? AND system_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (row["id"], row["system_id"]),
+    ).fetchone()
+    graph_confirmation = conn.execute(
+        """SELECT id, source_revision_id
+           FROM understanding_capability_confirmation
+           WHERE session_id = ? AND system_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (row["id"], row["system_id"]),
+    ).fetchone()
+    system_graph_confirmation = conn.execute(
+        """SELECT id FROM understanding_capability_confirmation
+           WHERE system_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (row["system_id"],),
+    ).fetchone()
+    latest_revision_id = latest_revision["id"] if latest_revision else None
+    confirmed_revision_id = (
+        graph_confirmation["source_revision_id"] if graph_confirmation else None
+    )
     return InterviewSessionOut(
         id=row["id"],
         system_id=row["system_id"],
@@ -210,12 +399,31 @@ def _session_out(row) -> InterviewSessionOut:
             row["understanding_confirmed_by"]
             if "understanding_confirmed_by" in row.keys() else None
         ),
+        capability_graph_confirmed_revision_id=confirmed_revision_id,
+        capability_graph_confirmation_required=bool(
+            row["current_understanding"]
+            and latest_revision_id is not None
+            and (
+                confirmed_revision_id != latest_revision_id
+                or graph_confirmation is None
+                or system_graph_confirmation is None
+                or graph_confirmation["id"] != system_graph_confirmation["id"]
+            )
+        ),
         answers_revised_at=(
             row["answers_revised_at"] if "answers_revised_at" in row.keys() else None
+        ),
+        understanding_update_available=not _understanding_update_blocked(
+            conn, row, row["system_id"]
         ),
         materialization_diff=row["materialization_diff"],
         materialization_ref=row["materialization_ref"],
         materialized_at=row["materialized_at"],
+        answerable_areas=(
+            _json.loads(row["answerable_areas"])
+            if ("answerable_areas" in row.keys() and row["answerable_areas"])
+            else []
+        ),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -233,6 +441,7 @@ def _message_out(row) -> InterviewMessageOut:
 
 
 def _intelligence_run_out(row) -> IntelligenceRunOut:
+    keys = row.keys()
     return IntelligenceRunOut(
         id=row["id"],
         system_id=row["system_id"],
@@ -248,10 +457,43 @@ def _intelligence_run_out(row) -> IntelligenceRunOut:
         is_mock=bool(row["is_mock"]),
         started_at=row["started_at"],
         completed_at=row["completed_at"],
+        # Issue #286: only present on run_type="investigation" rows written
+        # after this migration; older rows/tables without the columns yet
+        # (defensive -- init_db always adds them) stay None.
+        budget_files_read=row["budget_files_read"] if "budget_files_read" in keys else None,
+        budget_chars_read=row["budget_chars_read"] if "budget_chars_read" in keys else None,
+        budget_llm_calls=row["budget_llm_calls"] if "budget_llm_calls" in keys else None,
+        budget_elapsed_seconds=(
+            row["budget_elapsed_seconds"] if "budget_elapsed_seconds" in keys else None
+        ),
     )
 
 
 # --- Structured Interview Q&A (Issue #129) ----------------------------------
+
+
+def _qa_investigation_out(row) -> Optional[InterviewQaInvestigationOut]:
+    """Parse the persisted Investigation Agent result (Issue #286 review fix).
+
+    Tolerates a pre-migration row (missing columns) and a row that has
+    never been investigated (NULL json) the same way runtime_evidence does.
+    """
+    if "investigation_json" not in row.keys() or not row["investigation_json"]:
+        return None
+    run_id = row["investigation_run_id"] if "investigation_run_id" in row.keys() else None
+    if run_id is None:
+        return None
+    data = json.loads(row["investigation_json"])
+    return InterviewQaInvestigationOut(
+        run_id=run_id,
+        status=data.get("status", "unresolved"),
+        conclusion=data.get("conclusion", ""),
+        key_points=data.get("key_points", []),
+        evidence=[InterviewQaInvestigationEvidenceOut(**e) for e in data.get("evidence", [])],
+        uncertainty=data.get("uncertainty", ""),
+        confidence=data.get("confidence", "uncertain"),
+        decision_question=data.get("decision_question"),
+    )
 
 
 def _qa_out(row) -> InterviewQaOut:
@@ -273,11 +515,29 @@ def _qa_out(row) -> InterviewQaOut:
             else None
         ),
         answer_text=row["answer_text"],
+        answer_unknown=(
+            bool(row["answer_unknown"])
+            if "answer_unknown" in row.keys() and row["answer_unknown"] is not None
+            else None
+        ),
         status=row["status"],
         answered_by=row["answered_by"],
         superseded_by_id=row["superseded_by_id"],
         created_at=row["created_at"],
         answered_at=row["answered_at"],
+        route_category=(
+            row["route_category"] if "route_category" in row.keys() else None
+        ),
+        route_run_id=(
+            row["route_run_id"] if "route_run_id" in row.keys() else None
+        ),
+        knowledge_area=(
+            row["knowledge_area"] if "knowledge_area" in row.keys() else None
+        ),
+        handoff_id=(
+            row["handoff_id"] if "handoff_id" in row.keys() else None
+        ),
+        investigation=_qa_investigation_out(row),
     )
 
 
@@ -309,17 +569,21 @@ def _insert_qa_row(
     evidence_refs: List[InterviewQaEvidenceRefOut],
     now: float,
     answer_text: Optional[str] = None,
+    answer_unknown: Optional[bool] = None,
     status: str = "open",
     answered_by: Optional[str] = None,
     answered_at: Optional[float] = None,
     runtime_evidence: Optional[dict] = None,
+    investigation_json: Optional[dict] = None,
+    investigation_run_id: Optional[int] = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO interview_qa
             (session_id, system_id, question_text, question_category,
              question_source, hypothesis, evidence_refs, runtime_evidence,
-             answer_text, status, answered_by, created_at, answered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             answer_text, answer_unknown, status, answered_by, created_at, answered_at,
+             investigation_json, investigation_run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             session_id,
             system_id,
@@ -331,10 +595,13 @@ def _insert_qa_row(
             if evidence_refs else None,
             json.dumps(runtime_evidence, ensure_ascii=False) if runtime_evidence else None,
             answer_text,
+            None if answer_unknown is None else (1 if answer_unknown else 0),
             status,
             answered_by,
             now,
             answered_at,
+            json.dumps(investigation_json, ensure_ascii=False) if investigation_json else None,
+            investigation_run_id,
         ),
     )
     return cur.lastrowid
@@ -405,7 +672,7 @@ def list_interview_sessions(
             "SELECT * FROM interview_session WHERE system_id = ? ORDER BY id DESC",
             (system_id,),
         ).fetchall()
-        return [_session_out(r) for r in rows]
+        return [_session_out(conn, r) for r in rows]
 
 
 @router.post(
@@ -447,8 +714,85 @@ def create_interview_session(
             """,
             (system_id, payload.snapshot_id, payload.title, payload.focus, now, now),
         )
-        row = _get_session_or_404(conn, cur.lastrowid, system_id)
-        return _session_out(row)
+        session_id = cur.lastrowid
+        # Issue #349: `W0-B` completes by "creating a session AND the system
+        # starting to investigate" (spec §2.3). Both halves happen here.
+        #
+        # The run record is opened inside this request so the new session is
+        # `W1` from its very first evaluation -- otherwise a reload before the
+        # build starts sees a session with no understanding, no questions, no
+        # proposals and no diff, which falls through the whole rule table to
+        # `W7`, a terminal the developer can never leave because every build
+        # control is exception-only.
+        #
+        # The build itself is dispatched below, outside this connection. The
+        # record is never a mere reservation waiting for the client to send a
+        # second request: a caller that creates a session and then goes away
+        # (an API client, a closed tab) still gets the investigation, and a
+        # dispatch that cannot even start is turned into a recoverable
+        # `E3-a` immediately rather than after the stale sweep.
+        initial_run_id = interview_workflow.start_process_run(
+            conn, session_id, system_id, "understanding_build"
+        )
+        row = _get_session_or_404(conn, session_id, system_id)
+        session_out = _session_out(conn, row)
+        session_row = dict(row)
+
+    _dispatch_initial_understanding_build(session_row, system_id, initial_run_id)
+    return session_out
+
+
+def _initial_build_eager() -> bool:
+    """Run the initial build inline instead of on a worker thread.
+
+    Mirrors `interview_refresh`'s `PROBE_REFRESH_EAGER`: tests need the build
+    to be deterministic and finished when the request returns.
+    """
+    return os.getenv("PROBE_INTERVIEW_EAGER_INITIAL_BUILD", "0") == "1"
+
+
+def _dispatch_initial_understanding_build(
+    session_row: dict, system_id: int, run_id: int
+) -> None:
+    """Actually start the initial understanding build for a new session.
+
+    Owns the run record `create_interview_session` opened: the worker adopts
+    that exact id, so the record always describes a process that really ran.
+    If the worker cannot be started at all, the record is failed right away
+    with the reason -- a recoverable `E3-a` the developer can retry, instead
+    of 15 minutes of "システムが調べている" followed by a stale sweep.
+    """
+    import threading
+
+    if not run_id:
+        return
+
+    def _run() -> None:
+        try:
+            _rebuild_understanding(session_row, system_id, adopt_run_id=run_id)
+        except Exception as exc:  # pragma: no cover - defensive worker guard
+            logger.exception(
+                "initial understanding build failed for session %s",
+                session_row.get("id"),
+            )
+            try:
+                with get_conn() as conn:
+                    interview_workflow.finish_process_run(
+                        conn, run_id, ok=False, error=str(exc)
+                    )
+            except Exception:  # pragma: no cover
+                logger.exception("could not record initial build failure")
+
+    if _initial_build_eager():
+        _run()
+        return
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception as exc:  # pragma: no cover - thread creation failure
+        with get_conn() as conn:
+            interview_workflow.finish_process_run(
+                conn, run_id, ok=False, error=f"初期調査を開始できませんでした: {exc}"
+            )
 
 
 @router.get(
@@ -473,7 +817,7 @@ def get_interview_session(
             "SELECT * FROM interview_proposal WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
-        session_fields = _session_out(row).model_dump()
+        session_fields = _session_out(conn, row).model_dump()
         session_fields["snapshot_commit_sha"] = (
             snapshot_row["commit_sha"] if snapshot_row else None
         )
@@ -482,6 +826,45 @@ def get_interview_session(
             messages=[_message_out(m) for m in message_rows],
             proposals=[_proposal_out(conn, p) for p in proposal_rows],
         )
+
+
+@router.put(
+    "/interview/sessions/{session_id}/answerable-areas",
+    response_model=InterviewSessionOut,
+)
+def update_answerable_areas(
+    session_id: int,
+    payload: AnswerableAreasUpdateRequest,
+    system_id: int = Depends(get_system_id),
+) -> InterviewSessionOut:
+    """Set which knowledge areas the developer can answer RIGHT NOW.
+
+    No role inference (Principle 6/8's actor convention): the developer
+    picks their own answerable areas, changeable at any time during the
+    session. An empty list means NO FILTERING -- every question stays
+    askable regardless of its knowledge_area, exactly like the pre-#291
+    default -- never "every area is answerable".
+
+    probe-agent:
+      role: API boundary for setting the session's answerable knowledge
+        areas
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: write
+      state_effects: [database-write]
+      probe_value: Verify the selection persists, is changeable at any session stage, and that an empty list disables (not enables-all) area filtering.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        conn.execute(
+            "UPDATE interview_session SET answerable_areas = ?, updated_at = ? "
+            "WHERE id = ? AND system_id = ?",
+            (json.dumps(payload.areas), now, session_id, system_id),
+        )
+        row = _get_session_or_404(conn, session_id, system_id)
+        return _session_out(conn, row)
 
 
 def _latest_ready_snapshot_id(conn, system_id: int) -> Optional[int]:
@@ -544,7 +927,7 @@ def rebase_interview_snapshot(
                 from_snapshot_id=from_snapshot_id,
                 to_snapshot_id=target_snapshot_id,
                 message="Session is already pinned to the target snapshot.",
-                session=_session_out(session),
+                session=_session_out(conn, session),
             )
 
         proposal_rows = conn.execute(
@@ -665,7 +1048,7 @@ def rebase_interview_snapshot(
                 f"Updated session to snapshot #{target_snapshot_id}; "
                 f"{needs_review} proposal(s) require re-review."
             ),
-            session=_session_out(row),
+            session=_session_out(conn, row),
         )
 
 
@@ -923,6 +1306,11 @@ def create_interview_proposals(
 # --- Dialogue Turn (Issue #69) -----------------------------------------------
 
 
+# Issue #349 `OP-S6`: at the `proposal_generation` stage this turn IS the
+# proposal generation, so it carries a run record and shows as `W1`. Earlier
+# stages are the developer's own answer turn -- deliberately NOT recorded as
+# a system process (spec §8.1 fact B allows this, and the resulting refresh
+# job already produces the "回答を反映しています" `W1`).
 @router.post(
     "/interview/sessions/{session_id}/dialogue-turn",
     response_model=InterviewDialogueTurnOut,
@@ -931,6 +1319,46 @@ def interview_dialogue_turn(
     session_id: int,
     payload: InterviewDialogueTurnRequest,
     system_id: int = Depends(get_system_id),
+) -> InterviewDialogueTurnOut:
+    """Dialogue turn, recorded as proposal generation at the proposal stage.
+
+    See `_interview_dialogue_turn_core` for the turn itself. The stage is read
+    first (deterministic, one small query) because the run record has to be
+    opened before the core takes its own connections -- the process-wide DB
+    lock is not reentrant (app/db.py).
+    """
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+        stage = session["stage"] or "understanding_initialized"
+    if stage != "proposal_generation":
+        return _interview_dialogue_turn_core(session_id, payload, system_id)
+
+    from ..interview_workflow import ProcessRunTracker
+
+    tracker = ProcessRunTracker(session_id, system_id, "proposal_generation")
+    tracker.start()
+    try:
+        result = _interview_dialogue_turn_core(session_id, payload, system_id)
+    except BaseException as exc:  # noqa: BLE001 - recorded then re-raised
+        status = getattr(exc, "status_code", None)
+        if status in (404, 409, 422):
+            tracker.abandon()
+        else:
+            tracker.fail(exc)
+        raise
+    # The turn returns 200 with an `error` field when the reasoning call
+    # fails (fail-closed, no proposals persisted) -- that is a failed run.
+    if getattr(result, "error", None):
+        tracker.fail(result.error)
+    else:
+        tracker.succeed()
+    return result
+
+
+def _interview_dialogue_turn_core(
+    session_id: int,
+    payload: InterviewDialogueTurnRequest,
+    system_id: int,
 ) -> InterviewDialogueTurnOut:
     """Generate a reasoning-model dialogue turn for the interview (Issue #69).
 
@@ -992,33 +1420,14 @@ def interview_dialogue_turn(
         # Issue #129: the latest revisions of already-answered Q&A pairs are
         # injected into the prompt with a do-not-re-ask rule, so semantic
         # re-asking is suppressed by the reasoning model (never by fuzzy
-        # text matching — Principle 6).
-        answered_qa_rows = conn.execute(
-            """SELECT question_text, answer_text FROM interview_qa
-               WHERE session_id = ? AND system_id = ?
-                 AND superseded_by_id IS NULL AND status = 'answered'
-               ORDER BY id""",
-            (session_id, system_id),
-        ).fetchall()
-        answered_qa_pairs = [
-            {"question": r["question_text"], "answer": r["answer_text"]}
-            for r in answered_qa_rows
-        ] or None
-
-        # Issue #142: rows the developer explicitly could not confirm ("I
-        # don't know"). They are valid, recorded input — fed back as open
-        # hypotheses the model must re-confirm, never as established facts.
-        unconfirmed_qa_rows = conn.execute(
-            """SELECT question_text, answer_text FROM interview_qa
-               WHERE session_id = ? AND system_id = ?
-                 AND superseded_by_id IS NULL AND status = 'unconfirmed'
-               ORDER BY id""",
-            (session_id, system_id),
-        ).fetchall()
-        unconfirmed_qa_pairs = [
-            {"question": r["question_text"], "answer": r["answer_text"]}
-            for r in unconfirmed_qa_rows
-        ]
+        # text matching — Principle 6). Issue #142: rows the developer
+        # explicitly could not confirm ("I don't know") are valid, recorded
+        # input — fed back as open hypotheses the model must re-confirm,
+        # never as established facts. Shared with the update-understanding
+        # review via _load_qa_pairs (Issue #263).
+        answered_qa_pairs, unconfirmed_qa_pairs = _load_qa_pairs(
+            conn, session_id, system_id
+        )
 
         # Issue #142: when THIS turn is an explicit "I don't know" answer, the
         # question being answered is still 'open' (it is only marked
@@ -1074,97 +1483,108 @@ def interview_dialogue_turn(
             )
         )
 
-        # Issue #130: pass 1 selects (or declines) evidence to read from the
-        # pinned snapshot before pass 2 asks the next question. Both passes
-        # are audited as separate intelligence_runs rows below.
-        evidence_audit: Optional[EvidenceSelectionResult] = None
-        evidence_snippets: list = []
-        # Issue #137: the pass-1 reasoning call can succeed (valid targets) yet
-        # the deterministic read of those targets can still fail closed. That
-        # failure belongs on the evidence-selection run's audit record, not
-        # only on the turn — track it so the run is marked failed, not
-        # "completed", even though partial snippets were read.
-        evidence_read_error: Optional[str] = None
+        # Read the snapshot's Git location here, while the connection is
+        # open: the evidence read below runs after it is closed.
+        snapshot_row = conn.execute(
+            "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
+            (snapshot_id, system_id),
+        ).fetchone()
 
-        if client_error:
+    # Phase 2 (DB lock released): evidence selection, the deterministic
+    # evidence read from the pinned snapshot, and turn generation. The LLM
+    # client opens its own connection to consume System quota, so running
+    # any of this while the connection above is open would deadlock the
+    # whole server (see app/db.py).
+    # Issue #130: pass 1 selects (or declines) evidence to read from the
+    # pinned snapshot before pass 2 asks the next question. Both passes
+    # are audited as separate intelligence_runs rows below.
+    evidence_audit: Optional[EvidenceSelectionResult] = None
+    evidence_snippets: list = []
+    # Issue #137: the pass-1 reasoning call can succeed (valid targets) yet
+    # the deterministic read of those targets can still fail closed. That
+    # failure belongs on the evidence-selection run's audit record, not
+    # only on the turn — track it so the run is marked failed, not
+    # "completed", even though partial snippets were read.
+    evidence_read_error: Optional[str] = None
+
+    if client_error:
+        turn = InterviewTurnResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=config.provider == "mock",
+            error=client_error,
+        )
+    else:
+        evidence_audit = select_evidence_targets(
+            client,
+            config,
+            context_pack=context_pack,
+            history=history,
+            user_message=payload.user_message,
+            current_understanding=session_understanding,
+        )
+        turn = None
+        if evidence_audit.error:
             turn = InterviewTurnResult(
                 provider=config.provider,
                 model=config.model,
-                is_mock=config.provider == "mock",
-                error=client_error,
+                is_mock=evidence_audit.is_mock,
+                error=evidence_audit.error,
             )
-        else:
-            evidence_audit = select_evidence_targets(
+        elif evidence_audit.need_evidence:
+            try:
+                if snapshot_row is None or not snapshot_row["repo_path"]:
+                    raise EvidenceReadError(
+                        "Snapshot repository path is unavailable for evidence reads"
+                    )
+                evidence_snippets = read_evidence_snippets(
+                    snapshot_row["repo_path"],
+                    snapshot_row["commit_sha"],
+                    evidence_audit.targets,
+                )
+            except EvidenceReadError as exc:
+                # Fail-closed: no "continue without the snippet" fallback.
+                # Whatever snippets were read before the failing target
+                # are kept so they can still be audited (Issue #137).
+                evidence_snippets = exc.partial_snippets
+                evidence_read_error = str(exc)
+                turn = InterviewTurnResult(
+                    provider=config.provider,
+                    model=config.model,
+                    is_mock=False,
+                    error=str(exc),
+                )
+            except EvidenceConfigError as exc:
+                # Invalid INTERVIEW_EVIDENCE_* configuration is a recorded
+                # turn failure, not an unaudited HTTP 500. The read phase
+                # did not complete, so the selection run is failed too.
+                evidence_read_error = str(exc)
+                turn = InterviewTurnResult(
+                    provider=config.provider,
+                    model=config.model,
+                    is_mock=False,
+                    error=str(exc),
+                )
+
+        if turn is None:
+            turn = generate_interview_turn(
                 client,
                 config,
                 context_pack=context_pack,
                 history=history,
                 user_message=payload.user_message,
                 current_understanding=session_understanding,
+                gap_analysis=session_gaps,
+                open_questions=session_open_questions,
+                answered_qa=answered_qa_pairs,
+                unconfirmed_qa=unconfirmed_qa_for_turn,
+                evidence_snippets=evidence_snippets,
+                proposals_requested=proposals_requested,
             )
-            turn = None
-            if evidence_audit.error:
-                turn = InterviewTurnResult(
-                    provider=config.provider,
-                    model=config.model,
-                    is_mock=evidence_audit.is_mock,
-                    error=evidence_audit.error,
-                )
-            elif evidence_audit.need_evidence:
-                snapshot_row = conn.execute(
-                    "SELECT repo_path, commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
-                    (snapshot_id, system_id),
-                ).fetchone()
-                try:
-                    if snapshot_row is None or not snapshot_row["repo_path"]:
-                        raise EvidenceReadError(
-                            "Snapshot repository path is unavailable for evidence reads"
-                        )
-                    evidence_snippets = read_evidence_snippets(
-                        snapshot_row["repo_path"],
-                        snapshot_row["commit_sha"],
-                        evidence_audit.targets,
-                    )
-                except EvidenceReadError as exc:
-                    # Fail-closed: no "continue without the snippet" fallback.
-                    # Whatever snippets were read before the failing target
-                    # are kept so they can still be audited (Issue #137).
-                    evidence_snippets = exc.partial_snippets
-                    evidence_read_error = str(exc)
-                    turn = InterviewTurnResult(
-                        provider=config.provider,
-                        model=config.model,
-                        is_mock=False,
-                        error=str(exc),
-                    )
-                except EvidenceConfigError as exc:
-                    # Invalid INTERVIEW_EVIDENCE_* configuration is a recorded
-                    # turn failure, not an unaudited HTTP 500. The read phase
-                    # did not complete, so the selection run is failed too.
-                    evidence_read_error = str(exc)
-                    turn = InterviewTurnResult(
-                        provider=config.provider,
-                        model=config.model,
-                        is_mock=False,
-                        error=str(exc),
-                    )
 
-            if turn is None:
-                turn = generate_interview_turn(
-                    client,
-                    config,
-                    context_pack=context_pack,
-                    history=history,
-                    user_message=payload.user_message,
-                    current_understanding=session_understanding,
-                    gap_analysis=session_gaps,
-                    open_questions=session_open_questions,
-                    answered_qa=answered_qa_pairs,
-                    unconfirmed_qa=unconfirmed_qa_for_turn,
-                    evidence_snippets=evidence_snippets,
-                    proposals_requested=proposals_requested,
-                )
-
+    # Phase 3 (DB lock re-acquired): persist the turn, its audit runs and
+    # any proposals in a single transaction.
+    with get_conn() as conn:
         conn.execute("BEGIN")
         try:
             # Store user message.
@@ -1489,9 +1909,16 @@ def interview_dialogue_turn(
                     conn.execute(
                         """UPDATE interview_qa
                            SET answer_text = ?, status = ?,
-                               answered_by = ?, answered_at = ?
+                               answer_unknown = ?, answered_by = ?, answered_at = ?
                            WHERE id = ?""",
-                        (payload.user_message, consumed_status, payload.actor, now, consumed_id),
+                        (
+                            payload.user_message,
+                            consumed_status,
+                            1 if payload.answer_unknown else 0,
+                            payload.actor,
+                            now,
+                            consumed_id,
+                        ),
                     )
 
             if payload.user_message.strip():
@@ -1525,7 +1952,7 @@ def interview_dialogue_turn(
 
         # Re-read session for latest understanding state.
         updated_row = _get_session_or_404(conn, session_id, system_id)
-        updated_session = _session_out(updated_row)
+        updated_session = _session_out(conn, updated_row)
 
         return InterviewDialogueTurnOut(
             assistant_message=turn.assistant_message,
@@ -1554,12 +1981,45 @@ def interview_dialogue_turn(
 # --- Structured Interview Q&A (Issue #129) -----------------------------------
 
 
+def _is_out_of_area(knowledge_area: Optional[str], answerable_areas: List[str]) -> bool:
+    """Deterministic out-of-area rule (Issue #291, Principle 6).
+
+    A question is out-of-area for the current user iff the session has a
+    non-empty answerable-areas selection AND the question has a (non-null)
+    knowledge_area AND that area is not in the selection. An empty
+    selection means no filtering; an unrouted (null-area) question is
+    always in-area -- it is never hidden for lack of a classification.
+    """
+    if not answerable_areas:
+        return False
+    if not knowledge_area:
+        return False
+    return knowledge_area not in answerable_areas
+
+
+def _held_via_pending_handoff(conn, handoff_id: Optional[int], system_id: int) -> bool:
+    """True while a qa row's linked handoff is still pending/answered.
+
+    Once the handoff is 'returned' (surfaced back for explicit confirmation)
+    or 'cancelled', the question is askable again -- only an in-flight
+    handoff suppresses re-asking (Issue #291's duplicate-suppression rule).
+    """
+    if handoff_id is None:
+        return False
+    row = conn.execute(
+        "SELECT status FROM question_handoff WHERE id = ? AND system_id = ?",
+        (handoff_id, system_id),
+    ).fetchone()
+    return row is not None and row["status"] in ("pending", "answered")
+
+
 @router.get(
     "/interview/sessions/{session_id}/qa",
     response_model=InterviewQaListOut,
 )
 def list_interview_qa(
     session_id: int,
+    view: Optional[str] = Query(default=None),
     system_id: int = Depends(get_system_id),
 ) -> InterviewQaListOut:
     """List the current Q&A rows for a session.
@@ -1569,6 +2029,15 @@ def list_interview_qa(
     are reachable only via the ``previous`` field of the answer endpoint's
     response, not this list — this keeps the list one row per question.
 
+    Issue #291: ``?view=askable`` returns the same rows further filtered to
+    the primary "次に回答する質問" flow -- excluding rows that are already
+    answered, held via a still-pending/answered handoff, or out-of-area for
+    the session's current ``answerable_areas`` selection (see
+    ``_is_out_of_area`` / ``_held_via_pending_handoff``). This is the single
+    server-side source of truth for duplicate suppression so the dashboard
+    and any future agent never re-derive it independently. Omitting ``view``
+    (or any other value) keeps the existing full-list behavior unchanged.
+
     probe-agent:
       role: API boundary for the structured interview Q&A list
       capability: interactive-system-understanding
@@ -1576,7 +2045,7 @@ def list_interview_qa(
       consumers: [dashboard]
       operation_kind: read
       state_effects: [database-read]
-      probe_value: Verify the list excludes superseded rows and reports open/high-priority counts correctly
+      probe_value: Verify the list excludes superseded rows and reports open/high-priority counts correctly, and that view=askable excludes answered/handoff-pending/out-of-area rows while keeping unrouted null-area rows askable
     """
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
@@ -1587,6 +2056,18 @@ def list_interview_qa(
             (session_id, system_id),
         ).fetchall()
         items = [_qa_out(r) for r in rows]
+        if view == "askable":
+            answerable_areas = (
+                json.loads(session["answerable_areas"])
+                if ("answerable_areas" in session.keys() and session["answerable_areas"])
+                else []
+            )
+            items = [
+                i for i in items
+                if i.status != "answered"
+                and not _held_via_pending_handoff(conn, i.handoff_id, system_id)
+                and not _is_out_of_area(i.knowledge_area, answerable_areas)
+            ]
         open_items = [i for i in items if i.status == "open"]
         return InterviewQaListOut(
             session_id=session_id,
@@ -1644,6 +2125,31 @@ def create_interview_qa(
         return _qa_out(row)
 
 
+def _write_first_qa_answer(
+    conn,
+    *,
+    qa_id: int,
+    answer_text: str,
+    answer_unknown: bool,
+    status: str,
+    actor: str,
+    now: float,
+) -> None:
+    """Record the FIRST answer on a question's own row (no supersede needed).
+
+    Extracted (Issue #336) so the single 「わからない」 entry point records the
+    unknown answer through exactly this write rather than a similar-looking
+    copy. The caller owns the transaction.
+    """
+    conn.execute(
+        """UPDATE interview_qa
+           SET answer_text = ?, answer_unknown = ?, status = ?, answered_by = ?,
+               answered_at = ?
+           WHERE id = ?""",
+        (answer_text, 1 if answer_unknown else 0, status, actor, now, qa_id),
+    )
+
+
 @router.post(
     "/interview/sessions/{session_id}/qa/{qa_id}/answer",
     response_model=InterviewQaAnswerOut,
@@ -1675,6 +2181,7 @@ def answer_interview_qa(
       probe_value: Verify corrections create a new revision row, link the old row, and never overwrite a prior answer
     """
     now = time.time()
+    result: InterviewQaAnswerOut
     with get_conn() as conn:
         _get_session_or_404(conn, session_id, system_id)
         qa = _get_qa_or_404(conn, qa_id, session_id, system_id)
@@ -1684,6 +2191,34 @@ def answer_interview_qa(
                 status_code=409,
                 detail="This question has already been superseded by a newer revision",
             )
+
+        # Issue #291: explicit-confirm provenance for a returned handoff.
+        # This never writes the handoff's own answer_text/answered_by into
+        # interview_qa -- the developer's own answer_text/actor above are
+        # what gets recorded; this only validates that the referenced
+        # handoff really belongs to this question and has actually been
+        # returned for confirmation (Principle 2 -- an assignee's answer is
+        # never silently treated as the developer's own).
+        if payload.handoff_id is not None:
+            handoff = conn.execute(
+                "SELECT * FROM question_handoff WHERE id = ? AND system_id = ?",
+                (payload.handoff_id, system_id),
+            ).fetchone()
+            if handoff is None:
+                raise HTTPException(status_code=404, detail="Handoff not found")
+            if handoff["origin_kind"] != "qa" or handoff["origin_id"] != qa_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This handoff does not belong to this question",
+                )
+            if handoff["status"] != "returned":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This handoff has not been returned for confirmation "
+                        f"(current status: {handoff['status']})"
+                    ),
+                )
 
         proposal_row = conn.execute(
             "SELECT id FROM interview_proposal WHERE session_id = ? LIMIT 1",
@@ -1698,71 +2233,89 @@ def answer_interview_qa(
         conn.execute("BEGIN")
         try:
             if qa["status"] in ("open", "skipped"):
-                conn.execute(
-                    """UPDATE interview_qa
-                       SET answer_text = ?, status = ?, answered_by = ?,
-                           answered_at = ?
-                       WHERE id = ?""",
-                    (payload.answer_text, new_status, payload.actor, now, qa_id),
+                _write_first_qa_answer(
+                    conn, qa_id=qa_id, answer_text=payload.answer_text,
+                    answer_unknown=payload.answer_unknown, status=new_status,
+                    actor=payload.actor, now=now,
                 )
                 conn.execute("COMMIT")
                 updated = conn.execute(
                     "SELECT * FROM interview_qa WHERE id = ?", (qa_id,)
                 ).fetchone()
-                return InterviewQaAnswerOut(
+                result = InterviewQaAnswerOut(
                     qa=_qa_out(updated),
                     previous=None,
                     regeneration_recommended=False,
                 )
-
-            # status is 'answered' or 'unconfirmed': this is a correction.
-            # Insert a new
-            # revision row, then link the old row forward. runtime_evidence
-            # (Issue #135) is carried onto the new current row just like
-            # evidence_refs, so correcting a runtime question's answer never
-            # drops the trace-fact provenance that justified the question.
-            new_id = _insert_qa_row(
-                conn, session_id, system_id,
-                question_text=qa["question_text"],
-                question_category=qa["question_category"],
-                question_source=qa["question_source"],
-                hypothesis=qa["hypothesis"],
-                evidence_refs=(
-                    [InterviewQaEvidenceRefOut(**e) for e in json.loads(qa["evidence_refs"])]
-                    if qa["evidence_refs"] else []
-                ),
-                now=now,
-                answer_text=payload.answer_text,
-                status=new_status,
-                answered_by=payload.actor,
-                answered_at=now,
-                runtime_evidence=(
-                    json.loads(qa["runtime_evidence"])
-                    if ("runtime_evidence" in qa.keys() and qa["runtime_evidence"])
-                    else None
-                ),
-            )
-            conn.execute(
-                "UPDATE interview_qa SET status = 'revised', superseded_by_id = ? WHERE id = ?",
-                (new_id, qa_id),
-            )
-            conn.execute(
-                """UPDATE interview_session SET answers_revised_at = ?, updated_at = ?
-                   WHERE id = ? AND system_id = ?""",
-                (now, now, session_id, system_id),
-            )
-            conn.execute("COMMIT")
+            else:
+                # status is 'answered' or 'unconfirmed': this is a
+                # correction. Insert a new revision row, then link the old
+                # row forward. runtime_evidence (Issue #135) and, likewise,
+                # investigation_json/investigation_run_id (Issue #286 review
+                # fix, Finding 1) are carried onto the new current row just
+                # like evidence_refs, so correcting an answer never drops the
+                # trace-fact provenance or the Investigation Agent finding
+                # that justified/informed the question.
+                new_id = _insert_qa_row(
+                    conn, session_id, system_id,
+                    question_text=qa["question_text"],
+                    question_category=qa["question_category"],
+                    question_source=qa["question_source"],
+                    hypothesis=qa["hypothesis"],
+                    evidence_refs=(
+                        [InterviewQaEvidenceRefOut(**e) for e in json.loads(qa["evidence_refs"])]
+                        if qa["evidence_refs"] else []
+                    ),
+                    now=now,
+                    answer_text=payload.answer_text,
+                    answer_unknown=payload.answer_unknown,
+                    status=new_status,
+                    answered_by=payload.actor,
+                    answered_at=now,
+                    runtime_evidence=(
+                        json.loads(qa["runtime_evidence"])
+                        if ("runtime_evidence" in qa.keys() and qa["runtime_evidence"])
+                        else None
+                    ),
+                    investigation_json=(
+                        json.loads(qa["investigation_json"])
+                        if ("investigation_json" in qa.keys() and qa["investigation_json"])
+                        else None
+                    ),
+                    investigation_run_id=(
+                        qa["investigation_run_id"] if "investigation_run_id" in qa.keys() else None
+                    ),
+                )
+                conn.execute(
+                    "UPDATE interview_qa SET status = 'revised', superseded_by_id = ? WHERE id = ?",
+                    (new_id, qa_id),
+                )
+                conn.execute(
+                    """UPDATE interview_session SET answers_revised_at = ?, updated_at = ?
+                       WHERE id = ? AND system_id = ?""",
+                    (now, now, session_id, system_id),
+                )
+                conn.execute("COMMIT")
+                new_row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (new_id,)).fetchone()
+                old_row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
+                result = InterviewQaAnswerOut(
+                    qa=_qa_out(new_row),
+                    previous=_qa_out(old_row),
+                    regeneration_recommended=has_proposals,
+                )
         except Exception:
             conn.execute("ROLLBACK")
             raise
 
-        new_row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (new_id,)).fetchone()
-        old_row = conn.execute("SELECT * FROM interview_qa WHERE id = ?", (qa_id,)).fetchone()
-        return InterviewQaAnswerOut(
-            qa=_qa_out(new_row),
-            previous=_qa_out(old_row),
-            regeneration_recommended=has_proposals,
-        )
+    # Issue #288: kick off the automatic Understanding/Alignment/Review
+    # Queue refresh now that the answer is durably committed (this call is
+    # outside the `with get_conn()` block above -- request_refresh() opens
+    # its own connection, and eager-mode execution must not run while this
+    # request still holds db.py's single global connection lock).
+    from ..interview_refresh import request_refresh
+
+    request_refresh(session_id, system_id, "qa_answer")
+    return result
 
 
 @router.post(
@@ -2191,6 +2744,38 @@ def materialize_interview_session(
       state_effects: [database-write, filesystem]
       probe_value: Verify materialization produces a valid diff from approved proposals without modifying tracked branches
     """
+    from ..interview_workflow import ProcessRunTracker
+
+    # Issue #349: diff generation is `OP-S7`, an automatic system process, so
+    # it carries a persisted run record -- `W1` while it runs, and a blocking
+    # `E12` on `W5` when it fails (there is no diff to review, so `W6` must
+    # not be reachable). "No approved items" is a precondition, not a failed
+    # generation, so that run is abandoned rather than recorded as a failure.
+    tracker = ProcessRunTracker(session_id, system_id, "diff_generation")
+    tracker.start()
+    try:
+        result_out = _materialize_interview_session_core(
+            session_id, payload, system_id
+        )
+    except HTTPException as exc:
+        if exc.status_code in (404, 422) and "No approved items" in str(exc.detail):
+            tracker.abandon()
+        else:
+            tracker.fail(exc)
+        raise
+    except BaseException as exc:  # noqa: BLE001 - recorded then re-raised
+        tracker.fail(exc)
+        raise
+    tracker.succeed()
+    return result_out
+
+
+def _materialize_interview_session_core(
+    session_id: int,
+    payload: InterviewMaterializeRequest,
+    system_id: int,
+) -> InterviewMaterializeOut:
+    """Core of the materialization endpoint (see its docstring)."""
     import tempfile
     from ..docstring_writer import MetadataValues
     from ..interview_materializer import (
@@ -2292,6 +2877,27 @@ def materialize_interview_session(
 # --- Understanding Confirmation (Issue #123) ---------------------------------
 
 
+@router.get(
+    "/interview/sessions/{session_id}/capability-graph",
+    response_model=InterviewCapabilityGraphOut,
+)
+def get_interview_capability_graph(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> InterviewCapabilityGraphOut:
+    """Return the latest System-wide manually-confirmed composition (#312)."""
+
+    with get_conn() as conn:
+        _get_session_or_404(conn, session_id, system_id)
+        graph = latest_system_confirmed_graph(conn, system_id=system_id)
+        if graph is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No confirmed capability graph exists for this session",
+            )
+        return InterviewCapabilityGraphOut(**graph)
+
+
 @router.post(
     "/interview/sessions/{session_id}/confirm-understanding",
     response_model=InterviewSessionOut,
@@ -2300,6 +2906,7 @@ def confirm_interview_understanding(
     session_id: int,
     payload: InterviewConfirmUnderstandingRequest,
     system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
 ) -> InterviewSessionOut:
     """Record the developer's manual confirmation of the interview context.
 
@@ -2322,51 +2929,168 @@ def confirm_interview_understanding(
     """
     now = time.time()
     with get_conn() as conn:
-        session = _get_session_or_404(conn, session_id, system_id)
+        # get_conn() uses autocommit.  The human decision must therefore own
+        # one explicit transaction spanning the canonical graph, session
+        # state, and audit message; a failure in any later write rolls all of
+        # them back.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            session = _get_session_or_404(conn, session_id, system_id)
+            latest_revision = conn.execute(
+                """SELECT * FROM understanding_revision
+                   WHERE session_id = ? AND system_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id, system_id),
+            ).fetchone()
+            graph_already_confirmed = None
+            if latest_revision is not None:
+                graph_already_confirmed = conn.execute(
+                    """SELECT id FROM understanding_capability_confirmation
+                       WHERE system_id = ? AND session_id = ?
+                         AND source_revision_id = ?""",
+                    (system_id, session_id, latest_revision["id"]),
+                ).fetchone()
+            system_graph_head = conn.execute(
+                """SELECT id FROM understanding_capability_confirmation
+                   WHERE system_id = ? ORDER BY id DESC LIMIT 1""",
+                (system_id,),
+            ).fetchone()
+            if (
+                graph_already_confirmed is not None
+                and system_graph_head is not None
+                and graph_already_confirmed["id"] != system_graph_head["id"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This revision was confirmed from an older canonical "
+                        "Capability head. Create a fresh Understanding revision "
+                        "before confirming again."
+                    ),
+                )
+            if graph_already_confirmed is None:
+                actual_base_confirmation_id = (
+                    system_graph_head["id"] if system_graph_head is not None else None
+                )
+                if (
+                    payload.capability_base_confirmation_id
+                    != actual_base_confirmation_id
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The canonical Capability head changed or was not "
+                            "acknowledged. Refresh the graph and confirm again."
+                        ),
+                    )
 
-        # The Dashboard hides the confirmation control once complete. Keep a
-        # direct/retried API request idempotent so it cannot append another
-        # workflow event or alter the recorded decision.
-        if session["understanding_confirmed_at"] is not None:
-            return _session_out(session)
+            # Zero-base confirmation remains session-scoped.  Structured
+            # confirmation always reaches confirm_capability_graph so a retry
+            # with a different binding/relation request is rejected rather
+            # than silently treated as idempotent.
+            if session["understanding_confirmed_at"] is not None and (
+                session["current_understanding"] is None
+                or latest_revision is None
+            ):
+                result = _session_out(conn, session)
+                conn.execute("COMMIT")
+                return result
 
-        user_turns = conn.execute(
-            "SELECT COUNT(*) AS n FROM interview_message WHERE session_id = ? AND role = 'user'",
-            (session_id,),
-        ).fetchone()["n"]
-        if session["current_understanding"] is None and user_turns == 0:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Nothing to confirm: the session has no built understanding "
-                    "and no interview answers yet"
+            user_turns = conn.execute(
+                """SELECT COUNT(*) AS n FROM interview_message
+                   WHERE session_id = ? AND role = 'user'""",
+                (session_id,),
+            ).fetchone()["n"]
+            if session["current_understanding"] is None and user_turns == 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Nothing to confirm: the session has no built understanding "
+                        "and no interview answers yet"
+                    ),
+                )
+
+            if (
+                session["current_understanding"] is not None
+                and latest_revision is not None
+            ):
+                if not latest_revision["current_understanding"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The latest Understanding revision has no structured "
+                            "content and cannot be confirmed as a capability graph"
+                        ),
+                    )
+                revision_understanding = json.loads(
+                    latest_revision["current_understanding"]
+                )
+                confirm_capability_graph(
+                    conn,
+                    system_id=system_id,
+                    session_id=session_id,
+                    revision_id=latest_revision["id"],
+                    revision_created_at=latest_revision["created_at"],
+                    current_understanding=revision_understanding,
+                    actor=principal.username or f"user:{principal.user_id}",
+                    actor_user_id=principal.user_id,
+                    identity_bindings=[
+                        item.model_dump()
+                        for item in payload.capability_identity_bindings
+                    ],
+                    relations=(
+                        [
+                            item.model_dump()
+                            for item in payload.capability_relations
+                        ]
+                        if payload.capability_relations is not None
+                        else None
+                    ),
+                    now=now,
+                )
+                if graph_already_confirmed is not None:
+                    result = _session_out(conn, session)
+                    conn.execute("COMMIT")
+                    return result
+
+            confirmed_by = principal.username or f"user:{principal.user_id}"
+            new_stage = _advance_stage(
+                session["stage"] or "understanding_initialized",
+                "proposal_generation",
+            )
+            conn.execute(
+                """UPDATE interview_session
+                   SET understanding_confirmed_at = ?, understanding_confirmed_by = ?,
+                       stage = ?, updated_at = ?
+                   WHERE id = ? AND system_id = ?""",
+                (now, confirmed_by, new_stage, now, session_id, system_id),
+            )
+            conn.execute(
+                """INSERT INTO interview_message
+                    (session_id, system_id, role, content, created_at)
+                VALUES (?, ?, 'system', ?, ?)""",
+                (
+                    session_id,
+                    system_id,
+                    interview_message(
+                        "confirm_understanding_message",
+                        resolve_message_language(),
+                    ),
+                    now,
                 ),
             )
-
-        new_stage = _advance_stage(
-            session["stage"] or "understanding_initialized",
-            "proposal_generation",
-        )
-        conn.execute(
-            """UPDATE interview_session
-               SET understanding_confirmed_at = ?, understanding_confirmed_by = ?,
-                   stage = ?, updated_at = ?
-               WHERE id = ? AND system_id = ?""",
-            (now, payload.actor, new_stage, now, session_id, system_id),
-        )
-        conn.execute(
-            """INSERT INTO interview_message
-                (session_id, system_id, role, content, created_at)
-            VALUES (?, ?, 'system', ?, ?)""",
-            (
-                session_id,
-                system_id,
-                interview_message("confirm_understanding_message", resolve_message_language()),
-                now,
-            ),
-        )
-        row = _get_session_or_404(conn, session_id, system_id)
-        return _session_out(row)
+            row = _get_session_or_404(conn, session_id, system_id)
+            result = _session_out(conn, row)
+            conn.execute("COMMIT")
+            return result
+        except CapabilityGraphError as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
 
 
 # --- Stage Advancement (Issue #82) -------------------------------------------
@@ -2410,30 +3134,92 @@ def advance_interview_stage(
             params,
         )
         row = _get_session_or_404(conn, session_id, system_id)
-        return _session_out(row)
+        return _session_out(conn, row)
 
 
-@router.post(
-    "/interview/sessions/{session_id}/update-understanding",
-    response_model=InterviewSessionOut,
-)
-def update_interview_understanding(
-    session_id: int,
-    system_id: int = Depends(get_system_id),
-) -> InterviewSessionOut:
-    """Update the session's current understanding from its graph/reconciliation data.
+@dataclass
+class UnderstandingRebuildResult:
+    """Outcome of one core-rebuild pass.
 
-    This endpoint is the entry point for generating an initial understanding
-    when Start Interview is clicked, or for refreshing after new turns.
+    Shared by `update_interview_understanding` (below) and the automatic
+    refresh job (`app/interview_refresh.py`, Issue #288) so both paths run
+    the exact same reasoning call, persistence, and message/revision
+    bookkeeping -- only the caller differs in how it reacts to the result.
+    """
 
-    probe-agent:
-      role: API boundary for updating session understanding from graph data
-      capability: interactive-system-understanding
-      element_type: boundary
-      consumers: [dashboard, control-server]
-      operation_kind: orchestration
-      state_effects: [database-write]
-      probe_value: Verify understanding update rebuilds graph and reconciliation correctly
+    ok: bool
+    error: Optional[str] = None
+    intelligence_run_id: Optional[int] = None
+    revision_id: Optional[int] = None
+
+
+def _rebuild_understanding(
+    session, system_id: int, *, adopt_run_id: Optional[int] = None
+) -> UnderstandingRebuildResult:
+    """Understanding build/update with a persisted run record (Issue #349).
+
+    Thin wrapper over `_rebuild_understanding_core`: it records the run as
+    the spec's fact B so the screen can show `W1` while the rebuild runs and
+    the right failure state (`E3-a` blocking `W2`, or the degraded `E3-b`
+    zero-base path) once it ends -- decided by
+    `interview_workflow.classify_failure`, not by the Dashboard. Both entry
+    points (the manual endpoint and the automatic refresh job, Issue #288)
+    go through here, so both produce the same record.
+
+    The tracker owns short-lived connections only; the reasoning call still
+    runs with no connection held (app/db.py).
+    """
+    from ..interview_workflow import ProcessRunTracker
+
+    session_id = session["id"]
+
+    def _kind(conn) -> str:
+        """build vs update, resolved on the tracker's own connection.
+
+        Deliberately NOT a separate `with get_conn()` block: the DB lock is
+        process-wide, and this function runs on the automatic-refresh
+        thread too, so an extra acquisition adds latency to the very
+        rebuild the developer is waiting for after answering.
+        """
+        prior_revision = conn.execute(
+            """SELECT id FROM understanding_revision
+               WHERE session_id = ? AND system_id = ? LIMIT 1""",
+            (session_id, system_id),
+        ).fetchone()
+        return "understanding_update" if prior_revision else "understanding_build"
+
+    tracker = ProcessRunTracker(session_id, system_id, "understanding_update")
+    # `adopt_run_id` is set only by the initial build that session creation
+    # dispatched, which passes the exact record it opened. Every other caller
+    # (the manual endpoint, the automatic refresh) opens its own row, so two
+    # overlapping rebuilds never share one record and overwrite each other's
+    # outcome.
+    tracker.start(resolve_kind=_kind, adopt_run_id=adopt_run_id)
+    try:
+        result = _rebuild_understanding_core(session, system_id)
+    except BaseException as exc:  # noqa: BLE001 - recorded then re-raised
+        tracker.fail(exc)
+        raise
+    if result.ok:
+        tracker.succeed()
+    else:
+        tracker.fail(result.error or "understanding rebuild failed")
+    return result
+
+
+def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuildResult:
+    """Core of `update_interview_understanding`: always attempts a rebuild.
+
+    The caller is responsible for the `_understanding_update_blocked` gate
+    (the manual endpoint turns it into a 409; the refresh job treats it as a
+    no-op "nothing new" skip) -- this function never checks it itself, so it
+    cannot silently disagree with either caller about when a rebuild should
+    run.
+
+    This function owns its own database connections and must be called with
+    none open on the calling thread: the reasoning call runs between them so
+    the process-wide DB lock is never held across it (see app/db.py).
+    `session` is a detached row the caller already read.
     """
     now = time.time()
     # Issue #138: fixed-text messages this route composes itself follow
@@ -2442,78 +3228,66 @@ def update_interview_understanding(
     # message itself from being composed; reasoning calls below still fail
     # closed through get_interview_language() unchanged.
     msg_lang = resolve_message_language()
-    with get_conn() as conn:
-        session = _get_session_or_404(conn, session_id, system_id)
-        snapshot_id = session["snapshot_id"]
+    session_id = session["id"]
+    snapshot_id = session["snapshot_id"]
 
-        # After manual confirmation, rebuilding is meaningful only when an
-        # answer correction is waiting to be reflected. Keep this guard at
-        # the API boundary as well as in the Dashboard.
-        if (
-            (session["stage"] or "understanding_initialized") == "proposal_generation"
-            and session["understanding_confirmed_at"] is not None
-            and session["answers_revised_at"] is None
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "understanding_update_not_available",
-                    "message": (
-                        "Understanding is already confirmed. Update it after "
-                        "correcting an interview answer."
-                    ),
-                    "next_action": "generate_or_review_proposals",
-                },
-            )
+    from ..docs_code_reconciler import reconcile
+    from ..understanding_evidence_feed import (
+        current_entries as feed_current_entries,
+        prompt_facts as feed_prompt_facts,
+        record_consumption as feed_record_consumption,
+    )
+    from ..system_understanding_service import _load_graph_for_snapshot
+    from ..system_understanding_reviewer import (
+        PROMPT_VERSION as REVIEW_PROMPT_VERSION,
+        SCHEMA_VERSION as REVIEW_SCHEMA_VERSION,
+        generate_understanding_review,
+    )
 
-        from ..docs_code_reconciler import reconcile
-        from ..system_understanding_service import _load_graph_for_snapshot
-        from ..system_understanding_reviewer import (
-            PROMPT_VERSION as REVIEW_PROMPT_VERSION,
-            SCHEMA_VERSION as REVIEW_SCHEMA_VERSION,
-            generate_understanding_review,
+    # Principle 7: the understanding review is a reasoning run; record it
+    # in intelligence_runs for success and failure alike so the reviewer's
+    # prompt_version stays auditable (Issue #127).
+    def _record_review_run(
+        conn,
+        status: str,
+        error_details: Optional[str],
+        provider: str,
+        model: str,
+        is_mock: bool,
+    ) -> int:
+        cur = conn.execute(
+            """INSERT INTO intelligence_runs
+                (system_id, snapshot_id, run_type, provider, model,
+                 prompt_version, schema_version, decision_method, status,
+                 error_details, is_mock, started_at, completed_at)
+            VALUES (?, ?, 'understanding_review', ?, ?, ?, ?,
+                    'reasoning_llm', ?, ?, ?, ?, ?)""",
+            (
+                system_id,
+                snapshot_id,
+                provider,
+                model,
+                REVIEW_PROMPT_VERSION,
+                REVIEW_SCHEMA_VERSION,
+                status,
+                error_details,
+                1 if is_mock else 0,
+                now,
+                now,
+            ),
         )
+        return cur.lastrowid
 
-        # Principle 7: the understanding review is a reasoning run; record it
-        # in intelligence_runs for success and failure alike so the reviewer's
-        # prompt_version stays auditable (Issue #127).
-        def _record_review_run(
-            status: str,
-            error_details: Optional[str],
-            provider: str,
-            model: str,
-            is_mock: bool,
-        ) -> int:
-            cur = conn.execute(
-                """INSERT INTO intelligence_runs
-                    (system_id, snapshot_id, run_type, provider, model,
-                     prompt_version, schema_version, decision_method, status,
-                     error_details, is_mock, started_at, completed_at)
-                VALUES (?, ?, 'understanding_review', ?, ?, ?, ?,
-                        'reasoning_llm', ?, ?, ?, ?, ?)""",
-                (
-                    system_id,
-                    snapshot_id,
-                    provider,
-                    model,
-                    REVIEW_PROMPT_VERSION,
-                    REVIEW_SCHEMA_VERSION,
-                    status,
-                    error_details,
-                    1 if is_mock else 0,
-                    now,
-                    now,
-                ),
-            )
-            return cur.lastrowid
-
+    # Phase 1 (DB lock held): deterministic reads and the early
+    # failure paths. No external call happens inside this block.
+    with get_conn() as conn:
         config = LLMConfig.intelligence_from_env()
         try:
             client = create_llm_client(config)
         except LLMError as exc:
             error = str(exc)
             run_id = _record_review_run(
-                "failed", error, config.provider, config.model,
+                conn, "failed", error, config.provider, config.model,
                 config.provider == "mock",
             )
             conn.execute(
@@ -2532,8 +3306,7 @@ def update_interview_understanding(
                     run_id, now,
                 ),
             )
-            row = _get_session_or_404(conn, session_id, system_id)
-            return _session_out(row)
+            return UnderstandingRebuildResult(ok=False, error=error, intelligence_run_id=run_id)
 
         graph = _load_graph_for_snapshot(conn, system_id, snapshot_id)
         if graph is None:
@@ -2554,8 +3327,7 @@ def update_interview_understanding(
                     now,
                 ),
             )
-            row = _get_session_or_404(conn, session_id, system_id)
-            return _session_out(row)
+            return UnderstandingRebuildResult(ok=False, error=error)
 
         reconciliation = reconcile(conn, system_id, snapshot_id, graph)
 
@@ -2567,16 +3339,47 @@ def update_interview_understanding(
         ).fetchall()
         history = _review_history(history_rows)
 
-        review = generate_understanding_review(
-            client, config,
-            graph=graph,
-            reconciliation=reconciliation,
-            history=history or None,
+        # Issue #263: also feed the Q&A-panel answers into the review, same
+        # as the conversational interview turn already does — an answer
+        # given only via the Q&A panel never becomes an interview_message.
+        answered_qa_pairs, unconfirmed_qa_pairs = _load_qa_pairs(
+            conn, session_id, system_id
+        )
+        alignment_feedback = _load_alignment_feedback(
+            conn, session_id, system_id
         )
 
+        # Issue #336: the canonical rebuild reads the shared evidence feed.
+        # Before this, a joint investigation's verified facts reached the
+        # Understanding only if a human retyped them into an answer -- for a
+        # non-'qa' origin they never reached it at all. The entries are
+        # filtered for currency at read time (a corrected finding and a
+        # non-current premise are both excluded), and the ids are kept so the
+        # consumption can be recorded once the run exists.
+        feed_entries = feed_current_entries(
+            conn, system_id=system_id, session_id=session_id,
+        )
+        verified_evidence = feed_prompt_facts(feed_entries)
+
+    # Phase 2 (DB lock released): the reasoning call. The LLM client
+    # opens its own connection to consume System quota, so it must not
+    # run while this thread holds one (see app/db.py).
+    review = generate_understanding_review(
+        client, config,
+        graph=graph,
+        reconciliation=reconciliation,
+        history=history or None,
+        answered_qa=answered_qa_pairs,
+        unconfirmed_qa=unconfirmed_qa_pairs or None,
+        alignment_feedback=alignment_feedback,
+        verified_evidence=verified_evidence or None,
+    )
+
+    # Phase 3 (DB lock re-acquired): persist the review outcome.
+    with get_conn() as conn:
         if review.error:
             run_id = _record_review_run(
-                "failed", review.error, review.provider, review.model,
+                conn, "failed", review.error, review.provider, review.model,
                 review.is_mock,
             )
             conn.execute(
@@ -2595,11 +3398,10 @@ def update_interview_understanding(
                     run_id, now,
                 ),
             )
-            row = _get_session_or_404(conn, session_id, system_id)
-            return _session_out(row)
+            return UnderstandingRebuildResult(ok=False, error=review.error, intelligence_run_id=run_id)
 
         run_id = _record_review_run(
-            "completed", None, review.provider, review.model, review.is_mock,
+            conn, "completed", None, review.provider, review.model, review.is_mock,
         )
 
         # Issue #129: register the reviewer's open questions as
@@ -2658,9 +3460,10 @@ def update_interview_understanding(
         conn.execute(
             """UPDATE interview_session
                SET current_understanding = ?, gap_analysis = ?, open_questions = ?,
-                   stage = ?, last_error = NULL, answers_revised_at = NULL, updated_at = ?
+                   stage = ?, last_error = NULL, answers_revised_at = NULL,
+                   understanding_rebuilt_at = ?, updated_at = ?
                WHERE id = ? AND system_id = ?""",
-            (understanding_json, gap_json, questions_json, new_stage, now, session_id, system_id),
+            (understanding_json, gap_json, questions_json, new_stage, now, now, session_id, system_id),
         )
 
         # Issue #136: an existing session whose understanding was built before
@@ -2690,12 +3493,30 @@ def update_interview_understanding(
         # Issue #136: append (never overwrite) an understanding revision,
         # linked to the understanding_review run that produced it, so the
         # Dashboard can show a deterministic diff against the previous one.
-        conn.execute(
+        revision_cur = conn.execute(
             """INSERT INTO understanding_revision
                 (session_id, system_id, snapshot_id, intelligence_run_id,
                  current_understanding, gap_analysis, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (session_id, system_id, snapshot_id, run_id, understanding_json, gap_json, now),
+        )
+        revision_id = revision_cur.lastrowid
+
+        # Issue #336: record that this rebuild USED these verified facts. This
+        # is deliberately not a confirmation -- the developer accepting the
+        # rebuilt understanding is a separate fact with its own record
+        # (understanding_confirmed_at / the Issue #312 Capability
+        # confirmation). Writing both here would let "the AI fed this in" read
+        # as "the developer agreed with it".
+        feed_record_consumption(
+            conn,
+            system_id=system_id,
+            session_id=session_id,
+            consumer_kind="understanding_build",
+            entry_ids=[entry.id for entry in feed_entries],
+            revision_id=revision_id,
+            intelligence_run_id=run_id,
+            now=now,
         )
         try:
             limit = revision_limit()
@@ -2743,8 +3564,64 @@ def update_interview_understanding(
                     (session_id, system_id, asst_content, run_id, now),
                 )
 
+        return UnderstandingRebuildResult(ok=True, intelligence_run_id=run_id, revision_id=revision_id)
+
+
+@router.post(
+    "/interview/sessions/{session_id}/update-understanding",
+    response_model=InterviewSessionOut,
+)
+def update_interview_understanding(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> InterviewSessionOut:
+    """Update the session's current understanding from its graph/reconciliation data.
+
+    This endpoint is the entry point for generating an initial understanding
+    when Start Interview is clicked, or for refreshing after new turns. The
+    actual rebuild (reasoning call + persistence) is `_rebuild_understanding`,
+    shared with the automatic refresh job (Issue #288); this endpoint only
+    owns the blocked-gate 409 and the session response shape.
+
+    probe-agent:
+      role: API boundary for updating session understanding from graph data
+      capability: interactive-system-understanding
+      element_type: boundary
+      consumers: [dashboard, control-server]
+      operation_kind: orchestration
+      state_effects: [database-write]
+      probe_value: Verify understanding update rebuilds graph and reconciliation correctly
+    """
+    with get_conn() as conn:
+        session = _get_session_or_404(conn, session_id, system_id)
+
+        # After manual confirmation, rebuilding is meaningful only when new
+        # developer input is waiting to be reflected. Keep this guard at the
+        # API boundary as well as in the Dashboard; both sides evaluate the
+        # exact same predicate (Issue #229/#263 — see
+        # `_understanding_update_blocked` for the full condition) so the
+        # session's `understanding_update_available` flag and this 409 can
+        # never disagree.
+        if _understanding_update_blocked(conn, session, system_id):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "understanding_update_not_available",
+                    "message": (
+                        "Understanding is already confirmed. Update it after "
+                        "correcting an interview answer."
+                    ),
+                    "next_action": "generate_or_review_proposals",
+                },
+            )
+
+    # `_rebuild_understanding` owns its own connections around the reasoning
+    # call, so the gate above must have released this one first (app/db.py).
+    _rebuild_understanding(session, system_id)
+
+    with get_conn() as conn:
         row = _get_session_or_404(conn, session_id, system_id)
-        return _session_out(row)
+        return _session_out(conn, row)
 
 
 # --- Evidence read audit (Issue #137) ----------------------------------------
@@ -3041,6 +3918,11 @@ def get_runtime_reality_facts(
     "/interview/sessions/{session_id}/runtime-reality-check",
     response_model=RuntimeRealityCheckRunOut,
 )
+# Issue #349 `OP-S8`: the Runtime Reality Check is automatic under §4.2.2's
+# deterministic conditions, so it carries a run record (`W1` while running).
+# A deliberate skip is not a run; a failure is degraded (the developer can
+# keep working -- the check only ADDS confirmation questions).
+@tracked_process("runtime_reality_check", skipped_attr="skipped")
 def run_runtime_reality_check(
     session_id: int,
     system_id: int = Depends(get_system_id),

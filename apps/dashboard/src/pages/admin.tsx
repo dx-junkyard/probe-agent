@@ -13,6 +13,7 @@ import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
+import { TOKEN_STATUS_VARIANT, isTokenUsable } from "@/lib/token-display";
 import { UserPlus, Key, Trash2, Shield, RotateCcw } from "lucide-react";
 import { Navigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
@@ -192,11 +193,24 @@ export default function AdminPage() {
                           <td className="py-2">{t.user_id ?? "—"}</td>
                           <td className="py-2">{t.system_id ?? "—"}</td>
                           <td className="py-2">
-                            <Badge variant={t.revoked ? "destructive" : "success"}>{t.revoked ? "revoked" : "active"}</Badge>
+                            {/* Issue #368: status comes from the server (revoked +
+                                expires_at + clock); an expired token must not
+                                render green. The finite enum keeps its canonical
+                                English spelling on this English screen. */}
+                            <Badge
+                              variant={TOKEN_STATUS_VARIANT[t.status] ?? "outline"}
+                              data-testid={`admin-token-status-${t.id}`}
+                            >
+                              {t.status}
+                            </Badge>
                           </td>
                           <td className="py-2 text-right">
-                            {!t.revoked && (
-                              <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => handleRevokeToken(t.id)}>
+                            {isTokenUsable(t.status) && (
+                              <Button
+                                variant="ghost" size="icon" className="h-7 w-7"
+                                aria-label={`Revoke token ${t.name ?? `#${t.id}`}`}
+                                onClick={() => handleRevokeToken(t.id)}
+                              >
                                 <Trash2 className="h-4 w-4 text-destructive" />
                               </Button>
                             )}

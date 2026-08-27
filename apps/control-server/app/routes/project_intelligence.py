@@ -29,7 +29,6 @@ from ..capability_hierarchy import (
 )
 from ..capability_hierarchy import PROMPT_VERSION as HIERARCHY_PROMPT_VERSION
 from ..capability_hierarchy import SCHEMA_VERSION as HIERARCHY_SCHEMA_VERSION
-from ..code_indexer import index_snapshot_files
 from .. import drift as drift_service
 from ..code_mapper import (
     FeatureContext,
@@ -46,9 +45,9 @@ from ..draft_generator import (
 )
 from ..git_ops import (
     GitError,
-    create_snapshot,
     discover_repository_candidates,
     read_file_at_commit,
+    repository_head_relation,
     resolve_head,
     working_tree_status,
 )
@@ -60,6 +59,21 @@ from ..refresh_proposal import (
 )
 from ..refresh_proposal import PROMPT_VERSION as REFRESH_PROMPT_VERSION
 from ..refresh_proposal import SCHEMA_VERSION as REFRESH_SCHEMA_VERSION
+from ..repository_refresh_service import (
+    RepositoryRefreshServiceError,
+    _load_file_hash_map,
+    _load_metadata_map,
+    _snapshot_out,
+    _symbol_out,
+    _upgrade_index_if_stale,
+    create_snapshot_service,
+    index_symbols_service,
+)
+from ..repository_resync_jobs import (
+    ResyncJobConflict,
+    get_repository_resync_job,
+    start_repository_resync_job,
+)
 from ..models import (
     ApiScanPatternOut,
     ApiScanRequest,
@@ -81,9 +95,10 @@ from ..models import (
     FlowNodeOut,
     FlowOverlayRequest,
     FlowOverlayOut,
+    GapTriageDecisionOut,
+    GapTriageUpdateRequest,
     ProbePlanFromFlowRequest,
     ProbePreviewOut,
-    SourceMetadataOut,
     ExplanationAnchorOut,
     ExplanationAnchorsOut,
     CapabilityHierarchyOut,
@@ -120,17 +135,19 @@ from ..models import (
     ProbePointStatusUpdate,
     RepositoryCandidateOut,
     RepositoryConfigOut,
+    RepositoryResyncJobOut,
     RepositoryStatusOut,
     SnapshotRefOut,
     SystemUnderstandingOut,
     RepositoryConfigUpdate,
-    SnapshotFileOut,
     SnapshotOut,
     SymbolIndexOut,
     SymbolIndexWarningOut,
     SystemProfileDraftOut,
     SystemUnderstandingBuildOut,
     SystemUnderstandingJobRetryIn,
+    SystemUnderstandingPurposeConfirmationCreate,
+    SystemUnderstandingPurposeConfirmationOut,
     ValidationCommandOut,
     ValidationRunOut,
 )
@@ -230,6 +247,198 @@ def get_system_understanding_endpoint(
     from ..system_understanding_service import get_system_understanding
     summary = get_system_understanding(system_id)
     return _system_understanding_to_out(summary)
+
+
+@router.post(
+    "/repository/system-understanding/purpose-confirmation",
+    response_model=SystemUnderstandingPurposeConfirmationOut,
+    status_code=201,
+)
+def create_purpose_confirmation_endpoint(
+    payload: SystemUnderstandingPurposeConfirmationCreate,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> SystemUnderstandingPurposeConfirmationOut:
+    """Record a human confirmation reconciling the manual system_profile
+    purpose against the current AI/source-derived purpose view (Issue
+    #94/#275).
+
+    probe-agent:
+      role: API boundary for confirming the manual vs AI System Purpose views
+      capability: repository-understanding
+      element_type: boundary
+      consumers: [dashboard]
+      operation_kind: transformation
+      state_effects: [database-read, database-write]
+      probe_value: Verify a confirmation is refused (409) without a ready
+        snapshot or against a stale one, refused (422) without both a manual
+        and an AI purpose side, and otherwise persists an append-only,
+        decision_method=manual audit row capturing both sides verbatim.
+    """
+    from .. import state_facts
+    from ..system_understanding_service import _get_latest_ready_snapshot
+
+    with get_conn() as conn:
+        snapshot_row = _get_latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            raise HTTPException(
+                status_code=409,
+                detail="No ready snapshot exists yet; create a snapshot before confirming System Purpose.",
+            )
+        snapshot_id = snapshot_row["id"]
+
+        if payload.snapshot_id is None or payload.understanding_build_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Snapshot and completed understanding build ids are required; "
+                    "refresh System Understanding before confirming."
+                ),
+            )
+        if payload.snapshot_id != snapshot_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Snapshot has changed since this purpose was displayed; "
+                    "refresh System Understanding and confirm again."
+                ),
+            )
+
+        profile_row = state_facts.get_system_profile_row(conn, system_id)
+        manual_purpose = profile_row["purpose"] if profile_row is not None else None
+        if not manual_purpose or not manual_purpose.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="Manual system_profile purpose is empty; set it via PUT /system-profile first.",
+            )
+
+        ai_view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+        if ai_view is None:
+            raise HTTPException(
+                status_code=422,
+                detail="No AI/source-derived purpose view exists for this snapshot yet.",
+            )
+        understanding_build = state_facts.get_latest_completed_understanding_build(
+            conn, system_id, snapshot_id
+        )
+        if understanding_build is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No completed System Understanding build exists for this snapshot; "
+                    "run the build before confirming System Purpose."
+                ),
+            )
+        understanding_build_id = understanding_build["id"]
+        if payload.understanding_build_id != understanding_build_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "System Understanding was rebuilt since this purpose was displayed; "
+                    "refresh and confirm the current build."
+                ),
+            )
+
+        now = time.time()
+        cur = conn.execute(
+            """
+            INSERT INTO system_purpose_confirmations
+                (system_id, snapshot_id, understanding_build_id, decided_by_user_id,
+                 manual_purpose, manual_profile_name,
+                 ai_purpose_name, ai_purpose_summary, ai_source, ai_provenance_kind,
+                 note, decision_method, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)
+            """,
+            (
+                system_id,
+                snapshot_id,
+                understanding_build_id,
+                principal.user_id,
+                manual_purpose,
+                profile_row["name"],
+                ai_view["name"],
+                ai_view["summary"],
+                ai_view["source"],
+                ai_view["provenance_kind"],
+                payload.note,
+                now,
+            ),
+        )
+        confirmation_id = cur.lastrowid
+
+    return SystemUnderstandingPurposeConfirmationOut(
+        id=confirmation_id,
+        snapshot_id=snapshot_id,
+        understanding_build_id=understanding_build_id,
+        decided_by_user_id=principal.user_id,
+        decision_method="manual",
+        manual_purpose=manual_purpose,
+        ai_purpose_name=ai_view["name"],
+        ai_purpose_summary=ai_view["summary"],
+        ai_source=ai_view["source"],
+        ai_provenance_kind=ai_view["provenance_kind"],
+        note=payload.note,
+        created_at=now,
+        stale=False,
+        stale_reason=None,
+    )
+
+
+@router.post(
+    "/repository/system-understanding/gap-triage",
+    response_model=GapTriageDecisionOut,
+    status_code=201,
+)
+def update_gap_triage_endpoint(
+    payload: GapTriageUpdateRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> GapTriageDecisionOut:
+    """Record one explicit manual transition for a currently visible gap.
+
+    The server recomputes identity from the latest ready snapshot and checks
+    the caller's fingerprint, so a stale Dashboard cannot apply a decision to
+    changed evidence. The finite lifecycle is owned by ``gap_triage``.
+    """
+    from ..gap_triage import (
+        GapFingerprintConflict,
+        GapTransitionError,
+        annotate_gaps,
+        transition_gap,
+    )
+    from ..system_understanding_service import (
+        _get_latest_ready_snapshot,
+        _load_gaps_from_reconciler,
+    )
+
+    with get_conn() as conn:
+        snapshot = _get_latest_ready_snapshot(conn, system_id)
+        if snapshot is None:
+            raise HTTPException(status_code=409, detail="No ready snapshot exists.")
+        snapshot_id = snapshot["id"]
+        gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
+        annotate_gaps(conn, system_id, snapshot_id, gaps)
+        gap = next((g for g in gaps if g["gap_key"] == payload.gap_key), None)
+        if gap is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Gap is not present in the latest ready snapshot.",
+            )
+        try:
+            row = transition_gap(
+                conn,
+                system_id=system_id,
+                snapshot_id=snapshot_id,
+                gap=gap,
+                expected_fingerprint=payload.content_fingerprint,
+                target_status=payload.status,
+                user_id=principal.user_id,
+                note=payload.note,
+            )
+        except (GapFingerprintConflict, GapTransitionError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return GapTriageDecisionOut(**dict(row))
 
 
 @router.post(
@@ -807,6 +1016,8 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         IssueDraftRefOut,
         SystemUnderstandingStageStatusOut,
         SystemUnderstandingGapTrendOut,
+        SystemUnderstandingPurposeViewOut,
+        SystemUnderstandingPurposeConfirmationOut,
     )
     pipeline = [
         SystemUnderstandingPipelineStepOut(
@@ -843,6 +1054,17 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
             source_id=g.get("source_id"),
             source_key=g.get("source_key"),
             issue_drafts=[IssueDraftRefOut(**d) for d in g.get("issue_drafts", [])],
+            # Legacy/internal mock gaps and pre-#276 issue-draft payloads may
+            # not carry triage identity. Live service gaps always do.
+            gap_key=g.get("gap_key"),
+            content_fingerprint=g.get("content_fingerprint"),
+            triage_status=g.get("triage_status", "open"),
+            triage_decision=(
+                GapTriageDecisionOut(**g["triage_decision"])
+                if g.get("triage_decision") is not None
+                else None
+            ),
+            triage_reopen_reason=g.get("triage_reopen_reason"),
         )
         for g in summary.gaps
     ]
@@ -870,9 +1092,18 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         SystemUnderstandingGapTrendOut(gap_type=gt.gap_type, current=gt.current, previous=gt.previous)
         for gt in summary.gap_trend
     ]
+    purpose_views = [
+        SystemUnderstandingPurposeViewOut(**pv) for pv in summary.purpose_views
+    ]
+    purpose_confirmation = None
+    if summary.purpose_confirmation:
+        purpose_confirmation = SystemUnderstandingPurposeConfirmationOut(
+            **summary.purpose_confirmation
+        )
     return SystemUnderstandingOut(
         system_id=summary.system_id,
         snapshot_id=summary.snapshot_id,
+        understanding_build_id=summary.understanding_build_id,
         commit_sha=summary.commit_sha,
         pipeline=pipeline,
         purpose=purpose,
@@ -885,6 +1116,8 @@ def _system_understanding_to_out(summary) -> SystemUnderstandingOut:
         stages=stages,
         gap_trend=gap_trend,
         success_summary=summary.success_summary,
+        purpose_views=purpose_views,
+        purpose_confirmation=purpose_confirmation,
     )
 
 
@@ -988,40 +1221,6 @@ def put_repository_config(
 # ---------------------------------------------------------------------------
 
 
-def _snapshot_out(conn, snapshot_row, include_files: bool = False) -> SnapshotOut:
-    files = []
-    if include_files:
-        file_rows = conn.execute(
-            "SELECT path, source_type, size_bytes, inclusion_status, exclusion_reason "
-            "FROM snapshot_files WHERE snapshot_id = ?",
-            (snapshot_row["id"],),
-        ).fetchall()
-        files = [
-            SnapshotFileOut(
-                path=fr["path"],
-                source_type=fr["source_type"],
-                size_bytes=fr["size_bytes"],
-                inclusion_status=fr["inclusion_status"],
-                exclusion_reason=fr["exclusion_reason"],
-            )
-            for fr in file_rows
-        ]
-    return SnapshotOut(
-        id=snapshot_row["id"],
-        system_id=snapshot_row["system_id"],
-        repo_path=snapshot_row["repo_path"],
-        commit_sha=snapshot_row["commit_sha"],
-        status=snapshot_row["status"],
-        file_count=snapshot_row["file_count"],
-        total_size=snapshot_row["total_size"],
-        indexed_size=snapshot_row["indexed_size"],
-        metadata_only_count=snapshot_row["metadata_only_count"],
-        warnings=json.loads(snapshot_row["warnings"] or "[]"),
-        error_summary=snapshot_row["error_summary"],
-        created_at=snapshot_row["created_at"],
-        completed_at=snapshot_row["completed_at"],
-        files=files,
-    )
 
 
 @router.post("/repository/snapshots", response_model=SnapshotOut, status_code=201)
@@ -1039,129 +1238,13 @@ def create_snapshot_endpoint(
       state_effects: [database-write, filesystem]
       probe_value: verify snapshot captures committed files at pinned SHA
     """
-    with get_conn() as conn:
-        config_row = conn.execute(
-            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
-        ).fetchone()
-    if config_row is None:
+    try:
+        return create_snapshot_service(system_id)
+    except RepositoryRefreshServiceError as exc:
         raise HTTPException(
             status_code=400,
-            detail="Repository is not configured. PUT /repository first.",
-        )
-
-    repo_path = config_row["repo_path"]
-    include_patterns = json.loads(config_row["include_patterns"])
-    exclude_patterns = json.loads(config_row["exclude_patterns"])
-
-    now = time.time()
-    with get_conn() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO repository_snapshots
-                (system_id, repo_path, commit_sha, status, created_at)
-            VALUES (?, ?, '', 'indexing', ?)
-            """,
-            (system_id, repo_path, now),
-        )
-        snapshot_id = cur.lastrowid
-
-    try:
-        commit_sha, files = create_snapshot(
-            repo_path, include_patterns, exclude_patterns
-        )
-    except GitError as exc:
-        with get_conn() as conn:
-            conn.execute(
-                """
-                UPDATE repository_snapshots
-                SET status = 'failed', error_summary = ?, completed_at = ?
-                WHERE id = ?
-                """,
-                (str(exc), time.time(), snapshot_id),
-            )
-            row = conn.execute(
-                "SELECT * FROM repository_snapshots WHERE id = ?", (snapshot_id,)
-            ).fetchone()
-        return _snapshot_out(conn, row)
-
-    total_size = sum(f.size_bytes for f in files)
-    indexed_size = sum(
-        f.size_bytes for f in files if f.inclusion_status == "indexed"
-    )
-    metadata_only_count = sum(
-        1 for f in files if f.inclusion_status != "indexed"
-    )
-    warnings = []
-    too_large_files = [f for f in files if f.inclusion_status == "too_large"]
-    binary_files = [f for f in files if f.inclusion_status == "binary"]
-    excluded_files = [f for f in files if f.inclusion_status == "excluded"]
-    unsupported_files = [f for f in files if f.inclusion_status == "unsupported"]
-    if too_large_files:
-        warnings.append(
-            f"{len(too_large_files)} file(s) exceeded the per-file size limit "
-            f"and were recorded without content"
-        )
-    if binary_files:
-        warnings.append(
-            f"{len(binary_files)} binary file(s) were recorded without content"
-        )
-    if excluded_files:
-        warnings.append(
-            f"{len(excluded_files)} file(s) were excluded by repository policy"
-        )
-    if unsupported_files:
-        warnings.append(
-            f"{len(unsupported_files)} symlink or unsupported Git object(s) "
-            "were recorded without content"
-        )
-    completed_at = time.time()
-
-    with get_conn() as conn:
-        conn.execute("BEGIN")
-        try:
-            conn.execute(
-                """
-                UPDATE repository_snapshots
-                SET commit_sha = ?, status = 'ready', file_count = ?,
-                    total_size = ?, indexed_size = ?,
-                    metadata_only_count = ?, warnings = ?,
-                    completed_at = ?
-                WHERE id = ?
-                """,
-                (
-                    commit_sha, len(files), total_size,
-                    indexed_size, metadata_only_count,
-                    json.dumps(warnings), completed_at, snapshot_id,
-                ),
-            )
-            for f in files:
-                conn.execute(
-                    """
-                    INSERT INTO snapshot_files
-                        (snapshot_id, path, source_type, size_bytes,
-                         content_hash, content, inclusion_status,
-                         exclusion_reason)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        snapshot_id,
-                        f.path,
-                        f.source_type,
-                        f.size_bytes,
-                        f.content_hash,
-                        f.content,
-                        f.inclusion_status,
-                        f.exclusion_reason,
-                    ),
-                )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        row = conn.execute(
-            "SELECT * FROM repository_snapshots WHERE id = ?", (snapshot_id,)
-        ).fetchone()
-        return _snapshot_out(conn, row, include_files=True)
+            detail=str(exc),
+        ) from exc
 
 
 @router.get("/repository/snapshots/latest", response_model=Optional[SnapshotOut])
@@ -1281,6 +1364,7 @@ def repository_status(
         current_head is not None
         and (ready_commit is None or ready_commit != current_head)
     )
+    head_relation = repository_head_relation(repo_path, ready_commit, current_head)
     symbols_stale = bool(
         latest_ready is not None
         and (indexed_row is None or indexed_row["id"] != latest_ready["id"])
@@ -1320,9 +1404,56 @@ def repository_status(
         understanding_snapshot_id=(understanding or {}).get("snapshot_id"),
         understanding_status=(understanding or {}).get("status"),
         snapshot_stale=snapshot_stale,
+        head_relation=head_relation.head_relation,
+        commits_behind=head_relation.commits_behind,
         symbols_stale=symbols_stale,
         next_actions=next_actions,
     )
+
+
+@router.post(
+    "/repository/resync",
+    response_model=RepositoryResyncJobOut,
+    status_code=202,
+)
+def start_repository_resync_endpoint(
+    system_id: int = Depends(get_system_id),
+    _principal: Principal = Depends(require_user),
+) -> RepositoryResyncJobOut:
+    """Start the explicit snapshot -> symbol-index refresh sequence."""
+    try:
+        job_id = start_repository_resync_job(system_id)
+    except ResyncJobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    row = get_repository_resync_job(system_id, job_id)
+    return RepositoryResyncJobOut(**row)
+
+
+@router.get(
+    "/repository/resync/latest",
+    response_model=Optional[RepositoryResyncJobOut],
+)
+def latest_repository_resync_endpoint(
+    system_id: int = Depends(get_system_id),
+    _principal: Principal = Depends(require_user),
+) -> Optional[RepositoryResyncJobOut]:
+    row = get_repository_resync_job(system_id)
+    return RepositoryResyncJobOut(**row) if row is not None else None
+
+
+@router.get(
+    "/repository/resync/{job_id}",
+    response_model=RepositoryResyncJobOut,
+)
+def get_repository_resync_endpoint(
+    job_id: int,
+    system_id: int = Depends(get_system_id),
+    _principal: Principal = Depends(require_user),
+) -> RepositoryResyncJobOut:
+    row = get_repository_resync_job(system_id, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Repository resync job not found")
+    return RepositoryResyncJobOut(**row)
 
 
 # ---------------------------------------------------------------------------
@@ -1741,288 +1872,6 @@ def get_latest_drafts(
 # ---------------------------------------------------------------------------
 
 
-# Bumped when the deterministic symbol index gains new extracted facts so that
-# snapshots indexed by an older version can be deterministically upgraded
-# without re-creating code_symbols (which would cascade-delete feature links).
-# metadata-v1: #54 source metadata. provenance-v1: #55 source-hash provenance.
-SYMBOL_INDEX_SCHEMA_VERSION = "provenance-v1"
-
-
-def _metadata_out(row) -> SourceMetadataOut:
-    return SourceMetadataOut(
-        start_line=row["start_line"],
-        end_line=row["end_line"],
-        raw_block=row["raw_block"],
-        role=row["role"],
-        capability=row["capability"],
-        element_type=row["element_type"],
-        system_purpose=row["system_purpose"],
-        operation_kind=row["operation_kind"],
-        consumers=json.loads(row["consumers"]),
-        state_effects=json.loads(row["state_effects"]),
-        probe_value=row["probe_value"],
-        origin=row["origin"],
-        explanation_hash=row["explanation_hash"],
-    )
-
-
-def _load_metadata_map(conn, snapshot_id: int) -> dict:
-    """Return ``symbol_id -> SourceMetadataOut`` for a snapshot."""
-    rows = conn.execute(
-        "SELECT * FROM symbol_source_metadata WHERE snapshot_id = ?",
-        (snapshot_id,),
-    ).fetchall()
-    return {r["symbol_id"]: _metadata_out(r) for r in rows}
-
-
-def _load_file_hash_map(conn, snapshot_id: int) -> dict:
-    """Return ``path -> file_content_hash`` for an indexed snapshot."""
-    rows = conn.execute(
-        "SELECT path, content_hash FROM snapshot_files WHERE snapshot_id = ?",
-        (snapshot_id,),
-    ).fetchall()
-    return {r["path"]: r["content_hash"] for r in rows}
-
-
-def _insert_explanation_anchor(
-    conn, snapshot_id: int, system_id: int, metadata_id: int, symbol_id: int,
-    sym, meta, file_content_hash,
-) -> None:
-    """Persist the deterministic source anchor an explanation depends on."""
-    conn.execute(
-        """
-        INSERT INTO explanation_source_anchors
-            (snapshot_id, system_id, metadata_id, symbol_id, path,
-             qualified_name, start_line, end_line, file_content_hash,
-             symbol_source_hash, symbol_body_hash, explanation_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            snapshot_id,
-            system_id,
-            metadata_id,
-            symbol_id,
-            sym.path,
-            sym.qualified_name,
-            meta.start_line,
-            meta.end_line,
-            file_content_hash,
-            sym.symbol_source_hash,
-            sym.symbol_body_hash,
-            meta.explanation_hash,
-        ),
-    )
-
-
-def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: int) -> None:
-    """Deterministically upgrade a pre-existing symbol index in place.
-
-    Snapshots indexed by an older version keep their ``code_symbols`` rows (so
-    feature-code links are preserved) but may lack #54 source metadata and #55
-    source-hash provenance.  This re-parses the pinned snapshot files and
-    additively backfills, matching existing symbols by ``(path,
-    qualified_name)``:
-
-    - symbol source/body hashes on ``code_symbols`` (idempotent UPDATE),
-    - missing ``symbol_source_metadata`` rows (with explanation hash),
-    - missing explanation hashes on existing metadata rows,
-    - missing ``explanation_source_anchors``,
-    - metadata index warnings.
-
-    It runs once, gated by the run's ``schema_version``.
-    """
-    file_rows = conn.execute(
-        """
-        SELECT path, content FROM snapshot_files
-        WHERE snapshot_id = ? AND inclusion_status = 'indexed'
-        ORDER BY path
-        """,
-        (snapshot_id,),
-    ).fetchall()
-    files = [(fr["path"], bytes(fr["content"] or b"")) for fr in file_rows]
-    result = index_snapshot_files(files)
-    file_hash_map = _load_file_hash_map(conn, snapshot_id)
-
-    sym_rows = conn.execute(
-        "SELECT id, path, qualified_name FROM code_symbols WHERE snapshot_id = ?",
-        (snapshot_id,),
-    ).fetchall()
-    id_by_key = {(r["path"], r["qualified_name"]): r["id"] for r in sym_rows}
-    # symbol_id -> (metadata_id, explanation_hash)
-    existing_meta = {
-        r["symbol_id"]: (r["id"], r["explanation_hash"])
-        for r in conn.execute(
-            "SELECT id, symbol_id, explanation_hash FROM symbol_source_metadata "
-            "WHERE snapshot_id = ?",
-            (snapshot_id,),
-        ).fetchall()
-    }
-    existing_anchor_meta_ids = {
-        r["metadata_id"]
-        for r in conn.execute(
-            "SELECT metadata_id FROM explanation_source_anchors WHERE snapshot_id = ?",
-            (snapshot_id,),
-        ).fetchall()
-    }
-    existing_warnings = {
-        (w["path"], w["message"])
-        for w in conn.execute(
-            "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
-            (snapshot_id,),
-        ).fetchall()
-    }
-
-    conn.execute("BEGIN")
-    try:
-        for sym in result.symbols:
-            symbol_id = id_by_key.get((sym.path, sym.qualified_name))
-            if symbol_id is None:
-                continue
-            # Idempotently set the deterministic source hashes.
-            conn.execute(
-                "UPDATE code_symbols SET symbol_source_hash = ?, symbol_body_hash = ? "
-                "WHERE id = ?",
-                (sym.symbol_source_hash, sym.symbol_body_hash, symbol_id),
-            )
-
-            meta = sym.source_metadata
-            if meta is None:
-                continue
-
-            if symbol_id not in existing_meta:
-                cur = conn.execute(
-                    """
-                    INSERT INTO symbol_source_metadata
-                        (snapshot_id, system_id, symbol_id, path, qualified_name,
-                         start_line, end_line, role, capability, element_type,
-                         system_purpose, operation_kind, consumers, state_effects,
-                         probe_value, raw_block, origin, explanation_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        snapshot_id,
-                        system_id,
-                        symbol_id,
-                        sym.path,
-                        sym.qualified_name,
-                        meta.start_line,
-                        meta.end_line,
-                        meta.role,
-                        meta.capability,
-                        meta.element_type,
-                        meta.system_purpose,
-                        meta.operation_kind,
-                        json.dumps(meta.consumers),
-                        json.dumps(meta.state_effects),
-                        meta.probe_value,
-                        meta.raw_block,
-                        meta.origin,
-                        meta.explanation_hash,
-                    ),
-                )
-                metadata_id = cur.lastrowid
-            else:
-                metadata_id, existing_hash = existing_meta[symbol_id]
-                if existing_hash is None:
-                    conn.execute(
-                        "UPDATE symbol_source_metadata SET explanation_hash = ? "
-                        "WHERE id = ?",
-                        (meta.explanation_hash, metadata_id),
-                    )
-
-            if metadata_id not in existing_anchor_meta_ids:
-                _insert_explanation_anchor(
-                    conn, snapshot_id, system_id, metadata_id, symbol_id, sym,
-                    meta, file_hash_map.get(sym.path),
-                )
-                existing_anchor_meta_ids.add(metadata_id)
-
-        # Add only metadata warnings (syntax/decode warnings already exist from
-        # the original index); guard against duplicates so backfill is idempotent.
-        for warn in result.warnings:
-            if "probe-agent metadata:" not in warn.message:
-                continue
-            if (warn.path, warn.message) in existing_warnings:
-                continue
-            conn.execute(
-                """
-                INSERT INTO symbol_index_warnings
-                    (snapshot_id, system_id, path, message)
-                VALUES (?, ?, ?, ?)
-                """,
-                (snapshot_id, system_id, warn.path, warn.message),
-            )
-
-        conn.execute(
-            "UPDATE intelligence_runs SET schema_version = ? WHERE id = ?",
-            (SYMBOL_INDEX_SCHEMA_VERSION, run_id),
-        )
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-
-
-def _upgrade_index_if_stale(conn, system_id: int, snapshot_id: int):
-    """Deterministically upgrade a stale symbol index in place, if needed.
-
-    Returns the latest symbol_index run row (refreshed after any upgrade), or
-    ``None`` when the snapshot has not been indexed.  Idempotent and gated by
-    the run's ``schema_version`` so it is safe to call from read paths: existing
-    snapshots indexed by an older version are upgraded the first time they are
-    read instead of requiring an explicit re-index.  Mirrors the deterministic
-    INSERT-on-read pattern already used by flow-entrypoint discovery.
-    """
-    run_row = conn.execute(
-        """
-        SELECT * FROM intelligence_runs
-        WHERE system_id = ? AND snapshot_id = ? AND run_type = 'symbol_index'
-        ORDER BY id DESC LIMIT 1
-        """,
-        (system_id, snapshot_id),
-    ).fetchone()
-    if run_row is None or run_row["schema_version"] == SYMBOL_INDEX_SCHEMA_VERSION:
-        return run_row
-    has_symbols = conn.execute(
-        "SELECT 1 FROM code_symbols WHERE snapshot_id = ? LIMIT 1",
-        (snapshot_id,),
-    ).fetchone()
-    if has_symbols is None:
-        return run_row
-    _backfill_source_metadata(conn, system_id, snapshot_id, run_row["id"])
-    return conn.execute(
-        "SELECT * FROM intelligence_runs WHERE id = ?",
-        (run_row["id"],),
-    ).fetchone()
-
-
-def _symbol_out(
-    row,
-    metadata: Optional[SourceMetadataOut] = None,
-    file_content_hash: Optional[str] = None,
-) -> CodeSymbolOut:
-    return CodeSymbolOut(
-        id=row["id"],
-        snapshot_id=row["snapshot_id"],
-        system_id=row["system_id"],
-        path=row["path"],
-        qualified_name=row["qualified_name"],
-        kind=row["kind"],
-        start_line=row["start_line"],
-        end_line=row["end_line"],
-        decorators=json.loads(row["decorators"]),
-        imports=json.loads(row["imports"]),
-        docstring=row["docstring"],
-        is_test=bool(row["is_test"]),
-        is_pydantic_model=bool(row["is_pydantic_model"]),
-        route_path=row["route_path"],
-        route_method=row["route_method"],
-        component_id=row["component_id"],
-        source_metadata=metadata,
-        file_content_hash=file_content_hash,
-        symbol_source_hash=row["symbol_source_hash"],
-        symbol_body_hash=row["symbol_body_hash"],
-    )
 
 
 @router.post(
@@ -2044,210 +1893,10 @@ def index_symbols_endpoint(
       state_effects: [database-write]
       probe_value: verify AST symbols are extracted and persisted from snapshot files
     """
-    with get_conn() as conn:
-        snapshot_row = conn.execute(
-            """
-            SELECT * FROM repository_snapshots
-            WHERE system_id = ? ORDER BY id DESC LIMIT 1
-            """,
-            (system_id,),
-        ).fetchone()
-    if snapshot_row is None or snapshot_row["status"] != "ready":
-        raise HTTPException(
-            status_code=400,
-            detail="Latest snapshot is not ready. Create a successful snapshot first.",
-        )
-
-    snapshot_id = snapshot_row["id"]
-
-    with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM code_symbols WHERE snapshot_id = ?",
-            (snapshot_id,),
-        ).fetchone()
-        if existing["cnt"] > 0:
-            # Deterministically upgrade indexes created before #54/#55 so their
-            # source metadata and hashes are populated without re-creating
-            # symbols (which would cascade-delete feature links).
-            run_row = _upgrade_index_if_stale(conn, system_id, snapshot_id)
-            sym_rows = conn.execute(
-                "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
-                (snapshot_id,),
-            ).fetchall()
-            warn_rows = conn.execute(
-                "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
-                (snapshot_id,),
-            ).fetchall()
-            meta_map = _load_metadata_map(conn, snapshot_id)
-            file_hash_map = _load_file_hash_map(conn, snapshot_id)
-            return SymbolIndexOut(
-                snapshot_id=snapshot_id,
-                system_id=system_id,
-                symbol_count=len(sym_rows),
-                warning_count=len(warn_rows),
-                symbols=[
-                    _symbol_out(r, meta_map.get(r["id"]), file_hash_map.get(r["path"]))
-                    for r in sym_rows
-                ],
-                warnings=[
-                    SymbolIndexWarningOut(path=w["path"], message=w["message"])
-                    for w in warn_rows
-                ],
-                intelligence_run=_intelligence_run_out(run_row) if run_row else None,
-            )
-
-    with get_conn() as conn:
-        file_rows = conn.execute(
-            """
-            SELECT path, content, content_hash FROM snapshot_files
-            WHERE snapshot_id = ? AND inclusion_status = 'indexed'
-            ORDER BY path
-            """,
-            (snapshot_id,),
-        ).fetchall()
-
-    files = [(fr["path"], bytes(fr["content"] or b"")) for fr in file_rows]
-    file_hash_map = {fr["path"]: fr["content_hash"] for fr in file_rows}
-    started_at = time.time()
-    result = index_snapshot_files(files)
-    completed_at = time.time()
-
-    with get_conn() as conn:
-        conn.execute("BEGIN")
-        try:
-            cur = conn.execute(
-                """
-                INSERT INTO intelligence_runs
-                    (system_id, snapshot_id, run_type, provider, model,
-                     prompt_version, schema_version, decision_method,
-                     status, is_mock, started_at, completed_at)
-                VALUES (?, ?, 'symbol_index', 'deterministic', 'ast',
-                        'n/a', ?, 'deterministic',
-                        'completed', 0, ?, ?)
-                """,
-                (system_id, snapshot_id, SYMBOL_INDEX_SCHEMA_VERSION, started_at, completed_at),
-            )
-            run_id = cur.lastrowid
-
-            for sym in result.symbols:
-                sym_cur = conn.execute(
-                    """
-                    INSERT OR IGNORE INTO code_symbols
-                        (snapshot_id, system_id, path, qualified_name, kind,
-                         start_line, end_line, decorators, imports, docstring,
-                         is_test, is_pydantic_model, route_path, route_method,
-                         component_id, symbol_source_hash, symbol_body_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        snapshot_id,
-                        system_id,
-                        sym.path,
-                        sym.qualified_name,
-                        sym.kind,
-                        sym.start_line,
-                        sym.end_line,
-                        json.dumps(sym.decorators),
-                        json.dumps(sym.imports),
-                        sym.docstring,
-                        1 if sym.is_test else 0,
-                        1 if sym.is_pydantic_model else 0,
-                        sym.route_path,
-                        sym.route_method,
-                        sym.component_id,
-                        sym.symbol_source_hash,
-                        sym.symbol_body_hash,
-                    ),
-                )
-                # INSERT OR IGNORE skips duplicate (snapshot_id, qualified_name,
-                # path) rows instead of raising a UNIQUE constraint error. When a
-                # row is ignored, lastrowid is stale, so skip the dependent
-                # source-metadata/anchor inserts to avoid mis-attributing them.
-                if sym_cur.rowcount == 0:
-                    continue
-                symbol_id = sym_cur.lastrowid
-                meta = sym.source_metadata
-                if meta is not None:
-                    meta_cur = conn.execute(
-                        """
-                        INSERT INTO symbol_source_metadata
-                            (snapshot_id, system_id, symbol_id, path,
-                             qualified_name, start_line, end_line, role,
-                             capability, element_type, system_purpose,
-                             operation_kind, consumers, state_effects,
-                             probe_value, raw_block, origin, explanation_hash)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            snapshot_id,
-                            system_id,
-                            symbol_id,
-                            sym.path,
-                            sym.qualified_name,
-                            meta.start_line,
-                            meta.end_line,
-                            meta.role,
-                            meta.capability,
-                            meta.element_type,
-                            meta.system_purpose,
-                            meta.operation_kind,
-                            json.dumps(meta.consumers),
-                            json.dumps(meta.state_effects),
-                            meta.probe_value,
-                            meta.raw_block,
-                            meta.origin,
-                            meta.explanation_hash,
-                        ),
-                    )
-                    _insert_explanation_anchor(
-                        conn, snapshot_id, system_id, meta_cur.lastrowid,
-                        symbol_id, sym, meta, file_hash_map.get(sym.path),
-                    )
-
-            for warn in result.warnings:
-                conn.execute(
-                    """
-                    INSERT INTO symbol_index_warnings
-                        (snapshot_id, system_id, path, message)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (snapshot_id, system_id, warn.path, warn.message),
-                )
-
-            conn.execute("COMMIT")
-
-            sym_rows = conn.execute(
-                "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
-                (snapshot_id,),
-            ).fetchall()
-            warn_rows = conn.execute(
-                "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
-                (snapshot_id,),
-            ).fetchall()
-            run_row = conn.execute(
-                "SELECT * FROM intelligence_runs WHERE id = ?",
-                (run_id,),
-            ).fetchone()
-            meta_map = _load_metadata_map(conn, snapshot_id)
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-
-    return SymbolIndexOut(
-        snapshot_id=snapshot_id,
-        system_id=system_id,
-        symbol_count=len(sym_rows),
-        warning_count=len(warn_rows),
-        symbols=[
-            _symbol_out(r, meta_map.get(r["id"]), file_hash_map.get(r["path"]))
-            for r in sym_rows
-        ],
-        warnings=[
-            SymbolIndexWarningOut(path=w["path"], message=w["message"])
-            for w in warn_rows
-        ],
-        intelligence_run=_intelligence_run_out(run_row),
-    )
+    try:
+        return index_symbols_service(system_id)
+    except RepositoryRefreshServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/repository/symbols", response_model=SymbolIndexOut)

@@ -1,21 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import {
   useSystemUnderstanding,
   useBuildSystemUnderstanding,
   useLatestSystemUnderstandingBuild,
   useSystemDiagnostics,
   useSystemState,
+  useSystemProfile,
+  useUpdateSystemProfile,
+  useConfirmPurposeAlignment,
   sysKey,
 } from "@/api/hooks";
+import { useRepositoryConfiguredGate } from "@/components/repository-gate";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { ContextHeader } from "@/components/layout/context-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useDiagnosticHighlight, DiagnosticFixCallout } from "@/components/diagnostic-fix";
-import { cn } from "@/lib/utils";
+import { cn, formatTimestamp } from "@/lib/utils";
+import { ApiError } from "@/api/client";
 import { SystemStateBanner } from "@/components/system-state";
 import {
   RefreshCw, Boxes, Target,
@@ -29,6 +36,10 @@ import type {
   SystemStateItem,
   SystemUnderstandingOut,
   SystemUnderstandingStageStatus,
+  SystemUnderstandingPurpose,
+  SystemUnderstandingPurposeView,
+  PurposeConfirmationOut,
+  PurposeConfirmationStaleReason,
 } from "@/api/types";
 
 function findStage(
@@ -152,6 +163,211 @@ function EntryCards({ purposeDefined }: { purposeDefined: boolean }) {
   );
 }
 
+function purposeErrorMessage(e: unknown): string {
+  if (e instanceof ApiError) return e.detail;
+  return String(e);
+}
+
+const PURPOSE_STALE_REASON_LABELS: Record<PurposeConfirmationStaleReason, string> = {
+  profile_updated: "確認後に System Profile が更新されています",
+  snapshot_changed: "確認後に Snapshot が更新されています",
+  ai_updated: "確認後に AI/ソース由来の理解が更新されています",
+};
+
+/**
+ * Issue #94/#275: inline entry for the human (System Profile) side of the
+ * purpose section, shown only while it has no purpose yet. PUT
+ * /system-profile replaces the whole profile, so this merges the current
+ * profile (from useSystemProfile) with just the changed purpose field.
+ */
+function ManualPurposeEntryForm() {
+  const { data: profile } = useSystemProfile();
+  const updateProfile = useUpdateSystemProfile();
+  const [value, setValue] = useState("");
+
+  const handleSave = async () => {
+    const purpose = value.trim();
+    if (!purpose) return;
+    try {
+      await updateProfile.mutateAsync({
+        name: profile?.name ?? "",
+        purpose,
+        target_users: profile?.target_users ?? [],
+        stakeholder_value: profile?.stakeholder_value ?? "",
+        constraints: profile?.constraints ?? [],
+        success_criteria: profile?.success_criteria ?? [],
+      });
+      toast.success("System Purpose を保存しました");
+      setValue("");
+    } catch (e) {
+      toast.error(`System Purpose の保存に失敗しました: ${purposeErrorMessage(e)}`);
+    }
+  };
+
+  return (
+    <div className="space-y-2" data-testid="purpose-manual-entry-form">
+      <Textarea
+        placeholder="この System の目的を入力してください"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        rows={3}
+        data-testid="purpose-manual-entry-textarea"
+      />
+      <Button
+        size="sm"
+        onClick={handleSave}
+        disabled={updateProfile.isPending || !value.trim()}
+        data-testid="purpose-manual-entry-save"
+      >
+        保存
+      </Button>
+    </div>
+  );
+}
+
+/**
+ * Issue #94/#275: the "確認" action -- records that a human checked the
+ * manual and AI/source-derived purposes against each other. Rendered only
+ * once both sides of the purpose section have a view (see PurposeSection).
+ */
+function PurposeConfirmationControl({
+  snapshotId,
+  understandingBuildId,
+  confirmation,
+}: {
+  snapshotId: number | null;
+  understandingBuildId: number | null;
+  confirmation: PurposeConfirmationOut | null;
+}) {
+  const confirmAlignment = useConfirmPurposeAlignment();
+
+  const handleConfirm = async () => {
+    try {
+      await confirmAlignment.mutateAsync(
+        snapshotId != null && understandingBuildId != null
+          ? { snapshot_id: snapshotId, understanding_build_id: understandingBuildId }
+          : {},
+      );
+      toast.success("一致を確認しました");
+    } catch (e) {
+      toast.error(`確認に失敗しました: ${purposeErrorMessage(e)}`);
+    }
+  };
+
+  if (confirmation && !confirmation.stale) {
+    return (
+      <div className="flex items-center gap-2 text-sm" data-testid="purpose-confirmed">
+        <Badge variant="outline">確認済み</Badge>
+        <span className="text-muted-foreground">{formatTimestamp(confirmation.created_at)}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {confirmation?.stale && confirmation.stale_reason && (
+        <p className="text-xs text-muted-foreground" data-testid="purpose-confirmation-stale-note">
+          {PURPOSE_STALE_REASON_LABELS[confirmation.stale_reason]}
+        </p>
+      )}
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={handleConfirm}
+        disabled={
+          confirmAlignment.isPending || snapshotId == null || understandingBuildId == null
+        }
+        data-testid="purpose-confirm-button"
+      >
+        一致を確認した
+      </Button>
+      {(snapshotId == null || understandingBuildId == null) && (
+        <p className="text-xs text-muted-foreground" data-testid="purpose-confirm-build-required">
+          System Understanding の Build 完了後に確認できます。
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Issue #94/#275: replaces the old single-view System Purpose card with the
+ * human (System Profile) and AI/source-derived views side by side, each
+ * with a provenance Badge, plus a confirmation action once both sides
+ * exist. Falls back to the legacy single `purpose` field (rendered on
+ * whichever side its provenance_kind indicates) for responses from a server
+ * that predates `purpose_views`/`purpose_confirmation` (backward compat).
+ */
+function PurposeSection({ data }: { data: SystemUnderstandingOut }) {
+  const highlight = useDiagnosticHighlight<HTMLDivElement>("purpose-views");
+  const views = data.purpose_views ?? [];
+  let manualView = views.find((v) => v.source === "system_profile");
+  let aiView = views.find((v) => v.source === "capability_hierarchy" || v.source === "system_profile_draft");
+
+  if (!manualView && !aiView && data.purpose) {
+    const legacy: SystemUnderstandingPurpose = data.purpose;
+    const fallbackView: SystemUnderstandingPurposeView = {
+      source: legacy.provenance_kind === "manual" ? "system_profile" : "capability_hierarchy",
+      provenance_kind: legacy.provenance_kind ?? "unknown",
+      name: legacy.name,
+      summary: legacy.summary,
+    };
+    if (fallbackView.source === "system_profile") manualView = fallbackView;
+    else aiView = fallbackView;
+  }
+
+  return (
+    <Card {...highlight} data-testid="purpose-views-section">
+      <CardHeader>
+        <CardTitle className="text-base">System Purpose</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-2" data-testid="purpose-manual-card">
+            <p className="text-sm font-medium text-muted-foreground">人の認識(System Profile)</p>
+            {manualView ? (
+              <div>
+                <p className="font-medium">{manualView.name}</p>
+                {manualView.summary && (
+                  <p className="text-sm text-muted-foreground mt-1">{manualView.summary}</p>
+                )}
+                <Badge variant="outline" className="mt-2 text-xs">{manualView.provenance_kind}</Badge>
+              </div>
+            ) : (
+              <ManualPurposeEntryForm />
+            )}
+          </div>
+
+          <div className="space-y-2" data-testid="purpose-ai-card">
+            <p className="text-sm font-medium text-muted-foreground">AI/ソース由来の理解</p>
+            {aiView ? (
+              <div>
+                <p className="font-medium">{aiView.name}</p>
+                {aiView.summary && (
+                  <p className="text-sm text-muted-foreground mt-1">{aiView.summary}</p>
+                )}
+                <Badge variant="outline" className="mt-2 text-xs">{aiView.provenance_kind}</Badge>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground" data-testid="purpose-ai-empty">
+                AI/ソース由来の purpose はまだありません。Snapshot 作成と Build 実行後に表示されます。
+              </p>
+            )}
+          </div>
+        </div>
+
+        {manualView && aiView && (
+          <PurposeConfirmationControl
+            snapshotId={data.snapshot_id}
+            understandingBuildId={data.understanding_build_id ?? null}
+            confirmation={data.purpose_confirmation ?? null}
+          />
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: {
   data: SystemUnderstandingOut;
   checksByStep: Record<string, SystemDiagnosticCheck[]>;
@@ -239,60 +455,43 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
           </Card>
         )}
 
-        {!allMissing && <EntryCards purposeDefined={!!data.purpose} />}
+        {!allMissing && (
+          <EntryCards
+            purposeDefined={!!data.purpose || (data.purpose_views?.length ?? 0) > 0}
+          />
+        )}
 
-        <div className="grid gap-6 lg:grid-cols-2">
-          {/* System Purpose */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">System Purpose</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {data.purpose ? (
+        {/* System Purpose (Issue #94/#275): human vs AI/source-derived, side by side */}
+        <PurposeSection data={data} />
+
+        {/* Metadata Coverage */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Metadata Coverage</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {data.metadata_coverage ? (
+              <div className="grid grid-cols-2 gap-4 text-sm" data-testid="metadata-coverage">
                 <div>
-                  <p className="font-medium">{data.purpose.name}</p>
-                  {data.purpose.summary && (
-                    <p className="text-sm text-muted-foreground mt-1">{data.purpose.summary}</p>
-                  )}
-                  {data.purpose.provenance_kind && (
-                    <Badge variant="outline" className="mt-2 text-xs">{data.purpose.provenance_kind}</Badge>
-                  )}
+                  <p className="text-muted-foreground">Symbols</p>
+                  <p className="text-lg font-semibold">{data.metadata_coverage.symbol_count}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {data.metadata_coverage.symbols_with_source_metadata} with metadata
+                  </p>
                 </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">No system purpose defined yet.</p>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Metadata Coverage */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Metadata Coverage</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {data.metadata_coverage ? (
-                <div className="grid grid-cols-2 gap-4 text-sm" data-testid="metadata-coverage">
-                  <div>
-                    <p className="text-muted-foreground">Symbols</p>
-                    <p className="text-lg font-semibold">{data.metadata_coverage.symbol_count}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {data.metadata_coverage.symbols_with_source_metadata} with metadata
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-muted-foreground">Entrypoints</p>
-                    <p className="text-lg font-semibold">{data.metadata_coverage.entrypoint_count}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {data.metadata_coverage.entrypoints_with_capability_link} with capability link
-                    </p>
-                  </div>
+                <div>
+                  <p className="text-muted-foreground">Entrypoints</p>
+                  <p className="text-lg font-semibold">{data.metadata_coverage.entrypoint_count}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {data.metadata_coverage.entrypoints_with_capability_link} with capability link
+                  </p>
                 </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">Run a build to see coverage.</p>
-              )}
-            </CardContent>
-          </Card>
-        </div>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">Run a build to see coverage.</p>
+            )}
+          </CardContent>
+        </Card>
 
         {/* Core Capabilities */}
         {data.capabilities.length > 0 && (
@@ -488,6 +687,14 @@ export default function SystemUnderstandingPage() {
   const { data: latestBuild } = useLatestSystemUnderstandingBuild();
   const qc = useQueryClient();
   const settledBuildId = useRef<number | null>(null);
+  // Issue #258: build_system_understanding_endpoint has no snapshot-readiness
+  // precondition (it enqueues an async job unconditionally and lets each
+  // pipeline step report its own missing/blocked status), so only a
+  // definitively unconfigured repository is a real, unrecoverable-from-here
+  // precondition to gate on here -- unlike Probe Plan generation, which 400s
+  // outright without a ready snapshot. Two-stage rule: stays unblocked while
+  // status is loading/unknown.
+  const repoGate = useRepositoryConfiguredGate();
 
   const buildRunning = latestBuild?.status === "queued" || latestBuild?.status === "running";
   const buildHighlight = useDiagnosticHighlight<HTMLButtonElement>("build");
@@ -552,9 +759,10 @@ export default function SystemUnderstandingPage() {
         <Button
           {...buildHighlight}
           onClick={() => build.mutate()}
-          disabled={build.isPending || buildRunning}
+          disabled={build.isPending || buildRunning || repoGate.blocked}
           variant={pipelineAllComplete && !buildRunning ? "outline" : "default"}
           data-testid="build-button"
+          title={repoGate.blocked ? [repoGate.summary, repoGate.remediation].filter(Boolean).join(" ") : undefined}
         >
           {build.isPending || buildRunning ? (
             <>
@@ -569,6 +777,15 @@ export default function SystemUnderstandingPage() {
           )}
         </Button>
       </div>
+
+      {repoGate.blocked && (
+        <p className="text-xs text-destructive" data-testid="build-blocked-reason">
+          {repoGate.summary} {repoGate.remediation}{" "}
+          {repoGate.to && (
+            <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Go to Repository"}</Link>
+          )}
+        </p>
+      )}
 
       <SystemStateBanner
         item={bannerItem}

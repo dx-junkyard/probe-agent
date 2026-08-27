@@ -3,16 +3,19 @@ import contextvars
 import copy
 import functools
 import hashlib
+import inspect
 import logging
 import threading
 import time
 import traceback
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from . import context as _lineage
 from . import projection as _projection
+from . import redaction as _redaction
 from . import replay_capture as _replay
+from . import secret_patterns as _secret_patterns
 from .client import ControlClient
 from .config import ProbeConfig
 from .policy import PolicyCache
@@ -87,10 +90,88 @@ def _safe_repr(value: Any, limit: int = 4000) -> str:
     return text
 
 
-def _serialize_input(args: tuple, kwargs: dict) -> Dict[str, Any]:
+def _sensitive_arg_policy(
+    fn: Callable[..., Any],
+) -> Tuple[Set[int], Optional[int]]:
+    """Compile denied positional indexes once, at decoration time.
+
+    The second result is the start index of a denied ``*args`` parameter.
+    """
+    indexes: Set[int] = set()
+    sensitive_vararg_start: Optional[int] = None
+    try:
+        cursor = 0
+        for parameter in inspect.signature(fn).parameters.values():
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                if _redaction.is_sensitive_key(parameter.name):
+                    indexes.add(cursor)
+                cursor += 1
+            elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                if _redaction.is_sensitive_key(parameter.name):
+                    sensitive_vararg_start = cursor
+                break
+    except (TypeError, ValueError):
+        # Some C-extension callables do not expose a signature. Dict/kwargs
+        # redaction still applies; telemetry must never break the host call.
+        pass
+    return indexes, sensitive_vararg_start
+
+
+def redact_text(text: str, limit: int = 4000) -> str:
+    """Apply value-shaped credential redaction, then truncate (Issue #367).
+
+    Order matters: masking runs on the full text so a secret cannot survive by
+    straddling the truncation boundary.  Never raises -- an unusable pattern
+    engine must not cost the host application its telemetry, let alone its
+    call, so a failure degrades to a placeholder rather than to raw text.
+    """
+    try:
+        redacted, _ = _secret_patterns.redact_secret_values(text)
+    except Exception:  # noqa: BLE001 — telemetry must never break the host call
+        logger.debug("secret-pattern redaction failed", exc_info=True)
+        return "<payload-redaction-failed>"
+    if len(redacted) > limit:
+        redacted = redacted[:limit] + "...<truncated>"
+    return redacted
+
+
+def _payload_repr(value: Any) -> str:
+    """Render ``value`` for the trace payload with both redaction layers.
+
+    Layer 1 rebuilds containers *and user-defined objects* with sensitive
+    attributes masked, so ``repr`` never reaches a denied attribute.  Layer 2
+    masks known credential shapes in the rendered text, covering values whose
+    attribute name says nothing (``endpoint="https://u:pw@host"``) and custom
+    ``__repr__`` output the structural pass could not intercept.
+    """
+    try:
+        rendered = repr(_redaction.redact_for_repr(value))
+    except Exception:  # noqa: BLE001 — telemetry must never break the host call
+        logger.debug("payload redaction failed", exc_info=True)
+        return "<payload-redaction-failed>"
+    return redact_text(rendered)
+
+
+def _serialize_input(
+    args: tuple, kwargs: dict, sensitive_arg_indexes: Optional[Set[int]] = None
+) -> Dict[str, Any]:
+    sensitive_arg_indexes = sensitive_arg_indexes or set()
     return {
-        "args": [_safe_repr(a) for a in args],
-        "kwargs": {k: _safe_repr(v) for k, v in kwargs.items()},
+        "args": [
+            _redaction.REDACTION_MARKER if index in sensitive_arg_indexes else _payload_repr(arg)
+            for index, arg in enumerate(args)
+        ],
+        "kwargs": {
+            key: (
+                _redaction.REDACTION_MARKER
+                if _redaction.is_sensitive_key(key)
+                else _payload_repr(value)
+            )
+            for key, value in kwargs.items()
+        },
     }
 
 
@@ -110,7 +191,7 @@ def _snapshot(value: Any) -> Any:
 
 
 def flush(timeout: float = 10.0) -> None:
-    """Wait for in-flight shadow threads to finish (best-effort).
+    """Wait for shadow work and accepted telemetry POSTs (best-effort).
 
     Useful for short-lived scripts; an ``atexit`` hook calls this
     automatically with ``PROBE_SHUTDOWN_TIMEOUT`` (default 10s).
@@ -120,12 +201,38 @@ def flush(timeout: float = 10.0) -> None:
         with _inflight_lock:
             pending = list(_inflight)
         if not pending:
-            return
+            break
         for t in pending:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
             t.join(timeout=remaining)
+
+    client_flush = getattr(_client, "flush", None)
+    if callable(client_flush):
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                client_flush(timeout=remaining)
+            except Exception:  # noqa: BLE001 — telemetry is non-fatal
+                logger.debug("transport flush failed", exc_info=True)
+
+
+def transport_stats() -> Dict[str, Any]:
+    """Return the active client's transport snapshot (FakeClient-safe)."""
+    snapshot = getattr(_client, "transport_stats", None)
+    if callable(snapshot):
+        try:
+            return dict(snapshot())
+        except Exception:  # noqa: BLE001
+            logger.debug("transport stats failed", exc_info=True)
+    return {
+        "dropped_count": 0,
+        "failure_count": 0,
+        "state": "closed",
+        "consecutive_failures": 0,
+        "queue_size": 0,
+    }
 
 
 def _ensure_atexit() -> None:
@@ -174,6 +281,12 @@ def probe(
     payload carries none of the new keys and no capture code runs. Capture is
     best-effort and never affects the wrapped function's return value,
     exceptions, or trace sending.
+
+    Raw telemetry is controlled separately by ``PROBE_PAYLOAD_MODE``. The
+    default ``redacted`` mode exposes recursively key-redacted repr values;
+    ``metadata`` omits input/output and exception traceback, and ``full``
+    additionally exposes the exception message/traceback. The finite sensitive
+    key denylist is mandatory in both payload-bearing modes and replay capture.
     """
     if candidate is not None:
         set_candidate(component_id, candidate)
@@ -189,16 +302,41 @@ def probe(
     static_entities = _lineage._normalize_entities(entities)
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+        sensitive_fixed_indexes, sensitive_vararg_start = _sensitive_arg_policy(fn)
+
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             if not ProbeConfig.enabled():
                 return fn(*args, **kwargs)
+
+            # When the POST breaker is open, skip policy lookup, trace-id
+            # generation, sampling and serialization. Older/Fake clients do
+            # not implement the gate and retain their synchronous behaviour.
+            transport_open = getattr(_client, "transport_is_open", None)
+            if callable(transport_open):
+                try:
+                    if transport_open():
+                        return fn(*args, **kwargs)
+                except Exception:  # noqa: BLE001 — FakeClient compatibility
+                    logger.debug("transport gate failed", exc_info=True)
 
             policy = _policy_cache.get(component_id)
             mode = (policy or {}).get("mode", ProbeConfig.default_mode())
 
             if mode == "off":
                 return fn(*args, **kwargs)
+
+            payload_mode = ProbeConfig.payload_mode()
+            if payload_mode in ("redacted", "full") or replay_spec is not None:
+                sensitive_arg_indexes = {
+                    index for index in sensitive_fixed_indexes if index < len(args)
+                }
+                if sensitive_vararg_start is not None:
+                    sensitive_arg_indexes.update(
+                        range(sensitive_vararg_start, len(args))
+                    )
+            else:
+                sensitive_arg_indexes = set()
 
             trace_id = str(uuid.uuid4())
             # Deterministic sampling (Issue #152): the trace body is always
@@ -240,7 +378,12 @@ def probe(
             if replay_spec is not None and mode in ("trace", "shadow"):
                 try:
                     capture_payload, capture_replayability, capture_reasons = (
-                        _replay.capture_input(args, kwargs, replay_spec)
+                        _replay.capture_input(
+                            args,
+                            kwargs,
+                            replay_spec,
+                            sensitive_arg_indexes=sensitive_arg_indexes,
+                        )
                     )
                 except Exception:  # noqa: BLE001 — capture must never break fn
                     logger.debug("replay capture failed", exc_info=True)
@@ -270,18 +413,36 @@ def probe(
                     output = fn(*args, **kwargs)
                 except BaseException as e:  # noqa: BLE001
                     raised = e
-                    error_repr = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                    if payload_mode == "full":
+                        # Issue #367: an exception message/traceback is
+                        # free-form text, so only the value-shaped credential
+                        # layer can protect it -- and it is not optional,
+                        # since `full` is a verbosity choice, never a consent
+                        # to ship credentials.
+                        error_repr = redact_text(
+                            f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                        )
+                    else:
+                        # Exception messages and tracebacks are free-form and
+                        # cannot be structurally key-redacted.
+                        error_repr = type(e).__name__
             finally:
                 _lineage.exit_span(span_token)
 
             duration_ms = (time.perf_counter() - start) * 1000.0
 
+            expose_payload = payload_mode in ("redacted", "full")
             trace = {
                 "trace_id": trace_id,
                 "component_id": component_id,
                 "mode": mode,
-                "input": _serialize_input(args, kwargs),
-                "output": None if raised else _safe_repr(output),
+                "input": (
+                    _serialize_input(args, kwargs, sensitive_arg_indexes)
+                    if expose_payload else None
+                ),
+                "output": (
+                    None if raised is not None or not expose_payload else _payload_repr(output)
+                ),
                 "error": error_repr,
                 "duration_ms": duration_ms,
                 "timestamp": time.time(),
@@ -292,6 +453,22 @@ def probe(
                 trace["input_capture"] = capture_payload
                 trace["replayability"] = capture_replayability
                 trace["replay_reasons"] = capture_reasons
+            # Issue #290 Finding 5: optional deployment provenance
+            # (PROBE_ENVIRONMENT / PROBE_GIT_SHA). Omitted entirely when
+            # unset so pre-existing traces/payloads are unaffected; best-
+            # effort like replay capture above -- reading these env vars
+            # must never break the wrapped function or trace sending.
+            try:
+                env_value = ProbeConfig.environment()
+                git_sha_value = ProbeConfig.git_sha()
+            except Exception:  # noqa: BLE001 — must never break fn or trace sending
+                logger.debug("environment/git_sha env read failed", exc_info=True)
+                env_value = None
+                git_sha_value = None
+            if env_value is not None:
+                trace["environment"] = env_value
+            if git_sha_value is not None:
+                trace["git_sha"] = git_sha_value
 
             if spec is not None and raised is None:
                 # Output projection (the input phase was extracted pre-call).
@@ -307,6 +484,7 @@ def probe(
                 trace["entities"] = list(trace.get("entities", [])) + proj_entities
 
             try:
+                _ensure_atexit()
                 _client.send_trace(trace)
             except Exception:  # noqa: BLE001
                 logger.debug("send_trace failed", exc_info=True)
@@ -314,7 +492,7 @@ def probe(
             if run_shadow and raised is None:
                 cand = _get_candidate(component_id)
                 if cand is not None:
-                    current_output_repr = _safe_repr(output)
+                    current_output_repr = _payload_repr(output) if expose_payload else None
                     # shadow_current is projected here, in the caller's thread,
                     # so a caller mutating the returned object cannot race the
                     # shadow thread into a spurious current-vs-candidate diff.
@@ -325,6 +503,7 @@ def probe(
                     _spawn_shadow(
                         component_id, trace_id, cand, args_snap, kwargs_snap,
                         current_output_repr, shadow_ctx, spec, current_projection,
+                        payload_mode,
                     )
 
             if raised is not None:
@@ -342,10 +521,11 @@ def _spawn_shadow(
     candidate: Callable[..., Any],
     args: tuple,
     kwargs: dict,
-    current_output_repr: str,
+    current_output_repr: Optional[str],
     shadow_ctx: Optional[contextvars.Context] = None,
     spec: "Optional[_projection.ProjectionSpec]" = None,
     current_projection: Optional[Dict[str, Any]] = None,
+    payload_mode: str = "redacted",
 ) -> None:
     _ensure_atexit()
 
@@ -357,14 +537,23 @@ def _spawn_shadow(
             try:
                 c_output = candidate(*args, **kwargs)
             except BaseException as e:  # noqa: BLE001
-                c_error = f"{type(e).__name__}: {e}"
+                c_error = (
+                    # Issue #367: same rule as the main error path -- free-form
+                    # exception text gets the value-shaped credential layer.
+                    redact_text(f"{type(e).__name__}: {e}")
+                    if payload_mode == "full" else type(e).__name__
+                )
             c_duration = (time.perf_counter() - c_start) * 1000.0
 
             payload = {
                 "trace_id": trace_id,
                 "component_id": component_id,
                 "current_output": current_output_repr,
-                "candidate_output": None if c_error else _safe_repr(c_output),
+                "candidate_output": (
+                    None
+                    if c_error or payload_mode == "metadata"
+                    else _payload_repr(c_output)
+                ),
                 "candidate_error": c_error,
                 "candidate_duration_ms": c_duration,
                 "timestamp": time.time(),

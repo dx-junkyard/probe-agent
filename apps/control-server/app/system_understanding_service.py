@@ -25,6 +25,8 @@ from .system_state import UnderstandingStatus, evaluate_understanding
 
 logger = logging.getLogger(__name__)
 
+GAP_HISTORY_EMPTY_SENTINEL = "__no_open_gaps__"
+
 
 # Pipeline step names (from docs/system-understanding-navigation.md)
 PIPELINE_STEPS = [
@@ -94,6 +96,7 @@ class MetadataCoverage:
 class SystemUnderstandingSummary:
     system_id: int
     snapshot_id: Optional[int] = None
+    understanding_build_id: Optional[int] = None
     commit_sha: Optional[str] = None
     pipeline: List[PipelineStep] = field(default_factory=list)
     purpose: Optional[Dict[str, Any]] = None
@@ -121,6 +124,17 @@ class SystemUnderstandingSummary:
     # client-assembled `successSummary`). None while the pipeline is not
     # complete.
     success_summary: Optional[str] = None
+    # Issue #94/#275: manual system_profile purpose surfaced as a parallel
+    # provenance view next to `purpose` (the AI/source-derived view, whose
+    # existing semantics are unchanged). Manual view is snapshot-independent
+    # (included even without a ready snapshot); the AI view is included only
+    # when a ready snapshot exists. Each entry is a dict matching
+    # SystemUnderstandingPurposeViewOut's fields.
+    purpose_views: List[Dict[str, Any]] = field(default_factory=list)
+    # The latest human "confirmed" record reconciling the manual and AI
+    # purpose views (dict matching SystemUnderstandingPurposeConfirmationOut),
+    # or None if never confirmed.
+    purpose_confirmation: Optional[Dict[str, Any]] = None
 
 
 def _check_repository_configured(conn, system_id: int) -> PipelineStep:
@@ -310,34 +324,101 @@ def compute_pipeline_steps(conn, system_id: int, snapshot_row) -> List[PipelineS
 
 
 def _load_purpose(conn, system_id: int, snapshot_id: int) -> Optional[Dict[str, Any]]:
-    """Load system purpose from hierarchy or drafts."""
-    node = conn.execute(
-        "SELECT * FROM capability_hierarchy_nodes WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    if node:
-        return {
-            "name": node["name"],
-            "summary": node["summary"],
-            "provenance_kind": node["provenance_kind"],
-        }
-    draft = conn.execute(
-        "SELECT * FROM system_profile_drafts WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
-    if draft:
-        return {
-            "name": draft["name"],
-            "summary": draft["purpose"],
-            "provenance_kind": "structural",
-        }
-    return None
+    """Load system purpose from hierarchy or drafts.
+
+    Delegates to ``state_facts.load_ai_purpose_view`` (Issue #94/#275) and
+    drops its extra ``source`` key, so this function's public return shape
+    (``name`` / ``summary`` / ``provenance_kind``) stays exactly what it was
+    before that extraction -- a behavior-preserving refactor.
+    """
+    view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+    if view is None:
+        return None
+    return {
+        "name": view["name"],
+        "summary": view["summary"],
+        "provenance_kind": view["provenance_kind"],
+    }
+
+
+def _load_purpose_views(
+    conn, system_id: int, snapshot_id: Optional[int]
+) -> List[Dict[str, Any]]:
+    """Manual + AI purpose provenance views (Issue #94/#275).
+
+    Manual view first, snapshot-independent (included even when
+    ``snapshot_id`` is None): the human-entered ``system_profile.purpose``,
+    when non-empty. AI view second, only when ``snapshot_id`` is not None:
+    ``state_facts.load_ai_purpose_view``'s capability_hierarchy-node-or-draft
+    result for that snapshot, when present.
+    """
+    views: List[Dict[str, Any]] = []
+
+    profile = state_facts.get_system_profile_row(conn, system_id)
+    if profile is not None and (profile["purpose"] or "").strip():
+        name = (profile["name"] or "").strip() or "System Profile"
+        views.append({
+            "source": "system_profile",
+            "provenance_kind": "manual",
+            "name": name,
+            "summary": profile["purpose"],
+            "updated_at": profile["updated_at"],
+        })
+
+    if snapshot_id is not None:
+        ai_view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+        if ai_view is not None:
+            views.append({
+                "source": ai_view["source"],
+                "provenance_kind": ai_view["provenance_kind"],
+                "name": ai_view["name"],
+                "summary": ai_view["summary"],
+                "updated_at": None,
+            })
+
+    return views
+
+
+def _load_purpose_confirmation(
+    conn, system_id: int, current_ready_snapshot_id: Optional[int]
+) -> Optional[Dict[str, Any]]:
+    """The latest human purpose confirmation, with staleness computed against
+    the current profile/snapshot/AI-view state (Issue #94/#275)."""
+    row = state_facts.get_latest_purpose_confirmation(conn, system_id)
+    if row is None:
+        return None
+    stale_reason = state_facts.purpose_confirmation_staleness(
+        conn, system_id, current_ready_snapshot_id
+    )
+    return {
+        "id": row["id"],
+        "snapshot_id": row["snapshot_id"],
+        "understanding_build_id": row["understanding_build_id"],
+        "decided_by_user_id": row["decided_by_user_id"],
+        "decision_method": row["decision_method"],
+        "manual_purpose": row["manual_purpose"],
+        "ai_purpose_name": row["ai_purpose_name"],
+        "ai_purpose_summary": row["ai_purpose_summary"],
+        "ai_source": row["ai_source"],
+        "ai_provenance_kind": row["ai_provenance_kind"],
+        "note": row["note"],
+        "created_at": row["created_at"],
+        "stale": stale_reason is not None,
+        "stale_reason": stale_reason,
+    }
 
 
 def _load_capabilities(conn, system_id: int, snapshot_id: int) -> List[Dict[str, Any]]:
+    run = state_facts.get_latest_completed_capability_hierarchy_run(
+        conn, system_id, snapshot_id
+    )
+    if run is None:
+        return []
     rows = conn.execute(
-        "SELECT * FROM capability_hierarchy_nodes WHERE system_id = ? AND snapshot_id = ? AND node_type = 'capability' ORDER BY id",
-        (system_id, snapshot_id),
+        "SELECT * FROM capability_hierarchy_nodes "
+        "WHERE system_id = ? AND snapshot_id = ? AND intelligence_run_id = ? "
+        "AND node_type = 'capability' ORDER BY id",
+        (system_id, snapshot_id, run["id"]),
     ).fetchall()
     return [
         {"name": r["name"], "summary": r["summary"], "provenance_kind": r["provenance_kind"]}
@@ -705,6 +786,25 @@ def _attach_issue_drafts(conn, system_id: int, gaps: List[Dict[str, Any]]) -> No
         gap["issue_drafts"] = drafts_by_key.get(key, [])
 
 
+def _attach_gap_triage(
+    conn, system_id: int, snapshot_id: Optional[int], gaps: List[Dict[str, Any]]
+) -> None:
+    """Attach Issue #276's stable locator, fingerprint and effective state."""
+    from .gap_triage import annotate_gaps
+
+    annotate_gaps(conn, system_id, snapshot_id, gaps)
+
+
+def _open_gaps(gaps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return gaps still needing a human decision.
+
+    Summary, stage count, history/trend, and StateItem derivation consistently
+    use this definition. Acknowledged/dismissed/resolved gaps remain available
+    through the all-items worklist filter but no longer contribute noise.
+    """
+    return [g for g in gaps if g.get("triage_status", "open") == "open"]
+
+
 def _compute_gap_summary(gaps: List[Dict[str, Any]]) -> List[GapSummary]:
     counts: Dict[str, int] = {}
     for g in gaps:
@@ -894,7 +994,11 @@ def _load_gap_trend(conn, system_id: int) -> List[GapTrend]:
                WHERE system_id = ? AND build_id = ?""",
             (system_id, build_id),
         ).fetchall()
-        return {r["gap_type"]: r["count"] for r in rows}
+        return {
+            r["gap_type"]: r["count"]
+            for r in rows
+            if r["gap_type"] != GAP_HISTORY_EMPTY_SENTINEL
+        }
 
     current_counts = _counts_for(current_build_id)
     previous_counts = _counts_for(previous_build_id)
@@ -975,6 +1079,12 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             snapshot_id = snapshot_row["id"]
             summary.snapshot_id = snapshot_id
             summary.commit_sha = snapshot_row["commit_sha"]
+            completed_build = state_facts.get_latest_completed_understanding_build(
+                conn, system_id, snapshot_id
+            )
+            summary.understanding_build_id = (
+                completed_build["id"] if completed_build is not None else None
+            )
 
             summary.purpose = _load_purpose(conn, system_id, snapshot_id)
             summary.capabilities = _load_capabilities(conn, system_id, snapshot_id)
@@ -982,12 +1092,22 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             summary.major_symbols = _load_major_symbols(conn, system_id, snapshot_id)
             summary.metadata_coverage = _load_metadata_coverage(conn, system_id, snapshot_id)
             summary.gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
+            _attach_gap_triage(conn, system_id, snapshot_id, summary.gaps)
             _attach_issue_drafts(conn, system_id, summary.gaps)
-            summary.gap_summary = _compute_gap_summary(summary.gaps)
+            summary.gap_summary = _compute_gap_summary(_open_gaps(summary.gaps))
 
             purpose_defined = _purpose_defined_from_understanding_status(
                 evaluate_understanding(conn, system_id, snapshot_id, purpose=True)
             )
+
+        # Issue #94/#275: manual + AI purpose provenance views and the latest
+        # human confirmation. purpose_views is snapshot-independent for its
+        # manual entry, so this is computed regardless of whether a ready
+        # snapshot exists (summary.snapshot_id is None when it doesn't).
+        summary.purpose_views = _load_purpose_views(conn, system_id, summary.snapshot_id)
+        summary.purpose_confirmation = _load_purpose_confirmation(
+            conn, system_id, summary.snapshot_id
+        )
 
         # Issue #238/#239: these id lists used to also feed the deprecated
         # `_build_next_actions` ("Review probe plan" / "Generate / validate
@@ -1013,7 +1133,7 @@ def get_system_understanding(system_id: int) -> SystemUnderstandingSummary:
             pipeline,
             purpose_defined,
             summary.capabilities,
-            len(summary.gaps),
+            len(_open_gaps(summary.gaps)),
             summary.gap_summary,
             entrypoint_count,
             len(proposed_plan_ids),

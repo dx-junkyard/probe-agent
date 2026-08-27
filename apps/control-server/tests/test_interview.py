@@ -9,6 +9,7 @@ additive migration/backfill behavior. No LLM call or worktree write is
 exercised because this issue introduces none.
 """
 
+import json
 import time
 
 import pytest
@@ -30,7 +31,7 @@ def admin_client(tmp_path, monkeypatch):
 def _login(client, username="root", password="s3cret"):
     r = client.post("/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+    return r.cookies.get("probe_session")
 
 
 def _bearer(token):
@@ -153,6 +154,35 @@ def _confirm_and_reach_proposal_generation(client, session_id, headers):
         headers=headers,
     )
     assert r.status_code == 200, r.text
+
+
+def _set_structured_understanding_revision(
+    session_id, system_id, snapshot_id, understanding,
+):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE interview_session
+               SET current_understanding = ?, updated_at = ?
+               WHERE id = ? AND system_id = ?""",
+            (json.dumps(understanding), now, session_id, system_id),
+        )
+        cur = conn.execute(
+            """INSERT INTO understanding_revision
+                (session_id, system_id, snapshot_id, intelligence_run_id,
+                 current_understanding, gap_analysis, created_at)
+               VALUES (?, ?, ?, NULL, ?, NULL, ?)""",
+            (
+                session_id,
+                system_id,
+                snapshot_id,
+                json.dumps(understanding),
+                now,
+            ),
+        )
+        return cur.lastrowid
 
 
 def _valid_proposal_item():
@@ -545,6 +575,9 @@ def test_session_understanding_fields_initially_null(admin_client):
     assert data["gap_analysis"] is None
     assert data["open_questions"] is None
     assert data["user_intent"] is None
+    # Issue #229: a fresh (not yet confirmed) session is never blocked from
+    # rebuilding its understanding.
+    assert data["understanding_update_available"] is True
 
 
 def test_invalid_stage_rejected(admin_client):
@@ -732,7 +765,7 @@ def test_update_understanding_records_llm_config_failure(admin_client, monkeypat
     assert run is not None
     assert run["status"] == "failed"
     assert "ANTHROPIC_API_KEY" in run["error_details"]
-    assert run["prompt_version"] == "understanding-review-v3"
+    assert run["prompt_version"] == "understanding-review-v7"
     assert detail["messages"][-1]["intelligence_run_id"] == run["id"]
 
 
@@ -876,7 +909,7 @@ def test_update_understanding_records_run_and_reviewer_qa_rows(admin_client, mon
         ).fetchone()
     assert run is not None
     assert run["status"] == "completed"
-    assert run["prompt_version"] == "understanding-review-v3"
+    assert run["prompt_version"] == "understanding-review-v7"
     assert run["decision_method"] == "reasoning_llm"
 
     qa_listing = admin_client.get(
@@ -968,6 +1001,9 @@ def test_update_understanding_is_rejected_after_confirmation_without_revision(ad
         f"/interview/sessions/{session['id']}", headers=headers,
     ).json()
     assert [m["role"] for m in detail["messages"]] == ["user", "system"]
+    # Issue #229: the session serializer must mirror the API gate exactly so
+    # the Dashboard can disable the button without a second source of truth.
+    assert detail["understanding_update_available"] is False
 
     r = admin_client.post(
         f"/interview/sessions/{session['id']}/update-understanding",
@@ -999,12 +1035,527 @@ def test_update_understanding_is_rejected_after_confirmation_without_revision(ad
             "UPDATE interview_session SET answers_revised_at = ? WHERE id = ?",
             (time.time(), session["id"]),
         )
+    # The flag flips to available purely from the DB state, before the
+    # rebuild endpoint is ever called again.
+    reopened = admin_client.get(
+        f"/interview/sessions/{session['id']}", headers=headers,
+    ).json()
+    assert reopened["understanding_update_available"] is True
+
     allowed = admin_client.post(
         f"/interview/sessions/{session['id']}/update-understanding",
         headers=headers,
     )
     assert allowed.status_code == 200, allowed.text
     assert allowed.json()["last_error"] != ""
+
+
+# --- Issue #263: Q&A panel answers reach the review + widened rebuild gate --
+
+
+def test_update_understanding_opens_gate_on_first_time_answer_after_confirmation(
+    admin_client, monkeypatch,
+):
+    """A first-time answer (open -> answered) given after confirmation must
+    open the rebuild gate, even though `answers_revised_at` is only ever set
+    by the *correction* path (Issue #263)."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "first answer after confirm"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    # The question already existed (e.g. from an earlier review pass) before
+    # confirmation -- only its *answer* is new.
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "対象コンポーネントは何ですか?",
+            "question_category": "purpose",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+
+    time.sleep(0.01)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    still_blocked = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert still_blocked.status_code == 409, still_blocked.text
+    blocked_detail = admin_client.get(
+        f"/interview/sessions/{sid}", headers=headers,
+    ).json()
+    assert blocked_detail["understanding_update_available"] is False
+
+    time.sleep(0.01)
+    answer = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "APIサーバーです", "actor": "root"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["qa"]["status"] == "answered"
+    # Confirms this really is the first-answer branch, not a correction.
+    assert answer.json()["previous"] is None
+
+    # The session flag opens as soon as the Q&A answer lands — a first-time
+    # answer never touches `answers_revised_at`, so this proves the flag
+    # tracks the same widened Issue #263 condition as the API gate rather
+    # than re-deriving the pre-#263 `answers_revised_at`-only check.
+    reopened_detail = admin_client.get(
+        f"/interview/sessions/{sid}", headers=headers,
+    ).json()
+    assert reopened_detail["understanding_update_available"] is True
+
+    allowed = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert allowed.status_code == 200, allowed.text
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT answers_revised_at FROM interview_session WHERE id = ?", (sid,),
+        ).fetchone()
+    assert row["answers_revised_at"] is None  # this branch never sets it
+
+
+def test_update_understanding_opens_gate_on_answer_revision(admin_client, monkeypatch):
+    """Correcting an already-answered question after confirmation opens the
+    gate via the existing `answers_revised_at` path, driven end-to-end
+    through the real answer/correction routes rather than a direct DB poke."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "revision after confirm"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "対象コンポーネントは何ですか?",
+            "question_category": "purpose",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+    admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "APIサーバーです", "actor": "root"},
+        headers=headers,
+    )
+
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    still_blocked = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert still_blocked.status_code == 409, still_blocked.text
+
+    correction = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "バッチジョブサーバーです", "actor": "root"},
+        headers=headers,
+    )
+    assert correction.status_code == 200, correction.text
+    assert correction.json()["previous"] is not None
+
+    allowed = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert allowed.status_code == 200, allowed.text
+
+
+def test_update_understanding_opens_gate_on_runtime_check_answer_after_confirmation(
+    admin_client, monkeypatch,
+):
+    """A Runtime Reality Check question (question_source='runtime') answered
+    after confirmation must open the gate the same way a reviewer question
+    does (Issue #263)."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "runtime check after confirm"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "実行時にこの関数は本当に呼ばれていますか?",
+            "question_category": "general",
+            "question_source": "runtime",
+        },
+        headers=headers,
+    ).json()
+
+    time.sleep(0.01)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    still_blocked = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert still_blocked.status_code == 409, still_blocked.text
+
+    time.sleep(0.01)
+    answer = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "はい、1日あたり数百回呼ばれています", "actor": "root"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+
+    allowed = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert allowed.status_code == 200, allowed.text
+
+
+def test_update_understanding_stays_blocked_with_no_new_qa_activity(
+    admin_client, monkeypatch,
+):
+    """Confirmed with no answer/correction/new question at all: the gate
+    must stay closed exactly as before (Issue #263 must not loosen this
+    case)."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "no new info"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    # A question exists but is answered BEFORE confirmation -- ordinary,
+    # already-incorporated input, not "new info" relative to confirmation.
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "対象コンポーネントは何ですか?",
+            "question_category": "purpose",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+    admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "APIサーバーです", "actor": "root"},
+        headers=headers,
+    )
+
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert r.status_code == 409, r.text
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        runs = conn.execute(
+            """SELECT COUNT(*) AS n FROM intelligence_runs
+               WHERE system_id = ? AND run_type = 'understanding_review'""",
+            (system_id,),
+        ).fetchone()["n"]
+    assert runs == 0
+
+
+# --- Review-finding fix: last-successful-rebuild watermark ------------------
+
+
+def test_update_understanding_gate_closes_after_successful_rebuild(admin_client, monkeypatch):
+    """A new Q&A answer given after confirmation opens the rebuild gate
+    (Issue #263). Once a rebuild actually SUCCEEDS and consumes that answer,
+    the gate must close again -- without this fix, the interview_qa
+    condition kept comparing against the original confirmation timestamp
+    forever, so the same already-consumed row kept the gate open even after
+    a successful rebuild."""
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "o3-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    token, system_id, snapshot_id = _setup(admin_client)
+    _insert_understanding_graph(system_id, snapshot_id)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "gate closes after rebuild"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "対象コンポーネントは何ですか?",
+            "question_category": "purpose",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+
+    time.sleep(0.01)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    # Answering schedules the Issue #288 automatic refresh, which runs the
+    # SAME `_rebuild_understanding` this test is about. Left on a background
+    # thread it races the `create_llm_client` monkeypatch below: if the patch
+    # lands mid-flight the BACKGROUND rebuild succeeds, advances
+    # `understanding_rebuilt_at`, and closes the gate before this test issues
+    # its own rebuild -- so the assertion would depend on thread timing
+    # instead of on the behaviour under test (a successful MANUAL rebuild
+    # closes the gate). Waiting for the job is not an option either: with a
+    # real reasoning client configured it attempts a network call of
+    # unbounded duration.
+    #
+    # Make it deterministic instead: run the refresh inline (eager), with a
+    # client that fails immediately. The refresh then behaves exactly as the
+    # gate contract expects a FAILED rebuild to behave -- the answer is still
+    # persisted (Issue #288) and the gate stays open -- with no thread and no
+    # network involved.
+    from app.llm import LLMError
+    import app.routes.interview as interview_route
+
+    monkeypatch.setenv("PROBE_REFRESH_EAGER", "1")
+
+    def _failing_client(config):
+        raise LLMError("reasoning model unavailable in this test")
+
+    monkeypatch.setattr(interview_route, "create_llm_client", _failing_client)
+
+    time.sleep(0.01)
+    answer = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "APIサーバーです", "actor": "root"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+
+    opened = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert opened["understanding_update_available"] is True
+
+    class FakeReviewClient:
+        def generate_text(self, messages, *, temperature=None, max_tokens=None):
+            import json as _json
+
+            return _json.dumps({
+                "system_purpose": [{
+                    "name": "Probe repository inspection",
+                    "summary": "Inspects probe agent repositories",
+                    "confidence": {"level": "likely", "reason": "README evidence"},
+                    "evidence": [{
+                        "path": "README.md",
+                        "start_line": 1,
+                        "end_line": 5,
+                        "summary": "README states purpose",
+                    }],
+                    "why_core": "",
+                    "related_docs": ["README.md"],
+                    "related_apis": [],
+                    "children": [],
+                }],
+                "core_capabilities": [],
+                "capability_elements": [],
+                "supporting_elements": [],
+                "api_boundaries": [],
+                "probe_flow_candidates": [],
+                "gap_analysis": [],
+                "open_questions": [],
+                "suggested_next_action": "confirm_purpose",
+            })
+
+    import app.routes.interview as interview_route
+
+    monkeypatch.setattr(interview_route, "create_llm_client", lambda config: FakeReviewClient())
+
+    rebuild = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert rebuild.status_code == 200, rebuild.text
+    assert rebuild.json()["last_error"] is None
+
+    # The successful rebuild consumed the new answer -- the gate must close
+    # again with no further developer input.
+    closed = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert closed["understanding_update_available"] is False
+
+    blocked_again = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert blocked_again.status_code == 409, blocked_again.text
+    assert blocked_again.json()["detail"]["code"] == "understanding_update_not_available"
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT understanding_rebuilt_at FROM interview_session WHERE id = ?",
+            (sid,),
+        ).fetchone()
+    assert row["understanding_rebuilt_at"] is not None
+
+
+def test_update_understanding_failed_rebuild_leaves_gate_open(admin_client, monkeypatch):
+    """A FAILED rebuild (missing graph) must not advance the watermark: the
+    same new Q&A answer that opened the gate must keep it open until a
+    rebuild actually succeeds."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "mock")
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    # No _insert_understanding_graph call -- update-understanding hits the
+    # graph_not_built failure path below.
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "failed rebuild keeps gate open"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "対象コンポーネントは何ですか?",
+            "question_category": "purpose",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+
+    time.sleep(0.01)
+    _confirm_and_reach_proposal_generation(admin_client, sid, headers)
+
+    time.sleep(0.01)
+    answer = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "APIサーバーです", "actor": "root"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+
+    opened = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert opened["understanding_update_available"] is True
+
+    failed = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["last_error"]
+    assert "理解グラフが未構築" in failed.json()["last_error"]
+
+    # The failure must not have closed the gate.
+    still_open = admin_client.get(f"/interview/sessions/{sid}", headers=headers).json()
+    assert still_open["understanding_update_available"] is True
+
+    retried = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert retried.status_code == 200, retried.text
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT understanding_rebuilt_at FROM interview_session WHERE id = ?",
+            (sid,),
+        ).fetchone()
+    assert row["understanding_rebuilt_at"] is None
+
+
+def test_update_understanding_injects_qa_panel_only_answer(admin_client, monkeypatch):
+    """An answer given ONLY through the Q&A panel (no interview_message row
+    is ever created for it) must still reach the review prompt (Issue
+    #263)."""
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "o3-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    token, system_id, snapshot_id = _setup(admin_client)
+    _insert_understanding_graph(system_id, snapshot_id)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "qa panel only"},
+        headers=headers,
+    ).json()
+    sid = session["id"]
+
+    qa = admin_client.post(
+        f"/interview/sessions/{sid}/qa",
+        json={
+            "question_text": "このコンポーネントのオーナーは誰ですか?",
+            "question_category": "general",
+            "question_source": "reviewer",
+        },
+        headers=headers,
+    ).json()
+    answer = admin_client.post(
+        f"/interview/sessions/{sid}/qa/{qa['id']}/answer",
+        json={"answer_text": "プラットフォームチームです", "actor": "root"},
+        headers=headers,
+    )
+    assert answer.status_code == 200, answer.text
+
+    # No interview_message was ever posted for this session.
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        message_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM interview_message WHERE session_id = ?",
+            (sid,),
+        ).fetchone()["n"]
+    assert message_count == 0
+
+    captured = {}
+
+    class CapturingReviewClient:
+        def generate_text(self, messages, *, temperature=None, max_tokens=None):
+            import json
+
+            captured["messages"] = messages
+            return json.dumps({
+                "system_purpose": [],
+                "core_capabilities": [],
+                "capability_elements": [],
+                "supporting_elements": [],
+                "api_boundaries": [],
+                "probe_flow_candidates": [],
+                "gap_analysis": [],
+                "open_questions": [],
+                "suggested_next_action": "confirm_purpose",
+            })
+
+    import app.routes.interview as interview_route
+
+    monkeypatch.setattr(interview_route, "create_llm_client", lambda config: CapturingReviewClient())
+
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/update-understanding", headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["last_error"] is None
+
+    user_prompt = captured["messages"][1]["content"]
+    assert "このコンポーネントのオーナーは誰ですか?" in user_prompt
+    assert "プラットフォームチームです" in user_prompt
 
 
 def test_review_history_excludes_confirmation_control_events():
@@ -1191,6 +1742,246 @@ def test_confirm_understanding_requires_context(admin_client):
         headers=headers,
     )
     assert r.status_code == 422
+
+
+def test_structured_confirmation_is_revision_scoped_and_supports_explicit_rename(
+    admin_client,
+):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "canonical graph"},
+        headers=headers,
+    ).json()
+    session_id = session["id"]
+    first_understanding = {
+        "core_capabilities": [
+            {"name": "Core A", "summary": "A", "children": ["Shared"]},
+            {"name": "Core B", "summary": "B", "children": ["Shared"]},
+        ],
+        "capability_elements": [
+            {"name": "Shared", "summary": "shared", "children": []},
+        ],
+        "supporting_elements": [],
+        "api_boundaries": [],
+    }
+    first_revision_id = _set_structured_understanding_revision(
+        session_id, system_id, snapshot_id, first_understanding
+    )
+
+    confirmed = admin_client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={"actor": "root"},
+        headers=headers,
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["capability_graph_confirmed_revision_id"] == first_revision_id
+    assert confirmed.json()["capability_graph_confirmation_required"] is False
+    first_graph_response = admin_client.get(
+        f"/interview/sessions/{session_id}/capability-graph",
+        headers=headers,
+    )
+    assert first_graph_response.status_code == 200, first_graph_response.text
+    first_graph = first_graph_response.json()
+    assert len(first_graph["relations"]) == 2
+    old_a = next(node for node in first_graph["nodes"] if node["name"] == "Core A")
+    system_b = _create_system(admin_client, token, "Capability Graph Isolation")
+    foreign_graph = admin_client.get(
+        f"/interview/sessions/{session_id}/capability-graph",
+        headers=_headers(token, system_b["id"]),
+    )
+    assert foreign_graph.status_code == 404
+
+    # Same revision is idempotent and keeps the original human actor.
+    repeated = admin_client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={"actor": "someone-else"},
+        headers=headers,
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert admin_client.get(
+        f"/interview/sessions/{session_id}/capability-graph",
+        headers=headers,
+    ).json()["decided_by"] == "root"
+    conflicting_retry = admin_client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={"actor": "root", "capability_relations": []},
+        headers=headers,
+    )
+    assert conflicting_retry.status_code == 422
+    assert "different identity/relation request" in conflicting_retry.text
+
+    second_understanding = {
+        **first_understanding,
+        "core_capabilities": [
+            {"name": "Renamed Core A", "summary": "A", "children": ["Shared"]},
+            {"name": "Core B", "summary": "B", "children": ["Shared"]},
+        ],
+    }
+    second_revision_id = _set_structured_understanding_revision(
+        session_id, system_id, snapshot_id, second_understanding
+    )
+    before_reconfirm = admin_client.get(
+        f"/interview/sessions/{session_id}", headers=headers
+    ).json()
+    assert before_reconfirm["capability_graph_confirmation_required"] is True
+
+    stale_base = admin_client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={
+            "actor": "root",
+            "capability_base_confirmation_id": first_graph["confirmation_id"] + 999,
+        },
+        headers=headers,
+    )
+    assert stale_base.status_code == 409
+    assert "canonical Capability head changed" in stale_base.text
+
+    reconfirmed = admin_client.post(
+        f"/interview/sessions/{session_id}/confirm-understanding",
+        json={
+            "actor": "root",
+            "capability_base_confirmation_id": first_graph["confirmation_id"],
+            "capability_identity_bindings": [
+                {
+                    "entity_kind": "core_capability",
+                    "current_name": "Renamed Core A",
+                    "entity_id": old_a["entity_id"],
+                }
+            ],
+        },
+        headers=headers,
+    )
+    assert reconfirmed.status_code == 200, reconfirmed.text
+    assert (
+        reconfirmed.json()["capability_graph_confirmed_revision_id"]
+        == second_revision_id
+    )
+    assert reconfirmed.json()["capability_graph_confirmation_required"] is False
+    second_graph = admin_client.get(
+        f"/interview/sessions/{session_id}/capability-graph",
+        headers=headers,
+    ).json()
+    renamed_a = next(
+        node for node in second_graph["nodes"] if node["name"] == "Renamed Core A"
+    )
+    assert renamed_a["entity_id"] == old_a["entity_id"]
+    assert {relation["relation_id"] for relation in second_graph["relations"]} == {
+        relation["relation_id"] for relation in first_graph["relations"]
+    }
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        confirmations = conn.execute(
+            """SELECT source_revision_id, decided_by, decided_by_user_id
+               FROM understanding_capability_confirmation
+               WHERE system_id = ? AND session_id = ?
+               ORDER BY id""",
+            (system_id, session_id),
+        ).fetchall()
+    assert [row["source_revision_id"] for row in confirmations] == [
+        first_revision_id,
+        second_revision_id,
+    ]
+    assert [row["decided_by"] for row in confirmations] == ["root", "root"]
+    assert all(row["decided_by_user_id"] is not None for row in confirmations)
+
+
+def test_confirm_understanding_rejects_sdk_token_as_manual_actor(admin_client):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "manual-only"},
+        headers=headers,
+    ).json()
+    _set_structured_understanding_revision(
+        session["id"],
+        system_id,
+        snapshot_id,
+        {
+            "core_capabilities": [],
+            "capability_elements": [],
+            "supporting_elements": [],
+            "api_boundaries": [],
+        },
+    )
+    sdk_response = admin_client.post(
+        "/tokens",
+        json={"name": "sdk", "system_id": system_id},
+        headers=_bearer(token),
+    )
+    assert sdk_response.status_code == 201, sdk_response.text
+    sdk_token = sdk_response.json()["token"]
+
+    response = admin_client.post(
+        f"/interview/sessions/{session['id']}/confirm-understanding",
+        json={"actor": "spoofed-human"},
+        headers={"X-Api-Key": sdk_token},
+    )
+    assert response.status_code == 403
+    assert "SDK API tokens cannot access management APIs" in response.text
+
+
+def test_confirm_understanding_rolls_back_graph_when_audit_message_fails(
+    admin_client, monkeypatch,
+):
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    session = admin_client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "atomic-confirm"},
+        headers=headers,
+    ).json()
+    revision_id = _set_structured_understanding_revision(
+        session["id"],
+        system_id,
+        snapshot_id,
+        {
+            "core_capabilities": [
+                {"name": "Core A", "summary": "A", "children": []},
+            ],
+            "capability_elements": [],
+            "supporting_elements": [],
+            "api_boundaries": [],
+        },
+    )
+
+    def fail_message(*_args, **_kwargs):
+        raise RuntimeError("forced audit message failure")
+
+    monkeypatch.setattr("app.routes.interview.interview_message", fail_message)
+    with pytest.raises(RuntimeError, match="forced audit message failure"):
+        admin_client.post(
+            f"/interview/sessions/{session['id']}/confirm-understanding",
+            json={"actor": "root"},
+            headers=headers,
+        )
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        stored_session = conn.execute(
+            """SELECT understanding_confirmed_at
+               FROM interview_session WHERE id = ?""",
+            (session["id"],),
+        ).fetchone()
+        confirmation_count = conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM understanding_capability_confirmation
+               WHERE source_revision_id = ?""",
+            (revision_id,),
+        ).fetchone()["n"]
+        entity_count = conn.execute(
+            """SELECT COUNT(*) AS n FROM understanding_capability_entity
+               WHERE system_id = ?""",
+            (system_id,),
+        ).fetchone()["n"]
+    assert stored_session["understanding_confirmed_at"] is None
+    assert confirmation_count == 0
+    assert entity_count == 0
 
 
 def test_confirm_understanding_unlocks_zero_base_proposals(admin_client, monkeypatch):

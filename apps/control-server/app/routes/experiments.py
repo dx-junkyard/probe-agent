@@ -7,10 +7,11 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
+from .. import flow_orchestration
 from ..auth import get_system_id
 from ..db import get_conn
 from ..experiment_runner import comparison_payload, execute_variant, patch_hash
@@ -25,10 +26,113 @@ from ..models import (
     ExperimentVariantResultOut,
 )
 from ..validation_runner import load_validation_config_text
+from .execution_modes import gate_execution_target, record_attested_execution_observation
+from .snapshot_preflight import require_snapshot_preflight
 
 router = APIRouter()
 PROMPT_VERSION = "experiment-interpretation-v1"
 SCHEMA_VERSION = "experiment-analysis-v1"
+
+
+def _materialize_improvement_publish_artifact(
+    conn, experiment, variant, *, now: float
+) -> int:
+    """Persist the exact adopted-variant -> publish-artifact lineage.
+
+    The GitHub publisher already has a hardened, approval-gated transport for
+    unified diffs (``probe_patches``).  An improvement artifact deliberately
+    reuses that transport, but its semantic identity lives in
+    ``improvement_publish_artifacts`` so an instrumentation patch can never be
+    mistaken for an adopted improvement.
+    """
+    existing = conn.execute(
+        """SELECT id FROM improvement_publish_artifacts
+            WHERE experiment_id = ? AND variant_id = ?""",
+        (experiment["id"], variant["id"]),
+    ).fetchone()
+    if existing is not None:
+        return existing["id"]
+
+    # The selected non-baseline variant and the baseline must both have
+    # completed successfully; this is the experiment's validation gate.
+    baseline = conn.execute(
+        """SELECT id FROM experiment_variants
+            WHERE experiment_id = ? AND is_baseline = 1 AND status = 'completed'
+            ORDER BY id LIMIT 1""",
+        (experiment["id"],),
+    ).fetchone()
+    if baseline is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Adoption requires a completed baseline before a publish artifact can be created",
+        )
+
+    run_id = conn.execute(
+        """INSERT INTO intelligence_runs
+               (system_id, snapshot_id, run_type, provider, model,
+                prompt_version, schema_version, decision_method, status,
+                is_mock, started_at, completed_at)
+           VALUES (?, ?, 'probe_plan', 'deterministic', 'experiment-adoption',
+                   'experiment-adoption-v1', 'improvement-publish-artifact-v1',
+                   'deterministic', 'completed', 0, ?, ?)""",
+        (experiment["system_id"], experiment["snapshot_id"], now, now),
+    ).lastrowid
+    plan_id = conn.execute(
+        """INSERT INTO probe_plans
+               (system_id, snapshot_id, intelligence_run_id, feature_id,
+                objective, status, origin, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'approved', 'experiment_adoption', ?, ?)""",
+        (
+            experiment["system_id"],
+            experiment["snapshot_id"],
+            run_id,
+            experiment["feature_id"],
+            experiment["objective"],
+            now,
+            now,
+        ),
+    ).lastrowid
+    patch_id = conn.execute(
+        """INSERT INTO probe_patches
+               (plan_id, system_id, snapshot_id, commit_sha, diff, status,
+                cleanup_state, created_at)
+           VALUES (?, ?, ?, ?, ?, 'generated', 'not_attempted', ?)""",
+        (
+            plan_id,
+            experiment["system_id"],
+            experiment["snapshot_id"],
+            experiment["baseline_commit"],
+            variant["patch_text"],
+            now,
+        ),
+    ).lastrowid
+
+    # The publisher re-checks these immediately before approval.  They are a
+    # structural projection of the already completed Experiment, not a second
+    # evaluation or an inferred success.
+    for validation_variant in ("baseline", "probed"):
+        conn.execute(
+            """INSERT INTO validation_runs
+                   (patch_id, system_id, variant, worktree_path,
+                    overall_success, trace_status, network_isolation,
+                    cleanup_state, created_at)
+               VALUES (?, ?, ?, '', 1, 'not_checked', 'not_requested',
+                       'not_attempted', ?)""",
+            (patch_id, experiment["system_id"], validation_variant, now),
+        )
+
+    return conn.execute(
+        """INSERT INTO improvement_publish_artifacts
+               (system_id, experiment_id, variant_id, patch_id, status, created_at)
+           VALUES (?, ?, ?, ?, 'ready', ?)""",
+        (
+            experiment["system_id"],
+            experiment["id"],
+            variant["id"],
+            patch_id,
+            now,
+        ),
+    ).lastrowid
 
 
 def _json_object(text: str) -> Dict[str, Any]:
@@ -162,6 +266,16 @@ def create_experiment(
     system_id: int = Depends(get_system_id),
 ) -> ExperimentOut:
     now = time.time()
+
+    # Issue #369: the shared preflight decides freshness, and a snapshot that
+    # is definitively behind HEAD may only be used with the developer's stated
+    # reason. Evaluated BEFORE the write connection is opened: `gather_preflight`
+    # runs `git` subprocesses, and the SQLite lock is process-wide and
+    # non-reentrant (see .claude/skills/control-server/SKILL.md).
+    freshness, head_sha, stale_reason = require_snapshot_preflight(
+        system_id, payload.snapshot_id, payload.stale_snapshot_reason
+    )
+
     with get_conn() as conn:
         snapshot = conn.execute(
             """
@@ -229,8 +343,9 @@ def create_experiment(
             """
             INSERT INTO experiments
                 (system_id, feature_id, objective, snapshot_id, baseline_commit,
-                 config_revision, execution_config, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+                 config_revision, execution_config, status, created_at,
+                 snapshot_freshness, head_sha_at_creation, stale_ack_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -241,6 +356,9 @@ def create_experiment(
                 config_revision,
                 json.dumps(execution_config),
                 now,
+                freshness,
+                head_sha,
+                stale_reason,
             ),
         )
         experiment_id = cur.lastrowid
@@ -460,13 +578,55 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
 @router.post("/experiments/{experiment_id}/run", response_model=ExperimentOut)
 def run_experiment(
     experiment_id: int,
+    flow_experiment_proposal_id: Optional[int] = Query(default=None),
     system_id: int = Depends(get_system_id),
+    response: Response = None,
 ) -> ExperimentOut:
     now = time.time()
     with get_conn() as conn:
         row = _get_experiment_or_404(conn, experiment_id, system_id)
         if row["status"] == "running":
             raise HTTPException(status_code=409, detail="Experiment is already running")
+        if row["flow_experiment_proposal_id"] is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "experiment_execution_immutable",
+                    "message": (
+                        "A governed Experiment execution is immutable; create a new "
+                        "Experiment for another attempt."
+                    ),
+                },
+            )
+        candidate_refs = tuple(
+            f"patch_sha256:{variant['patch_hash']}"
+            for variant in conn.execute(
+                "SELECT patch_hash FROM experiment_variants "
+                "WHERE experiment_id = ? AND is_baseline = 0 ORDER BY id",
+                (experiment_id,),
+            ).fetchall()
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        # Execution-mode gate (#412 §4.3). An Experiment runs candidate source
+        # variants in isolated worktrees, so it is `candidate_execution`. The
+        # subject is the Experiment's `feature_id`, mapped to an Evolution Node
+        # by `evolution_node_link(link_kind='feature')`. A Feature no Node links
+        # is `unmapped` and runs exactly as before -- migrating existing
+        # Features onto Nodes is an explicit Epic non-goal. The gate sits before
+        # the status/variant reset below so a refusal leaves the Experiment
+        # untouched rather than half-reset.
+        execution_gate = gate_execution_target(
+            conn,
+            system_id=system_id,
+            capability="candidate_execution",
+            target_kind="feature",
+            target_ref=row["feature_id"],
+            response=response,
+            flow_experiment_proposal_id=flow_experiment_proposal_id,
+            candidate_refs=candidate_refs,
+            candidate_required=True,
+            snapshot_id=row["snapshot_id"],
+        )
         snapshot = conn.execute(
             """
             SELECT * FROM repository_snapshots
@@ -481,10 +641,35 @@ def run_experiment(
         conn.execute(
             """
             UPDATE experiments
-            SET status = 'running', error = NULL, started_at = ?, completed_at = NULL
+            SET status = 'running', error = NULL, started_at = ?, completed_at = NULL,
+                flow_experiment_proposal_id = ?,
+                flow_experiment_candidate_refs_json = ?
             WHERE id = ?
             """,
-            (now, experiment_id),
+            (
+                now,
+                flow_experiment_proposal_id,
+                json.dumps(candidate_refs, ensure_ascii=False),
+                experiment_id,
+            ),
+        )
+        if flow_experiment_proposal_id is not None:
+            flow_orchestration.record_execution(
+                conn,
+                system_id=system_id,
+                proposal_id=flow_experiment_proposal_id,
+                execution_kind="experiment",
+                execution_ref=str(experiment_id),
+                actor="execution-gate",
+                actor_kind="system",
+                note="Recorded at the governed Experiment execution boundary.",
+                now=now,
+            )
+        record_attested_execution_observation(
+            conn,
+            gate=execution_gate,
+            execution_kind="experiment",
+            execution_ref=str(experiment_id),
         )
         conn.execute(
             "DELETE FROM experiment_commands WHERE variant_id IN "
@@ -519,6 +704,7 @@ def run_experiment(
         execution_config = json.loads(row["execution_config"])
         repo_path = snapshot["repo_path"]
         commit_sha = row["baseline_commit"]
+        conn.execute("COMMIT")
 
     workspace_root = os.getenv("PROBE_EXPERIMENT_WORKSPACE_BASE", "/tmp/probe-experiments")
     os.makedirs(workspace_root, exist_ok=True)
@@ -632,7 +818,7 @@ def update_experiment_decision(
                 )
             variant = conn.execute(
                 """
-                SELECT variant_key, is_baseline, status
+                SELECT *
                 FROM experiment_variants
                 WHERE experiment_id = ? AND variant_key = ?
                 """,
@@ -648,6 +834,9 @@ def update_experiment_decision(
                     detail="Adopted variant must be a completed non-baseline variant",
                 )
             decision_variant_key = payload.variant_key
+            _materialize_improvement_publish_artifact(
+                conn, experiment, variant, now=time.time()
+            )
         conn.execute(
             """
             UPDATE experiments

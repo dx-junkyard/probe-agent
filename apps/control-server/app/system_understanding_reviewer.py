@@ -33,16 +33,39 @@ from .interview_language import (
     interview_message,
     language_directive,
 )
-from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
+from .llm import (
+    LLMClient,
+    LLMConfig,
+    LLMError,
+    LLMResourceLimitError,
+    MockLLMClient,
+    is_reasoning_model,
+)
 from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 
 # v2: configurable output language for questions/summaries (Issue #127).
-PROMPT_VERSION = "understanding-review-v3"
-SCHEMA_VERSION = "understanding-review-v1"
+# v4: injects answered_qa / unconfirmed_qa from the Q&A panel, same as the
+# interview-turn prompt (Issue #263).
+# v5: injects terminal Alignment Review decisions so a developer's rejection
+# or correction becomes input to the next Understanding rebuild instead of
+# merely preventing carry-over in the Review Queue.
+# v6 / schema v2: adds the `vision` section (Issue #352). Vision — 「誰の状態
+# を、どのように変えたいか」 — is a distinct claim from System Purpose (「その
+# Vision に対してこのシステムが担う役割」) and must never be produced by
+# folding the two together; the Understanding Brief shows them separately and
+# labels their provenance separately.
+PROMPT_VERSION = "understanding-review-v7"
+SCHEMA_VERSION = "understanding-review-v2"
 DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
 DEFAULT_REVIEW_MAX_NODES_PER_TYPE = 5
 DEFAULT_REVIEW_MAX_PROMPT_CHARS = 30_000
 DEFAULT_REVIEW_MAX_EVIDENCE_PER_NODE = 2
+# Same budget interview_agent.py uses for Q&A JSON-trim (GAP_AND_QUESTION_MAX_CHARS).
+QA_PROMPT_MAX_CHARS = 4_000
+ALIGNMENT_FEEDBACK_PROMPT_MAX_CHARS = 6_000
+#: Issue #352: the Understanding Brief shows exactly one Vision statement, so
+#: extra items a model returns are dropped rather than silently concatenated.
+_MAX_VISION_ITEMS = 1
 
 
 CONFIDENCE_LEVELS = {"confirmed", "likely", "uncertain", "conflicting"}
@@ -118,6 +141,10 @@ class _OpenQuestion(BaseModel):
 class _RawReviewResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Issue #352: at most one Vision claim. The list shape matches every other
+    # section so the Brief, the revision diff, and the Dashboard treat it with
+    # the same code path; `_MAX_VISION_ITEMS` trims a model that returns more.
+    vision: List[_UnderstandingItem] = Field(default_factory=list)
     system_purpose: List[_UnderstandingItem] = Field(default_factory=list)
     core_capabilities: List[_UnderstandingItem] = Field(default_factory=list)
     capability_elements: List[_UnderstandingItem] = Field(default_factory=list)
@@ -162,7 +189,8 @@ Respond with a single JSON object and nothing else (no markdown fences),
 matching exactly this shape:
 
 {
-  "system_purpose": [{"name": "...", "summary": "...", "confidence": {"level": "confirmed|likely|uncertain|conflicting", "reason": "..."}, "evidence": [{"path": "...", "start_line": 0, "end_line": 0, "summary": "..."}], "why_core": "", "related_docs": [], "related_apis": [], "children": []}],
+  "vision": [{"name": "...", "summary": "...", "confidence": {"level": "confirmed|likely|uncertain|conflicting", "reason": "..."}, "evidence": [{"path": "...", "start_line": 0, "end_line": 0, "summary": "..."}], "why_core": "", "related_docs": [], "related_apis": [], "children": []}],
+  "system_purpose": [...same shape...],
   "core_capabilities": [...same shape...],
   "capability_elements": [...same shape...],
   "supporting_elements": [...same shape...],
@@ -174,7 +202,20 @@ matching exactly this shape:
 }
 
 Rules:
+- vision and system_purpose are DIFFERENT claims and must never be merged:
+  - vision = whose situation this system intends to change, and how (the
+    people/stakeholders served, the outcome or value intended, and how success
+    would be recognised when the input states one).
+  - system_purpose = the role THIS system takes on in realising that vision.
+  Return at most one vision item. Base it only on the provided documentation
+  and code evidence; when the input does not state who is served or what
+  outcome is intended, return an empty vision list rather than inferring one
+  from the code's mechanics — an absent vision is a fact the developer is
+  asked to supply, and a fabricated one is not.
 - Keep confirmed, likely, uncertain, and conflicting claims separate using the confidence level.
+- Explicit Human Alignment Review Feedback is authoritative. When it
+  conflicts with generated graph hypotheses, the newest listed human
+  decision wins; never restore a rejected interpretation as confirmed.
 - Preserve evidence and provenance for all major understanding items.
 - Order open questions from top-level purpose toward API/probe flow details.
 - Do NOT generate metadata or probe proposals — this is understanding only.
@@ -230,6 +271,14 @@ def _trim(text: str, max_chars: int) -> str:
     return text[: max(0, max_chars - 3)].rstrip() + "..."
 
 
+def _trim_json(value: Any, max_chars: int) -> str:
+    """Same JSON-trim style as interview_agent._trim_json (Issue #263)."""
+    text = json.dumps(value, ensure_ascii=False)
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 30)] + "…[truncated to budget]"
+
+
 def _review_node_score(node: GraphNode) -> tuple:
     return (
         1 if not node.is_weak else 0,
@@ -275,9 +324,30 @@ def _build_review_prompt(
     graph: UnderstandingGraph,
     reconciliation: ReconciliationResult,
     history: Optional[List[Dict[str, str]]] = None,
+    answered_qa: Optional[List[Dict[str, Any]]] = None,
+    unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
+    alignment_feedback: Optional[List[Dict[str, Any]]] = None,
+    verified_evidence: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build the review prompt from graph + code facts."""
     parts: List[str] = []
+
+    # Human Alignment decisions have higher authority than generated graph
+    # hypotheses, so put them first.  The final prompt budget truncates from
+    # the tail; this ordering keeps an explicit rejection/correction from
+    # being dropped merely because the graph is large.
+    if alignment_feedback:
+        parts.append(
+            "## Human Alignment Review Feedback\n"
+            "These are explicit developer decisions from earlier Alignment "
+            "Review items. Treat corrected text and change requests as "
+            "authoritative requirements for this rebuild. Do not repeat a "
+            "rejected interpretation as an established fact. An "
+            "accept_current decision confirms the cited current claim."
+        )
+        parts.append(
+            _trim_json(alignment_feedback, ALIGNMENT_FEEDBACK_PROMPT_MAX_CHARS)
+        )
 
     selected_nodes = _selected_review_nodes(graph)
     parts.append(
@@ -325,6 +395,39 @@ def _build_review_prompt(
             parts.append(
                 f"- [{gap.gap_type}] {_trim(gap.node_name, 140)}: {_trim(gap.notes, 180)}"
             )
+
+    if verified_evidence:
+        # Issue #336: verified investigation facts from the shared evidence
+        # feed. They are deliberately their OWN section rather than merged into
+        # the Q&A block: these were established by reading the pinned snapshot,
+        # not answered by the developer, and the two provenances must not be
+        # conflated. Each carries its code citations, so the reviewer can cite
+        # them the same way it cites a graph node's evidence.
+        parts.append(
+            "\n## System-verified investigation facts (established by reading the "
+            "pinned snapshot during a joint investigation, each with its own code "
+            "citations; decision_method=reasoning_llm. These are NOT developer "
+            "answers -- treat them as established code facts, and prefer them over "
+            "a graph hypothesis they contradict.)"
+        )
+        parts.append(_trim_json(verified_evidence, QA_PROMPT_MAX_CHARS))
+
+    if answered_qa:
+        parts.append(
+            "\n## Confirmed Q&A (latest revisions of already-answered interview "
+            "questions, including answers given only through the Q&A panel; "
+            "treat the answers as established facts)"
+        )
+        parts.append(_trim_json(answered_qa, QA_PROMPT_MAX_CHARS))
+
+    if unconfirmed_qa:
+        parts.append(
+            "\n## Unconfirmed Q&A (the developer explicitly could NOT confirm "
+            "these topics — 「わかりません」/不明. Treat each as an OPEN "
+            "hypothesis, never as an established fact, and keep it as an open "
+            "question or gap rather than treating it as resolved.)"
+        )
+        parts.append(_trim_json(unconfirmed_qa, QA_PROMPT_MAX_CHARS))
 
     if history:
         parts.append("\n## Interview History\n")
@@ -380,8 +483,30 @@ def generate_understanding_review(
     graph: UnderstandingGraph,
     reconciliation: ReconciliationResult,
     history: Optional[List[Dict[str, str]]] = None,
+    answered_qa: Optional[List[Dict[str, Any]]] = None,
+    unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
+    alignment_feedback: Optional[List[Dict[str, Any]]] = None,
+    verified_evidence: Optional[List[Dict[str, Any]]] = None,
 ) -> ReviewResult:
     """Generate a system understanding review from graph + code facts.
+
+    ``answered_qa`` / ``unconfirmed_qa`` (Issue #263) carry the session's
+    Q&A-panel answers into the review the same way they are already fed into
+    the conversational interview turn, so an answer given only via the Q&A
+    panel (never posted as an ``interview_message``) still reaches
+    ``current_understanding`` regeneration.
+
+    ``verified_evidence`` (Issue #336) carries the shared evidence feed's
+    current verified investigation facts. They are a SEPARATE input from
+    ``answered_qa`` on purpose: a fact established by reading the pinned
+    snapshot has a different provenance from a developer's answer, and merging
+    them would make the rebuilt understanding unable to say which is which.
+
+    ``alignment_feedback`` carries explicit terminal decisions from
+    Alignment Review. In particular, ``needs_change``,
+    ``reject_interpretation``, and ``corrected`` must influence the newly
+    generated Understanding; keeping their old rows actionable is not by
+    itself sufficient.
 
     Fail-closed: mock clients and non-reasoning models return an error.
     No proposals are generated.
@@ -395,7 +520,12 @@ def generate_understanding_review(
             error="Understanding review requires a configured reasoning model",
         )
 
-    prompt = _build_review_prompt(graph, reconciliation, history)
+    prompt = _build_review_prompt(
+        graph, reconciliation, history,
+        answered_qa=answered_qa, unconfirmed_qa=unconfirmed_qa,
+        alignment_feedback=alignment_feedback,
+        verified_evidence=verified_evidence,
+    )
     try:
         max_output_tokens = _review_max_output_tokens()
         language = get_interview_language()
@@ -443,6 +573,8 @@ def generate_understanding_review(
                 max_tokens=max_output_tokens,
             )
             validated = _parse_review_response(raw)
+        except LLMResourceLimitError:
+            raise
         except (json.JSONDecodeError, ValidationError, LLMError):
             return ReviewResult(
                 provider=config.provider,
@@ -458,6 +590,22 @@ def generate_understanding_review(
                 model=config.model,
                 is_mock=False,
                 error=interview_message("invalid_review_response", language),
+            )
+
+    # Issue #352: Vision is the one claim a repository often cannot settle on
+    # its own, so it is deliberately NOT in `_EVIDENCE_REQUIRED_SECTIONS`
+    # below: turning every evidence-less Vision into a high-priority open
+    # question would fire on almost every session, and the developer's own
+    # Vision statement already has a home (the Intent Brief's `goal`). What is
+    # NOT optional is that it must not be presented as settled — an
+    # evidence-less Vision is clamped to `uncertain` here, deterministically,
+    # so the Brief can only ever render it as 「AI 仮説・未確認」.
+    del validated.vision[_MAX_VISION_ITEMS:]
+    for item in validated.vision:
+        if not item.evidence and item.confidence.level in ("confirmed", "likely"):
+            item.confidence = _ConfidenceLevel(
+                level="uncertain",
+                reason=interview_message("vision_without_evidence", language),
             )
 
     _EVIDENCE_REQUIRED_SECTIONS = (
@@ -478,6 +626,7 @@ def generate_understanding_review(
                 ))
 
     current_understanding = {
+        "vision": [item.model_dump() for item in validated.vision],
         "system_purpose": [item.model_dump() for item in validated.system_purpose],
         "core_capabilities": [item.model_dump() for item in validated.core_capabilities],
         "capability_elements": [item.model_dump() for item in validated.capability_elements],

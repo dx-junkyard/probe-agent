@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/cell_definition.json",
+  "title": "CellDefinition",
+  "description": "Common contract for both worker and orchestrator Probe Cells (Issue #298 / Probe Cell Fabric). There is no separate 'kind' field: orchestrator-ness is expressed structurally by the presence of a non-null `roster` (child cell_ids). A Cell is System-scoped; cell_id is unique within a System and is conventionally system_id + component_id (one logical Probe Cell per approved probe/component). This schema does not itself carry system_id -- system ownership is enforced at the persistence/API layer, not embedded in the portable contract document.",
+  "type": "object",
+  "required": ["cell_id", "role_card_ref", "status", "schema_version"],
+  "properties": {
+    "cell_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique within a System. Convention: system_id + component_id for a probe-backed Cell."
+    },
+    "roster": {
+      "type": ["array", "null"],
+      "description": "Child cell_ids. Null means a worker Cell. A non-null array (possibly empty) means an orchestrator Cell.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "role_card_ref": {
+      "type": "object",
+      "required": ["role_key", "version"],
+      "properties": {
+        "role_key": { "type": "string", "minLength": 1 },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "dormant", "retired"]
+    },
+    "mission": {
+      "type": ["string", "null"],
+      "description": "Optional override of the Role Card's mission for this specific Cell instance."
+    },
+    "schema_version": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

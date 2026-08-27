@@ -230,6 +230,14 @@ class TestReviewGeneration:
             graph=graph, reconciliation=recon,
         )
         assert result.error is not None
+        # Issue #229: even after the schema-reminder retry also fails, the
+        # session-facing error must stay a catalog message the Dashboard can
+        # show as-is -- never a raw Pydantic ValidationError repr (field
+        # paths, "validation error for...", etc).
+        lowered = result.error.lower()
+        assert "validationerror" not in lowered
+        assert "pydantic" not in lowered
+        assert "field required" not in lowered
 
     def test_llm_error_captured(self):
         graph = _build_graph([_claim()])
@@ -375,6 +383,114 @@ class TestReviewGeneration:
         )
         assert result.error is None
         assert len(result.open_questions) > 0
+
+
+class TestQaInjection:
+    """Issue #263: Q&A-panel answers must reach the understanding review the
+    same way conversational answers already do."""
+
+    def test_prompt_includes_answered_qa(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        answered_qa = [
+            {"question": "What does this system do?", "answer": "It runs probes."}
+        ]
+        prompt = _build_review_prompt(graph, recon, answered_qa=answered_qa)
+        assert "Confirmed Q&A" in prompt
+        assert "What does this system do?" in prompt
+        assert "It runs probes." in prompt
+
+    def test_prompt_includes_unconfirmed_qa(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        unconfirmed_qa = [
+            {"question": "Who owns this component?", "answer": "わかりません"}
+        ]
+        prompt = _build_review_prompt(graph, recon, unconfirmed_qa=unconfirmed_qa)
+        assert "Unconfirmed Q&A" in prompt
+        assert "Who owns this component?" in prompt
+        assert "わかりません" in prompt
+
+    def test_prompt_omits_qa_sections_when_absent(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        prompt = _build_review_prompt(graph, recon)
+        assert "Confirmed Q&A" not in prompt
+        assert "Unconfirmed Q&A" not in prompt
+
+    def test_prompt_includes_human_alignment_feedback_before_graph(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        feedback = [{
+            "alignment_item_id": 12,
+            "current_claim": "The API owns authorization",
+            "proposed_interpretation": "Authorization is automatic",
+            "decision": {
+                "action": "corrected",
+                "note": "Authorization requires an explicit operator approval.",
+            },
+        }]
+
+        prompt = _build_review_prompt(
+            graph, recon, alignment_feedback=feedback,
+        )
+
+        assert "Human Alignment Review Feedback" in prompt
+        assert "corrected" in prompt
+        assert "explicit operator approval" in prompt
+        assert prompt.index("Human Alignment Review Feedback") < prompt.index(
+            "Understanding Graph Nodes"
+        )
+
+    def test_generate_understanding_review_forwards_qa_to_prompt(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        client = CapturingReasoningClient([VALID_REVIEW_RESPONSE])
+        answered_qa = [{"question": "Panel Q1", "answer": "Panel A1"}]
+        unconfirmed_qa = [{"question": "Panel Q2", "answer": "不明"}]
+
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=recon,
+            answered_qa=answered_qa, unconfirmed_qa=unconfirmed_qa,
+        )
+
+        assert result.error is None
+        user_prompt = client.calls[0]["messages"][1]["content"]
+        assert "Panel Q1" in user_prompt
+        assert "Panel A1" in user_prompt
+        assert "Panel Q2" in user_prompt
+        assert "不明" in user_prompt
+
+    def test_generate_understanding_review_forwards_alignment_feedback_to_prompt(self):
+        graph = _build_graph([_claim()])
+        recon = _empty_reconciliation()
+        client = CapturingReasoningClient([VALID_REVIEW_RESPONSE])
+        feedback = [{
+            "alignment_item_id": 8,
+            "current_claim": "Wrong claim",
+            "decision": {
+                "action": "reject_interpretation",
+                "note": "Do not retain this interpretation.",
+            },
+        }]
+
+        result = generate_understanding_review(
+            client, _reasoning_config(),
+            graph=graph, reconciliation=recon,
+            alignment_feedback=feedback,
+        )
+
+        assert result.error is None
+        user_prompt = client.calls[0]["messages"][1]["content"]
+        assert "reject_interpretation" in user_prompt
+        assert "Do not retain this interpretation." in user_prompt
+
+    def test_prompt_version_is_bumped_when_the_prompt_changes(self):
+        # Bumped for the Alignment-feedback injection (v5) and again for the
+        # Vision section (v6). The audit record must never claim an output was
+        # produced by a prompt that no longer exists.
+        assert PROMPT_VERSION == "understanding-review-v7"
 
 
 class TestEnumValidation:
@@ -524,7 +640,7 @@ class TestOutputLanguage:
         system_msg = client.calls[0]["messages"][0]["content"]
         assert "in Japanese" in system_msg
         assert "enum values" in system_msg
-        assert result.prompt_version == "understanding-review-v3"
+        assert result.prompt_version == "understanding-review-v7"
         assert "review_capabilities" in system_msg
 
     def test_english_directive(self, monkeypatch):
@@ -569,3 +685,83 @@ class TestOutputLanguage:
         assert result.error is None
         questions = [q["question"] for q in result.open_questions]
         assert any("根拠" in q and "Runtime probe evaluation" in q for q in questions)
+
+
+class TestVisionSection:
+    """Issue #352: Vision is a claim in its own right, and never a settled one
+    unless the repository actually evidences it."""
+
+    def test_vision_is_returned_as_its_own_section(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["vision"] = [{
+            "name": "開発者が自分のシステムを説明できる状態にする",
+            "summary": "",
+            "confidence": {"level": "likely", "reason": "README states the goal"},
+            "evidence": [
+                {"path": "README.md", "start_line": 1, "end_line": 3, "summary": "目的"}
+            ],
+        }]
+        graph = _build_graph([_claim()])
+        result = generate_understanding_review(
+            FakeReasoningClient(response), _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        vision = result.current_understanding["vision"]
+        assert len(vision) == 1
+        assert vision[0]["name"] == "開発者が自分のシステムを説明できる状態にする"
+        # Vision never merges into System Purpose.
+        assert result.current_understanding["system_purpose"][0]["name"] != vision[0]["name"]
+
+    def test_vision_without_evidence_cannot_be_presented_as_settled(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["vision"] = [{
+            "name": "推定した Vision",
+            "summary": "",
+            "confidence": {"level": "confirmed", "reason": "trust me"},
+            "evidence": [],
+        }]
+        graph = _build_graph([_claim()])
+        result = generate_understanding_review(
+            FakeReasoningClient(response), _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        vision = result.current_understanding["vision"][0]
+        assert vision["confidence"]["level"] == "uncertain"
+        assert vision["confidence"]["reason"]
+        # Unlike the evidence-required sections, it does NOT manufacture a
+        # high-priority question: the developer's Vision belongs to the Intent
+        # Brief, and firing this on every session would be pure noise.
+        assert not [q for q in result.open_questions if "推定した Vision" in q["question"]]
+
+    def test_only_one_vision_item_is_kept(self):
+        response = dict(VALID_REVIEW_RESPONSE)
+        response["vision"] = [
+            {"name": "Vision A", "summary": "", "confidence": {"level": "likely", "reason": ""},
+             "evidence": [{"path": "README.md", "start_line": 1, "end_line": 2, "summary": "a"}]},
+            {"name": "Vision B", "summary": "", "confidence": {"level": "likely", "reason": ""},
+             "evidence": [{"path": "README.md", "start_line": 3, "end_line": 4, "summary": "b"}]},
+        ]
+        graph = _build_graph([_claim()])
+        result = generate_understanding_review(
+            FakeReasoningClient(response), _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        assert [v["name"] for v in result.current_understanding["vision"]] == ["Vision A"]
+
+    def test_absent_vision_is_an_empty_section_not_a_fabrication(self):
+        graph = _build_graph([_claim()])
+        result = generate_understanding_review(
+            FakeReasoningClient(VALID_REVIEW_RESPONSE), _reasoning_config(),
+            graph=graph, reconciliation=_empty_reconciliation(),
+        )
+        assert result.error is None
+        assert result.current_understanding["vision"] == []
+
+    def test_prompt_and_schema_versions_record_the_vision_change(self):
+        from app.system_understanding_reviewer import PROMPT_VERSION, SCHEMA_VERSION
+
+        assert PROMPT_VERSION == "understanding-review-v7"
+        assert SCHEMA_VERSION == "understanding-review-v2"

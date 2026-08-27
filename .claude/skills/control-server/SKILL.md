@@ -20,6 +20,74 @@ Use this skill for files under:
 - `PUT /components/{component_id}/policy`
 - `POST /components/{component_id}/shadow-results`
 
+## Trace ingestion redaction (Issue #367)
+
+`POST /traces` redacts **before the row is written**, in
+`app/trace_redaction.py`, reusing the SDK's rule tables
+(`probe_agent.redaction.SENSITIVE_KEYS` and `probe_agent.secret_patterns`) so
+the send boundary and the ingestion boundary cannot drift apart. This is not
+redundant with the SDK: an older SDK, a non-SDK HTTP client, and
+`PROBE_PAYLOAD_MODE=full` all reach this endpoint.
+
+The contract belongs to the **storage boundary**, not to `POST /traces`.
+Three tables hold payloads and all three are covered: `traces`,
+`trace_projections` (written by both the trace route and the shadow route),
+and `shadow_results`. Adding a payload column means updating the write path,
+`GET /traces/redaction-audit`, AND `POST /traces/redaction-rescan` — an audit
+narrower than the writers reports `unscanned_rows: 0` while plaintext sits in
+a table it never looked at.
+
+Rules to preserve when touching trace persistence:
+
+- Redact on the write path, never at render time. A presentation-only mask
+  leaves plaintext in the DB, in exports, and in Replay / Candidate Studio /
+  Workspaces, all of which read the stored row.
+- `traces.redaction_json` is `NULL` **only** for rows that predate this
+  feature. A clean payload still records `{"redacted": false, ...}`. Do not
+  "optimise" the clean case back to `NULL` — `GET /traces/redaction-audit`
+  uses exactly that distinction to find rows that were never scanned.
+- Redacting `input_capture` degrades `replayability` to `partial` with reason
+  `redacted`, one-directionally (never upgrades, never touches
+  `unreplayable`).
+- Add any new trace column to all four places or the quota accounting silently
+  drifts: the `CREATE TABLE`, the `_add_column_if_missing` migration,
+  `_stored_trace_bytes`, and `_current_trace_usage`'s SQL sum.
+- `POST /traces/redaction-rescan` is an explicit operator action, not a
+  startup migration: it destroys data on purpose and the exposed credential
+  still has to be rotated by a human. See `docs/secret-redaction.md`.
+
+## Two-axis state endpoints (Issue #366)
+
+Four surfaces in this epic had one displayed word carrying two independent
+facts. Each is now two finite axes decided server-side. When touching any of
+them, keep the axes separate and keep the decision on the server — the
+Dashboard renders, it does not re-derive:
+
+- `GET /connectivity/status` — `state` (cumulative milestone, never regresses)
+  and `freshness` (live, regresses). Thresholds come from
+  `connectivity_freshness_policy` and are returned with every reading;
+  `state_facts.classify_connectivity_freshness` is a pure function of
+  `(last_trace_at, now, thresholds)` so boundaries are testable at an exact
+  instant. Windowed counts exclude smoke traces.
+- `GET /tokens/me`, `GET /tokens` — `app/token_status.py` is the ONLY
+  definition of a token's status. Do not add a second one client-side.
+- `GET /snapshot-preflight` — processing state vs freshness, one recommended
+  snapshot, `unknown` never blocks. Every surface that pins a snapshot calls
+  `require_snapshot_preflight` (Experiment creation, Candidate Studio
+  sessions, Replay variant runs) and records the decision on its own row; a
+  preflight wired into one of the three is not shared. `gather_preflight`
+  runs `git` subprocesses: never call it inside a `get_conn()` block.
+- `GET /replay-readiness` — replayability counts before generation.
+  `POST /candidate-sessions` enforces it (422 `no_replayable_traces`) so no
+  reasoning-model call is spent on an unevaluable candidate, and
+  `POST .../generate` re-checks immediately before the call. Judge the set the
+  run will replay: with a `replay_set_id` that is the Set's own `trace_ids`,
+  never the recent-N window. Keep `not_captured` distinct from
+  `unreplayable`.
+- `connectivity/status` — `freshness` is the WORKLOAD axis, from
+  `last_real_trace_at`. A smoke ping must never revive it; that is what
+  `transport_freshness` is for.
+
 ## Evaluation context APIs (issue #9)
 
 - `GET /system-profile`, `PUT /system-profile` (singleton, id `default`)
@@ -241,6 +309,34 @@ fallback for intelligence work.
   copy. Dashboard consumes server copy (stage `label`/`description`,
   `SystemUnderstandingOut.success_summary`, `user_phase` labels, gap
   actions) and keeps its local label maps only as a last-resort fallback.
+
+## Manual System Profile alignment (issue #275, formerly #94)
+
+- `GET /repository/system-understanding` returns `purpose_views` (parallel
+  provenance views) alongside the unchanged legacy `purpose` field: the
+  manual `system_profile` view (`source: system_profile`,
+  `provenance_kind: manual`) is snapshot-independent and present whenever
+  the profile's purpose is non-empty; the AI/source view follows
+  `_load_purpose`'s existing hierarchy-node → draft order and appears only
+  with a ready snapshot. Do not change the legacy `purpose` fallback chain.
+- `POST /repository/system-understanding/purpose-confirmation` records the
+  human's cross-check as an append-only `system_purpose_confirmations` row
+  (`decision_method: manual`, both sides captured verbatim, System-scoped).
+  409 on missing/mismatched snapshot, 422 when either side is absent.
+  Never UPDATE/DELETE confirmation rows.
+- Staleness of the latest confirmation is read-time structural equality
+  only (`snapshot_changed` → `profile_updated` → `ai_updated`); no
+  similarity scoring or heuristic match/mismatch judgement (Principle 6) —
+  interpreting the difference is the human's job.
+- The unconfirmed pairing surfaces as StateItem
+  `understanding.purpose.manual_profile_unconfirmed` (info,
+  `user_action_kind: confirm`, anchor `purpose-views`, display route
+  `/system-understanding`); it disappears once a valid confirmation
+  exists. Copy lives in `state_messages.py`.
+- Shared readers (profile row, AI purpose view, latest confirmation,
+  staleness) live in `state_facts.py` and are consumed by both
+  `system_understanding_service` and `system_state` — do not duplicate
+  the queries.
 
 ## System settings diagnostics (issue #101)
 
@@ -604,6 +700,22 @@ heuristic result.
   writes one append-only `auth_audit_events` row
   (`event_type='admin_bootstrapped'`); `detail` is structural JSON only,
   never a password or hash.
+- **`GET /auth/bootstrap-status` (Issue #265)**: the one endpoint reachable
+  with no credentials and no System (`app/bootstrap_status.py`,
+  `routes/auth.py`) -- everything else (`GET /system-state`,
+  `system_diagnostics`, and every Dashboard component built on them) needs
+  `X-Probe-System-Id`, so a pre-login / zero-System install had no
+  deterministic state to show. Returns exactly four finite facts:
+  `admin_exists` (a System-id-free `role='admin' AND is_active=1` check,
+  independent from `system_diagnostics._check_auth_scope`'s system-scoped
+  "any active user" check), `auth_mode` (`"anonymous" | "user"`, mirrors
+  `auth.auth_enabled()`), `llm_configured` (env-presence only, never
+  validates the key -- mirrors `_api_key_status`'s presence logic without
+  reusing that private helper), and `environment`
+  (`environment.control_env()`). Never a username, key value, path, or
+  hostname. `llm.KNOWN_PROVIDERS` is the single source of truth for the
+  provider finite set; `system_diagnostics.py` imports it rather than
+  duplicating it.
 
 ## Probe Pattern lifecycle (issue #168)
 
@@ -704,6 +816,269 @@ heuristic result.
   (server); `PROBE_REPLAY_CAPTURE_MAX_BYTES` (SDK). See the Issue #242
   section of `docs/project-intelligence.md`.
 
+## Reviewable policy artifacts (issues #313, #341)
+
+Deterministic classification rules that operators are expected to tune live in
+`app/policies/*.yaml`, not in Python literals, and are loaded through
+`app/policy_loader.py`'s strict helpers (`UniqueKeySafeLoader`,
+`require_mapping` / `require_exact_keys` / `require_nonempty_string` /
+`require_enum` / `parse_enum_list`, each taking the caller's own error class).
+
+- `alignment_review.yaml` — the no-review-required first-match rule table.
+- `interview_metric_attention.yaml` — the Interview UX metric 要確認 criteria.
+
+Rules for any new artifact:
+
+- Load once at import so a broken policy fails startup, never the first
+  request, and NEVER fall back to an embedded default (Principle 6).
+- Validate schema version, exact key sets, every finite value, duplicate keys,
+  and terminal coverage of all inputs at load time.
+- Persist or return the `policy_version` and the SHA-256 of the raw bytes, so a
+  changed policy is auditable and invalidates anything cached under the old one.
+- Keep the vocabulary limited to what the evaluator actually honours. The
+  attention policy therefore accepts only `window: all_time`,
+  `trigger: single_breach`, and `clear: value_within_threshold`: sustained
+  triggers, bounded windows, and manual 「確認済み」 acknowledgement all need
+  persisted evaluation history or a scheduled evaluator, and silently ignoring
+  an unsupported value would be worse than rejecting it.
+- `guardrail` on `InterviewMetricOut` is only the DESIGNATION of a metric worth
+  watching; the evaluated judgement is the separate `attention` object. A
+  policy may only set `watch: true` on a designated guardrail — `apply_attention`
+  raises otherwise. Missing values never become `ok` or `attention`: they split
+  into `insufficient_data` (denominator empty / sample below minimum) and
+  `not_measurable` (the underlying fact is not recorded at all).
+
+## Joint Understanding premise / provenance / lineage (issues #337-#339, #336)
+
+`app/joint_premise.py` is the single premise and provenance contract for Joint
+Understanding, and it REUSES Issue #308's bundle (same column names, same digest
+helpers) rather than defining a parallel one.
+
+- Premise verdicts are the finite `current` / `stale` / `missing` / `invalid`,
+  first-match. Only `current` permits `hypothesis_adopted` / `decided` / reflux.
+  A premise that was never captured is `invalid`, NOT satisfied — the pre-#337
+  gate returned "fresh" for an uncaptured premise, an unresolvable session, and
+  a deleted snapshot, so its failure mode was permissive.
+- Staleness is decided by the pinned COMMIT, never the snapshot id (the same
+  commit re-pinned under a new snapshot row is the same premise). The
+  Understanding revision is captured for audit and lineage and is NEVER a
+  staleness input.
+- Three separate provenance axes on every finding: `origin_role` (whose voice),
+  `producer_kind` (which code path), `actor_kind` (whether an authenticated
+  human stands behind it). All resolved from the route and the `Principal`,
+  never from a request body. `POST /joint-understanding/{id}/findings` is
+  developer-only; producer roles are 403.
+- `app/understanding_evidence_feed.py` is the ONLY place a verified fact is
+  published to and the only place a rebuild reads it from. Currency (a corrected
+  finding, a non-`current` premise) is evaluated at READ time because neither is
+  knowable at publish time, and an excluded entry stays readable as history.
+  Publication is idempotent on a digest over the fact's MEANING that excludes
+  the finding id.
+- A rebuild's CONSUMPTION of a fact and a human's CONFIRMATION of the result are
+  separate tables. Writing them in one place would let "the AI fed this in" read
+  as "the developer agreed with it".
+- `app/joint_lineage.py` derives the finite outcome events; nothing about a
+  subject's lifecycle is stored. A subject with no terminal verdict is excluded
+  from every metric denominator.
+- Metric categories stay separate: `joint_understanding` (utilization),
+  `joint_understanding_quality` (outcome lineage), `joint_understanding_burden`
+  (per-session cost). No composite score anywhere, ever.
+- A literal path segment that collides with an existing `{id}` route must not
+  reuse its prefix: `GET /joint-understanding/{ju_id}` is registered first with
+  an int param, so the lineage endpoint is
+  `/interview/joint-understanding/lineage`.
+
+## Purpose Chain / Purpose Needs (Epic #387, issues #388-#389)
+
+`docs/purpose-chain.md` is the design contract; `app/purpose_chain.py` (#388)
+and `app/purpose_needs.py` (#389) are its only two modules, and both stay
+strictly deterministic — no LLM call anywhere in either file (Principle 6).
+`GET /purpose-chain` and `GET /purpose-chain/next-question` write nothing; the
+ONLY two writes in this whole area are `purpose_chain.record_relation_decision`
+(one relation's confirmed/rejected judgement, table `purpose_relation_decision`)
+and `routes/purpose_chain.respond_to_purpose_need`'s insert into
+`purpose_need_response` — both append-only, the same `interview_intent_item`
+discipline: a new row is inserted and the prior current row's
+`superseded_by_id` is set; nothing is ever UPDATEd or DELETEd.
+
+- Every element and relation is a PURE PROJECTION recomputed on every read
+  from `understanding_brief.build_understanding_brief` claims and Intent
+  Brief `pain`/`goal` rows (`purpose_chain.derive_purpose_chain`) — it has no
+  row identity of its own. Element ids are therefore stable content hashes
+  (the bare `kind` for a frame-slot singleton, `kind + ":" + sha256(name)[:16]`
+  for a repeatable kind), and `relation_id` is
+  `f"{kind}:{source_id}->{target_id}"` — never a row id, which would be
+  reassigned on every Understanding rebuild while describing the same thing
+  (#380's rule, applied here).
+- The finite vocabularies (`PurposeElementKind`, `PurposeElementState`,
+  `PurposeRelationKind`, `PurposeRelationStatus`, `PurposeRecheckState`,
+  `PurposeStaleReason`, `PurposeResolutionLevel`, `PurposeSourceKind`,
+  `PurposeFrameState`, `PurposeChainSection`, plus #389's `PurposeNeedCode`,
+  `PurposeAnswerability`, `PurposeNeedState`, `PurposeResponseKind`,
+  `PurposeQuestionFallbackReason`, `PurposeNeedTargetKind`) are declared
+  exactly once as `Literal` aliases in `app/models.py`, mirrored into
+  `purpose_chain.py`/`purpose_needs.py` with `get_args`, and held to the
+  Dashboard's TypeScript unions by `test_interview_type_parity.py`'s
+  `FINITE_TYPE_NAMES`. Add a value in one place only and the Python tuple and
+  the frontend union silently stop matching it.
+- `element_digest` hashes only the MEANING-bearing fields (`statement` +
+  `confirmation` + `provenance` + `source_ids`) — never `id` or
+  `resolution_level` (itself derived FROM relations, so including it would
+  make the digest circular). This is exactly what `purpose_relation_decision.
+  source_digest`/`target_digest` capture at decision time, and what a later
+  read compares against to decide `recheck_state`.
+- Staleness propagates DOWNSTREAM ONLY, and the check order matters:
+  `_recheck_relation` looks at the immediate upstream relation's
+  `recheck_state` FIRST, and only falls back to comparing its OWN captured
+  decision digests when upstream is `current`. Reversing that order breaks
+  the propagation table in `docs/purpose-chain.md` §1.3: an `intervention`
+  change would then make `intervention_to_capability` read `source_changed`
+  (a direct digest mismatch, since `intervention` is literally its own
+  source) instead of `upstream_changed`, and `change_to_intervention`'s own
+  change would never read as the real cause.
+- A relation's `status` and `recheck_state` are independent axes: a STALE
+  confirmed decision reads as `status="hypothesis"` (it can no longer be
+  trusted as confirmed) while `recheck_state="stale"` explains why. The
+  decision row itself is NEVER deleted or overwritten when an endpoint
+  changes — `docs/purpose-chain.md` §1.5's audit requirement ("決定は
+  上書きされず、digest が動いても削除されない") depends on this; only a NEW
+  decision (a fresh `confirmed`/`rejected` call) supersedes the prior row.
+- `_PROVENANCE_RANK` (a relation's provenance is the weaker of its two
+  endpoints') is an EXPLICIT dict with an import-time completeness assert
+  against `get_args(UnderstandingProvenanceKind)`, deliberately NOT derived
+  from the Literal's declaration order even though the two currently agree.
+  Deriving it would mean a purely cosmetic reorder of
+  `UnderstandingProvenanceKind` anywhere else in the codebase silently
+  relabels every relation's 出所 — the exact confusion this Epic exists to
+  prevent, one layer down. Keep the rank explicit when a provenance value is
+  ever added.
+- `purpose_needs.PRIORITY_TABLE` has 7 rows, one per need code, INCLUDING
+  `human_value_judgement_required` at row 2. It looks redundant with row 1's
+  `relation_conflict` for a frame-slot or Capability element (whose relation
+  is already `conflicting` when the element itself is), but a 2nd+
+  `system_purpose` claim (an additional, non-frame-slot `intervention`
+  element, per `purpose_chain._intervention_elements`) never gets a relation
+  built at all — so for THAT element a conflict has no path to the developer
+  except this row. A need with no row in the priority table is reachable
+  only through an explicit `need_id` deep link, and nothing generates a link
+  to a question the system never offers — so leaving a need out of the table
+  is functionally identical to never deriving it at all.
+- `derive_purpose_chain(session_id=None)` resolves to the System's newest
+  Interview session (`ORDER BY id DESC`), the SAME rule `understanding_brief`
+  and the Overview already use. An explicit `session_id` belonging to
+  ANOTHER System reads exactly like "unselected", never a leak and never a
+  404 — matching `GET /interview/understanding-brief`'s existing rule so the
+  two screens can never disagree about which session is current.
+- `GET /overview` embeds `purpose_chain` as its OWN guarded section
+  (`overview_projection.py`), composing the existing projection rather than
+  re-deriving it — the #380 discipline applied here. It reads the Overview's
+  own already-resolved `session_id` rather than letting
+  `derive_purpose_chain` resolve a second, independent `None`, so the
+  Overview and the Purpose Chain endpoint can never describe different
+  sessions a request apart.
+- `unknown`/`investigate` responses to a need open a Joint Understanding
+  session with `origin_kind='purpose_need'`, `trigger='purpose_need'` — a
+  trigger value ONLY `routes/purpose_chain.py` writes (the public
+  `POST /joint-understanding` create endpoint still forces
+  `explicit_request`, mirroring #336's `unknown_answer` rule). This module
+  never runs the investigation itself; it opens the shared workspace via
+  `capture_premise_bundle` and leaves the investigation to the existing
+  Joint Understanding panel/endpoints, so there is one investigation
+  implementation regardless of which of the now-5 origins opened it.
+- `decided_by` (`purpose_relation_decision`) and `responded_by`
+  (`purpose_need_response`) always come from the authenticated `Principal`
+  (`_principal_actor`), never a request-body field — the same lesson #337
+  records for Joint Understanding's provenance: a body-supplied identity
+  lets a caller fabricate an audit trail. `decision_method` is hardcoded
+  `'manual'` in both write paths; there is no parameter to set it to
+  anything else.
+- A relation whose endpoint is `unknown`/`unavailable` can never be decided
+  (422 `purpose_relation_not_decidable`) — confirming or rejecting a
+  connection that has no real content yet would record a judgement about
+  something that does not exist.
+
+## UX Design Lineage (Epic #405, issues #406-#409)
+
+`docs/ux-design-lineage.md` is the design contract; read §0 before touching
+`app/ux_design.py` (#407) or `app/solution_design.py` (#408). Both stay
+strictly deterministic — no LLM call in either module (Principle 6). This
+layer sits BETWEEN Purpose Chain and the implementation entities, and it is
+the first design layer in the repo that PERSISTS its own content.
+
+- **It persists content because nothing can derive it.** Purpose Chain is a
+  pure projection over `interview_intent_item` / `current_understanding`;
+  a Journey / Requirement / Solution Design is newly authored text with no
+  existing source row. The compensating discipline is that UPSTREAM
+  (Purpose element / relation / Capability entity) and DOWNSTREAM (Flow /
+  Node / Component / Cell) content is NEVER copied into a column — only a
+  `target_ref` + a captured digest, resolved fresh at read time against one
+  canonical source per kind (`node_design._LINK_KIND_TARGET_SOURCE`'s shape).
+  A copied Capability name still reads as current after the original is
+  superseded; that is the bug #397's handoff already had to fix.
+- **Identity is `(system_id, <kind>_key)`, a developer-given slug.** Never
+  derive it from a Purpose element id (`core_capability:<sha256(name)>` moves
+  when the claim is reworded) and never from a row id (an Understanding
+  rebuild renumbers `alignment_item` / `understanding_revision`). Same rule
+  as Evolution Node ADR-2's `node_key`.
+- **`perspective` (`as_is`/`to_be`) lives on the identity row, not the
+  revision.** A revision-level perspective would let one Journey change from
+  describing reality to describing a target, and its history would then be a
+  record of two different subjects. A `to_be` Journey points at its baseline
+  through `baseline_journey_id`, and `baseline_mode`
+  (`linked`/`greenfield`/`undecided`) keeps "the developer declared this is
+  greenfield" distinct from "nobody has decided yet".
+- **Four independent axes, never merged into one word:** `design_status`
+  (DERIVED from the `ux_design_decision` ledger — no status column exists, so
+  a stored value cannot drift from the rows it describes), `recheck_state`
+  (digest comparison — a `stale` confirmed item stays `confirmed`; the
+  decision row is never deleted, exactly as `purpose_relation_decision`
+  behaves), `revision_state` (`superseded_by_id IS NULL`), and
+  `authored_by_kind` (whose voice). An AI-authored revision CAN be
+  `confirmed` — that means a human approved AI-written text, not that the
+  author changed.
+- **Capability references use `understanding_capability_entity.id`** (#312:
+  System-scoped, versioned per confirmation), never
+  `capability_hierarchy_nodes.id` (regenerated per snapshot) and never the
+  Purpose Chain name-hash id. `node_design._resolve_capability` already picks
+  the same anchor.
+- **`static_flow` and `runtime_flow` are two `SolutionTargetKind` values, not
+  one.** There is no persistent flow table: the static path is
+  `(system_id, snapshot_id, entrypoint_ref)` and `flow_graph`'s `flow-{i}` is
+  stable only WITHIN one derivation, while `trace_spans.flow_id` is a runtime
+  correlation string. A `static_flow` link without `captured_snapshot_id` is
+  refused (422 `flow_target_requires_snapshot`). Never mint a permanent flow
+  id.
+- **Adopting a Solution Design option changes nothing downstream.** It must
+  not move `evolution_node.maturity`, Cell Improvement state,
+  `components.mode`, any patch/worktree/publish path, or Probe Plan approval —
+  five assertions the tests make explicitly (Evolution Node ADR-9's boundary,
+  defended from the design side). Adoption exclusivity is enforced by
+  REFUSING a second adopt (409 `solution_design_option_already_adopted`);
+  never auto-`withdraw` the previous option, which would fabricate a human
+  decision under that human's name.
+- **Requirement `confirm` and option `adopt` are deliberately different
+  ledgers** (`ux_design_decision` vs `solution_design_decision`): confirming
+  a statement is non-exclusive, choosing one of N options is exclusive. One
+  shared table would leave the exclusivity expressed nowhere.
+- **Artifacts store no body and fetch no URI.** There is no content column —
+  structural, not conventional. `verification_state='verified'` is reachable
+  only for a `repo:<path>` URI that resolves via `git show <sha>:<path>` on
+  the pinned snapshot (Principle 5); every external URI stays `unverified`
+  because its hash is the developer's assertion, and probe-agent does not
+  make outbound requests for it (SSRF). A repo path that used to verify and
+  no longer resolves is `unreachable` — a third, distinct state.
+- **Propagation is downstream only** (a Requirement edit never marks its
+  Journey stale — #388's rule), and `unknown` / `unavailable` /
+  `not_applicable` stay three different answers.
+- **No composite score.** No design completion rate, no confidence
+  percentage. The three `evolution_evaluation_policy` levels stay separate
+  (ADR-7) and the handoff returns them GROUPED BY LEVEL. Counts are fine.
+- **This layer writes to no existing canonical table.** `interview_*`,
+  `purpose_*`, `understanding_*`, `evolution_node*`, `cell_*`, `components`,
+  `probe_points` are read-only here, and a test enforces it (#329's boundary).
+- Vocabulary note: #397's "Design Studio" is the Evolution Node design layer.
+  #409's screen is the **UX Design Studio** (`/ux-design-studio`).
+
 ## Rules
 
 - Validate incoming payloads.
@@ -719,6 +1094,151 @@ heuristic result.
 - Commands must come from explicit configuration, run in an isolated workspace,
   and enforce timeout/network/environment policies.
 - Deterministic safety denylists override LLM output.
+- NEVER hold a `get_conn()` connection across an external call. `db.py`'s lock
+  is process-wide and NON-REENTRANT, and the server runs a single uvicorn
+  worker, so a connection held across an LLM round trip stalls every other
+  request for its duration. Worse, every LLM client consumes System quota via
+  `resource_limits.consume_llm_execution()`, which opens its OWN connection:
+  calling an LLM inside `with get_conn()` self-deadlocks the whole process
+  permanently (no timeout breaks it; only a restart does). `get_conn()` now
+  raises `DatabaseReentrancyError` instead of hanging, but the fix is to
+  structure the endpoint in 3 phases: read under the lock, close it, run the
+  reasoning call, then reopen to persist. Canonical examples:
+  `routes/interview.py::run_runtime_reality_check` and
+  `cell_orchestrator.run_triage`. Helpers that need both DB and an LLM
+  (`_rebuild_understanding`, `run_alignment_build`, `_generate_and_store_answer`,
+  `investigate`) own their connections rather than receiving one, and their
+  docstrings say so — call them with none open.
+  Mock providers do NOT exercise this: reasoning entry points fail closed
+  before `generate_text` on a mock/non-reasoning client, so any test that
+  must reach the LLM path has to configure a real reasoning model
+  (`openai`/`o3`) and stub `llm._request_json`.
+- The System Interview's developer-facing state is decided in exactly ONE
+  place: `app/interview_workflow.py` (Issue #349, implementing
+  `docs/system-interview-workflow-ux.md`). `evaluate_candidate_state` is the
+  13-row first-match table; `apply_backward_hold` is the ordered-state
+  (`W2 < W3 < W4 < W5 < W6 < W7`) backward hold. Both are pure functions of a
+  `WorkflowFacts` value — no clock, no request-scoped value, no client state
+  — so the same persisted facts always yield the same state. Add a new input
+  by adding a field to `WorkflowFacts` and reading it in `gather_facts`;
+  never branch on something a reload would lose.
+  - Any process that should show 「システムが調べている」 (`W1`) must persist a
+    run record via `process_run` / `ProcessRunTracker` / `tracked_process`.
+    They open short-lived connections only, so they are safe around an LLM
+    call — but the tracked function must still own its own connections.
+  - A 404/409 precondition rejection is `abandon()` (nothing ran), not a
+    failure. Recording it would surface a retry the developer cannot succeed
+    at. A deliberate skip (the Runtime Reality Check's finite skip condition)
+    is likewise not a run.
+  - Failure classification is deterministic and lives in `classify_failure`:
+    it depends on the material left behind (`E3-a` vs `E3-b`, `E4-a` vs
+    `E4-b`), not on which process failed. `target_state` is the finite set
+    `W2` / `W4` / `W5`; nothing else may be blocked.
+  - "Unresolved" is derived (no later success of the same `process_kind`),
+    never stored. `OP-D14` suspend/resume therefore cannot turn a failure
+    into a solved one — it only flips the existing session `status` and adds
+    an `interview_session_status_audit` row.
+  - `W0-B` completes by "session created AND the system started
+    investigating", so `POST /interview/sessions` opens the initial build's
+    run record itself AND dispatches the build. Leaving either half to a
+    second client call is a bug: without the record, a reload in between
+    produces a session that falls through the whole rule table to `W7` — a
+    terminal with no way back, because every build control is exception-only;
+    without the dispatch, the record describes a process nobody is running,
+    and an API-only or closed-tab session shows 「システムが調べている」
+    forever. The worker adopts that exact record
+    (`ProcessRunTracker.start(adopt_run_id=...)`), a dispatch that cannot
+    start is failed on the spot as a recoverable `E3-a`, and
+    `PROBE_INTERVIEW_EAGER_INITIAL_BUILD=1` makes it synchronous for tests.
+    Because the server starts the build, the client must NOT also post
+    `update-understanding` — that runs the same reasoning build twice.
+  - `adopt_run_id` names ONE record. "The oldest running row of this kind"
+    lets two legitimately overlapping rebuilds (a manual update while the
+    automatic refresh is in flight) share a row, so whichever finishes last
+    decides for both and can erase the other's failure.
+  - Resolution of a failure reads the LATEST finished run per `process_kind`
+    (`finished_at`, id as tiebreak), not "any later success": two runs of a
+    kind can overlap and the one that started first can finish last, and with
+    three or more an older success would mask the newest failure.
+  - `tests/conftest.py` stubs `_dispatch_initial_understanding_build` for
+    every test — otherwise every test that creates a session starts an
+    unbounded reasoning call on a daemon thread, racing its own writes.
+    `test_interview_workflow.py`'s `real_initial_build_dispatch` fixture puts
+    the real one back for the two tests that assert on the dispatch.
+  - The stale sweep is a GUESS from elapsed time (nothing writes
+    `heartbeat_at` while a process runs), so `finish_process_run` still
+    accepts a swept run and lets its real outcome replace the guess.
+  - A suspended session (rule row 3) never auto-resolves a pending backward
+    request: `W7` there means "the developer left", not "the backward
+    question was settled", and §5.4 requires resuming to acknowledge it.
+  - `open_required_questions` must exclude questions held by an in-flight
+    handoff. Handing off deliberately leaves `interview_qa.status` alone, so
+    the status column alone cannot express 「引き継ぎ済み」 (spec §2.3 `W3`).
+  - `routes/interview_workflow.py` writes exactly two developer decisions
+    (the diff review and the backward acknowledgement, both
+    `decision_method: manual`) and two system-recorded progress facts (the
+    `reached_state` checkpoint and the backward request). It confirms no
+    understanding, settles no Alignment item, approves no proposal, applies
+    no diff, and starts no observation.
+- The Understanding Brief and Decision Readiness (Issue #351) are derived in
+  exactly ONE place too: `app/understanding_brief.py`, served read-only by
+  `GET /interview/understanding-brief`. It is a second axis over the same
+  persisted facts, not a second workflow state.
+  - `classify_confirmation` (確認状態) and `classify_provenance` (出所) are
+    independent finite classifiers and must stay independent: provenance
+    answers "who wrote this claim", confirmation answers "is it settled".
+    Never let a human confirmation change a claim's provenance.
+  - `evaluate_readiness` is first-match over a `ReadinessFacts` value, same
+    purity rules as `WorkflowFacts` (no clock, no request-scoped value, no
+    client state) except for the runtime-freshness input, which the DB layer
+    resolves before calling it.
+  - Readiness NEVER gates. The single primary action keeps coming from
+    `app/interview_workflow.py` and must stay reachable under `blocked` —
+    "stop the flow until every uncertainty is gone" is an explicit non-goal.
+    The endpoint writes nothing.
+  - Only `BRIEF_AFFECTING_PROCESS_KINDS` may move the verdict — both for
+    running records and for blocking failures. A running `proposal_generation`
+    is not 「理解を作成しています」, and a failed `diff_generation` (always a
+    blocking failure) is not 「理解を作る処理が失敗した」. Add a kind to that
+    tuple only if it really writes `current_understanding` or an Intent Brief
+    item.
+  - Claim identity is exact name equality and content change is a
+    `claim_digest` comparison (name excluded). Do not introduce similarity
+    matching here — a rename is a remove + an add, exactly as in
+    `understanding_diff`.
+  - The Brief's finite vocabularies (`UnderstandingConfirmationState`,
+    `UnderstandingProvenanceKind`, `UnderstandingClaimKind`,
+    `UnderstandingReadinessState`, `UnderstandingReadinessSeverity`,
+    `UnderstandingChangeKind`) are declared ONCE as `Literal` aliases in
+    `app/models.py`; `understanding_brief.py` derives its tuples with
+    `get_args`, and `tests/test_interview_type_parity.py` holds the Dashboard
+    unions to the same sets. A bare `str` field here means the response schema
+    carries no enum and the TypeScript union can drift unnoticed — which is
+    exactly what happened when `change_kind` gained five members.
+  - `claim_payload` is the single definition of a claim's content: the digest
+    that decides a recheck AND the change list the developer reads are both
+    built from it. Adding a field to the payload means adding it to
+    `_DETAIL_FIELD_CHANGES` too, or a claim becomes reportable as "changed"
+    with nothing to show. `understanding_diff` covers names, summaries and
+    confidence only — never assume it covers the rest.
+  - The confirmed baseline is #312's
+    `understanding_capability_confirmation.source_revision_id`, with a
+    fallback to the newest revision at or before `understanding_confirmed_at`
+    for zero-base and pre-#312 sessions. Both are persisted facts; never
+    guess which revision "was probably on screen".
+  - Adding a `current_understanding` section (as #352 did with `vision`)
+    means updating `system_understanding_reviewer` (field + prompt +
+    `PROMPT_VERSION`/`SCHEMA_VERSION`), `understanding_diff.
+    UNDERSTANDING_SECTIONS`, `interview_workflow._has_understanding_content`,
+    and the Dashboard's `CurrentUnderstanding` / `hasUnderstandingContent` —
+    all five, or the section silently stops counting as content somewhere.
+- Additive nullable columns go through `db.py`'s `_add_column_if_missing`
+  (Issue #308). It only ever adds a nullable column and never backfills, so
+  do not use it for NOT NULL/DEFAULT migrations that need a value written
+  into existing rows. An index over a newly added column belongs in the
+  migration block, not in `SCHEMA`: that script also runs against older
+  databases, where `CREATE TABLE IF NOT EXISTS` is a no-op and the indexed
+  column does not exist yet.
 
 ## Required Tests
 
@@ -735,6 +1255,9 @@ Add or update tests for:
   legacy key / anonymous rejected
 - password reset and role change permissions and guards
 - System isolation for every intelligence table/API
+- no `get_conn()` connection is held across an LLM call — `tests/test_db_lock_isolation.py`
+  keeps a static check over every `with get_conn()` block plus dynamic checks
+  with a real reasoning model configured; extend it rather than duplicating it
 - committed-only snapshot behavior
 - reasoning-required operations fail closed without heuristic fallback
 - reasoning metadata and structured-output validation
@@ -744,3 +1267,146 @@ Add or update tests for:
   Issue #25 validation gate at job creation, the pre-push staleness
   re-check, approve/cancel idempotency, worktree cleanup on every terminal
   state, and system isolation
+
+## Probe Cell Fabric -- Goal/Task ledger (issue #300)
+
+Sub 3 of the Probe Cell Fabric epic (Issue #297; Sub 1's contract layer is
+`app/cell_fabric.py`, Issue #298). See the "Probe Cell Fabric(Issue #297)"
+section of `docs/project-intelligence.md` for the full epic design.
+
+- Core logic in `app/cell_tasks.py`; routes are thin
+  (`routes/cell_tasks.py`) and only translate `app.cell_tasks` errors to
+  HTTP status codes: `NotFoundError` -> 404, `ConflictError` -> 409,
+  `ValidationFailedError` -> 422.
+- Tables (System-scoped, additive `CREATE TABLE IF NOT EXISTS`, cascade
+  FKs): `cell_goals` (parent_goal_id nullable = root goal), `cell_tasks`
+  (exactly one `owner_cell_id` + one `goal_id` per row -- no many-to-many
+  membership table at this Sub), `cell_task_events` (append-only transition
+  audit), `cell_reports` (`kind` = `digest` | `escalation` only),
+  `cell_escalations` (created automatically from an escalation-kind report
+  in the same transaction).
+- Task transitions delegate legality to `cell_fabric.TASK_TRANSITIONS` /
+  `validate_task_transition` (Issue #298) -- this module never re-implements
+  the transition table. It only adds ledger-specific rules on top: a retry
+  (`failed -> todo`) increments `retry_count` and is refused (409) once
+  `retry_count >= retry_limit`; entering `blocked` requires `blocked_by`
+  task ids or an explicit `detail`; every transition writes exactly one
+  `cell_task_events` row (event_type is `created` / `transition` / `retry`
+  / `blocked` / `unblocked` / `returned_to_parent`, chosen structurally from
+  the from/to status pair, never inferred after the fact).
+  `return_to_parent` is only legal from `failed` or `blocked`.
+- Delegation (P1, `delegate_task`) reuses `cell_fabric.TaskDelegation` for
+  the acceptance/context_refs/budget/deadline/priority contract instead of
+  re-validating it -- a missing/empty `acceptance` list is the same
+  fail-closed error as #298's contract layer.
+- Evidence/context ref resolution (`resolve_evidence_ref`, Principle 6:
+  deterministic, finite ref grammar only) accepts exactly `trace:<id>` /
+  `evaluation:<id>` / `shadow_result:<id>` / `replay_run:<id>` /
+  `experiment:<id>` / `snapshot_file:<snapshot_id>:<path>`, and verifies the
+  referenced row exists AND belongs to the calling System (snapshot_file
+  additionally checks the path exists in `snapshot_files` for that
+  snapshot). Applied at the `done` transition's `evidence_refs`, a task's
+  `context_refs`, and a report's per-fact `evidence_refs`. `quality_sample:<id>`
+  and `improvement:<id>` are RESERVED P3/P4 ref formats (Sub 6 / #302 and
+  Sub 7 / #304 respectively) -- they parse but always fail closed with a
+  "not yet implemented" message; do not make them resolvable here.
+- Reports (P2, `submit_report`): `kind` outside `digest`/`escalation` is
+  rejected fail-closed, and any unknown request field is rejected by the
+  Pydantic `extra="forbid"` request model. `escalation` requires
+  `severity`; `digest` must not set one. `fact` / `interpretation` / `ask`
+  are stored as separate JSON columns -- raw evidence-backed facts are
+  never mixed with interpretation/ask text (Principle 7 discipline, even
+  though this module calls no reasoning model).
+- Idempotency: `delegate_task` and `submit_report` both accept an optional
+  `idempotency_key`; a resend with the same `(system_id, idempotency_key)`
+  returns the EXISTING row unchanged (`UNIQUE (system_id, idempotency_key)`
+  -- SQLite treats distinct NULLs as non-conflicting, so tasks/reports
+  without a key never collide with each other).
+- Goal cycle rejection (`would_create_cycle`) walks the parent chain
+  deterministically. There is no reparent endpoint at Sub 3 (only goal
+  creation and a status-only update), so the checker is exercised directly
+  in tests the same way #298 tests `validate_task_transition` directly --
+  it exists so a future reparent path can reuse it without adding a new
+  cycle-detection implementation.
+- This module has NO reasoning-model call anywhere (non-goal for #300):
+  orchestrator aggregation/triage is #301, quality sampling is #302,
+  improvement proposals are #304.
+- Tests: `tests/test_cell_tasks.py`.
+
+## Probe Cell Fabric -- epic-wide map (issue #297, subs #298-#304)
+
+See the "Probe Cell Fabric(Issue #297)" section of
+`docs/project-intelligence.md` for the binding design. Module map:
+
+- `app/cell_fabric.py` (#298): shared-schema mirror models
+  (`extra="forbid"` fail-closed), `TASK_TRANSITIONS` /
+  `validate_task_transition` (done requires acceptance + evidence),
+  Role Card semver compat (same-major AND >= pinned), and
+  `resolve_model_alias` (`CELL_MODEL_ALIAS_<UPPER_ALIAS>` env,
+  `provider:model`; unset falls back to `intelligence_from_env`). Role
+  Cards never store literal provider/model names; changing the env value
+  never requires a card revision. Tables `agent_role_cards` (append-only
+  versions) / `cell_definitions` (roster_json NULL = worker, non-null =
+  orchestrator; no separate kind column).
+- `app/cell_binding.py` (#299): `cell_bindings` append-only versions from
+  APPROVED probe points / pattern points only; drift is purely structural
+  (`active`/`stale`/`review_required`, never re-binds); `build_cell_health`
+  aggregates traces/activations deterministically (unobserved = None).
+  `cell_activations` audits explicit/aggregation-window triggers; there is
+  no per-trace LLM path anywhere in the fabric.
+- `app/cell_tasks.py` (#300): see the dedicated section above.
+- `app/cell_orchestrator.py` (#301): roster guardrails (span <= 7,
+  depth <= 3, no self/cycle, members must exist; static rosters changed
+  only via `PUT .../roster` + `cell_roster_events` audit); deterministic
+  digest with finite bottleneck rules (queue_depth / stuck_task /
+  blocked_chain / retry_churn, facts attached); `run_triage` is the ONE
+  reasoning boundary (run_type `cell_triage`, fail-closed, facts survive
+  failure, roster-external affected ids rejected).
+- `app/cell_quality.py` (#302): quality sampling is a SEPARATE contract
+  from the SDK's lineage `sample_rate`. Deterministic stable-hash
+  stratified selection (rare strata guaranteed >= 1); audit VERDICT is
+  deterministic via `evaluator.py` (`pass`/`fail`/`no_criteria`), only the
+  failure explanation is reasoning_llm (fail-closed; verdict row survives
+  LLM failure); blind re-audits never read prior audit rows; quality-floor
+  breach suspends ONLY that cell's intake + sev1 escalation via
+  `cell_tasks.submit_report`; `cell_quality_usage` enforces the
+  System-scoped daily audit budget.
+- `app/cell_root.py` (#303): `GET /cell-fabric/root-digest` reuses
+  `system_state.build_system_state` as the canonical fact source (call it
+  BEFORE opening your own `get_conn` -- it manages its own connection);
+  4-level progressive disclosure (conclusion / key_points / evidence /
+  audit), sev1 -> conclusion, sev2 -> key_points, sev3 -> evidence,
+  sha256 dedupe with merged `sources`. `cell_asks` decisions are
+  `decision_method: manual`; `execution_approved` is ALWAYS 0 here --
+  proposal accept never executes anything. Dashboard page:
+  `apps/dashboard/src/pages/cell-fabric.tsx` (Japanese UI).
+- `app/cell_improvement.py` (#304): finite lifecycle `observed ->
+  proposed -> canary_ready -> canary_running -> adopted|rejected|blocked`
+  with append-only `cell_improvement_events` (rejected history never
+  deleted); canary evidence refs restricted to existing Replay /
+  Experiment / Evaluation rows (no new execution path); `adopted`
+  requires BOTH parent and human approval; role_card adoption re-pins
+  `cell_definitions.role_card_id` (rollback re-pins back);
+  candidate_patch adoption is a handoff marker only -- the real
+  adoption/publish flows through the existing #25/#216/#242/#252 gates.
+  `cell_shadow_decisions` keeps `shadow_proposal` and
+  `live_shadow_execution_approval` as separate manual records; approving
+  execution writes NO policy/candidate rows. Rubric changes are
+  parent-owned; >= 3 consecutive rejections auto-suspend the cell's
+  improvement rights.
+
+Cross-cutting rules for every fabric module:
+
+- `db.get_conn()`'s lock is NON-REENTRANT: pass `conn` into helpers, and
+  NEVER hold a connection across `generate_text` (the quota wrapper opens
+  its own connection) -- use the 3-phase read / LLM / write structure of
+  `cell_orchestrator.run_triage`. This is now a server-wide rule (see
+  `## Rules`), enforced by `get_conn()` itself and by
+  `tests/test_db_lock_isolation.py`.
+- All tables are System-scoped with isolation tests; all reasoning goes
+  through `intelligence_runs` fail-closed with `is_mock` surfaced; the
+  Probe SDK is never touched by fabric work.
+- Tests: `tests/test_cell_fabric.py`, `test_cell_binding.py`,
+  `test_cell_tasks.py`, `test_cell_orchestrator.py`,
+  `test_cell_quality.py`, `test_cell_root.py`,
+  `test_cell_improvement.py`.

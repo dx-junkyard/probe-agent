@@ -20,7 +20,7 @@ import os
 import posixpath
 import subprocess
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 MAX_FILE_SIZE = int(os.getenv("SNAPSHOT_MAX_FILE_SIZE", str(512 * 1024)))
 
@@ -40,6 +40,22 @@ DEFAULT_EXCLUDE = [
 
 class GitError(Exception):
     pass
+
+
+HeadRelation = Literal["same", "behind", "diverged", "unknown"]
+
+
+@dataclass(frozen=True)
+class RepositoryHeadRelation:
+    """Read-only relationship between a snapshot commit and repository HEAD.
+
+    ``commits_behind`` is meaningful only when the snapshot is HEAD itself or
+    an ancestor of HEAD. Git errors are projected to ``unknown`` rather than
+    leaking through repository-status reads.
+    """
+
+    head_relation: HeadRelation
+    commits_behind: Optional[int]
 
 
 INCLUSION_STATUSES = {
@@ -70,7 +86,7 @@ def _run_git(
     repo_path: str,
     args: List[str],
     *,
-    timeout: int = 30,
+    timeout: float = 30,
     input_bytes: Optional[bytes] = None,
 ) -> subprocess.CompletedProcess:
     try:
@@ -92,6 +108,54 @@ def resolve_head(repo_path: str) -> str:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         raise GitError(f"Not a git repository or no commits: {stderr}")
     return result.stdout.decode("utf-8").strip()
+
+
+def repository_head_relation(
+    repo_path: str,
+    snapshot_sha: Optional[str],
+    head_sha: Optional[str],
+) -> RepositoryHeadRelation:
+    """Compare a snapshot commit with HEAD without changing repository state.
+
+    A count is returned only when ``snapshot_sha`` is an ancestor of
+    ``head_sha``. Rewinds, forks, and unrelated histories therefore report
+    ``diverged`` with no count. Any validation or Git command failure reports
+    ``unknown`` so a status refresh remains available during repository
+    failures.
+    """
+    unknown = RepositoryHeadRelation(head_relation="unknown", commits_behind=None)
+    if not snapshot_sha or not head_sha:
+        return unknown
+    if snapshot_sha == head_sha:
+        return RepositoryHeadRelation(head_relation="same", commits_behind=0)
+
+    try:
+        real_path = _validate_repo_path(repo_path)
+        ancestor = _run_git(
+            real_path,
+            ["merge-base", "--is-ancestor", snapshot_sha, head_sha],
+        )
+        if ancestor.returncode == 1:
+            return RepositoryHeadRelation(
+                head_relation="diverged", commits_behind=None
+            )
+        if ancestor.returncode != 0:
+            return unknown
+
+        count_result = _run_git(
+            real_path,
+            ["rev-list", "--count", f"{snapshot_sha}..{head_sha}"],
+        )
+        if count_result.returncode != 0:
+            return unknown
+        count = int(count_result.stdout.decode("utf-8", errors="replace").strip())
+        if count < 1:
+            return unknown
+        return RepositoryHeadRelation(
+            head_relation="behind", commits_behind=count
+        )
+    except (GitError, UnicodeError, ValueError):
+        return unknown
 
 
 @dataclass(frozen=True)
@@ -275,8 +339,12 @@ def classify_source_type(path: str) -> str:
     return "source"
 
 
-def list_tree_entries(repo_path: str, commit_sha: str) -> List[GitTreeEntry]:
-    result = _run_git(repo_path, ["ls-tree", "-r", "-z", commit_sha])
+def list_tree_entries(
+    repo_path: str, commit_sha: str, *, timeout: float = 30,
+) -> List[GitTreeEntry]:
+    result = _run_git(
+        repo_path, ["ls-tree", "-r", "-z", commit_sha], timeout=timeout,
+    )
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         raise GitError(f"git ls-tree failed: {stderr}")
@@ -303,10 +371,14 @@ def list_tree_entries(repo_path: str, commit_sha: str) -> List[GitTreeEntry]:
     return entries
 
 
-def read_file_at_commit(repo_path: str, commit_sha: str, path: str) -> bytes:
+def read_file_at_commit(
+    repo_path: str, commit_sha: str, path: str, *, timeout: float = 30,
+) -> bytes:
     if not _is_safe_git_path(path):
         raise GitError(f"Unsafe Git path: {path!r}")
-    result = _run_git(repo_path, ["show", f"{commit_sha}:{path}"])
+    result = _run_git(
+        repo_path, ["show", f"{commit_sha}:{path}"], timeout=timeout,
+    )
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         raise GitError(f"Cannot read {path} at {commit_sha}: {stderr}")

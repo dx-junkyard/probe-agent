@@ -1,14 +1,146 @@
 import json
+import math
 import time
-from typing import List
+from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..auth import get_system_id
+from probe_agent.replay_capture import PARTIAL, REASON_REDACTED, REPLAYABLE
+
+from ..auth import Principal, get_principal, get_system_id
 from ..db import get_conn
 from ..models import ProjectionOut, TraceEvent
+from ..resource_limits import (
+    ResourceLimitExceeded,
+    enforce_trace_rate_limit,
+    trace_storage_limits,
+)
+from ..trace_redaction import (
+    redact_projection,
+    redact_shadow_outputs,
+    redact_trace_payload,
+)
 
 router = APIRouter()
+
+
+def _utf8_size(value) -> int:
+    if value is None:
+        return 0
+    return len(str(value).encode("utf-8"))
+
+
+def _trace_values(event: TraceEvent) -> dict:
+    """Serialise one event for storage, redacting first (Issue #367).
+
+    Redaction happens here, on the write path, so no consumer can reintroduce
+    the leak by forgetting to mask: the plaintext never reaches disk.
+
+    A capture the server had to redact can no longer restore the original call
+    inputs, so its replayability is degraded to ``partial`` with the SDK's own
+    ``redacted`` reason code rather than left claiming ``replayable``. The
+    degradation is one-directional -- it never upgrades a classification the
+    SDK made, and an already ``unreplayable`` capture stays unreplayable.
+    """
+    result = redact_trace_payload(
+        input_value=event.input,
+        output=event.output,
+        error=event.error,
+        input_capture=event.input_capture,
+    )
+
+    replayability = event.replayability
+    replay_reasons = event.replay_reasons
+    capture_redacted = any(
+        entry.field == "input_capture" for entry in result.fields
+    )
+    if capture_redacted and replayability == REPLAYABLE:
+        replayability = PARTIAL
+        replay_reasons = sorted(set(replay_reasons or []) | {REASON_REDACTED})
+    elif capture_redacted and replayability == PARTIAL:
+        replay_reasons = sorted(set(replay_reasons or []) | {REASON_REDACTED})
+
+    return {
+        "trace_id": event.trace_id,
+        "component_id": event.component_id,
+        "mode": event.mode,
+        "input_json": json.dumps(result.input, ensure_ascii=False)
+        if result.input is not None else None,
+        "output_text": result.output,
+        "error": result.error,
+        "input_capture_json": json.dumps(result.input_capture, ensure_ascii=False)
+        if result.input_capture is not None else None,
+        "replayability": replayability,
+        "replay_reasons_json": json.dumps(replay_reasons, ensure_ascii=False)
+        if replay_reasons is not None else None,
+        # Issue #290 Finding 5: optional deployment provenance reported by
+        # the SDK (PROBE_ENVIRONMENT / PROBE_GIT_SHA); None when unset.
+        "environment": event.environment,
+        "git_sha": event.git_sha,
+        # Always recorded, even for a clean payload: a NULL must keep meaning
+        # "never scanned" so the operational rescan can find exactly the rows
+        # that predate this feature.
+        "redaction_json": json.dumps(result.summary(), ensure_ascii=False),
+    }
+
+
+def _estimated_trace_bytes(values: dict) -> int:
+    # Text/blob payload dominates storage. Include fixed numeric columns as a
+    # conservative constant so the approximation never reports zero.
+    return 16 + sum(_utf8_size(value) for value in values.values())
+
+
+def _stored_trace_bytes(row) -> int:
+    if row is None:
+        return 0
+    return 16 + sum(_utf8_size(row[key]) for key in (
+        "trace_id", "component_id", "mode", "input_json", "output_text",
+        "error", "input_capture_json", "replayability", "replay_reasons_json",
+        "environment", "git_sha", "redaction_json",
+    ))
+
+
+def _current_trace_usage(conn, system_id: int) -> tuple[int, int]:
+    row = conn.execute(
+        """SELECT COUNT(*) AS trace_rows,
+                  COALESCE(SUM(
+                    16
+                    + length(CAST(COALESCE(trace_id, '') AS BLOB))
+                    + length(CAST(COALESCE(component_id, '') AS BLOB))
+                    + length(CAST(COALESCE(mode, '') AS BLOB))
+                    + length(CAST(COALESCE(input_json, '') AS BLOB))
+                    + length(CAST(COALESCE(output_text, '') AS BLOB))
+                    + length(CAST(COALESCE(error, '') AS BLOB))
+                    + length(CAST(COALESCE(input_capture_json, '') AS BLOB))
+                    + length(CAST(COALESCE(replayability, '') AS BLOB))
+                    + length(CAST(COALESCE(replay_reasons_json, '') AS BLOB))
+                    + length(CAST(COALESCE(environment, '') AS BLOB))
+                    + length(CAST(COALESCE(git_sha, '') AS BLOB))
+                    + length(CAST(COALESCE(redaction_json, '') AS BLOB))
+                  ), 0) AS trace_bytes
+           FROM traces WHERE system_id = ?""",
+        (system_id,),
+    ).fetchone()
+    return row["trace_rows"], row["trace_bytes"]
+
+
+def _record_trace_quota_status(
+    conn, system_id: int, rows: int, size_bytes: int, *, reason: Optional[str]
+) -> None:
+    now = time.time()
+    conn.execute(
+        """INSERT INTO trace_quota_status
+               (system_id, trace_rows, trace_bytes, rejected_reason,
+                rejected_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(system_id) DO UPDATE SET
+               trace_rows = excluded.trace_rows,
+               trace_bytes = excluded.trace_bytes,
+               rejected_reason = excluded.rejected_reason,
+               rejected_at = excluded.rejected_at,
+               updated_at = excluded.updated_at""",
+        (system_id, rows, size_bytes, reason, now if reason else None, now),
+    )
 
 
 def _ensure_component(conn, system_id: int, component_id: str) -> None:
@@ -99,16 +231,21 @@ def _write_projections(conn, system_id: int, event: TraceEvent) -> None:
         (system_id, event.trace_id),
     )
     for proj in event.projections or []:
-        data_json = json.dumps(
-            {"fields": proj.fields, "metrics": proj.metrics, "samples": proj.samples},
-            ensure_ascii=False,
+        # Issue #367: a projection is a bounded slice of a payload, and a
+        # bounded slice of a credential is still a credential. The spec's own
+        # `redact` paths are the author's intent; this is the mandatory floor
+        # underneath them.
+        redaction = redact_projection(
+            fields=proj.fields, metrics=proj.metrics, samples=proj.samples
         )
+        data_json = json.dumps(redaction.values, ensure_ascii=False)
         conn.execute(
             """
             INSERT OR REPLACE INTO trace_projections
                 (system_id, trace_id, component_id, projection_name, phase,
-                 data_json, data_hash, truncated, extract_error, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 data_json, data_hash, truncated, extract_error, created_at,
+                 redaction_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 system_id,
@@ -121,46 +258,443 @@ def _write_projections(conn, system_id: int, event: TraceEvent) -> None:
                 1 if proj.truncated else 0,
                 proj.error,
                 event.timestamp,
+                json.dumps(redaction.summary(), ensure_ascii=False),
             ),
         )
 
 
 @router.post("/traces", status_code=201)
 def post_trace(
-    event: TraceEvent, system_id: int = Depends(get_system_id)
+    event: TraceEvent,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
 ) -> dict:
+    token_key = None
+    if principal.token_kind == "api" and principal.token_id is not None:
+        token_key = f"api:{principal.token_id}"
+    elif principal.auth == "legacy_api_key" and principal.credential_fingerprint:
+        token_key = f"legacy:{principal.credential_fingerprint}"
+    if token_key is not None:
+        try:
+            enforce_trace_rate_limit(token_key)
+        except ResourceLimitExceeded as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+
+    values = _trace_values(event)
     with get_conn() as conn:
-        _ensure_component(conn, system_id, event.component_id)
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO traces
-                (system_id, trace_id, component_id, mode, input_json, output_text,
-                 error, duration_ms, timestamp,
-                 input_capture_json, replayability, replay_reasons_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                system_id,
-                event.trace_id,
-                event.component_id,
-                event.mode,
-                json.dumps(event.input, ensure_ascii=False) if event.input is not None else None,
-                event.output,
-                event.error,
-                event.duration_ms,
-                event.timestamp,
-                # Replay capture (Issue #242 Phase A / #243): stored verbatim as
-                # JSON; NULL when the SDK did not opt this component in.
-                json.dumps(event.input_capture, ensure_ascii=False)
-                if event.input_capture is not None else None,
-                event.replayability,
-                json.dumps(event.replay_reasons, ensure_ascii=False)
-                if event.replay_reasons is not None else None,
-            ),
-        )
-        _write_lineage(conn, system_id, event)
-        _write_projections(conn, system_id, event)
-    return {"ok": True, "trace_id": event.trace_id}
+        # Serialize check + write across processes, not only the in-process DB
+        # lock, so concurrent workers cannot both pass the same last slot.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current_rows, current_bytes = _current_trace_usage(conn, system_id)
+            previous = conn.execute(
+            """SELECT trace_id, component_id, mode, input_json, output_text, error,
+                      input_capture_json, replayability, replay_reasons_json,
+                      environment, git_sha, redaction_json
+               FROM traces WHERE system_id = ? AND trace_id = ?""",
+            (system_id, event.trace_id),
+            ).fetchone()
+            projected_rows = current_rows + (0 if previous is not None else 1)
+            projected_bytes = (
+                current_bytes - _stored_trace_bytes(previous)
+                + _estimated_trace_bytes(values)
+            )
+            max_rows, max_bytes = trace_storage_limits()
+            reject_code = None
+            if projected_rows > max_rows:
+                reject_code = "trace_storage_row_limit_exceeded"
+            elif projected_bytes > max_bytes:
+                reject_code = "trace_storage_byte_limit_exceeded"
+            if reject_code:
+                _record_trace_quota_status(
+                    conn, system_id, current_rows, current_bytes, reason=reject_code
+                )
+                conn.execute("COMMIT")
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "code": reject_code,
+                        "message": "System trace storage quota exceeded",
+                        "current_rows": current_rows,
+                        "current_bytes": current_bytes,
+                        "max_rows": max_rows,
+                        "max_bytes": max_bytes,
+                    },
+                )
+            _ensure_component(conn, system_id, event.component_id)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO traces
+                    (system_id, trace_id, component_id, mode, input_json, output_text,
+                     error, duration_ms, timestamp,
+                     input_capture_json, replayability, replay_reasons_json,
+                     environment, git_sha, redaction_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    system_id,
+                    event.trace_id,
+                    event.component_id,
+                    event.mode,
+                    values["input_json"],
+                    values["output_text"],
+                    values["error"],
+                    event.duration_ms,
+                    event.timestamp,
+                    values["input_capture_json"],
+                    values["replayability"],
+                    values["replay_reasons_json"],
+                    values["environment"],
+                    values["git_sha"],
+                    values["redaction_json"],
+                ),
+            )
+            _write_lineage(conn, system_id, event)
+            _write_projections(conn, system_id, event)
+            _record_trace_quota_status(
+                conn, system_id, projected_rows, projected_bytes, reason=None
+            )
+            if event.sdk_transport is not None:
+                conn.execute(
+                    """INSERT OR REPLACE INTO sdk_transport_observations
+                           (system_id, trace_id, dropped_count, failure_count,
+                            state, observed_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        system_id,
+                        event.trace_id,
+                        event.sdk_transport.dropped_count,
+                        event.sdk_transport.failure_count,
+                        event.sdk_transport.state,
+                        time.time(),
+                    ),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    return {
+        "ok": True,
+        "trace_id": event.trace_id,
+        "sdk_transport_observed": event.sdk_transport is not None,
+    }
+
+
+@router.get("/traces/redaction-audit")
+def trace_redaction_audit(system_id: int = Depends(get_system_id)) -> dict:
+    """Report how much stored trace data predates ingestion-time redaction.
+
+    Issue #367: rows written before this feature existed were never scanned,
+    so they are the population that may still hold plaintext credentials.
+    ``unscanned_rows`` counts them; ``findings`` re-runs the scan over them
+    *read-only* so an operator can size the problem -- and decide which
+    credentials to rotate -- before changing any data. The endpoint never
+    returns a matched value, only the rule that matched and where.
+    """
+    tables: dict = {}
+    findings: List[dict] = []
+
+    with get_conn() as conn:
+        trace_rows = conn.execute(
+            """SELECT trace_id, component_id, timestamp, input_json, output_text,
+                      error, input_capture_json, redaction_json
+               FROM traces WHERE system_id = ?
+               ORDER BY timestamp DESC""",
+            (system_id,),
+        ).fetchall()
+        projection_rows = conn.execute(
+            """SELECT rowid AS row_id, trace_id, component_id, projection_name,
+                      phase, created_at, data_json, redaction_json
+               FROM trace_projections WHERE system_id = ?
+               ORDER BY created_at DESC""",
+            (system_id,),
+        ).fetchall()
+        shadow_rows = conn.execute(
+            """SELECT id, trace_id, component_id, timestamp, current_output,
+                      candidate_output, candidate_error, redaction_json
+               FROM shadow_results WHERE system_id = ?
+               ORDER BY timestamp DESC""",
+            (system_id,),
+        ).fetchall()
+
+    def _record(table: str, rows, scan) -> None:
+        unscanned = 0
+        affected = 0
+        for row in rows:
+            if row["redaction_json"] is not None:
+                # Already carries a server-side audit summary: it was scanned.
+                continue
+            unscanned += 1
+            result = scan(row)
+            if result.redacted:
+                affected += 1
+                findings.append(
+                    {
+                        "table": table,
+                        "trace_id": row["trace_id"],
+                        "component_id": row["component_id"],
+                        "rules": result.rules,
+                        "fields": sorted({entry.field for entry in result.fields}),
+                    }
+                )
+        tables[table] = {
+            "total_rows": len(rows),
+            "unscanned_rows": unscanned,
+            "affected_rows": affected,
+        }
+
+    _record("traces", trace_rows, _rescan_row)
+    _record("trace_projections", projection_rows, _rescan_projection_row)
+    _record("shadow_results", shadow_rows, _rescan_shadow_row)
+
+    return {
+        "system_id": system_id,
+        # Aggregate across every table that stores a payload: reporting only
+        # `traces` would let an operator read `unscanned_rows: 0` while
+        # plaintext still sat in projections or shadow results.
+        "total_rows": sum(t["total_rows"] for t in tables.values()),
+        "unscanned_rows": sum(t["unscanned_rows"] for t in tables.values()),
+        "affected_rows": sum(t["affected_rows"] for t in tables.values()),
+        "tables": tables,
+        "rules": sorted({rule for f in findings for rule in f["rules"]}),
+        "findings": findings,
+    }
+
+
+@router.post("/traces/redaction-rescan")
+def trace_redaction_rescan(
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> dict:
+    """Rewrite stored traces that still hold unredacted credentials.
+
+    Deliberately a separate, explicit operation rather than a startup
+    migration: it destroys data (that is the point), and rotating the exposed
+    credential must happen too -- see ``docs/secret-redaction.md``. Rewriting
+    is idempotent, and a row that needed no change keeps its bytes.
+    """
+    rewritten = 0
+    scanned = 0
+    rules: set = set()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                """SELECT trace_id, input_json, output_text, error,
+                          input_capture_json, replayability, replay_reasons_json,
+                          redaction_json
+                   FROM traces WHERE system_id = ? AND redaction_json IS NULL""",
+                (system_id,),
+            ).fetchall()
+            for row in rows:
+                scanned += 1
+                result = _rescan_row(row)
+                summary = result.summary()
+                if not result.redacted:
+                    # Nothing to remove; mark it scanned so a later audit does
+                    # not keep re-reporting a clean row as unverified.
+                    conn.execute(
+                        """UPDATE traces SET redaction_json = ?
+                           WHERE system_id = ? AND trace_id = ?""",
+                        (json.dumps(summary, ensure_ascii=False),
+                         system_id, row["trace_id"]),
+                    )
+                    continue
+                rules.update(result.rules)
+                capture_redacted = any(
+                    entry.field == "input_capture" for entry in result.fields
+                )
+                replayability = row["replayability"]
+                reasons = _load_json_or_none(row["replay_reasons_json"])
+                if capture_redacted and replayability in (REPLAYABLE, PARTIAL):
+                    replayability = PARTIAL
+                    reasons = sorted(set(reasons or []) | {REASON_REDACTED})
+                conn.execute(
+                    """UPDATE traces
+                       SET input_json = ?, output_text = ?, error = ?,
+                           input_capture_json = ?, replayability = ?,
+                           replay_reasons_json = ?, redaction_json = ?
+                       WHERE system_id = ? AND trace_id = ?""",
+                    (
+                        json.dumps(result.input, ensure_ascii=False)
+                        if result.input is not None else None,
+                        result.output,
+                        result.error,
+                        json.dumps(result.input_capture, ensure_ascii=False)
+                        if result.input_capture is not None else None,
+                        replayability,
+                        json.dumps(reasons, ensure_ascii=False)
+                        if reasons is not None else None,
+                        json.dumps(summary, ensure_ascii=False),
+                        system_id,
+                        row["trace_id"],
+                    ),
+                )
+                rewritten += 1
+            trace_counts = {"scanned_rows": scanned, "rewritten_rows": rewritten}
+
+            # Projections and shadow results reach storage through their own
+            # routes, so a rescan that stopped at `traces` would leave
+            # plaintext behind while reporting the migration complete.
+            projection_counts = _rescan_projection_rows(conn, system_id, rules)
+            shadow_counts = _rescan_shadow_rows(conn, system_id, rules)
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    tables = {
+        "traces": trace_counts,
+        "trace_projections": projection_counts,
+        "shadow_results": shadow_counts,
+    }
+    total_rewritten = sum(t["rewritten_rows"] for t in tables.values())
+    return {
+        "system_id": system_id,
+        "scanned_rows": sum(t["scanned_rows"] for t in tables.values()),
+        "rewritten_rows": total_rewritten,
+        "tables": tables,
+        "rules": sorted(rules),
+        "performed_by_user_id": principal.user_id,
+        # The plaintext is gone from this store, but it was exposed while it
+        # was here. Rotation is the operator's job and cannot be automated.
+        "rotation_required": total_rewritten > 0,
+    }
+
+
+def _rescan_projection_rows(conn, system_id: int, rules: set) -> dict:
+    """Rewrite unscanned `trace_projections` rows in the caller's transaction."""
+    rows = conn.execute(
+        """SELECT rowid AS row_id, data_json FROM trace_projections
+           WHERE system_id = ? AND redaction_json IS NULL""",
+        (system_id,),
+    ).fetchall()
+    rewritten = 0
+    for row in rows:
+        result = _rescan_projection_row(row)
+        summary = json.dumps(result.summary(), ensure_ascii=False)
+        if result.redacted:
+            rules.update(result.rules)
+            conn.execute(
+                """UPDATE trace_projections SET data_json = ?, redaction_json = ?
+                   WHERE rowid = ?""",
+                (json.dumps(result.values, ensure_ascii=False), summary, row["row_id"]),
+            )
+            rewritten += 1
+        else:
+            conn.execute(
+                "UPDATE trace_projections SET redaction_json = ? WHERE rowid = ?",
+                (summary, row["row_id"]),
+            )
+    return {"scanned_rows": len(rows), "rewritten_rows": rewritten}
+
+
+def _rescan_shadow_rows(conn, system_id: int, rules: set) -> dict:
+    """Rewrite unscanned `shadow_results` rows in the caller's transaction."""
+    rows = conn.execute(
+        """SELECT id, current_output, candidate_output, candidate_error
+           FROM shadow_results WHERE system_id = ? AND redaction_json IS NULL""",
+        (system_id,),
+    ).fetchall()
+    rewritten = 0
+    for row in rows:
+        result = _rescan_shadow_row(row)
+        summary = json.dumps(result.summary(), ensure_ascii=False)
+        if result.redacted:
+            rules.update(result.rules)
+            conn.execute(
+                """UPDATE shadow_results
+                   SET current_output = ?, candidate_output = ?,
+                       candidate_error = ?, redaction_json = ?
+                   WHERE id = ?""",
+                (
+                    result.values["current_output"],
+                    result.values["candidate_output"],
+                    result.values["candidate_error"],
+                    summary,
+                    row["id"],
+                ),
+            )
+            rewritten += 1
+        else:
+            conn.execute(
+                "UPDATE shadow_results SET redaction_json = ? WHERE id = ?",
+                (summary, row["id"]),
+            )
+    return {"scanned_rows": len(rows), "rewritten_rows": rewritten}
+
+
+def _decode_stored_input(raw):
+    """Decode a stored ``input_json`` the same way the read path does.
+
+    A row whose column is not valid JSON is scanned as raw text rather than
+    dropped -- an unparseable payload is exactly the kind that would otherwise
+    slip past the rescan still holding a credential.
+    """
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def _rescan_row(row):
+    """Re-run redaction over one stored trace row's decoded payload."""
+    return redact_trace_payload(
+        input_value=_decode_stored_input(row["input_json"]),
+        output=row["output_text"],
+        error=row["error"],
+        input_capture=_load_json_or_none(row["input_capture_json"]),
+    )
+
+
+def _rescan_projection_row(row):
+    data = _load_json_or_none(row["data_json"]) or {}
+    return redact_projection(
+        fields=data.get("fields"),
+        metrics=data.get("metrics"),
+        samples=data.get("samples"),
+    )
+
+
+def _rescan_shadow_row(row):
+    return redact_shadow_outputs(
+        current_output=row["current_output"],
+        candidate_output=row["candidate_output"],
+        candidate_error=row["candidate_error"],
+    )
+
+
+@router.get("/sdk-transport/status")
+def sdk_transport_status(system_id: int = Depends(get_system_id)) -> dict:
+    """Expose persisted SDK loss/breaker observations without raw payloads."""
+    with get_conn() as conn:
+        latest = conn.execute(
+            """SELECT trace_id, dropped_count, failure_count, state, observed_at
+               FROM sdk_transport_observations WHERE system_id = ?
+               ORDER BY observed_at DESC, trace_id DESC LIMIT 1""",
+            (system_id,),
+        ).fetchone()
+        totals = conn.execute(
+            """SELECT COALESCE(SUM(dropped_count), 0) AS dropped_count,
+                      COALESCE(SUM(failure_count), 0) AS failure_count,
+                      COUNT(*) AS observation_count
+               FROM sdk_transport_observations WHERE system_id = ?""",
+            (system_id,),
+        ).fetchone()
+    return {
+        "system_id": system_id,
+        "dropped_count": totals["dropped_count"],
+        "failure_count": totals["failure_count"],
+        "observation_count": totals["observation_count"],
+        "latest": dict(latest) if latest is not None else None,
+    }
 
 
 def _row_to_projection(row) -> ProjectionOut:
@@ -223,6 +757,75 @@ def list_component_projections(
     return [_row_to_projection(r) for r in rows]
 
 
+@router.get("/components/{component_id}/trace-summary")
+def component_trace_summary(
+    component_id: str,
+    system_id: int = Depends(get_system_id),
+) -> dict:
+    """Deterministic monitoring summary for one component (Issue #373).
+
+    Computed over ALL of the component's traces, not the page the Dashboard
+    happens to have loaded: a p95 taken from the most recent 20 rows would be
+    a different number every poll and would not describe the component.
+
+    Percentiles use the nearest-rank method on the sorted sample, which needs
+    no interpolation and is exactly reproducible.
+    """
+    with get_conn() as conn:
+        totals = conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN error IS NOT NULL AND error != '' THEN 1 ELSE 0 END)
+                          AS error_count,
+                      MAX(timestamp) AS last_trace_at,
+                      SUM(CASE WHEN replayability IN ('replayable', 'partial')
+                               THEN 1 ELSE 0 END) AS replayable_count,
+                      SUM(CASE WHEN redaction_json IS NOT NULL
+                                AND redaction_json LIKE '%"redacted": true%'
+                               THEN 1 ELSE 0 END) AS redacted_count
+               FROM traces WHERE system_id = ? AND component_id = ?""",
+            (system_id, component_id),
+        ).fetchone()
+        durations = [
+            row["duration_ms"]
+            for row in conn.execute(
+                """SELECT duration_ms FROM traces
+                   WHERE system_id = ? AND component_id = ? AND duration_ms IS NOT NULL
+                   ORDER BY duration_ms""",
+                (system_id, component_id),
+            ).fetchall()
+        ]
+
+    total = totals["total"] or 0
+    error_count = totals["error_count"] or 0
+    return {
+        "component_id": component_id,
+        "total": total,
+        "error_count": error_count,
+        # Reported as a fraction of the traces that exist; the client formats
+        # it. `None` when there is nothing to divide by, never 0.0 — "no
+        # errors" and "no data" are different answers.
+        "error_rate": (error_count / total) if total else None,
+        "last_trace_at": totals["last_trace_at"],
+        "replayable_count": totals["replayable_count"] or 0,
+        "redacted_count": totals["redacted_count"] or 0,
+        "duration_p50_ms": _percentile(durations, 50),
+        "duration_p95_ms": _percentile(durations, 95),
+        "duration_max_ms": durations[-1] if durations else None,
+    }
+
+
+def _percentile(sorted_values: List[float], percentile: int) -> Optional[float]:
+    """Nearest-rank percentile over an already-sorted list.
+
+    No interpolation, so the result is always an observed value and two
+    callers computing it never disagree by a rounding rule.
+    """
+    if not sorted_values:
+        return None
+    rank = max(1, math.ceil(percentile / 100 * len(sorted_values)))
+    return sorted_values[min(rank, len(sorted_values)) - 1]
+
+
 @router.get("/components/{component_id}/traces")
 def list_traces(
     component_id: str,
@@ -235,7 +838,8 @@ def list_traces(
             """
             SELECT trace_id, component_id, mode, input_json, output_text,
                    error, duration_ms, timestamp,
-                   input_capture_json, replayability, replay_reasons_json
+                   input_capture_json, replayability, replay_reasons_json,
+                   redaction_json
             FROM traces
             WHERE system_id = ? AND component_id = ?
             ORDER BY timestamp DESC
@@ -244,24 +848,145 @@ def list_traces(
             (system_id, component_id, limit),
         ).fetchall()
 
-    result = []
-    for row in rows:
-        d = dict(row)
-        if d.get("input_json"):
-            try:
-                d["input"] = json.loads(d["input_json"])
-            except json.JSONDecodeError:
-                d["input"] = d["input_json"]
-        else:
-            d["input"] = None
-        d.pop("input_json", None)
-        d["output"] = d.pop("output_text", None)
-        # Replay capture (Issue #242 Phase A / #243): NULL columns (pre-Phase-A
-        # rows or components not opted in) surface as explicit nulls.
-        d["input_capture"] = _load_json_or_none(d.pop("input_capture_json", None))
-        d["replay_reasons"] = _load_json_or_none(d.pop("replay_reasons_json", None))
-        result.append(d)
-    return result
+    return [_trace_row_out(row) for row in rows]
+
+
+def _trace_row_out(row) -> dict:
+    d = dict(row)
+    if d.get("input_json"):
+        try:
+            d["input"] = json.loads(d["input_json"])
+        except json.JSONDecodeError:
+            d["input"] = d["input_json"]
+    else:
+        d["input"] = None
+    d.pop("input_json", None)
+    d["output"] = d.pop("output_text", None)
+    # Replay capture (Issue #242 Phase A / #243): NULL columns (pre-Phase-A
+    # rows or components not opted in) surface as explicit nulls.
+    d["input_capture"] = _load_json_or_none(d.pop("input_capture_json", None))
+    d["replay_reasons"] = _load_json_or_none(d.pop("replay_reasons_json", None))
+    # Issue #367: the redaction audit summary, plus the deterministic
+    # payload shape facts the collapsed detail view shows *before* a
+    # reader expands anything (AC: type / count / size / redaction).
+    d["redaction"] = _load_json_or_none(d.pop("redaction_json", None))
+    d["payload_summary"] = _payload_summary(d["input"], d["output"], d["error"])
+    return d
+
+
+@router.get("/components/{component_id}/trace-page")
+def list_trace_page(
+    component_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    status: Literal["all", "ok", "error"] = "all",
+    mode: Literal["all", "off", "trace", "shadow"] = "all",
+    replay: Literal["all", "usable", "replayable", "not_captured"] = "all",
+    window: Literal["all", "5m", "1h", "24h", "7d"] = "all",
+    sort: Literal["recent", "slowest", "errors_first"] = "recent",
+    query: str = Query("", max_length=200),
+    system_id: int = Depends(get_system_id),
+) -> dict:
+    """Server-side monitoring filter/sort/page over the complete trace set.
+
+    The summary and the table now describe the same population.  The previous
+    client-only filter saw at most the newest 20 rows, so an older error or the
+    slowest call could not be found even while the summary counted it.
+    """
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    clauses = ["system_id = ?", "component_id = ?"]
+    params: list = [system_id, component_id]
+    if status == "ok":
+        clauses.append("(error IS NULL OR error = '')")
+    elif status == "error":
+        clauses.append("error IS NOT NULL AND error != ''")
+    if mode != "all":
+        clauses.append("mode = ?")
+        params.append(mode)
+    if replay == "usable":
+        clauses.append("replayability IN ('replayable', 'partial')")
+    elif replay == "replayable":
+        clauses.append("replayability = 'replayable'")
+    elif replay == "not_captured":
+        clauses.append("replayability IS NULL")
+    window_seconds = {"5m": 300, "1h": 3600, "24h": 86400, "7d": 604800}
+    if window != "all":
+        clauses.append("timestamp >= ?")
+        params.append(time.time() - window_seconds[window])
+    if query:
+        clauses.append("trace_id LIKE ? ESCAPE '\\'")
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params.append(f"%{escaped}%")
+
+    where = " AND ".join(clauses)
+    order_by = {
+        "recent": "timestamp DESC, trace_id",
+        "slowest": "duration_ms DESC, timestamp DESC, trace_id",
+        "errors_first": "CASE WHEN error IS NOT NULL AND error != '' THEN 0 ELSE 1 END, timestamp DESC, trace_id",
+    }[sort]
+    with get_conn() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) AS count FROM traces WHERE {where}", params
+        ).fetchone()["count"]
+        rows = conn.execute(
+            f"""SELECT trace_id, component_id, mode, input_json, output_text,
+                       error, duration_ms, timestamp, input_capture_json,
+                       replayability, replay_reasons_json, redaction_json
+                FROM traces WHERE {where}
+                ORDER BY {order_by} LIMIT ? OFFSET ?""",
+            (*params, limit, offset),
+        ).fetchall()
+    return {
+        "items": [_trace_row_out(row) for row in rows],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }
+
+
+def _value_kind(value) -> str:
+    """Finite type label for the collapsed trace-detail summary (Issue #367)."""
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "object"
+    return "unknown"
+
+
+def _payload_summary(input_value, output, error) -> dict:
+    """Deterministic size/shape facts about one trace's payload.
+
+    Computed server-side so the Dashboard can render a collapsed summary
+    without first shipping — and parsing — the whole payload it is summarising.
+    """
+
+    def describe(value, serialized: str) -> dict:
+        item_count = None
+        if isinstance(value, (list, dict)):
+            item_count = len(value)
+        return {
+            "kind": _value_kind(value),
+            "item_count": item_count,
+            "bytes": len(serialized.encode("utf-8")) if serialized else 0,
+        }
+
+    input_serialized = (
+        json.dumps(input_value, ensure_ascii=False) if input_value is not None else ""
+    )
+    return {
+        "input": describe(input_value, input_serialized),
+        "output": describe(output, output or ""),
+        "error": describe(error, error or ""),
+    }
 
 
 def _load_json_or_none(raw):

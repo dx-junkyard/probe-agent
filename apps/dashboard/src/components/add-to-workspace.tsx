@@ -22,7 +22,7 @@ export function AddToWorkspaceButton({ itemType, itemId, label }: {
     <>
       <Button size="sm" variant="outline" onClick={() => setOpen(true)}>
         <MessageSquarePlus className="h-4 w-4 mr-1" />
-        Add to Workspace
+        Workspaceに追加
       </Button>
       <AddToWorkspaceDialog open={open} onOpenChange={setOpen} itemType={itemType} itemId={itemId} label={label} />
     </>
@@ -56,12 +56,12 @@ function AddToWorkspaceDialog({ open, onOpenChange, itemType, itemId, label }: {
         workspaceId = created.id;
       }
       if (!workspaceId) {
-        toast.error("Select or create a workspace first");
+        toast.error("Workspaceを選択または作成してください");
         return;
       }
       await api.post<WorkspaceContextItemOut>(`/workspaces/${workspaceId}/context`, { item_type: itemType, item_id: itemId, label });
       qc.invalidateQueries({ queryKey: ["workspace"] });
-      toast.success("Added to workspace");
+      toast.success("Workspaceに追加しました");
       onOpenChange(false);
       reset();
       navigate(`/workspaces?open=${workspaceId}`);
@@ -77,37 +77,37 @@ function AddToWorkspaceDialog({ open, onOpenChange, itemType, itemId, label }: {
   return (
     <Dialog open={open} onOpenChange={(o) => { onOpenChange(o); if (!o) reset(); }}>
       <DialogHeader>
-        <DialogTitle>Add to Decision Workspace</DialogTitle>
+        <DialogTitle>Decision Workspaceに追加</DialogTitle>
       </DialogHeader>
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground">
-          Pin <span className="font-mono">{itemId}</span> ({itemType}) as context in a workspace.
+          <span className="font-mono">{itemId}</span> ({itemType}) をWorkspaceのcontextとしてpinする。
         </p>
         <div className="flex gap-2">
           <Button size="sm" variant={mode === "existing" ? "default" : "outline"} onClick={() => setMode("existing")}>
-            Existing
+            既存のWorkspace
           </Button>
           <Button size="sm" variant={mode === "new" ? "default" : "outline"} onClick={() => setMode("new")}>
-            New Workspace
+            新しいWorkspace
           </Button>
         </div>
         {mode === "existing" ? (
           <div className="space-y-2">
             <Label>Workspace</Label>
             <Select value={selectedId} onChange={e => setSelectedId(e.target.value)}>
-              <option value="">Select a workspace...</option>
+              <option value="">Workspaceを選択...</option>
               {workspaces?.map(w => <option key={w.id} value={w.id}>{w.title}</option>)}
             </Select>
-            {!workspaces?.length && <p className="text-xs text-muted-foreground">No workspaces yet. Create one instead.</p>}
+            {!workspaces?.length && <p className="text-xs text-muted-foreground">Workspaceがまだありません。新規作成してください。</p>}
           </div>
         ) : (
           <div className="space-y-2">
-            <Label>Title</Label>
+            <Label>タイトル</Label>
             <Input value={newTitle} onChange={e => setNewTitle(e.target.value)} placeholder="Improve summarizer quality" />
           </div>
         )}
         <Button className="w-full" disabled={!canSubmit || submitting} onClick={handleAdd}>
-          {submitting ? "Adding..." : "Add"}
+          {submitting ? "追加中..." : "追加"}
         </Button>
       </div>
     </Dialog>

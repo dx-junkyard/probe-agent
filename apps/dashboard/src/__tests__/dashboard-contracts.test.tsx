@@ -30,8 +30,6 @@ vi.mock("@/api/client", () => ({
   api: mockApi,
   getSystemId: () => mockSystemId,
   setSystemId: (id: number | null) => { mockSystemId = id; },
-  getSessionToken: () => "fake-token",
-  setSessionToken: vi.fn(),
   ApiError,
 }));
 
@@ -69,8 +67,8 @@ describe("Components page trace details", () => {
           { component_id: "order-validator", mode: "trace", trace_count: 1, last_seen: 1000 },
         ]);
       }
-      if (path === "/components/order-validator/traces?limit=20") {
-        return Promise.resolve([{
+      if (path.startsWith("/components/order-validator/trace-page?")) {
+        const items = [{
           trace_id: "trace-1234567890",
           component_id: "order-validator",
           mode: "trace",
@@ -79,7 +77,8 @@ describe("Components page trace details", () => {
           error: "ValidationError: missing customer",
           duration_ms: 12.5,
           timestamp: 1000,
-        }]);
+        }];
+        return Promise.resolve({ items, total: 1, offset: 0, limit: 50 });
       }
       if (path === "/components/order-validator/profile") {
         return Promise.resolve(null);
@@ -106,25 +105,38 @@ describe("Components page trace details", () => {
     );
 
     const detailsButton = await screen.findByRole("button", {
-      name: "Show signal details for trace trace-1234567890",
+      name: "Trace trace-1234567890 の詳細を表示",
     });
     expect(screen.queryByText("ValidationError: missing customer")).not.toBeInTheDocument();
 
     fireEvent.click(detailsButton);
 
     expect(screen.getByRole("button", {
-      name: "Hide signal details for trace trace-1234567890",
+      name: "Trace trace-1234567890 の詳細を隠す",
     })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("trace-1234567890")).toBeInTheDocument();
+
+    // Issue #367: opening a trace row no longer renders the payload. The
+    // audited leak was a JsonTree auto-expanded straight onto an API key, so
+    // the values now need one more deliberate step.
+    expect(screen.queryByText("ValidationError: missing customer")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("入出力の中身を表示"));
+
     fireEvent.click(screen.getByRole("button", { name: /0.*object/ }));
     expect(screen.getByText(/order-42/)).toBeInTheDocument();
     expect(screen.getByText("{'valid': False}")).toBeInTheDocument();
     expect(screen.getByText("ValidationError: missing customer")).toBeInTheDocument();
-    expect(screen.getByText("trace-1234567890")).toBeInTheDocument();
 
+    // The detail stays visually stable while expanded, so list polling pauses.
+    // Collapsing resumes polling without affecting the independently refreshed
+    // component summary.
+    fireEvent.click(screen.getByRole("button", {
+      name: "Trace trace-1234567890 の詳細を隠す",
+    }));
     await waitFor(() => {
       const componentRefreshes = mockApi.get.mock.calls.filter(([path]) => path === "/components");
       const traceRefreshes = mockApi.get.mock.calls.filter(
-        ([path]) => path === "/components/order-validator/traces?limit=20",
+        ([path]) => String(path).startsWith("/components/order-validator/trace-page?"),
       );
       expect(componentRefreshes.length).toBeGreaterThanOrEqual(2);
       expect(traceRefreshes.length).toBeGreaterThanOrEqual(2);
@@ -136,6 +148,8 @@ vi.mock("sonner", () => ({
   toast: {
     success: vi.fn(),
     error: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
   },
   Toaster: () => null,
 }));
@@ -272,9 +286,9 @@ async function openCreateDialog() {
   render(<ExperimentsPage />, { wrapper: createWrapper() });
 
   await waitFor(() => {
-    expect(screen.getByText("New Experiment")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Experimentを作成" })).toBeInTheDocument();
   });
-  fireEvent.click(screen.getByText("New Experiment"));
+  fireEvent.click(screen.getByRole("button", { name: "Experimentを作成" }));
 
   await waitFor(() => {
     expect(screen.getByPlaceholderText("feature-id")).toBeInTheDocument();
@@ -283,7 +297,7 @@ async function openCreateDialog() {
 
 function fillBasicFields() {
   fireEvent.change(screen.getByPlaceholderText("feature-id"), { target: { value: "feat-1" } });
-  fireEvent.change(screen.getByPlaceholderText("What are you trying to learn?"), { target: { value: "Test objective" } });
+  fireEvent.change(screen.getByPlaceholderText("この比較で確認したいこと"), { target: { value: "Test objective" } });
   const selects = screen.getAllByRole("combobox");
   const snapshotSelect = selects[selects.length - 1];
   fireEvent.change(snapshotSelect, { target: { value: "1" } });
@@ -300,13 +314,12 @@ describe("Experiment creation", () => {
     await openCreateDialog();
     fillBasicFields();
 
-    const labelInputs = screen.getAllByPlaceholderText("Label (e.g., optimized-v1)");
-    const patchInputs = screen.getAllByPlaceholderText("Patch text (unified diff format)");
+    const labelInputs = screen.getAllByPlaceholderText("ラベル（例: optimized-v1）");
+    const patchInputs = screen.getAllByPlaceholderText("Patch内容（unified diff形式）");
     fireEvent.change(labelInputs[0], { target: { value: "variant-a" } });
     fireEvent.change(patchInputs[0], { target: { value: "patch-a" } });
 
-    const buttons = screen.getAllByRole("button");
-    const createBtn = buttons.find(b => b.textContent === "Create Experiment");
+    const createBtn = screen.getAllByRole("button", { name: "Experimentを作成" }).at(-1);
     expect(createBtn).toBeDisabled();
   });
 
@@ -320,16 +333,15 @@ describe("Experiment creation", () => {
     await openCreateDialog();
     fillBasicFields();
 
-    const labelInputs = screen.getAllByPlaceholderText("Label (e.g., optimized-v1)");
-    const patchInputs = screen.getAllByPlaceholderText("Patch text (unified diff format)");
+    const labelInputs = screen.getAllByPlaceholderText("ラベル（例: optimized-v1）");
+    const patchInputs = screen.getAllByPlaceholderText("Patch内容（unified diff形式）");
 
     fireEvent.change(labelInputs[0], { target: { value: "variant-a" } });
     fireEvent.change(patchInputs[0], { target: { value: "patch-a" } });
     fireEvent.change(labelInputs[1], { target: { value: "variant-b" } });
     fireEvent.change(patchInputs[1], { target: { value: "patch-b" } });
 
-    const buttons = screen.getAllByRole("button");
-    const createBtn = buttons.find(b => b.textContent === "Create Experiment")!;
+    const createBtn = screen.getAllByRole("button", { name: "Experimentを作成" }).at(-1)!;
     expect(createBtn).not.toBeDisabled();
 
     fireEvent.click(createBtn);
@@ -351,8 +363,8 @@ describe("Experiment creation", () => {
     setupExperimentMocks();
     await openCreateDialog();
 
-    expect(screen.getByText("Variant 1")).toBeInTheDocument();
-    expect(screen.getByText("Variant 2")).toBeInTheDocument();
+    expect(screen.getByText("候補 1")).toBeInTheDocument();
+    expect(screen.getByText("候補 2")).toBeInTheDocument();
 
     const trashIcons = document.querySelectorAll(".lucide-trash-2");
     expect(trashIcons.length).toBe(0);
@@ -411,7 +423,7 @@ describe("Experiment decision (adopted)", () => {
     fireEvent.click(header);
 
     await waitFor(() => {
-      expect(screen.getByText("Decision")).toBeInTheDocument();
+      expect(screen.getByText("判断")).toBeInTheDocument();
     });
 
     const verdictSelect = screen.getAllByRole("combobox").find(
@@ -420,7 +432,7 @@ describe("Experiment decision (adopted)", () => {
     fireEvent.change(verdictSelect, { target: { value: "adopted" } });
 
     await waitFor(() => {
-      expect(screen.getByText("Adopt Variant *")).toBeInTheDocument();
+      expect(screen.getByText("採用する候補 *")).toBeInTheDocument();
     });
 
     const variantSelect = screen.getAllByRole("combobox").find(
@@ -428,10 +440,10 @@ describe("Experiment decision (adopted)", () => {
     ) as HTMLSelectElement;
     fireEvent.change(variantSelect, { target: { value: "opt-v1" } });
 
-    const noteTextarea = screen.getByPlaceholderText("Reason for decision...");
+    const noteTextarea = screen.getByPlaceholderText("判断理由を入力...");
     fireEvent.change(noteTextarea, { target: { value: "Better performance" } });
 
-    fireEvent.click(screen.getByText("Save Decision"));
+    fireEvent.click(screen.getByText("判断を保存"));
 
     await waitFor(() => {
       expect(mockApi.put).toHaveBeenCalledWith("/experiments/1/decision", {
@@ -440,6 +452,108 @@ describe("Experiment decision (adopted)", () => {
         note: "Better performance",
       });
     });
+  });
+});
+
+// ── Experiment decision next-action (Issue #259) ────────────────────
+
+describe("Experiment decision next-action (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function decidedExperimentFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 1, feature_id: "feat-1", objective: "Test", status: "completed",
+      human_decision: "adopted", human_decision_variant_key: "opt-v1", human_decision_note: "note",
+      created_at: "2024-01-01T00:00:00Z",
+      variants: [
+        { id: 1, variant_key: "baseline", label: "Baseline", is_baseline: true, status: "completed", patch_text: null, risk_note: null, error: null, metrics: {} },
+      ],
+      comparison: {},
+      ...overrides,
+    };
+  }
+
+  function setupDecidedExperiment(exp: Record<string, unknown>, github: {
+    appStatus?: Record<string, unknown>;
+    connections?: Record<string, unknown>[];
+  } = {}) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/experiments") return Promise.resolve([exp]);
+      if (path === "/repository/snapshots") return Promise.resolve([]);
+      if (path === "/repository/drafts/latest") return Promise.resolve({ feature_drafts: [] });
+      if (path === "/github/app-status") return Promise.resolve(
+        github.appStatus ?? { configured: false, app_id: null, api_base_url: "", web_base_url: "" },
+      );
+      if (path === "/github/connections") return Promise.resolve(github.connections ?? []);
+      return Promise.resolve(null);
+    });
+  }
+
+  async function renderAndExpand() {
+    const { default: ExperimentsPage } = await import("@/pages/experiments");
+    render(<ExperimentsPage />, { wrapper: createWrapper() });
+    await waitFor(() => expect(screen.getByText(/Experiment #1/)).toBeInTheDocument());
+    fireEvent.click(screen.getByText(/Experiment #1/).closest("[class*=cursor-pointer]")!);
+  }
+
+  test("adopted decision shows GitHub publish + Probe Planner next actions when GitHub is configured", async () => {
+    setupDecidedExperiment(decidedExperimentFixture(), {
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "connected" }],
+    });
+    await renderAndExpand();
+
+    const githubLink = await screen.findByTestId("experiment-github-publish-link");
+    expect(githubLink).toHaveAttribute("href", "/github");
+    expect(screen.getByTestId("experiment-probe-planner-link")).toHaveAttribute("href", "/probe-planner");
+  });
+
+  test("adopted decision hides the GitHub publish link (but keeps Probe Planner) when GitHub is not configured", async () => {
+    setupDecidedExperiment(decidedExperimentFixture());
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("experiment-probe-planner-link")).toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-github-publish-link")).not.toBeInTheDocument();
+  });
+
+  test("adopted decision also hides the GitHub publish link when configured but no connection is connected", async () => {
+    setupDecidedExperiment(decidedExperimentFixture(), {
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "error" }],
+    });
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("experiment-probe-planner-link")).toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-github-publish-link")).not.toBeInTheDocument();
+  });
+
+  test("rejected decision links to AI Candidate Studio", async () => {
+    setupDecidedExperiment(decidedExperimentFixture({ human_decision: "rejected", human_decision_variant_key: null }));
+    await renderAndExpand();
+
+    const link = await screen.findByTestId("experiment-candidate-studio-link");
+    expect(link).toHaveAttribute("href", "/candidate-studio");
+    expect(screen.queryByTestId("experiment-github-publish-link")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-probe-planner-link")).not.toBeInTheDocument();
+  });
+
+  test("needs_more_data decision also links to AI Candidate Studio", async () => {
+    setupDecidedExperiment(decidedExperimentFixture({ human_decision: "needs_more_data", human_decision_variant_key: null }));
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("experiment-candidate-studio-link")).toBeInTheDocument();
+  });
+
+  test("undecided experiment shows no next-action card", async () => {
+    setupDecidedExperiment(decidedExperimentFixture({ human_decision: null, human_decision_variant_key: null }));
+    await renderAndExpand();
+
+    await waitFor(() => expect(screen.getByText("判断")).toBeInTheDocument());
+    expect(screen.queryByTestId("experiment-next-action-adopted")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("experiment-next-action-candidate-studio")).not.toBeInTheDocument();
   });
 });
 
@@ -521,6 +635,90 @@ describe("Probe Patch application", () => {
         },
       );
     });
+  });
+});
+
+// ── Probe Patch apply-success next action (Issue #259) ──────────────
+
+describe("Probe Patch apply-success next action (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function mockAppliedPatch(github: {
+    appStatus?: Record<string, unknown>;
+    connections?: Record<string, unknown>[];
+  } = {}) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") {
+        return Promise.resolve({
+          system_id: 1, is_mock: false,
+          plans: [{
+            id: 10, feature_id: "feat-1", objective: "Observe behavior", status: "proposed",
+            created_at: "2024-01-01", probe_points: [],
+          }],
+        });
+      }
+      if (path === "/repository/probe-patches") {
+        return Promise.resolve([{
+          id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+          commit_sha: "abcdef1234567890", diff: "diff --git a/a.py b/a.py",
+          worktree_path: null, skipped: [], status: "generated", error: null,
+          cleanup_state: "removed", cleanup_error: null,
+          apply_status: "applied", apply_error: null,
+          applied_at: "2024-01-02T00:00:00Z", applied_by_user_id: 1,
+          validation_runs: [
+            { id: 1, variant: "baseline", overall_success: true, commands: [] },
+            { id: 2, variant: "probed", overall_success: true, commands: [] },
+          ],
+          created_at: "2024-01-01",
+        }]);
+      }
+      if (path === "/github/app-status") return Promise.resolve(
+        github.appStatus ?? { configured: false, app_id: null, api_base_url: "", web_base_url: "" },
+      );
+      if (path === "/github/connections") return Promise.resolve(github.connections ?? []);
+      return Promise.resolve(null);
+    });
+  }
+
+  async function renderAndExpand() {
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+  }
+
+  test("shows a Create Publish Job link targeting ?patch=<id> when GitHub publish is configured and connected", async () => {
+    mockAppliedPatch({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "connected" }],
+    });
+    await renderAndExpand();
+
+    const link = await screen.findByTestId("patch-publish-link");
+    expect(link).toHaveAttribute("href", "/github?patch=20");
+    expect(screen.queryByTestId("patch-manual-git-instructions")).not.toBeInTheDocument();
+  });
+
+  test("falls back to manual git instructions when GitHub is not configured", async () => {
+    mockAppliedPatch();
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("patch-manual-git-instructions")).toBeInTheDocument();
+    expect(screen.queryByTestId("patch-publish-link")).not.toBeInTheDocument();
+  });
+
+  test("falls back to manual git instructions when GitHub is configured but has no connected connection", async () => {
+    mockAppliedPatch({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [{ id: 1, status: "error" }],
+    });
+    await renderAndExpand();
+
+    expect(await screen.findByTestId("patch-manual-git-instructions")).toBeInTheDocument();
+    expect(screen.queryByTestId("patch-publish-link")).not.toBeInTheDocument();
   });
 });
 
@@ -636,6 +834,7 @@ describe("Repository Refresh Hub", () => {
       latest_indexed_snapshot: null,
       understanding_snapshot_id: null, understanding_status: null,
       snapshot_stale: true, symbols_stale: false,
+      head_relation: "behind", commits_behind: 3,
       next_actions: ["Repository HEAD changed; create a new snapshot before generating new analysis or patches."],
     }));
 
@@ -644,9 +843,9 @@ describe("Repository Refresh Hub", () => {
 
     const hub = await screen.findByTestId("refresh-hub");
     expect(within(hub).getByTestId("snapshot-stale-badge")).toBeInTheDocument();
-    // The next-steps list echoes the server's actionable guidance verbatim.
+    expect(within(hub).getByTestId("repository-lag")).toHaveTextContent("3 commit遅れ");
     expect(
-      within(hub).getByText(/create a new snapshot before generating new analysis or patches/i),
+      within(hub).getByText(/新しい解析やpatchを生成する前にSnapshotを更新してください/),
     ).toBeInTheDocument();
   });
 
@@ -658,6 +857,7 @@ describe("Repository Refresh Hub", () => {
       latest_snapshot: { id: 12, commit_sha: "abc1234000", status: "ready", created_at: 1 },
       latest_indexed_snapshot: { id: 12, commit_sha: "abc1234000", status: "ready", created_at: 1 },
       understanding_snapshot_id: 12, understanding_status: "completed",
+      head_relation: "same", commits_behind: 0,
       snapshot_stale: false, symbols_stale: false, next_actions: [],
     }));
 
@@ -665,7 +865,89 @@ describe("Repository Refresh Hub", () => {
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
     const hub = await screen.findByTestId("refresh-hub");
-    expect(within(hub).getByText("Up to date")).toBeInTheDocument();
+    expect(within(hub).getByText("最新です")).toBeInTheDocument();
+    expect(within(hub).getByTestId("repository-lag")).toHaveTextContent("最新");
+  });
+
+  test("starts the explicit snapshot and symbol resync from one button", async () => {
+    mockApi.get.mockImplementation(baseGet({
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "abc1234000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 12, commit_sha: "abc1234000", status: "ready", created_at: 1 },
+      latest_indexed_snapshot: null,
+      understanding_snapshot_id: null, understanding_status: null,
+      head_relation: "same", commits_behind: 0,
+      snapshot_stale: false, symbols_stale: true, next_actions: [],
+    }));
+    mockApi.post.mockResolvedValue({
+      id: 7, system_id: 1, snapshot_id: null, status: "queued", error: null,
+      stale_capability_count: 0, created_at: 1, started_at: null, completed_at: null,
+    });
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("repository-resync-button"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/resync");
+    });
+  });
+
+  test("guides capability review and understanding build after resync", async () => {
+    const getBase = baseGet({
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "def5678000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 13, commit_sha: "def5678000", status: "ready", created_at: 2 },
+      latest_indexed_snapshot: { id: 13, commit_sha: "def5678000", status: "ready", created_at: 2 },
+      understanding_snapshot_id: 12, understanding_status: "completed",
+      head_relation: "same", commits_behind: 0,
+      snapshot_stale: false, symbols_stale: false, next_actions: [],
+    });
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/resync/latest") return Promise.resolve({
+        id: 7, system_id: 1, snapshot_id: 13, status: "completed", error: null,
+        stale_capability_count: 2, created_at: 1, started_at: 1, completed_at: 2,
+      });
+      return getBase(path);
+    });
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    const guidance = await screen.findByTestId("stale-capability-guidance");
+    expect(guidance).toHaveTextContent("2件のCapabilityが古いSnapshotを参照しています");
+    expect(within(guidance).getByText("Capability Mapを確認").closest("a"))
+      .toHaveAttribute("href", "/capability-map");
+    expect(within(guidance).getByText("System Understandingを構築").closest("a"))
+      .toHaveAttribute("href", "/system-understanding?fix=build");
+  });
+
+  test("does not show a completed resync message for an obsolete snapshot", async () => {
+    const getBase = baseGet({
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "new0000000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 14, commit_sha: "new0000000", status: "ready", created_at: 3 },
+      latest_indexed_snapshot: null,
+      understanding_snapshot_id: null, understanding_status: null,
+      head_relation: "same", commits_behind: 0,
+      snapshot_stale: false, symbols_stale: true, next_actions: [],
+    });
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/resync/latest") return Promise.resolve({
+        id: 7, system_id: 1, snapshot_id: 13, status: "completed", error: null,
+        stale_capability_count: 0, created_at: 1, started_at: 1, completed_at: 2,
+      });
+      return getBase(path);
+    });
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    await screen.findByTestId("refresh-hub");
+    expect(screen.queryByTestId("resync-job-status")).not.toBeInTheDocument();
   });
 });
 
@@ -1788,9 +2070,14 @@ function interviewSession(overrides: Record<string, unknown> = {}) {
     last_error: null,
     understanding_confirmed_at: 3,
     understanding_confirmed_by: "admin",
+    // Issue #229: mirrors the server's update-understanding gate. Defaults
+    // to blocked, matching this session's default confirmed/no-revision
+    // shape; tests exercising the unblocked path override it explicitly.
+    understanding_update_available: false,
     materialization_diff: null,
     materialization_ref: null,
     materialized_at: null,
+    answerable_areas: [],
     created_at: 1,
     updated_at: 2,
     ...overrides,
@@ -1863,18 +2150,138 @@ function interviewProposal() {
   };
 }
 
+// Issue #349: the canonical workflow-state response. The interview page
+// renders the state THIS returns -- it never derives one client-side -- so
+// every interview test declares which developer-facing state it is
+// exercising instead of relying on incidental client state.
+function interviewWorkflowState(overrides: Record<string, unknown> = {}) {
+  const facts = {
+    has_snapshot: true,
+    has_session: true,
+    session_closed: false,
+    running_process_kinds: [],
+    blocking_failure_states: [],
+    understanding_unconfirmed: false,
+    open_required_questions: 0,
+    outstanding_alignment_items: 0,
+    proposals_needing_review: 0,
+    proposals_generatable: false,
+    approved_proposal_count: 0,
+    diff_matches_approval_set: false,
+    diff_review_complete: false,
+    pending_handoff_count: 0,
+    ...((overrides.facts as Record<string, unknown>) ?? {}),
+  };
+  return {
+    system_id: 1,
+    session_id: 7,
+    state: "W5",
+    candidate_state: "W5",
+    rule_row: 11,
+    reached_state: "W5",
+    backward_hold: false,
+    pending_back_request: null,
+    terminal_kind: null,
+    primary_action: "approve_proposal",
+    running_processes: [],
+    unresolved_failures: [],
+    exceptions: [],
+    diff_materialized_at: null,
+    latest_ready_snapshot_id: 42,
+    ...overrides,
+    facts,
+  };
+}
+
+// Issue #351: the Understanding Brief / Decision Readiness response. Like the
+// workflow state it is decided server-side, so a test declares what the
+// server concluded rather than letting the page infer it.
+function understandingBrief(overrides: Record<string, unknown> = {}) {
+  return {
+    system_id: 1,
+    session_id: 7,
+    built: true,
+    vision: null,
+    vision_missing_information: ["このシステムで実現したい状態・価値"],
+    system_purpose: [
+      {
+        kind: "system_purpose",
+        name: "テキストを正規化して配信する",
+        summary: "",
+        confirmation: "ai_hypothesis",
+        provenance: "implementation_fact",
+        confirmation_label: "AI 仮説・未確認",
+        provenance_label: "コード・ドキュメントの実装事実",
+        reason: "",
+        contribution: "",
+        is_mock: false,
+        evidence: [],
+        related_docs: [],
+        related_apis: [],
+      },
+    ],
+    core_capabilities: [],
+    core_capability_initial_count: 0,
+    key_unconfirmed: [],
+    detail_counts: {},
+    readiness_state: "needs_confirmation",
+    readiness_label: "確認が必要です",
+    readiness_description: "判断の対象はありますが、あなたの確認が必要な内容が残っています。",
+    readiness_reasons: [
+      {
+        code: "purpose_unconfirmed",
+        severity: "attention",
+        message: "System Purpose が未確認です。",
+        target_kind: "claim",
+        target_name: "system_purpose",
+      },
+    ],
+    changes_since_confirmation: [],
+    confirmed_at: null,
+    confirmed_revision_id: null,
+    revision_id: 3,
+    snapshot_id: 42,
+    ...overrides,
+  };
+}
+
+function understandingBriefClaim(kind: string, name: string) {
+  return {
+    kind,
+    name,
+    summary: "",
+    confirmation: "confirmed",
+    provenance: "user_statement",
+    confirmation_label: "確認済み",
+    provenance_label: "ユーザーの明示入力",
+    reason: "",
+    contribution: "",
+    is_mock: false,
+    evidence: [],
+    related_docs: [],
+    related_apis: [],
+  };
+}
+
 function mockInterviewApi(options: {
   approvedCount?: number;
   session?: Record<string, unknown>;
   proposals?: unknown[];
   understandingDiff?: Record<string, unknown>;
   qaList?: Record<string, unknown>;
+  workflow?: Record<string, unknown>;
+  brief?: Record<string, unknown>;
 } = {}) {
   const session = interviewSession(options.session ?? {});
   const proposal = interviewProposal();
   const proposals = options.proposals ?? [proposal];
   const approvedCount = options.approvedCount ?? 0;
+  const workflow = interviewWorkflowState(options.workflow ?? {});
+  const brief = understandingBrief(options.brief ?? {});
   mockApi.get.mockImplementation((path: string) => {
+    if (path.startsWith("/interview/understanding-brief")) return Promise.resolve(brief);
+    if (path.startsWith("/interview/workflow-state")) return Promise.resolve(workflow);
+    if (path === "/interview/sessions/7/process-runs") return Promise.resolve([]);
     if (path === "/interview/sessions/7/understanding-diff") {
       return Promise.resolve(options.understandingDiff ?? null);
     }
@@ -2044,7 +2451,12 @@ describe("Interview page", () => {
     expect(screen.getByText("mock")).toBeInTheDocument();
     expect(screen.getByText("reasoning_llm")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /承認/ }));
+    // Issue #356: コックピットの修正手段カード (現在の状態を引用した理由文)
+    // も同じ語を含むため、提案カードの中に限定して押す。
+    fireEvent.click(
+      within(screen.getAllByTestId("interview-proposal-card")[0])
+        .getByRole("button", { name: /承認/ }),
+    );
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
         "/interview/sessions/7/proposals/9/approve",
@@ -2061,19 +2473,34 @@ describe("Interview page", () => {
     });
   });
 
-  test("runtime reality check trigger is reachable with zero Q&A rows (Issue #135)", async () => {
-    // Approved elements exist but no questions yet — the most useful moment
-    // for the first reality check. The trigger must not be hidden behind an
-    // empty Q&A list.
+  test("実態チェックの手動トリガーは、その処理が失敗しているときだけ現れる (Issue #349 / #61)", async () => {
+    // `OP-S8` は §4.2.2 の決定的条件で自動実行される処理なので、通常時に
+    // 手動トリガーを常設しない (原則 P3 / §5.3-1)。処理そのものが失敗した
+    // ときにだけ、同じ処理の再試行として現れる。
+    const qaList = {
+      session_id: 7,
+      system_id: 1,
+      items: [{
+        id: 3, session_id: 7, system_id: 1,
+        question_text: "この計測でよいですか?",
+        question_category: "runtime", question_source: "runtime",
+        hypothesis: null, evidence_refs: [], runtime_evidence: null,
+        answer_text: null, status: "open", answered_by: null,
+        superseded_by_id: null, created_at: 1, answered_at: null,
+        knowledge_area: null, handoff_id: null, investigation: null,
+        revisions: [],
+      }],
+      open_count: 1,
+      high_priority_open_count: 0,
+      answers_revised_at: null,
+    };
     mockInterviewApi({
       approvedCount: 1,
-      qaList: {
-        session_id: 7,
-        system_id: 1,
-        items: [],
-        open_count: 0,
-        high_priority_open_count: 0,
-        answers_revised_at: null,
+      qaList,
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 1 },
       },
     });
 
@@ -2081,16 +2508,49 @@ describe("Interview page", () => {
       defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
     });
     const { default: InterviewPage } = await import("@/pages/interview");
-    render(
+    const { unmount } = render(
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={["/interview?session=7"]}>
           <InterviewPage />
         </MemoryRouter>
       </QueryClientProvider>,
     );
+    await screen.findByTestId("qa-panel");
+    expect(screen.queryByTestId("run-runtime-reality-check")).toBeNull();
+    unmount();
 
-    const button = await screen.findByTestId("run-runtime-reality-check");
-    expect(button).toBeEnabled();
+    mockInterviewApi({
+      approvedCount: 1,
+      qaList,
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 1 },
+        unresolved_failures: [{
+          id: 4, session_id: 7, system_id: 1,
+          process_kind: "runtime_reality_check", status: "failed",
+          failure_class: "degraded", target_state: null,
+          error: "LLM 呼び出しに失敗", started_at: 1, finished_at: 2,
+        }],
+        exceptions: [{
+          code: "E14", severity: "degraded", target_state: null,
+          message: "処理に失敗しました。", detail: "LLM 呼び出しに失敗",
+          recovery_process_kind: "runtime_reality_check",
+          recovery_condition: "同じ処理の再試行が成功すると解消します。",
+        }],
+      },
+    });
+    const qc2 = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc2}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByTestId("run-runtime-reality-check")).toBeEnabled();
   });
 
   test("shows understanding diff summary and expandable detail (Issue #136)", async () => {
@@ -2172,9 +2632,9 @@ describe("Interview page", () => {
     expect(within(panel).getByText("比較対象となる前のリビジョンがありません(初回の理解構築です)。")).toBeInTheDocument();
   });
 
-  test("shows 'your answer correction was reflected' after rebuilding from a revised answer (Issue #136)", async () => {
+  test("E3-a の復旧で理解を再構築すると、回答修正の反映が示される (Issue #136 / #349)", async () => {
     mockInterviewApi({
-      session: { answers_revised_at: 123 },
+      session: { answers_revised_at: 123, understanding_update_available: true },
       understandingDiff: {
         session_id: 7,
         system_id: 1,
@@ -2183,10 +2643,26 @@ describe("Interview page", () => {
         has_previous: true,
         sections: [],
       },
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 5, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { blocking_failure_states: ["W2"] },
+        exceptions: [{
+          code: "E3-a", severity: "blocking", target_state: "W2",
+          message: "システム理解を構築できず、代わりに提示できる質問もありません。",
+          detail: null,
+          recovery_process_kind: "understanding_build",
+          recovery_condition: "再試行が成功すると通常フローへ戻ります。",
+        }],
+      },
     });
     mockApi.post.mockImplementation((path: string) => {
       if (path === "/interview/sessions/7/update-understanding") {
-        return Promise.resolve(interviewSession({ answers_revised_at: null, last_error: null }));
+        return Promise.resolve(interviewSession({
+          answers_revised_at: null,
+          last_error: null,
+          understanding_update_available: false,
+        }));
       }
       return Promise.resolve({ id: 1, decision: "approved", decision_method: "manual" });
     });
@@ -2203,18 +2679,98 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
-    expect(refreshButton).not.toBeDisabled();
-    fireEvent.click(refreshButton);
-
+    fireEvent.click(await screen.findByTestId("workflow-retry-understanding_build"));
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/7/update-understanding", {});
     });
+    fireEvent.click(await screen.findByTestId("history-audit-entry"));
     expect(await screen.findByTestId("answer-revision-reflected-banner")).toBeInTheDocument();
   });
 
-  test("disables understanding refresh after confirmation until an answer is revised (Issue #229)", async () => {
+  test("理解の再構築は常設せず、E3-a のときだけ復旧操作として現れる (Issue #349 / #21・#47・#48)", async () => {
+    // 以前は「理解を更新」を disabled + 説明文で常設していた。仕様は
+    // 未到達の操作を disabled で見せることを禁じ (原則 P3)、`OP-S1`/`OP-S2`
+    // は自動処理なので、通常フローではボタンそのものを出さない。
     mockInterviewApi();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    const { unmount } = render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await screen.findByTestId("workflow-location");
+    expect(screen.queryByTestId("workflow-retry-understanding_build")).toBeNull();
+    expect(screen.queryByTestId("understanding-refresh-blocked-reason")).toBeNull();
+    unmount();
+
+    // E3-a(理解を構築できず、提示できる質問も無い)のときだけ、復旧操作と
+    // して現れる。迂回路ではなく「同じ処理の再試行」だけを提供する。
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 5, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { blocking_failure_states: ["W2"] },
+        exceptions: [{
+          code: "E3-a", severity: "blocking", target_state: "W2",
+          message: "システム理解を構築できず、代わりに提示できる質問もありません。",
+          detail: "reasoning model is not configured",
+          recovery_process_kind: "understanding_build",
+          recovery_condition: "再試行が成功すると通常フローへ戻ります。",
+        }],
+      },
+    });
+    const qc2 = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc2}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const blocking = await screen.findByTestId("workflow-exception-E3-a");
+    expect(blocking).toHaveAttribute("data-severity", "blocking");
+    expect(blocking.textContent).toContain("作業を進められません");
+    expect(blocking.textContent).toContain("再試行が成功すると通常フローへ戻ります");
+    // 失敗内容・影響・復旧条件・再試行は 1 つの枠にまとまっている (§4.4)。
+    expect(within(blocking).getByTestId("workflow-retry-understanding_build")).toBeEnabled();
+    // 復旧は「同じ処理の再試行」と「安全な終端へ抜ける」の 2 つだけ (§5.3-7)。
+    expect(screen.getByTestId("workflow-leave-safely")).toBeInTheDocument();
+    // 同じ再試行が別パネルにも並ばない (原則 P7)。
+    expect(screen.queryByTestId("understanding-recovery-build")).toBeNull();
+  });
+
+  test("劣化例外 (E3-b) は主操作を止めず、ブロッキングとは別のラベルで示す (Issue #349)", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 1 },
+        exceptions: [{
+          code: "E3-b", severity: "degraded", target_state: null,
+          message: "自動でのシステム理解を構築できませんでした。以降は質問で理解を組み立てます。",
+          detail: null,
+          recovery_process_kind: "understanding_build",
+          recovery_condition: "以降の理解更新が成功すると解消します。",
+        }],
+      },
+      proposals: [],
+      session: {
+        stage: "capability_confirmation",
+        current_understanding: null,
+        last_error: "reasoning model is not configured",
+        open_questions: [{
+          question: "計測したい対象は何ですか?",
+          category: "followup", priority: "high", hypothesis: null, qa_id: 31,
+        }],
+      },
+    });
     const qc = new QueryClient({
       defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
     });
@@ -2226,17 +2782,21 @@ describe("Interview page", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-
-    const refreshButton = await screen.findByRole("button", { name: /理解を更新/ });
-    expect(refreshButton).toBeDisabled();
-    expect(refreshButton).toHaveAttribute("title", "回答を修正した場合にのみ、理解を再構築できます");
-    expect(await screen.findByTestId("understanding-refresh-blocked-reason"))
-      .toHaveTextContent("次は提案を生成またはレビューしてください");
-    expect(screen.getByTestId("next-action")).toHaveTextContent("各提案を承認・編集・却下してください");
+    const degraded = await screen.findByTestId("workflow-exception-E3-b");
+    expect(degraded).toHaveAttribute("data-severity", "degraded");
+    // 色だけで区分を伝えない (原則 P8)。
+    expect(degraded.textContent).toContain("一部の情報が欠けています");
+    // 主作業 (W3 の回答送信) は継続できる。
+    expect(await screen.findByTestId("focused-question")).toBeInTheDocument();
+    const input = screen.getByPlaceholderText(/上の質問への回答や修正点を入力してください。/);
+    fireEvent.change(input, { target: { value: "要約フローです" } });
+    expect(screen.getByRole("button", { name: /送信/ })).toBeEnabled();
+    // 劣化では安全な終端への導線を出さない (ブロッキングだけ)。
+    expect(screen.queryByTestId("workflow-leave-safely")).toBeNull();
   });
 
   test("shows all evidence read for a turn, even when uncited (Issue #137)", async () => {
-    mockInterviewApi();
+    mockInterviewApi({ workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } } });
     mockApi.post.mockResolvedValue({
       assistant_message: "読みました。",
       proposals: [],
@@ -2294,6 +2854,7 @@ describe("Interview page", () => {
     // "ready for proposals" prompt, and answering it consumes the qa_id
     // while re-requesting proposal generation.
     mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
       proposals: [],
       session: {
         open_questions: [{
@@ -2361,8 +2922,152 @@ describe("Interview page", () => {
     });
   });
 
+  // Issue #295 §4.8 review fix (Finding 4): 画面中央の focused question の
+  // 「わからない」を、QaItemCard 側と同じ共有オートインベスティゲート
+  // コントローラに接続した。
+  test("focused question の「わからない」は qa_ids=[その id] だけを対象に自動調査し、成功時は dialogue-turn へ進まない", async () => {
+    mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
+      proposals: [],
+      session: {
+        open_questions: [{
+          question: "対象のプローブ範囲はどこですか?",
+          category: "followup",
+          priority: "medium",
+          hypothesis: null,
+          qa_id: 55,
+        }],
+      },
+    });
+    let resolveInvestigate: (v: unknown) => void = () => {};
+    const investigatePromise = new Promise(resolve => { resolveInvestigate = resolve; });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/qa/route-and-investigate") return investigatePromise;
+      return Promise.resolve(undefined);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("focused-question");
+    fireEvent.click(within(card).getByTestId("quick-answer-unknown"));
+
+    // Only a short status line while investigating -- the button itself is
+    // replaced (no duplicate firing), matching QaItemCard's pattern.
+    expect(within(card).getByTestId("focused-question-unknown-investigating")).toHaveTextContent(
+      "関連コードとテストを確認しています",
+    );
+    await waitFor(() => {
+      // Scoped to qa_ids=[55] -- never the unrestricted whole-session batch.
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/qa/route-and-investigate", { qa_ids: [55] },
+      );
+    });
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/interview/sessions/7/dialogue-turn", expect.anything(),
+    );
+
+    resolveInvestigate({
+      session_id: 7, system_id: 1,
+      results: [{ qa_id: 55, route_category: "system_researchable", knowledge_area: null, investigation_status: "completed", error: null }],
+      counts: { routed: 1, investigated: 1, failed: 0, skipped_cap: 0 },
+    });
+
+    await waitFor(() => {
+      expect(within(card).queryByTestId("focused-question-unknown-investigating")).not.toBeInTheDocument();
+    });
+    // Investigation succeeded for this question: never falls back to
+    // recording an unknown answer via the dialogue-turn endpoint.
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/interview/sessions/7/dialogue-turn", expect.anything(),
+    );
+  });
+
+  test("focused question の「わからない」は自動調査が使えないとき従来の #142 フロー(dialogue-turn, answer_unknown)にフォールバックする", async () => {
+    mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
+      proposals: [],
+      session: {
+        open_questions: [{
+          question: "対象のプローブ範囲はどこですか?",
+          category: "followup",
+          priority: "medium",
+          hypothesis: null,
+          qa_id: 56,
+        }],
+      },
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/qa/route-and-investigate") {
+        return Promise.reject(new Error("boom"));
+      }
+      if (path === "/interview/sessions/7/dialogue-turn") {
+        return Promise.resolve({
+          assistant_message: "了解しました。",
+          proposals: [],
+          proposals_requested: true,
+          next_questions: [],
+          intelligence_run: null,
+          error: null,
+          stage: "proposal_generation",
+          current_understanding: null,
+          gap_analysis: null,
+          open_questions_structured: [],
+          created_qa_ids: [],
+          evidence_run: null,
+          evidence_used: [],
+          evidence_reads: [],
+          evidence_refs_dropped: 0,
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("focused-question");
+    fireEvent.click(within(card).getByTestId("quick-answer-unknown"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/dialogue-turn",
+        expect.objectContaining({ answer_unknown: true, answered_qa_id: 56 }),
+      );
+    });
+  });
+
   test("sends edits through the validated edit endpoint and materializes a diff", async () => {
-    mockInterviewApi({ approvedCount: 1 });
+    mockInterviewApi({
+      approvedCount: 1,
+      // W5 with every proposal reviewed and no diff for the current approval
+      // set: exactly the condition `OP-S7` generates the diff on.
+      workflow: {
+        facts: {
+          proposals_needing_review: 0,
+          approved_proposal_count: 1,
+          diff_matches_approval_set: false,
+        },
+      },
+    });
     mockApi.post.mockImplementation((path: string) => {
       if (path === "/interview/sessions/7/materialize") {
         return Promise.resolve({
@@ -2393,7 +3098,10 @@ describe("Interview page", () => {
     );
 
     expect(await screen.findByText("提案レビュー")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /編集/ }));
+    fireEvent.click(
+      within(screen.getAllByTestId("interview-proposal-card")[0])
+        .getByRole("button", { name: /編集/ }),
+    );
     fireEvent.click(await screen.findByRole("button", { name: /修正を保存して承認/ }));
 
     await waitFor(() => {
@@ -2407,15 +3115,20 @@ describe("Interview page", () => {
       );
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /差分を生成/ }));
+    // Issue #349 `OP-S7`: the diff is generated automatically once the
+    // approval set has no corresponding diff -- there is no 「差分を生成」
+    // button to press (§4.2.1).
+    expect(screen.queryByRole("button", { name: /差分を生成/ })).toBeNull();
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/interview/sessions/7/materialize", {});
     });
-    expect(await screen.findByText(/diff --git/)).toBeInTheDocument();
+    // The generated diff becomes the work surface only once the server moves
+    // the session to W6 -- that transition is covered by its own test.
   });
 
   test("shows confirmation question and hides proposal panels before proposal stage (Issue #123)", async () => {
     mockInterviewApi({
+      workflow: { state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2", primary_action: "confirm_understanding", facts: { understanding_unconfirmed: true } },
       session: {
         stage: "purpose_confirmation",
         current_understanding: {
@@ -2461,6 +3174,7 @@ describe("Interview page", () => {
   test("renders hypothesis-first question with evidence and quick answers (Issue #128)", async () => {
     const questionText = "トレース取り込みは control-server の責務という理解で正しいですか?";
     mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
       session: {
         stage: "capability_confirmation",
         current_understanding: {
@@ -2541,6 +3255,23 @@ describe("Interview page", () => {
 
   test("falls back to a zero-base interview when understanding cannot be built (Issue #123)", async () => {
     mockInterviewApi({
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 1 },
+        exceptions: [{
+          code: "E3-b", severity: "degraded", target_state: null,
+          message: "自動でのシステム理解を構築できませんでした。以降は質問で理解を組み立てます。",
+          detail: "reasoning model is not configured",
+          recovery_process_kind: "understanding_build",
+          recovery_condition: "以降の理解更新が成功すると解消します。",
+        }],
+        unresolved_failures: [{
+          id: 1, session_id: 7, system_id: 1, process_kind: "understanding_build",
+          status: "failed", failure_class: "degraded", target_state: null,
+          error: "reasoning model is not configured", started_at: 1, finished_at: 2,
+        }],
+      },
       session: {
         stage: "understanding_initialized",
         current_understanding: null,
@@ -2577,6 +3308,7 @@ describe("Interview page", () => {
     // Reached proposal_generation through zero-base answers, but the user
     // has not confirmed the gathered context yet.
     mockInterviewApi({
+      workflow: { state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2", primary_action: "confirm_understanding", facts: { understanding_unconfirmed: true } },
       session: {
         stage: "proposal_generation",
         current_understanding: null,
@@ -2619,6 +3351,7 @@ describe("Interview page", () => {
 
   test("structured understanding can be explicitly confirmed from the interview page", async () => {
     mockInterviewApi({
+      workflow: { state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2", primary_action: "confirm_understanding", facts: { understanding_unconfirmed: true } },
       session: {
         stage: "proposal_generation",
         current_understanding: {
@@ -2661,8 +3394,21 @@ describe("Interview page", () => {
     );
 
     const confirmButton = await screen.findByTestId("confirm-understanding");
-    expect(confirmButton).toHaveTextContent("この理解を確認済みにする");
-    expect(screen.getByTestId("next-action")).toHaveTextContent("この理解を確認済みにする");
+    // Issue #349: the CTA uses the spec's canonical W2 wording (§4.3), and
+    // 「次にやること」 names the same operation (原則 P2).
+    expect(confirmButton).toHaveTextContent("この理解で進む");
+    expect(screen.getByTestId("next-action")).toHaveTextContent("この理解で進む");
+    // Issue #351: 判断対象は Understanding Brief そのもので、主操作はその
+    // カードの中にある -- 別カラムも別カードも探させない (原則 P2)。
+    const brief = screen.getByTestId("understanding-brief");
+    expect(brief).toHaveAttribute("data-display", "full");
+    expect(brief).toContainElement(confirmButton);
+    // 進行可否とその理由が同じ表示領域にある (#353)。
+    expect(brief).toContainElement(screen.getByTestId("readiness-summary"));
+    expect(screen.getByTestId("readiness-reason-purpose_unconfirmed")).toBeInTheDocument();
+    // 「正しい」と認める操作は 1 つだけ。会話側の「はい、正しいです」は
+    // 確定ゲートを通らないので、確定操作が出ているあいだは並べない (P7)。
+    expect(screen.queryByTestId("quick-answer-yes")).toBeNull();
 
     fireEvent.click(confirmButton);
     await waitFor(() => {
@@ -2673,8 +3419,169 @@ describe("Interview page", () => {
     });
   });
 
+  test("W2 では会話は訂正の手段で、確定操作は Brief 側の 1 つだけ", async () => {
+    // Issue #351: 会話カードの「はい、正しいです」は会話ターンを送るだけで
+    // 確定ゲート (`confirm-understanding`) を通らない。両方並ぶと「どちらを
+    // 押せば進むのか」が分からなくなるので、確定操作が出ているあいだは
+    // 肯定側を出さず、訂正の入口だけを会話に残す。
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { understanding_unconfirmed: true },
+      },
+      session: {
+        // uiState = "confirm_understanding" になるステージ。
+        stage: "understanding_initialized",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [],
+          supporting_elements: [],
+          api_boundaries: [],
+          probe_flow_candidates: [],
+        },
+        understanding_confirmed_at: null,
+        understanding_confirmed_by: null,
+      },
+      proposals: [],
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // 訂正の入口は会話側に残る -- 会話は理解を訂正・補足する手段 (#354)。
+    expect(await screen.findByTestId("quick-answer-no")).toBeInTheDocument();
+    expect(screen.queryByTestId("quick-answer-yes")).toBeNull();
+    // 確定操作は Brief カードの中に 1 つだけ。
+    const confirm = screen.getByTestId("confirm-understanding");
+    expect(screen.getByTestId("understanding-brief")).toContainElement(confirm);
+  });
+
+  test("reconfirmation lets the user bind a rename and confirm shared relations", async () => {
+    const renamedCore = { ...understandingItem("Renamed Core A"), children: ["Shared"] };
+    mockInterviewApi({
+      workflow: { state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2", primary_action: "confirm_understanding", facts: { understanding_unconfirmed: true } },
+      session: {
+        stage: "proposal_generation",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [renamedCore],
+          capability_elements: [understandingItem("Shared")],
+          supporting_elements: [],
+          api_boundaries: [],
+          probe_flow_candidates: [],
+        },
+        understanding_confirmed_at: 9,
+        understanding_confirmed_by: "admin",
+        capability_graph_confirmed_revision_id: 10,
+        capability_graph_confirmation_required: true,
+      },
+      proposals: [],
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/capability-graph") {
+        return Promise.resolve({
+          confirmation_id: 3,
+          system_id: 1,
+          session_id: 7,
+          source_revision_id: 10,
+          source_revision_at: 1,
+          composition_digest: "digest",
+          decided_by: "admin",
+          decided_by_user_id: 1,
+          decision_method: "manual",
+          created_at: 1,
+          nodes: [
+            {
+              entity_id: 7,
+              entity_kind: "core_capability",
+              name: "Core A",
+              summary: "A",
+              semantic_digest: "a",
+              payload: {},
+            },
+            {
+              entity_id: 9,
+              entity_kind: "capability_element",
+              name: "Shared",
+              summary: "shared",
+              semantic_digest: "s",
+              payload: {},
+            },
+          ],
+          relations: [{
+            relation_id: 44,
+            supported_entity_id: 7,
+            supporting_entity_id: 9,
+            relation_kind: "supports",
+            role: "",
+            scope: "",
+            semantic_digest: "r",
+          }],
+        });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue(interviewSession({
+      capability_graph_confirmation_required: false,
+    }));
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByTestId("confirm-understanding"));
+    expect(await screen.findByTestId("capability-confirm-dialog")).toBeInTheDocument();
+    fireEvent.change(
+      screen.getByTestId("capability-identity-core_capability-Renamed Core A"),
+      { target: { value: "7" } },
+    );
+    fireEvent.click(screen.getByTestId("confirm-capability-composition"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/confirm-understanding",
+        {
+          actor: "admin",
+          capability_base_confirmation_id: 3,
+          capability_identity_bindings: [{
+            entity_kind: "core_capability",
+            current_name: "Renamed Core A",
+            entity_id: 7,
+          }],
+          capability_relations: [{
+            supported_kind: "core_capability",
+            supported_name: "Renamed Core A",
+            supporting_kind: "capability_element",
+            supporting_name: "Shared",
+          }],
+        },
+      );
+    });
+  });
+
   test("answering a gap question passes it to the server for consumption (Issue #123)", async () => {
     mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
       session: {
         stage: "capability_confirmation",
         current_understanding: {
@@ -2745,6 +3652,18 @@ describe("Interview page", () => {
         });
       }
       if (path === "/interview/sessions") return Promise.resolve([]);
+      if (path.startsWith("/interview/workflow-state")) {
+        // snapshot はあるがセッション未選択 -> W0-B (ルール表 行 2)。
+        return Promise.resolve(interviewWorkflowState({
+          session_id: null,
+          state: "W0-B",
+          candidate_state: "W0-B",
+          rule_row: 2,
+          reached_state: null,
+          primary_action: "start_session",
+          facts: { has_session: false },
+        }));
+      }
       return Promise.resolve(null);
     });
     mockApi.post.mockImplementation((path: string) => {
@@ -2779,13 +3698,1363 @@ describe("Interview page", () => {
         expect.objectContaining({ snapshot_id: 42 }),
       );
     });
-    // Understanding is built automatically for the created session.
+    // Issue #349 (再レビュー #2): 初期理解の構築はセッション作成リクエスト
+    // 自身が dispatch する。クライアントから 2 本目を投げると同じ推論処理が
+    // 二重に走るので、`update-understanding` は呼ばれてはいけない。進捗は
+    // `W1` の現在地カードが示す。
+    await new Promise(r => setTimeout(r, 50));
+    expect(
+      mockApi.post.mock.calls.filter(
+        (c: unknown[]) => String(c[0]).endsWith("/update-understanding"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  // PR #296 review restructure: Alignment Review moves into the main,
+  // tabbed content area instead of a 380px sidebar slot, and defaults to
+  // whichever tab matches whether the session's alignment has been built.
+  function alignmentItem(overrides: Record<string, unknown> & { id: number }) {
+    return {
+      session_id: 7,
+      system_id: 1,
+      revision_id: 1,
+      snapshot_id: 42,
+      intent_item_id: null,
+      intent_summary: "トレース収集を効率化したい",
+      current_claim: "現在は手動でトレースを確認している",
+      current_evidence: [{ path: "src/a.py", start_line: 1, end_line: 3, summary: "手動確認箇所" }],
+      gap_summary: "自動化されていない",
+      proposed_interpretation: "自動収集の追加を検討",
+      alignment_state: "gap",
+      risk_flags: [],
+      confidence: "likely",
+      review_category: "must_review",
+      reason_code: "core_intent",
+      user_reason: "目標に関わるため個別確認が必要です",
+      status: "open",
+      user_decision: null,
+      intelligence_run_id: 1,
+      is_mock: false,
+      created_at: 0,
+      updated_at: 0,
+      ...overrides,
+    };
+  }
+
+  // 3rd review round (Finding 3): a proposal_review session (the default
+  // mockInterviewApi shape -- proposal_generation stage + a pending proposal)
+  // keeps its required next action (承認・却下・差分生成) in the conversation
+  // tab, so even when Alignment has been built the default main-area tab must
+  // stay on conversation, not Alignment Review -- otherwise the tab shown and
+  // the NextActionBanner's instruction point at different places. Alignment
+  // Review stays one click away, with the count surfaced on its tab label.
+
+
+
+  // PR #296 review fix (2nd pass, Finding 4): "build 済みだから Alignment
+  // Review が既定" は、会話タブ側にまだ必須操作(ここでは fill_gaps の
+  // 「この理解を確認済みにする」)が残っているケースでは適用されない --
+  // 既定は会話タブのままで、必須操作を見失わせない。
+
+  // PR #296 review fix (2nd pass, Finding 5a/5b/3): outstanding_counts feeds
+  // both the tab label and AlignmentSummaryHeader's counts (matching the
+  // Review Queue's own card count), and the gap summary shows the top
+  // outstanding gap's text instead of only a count.
+  // Issue #349: the two-tab main area (element #12) and the 「会話タブへ移動」
+  // lead (element #10) are abolished. Which work surface is shown is decided
+  // by the server's workflow state, so exactly ONE primary work surface is
+  // rendered at a time and no compensating tab-default heuristic exists.
+  // Review finding 1: the page renders ONE server-decided state, so any
+  // mutation that changes a state-deciding fact must re-read it. Without
+  // this the screen keeps showing the old state -- and because the spec
+  // removed the manual 「差分を生成」 CTA, W5 wedges until a reload.
+  test("提案を承認すると正準 Workflow query が再取得される", async () => {
+    mockInterviewApi();
+    mockApi.post.mockResolvedValue({ id: 1, decision: "approved", decision_method: "manual" });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText("summarize.summarize_text");
+    const before = mockApi.get.mock.calls.filter(
+      ([path]) => typeof path === "string" && path.startsWith("/interview/workflow-state"),
+    ).length;
+
+    // Issue #356: コックピットの修正手段カード (現在の状態を引用した理由文)
+    // も同じ語を含むため、提案カードの中に限定して押す。
+    fireEvent.click(
+      within(screen.getAllByTestId("interview-proposal-card")[0])
+        .getByRole("button", { name: /承認/ }),
+    );
+
+    await waitFor(() => {
+      const after = mockApi.get.mock.calls.filter(
+        ([path]) => typeof path === "string" && path.startsWith("/interview/workflow-state"),
+      ).length;
+      expect(after).toBeGreaterThan(before);
+    });
+  });
+
+  /**
+   * Issue #358 用の `W3` (質問に回答する) セッション。未解決質問が 1 件あり、
+   * 主作業面・未解決事項・補助情報がすべて描かれる状態。
+   */
+  function mockInterviewW3Cockpit() {
+    mockInterviewApi({
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 1 },
+      },
+      proposals: [],
+      brief: {
+        system_purpose: [understandingBriefClaim("system_purpose", "Runtime probe platform")],
+        core_capabilities: [understandingBriefClaim("core_capability", "Trace ingestion")],
+      },
+      session: {
+        stage: "gap_questions",
+        understanding_confirmed_at: 5,
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [understandingItem("POST /traces")],
+          probe_flow_candidates: [understandingItem("summarize flow")],
+        },
+        open_questions: [
+          { question: "トレース収集は独立した責務か", category: "capability", priority: "high" },
+        ],
+      },
+      qaList: {
+        session_id: 7,
+        system_id: 1,
+        items: [
+          {
+            id: 31, session_id: 7, system_id: 1,
+            question_text: "トレース収集は独立した責務か",
+            question_category: "capability", question_source: "reviewer",
+            hypothesis: null, evidence_refs: [], runtime_evidence: null,
+            answer_text: null, answer_unknown: null, status: "open",
+            answered_by: null, superseded_by_id: null, created_at: 1, answered_at: null,
+          },
+        ],
+        open_count: 1,
+        high_priority_open_count: 1,
+        answers_revised_at: null,
+      },
+    });
+  }
+
+  // Issue #356: インタビュー・コックピット。ファーストビューの全体像 (完成度
+  // / 要確認 / 未設定 / 次にやること)、5 カテゴリの全体マップ、選択に追従する
+  // 詳細・修正ペイン、未解決事項、Q&A 進捗が 1 画面に揃うこと。状態集約その
+  // ものの検証は interview-cockpit.test.tsx にある。
+  test("コックピットの全体像・修正ペイン・未解決事項が /interview に出る", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { understanding_unconfirmed: true },
+      },
+      proposals: [],
+      brief: {
+        system_purpose: [understandingBriefClaim("system_purpose", "Runtime probe platform")],
+        core_capabilities: [understandingBriefClaim("core_capability", "Trace ingestion")],
+      },
+      session: {
+        stage: "purpose_confirmation",
+        understanding_confirmed_at: null,
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [understandingItem("POST /traces")],
+          probe_flow_candidates: [understandingItem("summarize flow")],
+        },
+        open_questions: [
+          { question: "トレース収集は独立した責務か", category: "capability", priority: "high" },
+        ],
+      },
+      qaList: {
+        session_id: 7,
+        system_id: 1,
+        items: [
+          {
+            id: 31, session_id: 7, system_id: 1,
+            question_text: "トレース収集は独立した責務か",
+            question_category: "capability", question_source: "reviewer",
+            hypothesis: null, evidence_refs: [], runtime_evidence: null,
+            answer_text: null, answer_unknown: null, status: "open",
+            answered_by: null, superseded_by_id: null, created_at: 1, answered_at: null,
+          },
+          {
+            id: 32, session_id: 7, system_id: 1,
+            question_text: "対象範囲は決まっているか",
+            question_category: "purpose", question_source: "reviewer",
+            hypothesis: null, evidence_refs: [], runtime_evidence: null,
+            answer_text: "はい", answer_unknown: null, status: "answered",
+            answered_by: "admin", superseded_by_id: null, created_at: 1, answered_at: 2,
+          },
+        ],
+        open_count: 1,
+        high_priority_open_count: 1,
+        answers_revised_at: null,
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7#cockpit-aux-intent"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // ファーストビュー: 完成度・要確認・未設定・次にやること。
+    await screen.findByTestId("cockpit-status-summary");
+    const intent = screen.getByTestId("cockpit-aux-intent") as HTMLDetailsElement;
+    expect(intent).toBeInTheDocument();
+    expect(intent.open).toBe(true);
+    // Vision のみ未設定、Capabilities が要確認 → (3 + 0.5)/5 = 70%
+    expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("70");
+    expect(screen.getByTestId("cockpit-stat-missing")).toHaveTextContent("1");
+    expect(screen.getByTestId("cockpit-stat-review")).toHaveTextContent("1");
+    expect(screen.getByTestId("cockpit-next-step")).toHaveTextContent("Vision");
+
+    // 5 カテゴリのマップ。既定選択は未設定の Vision。
+    for (const key of ["vision", "system_purpose", "capabilities", "api_boundaries", "probe_flow"]) {
+      expect(screen.getByTestId(`cockpit-category-card-${key}`)).toBeInTheDocument();
+    }
+    expect(screen.getByTestId("cockpit-detail-panel")).toHaveAttribute("data-category", "vision");
+
+    // カード選択で詳細・修正ペインが切り替わる。
+    fireEvent.click(screen.getByTestId("cockpit-category-card-capabilities"));
+    expect(screen.getByTestId("cockpit-detail-panel")).toHaveAttribute("data-category", "capabilities");
+    expect(screen.getByTestId("cockpit-detail-question"))
+      .toHaveTextContent("トレース収集は独立した責務か");
+
+    // 未解決事項 (open_questions と Q&A の重複は 1 件に畳まれる) と Q&A 進捗。
+    expect(screen.getAllByTestId("cockpit-unresolved-row")).toHaveLength(1);
+    expect(screen.getByTestId("cockpit-qa-answered")).toHaveTextContent("1 件");
+    expect(screen.getByTestId("cockpit-qa-open")).toHaveTextContent("1 件");
+    expect(screen.getByTestId("cockpit-qa-total")).toHaveTextContent("2 件");
+
+    // セッション情報 (§7)。Issue #361: セッション番号 / Snapshot /
+    // ステータスはヘッダーが正準で、セッション情報カードには再掲しない。
+    expect(screen.getByTestId("cockpit-header-meta")).toHaveTextContent("Snapshot 42");
+    expect(screen.getByTestId("cockpit-session-info")).not.toHaveTextContent("Snapshot 42");
+    expect(screen.getByTestId("cockpit-session-participants")).toHaveTextContent("admin");
+  });
+
+  // Issue #360: ファーストビューの主役は「次にやること」と 1 つの主 CTA で、
+  // 対応する主作業面はその直後に来る。全体像 (Understanding Brief / 理解の
+  // 全体マップ) は主作業面より後ろ。
+  it("W3 では 次にやること → 主作業面 → 未解決事項 → 全体像 の順で描かれる", async () => {
+    mockInterviewW3Cockpit();
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    const { container } = render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await screen.findByTestId("cockpit-status-summary");
+    const order = (testId: string) => {
+      const index = container.innerHTML.indexOf(`data-testid="${testId}"`);
+      expect(index, `${testId} が描かれていない`).toBeGreaterThan(-1);
+      return index;
+    };
+    expect(order("cockpit-next-step")).toBeLessThan(order("work-surface-W3"));
+    expect(order("work-surface-W3")).toBeLessThan(order("cockpit-unresolved-items"));
+    expect(order("cockpit-unresolved-items")).toBeLessThan(order("understanding-brief"));
+    expect(order("understanding-brief")).toBeLessThan(order("cockpit-understanding-map"));
+    // Brief は 1 つの値から描かれる。2 箇所に同時には出ない (原則 P7)。
+    expect(screen.getAllByTestId("understanding-brief")).toHaveLength(1);
+    // Overview から Vision を定義できるよう、W3 でも Intent Brief を隠さない。
+    expect(screen.getByTestId("cockpit-aux-intent")).toBeInTheDocument();
+
+    // レビュー指摘 P1: 主作業面を初期表示 (1280 x 720) へ入れるため、
+    // サマリーの統計は既定で畳む。主 CTA はその外に出ていること。
+    const stats = screen.getByTestId("cockpit-status-stats") as HTMLDetailsElement;
+    expect(stats.open).toBe(false);
+    expect(stats.contains(screen.getByTestId("cockpit-completion-percent"))).toBe(true);
+    expect(stats.contains(screen.getByTestId("cockpit-next-step-action"))).toBe(false);
+    // #356 の受け入れ条件。詳細タイルを畳んでも、判断に必要な件数は
+    // 常に見える summary に残す。
+    expect(screen.getByTestId("cockpit-status-compact-counts"))
+      .toHaveTextContent("要確認 1 · 未設定 1件");
+
+    // セッション表示中は画面の説明文を出さない (縦を主作業面へ譲る)。
+    expect(screen.queryByText(/理解の全体像を確認し、曖昧な箇所を順番に解消します/))
+      .toBeNull();
+  });
+
+  // Issue #363 (レビュー指摘 P1): sticky は右カラム **そのもの** に付ける。
+  // 中の詳細ペインだけを sticky にすると、動ける範囲が「中身ぶんの高さしか
+  // 無い右カラム」に限られ、理解マップへ到達する前に画面外へ流れ去る。
+  // Grid の直接の子であれば、動ける範囲は行の高さいっぱいの grid area になる。
+  it("詳細ペインの sticky は Grid の直接の子である右カラムに付く", async () => {
+    mockInterviewW3Cockpit();
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const panel = await screen.findByTestId("cockpit-detail-panel");
+    const column = panel.closest<HTMLElement>(".grid > div");
+    expect(column).not.toBeNull();
+    expect(column!.className).toMatch(/xl:sticky/);
+    // 高さがビューポートを超えても下端へ到達できるよう、内部スクロールを持つ。
+    expect(column!.className).toMatch(/xl:overflow-y-auto/);
+    // 詳細ペインを別の sticky ラッパーで包み直さない (二重 sticky にすると
+    // 内側は再び右カラムの高さに閉じ込められる)。
+    const wrapper = panel.parentElement!;
+    expect(wrapper).toBe(column);
+
+    // 未解決事項と Q&A 進捗を並べる内側の Grid は `items-start` のまま
+    // (背の高いカードに合わせて Q&A カードが引き伸ばされない、#359)。
+    const unresolved = screen.getByTestId("cockpit-unresolved-items");
+    expect(unresolved.parentElement!.className).toMatch(/items-start/);
+  });
+
+  // Issue #360 の例外: `W2` では Brief 自体が判断対象で、主操作
+  // 「この理解で進む」も同じカードにある (#351 / 原則 P2)。この状態でだけ
+  // Brief が主作業面の位置に立つ。
+  it("W2 では Brief が主作業面の位置に立ち、全体マップより先に来る", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { understanding_unconfirmed: true },
+      },
+      proposals: [],
+      session: {
+        stage: "purpose_confirmation",
+        understanding_confirmed_at: null,
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [understandingItem("POST /traces")],
+          probe_flow_candidates: [understandingItem("summarize flow")],
+        },
+        open_questions: [],
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    const { container } = render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await screen.findByTestId("cockpit-status-summary");
+    const html = container.innerHTML;
+    const brief = html.indexOf('data-testid="understanding-brief"');
+    const work = html.indexOf('data-testid="work-surface-W2"');
+    const map = html.indexOf('data-testid="cockpit-understanding-map"');
+    expect(brief).toBeGreaterThan(-1);
+    expect(brief).toBeLessThan(work);
+    expect(work).toBeLessThan(map);
+    expect(screen.getAllByTestId("understanding-brief")).toHaveLength(1);
+
+    // レビュー指摘 P1: `W2` の主操作「この理解で進む」は Brief カードの
+    // 見出し側にある。本文の下だとカードが約 566px あるため、初期表示
+    // (1280 x 720) に主操作が入らなかった。カードの中にある、という #351 の
+    // 条件は変わらないので、カードは 1 枚・主操作も 1 つのまま。
+    const confirm = screen.getByTestId("understanding-confirm-block");
+    const briefCard = screen.getByTestId("understanding-brief");
+    expect(briefCard.contains(confirm)).toBe(true);
+    expect(screen.getAllByTestId("understanding-confirm-block")).toHaveLength(1);
+    const briefHtml = briefCard.innerHTML;
+    expect(briefHtml.indexOf('data-testid="understanding-confirm-block"'))
+      .toBeLessThan(briefHtml.indexOf('id="brief-body"'));
+  });
+
+  // Issue #361: 補助情報は折りたたみの中。閉じていても、そこへ移動する CTA は
+  // 祖先の `<details>` を開いてからフォーカスするので機能し続ける。
+  it("補助情報は折りたたまれ、詳細ペインの CTA から開いて到達できる", async () => {
+    mockInterviewW3Cockpit();
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await screen.findByTestId("cockpit-auxiliary");
+    const changeSetEntry = screen.getByTestId("cockpit-aux-change-set") as HTMLDetailsElement;
+    const qaEntry = screen.getByTestId("cockpit-aux-qa-list") as HTMLDetailsElement;
+    expect(changeSetEntry.open).toBe(false);
+    expect(qaEntry.open).toBe(false);
+
+    // 「直接編集する」は `change-set-panel` へ移動する。閉じたままだと
+    // フォーカスが当たらないので、祖先の折りたたみが開くこと自体が契約。
+    fireEvent.click(screen.getByTestId("cockpit-action-direct_edit"));
+    expect(changeSetEntry.open).toBe(true);
+
+    // ヘッダーの「セッション情報」もその折りたたみを開く (ヘッダーの
+    // バッジと同じ内容を右カラムへ常設しないための入口)。
+    const sessionEntry = screen.getByTestId("cockpit-aux-session") as HTMLDetailsElement;
+    expect(sessionEntry.open).toBe(false);
+    fireEvent.click(screen.getByTestId("cockpit-open-session-info"));
+    expect(sessionEntry.open).toBe(true);
+  });
+
+  // Issue #356 指摘 P2: 「この項目を開く」は、作業面の先頭操作ではなく、その
+  // 質問の行へフォーカスを移す。質問が複数あるとき、選んだものと違う質問に
+  // 当たると一覧の意味が無くなる。
+  test("未解決事項の行アクションは選んだ質問そのものへフォーカスする", async () => {
+    function openQa(id: number, text: string, category: string) {
+      return {
+        id, session_id: 7, system_id: 1,
+        question_text: text, question_category: category, question_source: "reviewer",
+        hypothesis: null, evidence_refs: [], runtime_evidence: null,
+        answer_text: null, answer_unknown: null, status: "open",
+        answered_by: null, superseded_by_id: null, created_at: 1, answered_at: null,
+      };
+    }
+    mockInterviewApi({
+      workflow: {
+        state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
+        primary_action: "submit_answer",
+        facts: { open_required_questions: 2 },
+      },
+      proposals: [],
+      session: {
+        stage: "gap_questions",
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [understandingItem("POST /traces")],
+          probe_flow_candidates: [understandingItem("summarize flow")],
+        },
+        open_questions: [
+          { question: "先に表示される質問", category: "capability", priority: "high", qa_id: 41 },
+          { question: "後に表示される質問", category: "api", priority: "low", qa_id: 42 },
+        ],
+      },
+      qaList: {
+        session_id: 7, system_id: 1,
+        items: [
+          openQa(41, "先に表示される質問", "capability"),
+          openQa(42, "後に表示される質問", "api"),
+        ],
+        open_count: 2, high_priority_open_count: 1, answers_revised_at: null,
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const rows = await screen.findAllByTestId("cockpit-unresolved-row");
+    expect(rows).toHaveLength(2);
+    // 2 行目 (低優先) を選んでも、1 行目や作業面の先頭ではなくその質問へ移る。
+    fireEvent.click(within(rows[1]).getByTestId("cockpit-unresolved-action"));
+    await waitFor(() => {
+      expect(screen.getByTestId("qa-item-42").contains(document.activeElement)).toBe(true);
+      expect(screen.getByTestId("qa-item-41").contains(document.activeElement)).toBe(false);
+      expect(document.activeElement?.tagName).not.toBe("BODY");
+    });
+  });
+
+  // Issue #356 再レビュー指摘 P1: Q&A 取得だけが失敗した場合、セッション詳細
+  // は取れているので画面自体は描ける。そのとき「質問 0 件 / 完成度 100%」と
+  // いう確定値を出してはならない (0 件と未取得は別物)。
+  test("Q&A の取得だけ失敗したら 0 件ではなくエラーと再試行を出す", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { understanding_unconfirmed: true },
+      },
+      proposals: [],
+      brief: {
+        vision: understandingBriefClaim("vision", "開発者が挙動を説明できる"),
+        vision_missing_information: [],
+        system_purpose: [understandingBriefClaim("system_purpose", "Runtime probe platform")],
+        core_capabilities: [understandingBriefClaim("core_capability", "Trace ingestion")],
+      },
+      session: {
+        stage: "purpose_confirmation",
+        understanding_confirmed_at: null,
+        current_understanding: {
+          vision: [understandingItem("開発者が挙動を説明できる")],
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [understandingItem("POST /traces")],
+          probe_flow_candidates: [understandingItem("summarize flow")],
+        },
+      },
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    let qaFailing = true;
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/qa") {
+        if (qaFailing) return Promise.reject(new Error("qa unavailable"));
+        return Promise.resolve({
+          session_id: 7, system_id: 1,
+          items: [
+            {
+              id: 81, session_id: 7, system_id: 1,
+              question_text: "回答済みの質問", question_category: "purpose",
+              question_source: "reviewer", hypothesis: null, evidence_refs: [],
+              runtime_evidence: null, answer_text: "はい", answer_unknown: null,
+              status: "answered", answered_by: "admin", superseded_by_id: null,
+              created_at: 1, answered_at: 2,
+            },
+          ],
+          open_count: 0, high_priority_open_count: 0, answers_revised_at: null,
+        });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // セッション詳細は取れているので、画面全体のエラーカードにはしない。
+    await screen.findByTestId("cockpit-status-summary");
+    expect(screen.queryByTestId("interview-load-error")).toBeNull();
+
+    // 質問合計と完成度は確定値にしない。
+    await waitFor(() => {
+      expect(screen.getByTestId("cockpit-qa-progress")).toHaveAttribute("data-status", "unavailable");
+    });
+    expect(screen.getByTestId("cockpit-stat-questions")).toHaveTextContent("—");
+    expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("—");
+    expect(screen.getByTestId("cockpit-completion-percent")).not.toHaveTextContent("100");
+    expect(screen.queryByTestId("cockpit-progress-bar")).toBeNull();
+    // 「未解決なし」とも読ませない。
+    expect(screen.getByTestId("cockpit-unresolved-qa-unavailable")).toBeInTheDocument();
+    expect(screen.queryByTestId("cockpit-unresolved-empty")).toBeNull();
+    // 取得できていないカテゴリは確認済みと言い切らず、第 4 の状態ラベルも
+    // 出さない (状態は confirmed / review / missing の 3 値のまま)。
+    const purposeCard = screen.getByTestId("cockpit-category-card-system_purpose");
+    expect(within(purposeCard).getByTestId("cockpit-status-pending")).toBeInTheDocument();
+    expect(within(purposeCard).queryByTestId("cockpit-status-confirmed")).toBeNull();
+    expect(screen.getByTestId("cockpit-map-qa-unavailable")).toBeInTheDocument();
+    // 「要確認 0」を確定値として出さない。
+    expect(screen.getByTestId("cockpit-stat-review")).toHaveTextContent("件以上");
+    expect(screen.getByTestId("cockpit-qa-error-detail")).toHaveTextContent("qa unavailable");
+
+    // 再試行が成功すれば通常表示に戻り、件数が入る。
+    qaFailing = false;
+    fireEvent.click(screen.getByTestId("cockpit-qa-retry"));
+    await waitFor(() => {
+      expect(screen.getByTestId("cockpit-qa-progress")).toHaveAttribute("data-status", "ready");
+    });
+    expect(screen.getByTestId("cockpit-qa-answered")).toHaveTextContent("1 件");
+    expect(screen.getByTestId("cockpit-stat-questions")).toHaveTextContent("1");
+    expect(screen.getByTestId("cockpit-completion-percent")).toHaveTextContent("100");
+    // 通常の 3 状態へ戻る。
+    expect(
+      within(screen.getByTestId("cockpit-category-card-system_purpose"))
+        .getByTestId("cockpit-status-confirmed"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("cockpit-status-pending")).toBeNull();
+    expect(screen.queryByTestId("cockpit-map-qa-unavailable")).toBeNull();
+    expect(screen.getByTestId("cockpit-stat-review")).toHaveTextContent("0");
+    expect(screen.getByTestId("cockpit-stat-review")).not.toHaveTextContent("件以上");
+  });
+
+  // Issue #356 受け入れ条件「loading、空データ、エラー…に適切な表示になる」。
+  // 以前はセッション一覧 / 詳細の取得に失敗すると loading 分岐を抜けたあと
+  // 本文が丸ごと空になり、失敗したことすら読めなかった。
+  test("セッション一覧の取得に失敗したらエラーと再試行を出す", async () => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    let failing = true;
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions" && failing) {
+        return Promise.reject(new Error("Failed to fetch"));
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("interview-load-error");
+    expect(card).toHaveTextContent("インタビューセッション一覧を取得できませんでした");
+    expect(screen.getByTestId("interview-load-error-detail")).toHaveTextContent("Failed to fetch");
+
+    // 再試行で復旧できる。
+    failing = false;
+    fireEvent.click(screen.getByTestId("interview-load-error-retry"));
+    await waitFor(() => {
+      expect(screen.queryByTestId("interview-load-error")).toBeNull();
+    });
+  });
+
+  test("セッション詳細の取得に失敗したらエラーと再試行を出す", async () => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7") {
+        return Promise.reject(new Error("session detail unavailable"));
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("interview-load-error");
+    expect(card).toHaveTextContent("セッション #7 を取得できませんでした");
+    expect(screen.getByTestId("interview-load-error-detail"))
+      .toHaveTextContent("session detail unavailable");
+    expect(screen.getByTestId("interview-load-error-retry")).toBeInTheDocument();
+  });
+
+  test("理解の確認・回答の送信でも正準 Workflow query が再取得される", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W2", candidate_state: "W2", rule_row: 6, reached_state: "W2",
+        primary_action: "confirm_understanding",
+        facts: { understanding_unconfirmed: true },
+      },
+      proposals: [],
+      session: {
+        stage: "purpose_confirmation",
+        understanding_confirmed_at: null,
+        current_understanding: {
+          system_purpose: [understandingItem("Runtime probe platform")],
+          core_capabilities: [understandingItem("Trace ingestion")],
+          capability_elements: [], supporting_elements: [],
+          api_boundaries: [], probe_flow_candidates: [],
+        },
+      },
+    });
+    mockApi.post.mockResolvedValue(interviewSession({ understanding_confirmed_at: 9 }));
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const confirm = await screen.findByTestId("confirm-understanding");
+    const before = mockApi.get.mock.calls.filter(
+      ([path]) => typeof path === "string" && path.startsWith("/interview/workflow-state"),
+    ).length;
+    fireEvent.click(confirm);
+
+    await waitFor(() => {
+      const after = mockApi.get.mock.calls.filter(
+        ([path]) => typeof path === "string" && path.startsWith("/interview/workflow-state"),
+      ).length;
+      expect(after).toBeGreaterThan(before);
+    });
+  });
+
+  // Review finding 4: while the current-location card says 「操作は不要」, the
+  // page must not simultaneously offer the inputs that the running process
+  // is consuming (Intent / Q&A / まとめて修正).
+  test("W1 では待機と例外だけを出し、開発者の変更操作は描かれない", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W1", candidate_state: "W1", rule_row: 4, reached_state: "W3",
+        primary_action: "none",
+        facts: { running_process_kinds: ["understanding_update"] },
+        running_processes: [{
+          id: 1, session_id: 7, system_id: 1,
+          process_kind: "understanding_update", status: "running",
+          failure_class: null, target_state: null, error: null,
+          started_at: 1, finished_at: null,
+        }],
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByTestId("workflow-running")).toHaveTextContent("理解を更新しています");
+    for (const testId of [
+      "work-surface-W2", "work-surface-W3", "work-surface-W4",
+      "work-surface-W5", "work-surface-W6", "work-surface-W7",
+      "qa-panel", "intent-brief-panel", "change-set-panel",
+      "observation-proposal-panel", "handoff-list-panel",
+    ]) {
+      expect(screen.queryByTestId(testId)).toBeNull();
+    }
+    // 履歴・監査の入口だけは状態に依存せず常に開ける (§3.6)。
+    expect(screen.getByTestId("history-audit-entry")).toBeInTheDocument();
+  });
+
+  test("W0-A では Repository 導線だけが主操作で、開始ボタンは描かれない", async () => {
+    // `E1` は例外ではなく `W0-A` という状態そのもの。実行できない
+    // 「インタビューを開始」を disabled で見せない (原則 P3)。
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/interview/workflow-state")) {
+        return Promise.resolve(interviewWorkflowState({
+          session_id: null,
+          state: "W0-A", candidate_state: "W0-A", rule_row: 1,
+          reached_state: null, primary_action: "open_repository",
+          facts: { has_snapshot: false, has_session: false },
+          latest_ready_snapshot_id: null,
+          exceptions: [{
+            code: "E1", severity: "blocking", target_state: "W0-A",
+            message: "対象リポジトリの snapshot がまだありません。",
+            detail: null, recovery_process_kind: null,
+            recovery_condition: "Repository 画面で snapshot を作成すると開始できます。",
+          }],
+        }));
+      }
+      if (path === "/repository/snapshots/latest") return Promise.resolve(null);
+      if (path === "/interview/sessions") return Promise.resolve([]);
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("work-surface-W0-A")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("w0a-primary-action")).toHaveTextContent(
+      "Repository で snapshot を作成する",
+    );
+    expect(screen.queryByRole("button", { name: /インタビューを開始/ })).toBeNull();
+    expect(screen.queryByTestId("work-surface-W0-B")).toBeNull();
+    // `E1` は `W0-A` そのものなので、R5 の警告カードとしては出さない。
+    expect(screen.queryByTestId("workflow-exception-E1")).toBeNull();
+  });
+
+  test("セッションを明示的に未選択にすると W0-B に到達でき、自動選択で戻らない (Issue #349 再レビュー #1)", async () => {
+    // 既存セッションがあるシステムでも新しいインタビューを開始できること。
+    // 以前は「未選択を見つけたら最新セッションを選ぶ」副作用が毎レンダー
+    // 走ったため、選択を外した瞬間に元のセッションへ引き戻され、`W0-B` の
+    // 主操作 (インタビューを開始) に永久に到達できなかった。
+    let sessionSelected = true;
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path.startsWith("/interview/workflow-state")) {
+        // 未選択のときサーバーは `W0-B` を返す (rule row 2)。
+        return Promise.resolve(
+          interviewWorkflowState(
+            sessionSelected
+              ? {}
+              : {
+                  session_id: null,
+                  state: "W0-B",
+                  candidate_state: "W0-B",
+                  rule_row: 2,
+                  reached_state: null,
+                  primary_action: "start_session",
+                  facts: { has_session: false },
+                },
+          ),
+        );
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const picker = (await screen.findByLabelText(
+      "インタビューセッション",
+    )) as HTMLSelectElement;
+    // セッション一覧が届くまで option #7 が存在しないので値は空のまま。
+    await waitFor(() => expect(picker.value).toBe("7"));
+
+    sessionSelected = false;
+    fireEvent.change(picker, { target: { value: "" } });
+
+    // 選択が復活しないこと。
+    await waitFor(() => {
+      expect(picker.value).toBe("");
+    });
+    expect(await screen.findByTestId("work-surface-W0-B")).toBeInTheDocument();
+    expect(screen.getByTestId("w0b-primary-action")).toBeInTheDocument();
+    // 数レンダー分待っても引き戻されない。
+    await new Promise(r => setTimeout(r, 50));
+    expect(picker.value).toBe("");
+  });
+
+  test("W4 では意図とのズレの作業面だけが描かれ、会話・提案・差分の作業面は描かれない", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W4", candidate_state: "W4", rule_row: 9, reached_state: "W4",
+        primary_action: "confirm_alignment_item",
+        facts: { outstanding_alignment_items: 1 },
+      },
+    });
+    const item = alignmentItem({ id: 1 });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/alignment") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          items_by_category: {
+            must_review: [item], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [],
+          },
+          counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+        });
+      }
+      if (path === "/interview/sessions/7/review-queue") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items: [item] });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByTestId("work-surface-W4")).toBeInTheDocument();
+    expect(screen.queryByTestId("work-surface-W3")).toBeNull();
+    expect(screen.queryByTestId("work-surface-W5")).toBeNull();
+    expect(screen.queryByTestId("work-surface-W6")).toBeNull();
+    // The abolished tab machinery is gone entirely.
+    expect(screen.queryByTestId("main-tab-alignment")).toBeNull();
+    expect(screen.queryByTestId("main-tab-conversation")).toBeNull();
+    expect(screen.queryByTestId("next-action-go-to-conversation")).toBeNull();
+    // The current location names this state's single primary action.
+    expect(screen.getByTestId("workflow-next-action")).toHaveTextContent("この項目を確定する");
+  });
+
+  test("W5 では提案の作業面だけが描かれ、差分生成ボタンと前提説明は描かれない", async () => {
+    mockInterviewApi({ approvedCount: 0 });
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByTestId("work-surface-W5")).toBeInTheDocument();
+    expect(screen.queryByTestId("work-surface-W4")).toBeNull();
+    // #33 / #34 / #35: the manual diff-generation button, the "approve first"
+    // note and the "no proposals yet" note are abolished (`OP-S7` is
+    // automatic; 原則 P3).
+    expect(screen.queryByRole("button", { name: /差分を生成/ })).toBeNull();
+    expect(screen.queryByTestId("materialize-prerequisite")).toBeNull();
+    expect(screen.queryByTestId("no-proposals-yet")).toBeNull();
+    expect(screen.getByTestId("workflow-next-action")).toHaveTextContent("この提案を承認する");
+  });
+
+  test("W6 の主操作は差分レビューの明示記録であり、ダウンロードでは代替されない", async () => {
+    mockInterviewApi({
+      approvedCount: 1,
+      session: { materialization_diff: "diff --git a/x b/x\n", materialized_at: 10 },
+      workflow: {
+        state: "W6", candidate_state: "W6", rule_row: 12, reached_state: "W6",
+        primary_action: "record_diff_review",
+        diff_materialized_at: 10,
+        facts: { approved_proposal_count: 1, diff_matches_approval_set: true },
+      },
+    });
+    mockApi.post.mockResolvedValue({
+      id: 1, session_id: 7, system_id: 1, diff_materialized_at: 10,
+      diff_digest: "d", reviewed_by: "admin", decision_method: "manual",
+      note: "", created_at: 1,
+    });
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByTestId("work-surface-W6")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-next-action")).toHaveTextContent("この差分を確認した");
+    // The download exists, but only as an auxiliary action.
+    expect(screen.getByTestId("download-patch-button")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("record-diff-review"));
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
-        "/interview/sessions/8/update-understanding",
-        {},
+        "/interview/sessions/7/diff-review",
+        { reviewed_by: "admin" },
       );
     });
+  });
+
+  test("W7 は終端ごとに 1 つの主操作を出し、中断からは再開できる", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W7", candidate_state: "W7", rule_row: 3, reached_state: "W5",
+        terminal_kind: "suspended", primary_action: "resume_session",
+        facts: { session_closed: true },
+      },
+      session: { status: "closed" },
+    });
+    mockApi.post.mockResolvedValue(interviewWorkflowState({ state: "W5" }));
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("terminal-card");
+    expect(card).toHaveAttribute("data-terminal-kind", "suspended");
+    const primary = screen.getByTestId("terminal-primary-action");
+    expect(primary).toHaveTextContent("このセッションを再開する");
+    // A closed session cannot also be closed again -- the terminals are
+    // mutually exclusive (§5.4).
+    expect(screen.queryByTestId("terminal-close-session")).toBeNull();
+
+    fireEvent.click(primary);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/reopen", { actor: "admin" },
+      );
+    });
+  });
+
+  test("未承諾の戻り要求がある間は reached_state のまま表示し、承諾で候補状態へ移る", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W5", candidate_state: "W3", rule_row: 7, reached_state: "W5",
+        primary_action: "approve_proposal",
+        backward_hold: true,
+        pending_back_request: {
+          id: 12, session_id: 7, system_id: 1,
+          cause_kind: "question_reopened",
+          candidate_state: "W3", reached_state: "W5",
+          status: "pending", created_at: 1,
+        },
+        exceptions: [{
+          code: "E8", severity: "informational", target_state: "W3",
+          message: "回答の修正により、確認が必要な質問が発生しました。",
+          detail: null, recovery_process_kind: null,
+          recovery_condition: "「先に確認する」を選ぶと該当の状態へ戻ります。",
+        }],
+        facts: { open_required_questions: 1 },
+      },
+    });
+    mockApi.post.mockResolvedValue(interviewWorkflowState({ state: "W3" }));
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // The held-back state is still the one shown, and its work stays usable.
+    expect(await screen.findByTestId("work-surface-W5")).toBeInTheDocument();
+    expect(screen.queryByTestId("work-surface-W3")).toBeNull();
+    // E8 is informational, so it is NOT rendered as an R5 warning.
+    expect(screen.queryByTestId("workflow-exception-E8")).toBeNull();
+    const notice = await screen.findByTestId("workflow-back-request");
+    expect(notice).toHaveTextContent("回答の修正により、確認が必要な質問が発生しました");
+
+    fireEvent.click(screen.getByTestId("workflow-acknowledge-back"));
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/interview/sessions/7/back-requests/12/acknowledge",
+        { actor: "admin" },
+      );
+    });
+  });
+
+  test("outstanding_counts がギャップサマリの件数に使われ、Review Queue のカード数と一致する", async () => {
+    mockInterviewApi({
+      workflow: {
+        state: "W4", candidate_state: "W4", rule_row: 9, reached_state: "W4",
+        primary_action: "confirm_alignment_item",
+        facts: { outstanding_alignment_items: 1 },
+      },
+    });
+    const answeredItem = alignmentItem({
+      id: 1, review_category: "must_review", status: "answered",
+      gap_summary: "解消済みの古いギャップ文言",
+    });
+    const openItem = alignmentItem({
+      id: 2, review_category: "must_review",
+      gap_summary: "承認フローが自動化されていません",
+      current_claim: "現在は手動で承認している",
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/alignment") {
+        return Promise.resolve({
+          session_id: 7,
+          system_id: 1,
+          items_by_category: {
+            must_review: [answeredItem, openItem], batch_reviewable: [], no_review_required: [], unchanged: [], informational: [],
+          },
+          // `counts` stays a total (2, including the already-answered
+          // item); `outstanding_counts` (未対応件数) is 1, matching the
+          // review-queue response below exactly.
+          counts: { must_review: 2, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+          outstanding_counts: { must_review: 1, batch_reviewable: 0, no_review_required: 0, unchanged: 0, informational: 0 },
+        });
+      }
+      if (path === "/interview/sessions/7/review-queue") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items: [openItem] });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Tab label count uses outstanding_counts (1), not counts (2). The tab
+    // Issue #349: the tab (and its count badge) is abolished -- W4 is a
+    // state, so the Alignment work surface is simply what is rendered.
+    // AlignmentSummaryHeader shows the top outstanding gap's own text (not
+    // the resolved item's stale gap text) plus the matching outstanding
+    // count.
+    const gapItem0 = await screen.findByTestId("alignment-summary-gap-item-0");
+    expect(gapItem0).toHaveTextContent("承認フローが自動化されていません");
+    expect(screen.queryByText("解消済みの古いギャップ文言")).not.toBeInTheDocument();
+    expect(screen.getByTestId("alignment-summary-gap-count")).toHaveTextContent("要確認 1件");
+
+    // The Review Queue panel's own category summary agrees, and renders
+    // exactly the one outstanding item as an action card.
+    expect(await screen.findByTestId("review-queue-summary-must_review")).toHaveTextContent("要確認 1件");
+    expect(screen.getByTestId("review-item-2")).toBeInTheDocument();
+    expect(screen.queryByTestId("review-item-1")).not.toBeInTheDocument();
+  });
+
+  function intentItem(overrides: Record<string, unknown> & { field: string; value_text: string }) {
+    return {
+      id: 1, session_id: 7, system_id: 1,
+      status: "confirmed", origin: "user", source_statement: null,
+      decision_method: "manual", intelligence_run_id: null, is_mock: false,
+      superseded_by_id: null, created_at: 1, updated_at: 1,
+      ...overrides,
+    };
+  }
+
+  // 3rd review round (Finding 2): an unconfirmed AI-proposed goal must NOT be
+  // shown as "あなたが実現したいこと" (confirmed human intent). Issue #295's
+  // "AI推定と人間確認済み情報の区別" -- it is surfaced as an explicit
+  // unconfirmed candidate instead.
+  test("未確認のAI提案 goal は確定した『あなたが実現したいこと』として表示せず、未確認候補として明示する", async () => {
+    mockInterviewApi({
+      workflow: { state: "W4", candidate_state: "W4", rule_row: 9, reached_state: "W4", primary_action: "confirm_alignment_item", facts: { outstanding_alignment_items: 1 } },
+    });
+    const proposedGoal = intentItem({
+      field: "goal", value_text: "AIが推定した目標", status: "proposed",
+      origin: "ai_proposed", decision_method: "reasoning_llm", intelligence_run_id: 3,
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/intent") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items_by_field: { goal: [proposedGoal] } });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const proposed = await screen.findByTestId("alignment-summary-goal-proposed");
+    expect(proposed).toHaveTextContent("AIが推定した目標");
+    expect(proposed).toHaveTextContent("AI提案");
+    expect(proposed).toHaveTextContent("未確認");
+    // It is never rendered as the confirmed human intent.
+    expect(screen.queryByTestId("alignment-summary-goal-confirmed")).not.toBeInTheDocument();
+  });
+
+  test("却下済みのAI提案 goal は未確認候補として再表示しない", async () => {
+    mockInterviewApi({
+      workflow: { state: "W4", candidate_state: "W4", rule_row: 9, reached_state: "W4", primary_action: "confirm_alignment_item", facts: { outstanding_alignment_items: 1 } },
+    });
+    const declinedGoal = intentItem({
+      field: "goal", value_text: "却下したAI目標", status: "not_applicable",
+      origin: "ai_proposed", decision_method: "manual", intelligence_run_id: 3,
+    });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/intent") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items_by_field: { goal: [declinedGoal] } });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const summary = await screen.findByTestId("alignment-summary-goal");
+    expect(summary).toHaveTextContent("未入力です");
+    expect(summary).not.toHaveTextContent("却下したAI目標");
+    expect(screen.queryByTestId("alignment-summary-goal-proposed")).not.toBeInTheDocument();
+  });
+
+  test("確認済みの goal は『あなたが実現したいこと』として確定表示する", async () => {
+    mockInterviewApi({
+      workflow: { state: "W4", candidate_state: "W4", rule_row: 9, reached_state: "W4", primary_action: "confirm_alignment_item", facts: { outstanding_alignment_items: 1 } },
+    });
+    const confirmedGoal = intentItem({ field: "goal", value_text: "確定した目標" });
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions/7/intent") {
+        return Promise.resolve({ session_id: 7, system_id: 1, items_by_field: { goal: [confirmedGoal] } });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const confirmed = await screen.findByTestId("alignment-summary-goal-confirmed");
+    expect(confirmed).toHaveTextContent("確定した目標");
+    expect(screen.queryByTestId("alignment-summary-goal-proposed")).not.toBeInTheDocument();
+  });
+
+  // PR #296 review restructure / previous reviewer's note (Finding 4): a
+  // just-investigated question's qa.investigation conclusion must be visible
+  // in the same view as the focused question, not only inside the Q&A list.
+  test("調査済みの focused question は、その qa.investigation を同じ画面領域に表示する", async () => {
+    mockInterviewApi({
+      workflow: { state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3", primary_action: "submit_answer", facts: { open_required_questions: 1 } },
+      proposals: [],
+      session: {
+        open_questions: [{
+          question: "対象のプローブ範囲はどこですか?",
+          category: "followup",
+          priority: "medium",
+          hypothesis: null,
+          qa_id: 77,
+        }],
+      },
+      qaList: {
+        session_id: 7,
+        system_id: 1,
+        items: [{
+          id: 77,
+          session_id: 7,
+          system_id: 1,
+          question_text: "対象のプローブ範囲はどこですか?",
+          question_category: "followup",
+          question_source: "dialogue",
+          hypothesis: null,
+          evidence_refs: [],
+          runtime_evidence: null,
+          answer_text: null,
+          status: "unconfirmed",
+          answered_by: null,
+          superseded_by_id: null,
+          created_at: 0,
+          answered_at: null,
+          route_category: "system_researchable",
+          route_run_id: 1,
+          knowledge_area: "implementation",
+          handoff_id: null,
+          investigation: {
+            run_id: 1,
+            status: "completed",
+            conclusion: "対象はsummarize.summarize_textです",
+            key_points: ["要約フローが主対象"],
+            evidence: [{ path: "src/summarize.py", start_line: 1, end_line: 5, summary: "要約処理" }],
+            uncertainty: "",
+            confidence: "likely",
+            decision_question: null,
+          },
+        }],
+        open_count: 1,
+        high_priority_open_count: 0,
+        answers_revised_at: null,
+      },
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const card = await screen.findByTestId("focused-question");
+    const investigation = await within(card).findByTestId("qa-investigation-77");
+    expect(investigation).toHaveTextContent("AIの調査結果: 対象はsummarize.summarize_textです");
+
+    // Transcribing fills the conversation's message box (not the Q&A
+    // panel's own draft), matching this view's own input control.
+    fireEvent.click(within(investigation).getByTestId("qa-investigation-transcribe-77"));
+    const textarea = await screen.findByPlaceholderText(
+      /上の質問への回答や修正点を入力してください。|提案の対象範囲や重視したい観点があれば入力してください。/,
+    );
+    expect((textarea as HTMLTextAreaElement).value).toBe("対象はsummarize.summarize_textです");
   });
 });
 
@@ -2851,43 +5120,171 @@ describe("Flow Explorer auto-select from URL (Issue #62)", () => {
 
 // ── Sidebar navigation ───────────────────────────────────────────────
 
-describe("Sidebar navigation grouping (Issue #179)", () => {
+describe("Sidebar phase-linked navigation (Issue #257)", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     mockSystemId = 1;
   });
 
-  test("renders Hub / Detail views / Other headings and every existing route", async () => {
-    const { Sidebar } = await import("@/components/layout/sidebar");
-    render(
-      <MemoryRouter initialEntries={["/"]}>
-        <Sidebar />
-      </MemoryRouter>,
-    );
+  function stateWithPhase(userPhase: string) {
+    return {
+      system_id: 1, generated_at: 1, overall_severity: "ok",
+      severity_counts: {}, items: [], primary_item: null,
+      notification_items: [], page_items: {},
+      user_phase: userPhase,
+      phases: [
+        { phase: "setup", complete: true },
+        { phase: "preparation", complete: true },
+        { phase: "instrumentation", complete: true },
+        { phase: "observation", complete: true },
+        { phase: "evaluation", complete: true },
+        { phase: "publish", complete: true },
+      ],
+    };
+  }
 
-    expect(screen.getByTestId("sidebar-group-hub")).toBeTruthy();
-    expect(screen.getByTestId("sidebar-group-detail-views")).toBeTruthy();
+  // Renders the Sidebar with /system-state resolving to `stateResponse`
+  // (or null, simulating an older server / not-yet-loaded / errored state).
+  async function renderSidebar(stateResponse: unknown | null) {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/system-state" ? Promise.resolve(stateResponse) : Promise.resolve(null),
+    );
+    const { Sidebar } = await import("@/components/layout/sidebar");
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const result = render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/"]}>
+          <Sidebar />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    // Let the /system-state query settle before assertions.
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
+    return result;
+  }
+
+  test("renders the new Setup/Understand/Instrument/Observe & Evaluate/Publish/Other groups with every existing route", async () => {
+    await renderSidebar(null);
+
+    expect(screen.getByTestId("sidebar-group-setup")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-understand")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-instrument")).toBeTruthy();
+    // "Observe & Evaluate" slugifies (lowercase, whitespace runs -> "-") to
+    // exactly this — the ampersand itself is not stripped by the existing
+    // slug logic in sidebar.tsx.
+    expect(screen.getByTestId("sidebar-group-observe-&-evaluate")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-group-publish")).toBeTruthy();
     expect(screen.getByTestId("sidebar-group-other")).toBeTruthy();
 
     const nav = screen.getByTestId("sidebar-nav");
-    // Existing routes/URLs are unchanged — every prior nav item is still present.
     for (const label of [
-      "Overview", "System Understanding", "Repository", "Capability Map", "Feature Map",
-      "Flow Explorer", "Trace Lineage", "Trace Analyzers", "Probe Planner", "Interview",
-      "Experiments", "Connect SDK", "Generate", "Components", "Decision Workspace", "Settings",
+      "Overview", "Setup Guide", "Repository", "Settings",
+      "System Understanding", "Capability Map", "Feature Map", "Flow Explorer", "Interview",
+      "Probe Planner", "Probe Patterns", "Connect SDK",
+      "Components / Traces", "Trace Lineage", "Trace Analyzers", "Experiments",
+      "Simulation Workbench", "AI Candidate Studio", "Decision Workspace",
+      "GitHub", "Generate",
     ]) {
       expect(within(nav).getByText(label)).toBeTruthy();
     }
+    // Old label is gone, replaced by "Components / Traces".
+    expect(within(nav).queryByText("Components")).toBeNull();
 
-    // System Understanding is grouped under Hub, not Detail views.
-    expect(within(screen.getByTestId("sidebar-group-hub")).getByText("System Understanding")).toBeTruthy();
-    expect(within(screen.getByTestId("sidebar-group-detail-views")).getByText("Flow Explorer")).toBeTruthy();
+    // Group membership per the #257 design mapping.
+    expect(within(screen.getByTestId("sidebar-group-instrument")).getByText("Probe Patterns")).toBeTruthy();
+    expect(within(screen.getByTestId("sidebar-group-publish")).getByText("GitHub")).toBeTruthy();
+    expect(within(screen.getByTestId("sidebar-group-other")).getByText("Generate")).toBeTruthy();
+  });
 
-    // Issue #199: Interview sits directly after Capability Map in Detail views.
-    const detailLabels = within(screen.getByTestId("sidebar-group-detail-views"))
-      .getAllByRole("link")
-      .map((el) => el.textContent);
-    const capIdx = detailLabels.indexOf("Capability Map");
-    expect(detailLabels[capIdx + 1]).toBe("Interview");
+  test("preparation phase: Understand is current, Setup is reached, later groups are future and dimmed", async () => {
+    await renderSidebar(stateWithPhase("preparation"));
+
+    const setup = screen.getByTestId("sidebar-group-setup");
+    const understand = screen.getByTestId("sidebar-group-understand");
+    const instrument = screen.getByTestId("sidebar-group-instrument");
+    const observeEvaluate = screen.getByTestId("sidebar-group-observe-&-evaluate");
+    const publish = screen.getByTestId("sidebar-group-publish");
+
+    // /system-state resolves asynchronously; wait for the re-render it
+    // triggers (these DOM nodes are stable across the update, so the same
+    // references keep working once settled).
+    await waitFor(() => expect(understand.getAttribute("data-phase-state")).toBe("current"));
+
+    expect(setup.getAttribute("data-phase-state")).toBe("reached");
+    expect(instrument.getAttribute("data-phase-state")).toBe("future");
+    expect(observeEvaluate.getAttribute("data-phase-state")).toBe("future");
+    expect(publish.getAttribute("data-phase-state")).toBe("future");
+
+    // Dimmed (future) groups carry a reduced-opacity class; reached/current do not.
+    expect(instrument.className).toMatch(/opacity-50/);
+    expect(observeEvaluate.className).toMatch(/opacity-50/);
+    expect(publish.className).toMatch(/opacity-50/);
+    expect(setup.className).not.toMatch(/opacity-50/);
+    expect(understand.className).not.toMatch(/opacity-50/);
+
+    // The current group's heading shows the sidebar's own 現在地表示 marker.
+    expect(within(understand).getByText("現在")).toBeTruthy();
+    expect(within(setup).queryByText("現在")).toBeNull();
+
+    // Never hidden: every item in a dimmed, not-yet-reached group is still a
+    // clickable link with its real href.
+    const probePlannerLink = within(instrument).getByText("Probe Planner").closest("a");
+    expect(probePlannerLink).toBeTruthy();
+    expect(probePlannerLink?.getAttribute("href")).toBe("/probe-planner");
+  });
+
+  test("publish phase: nothing is dimmed (Publish is current, everything else already reached)", async () => {
+    await renderSidebar(stateWithPhase("publish"));
+
+    const publish = screen.getByTestId("sidebar-group-publish");
+    // /system-state resolves asynchronously; wait for the re-render it triggers.
+    await waitFor(() => expect(publish.getAttribute("data-phase-state")).toBe("current"));
+
+    for (const testId of [
+      "sidebar-group-setup", "sidebar-group-understand", "sidebar-group-instrument",
+      "sidebar-group-observe-&-evaluate",
+    ]) {
+      const group = screen.getByTestId(testId);
+      expect(group.getAttribute("data-phase-state")).toBe("reached");
+      expect(group.className).not.toMatch(/opacity-50/);
+    }
+    expect(publish.getAttribute("data-phase-state")).toBe("current");
+    expect(publish.className).not.toMatch(/opacity-50/);
+    expect(within(publish).getByText("現在")).toBeTruthy();
+  });
+
+  test("no system-state data: every group's data-phase-state is absent or none, and nothing is dimmed", async () => {
+    await renderSidebar(null);
+
+    for (const testId of [
+      "sidebar-group-setup", "sidebar-group-understand", "sidebar-group-instrument",
+      "sidebar-group-observe-&-evaluate", "sidebar-group-publish",
+    ]) {
+      const group = screen.getByTestId(testId);
+      const state = group.getAttribute("data-phase-state");
+      expect(state === null || state === "none").toBe(true);
+      expect(group.className).not.toMatch(/opacity-50/);
+    }
+    expect(screen.queryByText("現在")).toBeNull();
+
+    // Every route is still rendered as a real, clickable link.
+    const nav = screen.getByTestId("sidebar-nav");
+    expect(within(nav).getAllByRole("link").length).toBeGreaterThan(15);
+  });
+
+  test("Generate carries a Legacy badge, a pointer to AI Candidate Studio, and lives in Other", async () => {
+    await renderSidebar(null);
+
+    const other = screen.getByTestId("sidebar-group-other");
+    expect(within(other).getByText("Generate")).toBeTruthy();
+    const badge = within(other).getByTestId("sidebar-legacy-badge");
+    expect(badge.textContent).toBe("Legacy");
+
+    const generateLink = within(other).getByText("Generate").closest("a");
+    expect(generateLink?.getAttribute("href")).toBe("/generation");
+    expect(generateLink?.getAttribute("title")).toBe("旧世代の候補生成。AI Candidate Studio を推奨");
   });
 });
 
@@ -2922,6 +5319,7 @@ describe("Context Header", () => {
           dirty_sample: [], latest_snapshot: { id: 5, commit_sha: "abc1234567", status: "ready" },
           latest_indexed_snapshot: null,
           understanding_snapshot_id: null, understanding_status: null,
+          head_relation: "behind", commits_behind: 2,
           snapshot_stale: false, symbols_stale: false, next_actions: [],
         });
       }
@@ -2950,6 +5348,7 @@ describe("Context Header", () => {
     expect(screen.getByTestId("context-header-snapshot")).not.toHaveTextContent("def56780");
     expect(screen.getByTestId("context-header-capability")).toHaveTextContent("doc-analysis");
     expect(screen.getByTestId("context-header-entrypoint")).toHaveTextContent("http_route: GET:/flow");
+    expect(screen.getByTestId("context-header-freshness")).toHaveTextContent("2 commits behind");
     expect(screen.getByTestId("context-header-status")).toHaveTextContent(
       "symbols indexed, entrypoints discovered, 3 gaps",
     );
@@ -3441,6 +5840,59 @@ describe("System Understanding page", () => {
     expect(cards.length).toBe(2);
   });
 
+  test("gap worklist defaults to untriaged, exposes all filter, and records manual triage", async () => {
+    const triageResponse = {
+      ...gapWorklistResponse,
+      gaps: gapWorklistResponse.gaps.map((gap, index) => ({
+        ...gap,
+        gap_key: index === 0
+          ? "unclassified_entrypoint|entrypoint|http_route:GET /items"
+          : "docs_only|document|docs/design.md::Auth [node:abc]",
+        content_fingerprint: index === 0 ? "a".repeat(64) : "b".repeat(64),
+        triage_status: index === 0 ? "open" : "dismissed",
+        triage_decision: index === 0 ? null : {
+          id: 2, system_id: 1, snapshot_id: 5,
+          gap_key: "docs_only|document|docs/design.md::Auth [node:abc]",
+          content_fingerprint: "b".repeat(64), status: "dismissed",
+          decided_by_user_id: 1, decision_method: "manual", created_at: 1,
+        },
+      })),
+      gap_summary: [{ gap_type: "unclassified_entrypoint", count: 1 }],
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve(triageResponse)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockResolvedValue({
+      id: 3, system_id: 1, snapshot_id: 5,
+      gap_key: triageResponse.gaps[0].gap_key,
+      content_fingerprint: "a".repeat(64), status: "acknowledged",
+      decided_by_user_id: 1, decision_method: "manual", created_at: 2,
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("gap-filter-open")).toHaveTextContent("Untriaged (1)");
+    expect(screen.getAllByTestId("gap-card")).toHaveLength(1);
+    expect(screen.getByTestId("gap-triage-status")).toHaveTextContent("open");
+
+    fireEvent.click(screen.getByTestId("gap-filter-all"));
+    expect(screen.getAllByTestId("gap-card")).toHaveLength(2);
+    expect(screen.getAllByTestId("gap-triage-status")[1]).toHaveTextContent("dismissed");
+
+    fireEvent.click(screen.getByTestId("gap-triage-acknowledge"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/repository/system-understanding/gap-triage",
+      {
+        gap_key: triageResponse.gaps[0].gap_key,
+        content_fingerprint: "a".repeat(64),
+        status: "acknowledged",
+      },
+    ));
+  });
+
   test("renders gap next action buttons", async () => {
     mockApi.get.mockImplementation((path: string) =>
       path === "/repository/system-understanding"
@@ -3868,7 +6320,10 @@ describe("System Understanding page", () => {
         phases: [
           { phase: "setup", complete: true },
           { phase: "preparation", complete: false },
-          { phase: "diagnosis", complete: false },
+          { phase: "instrumentation", complete: false },
+          { phase: "observation", complete: false },
+          { phase: "evaluation", complete: false },
+          { phase: "publish", complete: false },
         ],
       });
       return Promise.resolve(null);
@@ -4743,7 +7198,10 @@ describe("System settings diagnostics", () => {
     // withdrawal in `notification_items`; the badge must consume that
     // projection verbatim instead of re-deriving phase visibility.
     const setupItem = { ...snapshotItem, phase: "setup" as const };
-    const diagnosisItem = projectedStateItem({
+    // proposal.probe_plans.*/proposal.experiments.* items default to
+    // phase="evaluation" (Issue #256's state_group="proposal" default) --
+    // a real later-phase token, not an arbitrary placeholder.
+    const evaluationItem = projectedStateItem({
       state_id: "proposal.experiments.undecided",
       severity: "warning",
       summary: "評価待ちの experiment があります。",
@@ -4752,17 +7210,20 @@ describe("System settings diagnostics", () => {
       related_checks: [],
       dedupe_key: "proposal.experiments.undecided",
     });
-    diagnosisItem.phase = "diagnosis";
-    const scoped = (userPhase: "setup" | "diagnosis") => ({
-      ...stateResponse([setupItem, diagnosisItem]),
+    evaluationItem.phase = "evaluation";
+    const scoped = (userPhase: "setup" | "evaluation") => ({
+      ...stateResponse([setupItem, evaluationItem]),
       notification_items: userPhase === "setup"
         ? [setupItem]
-        : [setupItem, diagnosisItem],
+        : [setupItem, evaluationItem],
       user_phase: userPhase,
       phases: [
         { phase: "setup", complete: userPhase !== "setup" },
-        { phase: "preparation", complete: userPhase === "diagnosis" },
-        { phase: "diagnosis", complete: false },
+        { phase: "preparation", complete: userPhase === "evaluation" },
+        { phase: "instrumentation", complete: userPhase === "evaluation" },
+        { phase: "observation", complete: userPhase === "evaluation" },
+        { phase: "evaluation", complete: false },
+        { phase: "publish", complete: false },
       ],
     });
 
@@ -4777,7 +7238,7 @@ describe("System settings diagnostics", () => {
     first.unmount();
 
     mockApi.get.mockImplementation((path: string) =>
-      path === "/system-state" ? Promise.resolve(scoped("diagnosis")) : Promise.resolve(null),
+      path === "/system-state" ? Promise.resolve(scoped("evaluation")) : Promise.resolve(null),
     );
     render(<DiagnosticsBadge />, { wrapper: createWrapper() });
     await screen.findByTestId("diagnostics-badge");
@@ -5261,6 +7722,79 @@ describe("Per-screen assistant panel", () => {
     );
   });
 
+  test("an in-page review action opens the assistant with an unsent contextual draft", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/");
+    const { OPEN_ASSISTANT_EVENT } = await import("@/lib/assistant-control");
+
+    fireEvent(
+      window,
+      new CustomEvent(OPEN_ASSISTANT_EVENT, {
+        detail: { question: "Visionの根拠を確認したい" },
+      }),
+    );
+
+    expect(await screen.findByTestId("assistant-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("assistant-question-input")).toHaveValue(
+      "Visionの根拠を確認したい",
+    );
+    expect(mockApi.post).not.toHaveBeenCalledWith("/assistant/ask", expect.anything());
+  });
+
+  // Issue #358 追補: 開いたパネルは本文の上に重なるモーダルな面である。
+  // 390px 幅では画面全体を覆うので、閉じる手段が右上のボタン 1 つだけだと
+  // 逃げ場が無い。背景・Escape・フォーカストラップ・戻りフォーカスは
+  // サイドバー Drawer (#362) と同じ `useModalSurface` の規則で揃える。
+  test("開いたアシスタントは背景・Escape・フォーカストラップを持つ", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/system-understanding");
+
+    fireEvent.click(screen.getByTestId("assistant-button"));
+    const panel = await screen.findByTestId("assistant-panel");
+    expect(panel).toHaveAttribute("role", "dialog");
+    expect(panel).toHaveAttribute("aria-modal", "true");
+
+    // 開いた直後、フォーカスは面の中にある (背後の本文を操作させない)。
+    expect(panel.contains(document.activeElement)).toBe(true);
+
+    // Tab は面の中で循環する。最後の要素から進むと先頭へ戻る。
+    const focusables = Array.from(
+      panel.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    expect(focusables.length).toBeGreaterThan(1);
+    focusables[focusables.length - 1].focus();
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(focusables[0]);
+
+    // 背景クリックで閉じる。
+    fireEvent.click(screen.getByTestId("assistant-backdrop"));
+    expect(screen.queryByTestId("assistant-panel")).toBeNull();
+
+    // Escape でも閉じ、閉じたらフォーカスは開くボタンへ戻る。
+    const button = screen.getByTestId("assistant-button");
+    button.focus();
+    fireEvent.click(button);
+    await screen.findByTestId("assistant-panel");
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("assistant-panel")).toBeNull());
+    expect(document.activeElement).toBe(screen.getByTestId("assistant-button"));
+  });
+
+  // Issue #102: アシスタントは画面の主操作を隠さない。浮いているボタンの
+  // 位置と `<main>` の予約余白 (`pb-24`) は対で意味を持つ。
+  test("閉じているボタンは狭い画面で端へ寄り、本文の予約余白と対応する", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/system-understanding");
+
+    const floating = screen.getByTestId("assistant-button").parentElement!;
+    expect(floating.className).toMatch(/bottom-4/);
+    expect(floating.className).toMatch(/right-4/);
+    expect(floating.className).toMatch(/md:bottom-6/);
+    expect(floating.className).toMatch(/md:right-6/);
+  });
+
   test("closed agent button can show a snapshot notice bubble", async () => {
     const onSnapshotNoticeClick = vi.fn();
     const { AssistantPanel } = await import("@/components/assistant-panel");
@@ -5676,58 +8210,14 @@ describe("Trace Analyzers page", () => {
   });
 });
 
-// ── Cross-page onboarding and navigation links (Issue #212) ─────────
-
-describe("Overview get-started zero state (Issue #212)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockSystemId = 1;
-    mockSystems = [{ id: 1, name: "alpha" }];
-  });
-
-  test("renders ordered get-started links when no components exist", async () => {
-    mockApi.get.mockImplementation((path: string) => {
-      if (path === "/components") return Promise.resolve([]);
-      if (path === "/system-state") return Promise.resolve({
-        system_id: 1, generated_at: 1, overall_severity: "ok",
-        severity_counts: {}, items: [], primary_item: null,
-        notification_items: [], page_items: {},
-      });
-      return Promise.resolve(null);
-    });
-
-    const { default: OverviewPage } = await import("@/pages/overview");
-    render(<OverviewPage />, { wrapper: createWrapper() });
-
-    const getStarted = await screen.findByTestId("overview-get-started");
-    expect(within(getStarted).getByTestId("overview-link-repository"))
-      .toHaveAttribute("href", "/repository");
-    expect(within(getStarted).getByTestId("overview-link-system-understanding"))
-      .toHaveAttribute("href", "/system-understanding");
-    expect(within(getStarted).getByTestId("overview-link-connect-sdk"))
-      .toHaveAttribute("href", "/connect-sdk");
-  });
-
-  test("does not render get-started links when components exist", async () => {
-    mockApi.get.mockImplementation((path: string) => {
-      if (path === "/components") return Promise.resolve([{
-        component_id: "summarize", mode: "trace", trace_count: 3, last_seen: 1,
-      }]);
-      if (path === "/system-state") return Promise.resolve({
-        system_id: 1, generated_at: 1, overall_severity: "ok",
-        severity_counts: {}, items: [], primary_item: null,
-        notification_items: [], page_items: {},
-      });
-      return Promise.resolve(null);
-    });
-
-    const { default: OverviewPage } = await import("@/pages/overview");
-    render(<OverviewPage />, { wrapper: createWrapper() });
-
-    await screen.findByText("summarize");
-    expect(screen.queryByTestId("overview-get-started")).not.toBeInTheDocument();
-  });
-});
+// ── Overview onboarding tests removed with Issue #384 ──────────────
+//
+// The ordered get-started list these covered (Issues #212 / #259 / #267)
+// no longer exists: the Overview now presents exactly ONE server-decided
+// primary action instead of a catalogue of steps, so there is no per-step
+// completion state left to assert. The onboarding path itself lives on the
+// Setup Guide (`components/setup-next-step.ts`, Issue #374), which keeps
+// its own tests. The Overview's own contracts are in `overview.test.tsx`.
 
 describe("Probe Planner manual feature-id escape hatch (Issue #212)", () => {
   beforeEach(() => {
@@ -6000,6 +8490,251 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
   });
 });
 
+// ── System Purpose side-by-side views (Issue #94/#275) ──────────────
+
+describe("System Purpose side-by-side views (Issue #94/#275)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const completePipeline = [
+    { step: "repository_configured", status: "complete" },
+    { step: "snapshot_ready", status: "complete" },
+    { step: "documentation_indexed", status: "complete" },
+    { step: "documentation_claims_scanned", status: "complete" },
+    { step: "symbols_indexed", status: "complete" },
+    { step: "entrypoints_discovered", status: "complete" },
+    { step: "docs_code_reconciled", status: "complete" },
+    { step: "capability_hierarchy_ready", status: "complete" },
+  ];
+
+  function purposeResponse(overrides: Record<string, unknown> = {}) {
+    return {
+      system_id: 1,
+      snapshot_id: 5,
+      understanding_build_id: 9,
+      commit_sha: "abc12345def",
+      pipeline: completePipeline,
+      purpose: null,
+      capabilities: [],
+      entrypoints: [],
+      major_symbols: [],
+      gaps: [],
+      gap_summary: [],
+      metadata_coverage: null,
+      purpose_views: [],
+      purpose_confirmation: null,
+      ...overrides,
+    };
+  }
+
+  const emptyProfile = {
+    name: "", purpose: "", target_users: [], stakeholder_value: "",
+    constraints: [], success_criteria: [], created_at: null, updated_at: null,
+  };
+
+  function mockApis(response: Record<string, unknown>, profile: Record<string, unknown> = emptyProfile) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/system-understanding") return Promise.resolve(response);
+      if (path === "/system-profile") return Promise.resolve(profile);
+      if (path === "/system-diagnostics") return Promise.resolve(null);
+      if (path === "/system-state") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+  }
+
+  test("renders manual and AI purpose views side by side with provenance badges", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose", summary: "human summary" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose", summary: "ai summary" },
+      ],
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const manualCard = await screen.findByTestId("purpose-manual-card");
+    expect(manualCard.textContent).toContain("Manual purpose");
+    expect(manualCard.textContent).toContain("human summary");
+    expect(manualCard.textContent).toContain("manual");
+
+    const aiCard = screen.getByTestId("purpose-ai-card");
+    expect(aiCard.textContent).toContain("AI purpose");
+    expect(aiCard.textContent).toContain("reasoning_llm");
+  });
+
+  test("manual side empty shows an inline entry form that saves via PUT /system-profile", async () => {
+    mockApis(
+      purposeResponse({
+        purpose_views: [
+          { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose", summary: "ai summary" },
+        ],
+      }),
+      {
+        name: "Existing name", purpose: "", target_users: ["dev"], stakeholder_value: "value",
+        constraints: [], success_criteria: [], created_at: 1, updated_at: 1,
+      },
+    );
+    mockApi.put.mockResolvedValue({});
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const textarea = await screen.findByTestId("purpose-manual-entry-textarea");
+    fireEvent.change(textarea, { target: { value: "新しい目的" } });
+    fireEvent.click(screen.getByTestId("purpose-manual-entry-save"));
+
+    await waitFor(() => expect(mockApi.put).toHaveBeenCalledWith("/system-profile", {
+      name: "Existing name",
+      purpose: "新しい目的",
+      target_users: ["dev"],
+      stakeholder_value: "value",
+      constraints: [],
+      success_criteria: [],
+    }));
+
+    const { toast } = await import("sonner");
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+  });
+
+  test("AI side empty shows the Japanese empty state", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose", summary: null },
+      ],
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("purpose-ai-empty")).toHaveTextContent(
+      "AI/ソース由来の purpose はまだありません。Snapshot 作成と Build 実行後に表示されます。",
+    );
+  });
+
+  test("both views present with no confirmation shows the confirm button and posts on click", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose" },
+      ],
+    }));
+    mockApi.post.mockResolvedValue({
+      id: 1, snapshot_id: 5, decision_method: "manual", manual_purpose: "Manual purpose",
+      created_at: 1700000000, stale: false,
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("purpose-confirm-button"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/repository/system-understanding/purpose-confirmation",
+      { snapshot_id: 5, understanding_build_id: 9 },
+    ));
+
+    const { toast } = await import("sonner");
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("一致を確認しました"));
+  });
+
+  test("confirmed and not stale shows the 確認済み badge without the confirm button", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose" },
+      ],
+      purpose_confirmation: {
+        id: 1, snapshot_id: 5, decision_method: "manual", manual_purpose: "Manual purpose",
+        created_at: 1700000000, stale: false,
+      },
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const confirmed = await screen.findByTestId("purpose-confirmed");
+    expect(confirmed.textContent).toContain("確認済み");
+    expect(screen.queryByTestId("purpose-confirm-button")).not.toBeInTheDocument();
+  });
+
+  test("confirmation stays disabled until a completed understanding build is present", async () => {
+    mockApis(purposeResponse({
+      understanding_build_id: null,
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose" },
+      ],
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("purpose-confirm-button")).toBeDisabled();
+    expect(screen.getByTestId("purpose-confirm-build-required")).toHaveTextContent(
+      "System Understanding の Build 完了後に確認できます。",
+    );
+    expect(mockApi.post).not.toHaveBeenCalled();
+  });
+
+  test("stale confirmation shows the reason note and the confirm button again", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose" },
+      ],
+      purpose_confirmation: {
+        id: 1, snapshot_id: 5, decision_method: "manual", manual_purpose: "Manual purpose",
+        created_at: 1700000000, stale: true, stale_reason: "profile_updated",
+      },
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const note = await screen.findByTestId("purpose-confirmation-stale-note");
+    expect(note.textContent).toBe("確認後に System Profile が更新されています");
+    expect(screen.getByTestId("purpose-confirm-button")).toBeInTheDocument();
+  });
+
+  test("confirmation error is surfaced via toast", async () => {
+    mockApis(purposeResponse({
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+        { source: "capability_hierarchy", provenance_kind: "reasoning_llm", name: "AI purpose" },
+      ],
+    }));
+    mockApi.post.mockRejectedValue(new ApiError(422, "Manual purpose is missing"));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByTestId("purpose-confirm-button"));
+
+    const { toast } = await import("sonner");
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(
+      "確認に失敗しました: Manual purpose is missing",
+    ));
+  });
+
+  test("purposeDefined falls back to purpose_views when the legacy purpose field is null", async () => {
+    mockApis(purposeResponse({
+      purpose: null,
+      purpose_views: [
+        { source: "system_profile", provenance_kind: "manual", name: "Manual purpose" },
+      ],
+    }));
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await screen.findByTestId("purpose-manual-card");
+    expect(screen.queryByTestId("entry-cards-prereq-note")).not.toBeInTheDocument();
+  });
+});
+
 // ── Notification surfaces consume one canonical StateItem (Issue #239) ──
 
 describe("Notification surface consistency (Issue #239)", () => {
@@ -6141,7 +8876,10 @@ describe("User phase indicator (Issue #239)", () => {
         ? Promise.resolve(stateWithPhase("preparation", [
             { phase: "setup", complete: true },
             { phase: "preparation", complete: false },
-            { phase: "diagnosis", complete: false },
+            { phase: "instrumentation", complete: false },
+            { phase: "observation", complete: false },
+            { phase: "evaluation", complete: false },
+            { phase: "publish", complete: false },
           ]))
         : Promise.resolve(null),
     );
@@ -6160,7 +8898,13 @@ describe("User phase indicator (Issue #239)", () => {
     expect(preparation.getAttribute("data-complete")).toBe("false");
     expect(preparation.getAttribute("data-current")).toBe("true");
 
-    expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("false");
+    // All 6 phase chips render (Issue #256), and none of the later ones is
+    // mistaken for the current phase.
+    for (const phase of ["instrumentation", "observation", "evaluation", "publish"]) {
+      const chip = screen.getByTestId(`user-phase-${phase}`);
+      expect(chip.getAttribute("data-complete")).toBe("false");
+      expect(chip.getAttribute("data-current")).toBe("false");
+    }
   });
 
   test("prefers the server-provided phase label over the client fallback map (Issue #240)", async () => {
@@ -6169,9 +8913,12 @@ describe("User phase indicator (Issue #239)", () => {
         ? Promise.resolve(stateWithPhase("preparation", [
             { phase: "setup", complete: true, label: "セットアップ完了" },
             { phase: "preparation", complete: false, label: "準備" },
+            { phase: "instrumentation", complete: false, label: "計装" },
+            { phase: "observation", complete: false, label: "観測中" },
+            { phase: "evaluation", complete: false, label: "評価" },
             // No server label for this entry: proves the client fallback
             // (USER_PHASE_LABELS) still applies when the server omits it.
-            { phase: "diagnosis", complete: false },
+            { phase: "publish", complete: false },
           ]))
         : Promise.resolve(null),
     );
@@ -6183,17 +8930,20 @@ describe("User phase indicator (Issue #239)", () => {
     expect(indicator.getAttribute("title")).toBe("現在のフェーズ: 準備");
     expect(screen.getByTestId("user-phase-setup").textContent).toContain("セットアップ完了");
     expect(screen.getByTestId("user-phase-preparation").textContent).toContain("準備");
-    expect(screen.getByTestId("user-phase-diagnosis").textContent)
-      .toContain(USER_PHASE_LABELS.diagnosis);
+    expect(screen.getByTestId("user-phase-publish").textContent)
+      .toContain(USER_PHASE_LABELS.publish);
   });
 
   test("display switches when the server-derived phase changes", async () => {
     mockApi.get.mockImplementation((path: string) =>
       path === "/system-state"
-        ? Promise.resolve(stateWithPhase("diagnosis", [
+        ? Promise.resolve(stateWithPhase("publish", [
             { phase: "setup", complete: true },
             { phase: "preparation", complete: true },
-            { phase: "diagnosis", complete: false },
+            { phase: "instrumentation", complete: true },
+            { phase: "observation", complete: true },
+            { phase: "evaluation", complete: true },
+            { phase: "publish", complete: false },
           ]))
         : Promise.resolve(null),
     );
@@ -6202,9 +8952,10 @@ describe("User phase indicator (Issue #239)", () => {
     render(<UserPhaseIndicator />, { wrapper: createWrapper() });
 
     const indicator = await screen.findByTestId("user-phase-indicator");
-    expect(indicator.getAttribute("data-current-phase")).toBe("diagnosis");
+    expect(indicator.getAttribute("data-current-phase")).toBe("publish");
     expect(screen.getByTestId("user-phase-preparation").getAttribute("data-complete")).toBe("true");
-    expect(screen.getByTestId("user-phase-diagnosis").getAttribute("data-current")).toBe("true");
+    expect(screen.getByTestId("user-phase-evaluation").getAttribute("data-complete")).toBe("true");
+    expect(screen.getByTestId("user-phase-publish").getAttribute("data-current")).toBe("true");
   });
 
   test("renders nothing when the server does not provide a phase", async () => {
@@ -6463,7 +9214,7 @@ describe("GitHub page", () => {
     render(<GithubPage />, { wrapper: createWrapper() });
 
     await waitFor(() =>
-      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("Configured"),
+      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("設定済み"),
     );
   });
 
@@ -6473,7 +9224,7 @@ describe("GitHub page", () => {
     render(<GithubPage />, { wrapper: createWrapper() });
 
     await waitFor(() =>
-      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("Not configured"),
+      expect(screen.getByTestId("github-app-configured-badge")).toHaveTextContent("未設定"),
     );
     expect(screen.getByText("GITHUB_APP_ID")).toBeInTheDocument();
     expect(screen.getByTestId("new-connection-button")).toBeDisabled();
@@ -6535,8 +9286,82 @@ describe("GitHub page", () => {
     expect(screen.getByTestId("publish-job-cancel-button")).toBeInTheDocument();
     // The confirmation dialog shows the publish target before approving.
     fireEvent.click(screen.getByTestId("publish-job-approve-button"));
-    expect(await screen.findByText("Approve publish")).toBeInTheDocument();
+    expect(await screen.findByText("Publishを承認")).toBeInTheDocument();
     expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
+  });
+
+  test("approval confirmation dialog shows the patch diff alongside the approve action (Issue #264)", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 3, status: "awaiting_approval" })],
+      patches: [patchFixture],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-3")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-3"));
+    fireEvent.click(await screen.findByTestId("publish-job-approve-button"));
+
+    // The confirmation dialog is on screen at the same time as the diff and
+    // the approve action -- the diff must not only exist in the parent
+    // dialog, which is covered by the confirmation overlay.
+    expect(await screen.findByText("Publishを承認")).toBeInTheDocument();
+    const confirmDiff = await screen.findByTestId("publish-job-confirm-diff");
+    expect(confirmDiff).toHaveTextContent(patchFixture.diff);
+    expect(screen.queryByTestId("publish-job-confirm-diff-unavailable")).not.toBeInTheDocument();
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeInTheDocument();
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).not.toBeDisabled();
+  });
+
+  test("approval confirmation button stays disabled and warns when the patch diff cannot be found (fail-closed)", async () => {
+    mockGithubData({
+      connections: [connectionFixture],
+      jobs: [jobFixture({ id: 3, status: "awaiting_approval" })],
+      patches: [], // job.patch_id (20) is not present in the probe-patches list
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-3")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-3"));
+    fireEvent.click(await screen.findByTestId("publish-job-approve-button"));
+
+    expect(await screen.findByTestId("publish-job-confirm-diff-unavailable")).toHaveTextContent(
+      "Patch diffを取得できないため、承認できません。",
+    );
+    expect(screen.queryByTestId("publish-job-confirm-diff")).not.toBeInTheDocument();
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeDisabled();
+  });
+
+  test("approval confirmation button stays disabled and warns when the probe-patches fetch fails (fail-closed)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/github/app-status") {
+        return Promise.resolve({
+          configured: true, app_id: "123",
+          api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+        });
+      }
+      if (path === "/github/connections") return Promise.resolve([connectionFixture]);
+      if (path === "/github/publish-jobs") return Promise.resolve([jobFixture({ id: 3, status: "awaiting_approval" })]);
+      if (path === "/repository/probe-patches") return Promise.reject(new ApiError(500, "boom"));
+      if (path === "/users") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-3")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-3"));
+    fireEvent.click(await screen.findByTestId("publish-job-approve-button"));
+
+    expect(await screen.findByTestId("publish-job-confirm-diff-unavailable")).toHaveTextContent(
+      "Patch diffの取得に失敗したため、承認できません。",
+    );
+    expect(screen.getByTestId("publish-job-confirm-approve-button")).toBeDisabled();
   });
 
   test("approve button is hidden for a completed job", async () => {
@@ -6626,6 +9451,109 @@ describe("GitHub page", () => {
   });
 });
 
+// ── GitHub ?patch= preselection (Issue #259) ────────────────────────
+
+describe("GitHub ?patch= preselection (Issue #259)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const connectedConnectionFixture = {
+    id: 1, system_id: 1,
+    api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+    owner: "acme", repo: "widgets", clone_url: "https://github.com/acme/widgets.git",
+    installation_id: 42, default_branch: "main", credential_type: "github_app",
+    status: "connected", last_error: null, last_synced_at: null, last_synced_commit_sha: null,
+    created_by_user_id: 1, updated_by_user_id: 1,
+    created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-01T00:00:00Z",
+  };
+
+  function greenPatchFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+      commit_sha: "abc1234567890", diff: "diff --git a/a.py b/a.py",
+      worktree_path: null, skipped: [], status: "generated", error: null,
+      cleanup_state: "removed", cleanup_error: null,
+      apply_status: "applied", apply_error: null, applied_at: null, applied_by_user_id: null,
+      validation_runs: [
+        { id: 1, variant: "baseline", overall_success: true, commands: [] },
+        { id: 2, variant: "probed", overall_success: true, commands: [] },
+      ],
+      created_at: "2024-01-01",
+      ...overrides,
+    };
+  }
+
+  function mockGithubForPatchParam(data: {
+    connections?: Record<string, unknown>[];
+    patches?: Record<string, unknown>[];
+  }) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/github/app-status") return Promise.resolve({
+        configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+      });
+      if (path === "/github/connections") return Promise.resolve(data.connections ?? []);
+      if (path === "/github/publish-jobs") return Promise.resolve([]);
+      if (path === "/repository/probe-patches") return Promise.resolve(data.patches ?? []);
+      if (path === "/users") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+  }
+
+  function renderGithubAt(route: string) {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    return import("@/pages/github").then(({ default: GithubPage }) =>
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={[route]}>
+            <GithubPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      ),
+    );
+  }
+
+  test("preselects a valid, green patch from ?patch= and opens the create-job dialog on the Publish Jobs tab", async () => {
+    mockGithubForPatchParam({
+      connections: [connectedConnectionFixture],
+      patches: [greenPatchFixture()],
+    });
+    await renderGithubAt("/github?patch=20");
+
+    const select = await screen.findByTestId("publish-job-patch-select") as HTMLSelectElement;
+    expect(select.value).toBe("20");
+  });
+
+  test("ignores ?patch= for a patch that fails the green-validation gate", async () => {
+    mockGithubForPatchParam({
+      connections: [connectedConnectionFixture],
+      patches: [greenPatchFixture({
+        validation_runs: [{ id: 1, variant: "baseline", overall_success: false, commands: [] }],
+      })],
+    });
+    await renderGithubAt("/github?patch=20");
+
+    // Still lands on the Publish Jobs tab (the button below is proof of that)
+    // but does not auto-open the create dialog for an invalid patch.
+    await waitFor(() => expect(screen.getByTestId("new-publish-job-button")).toBeInTheDocument());
+    expect(screen.queryByTestId("publish-job-patch-select")).not.toBeInTheDocument();
+  });
+
+  test("ignores ?patch= for a patch id that does not exist", async () => {
+    mockGithubForPatchParam({
+      connections: [connectedConnectionFixture],
+      patches: [greenPatchFixture({ id: 99 })],
+    });
+    await renderGithubAt("/github?patch=20");
+
+    await waitFor(() => expect(screen.getByTestId("new-publish-job-button")).toBeInTheDocument());
+    expect(screen.queryByTestId("publish-job-patch-select")).not.toBeInTheDocument();
+  });
+});
+
 // ── Replay / Simulation Workbench (Issue #242 Phase D / #246) ──────────────
 
 function replayComponentsFixture() {
@@ -6666,7 +9594,10 @@ function replayTracesFixture() {
 function setupComponentsPageForReplay(extra: Record<string, unknown> = {}) {
   mockApi.get.mockImplementation((path: string) => {
     if (path === "/components") return Promise.resolve(replayComponentsFixture());
-    if (path === "/components/norm/traces?limit=20") return Promise.resolve(replayTracesFixture());
+    if (path.startsWith("/components/norm/trace-page?")) {
+      const items = replayTracesFixture();
+      return Promise.resolve({ items, total: items.length, offset: 0, limit: 50 });
+    }
     if (path === "/components/norm/profile") return Promise.resolve(null);
     if (path === "/components/norm/shadow-results?limit=20") return Promise.resolve([]);
     if (path === "/components/norm/criteria") return Promise.resolve([]);
@@ -6705,7 +9636,7 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
       </QueryClientProvider>,
     );
     const expandButton = await screen.findByRole("button", {
-      name: "Show signal details for trace trace-replayable-0001",
+      name: "Trace trace-replayable-0001 の詳細を表示",
     });
     fireEvent.click(expandButton);
     return within(expandButton.closest("tr")!.nextElementSibling as HTMLElement);
@@ -6731,15 +9662,15 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
     expect(unreplayableBadge).toHaveAttribute("title", "Reasons: size_limit_exceeded");
 
     const expandButton = await screen.findByRole("button", {
-      name: "Show signal details for trace trace-replayable-0001",
+      name: "Trace trace-replayable-0001 の詳細を表示",
     });
     fireEvent.click(expandButton);
     const row = within(expandButton.closest("tr")!.nextElementSibling as HTMLElement);
 
     expect(row.getByText("Replay")).toBeInTheDocument();
-    expect(row.getByText("Add to Replay Set")).toBeInTheDocument();
-    expect(row.getByText("Create Experiment")).toBeInTheDocument();
-    expect(row.getByText("Add to Workspace")).toBeInTheDocument();
+    expect(row.getByText("Replay Setに追加")).toBeInTheDocument();
+    expect(row.getByText("Experimentを作成")).toBeInTheDocument();
+    expect(row.getByText("Workspaceに追加")).toBeInTheDocument();
   });
 
   test("Replay adds the trace to a new Replay Set and navigates to the Workbench", async () => {
@@ -6773,8 +9704,8 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
       trace_ids: ["trace-replayable-0001"], traces: [], created_at: 1,
     });
 
-    fireEvent.click(row.getByText("Add to Replay Set"));
-    fireEvent.click(await screen.findByText("Add", { selector: "button" }));
+    fireEvent.click(row.getByText("Replay Setに追加"));
+    fireEvent.click(await screen.findByText("追加", { selector: "button" }));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/replay-sets", expect.objectContaining({
@@ -6787,13 +9718,13 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
 
   test("Create Experiment from this trace routes to Experiments with prefilled context", async () => {
     const row = await renderExpanded();
-    fireEvent.click(row.getByText("Create Experiment"));
+    fireEvent.click(row.getByText("Experimentを作成"));
 
     await waitFor(() => {
-      expect(screen.getByText(/Prefilled context from trace/)).toBeInTheDocument();
+      expect(screen.getByText(/から文脈を入力済みです/)).toBeInTheDocument();
     });
     expect(
-      screen.getByPlaceholderText("What are you trying to learn?"),
+      screen.getByPlaceholderText("この比較で確認したいこと"),
     ).toHaveValue("Investigate trace trace-replayable-0001 (component norm)");
   });
 });
@@ -6937,7 +9868,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     });
 
     // Simulation disclaimer is always shown alongside the results.
-    expect(screen.getByText(/Simulation only/)).toBeInTheDocument();
+    expect(screen.getByText(/シミュレーションのみ/)).toBeInTheDocument();
 
     // The diff matrix distinguishes match / diff / candidate error / rescued.
     await waitFor(() => {
@@ -6948,7 +9879,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     expect(screen.getByText("rescued")).toBeInTheDocument();
 
     // The unreplayable trace's next-step guidance is shown in the left pane.
-    expect(screen.getByText(/Next step: pick a different trace, or adjust replay_capture/)).toBeInTheDocument();
+    expect(screen.getByText(/次の一歩: 別のTraceを選ぶか/)).toBeInTheDocument();
   });
 
   test("unapproved component shows the not-approved next step and Approve posts", async () => {
@@ -6956,13 +9887,13 @@ describe("Simulation Workbench (Issue #246)", () => {
     await renderWorkbenchAt("/simulation-workbench?replay_set_id=1");
 
     await waitFor(() => {
-      expect(screen.getByText(/Replay is not approved for "norm"/)).toBeInTheDocument();
+      expect(screen.getByText(/「norm」のReplayは未承認です/)).toBeInTheDocument();
     });
-    expect(screen.getByText(/Next step: review the risk context and approve/)).toBeInTheDocument();
+    expect(screen.getByText(/次の一歩: リスクの内容を確認し/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByText("Review & Approve"));
+    fireEvent.click(screen.getByText("確認して承認する"));
     fireEvent.change(
-      await screen.findByPlaceholderText("Why is replay safe to approve for this component?"),
+      await screen.findByPlaceholderText("このcomponentのReplayがなぜ安全か"),
       { target: { value: "It only normalizes text." } },
     );
     mockApi.post.mockResolvedValue({
@@ -6970,7 +9901,7 @@ describe("Simulation Workbench (Issue #246)", () => {
       approved_by_user_id: 1, decision_method: "manual", risk_context: null, created_at: 1,
       revoked_at: null, revoked_by_user_id: null,
     });
-    fireEvent.click(screen.getByText("Approve", { selector: "button" }));
+    fireEvent.click(screen.getByText("承認する", { selector: "button" }));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith(
@@ -6987,7 +9918,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     fireEvent.click(await screen.findByText("LLM draft"));
     fireEvent.change(screen.getByRole("combobox", { name: "Trace for the LLM draft" }), { target: { value: "t1" } });
     fireEvent.change(
-      screen.getByPlaceholderText("What should the candidate do differently?"),
+      screen.getByPlaceholderText("候補コードにどう変わってほしいか"),
       { target: { value: "Uppercase the result" } },
     );
     mockApi.post.mockResolvedValue({
@@ -6999,7 +9930,7 @@ describe("Simulation Workbench (Issue #246)", () => {
       prompt_version: "v1", schema_version: "v1", decision_method: "reasoning_llm",
       is_mock: true, created_at: 1,
     });
-    fireEvent.click(screen.getByText("Generate draft"));
+    fireEvent.click(screen.getByText("Draftを生成"));
 
     await waitFor(() => {
       expect(mockApi.post).toHaveBeenCalledWith("/replay-variant-drafts", expect.objectContaining({
@@ -7064,7 +9995,7 @@ describe("Simulation Workbench (Issue #246)", () => {
       </QueryClientProvider>,
     );
 
-    const promoteBtn = await screen.findByText('Promote "My candidate"');
+    const promoteBtn = await screen.findByText('「My candidate」をpromote');
     fireEvent.click(promoteBtn);
 
     await waitFor(() => {
@@ -7073,9 +10004,9 @@ describe("Simulation Workbench (Issue #246)", () => {
       );
     });
     await waitFor(() => {
-      expect(screen.getByText(/Prefilled from Replay Variant run #1/)).toBeInTheDocument();
+      expect(screen.getByText(/Replay候補run #1、候補 #11/)).toBeInTheDocument();
     });
-    const patchTextarea = screen.getAllByPlaceholderText("Patch text (unified diff format)")[0];
+    const patchTextarea = screen.getAllByPlaceholderText("Patch内容（unified diff形式）")[0];
     expect((patchTextarea as HTMLTextAreaElement).value).toContain("diff --git a/svc.py");
   });
 
@@ -7093,7 +10024,7 @@ describe("Simulation Workbench (Issue #246)", () => {
     });
 
     const generate = await screen.findByRole("button", {
-      name: "Generate regression-test scaffold",
+      name: "回帰テストscaffoldを生成",
     });
     await waitFor(() => expect(generate).toBeEnabled());
     fireEvent.click(generate);
@@ -7141,6 +10072,11 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     phase: "setup",
   };
 
+  // Issue #256: preparation counts complete for any phase past
+  // "setup"/"preparation" themselves (the later instrumentation / observation
+  // / evaluation / publish phases all chain on preparation being done); the
+  // later phases themselves are left incomplete here since none of these
+  // tests need to distinguish between them.
   const stateWith = (
     userPhase: string,
     primaryItem: unknown = guidePrimaryItem,
@@ -7157,8 +10093,15 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     user_phase: userPhase,
     phases: [
       { phase: "setup", complete: userPhase !== "setup", label: phaseLabels?.setup },
-      { phase: "preparation", complete: userPhase === "diagnosis", label: phaseLabels?.preparation },
-      { phase: "diagnosis", complete: false, label: phaseLabels?.diagnosis },
+      {
+        phase: "preparation",
+        complete: userPhase !== "setup" && userPhase !== "preparation",
+        label: phaseLabels?.preparation,
+      },
+      { phase: "instrumentation", complete: false, label: phaseLabels?.instrumentation },
+      { phase: "observation", complete: false, label: phaseLabels?.observation },
+      { phase: "evaluation", complete: false, label: phaseLabels?.evaluation },
+      { phase: "publish", complete: false, label: phaseLabels?.publish },
     ],
   });
 
@@ -7193,9 +10136,9 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     expect(screen.getByTestId("prerequisite-guide-phase").textContent).toContain("セットアップ完了");
   });
 
-  test("disappears at the terminal diagnosis phase", async () => {
+  test("disappears once preparation is complete (instrumentation phase onward)", async () => {
     mockApi.get.mockImplementation((path: string) =>
-      path === "/system-state" ? Promise.resolve(stateWith("diagnosis", null)) : Promise.resolve(null),
+      path === "/system-state" ? Promise.resolve(stateWith("instrumentation", null)) : Promise.resolve(null),
     );
     const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
     const { container } = render(<PrerequisiteGuide />, { wrapper: createWrapper() });
@@ -7204,6 +10147,26 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
     expect(screen.queryByTestId("prerequisite-guide")).not.toBeInTheDocument();
     expect(container.textContent).toBe("");
+  });
+
+  test("renders nothing for any later phase without authored copy (Issue #256)", async () => {
+    // instrumentation / observation / evaluation / publish have no guide
+    // copy of their own (that guidance UX belongs to sibling sub-issues
+    // #257/#258) -- the guide must stay silent, not render a broken/empty
+    // card, for every one of them.
+    for (const phase of ["instrumentation", "observation", "evaluation", "publish"]) {
+      vi.clearAllMocks();
+      mockApi.get.mockImplementation((path: string) =>
+        path === "/system-state" ? Promise.resolve(stateWith(phase, null)) : Promise.resolve(null),
+      );
+      const { PrerequisiteGuide } = await import("@/components/prerequisite-guide");
+      const { container, unmount } = render(<PrerequisiteGuide />, { wrapper: createWrapper() });
+
+      await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/system-state"));
+      expect(screen.queryByTestId("prerequisite-guide")).not.toBeInTheDocument();
+      expect(container.textContent).toBe("");
+      unmount();
+    }
   });
 
   test("CTA navigates to the StateItem target", async () => {
@@ -7235,7 +10198,7 @@ describe("PrerequisiteGuide (Issue #241)", () => {
 
   test("Probe Planner hides the gate once preparation is complete", async () => {
     mockApi.get.mockImplementation((path: string) => {
-      if (path === "/system-state") return Promise.resolve(stateWith("diagnosis", null));
+      if (path === "/system-state") return Promise.resolve(stateWith("instrumentation", null));
       if (path === "/probe-plans") return Promise.resolve({ plans: [], is_mock: false });
       return Promise.resolve(null);
     });
@@ -7246,5 +10209,859 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     // Dialog opened (feature label present) but no prerequisite gate.
     expect(await screen.findByText("Feature")).toBeInTheDocument();
     expect(screen.queryByTestId("planner-prerequisite-guide")).not.toBeInTheDocument();
+  });
+});
+
+// ── Dangerous/no-op action gating (Issue #255) ──────────────────────
+//
+// Three dashboard actions were previously clickable in states where they
+// could not succeed (or were dangerous), because state that was already
+// fetched for display was never wired into the button's disabled condition.
+// Each case below asserts the button is disabled AND a reason is visible —
+// never a silent no-op and never a dangerous apply.
+
+describe("Dashboard action gating (Issue #255)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("Probe Planner: Apply is disabled with a visible reason when the patch is stale vs HEAD", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{ id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01", probe_points: [] }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([{
+        id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+        commit_sha: "abcdef1234567890", diff: "diff --git a/a.py b/a.py",
+        worktree_path: null, skipped: [], status: "generated", error: null,
+        cleanup_state: "removed", cleanup_error: null,
+        apply_status: "not_applied", apply_error: null, applied_at: null,
+        applied_by_user_id: null, validation_runs: [], created_at: "2024-01-01",
+      }]);
+      if (path === "/repository/status") return Promise.resolve({
+        configured: true, repo_path: "/repos/alpha",
+        current_head: "9999999999", head_error: null,
+        working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+        latest_snapshot: null, latest_indexed_snapshot: null,
+        understanding_snapshot_id: null, understanding_status: null,
+        snapshot_stale: true, symbols_stale: false, next_actions: [],
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    expect(await screen.findByTestId("patch-stale-badge")).toBeInTheDocument();
+    const reason = await screen.findByTestId("patch-apply-stale-reason");
+    expect(reason).toHaveTextContent(/abcdef12/);
+    expect(screen.getByRole("button", { name: /Apply/ })).toBeDisabled();
+
+    const { toast } = await import("sonner");
+    expect(toast.success).not.toHaveBeenCalledWith("Patch applied to repository");
+  });
+
+  test("Connect SDK: Issue Token is disabled with a visible reason when no System is selected", async () => {
+    mockSystemId = null;
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/auth/my-tokens") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    const { default: ConnectSdkPage } = await import("@/pages/connect-sdk");
+    render(<ConnectSdkPage />, { wrapper: createWrapper() });
+
+    const nameInput = await screen.findByPlaceholderText("my-service");
+    fireEvent.change(nameInput, { target: { value: "my-new-token" } });
+
+    expect(screen.getByTestId("issue-token-no-system-reason")).toBeInTheDocument();
+    // Issue #368/#374: the CTA label follows CLAUDE.md's Dashboard UI言語規約.
+    const issueButton = screen.getByRole("button", { name: "Token を発行" });
+    expect(issueButton).toBeDisabled();
+
+    // Even though the name is filled in, clicking the disabled button must
+    // not silently reach handleIssue's early-return guard.
+    fireEvent.click(issueButton);
+    expect(mockApi.post).not.toHaveBeenCalled();
+    const { toast } = await import("sonner");
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  test("Repository: unified refresh can bootstrap a snapshot while Symbols tab remains gated", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository") return Promise.resolve({
+        id: 1, system_id: 1, repo_path: "/repos/alpha", include_patterns: [], exclude_patterns: [],
+      });
+      if (path === "/repository-candidates") return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
+      if (path === "/repository/snapshots") return Promise.resolve([]);
+      if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
+      if (path === "/repository/status") return Promise.resolve({
+        configured: true, repo_path: "/repos/alpha",
+        current_head: "abc1234000", head_error: null,
+        working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+        latest_snapshot: null, latest_indexed_snapshot: null,
+        understanding_snapshot_id: null, understanding_status: null,
+        snapshot_stale: true, symbols_stale: false, next_actions: [],
+      });
+      return Promise.resolve(null);
+    });
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    // The canonical action can bootstrap the first snapshot and its index.
+    const hub = await screen.findByTestId("refresh-hub");
+    expect(within(hub).getByRole("button", { name: "Snapshotとsymbolをまとめて更新" })).not.toBeDisabled();
+
+    // The Symbols tab's button must be gated the same way instead of being
+    // clickable with nothing to index.
+    fireEvent.click(screen.getByRole("button", { name: "Symbols" }));
+    expect(await screen.findByTestId("index-symbols-no-snapshot-reason")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Index Symbols" })).toBeDisabled();
+  });
+});
+
+// ── Prerequisite-based action gating (Issue #258) ───────────────────
+//
+// Several generate/execute buttons were previously disabled only while a
+// mutation was `isPending`, so a user could click straight into a
+// guaranteed server rejection (no ready snapshot, no approved probe point,
+// a failed patch, a component with zero recorded traces). Each case below
+// asserts the button is disabled AND a reason + link/next-step is visible,
+// that an unknown/loading precondition never blocks (escape hatch), and
+// that satisfying the precondition re-enables the button without any
+// manual refetch.
+
+describe("Prerequisite-based action gating (Issue #258)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  function repoStatusFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      configured: true, repo_path: "/repos/alpha",
+      current_head: "abc1234000", head_error: null,
+      working_tree_dirty: false, dirty_file_count: 0, dirty_sample: [],
+      latest_snapshot: { id: 1, commit_sha: "abc1234000", status: "ready", created_at: 1 },
+      latest_indexed_snapshot: null,
+      understanding_snapshot_id: null, understanding_status: null,
+      snapshot_stale: false, symbols_stale: false, next_actions: [],
+      ...overrides,
+    };
+  }
+
+  const repoConfigMissingItem = {
+    state_id: "repository.configuration.missing",
+    state_group: "repository",
+    severity: "warning",
+    status: "missing",
+    user_action_kind: "configure",
+    intervention_timing: "now",
+    subject: "Repository",
+    summary: "対象リポジトリが未設定です。",
+    detail: "対象リポジトリが未設定です。",
+    impact: "",
+    remediation: "Repository タブでリポジトリを設定してください。",
+    evidence: {},
+    target_ui: { route: "/repository", anchor: "repo-config", action_label: "リポジトリを設定" },
+    related_checks: [],
+    related_pipeline_steps: [],
+    source: "system_state",
+    dedupe_key: "repository.configuration",
+    scope: "global",
+    decision_method: "deterministic",
+    phase: "setup",
+  };
+
+  function systemStateFixture(pageItems: Record<string, unknown[]> = {}) {
+    return {
+      system_id: 1, generated_at: 1, overall_severity: "ok",
+      severity_counts: {}, items: [], primary_item: null,
+      notification_items: [], page_items: pageItems,
+    };
+  }
+
+  // ── Probe Planner: Generate Plan ──────────────────────────────────
+
+  test("Probe Planner: Generate Plan is disabled with a reason when the repository is unconfigured", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(
+        repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+      );
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("generate-plan-blocked-reason")).toBeInTheDocument();
+
+    // Clicking a disabled button must not open the dialog / reach the mutation.
+    fireEvent.click(button);
+    expect(screen.queryByText("Observation objective")).not.toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Plan's reason reuses the repository.configuration.missing catalog copy when present", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(
+        repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+      );
+      if (path === "/system-state") return Promise.resolve(
+        systemStateFixture({ "/repository": [repoConfigMissingItem] }),
+      );
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const reason = await screen.findByTestId("generate-plan-blocked-reason");
+    expect(reason).toHaveTextContent("対象リポジトリが未設定です。");
+    expect(reason).toHaveTextContent("Repository タブでリポジトリを設定してください。");
+    const link = within(reason).getByRole("link", { name: "リポジトリを設定" });
+    expect(link).toHaveAttribute("href", "/repository?fix=repo-config");
+  });
+
+  test("Probe Planner: Generate Plan is disabled with a reason when there is no ready snapshot", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture({ latest_snapshot: null }));
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("generate-plan-blocked-reason")).toHaveTextContent(
+      /no ready repository snapshot/i,
+    );
+  });
+
+  test("Probe Planner: Generate Plan stays enabled when repository status is unknown (escape hatch)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      // /repository/status intentionally left unhandled -> resolves to null,
+      // an indeterminate state that must never block the button.
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/repository/status"));
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    expect(button).not.toBeDisabled();
+    expect(screen.queryByTestId("generate-plan-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Plan is enabled once the repository is configured with a ready snapshot", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({ system_id: 1, is_mock: false, plans: [] });
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(screen.queryByTestId("generate-plan-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Probe Planner: Generate Patch / Validate ──────────────────────
+
+  function probePointFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 100, plan_id: 10, system_id: 1, component_id: "comp-a", feature_id: "feat-1",
+      path: "a.py", symbol: "foo", line_start: 1, line_end: 5, reason: "observe",
+      recommended_mode: "trace", side_effect_risk: "low", replayability: "safe",
+      denylist_hit: null, status: "proposed", created_at: "2024-01-01", updated_at: "2024-01-01",
+      ...overrides,
+    };
+  }
+
+  test("Probe Planner: Generate Patch is disabled with a reason when the plan has no approved probe points", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{
+          id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01",
+          probe_points: [probePointFixture({ status: "proposed" })],
+        }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    expect(genPatchButton).toBeDisabled();
+    expect(await screen.findByTestId("generate-patch-no-points-reason")).toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Patch is disabled when the only approved point is safety-denylisted", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{
+          id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01",
+          probe_points: [probePointFixture({ status: "approved", denylist_hit: "payment write" })],
+        }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    expect(genPatchButton).toBeDisabled();
+    expect(await screen.findByTestId("generate-patch-no-points-reason")).toBeInTheDocument();
+  });
+
+  test("Probe Planner: Generate Patch is enabled once at least one non-denylisted probe point is approved", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{
+          id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01",
+          probe_points: [
+            probePointFixture({ id: 101, status: "rejected" }),
+            probePointFixture({ id: 102, status: "approved", denylist_hit: null }),
+          ],
+        }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    await waitFor(() => expect(genPatchButton).not.toBeDisabled());
+    expect(screen.queryByTestId("generate-patch-no-points-reason")).not.toBeInTheDocument();
+  });
+
+  test("Probe Planner: Validate is disabled with a reason when the patch failed to generate", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{ id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01", probe_points: [] }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([{
+        id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+        commit_sha: "abcdef1234567890", diff: "", worktree_path: null, skipped: [],
+        status: "failed", error: "git apply failed", cleanup_state: "removed", cleanup_error: null,
+        apply_status: "not_applied", apply_error: null, applied_at: null,
+        applied_by_user_id: null, validation_runs: [], created_at: "2024-01-01",
+      }]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const validateButton = await screen.findByRole("button", { name: /Validate/ });
+    expect(validateButton).toBeDisabled();
+    const reason = await screen.findByTestId("validate-patch-failed-reason");
+    expect(reason).toHaveTextContent("git apply failed");
+  });
+
+  test("Probe Planner: Validate is enabled for a successfully generated patch", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") return Promise.resolve({
+        system_id: 1, is_mock: false,
+        plans: [{ id: 10, feature_id: "feat-1", objective: "Observe", status: "proposed", created_at: "2024-01-01", probe_points: [] }],
+      });
+      if (path === "/repository/probe-patches") return Promise.resolve([{
+        id: 20, plan_id: 10, system_id: 1, snapshot_id: 5,
+        commit_sha: "abcdef1234567890", diff: "diff --git a/a.py b/a.py", worktree_path: null, skipped: [],
+        status: "generated", error: null, cleanup_state: "removed", cleanup_error: null,
+        apply_status: "not_applied", apply_error: null, applied_at: null,
+        applied_by_user_id: null, validation_runs: [], created_at: "2024-01-01",
+      }]);
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      return Promise.resolve(null);
+    });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+
+    const validateButton = await screen.findByRole("button", { name: /Validate/ });
+    await waitFor(() => expect(validateButton).not.toBeDisabled());
+    expect(screen.queryByTestId("validate-patch-failed-reason")).not.toBeInTheDocument();
+  });
+
+  // ── System Understanding: Build / Refresh ─────────────────────────
+
+  test("System Understanding: Build / Refresh is disabled with a reason when the repository is unconfigured", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") return Promise.resolve(
+        repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+      );
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByTestId("build-button");
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("build-blocked-reason")).toBeInTheDocument();
+  });
+
+  test("System Understanding: Build / Refresh stays enabled with no ready snapshot (narrower gate than Probe Planner)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture({ latest_snapshot: null }));
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByTestId("build-button");
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/repository/status"));
+    expect(button).not.toBeDisabled();
+    expect(screen.queryByTestId("build-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  test("System Understanding: Build / Refresh stays enabled when repository status is unknown (escape hatch)", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      // /repository/status intentionally left unhandled -> resolves to null.
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/repository/status"));
+    const button = await screen.findByTestId("build-button");
+    expect(button).not.toBeDisabled();
+  });
+
+  test("System Understanding: Build / Refresh is enabled once the repository is configured", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/status") return Promise.resolve(repoStatusFixture());
+      if (path === "/repository/system-understanding") return Promise.resolve(null);
+      if (path === "/repository/system-understanding/build/latest") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const button = await screen.findByTestId("build-button");
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(screen.queryByTestId("build-blocked-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Repository: Create Snapshot (Snapshots tab) ───────────────────
+
+  function repositoryBaseGet(status: Record<string, unknown>) {
+    return (path: string) => {
+      if (path === "/repository") return Promise.resolve(
+        status.configured
+          ? { id: 1, system_id: 1, repo_path: "/repos/alpha", include_patterns: [], exclude_patterns: [] }
+          : null,
+      );
+      if (path === "/repository-candidates") return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
+      if (path === "/repository/snapshots") return Promise.resolve([]);
+      if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
+      if (path === "/repository/status") return Promise.resolve(status);
+      return Promise.resolve(null);
+    };
+  }
+
+  test("Repository: Create Snapshot (Snapshots tab) is disabled with a reason when the repository is unconfigured", async () => {
+    mockApi.get.mockImplementation(repositoryBaseGet(
+      repoStatusFixture({ configured: false, repo_path: null, latest_snapshot: null }),
+    ));
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Snapshots" }));
+    const button = await screen.findByRole("button", { name: /Snapshotのみ作成/ });
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(await screen.findByTestId("create-snapshot-not-configured-reason")).toBeInTheDocument();
+  });
+
+  test("Repository: Create Snapshot (Snapshots tab) is enabled when configured even with zero snapshots (no chicken-and-egg gate)", async () => {
+    mockApi.get.mockImplementation(repositoryBaseGet(
+      repoStatusFixture({ latest_snapshot: null }),
+    ));
+
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    render(<RepositoryPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Snapshots" }));
+    const button = await screen.findByRole("button", { name: /Snapshotのみ作成/ });
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(screen.queryByTestId("create-snapshot-not-configured-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Components: candidate generation / shadow mode vs. trace count ─
+
+  function componentsGet(component: Record<string, unknown>) {
+    return (path: string) => {
+      if (path === "/components") return Promise.resolve([component]);
+      if (path.startsWith("/components/") && path.includes("/traces")) return Promise.resolve([]);
+      if (path.endsWith("/profile")) return Promise.resolve(null);
+      if (path.endsWith("/shadow-results?limit=20")) return Promise.resolve([]);
+      if (path.endsWith("/criteria")) return Promise.resolve([]);
+      return Promise.resolve(null);
+    };
+  }
+
+  test("Components: AI candidate generation and shadow mode are disabled with a reason for a zero-trace component", async () => {
+    window.history.pushState({}, "", "/components?component=comp-a");
+    mockApi.get.mockImplementation(
+      componentsGet({ component_id: "comp-a", mode: "off", trace_count: 0, last_seen: null }),
+    );
+
+    const { default: ComponentsPage } = await import("@/pages/components");
+    render(<ComponentsPage />, { wrapper: createWrapper() });
+
+    const aiButton = await screen.findByRole("button", { name: /AIで別バージョンを作る/ });
+    await waitFor(() => expect(aiButton).toBeDisabled());
+    const shadowButton = screen.getByRole("button", { name: "shadow" });
+    expect(shadowButton).toBeDisabled();
+    expect(await screen.findByTestId("component-zero-traces-reason")).toBeInTheDocument();
+
+    // The escape hatch for mode switching stays open: off/trace must never
+    // be gated on trace count, since switching to trace is how a component
+    // starts collecting its first traces.
+    expect(screen.getByRole("button", { name: "off" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "trace" })).not.toBeDisabled();
+  });
+
+  test("Components: AI candidate generation and shadow mode are enabled once the component has recorded traces", async () => {
+    window.history.pushState({}, "", "/components?component=comp-a");
+    mockApi.get.mockImplementation(
+      componentsGet({ component_id: "comp-a", mode: "trace", trace_count: 5, last_seen: 1000 }),
+    );
+
+    const { default: ComponentsPage } = await import("@/pages/components");
+    render(<ComponentsPage />, { wrapper: createWrapper() });
+
+    const aiButton = await screen.findByRole("button", { name: /AIで別バージョンを作る/ });
+    await waitFor(() => expect(aiButton).not.toBeDisabled());
+    expect(screen.getByRole("button", { name: "shadow" })).not.toBeDisabled();
+    expect(screen.queryByTestId("component-zero-traces-reason")).not.toBeInTheDocument();
+  });
+
+  // ── Issue #267 item 3: mode explanation next to the policy toggle ──
+
+  test("Components: mode toggle shows an explanation of off/trace/shadow and the shadow guarantee", async () => {
+    window.history.pushState({}, "", "/components?component=comp-a");
+    mockApi.get.mockImplementation(
+      componentsGet({ component_id: "comp-a", mode: "trace", trace_count: 5, last_seen: 1000 }),
+    );
+
+    const { default: ComponentsPage } = await import("@/pages/components");
+    render(<ComponentsPage />, { wrapper: createWrapper() });
+
+    const note = await screen.findByTestId("component-mode-explanation");
+    expect(note).toHaveTextContent("本番の戻り値を変更しません");
+  });
+});
+
+// ── Issue #267 item 4: 送信 vs 候補を生成 note in AI Candidate Studio ──
+
+describe("AI Candidate Studio send-vs-generate note (Issue #267)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("shows a note distinguishing 送信 (conversation only) from 候補を生成", async () => {
+    window.history.pushState({}, "", "/candidate-studio?session_id=1");
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/candidate-sessions/1") {
+        return Promise.resolve({
+          id: 1, system_id: 1, component_id: "comp-a", snapshot_id: 1,
+          commit_sha: "abc123", symbol_path: "a.py", symbol_qualified_name: "comp_a",
+          replay_set_id: 1, objective: "improve accuracy",
+          status: "active", created_at: 1, updated_at: 1,
+          messages: [], versions: [],
+        });
+      }
+      if (path.endsWith("/replay-approval")) return Promise.resolve({ active: false });
+      return Promise.resolve(null);
+    });
+
+    const { default: CandidateStudioPage } = await import("@/pages/candidate-studio");
+    render(<CandidateStudioPage />, { wrapper: createWrapper() });
+
+    const note = await screen.findByTestId("candidate-studio-send-vs-generate-note");
+    expect(note).toHaveTextContent("候補versionは作成しません");
+  });
+});
+
+// ── Issue #267 item 10: legacy Generate page banner ─────────────────
+
+describe("Generate page legacy banner (Issue #267)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("points to AI Candidate Studio", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/components") return Promise.resolve([]);
+      if (path === "/generation-runs") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    const { default: GenerationPage } = await import("@/pages/generation");
+    render(<GenerationPage />, { wrapper: createWrapper() });
+
+    const link = await screen.findByTestId("generation-legacy-banner-link");
+    expect(link).toHaveAttribute("href", "/candidate-studio");
+  });
+});
+
+// ── Issue #267 item 11: Observe & Evaluate sidebar subtexts ─────────
+
+describe("Sidebar Observe & Evaluate subtexts (Issue #267)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("renders a usage-distinction subtext for each of the 7 pages", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/system-state") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    const { Sidebar } = await import("@/components/layout/sidebar");
+    render(<Sidebar />, { wrapper: createWrapper() });
+
+    const group = screen.getByTestId("sidebar-group-observe-&-evaluate");
+    expect(within(group).getByText("手動でdiffを編集して検証")).toBeInTheDocument();
+    expect(within(group).getByText("会話でAIに指示して候補生成")).toBeInTheDocument();
+  });
+});
+
+// ── Issue #267 items 5-9: GitHub publish workflow UX gaps ───────────
+
+describe("GitHub publish workflow UX gaps (Issue #267)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const connectionFixture267 = {
+    id: 1, system_id: 1,
+    api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+    owner: "acme", repo: "widgets", clone_url: "https://github.com/acme/widgets.git",
+    installation_id: 42, default_branch: "main", credential_type: "github_app",
+    status: "connected", last_error: null, last_synced_at: null, last_synced_commit_sha: null,
+    created_by_user_id: 1, updated_by_user_id: 1,
+    created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-01T00:00:00Z",
+  };
+
+  function jobFixture267(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 1, system_id: 1, connection_id: 1, patch_id: 20, snapshot_id: 5,
+      base_branch: "main", base_commit_sha: "abc1234567890",
+      branch_name: "probe/publish-1-abc12345", commit_sha: null,
+      pr_url: null, pr_number: null, status: "retryable_failed", error: "temporary network error",
+      validation_summary: null, requested_by_user_id: 1, approved_by_user_id: null,
+      cleanup_state: "not_attempted", cleanup_error: null,
+      created_at: 1700000000, updated_at: 1700000000, approved_at: null, completed_at: null,
+      heartbeat_at: null, retry_count: 1, last_attempt_at: null,
+      ...overrides,
+    };
+  }
+
+  function mockGithubData267(data: {
+    appStatus?: Record<string, unknown>;
+    connections?: Record<string, unknown>[];
+    jobs?: Record<string, unknown>[];
+    installations?: Record<string, unknown>[];
+    events?: Record<string, unknown>[];
+  }) {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/github/app-status") {
+        return Promise.resolve(
+          data.appStatus ?? {
+            configured: false, app_id: null,
+            api_base_url: "https://api.github.com", web_base_url: "https://github.com",
+          },
+        );
+      }
+      if (path === "/github/connections") return Promise.resolve(data.connections ?? []);
+      if (path === "/github/publish-jobs") return Promise.resolve(data.jobs ?? []);
+      if (path === "/repository/probe-patches") return Promise.resolve([]);
+      if (path === "/users") return Promise.resolve([]);
+      if (path === "/github/installations") return Promise.resolve(data.installations ?? []);
+      if (path.endsWith("/events")) return Promise.resolve(data.events ?? []);
+      return Promise.resolve(null);
+    });
+  }
+
+  test("item 9: not-configured banner links to the deployment doc", async () => {
+    mockGithubData267({ appStatus: { configured: false, app_id: null, api_base_url: "https://api.github.com", web_base_url: "https://github.com" } });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    await screen.findByTestId("github-app-configured-badge");
+    expect(screen.getAllByText(/github-app-deployment\.md/).length).toBeGreaterThan(0);
+  });
+
+  test("item 9: installations panel also references the deployment doc", async () => {
+    mockGithubData267({});
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Installations"));
+    expect(await screen.findByText(/github-app-deployment\.md/)).toBeInTheDocument();
+  });
+
+  test("item 6: unassign button calls the unassign endpoint for an assigned installation", async () => {
+    mockGithubData267({
+      installations: [{
+        installation_id: 42, github_account_login: "acme", github_account_type: "Organization",
+        status: "active", registered_by_user_id: 1, verified_at: "2024-01-01",
+        disabled_by_user_id: null, disabled_at: null,
+        created_at: "2024-01-01", updated_at: "2024-01-01",
+        assigned_system_ids: [1],
+      }],
+    });
+    mockApi.delete.mockResolvedValue(undefined);
+
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Installations"));
+    const unassignButton = await screen.findByTestId("installation-42-unassign");
+    fireEvent.click(unassignButton);
+
+    await waitFor(() => {
+      expect(mockApi.delete).toHaveBeenCalledWith("/github/installations/42/systems/1");
+    });
+  });
+
+  test("item 7: manual_intervention_required shows a distinct retry label and a warning note", async () => {
+    mockGithubData267({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [connectionFixture267],
+      jobs: [jobFixture267({ id: 9, status: "manual_intervention_required", error: "remote branch mismatch" })],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-9")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-9"));
+
+    const retryButton = await screen.findByTestId("publish-job-retry-button");
+    expect(retryButton).toHaveTextContent("再試行(要確認)");
+    expect(await screen.findByTestId("publish-job-manual-intervention-note")).toBeInTheDocument();
+  });
+
+  test("item 7: retryable_failed shows the plain retry label without the warning note", async () => {
+    mockGithubData267({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [connectionFixture267],
+      jobs: [jobFixture267({ id: 10, status: "retryable_failed" })],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-10")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-10"));
+
+    const retryButton = await screen.findByTestId("publish-job-retry-button");
+    expect(retryButton).toHaveTextContent("再試行");
+    expect(retryButton).not.toHaveTextContent("要確認");
+    expect(screen.queryByTestId("publish-job-manual-intervention-note")).not.toBeInTheDocument();
+  });
+
+  test("item 5: renders the publish job's audit event timeline", async () => {
+    mockGithubData267({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [connectionFixture267],
+      jobs: [jobFixture267({ id: 11, status: "completed" })],
+      events: [
+        { id: 1, job_id: 11, connection_id: 1, event_type: "status_changed:pending", actor_user_id: null, detail: null, created_at: 1700000000 },
+        { id: 2, job_id: 11, connection_id: 1, event_type: "retry_requested", actor_user_id: 1, detail: { reason: "manual" }, created_at: 1700000100 },
+      ],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-11")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-11"));
+
+    const timeline = await screen.findByTestId("publish-job-events");
+    fireEvent.click(within(timeline).getByText(/イベント履歴/));
+    expect(await screen.findByTestId("publish-job-event-1")).toHaveTextContent("status_changed:pending");
+    expect(screen.getByTestId("publish-job-event-2")).toHaveTextContent("retry_requested");
+  });
+
+  test("item 5: shows an empty-state message when there are no events yet", async () => {
+    mockGithubData267({
+      appStatus: { configured: true, app_id: "1", api_base_url: "https://api.github.com", web_base_url: "https://github.com" },
+      connections: [connectionFixture267],
+      jobs: [jobFixture267({ id: 12, status: "completed" })],
+      events: [],
+    });
+    const { default: GithubPage } = await import("@/pages/github");
+    render(<GithubPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(screen.getByText("Publish Jobs"));
+    await waitFor(() => expect(screen.getByTestId("publish-job-12")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("publish-job-12"));
+
+    const timeline = await screen.findByTestId("publish-job-events");
+    expect(within(timeline).getByText("イベントはまだありません。")).toBeInTheDocument();
   });
 });

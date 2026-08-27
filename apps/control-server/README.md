@@ -79,6 +79,21 @@ DB ファイルは `PROBE_DB_PATH` (既定 `./probe.db`) で切り替えられ�
 | `ANALYZER_MAX_EXAMPLES` | `5` | shadow diff の diff クラスごとに保持する例示トレース数(#150) |
 | `RETENTION_BATCH_SIZE` | `1000` | retention 削除のバッチ上限(長時間ロック回避、#152) |
 
+### Rate limit / resource quota
+
+| 変数 | 開発既定 | 説明 |
+| --- | --- | --- |
+| `CONTROL_TRACE_RATE_LIMIT_PER_SECOND` | `1000` | SDK API token ごとの `/traces` 1秒固定窓上限。超過は 429 |
+| `CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE` | `600` | login user ごとの管理 API 1分固定窓上限。超過は 429 |
+| `CONTROL_LLM_DAILY_EXECUTION_LIMIT` | `1000` | System ごとの UTC 1日あたり LLM 実行回数。超過は fail-closed |
+| `CONTROL_TRACE_MAX_ROWS_PER_SYSTEM` | `1000000` | System ごとの Trace 最大行数 |
+| `CONTROL_TRACE_MAX_BYTES_PER_SYSTEM` | `1073741824` | System ごとの Trace 概算 bytes 上限 |
+
+すべて正の整数で指定する。`CONTROL_ENV=production` では5項目すべてが
+必須で、未設定・不正値なら起動を拒否する。Trace 容量超過は 429 で拒否され、
+`GET /system-state` に警告が投影される。SDK の queue/breaker が報告した drop/
+failure は `GET /sdk-transport/status` で System 単位に観測できる。
+
 SDK 側の projection 上限(`PROBE_PROJECTION_MAX_*`)は `packages/python-probe/README.md` を参照。
 
 ## LLM 設定
@@ -126,6 +141,47 @@ cancelled の step が残る場合は `partial`(1 つも完了していなけれ
 | `SYSTEM_UNDERSTANDING_STUCK_AFTER_SECONDS` | heartbeat がこの秒数更新されない active job を stuck と判定（既定値: `300`） |
 | `SYSTEM_UNDERSTANDING_LLM_MAX_ATTEMPTS` | claim scan chunk task の最大試行回数（既定値: `3`） |
 | `SYSTEM_UNDERSTANDING_LLM_BACKOFF_SECONDS` | chunk task retry の指数 backoff 基準秒（既定値: `2`） |
+
+## Interview 回答バッチ後の自動更新 (Issue #288)
+
+Q&A 回答 / Intent の confirm・correct・decline / Alignment の
+answer・correct を保存すると、`app/interview_refresh.py` が
+Understanding / Alignment / Review Queue の自動更新ジョブ
+(`interview_refresh_job`)を enqueue する。手動の
+`POST /interview/sessions/{id}/update-understanding` は障害復旧・診断用
+として残る。詳細は `docs/project-intelligence.md` の
+「回答バッチ後の自動更新(Issue #288)」を参照。
+
+### Control Server の実行モデル
+
+`interview_refresh_job` がサポートする実行モデルは、**Control Server
+1プロセス・ASGI worker 1個・DBを共有するレプリカなし**に限定する。
+同一プロセス内では session ごとの `threading.Lock` と `db.get_conn()` の
+process-wide lock が直列化を保証するが、これらは別プロセスを調停しない。
+Docker image はこの契約を明示するため Uvicorn を `--workers 1` で起動する。
+Gunicorn/Uvicorn の worker 数を増やしたり、`control-server` service を
+scale したりしてはならない。`PROBE_REFRESH_EAGER` は同期/非同期 dispatch
+だけを切り替えるテスト用設定であり、この実行モデルを変更しない。
+
+将来マルチワーカーへ移行する際は、少なくとも以下をすべて実装してから
+deployment の worker/replica 数を変更する。
+
+- `pending → updating` を owner token/lease 付きの原子的な DB claim にし、
+  crash した owner の lease/heartbeat recovery を定義する。
+- session 単位の直列化と pending job の dedupe/follow-up drain を、プロセス内
+  lock ではなく DB 制約・transaction または分散 lock で保証する。
+- 推論呼び出し後、各永続化の直前に base revision/answer marker と
+  superseding job を再検証し、条件付き更新(CAS)に失敗した結果は `stale`
+  として書き込まない。
+- 同じ SQLite DB を共有する別プロセスを実際に起動する concurrency test で、
+  二重実行、古い結果の上書き、orphan job、follow-up 取りこぼしがないことを
+  固定する。必要な write concurrency を SQLite で満たせない場合は、
+  lease/CAS を提供できる外部 DB/job queue へ移行する。
+
+| 変数 | 用途 |
+| --- | --- |
+| `PROBE_REFRESH_EAGER` | `1`/`true` で、enqueue された自動更新ジョブを呼び出し元スレッドで同期実行する（既定値は非同期のバックグラウンドスレッド実行）。テストでの決定的なアサーション用（既定値: `0`） |
+| `PROBE_INTERVIEW_EAGER_INITIAL_BUILD` | `1` で、`POST /interview/sessions` が dispatch する初期理解構築をリクエストスレッドで同期実行する（既定値は daemon スレッド）。`PROBE_REFRESH_EAGER` と同じくテストでの決定的なアサーション用（既定値: `0`, Issue #349） |
 
 ## 設定診断 (System Diagnostics)
 

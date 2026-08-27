@@ -154,6 +154,22 @@ UNDERSTANDING_MESSAGES: Dict[str, Dict[str, str]] = {
         "remediation": "Interview で Core Capabilities を定義・確認してください。",
         "action_label": "Interview でCore Capabilitiesを定義",
     },
+    # Issue #94/#275: the manually entered system_profile purpose (System
+    # Profile 画面で入力された purpose) awaits a human confirmation against
+    # the current AI/source-derived purpose view (capability_hierarchy or
+    # system_profile_drafts). {ai_source} is a finite raw source token
+    # ("capability_hierarchy" | "system_profile_draft"), never free text.
+    "understanding.purpose.manual_profile_unconfirmed": {
+        "summary": "System Profile の purpose が AI 由来の purpose とまだ確認されていません。",
+        "detail": (
+            "System Profile に入力された purpose と、{ai_source} から得られた"
+            "AI/ソース由来の purpose の両方が存在しますが、両者を突き合わせた"
+            "確認記録がまだありません。"
+        ),
+        "impact": "手動入力とAI/ソース由来の purpose のどちらを正とするか、開発者による判断がまだ記録されていません。",
+        "remediation": "System Understanding 画面で purpose を確認してください。",
+        "action_label": "purposeを確認",
+    },
 }
 
 
@@ -367,6 +383,13 @@ STATE_MESSAGES: Dict[str, Dict[str, str]] = {
         "remediation": "System Understanding で Build / Refresh を実行してください。",
         "action_label": "Build / Refresh を実行",
     },
+    "understanding.gaps.open": {
+        "summary": "未判断の Docs-code gap が {open_count} 件あります。",
+        "detail": "検出 {total_count} 件のうち {triaged_count} 件は判断済みとして worklist の既定表示と集計から除外されています。",
+        "impact": "未判断の差異だけを確認対象として扱えます。",
+        "remediation": "Gap worklist で内容を確認し、acknowledged から dismissed / resolved へ明示的に triage してください。",
+        "action_label": "Gap worklist を確認",
+    },
     "runtime.connectivity.no_signal": {
         "summary": "SDK からのトレースをまだ受信していません。",
         "detail_blocking": "このシステムでは probe SDK からのトレースを一度も受信していません。承認済みの probe plan もまだありません。",
@@ -422,6 +445,20 @@ STATE_MESSAGES: Dict[str, Dict[str, str]] = {
         "remediation": "Repository で新しい snapshot を作成してください。",
         "action_label": "Snapshot を作成",
     },
+    "repository.resync.capabilities_stale": {
+        "summary": "{count} 件の Capability が古い snapshot を参照しています。",
+        "detail": "Repository refresh は snapshot #{snapshot_id} の symbol index まで完了しましたが、Capability Map は以前の snapshot を基準にしています。",
+        "impact": "Capability Map と System Understanding に最新コードの変更がまだ反映されていません。",
+        "remediation": "Capability Map を確認し、System Understanding の Build / Refresh を実行してください。",
+        "action_label": "Build / Refresh を実行",
+    },
+    "runtime.trace_storage.quota_exceeded": {
+        "summary": "Trace ストレージ上限に達したため取り込みを拒否しました。",
+        "detail": "この System は {rows} 行・概算 {bytes} bytes の Trace を保持しています。直近の拒否理由: {reason}",
+        "impact": "新しい Trace は保存されず、観測結果が欠落します。",
+        "remediation": "保存期間と容量計画を確認し、古い Trace を安全に削除した後で System 上限を見直してください。",
+        "action_label": "Trace を確認",
+    },
     "repository.working_tree.dirty": {
         "summary": "未コミット差分があります。",
         "detail": "Working tree に {dirty_count} 件の未コミット変更があります。",
@@ -448,12 +485,20 @@ DIAGNOSTIC_STATE_ACTION_LABEL_TEMPLATE = "「{title}」を修正"
 # ---------------------------------------------------------------------------
 # system_state.py: user_phase display labels (Issue #240 -- additive
 # `phases[].label`; the Dashboard's USER_PHASE_LABELS becomes a fallback).
+# Issue #256 replaced the single terminal "diagnosis" placeholder with the
+# four remaining steps of the 6-step improvement flow (instrumentation /
+# observation / evaluation / publish); "preparation"'s label was also
+# updated since it used to read as "prep for diagnosis" ("診断準備"), which
+# no longer makes sense with "diagnosis" gone from the phase model.
 # ---------------------------------------------------------------------------
 
 PHASE_LABELS: Dict[str, str] = {
     "setup": "必要最低限の設定",
-    "preparation": "診断準備",
-    "diagnosis": "診断",
+    "preparation": "分析準備",
+    "instrumentation": "プローブ設定",
+    "observation": "観測",
+    "evaluation": "候補評価",
+    "publish": "公開",
 }
 
 
@@ -1115,3 +1160,55 @@ def gap_note(key: str, **kwargs: Any) -> str:
 
 def success_summary(*, done: int, total: int, symbol_count: int, entrypoint_count: int) -> str:
     return f"分析完了 — {done}/{total} ステップ ・ {symbol_count} シンボル ・ {entrypoint_count} エントリポイント"
+
+
+# ---------------------------------------------------------------------------
+# interview_refresh.py: automatic-refresh job notes (Issue #288). These are
+# fixed informational notes stored in interview_refresh_job.error for
+# non-failure terminal states (status='updated' with nothing new to rebuild,
+# or status='stale' when a newer job already completed) -- never LLM free
+# text (Principle 6/7).
+# ---------------------------------------------------------------------------
+
+REFRESH_JOB_MESSAGES: Dict[str, str] = {
+    "skipped_no_new_answers": "新しい回答がないため、理解の更新をスキップしました。",
+    "superseded": "より新しい更新結果が既に存在するため、この結果は破棄されました。",
+}
+
+
+def refresh_job_message(key: str) -> str:
+    try:
+        return REFRESH_JOB_MESSAGES[key]
+    except KeyError as exc:
+        raise KeyError(
+            f"state_messages.REFRESH_JOB_MESSAGES: no entry for key={key!r}. "
+            "Add one instead of falling back to hardcoded/English text (Issue #240)."
+        ) from exc
+
+
+# --- Natural-language bulk correction / structured change set (Issue #289) -
+#
+# Fixed Japanese copy for the change-set preview/apply flow: the rebuild
+# note shown alongside every preview, and one message per per-item apply
+# skip reason (resolution_state at the moment apply revalidated it).
+# Never LLM free text (Principle 6/7).
+
+CHANGE_SET_MESSAGES: Dict[str, str] = {
+    "rebuild_note": "適用すると、レビューキューと現在の理解が自動的に更新されます。",
+    "skip_ambiguous": "対象を一意に特定できなかったため、適用できません。",
+    "skip_forbidden": "この項目は自然文一括修正では変更できない対象です。",
+    "skip_stale": "前提となる理解がその後更新されているため、適用できません。最新の状態を確認してください。",
+    "skip_conflict": "対象が別の変更で既に更新されているため、適用できません。",
+    "skip_already_applied": "この項目は既に適用済みです。",
+    "skip_not_found": "対象の項目が見つかりませんでした。",
+}
+
+
+def change_set_message(key: str) -> str:
+    try:
+        return CHANGE_SET_MESSAGES[key]
+    except KeyError as exc:
+        raise KeyError(
+            f"state_messages.CHANGE_SET_MESSAGES: no entry for key={key!r}. "
+            "Add one instead of falling back to hardcoded/English text (Issue #240)."
+        ) from exc

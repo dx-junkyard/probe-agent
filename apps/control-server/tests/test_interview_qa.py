@@ -30,7 +30,7 @@ def admin_client(tmp_path, monkeypatch):
 def _login(client, username="root", password="s3cret"):
     r = client.post("/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text
-    return r.json()["access_token"]
+    return r.cookies.get("probe_session")
 
 
 def _bearer(token):
@@ -637,6 +637,7 @@ def test_migration_creates_interview_qa_table(admin_client):
         assert "interview_qa" in tables
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(interview_session)")}
         assert "answers_revised_at" in cols
+        assert "understanding_rebuilt_at" in cols
 
 
 def test_old_session_without_qa_rows_returns_empty_list(admin_client):

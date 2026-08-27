@@ -7,6 +7,7 @@ wiring the runbook depends on. Also guards Issue #225's invariant that
 file, since both invariants live in the same file.
 """
 
+import json
 import os
 
 import yaml
@@ -56,3 +57,50 @@ def test_github_publish_enabled_env_present():
     control_server = compose["services"]["control-server"]
     env = control_server["environment"]
     assert "GITHUB_PUBLISH_ENABLED" in env
+
+
+def test_production_resource_limits_are_explicitly_required():
+    env = _load_compose()["services"]["control-server"]["environment"]
+    for name in (
+        "CONTROL_TRACE_RATE_LIMIT_PER_SECOND",
+        "CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE",
+        "CONTROL_LLM_DAILY_EXECUTION_LIMIT",
+        "CONTROL_TRACE_MAX_ROWS_PER_SYSTEM",
+        "CONTROL_TRACE_MAX_BYTES_PER_SYSTEM",
+    ):
+        assert env[name] == f"${{{name}:?Set {name}}}"
+
+
+def test_execution_worker_is_secretless_and_hardened():
+    compose = _load_compose()
+    worker = compose["services"]["execution-worker"]
+    assert worker["network_mode"] == "none"
+    assert worker["read_only"] is True
+    assert worker["cap_drop"] == ["ALL"]
+    assert "no-new-privileges:true" in worker["security_opt"]
+    assert "seccomp:unconfined" in worker["security_opt"]
+    assert worker["user"] == "65534:65534"
+    assert worker["pids_limit"] == 128
+    assert worker["mem_limit"] == "512m"
+    assert worker["cpus"] == "1.0"
+    assert worker.get("secrets", []) == []
+    assert "docker.sock" not in json.dumps(worker)
+    assert set(worker["environment"]) == {
+        "PROBE_EXECUTION_SPOOL_ROOT",
+        "PROBE_EXECUTION_WORKSPACE_ROOT",
+        "PROBE_EXECUTION_WORKER_POLL_SECONDS",
+        "PROBE_EXECUTION_MAX_OUTPUT_BYTES",
+    }
+
+
+def test_execution_worker_mounts_only_spool_and_workspace_shared_with_control():
+    compose = _load_compose()
+    worker = compose["services"]["execution-worker"]
+    control = compose["services"]["control-server"]
+    worker_volumes = set(worker["volumes"])
+    assert worker_volumes == {
+        "execution-spool:/execution-spool",
+        "execution-workspaces:/execution-workspaces",
+    }
+    assert worker_volumes.issubset(set(control["volumes"]))
+    assert control["environment"]["PROBE_EXECUTION_BACKEND"] == "worker"

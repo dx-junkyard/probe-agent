@@ -899,6 +899,80 @@ dedupe)、`open_questions` JSON のエントリに `qa_id` を付与する。ま
 共有スキーマ: `InterviewQA` / `InterviewQaEvidenceRef` / `InterviewQaAnswerOut`
 （[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
 
+## Q&A パネル回答の理解レビューへの還流とゲート拡張(Issue #263)
+
+#129 の Q&A パネル(`interview_qa`)経由の回答は、対話ターン
+(`generate_interview_turn`)のプロンプトには `answered_qa` / `unconfirmed_qa`
+として注入されていたが、`update-understanding` が呼ぶ理解レビュー
+(`generate_understanding_review`)には一切渡っていなかった。パネルでのみ
+回答された質問は `interview_message` に書かれないため、対話ターンを経由
+しない限り理解に反映されない欠落があった。
+
+- **共有ヘルパー**: `routes/interview.py::_load_qa_pairs(conn, session_id,
+  system_id)` が、対話ターンにインライン実装されていた `answered_qa` /
+  `unconfirmed_qa` の取得・整形(#129/#142 と同じ SQL・同じ shape)を1箇所に
+  切り出し、対話ターンと `update-understanding` の両方が同じ関数を呼ぶ。
+  整形ルール自体は変更しない。
+- **理解レビューへの注入**: `generate_understanding_review` が
+  `answered_qa` / `unconfirmed_qa` を任意引数として受け取り、
+  `interview_agent._trim_json` と同じ JSON-trim 方式(新設の
+  `system_understanding_reviewer._trim_json` /
+  `QA_PROMPT_MAX_CHARS = 4_000`、`interview_agent.GAP_AND_QUESTION_MAX_CHARS`
+  と同じ予算)でプロンプトに追加する。プロンプトが変わるため
+  `PROMPT_VERSION` を `understanding-review-v3` から `understanding-review-v4`
+  に上げる(Principle 7 の監査可能性)。
+- **確定後ゲートの拡張**: `update-understanding` の 409 ゲートは、これまで
+  `answers_revised_at`(訂正パスでのみセット)だけを見ていたため、確定後の
+  **初回**回答や、確定後に新規発行された Runtime Reality Check 質問への回答は
+  ゲートを開かなかった。決定的な構造チェック(Principle 6、日時/行存在の
+  比較のみ)として、そのセッションの `interview_qa` に
+  `created_at > understanding_confirmed_at` または
+  `answered_at > understanding_confirmed_at` の行が1件でもあれば
+  `answers_revised_at` と同様に再構築を許可する。該当行が無ければ
+  従来どおり 409 のまま(ヒューリスティックや自由文解釈は行わない)。
+
+**含まない:** 409 のレスポンス形状変更、無効化ボタンなどの UI 変更、ターン
+ごとの `current_understanding` 差分更新、`understanding_graph._is_similar_name`
+の変更(いずれも Issue #229 のスコープ)。
+
+## 状態に応じた無効操作抑止の完了(Issue #229)
+
+Issue #229 の大半(409 構造化・`confirm-understanding` の role 分離・
+`理解を更新`/`差分を生成`/`実態チェックを実行`/`差分を開く` の disabled+理由
+表示)は commit `35f1bbc`ですでに実装済みだった。#263 が確定後ゲートを
+「`answers_revised_at` のみ」から「確認済み時刻以降に作成/回答された
+`interview_qa` 行の有無」へ拡張した際、Dashboard 側の disabled 条件
+(`answers_revised_at` のみを見るローカル判定)は追随していなかった —
+Q&A パネルのみで初回回答した場合や新規 Runtime Reality Check 質問に回答した
+場合、サーバーは 200 を返すのに UI は無効のまま、というズレが残っていた。
+
+- **単一の判定関数**: `routes/interview.py::_understanding_update_blocked(conn,
+  session, system_id)` が、`update-understanding` の 409 チェックと
+  `InterviewSessionOut.understanding_update_available` の両方から呼ばれる
+  唯一の判定になった(以前は 409 チェック内にインライン実装されていた
+  #263 拡張後の SQL をそのまま関数へ抽出しただけで、判定ルール自体は変更
+  していない)。決定的な stage/timestamp/行存在チェックのみ(Principle 6)。
+- **セッションシリアライザへの反映**: `_session_out` は `conn` を受け取るように
+  なり(全 14 箇所の呼び出しを更新)、`understanding_update_available: bool`
+  を返す。これにより Dashboard は 409 になるかどうかをローカルで再計算せず、
+  サーバーが計算した同じ値を読むだけになる。
+- **Dashboard**: `pages/interview.tsx` の `canRefreshUnderstanding` は
+  `session.understanding_update_available` を直接使う(以前の
+  `answers_revised_at` のみのローカル判定を置き換え)。理由文言・title は
+  「新しい回答(修正・追加回答)がある場合にのみ、理解を再構築できます」に
+  更新し、修正だけでなく初回回答/Reality Check 回答でも開くことを示す。
+- **エラー表面化(項目C)**: `generate_understanding_review` はスキーマ検証
+  失敗時、リトライ後も失敗した場合は catalog メッセージ
+  (`invalid_review_response`)を返す実装がすでに存在し、生の Pydantic
+  `ValidationError` 文字列が session の `last_error` に漏れることはない
+  (回帰テストを追加して固定)。409 応答はすでに構造化されている
+  (`code` / `message` / `next_action`)。
+
+**含まない:** `understanding_update_not_available` 応答へ新しいフィールドを
+追加すること、`ApiError.code`/`nextAction` を使った専用のエラー UI(現状は
+disabled 化で 409 パスにほぼ到達しないため、既存のトースト表示のままで
+充分と判断)。
+
 ## サーバー生成固定文言の INTERVIEW_LANGUAGE 対応(Issue #138)
 
 #127 は LLM 生成テキストの出力言語を `INTERVIEW_LANGUAGE`(既定 `ja`)に従わせたが、
@@ -2123,3 +2197,5496 @@ POST /candidate-versions/{id}/promote        Experiment 引き渡し payload
 
 LLM のみでの自動採用、任意コードの本番プロセスへの動的配布・実行、対象リポジトリの
 自動編集、本番相当性の保証、live shadow SDK の動的候補ロード。
+
+## フェーズ0(System 作成前)の状態案内(Issue #265)
+
+`GET /system-state` を土台にした案内スタック(6 フェーズ、`PrerequisiteGuide`、
+`DiagnosticsBadge`)は、いずれも `X-Probe-System-Id` を要求するため、ログイン前
+および「System が 0 件」の状態では一切機能しない。0 admin(初回ブートでまだ
+`CONTROL_ADMIN_USERNAME`/`CONTROL_ADMIN_PASSWORD` が設定・再起動されていない)
+状態からは UI/API 経由で管理者を作成する手段が無く(`POST /users` は admin 専用)、
+ログイン画面はその案内すら出していなかった。
+
+- **`GET /auth/bootstrap-status`**(`app/bootstrap_status.py`、
+  `routes/auth.py`): 認証なし・System なしで呼べる、唯一の決定的な事実だけを
+  返すエンドポイント。`admin_exists`(`role='admin' AND is_active=1` の行の
+  有無。`system_diagnostics._check_auth_scope` の「0 admin」判定は system_id
+  付きで *任意ユーザー* の有無を見るのに対し、こちらは system_id を取らない
+  独立ヘルパーで、判定対象も admin ロールに絞っている)、`auth_mode`
+  (`auth.auth_enabled()` と同じ判定を `"anonymous" | "user"` で表現)、
+  `llm_configured`(`LLM_PROVIDER` が既知の値か、`mock` か、鍵環境変数が
+  *存在するか* だけを見る -- 値の検証はしない)、`environment`
+  (`environment.control_env()` -- Issue #225 の本番判定をそのまま流用)の
+  4 つの bool/finite token のみを返す。ユーザー名・鍵の値・パス・ホスト名は
+  一切含まない。`KNOWN_PROVIDERS` は `system_diagnostics.py` の重複定義を
+  `llm.py` に一本化し、両方がそこから import する。
+- **ログイン画面**(`pages/login.tsx`): `admin_exists=false` のとき、ログイン
+  フォームの代わりに(すでに存在しない admin では絶対に成功しない画面を出して
+  も意味が無いため)、環境変数 `CONTROL_ADMIN_USERNAME`/`CONTROL_ADMIN_PASSWORD`
+  を設定して Control Server を再起動する、という静的な案内を表示する。この
+  文言は純粋にクライアント側固定文字列(サーバーから配信される copy ではない)
+  なので #240/#266 の方針どおり `state_messages.py` には追加せず、そのまま
+  日本語で `login.tsx` に置く。Issue #225 の fail-closed 本番方針との整合として、
+  `environment=production` のときは具体的な環境変数名を出さず
+  (`login-bootstrap-guide-production`)、「システム管理者に問い合わせてください」
+  という一般化した文言のみを出す -- 本番で未認証の任意の呼び出し元に、内部の
+  設定手順(変数名)を晒さないため。`llm_configured=false` の場合は開発環境の
+  案内の中に、LLM_PROVIDER/LLM_API_KEY も合わせて設定する旨の補足を出す
+  (blocking ではない)。
+- **0 System の空状態**: ヘッダー(`components/layout/header.tsx`)は
+  `systems.length === 0` のとき、アイコンのみの「+」ボタン(見落としやすい
+  死角だった)をやめ、「System が未作成です」というテキストと「System を作成」
+  というラベル付きボタンを表示する。Overview(`pages/overview.tsx`)は
+  Components カード内で、0-*components*(既存、Issue #212)とは別の分岐として
+  `systems.length === 0` を先に判定し、System 作成へ誘導する文言のみを表示する
+  (System スコープの get-started リストは System が無ければ無意味なため)。
+  Settings(`pages/settings.tsx`)は、これまで見出しだけの空白画面だったのを、
+  `connect-sdk.tsx` の no-System 案内文と同じパターン(`<p>` + `data-testid`)
+  で修正し、System が 1 件以上あるが未選択の場合の文言も追加した。
+- ここでの分岐はすべて決定的な有無判定(Principle 6)であり、新しい
+  `user_phase` 値は追加しない -- `user_phase`/`phases` は System 選択後にしか
+  評価できない既存の仕組みのままで、フェーズ0はこのエンドポイントとクライアント
+  側の表示分岐だけで完結する。
+
+**含まない:** UI からの管理者作成・signup フロー(env + restart のブート方式は
+そのまま)、LLM 設定を書き込む UI(表示・診断のみ)、新しい DB テーブル。
+
+## 手動 System Profile と AI 理解の突き合わせ(Issue #275、旧 #94)
+
+probe-agent の世界観は「人の認識と AI に任せたシステム構築を同期させる」こと
+だが、手動入力の `system_profile`(`PUT /system-profile`)は System
+Understanding の表示にも比較にも登場していなかった(`_load_purpose` は
+capability hierarchy の purpose ノード → `system_profile_drafts` の単一
+fallback チェーンのみ)。本 Issue は「人の認識」を第一級の provenance として
+並置し、人が突き合わせを確認した事実を `decision_method: manual` で記録する。
+
+- **`purpose_views`(並置ビュー)**: `GET /repository/system-understanding` に
+  追加。手動 profile 由来のビュー(`source: system_profile`,
+  `provenance_kind: manual`)は snapshot に依存せず、purpose が入力されて
+  いれば常に含まれる。AI/ソース由来のビューは ready snapshot がある場合のみ、
+  capability hierarchy の purpose ノード(行の `provenance_kind` をそのまま)
+  → `system_profile_drafts`(従来どおり `structural`)の順で 1 件。既存の
+  `purpose` フィールドの意味は変えない(後方互換)。
+- **確認記録**: 新テーブル `system_purpose_confirmations`(System-scoped、
+  append-only の監査行。UPDATE/DELETE しない)。`POST
+  /repository/system-understanding/purpose-confirmation` が最新 ready
+  snapshot に対して両ビューの内容を逐語でキャプチャして 1 行 INSERT する
+  (`decision_method` は常に `manual`)。どちらか一方が欠けていれば 422、
+  snapshot 不一致・snapshot 無しは 409(issue-drafts と同じ staleness
+  パターン)。
+- **staleness(決定的な構造等価のみ、Principle 6)**: 読み出し時に最新確認行を
+  現在状態と比較し、`snapshot_changed` → `profile_updated` → `ai_updated` の
+  順で判定した `stale_reason` を返す。一致/不一致の「解釈」はしない --
+  類似度・heuristic 判定は導入せず、差分の解釈は人に委ねる。
+- **StateItem**: 両ビューが存在し有効な確認が無いとき
+  `understanding.purpose.manual_profile_unconfirmed`(severity `info`、
+  `user_action_kind: confirm`、`display_routes: [/system-understanding]`、
+  anchor `purpose-views`)。確認後(非 stale)は消える。文言は
+  `state_messages.py` のカタログに追加。
+- **共有リーダー**: profile 行・AI purpose ビュー・最新確認行・staleness の
+  読み出しは `state_facts.py` の純関数に置き、
+  `system_understanding_service` と `system_state` が同一実装を共有する
+  (Issue #236 の方針)。
+- **Dashboard**: System Understanding ページの purpose セクションを
+  「人の認識(System Profile)」/「AI/ソース由来の理解」の並置カードに改修。
+  手動側が空ならその場入力(既存 `PUT /system-profile` へ purpose のみ
+  マージ更新)、両方あれば「一致を確認した」ボタン → 確認 POST。確認済みは
+  バッジ + 日時で表示し、stale 時は理由別の日本語注記を出す(#266 の言語規約)。
+
+**含まない:** LLM による purpose の自動マージ・書き換え(#59 の領分)、
+`probe-agent:` docstring への書き戻し(Principle 8 の interview 系 issue の
+領分)、`system_profile` スキーマ拡張、一致/不一致の自動判定。
+
+## Interview 現在の理解の段階表示(Issue #283)
+
+`pages/interview.tsx` の「現在の理解」パネル(旧 `UnderstandingPanel`)は、
+`confidence.level` などの内部状態・確信度の理由・根拠コードを一度にフラット
+表示しており、何が分かっていて何をユーザーに確認してほしいかが読み取り
+にくかった。本 Issue は Dashboard 表示のみを再設計する(API・スキーマ・
+理解生成ロジックは変更しない)。
+
+- **`components/system-understanding/understanding-overview.tsx`
+  (`UnderstandingOverview`)**: `current_understanding` /
+  `gap_analysis` / `open_questions` と、呼び出し側が既に算出している
+  next-action の文言(`nextActionText`、ロジックは再実装せず prop で
+  受け取るだけ)から、初期表示を3グループのサマリーに絞る。
+  - 「分かったこと」: `confidence.level` が `confirmed`/`likely` の
+    `UnderstandingItem`。
+  - 「確認したいこと」: `confidence.level` が `uncertain`/`conflicting`
+    (未知の値もこちら側にフォールバック)の `UnderstandingItem` +
+    `gap_analysis` の各項目 + `open_questions` の各項目。
+  - 「次にすること」: `nextAction` prop をそのまま表示。
+- **claim とその根拠の分離**: 各アイテムはまず見出し(`name`/`question`)・
+  1–3文の要約・要対応バッジのみを表示する。`confidence.reason` ・
+  `evidence`(path:line)・`related_docs`/`related_apis`/`children`・
+  `hypothesis`/`evidence_refs`/`answer_options` は「根拠を見る」トグルで
+  折りたたみ、初期表示では連結表示しない。
+- **表示ラベルの単一マッピングテーブル**: `confidence.level` /
+  `severity` / `gap_type` / `priority` の canonical enum 値はデータ上
+  変更せず、`understanding-overview.tsx` 内の1つのテーブル
+  (`CONFIDENCE_LABELS` 等)だけを通して日本語ラベルへ変換する。未知の値は
+  常に安全側(要確認寄り)のラベルへフォールバックし、生の enum 文字列を
+  画面に出さない。
+- **要対応/参考情報の区別**: 色だけに依存せず、バッジ内の視覚的に隠した
+  テキスト(`sr-only` の「要確認: 」/「参考情報: 」)と
+  `data-action-required` 属性の両方で伝える。「分かったこと」側の項目は
+  「要確認」カードとして提示しない(要件4)。
+- **「詳細をすべて見る」**: 旧 `UnderstandingPanel` のカテゴリ別グルーピング
+  表示は、既定で折りたたまれた詳細レイヤー(`UnderstandingCategoryDetail`)
+  として残し、確信度バッジは翻訳済みラベルのみを表示する(生の enum 値は
+  出さない)。
+- 冗長になっていた旧「残りの質問」カード・「ギャップ分析」カードは、同じ
+  情報が「確認したいこと」グループに翻訳付きで統合されたため削除した。
+  Q&A の個別編集・スキップ・実態チェックなど既存の操作は `QaPanel` に残る
+  (本 Issue はそれらの操作系・ライフサイクルを変更しない)。
+
+**含まない:** 理解生成ロジック・API・スキーマの変更、Intent Brief /
+Alignment Review / Investigation Agent(後続 Issue の領分)、長い調査ログ
+(Q&A の逐次編集など)を初期表示に持ち込むこと。
+
+## Intent Brief(Issue #284)
+
+「現在の理解」(実装事実の理解)とは別に、ユーザーの意図(本人だけが決めら
+れる)を構造化して保持する。両者を混在させない。
+
+- **テーブル `interview_intent_item`**(System-scoped、additive、
+  `interview_session` に `ON DELETE CASCADE`): `id` / `session_id` /
+  `system_id` / `field`(`goal | pain | success_criteria | priority |
+  constraints | non_goals`、API 側で有限集合を検証)/ `value_text` /
+  `status`(`proposed | confirmed | needs_review | undecided |
+  not_applicable`、既定 `proposed`)/ `origin`(`user | ai_proposed`)/
+  `source_statement`(AI 提案の根拠となったユーザー発言、nullable)/
+  `decision_method`(`manual` | `reasoning_llm`、確定操作は常に `manual`)/
+  `intelligence_run_id`(`ai_proposed` 行のみ、FK `intelligence_runs`)/
+  `is_mock` / `superseded_by_id`(自己 FK、訂正は新規行を追加し旧行を
+  supersede — `interview_qa` の回答訂正チェーンと同じ設計)/
+  `created_at` / `updated_at`。
+- **エンドポイント**(`app/routes/interview_intent.py`。`interview.py` を
+  これ以上肥大化させないため新規モジュールに分離し、`main.py` に登録):
+  - `GET /interview/sessions/{id}/intent` — 6フィールド固定キーで
+    グルーピングした現在値(非 superseded)の一覧。
+    `?include_superseded=true` で訂正履歴も返す。
+  - `POST /interview/sessions/{id}/intent` — ユーザーが直接作成。常に
+    `origin='user'` / `decision_method='manual'`。`status` は既定
+    `confirmed`、`undecided` / `not_applicable` も明示的に指定可能
+    (「現状把握だけが目的」「対象外」は正規の回答であり、エラーではな
+    い)。`field` / `status` は Pydantic の有限 `Literal` で検証し、
+    不正値は 422。
+  - `POST /interview/intent/{item_id}/confirm` — `ai_proposed` 項目を
+    ユーザーが確認 → `status='confirmed'` / `decision_method='manual'`。
+    `ai_proposed` 行がこの明示的な呼び出し以外で `confirmed` になる経路
+    はない(Principle 2)。
+  - `POST /interview/intent/{item_id}/correct`(body `{value_text}`)—
+    新規行を追加(`origin='user'` / `status='confirmed'` /
+    `decision_method='manual'`)し、旧行の `superseded_by_id` を設定。
+    旧行の `value_text` は上書きされない(監査用に保持)。
+  - `POST /interview/intent/{item_id}/decline` — `status='not_applicable'`
+    に変更する manual decision。行は削除せず保持。
+  - `POST /interview/sessions/{id}/intent/propose` — セッションの会話
+    履歴 + `user_intent` 自由記述から、まだ値が存在しないフィールドだけ
+    を対象に reasoning LLM(`app/interview_intent_agent.py`、
+    `prompt_version`/`schema_version` = `intent-brief-v1`)が候補を提案
+    する。fail-closed(mock/非推論モデル・API 失敗・構造化出力検証失敗は
+    すべて `intelligence_runs`(`run_type='intent_proposal'`)に失敗行を
+    記録した上で HTTP 502、行は一切作成しない — ヒューリスティック
+    フォールバックなし)。成功時に作成される行は常に `status='proposed'`
+    / `origin='ai_proposed'` / `decision_method='reasoning_llm'`。モック
+    出力は `is_mock=1` を必ず伝播する。
+  - すべて既存の `require_system`(`X-Probe-System-Id` + `get_system_id`)
+    パターンで System-scoped。
+- **UI**(`components/system-understanding/intent-brief-panel.tsx`、
+  `pages/interview.tsx` の「現在の理解」カードの隣に独立した Card として
+  配置、タイトル「Intent Brief(目標と成功条件)」): 6フィールドをそれ
+  ぞれ表示し、`proposed` 項目には「AI 提案(未確認)」バッジ +
+  「確認する」/「修正する」/「対象外」の3操作、`confirmed` 項目には
+  「確認済み」バッジのみを表示する。一度にすべての未入力フィールドを
+  尋ねない: 現在値が1件もない最初のフィールド(固定順 goal → pain →
+  success_criteria → priority → constraints → non_goals)だけを「次に
+  確認したい項目」として提示し、自由記述の入力に加えて「未定」
+  「対象外」のクイック選択肢を用意する。canonical enum の値は変更せず、
+  このコンポーネント内の単一マッピングテーブルのみを通して日本語ラベル
+  に変換する(生の enum 文字列は画面に出さない)。
+
+**含まない:** 対話ターン(`interview_agent.py`)からの自動抽出・Intent
+Brief の自動確定・Alignment Review / Investigation Agent との接続(後続
+Issue の領分)。
+
+## Inquiry lifecycle(Issue #285)
+
+確認項目(Q&A の質問・Intent Brief の項目・将来の review item)に疑問が
+あるとき、元の項目はいったん保留し、別の Inquiry 会話で疑問だけを解消す
+る。「疑問は解消した」(resolve)は元の項目への回答・確認とは厳密に別物
+であり、Inquiry の作成・発言・resolve/unresolved/hold/cancel はいずれも
+`interview_qa` / `interview_intent_item` の状態を一切変更しない。解消後
+もユーザーは元の項目自身の回答/確認エンドポイントを明示的に呼ぶ必要があ
+る(「解消を同意と誤認しない」)。
+
+### 状態機械(有限集合、Principle 6)
+
+`status`: `open | resolved | unresolved | cancelled | held | superseded`。
+
+```
+open       -> resolved | unresolved | held | cancelled | open(no-op)
+held       -> open (resume)
+open|held|resolved -> superseded (system のみ、Issue #308/#323)
+それ以外   -> 409 { code: "invalid_inquiry_transition", message }
+```
+
+`superseded` は Issue #308(#323)で追加した終端状態で、ユーザー
+エンドポイントからは決して到達しない。Alignment 再ビルド内の決定的な前提
+評価だけが書き込み、`superseded` からの遷移は存在しない(`/message` /
+`/resolve` / `/resume` / `/reopen-doubt` はすべて 409)。詳細は
+「Inquiry の前提追跡と superseded(Issue #308)」節。
+
+`open -> open` は `/reopen-doubt`(「解消していない」)専用の no-op 遷移
+で、既に `open` のときだけ許可される(held からの再開は `/resume` を使
+う)。すべての遷移は `interview_inquiry_transition` に監査行として記録
+される(from_status / to_status / actor / reason)。`resolved` /
+`unresolved` / `cancelled` は `closed_at` を刻む終端状態、`held` は
+`closed_at` を刻まない再開可能な状態。
+
+### テーブル(System-scoped、additive、`interview_session` に
+`ON DELETE CASCADE`)
+
+- **`interview_inquiry`**: `id` / `session_id` / `system_id` /
+  `origin_kind`(`qa | intent | review_item`、`review_item` は Issue #287
+  以降にしか行が現れないが enum は今から存在する)/ `origin_id`(`qa` /
+  `intent` は作成時に存在確認、`review_item` は対応テーブルがまだ無いの
+  で検証しない)/ `held_draft`(ユーザーの未確定な回答下書き、サーバー
+  にとって不透明な文字列としてそのまま GET/resolve で往復させる)/
+  `status` / `status_reason` / `created_at` / `updated_at` / `closed_at`。
+- **`interview_inquiry_message`**: `id` / `inquiry_id` / `system_id` /
+  `role`(`user | assistant`)/ `content` / `detail`(JSON
+  `{key_points, evidence, uncertainty}`、assistant 行のみ、段階的開示用
+  — `content` が結論、`detail` が「根拠を見る」の展開)/
+  `intelligence_run_id` / `is_mock` / `created_at`。
+- **`interview_inquiry_transition`**: `id` / `inquiry_id` / `system_id` /
+  `from_status` / `to_status` / `actor` / `reason` / `created_at`(監査専
+  用、追記のみ)。
+
+### エンドポイント(`app/routes/interview_inquiry.py`、`main.py` に登録)
+
+- `POST /interview/sessions/{id}/inquiries` `{origin_kind, origin_id,
+  question_text, held_draft?}` — Inquiry を作成し(`status='open'`)、
+  ユーザーの質問を最初のメッセージとして保存、初回の assistant 回答を
+  即座に生成する。元の項目は一切更新しない。LLM 失敗時も Inquiry と
+  ユーザーメッセージ自体は保存され(再試行できるように)、レスポンスは
+  502(`detail.inquiry_id` に作成済み ID を含む)で assistant メッセー
+  ジだけが欠ける。**同一 origin(session_id/system_id/origin_kind/
+  origin_id)につき同時に活性な Inquiry は1件まで**(レビュー指摘修
+  正): 同じ origin に対して `status IN ('open', 'held')` の Inquiry が
+  既に存在する場合、新規作成は 409
+  `{code: "inquiry_already_active", message, inquiry_id}` で拒否する。
+  チェックは INSERT と同じトランザクション内で行う — `db.py` の
+  `get_conn()` はプロセス全体で単一のグローバル接続ロックを取るため書き
+  込みは常に直列化されており、この in-transaction check-then-insert で
+  競合は起きない(事前データが原因で失敗しうる部分ユニークインデックス
+  は追加しない)。
+- `GET /interview/sessions/{id}/inquiries?status=...` — 一覧。
+- `GET /interview/inquiries/{id}` — メッセージ全件を含む詳細
+  (`held_draft` / `origin_kind` / `origin_id` を含み、リフレッシュ後の
+  UI 復元に必要な情報をすべて返す)。
+- `POST /interview/inquiries/{id}/message` `{content}` — 追加の質問と
+  新しい assistant 回答。`status='open'` のときのみ許可(409)。
+- `POST /interview/inquiries/{id}/resolve` — `status='resolved'` /
+  `closed_at` 設定。レスポンスは `origin_kind` / `origin_id` /
+  `held_draft` を含む(`InterviewInquiryOut` の一部としてそのまま返る)
+  ので、UI はここから元の項目に戻って下書きを復元できる。
+- `POST /interview/inquiries/{id}/unresolved` `{status_reason?}` —
+  assistant が回答できなかった場合などに `status='unresolved'`。
+- `POST /interview/inquiries/{id}/hold` `{status_reason?}` — 「今回は
+  保留する」。`POST /interview/inquiries/{id}/resume` で `open` に戻せ
+  る。
+- `POST /interview/inquiries/{id}/cancel` `{status_reason?}`。
+- `POST /interview/inquiries/{id}/reopen-doubt` — 「解消していない」。
+  `open` のときだけ許可、監査行だけ追加して `open` のまま。
+
+### 回答生成(`app/inquiry_answering.py: generate_inquiry_answer`)
+
+（Issue #286 で内部実装を Question Router / Investigation Agent / Response
+Composer の3段構成に差し替え済み。`prompt_version`/`schema_version` は
+`inquiry-answer-v2` に更新した。以下は Issue #285 時点の単一パス設計の記
+述で、歴史的経緯として残す。詳細は次の「Question Router / Investigation
+Agent(Issue #286)」節を参照。）
+
+`interview_context.py` の `build_interview_context` が返すスナップショッ
+ト由来のコンテキストパックだけを根拠に、reasoning LLM を1回呼ぶ
+(`prompt_version`/`schema_version` = `inquiry-answer-v1`、#286 以降は
+`inquiry-answer-v2`)。
+`interview_agent.py` の2段階(エビデンス選定→読込)とは異なり、この呼び
+出しは単一パスで、コンテキストパックに既出の `(path, start_line,
+end_line)` だけを引用させ、範囲外の引用は Issue #142 と同じ「致命的では
+なく破棄」ルールで落とす。
+
+- fail-closed(Principle 6): mock/非推論モデル・API 失敗・構造化出力検
+  証失敗はすべて `intelligence_runs`(`run_type='inquiry_answer'`)に失
+  敗行を記録した上でエラーを返す。assistant メッセージは一切作成しない
+  (Inquiry は `open` のまま、ユーザーの質問だけが残る)。
+- `answerable=false` はエラーではない: モデルが「根拠不足で回答不能」
+  と判断した場合の正常系。この場合は LLM の文面を一切使わず、
+  `interview_language.py` の固定メッセージキー
+  `inquiry_insufficient_information`(ja/en 両方定義)だけを
+  `interview_inquiry_message.content` に保存する(絶対に LLM の文章を
+  捏造して使わない)。
+- `answerable=true` のときは `conclusion` を `content` に、
+  `{key_points, evidence, uncertainty}` を `detail` に保存する
+  (段階的開示: UI はまず結論だけを見せ、「根拠を見る」で `detail` を
+  展開する)。
+- モック出力は `is_mock=1` を伝播し、UI の `is_mock` バッジ規約(既存)
+  で可視化する。
+
+**#286 への差し替え口:** 回答生成は `generate_inquiry_answer` 一箇所に
+閉じてあるので、Issue #286(Question Router / Investigation Agent)は
+このライフサイクル/遷移ロジックに触れずに内部実装だけを差し替えられる。
+
+### UI(`components/system-understanding/inquiry-panel.tsx`)
+
+Q&A パネル(`QaItemCard`)と Intent Brief パネル(`IntentItemRow`)の両
+方に「疑問がある」ボタンを追加。押すと元のカードは「保留中(疑問を解消
+してから回答)」の表示に切り替わり、`InquiryPanel` が質問入力→会話
+(assistant の結論を先に表示し「根拠を見る」で `key_points` /
+`evidence` / `uncertainty` を展開)→「疑問は解消した」/「解消していな
+い(追加で質問)」/「今回は保留する」の3操作を提供する。「疑問は解消し
+た」を押すと元のカードに戻り、resolve レスポンスの `held_draft` を入力
+欄に復元するが、送信は自動では行わない(ユーザーが明示的に保存/確認す
+るまで元の項目は更新されない)。「今回は保留する」を押すと元のカードに
+「保留中の疑問があります」マーカーが残る。`api/client.ts` は無変更
+(`{code, message}` 形式の構造化エラーは既存の `ApiError` がそのまま解
+釈する)。`api/types.ts` / `api/hooks.ts` に型と対応するフックを追加。
+
+**リフレッシュ/再開(refresh/resume)の UI 復元:** サーバーは Inquiry の
+状態を常時永続化しているが、これをページリロード後も見失わないよう、
+`QaPanel` / `IntentBriefPanel` はセッション単位で
+`useActiveInquiriesByOrigin`(`api/hooks.ts`、既存の
+`GET /interview/sessions/{id}/inquiries` を素の一覧取得のまま使い、追加
+のサーバー変更なしでクライアント側だけで `status ∈ {open, held}` の行を
+`origin_kind:origin_id` キーの Map に組み直す)を呼び、各カードへ
+`existingInquiry` として渡す。カード側の描画は以下の3状態を区別する:
+`status='open'` の既存 Inquiry があれば「疑問がある」の代わりに「疑問を
+再開する」ボタンを表示し、押すと新規作成せずその Inquiry の会話をその
+まま再取得する(`InquiryPanel` に `existingInquiryId` を渡し、質問入力
+フォームを飛ばして会話ビューへ直行させる)。`status='held'` なら「保留
+中の疑問があります」マーカーの隣に「疑問を再開する」ボタンを出し、押す
+と `/resume` を呼んでから同じ Inquiry に再接続する。どちらのケースも
+新しい Inquiry 行は作られない。
+
+**含まない:** `review_item` origin からの Inquiry 作成 UI(Issue #287
+の Review Queue が対応するまで導線がない)、質問ルーティング/調査エー
+ジェント(Issue #286)。
+
+## Question Router / Investigation Agent(Issue #286)
+
+Inquiry の質問応答を「分類 → 調査 → 組み立て」の3段に分割した:
+`app/question_router.py`(質問を有限カテゴリに分類する reasoning 呼び出
+し1回)→ `app/investigation_agent.py`(pin 済み snapshot だけを read-only
+で調べる reasoning 呼び出し、system_researchable/hybrid のみ)→
+`app/response_composer.py`(LLM を呼ばない決定的な組み立て)。
+`app/inquiry_answering.py` の `generate_inquiry_answer` はこの3段を束ね
+るオーケストレーションのみを行う純関数(DB に触れない)で、
+Issue #285 が確立した Inquiry ライフサイクル/遷移ロジック
+(`routes/interview_inquiry.py`)には手を入れていない — 呼び出し引数
+(`repo_path`/`commit_sha` の追加)とレスポンス組み立て(`route`/
+`investigation` サブ結果の追加)だけを差し替えた。
+
+### エージェント構成
+
+- **Question Router**(`route_question`、`prompt_version`/
+  `schema_version` = `question-router-v3`。当初 `v1`、Issue #291 の
+  `knowledge_area` 追加で `v2`、後続のレビュー指摘修正(下記
+  `search_keywords`)で `v3` まで additive にバンプしてきた):質問文 +
+  短い文脈(Inquiry なら元項目の要約と直近の会話、`interview_qa` 単体
+  ルーティングなら question_category/hypothesis)を渡し、構造化出力
+  `{category, reason, research_focus, knowledge_area, search_keywords}`
+  を1回の reasoning 呼び出しで得る。`category` は有限集合
+  `human_only | system_researchable | hybrid`(Principle 6 — 自由文から
+  の意味分類なので reasoning LLM 必須、キーワードヒューリスティックでは
+  代替しない)。`research_focus` / `search_keywords` はどちらも
+  `human_only` では常に `null` / `[]` に強制する(調査対象がないため)。
+- **Investigation Agent**(`investigate`、`prompt_version`/
+  `schema_version` = `investigation-v1`): `system_researchable` /
+  `hybrid` のときだけ呼ぶ。候補ファイルの**取得**は `git ls-files`(pin
+  済み commit)に対する決定的キーワード一致(質問文 + `research_focus` を
+  トークン化してパス文字列に部分一致させ、一致数降順・パス昇順でソート)
+  — これはあくまで候補を絞る足切りで、実際に**何が関連するか**の選択と
+  結論は常に reasoning LLM が行う(Principle 6)。読み込みは
+  `git_ops.read_file_at_commit` / `list_tree_entries` のみで、pin 済み
+  commit 以外(作業ツリー・未追跡ファイル)には一切触れない。ファイル書
+  き込み・パッチ・任意のサブプロセス実行・LLM 呼び出し以外のネットワー
+  クはしない(Principle 5・8)。**トークン化とキーワードヒント(レ
+  ビュー指摘修正):** `_keywords()` は ASCII トークン(`[A-Za-z0-9_]+`、
+  従来どおり長さ3以上・ストップワード除外)に加えて CJK(日本語含む)
+  の連続文字列も長さ2以上で抽出する。ただしリポジトリのファイルパス/
+  識別子はほぼ ASCII なので、日本語だけの質問はそれ単独では依然として
+  候補ファイルにほぼマッチしない。そこで Question Router が返す
+  `search_keywords`(ASCII のコード識別子/シンボル名/パス断片の推測、
+  例: 「認証」についての質問 → `["auth", "login", "token", "session"]`)
+  を `investigate()` の追加引数として受け取り、同じ正規表現でトークン化
+  した上で(ただし最小長2・ストップワード除外なし — 明示的なヒントの
+  ため)、質問文/`research_focus` から得たキーワードより**先頭に**連結
+  する。これが無いと、日本語のみの質問は候補ゼロで
+  `status="unresolved"` のまま reasoning LLM 呼び出しに到達できなかった
+  (Issue #286 実装時点のレビュー指摘)。
+- **Response Composer**(`compose_human_only` /
+  `compose_system_researchable` / `compose_hybrid`): reasoning を一切呼
+  ばない決定的な組み立てのみ。文面は固定サーバーテンプレート
+  (`interview_language.py` の `inquiry_human_only_answer` /
+  `inquiry_hybrid_unresolved_note` / `inquiry_hybrid_decision_heading` /
+  `inquiry_hybrid_default_decision_question`)か、reasoning ステップが既
+  に検証済みの出力(Investigation の `conclusion`/`key_points`/
+  `evidence`/`uncertainty`、Router の `reason`)のいずれかであり、ここで
+  新しい文章を作らない。
+
+### Budget(`investigation_agent.InvestigationBudget`)
+
+明示的な有限上限をデータクラスで持ち、`__post_init__` で常にハード上限
+にクランプする(呼び出し側が上書きしても範囲外にはならない):
+
+| フィールド | デフォルト | ハード上限 |
+| --- | --- | --- |
+| `max_files` | 20 | 1–50 |
+| `max_snippet_chars` | 40,000 | 1,000–200,000 |
+| `max_llm_calls` | 3(現状の実装は常に高々1回だけ実際に呼ぶ) | 1–5 |
+| `max_evidence_items` | 10 | 1–20 |
+| `timeout_seconds` | 60 | 1–300 |
+
+- 候補選定は `max_files` 件までしか候補に残さないため、実際に読んだファ
+  イル数(`files_read`)は構造的に `max_files` を超えない。
+- 文字数は候補ファイルを順に読みながら `max_snippet_chars` の残り予算を
+  消費し、1行も収まらないファイルはスキップして次の(より小さい)候補
+  を試す。
+- 経過時間(`time.monotonic()`)がタイムアウトを超えた時点で以降の候補
+  読み込みを打ち切る。
+- 候補が1件も見つからない・タイムアウトで1件も読めなかった場合
+  (`files_read == 0`)は reasoning LLM 呼び出しを一切行わず(予算の節約
+  と「根拠なしからの捏造」防止)、`status="unresolved"` を返す。
+- 予算の使用量(`files_read` / `chars_read` / `llm_calls` /
+  `elapsed_seconds`)は `intelligence_runs` の追加カラム
+  `budget_files_read` / `budget_chars_read` / `budget_llm_calls` /
+  `budget_elapsed_seconds`(すべて additive ALTER、`run_type='investigation'`
+  行のみ設定、他の `run_type` は常に `NULL`)に監査記録する。
+
+### read-only 境界(Principle 5・8)
+
+Investigation Agent はファイル書き込み・パッチ適用・任意コード実行を一
+切行わない。すべての読み込みは pin 済み `commit_sha` に対する
+`git show` / `git ls-tree` 相当(`git_ops.read_file_at_commit` /
+`list_tree_entries`)のみで、作業ツリーの未コミット/未追跡の変更を読む
+経路は存在しない。テストは `git status --porcelain` が調査前後で空のま
+まであることを確認する(`tests/test_investigation_agent.py`)。
+
+### fail-closed のルール(Principle 6・7)
+
+- Question Router: mock クライアント・非 reasoning モデル・API 失敗・構
+  造化出力の検証失敗・`category` が有限集合外、のいずれも `error` を返
+  し、呼び出し元は `intelligence_runs`(`run_type='question_route'`)に
+  失敗行を記録するだけで質問のルーティング結果を確定させない。
+- Investigation Agent: 同様の失敗条件に加えて、`status` が
+  `completed | unresolved` の集合外、`intelligence_runs`
+  (`run_type='investigation'`)は常に記録し、成功時は
+  `intelligence_run_evidence` に実際に読んだ全スニペット(引用されたか
+  どうかに関わらず、Issue #137 のパス1監査パターンを踏襲)を記録する。
+- Evidence の検証: モデルが返した `evidence` は「実際に読んだ excerpt の
+  path・行範囲に収まっているか」を決定的にチェックする。範囲外の引用は
+  「有効な引用が1件以上残るなら破棄して警告付きで続行」
+  (`pruned_evidence` に記録、`uncertainty` にも件数を追記)、「全件が無
+  効なら `status="failed"` で fail-closed」の二択(Issue #142 のパター
+  ンを踏襲しつつ、全滅ケースは新規追加)。
+- 根拠ゼロの `"completed"` を却下する(レビュー指摘修正): 上記の
+  evidence 検証・pruning と `runtime_evidence` の検証(Issue #290)の両方
+  が終わった**後**、`validated.status == "completed"` かつ検証済みの
+  `evidence` と `runtime_evidence` が**両方とも空**であれば、モデルが
+  一切検証可能な根拠を挙げずに完了を主張したということなので、
+  `status` を決定的に `"unresolved"` へ格下げし、固定の英語ノート
+  (`"Model reported completion without any verifiable evidence citation;
+  demoted to unresolved."`)を `uncertainty` に追記する。`evidence` は空
+  でも `runtime_evidence` が有効な値を1件以上持つ場合(コード根拠は無い
+  がランタイム根拠だけで裏付けられている場合)は格下げしない —
+  `"completed"` のまま返す。
+- Inquiry 統合(`generate_inquiry_answer`)は Router の失敗、
+  `system_researchable`/`hybrid` で pin 済み snapshot の
+  `repo_path`/`commit_sha` が無い場合、Investigation の
+  `status="failed"` のいずれでも `error` を伝播し、呼び出し元
+  (`routes/interview_inquiry.py`)は assistant メッセージを一切作成しな
+  い(Inquiry は `open` のまま)。
+
+### カテゴリ別の応答組み立て
+
+- **`human_only`**: Investigation を呼ばない。固定テンプレート
+  (`inquiry_human_only_answer`)で質問文をそのままエコーし、Router の
+  `reason` を「AI 判断根拠」として明示した上でユーザー自身の判断を促
+  す。常に `answerable=true`(「情報不足」ではなく正常な完了状態)。
+- **`system_researchable`**: Investigation の `status="completed"` ならそ
+  の `conclusion`/`key_points`/`evidence`/`uncertainty` をそのまま
+  `answerable=true` で使う。`status="unresolved"` なら `answerable=false`
+  にして、呼び出し元が既存の固定メッセージキー
+  `inquiry_insufficient_information`(Issue #285)に差し替える — Investigation
+  の生の文言を絶対に使わない。
+- **`hybrid`**: 常に `answerable=true`(片方が人間の判断である以上、
+  「情報不足」で全体を差し止めない)。Investigation が完了していればその
+  結論を、未解決なら固定ノート(`inquiry_hybrid_unresolved_note`)を土台
+  にし、末尾に「確認したいこと:」見出し + `decision_question`(モデルが
+  返した検証済みの値、無ければ固定テンプレート
+  `inquiry_hybrid_default_decision_question` で質問文をエコー)を付加す
+  る。`decision_question` は `interview_inquiry_message.detail` にも別
+  フィールドとして保存し、UI が強調表示できるようにする。
+
+### `interview_qa` への単体ルーティング
+
+`POST /interview/qa/{qa_id}/route`(`app/routes/question_router.py`、
+system-scoped)は `interview_qa` の1問を単独でルーティングし、
+`route_category` / `route_run_id`(additive ALTER)に結果を保存する。
+`interview_agent.py` のダイアログターンには一切手を入れていない(スコー
+プを絞る、Issue #286 のブリーフどおり)。当初は Inquiry 内の自動ルーティ
+ングとは完全に独立していたが、後続のレビュー指摘修正(下記「通常の Q&A
+フローへの接続」)で同じ通常フローの一部として、バッチ版のエンドポイン
+トからも(未ルーティングの質問に対して)呼び出されるようになった —
+歴史的経緯として残す。単体エンドポイント自体の挙動(1問だけをルーティ
+ングし、調査は一切行わない)は変わっていない。
+
+### 通常の Q&A フローへの接続(レビュー指摘修正、Finding 1)
+
+Issue #286 実装時点では、Question Router / Investigation Agent は Inquiry
+の会話(上記)からしか自動では呼ばれず、`interview_qa` の通常フローでは
+単体ルーティングエンドポイントが「分類だけして調査しない」ため、実装で
+回答可能な質問がそのままユーザーに丸投げされ、`interview_qa.knowledge_area`
+も通常フローでは常に null のままだった(#291 の対象外グルーピングが弱
+まる)。これを埋めるのが `POST
+/interview/sessions/{session_id}/qa/route-and-investigate`
+(`app/routes/question_router.py`)で、Question Router と Investigation
+Agent を1回のバッチ呼び出しで通常フローに接続する。
+
+- **対象の選定**: 現在行(`superseded_by_id IS NULL AND status = 'open'`)
+  のうち、未ルーティング、または `route_category IN
+  ('system_researchable', 'hybrid')` かつ未調査
+  (`investigation_run_id IS NULL`)の質問を `id` 昇順に最大10件
+  (`MAX_BATCH_QUESTIONS`、決定的な定数)まで処理する。超過分は
+  `counts.skipped_cap` に計上され、次回呼び出しで続きから処理される。
+- **fail-closed はリクエスト全体ではなく質問単位(Principle 6/7)**:
+  設定ゲート(mock クライアント・非 reasoning モデル)だけはバッチ全体
+  の前提なので、呼び出しの最初に1回だけチェックし、失敗時は
+  1行も書き換えずに 502(単体エンドポイントと同じ
+  `question_route_failed` 形状)を返す。個別の質問のルーティング失敗・
+  調査失敗はそれぞれ失敗した `intelligence_runs` 監査行だけを残してその
+  質問を未処理のまま次の質問へ進む — 1問の失敗がバッチ全体を中断しない。
+- **永続化ヘルパーの共有**: `app/investigation_persistence.py`
+  (`persist_route_run` / `persist_investigation_run`)に
+  `routes/interview_inquiry.py` の元実装を抽出し、単体ルーティングエン
+  ドポイント・バッチエンドポイント・Inquiry フローの3箇所が同じ
+  `intelligence_runs` / `intelligence_run_evidence` 書き込みコードを共有
+  する(重複実装しない)。
+- **`interview_qa` への調査結果の永続化(additive)**:
+  `investigation_run_id`(`intelligence_runs` 参照)/
+  `investigation_json`(`{status, conclusion, key_points, evidence,
+  uncertainty, confidence, decision_question}` の JSON、Inquiry の
+  `InvestigationResult` と同じ形)。調査が `status="failed"` の場合は両方
+  とも `NULL` のまま(監査行だけ残る)。回答の訂正(`answer_interview_qa`
+  の correction 経路)は `runtime_evidence` と同様、この2列も新しいリビ
+  ジョン行へ引き継ぐ。
+- **調査は絶対に回答を確定しない**: このエンドポイントは
+  `answer_text`/`status`/`answered_by` を一切書き込まない。調査結果は
+  「レビューする材料」であって「回答」ではない(#286 受け入れ基準
+  「調査完了だけで元のユーザー回答が確定しない」、#284 の「AI 提案は自
+  動確定しない」と同じ原則)。ユーザーは Dashboard の「調査結果を回答欄
+  に転記」ボタンで結論をテキストエリアへコピーできるが、これは送信しな
+  い — 既存の回答エンドポイントを明示的に呼ぶまで何も確定しない。
+- **`models.py`**: `InterviewQaOut.investigation:
+  Optional[InterviewQaInvestigationOut]`(永続化済みの調査結果を
+  `_qa_out` が組み立てる)、`InterviewQaRouteInvestigateBatchOut`
+  (`results: [{qa_id, route_category, knowledge_area,
+  investigation_status, error}]` + `counts: {routed, investigated, failed,
+  skipped_cap}`)を additive に追加。
+
+### Dashboard(バッチ接続)
+
+`pages/interview.tsx` の Q&A パネルヘッダーに「AIに先に調査させる」ボタ
+ン(未回答の質問が1件以上あるときだけ表示、成功時に「分類 n 件・調査 n
+件が完了しました」という日本語トーストを表示)を追加した。各質問カード
+は `route_category` を(`inquiry-panel.tsx` の
+`ROUTE_CATEGORY_LABELS` を再エクスポートして再利用した)同じ日本語ラベ
+ルのバッジで表示し、`investigation` があれば結論を「AIの調査結果: …」
+として強調表示し、`key_points` を箇条書き、`hybrid` なら
+「確認したいこと: …」を強調表示し、「根拠を見る」で evidence/uncertainty
+を折りたたみ表示する(いずれも Inquiry パネルの表示パターンを踏襲)。
+`status === "unresolved"` のときは結論ブロックの代わりに「AIの調査では
+特定できませんでした」という控えめな注記だけを出す。「調査結果を回答欄
+に転記」ボタンは回答用テキストエリアに結論を書き込むだけで、送信は一切
+行わない。raw な enum はどこにも出さない(Issue #266)。
+
+### テーブル/スキーマ変更(additive)
+
+- `interview_qa`: `route_category TEXT NULL` / `route_run_id INTEGER NULL
+  REFERENCES intelligence_runs(id) ON DELETE SET NULL`。
+- `intelligence_runs`: `budget_files_read` / `budget_chars_read` /
+  `budget_llm_calls INTEGER NULL` / `budget_elapsed_seconds REAL NULL`
+  (`run_type='investigation'` のみ設定)。`run_type` の有限集合に
+  `question_route` / `investigation` / `inquiry_answer`(#285 時点で未登
+  録だったものを今回追加)を追加。
+- `interview_inquiry_message.detail` に `route_category` /
+  `decision_question`(どちらも optional、旧行は `null`)を追加。
+- (レビュー指摘修正、Finding 1)`interview_qa`: `investigation_run_id
+  INTEGER NULL REFERENCES intelligence_runs(id) ON DELETE SET NULL` /
+  `investigation_json TEXT NULL`(`runtime_evidence` と同じ JSON カラム
+  の慣習)。バッチ route-and-investigate エンドポイントだけが書き込み、
+  調査失敗時は両方とも `NULL` のまま。
+
+### UI(`components/system-understanding/inquiry-panel.tsx`)
+
+assistant メッセージの先頭行に、`detail.route_category` を日本語ラベル
+に変換したバッジを表示する(Issue #266 規約: canonical enum は英語のま
+ま保持し、画面には出さない):
+`system_researchable` → 「AI が調査して回答」、`human_only` →
+「あなたの判断が必要」、`hybrid` → 「調査 + あなたの判断」。`hybrid` の
+`decision_question` は「確認したいこと: …」として、結論本文の直後(「根
+拠を見る」の展開を待たず)に強調表示する。コンポーネントテストは
+`tests/__tests__/inquiry-panel.test.tsx` の `route category badge` 節
+(バッジのラベルマッピングと raw な enum 文字列が画面に出ないことを確
+認)。
+
+### テスト
+
+- `tests/test_question_router.py`: 各カテゴリのパース、`human_only` で
+  `research_focus` が強制的に `null` になること、mock/非 reasoning モデ
+  ル/API 失敗/不正 JSON/カテゴリ外の値それぞれの fail-closed、
+  `POST /interview/qa/{qa_id}/route` の永続化・失敗時の未ルーティング維
+  持・System 分離。加えて(レビュー指摘修正)`question-router-v3` への
+  バンプ、`search_keywords` のパース、`human_only` で強制的に `[]` に
+  なること、フィールド省略時に `[]` にデフォルトすること(後方互換)。
+  さらに(Finding 1)バッチエンドポイント
+  `POST /interview/sessions/{id}/qa/route-and-investigate` を追加テスト:
+  未ルーティングの質問をルーティングし `knowledge_area` を永続化するこ
+  と、fake reasoning クライアントで `system_researchable`/`hybrid` を調
+  査し `investigation_json` + budget カラム付きの完了 `investigation`
+  行 + evidence 行を永続化すること、1問のルーティング失敗がバッチを中
+  断しないこと、調査失敗は `investigation_json`/`investigation_run_id`
+  を `NULL` のまま失敗行だけ残すこと、`human_only` は調査されないこと、
+  `answer_text`/`status`/`answered_by` を一切書き換えないこと、10件の
+  上限、System 分離(他 System のセッションは 404・行は無変更)、
+  mock 設定時は 502 かつ1行も変更されないこと。
+- `tests/test_investigation_agent.py`: pin 済み snapshot のみを読むこと
+  (未コミット/新規ファイルが結果に一切現れない)、budget 上限の遵守
+  (`files_read <= max_files`、文字数予算の枯渇、タイムアウトで
+  `status="unresolved"` かつ LLM 呼び出しゼロ)、read-only 境界
+  (`git status --porcelain` が空のまま)、evidence の破棄/全滅
+  fail-closed、hybrid の `decision_question` 伝播、監査メタデータ
+  (`prompt_version`/`schema_version`/`llm_calls`/`elapsed_seconds`)。加え
+  て(レビュー指摘修正)`_keywords()` が日本語質問から CJK トークンを抽
+  出すること、日本語の質問 + Router の `search_keywords=["auth", ...]`
+  が(フィクスチャの `auth.py` のような)候補ファイルを選択・読み込める
+  こと(ヒント無しでは候補ゼロで `unresolved` のままであることも回帰確
+  認として対比)、`status="completed"` かつ evidence/runtime_evidence が
+  両方空のとき `"unresolved"` へ格下げされ固定ノートが付き
+  `status="completed"` を一切報告しないこと、有効な
+  `runtime_evidence` のみで裏付けられた `"completed"` は格下げされずそ
+  のまま維持されること。
+- `tests/test_interview_inquiry.py`: Issue #286 のオーケストレーション単
+  体テスト(3カテゴリそれぞれの経路、investigation 失敗時の fail-closed、
+  pin 済み snapshot が無い場合の fail-closed)を追加しつつ、Issue #285
+  のライフサイクル/遷移テスト(30件、`generate_inquiry_answer` を丸ごと
+  スタブする方式)はそのまま維持した(`investigate()` へのシグネチャ追
+  加は additive/optional のため無改修で green のまま)。
+
+## Alignment Review / Review Queue(Issue #287)
+
+Intent Brief(確定/提案済みの意図、Issue #284)と、証拠付きの「現在の理
+解」(最新の `understanding_revision`、Issue #136)を突き合わせ、
+**alignment item**(突き合わせ結果1件)を生成する。各 item は
+reasoning モデルが提案した内容(claim・evidence・alignment_state・
+risk_flags・confidence など)と、そこから **決定的に** 導出される
+review_category/reason_code を持つ。Review Queue には
+`must_review`/`batch_reviewable` の item だけが「要対応」として現れ、
+残りは折りたたみ表示にとどまる。さらに(レビュー指摘修正)
+`status IN ('answered', 'corrected')` の終端行と `superseded = 1` の行
+は、たとえ `review_category` が `must_review`/`batch_reviewable` のまま
+でも Review Queue には一切現れない — 「action required の item だけが
+Review Queue の主導線に現れる」という #287 の受け入れ基準どおり、回答
+済み/修正済みの行は履歴として残るだけで、二度とアクションカードになら
+ない。
+
+### テーブル(additive): `alignment_item`
+
+| カラム | 型 | 説明 |
+| --- | --- | --- |
+| `id` | INTEGER PK | |
+| `session_id` / `system_id` | INTEGER NOT NULL | System-scoped、`interview_session` に紐づく |
+| `revision_id` | INTEGER NULL | この item を計算した基準の `understanding_revision` |
+| `snapshot_id` | INTEGER NOT NULL | `revision_id` が指すスナップショット |
+| `intent_item_id` | INTEGER NULL | 関連する `interview_intent_item`(構造的に解決。下記参照) |
+| `intent_summary` | TEXT NULL | reasoning モデルが付けた意図側の短い要約(表示専用) |
+| `current_claim` | TEXT NOT NULL | 「現在の理解」側のクレーム本文 |
+| `current_evidence` | TEXT NOT NULL (JSON) | `[{path,start_line,end_line,summary}]`。pin 済みスナップショットに対して検証済み |
+| `gap_summary` / `proposed_interpretation` | TEXT NULL | |
+| `alignment_state` | TEXT NOT NULL | `aligned\|gap\|unknown\|conflict\|not_applicable` |
+| `risk_flags` | TEXT NOT NULL (JSON) DEFAULT `[]` | 有限集合 `security\|high_risk\|core_intent` の部分集合 |
+| `confidence` | TEXT NOT NULL | `confirmed\|likely\|uncertain\|conflicting`(既存の水準を再利用) |
+| `review_category` | TEXT NOT NULL | `must_review\|batch_reviewable\|no_review_required\|unchanged\|informational` |
+| `reason_code` | TEXT NOT NULL | 下記ルール表参照 |
+| `user_reason` | TEXT NOT NULL | `reason_code` ごとの固定日本語テンプレート(LLM 自由文ではない) |
+| `status` | TEXT NOT NULL DEFAULT `'open'` | `open\|answered\|corrected\|held\|inquiry` |
+| `user_decision` | TEXT NULL (JSON) | `{action, note, decided_at, decided_by}`。サーバーは絶対に自動セットしない |
+| `superseded` | INTEGER NOT NULL DEFAULT 0 | additive(レビュー指摘修正)。再ビルド時点で終端状態(`answered`/`corrected`)だった行に `1` を立て、同じ突き合わせ対象の新しい行と区別する履歴フラグ。既存行は 0 にバックフィルされる |
+| `intelligence_run_id` | INTEGER NOT NULL | この item を生成した `intelligence_runs` 行 |
+| `is_mock` | INTEGER DEFAULT 0 | |
+| `created_at` / `updated_at` | REAL NOT NULL | |
+
+`unchanged` は将来のビルド間差分検出(前回ビルドと同一内容)のために予
+約された値で、現時点のルール表からは到達しない(#287 の決定的ルール表
+は brief の記述どおり実装されており、`unchanged` を出力する分岐を持た
+ない)。Dashboard 側は未知/未到達の値でも折りたたみ扱いに倒すため、実
+装上の問題にはならない。
+
+### 生成(`app/alignment.py`)
+
+`build_alignment`(実体は `routes/interview_alignment.py` の
+`POST .../alignment/build` ハンドラ。DB オーケストレーションはルート層、
+reasoning 呼び出しと決定的検証は `app/alignment.py` という、Issue
+#284/#285 と同じ責務分割)は次の手順で動く:
+
+1. セッションの現在(`superseded_by_id IS NULL`)の Intent Brief item 全
+   件と、最新の `understanding_revision`(`current_understanding` /
+   `gap_analysis`)を読み込む。`understanding_revision` が1件も無い場合
+   は 409(reasoning 呼び出しは一切行わず、`intelligence_runs` 行も作ら
+   ない — 「先に System Understanding を構築してください」という前提条
+   件の欠落であり、reasoning の失敗ではないため)。
+2. reasoning モデル(`generate_alignment_proposal`、`prompt_version`/
+   `schema_version` = `alignment-v1`、run_type
+   `alignment_build`)が alignment item 候補を提案する:
+   `{items: [{intent_field, intent_ref_hint, current_claim, evidence[],
+   alignment_state, risk_flags, confidence, gap_summary,
+   proposed_interpretation}]}`。`alignment_state`/`confidence`/
+   `risk_flags`/`intent_field` はすべて有限集合に対してスキーマ検証さ
+   れ、外れた値が1つでもあればビルド全体を fail-closed する(Issue
+   #286 の Question Router と同じ扱い)。
+   - `intent_item_id` はモデルの自由文からは決めない。モデルが返すのは
+     `intent_field`(6値の enum、または関連する意図が無ければ `null`)
+     だけで、実際の `interview_intent_item.id` への解決はサーバー側で
+     「そのセッションの、その `field` の現在(非supersede)行」への完
+     全一致検索という決定的な構造チェックで行う(Principle 6 — 自由文
+     の fuzzy match は一切しない)。
+3. `evidence` は Issue #286 の Investigation Agent と同じ規律で pin 済
+   みスナップショットに対して検証する: path がそのコミットに存在し、
+   `1 <= start_line <= end_line <= (そのファイルの実際の行数)` を満た
+   すことを `git_ops.read_file_at_commit` で確認する(決定的、reasoning
+   ではない)。無効な evidence は item から取り除かれる(記録される)。
+   取り除いた結果その item の evidence が0件になった item はその item
+   ごと破棄する。**モデルが1件以上の item を提案したにもかかわらず、
+   有効な item が1件も残らなかった場合はビルド全体を fail-closed する**
+   (「有効な引用が0件なら失敗」の単位を、Issue #286 の1メッセージ単位
+   ではなく、このビルド1回の単位に広げたもの)。モデルが最初から
+   `items: []` を返した場合(比較する新事実が無い、という結論)は失敗
+   ではない。
+4. `review_category` + `reason_code` は前段の**決定的な**ルール表
+   (`app/alignment.py` の `_RULES`、先勝ちのデータ列で実装)から導出す
+   る。数値スコアの合算や LLM による並べ替えは一切行わない:
+
+   ```
+   'security' in risk_flags                                          -> must_review, security_related
+   'high_risk' in risk_flags                                         -> must_review, high_risk
+   'core_intent' in risk_flags OR (intent_field == 'goal' AND
+       alignment_state in (gap, conflict))                           -> must_review, core_intent
+   alignment_state == 'conflict'                                     -> must_review, conflict_detected
+   confidence in (uncertain, conflicting)                            -> must_review, low_confidence
+   alignment_state == 'unknown'                                      -> must_review, low_confidence
+   alignment_state == 'gap'                                          -> batch_reviewable, routine_update
+   alignment_state == 'aligned'                                      -> no_review_required, no_change
+   alignment_state == 'not_applicable'                               -> informational, informational_only
+   ```
+
+   有効な `alignment_state`(5値)は必ずこの表のどれか1行に一致する
+   (先勝ち)ため、スキーマ検証済みの入力に対してこの関数が例外を投げる
+   ことはない。`user_reason` は `reason_code` ごとの固定辞書
+   (`USER_REASON_TEMPLATES`)からそのまま引く(例:
+   `security_related` → 「セキュリティに関わるため個別確認が必要です」)。
+
+5. **キューの並び順**は `review_sort_key` によって決定的に決まる:
+   `(review_category のランク, reason_code のランク, id 昇順)`。ランク
+   は `REVIEW_CATEGORIES`/`REASON_CODES` タプルの並び順(must_review が
+   最優先、reason_code は `security_related < high_risk < core_intent <
+   conflict_detected < low_confidence < runtime_mismatch <
+   routine_update < no_change < informational_only`)そのもの。LLM によ
+   る並べ替えや数値スコアの掛け算は一切しない。
+
+### 再ビルド(rebuild-merge)のルール
+
+`POST .../alignment/build` を再度呼ぶと、そのセッションの
+`status = 'open' AND user_decision IS NULL` の行だけを **削除して作り直
+す**(未対応・ユーザー操作が一切入っていない提案のみが対象)。それ以外
+の行 —`answered`/`corrected`/`held`/`inquiry` のいずれか、または
+`user_decision` が記録済み — は、基準リビジョンがどれだけ新しくなって
+も再ビルドで削除・上書きされない(Principle 2: 再ビルドが人間の決定を
+失わせてはならない)。この非対称性はテーブルコメントと
+`tests/test_interview_alignment.py` の
+`test_rebuild_preserves_items_with_user_progress_and_refreshes_untouched_open`
+/ `test_held_item_is_also_preserved_across_rebuild` で固定化している。
+
+**superseded マーキング(レビュー指摘修正):** 上記で削除されずに残る
+行のうち終端状態(`answered`/`corrected`)のものだけを、新しい行を挿入
+する**前**に `superseded = 1` へ更新する(`held`/`inquiry` は対象外 —
+まだ進行中で「現在の行」であり続ける)。
+これにより、同じ突き合わせ対象について再ビルド後は「新しい未対応行
+(`superseded = 0`)」と「古い回答済み/修正済み行(`superseded = 1`、履
+歴)」が共存しても、後者が二度と Review Queue のアクションカードとして
+復活しない(削除ベースの merge だけでは、行そのものは残っても
+`review_category` が `must_review`/`batch_reviewable` のままだと再度
+アクションカードに見えてしまっていた回帰)。
+
+### ルート(`routes/interview_alignment.py`、`main.py` に登録)
+
+- `POST /interview/sessions/{id}/alignment/build` — 上記の生成 + 再ビル
+  ド。前提条件欠落は 409、reasoning/検証の失敗は 502(いずれも
+  `alignment_item` 行は一切変更されない)。
+- `GET /interview/sessions/{id}/alignment` — 全 item を `review_category`
+  ごとにグルーピングして返す(`items_by_category` + `counts`)。
+- `GET /interview/sessions/{id}/review-queue` — `must_review` /
+  `batch_reviewable` の item だけを `review_sort_key` の順で返す。
+  さらに(レビュー指摘修正)`status NOT IN ('answered', 'corrected')`
+  と `superseded = 0` を条件に加える —
+  終端状態(回答済み/修正済み)の行と、再ビルドで履歴化された行は、
+  `review_category` が `must_review`/`batch_reviewable` のままであって
+  も二度とこのキューに現れない。`held`/`inquiry` はここでは除外しない
+  (`held` は一時停止であって対応不要ではなく、`inquiry` はダッシュボー
+  ドが「疑問を確認中」としてブロック表示する対象であり、いずれも「まだ
+  action が必要」な状態のため)。
+- `POST /interview/alignment/{item_id}/answer` —
+  `{decision: accept_current|needs_change|reject_interpretation, note?}`。
+  `status='answered'` + `user_decision` を記録する(`decision_method` は
+  常に人間の明示操作、Principle 2)。
+- `POST /interview/alignment/{item_id}/correct` —
+  `{corrected_interpretation}`。`status='corrected'`。
+- `POST /interview/alignment/{item_id}/hold` — `status='held'`。
+- 上記3エンドポイントは、対象 item の `status == 'inquiry'`(下記)の
+  間は 409 で拒否する — 疑問を解消してから回答させるため。
+- サーバーが `user_decision` を自動でセットする経路は存在しない
+  (`test_build_never_auto_sets_user_decision` で固定化)。
+
+### Inquiry 統合(Issue #285 の `origin_kind='review_item'` 拡張)
+
+`routes/interview_inquiry.py` の `_validate_origin_exists` は
+`review_item` を受け取ると `alignment_item` の実在を確認するようになっ
+た(存在しなければ 404 — Issue #285/#286 時点の「テーブルが無いので存
+在チェックをスキップする」プレースホルダ挙動から変更)。
+
+`review_item` は qa/intent と異なり、Inquiry の開閉が origin の
+`alignment_item.status` に反映される唯一のケースとして明示的に許容され
+ている(Principle 2 の「origin テーブルを書き換えない」という原則の中
+での、ドキュメント化された例外— 変更するのは `status` だけで、
+`user_decision` には一切触れない):
+
+- Inquiry を作成した瞬間、対象 `alignment_item.status` を `'inquiry'`
+  にする。
+- Inquiry が **閉じる**(`resolved`/`unresolved`/`cancelled` —
+  `_CLOSED_STATUSES` をそのまま再利用)と `'open'` に戻す。**
+  `'answered'` には絶対にしない** — 開発者は改めて `/answer` 等を明示
+  的に呼ぶ必要がある(brief が明示するリグレッションテスト:
+  `test_review_item_inquiry_resolve_sets_item_back_to_open_not_answered`)。
+  ただし(レビュー指摘修正)`'open'` へ戻すのは、同じ origin
+  (session_id/system_id/origin_kind/origin_id)に対する**他の** Inquiry
+  が `status IN ('open', 'held')` で一切残っていない場合に限る — 同一
+  origin に対する Inquiry は作成時点で1件までに制限した(上記
+  `POST /interview/sessions/{id}/inquiries` の 409
+  `inquiry_already_active`)ので通常は発生しないが、この修正より前に作
+  られた重複行が万一残っていた場合の defense in depth として、
+  `_apply_transition` は閉じる直前に同一 origin の他の活性 Inquiry の
+  有無を確認してから `alignment_item.status` を戻す。
+- `held`(一時停止であって終了ではない)は対象外: Inquiry が再開待ちの
+  間、item は `'inquiry'` のままブロックされ続ける
+  (`test_review_item_inquiry_held_keeps_item_status_inquiry`)。
+
+### Dashboard(`components/system-understanding/review-queue.tsx`)
+
+interview ページに新設した Review Queue パネル:
+
+- `must_review`/`batch_reviewable` の item だけをアクションカードとして
+  表示する(意図/現状/ギャップの短い対比 + `user_reason` バッジ +
+  「根拠を見る」でパス:行番号とスナップショット参照を展開)。
+- `no_review_required`/`unchanged`/`informational` は「対応不要の項目
+  (n)」という折りたたみセクションの中にだけ表示し、アクションボタンは
+  一切持たない。
+- `must_review` の item は破壊的トーンの枠線 + 「要確認」バッジ(色だ
+  けに依存せず `sr-only` テキストも付与)で視覚的に区別する。
+- 「疑問がある」は既存の `InquiryPanel`(Issue #285)を
+  `origin_kind="review_item"` でそのまま再利用する。`status='inquiry'`
+  の間、回答/修正/保留ボタンは非表示になり、代わりに「疑問を確認中で
+  す」という案内を出す。
+- canonical enum(`alignment_state`/`risk_flags`)は本ファイル内の単一
+  マッピングテーブルのみを通して日本語ラベルに変換する。
+- `superseded`(レビュー指摘修正): `GET .../review-queue` は既に
+  `superseded = 1` の行を返さないためアクションカード側の対応は不要だ
+  が、`GET .../alignment` の全件リスト(折りたたみ「対応不要の項目」な
+  ど)は `review_category` 単位のグルーピングをそのまま流用しているた
+  め、履歴化された行が理論上そこに混ざりうる。`InformationalItemRow` は
+  `item.superseded` が真のとき「履歴」バッジを1つ追加するだけの最小限
+  の対応にとどめ、除外はしない(監査性を優先し、is_mock バッジと同じ
+  「隠さず可視化する」方針)。
+
+### テスト
+
+- `tests/test_interview_alignment.py`: ルール表の全分岐を網羅する
+  table-driven テスト + 決定性の確認、must_review リグレッション集合
+  (security/high_risk/core_intent/conflict/unknown/uncertain)、
+  `review_sort_key` の固定フィクスチャによる並び順契約テスト、
+  `generate_alignment_proposal` の fail-closed(mock/非 reasoning モデ
+  ル/API 失敗/不正 JSON/有限集合外の値それぞれ)、
+  `validate_evidence_against_snapshot` の実 git フィクスチャ検証、ビル
+  ド API の 409(前提条件欠落)/502(reasoning 失敗・全 evidence 無効)、
+  再ビルドの保護/更新境界、review-queue のフィルタ+順序、
+  answer/correct/hold、`user_decision` 自動セット無し、review_item
+  Inquiry の実ビルド経由エンドツーエンド往復、System 分離。加えて(レ
+  ビュー指摘修正)answered/corrected 項目が review-queue から消えるこ
+  と(held/inquiry は残ること)、再ビルドで終端行が `superseded=1` にな
+  り review-queue から消える一方で新しい代替行(`superseded=0`)がちょ
+  うど1件だけ現れること、held/inquiry の保持行は再ビルドを跨いでも
+  `superseded=0` のままであること、`superseded` 列についても System 分
+  離が保たれること、`superseded` 列の追加マイグレーションで既存行が0に
+  バックフィルされること。
+- `tests/test_interview_inquiry.py`: `review_item` の存在チェック(未知
+  の id は 404 に変更)、Inquiry 開始で `alignment_item.status` が
+  `'inquiry'` になること、resolve/cancel/unresolved で `'open'` に戻る
+  こと(`'answered'` にはならないこと)、hold では `'inquiry'` のまま
+  であること、`status='inquiry'` の間は `/answer` が 409 で拒否される
+  こと。加えて(レビュー指摘修正)同一 origin への2件目の Inquiry 作成
+  が `open`/`held` いずれの場合も 409
+  `inquiry_already_active` になること、最初の Inquiry が閉じた後は再度
+  作成できること、origin が異なれば影響しないこと、SQL で直接2件の活
+  性 Inquiry を仕込んだ場合(修正前データのシミュレーション)に1件目
+  を閉じても `alignment_item.status='inquiry'` のままで、最後の1件を閉
+  じて初めて `'open'` に戻ること。
+- Dashboard: `src/__tests__/review-queue-panel.test.tsx`(アクションカ
+  ードが actionable なカテゴリだけに出ること、informational が折りた
+  たまれ操作を持たないこと、`status='inquiry'` でアクションが隠れるこ
+  と、raw enum が画面に出ないこと、answer/hold/build 各アクションが対
+  応する API を呼ぶこと)。加えて(レビュー指摘修正)`superseded=true`
+  の informational 行にだけ「履歴」バッジが表示され、通常の行には表示
+  されないこと。
+
+## 回答バッチ後の自動更新(Issue #288)
+
+Q&A 回答 / Intent の confirm・correct・decline / Alignment の
+answer・correct のいずれかが保存された直後、手動の「理解を更新」を押さ
+なくても、入力種別に応じて Understanding を再構築し、Alignment /
+Review Queue を自動で最新化する。
+保存済みの回答を失わないこと(Principle 1)、冪等であること、古い(=
+実行順序が入れ替わって後から書き込もうとした)結果が新しい結果を上書き
+しないことを満たす。
+
+### テーブル(additive): `interview_refresh_job`
+
+| カラム | 型 | 説明 |
+| --- | --- | --- |
+| `id` | INTEGER PK | |
+| `session_id` / `system_id` | INTEGER NOT NULL | System-scoped、`interview_session` に紐づく |
+| `trigger_kind` | TEXT NOT NULL | `qa_answer\|intent_update\|alignment_answer\|nl_change_set`(`nl_change_set` は #289 が使う予約値。本 issue では発行しない) |
+| `base_revision_id` | INTEGER NULL | enqueue 時点の最新 `understanding_revision.id`(まだ無ければ NULL) |
+| `base_answer_marker` | REAL NOT NULL | enqueue 時刻(このトリガー入力のデデュープキー) |
+| `status` | TEXT NOT NULL DEFAULT `'pending'` | `pending\|updating\|updated\|failed\|stale` |
+| `error` | TEXT NULL | `failed` 時は失敗理由、`updated`/`stale` 時は固定の日本語注記(何もすることがなかった/より新しい結果に破棄された)。LLM 自由文ではない |
+| `intelligence_run_id` | INTEGER NULL | この job が生成した `understanding_review` の `intelligence_runs` 行 |
+| `result_revision_id` | INTEGER NULL | この job が生成した `understanding_revision.id` |
+| `created_at` / `started_at` / `finished_at` | REAL | |
+
+インデックス: `(session_id, id DESC)` / `(system_id, session_id)`。
+
+### オーケストレーション(`app/interview_refresh.py`)
+
+- `request_refresh(session_id, system_id, trigger_kind)`: 回答/決定の
+  コミットが**完了した後**に呼ぶ(回答の永続化成功と自動更新の成否を結
+  合しない、Principle 1)。デデュープ規則:
+  - そのセッションに `pending` job が既にあれば、新しい行は作らない
+    (既存の `pending` job が実行される時点で、その時点までに保存され
+    ているすべての回答を拾う — 束ねられたバッチ)。必要処理を失わない
+    よう trigger は `alignment_answer > qa_answer >
+    intent_update/nl_change_set` の順に昇格する。
+  - `updating` job があり `pending` が無ければ、`pending` job を1件だ
+    け作る(実行中の job には今回のトリガーが間に合わないため)。
+  - どちらも無ければ `pending` job を作って即座にディスパッチする。
+  - 結果として、1セッションにつき常に「`pending` 高々1件 + `updating`
+    高々1件」までしか積み上がらない(連続した回答が revision の乱発を
+    生まない)。
+- `run_refresh_job(job_id)`:
+  1. セッションと同じ `session_id` に紐づく in-process lock
+     (`_lock_for_session`)を取得し、このセッションの job 実行を直列化
+     する。
+  2. job が `pending` でなければ即座に no-op で返る(同じ job を2回実
+     行しても2回目は何もしない — 冪等性)。
+  3. 「このセッションで、より新しい(`id` が大きい)job が既に
+     `updated` で完了している」場合は、この job を `status='stale'` に
+     し、何も書き込まずに返る(実行順序が入れ替わって古い job が後から
+     動いても、新しい結果を上書きしない)。
+  4. `qa_answer` だけは `_understanding_update_blocked` が真(確定済み
+     で新しい Q&A が無い)なら再構築をスキップし、
+     `status='updated'` + 固定注記で終える。`alignment_answer` は Q&A
+     watermark と別の人間入力なので gate を迂回する。
+  5. `qa_answer` / `alignment_answer` は
+     `routes/interview._rebuild_understanding` を呼ぶ
+     (`update_interview_understanding` と同じ reasoning・永続化コード)。
+     `intent_update` は desired state のみ、`nl_change_set` は選択された
+     revision edit を永続化済みなので Understanding を再生成せず、
+     最新 revision をそのまま次の Alignment build に渡す。rebuild が
+     失敗すれば `status='failed'` + エラー内容 + reasoning run id を
+     記録して終了し、保存済み回答は変更しない。
+  6. 成功したら続けて `routes/interview_alignment.run_alignment_build`
+     を呼ぶ(`POST .../alignment/build` と同じコードパス)。Alignment
+     側の失敗は Understanding の成功を無効化しない — job は `updated`
+     のまま、`error` に Alignment 失敗のメモを残す(Understanding は既
+     に永続化済みであり、それを握りつぶして `failed` にする方が
+     Principle 1 に反するため)。
+  7. job の `intelligence_run_id`/`result_revision_id` を記録して
+     `status='updated'` で終える。この2列と `understanding_revision`
+     の `intelligence_run_id` を辿ることで job → intelligence_run →
+     revision の監査系列が常に問い合わせ可能(Principle 7)。
+  8. `run_refresh_job` はこの job を終えた後、同じセッションに
+     `pending` job が残っていればそれを続けて実行する(ドレイン)。バ
+     ックグラウンドスレッド1本の中で完結するため、追加のディスパッチ
+     やポーリングを別途必要としない。
+
+現在の実装は「セッション単位の直列実行」を in-process lock で保証して
+いる前提で、`stale` 判定を job 開始前の1回のチェックに単純化している
+(ブリーフが示す「reasoning 呼び出し後・書き込み前」の再チェックまでは
+実装していない)。`db.get_conn()` がプロセス全体で単一のグローバルロッ
+クを介して DB アクセスを直列化する既存設計のもとでは、同一セッション
+の2 job が本当に同時に書き込むことは構造的に起こり得ないため、この単
+純化は安全側に倒れている。
+
+### 実行モデル・eager モード
+
+`system_understanding_jobs.py` の「バックグラウンドスレッドで実行し、
+状態は DB 行に永続化する」という既存パターンに倣う。ただし #288 の
+job は単一ステップなので、専用のステップ/ハートビート/キャンセルの仕
+組みは持たない(必要になれば #109 のパターンへ寄せる余地を残す)。
+
+環境変数 `PROBE_REFRESH_EAGER`(デフォルト `0`/`false`)を `1` にする
+と、`request_refresh` がディスパッチする最初の job をバックグラウンド
+スレッドではなく呼び出し元のスレッドで同期的に実行する。テストで決定
+的にアサーションするための切り替えで、`tests/test_interview_refresh.py`
+がテストごとに `monkeypatch.setenv("PROBE_REFRESH_EAGER", "1")` してい
+る。
+
+### ルート(`routes/interview_refresh.py`、`main.py` に登録)
+
+- `GET /interview/sessions/{id}/refresh-status` — `{latest_job: {status,
+  trigger_kind, error, created_at, finished_at, result_revision_id, ...},
+  pending_count}`。Dashboard のステータスチップが参照する。
+- `POST /interview/sessions/{id}/refresh-jobs/{job_id}/retry` —
+  `failed` の job だけを再試行できる(それ以外は 409)。既存の手動
+  「理解を更新」エンドポイントと同様、障害復旧・診断用の明示操作。
+  内部的には `request_refresh` と同じデデュープ経路を通る新しい
+  `pending` job を発行する(失敗した行自体は書き換えない — 監査履歴と
+  して残す)。
+
+既存の手動「理解を更新」(`POST .../update-understanding`)はそのまま
+残る(障害復旧・診断用)。その内部実装は本 issue で
+`routes/interview._rebuild_understanding` として抽出し、409 ゲート
+(`_understanding_update_blocked`)を持つのはこのエンドポイントだけ、
+という既存の契約はそのまま維持している。
+
+### Dashboard
+
+- `RefreshStatusChip`(`components/system-understanding/refresh-status-chip.tsx`)
+  を「現在の理解」カードと「レビューキュー」カードの両方のヘッダーに表
+  示する。`pending|updating|updated|failed|stale` を
+  「更新待ち…/更新中…/更新済み/更新に失敗しました/古い結果を破棄しま
+  した」に日本語マップし(Issue #266 の規約どおりクライアント側の固定
+  マッピング)、`failed` のときだけ「再試行」ボタンを表示する。
+  `useRefreshStatus` は job が `pending`/`updating` の間だけ2秒間隔で
+  ポーリングし、回答/決定の各 mutation フックは成功時にこのクエリを直
+  接無効化する(ポーリングの次の tick を待たずに反映するため)。
+- 「理解を更新」ボタンは残すが、二次的な操作(`variant="ghost"`)に位
+  置づけ、カード説明文に「通常は回答後に自動で更新されます」という補
+  足を添える。回答後に押す必要がある、という UI 上の要求は取り除いた。
+
+### テスト
+
+- `tests/test_interview_refresh.py`: 回答 → job 実行 → 新 revision +
+  Alignment 再構築 + `refresh-status` 反映のエンドツーエンド(eager
+  モード)、reasoning 失敗時も回答自体は残ること + 失敗 job の retry が
+  回復すること、`updating` 中の複数回トリガーが `pending` 1件までしか
+  積まないこと、古い job が新しい job の後に実行されると `stale` にな
+  り revision を上書きしないこと、同じ job の2回実行が冪等であること
+  (revision/alignment_item が重複しないこと)、Alignment が生成した
+  `must_review` item が Review Queue に現れること、job →
+  intelligence_run → revision の監査系列が辿れること(prompt/schema
+  version の契約チェック込み)、2スレッドが同じ job を同時に実行して
+  も再構築が1回しか起きないこと、確定済みで新しい回答が無いときは
+  rebuild をスキップして `updated` + 注記になること。
+- Dashboard: `src/__tests__/refresh-status-chip.test.tsx`(job が無け
+  れば何も出さないこと、各 status の日本語ラベル、`failed` のときだけ
+  再試行ボタンが出て retry API を呼ぶこと)。
+
+## 自然文一括修正(Issue #289)
+
+開発者が複数の理解項目にまたがる修正をまとめて自由文で書いても、その自
+由文が直接状態に反映されることは一切ない(Principle 2/6)。reasoning
+LLM(fail-closed)が構造化された change item に変換し、決定的な post-
+pass が各項目の対象を有限候補リストに対して解決し、開発者がフィールド
+単位の diff + 決定的な影響プレビューを確認したうえで選択した項目だけを
+適用する。
+
+### テーブル(additive)
+
+`understanding_change_set`(1回の投稿につき1行):
+
+| カラム | 型 | 説明 |
+| --- | --- | --- |
+| `id` | INTEGER PK | |
+| `session_id` / `system_id` | INTEGER NOT NULL | |
+| `base_revision_id` | INTEGER NULL | 提案時点の最新 `understanding_revision.id`(understanding_claim 系項目の古さ判定の基準) |
+| `source_text` | TEXT NOT NULL | 開発者が入力した自由文そのもの(監査用。状態には決して直接反映しない) |
+| `status` | TEXT NOT NULL DEFAULT `'proposed'` | `proposed\|previewed\|partially_applied\|applied\|discarded\|failed` |
+| `intelligence_run_id` | INTEGER NOT NULL | この提案を生成した `intelligence_runs` 行(`run_type='nl_change_set'`) |
+| `is_mock` | INTEGER | |
+| `created_at` / `updated_at` | REAL | |
+
+`understanding_change_item`(1提案項目につき1行):
+
+| カラム | 型 | 説明 |
+| --- | --- | --- |
+| `id` / `change_set_id` / `system_id` | INTEGER | |
+| `target_kind` | TEXT NOT NULL | `intent_item\|understanding_claim`(有限集合。構造上これ以外は存在し得ない — LLM の生スキーマ自体がこの2値の Literal で検証される) |
+| `target_ref` | TEXT NOT NULL(JSON) | `{"intent_item_id": ...}` または `{"section": ..., "name": ...}`(未解決時は `{"hint": ...}` を保持し、何を狙っていたかの監査だけ残す) |
+| `field` | TEXT NOT NULL | `value_text`(intent_item 用)または `summary`(understanding_claim 用)。この2ペア以外は構造的に `forbidden` になる |
+| `before_value` / `after_value` | TEXT | 解決できた場合のみ `before_value` が入る |
+| `reason` | TEXT NOT NULL | LLM が付けた短い理由(自由文だが、状態そのものではなく提案の説明に過ぎない) |
+| `resolution_state` | TEXT NOT NULL | `resolved\|ambiguous\|conflict\|stale\|forbidden` |
+| `applied` / `applied_at` | INTEGER / REAL | 二重適用防止フラグ |
+| `created_at` | REAL | |
+
+### 決定的な対象解決(`app/change_sets.py`)
+
+- `generate_change_set_proposal`: Intent Brief / Alignment と同じ
+  fail-closed パターン(mock・非 reasoning モデル・API 失敗・スキーマ
+  検証失敗はすべて `error` 付きの結果を返し、何も永続化しない)。プロ
+  ンプトには「候補リスト」(`{kind, hint, current_value}` の有限配列)
+  を渡し、モデルは `target_hint` にその `hint` を**一字一句そのまま**
+  返すことしか許されない — 曖昧な言い換えやファジーマッチは一切な
+  い。生レスポンスの `target_kind` は `Literal["intent_item",
+  "understanding_claim"]` でスキーマ検証される(Alignment の
+  `alignment_state`/`confidence` などと同じく、範囲外の値はバッチ全体
+  を失敗させる)。`field` はここでは検証しない自由文字列のまま
+  — 「有効な `target_kind` に対して許されていない `field` を狙う」と
+  いう、まさに `forbidden` が拾うべき現実的なケースを個別項目の判定に
+  残すため。
+- `resolve_change_set_items`(純粋関数、DB 非依存): `(target_kind,
+  field)` が `ALLOWED_TARGET_FIELDS` のホワイトリスト(`intent_item` →
+  `value_text`、`understanding_claim` → `summary` の2エントリのみ)と
+  完全一致しなければ `forbidden`。一致すれば `(target_kind,
+  target_hint)` を候補リストに対して**完全一致**で引き、一致がちょう
+  ど1件なら `resolved`(`before_value`/`target_ref` を確定)、0件また
+  は複数件なら `ambiguous`(タイポで一致しない場合も、本当に複数候補
+  がある場合も、人が入力し直すべき点は同じなので同じ状態にまとめる)。
+  同じ入力からは常に同じ出力(決定性のテスト契約)。
+- `effective_resolution_state`: `resolved` 項目だけを対象に、呼ばれる
+  たびに現在の状態へ再検証する。`ambiguous`/`forbidden` は作成時点で
+  確定した構造的事実で変化しない。再検証が拾う2つの退行:
+  - `stale`(`understanding_claim` のみ): この change set の
+    `base_revision_id` が、その時点の最新 `understanding_revision.id`
+    と一致しない(理解がその後リビルドされた)。`intent_item` はこの
+    方式でリビジョン管理されないため対象外。
+  - `conflict`: 対象の現在値が記録済み `before_value` と一致しない、
+    または(`intent_item`)対象行が既に superseded/削除された。
+  このロジックはプレビュー(`GET`、表示のみで永続化しない)と適用
+  (`POST .../apply`、実際にスキップした項目だけ永続化する遷移)の両方
+  から同じ関数で呼ばれるため、プレビューと適用が食い違うことはない。
+
+### ルート(`routes/interview_change_sets.py`、`main.py` に登録)
+
+1. `POST /interview/sessions/{id}/change-sets` `{text}` — 候補リストを
+   構築(現在の非 superseded `interview_intent_item` + 最新
+   `understanding_revision.current_understanding` の5セクション)し、
+   reasoning LLM を呼び、`understanding_change_set` + 解決済み
+   `understanding_change_item` 群を作成する。失敗時も
+   `status='failed'` の change set 行だけは監査のために残し(項目は
+   0件)、502 を返す — NL は絶対に直接適用されない。
+2. `GET /interview/change-sets/{id}` — フィールド単位の diff
+   (`before_value → after_value`)、`effective_resolution_state` で再検
+   証した `resolution_state`、決定的な影響プレビュー
+   (`_affected_alignment_items`: `intent_item` 対象は
+   `alignment_item.intent_item_id` 一致、`understanding_claim` 対象は
+   `current_claim`/`intent_summary` への構造的な部分一致で拾う)、固定
+   の日本語注記(`rebuild_note`、`state_messages.change_set_message`)
+   を返す。初回参照時に change set の `status` を `proposed` →
+   `previewed` に進める(項目の解決状態自体は書き換えない読み取り専用
+   の遷移)。
+3. `POST /interview/change-sets/{id}/apply` `{item_ids}` — 指定された
+   項目だけを、この瞬間に再検証してから適用する(バッチ全体ではなく項
+   目単位の fail-closed)。`intent_item` 対象は Issue #284 の
+   `correct_intent_item` と同じ supersede 行パターン
+   (`origin='user'`, `decision_method='manual'`,
+   `source_statement=<投稿した自由文>`)。`understanding_claim` 対象は
+   同じ apply 呼び出し内のすべての claim 編集をまとめて1つの新しい
+   `understanding_revision`(最新リビジョンをディープコピーして編集、
+   既存行は絶対に書き換えない)にする — 個別にリビジョンを作ると、先
+   に適用した編集が後続の編集を誤って `stale` にしてしまうため。適用
+   後は `interview_refresh.request_refresh(trigger_kind='nl_change_set')`
+   を呼ぶ(Issue #288 の自動更新に接続)。`change_set.status` は「選択
+   した項目が全部適用できた」なら `applied`、一部だけなら
+   `partially_applied`。既に `applied=1` の項目を再度指定してもスキッ
+   プされるだけで再適用はしない(冪等)。
+4. `POST /interview/change-sets/{id}/discard` — `status='discarded'`。
+   以降の apply は 409。
+
+### Dashboard
+
+- `ChangeSetPanel`(`components/system-understanding/change-set-panel.tsx`)
+  を Interview ページのレビューキュー直下に配置。「まとめて修正」の
+  テキストエリア + 送信ボタンで変更案を作成し、フィールド単位の diff
+  一覧をプレビュー表示する。`resolution_state` を「適用可能/あいまい/
+  競合/古い前提/変更不可」に日本語マップ(Issue #266 の規約どおりクラ
+  イアント側の固定マッピング、canonical enum はログ/ペイロードのみ)。
+  `resolved` かつ未適用の項目だけ既定でチェック済み、それ以外は既定で
+  未選択かつ操作不能(誤って選択できない)。「選択した変更を適用」は
+  チェック済みの `resolved` 項目 id だけを送る。適用後は
+  `RefreshStatusChip`(Issue #288)が自動更新の反映を示す。
+
+### テスト
+
+- `tests/test_change_sets.py`: `resolve_change_set_items` /
+  `effective_resolution_state` の決定性(resolved/ambiguous/conflict/
+  stale/forbidden の各状態を fixture から再現)、
+  `generate_change_set_proposal` の fail-closed(mock・非 reasoning モ
+  デル・API 失敗・不正 JSON・範囲外 `target_kind` の各ケース)、作成→
+  プレビュー(影響プレビュー込み)→部分選択→適用のエンドツーエンド
+  (選択+resolved のみ適用、未選択/未解決項目は無変更、intent 対象は
+  supersede 行トレイルを作る、understanding_claim 対象は新しい
+  revision を作り旧 revision は変更されずに残る、apply が Issue #288
+  の refresh job を発行すること)、LLM 失敗時は `failed` になり何も適
+  用されないこと、apply 時点で base revision が古くなっていれば
+  `stale` としてスキップされること、ホワイトリスト外の `field` は
+  `forbidden` として拒否されること、同じ項目への2回目の apply が
+  no-op になること、change_set → intelligence_run → revision の監査系
+  列。
+- Dashboard: `src/__tests__/change-set-panel.test.tsx`(diff プレビュー
+  表示、非 resolved 項目のチェックボックスが既定で外れ無効化されるこ
+  と、apply が選択済み id だけを送ること、discard が discard API を呼
+  ぶこと)。
+
+## Runtime Reality Check 統合(Issue #290)
+
+既存の Runtime Reality Check(Issue #135、`app/runtime_reality.py`)の
+決定的トレース集計を、Investigation Agent(#286)の証拠種別・Alignment
+Review(#287)の Review Queue 判定・新規の観測提案フローへ接続する。
+「新しい runtime 事実をどう解釈するか」は reasoning モデルの仕事のまま
+だが、「その事実が今なお現在のものと呼べるか(鮮度・有無・環境)」は
+決定的ルールだけで判定する(Principle 6)。
+
+**Finding 5 の修正(レビュー指摘)**: 初期実装は (a) `traces` に
+environment/version 情報が無く `compare_claim_to_runtime` の environment
+mismatch 分岐が実データで到達不能、(b) `build_provenance` がセッション
+の pinned snapshot を `snapshot_ref` として渡していた(トレースを送った
+デプロイが実際にどの snapshot かは分からないのに)、(c) claim テキスト
+が意味的に一切判定されず新鮮なトレースは常に `match` になり
+`runtime_mismatch → must_review` ルールが実データで到達不能、という 3
+つの欠陥を持っていた。以下はその修正後の仕様。
+
+### SDK からの provenance 取得(`PROBE_ENVIRONMENT` / `PROBE_GIT_SHA`)
+
+`packages/python-probe/probe_agent/config.py` に `ENV_ENVIRONMENT`
+(`PROBE_ENVIRONMENT`)/`ENV_GIT_SHA`(`PROBE_GIT_SHA`)を追加。両方とも
+未設定/空文字なら `None`(捏造しない)。設定されている場合のみ
+`decorator.py` が trace ペイロードに `environment`/`git_sha` を追加する
+(read が失敗しても対象関数・trace 送信は壊れない、既存の replay
+capture と同じ best-effort パターン)。`shared/schemas/trace_event.schema.json`
+・`TraceEvent`(server)・`traces` テーブル(`environment TEXT`,
+`git_sha TEXT`、additive `ALTER TABLE`)がこれを additive に受け取る。
+
+### 出所エンベロープ(`RuntimeFactProvenanceOut`)
+
+`aggregate_component_facts` が返す `RuntimeTraceFactsOut` に
+`observed_environment` / `observed_git_sha` を additive に追加: 集計ウィ
+ンドウ内で `environment`/`git_sha` が非 NULL・非空文字列の行のうち
+`timestamp` が最大のものを1件ずつ選ぶ(決定的な「最新観測値」ピック。
+列ごとに1クエリ)。1件も無ければ `None`。
+
+`app/runtime_reality.py` の `build_provenance(fact, *, conn=None,
+system_id=None, now=None)` がこれを次の形にラップする:
+
+```
+{
+  environment: str | null,       # fact.observed_environment そのまま(捏造しない)
+  first_observed_at: float | null,
+  last_observed_at: float | null,
+  snapshot_ref: {snapshot_id: int | null, git_sha} | null,
+  source: "trace_aggregation",   # 固定値
+  freshness: "fresh" | "stale" | "unobserved",
+}
+```
+
+`snapshot_ref` は `fact.observed_git_sha` が無ければ常に `null`
+(Finding 5(b) の再発防止 — **セッションの pinned snapshot を絶対に代入
+しない**)。sha が観測されていれば、`conn`/`system_id` が両方渡された時
+だけ `repository_snapshots`(その System)を commit_sha 完全一致で検索
+し、見つかった `id` を `snapshot_id` に入れる。見つからなくても
+`git_sha` は生の観測値のまま保持し(`snapshot_id` は `null`)、`conn`/
+`system_id` を渡さなかった呼び出し元でも同様に `git_sha` だけは保持され
+る。呼び出し元(`routes/interview_alignment.py::run_alignment_build`、
+`investigation_agent.py::_gather_runtime_candidates`)はどちらも
+pinned snapshot_id/commit_sha を渡さなくなった。
+
+`freshness` は `freshness_for()` が決定的に計算する: トレースが1件も
+無ければ `unobserved`、`last_observed_at` が `RUNTIME_FACT_FRESH_SECONDS`
+(環境変数、デフォルト 7 日 = 604800 秒)以内なら `fresh`、それ以外は
+`stale`。鮮度が古い事実が「最新」として提示されることは無い(stale
+guard)。
+
+### 有限マッチ状態(`app/runtime_alignment.py`)
+
+- `resolve_component_for_evidence(conn, snapshot_id, evidence)` —
+  evidence の `{path, start_line, end_line}` を `code_symbols`(Issue
+  #24 の Feature-to-Code index)に対して構造的に突き合わせ、
+  `component_id` を決定的に1つだけ解決する。0件または複数件の異なる
+  `component_id` にマッチした場合は `None`(推測しない)。
+- `compare_claim_to_runtime(claim, fact, provenance, *,
+  expected_environment=None)` — `match | mismatch | unobserved | stale`
+  を返す。`claim`(自由文)は監査上の引数として受け取るだけで一切解析
+  しない。判定は `provenance.freshness` のみ(`unobserved`/`stale` は
+  そのまま返す)と、`expected_environment`(呼び出し元が渡す Systemの
+  `environment` 列。空文字は未知として扱い None 同等)と
+  `provenance.environment`(実際にトレースで観測された値)が両方既知
+  かつ不一致のときの `mismatch` だけ。SDK が `PROBE_ENVIRONMENT` を送る
+  ようになったことで、この分岐は今や実データ(構築した
+  `RuntimeFactProvenanceOut` に頼らないエンドツーエンドの trace 挿入)
+  で到達できる。それ以外は `match`。「振る舞いが意味的に一致している
+  か」の判断は下記の Runtime Match Judge(Alignment Review 側)や
+  Investigation Agent の仕事で、この関数の仕事ではない。
+
+### Investigation Agent への統合(#286 拡張)
+
+`investigate()` に `conn`/`system_id`/`snapshot_id`(すべて省略可、既定
+`None` — 省略時は #286 と完全に同じ read-only/git-only 挙動)を追加。
+指定された場合、コード証拠として既に選ばれた候補ファイル(`candidates`)
+と同じパス集合から `code_symbols.component_id` を引き、
+`InvestigationBudget.max_runtime_facts`(既定 10、範囲 0〜20)件までの
+runtime fact 候補をプロンプトに追加提示する。モデルは
+`runtime_evidence: [{component_id, runtime_check, summary}]` として引用
+できる(コード証拠と同じく、提示された `component_id` 以外は引用できな
+い — 未知の引用は破棄されるだけで、コード証拠と違いこの拡張だけでは
+実行全体を fail-closed にしない)。**stale guard**: 決定的ベースライン
+(鮮度のみで計算、claim 抜き)が `unobserved`/`stale` の場合、モデルが
+何と言おうと必ずその値で上書きして永続化する — モデルが古い/未観測の
+事実を `match` と主張することは構造的にできない。ベースラインが
+`match`(=新鮮なデータがある)のときだけ、モデル自身の
+`match`/`mismatch` という意味的判断を採用する。この意味的判断は
+Investigation Agent 自身の会話フロー内に限定される(引用として提示され
+るだけで `alignment_item.runtime_check` には反映されない)。Alignment
+Review 側の同種の判断は下記の Runtime Match Judge という別のコード経路
+が担当する。
+
+### 段階的開示(Progressive disclosure)
+
+Inquiry の assistant メッセージの `content`(最初に見える結論)には
+runtime の生データ・出所情報は一切含めない。`runtime_evidence` は既存
+の `detail` JSON 展開レイヤー(`InterviewInquiryMessageDetailOut`)に
+だけ入る。同じ detail に `suggested_observation_proposal`
+(`{target_component, reason: "unobserved"|"stale"}` または `null`)も
+入る — これは固定テンプレートによるヒントであり、これ自体は提案レコー
+ドを一切作らない。
+
+### Alignment Review / Review Queue への統合(#287 拡張)
+
+`alignment_item` に additive カラム `runtime_check TEXT NULL`
+(`match|mismatch|unobserved|stale`)を追加。`run_alignment_build` は
+各 item の検証済み evidence から `resolve_component_for_evidence` で
+`component_id` を解決できたときだけ `aggregate_component_facts` +
+`build_provenance` + `compare_claim_to_runtime`(`expected_environment`
+は Systemの `environment` 列)を呼び、決定的ベースラインの
+`runtime_check` を決定する。決定的マッピングが無ければ `null`(推測し
+ない)。
+
+`app/alignment.py` の `_RULES`(先勝ちルール表)に、`conflict_detected`
+の直後・`low_confidence` の直前として次を追加:
+
+```
+runtime_check == 'mismatch' -> must_review, runtime_mismatch
+```
+
+`stale`/`unobserved` はそれ単独では must_review を強制しない。
+`user_reason_for('runtime_mismatch')` の固定文言は
+「コード上の理解と実行時の観測が一致していません」。
+
+### Runtime Match Judge(Finding 5 Part 2、reasoning モデルによる意味判定)
+
+決定的ベースラインは鮮度と環境一致しか見ないため、claim の *内容* が新
+鮮なトレースと意味的に矛盾していても検出できなかった(`runtime_mismatch
+→ must_review` ルールが実データで到達不能という Finding 5(c))。
+`app/runtime_match_judge.py` の `judge_runtime_match(client, config,
+items, *, language)` がこの意味的判定を追加する:
+
+- 対象は決定的ベースラインが **`match`(新鮮・構造的な矛盾なし)の item
+  だけ**。`stale`/`unobserved`/`mismatch`(environment)は絶対に judge
+  に渡さない — stale guard と同じ思想で、モデルはこれらの決定を一切上
+  書きできない(Principle 6)。
+- 1バッチで全 eligible item をまとめて1回だけ呼ぶ。
+  `PROMPT_VERSION`/`SCHEMA_VERSION` は `"runtime-match-v1"`。
+- 構造化出力 `{items: [{index, runtime_check: "match"|"mismatch",
+  note}]}` を厳密検証: 集合外の `runtime_check`、未知/重複/欠落した
+  `index` はどれか1つでもあれば **レスポンス全体を無効**とする
+  (fail-closed、部分採用しない)。
+- mock/非 reasoning モデル・LLM エラー・不正な構造化出力はいずれも
+  `error` を返す。`run_alignment_build` はこのとき対象 item の
+  `runtime_check` を `NULL` として永続化する(**推測せず、決定的な
+  `match` ベースラインへフォールバックもしない**)。
+- `intelligence_runs` に必ず1行記録する(`run_type='runtime_match'`、
+  `decision_method='reasoning_llm'`、成功/失敗どちらも
+  `status`/`error_details`/prompt・schema version/`is_mock` を保存)。
+  eligible item が 0 件のときは LLM 呼び出し自体をスキップし、この行も
+  作らない。
+- judge の `note` は監査目的の一時情報であり、`alignment_item` には永続
+  化しない(決定的事実と reasoning 出力を分離して保存する原則どおり、
+  永続化されるのは finite enum の `runtime_check` だけ)。
+- `run_alignment_build` は各 item の `classify_alignment_item` 呼び出し
+  を judge 実行後まで遅延させる: 決定的ベースラインと judge 判定のどち
+  らが最終的な `runtime_check` になっても、`_RULES` の
+  `runtime_mismatch` ルールが正しく評価される。
+
+### 観測提案(承認ゲート、新規テーブル `runtime_observation_proposal`)
+
+新しい runtime 観測を「開始する」ことは、この Issue のどのコード経路
+からも自動実行されない(Principle 5/8)。開発者の依頼は additive な
+`runtime_observation_proposal` テーブルに `status='proposed'` として記
+録されるだけ:
+
+| カラム | 型 | 説明 |
+| --- | --- | --- |
+| `id` | INTEGER PK | |
+| `session_id` / `system_id` | INTEGER NOT NULL | System-scoped |
+| `origin_inquiry_id` / `origin_alignment_item_id` | INTEGER NULL | 任意の監査リンク |
+| `target_component` | TEXT NOT NULL | |
+| `purpose` / `expected_cost` / `risk_note` / `retention_note` | TEXT | 開発者が入力 |
+| `status` | TEXT NOT NULL DEFAULT `'proposed'` | `proposed\|approved\|rejected\|expired` |
+| `decision_by` / `decision_at` | TEXT / REAL NULL | 手動承認のみ(`decision_method: manual`) |
+| `created_at` | REAL NOT NULL | |
+
+ルート(`routes/interview_observation.py`):
+
+- `POST /interview/sessions/{id}/observation-proposals` — 提案を作成
+  するだけ。
+- `GET /interview/sessions/{id}/observation-proposals` — 一覧
+  (`status` で絞り込み可)。
+- `POST /interview/observation-proposals/{id}/approve` /
+  `.../reject` — `status='proposed'` の行だけを遷移できる(409 それ以
+  外)。**承認しても観測は開始されない** — レスポンスの `policy_pointer`
+  は固定テンプレート文言(`interview_language.py` の
+  `observation_proposal_policy_hint`)で、既存の
+  `PUT /components/{component_id}/policy` を指し示すだけ。interview/
+  investigation 系のどのコードパスも `components` テーブル(ポリシー)
+  へは一切書き込まない — これは回帰テストで固定する。
+
+新しい runtime 事実が届いた後(テストではトレースを直接 INSERT して模
+擬する)、Issue #288 の自動 refresh を再実行すると `run_alignment_build`
+が再度呼ばれ、`runtime_check` が更新される(revision の系列は既存の
+リビジョン/監査の仕組みでそのまま追跡できる)。
+
+### 環境変数
+
+- `RUNTIME_FACT_FRESH_SECONDS`(デフォルト `604800` = 7日)— runtime
+  fact が `fresh` とみなされる上限秒数。`RUNTIME_REALITY_CHECK_*` と同
+  じ正の整数パーサーを使い、不正な値は 422 で fail-closed する。
+- `PROBE_ENVIRONMENT` / `PROBE_GIT_SHA`(SDK、`packages/python-probe`)—
+  デプロイの provenance タグ。両方とも既定は未設定(`None`)で、trace
+  ペイロードに新フィールドは付かない。設定した場合のみ
+  `traces.environment`/`traces.git_sha` として永続化され、
+  `aggregate_component_facts`/`build_provenance` の唯一の入力になる。
+
+### テスト
+
+- `tests/test_runtime_reality.py` 拡張: `aggregate_component_facts` の
+  `observed_environment`/`observed_git_sha`(最新観測値ピック、空文字/
+  NULL の除外、後続の値なしトレースが以前の観測値を上書きしないこと、
+  System 分離)。
+- `tests/test_runtime_alignment.py`: `freshness_for`/`build_provenance`
+  の時刻固定フィクスチャ(fresh/stale/unobserved の境界、環境変数上書
+  き)、`compare_claim_to_runtime` の全分岐(unobserved 優先 > stale
+  優先 > environment mismatch > match、stale な事実が絶対に `match` に
+  ならないこと)、`resolve_component_for_evidence` の一意/曖昧/無マッ
+  チ、`build_provenance` の新シグネチャ(`conn`/`system_id` 省略時は生
+  の sha のみ保持、sha 未観測なら pinned snapshot があっても
+  `snapshot_ref` が絶対に `null` になる捏造防止回帰テスト、commit_sha
+  完全一致での解決/非解決)。
+- `tests/test_runtime_match_judge.py`(新規): `judge_runtime_match` の
+  mock/非 reasoning モデル拒否、LLM エラー、不正 JSON、集合外
+  `runtime_check`、未知/重複/欠落 index のいずれもレスポンス全体を無効
+  にすること、成功バッチの検証済み結果。
+- `tests/test_interview_alignment.py` 拡張: `classify_alignment_item`
+  への `runtime_check='mismatch'` が `must_review`/`runtime_mismatch`
+  になること(conflict_detected より後・low_confidence より前の優先順
+  位を含む)、`run_alignment_build` 経由の統合テスト(evidence を
+  `code_symbols` にマッピングして runtime_check を決定的に付与、
+  environment mismatch は実際に `environment` 付きトレースを INSERT し
+  て到達させる)、Runtime Match Judge の統合(成功バッチの mismatch 判
+  定が must_review に反映される、judge 失敗時は `runtime_check=NULL` +
+  失敗した `runtime_match` 監査行を残しつつ build 自体は成功する、
+  stale/unobserved item は judge に一切送られず監査行も作られないこと)。
+- `tests/test_investigation_agent.py` 拡張: runtime_evidence の
+  budget/schema 検証、stale/unobserved の上書きガード、未提示
+  `component_id` の引用が破棄されること、`conn` 省略時は従来どおり
+  runtime_evidence が空であること。
+- `tests/test_interview_observation.py`(新規): 提案の作成/一覧/承認/
+  却下のライフサイクル、`proposed` 以外からの承認・却下が 409 になる
+  こと、承認後も `components` テーブルが一切変化しないこと(否定テス
+  ト)。
+- 進行的開示: assistant メッセージの `content` に生トレース/出所デー
+  タが含まれないこと(`detail.runtime_evidence` にだけ入ること)を
+  コンポーネント/ユニットテストで固定。
+- `tests/test_schemas.py` 拡張: `trace_event.schema.json` が
+  `environment`/`git_sha` を受理すること、SDK が実際に組み立てた
+  `PROBE_ENVIRONMENT`/`PROBE_GIT_SHA` 付き payload がスキーマとサーバ
+  モデルの両方を通ること。
+- `tests/test_api.py` 拡張: `POST /traces` が `environment`/`git_sha` を
+  永続化すること(設定時/未設定時の両方)。
+- `packages/python-probe/tests/test_decorator.py` 拡張: 設定時に trace
+  payload へ `environment`/`git_sha` が追加されること、未設定/空文字な
+  ら追加されないこと、読み取り失敗時も対象関数の返り値・trace 送信が
+  壊れないこと。
+
+## 回答可能領域と担当者引き継ぎ(Issue #291)
+
+開発者が「今回自分が答えられる領域」を明示的に選び(ロールからの推論は
+しない、Principle 6)、担当外の質問・Review Queue 項目は非表示にせず別
+グループへ回す。引き継いだ回答は必ず元のユーザーの明示確認を経てから
+本来の回答として確定する(Principle 2)。
+
+### 回答可能領域(`interview_session.answerable_areas`)
+
+- 有限集合 `KnowledgeArea`: `product_intent | domain_rule | operations |
+  implementation | security`。`app/models.py`(`InterviewSessionOut`
+  より前)と `app/question_router.py`(`KNOWLEDGE_AREAS`)の双方に定義
+  し、値を一致させる。
+- `interview_session.answerable_areas`(additive、`TEXT NOT NULL DEFAULT
+  '[]'`、JSON 配列)。`PUT /interview/sessions/{id}/answerable-areas
+  {areas: [...]}` でいつでも変更できる。**空配列は「フィルタなし」**
+  (#291 以前と同じ全件表示)であって「全領域を選択した」ではない —
+  この違いは UI・API どちらでも明示する。
+
+### 質問への領域タグ付け(`interview_qa.knowledge_area`)
+
+- `interview_qa.knowledge_area`(additive、`TEXT NULL`)。Question
+  Router(#286、`app/question_router.py`)の reasoning モデル呼び出しで
+  のみ設定される。プロンプト/スキーマへ `knowledge_area`
+  (finite enum または null)を additive に追加し、当時の
+  `PROMPT_VERSION` / `SCHEMA_VERSION` を `question-router-v2` へバンプ
+  (Principle 7。後続のレビュー指摘修正で `search_keywords` が additive
+  に加わり、現在は `question-router-v3`)。fail-closed: 集合外の値はエ
+  ラー、`null` は正当な「どの領域にも当てはまらない」判定として受理す
+  る。タイトルやリポジトリ情報からの決定的推論は行わない(Principle
+  6)。未ルーティング(`null`)の質問は絶対に非表示にしない。
+- (レビュー指摘修正、Finding 1)本 issue 実装時点では `knowledge_area`
+  は Inquiry の自動ルーティングと単体ルーティングエンドポイントからしか
+  設定されず、通常の Q&A フローで質問を作成しただけでは null のまま
+  だった。バッチ版の `POST
+  /interview/sessions/{session_id}/qa/route-and-investigate`(「Question
+  Router / Investigation Agent(Issue #286)」節参照)が通常フローにも
+  ルーティングを接続したことで、開発者が明示的にバッチ実行すれば
+  `knowledge_area` が通常フローでも埋まるようになった。それでも自動実
+  行ではなく開発者の明示操作(ボタン押下)が起点である点は変わらない。
+
+### 決定的な対象外判定
+
+`routes/interview.py::_is_out_of_area` — 質問が現在のユーザーにとって
+「対象外」なのは、`session.answerable_areas` が空でなく **かつ**
+`question.knowledge_area` が非 null **かつ** その領域が
+`answerable_areas` に含まれない場合のみ。対象外の質問は非表示にせず、
+別グループへ分類し 後で回答 / 保留 / 引き継ぐ の操作を提供する。
+「わからない」を低確信度の Yes/No などへ変換することは決してしない。
+
+### 引き継ぎ(`question_handoff` テーブル、`routes/interview_handoff.py`)
+
+System スコープの additive テーブル。`origin_kind` は有限集合 `qa |
+review_item`(#285/#287 と同じ finite origin_kind パターン)。
+`assignee` / `created_by` / `answered_by` は自由文の担当者名/連絡先
+(組織的な認証システムは無いため、既存の `understanding_confirmed_by` /
+`interview_qa.answered_by` と同じ慣習を踏襲)。
+
+引き継ぎの作成は元の項目の回答・判断フィールドへは一切書き込まない:
+
+- `origin_kind='qa'`: `interview_qa.status` はそのまま変更しない
+  (既存の finite set を上書きしない、#285/#287 の方針を踏襲)。
+  additive な `interview_qa.handoff_id` だけを設定する。
+- `origin_kind='review_item'`: `alignment_item.status` を
+  `'held'`(既存の `/hold` エンドポイントと同じ値)にし、additive な
+  `alignment_item.handoff_id` を設定する(`user_decision` は書き込ま
+  ない — 引き継ぎは判断ではない)。
+
+ライフサイクル(有限遷移表、Principle 6):
+
+```
+pending -> answered | cancelled
+answered -> returned
+それ以外 -> 409
+```
+
+- `POST /interview/sessions/{id}/handoffs` — 作成、`pending` で開始。
+  対象項目に既に in-flight(`pending`/`answered`)な引き継ぎがある場合
+  は `409 handoff_already_in_flight`。
+- `GET /interview/sessions/{id}/handoffs?status=` — 一覧・状態フィルタ。
+- `POST /interview/handoffs/{id}/answer {answer_text, answered_by}` —
+  担当者自身の回答を **引き継ぎ行にだけ** 記録する(`answered` へ遷
+  移)。元の `interview_qa`/`alignment_item` 行は一切変更しない。
+- `POST /interview/handoffs/{id}/return` — `returned` へ遷移。UI は
+  担当者の回答を元の項目に「引き継ぎ先の回答(未確定)」として表示す
+  る。ここでも元の行への書き込みは無い。
+- `POST /interview/handoffs/{id}/cancel` — `pending` からのみ
+  `cancelled` へ。
+
+### 明示確認による確定
+
+`return` された引き継ぎは、元のユーザーが **既存の回答エンドポイント**
+経由で明示的に確定する。`interview_qa` の
+`POST .../qa/{id}/answer` を additive に拡張し、任意の `handoff_id` を
+受け付ける:サーバーは当該 handoff が存在し、この質問に属し、
+`status='returned'` であることを検証したうえで、通常どおり
+`answer_text`/`actor` を記録する(担当者の回答をそのまま「元ユーザーの
+回答」として書き込むことは絶対にしない — 開発者自身が
+`answer_text`/`actor` を送信する)。検証失敗(未 return / 対象質問不一
+致 / 存在しない)は 409/404。Alignment 側の `/answer`・`/correct` は本
+issue では拡張しない(brief が明示的に要求していないため) — 引き継ぎ
+の来歴は `alignment_item.handoff_id` と `status='held'` だけで追跡でき
+る。
+
+### 重複抑止(決定的)
+
+`GET /interview/sessions/{id}/qa?view=askable` — 「次に回答する質問」
+の一次フローが共有する単一のサーバー側フィルタ。除外条件:
+回答済み(`status == 'answered'`)、in-flight な引き継ぎあり
+(`handoff_id` が `pending`/`answered` の引き継ぎを指す)、対象外
+(`_is_out_of_area`)。`view` を指定しない既存の一覧は挙動不変。
+
+### Dashboard
+
+- セッションヘッダーの「今回回答できる領域」チップ(5 領域、日本語ラ
+  ベル: 事業・目的 / 業務ルール / 運用 / 実装 / セキュリティ)、
+  `PUT` で即時反映、セッション中いつでも変更可能。
+- Q&A パネル: 対象外の質問を「担当外の質問」として別グループ表示し、
+  後で回答(既存 skip 再利用) / 担当者へ引き継ぐ(モーダル: 担当者・
+  背景・決めてほしいこと・優先度・期限メモ)を提供する。
+- Review Queue: 各項目に「担当者へ引き継ぐ」操作を追加(alignment_item
+  は領域タグを持たないため対象外グルーピングは行わない — 引き継ぎ機能
+  のみ)。
+- 引き継ぎ一覧パネル: pending/answered/returned を日本語で表示。
+  `returned` の項目は担当者の回答を「引き継ぎ先の回答(未確定)」と
+  マークし、「この内容で回答を確定する」ボタンから通常の回答エンドポ
+  イントを呼び出す(明示確定)。
+- 生の enum 値をそのまま表示しない(Issue #266 規約)。
+
+### テスト
+
+- `tests/test_interview_handoff.py`(新規): 領域選択の検証・随時変更・
+  空配列でのフィルタなし、askable ビューの回答済み/引き継ぎ中/対象外
+  除外と null 領域の非表示なし、引き継ぎのライフサイクル・不正遷移
+  409、`/answer` が元行に一切書き込まないこと(回帰)、
+  `return` 後の明示確認で確定ユーザーと `handoff_id` 来歴が記録される
+  こと、キャンセル経路、System 分離。
+- `tests/test_question_router.py` 拡張: 当時の `question-router-v2` への
+  バンプ、`knowledge_area` の null/各 enum 値の受理、集合外値の
+  fail-closed、ルーティング結果の永続化(その後 `search_keywords` 追加
+  で `question-router-v3` までバンプ済み。「Question Router /
+  Investigation Agent(Issue #286)」節参照)。
+
+## Interview Alignment UX 差分改善(Issue #295)
+
+Issue #295 は Interview Alignment UX の元提案であり、その大部分は Issue
+#282(サブイシュー #283-#291)で実装済み。本節は #295 のうち #283-#291
+でカバーされていなかった差分として実装した内容と、意図的に見送った残課
+題を記録する。
+
+### unchanged 分類の実体化(#295 §4.3 / §7.1、control-server)
+
+#287 で予約値だった `review_category='unchanged'` を決定的ロジックで到
+達可能にした。
+
+- `app/alignment.py` の `compute_content_hash()`: `current_claim` +
+  正規化した `current_evidence`(path/start_line/end_line/summary をソー
+  ト)+ ルール表 `classify_alignment_item` の入力になる全フィールド
+  (`alignment_state` / `risk_flags`(ソート)/ `confidence` /
+  `intent_field` / `runtime_check`)の canonical JSON を sha256 する。
+  分類に影響する変化(Runtime Reality Check の反転を含む)が
+  「変更なし」と誤判定されることはない。完全一致のみで、類似度・
+  LLM 判断は使わない(Principle 6)。
+- 再ビルド(`run_alignment_build`)時、直前ビルドの **`accept_current`
+  回答済み行**(`status='answered'` かつ `user_decision.action=
+  'accept_current'`、`superseded=0`。加えて多世代 `unchanged` チェーン)と
+  `content_hash` が一致する新項目は `unchanged` /
+  `reason_code='unchanged_since_confirmation'` に分類し、
+  `carried_over_from` に引き継ぎ元 id を記録する(監査専用の参照。
+  ON DELETE SET NULL)。`needs_change` / `reject_interpretation` /
+  `corrected` は人間の異議・修正なので carry-over 対象外とし(3回目
+  レビュー指摘1)、次の Understanding rebuild の reviewer prompt に
+  還流する。新しい理解でもなお差分が残る場合はルール表で再分類され
+  actionable のまま残る。unchanged 項目は `GET .../review-queue` の
+  主導線(must_review/batch_reviewable フィルタ)に現れない。
+- §5.5 の狭い決定的版: goal intent(System Purpose 相当)が直前ビルド
+  以降に確定・変更された場合、そのビルドでは引き継ぎを行わず全項目を
+  ルール表で再分類する。`trigger_kind` は `interview_refresh` の
+  dedupe(pending ジョブへの合流)によりバッチ全体を代表しないため、
+  goal 行の `updated_at` と直前ビルドの `alignment_item.created_at`
+  最大値の比較で判定する。
+- additive migration: `alignment_item.content_hash TEXT` /
+  `carried_over_from INTEGER`(既存行は NULL のまま)。
+- テスト: `tests/test_interview_alignment.py` に hash の決定性・順序
+  非依存性、引き継ぎ、内容変化時の非引き継ぎ、goal 変更によるブロック
+  と過剰ブロックの回帰、旧 DB からの migration を追加(98件)。
+
+### Review Queue の表示・操作(#295 §4.1 / §5.3 / §5.4 / §4.4、dashboard)
+
+`review-queue.tsx` のみの変更。分類・優先度はバックエンド値をそのまま
+使い、フロントで再分類しない。
+
+- カテゴリ別件数サマリ: 要確認 / 一括レビュー可 / 確認不要 / 前回から
+  変更なし / 参考情報 の5固定区分を `counts` から表示(欠損は0扱い)。
+- まとめて回答モード(既定OFF): 回答をローカルに保留し「まとめて送信」
+  で既存 `/answer` を項目ごとに順次呼ぶ。#288 の refresh dedupe が
+  バッチを1回の再ビルドにまとめるため一括 API は追加しない。失敗項目
+  は保留のまま残し「N件送信、M件失敗しました」を表示。1件即時送信の
+  従来 UX は不変。
+- 確認不要/参考情報/unchanged 行の監査詳細展開(§5.3): 応答に存在する
+  フィールドのみ(state・confidence・evidence・snapshot/revision・
+  updated_at・intelligence run・carried_over_from/content_hash)を表示。
+- サンプル確認(§5.4 最小版): no_review_required + informational から
+  id 昇順で最大3件を決定的に選び、展開済み+「疑問がある」導線付きで
+  提示(全件3件以下ならサンプル節なし)。誤り発見時は #310 の明示的な
+  手動再確認へ接続し、分類ルールの自動調整は行わない。
+- 根拠の先出し例外(§4.4): conflict / security・high_risk フラグ /
+  runtime_check mismatch・stale / 根拠1件のみ、のとき EvidenceList を
+  初期展開する(応答の有限フィールドからの決定的判定のみ)。
+
+### Inquiry 段階開示の4段階化と「わからない」自動調査(#295 §4.4 / §4.8 / §4.10、dashboard)
+
+- `inquiry-panel.tsx`: 従来の「結論 → detail 一括トグル」2段階を、
+  結論(常時)/「理由を見る」(`key_points`)/「根拠を見る」
+  (evidence の docs/code/test/Runtime 種別+要約+uncertainty)/
+  「調査詳細を見る」(path:行番号・runtime provenance・調査 run 参照)
+  の4段階に分割。種別はパス文字列からの構造的分類(file kind、
+  Principle 6 の許容例)。バックエンド・スキーマ変更なし(既存
+  detail payload の表示分割のみ)。
+- 例外の先出し: `runtime_evidence[].runtime_check=='mismatch'` または
+  `detail.uncertainty` 非空のとき第2〜3層を初期展開(第4層は自動展開
+  しない)。
+- `interview.tsx`: Q&A の「わからない」選択時、既存の
+  route-and-investigate バッチ調査(#286/#291 で整備済みのエンドポイ
+  ント)を自動起動する。調査中は「関連コードとテストを確認しています」
+  の短い状態表示のみ。API 失敗・バッチ対象外時は従来の #142 フロー
+  (`answer_unknown: true`)へ無条件フォールバックし、回答機会を失わ
+  せない。実行中の重複発火は防止。`investigation_status='unresolved'`
+  は調査成功(特定できず)として扱い、既存の表示に委ねる。
+
+### 実装しない・見送った残課題
+
+Issue #295 は実装レビュー完了によりクローズ済み。以下の残課題は
+Epic #307 の子 Issue として起票し直した。
+
+- **低リスク提案の一括承認(旧 #292 → #311)**: 引き続き実装しない
+  (開始条件の観測データが未取得。計測手段は #309)。本節の「まとめて回答」は
+  ユーザーが1件ずつ選んだ回答の送信バッチ化であり、AI 分類による
+  自動承認ではない — `decision_method: manual` は項目単位で維持。
+- **Inquiry の前提追跡(#295 §5.6 拡張 → #308)**: 完了。作成時に固定する
+  前提 bundle(snapshot / revision / content hash / Capability digest /
+  linked Intent digest / tracking version)、構造的 anchor だけで作る
+  Review item の論点 identity と世代 lineage、Alignment 再ビルド内の決定的
+  な前提評価と `superseded` 遷移、後継の再確認導線までを実装した。詳細は
+  「Inquiry の前提追跡と superseded(Issue #308)」節。
+- **評価指標(#295 §9 → #309)**: 集計基盤と接続済み収集点は実装済み。
+  既存の永続データと有限な UI 計測イベントだけから System 単位に集計し、
+  算出不能な指標は 0 や推定値ではなく `unmeasured` として返す。途中離脱と
+  unchanged 再確認の収集意味は下記のとおり仕様判断を残す。
+- **サンプル誤り発見時の分類ルール再評価(§5.4 後半 → #310)**: 完了。
+  `no_review_required` の決定的サンプル（確認不要/参考情報の id 昇順先頭3件、
+  全体4件以上）から既存 Inquiry を開くと、対象 `alignment_item` の
+  `policy_rule_id` / policy version / policy digest / `reason_code` を
+  `alignment_rule_objection` に不変の監査事実として記録する。System 単位の
+  API はこの正確なルール来歴ごとに異議数を決定的に集計し、人間が選択した
+  同じルール版の現行 `no_review_required` 項目だけを再確認対象へ戻せる。
+  対象は session と物理 item ごとに分離し、同一 content hash でも潰さない。
+  再確認化は決定的分類を変更せず、実行者と `decision_method: manual` を保存し、
+  通常の手動回答/修正だけが現行対象を解消する。rebuild で内容が変わった旧対象は
+  監査行を `superseded` として残し、現行の pending 件数には含めない。
+- **再確認カスケードの範囲(§5.5 → #312)**: 完了。既存の goal / 確定済み
+  Intent ガードに加え、reasoning model の `current_understanding` を提案、
+  `confirm-understanding` を人間による正準構成の確定として分離した。
+  Core Capability / Capability Element / Supporting Element / API Boundary は
+  表示名と独立した System-scoped の安定 entity id を持ち、rename は人間が
+  明示 binding した場合だけ同一 identity を引き継ぐ。支援関係も安定 relation
+  id の多対多グラフなので、同じ下位機能を複数 Core Capability が共有できる。
+  確定履歴は System-wide の canonical head と `base_confirmation_id` で直列化し、
+  確定requestは表示時のhead idをoptimistic lockとして照合するため、
+  同時更新後の古い構成を上書きしない。
+  別 Interview session でも同名 identity を継承する。古い head に紐づく
+  session は新しい Understanding revision を確定するまで Alignment build を
+  409 で拒否する。確定APIはログインユーザー専用で、Principal の user id/名前を
+  保存し、graph・session stage・監査messageを単一transactionで確定する。
+  Dashboard の再確定dialogでは rename binding と採用する多対多relationを
+  人間が確認・編集できる。
+  Alignment item は、生成時に提示された現行の確定グラフに存在する entity /
+  relation id だけを依存先として受理し、`accept_current` の監査範囲と一緒に
+  sidecar tableへ保存し、Review Queueにも名称付きで表示する。次回 build は
+  `base_content_hash` が同じ候補について確定
+  グラフ間の依存 digest を決定的に比較し、変更関係を参照する項目だけを
+  `must_review` / `reason_code='core_capability_changed'` へ戻す。共有機能の
+  非変更側relation、明示 binding 済みの純粋rename、無関係な追加は
+  `unchanged` carry-overを維持する。この有限分類は
+  `alignment-review-policy-v2` の `core-capability-changed` ruleとして監査する。
+  旧DBの既存 `content_hash` は推測なしで `base_content_hash` にcopyする一方、
+  名前からidentity/依存関係は推測backfillせず、最初の人間確定後から正準履歴を
+  開始する。
+- **no_review_required ポリシーの外部化(§7.3 → #313)**: 完了。
+  `app/policies/alignment_review.yaml` に、有限条件だけを受け付ける
+  first-match ポリシーとして切り出した。読み込み時に schema version、全
+  reason template、許可済み有限値、重複キー、全入力組合せの終端到達を検証し、
+  不正・欠損時は既定値へフォールバックせず fail-closed で起動を拒否する。
+  各 `alignment_item` には policy version と YAML 本文の SHA-256 を保存し、
+  policy 変更は content hash を変えて `unchanged` carry-over を安全側に無効化する。
+- **提案 §7 のフィールド名・status 集合との差異**: 既存実装のフィールド名
+  (`non_goals`、`status` 等)を維持し、#295 記載の名称
+  (`out_of_scope`、`confirmation_state` 等)への改名は行わない
+  (スキーマ契約の互換性優先)。同様に Inquiry status は現行の 5 値
+  (`open` / `resolved` / `unresolved` / `cancelled` / `held`)を維持する。
+  #295 §7.5 の `investigating` / `answered` / `insufficient_evidence` は
+  メッセージ内容と固定テンプレートで同等の区別を実現しており機能差がない。
+  `superseded` のみ機能追加を伴うため #308 で扱う。
+
+### Alignment / Inquiry UX 評価指標パイプライン(Issue #309)
+
+UX 改善の効果を、LLM の解釈や外部分析基盤を使わず、選択中の
+System に属する永続データだけから監査できるようにした。
+
+- **API 契約**:
+  - `GET /interview/metrics` は固定 schema でユーザー負担・精度・UX 品質の
+    指標を返す(#309 時点は `interview-metrics-v1`、#341 で要確認判定を
+    追加した現行は `interview-metrics-v2`)。
+    各指標は `description` / `formula` / `sources`、分子・分母、
+    `measured|unmeasured` を持つ。分母 0、因果 lineage 不足、未収集は
+    `value: null` と固定理由を返し、計測済みの 0 と区別する。
+  - `POST /interview/metric-events` は
+    `interview-metric-event-v1` の有限 event/target 組だけを受け付ける。
+    対象 session・QA・Alignment item・Inquiry message の System 所有権を
+    検証する。`event_key` は転送再送キーとして扱い、さらに
+    system/session/event/target の意味的同一性で別キーの重複も冪等化する。
+    展開・完了・離脱・再確認は対応する提示/開始イベントが先に存在しなければ
+    409 で拒否する。自由文や画面内容は保存せず、外部サービスにも送信しない。
+- **additive persistence**:
+  - `interview_metric_event` は根拠詳細の提示・展開、質問提示など、
+    domain table から復元できない UI 事実だけを append-only で保持する。
+  - `interview_qa.answer_unknown` は回答操作時の「わからない」を nullable
+    で保持する。既存 `answered` / `unconfirmed` は決定的に backfill するが、
+    旧 `revised` 行は元状態を復元できないため NULL のまま分母から除外する。
+- **決定的に算出する指標**:
+  明示記録 cohort の「わからない」率、確認済み Intent の後日修正率、
+  non-mock・non-superseded な Runtime contradiction 率、承認後却下率、
+  同一 session 内の同一質問文再出現率、Inquiry 解消率、解消後に元項目へ
+  明示回答した割合を既存行から算出する。根拠展開率・途中離脱率・変更なし
+  項目再確認率・実装質問転嫁率は、対応する有限イベントが実際に記録された
+  cohort に限って算出する。
+- **推定しない指標**:
+  回答 ID と Understanding Revision の対応がない
+  「理解更新 1 回あたり回答数」、全 UI 操作を覆えない
+  「Inquiry 1 件あたり追加操作数」、意味的な誤回答確定率、
+  field-level lineage がない Revision 再修正率、未実装の rollback、
+  却下と rollback の合成率は常に `unmeasured` とする。
+- **仕様判断を残す収集点**:
+  `review_started/completed/abandoned` と `unchanged_item_reconfirmed` は有限
+  schema と fail-closed な前提関係まで定義したが、Dashboard の本番 writer は
+  未接続。画面遷移・tab close・一定時間無操作のどれを「途中離脱」とするか、
+  対応不要行に独立した「再確認」操作を追加するかは UX の意味を変えるため
+  自動推定しない。決定するまでは該当 cohort を `unmeasured` のまま扱う。
+- **Dashboard**:
+  Interview 画面に System 集計パネルを追加し、guardrail
+  (疑問解消率、誤回答確定率、実装質問転嫁率)を他の指標から分離する。
+  未計測は理由付きで表示し、計測済み 0 と同じ表示にしない。
+- **安全性**:
+  指標は表示と監査にだけ使い、分類ルール、自動承認、publish、policy
+  変更を起動しない。全 query・event target 検証に `system_id` を含め、
+  System 間の分離を回帰テストで固定する。
+
+### 評価指標の段階的開示と要確認判定(Issue #341)
+
+評価指標は、インタビュー中に常に見る一次情報ではなく、運用が健全か・意味の
+あるデータを取れているかを定期的に確認するための二次情報である。#309 では
+ページ見出し直後に全カードが常時展開されていたため、セッション開始・回答・
+共同理解の更新より監視情報の視覚的優先度が高くなっていた。これを、状態を
+持つ入口の背後へ畳んだ。
+
+- **`guardrail` と要確認判定の分離**: `InterviewMetricOut.guardrail` は
+  「監視対象として指定されているか」だけを表し、実際に異常かどうかは
+  新しい `attention` オブジェクトが持つ。両者を1つの boolean に混ぜない。
+  `attention.state` は有限6値 — `attention`(閾値超過)/ `ok` /
+  `insufficient_data`(母数不足・観測なし)/ `not_measurable`(元の事実が
+  記録されておらず算出手段が無い)/ `criterion_unset`(監視対象だが閾値
+  未設定)/ `observation_only`(通知対象ではない定期観測)。未計測が
+  `ok` や `attention` になることはなく、0 で補うこともない。
+- **判定条件の外部化**: `app/policies/interview_metric_attention.yaml` に、
+  指標ごとの `watch` / `direction`(high_is_bad|low_is_bad)/ `threshold` /
+  `min_sample` / `window` / `trigger` / `clear` を持つ成果物として切り出した
+  (#313 と同じ fail-closed 方式、共通の strict loader は
+  `app/policy_loader.py`)。読み込み時に schema version、全 metric key の
+  終端カバレッジ、有限値、重複キー、`watch: false` 側の余分なフィールドを
+  検証し、不正・欠損時は既定値へフォールバックせず起動を拒否する。
+  `policy_version` と YAML 本文の SHA-256 を応答に含める。
+  `watch: true` にできるのは `guardrail` 指定のある指標だけで、
+  違反は `apply_attention` が例外にする。
+- **v1 語彙の意図的な制限**: `window` は `all_time`、`trigger` は
+  `single_breach`、`clear` は `value_within_threshold` のみ。継続時点灯・
+  期間限定集計・手動の「確認済み」は評価履歴の永続化かスケジュール実行が
+  前提であり、GET 呼び出し(=画面表示回数)を観測回数として数えるのは
+  無意味なため、黙って無視するのではなく語彙から除外して拒否する。
+- **閾値の数値は未設定**: 具体的な閾値は各指標の意味と実データを見て別途
+  決めるため(#341 対象外)、出荷時の全 `threshold` は `null`。この状態の
+  監視対象は `criterion_unset` となり入口を点灯させない。母数チェックは
+  閾値と独立に効くため、「データ不足」の判定は最初から機能する。
+- **通知対象と定期観測の分離**: 出荷時の `watch: true` は #309/#334 で
+  guardrail 指定済みの6指標のみ。「調査だけで答えに到達した割合」や
+  「わからない選択率」のように単純な高低で良否を決められない指標は
+  `watch: false` の定期観測とし、入口を点灯させない。
+- **Dashboard**: カード群は既定で閉じ、見出し付近にラベル付きの常設導線を
+  置く。導線は 正常 / 要確認 N件 / データ不足 / 取得失敗 を色だけでなく
+  テキストで示し、「値が悪い」と「まだ判断できない」に同じ警告表現を
+  使わない。取得失敗はサーバーが自分の失敗を報告できないためクライアント
+  側で導出し、インタビュー操作は従来どおり継続できる。展開時は
+  要確認事項 → データの評価可能性 → 全指標 の順で段階表示する。導線は
+  ネイティブ `<button>` + `aria-expanded` / `aria-controls`、本体は
+  ラベル付き `region`。
+- **契約**: 応答 schema は `interview-metrics-v2`(`attention` の追加と
+  System 単位の集計 summary)。
+
+### PR #296 レビュー対応(#295 実装の修正)
+
+初回実装へのレビュー指摘5件とUX評価に対する修正。
+
+1. **content hash の対象拡張**: `compute_content_hash` に
+   `intent_summary` / `gap_summary` / `proposed_interpretation` と、
+   evidence 参照範囲の実テキスト digest(`source_digest`: pin 済み
+   commit から `read_file_at_commit` で読んだ start〜end 行の sha256、
+   ビルド単位キャッシュ)を追加。同じ行範囲のコード変更や制約・scope
+   の変化が unchanged と誤判定される穴を塞いだ。evidence が読めない
+   項目は hash を None とし carry-over 対象外(安全側)。旧形式 hash
+   とは一致しなくなるが再確認へ戻る方向なので移行処理は不要。
+2. **carry-over の多世代持続**: carry 候補に
+   `review_category='unchanged'` の行を追加し、`carried_over_from` は
+   チェーンを辿った元の人間回答行(answered/corrected)の id を伝播。
+   3世代目以降も引き継ぎが持続し、監査参照は常に実際の人間回答を指す。
+3. **superseded 履歴の分離**: `GET /alignment` の `items_by_category` /
+   `counts` は superseded=0 の現行行のみを対象にし、履歴行は additive な
+   `superseded_items` で返す。UI は「履歴 N件」の折りたたみで監査閲覧
+   可能にし、件数サマリ・サンプル確認への履歴混入を解消。
+4. **調査の単件スコープ化と主導線接続**: `route-and-investigate` に
+   optional な `qa_ids` body を追加(省略時は従来の全対象バッチ)。
+   フロントは `useQaAutoInvestigate` 共通コントローラに調査呼び出しを
+   一本化し、focused question の「わからない」も自動調査へ接続。
+   1操作で複数件の LLM 調査が走らない。
+5. **回答バッチ API**: `POST .../alignment/answers-batch` を追加。
+   単体 `/answer` と同じ書き込みロジックを項目単位で再利用
+   (`decision_method: manual` は項目単位のまま)、`request_refresh` は
+   バッチ全体で一度だけ。部分失敗は項目ごとの成否で応答し、UI は失敗
+   項目を保留に残す。
+6. **画面再構成(UX評価対応)**: Interview 画面の中央主領域を
+   「Alignment Review / 会話」の2タブにし、Alignment build 済み
+   セッションは Alignment Review(Intent/現状/gap サマリ +
+   ReviewQueuePanel)を既定表示。サイドバーの Review Queue 二重表示を
+   撤去し、`qa.investigation` の結論表示を focused question と同じ
+   ビューでも表示する(`QaInvestigationBlock` 共有)。
+
+### PR #296 2回目レビュー対応
+
+初回レビュー対応後の再レビューで残った P1×2・P2×3 への修正。
+
+1. **carry-over が Intent/上位概念変更を検知(指摘1, P1)**:
+   `compute_content_hash` に `intent_item_id`(リンク先 Intent の生 FK)と
+   `linked_intent_digest`(リンク先 `interview_intent_item` の
+   field/value_text/status の sha256)を追加。`/correct` は新 id を発行、
+   `/confirm`・`/decline` は同 id で status が変わるため、どちらも
+   ハッシュが変化し「LLM が同じ要約を返しても依存 Intent が変わった」
+   ケースを項目単位で検知する。加えて goal 専用だった再ビルドガードを
+   **確定済み(confirmed/not_applicable)Intent フィールドのいずれかが
+   直前ビルド以降に更新された場合**へ一般化(全項目を再分類)。
+   当時は Core Capability に per-capability の確定履歴が無かったため対象外
+   とした。後続 #312 で、安定entity id・人間確定composition・多対多support
+   relation・Alignment依存参照を追加し、ヒューリスティックを使わない限定
+   カスケードを実装した。
+2. **回答対象の検証強化(指摘2, P1)**: batch の項目検証に
+   `superseded=1` 拒否・回答可能 status(open/held)以外の拒否・
+   actionable category(must_review/batch_reviewable)以外の拒否・
+   optional な `content_hash` 不一致拒否を追加。単体 answer/correct/hold
+   にも `_reject_if_superseded`(409, `alignment_item_superseded`)を追加。
+   別タブや自動更新で履歴化した項目を古い判断で上書きできない。
+3. **未対応件数の分離(指摘3, P2)**: `AlignmentListOut` に
+   `outstanding_counts` を追加(get_review_queue と同一述語 = superseded=0
+   かつ status NOT IN answered/corrected)。`counts`(現行行総数)は互換
+   維持。UI の要確認・一括レビュー可の件数は outstanding_counts を優先
+   使用し Review Queue のカード数と一致させる。
+4. **既定タブの必須操作優先(指摘4, P2)**: 既定タブを
+   「会話タブに必須アクションが残る間は会話」優先に変更(alignmentBuilt
+   だけで alignment を既定にしない)。会話タブの必須アクションがある間は
+   NextActionBanner に「会話タブへ移動」導線を出し、どのタブからも必須
+   操作へ到達できるようにした。
+5. **gap サマリの内容表示とサンプルの情報量抑制(指摘5, P2)**:
+   AlignmentSummaryHeader のギャップ欄に最重要 gap の要約
+   (gap_summary || current_claim、未対応のみ、Review Queue と同じ決定的
+   順序)を主表示し件数を補助に。確認不要サンプルの根拠・content_hash は
+   初期折りたたみ(主張のみ表示)にして確認疲れを抑制。
+
+### PR #296 3回目レビュー対応
+
+2回目レビュー対応をマージ後の再レビューで残った P1×2・P2×2 への修正。
+
+1. **carry-over の起点を accept_current に限定(指摘1, P1)**:
+   これまで carry-over 候補は `status IN ('answered','corrected')` の終端行
+   全てだったため、`needs_change` / `reject_interpretation` の回答や
+   `corrected` 行も、再生成内容が同一なら `unchanged`(対応不要)になり、
+   人間が明示した異議・修正が Review Queue から消えていた。これらは
+   Understanding へ反映する処理も無いため、実質的に異議が隠れる。carry
+   候補を **`accept_current` の `answered` 行のみ**(＋その id を辿る
+   多世代 `unchanged` チェーン)に限定し、否定・修正判断はルール表での
+   再分類に落として actionable のまま残す。FK 安全性(carried_over_from
+   の参照先は DELETE 対象の status='open' 行に決してならない)も維持。
+2. **未確認 goal を確定 Intent として表示しない(指摘2, P1)**:
+   `AlignmentSummaryHeader` は確認済み goal が無いとき `goalItems[0]` を
+   「あなたが実現したいこと」として表示していたため、`status='proposed'`
+   の AI 提案が人間の確定 Intent に見えていた。確認済み goal のみを確定
+   表示し、未確認の AI 提案しか無い場合は「AI提案・未確認」ラベル付きの
+   未確認候補として明示、どちらも無ければ未入力表示にする(#295 の
+   「AI推定と人間確認済み情報の区別」)。
+3. **proposal_review を会話タブの必須操作として扱う(指摘3, P2)**:
+   提案の承認・却下・差分生成の UI は会話タブ内にあるのに、
+   `conversationHasRequiredAction` が `proposal_review` を「必須操作なし」
+   と判定していたため、build 済みだと Alignment タブが既定表示され、
+   NextActionBanner の指示先と表示タブが食い違い「会話タブへ移動」導線も
+   出なかった。`proposal_review` も会話タブの必須操作として扱い、既定を
+   会話タブにする(Alignment はタブ切替で常時到達可能、切替時はバナー
+   導線を表示)。
+4. **監査詳細に人間の判断を表示(指摘4, P2)**:
+   `AuditDetail` が `user_decision` の action・note・日時を表示せず、
+   承認・変更要求・却下・修正・保留のどれだったか判別不能だった。
+   `USER_DECISION_LABELS`(5 action の日本語ラベル)を追加し、判断内容と
+   メモを監査詳細に表示。carried_over_from / superseded 履歴と合わせて
+   #295 の監査可能性を満たす。
+
+### PR #296 4回目レビュー対応
+
+3回目レビュー対応後に残った動作上の指摘6件への修正。
+
+1. **Alignment 判断を Understanding に還流(P1)**:
+   `answered` / `corrected` の終端 `alignment_item.user_decision` を
+   `routes/interview.py::_load_alignment_feedback` で新旧履歴から読み、
+   `generate_understanding_review(..., alignment_feedback=...)` に渡す。
+   reviewer prompt では人間の判断を graph 仮説より優先し、最新判断を
+   先頭に配置する。`needs_change` / `reject_interpretation` /
+   `corrected` が同じ提案の再表示抑止だけでなく、次の Understanding
+   自体へ反映される。prompt 変更の監査用に
+   `PROMPT_VERSION='understanding-review-v5'` とした。`held` は作業状態で
+   内容判断ではないため注入しない。
+2. **refresh job をトリガー別に実行(P1)**:
+   確定後の `_understanding_update_blocked` は Q&A watermark の gate
+   なので `qa_answer` の「新規回答なし」判定にだけ使う。
+   `alignment_answer` は gate を迂回して Alignment 判断込みで
+   Understanding を再構築する。`intent_update` は desired state の変更、
+   `nl_change_set` は選択済み claim edit を revision に永続化済みなので、
+   最新 revision を再生成せずそのまま Alignment build へ進む。
+   pending job へ別 trigger が合流した場合は
+   `alignment_answer > qa_answer > intent/change-set` の必要処理順に
+   `trigger_kind` を昇格し、強い入力を dedupe で失わない。
+3. **単体判断 API の上書き防止(P1)**:
+   `/answer` / `/correct` / `/hold` も batch と同じく actionable category
+   だけを受け付け、`answered` / `corrected` への再判断を 409 にする。
+   `/hold` の再送は既存行をそのまま返す冪等処理とし、判断時刻を
+   書き換えない。`held` から明示的な answer/correct への遷移は維持する。
+4. **非同期 refresh 完了後の再取得(P1)**:
+   Dashboard の `useRefreshStatus` は pending/updating の polling に加え、
+   job が terminal になった時点で session/Q&A/understanding revision・
+   diff/alignment/review queue を再取得する。mutation 直後の早すぎる
+   invalidation が旧状態を取得しても、完了後に新 revision が必ず反映される。
+5. **Alignment 自動既定の到達可能化(P2)**:
+   `conversationHasRequiredAction` を `uiState` の truthiness ではなく
+   実際の CTA から導出する。proposal review 中は proposed/needs_review
+   または approved/edited が残る間だけ会話タブを優先し、全提案却下済み
+   かつ Alignment build 済みなら Alignment Review が自動既定になる。
+6. **却下済み AI goal の除外(P2)**:
+   未確認候補は `status='proposed' AND origin='ai_proposed'` の行だけ。
+   `not_applicable` へ却下済みの AI goal は「AI提案・未確認」として
+   再表示しない。
+
+## Inquiry の前提追跡と superseded(Issue #308)
+
+#285 の Inquiry は「どの Snapshot / Understanding Revision / Review item
+の内容を前提に回答されたか」を保持していなかったため、前提が変わった後も
+`resolved` のまま現行の判断根拠として残り続けた。#308 はこれを、作成時に
+固定する**前提 bundle**、Review item の**論点 identity**、再ビルド時の
+**決定的な前提評価**、そして Dashboard 表示の4つに分けて実装する
+(sub-issue #320 / #321 / #323 / #322)。
+
+`superseded` は「回答が誤り」でも「未解決」でもない。**当時の前提に対する
+会話は履歴として残すが、現行の判断には流用しない**という意味だけを持つ。
+
+### 前提 bundle(#320)
+
+`interview_inquiry` に additive 列として追加する。既存行はすべて NULL の
+まま移行し、過去の snapshot / revision / hash を推測して backfill しない。
+
+| 列 | 意味 |
+| --- | --- |
+| `premise_snapshot_id` | 回答生成が固定して使う Snapshot。全 origin で記録 |
+| `premise_revision_id` | 元 Review item がビルドされた Understanding Revision |
+| `premise_review_subject_id` | 論点 identity(#321)。後継の探索に使う |
+| `premise_content_hash` | 元 Review item の `base_content_hash` |
+| `premise_capability_digest` | 確定 Capability scope の digest(#312 の entity/relation id + captured digest) |
+| `premise_intent_digest` | 紐づく Intent 行の `compute_intent_item_digest` |
+| `premise_tracking_version` | 前提追跡契約自体の版(`inquiry-premise-v1`) |
+| `premise_captured_at` | 固定した時刻 |
+
+snapshot / revision は監査参照(retention 時は `ON DELETE SET NULL`)、
+hash / digest / tracking version は**意味内容の比較に使う監査事実**として
+retention 後も残る。
+
+`premise_capability_digest` の入力は `alignment_item_capability_dependency`
+の `(entity_id | relation_id, captured_digest)` 対だけで、所属する
+`alignment_item_capability_scope.confirmation_id` は**意図的に含めない**。
+Alignment は新しい Understanding revision に対して確定 Capability graph を
+要求するため、確定し直すたびに `confirmation_id` は必ず変わる。これを
+digest に入れると、自分が引用している entity / relation が1つも動いていない
+Inquiry まで次のビルドで `capability_scope_changed` として失効してしまい、
+「ID が変わっただけでは失効させない」(#323)に反する。#312 の
+`_capability_scope_changed` も同じ理由で、`confirmation_id` の相違だけでは
+変更と見なさず、その item 自身の entity / relation id が変更集合に入って
+いるかで判定している。`captured_digest` は entity / relation の
+`semantic_digest` であり、id は確定をまたいで安定なので、この対そのものが
+scope の「意味」である。
+
+`premise_tracking_state`(API のみ、保存しない決定的導出値)は有限集合
+`not_applicable | untrackable | tracked`。
+
+- `not_applicable`: `origin_kind` が `review_item` 以外。v1 の自動前提追跡
+  対象は `review_item` のみ。
+- `untrackable`: legacy 行、元 item の `content_hash` が NULL、安定
+  anchor が無い、または論点 identity が `ambiguous`。**評価対象にしない**。
+- `tracked`: 比較可能な bundle が揃っている。
+
+初回回答も follow-up も `premise_snapshot_id` を使う。session の
+`snapshot_id` が会話の途中で進んでも、1つの Inquiry の前提は暗黙に rebase
+されない(legacy 行だけ従来どおり session の snapshot にフォールバック)。
+
+### Review item の論点 identity と世代 lineage(#321)
+
+`alignment_item.content_hash` は「完全一致か」しか判定できず、内容が変わっ
+た後も同じ論点であることを示せない。Alignment rebuild は未回答の open 行を
+削除して新しい物理行を作るため、identity が無いと後継を決定的に選べない。
+
+`review_subject_id` は **構造的 anchor だけ**から作る sha256:
+
+- System / session id(System 分離を identity 自体に含める)
+- `intent_field`(#284 の有限な Intent Brief フィールド。1 session 1 field
+  につき現在行は1つなので、field 名自体が安定した Intent identity)
+- 確定 Capability の entity id / relation id(#312 の rename を跨ぐ安定 id)
+
+claim 本文・エビデンス引用・要約・confidence は**入力にしない**。これらは
+reasoning model の言い回しであり、それで論点を結ぶのは #321 が禁じる類似度
+一致そのものになる。anchor がまったく無い item は identity を持たず
+(`review_subject_id IS NULL`)、明示的に `untrackable` になる。
+
+`subject_state`(有限集合)と `replaces_item_id` を各行に記録する。
+
+| 値 | 条件 |
+| --- | --- |
+| `new` | この論点の先行世代が無い |
+| `unchanged` | 先行世代が一意で `base_content_hash` が完全一致 |
+| `changed` | 先行世代が一意で内容が異なる |
+| `ambiguous` | 同一 build 内、または先行世代側で同じ anchor が複数(split / merge) |
+| `untrackable` | 安定 anchor が無い |
+
+`ambiguous` / `untrackable` では `replaces_item_id` を結ばない。「一意に
+対応できない場合は後継を推測しない」ため、`ambiguous` な item から開いた
+Inquiry は前提 bundle に subject を記録せず `untrackable` 扱いにする
+(記録すると、その行を一意に指していなかった identity から後継を1つ選ぶ
+ことになり、まさに禁止された推測になる)。
+
+`removed` はこの集合に含めない。「現行 build に行が無い論点」は行の属性で
+はなく前提評価(#323)の結果だからである。
+
+`content_hash` / `base_content_hash` / `carried_over_from` による #295 の
+unchanged carry-over とは独立で、既存挙動を変えない。前者は「人間が
+accept_current した行と完全一致か」、後者は「どの旧行が同じ論点か」という
+別の問いに答える。古い物理行を current/open に戻すことはなく、常に新しい
+物理行が現行版である。
+
+### 前提評価と superseded 化(#323)
+
+`run_alignment_build` の**書き込みトランザクション内**、現行 Review item
+集合が確定した後に評価する。build が失敗すれば遷移も一緒に rollback する。
+
+対象は `origin_kind='review_item'` かつ `status IN (open, held, resolved)`
+かつ bundle が揃っている Inquiry のみ。`cancelled` / `unresolved` /
+既に `superseded` の行は再訪しない。
+
+後継は `premise_review_subject_id` と**この build が作った行**
+(`created_at = build の completed_at`、`superseded = 0`)を突き合わせて
+構造的に決める。snapshot / revision の id が変わっただけでは失効させない
+(同じソース本文を新しい snapshot に貼り直しても hash は一致する)。
+
+判定結果は有限集合で、first-match:
+
+| 後継 | 比較 | 結果 | reason code |
+| --- | --- | --- | --- |
+| 0件 | — | `removed` | `origin_removed` |
+| 2件以上 | — | `ambiguous` | `successor_ambiguous` |
+| 1件 | hash / capability digest / intent digest がすべて一致 | `unchanged` | (遷移なし) |
+| 1件 | intent digest が異なる | `changed` | `linked_intent_changed` |
+| 1件 | capability digest が異なる | `changed` | `capability_scope_changed` |
+| 1件 | それ以外 | `changed` | `review_item_content_changed` |
+
+reason code は根本原因を優先して選ぶ(content hash は linked intent digest
+を含むため、intent の変更は必ず hash も変える)。
+
+`unchanged` 以外は `superseded` へ遷移させ、
+`interview_inquiry_transition` に `actor='system'` と有限 reason code を
+記録する。`superseded` は終端で、`/message` / `/resolve` / `/resume` /
+`/reopen-doubt` はすべて 409 になる(古い前提のまま会話を継続したり、
+現行の判断として確定したりできない = fail-closed)。再確認は現行 Review
+item から新しい Inquiry を開いて行う。
+
+- `closed_at` は**書き換えない**。`closed_at` は「開発者がこの会話を閉じ
+  た時刻」を意味し続け、`resolved` だった Inquiry は解消時刻をそのまま保
+  持する。open/held のまま失効した Inquiry は `closed_at` を NULL のまま
+  にし、解消したように見える時刻を後から与えない。失効時刻は
+  `superseded_at` に別途記録する。
+- 後継が一意(`changed`)のときだけ、その後継 item に
+  `manual_recheck_required = 1` を立てて Review Queue に戻し、旧物理行を
+  `superseded = 1` の履歴にする。`user_decision` には一切触れない
+  (Principle 2 — 表示や遷移が回答・承認になってはいけない)。
+- 元 item が `status='inquiry'` でロックされたままにならないよう、他に
+  active な Inquiry が無ければ `open` に戻す(`answered` にはしない。
+  #287 の release 規則と同じ)。
+- `removed` / `ambiguous` では旧物理行を `superseded = 1` に**しない**。
+  一意な後継が無い以上、その論点を履歴化してよいかは決定的に言えず、
+  行を隠すと未回答の確認項目が黙って消える。ロックだけ外して `open` の
+  まま Review Queue に残し、判断は開発者に委ねる(後継の推測をしないのと
+  同じ理由で、消滅の推測もしない)。
+- `superseded` は終端なので、同じ rebuild を何度実行しても2つ目の遷移行や
+  重複した recheck 対象は作られない(冪等)。
+
+### Dashboard(#322)
+
+`superseded` は active な Inquiry として数えず、resume 導線も出さない
+(`activeInquiryByOrigin` は `open` / `held` だけを許可する allow-list)。
+履歴としては読める。表示はすべてサーバーのフィールドからの決定的な写像で、
+クライアント側で後継を推測しない。
+
+- 失効バッジ「前提が変わったため再確認が必要」+ 「未解決・取り消しとは異
+  なる」ことを明示する固定説明文。
+- 理由ごとの固定文言4種: `changed`(内容が変わった) / `removed`(論点が
+  無くなった) / `ambiguous`(後継を一意に特定できない) /
+  `untrackable`(旧データまたは hash 不明で自動比較できない)。
+- 監査詳細に作成時の snapshot / revision、失効理由、tracking version、
+  解消日時と失効日時の両方。
+- `premise_successor_item_id` があるときだけ後継 Review item カードへの
+  導線を出し、無いときは固定文言だけを出す。新しい Inquiry の開始と元
+  Review item への明示回答は別操作のまま。
+- `untrackable` は失効ではないので、失効バッジは付けず固定文言だけを出す。
+
+### 実装しない(#308 の non-goals)
+
+- Inquiry 回答の自動再生成(検知と再確認対象化まで)。
+- `answered` / `investigating` / `insufficient_evidence` への status 追加。
+  現行実装はメッセージ内容と固定テンプレートでこれらを表現しており、命名
+  だけの変更は行わない。
+- qa / intent origin の自動前提追跡(snapshot の固定だけは全 origin で行う)。
+- ambiguous な後継の自動選択、Review item の自動回答・自動承認。
+
+## Probe Cell Fabric(Issue #297)
+
+自律改善エージェント組織(Cell Fabric)の思想を取り込み、承認済みの各
+Probe Point / Component に論理的な Probe Cell を割り当て、Feature・UX・
+API/Flow 単位のオーケストレーターが状態を集約し、Root Orchestrator が
+ユーザーとのやり取りを一本化する。sub-issue は依存順に
+#298 → (#299 ∥ #300) → #301 → (#303 ∥ #302) → #304。
+
+### 全体アーキテクチャ決定
+
+1. **三つの構造の分離**。
+   - System Topology Graph: Feature / Capability / API / UX / Symbol /
+     Component の多対多関係。既存の understanding graph / feature_code_links
+     / capability_hierarchy を正本とし、Cell Fabric は参照のみ行う。
+   - Goal / Accountability Tree: `cell_goals` / `cell_tasks`(#300)。各 task
+     は単一の owner Cell と単一の `parent_goal` を持つ。Topology を Goal
+     Tree として流用しない。
+   - Cell Runtime State: mission / tasks / quality / health / improvement /
+     role card version。`cell_state` は読み取り時に既存の Trace /
+     Evaluation / Shadow Result / Replay / Experiment 参照から決定的に構築
+     し、キャッシュ用の別テーブルを持たない。
+2. **1 probe = 1 論理 Probe Cell**。Cell ID は原則
+   `system_id + component_id`。常駐 LLM プロセスや trace ごとの LLM 呼び出し
+   にはしない。モデル起動は明示要求または集約窓/イベント単位のみで、起動は
+   `cell_activations` に監査記録される。dormant Cell は LLM を消費しない。
+3. **Agent Role Card は既存の API Role Card(#58)と別物**。API Role Card は
+   API のシステム内役割の表示モデル。Agent Role Card(#298)は Cell の
+   mission / scope / model alias / tool policy / acceptance template /
+   rubric ref を宣言する versioned 契約で、同一 schema へ混在させない。
+4. **provider/model の実体名は Role Card に直書きしない**。Role Card は
+   `model_alias`(例 `worker-default` / `auditor-default`)のみを持ち、
+   alias → provider/model の解決は環境変数
+   `CELL_MODEL_ALIAS_<UPPER_ALIAS>`(値は `provider:model` 形式、未設定時は
+   既存 `LLMConfig.intelligence_from_env()` に委譲)で行う。実モデル名変更が
+   card 改版を要求しない。
+5. **shadow の「提案」と「実行」の分離**。Cell は `recommended_mode: shadow`
+   や候補・Replay Set・Experiment plan を提案できるが、policy 切替・
+   candidate 登録/配備・live shadow・patch 適用・採用・publish は既存の
+   人間ゲート(#25 / #216 / #242 / #252)を通る。#304 は提案 status と実行
+   承認 decision record を別レコードとして持つ。
+6. **判断境界(Principle 6)**。状態集約・優先度・ゲート・bottleneck 候補
+   抽出・sampling 選択・quality floor はすべて決定的。系統的問題の切り分け
+   (#301)、監査 verdict の根拠説明(#302)、改善仮説の生成(#304)は
+   reasoning_llm で fail-closed。承認・採用は常に `decision_method: manual`。
+
+### Sub 1: Cell 契約・Role Card・共通状態 schema(Issue #298)
+
+- shared schemas: `shared/schemas/cell_definition.schema.json` /
+  `cell_state.schema.json` / `agent_role_card.schema.json`。すべて
+  `additionalProperties: false` で unknown field を fail-closed 拒否。
+- サーバ契約層は `app/cell_fabric.py`。Pydantic モデルは
+  `model_config = ConfigDict(extra="forbid")`。
+- worker と orchestrator は別種類にせず、`roster`(子 Cell ID 配列、
+  nullable)の有無で表現する共通 Cell contract。
+- task 状態は有限集合 `todo | doing | review | done | failed | blocked`。
+  遷移規則は明示的な遷移表(`TASK_TRANSITIONS`)で検証し、`done` への遷移は
+  acceptance 充足フラグと evidence ref(1件以上)を必須とする。違反は
+  validation error。
+- Role Card は semver。`role_key` ごとに versioned 行を追加し(上書き禁止)、
+  changelog 必須。互換性検証は決定的: major 一致かつ以上のバージョンのみ
+  互換、schema_version 不一致・未知 enum・非互換 version は fail-closed。
+- テーブル(System-scoped、additive CREATE のみ):
+  `agent_role_cards`(role_key, version, status `draft|active|deprecated`,
+  mission, scope_json, out_of_scope_json, model_alias, tool_policy_json,
+  acceptance_template_json, rubric_ref, changelog, created_at, created_by,
+  decision_method)と `cell_definitions`(cell_id, roster_json nullable,
+  role_card_id + pinned card version, status `active|dormant|retired`,
+  mission override)。
+- API: `POST/GET /cell-fabric/role-cards`(+`/{id}`)、
+  `POST/GET /cell-fabric/cells`(+`/{cell_id}`)。routes は
+  `routes/cell_fabric.py`。
+- Goal/Task の永続化・Cell worker の起動・LLM による Role Card 自動生成は
+  非スコープ。
+
+### Sub 2: versioned Cell Binding と read-only pilot(Issue #299)
+
+- `cell_bindings`(cell FK, version 連番, snapshot_id, commit_sha, path,
+  qualified_symbol, probe_point_id / probe_pattern_id provenance,
+  feature/capability/entrypoint refs json, status
+  `active|stale|review_required|superseded`)。同一 Cell の source 移動・
+  snapshot 更新は新 version 行として保持し、上書きしない。
+- binding は承認済み Probe Point(status `approved`)または Probe Pattern
+  由来のみ作成可能。未承認は 409/422 で拒否。
+- read-only cell state: traces / evaluation_results / shadow_results /
+  replay_runs / experiments から heartbeat(最終 trace 時刻)、error rate、
+  duration 統計、直近 window 件数を決定的に集約(`GET
+  /cell-fabric/cells/{cell_id}/state`)。
+- drift 検出は構造的判定のみ: 最新 ready snapshot の `code_symbols` に同一
+  path + qualified symbol が存在しなければ `review_required`、存在するが
+  binding の snapshot が古ければ `stale`。推測で別 symbol へ再接続しない
+  (再接続は #168 の reconcile フローの領分)。
+- activation: `POST /cell-fabric/cells/{cell_id}/activations`(明示)または
+  集約窓条件。`cell_activations` に trigger 種別・窓・LLM 使用有無・
+  intelligence_run 参照を監査記録。trace ごとの LLM 呼び出し経路は存在
+  しない。
+- Probe SDK は変更しない。host isolation / non-blocking の回帰テストを維持。
+
+### Sub 3: Goal/Task 台帳と protocol(Issue #300)
+
+- テーブル: `cell_goals`(parent_goal_id nullable=root、循環拒否)、
+  `cell_tasks`(goal_id 必須、owner_cell_id 必須、acceptance_json 必須、
+  context_refs_json、budget_json、deadline/priority、retry_count/limit、
+  blocked_by_json、idempotency_key、evidence_json、returned_to_parent)、
+  `cell_reports`(kind `digest|escalation` は schema 検証、fact_json /
+  interpretation_json / ask_json を別 field、idempotency_key)、
+  `cell_escalations`(severity `sev1|sev2|sev3`、status
+  `open|acknowledged|resolved`)。
+- P1 delegate = task 作成(goal / acceptance / context_refs / budget /
+  deadline)。P2 report = digest / escalation の二形式のみで、契約外の
+  自由形式 payload は fail-closed 拒否。P3(quality sample event)と
+  P4(improvement proposal)は参照契約(ref 形式)のみ定義し、実装は
+  #302 / #304。
+- evidence は決定的に解決検証する: `trace:<id>` / `evaluation:<id>` /
+  `shadow_result:<id>` / `replay_run:<id>` / `experiment:<id>` /
+  `snapshot_file:<snapshot_id>:<path>` 形式のみ受け付け、実在しない参照は
+  422。
+- 同一 idempotency_key の再送は既存行を返し重複しない。
+
+### Sub 4: 領域オーケストレーター(Issue #301)
+
+- orchestrator は roster 付き `cell_definitions` 行。context lens
+  (feature/ux/api/flow)ごとの参照は多対多だが task owner は常に一意。
+- guardrail: roster は span of control 上限 7(5±2 の上限)、Goal Tree
+  深さ上限 3、構成は静的(API 経由の明示更新のみ)。違反は validation
+  error。
+- digest(`GET /cell-fabric/orchestrators/{cell_id}/digest`)は決定的
+  集約: 子 Cell の task 進捗、health、queue length、cycle time、WIP age、
+  blocked_by graph、critical path から bottleneck 候補を有限規則で列挙し、
+  各候補に根拠 fact と対処 task 参照を付ける。
+- 個別 Cell 問題か系統的/上流問題かの切り分けは reasoning_llm
+  (`run_type: cell_triage`、fail-closed)。失敗時も fact digest は返り、
+  推測で ask を確定しない。結果は fact と分離して
+  `cell_triage_results` に永続化。
+
+### Sub 5: Root Orchestrator と統合ダイジェスト(Issue #303)
+
+- `GET /cell-fabric/root-digest`: canonical deterministic facts は
+  `GET /system-state`(#235)の実装(`build_system_state`)を正本として
+  再利用し、Cell Fabric 由来の進捗・品質・escalation・Ask を統合。
+- severity routing: sev1 は即時 surface、sev2 は判断要求として集約、
+  sev3 は詳細格納。同一 root cause(決定的 dedupe key = 対象 Cell +
+  escalation 種別 + 根拠 evidence 集合のハッシュ)は一つに集約。
+- progressive disclosure: conclusion → key_points → evidence/uncertainty →
+  audit detail の 4 段を応答構造として持ち、UI はユーザー操作で展開。
+- Ask(`cell_asks`): 回答 `accept | hold | reject` は
+  `decision_method: manual` で記録し、元 Goal/Task へ還流(task の
+  blocked 解除/failed 化)。提案 accept と実行承認は別レコード・別状態
+  (実行承認は #304 のゲートおよび既存 #25/#216 ゲートの領分)。
+- Dashboard: `/cell-fabric` ページ(日本語 UI)。digest 表示・drill-down
+  (Feature → Cell → Trace/evidence)・Ask 回答。stale snapshot /
+  provenance / decision_method を明示。
+
+### Sub 6: 品質サンプリング・独立監査・quality floor(Issue #302)
+
+- SDK の lineage/projection `sample_rate` とは独立した quality sampling
+  契約。`cell_quality_configs`(sample_rate 既定 0.05〜0.10、strata_json
+  = task type / risk / rare case、audit_rate、quality_floor、budget)。
+- サンプル選択は決定的(安定ハッシュによる層化選択)。希少 stratum は
+  最低 1 件保証。選択結果は `cell_quality_samples`。
+- worker 実行モデルと auditor モデルは model alias で分離
+  (`auditor-default`)。監査は `cell_quality_audits`(verdict
+  `pass|fail` は golden set / Evaluation Criteria の決定的判定を優先し、
+  根拠説明のみ reasoning_llm・fail-closed。blind re-audit フラグ)。
+- pass/fail 集計・逐語例・fact・hypothesis は別 field で混在させない。
+- quality floor 割れ: 対象 Cell のみ `cell_intake_states` を
+  `suspended` にし sev1 escalation を発行。host app や無関係 Cell は
+  止めない。回復は floor 回復の決定的判定+明示操作。
+- sampling / audit に System-scoped 上限を持つ。`daily_audit_budget` の単位は
+  **UTC日ごとの監査呼び出し回数**で、許可された `run_audit` 1回につき
+  verdict や任意の説明 LLM 呼び出し有無にかかわらず1消費する。token 数や
+  通貨金額ではない。説明 LLM を実際に呼ぶ場合は、これとは別に
+  `CONTROL_LLM_DAILY_EXECUTION_LIMIT` の実行回数上限も適用される。
+- 現行プロダクトは billing/原価配賦をスコープに持たず、provider 横断で
+  token usage と時点別価格表を正規化する台帳もない。そのため Issue #315
+  時点では金額ベースの追跡を追加せず、別 Issue も起票しない。請求額表示、
+  chargeback、または通貨建て hard limit がプロダクト要件になった時点で、
+  provider usage の永続化・価格 version/provenance・currency・rounding・
+  retry/cache の課金規則を独立 Issue として設計する。
+
+### Sub 7: 改善仮説・カナリア・承認ゲート(Issue #304)
+
+- `cell_improvements`: lifecycle
+  `observed → proposed → canary_ready → canary_running → adopted |
+  rejected | blocked`(有限遷移表)。hypothesis / 対象(role_card |
+  candidate_patch)/ 期待効果 / risk / rollback_plan / canary evidence
+  refs(golden set・Replay run・offline shadow・Experiment の参照のみ)/
+  parent 承認 / 人間承認 / suspension。`cell_improvement_events` は
+  append-only 履歴で rejected も削除しない。
+- 仮説文面の生成は reasoning_llm(fail-closed、intelligence_runs 監査)。
+  遷移はすべて決定的ゲート+manual 承認。
+- Role Card 変更はカナリア evidence + 直属親承認なしに `adopted` に
+  ならない。shared protocol/schema 変更は Root 承認 + 互換性テスト、
+  harness 変更は人間レビュー必須。rubric は親所有で自己変更不可。
+- shadow 提案(proposal record)と live shadow 実行承認(decision
+  record)は別テーブル列・別 status。live shadow 承認だけでは candidate
+  配備や policy 変更を実行しない。candidate 採用・patch 適用・publish は
+  既存人間ゲート(#25 / #216 / #242 / #252)へ handoff し、迂回経路を
+  作らない。
+- 連続失敗(閾値)・quality 悪化・契約違反で改善権を `suspended` にし、
+  rollback(Role Card は前 version へ pin)できる。
+
+### 非スコープ(Epic 全体)
+
+- `@probe` 内または trace 受信ごとの LLM 呼び出し
+- 既存 Component の一括 Cell 化、動的な無制限 Cell 生成・無限の入れ子
+- reasoning model だけによる承認・採用・publish
+- live shadow・source 変更・外部副作用の無承認実行
+- #282 Interview / #242 Replay 基盤の別系統再実装
+
+### 2〜5 Cell read-only pilot の end-to-end 実証(Issue #314)
+
+Issue #297 と sub-issue #298-#304 の実装レビュー後に残った運用上の実証を、
+`tests/test_cell_read_only_pilot.py` の 3-Cell 統合 fixture で完了した。
+
+- 1 つの承認済み Probe Plan / Feature に属する 3 件の Probe Point から、
+  versioned Cell Binding を API 経由で作成する。
+- 3 Cell すべてを `GET /cell-fabric/cells/{id}/state` で読み出し、領域
+  orchestrator digest と Root digest が同じ roster と
+  `feature_refs` / `capability_refs` / `entrypoint_refs` を集約する。
+- binding の参照先が実在する Feature / API entrypoint に解決し、
+  component trace API と Root digest の task evidence
+  (`trace:<id>`)まで drill-down できることを確認する。
+- read-only pilot 実行前後で、対象 repository の全ファイル hash と
+  component policy を含む保護対象 DB 行が完全一致することを確認する。
+  `create_llm_client` は呼ばれた時点でテストを失敗させ、
+  `intelligence_runs` に新規行が増えないことも同じ DB snapshot で保証する。
+- 同一 Cell ID / roster を持つ別 System を positive-collision fixture
+  とし、binding / trace / topology / task evidence が一切漏れないことを
+  end-to-end で確認する。
+
+---
+
+## 共同理解セッション(Epic #328)
+
+Epic #328 は、開発者が「わからない」と答えた地点を**終端**ではなく**共同で状況
+理解を作る工程の開始点**として扱うための Epic である。既存の Interview(#282
+系)、Inquiry(#285/#286)、Alignment Review(#287)、前提追跡(#308)、評価
+基盤(#309)を置き換えず、その上に「調査 → 通訳 → 開発者の判断」を分離したまま
+往復できる 1 本の循環を足す。
+
+Phase 分割と sub-issue:
+
+| Phase | Issue | 内容 |
+| --- | --- | --- |
+| A | #329 | 受け渡し契約・対話状態の基盤(決定的、LLM 呼び出し無し) |
+| B | #330 | 反復調査ループと探索継続性 |
+| C | #331 | 通訳(目的・影響への翻訳)と選択肢提示 |
+| D | #332 | システム理解への還流と確定状態の分離 |
+| E | #333 | Dashboard 共同理解パネル |
+| F | #334 | 共同理解の質を測る評価枠組み |
+
+### Phase A: 受け渡し契約と対話状態(Issue #329)
+
+#### 共有スキーマ
+
+`shared/schemas/joint_understanding.schema.json`(`schema_version:
+joint-understanding-v1`)が、1 セッション分の受け渡し契約 —
+`session` / `findings` / `actions` — を定義する。契約の要点は「三つの来歴を
+1 つの回答に混ぜない」ことにある。
+
+- `origin_role`(**誰が**書いたか): `investigation` / `translation` / `developer`
+- `claim_kind`(**何の種類**の主張か): `fact` / `inference` / `hypothesis` /
+  `unknown` / `conflict`
+
+この 2 軸は独立している。`unknown` は失敗ではなく第一級の結果であり、
+もっともらしさで埋めない。`conflict` は両立しない情報源を記録する。
+
+#### 有限語彙(`app/joint_understanding.py`)
+
+すべて Principle 6 の明示的な有限集合で、未知値は 422(推測補完しない)。
+
+- `ORIGIN_KINDS`: `qa` / `intent` / `review_item` / `inquiry`
+- `TRIGGERS`: `unknown_answer` / `explicit_request`
+- `SESSION_STATUSES`: `open` / `held` / `closed`
+- `SESSION_TRANSITIONS`: `open → {held, closed}`、`held → {open}`、
+  `closed` は終端(表に無い遷移は 409)
+- `SESSION_OUTCOMES`: `understood` / `doubt_resolved` /
+  `hypothesis_adopted` / `decided` / `handed_off` / `abandoned`
+  - `PROVISIONAL_OUTCOMES = ("hypothesis_adopted",)` は**暫定**であり、
+    API 応答の `outcome_is_provisional` で常に判別できる。事実として再利用しない。
+  - `decided` だけが人間の最終的な価値判断。
+- `ACTION_KINDS`: `request_investigation` / `explain_reasoning` /
+  `compare_options` / `adopt_hypothesis` / `revise_intent` / `hold` /
+  `handoff` / `decide`
+
+#### 役割ごとの契約(`validate_finding`)
+
+| 役割 | decision_method | evidence | supports_finding_ids |
+| --- | --- | --- | --- |
+| `investigation` | `reasoning_llm` / `deterministic` | 可 | 任意 |
+| `translation` | `reasoning_llm` | **不可** | **1 件以上必須** |
+| `developer` | `manual` のみ | **不可** | 任意 |
+
+- `developer` の Finding は `intelligence_run_id` を持てず `is_mock` にもできない
+  — reasoning model が開発者の名前で発言する経路を機構的に塞ぐ。
+- `translation` は証拠を作れない。一般化した説明から必ず元の技術的主張と証拠へ
+  戻れるように、同一セッション内の Finding id 参照のみを許す(他セッション・
+  存在しない id は 422)。
+- `investigation` の `hypothesis` は競合説明と反証条件を必須にする(仮説は
+  単なる低 confidence claim ではない — `docs/system-understanding-ideal-state.md`
+  §3.4)。
+- `reasoning_llm` の Finding は必ず `intelligence_run_id` を持つ(Principle 7)。
+- Finding は**追記のみ**。更新・削除エンドポイントは存在せず、訂正は
+  `supersedes_finding_id` を持つ新しい Finding で表現する。
+
+#### テーブル(additive、System スコープ)
+
+`joint_understanding_session` / `joint_understanding_finding` /
+`joint_understanding_action`。`premise_snapshot_id` は作成時に interview session
+の snapshot を固定する(#308 の premise bundle と同じ規律。Phase B の追加調査が
+新しい snapshot へ暗黙に乗り換えないため)。
+
+#### API(`routes/joint_understanding.py`)
+
+- `POST /interview/sessions/{session_id}/joint-understanding`(201)
+- `GET /interview/sessions/{session_id}/joint-understanding`(`status` /
+  `origin_kind` フィルタ、未知値は 422)
+- `GET /joint-understanding/{ju_id}`(findings + actions + `available_actions`)
+- `POST /joint-understanding/{ju_id}/findings`(追記)
+- `POST /joint-understanding/{ju_id}/actions`(開発者が選んだ次の行動)
+- `POST /joint-understanding/{ju_id}/hold` / `/resume` / `/close`
+
+`available_actions` は現在の status から決定的に導出する(`open` のときだけ
+`ACTION_KINDS` 全件、`held` / `closed` では空)。
+
+#### 「わからない」を意図として混入させない境界
+
+Phase A のテーブル群が存在する最大の理由がこれである。
+
+- どのエンドポイントも origin 行(`interview_qa` / `interview_intent_item` /
+  `alignment_item` / `interview_inquiry`)に**書き込まない**。読むのは存在確認の
+  SELECT だけ。#287 の Inquiry が行う `alignment_item.status='inquiry'` の
+  ミラーリングも**行わない**(両フローの統合方法は Phase D / #332 で決める。
+  それまで共同理解セッションは既存フローに触れない並走系統として保つ)。
+- `question_text` はセッション行にのみ保持し、回答欄へコピーしない。
+- `trigger='unknown_answer'` でセッションを作っても developer Finding は
+  1 件も作られない(「わからない」はシステムについての主張ではない)。
+- `outcome='decided'` で閉じても origin 行は変わらない。項目の確定は
+  引き続き項目自身の回答・確認エンドポイントだけが行う。
+
+#### Phase A の非スコープ
+
+reasoning model 呼び出し(Phase B / C)、理解への還流(Phase D)、Dashboard
+(Phase E)、評価指標(Phase F)。Phase A の `decision_method` は `manual` か、
+呼び出し側が検証済みで渡す値のみで、この層は LLM を呼ばない。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding.py`:
+契約の単体テスト(遷移表・暫定 outcome・役割別ルール・未知語彙)、共有スキーマの
+検証(translation の evidence 拒否・未知 enum・hypothesis 構造)、API ライフサイクル、
+**origin 行不変**(qa / intent / review_item)、追記のみ、他セッション参照の拒否、
+有限遷移、System 分離。
+
+### Phase B: 反復調査ループと探索継続性(Issue #330)
+
+`app/investigation_loop.py`。#286 の `investigate()`(1 ラウンド・1 回の
+reasoning 呼び出し)はそのまま残し、その読み取り専用機構の上に「まだ分かって
+いないことを持ち越しながら続ける」ループを足す。
+
+#### 横断的な候補取得(決定的、候補の絞り込みのみ)
+
+`_index_candidates` が pin された snapshot に対して次を横断する。
+
+- `code_symbols` の `qualified_name` / `docstring`(重み 2)
+- `code_entrypoints` の `label` / `route_path` / `handler_qualified_name`(重み 2)
+- `snapshot_files.content` の内容一致(重み 1)
+
+これに #286 の**パス名**一致(`_path_name_candidates`)を後続で足し、既読パスを
+除外して 1 ラウンド分の候補にする。並び順は (一致数 降順, path 昇順) で固定。
+「ファイル名や冒頭部分だけに依存しない探索」(Epic #328)を、最終判断を
+reasoning に残したまま満たす(Principle 6)。
+
+#### ラウンド間・再試行間の継続性
+
+各ラウンドの構造化出力が `search_leads` / `open_hypotheses` /
+`missing_evidence` を返し、次ラウンドの候補取得とプロンプトへ入る。
+`read_paths` は既読集合として累積し、`no_new_evidence` 判定に使う。
+`POST /joint-understanding/{ju_id}/investigate` を再度呼ぶと
+`_restore_carry_over` が永続化済みラウンドから復元するため、**再試行は質問から
+やり直さず、すでに得た手がかりから再開する**(失敗ラウンドは leads を返さないので、
+その前のラウンドの手がかりを消さない)。
+
+#### 有限な停止理由(`STOP_REASONS`)
+
+`answered` / `budget_exhausted` / `no_new_evidence` / `unresolved` / `failed`。
+新しく読めるファイルが 1 件も無いラウンドは決定的に `no_new_evidence` で止める
+(モデルの自己申告で継続しない)。予算 `InvestigationLoopBudget` は
+`max_rounds` / `max_llm_calls` / `max_files` / `max_snippet_chars` /
+`max_files_per_round` / `timeout_seconds` をハードクランプする。
+
+#### Phase A 契約の適用点
+
+ラウンド出力は Phase A の `claim_kind` そのままで返り、次を満たさない Finding は
+**破棄**する(`pruned_findings` に計上、書き換えない)。
+
+- `claim_kind` が有限集合外
+- `hypothesis` なのに競合説明・反証条件が無い
+- 引用が全て snapshot 検証に失敗、または引用が無いのに `unknown` 以外
+  (「調べたが分からなかった」だけは証拠なしで残す)
+
+`completed` なのに有効な Finding が 0 件のラウンドは `unresolved` へ決定的に降格
+(#286 と同じ規律)。
+
+#### 永続化と監査
+
+- `joint_understanding_investigation_round`(additive): ラウンドごとの
+  status / stop_reason / conclusion / carry-over / 未読候補 / 予算使用量 /
+  `intelligence_run_id` / エラー。
+- `intelligence_runs` に 1 ラウンド 1 行(`run_type='joint_investigation'`、
+  新規に `IntelligenceRunType` と `shared/schemas/project_intelligence.schema.json`
+  へ追加)。読んだ抜粋は `intelligence_run_evidence` に全件記録する。
+- Finding は `origin_role='investigation'` / `decision_method='reasoning_llm'` /
+  そのラウンドの `intelligence_run_id` 付きで追記される。
+
+#### fail-closed
+
+mock / 非 reasoning モデル / git 失敗 / API 失敗 / 構造化出力検証失敗はすべて
+`stop_reason='failed'`。ラウンド 1 の失敗は Finding を 1 件も作らず、ラウンド N の
+失敗は**それまでに検証済みの Finding を残したまま**停止する。Finding が 0 件のまま
+`failed` になった呼び出しは 502(監査行は永続化済み)。
+
+#### DB ロック
+
+`run_investigation_loop` は index / runtime facts 用の接続を自分で開き、各ラウンドの
+LLM 呼び出し**前に**閉じる。ルートは read → reason → persist の 3 フェーズ。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding_investigation.py`:
+複数ラウンドと持ち越し、carry-over 指定での再開、`no_new_evidence` /
+`budget_exhausted` / `failed` の停止、mock・非 reasoning・LLM 例外・不正 JSON の
+fail-closed、ラウンド N 失敗時の Finding 保持、hypothesis 構造・引用剪定・
+根拠なし主張の破棄、pin された commit のみ読むこと(作業ツリー汚染後も不変)、
+API での監査行・Finding 永続化、再試行での leads 復元、open 以外での 409、System 分離。
+
+### Phase C: 通訳(目的・影響への翻訳)と選択肢提示(Issue #331)
+
+`app/understanding_translator.py` + `POST /joint-understanding/{ju_id}/translate`。
+
+#### 入力と絶対条件
+
+入力は**同一セッションに記録済みの investigation Finding だけ**(snapshot の
+抜粋は渡さない)。したがって通訳は新しい技術的事実を作れない。出力の各文は
+`supports_finding_ids` を必須とし、渡していない id を 1 つでも参照したら
+**呼び出し全体を fail-closed**(部分保存しない)。
+
+#### 説明の層(`STATEMENT_LAYERS`)
+
+`purpose` / `impact` / `gap` / `consistency` / `decision`。第 1 層(purpose /
+impact)の主語は目的・利用者・観測可能な振る舞いであり、内部変数・関数・API・
+列名ではない。内部名称は隠蔽せず、Finding → evidence の層で必ず開示される
+(Epic #328 の説明の原則)。
+
+#### 通訳が主張できる種類(`TRANSLATION_CLAIM_KINDS`)
+
+`inference` / `unknown` / `conflict` のみ。`fact` と `hypothesis` は不可 —
+新しい事実の断定も、競合説明・反証条件を伴う新仮説の提示も investigation の
+責務であり、通訳が肩代わりしない。`hypothesis` / `unknown` の Finding を
+確定事項へ格上げすることも禁止(プロンプト規則 + 検証)。
+
+#### 追跡性の永続化
+
+翻訳文は `origin_role='translation'` の Finding として追記される(evidence を
+持てず `supports_finding_ids` 必須 = Phase A 契約)。要約・選択肢・未解決点・
+判断質問は `joint_understanding_translation` 行に入り、`statements_json` の
+各要素が対応する translation Finding の `finding_id` を保持する。
+これにより「一般化した説明 → Finding → evidence(path:行)」が常に辿れる。
+
+#### 選択肢メニューは決定的
+
+`build_action_menu()` は `ACTION_KINDS` の順に、`interview_language` の固定
+カタログ(`joint_action_<kind>_label` / `_effect`)から「何が変わるか」を組み立てる。
+モデル出力ではないので、同じ状態なら常に同じメニューになる。
+`adopt_hypothesis` の説明文は「暫定であり事実にならない」ことを明示する。
+
+#### 質問ゲート(`ask_developer`)
+
+「人間にしか決められないと分類した直後、判断材料を示さずユーザーへ返す流れ」
+(Epic #328 が置き換える対象)を防ぐ決定的ゲート。
+
+- `decision_question` が無ければ聞かない
+- `decision` 層の文があれば聞く
+- 判断材料が無く、まだ調べられること(`open_unknowns`)が残っているなら**聞かない**
+  — それは追加調査の理由であって質問の理由ではない
+
+`ask_developer=false` のとき `decision_question` は永続化されない。
+
+#### 監査と fail-closed
+
+`intelligence_runs`(`run_type='joint_translation'`)を成功・失敗とも 1 行記録。
+mock / 非 reasoning モデル / Finding 0 件 / LLM 例外 / 不正 JSON / 未知 id 参照 /
+未知 layer / 禁止 claim_kind はすべて 502 で、翻訳行も translation Finding も作らない。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding_translation.py`:
+参照検証(未知 id・参照なし・選択肢の未知 id)、禁止 claim_kind、未知 layer、
+fail-closed 一式、メニューの決定性と両言語、質問ゲートの 4 分岐、
+API での translation Finding 永続化と `finding_id` 対応、失敗時に監査行のみ、
+origin 行不変、open 以外 409、System 分離。
+
+### Phase D: システム理解への還流と確定状態の分離(Issue #332)
+
+#### 還流(reflux)— 回答へ転記しなくても理解へ反映する
+
+`POST /joint-understanding/{ju_id}/reflux`。Epic #328 が置き換える
+「調査結果を回答欄へ転記しないと理解へ反映されない流れ」の代替経路。
+
+- 還流対象は `origin_role='investigation'` かつ `claim_kind='fact'` のみ
+  (`REFLUXABLE_CLAIM_KINDS`)。inference / hypothesis / unknown / conflict は
+  会話内に留まる — confidence だけで仮説を事実へ昇格させない。
+- 訂正済み(後続 Finding に `supersedes_finding_id` で置き換えられた)Finding は
+  還流しない。
+- `decision_method` は常に `reasoning_llm`。**`manual` にはならない**
+  (誰も決定していない = 人間の回答ではない)。
+- 反映先(`REFLUX_TARGET_KINDS`、既存構造のみ):
+  - `qa_investigation`: `interview_qa.investigation_json` /
+    `investigation_run_id`。#286 の route-and-investigate が書くのと同じ
+    **回答ではないスロット**。`answer_text` / `status` / `answered_by` は書かない。
+  - `session_ledger`: intent / review_item / inquiry 由来。これらの行は
+    Alignment / Understanding の再ビルドが所有しており、事実を書き込んでも
+    次のビルドで黙って消えるため、台帳行そのものを反映先とする
+    (第三の理解モデルを新設しない、という制約の下での明示的な設計判断)。
+- 同じ Finding は二重に還流しない(`UNIQUE (joint_understanding_id, finding_id)`、
+  再呼び出しは `already_refluxed` に計上)。
+- policy / 実行系(`components` の mode、experiments、probe_plans、publish_jobs)には
+  一切触れない。理解の更新と実行権限は別(Principle 7)。
+
+#### 前提整合性(premise state)
+
+`_premise_state()` は決定的・構造的判定:セッション作成時に固定した
+`premise_snapshot_id` と、現在の interview session の `snapshot_id` が異なれば
+`stale`。`stale` のとき
+
+- 還流は 409(古い調査結果を現在の理解として貼らない)
+- `hypothesis_adopted` / `decided` での close は 409
+- 何も断定しない outcome(`understood` / `doubt_resolved` / `handed_off` /
+  `abandoned`)は許可し、`outcome_premise_state='stale'` として記録する
+
+#### 確定状態の分離(`validate_outcome_basis`)
+
+`OUTCOMES_REQUIRING_BASIS = ("hypothesis_adopted", "decided")` は
+`outcome_finding_ids`(同一セッションの Finding)を必須にする。根拠を示せない
+採用・決定は監査できないため 422。`hypothesis_adopted` は
+`outcome_is_provisional=true` を返し続け、事実として還流されることもない
+(仮説は還流対象外)。
+
+追加列(additive、既存 DB は `_add_column_if_missing` / ALTER で追従):
+`joint_understanding_session.outcome_finding_ids` / `outcome_premise_state`。
+新規テーブルは `joint_understanding_reflux` のみ。
+
+#### 既存フローとの関係
+
+Phase D は Inquiry(#285)/ Review Queue(#287)を置き換えず、origin 行への
+書き込みも増やさない。共同理解セッションが書くのは、既存の「回答ではない」
+調査スロットと自身の台帳だけである。
+
+#### テスト
+
+`apps/control-server/tests/test_joint_understanding_reflux.py`:
+還流可否の有限規則、反映先の決定性、outcome basis 規則(不足・他セッション・
+stale)、QA 調査スロットへの反映と回答欄不変、fact 以外の非還流、superseded の
+除外、冪等性、非 QA 由来の台帳のみ反映、stale 前提での 409、4 つの終端状態の
+区別と根拠記録、暫定採用が還流されないこと、policy / 実行系テーブル不変、System 分離。
+
+### Phase E: Dashboard 共同理解パネル(Issue #333)
+
+`apps/dashboard/src/components/system-understanding/joint-understanding-panel.tsx`。
+既存の Inquiry パネル(#295 の 4 段階開示)と同じ規約に合わせ、別系統の表示規則を
+作らない。
+
+#### 4 段階表示
+
+1. **目的と影響**: 通訳の `purpose_summary` + `purpose` / `impact` 層の文。
+   ここに内部名称(path:行)は出さない。
+2. **理由**: `gap` / `consistency` / `decision` 層、未解決点、選択肢
+   (「変わること」「代償」)、`ask_developer=true` のときだけ判断質問。
+3. **根拠**: Finding 一覧(claim_kind バッジ、競合説明、反証条件、未確認、
+   `path:開始-終了`)。**内部名称はここで必ず開示する**(隠蔽しない)。
+4. **調査詳細**: ラウンドごとの読了ファイル・未読候補・不足証拠・停止理由・
+   調査 run、還流済み件数。
+
+例外の先出し: 前提が `stale`、未解決点あり、`conflict` Finding ありのいずれかで
+第 2 層を初期表示する(第 4 層は自動展開しない)。
+
+#### 行動メニューと視覚的区別
+
+`available_actions`(サーバ)をボタン化し、翻訳済みならサーバの `action_menu`
+のラベル/効果説明を優先、未翻訳ならローカルの日本語ラベルにフォールバックする
+(Issue #266: クライアント側フォールバックも日本語)。
+`hypothesis_adopted` は琥珀色 +「(暫定・事実ではありません)」、`decided` は
+緑系で表示し、暫定と確定を取り違えられないようにする。閉じたセッションでは
+メニューを出さない。
+
+調査中は「関連するコードとテストを確認しています…」の短い状態表示のみ。
+API 失敗時もパネルとメニューは残り、回答機会を失わせない。
+
+#### 既存機能との住み分け
+
+パネルの「他の人に引き継ぐ」は共同理解セッションを `handed_off` で閉じる
+**記録**であり、実際の担当者割り当ては既存の引き継ぎ機能(#291 の
+`question_handoff`)で行う。「意図を修正する」も同様に行動の記録で、
+Intent Brief 自体の編集は既存の Intent パネルで行う — 共同理解セッションは
+どちらの元データにも書き込まない。
+
+#### 起動導線
+
+`pages/interview.tsx` の Q&A カードに「一緒に確かめる」を追加。既存の #142 /
+#295 の「わからない」フロー(自動調査 → 既存導線へ戻す)は変更せず、その後段の
+任意手段として `trigger='unknown_answer'` のセッションを開始する。開いても
+元の質問には一切回答しない。既に open/held のセッションがあればそれを再表示する。
+
+#### テスト
+
+`apps/dashboard/src/__tests__/joint-understanding-panel.test.tsx`(8 件):
+第 1 層に内部名称が出ず第 3 層で開示されること、有限メニューの表示と送信、
+暫定採用と確定の視覚的区別、前提 stale の警告と第 2 層先出し、調査失敗後も
+対話が残ること、`is_mock` バッジ、未翻訳時の日本語案内。
+
+### Phase F: 共同理解の質を測る評価枠組み(Issue #334)
+
+#309 の指標パイプライン(`app/interview_metrics.py`)に**別カテゴリ**
+`joint_understanding` として追加する。効率化指標(確認件数・承認速度)と
+同じ数値へまとめない — 「効率化を共同理解の質より先に最適化する流れ」を
+置き換えるという Epic #328 の目的上、両者は独立して読めなければならない。
+
+すべて永続化済みの事実に対する決定的な集計で、モデルの自己申告による品質
+スコアは導入しない。分母が 0 の指標は 0 ではなく `unmeasured`
+(`unmeasured_reason='no_observations'`)を返す(#309 の方針を踏襲)。
+
+| key | guardrail | 意味 |
+| --- | --- | --- |
+| `joint_understanding_from_unknown_rate` | – | 「わからない」から始まった割合(終端ではなく開始点として使われているか) |
+| `joint_understanding_conclusion_rate` | – | 閉じたセッションのうち理解・疑問解消・暫定採用・正式判断へ到達した割合 |
+| `joint_understanding_provisional_outcome_rate` | ✓ | 暫定採用で終わった割合(高止まり = 確かめきれずに前へ進めている) |
+| `joint_understanding_stale_premise_close_rate` | ✓ | 前提が変わった状態で閉じた割合 |
+| `joint_understanding_unknown_finding_rate` | ✓ | 調査 Finding のうち `unknown` の割合(証拠不足を埋めていないか) |
+| `joint_understanding_reflux_rate` | – | 確認できた事実のうち、回答へ転記せず理解へ反映された割合 |
+| `joint_understanding_investigation_answered_rate` | – | 反復調査が人へ聞かずに答えへ到達した割合 |
+| `joint_understanding_developer_question_rate` | – | 通訳のうち実際に判断質問まで到達した割合(少ないほど良い指標ではない) |
+
+`InterviewMetricCategory` に `joint_understanding` を、`InterviewMetricKey` に
+上記 8 key を追加(いずれも既存の有限集合の拡張)。
+
+#### #311 との関係
+
+本 Phase の観測項目は #311(低リスク提案の一括承認)の開始条件
+「実利用の誤分類・取り消し・理解低下を観測できること」を判断する材料になるが、
+#311 自体は引き続き実装しない。
+
+#### テスト
+
+`test_joint_understanding_reflux.py` 末尾の 3 件: カテゴリ分離と決定性、
+観測ゼロでの `unmeasured`、System 分離。
+
+### 2026-07-31 完了監査と後続スコープ
+
+#328 と #329〜#334 の完了監査で、既存実装に対して次を補強した。
+
+- Investigation Finding のコード/実行時証拠と run provenance を保存時に検証する。
+- 再実行時のラウンド番号・空の carry state を正しく引き継ぎ、検証済み証拠が
+  増えない場合だけ `no_new_evidence` とする。
+- 通訳の目的/影響と選択肢を Finding 参照で根拠付ける。
+- reflux に runtime evidence を保持し、未検証 fact を除外し、増分実行でも
+  過去の有効 fact を失わない。
+- Dashboard の実トリガー、action audit、保留からの再開、終了理由、実行時証拠
+  表示を整合させる。
+- supersede 済み Finding を reflux 率の分母から除外する。
+
+一方、既存 Interview / Inquiry / System Understanding と並走する独立系統を
+「共同理解の単一フロー」に変える作業は仕様判断を伴う。このため元 Epic と
+Phase issue は閉じ、残件を以下へ限定して移管した。
+
+- #336: 実運用フローへの統合、origin 別導線、reflux 後の canonical rebuild。
+- #337: #308 の前提 bundle、actor/provenance、判断根拠の監査契約。
+- #338: 不明解消・仮説反転・訂正・負担を outcome lineage で測る品質指標。
+- #339: 依存/変更履歴/実行時候補を含む探索と Question Router の統合。
+
+### 共同理解フロー統合(#337 / #336 / #339 / #338)
+
+4 Issue は依存順に実装する。#337 が保存形式と安全境界を確定し、#336 が起点と
+還流先を統合し、#339 が探索と予算を拡張し、#338 がそこで生じる実イベントから
+品質を測る。#337 が確定する前に新しい origin や Finding producer を増やさない。
+
+#### Phase 1: 前提・来歴・決定監査(Issue #337)
+
+**直した欠陥は「失敗できないゲート」だった。** 旧 `_premise_state` は
+`interview_session.snapshot_id` と pin 済み id を比較し、それ以外はすべて
+`"fresh"` を返していた — pin が無いセッション、interview session が解決できない
+場合、pin 済み snapshot 行が削除された場合の 3 つがいずれも「前提は満たされて
+いる」と読めていた。さらに snapshot id が動かない変更(意図の訂正、Alignment
+再構築による review item 差し替え、Inquiry の supersede)は原理的に検知できて
+いなかった。
+
+- **#308 の premise bundle を共通化する**(`app/joint_premise.py`)。列名は
+  `interview_inquiry` の #308 列と同一にした — 同じ bundle だからで、名前を
+  揃えることで運用者が 1 つの前提契約として読める。digest 関数
+  (`compute_intent_item_digest` / `compute_capability_scope_digest` /
+  `capability_scope_digest_for_item`)も #308 のものをそのまま使う。
+  追加したのは `premise_commit_sha` の 1 列だけ: #308 は review item の
+  *内容* を比較するので pin 先を無視できるが、共同理解の調査は**コードを読む**
+  ので、読んだコミットが前提そのものになる。
+- **verdict は `current` / `stale` / `missing` / `invalid` の有限 4 値**
+  (first-match)。追加した 2 値は旧 2 値が嘘をつくしかなかったケースに対応する。
+  `missing` = 前提は記録されていたが消えた(pin 済み snapshot 行の削除、origin
+  項目の削除)。`invalid` = 比較できる bundle がそもそも無い(移行前の行、
+  snapshot 無しで開かれたセッション)。**`invalid` を `current` へ昇格させない**
+  ことが互換性の意味であり、「旧行が読める・記録済み outcome を保持する」ことと
+  「前提が満たされている」ことは別である。
+- **snapshot id 単独では判定しない。** 同一コミットを新しい snapshot 行へ
+  pin し直しただけなら前提は動いていない(#323 の判断を snapshot 軸へ適用)。
+  逆に `premise_revision_id` は **staleness の入力にしない** — Understanding を
+  再構築しただけで、コードが動いていないセッションまで失効させてしまう(#323 が
+  同じ問いを同じ結論で決着させている)。revision は監査と仮説再確認 lineage の
+  ためだけに保存する。
+- **origin ごとの content hash**:
+  `qa` は質問文のみ(答えを入れると、自分の reflux が着地した瞬間に自分の前提を
+  stale にしてしまう)。`intent` は `field` + `value_text` のみで **`status` を
+  除外**する — その項目を決めるためのセッションなので、確定させた瞬間に前提が
+  壊れて判断を記録できなくなる(#308 が `confirmation_id` を除いたのと同じ理由:
+  **意味で失効させ、決定マーカーで失効させない**)。`review_item` は
+  `base_content_hash` + Capability scope + linked Intent digest(#308 と同じ)。
+  `inquiry` は**親 Inquiry の #308 bundle を継承する** — Inquiry には質問文の列が
+  無く、Alignment build が Inquiry を supersede したとき両機能が同じ事実から
+  同じ verdict へ到達するのが bundle 共通化の目的である。
+- **`qa` / `intent` は加算訂正**(訂正で新しい行が入り、旧行が
+  `superseded_by_id` を得る)なので、現在の行まで chain を辿って比較する。
+  `PremiseFacts.current_origin_id` として報告し、置き換えはしない — セッションは
+  会話が始まった行を指し続け、生きた行に届く必要がある消費者(reflux)だけが
+  明示的に解決する。これが無いと、回答を訂正した後の reflux が `revised` 行
+  (Dashboard に出ない)へ書き込まれていた。
+- **producer と actor を分離する。** `origin_role` は文の *声*、`producer_kind`
+  はその行を書いた *コードパス*、`actor_kind` は *認証済み人間が背後にいるか*。
+  塞いだ穴: `POST /joint-understanding/{id}/findings` は body の `origin_role` を
+  そのまま採用していたので、(a) 捏造した引用を持つ検証不能な "fact" を本物の
+  調査 Finding の隣に保存でき、(b) 任意の呼び出し元が自分の文を
+  `decision_method='manual'` 付きで人間の判断として記録できた。現在この
+  endpoint は **developer 専用**(他 role は 403
+  `joint_understanding_producer_internal`)で、provenance は route と
+  `Principal` から決まる。`investigation` / `translation` は producer
+  (`/investigate`, `/translate`)だけが書き、その triple は SQL リテラルなので
+  構造的に成立する。`legacy` は読み取り専用で、**人間だと仮定しない**。
+- **close を監査記録にする。** `outcome_reason`(判断内容)を必須にし、
+  `closed_by_*`(認証済み caller)、basis findings、premise verdict と reason を
+  保存する。reload 後も「誰が・何を・どの根拠で・どの前提に対して」決めたかが
+  復元できる。
+- **basis を fail-closed で検証する**(`validate_basis`)。superseded / mock /
+  他セッションの Finding を拒否し、`hypothesis_adopted` は **current な調査仮説**
+  (検証済み run と証拠を持つもの)だけを basis にできる。fact を「仮説として
+  暫定採用」できてしまうと暫定マーカーが何も意味せず、調査側が訂正した仮説を
+  再採用できてしまうと調査自身が取り下げた主張を採用することになる。
+  開発者自身の証拠なき直感も拒否する — それを採用するのは
+  「確度だけで仮説を事実に昇格させる」ことに他ならない。
+- **仮説採用 lineage**: `joint_understanding_hypothesis_adoption` に
+  基準 Finding と採用時の premise digest を不変記録する。状態
+  (`provisional` / `reconfirmation_required` / `basis_withdrawn`)は
+  **保存せず導出する**(#349 が未解消のブロッキング失敗に対して取っている規律と
+  同じ理由 — 保存した状態は、それが記述する事実から乖離しうる)。これにより
+  暫定採用が「静かに事実と区別できなくなる」のを防ぎ、前提が動いたときに
+  再確認対象として戻ってくる。
+
+#### Phase 2: 単一フローと canonical reflux(Issue #336)
+
+**同じ欠陥を両端から見ている。入口も出口も存在していなかった。**
+
+- **入口**: 実際の 「わからない」 は #142 の回答フロー(Joint Understanding を
+  知らない)を通り、Dashboard が別途 one-shot の `route-and-investigate` を
+  呼んでいた。本物の「わからない」から共同理解セッションが開かれることは
+  一度も無く、この機能は「明示的に頼んだときだけ」到達可能だった。
+- **出口**: reflux は検証済み事実を attach していたが、`qa` 以外の origin では
+  attach 先が `joint_understanding_reflux` 行そのもので、**どの rebuild も
+  そのテーブルを読んでいなかった**。事実は記録され、帰属もでき、そして
+  それを使えたはずのすべての consumer から見えなかった。
+
+##### 単一の 「わからない」 入口
+
+`POST /interview/sessions/{id}/qa/{qa_id}/unknown` の**順序が契約**である。
+
+1. **「わからない」を先に、独立したトランザクションで commit する。** この後は
+   router・reasoning 設定・調査のいずれが失敗してもよく、開発者が持っていた
+   選択肢(回答の訂正・引き継ぎ・後で回答)は 1 つも失われない。
+2. **Question Router が「調査するかどうか」を決める。** `system_researchable` と
+   `hybrid` だけがセッションを開く。`human_only` は開かない — コードから
+   見つかるものが無いのに会話を開くのは、同じ質問を遅く返すだけである。
+3. **`hybrid` は聞く前に調べる。** 調査可能な部分を先に消費し、人へ質問が
+   必要かどうかは翻訳ゲート(`understanding_translator.ask_developer`)が決める。
+
+`trigger='unknown_answer'` は**この経路だけ**が書く。public な create endpoint は
+`explicit_request` を強制する(それ以外は 422
+`joint_understanding_trigger_not_settable`)ので、自動開始と明示開始の監査上の
+区別は「どちらの経路が走ったか」という事実になり、リクエスト本文の主張には
+ならない。応答の `next_step` は有限 4 値で、内部の分類名
+(`system_researchable` / `hybrid` / `human_only`)は**含めない** — 内部の分類名は
+開発者向けラベルではない。
+
+##### 共通 evidence feed
+
+`understanding_evidence_feed` が「検証済み事実を publish する唯一の場所」であり
+「rebuild が読む唯一の場所」。3 つの性質が、これを second opinion ではなく
+rebuild の入力にしている。
+
+- **固有の来歴**: 常に `decision_method='reasoning_llm'` で、reasoning run と
+  確立時の premise を持つ。決して `manual` ではない — 誰も何も回答していないし、
+  rebuild は「調査された事実」と「開発者の確定回答」を区別できなければならない。
+  だから Q&A セクションへ混ぜず、独立した prompt 入力にしている。
+- **冪等な publish**: `content_digest` は source session、finding、fact の semantic
+  digest を含む canonical sha256。同じ finding の再送は同じ publication だが、別の
+  premise で独立に再検証された同内容の fact は別の来歴である。前者だけを
+  `UNIQUE (system_id, content_digest)` で重複排除する。これにより古い source が
+  stale になっても、新しい current premise で再検証された fact を失わない。
+- **currency は write 時ではなく read 時に評価する**(`current_entries`)。
+  後続 finding に訂正された fact と、source session の premise が `current`
+  でなくなった fact を除外する。どちらも publish 時点では知り得ない。除外された
+  entry は履歴として読めるまま残り、削除も書き換えもしない。
+
+consumer は `understanding_build` / `alignment_build` / `inquiry_answer` の 3 つで、
+いずれも prompt へ独立セクションとして渡す(`understanding-review-v7` /
+`alignment-v3` へ prompt version を更新)。**消費の記録は人間の確認とは別の事実**
+として `understanding_evidence_consumption` に持つ — 前者は「AI が rebuild に
+使った」、後者(`understanding_confirmed_at` / #312 の Capability confirmation)は
+「人間が結果を受け入れた」であり、同じ場所に書くと「AI が入力した」が
+「開発者が同意した」と読めてしまう。
+
+##### 起点ごとの導線
+
+入口は Q&A カードだけだった。他の 3 起点(Intent / Review item / Inquiry)は
+サーバ側の契約は動いていたのに開発者が到達する経路が無く、Epic #328 が取り除こう
+とした「孤立した第三の機能」と同じ形が UI 側に残っていた。
+
+`components/system-understanding/joint-understanding-entry.tsx` を 3 起点で共用
+する — 起点固有の表示(ラベル・質問文)は持てるが、セッションの探索・作成・
+パネルは共通にする(§2.1: 調査・翻訳・監査の実装系統は共通化する)。Q&A カードは
+「わからない」の応答から自動でパネルを開くため独自の配線を残すが、突き合わせ
+規則だけは `findOpenJointSession` として共有する。
+
+その規則には機微がある: `interview_qa` / `interview_intent_item` は加算訂正な
+ので、項目を修正すると**行 id が変わる**が、セッションは会話が始まった行を指し
+続ける。`origin_id` だけで突き合わせていたため、質問に回答訂正が入った瞬間に
+会話ごとカードから消えていた。サーバはこのために `current_origin_id` を返す。
+
+Inquiry からの導線を入れたのは、「疑問が解消しなかった」が開発者自身も分からない
+と気づく最も一般的な経路だから(Epic #328)。どの起点でも、開くこと・閉じることが
+元の項目の回答・確定・保留・引き継ぎを一切書き換えない。
+
+##### action と正式操作の対応
+
+`ACTION_FORMAL_OPERATIONS` が「どの action がどの既存の正式操作へ行くか」の
+決定的カタログ。`EXTERNAL_FORMAL_OPERATIONS`(`intent_correct` /
+`question_handoff_create` / `origin_item_answer`)はこの機能の**外の** endpoint が
+行う操作で、**action 行があることを完了と読んではいけない**もの。この区別は
+それまで機械可読な形を持っておらず、開発者が 「意図を修正する」 を選んでも
+`POST /interview/intent/{id}/correct` とは何も繋がっていなかった。
+
+#### Phase 3: 探索拡張・Router 統合・hard budget(Issue #339)
+
+- **探索源が 1 つの問いしか答えられなかった。** 既存の 4 源(ファイル名 /
+  シンボル索引 / 入口索引 / 内容スキャン)はすべて「どのファイルがこれに
+  *言及* しているか」を答える。開発者が日常的に必要とする 3 つ —
+  **何がこれに依存しているか**(ここを変えると誰に影響するか)、
+  **誰がこれを呼ぶか**(振る舞いは上流で決まっている)、
+  **いつ・なぜ変わったか**(理由はコードではなく履歴にある)— は
+  原理的に到達できなかった。`app/snapshot_explorers.py` が
+  dependency / call_graph / git_history を追加し、runtime facts を
+  「選択済みファイルの注釈」から**候補発見**へ引き上げる。
+- **dependency は `code_symbols.imports` を使う**(#24 の indexer が AST から
+  抽出済み)。テキストスキャンではなく実際の索引を使うことが、これを「言及」
+  ではなく構造的関係にしている — docstring がモジュール名を書いているのは
+  依存ではない。
+- **git_history は 2 段階で呼ぶ。** `git log --name-only -- <pathspec>` は
+  表示するファイル一覧も pathspec で絞るので、1 回の呼び出しでは seed 自身しか
+  返らない — 目的である co-change ファイルが全部消える。よって
+  (1) seed を触ったコミットを探し、(2) `--no-walk` でそのコミット群の変更
+  ファイルを列挙する。`--no-walk` は指定コミットだけを列挙するので、pathspec の
+  制約が無くても pin されたコミットの履歴から出られない。
+- **構造探索は round 1 では走らせない。** これらは「これらのファイルの
+  *周辺*」を答えるので、keyword の当て推量を seed にすると「同じ推量に対する
+  2 つ目の推量」になり、さらに小さい per-round read budget では**開発者が
+  実際に聞いたファイルを読めなくなる**。よって seed は「earlier round が実際に
+  読んだファイル」のみで、fresh な round 1 は直接一致だけで答え、追加の
+  breadth は round 1 が生んだ lead を追う。再開実行は carry された read paths を
+  持つので、その最初の round から lead-driven に動く。候補順序も
+  「直接一致 → 構造探索」で固定する(`_round_candidates` の
+  `structural_paths` は最後)。
+- **`failed` が 2 つの正反対を 1 つにまとめていた。** research limitation
+  (システムは見たが確定できなかった)と execution failure(システムは見ることが
+  できなかった)は意味も帰結も逆である。前者は根拠付きの実結果で、
+  「X は判断できなかった」は一級の Finding。後者は結果の**不在**であり、
+  Finding を作ってはいけない(何も読んでいないのにシステムについて主張する
+  ことになる)— 監査イベントと復帰操作だけが残る。
+  `RESEARCH_LIMITATIONS` / `EXECUTION_FAILURE_CLASSES` / `OUTCOME_CLASSES` と
+  `failure_class` 列で有限に分ける。
+- **時間予算を LLM 呼び出し自体に適用する。** ラウンド間で時計を見るのは
+  ループ自身の帳簿を縛るだけで、実際に時間を使う往復は縛らない — 1 回の
+  hang で全予算を超過しても、ラウンド間チェックはすべて通る。
+  `LLMClient.generate_text(timeout=...)` を追加し、残り予算から per-call
+  deadline を導出する。残りが floor 未満なら呼ばずに停止する。
+- **Question Router を質問ゲートへ共通利用する**(`ask_developer`)。
+  `system_researchable` は**決して人へ渡さない** — router 自身の分類により
+  答えはコードの中にあるので、未回答なら調査が終わっていないという意味であり、
+  渡すのは「読む作業を開発者にさせる」ことになる。調査がまだ可能な間
+  (`research_exhausted=False`)は decision material が無ければ質問を保留する
+  (`hybrid` の契約)。`human_only` も material を要求する — 分類は「開発者が
+  決める」と言っているだけで「材料無しで決められる」とは言っていない。
+- **探索源ごとに revision / provenance / budget / 失敗を監査する**
+  (`joint_understanding_exploration_source`)。round 単位の合計では
+  「各源が pin された revision に留まったか」を答えられない。失敗した源は
+  記録してスキップし、round を失敗させず、**無制限の fallback 探索へ
+  置き換えない**。
+
+#### Phase 4: 結果 lineage と品質評価(Issue #338)
+
+- **既存の 8 指標は「利用率と自己申告状態」しか測っていなかった。** 開始率、
+  close outcome、Finding 種別、reflux 件数 — いずれも「使われた」「どのラベルで
+  終わった」を答える。Epic #328 が問う「理解は改善したか」には答えられない。
+  outcome ラベルは会話についての主張であって、その後どうなったかの観測ではない:
+  `understood` で閉じたセッションと、2 ラウンド後に仮説が覆ったセッションが、
+  どちらも「結論に至った」1 件として数えられていた。
+- **`app/joint_lineage.py` は有限イベント列を永続事実から導出する。** 遷移時に
+  書かず導出するのは、このコードベースが他所でも採る規律と同じ理由(#337 の
+  adoption state、#349 の未解消失敗): 保存した lifecycle 値は記述対象の行から
+  乖離しうるが、導出値は乖離しない。同じ行が常に同じイベントを生むので、
+  指標が再現可能になる。
+- **不明の発生と解消は 1 つの lineage。** `unknown` Finding が後続 Finding に
+  supersede されたら `unknown_resolved`、セッションが閉じても残っていたら
+  `unknown_remained`。無関係な 2 つのカウントでは「いくつの不明が解消したか」に
+  答えられない。**終端に達していない subject は分母から除外する** —
+  未決着の仮説を成功にも失敗にも数えるのは、起きていない結果を報告することで
+  あり、close ラベルを品質の代理にするのと同じ誤りである。
+- **観測されていない反転・undo・誤分類を推測しない。** 仮説を別の仮説で
+  supersede したことは訂正だが、fact で supersede しただけでは確認か反転かを
+  判別できない。仮説の暫定採用も確認ではない。同様に、`decided` 後に同じ項目で
+  新しい会話を開いたことは undo を、`system_researchable` が引き継ぎ・中断で
+  終わったことは Router 誤分類を、それぞれ必ずしも意味しない。明示的な
+  user-observation 契約が決まるまではこれらを `unmeasured` とし、#311 の開始条件へ
+  推測値を渡さない。
+- **カテゴリを 3 つに分ける。** `joint_understanding`(利用状況・効率)、
+  `joint_understanding_quality`(結果 lineage)、`joint_understanding_burden`
+  (1 セッションあたりの負担)。合成スコアはどこにも作らない —
+  **効率の改善を質の改善として表示しない**ため。guardrail は既存の直交フラグの
+  ままで、カテゴリにはしない。
+- **`per_session` 単位を追加し、表示側の fallthrough を潰した。** 旧
+  `formatMetricValue` は ratio 以外をすべて 「操作/疑問」 と表示していたので、
+  新しい単位は別の単位名で描画されていた — #366 が取り除こうとしている
+  「1 つの表示語が 2 つの事実を運ぶ」欠陥そのもの。
+- **`GET /interview/joint-understanding/lineage` は観測のみ。**
+  `bulk_approval_readiness` は #311 の開始条件を**カウントと明示的に未設定の
+  threshold** で返す。go/no-go は返さない — #311 を gate すべき数値は実データから
+  決めるべきもので、ここで判定を返せばそれ自体が Issue #338 が禁じる自己申告
+  readiness スコアになる(#341 が threshold を未設定にしたのと同じ規律)。
+  なお path は `/joint-understanding/lineage` ではない: `GET
+  /joint-understanding/{ju_id}` が先に登録された int path param を持つため、
+  その綴りでは "lineage" を id として解釈しようとして 422 になる。
+
+## システムインタビューの状態駆動ワークフロー UX(Issue #342)
+
+Issue #342(サブイシュー #343-#346)は、システムインタビュー画面を
+「すべての機能へ常にアクセスできる画面」から「現在の判断だけを、必要な
+根拠とともに順番に提示するワークフロー」へ再設計するための **UX 仕様策定**
+Issue である。4 つの sub-issue はいずれも 対象外 に「Dashboard コンポーネント
+の変更」「API・DB・状態管理の具体設計」「テスト実装」を明記しており、
+成果物は仕様そのものになる。
+
+仕様本体は `docs/system-interview-workflow-ux.md`。本節はその要点と、
+仕様策定の過程で確定した設計判断だけを記録する。
+
+### 決めたこと
+
+- **開発者向け状態 `W0-A` / `W0-B` / `W1`-`W7`**(#343): 開始の前提を満たす /
+  インタビューを始める / システム調査中 / 理解の要点確認 / 判断への回答 /
+  意図とのズレ確認 / 提案レビュー / 差分レビュー / 完了・次の作業。
+  `W0` を 2 変種に分けたのは、snapshot 不在時に「インタビューを開始」が
+  実行不能になり、「1 状態 1 主操作」と「無効操作を表示しない」の両方に
+  反するため。内部 stage(`STAGE_ORDER`)と `deriveUiState` の値は開発者に
+  露出せず、対応表としてのみ保持する。
+- **2 段階の状態決定**(#343 §2.2): 第 1 段は #287 の Alignment 分類ルール表と
+  同じ first-match(13 行)で候補状態を決め、第 2 段で「完了済み状態への後退は
+  明示確認」を適用する。ルール表だけでは基準 C を実現できない — 回答修正で
+  未回答質問が発生した瞬間、候補状態は無条件に `W3` になる。第 2 段は
+  `reached_state`(現在到達している判断状態。通常は前進し、明示承諾時だけ後退する
+  ワークフローチェックポイント)と戻り要求ごとの承諾を永続事実
+  として持ち、承諾されるまで表示状態を `reached_state` に留める。両段とも
+  スコア・類似度・LLM 判断は使わない(Principle 6)。
+- **進捗順序を持つ状態と持たない状態の分離**(#343 §2.2): 抑止の比較対象は
+  `W2 < W3 < W4 < W5 < W6 < W7` のみ。`W0-A` / `W0-B` / `W1` はワークフロー上の
+  位置ではなく一時的な事情なので順序を持たず、抑止対象にも `reached_state` の
+  更新対象にもならない。この分離が無いと、正常系の `W3`→`W1`(回答の自動反映)
+  や `W5`→`W1`(差分生成)まで「後退」と判定され、システム処理中であることが
+  表示されなくなる。
+- **ブロッキング失敗を first-match 表の行にする**(#343 §2.2): 実行中レコードが
+  失敗で終了すると「実行中」の行から外れるため、そのままでは失敗の表示先が
+  決まらない。失敗レコードは **対象状態**(`W2` / `W4` / `W5` の有限集合)を
+  持ち、未解消の間だけ対象状態の行の直前に置いた失敗行に一致する。失敗より
+  手前でできる作業が残っていればそちらが優先されるので、失敗表示が主フローを
+  塞がない。実行中レコードと失敗レコードは同じ 1 つの実行記録から導出する。
+- **復旧不能時の安全な終端**(#343 / #346): 中断・引き継ぎを選ぶ `OP-D14` は
+  既存のセッション `status` を `closed` にし、その行を実行中・失敗行より先に
+  評価して `W7` を表示する。この終端は進捗到達ではないので `reached_state` を
+  更新せず、失敗自体も解消扱いにしない。再開で `status=open` に戻すと未解消の
+  失敗が再表示される。終了・再開はいずれも manual の監査記録を伴う。
+- **承認セットと差分の対応**(#343 §2.2 行 11): `W5` の条件に「承認済み提案が
+  1 件以上あり、現在の承認セットに対応する差分が存在しない」を加えた。これが
+  無いと、全提案を承認し終えた直後や差分生成に失敗した直後に `W7` へ落ちる。
+  対応関係は差分の生成時刻と提案の最終更新時刻の比較で決定的に判定でき、
+  新しい永続事実を必要としない。差分レビューの完了記録も対象の差分に紐づけ、
+  新しい差分が生成されたら引き継がない。
+- **自動遷移と明示確認の 4 基準**(#343 §2.5): システム処理の開始・完了(A)と
+  開発者の確定操作による前進(B)は自動、**既に完了した状態への後退は常に
+  明示確認**(C、第 2 段として実現)、ブロッキング例外による中断は自動(D)。
+  後退を自動化すると「さっきまでの作業が消えた」体験になり、#342 が問題視
+  する探索コストを再生産するため。
+- **情報役割 `R1`-`R6`**(#344): 現在地 / 必須作業 / 根拠 / 詳細 /
+  例外時の警告・復旧 / 履歴・監査。**1 要素 1 役割**で、状態によって役割が
+  変わる要素は作らない(複数役割を担う UI は要素の側を分割する。Intent Brief
+  は確定操作 `R2` と内容表示 `R3` に分けた)。`R5` はブロッキングと劣化の
+  例外に対応し、情報区分の例外は `R2` の主作業カード内で扱う。現行画面の
+  主要 70 要素を棚卸しし、状態 × 役割のマトリクスに割り当てた。
+- **自動化の有限ゲート `A1`-`A4`**(#345 §4.1): 対象リポジトリを変更しない /
+  承認状態を変えない / 失敗が既存の確定を壊さない / 結果が監査記録として
+  残り人間の確定を待つ。4 条件すべてを満たす処理のみ自動化してよい。
+  Principle 5 / 7 と #288 を操作分類の判定基準に言い換えたもので、新しい
+  安全境界は導入していない。
+- **主操作は完了条件を満たす操作そのもの**(#345 §4.3): `W6` の主操作を
+  「.patch をダウンロード」ではなく「この差分を確認した」としたのはこのため。
+  ダウンロードは差分を読む手段であって「読んで問題ないと判断した」記録では
+  なく、完了扱いにすると内容を見ないまま `W7` へ進めてしまう。
+- **例外 `E1`-`E14`**(#346): ブロッキング / 劣化 / 情報 の 3 区分。区分は
+  処理の種類ではなく **失敗時点で、その状態の判断を進められる材料が残って
+  いるか** で決まる。したがって突き合わせ失敗は `E4-a`(初回失敗、有効な項目が
+  0 件 → ブロッキング。ズレを一度も確認しないまま `W5` へ進ませない)と
+  `E4-b`(再構築失敗、前回の項目が残る → 劣化)に、理解の構築失敗は
+  `E3-a`(質問すら提示できない → ブロッキング)と `E3-b`(ゼロベース質問で
+  継続できる → 劣化)に分かれる。
+- **ブロッキング例外に迂回路を作らない**(#346 §5.3-7): 復旧操作は「同じ処理の
+  再試行」と「§5.4 の終端へ安全に抜ける」の 2 つに限る。検討していた `E4-a` の
+  「突き合わせを行わずに進む」は削除した — Alignment 確認という人間のゲートを
+  復旧の名目で無効化する新しい判断になってしまうため。
+- **情報区分の例外は `R5` に出さない**(#344 §3.1): `R5` はブロッキングと劣化
+  のみ。`E5`〜`E9` / `E13` は通常フローの分岐なので `R2` の主作業カードの中で
+  扱う。1 要素 1 役割を満たすため、Q&A 一覧は未回答一覧(`R4`)と回答済み履歴
+  (`R6`)に分割した。
+- **`W7` の 3 終端は first-match で排他化**(#346 §5.4): 完了 → 引き継ぎ →
+  中断 の優先順位で 1 つに決まり、**終端ごとに異なる主操作**を持つ
+  (接続セットアップへ進む / 引き継ぎ状況を確認する / セッションを再開する)。
+  `W7` 共通で「接続セットアップへ進む」を主操作にすると、中断・引き継ぎ
+  終端で意味を成さない操作が主操作になる。
+
+### 現行実装に対して仕様が指摘した構造的な差分
+
+1. `InterviewUiState` は理解構築フェーズに 5 状態、承認以降に 1 状態という
+   非対称な粒度で、`W4`(意図とのズレ確認)・`W6`(差分レビュー)・`W7`(終端)
+   に対応する状態が存在しない。
+2. `W4` が状態として無いため「どちらのタブを既定にするか」という本来不要な
+   判断が生まれ、`conversationHasRequiredAction` / `manualMainTab` /
+   「会話タブへ移動」導線という 3 つの補償機構を必要としている
+   (`interview.tsx:1636-1666`, `509-546`)。状態モデルを直せば 3 つとも不要。
+3. `zero_base` は「理解構築の失敗」という例外を状態として主フローへ混ぜて
+   いる。仕様では `W3` の一形態 + `E3` の劣化表示として扱う。
+4. 状態判定にクライアント限定の事実(`manualMainTabState` /
+   `lastMaterialization` / `lastEvidenceReadsState` /
+   `answerRevisionReflectedState`、`interview.tsx:1538-1556`)が混ざっており、
+   再読込前後で表示状態が変わりうる。
+5. 「未到達の操作を disabled + 説明文で見せる」パターンが、操作 6 件
+   (差分を生成 / 理解を構築 / 理解を更新 / 突き合わせを実行 /
+   AI に先に調査させる / 実態チェックを実行)と、その前提を説明する
+   固定文 4 件の計 10 箇所ある。操作はいずれも §4.1 のゲートを満たすため
+   自動側へ移り、`E3`/`E4`/`E5` の復旧操作としてのみ残る。説明文は
+   ボタンを常設しなくなるため不要になる。
+
+### 明示的に変えなかったこと
+
+- 人間のゲート(理解の確認・Alignment 項目の確定・提案の承認/編集/却下・
+  差分の適用・観測の開始)は 1 つも緩めない。差分生成(`OP-S7`)を自動側に
+  置くのは、その前(承認)と後(確認と製品外での適用)にゲートがあり、変換
+  そのものはゲートではないため。隔離 worktree の境界も不変。
+- #341 の指標パネル(段階的開示・`guardrail` designation と要確認判定の分離)
+  は変更しない。仕様が追加するのは配置(主フロー最上部から「履歴と監査情報」
+  入口の中へ)と、指標は常に `R6` でありルール表に現れない、の 2 点のみ。
+- #295 の根拠先出し条件(conflict / high_risk / runtime mismatch・stale /
+  根拠 1 件)、Inquiry の 4 段階開示、`accept_current` のみ carry-over は
+  そのまま維持する。
+
+### 実装前提として新たに必要な永続事実
+
+いずれも「表示状態は永続事実だけから一意に決まる」(原則 P9)を満たすために
+必要で、1 つでも欠けると再読込前後で表示状態が変わる。設計は後続の実装 Issue
+が行う(#343-#346 の対象外)。
+
+- **A: 差分レビューの完了**(`W6` → `W7`)。現行はクライアント限定状態
+  (`lastMaterialization`)でしか表現されていない。確認したという判断の記録
+  なので `decision_method: manual`。
+- **B: システム処理の実行中レコード**(`W1`)。現行で永続的な実行状態を持つのは
+  #288 の refresh job だけで、理解の構築・更新、突き合わせ build、質問の分類・
+  調査、差分生成はクライアントの `isPending` にしか現れない。このままだと
+  再読込した瞬間に `W1` が消えて別状態が表示される。`W1` を発生させうる処理は
+  すべて開始・終了・失敗を永続事実として持つ必要がある。持てない処理は `W1` を
+  発生させず、進行中表示を現在地の一時的な補助表示に留める。
+- **C: `reached_state` と戻り要求**(§2.2 第 2 段)。`reached_state` は過去の最大値
+  ではなく現在のワークフローチェックポイントで、通常は前進し D の承諾時だけ
+  後退する。システムが機械的に導出・記録する進行の事実。
+- **D: 戻り要求への承諾**(§2.2 第 2 段)。**開発者の明示判断**であり
+  `decision_method: manual` として記録する。C とは別の事実として扱う —
+  「今の作業を中断して手前の状態へ戻る」はシステムが観測する進行ではなく
+  人が下す判断だから。C と D が揃って初めて後退の明示確認が成立する。
+
+A〜D は表示状態の決定にのみ用い、人間のゲートを増やしも減らしもしない
+(A・D が manual、B・C がシステム事実)。B は `W1` の実行中判定と、ブロッキング
+失敗レコードの対象状態の両方をまかなう。それ以外の状態(`W0-A` / `W0-B` /
+`W2`-`W5` / `W7`)は既存の永続事実から決定的に導出できる。安全な終端は既存の
+セッション `status` を使うため A〜D を増やさないが、変更操作は manual として
+監査する。
+
+---
+
+## 状態駆動 System Interview の実装(Issue #349)
+
+Issue #349 は上の #342 仕様(`docs/system-interview-workflow-ux.md`)を実際の
+プロダクトへ落とした実装 Issue である。#342〜#346 の「コンポーネント・API・
+DB・状態管理・テストは対象外」という制約は仕様策定 Issue のスコープにだけ
+かかるもので、本 Issue には適用されない。以下は、後から読む人が「なぜこの
+形なのか」を再構築できるようにするための設計判断の記録である。
+
+### 正準実装は 1 つだけ
+
+表示状態は `app/interview_workflow.py` だけが決める。
+
+- `evaluate_candidate_state(facts) -> (state, rule_row)` が §2.2 第 1 段の
+  13 行 first-match。`rule_row` を返すのは、表示状態を「どの行で決まったか」
+  まで説明可能・テスト可能にするため。
+- `apply_backward_hold(facts, reached_state=...)` が第 2 段。順序を持つのは
+  `W2 < W3 < W4 < W5 < W6 < W7` だけで、`W0-A` / `W0-B` / `W1` は
+  `state_rank()` が `-1` を返し、抑止対象にも `reached_state` 更新対象にも
+  ならない。これが無いと正常系の `W3`→`W1`→`W4` すら後退と判定される。
+- どちらも `WorkflowFacts` の純関数。時刻もリクエストスコープの値も
+  クライアント状態も入力にしない。新しい判定材料を足すときは
+  `WorkflowFacts` にフィールドを足して `gather_facts` で読む。
+
+Dashboard 側は `GET /interview/workflow-state` の結果を描くだけで、状態を
+再導出しない(原則 P9)。`deriveUiState` は残っているが、それはもはや
+「会話カードに何を出すか」というコンテンツ選択であって作業状態ではない。
+だから `building`(mutation の `isPending`)を渡さなくなった。
+
+### 承諾は「チェックポイントを引き下げる」ことで消費する
+
+第 2 段の純関数は「承諾済みかどうか」を入力に取らない。承諾
+(`POST .../back-requests/{id}/acknowledge`)が `reached_state` をその要求の
+`candidate_state` まで引き下げるので、以後の評価では候補が手前でなくなり、
+自然に候補状態が表示される。これにより「承諾フラグを見て分岐する」経路が
+存在しなくなり、§2.2 第 2 段 5.(過去の承諾を新しい戻り要求に流用しない)が
+構造的に保証される。
+
+pending な戻り要求はセッションにつき常に 1 件だけ持つ。戻る理由が未承諾の
+まま変わった場合は同じ行を更新する — 開発者に見せる導線は常に 1 つ
+(§2.2 第 2 段 3.)であるべきだから。事実が自力で前進して戻り要求が意味を
+失った場合は `resolved` にする。これはシステムの観測であって承諾ではなく、
+fact D の行は書かれず、状態も後退しない。
+
+### 「未解消」は保存せず導出する
+
+ブロッキング失敗が未解消かどうかは、`process_kind` ごとに**最後に終わった**
+実行レコード(`finished_at`、同時刻なら id が大きい方)を取り、それが失敗で
+あること、として毎回導出する。「より新しい成功が 1 つでもあれば解消」では
+3 本以上が並行したときに古い成功が最新の失敗を覆い隠す。`resolved_at` を書かないのは、
+書けば「誰が解消済みにしたか」という新しい判断ポイントが生まれるからで、
+導出にしておけば手動再試行でも #288 の自動 refresh でも同じ 1 つの条件で
+解消する。副作用として、中断(`status=closed`)は失敗を解消できない —
+仕様 §5.3-6 が要求するとおり、再開すると同じ失敗が再び現れる。
+
+### 実行中レコードは「実際に走った処理」だけを表す
+
+セッション作成 `POST /interview/sessions` は、`understanding_build` の実行中
+レコードを開いたうえで**実際に初期理解の構築を dispatch する**。レコードだけ
+先に開いてクライアントの 2 本目のリクエストを待つ設計にはしない — API だけ
+で作られたセッションや、作成直後にタブを閉じられたセッションが、誰も走らせて
+いない処理を「システムが調べています」と表示し続けてしまうからである。
+
+- 既定では daemon スレッドで走る。`PROBE_INTERVIEW_EAGER_INITIAL_BUILD=1`
+  で同期実行に切り替わる(`interview_refresh` の `PROBE_REFRESH_EAGER` と
+  同じ趣旨で、テストが決定的に検証するための切替)。
+- スレッドすら起動できなかった場合はその場でレコードを失敗にする。15 分後の
+  stale sweep を待たせず、`E3-a` の復旧操作としてすぐ再試行できる。
+- worker は作成時に開かれた**その id** を `adopt_run_id` で引き継ぐ。
+  「この種類の最も古い実行中行」を拾う実装にすると、正当に並行しうる 2 本の
+  再構築(手動更新と自動 refresh)が 1 行を共有し、後に終わった方がもう一方の
+  結果を消してしまう。
+- サーバー側が構築を開始するので、Dashboard の開始フローは
+  `update-understanding` を続けて呼ばない。呼べば同じ推論処理が二重に走る。
+
+テストは全件この dispatch を止める(`tests/conftest.py` の autouse fixture)。
+止めないと、セッションを作るすべてのテストが daemon スレッド上で境界の無い
+推論モデル呼び出しを始め、テスト自身の書き込みと競合する。dispatch 自体を
+検証する 2 本だけが `real_initial_build_dispatch` fixture で本物に戻す。
+
+### 実行中レコードを持てない処理は `W1` を出さない
+
+仕様 §8.1 実装前提 B は明示的にこの選択を認めている。実装では:
+
+- 実行中レコードを持つ: 理解の構築 / 更新、Alignment build、質問の分類・
+  調査、Intent 候補生成、提案生成、差分生成、Runtime Reality Check。
+- 持たない: `proposal_generation` ステージ以外の dialogue turn(開発者自身の
+  回答ターン)。回答後の反映は #288 の refresh job が走り、その中の理解更新・
+  Alignment build が実行中レコードを持つので、「回答を反映しています」の
+  `W1` は結局そちらから出る。
+
+前提拒否(404/409)は失敗レコードにしない。失敗にすると、再試行しても
+決して成功しない復旧操作を画面に出すことになる。`ProcessRunTracker.abandon()`
+がその区別を担う。
+
+### 差分レビューは差分に紐づく
+
+fact A は `interview_session.materialized_at` を差分の同一性として持つ。
+差分を再生成すると新しい時刻になるので、前の確認記録は自動的に対応しなく
+なる(§2.3 `W6`)。「現在の承認セットに対応する差分」の判定は、差分の生成
+時刻が `interview_proposal_decision.decided_at` の最大値より後であること
+——新しい永続事実を足さずに決定的に判定できる、という仕様 §2.2 行 11 の
+指摘をそのまま実装した。
+
+### 廃止した UI 要素と、残した復旧経路
+
+仕様 §3.2 で「廃止」8 件・「常設をやめる」5 件とされた要素は、機能そのものの
+削除ではない。廃止したのは、状態モデルの不足を補償するために存在していた
+機構(2 タブ、会話タブへの導線、前提未達の説明文 3 種、Intent の AI 提案
+ボタン、手動の差分生成ボタン)である。`OP-S1`〜`OP-S8` の手動起動は
+「今その例外が発生しているときだけ現れる復旧操作」として残っており、
+復旧の選択肢は §5.3-7 のとおり「同じ処理の再試行」と「§5.4 の終端へ安全に
+抜ける」の 2 つに限られる。人間のゲートを飛ばす迂回路は追加していない。
+
+### 検証
+
+`apps/control-server/tests/test_interview_workflow.py` が 13 行すべて、行の
+優先順位(失敗行が手前の作業を塞がないこと)、順序を持たない状態が抑止対象に
+ならないこと、戻り抑止と要求ごとの承諾、実行中→成功/失敗、ブロッキング失敗の
+対象状態、差分とレビュー記録の対応、中断・再開と失敗の再表示、承認セットと
+差分の対応、System/セッション分離、そして §6 の代表シナリオを検証する。
+Dashboard 側は `apps/dashboard/src/__tests__/workflow-panel.test.tsx`
+(役割・主操作・例外区分の表示規約)と `dashboard-contracts.test.tsx` の
+Interview page 群(状態ごとに 1 つの作業面、未到達操作が描かれないこと、
+主操作と完了条件の一致、戻り要求の承諾導線)で検証する。
+
+## Understanding Brief と Decision Readiness(Epic #351 / #352 / #353 / #354)
+
+#342 / #349 で、インタビュー画面は「工程のどこにいて、次に何をするか」を
+1 つの正準な状態から描くようになった。#351 が指摘したのはその **手前** の
+欠落である — 開発者が本当に最初に判断したいのは工程上の現在地ではなく、
+「AI はこのシステムを何のためのものと理解しているか」「どこが確実でどこが
+仮説か」「この理解のまま進めてよいか」の 3 点で、従来の「現在の理解」は
+確信度で「分かったこと / 確認したいこと」へ平坦に分類するだけだったため、
+システム全体を **意味として** 要約する層が存在しなかった。
+
+実装は 3 つ:`app/understanding_brief.py`(決定的な導出)、
+`GET /interview/understanding-brief`(唯一の読み取り口)、
+`components/system-understanding/understanding-brief.tsx`(表示)。
+
+### Vision は Purpose と別の主張として持つ
+
+`system_understanding_reviewer` の出力に `vision` セクションを追加した
+(`PROMPT_VERSION='understanding-review-v7'` / `SCHEMA_VERSION=
+'understanding-review-v2'`)。Vision(誰の状態をどう変えたいか)と
+System Purpose(その Vision に対してこのシステムが担う役割)を 1 つの
+セクションに畳むと、#351 が解消対象とした「開発者の意図と実装上の責務が
+同じ『確認済み』表現に混ざる」状態がデータ構造の時点で発生する。
+
+- Vision は最大 1 件(`_MAX_VISION_ITEMS`)。超過分は決定的に切り捨てる。
+- Vision は `_EVIDENCE_REQUIRED_SECTIONS` に **入れない**。根拠が無い Vision
+  ごとに高優先度の open question を作ると、ほぼ全セッションで発火する
+  ノイズになり、しかも開発者自身の Vision には Intent Brief という正しい
+  置き場がすでにある。代わりに、根拠の無い Vision の確信度を決定的に
+  `uncertain` へ落とす。これで Brief 側では「AI 仮説・未確認」または
+  「不明・情報不足」としてしか表示されえない。
+- 「Vision を推定できない」ことは事実として表示する。プロンプトも、入力に
+  対象や実現したい状態が書かれていなければ空配列を返せと明示している —
+  コードの機構から Vision を逆算した文章は事実ではない。
+
+Brief 上の Vision の解決順は first-match で、確定済みの Intent Brief
+`goal` > モデルの `vision` > 未確定の `goal` > 無し(不足情報を明示)。
+開発者自身が「何を変えたいか」を確定しているなら、モデルのリポジトリ読解
+より常にそちらが上位に来る。
+
+モック LLM 由来の主張は隠さずに `is_mock` で明示する。理解レビュー自体は
+mock クライアントに対して fail closed なので `current_understanding` が
+モックになることはないが、Intent Brief の `ai_proposed` 行はモックになりうる
+——そしてそれが Vision として表示されうる。
+
+### 確認状態と出所は独立した 2 軸
+
+同じ「確認済み」表現に混ぜないという要求を、1 つの値で表現することはできない。
+そこで claim ごとに 2 つの有限集合を別々に持つ。
+
+- 確認状態 `confirmation`: `confirmed` / `ai_hypothesis` / `conflicting` /
+  `unknown` / `recheck_required`。first-match で、矛盾 > 確認後の変更 >
+  確認済み > 情報不足 > 仮説。矛盾が確認済みより上なのは、確定した主張が
+  後から矛盾と判定されたときに「確認済み」のままにしないため。確認後の変更が
+  確認済みより上なのは、まさに #351 が禁じた「黙って差し替える」表示を
+  構造的に不可能にするため。
+- 出所 `provenance`: `developer_intent` / `runtime_observation` /
+  `implementation_fact` / `ai_hypothesis`。`classify_provenance` は
+  「人間が確認したか」を **見ない**。AI が書いた文を人が承認しても、著者は
+  AI のままである。
+
+「同じ主張か」の判定は名前の完全一致のみで、`understanding_diff` と同じ規則。
+内容が変わったかは `claim_digest`(名前を除く意味項目の正準 JSON の SHA-256)
+の比較で、改名は「削除 + 追加」として現れる。類似度も埋め込みも使わない
+(Principle 6)。確認済みリビジョンの取得は #312 の
+`understanding_capability_confirmation.source_revision_id` を第一とし、
+ゼロベース確定や #312 以前のセッションでは
+`understanding_confirmed_at` 以前の最新リビジョンにフォールバックする —
+どちらも永続事実で、「たぶんこれを見ていたはず」という推測はしない。
+
+### Decision Readiness はワークフロー状態とは別の軸で、ゲートではない
+
+`evaluate_readiness` は `not_built` / `building` / `blocked` /
+`recheck_required` / `needs_confirmation` / `ready` を first-match で返し、
+同時に有限コードの理由を返す。理由には severity(`blocking` /
+`attention` / `informational`)と対象(claim 名・process 種別・snapshot)が
+必ず付く — #353 の「件数だけで理由を代替しない」「参考情報の不足と判断を
+止める不足を混同しない」に対応する。
+
+「変更後の再確認待ち」は `change_count`(変更の列挙件数)と
+`recheck_claim_count`(claim_digest が変わった主張の件数)の **両方** を見る。
+また、再確認待ちの主張を `unconfirmed_capability_count` /
+`purpose_confirmed` の「未確認」側に数えない。同じ主張について
+「未確認です」と「前回の確認後に変わりました」を並べると、両立しない 2 つの
+説明を同時に出すことになる。
+
+**変更の列挙は再確認の判定と同じフィールド集合から作る。** `claim_payload`
+(名前を除く意味項目の正規化)が唯一の定義で、`claim_digest` はその SHA-256、
+変更リストは同じ payload のフィールド比較である。`understanding_diff` は
+名前・説明・確信度しか報告しないので、それだけに頼ると `why_core`・根拠・
+関連 API・子要素が変わった Capability について「変わりました」とだけ言って
+中身を示せない(#353 の「何が、どのように変わったか」が満たせない)。
+`_DETAIL_FIELD_CHANGES` がこの差を埋め、
+`test_every_digest_field_is_nameable_as_a_change` が両者の乖離を禁止している。
+追加・削除と詳細変更は同時に列挙する — 以前は `elif` で、同じ再構築に追加が
+あると詳細の説明ごと落ちていた。
+
+有限集合は `app/models.py` の `Literal` を唯一の定義とし、
+`understanding_brief.py` は `get_args` で同じ集合をタプルとして取り出す
+(`UnderstandingConfirmationState` / `UnderstandingProvenanceKind` /
+`UnderstandingClaimKind` / `UnderstandingReadinessState` /
+`UnderstandingReadinessSeverity` / `UnderstandingChangeKind`)。API モデルを
+素の `str` にしておくとレスポンススキーマに enum が乗らず、Dashboard の
+union が黙ってずれる — 実際 `change_kind` に 5 種類を足したときにずれた。
+既存の `tests/test_interview_type_parity.py`(models.py と types.ts を直接
+パースして比較する)の `FINITE_TYPE_NAMES` に 6 つとも登録してあるので、
+片側だけの追加は失敗する。
+
+**Readiness を動かせるのは Brief を変えうる処理だけ**
+(`BRIEF_AFFECTING_PROCESS_KINDS` = `understanding_build` /
+`understanding_update` / `intent_candidates`)。実行中レコードとブロッキング
+失敗の両方をこの集合で絞る。絞らないと、提案生成が走っているだけで
+「システムが理解を作成しています」になり、差分生成の失敗(`E12`、常に
+blocking)だけで「理解を作る処理が失敗した」と表示される — どちらも工程の
+状態を理解の信頼性として読ませることになり、両者を分離するという #353 の
+要件そのものに反する。Dashboard 側の `W1` カードも同じ理由で、見出しを
+サーバーの `readiness_state === "building"` で切り替える。`W1` は
+「システムが何か実行中」であって「理解を作り直し中」とは限らない。
+
+**主要機能が 0 件の理解は「進行可能」にならない。** Purpose と主要機能の
+両方が空のときだけブロックする作りでは、Purpose だけのリビジョンを確定すると
+「System Purpose と主要機能は確認済み」と表示されてしまう。`capabilities_missing`
+(attention)を出すことで `ready` に到達しなくなる。ブロッキングにはしない —
+Purpose だけでも開発者は判断できるし、#352 が求めているのは「完了したように
+見せない」ことであって工程を止めることではない。
+
+2 つの境界を意図的に守っている。
+
+1. **ゲートにしない。** 主操作は引き続き `app/interview_workflow.py` が
+   決める 1 つだけで、`blocked` でも消えない。「すべての未確認事項が
+   なくなるまで工程を止める」ことは #353 の明示的な非目標である。
+   `test_a_blocking_failure_blocks_the_brief_but_never_the_primary_action`
+   がこの不変条件を固定している。
+2. **工程状態を再定義しない。** Readiness は「この判断材料を信頼できるか」、
+   ワークフロー状態は「どこにいるか」。事実は `gather_facts` を共有して
+   読むので両者が食い違うことはないが、語彙・見出し・API を分けている。
+
+`ready` は「理解が完全・無誤謬」という意味ではない。説明文にもそう書いて
+あり、根拠として「Purpose と主要機能は確認済みで、判断を止める未解決事項が
+ない」という理由コードを必ず 1 件返す。合成された信頼度パーセントは
+どこにも出さない。
+
+### 全ワークフロー状態で同じ位置・異なる展開量
+
+`BRIEF_DISPLAY_BY_STATE` は状態 → 展開量の固定表で、状態そのものは常に
+サーバーの `workflow.state`(#349 の原則 P9 は緩めていない)。
+
+| 状態 | 展開量 | 出すもの |
+| --- | --- | --- |
+| `W0-A` / `W0-B` | `empty` | 「まだ構築していない」事実のみ。架空の Vision は出さない |
+| `W1` | `building` | 骨格 + 何を構築中か + 表示中が更新前である旨。確定操作は出さない |
+| `W2` | `full` | 主作業。Vision / Purpose / 主要機能 / 重要な未確認事項 + 主操作 |
+| `W3`〜`W7` | `compact` | Vision / Purpose / 主要機能名 / Readiness / 変更有無。展開で `full` と同じ |
+
+配置はメインカラムの先頭に統一した。右カラムは狭い画面で下へ回り込むため、
+そこに置くと Vision・Purpose・進行可否が主作業より大幅に下がる(#354 の
+画面幅要件)。これに伴い、右カラムにあった「現在の理解」カードは廃止した —
+同じ対象を 2 箇所に置かない(#349 の原則 P7)。全文ツリー(従来の
+`UnderstandingOverview`)は Brief の折りたたみの中に R4 として残っている。
+`W2` の確認操作(「この理解で進む」)も会話カードから Brief カードへ移した。
+判断対象と主操作は同じ作業面に置く(原則 P2)という規則を、判断対象が
+Brief になった以上そのまま適用した結果である。会話カードに残る確定操作は
+ゼロベース(構造化された理解が無く、会話内容そのものが確認対象になる場合)
+だけになった。
+
+右カラムの `last_error` 表示も削除した。表示条件が「未解消の失敗がある」
+ことそのもので、失敗内容・影響・復旧条件・再試行を 1 枠にまとめる
+`WorkflowExceptions`(#342 §4.4)と必ず同時に出る重複だったからである。
+
+Brief の取得に失敗した場合(読み込み中、または `understanding-brief` を
+持たない古い Control Server)は、`unavailable` 表示に落として **主操作と
+全文ツリーを残す**。要約は判断の補助であって、ワークフローの前提ではない —
+要約 API が落ちただけで状態の主操作へ到達できなくなるのは、#349 が繰り返し
+潰してきた「画面が詰まる」バグそのものである。
+
+### 検証
+
+`apps/control-server/tests/test_understanding_brief.py` が、確認状態と出所の
+全値の到達可能性・first-match 順序・2 軸の独立性、`claim_digest` の改名/編集
+の扱い、Readiness 全状態と severity 分離と決定性、確定→変更で
+`recheck_required` と具体的な変更内容が出ること、確定済み Intent `goal` が
+Vision を上書きすること、ブロッキング失敗が Readiness を `blocked` にしても
+主操作を変えないこと、リロード再現性、System 分離を検証する。
+`test_system_understanding_reviewer.py` の `TestVisionSection` が Vision の
+独立性・根拠なし時のクランプ・1 件制限・不在時に捏造しないこと・
+prompt/schema version の更新を検証する。Dashboard 側は
+`apps/dashboard/src/__tests__/understanding-brief.test.tsx` と
+`dashboard-contracts.test.tsx` の Interview page 群。
+
+## インタビュー・コックピット(Issue #356)
+
+#349 で状態駆動になり、#351 で「現在の理解」を要約するようになったあとも、
+インタビュー画面には **全体像** の層が無かった。開発者は「今どの状態か」
+(#349)と「AI は何と理解しているか」(#351)は読めるのに、
+
+- インタビュー全体がどこまで完成しているか
+- どの理解カテゴリが確認済み / 要確認 / 未設定なのか
+- 各カテゴリを直すにはどの操作をすればよいか
+- その修正が他のカテゴリへどう波及するか
+
+を 1 画面で把握できなかった。#356 はこの層を足す。既存のデータ取得・
+mutation・権限制御をそのまま使い、**新しいバックエンド API は追加しない**。
+
+### 集約は純粋関数に閉じ込める
+
+`apps/dashboard/src/components/system-understanding/cockpit/model.ts` が
+唯一の集約・判定の場所で、React にも API クライアントにも依存しない。表示
+コンポーネントは決まった値を描くだけで、状態判定を内部に持たない。
+
+- 5 カテゴリ(Vision / System purpose / Capabilities / API boundaries /
+  Probe flow)は `CurrentUnderstanding` のセクションを固定表で束ねたもの。
+  `vision` は #352 で後から入った任意キーなので、キーが無い古い応答でも
+  「未設定」として扱えるようにしている。
+- カテゴリ状態は `confirmed` / `review` / `missing` の 3 値**のみ**で、増や
+  さない(issue §3 の契約)。「データが取れていない」はカテゴリの業務状態では
+  ないので状態値にはせず、`CockpitQaFetchStatus` という別軸に持ち、確定でき
+  ないカテゴリは `status: null`(状態ラベルを保留)として表す。内容が
+  無ければ `missing`、対応する gap か未解決質問があれば `review`、それ以外は
+  `confirmed`。gap の割り当ては (1) `gap.name` と理解項目名の**完全一致**
+  (`understanding_diff` と同じ規則)、(2) 一致しなければ `gap_type` の既定
+  カテゴリ、(3) どちらでもなければ未割り当て、の順。類似度・キーワード
+  スコアは使わない(Core Design Principle 6)。
+- 完成度は固定値ではなくカテゴリ状態から算出する(`completionPercent`:
+  confirmed=1 / review=0.5 / missing=0 の平均を百分率へ)。合成した
+  「信頼度パーセント」ではなく、5 カテゴリという数えられる対象の充足率で
+  ある点が #353 の「合成信頼度を出さない」規則との違い。
+- 未解決事項は `open_questions` と未解決 Q&A を突き合わせ、`qa_id`(無ければ
+  質問文)で **1 件にまとめて** から優先度順に並べる。重複を「後から来た方を
+  捨てる」形にしてはならない: 状態を持っているのは Q&A 行だけで、skip /
+  resume は `interview_qa.status` しか更新せず `session.open_questions` の
+  JSON エントリは元のまま残る(`routes/interview.py`)。捨てるだけだと
+  `skipped` / `unconfirmed` が通常の未回答として表示され、Q&A 進捗では
+  見送り中なのに一覧では普通の質問に見えるという食い違いが起きる。
+  `unconfirmed` / `deferred` と状態由来の優先度は Q&A 側から反映し、Q&A 側が
+  `answered` / `revised` になっている質問は `open_questions` に残っていても
+  未解決から外す。一覧と Q&A 合計から外すのは
+  `answered`(解決済み)と `revised`(後続行に置き換えられた履歴)だけ。
+  **`skipped` は外さない** — `routes/interview.py` の skip/resume が示すとおり
+  「後で回答する」ための一時状態で、`resume` でいつでも `open` に戻せる未回答
+  であり、除外すると未回答が残っているのに未解決 0 件・完成度 100% と表示
+  されてしまう。未回答(`open`)に数え、内訳として「後で回答 N 件」を再掲し、
+  一覧の行にも 「後で回答」 を明示する。優先度は、開発者自身が見送ったもの
+  なので通常の未回答より下(`low`)、「わからない」による再確認待ちは上
+  (`high`)。合計 = 回答済み + 確認待ち + 未回答 は常に成り立つ。
+
+### 修正手段は案内であって主操作ではない
+
+詳細ペインの「修正するには」(質問に回答する / 直接編集する / 根拠を確認する)
+は、既存パネル(`work-surface-W3` / `change-set-panel` /
+`understanding-brief`)へスクロールとフォーカスを移すだけで、回答・編集・
+根拠表示の処理を重複実装しない。
+
+移動先は 1 つの固定値ではなく、`unresolvedTargets()` が返す優先度付きの候補
+列で、`focusFirstCockpitTarget()` が実際に描かれている最初のものを選ぶ。
+質問に紐づく操作の先頭候補は必ずその質問の行(`qa-item-<id>`)である —
+作業面(`work-surface-W3`)の先頭ボタンへ飛ばすと、質問が複数あるときに
+選んだものと違う質問へフォーカスが当たり、一覧から個別の質問を開く意味が
+無くなる。行が描かれない状態(`W3` 以外)でだけ作業面 → 未解決一覧へ落とす。実行できない手段は **理由付きの disabled**
+として残す。これは #342 の原則 P3(前提未達の主操作を disabled で見せない)
+と衝突しない — P3 が対象にするのはその状態の主操作で、ここは「この項目を
+どう直すか」の案内である。案内ごと消すと「今は直せない」ことすら読めなく
+なるため、issue §4 の指定どおり理由を添えて残す方を採った。
+
+可否の判定にはサーバーが決めたワークフロー状態(#349)をそのまま使う。
+クライアントで状態を再導出はしない。
+
+### 配置
+
+- Interview status サマリーは 2 カラムの **外**(全幅)に置く。狭い画面で
+  右カラムが下へ回り込んでも位置が変わらないようにするためで、メインカラム
+  先頭は #351 が定めたとおり Understanding Brief のまま。
+- 理解の全体マップは Brief の直後(同じ「現在の理解」の話題をまとめる)。
+- 未解決事項と Q&A 進捗は主作業面の**下**。全体像が「今すぐ何をするか」より
+  上に来ないようにする。
+- 詳細・修正ペインは右カラム先頭、セッション情報(参加者 / 最終更新 /
+  根拠数 / 保存状態)は従来の「セッション #id」カードを置き換える形で
+  同じ位置に置く(同じ対象のカードを 2 枚にしない、原則 P7)。
+
+### 0 件と「取得できていない」を同じ表示にしない
+
+質問合計・未解決件数・Q&A 進捗の根拠は `GET /interview/sessions/{id}/qa` だけ
+なので、この応答が取得前・取得失敗のときに 0 件という確定値を出すと、質問が
+残っていても「未解決 0 件 / 完成度 100% / カテゴリは確認済み」と読めてしまう。
+`CockpitInput.qaFetchStatus`(`ready` / `loading` / `unavailable`)を集約の
+入力にし、`ready` 以外では:
+
+- `CockpitModel.qa` を `null` にする(0 件の `CockpitQaProgress` を作らない)
+- 完成度を `null` にし、進捗バーの代わりに理由を出す
+- 「未解決の質問が無い」ことを根拠にした `confirmed` を出さず、そのカテゴリ
+  の `status` を `null` にする(状態ラベルを出さず、「Q&A 未取得のため保留」
+  というデータ取得側の説明に切り替える)。内容の有無(`missing`)と gap の
+  有無(`review`)は session 詳細だけで判定できるので、そちらは 3 値のまま
+  そのまま出す
+- 要確認の件数は確定値ではなく下限になるので、`countsSettled: false` として
+  「N 件以上」と表示する。0 件と表示すると「問題なし」と読めてしまう。未設定
+  は内容の有無だけで決まるため常に確定値
+- Q&A 進捗カードを再試行付きのエラー表示 / 読み込み表示にし、マップ全体には
+  理由 + 再試行を 1 度だけ、未解決一覧には「Q&A 由来の項目が含まれていない」
+  ことを明示する
+
+状態の有限集合は 3 値のままである点が要点で、第 4 の状態値を作ってはならない
+(レビュー指摘)。取得状態は `qaFetchStatus` にだけ持ち、業務状態と混ぜない
+(#341 の データ不足 / 取得失敗 を判定と分離したのと同じ考え方)。
+
+### 取得失敗は本文を空にしない
+
+セッション一覧・セッション詳細が取れないと、この画面は本文を 1 つも描けない。
+以前は loading 分岐を抜けたあと何も出ないままで、失敗した事実も次の操作も
+読めなかった。`interview-load-error` カードで、失敗した対象・サーバーからの
+理由・再試行を 1 枠にまとめる(#342 §4.4 の例外表示と同じ形)。再試行は該当
+クエリの `refetch` だけを呼び、人間のゲートには触れない。
+
+`/interview-mock` のモック専用ルートと `pages/interview-mock.tsx` は、この
+実装で役目を終えたので削除した(issue「実装方針」)。
+
+### 検証
+
+`apps/dashboard/src/__tests__/interview-cockpit.test.tsx` が、完成度の算出、
+全カテゴリ確認済み / Vision のみ未設定 / 複数カテゴリ要確認 / 理解が null
+(構築中) / 旧応答に `vision` キーが無い各ケース、未解決事項の優先度順と
+重複時の状態マージ(`skipped` / `unconfirmed` / 回答済みの除外)、`skipped`
+が未解決として数えられカテゴリを要確認にすること、Q&A 未取得時に 0 件・
+完成度を確定値として出さないこと、状態が 3 値に限定され Q&A 未取得時は
+ラベルを保留すること、再取得成功後に通常の 3 状態へ戻ること、
+Q&A 3 区分の合計一致、修正手段の可否と理由、質問単位の移動先候補、カード
+選択とキーボード操作、CTA のフォーカス移動を検証する。画面全体の組み上がり
+(セッション一覧 / 詳細それぞれの API エラー表示と再試行、Q&A だけが失敗した
+ときの非確定表示と再試行後の復帰、選んだ質問へのフォーカス移動を含む)は
+`dashboard-contracts.test.tsx` の Interview page 群。
+
+## コックピットの情報設計(Issue #358, sub #359-#363)
+
+#356 でコックピットは揃ったが、実データでの UX レビュー(probe-agent /
+self-test, session #13, `W3`)で、**主操作が埋没し情報が同時展開されている**
+ことが分かった。1280 × 720 で Interview status の上端が 442px、主作業面の
+上端が 1,807px、内容全体が約 5,897px。画面は「次にやること: 回答を送信」と
+言うのに、その入力面までは約 1,100px のスクロールが要る。390 × 844 では
+固定サイドバーが 223px を取り、`main` が 166px、カードの実表示幅が約 118px。
+
+#358 はこの層の **並び順・密度・幅** を直すだけで、Dashboard の中に閉じて
+いる。新しいエンドポイント・mutation・権限制御は一切足していない。
+
+### 主役は「次にやること」で、CTA は移動しか行わない
+
+`CockpitStatusSummary` の先頭は「次にやること」+ 主 CTA 1 つで、完成度は件数
+と同じ密度の 1 タイルに降ろした(受け入れ条件「完成度・件数は主 CTA より
+視覚的に強くならない」)。
+
+この CTA は **実行しない**。対応する作業面・質問行・詳細ペインへスクロールと
+フォーカスを移すだけで、状態の完了条件を満たす操作はその状態の作業面にある
+ボタンが唯一の実行者であり続ける。同じ操作を 2 箇所に置くと、どちらが正準か
+分からない重複になる(#342 原則 P1/P7)。「確認事項が無い」ときの CTA 文言だけ
+はサーバーの `primary_action` から取る -- どれが主操作かを決めるのはサーバー
+だけである(#349)。
+
+`CockpitNextStep` は `model.ts` の先頭一致表で決める:
+
+1. `qaFetchStatus === "unavailable"` → `retry_qa`
+2. `qaFetchStatus === "loading"` → `state_primary`(読み込み中は何も実行できない)
+3. 未設定カテゴリがある → `fix_category`
+4. 未解決の確認事項がある → `answer_question`(移動先は `unresolvedTargets()`)
+5. 要確認カテゴリがある → `fix_category`
+6. それ以外 → `state_primary`
+
+有限集合の固定表であってスコアではない(Core Design Principle 6)。#356 では
+未解決事項が 1 件も無いと CTA を出せなかったが、この表により「次にやること」
+が存在する限り必ず実行可能な CTA が出る。
+
+### 未解決事項のグルーピングは有限カテゴリの所属であって類似度ではない
+
+セッション #13 では未解決 11 件がそれぞれ独立行として並び、カード高が約
+3,416px、さらに下の Q&A 全一覧で同じ質問が再掲されていた。
+
+`groupUnresolvedItems()` は **カテゴリキーだけ** をグループキーにする
+(5 つの `CockpitCategoryKey` + `null`)。「意味的に近い質問をまとめる」は、
+サーバー由来のすでに有限な集合への所属として実現しており、テキスト類似度・
+埋め込み・キーワードスコアは使わない(Principle 6: 類似度は候補の取得には
+使えても、最終的な開放的判断になってはならない)。並び順は代表質問が元の
+優先度順配列に現れた順で、グループ内も入力順を保つ。
+
+初期表示は上位 3 グループで、「残り N 件を表示」の N は隠れている **質問数**
+である(開発者が数えるのは質問であってグループではない)。代表以外の質問にも
+それぞれ「開く」を用意する -- 代表しか開けないと、非代表の質問がこの一覧から
+到達不能になる。展開すると新たに現れた先頭行へ、畳むとトグル自身へフォーカス
+を戻す。
+
+Q&A 進捗カードが 3,416px まで伸びていた原因は CSS Grid の既定 `stretch` で、
+背の高いカードと短いカードを並べる行には `items-start` を置く。
+
+### マップは走査、詳細ペインは読む場所
+
+理解マップのカードは 番号 / 名称 / 状態 / 1 行要約 だけにし、caption と hint
+は詳細ペインへ移した。`missing` / `review` にはリング強調と「要対応」という
+テキスト標識を付ける(色だけに依存しない)。5 カテゴリの並び順は固定のままで、
+状態で並べ替えない。
+
+詳細ペインは `xl` 以上で sticky にする(マップをスクロールしても選択内容と
+修正導線を見失わない)。`xl` 未満では右列が下へ回り込むので、マップの
+「選択中のカテゴリの詳細へ」がキーボードでもモバイルでも使える到達手段になる。
+理由と根拠は 3 件まで出し、残りは展開式。
+
+### 補助情報は 1 箇所へ、ただし即時対応が必要なものは折りたたまない
+
+`CockpitAuxiliaryPanel` / `CockpitAuxiliarySection` に セッション情報 /
+Intent Brief / 引き継ぎ / 観測提案 / まとめて修正 / Q&A 全一覧 / 履歴と監査
+をまとめた。**どのセクションが存在するかは #342 §3.3 の状態マトリクスの
+まま** で、密度だけが変わっている。
+
+折りたたみへ入れないものが 3 つある:
+
+- 未処理の引き継ぎがあるときの一覧(0 件のときだけ補助情報へ降りる)
+- ブロッキング / 劣化中の失敗(`WorkflowExceptions` はサマリーより上)
+- 補助処理が失敗しているときの Q&A セクション(既定で開く。復旧操作が中にある)
+
+閉じた `<details>` の中身は DOM に残るので `querySelector` では見つかるが、
+表示されていないので `focus()` が黙って失敗する。`focusCockpitTarget` は
+祖先の `<details>` をすべて開いてからフォーカスする。これが無いと詳細ペインの
+「直接編集する」や未解決事項の「この項目を開く」が何も起こさない。
+
+セッション番号 / Snapshot 番号 / ステータスはヘッダーだけが常時表示し、
+`CockpitSessionInfo` からは外した(原則 P7)。入口はヘッダーの
+「セッション情報」ボタン。
+
+### 幅
+
+`md` 未満ではサイドバーを本文から切り離し、ヘッダーのメニューボタンから開く
+オーバーレイ Drawer にする(フォーカストラップ / Escape / 遷移で閉じる /
+閉じたらボタンへフォーカスを戻す)。`md` 以上の展開・折りたたみは従来どおりで、
+ナビゲーション項目・ルート・権限制御は変えていない。`main` の padding は
+`p-4 md:p-6`。
+
+### 検証
+
+`cockpit-unresolved.test.tsx`(グルーピング、`nextStep` の 6 分岐、段階的
+開示とフォーカス、状態表示)、`cockpit-map-detail.test.tsx`(カードの内容縮小、
+非色の要対応標識、矢印キーの移動、詳細への導線、理由・根拠の展開)、
+`layout-navigation.test.tsx`(390 / 768 / 1280 の Drawer 挙動)、および
+`dashboard-contracts.test.tsx` の Interview page 群(並び順、補助情報の
+折りたたみと CTA からの到達、ヘッダーとの重複解消)。
+
+### レビューで直した 3 点 (#358)
+
+実データでの再レビューで、#360 と #363 の受け入れ条件が未達だと分かった。
+
+**主作業面が初期ビューポートの外だった。** 並び順は正しかったが、ヘッダー・
+画面説明・現在地・ステータスサマリーを積んだ時点で 1280 × 720 を使い切り、
+`work-surface-W3` の上端が 756px になっていた。「次にやること」と CTA は
+見えるのに、その操作面はスクロールしないと見えない -- 順序だけでは目的を
+果たさない。サマリーの統計を既定で畳み(`cockpit-status-stats`)、セッション
+表示中は画面の説明文を出さず、ページ root を `space-y-4` にして上端を
+470px まで押し上げた。`W2` では主操作「この理解で進む」が Brief カード
+(約 566px)の本文下にあり 979px だったので、カードのヘッダー側へ移した
+(495px)。カードは 1 枚・主操作は 1 つのままなので #351 の条件は変わらない。
+
+**sticky が効いていなかった。** 原因は #359 のために外側 Grid へ入れた
+`items-start` ではなく、sticky を **右カラムの中のラッパー** に付けていた
+ことである。sticky 要素が動けるのは containing block の中までで、右カラムは
+中身ぶんの高さ(約 875px)しか無い一方、Grid の行は約 2,477px あった。
+sticky を Grid の直接の子である右カラム自身へ移すと、containing block が
+行いっぱいの grid area になり、`items-start` のままマップの末尾まで追従する。
+詳細ペインだけを浮かせなかったのは、通常フローに残る補助情報の上へ重なる
+ため。カラムごと動かし、背が高いときの下端到達のために内部スクロールを持たせた。
+
+**カテゴリを切り替えても展開状態が残っていた。** 理由・根拠の展開状態は
+`CockpitDetailPanel` が持つので、あるカテゴリで全件表示にすると次のカテゴリも
+全件展開で始まり、「初期 3 件」の段階的開示が 2 つ目以降ずっと無効になる。
+レンダー中に前回の `category.key` と比べて畳む(effect にすると一度古い状態で
+描いてから畳み直すちらつきになる)。
+
+確認は Chromium (`/opt/pw-browsers/chromium`) で、`container.innerHTML` を
+`dist/assets/*.css` と一緒に静的 HTML へ入れて実測した。1280 × 720 で
+`work-surface-W3` 上端 470px / `W2` の主操作 495px、理解マップの先頭・中央・
+末尾いずれでも詳細ペインと「修正するには」が可視、390 × 844 で横スクロール
+無しを確認している。Playwright はリポジトリの依存には入れていない。
+
+## Overview を意思決定コックピットへ再設計(Epic #380, sub #381-#384)
+
+### 何が問題だったか
+
+Overview は Component 数 / Trace 総数 / 最終受信日時 / mode 内訳の 4 枚の
+metric card と Component 一覧が主情報で、Component が 0 件のときだけ
+Get Started の順序リストを出していた。
+
+これは MVP の「接続できたか、データがあるか」には十分だが、初見の印象が
+「内部 Component を監視する管理画面」で止まり、System Understanding →
+Runtime observation → safe improvement decision という製品の Vision が
+見えない。Component 一覧は Components / Traces 画面と役割が重複しており、
+Overview 固有の責務が曖昧だった。
+
+Epic の North Star は「開いた瞬間に、このシステムについて前回より賢くなり、
+根拠を理解したうえで次の一手を実行したくなる」。10 秒以内に 5 問
+(何のためのシステムか / AI はどう理解しているか / 前回から何が変わったか /
+いま注意すべきことは何か / 次の 1 操作は何か)に答えられる状態を目標とする。
+
+### 何を作ったか
+
+`app/overview_projection.py` + `routes/overview.py` の `GET /overview` が
+唯一の判断元。5 領域を**合成する**だけで、新しい理解モデルは 1 つも作らない。
+
+| 領域 | 再利用した正本 |
+| --- | --- |
+| System Brief / Decision Readiness | `understanding_brief.build_understanding_brief`(#351-#354) |
+| Interview の位置 | `interview_workflow` の純粋関数(#349) |
+| 改善ループの現在地 | `system_state.derive_user_phase`(#237/#256) |
+| Runtime の 2 軸 | `state_facts` の `state` / `freshness`(#370) |
+| replayability の内訳 | `replay_readiness.count_replayability`(#372) |
+
+画面順・rule table・finding 契約の詳細は
+`docs/system-understanding-navigation.md` の「Overview: System Intelligence
+Brief / 意思決定コックピット」節が正本。ここでは、後から変えるときに
+壊してはいけない判断だけを残す。
+
+### 後から変えるときに守ること
+
+**`evaluate_session_workflow` を呼ばない。** これは workflow checkpoint を
+永続化し、戻り要求を作る。Overview を眺めただけで Interview の進捗事実が
+書き込まれるのは、#382 の「暗黙の page view を人間判断として保存しない」に
+真っ向から反する。必要なのは候補状態だけなので、`gather_facts` +
+`evaluate_candidate_state`(どちらも純粋)を使う。Overview は何も書かない。
+
+**Brief を読むセッションは「その System の最新セッション」。** Interview 画面
+の自動選択と同じ `ORDER BY id DESC` である。別の規則にすると、Overview の
+Brief と Interview の Brief が違うセッションを指し、同じシステムについて
+2 つの理解が並ぶ。deep link もこのセッションに着地する。
+
+**finding の id は原因から導出する。** 行 id を使うと、理解を作り直すたびに
+Alignment 行も understanding revision も採番し直されて id が変わる。id が
+毎回変わる finding は永久に「新規」で、`ongoing` を表示できない。
+
+**「前回」は開発者自身の 理解の確認。** `understanding_confirmed_at` は
+永続化された人間の判断である。ページを開いた時刻を「前回」にすると、
+閲覧が承認として記録されることになる。基準が無い場合は `not_compared` を
+返す -- 「新しい発見がない」と言い切らない。
+
+**重複排除は 2 段。** `dedupe_key`(同一原因)だけでは足りない。矛盾していて
+かつ未確認でもある claim は、2 つの kind から 2 件出て 3 枠のうち 2 枠を
+占める。`subject_key` で kind をまたいで畳み、blocking な事実だけを残す。
+
+**severity は kind が持つ固定値で、finding ごとに計算しない。** 計算にすると
+それは重要度スコアであり、#382 の非目標そのものになる。順位のゲートは
+`severity → status → kind → last_updated → id` で全順序、同じ事実からは
+常に同じ 3 件が出る。
+
+**`waiting` / `unavailable` は action を持たない。** 実行できない操作を
+disabled で並べると、開発者は主操作を無視するようになる(#383 の明示条件)。
+「システムが処理中」「判定できなかった」は文章で言う。
+
+**行の順序が契約。** 特に 2 箇所:
+`W3`(必須質問が未回答)は「理解を確認する」より**上**。`W3` はまさに理解を
+確定できない状態なので、下に置くと押せない確認ボタンを出すことになる。
+freshness の `delayed` / `stale` は「採否を記録する」より**上**。更新の
+止まった観測を根拠に採否を判断させないためである。
+
+**Runtime health の見出しは `freshness`。** 累積の `state` を見出しにすると、
+14 日沈黙したシステムが緑の「受信中」を出す #370 のバグが戻る。累積値
+(Component 数 / Trace 総数 / mode 内訳)は `details` の中に「現在の稼働状態
+ではありません」と明記して残す。error / 不一致 / replay の件数は直近 24
+時間の有界ウィンドウで、累積値では「止まった」ことを示せない。
+
+**degrade は 1 領域だけ。** 領域ごとに例外を捕まえて `degraded_sections` に
+記録し、他は描き続ける。ただし失敗した領域の**表示**を落とすだけで、読めな
+かった事実を推測値で埋めない。「取得できませんでした」と「発見がありません」
+「受信が止まっています」は別の文言にする。
+
+**CTA は人間ゲートを迂回しない。** 理解の確認 / 提案の承認 / 差分の適用 /
+観測の開始 / 採否の記録 / publish はすべて元の画面の
+`decision_method: manual` 記録のまま。Overview は案内するだけである。
+
+### 廃止したもの
+
+Overview の Get Started 順序リスト(#212 / #259 / #267)と、その per-step
+完了判定テストを削除した。段階リストは「次の 1 操作」に置き換わり、
+オンボーディング導線自体は Setup Guide(`components/setup-next-step.ts`、
+#374)が持つ。旧 4 metric card と Component 完全一覧もファーストビューから
+外れた(Component 一覧は `/components` にのみ置く)。
+
+### レビューで直した 6 点
+
+実装レビューで、canonical fact を取得できなかった場合の扱い、provenance、
+改善サイクルの identity、時間追従、coverage の単位、finding の発生時刻に
+未達が見つかった。いずれも「表示が惜しい」ではなく「間違ったことを断言する」
+種類の欠陥である。
+
+**部分障害時に推測の CTA を出していた。** Brief 取得失敗を `not_built`、
+Runtime 取得失敗を `no_signal` / `never_received` に読み替えていたため、
+すでに理解済みのシステムに「システムを理解する」、何週間も Trace を受信して
+いるシステムに「SDK を接続する」と表示しうる。これは #366 が一つの Epic を
+かけて潰した「1つの表示語が2つの事実を兼ねる」欠陥そのもので、しかも間違って
+いる語が行動の指示なので影響が大きい。`NextActionFacts` に
+`brief_available` / `runtime_available` / `workflow_available` を持たせ、
+読めなかった fact を既定値に落とさず、その fact を読む行を評価しない。
+飛ばした行が答えだった可能性がある以上、後ろの行に落とすこともできないので
+`unavailable` を返す。ただし fail-closed は fail-blank ではない: 行 1-2 は
+repository/snapshot だけを読むので、他が全滅でも答えられる。
+
+**provenance を正本どおり保持していなかった。** Overview 側の enum に
+`developer_intent` が無く、変換関数が未知の値を `ai_hypothesis` に落として
+いたため、開発者が書いて確定した Vision が AI の推測として表示されていた。
+#381/#382 が防ごうとしている混同そのものである。`OverviewFindingProvenance`
+を Brief の語彙の**厳密な上位集合**にして変換を恒等写像にし、finding 固有の
+3 値(`developer_decision` / `system_process` / `mixed`)を足した。
+`developer_intent`(表明した意図)と `developer_decision`(採否・確認の判断
+記録)は別物として分けている。理解変更 finding は変更対象 claim の provenance
+を引き継ぎ、複数に割れたときは `mixed`(集約が勝者を選ぶと、他が同意したと
+いう意味になる)。全削除で引き継ぐ元が無い場合だけ `implementation_fact` を
+明示的な規則として使う。
+
+**publish 判定が System 全体の存在チェックだった。** 「adopted な experiment が
+1件でもある」と「成功した publish job が1件でもある」を独立に見ていたため、
+サイクル A を公開した後はサイクル B が永久に公開済みに見えた。identity は
+`probe_patches.id` -> `publish_jobs.patch_id` に変更した。`completed` のみを
+公開とみなし(`failed` / `cancelled` / `retryable_failed` は公開ではない)、
+両側を System で絞り、適用日時降順 + id で決定的に 1 件を選ぶ。CTA は
+`?patch=<id>` を運ぶ。
+
+**adopted experiment を publish 判定に使わないのは意図的である。**
+`experiments` は patch も publish job も参照しておらず、`publish_jobs` が
+公開するのは probe plan 由来の計測 patch である(Experiments 画面から GitHub
+への導線が `?patch=` を渡さず手動選択させているのはこのため)。存在しない
+lineage を列で足しても、何も書き込まないので CTA が永久に解消しない。
+レビューは「必要な参照を追加する」も選択肢に挙げていたが、実在する identity
+だけを使い、experiment 側は主張しない方を選んだ。
+
+**時間・状態変化に追従していなかった。** `waiting` のときだけ poll していた
+ので、画面を開いたまま受信が停止・復旧しても Runtime と CTA が古いままだった。
+サーバーが返す経過秒としきい値から**次の境界までの時間**を計算して再取得し
+(ブラウザの時計は duration にしか使わない)、境界が無い場合も 5 分の上限で
+再取得する。上限は「受信停止を検知するまでの最大遅延」として明示した値で、
+window focus / reconnect でも再取得する。
+
+**coverage が別 entity どうしの割り算だった。** `COUNT(DISTINCT
+component_id)` を Core Capability 数の隣に置いていたので、1 Capability に
+複数 component が紐づくと分子が分母を超えうる。component は component の
+分母(`known_component_count`)と並べ、Capability カバレッジは
+`capability_coverage_state="not_computed"` として「算出していない」と述べる。
+component -> Capability の対応が保存されていない以上、比率は出せない。
+
+**connectivity finding の発生時刻が最終受信時刻だった。** 停止が始まったのは
+最終受信ではなく**閾値を超えた瞬間**(`last_real_trace_at + delayed/stale_
+after_seconds`)である。既定値ではこの差が最大 1 日あるので、確認直後に
+発生した障害が「前回の確認時点から継続」と誤分類されていた。`freshness_onset`
+で導出し、`delayed` -> `stale` の昇格では id を保ったまま summary と
+`last_updated` を更新する(同じ障害なので identity は変えない)。
+
+**Experiment への deep link と reload 復元。** 採否待ちの CTA は件数しか
+持たず `/experiments` へ飛ばしていた。対象 id を `NextActionFacts` に入れ
+(`completed_at DESC, id DESC` で決定的に 1 件)、`?experiment=<id>` を付け、
+Experiments 画面はそれを初期 state として読む。存在しない・別 System の id は
+どのカードにも一致しないので、一覧へ安全に落ちる。
+
+**初期コンテキストと heading。** Snapshot / commit / freshness / 理解リビジョン
+/ 最後の確認をページ見出し直下に出した(ページ上の全ての主張と CTA を限定
+する情報なので、`details` の中には置けない)。freshness はサーバーの判定で、
+Dashboard が id を比較し直すことはしない。`CardTitle` に `as` を足し、
+Overview のカードだけを `h2` に昇格して `h1 → h2 → h3` の見出し階層を成立
+させた(既存画面の見出し構造は変えていない)。
+
+### 再レビューで直した 5 点
+
+1 回目の修正を再レビューした結果、まだ「誤った意味を断言する経路」と
+「部分障害で画面全体を失う経路」が残っていた。
+
+**計測 patch を改善変更の公開として扱っていた。** `probe_patches` は probe
+plan 由来の**計測 patch** であり、Experiment で評価・採用された改善 variant
+ではない。`experiments` / `replay_variants` と `probe_patches` /
+`publish_jobs` の間には改善変更の lineage が永続化されていない。それなのに
+rule 12 は「公開へ進む」「この改善サイクルが閉じます」と表示していた。
+
+方針 B（CTA の再定義）を採用した。action key を `publish_instrumentation` に
+変え、文言を「計測の変更を公開する」「観測に使っている計測コードをレビュー
+可能な形で共有できます。改善候補の採否や公開はこの操作とは別です」にした。
+改善サイクルの Publish 到達は**主張しない**。方針 A（lineage の永続化）を
+選ばなかったのは、書き込む主体が存在しない列を足しても CTA が永久に解消
+しないためで、実装するなら adopt → variant → artifact → publish job を通す
+別 Issue が必要である。adopted experiment の存在チェックへ戻すことは、前回の
+identity 欠陥の再発なので禁止する。
+
+**next action 用 fact の一部が guard の外にあった。** Brief / Runtime /
+workflow には section 単位の例外処理があったが、undecided experiments /
+pending publish / completed variants / repository config / decided experiments
+は素の SQL のままで、`resolve_pending_publish()` が例外になると `/overview`
+全体が 500 になった。Brief も Runtime health も findings も loop も表示できる
+状態でである。
+
+fact group ごとに loader を切り出し（`load_repository_fact` /
+`load_pending_experiments` / `resolve_pending_publish` / `load_variant_facts` /
+`load_decision_facts`）、それぞれを個別に guard して `NextActionFacts` の
+availability に落とすようにした。例外を `0` / `None` / `False` に変換しない。
+`degraded_detail` は `next_action.<group>` のキーでどの group が落ちたかを
+残す。`decide_next_action` は常に呼ばれ、どこまで安全に評価できるかは rule
+table 自身が決める（外側に「全部飛ばす」分岐を置くと二重定義になる）。
+
+**Brief 取得不能を「未確認」と断言していた。** `confirmed_at` の `None` が
+「確認していない」と「読めなかった」の両方に使われ、表示は前者に断定して
+いた。`findings_baseline_state` を `has_baseline` / `no_baseline` /
+`unavailable` の 3 値にし、Brief が読めなかったときは
+「比較の基準を取得できませんでした。確認済みかどうかは判定していません」と
+表示する。この場合 findings は `unavailable` にして、確認基準に対する
+`new` / `ongoing` を一切付けない。Runtime section は独立して表示し続ける。
+
+**provenance の索引が claim 名だけだった。** Vision / System Purpose /
+Core Capability は独立した名前空間なので、同名 claim があると後から走査した
+section が先の provenance を上書きし、Vision の変更 finding に Capability の
+provenance が付きうる。索引キーを `(section, name)` にした。section 語彙は
+`understanding_brief.BRIEF_SECTIONS` を正本として共有しており、
+`UnderstandingChange.section` が運ぶ値と同一である。
+
+**既決定 Experiment も URL から展開されていた。** CTA の id は Overview を
+描画した瞬間のスナップショットなので、保存した URL を後で開く / 別タブで
+決定する / reload 前に状態が変わる、で容易に古くなる。URL 由来の選択と
+開発者の手動展開を別 state にし、URL 由来は「一覧に存在する」かつ
+`status == completed` かつ `human_decision == undecided` のときだけ有効に
+した。不一致なら一覧へ落ち、代わりの行を勝手に選ぶこともしない。手動展開は
+常に URL 由来より優先されるので、リンクで開いた行も畳める。
+
+### ファーストビューの実測
+
+情報順だけでは目的を果たさない -- #358 と同じ失敗をここでも一度踏んだ。
+Brief の下に「今わかったこと」と「次にすること」を積む最初の版は、読み順は
+正しかったが 1280 × 720 で findings が 824px、CTA が 1066px に落ちていた。
+#384 の受け入れ条件「Vision / Purpose / findings / next action が通常
+desktop の初期 viewport で把握できる」を満たしていない。
+
+`xl` で **3 領域を横に並べる**(Brief 5 / findings 4 / 次にすること + 改善
+ループ + Runtime health 3 の 12 分割)ことで解決した。#384 が明示的に許して
+いる構成である。DOM 順は変えていないので、`xl` 未満で 1 カラムに畳んだときの
+読み順(Brief → 今わかったこと → 次にすること → 改善ループ → Runtime health)は
+そのままで、読み上げ順も同じである。
+
+実測(Chromium `/opt/pw-browsers/chromium-1194`、ビルド済み CSS + `container.
+innerHTML` の静的 HTML)。レビュー後の初期コンテキスト行ぶん 25px 下がった値:
+
+| viewport | Brief | Vision | Purpose | 主要機能 | findings | 次にすること | CTA | 改善ループ | 横スクロール |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1280×720 | 125 | 318 | 442 | 634 | 125 | 125 | 198 | 496 | なし |
+| 1440×900 | 125 | 318 | 442 | 610 | 125 | 125 | 198 | 476 | なし |
+| 768×1024 | 125 | 298 | 392 | 540 | 879 | 1584 | — | — | なし |
+| 390×844 | 165 | 390 | 538 | 796 | 1347 | 2468 | — | — | なし |
+
+Runtime health は 1280×720 で 1144px、つまり初期ビューの外にある。これは
+意図どおりで、二次領域を主役にしないという #380 UX 原則 4 の帰結である。
+Playwright はリポジトリの依存には入れていない(#358 と同じ扱い)。
+
+### 実ブラウザ検証（`apps/dashboard/browser-tests/`）
+
+jsdom には layout も時計駆動の refetch も実ナビゲーションも無いので、#384 の
+受け入れ条件のうち 3 つはそこでは検証できない。実 Control Server と build 済み
+SPA を Chromium で動かして検証し、スクリプトをリポジトリに残した。
+
+1. **`receiving_now → delayed → stale → receiving_now`**（reload なし・操作
+   なし）。System の閾値を 6s / 14s に絞り、freshness・connectivity finding・
+   CTA が同じ応答から同時に更新されることを確認する。
+2. **Experiment deep link**: undecided な対象は到達時と reload 後の両方で
+   展開され、adopted な対象と未知の id は何も展開せず一覧へ落ちる。
+3. **degraded**: Brief 取得失敗を注入しても Runtime / loop は描画され、CTA は
+   推測されず、読めなかった baseline が「未確認」と表示されない。
+
+1 は実サーバーの時計そのものを検証するので実サーバーで動かす。2・3 は
+ブラウザ側の挙動（router / reload / render）が対象なので応答は route
+interception で固定している（サーバー側の projection は pytest が担当）。
+
+**この検証が実際に見つけた欠陥**: Overview の `refetchOnWindowFocus` /
+`refetchOnReconnect` が効いていなかった。アプリ全体の `staleTime: 30_000`
+（`main.tsx`）の内側では focus 由来の refetch がスキップされるためである。
+interval 由来の遷移は動く（`refetchInterval` は `staleTime` を無視する）ので、
+実ブラウザで実際にタブへ戻る操作をしないと現れない。`useOverview` に
+`staleTime: 0` を明示した。
+
+### アクセシビリティの実測
+
+同じ Chromium で確認した。
+
+- 見出し階層: `h1 Overview` → `h2 System Brief` / `h2 今わかったこと` /
+  `h2 次にすること` / `h2 改善ループの現在地` / `h2 Runtime health`、
+  Brief の中だけ `h3`。**レベルの飛びなし**。
+- Tab 順は DOM 順(= 意味順)と一致。10 個の focusable がすべて到達可能で、
+  閉じた `<details>` の中のリンクは開くまで tab 対象にならない。
+- `<details>` は summary の操作で開閉する(Runtime の累積、Brief の要素一覧)。
+- 状態はすべてテキストを併記: 「再確認が必要です」「受信が途絶えています」
+  「判断の前提が変わりました」「前回の確認より後に発生」。色だけの表現なし。
+- `aria-current="step"` は現在の phase 1 件だけ。
+- CTA の accessible name は結果を述べる(「理解を確認する」「Component と
+  Trace の詳細」)。
+- animation は使っていないので reduced motion の分岐は無い。
+
+jsdom では実寸を測れないので、`overview-page.test.tsx` は測定が依存する構造
+(Brief / findings / 次にすること が Grid の**別々の直接の子**であること)を
+回帰テストとして固定している。
+
+### 検証
+
+`tests/test_overview.py`(rule table 全 14 行と行の優先関係、finding の
+全 kind 到達性・2 段の重複排除・全順序の順位・3 つの空状態・status の
+3 値、loop rail、API の代表状態、System 分離、部分失敗、書き込みが無いこと)、
+`src/__tests__/overview.test.tsx`(表示コンポーネント: 二軸の分離、Vision
+不明時の非捏造、サーバー順の保持、3 つの空状態、waiting が disabled に
+ならないこと、freshness が見出しであること)、`src/__tests__/overview-page.test.tsx`
+(ページ: System 0 件、意味順、旧 metric card の不在、部分失敗、全体失敗、
+loading と empty の区別)。
+
+## Purpose Chain(Epic #387, sub #388-#391)
+
+### 何が問題だったか
+
+probe-agent は Vision(#351/#352 の `desired_change` にあたる)と System
+Purpose を「並んだ2つの文章」として同時に表示できていたが、片方からもう
+片方を**説明・検証**できる状態ではなかった——「このシステムは何のために
+あるのか」を、開発者が追跡可能な因果関係として確認する手段が無かった。
+同時に、初回に対象者ペルソナ・利用ジャーニー・成功指標まで全部入力させると、
+開発者は価値を得る前に要件定義フォームを埋めることになる。#387 はこの
+2 つを同時に解く: Vision / System Purpose / Capabilities を「対象者と現在の
+課題 → 望ましい変化 → システムの介入 → Capabilities」の追跡可能な連鎖
+(Purpose Chain)として扱いながら、初回に開発者へ求める入力は最小 3 要素
+(Purpose Frame)だけに保つ。
+
+### 何を作ったか
+
+`docs/purpose-chain.md` が正本の設計契約。実装は依存順に #388(canonical
+projection と lineage)→ #389(判断必要性に基づく適応的な次の質問)→
+#390(Overview / Interview の段階的開示 UX)。#391(Experience / Outcome /
+Reuse による検証)はこの Epic の最終段だが、この時点ではまだ実装されて
+いない — 契約は §4 に定義済みで、別 agent が実装中である。
+
+**新しい理解モデルは 1 つも作らない。** Purpose Frame の各要素は既存行の
+projection であり、`purpose_chain.py` は relation と lineage を足すだけ:
+
+| Purpose Frame 要素 | 正本(既存行) | 導出箇所 |
+| --- | --- | --- |
+| `beneficiary_problem`(対象者と現在の課題) | Intent Brief `pain` の最新非 superseded 行 | `purpose_chain._beneficiary_problem_element` |
+| `desired_change`(望ましい変化) | `understanding_brief.BriefResult.vision`(そのもの、`_resolve_vision` の結果を再利用) | `purpose_chain._desired_change_element` |
+| `intervention`(システムの介入) | `BriefResult.system_purpose` の claim(先頭が frame slot、残りは `elements` に `additional` として残る) | `purpose_chain._intervention_elements` |
+| `core_capability`(Capabilities、frame 外) | `BriefResult.core_capabilities` の claim | `purpose_chain._capability_elements` |
+
+relation kind は 3 つの固定値: `problem_to_change` / `change_to_intervention`
+/ `intervention_to_capability`。要素・relation そのものは
+`purpose_chain.derive_purpose_chain` が読みのたびに再計算する projection で
+行として保存しない — 保存するのは「システムでは再導出できない人間の判断」
+だけの 2 テーブル:
+
+| 決定 | table | 唯一の書き手 |
+| --- | --- | --- |
+| relation の confirmed / rejected(#388) | `purpose_relation_decision` | `purpose_chain.record_relation_decision` |
+| need への confirm / correct / unknown / defer / investigate(#389) | `purpose_need_response` | `routes/purpose_chain.py`(confirm/correct は既存の Intent Brief 書き込み・`record_relation_decision` へ委譲し、二重実装しない) |
+
+`確認状態(confirmation)` / `出所(provenance)` は `understanding_brief` の
+`UnderstandingConfirmationState` / `UnderstandingProvenanceKind` をそのまま
+再利用する(値を変換・翻訳しない)。#389 の 7 need code、固定
+answerability 表、7 行の質問選択 rule table は `app/purpose_needs.py` に
+ある。Dashboard は `overview.tsx` の `PurposeFrameCard`(Level 0)と
+`interview.tsx` の `PurposeFramePanel`(Level 1)で、どちらも server の
+判定を再導出せずそのまま描画する(`components/purpose-chain/model.ts` に
+あるのは順序と固定ラベルだけ)。
+
+### 後から変えるときに守ること
+
+**確認状態 / 出所は既存語彙をそのまま再利用し、変換しない。** #380 が
+`OverviewFindingProvenance` を厳密な上位集合にしたのと同じ理由: ここで
+独自のマッピングへ変換すると、開発者が確定した Vision が AI の推測として
+表示され得る。関連して `_weaker_provenance` の
+`_PROVENANCE_RANK`(relation の出所を決める強さ順位)は `Literal` の宣言
+順序から**あえて**導出せず、明示的な辞書として書いてある — 現時点では
+両者が一致しているが、それは偶然であり危険でもある。`UnderstandingProvenanceKind`
+の並びを(他の場所では見た目だけの変更である)並べ替えると、この辞書が
+独立に定義されていなければ全 relation の出所ラベルが黙って変わる。
+
+**`pain` は対象者と課題へ分解しない。** 自由記述の解釈は Principle 6 に
+反する。分解を実装すると、AI が補完した対象者が確認済みとして表示されうる
+——それは #388 が禁じている失敗そのものである。「対象者が書かれていない」
+ことへの対応は #389 の `frame_missing` need を通じた開発者自身の訂正に
+委ねる。
+
+**relation status は `unknown` を第 5 の値として持つ。** `hypothesis` へ
+畳むと、「接続を説明できない(端点が unknown)」と「未確認の仮説」が
+区別できなくなる。#389 の `relation_unknown` need はこの区別に依存して
+おり、`unknown` を落とすと「関係がない」との区別も失われる。
+
+**relation の決定は端点の確認からは決して昇格しない、追記のみの別行。**
+Vision を確認し Purpose を確認しても、「Purpose が Vision に資する」ことは
+自動的に確認されない——それは開発者が明示的に下す別の判断であり、
+`purpose_relation_decision` に `decision_method: manual` で記録する。端点の
+意味が後で動いても行は**削除しない**: `recheck_state` が `stale` になり、
+関係の status は `hypothesis` へ落ちるが、「あの時点の両端点に対して人が
+確定した」という監査事実は生き続ける。ここを UPDATE に変えると、過去に
+何を根拠に確認したかの記録が失われる。
+
+**変化の伝播は下流方向のみ。** Capability の変更は
+`intervention_to_capability` を stale にするが、`intervention` 自体は
+変えない(`purpose_chain.py` 設計判断 2、`_recheck_relation` が upstream の
+`recheck_state` を自分自身の digest 比較より先に見る)。ここを対称的な
+比較に変えると、下流の変更が上流の要素を stale と誤判定し、実際には
+変わっていない Vision や Purpose が「再確認が必要」と表示されるように
+なる。snapshot の変化による stale 化は `implementation_fact` 由来の
+evidence に限られ、`gather_facts(...).snapshot_stale` を読むだけで独自に
+git を呼ばない。
+
+**resolution level は要素ごとの min であり、スコアへ集約しない。**
+`frame_resolution_level` は 3 slot の有限段階(`L0`-`L3`)の最小値と明示
+されている。ここを平均や完成率へ変えると、#387 UX原則6(合成 score を
+作らない)に反し、Overview / Understanding Brief と同じ「confidence
+percentage を出さない」規律が破れる。
+
+**全 need code が優先度表(`PRIORITY_TABLE`)に行を持つ。** 行を持たない
+need code は明示的な `need_id` deep link でしか到達できないが、システムが
+提示しない質問への link は誰も生成しない——結果として「導出され、判断を
+止め、一度も聞かれない」need になり、これは導出しないのと区別できない。
+`human_value_judgement_required` は当初この表から漏れそうになった
+(frame-slot 要素の矛盾は relation 経由の `relation_conflict` でも表に
+出るため冗長に見える)が、2 件目以降の `intervention` 追加要素には
+relation が作られないため、その要素の矛盾には relation 経由の他の
+経路が一切ない。表に無いままにすると、この 1 種類の矛盾だけが永久に
+質問されない。
+
+**固定 need→answerability 表は #286 の reasoning router を置き換えない。**
+need はすでにシステムが 7 code のどれかへ分類し終えた信号(要素が
+`unknown`、relation が `unknown`/`conflicting`/`stale` など)で、
+「system_researchable か human_judgement か」は構造的に既知
+(Principle 6 が許す「小さな有限集合への分類」)。これに対し開発者自身の
+自由記述の追質問(Q&A / Inquiry 確認中に打ち込む文)には同じ構造が無く、
+`question_router.route_question` の reasoning-model 判定が必要であり続ける。
+固定表をここへ拡張して自由記述も分類しようとすると、Principle 6 が
+reasoning-model 専有と定めた領域へ heuristic を持ち込むことになる。
+
+**Purpose Frame panel は Interview の全体像(Understanding Brief と同じ
+領域)に置き、状態の主作業面より前には置かない。** #358 が実測で固定した
+契約: 「1280×720 の初期ビューポートに、その状態の主作業面が入っている
+こと」。Purpose Frame panel を主作業面より前・2 カラムの外に全幅で置くと、
+主作業面の上端がカード 1 枚ぶん押し下がり、この回帰済みの制約を壊す。
+Purpose Frame が読むのは Understanding Brief と同じ Vision / System Purpose
+/ Core Capabilities の行を因果順に読み直したものなので、主作業面より前で
+なく、Brief の直後・全体像の一部として置くのが正しい(`interview.tsx` の
+`purposeFramePanel` はこの理由をコメントで固定している)。
+
+### 検証
+
+`apps/control-server/tests/test_purpose_chain.py` が #388 の受け入れ条件を
+1 対 1 で検証する: 4 element kind すべてが到達可能で全ソースが既存行で
+あること、確認済み Intent `goal` がレビュアーの Vision claim より優先
+されること、AI 由来の relation が明示的な manual 決定なしに `confirmed`
+にならないこと、`unknown` / `conflicting` / `unavailable` / missing-information
+が別々の表示を持つこと、relation status 5 値すべての到達と first-match
+順序、change propagation 表の各行(下流のみの伝播、Capability 変更が
+`intervention` を変えないこと)、決定行の無い legacy System が
+`confirmed` にならないこと、端点変更後に relation が `stale` になっても
+決定行自体は残ること、System 分離、relation 導出の失敗時にも frame は
+返ること、`element_digest` のリロード再現性。`test_purpose_needs.py` は
+#389 を検証する: 7 need code すべてが実際に質問へ到達可能なこと、
+`select_question` が `system_researchable` を一度も返さないこと、優先度
+表の順序とタイブレークが決定的であること、応答 5 状態
+(available/waiting/answered/deferred/unavailable)の永続化、AI 候補が
+明示的な応答なしに `confirmed` にならないこと、optional な Intent field を
+空にしても need が発火しないこと(「need は空欄ではない」の構造的保証)、
+degraded section が推測の質問を作らないこと、`unknown`/`investigate` が
+`trigger='purpose_need'` の Joint Understanding session を開くこと、公開の
+Joint Understanding 作成 endpoint がその trigger 値を依然拒否すること、
+deep link の 4 つの fallback_reason、System 分離。Dashboard 側は
+`src/__tests__/purpose-chain.test.tsx` が `model.ts` の純粋関数と、
+Overview Level 0 / Interview Level 1 双方の状態別レンダリング(loading /
+質問なし / 質問 1 件 / 部分失敗 / relation 不明で決定不可 / 矛盾 /
+stale / deferred / system_researchable のルーティング表示 / セッション
+未選択)を検証する。
+
+## Issue #394 / #395 — 進化型パイプライン制御基盤
+
+### 何が問題だったか
+
+Component の policy mode、Probe Cell の Improvement status(#297〜#304)、
+Candidate Studio / Replay / Experiment(#242〜#252)、System Interview の
+状態駆動ワークフロー(#349)、Overview の意思決定プロジェクション(#380)は、
+いずれも「AI が生成したものを人間が承認し、運用しながら評価する」という
+同じ形の作業を、機能ごとに独立した語彙・ID・projection で実装してきた。
+これ以上同じ形を機能ごとに増やす前に、進化する処理単位そのもの
+(Evolution Node)を横断的な正本として導入する準備が要る。
+
+### 何を作ったか(Phase 0、Issue #395)
+
+`docs/evolutionary-pipeline.md` が正本。**この Phase ではコードを一切
+変更していない**(DB / API / UI いずれも無変更)——ADR・concept map・
+migration inventory・pilot 定義のみの設計文書。
+
+主要な ADR(全 9 件、根拠・却下案・検証方法は同文書 §4 に記載):
+
+- **ADR-1**: Evolution Node は Probe Cell 契約のバージョンアップではなく
+  新しい正本エンティティ。Cell は実行ロール、Node は進化する処理単位
+  そのものを所有し、既存 Cell のテーブル・schema は無変更のまま Node が
+  参照するだけ。
+- **ADR-2**: Node identity は `(system_id, node_key)`。`component_id`
+  からは導出しない。既存資産(component/probe_point/cell_binding/
+  capability/flow/purpose_element/feature)への参照は追記専用の
+  `evolution_node_link` で持つ。
+- **ADR-3**: contract version(`evolution_node_version`)と implementation
+  (`evolution_node_implementation`)を分離。1 つの契約に複数の実装が
+  ありうる。provider/model 名は identity に含めない(#298 と同じ規律)。
+- **ADR-4**: maturity は保存されるが、append-only の `evolution_node_event`
+  ログと常に整合する(#337/#338/#349 と同じ discipline)。
+- **ADR-5**: `established`(固定決定)と `monitoring`(実際に観測中)は
+  別状態。`reopened` は本番の pin implementation を外さない。`suspended`
+  はどこからでも到達する安全停止であり成熟の達成ではない。
+- **ADR-6**: Node maturity / Cell Improvement status / SDK policy mode /
+  Dashboard user phase(`derive_user_phase`)の 4 軸は互いから導出しない。
+  API は 4 つの独立フィールドを返す。
+- **ADR-7**: 評価は Node / Flow-Capability / UX-Outcome の 3 契約に分離し、
+  単一の重み付き score へ合成しない。floor(下回ってはならない)と
+  criterion(到達すべき)は別概念。
+- **ADR-8**: この Epic の初期 Phase では何も削除しない。既存資産は
+  `keep_canonical` | `adapt_behind_projection` | `migrate` | `deprecate`
+  | `remove_after_gate` に分類し、削除・データ移行を伴う分類は今回
+  存在しない。
+- **ADR-9**: maturity 遷移を自動化しない。決定的ゲート+人間承認、または
+  列挙済みの system-recorded observation transition のみ。LLM が
+  canonical state を直接出力すること、失敗時のヒューリスティック
+  フォールバックはいずれも禁止(Principle 6)。
+
+Migration inventory(同文書 §6)は DB table / API route / Dashboard
+route / domain module / docs を横断して分類した。**大半が
+`keep_canonical`** であり、これは意図した結果——何を消してよいかの
+証拠は Phase 1〜6 の実装と実運用を経て初めて揃う(ADR-8)。
+
+Pilot(同文書 §7)はいずれも現時点で Probe Point/Component/Cell の
+いずれにも紐づいていないことを確認済み(`@probe(` decorator は 3 つの
+モジュールいずれにも実際には付与されていない):
+
+1. `app/question_router.py`(genuinely ambiguous、LLM-appropriate の
+   参照例)
+2. `app/interview_workflow.py::evaluate_candidate_state`(既に
+   `established`+`deterministic_code` へ到達した参照例。実装後 2 回の
+   レビューで見つかった 9 件の不変条件違反は、いずれも「決定的コードが
+   自動で maturity を進めたことは一度もない」という ADR-9 の実例)
+3. `app/understanding_translator.py`(external boundary で LLM が
+   居続けるべき参照例)
+
+### 後から変えるときに守ること
+
+**Phase 1〜6(#396〜#401)は `docs/evolutionary-pipeline.md` が確定した
+語彙・境界の内側でのみ実装する。** ADR-1〜9 は再検討の対象ではなく、
+実装の前提として扱う——再検討したい場合は、この文書自体の改訂を先に
+行う(§0.1 の位置づけ通り)。
+
+**4 軸(ADR-6)を 1 つのバッジ・1 つの色・1 つの合成値へまとめない。**
+CLAUDE.md #366 が定式化した「1 つの表示語が 2 つの事実を兼ねる」欠陥を、
+この Epic で 4 つに拡張して再現しないための規律である。
+
+**既存の人間承認ゲート・SDK isolation・sandbox・redaction は一切
+緩和しない**(同文書 §9)。Evolution Node の maturity 遷移(ADR-9)は
+既存の `decision_method: manual` 規律をそのまま踏襲し、新しい自動承認
+経路を作らない。
+
+**未決事項(同文書 §10、3 件)に先回りして答えを作らない。** 特に
+`monitoring` の sub-state(#1)と Flow-level evaluation の参照方式(#2)
+は、実データが無い段階で決めると ADR-5/ADR-7 が禁じる「早すぎる合成」を
+設計レベルで先取りしてしまう。
+
+### 検証
+
+Phase 0 は DB/API/UI を変更していないため、既存のテストスイートは
+無変更のまま通る。`docs/evolutionary-pipeline.md` 自体が Issue #395 の
+受け入れ条件(product thesis の確定、主要概念の identity owner の一意性、
+4 軸の非混同、Vision→Node runtime evidence の lineage 定義、migration
+inventory、compatibility seam と rollback、既存安全境界の維持明記、
+Phase 1〜6 の入力・出力・完了ゲート、AI型/固定処理型を含む pilot 選定、
+owner・期限付きの未決事項)を満たす。
+
+## Issue #396 — Phase 1: Evolution Node 契約と canonical lifecycle
+
+`docs/evolutionary-pipeline.md` の ADR-1〜ADR-9 をコードにした Phase。
+新規テーブル 5 つ、pure evaluator 1 つ、API 1 本、読み取り中心の
+inspector 1 画面。**既存の Component / Probe Cell / Cell Improvement /
+Cell Binding は 1 行も変更していない** — 読むだけで、書かない。
+
+### 何を作ったか
+
+- `app/evolution_node.py` — `evaluate_transition` は純関数(時計もDBも
+  client 状態も見ない)の first-match 表で、有限な 12 個の拒否コードを
+  返す。うち 2 つがこの Epic の中心規則:`llm_state_not_allowed` は
+  無条件で最初に評価され(LLM は canonical state を出力しない、
+  Principle 6)、`manual_approval_required` は system-recorded 遷移を
+  `established ↔ monitoring` の 2 つだけに限定し、それ以外は必ず名前の
+  ある人間を要求する(ADR-9)。
+- `reopened` は stable implementation の pin を要求も解除もしない。本番は
+  established 実装を動かし続けたまま探索する — 局所再探索が安全である
+  理由そのもので、テストで直接 assert している。
+- `fold_events` は append-only ログを畳み込んで maturity を再現する
+  (ADR-4)。保存された lifecycle 値は記述対象の行から drift しうるが、
+  ログがあれば drift を検出できる。だから projection の末尾としてだけで
+  なく専用エンドポイントとしても公開する。
+- `build_node_projection` は maturity / improvement_status / policy_mode を
+  3 つの正本から独立に読む。食い違っていてもそのまま返す。4 つめの軸は
+  `null` ではなく**ドキュメントから欠落**させる — `null` は「評価した
+  結果それが無かった」と読めてしまう。`interview_workflow.
+  evaluate_session_workflow` は checkpoint を永続化するので呼ばない
+  (読み取りが書き込んではならない、#380 の規則)。
+- `availability` は「読めなかった」を「既定値」と区別する(#380)。
+
+### 境界での規則
+
+拒否された遷移は 422 で、`detail.code` はドメイン層の有限コードをその
+まま返す — 言い換えると Dashboard が散文で分岐することになる。
+重複した `idempotency_key` は 409 ではなく 200 の `duplicate`:何も
+変えなかった再送は成功であり、409 にすると通常のネットワーク再送が
+開発者の解決すべき衝突に見える。actor は認証済み `Principal` から取り、
+body からは取らない(#337 の provenance 規則)。
+
+### 検証
+
+domain 49 + API 20 + dashboard 5。拒否コードは 1 つずつ個別のテストを
+持ち、3 軸の独立性は「Improvement が `adopted` かつ Component が
+`shadow` かつ Node は `validating`」という食い違う状態で assert する。
+
+## Issue #397 — Phase 2: Design Studio
+
+Vision → Outcome → Capability → Flow を検証可能な Node 仮説へ落とす層。
+**新しい Vision/Purpose 正本は作らない** — Purpose Frame は
+`app/purpose_chain.py` が既存行から都度導出する projection のままで、
+Node との接続はただの `evolution_node_link` である。
+
+### 4 つの構成要素
+
+1. **Purpose-to-Node lineage** (`derive_node_lineage`)。link の
+   `decision_method` が既に「AI の提案」と「開発者の確認」を区別して
+   いるので、新しい列は足さない — 足せば両者が食い違える場所が 1 つ
+   増えるだけ。`relation_status`(その関係を誰が決めたか)と
+   `element_state`(指している Purpose 要素自体が確定しているか)は
+   独立の 2 軸で、「確定した関係が未確定の要素を指している」という
+   実在する状態を潰さない。`component`/`probe_point`/`cell_binding` は
+   実装事実であって設計関係ではないので lineage から除外する。
+2. **Node decomposition**。reasoning model は 1 つの scope に対して
+   複数の**切り方全体**を提案する — 切り方をまたいで個々の node を
+   比較すると、切り方どうしを区別している唯一のものが失われる。
+   採用は別の `decision_method: manual` 記録で、Phase 1 の
+   `create_node`/`add_version` を通して本物の Node を作る。**モデルは
+   Node を作らない。** 失敗した run は失敗として保存され、候補は
+   0 件になる(Principle 6:heuristic fallback を作らない)。部分的に
+   妥当な応答は全体を拒否する — 壊れた候補だけ黙って落とすと、3 通りの
+   比較が最初から 2 通りだったかのように見える。
+3. **3 つの評価契約** (ADR-7)。score/weight/total 列はどこにも無い。
+   latency の改善が safety の劣化を買えないようにする確実な方法は、
+   合成した数値を書く場所を用意しないことである。`criteria`(到達すべき
+   もの)と `floors`(割ってはいけないもの)は別の列 — 読まれる時点が
+   違い、混ぜると「基準を満たした」と「劣化していない」が区別できなく
+   なる。`unmeasured` は理由付きで記録する(#391 の規則)。
+   API は level ごとに**グループ化して**返す。ADR-7 の分離を文書では
+   なく構造にしている。
+4. **Phase 3 への handoff**。参照だけを保存し、内容はコピーしない —
+   コピーした criterion は元の policy が superseded された後も current
+   として読めてしまう。解決できない参照は名前付きで残り bundle を
+   `incomplete` にする。黙って落とすと、失敗データセットを失った
+   handoff と最初から持っていなかった handoff が区別できない。
+
+### 接続規律
+
+`propose_decomposition` は**接続を一切取らない**。route は
+「読む → 閉じる → モデルを呼ぶ → 開き直して保存する」の順で動く。
+`get_conn()` を LLM 往復の間保持すると、lock は process-wide で
+非再帰なのでサーバ全体が再起動まで停止する。
+
+### 検証
+
+39 テスト。fail-closed は 7 通り(mock client / API エラー / 解析不能 /
+語彙外の side_effect_class / 語彙外の trust_boundary / out_of_scope 欠落 /
+候補内の node_key 重複)を個別に検証し、いずれも候補 0 件になることを
+assert する。採用は「提案だけでは Node が 0 件のまま」「二重採用は 409」
+「node_key 衝突は採用全体を中止し、半分だけ作らない」を含む。
+
+## Issue #398 — Phase 3: Exploration Workbench
+
+Phase 3 の問いは「どの LLM 候補が良いか」ではない。**同じ Node 契約・同じ
+評価条件に対して、LLM 実装と rule 実装と deterministic code 実装がどう
+比較されるか**である。この問いが表現できるのは、ADR-3 が「その Node が
+何を約束するか」と「今どうやってその約束を守っているか」を別々に
+versioned にしたからに他ならない。
+
+### 4 つの規則(いずれも構造で強制している)
+
+1. **これは比較の記録であって、2 つめの実行エンジンではない。** コードを
+   走らせるのは Replay(#242〜#246)/ Experiment(#26)/ offline shadow
+   sandbox のままで、variant は数値を出した run を**参照する**だけ。
+   source / patch / command の列も引数もどこにも無い — API からそれらを
+   受け取れば、既存機能が強制している pinned-snapshot・pinned-command・
+   network-off の sandbox を迂回できてしまう(Principle 8)。
+   `test_the_variant_contract_accepts_no_executable_content` がこれを
+   signature レベルで assert する。
+2. **一定に保つべきものは variant ではなく run に置く。** dataset /
+   snapshot / environment / evaluation policy 参照は `exploration_run` の
+   列なので、同一 run の 2 つの variant が別のデータセットで測られること
+   が**構造的に起こり得ない**。起きれば、比較に見えるのに比較になって
+   いない数値が残る。契約 version が違う implementation も拒否する —
+   別の約束どうしを比べることになる。
+3. **何も合成しない。** 各 dimension は自分の coverage を持つ独立した行で、
+   score / weight / total はどこにも無い。順位付けは
+   `rank_by_dimension(variants, dimension)` のように **dimension を必須
+   引数**にしてあり、「総合的に一番良い variant」を返す関数は存在しない。
+   方向(高い方が良いか)は `HIGHER_IS_BETTER` の明示表で、metric 名から
+   推測しない — 推測すると名前が一致しない metric で判定が黙って反転する。
+4. **欠測を勝ち負けに丸めない。** `value_state` は
+   `measured`/`not_applicable`/`not_measured`/`unsupported` の 4 値で、
+   両者の測定可能性が食い違う dimension は `incomparable` になる。
+   これが無いと「この variant に token cost は無い」と「この variant の
+   token cost は 0 だ」が同じ表示になり、**測られなかった方が勝つ**。
+   coverage が違えば `coverage_mismatch`(数値は見せるが比較はしない)。
+   未測定の variant は `ranked` の末尾ではなく `unranked` に分ける —
+   末尾に置けば「最下位」と読める。
+
+### 比較の判定順
+
+`compare_variants` は純関数の first-match 表で、行の順序が契約:
+(1) どちらかが `measured` でなければ `incomparable`(**算術より先**)、
+(2) coverage が違えば `coverage_mismatch`、(3) 等しければ `equal`、
+(4) それ以外は `HIGHER_IS_BETTER` に従って `better`/`worse`。
+片側にしか無い dimension は落とさず報告する — 候補側の safety 測定が
+無いことは、読み手が最も見なければならない事実である。
+
+### 完了は採用ではない
+
+`complete_run` は Node の maturity を変えず、implementation を pin せず、
+何も承認しない。採用は #399 の固定化ゲート + 人間承認(ADR-9)であり、
+比較が勝者を黙って昇格させたら、それこそこの Epic が禁じている自動採用に
+なる。baseline の無い run は完了できない(基準点の無い差分は差分ではない)。
+
+### 検証
+
+35 テスト。`incomparable` / `coverage_mismatch` / 片側欠測 / 方向表の
+網羅性 / `unranked` / composite 列の不在 / 実行参照の解決 / 契約 version
+不一致 / baseline 重複 / System 分離を個別に assert する。
+
+## Issue #399 — Phase 4: Stabilization Evidence Package と固定化ゲート
+
+Epic 全体が向かってきた判断 —「この Node の処理は、安定した実装を pin して
+よいだけ理解できたか」— を明示的な契約にする Phase。
+
+**固定化は「LLM をやめること」ではない。** 「この処理がどの条件下で動くかが
+分かったので、再現可能で rollback 可能な実装として定着させる」ことである。
+modality が `reasoning_llm` のままの実装も、`rule` の実装とまったく同じ
+正当性で established になれる。**ゲートは modality を読まない** —
+`GateFacts` に modality フィールドは無く、`evaluate_establishment_gate` の
+ソースに `modality` の文字列すら現れないことをテストが assert する。#399 の
+非目標は「LLM 利用の最小化を目的化すること」であり、modality を読めるゲートは
+その選好を埋め込めるゲートである。
+
+### ゲートの 3 つの性質
+
+1. **失敗だけでなく「不在」でも閉じる。** `floor_unmeasured` は
+   `floor_violated` と同じ強さで拒否する。「floor は守られた」と
+   「誰も floor を測っていない」は別の事実で、establish してよいのは前者
+   だけである。後者を通すのが、ゲートが黙って飾りになる経路そのもの。
+   Phase 3 の `incomparable` と同じ規律を、比較ではなく判断に適用している。
+2. **何も合成しない。** dimension をまたぐ算術は存在せず、criterion と
+   floor は 1 つずつ評価される。latency の改善が safety の劣化を買えない
+   (ADR-7)。テストは「latency も accuracy も cost も met、safety だけ
+   violated」で `floor_violated` になることを assert する。
+3. **ゲート通過は承認ではない。** 通過は package を*適格*にするだけで、
+   `approve_package` は名前のある人間を必須とし、`validating → established`
+   遷移は Phase 1 の evaluator を `decision_method: manual` で通す。
+   ゲート通過が source 適用・policy 変更・deploy・publish を行うことは無い
+   — それぞれ既存の別ゲートのまま(Principle 5/8)。
+
+### そのほかの規則
+
+- **証拠は参照であって複製ではなく、currency は gate 実行時に評価する。**
+  複製した数値は、元の run が superseded された後も current として読める。
+- **Outcome は「未計測でよいが、黙ってはいけない」。** 未計測の Outcome が
+  あって理由が記録されていなければ `outcome_unmeasured_unacknowledged` で
+  拒否する。Outcome 無しの establish は許すが、無言の establish は許さない
+  (#391)。
+- **applicability envelope が無ければ拒否する。** envelope が無いと成功が
+  全入力へ既定で一般化する。「作られたケースでは動いた」と「動いた」は別の
+  主張で、実証されたのは前者だけである。
+- **初回の establish は rollback 先を要求しない。** 一度も stable pin を
+  持ったことが無い Node には戻る先が無く、それは欠落ではなく正当な状態。
+  2 回目以降は必ず戻り先を名指しさせる。
+- **安定性の要件は package 自身が宣言する。** 全領域共通の固定 threshold は
+  #399 が禁じている。ただし宣言は gate 実行より前なので、返ってきた結果に
+  合わせて下げることはできない。
+- **構造的前提を証拠チェックより先に評価する。** candidate implementation が
+  消えている package に「safety floor が未計測です」と返すと、開発者を
+  間違った修正へ送ってしまう。
+- `approved_by` は認証済み principal から取り、request body には存在しない
+  (#337 の provenance 規則)。rollback 先も caller ではなく Node の現在の
+  stable pin から読む — caller に言わせると、Node が持っていない rollback
+  先を package が主張できてしまう。
+- reject は記録であって降格ではない。Node の maturity は動かない。
+- gate verdict は読むたびに再計算し、保存しない(保存した判定は記述対象の
+  証拠から drift する。#337/#338/#349 と同じ規律)。
+
+### Phase 1 との接続
+
+`load_node_facts` の `known_evidence_refs` に、その Node 自身の
+Stabilization Package (`stabilization_package:<id>`) を加えた。Phase 1 の
+`foreign_evidence` 規則の目的は「他の Node・他の System の証拠を拒否する」
+ことであり、それは維持されている — 問い合わせは node_id と system_id で
+絞られているので、別 Node の package は今も拒否される。テストが直接
+assert する。テーブルが存在しない DB でも Phase 1 が動き続けるよう、
+問い合わせは防御的に行う(テーブル欠如は「package 無し」であって、
+全遷移を止めるエラーではない)。
+
+### 検証
+
+36 テスト。17 個の refusal code すべてに個別のテストがあり、
+「code がテストに現れること」をソース走査で強制している(誰も出せない
+code は誰も強制していない規則である)。承認は Phase 1 の event log に
+`manual` で記録されること、gate は承認時に再評価されること(読んだ時点の
+PASS を信じない)、reject が Node を動かさないこと、rollback 先が
+Node から読まれることを含む。
+
+## Issue #400 — Phase 5: 運用 drift と局所再探索
+
+ADR-5 の分離を実際に表現する層。`established`(固定化判断が承認され安定実装が
+pin されている)と `monitoring`(その Node が実際に観測されている)は**独立に
+壊れる**。telemetry が止まっても固定化判断が誤りになるわけではなく、
+telemetry が死んだ Node は健全に観測されている Node と区別され続けなければ
+ならない。統合すると #366 の「一つの表示語が二つの事実を運ぶ」欠陥になる。
+
+### 4 つの規則
+
+1. **沈黙は健全ではない。** `evaluate_observation_health` は `unobserved` /
+   `insufficient_sample` を独立の状態として返し、「budget 内」へ丸めない。
+   判定順も契約で、`unobserved` が最初に来る — データが止まった Node は
+   drift した/しなかったのどちらとも判定できない。判定材料が無いのだから。
+   under-sample も drift 判定より先に評価する:データが少なすぎることは
+   「drift した」を否定する根拠にも肯定する根拠にもならない。
+2. **決定的事実と、その解釈は別の行。** `node_drift_observation` は測定値、
+   `node_anomaly` は結論。reasoning による分類が失敗したときは
+   `unknown` + `classification_error` を記録し、heuristic の当て推量へ
+   fallback しない(Principle 6)。「システムは何かを見たが、それが何かは
+   言えなかった」は実在する actionable な状態である。具体的な分類と
+   error を同時に持つことは拒否する — それこそが禁じられている fallback。
+3. **defect と frame-breaking signal は別の答え。** taxonomy の要点は、
+   `implementation_defect` は直すものだが `new_use_case_signal` /
+   `purpose_or_vision_reconsideration` は「設計が狙う先を間違えていた」の
+   合図だということ。後者を前者として扱うと、システムは自分の目的から
+   さらに遠ざかる方向へ最適化されていく。projection は
+   `frame_breaking` を明示する。
+4. **reopen は局所的で、承認制で、本番を落とさない。**
+   `propose_reopen_scope` は Node graph を決定的にたどる — 「同じ
+   Component / Probe Point / Capability / Flow に紐づいている」という
+   構造的事実であって、類似度判定ではない(Principle 6)。無関係な Node は
+   黙って省かず `excluded_node_ids` に**明示**する:読み手が「無関係な
+   Node は reopen されていない」を確認できる唯一の方法だから。承認は
+   名前のある人間(ADR-9)、そして**安定実装の pin は外れない** —
+   本番は established 実装を動かし続ける。それこそが再探索を安全に
+   始められる理由である。
+
+### そのほか
+
+- 同一条件の繰り返しは `dedupe_key` で 1 件に畳まれる。polling のたびに
+  新しい anomaly が生まれ、そのたびに reopen が生まれることを防ぐ。
+- 監視契約の閾値はすべて契約ごと。#399 が単一の固定 threshold を禁じるのと
+  同じ理由で、中央で決めた数値は誰も見ていない Node にも適用されてしまう。
+- `observed_environment_ref` / `deployed_commit_sha` は Node の pinned
+  snapshot と別に持つ。「何がデプロイされているか」と「何を解析したか」は
+  別の事実で、混ぜた drift 報告は環境変化をコードのせいにする。
+- 一括 reopen で遷移できない Node は強制せず結果を報告する。gate を黙って
+  無視する一括操作は、存在しない gate と同じ。
+
+### 検証
+
+26 テスト。fixture 自体が `established` に到達したことを assert する —
+到達していなければ、以降のテストが黙って `validating` の Node を検証して
+しまうため。
+
+### この Phase の範囲
+
+本コミットは domain 層(監視契約・drift 観測・anomaly taxonomy・reopen
+scope)とそのテストまで。operations cockpit の API/画面は Phase 6(#401)の
+統合対象であり、そこで既存 Overview / Components / Cell Fabric と合わせて
+配置する。
+
+## Epic #394 検証ラウンド(2026-08-17)
+
+Phase 0〜5(#395〜#400)の実装を、`docs/evolutionary-pipeline.md`
+(ADR-1〜9)・各 Issue の受け入れ条件・CLAUDE.md Core Design Principles に
+対して照合した。中核規律(純粋 evaluator、append-only lineage、3 軸独立
+projection、fail-closed 推論、3 評価契約の非合成、欠測の非丸め、System
+分離)は設計どおりだったが、**「比較・証拠・承認の記録が後段の判断の
+入力になる」という自らの前提に対する完全性**が複数箇所で破れており、
+以下を修正した。いずれも個別の再現/回帰テストを伴う。
+
+### 修正(#396 Phase 1)
+
+- **未承認 Probe Point リンクの拒否**(ADR-2 の検証方法そのもの):
+  `add_link(kind=probe_point)` が `probe_points` を一切照会していなかった。
+  `target_ref` は `probe_points.id` の 10 進文字列で、不存在/他 System は
+  404(id の System 横断プロービング防止の既存規則)、未承認は 409、
+  malformed は 422。#299 の `_resolve_from_probe_point` と同じゲート。
+- **provenance の偽装不能化**(ADR-9/#337): transition エンドポイントが
+  `actor_kind` を body から受けていたため、人間の POST が「system-recorded
+  observation transition」を名乗れた。`actor`/`actor_kind` を
+  `EvolutionNodeTransitionIn` から削除し、route が Principal から導出。
+  `decision_method='deterministic'` は route 層の有限コード
+  `deterministic_via_api_not_allowed`(ドメイン語彙とは分離、非交差を
+  テストで assert)で 422。`reasoning_llm` はドメインへ素通しし
+  `llm_state_not_allowed` の API 到達性を維持。
+- **rule 4 の非対称化**(ドメイン最小変更): `monitoring→established`
+  (観測停止の記録)のみ manual+実名 actor でも受理する。
+  `established→monitoring`(activation)は従来どおり
+  deterministic+system 専用。これがないと、公開 API から deterministic を
+  封じた時点で観測停止を人間が記録する経路が消える。12 拒否コードは不変。
+- **固定化ゲートの迂回閉鎖**: `POST /evolution-nodes/{id}/transitions` は
+  現 maturity が `monitoring` 以外での `to_state='established'` を
+  `establishment_via_stabilization_required`(422)で拒否し、
+  `POST /stabilization/packages/{id}/approve` へ誘導する。#399 のゲートを
+  通らない establish の公開経路はもう無い(ドメイン関数は内部呼び出し
+  向けにそのまま)。
+- **評価順序の正誤**: 「`llm_state_not_allowed` は無条件で最初」という
+  本書 #396 節の主張どおりに evaluator の行 1・2 を入れ替えた(従来は
+  `unknown_target_state` が先で、未知状態 + reasoning_llm の組で中心
+  規則のコードが返らなかった)。
+- **ADR-1 の DDL 凍結テスト**(`tests/test_evolution_compatibility.py`):
+  `cell_definitions`/`cell_bindings`/`agent_role_cards` の CREATE TABLE が
+  バイト単位で不変であることを assert。§8.1 の 3 pilot 登録 smoke テスト
+  (runtime 系テーブルへの書き込みゼロの assert 付き)と、ADR-3 の
+  「provider/model 実名が identity にもレスポンスにも無い」テストも追加。
+- **/events の offset ページング**(ADR-4): 上限 200 件でログ全量の
+  fold 検証が不可能だった。
+- **idempotency の競合窓**: 同一 key の並行 2 リクエスト目が
+  `IntegrityError`→500 になっていた。捕捉して勝者 event を 200
+  `duplicate` で返す(逐次リトライと同形)。
+
+### 修正(#397/#398 Phase 2/3)
+
+- **[critical] 実行参照の完了状態検証**: `attach_execution` が
+  draft/running/failed の Replay run / Experiment を `executed` の根拠と
+  して受理していた(§6.1 は「完了済み run」を明記)。終端 `completed`
+  以外は 409。
+- **完了済み run の改竄防止**: `attach_execution`/`record_measurement` が
+  run の status を見ず、`complete_run` 後の測定値を ON CONFLICT で無音
+  上書きできた——完了済み run はまさに #399 のゲートが読む evidence で
+  ある。`_require_open_run` で open を必須化。
+- **採用の all-or-nothing 化**: 保存済み候補に create_node/add_version が
+  拒否する値(空白のみの mission 等)が含まれると、1 個目の Node だけ
+  完全作成→2 個目が version 無し Node として残骸化→以後の再試行が
+  node_key 衝突で永久 409、というデッドエンドを再現確認。提案 parse 時に
+  Phase 1 の strip 検証をミラーして全体 fail-closed + 採用時に全候補
+  preflight(書き込みゼロで 422)+ route の error map に
+  `EvolutionNode*Error` を追加(残余 500 の排除)。
+- **方向表の fail-closed 化**: `HIGHER_IS_BETTER.get(dim, True)` が未知
+  dimension を silent に higher-is-better 扱いしていた。有限語彙外は
+  `ExplorationValidationError`。
+- **ranking の整合**: `rank_by_dimension` が metric_name/coverage を
+  無視し、baseline の p50 と candidate の p95 を同一順位表で比較できた。
+  `compare_variants` と同じ `(dimension, metric_name)` キーに統一し、
+  複数 metric_name は明示指定を要求(422)、coverage 基準は
+  「baseline の coverage、baseline 不在なら全 measured の単一 coverage」
+  の決定的規則、外れた variant は理由付き `unranked`。
+  `ExplorationRankingOut`/`EntryOut` に `metric_name`/`reason` を露出。
+
+### 修正(#399/#400 Phase 4/5)
+
+- **approve の原子性**(ADR-4): gate 再評価→pin(自前 COMMIT)→
+  Phase 1 遷移、の順だったため、遷移拒否後も pin・rollback 回転・
+  `stable_pinned` イベントが残る half-established 状態を再現確認。pin の
+  前に純粋 evaluator を「pin 後の仮想 facts」で事前検証し、レースで
+  なお失敗した場合は同一リクエスト内で pin 状態を復元する補償を追加。
+- **gate currency**: `contract_version_moved`(package 作成後に契約
+  version が動いた)と `evidence_ref_stale`(参照先 run の削除・
+  abandoned/failed 終端)を毎評価時に読む。ゲート語彙は 18 拒否コード +
+  `ok` になった(Phase 1 と異なり `GATE_REFUSAL_CODES` は
+  `GateDecision.reason_code` の語彙なので `ok` を含む——docstring に
+  明記)。
+- **supersede の実経路**: `POST /stabilization/packages/{id}/supersede`
+  (manual、Principal 由来の実名、対象は draft/under_review のみ、
+  後継は同一 Node の生存 package)。`package_superseded` が実コードで
+  到達可能になった。`reject` も approve と同型の実名必須に。
+- **bulk-reopen の報告分岐**: 遷移できない Node が `applied=false` で
+  報告される分岐に初めてテストが付いた(全 Node の stable pin 維持も
+  assert)。
+
+### 明示的な残件(未実装かつ本ラウンドでは対象外)
+
+いずれも実装の欠陥ではなく scope の記録である。#401 着手時にこの一覧を
+入力にすること。
+
+- **#398 既存導線の consolidation**: `candidate_versions` →
+  `evolution_node_implementation` のアダプタ(§6.1 の検証方法
+  「generated_code とアダプタ由来の実装参照が同一内容を指す」)は未実装。
+  Candidate Studio / Simulation Workbench の導線 inventory 化とともに
+  #401 の統合対象。
+- **Phase 2/3/5 の Dashboard UI**: `/evolution-nodes`(Phase 1 inspector)
+  以外の画面は #401 の再配置対象(既存記載どおり)。
+- **`exploration_run.status='abandoned'` の設定経路**: 語彙には存在するが
+  setter が無い(gate の `evidence_ref_stale` は defensive に判定済み)。
+- **monitoring contract の deactivate API**: 検証ラウンド2で
+  `established→monitoring` は参照先 contract 行の解決・`active`・
+  `superseded_by_id` を fail-closed に検証するようになった
+  (`monitoring_contract_invalid`、下記参照)が、contract を明示的に
+  deactivate する API は依然として無い。§10 未決事項 #1(coverage
+  sub-state)とあわせて #401 で決める。
+- **#400 実装内容のうち**: notification/cooldown(dedupe のみ実装)、
+  realistic drift fixtures / long-running simulations、
+  replay→offline shadow→approved live shadow の順序を使う handoff の
+  自動化。drift→局所 reopen→再検証→再 establish の pilot 完走は #401 の
+  dogfooding 項目。
+- **#399 実装内容のうち**: decision UI(#401)、fixed-code variant を
+  established へ進める pilot 完走(#401 dogfooding)、§8.4 完了ゲートの
+  「pilot 2 の安定化過程の再検証」。
+- **§10 未決事項 #2**(Flow-level evaluation の identity)は Phase 2 完了
+  時点でも未解決のまま——`evolution_evaluation_policy.subject_ref` は
+  自由 TEXT で運用し、実データが揃う #401 で再評価する(答えの先取りを
+  しないという §10 自身の規律に従う)。
+- **Phase 1 ドメイン層の残余**: `stale_implementation` は current
+  implementation のみを見る(stable pin が旧契約の実装のままでも通る)。
+  公開 API 側は establishment 迂回閉鎖 + gate の `contract_version_moved`
+  で塞がっており、検証ラウンド2の contract freeze(established/monitoring
+  中は `add_version` 自体を拒否)で「pin が旧契約に取り残される」入口も
+  閉じた。ドメイン単体のさらなる強化は #401 で判断する。
+
+## Epic #394 検証ラウンド2(2026-08-17, 外部レビュー指摘対応)
+
+Phase 1〜5 の実装レビュー(#396〜#400 不合格判定)で指摘された欠陥の
+うち、コードレベルで妥当と確認できたものをすべて修正した。いずれも
+「記録された事実が後段の判断の入力になる」という Epic 自身の規律に
+対する破れであり、個別の再現/回帰テストを伴う。UI・pilot・dogfooding・
+既存導線 consolidation 系の指摘は上記「明示的な残件」どおり #401 の
+scope であり、本ラウンドの対象外(実装欠陥ではなく scope の記録)。
+
+### 修正(#396 Phase 1)
+
+- **contract freeze**: `add_version` は maturity が
+  `established`/`monitoring` の Node を 409 で拒否する
+  (`_CONTRACT_FROZEN_MATURITIES`)。stable pin が旧契約の約束を実装した
+  まま Node が established 表示を続ける穴を入口で閉じる。ADR-9 により
+  `add_version` が maturity を自動遷移させて補うことは許されないので、
+  拒否こそが設計——開発者が先に reopen / suspend(manual)する。
+- **transition の原子性**: `apply_transition` は `BEGIN IMMEDIATE` で
+  write lock を取ってから facts 読取り + `evaluate_transition` を
+  transaction 内で行い、maturity 更新は
+  `UPDATE ... WHERE id = ? AND maturity = ?` の CAS(rowcount 検証、
+  失敗は rollback + 409)。異なる idempotency key の並行リクエストが
+  同じ旧 state を読んで双方 commit し、event log の from-state 連続性が
+  壊れる競合を閉じた。idempotency の duplicate 判定は transaction 内で
+  再実行される(勝者が pre-check と transaction の間に commit した場合、
+  再検査なしでは applied 済みリクエストの retry が `illegal_transition`
+  になってしまう)。実 2 connection の競合テストを追加。
+- **projection の lineage 照合**(ADR-4): `build_node_projection` が
+  transition event 全量(`event_limit` ページではない専用クエリ)を
+  `fold_events` で畳み込み、`folded_maturity` / `maturity_consistent` を
+  返す。stored column は log の cache だという主張を、実際に照合して
+  読者に見せる。transition 未発生の fold `null` + stored `exploring` は
+  整合。schema は `evolution_node.schema.json` に追記(additive)。
+
+### 修正(#397 Phase 2)
+
+- **採用時の Capability/Flow lineage 継承**: `decide_candidate` の
+  adoption が、親 proposal の `capability_ref` / `flow_ref` を作成した
+  全 Node へ `evolution_node_link`(kind `capability` / `flow`、
+  `decision_method='manual'`、候補 id を note に記録)として書く。
+  handoff は Node 側の links を読取り時に参照する `design_links` で
+  lineage を運ぶ(コピーではなく参照——handoff テーブルに列は増やさ
+  ない)。
+- **lineage の per-kind 解決**: `derive_node_lineage` が link kind ごとに
+  正本ソースで解決する(`_LINK_KIND_TARGET_SOURCE`): `purpose_element`
+  は従来どおり呼出元の Purpose Frame、`capability` は #312 の
+  `understanding_capability_entity.id`(canonical head 照合で
+  confirmed/superseded)、`flow` は `trace_spans.flow_id`(observed)、
+  `feature` は `feature_drafts.feature_id`(確認 lifecycle が無いので
+  `not_applicable`——存在するものを unresolved と偽らない)。全て
+  存在 + 完全一致 id 照合のみ(Principle 6)。`target_resolution`
+  (`resolved`/`unresolved`/`unavailable`)と `target_source` を relation
+  に追加(additive)。
+
+### 修正(#398 Phase 3)
+
+- **complete_run の完了要件**: first-match の有限
+  `COMPLETION_REFUSAL_REASONS` で拒否——`missing_baseline` /
+  `no_candidate_variant`(非 baseline variant ゼロ)/
+  `execution_unresolved`(`not_executed` の variant が残存;
+  `not_executable`/`unsupported` は記録済みの一級 outcome であり
+  ブロックしない)/ `executed_without_measurement` /
+  `measured_without_execution`。≥2 modality は要求しない——§8.3 の
+  cross-modality は Phase の能力要件であり、同一 modality の 2 変種
+  比較も正当な探索である(docstring に明記)。
+- **measured 値の実行裏付け**: `record_measurement` は
+  `value_state='measured'` を `execution_state='executed'` の variant に
+  しか受理しない(手入力数値の自己申告経路の閉鎖)。順序は
+  `attach_execution` → `record_measurement` となり、完了時ゲートが
+  同じ不変条件を再検査する。
+- **pinned inputs との照合**: `attach_execution` が参照先の実行
+  (replay_run / replay_variant は親 run、experiment)の
+  snapshot_id / commit_sha(git 略記規則対応)/ replay_set / 実装側の
+  snapshot・commit を run の固定条件と照合し、矛盾は
+  `pinned_input_mismatch`(どの fact かを名指し)。両側が記録している
+  fact のみ比較——片側にしか無い fact は不一致ではない(記録されて
+  いないものは検証できず、拒否すればゲートが使用不能になる;記録済みの
+  矛盾こそが欠陥)。
+
+### 修正(#399 Phase 4)
+
+- **自己申告 evidence の閉鎖**: asserting verdict(`met`/`held`)の
+  `criterion`/`floor`/`stability` evidence は `EXECUTION_REF_KINDS`
+  (exploration_run/exploration_variant/replay_run/experiment)の解決可能な
+  実行参照を必須とする(add 時 422 + gate 時 `evidence_ref_missing`——
+  旧データも fail-closed)。`evaluation_policy` は「何が要求されたか」で
+  あって「何が観測されたか」ではないので実行参照として不可。
+  `not_met`/`violated` は ref 不要(負の自己申告は block しかできない;
+  拒否を確立より難しくしない)。`node_evidence_missing` は node-level の
+  **asserted** result を要求するよう強化。exploration 系 ref は package の
+  Node への帰属も検証(cross-Node は `foreign_evidence`)。
+- **stability 宣言の必須化**: gate は `required_case_count <= 0` または
+  `stability_window_seconds <= 0` を `stability_declaration_missing` で
+  拒否。閾値の大きさは per-package のまま(全域固定 threshold の禁止は
+  不変)——正の宣言だけが必須。draft 作成時の default 0 は許容。
+- **parent / human 承認の分離**: `stabilization_package` に
+  `parent_reviewed_by` / `parent_reviewed_at` /
+  `parent_review_disposition`(endorsed/declined)/ `parent_review_note`
+  を additive migration で追加。`POST /stabilization/packages/{id}/
+  parent-review`(Principal 由来の実名、draft/under_review のみ、
+  append-only)。gate は `endorsed` を要求
+  (`parent_review_missing` / `parent_review_declined`)、
+  `approve_package` は parent reviewer と approver の同一人物を
+  `parent_approver_identical` で拒否(gate とは別の有限
+  `APPROVAL_REFUSAL_CODES`——gate は読取り毎再計算で approver が
+  存在しないため)。reject / supersede は parent review 不要(拒否は
+  常に可能でなければならない)。gate 語彙は 22 拒否コード + `ok`。
+
+### 修正(#400 Phase 5)
+
+- **monitoring contract の実解決検証**: `established→monitoring` は
+  `monitoring_contract_ref` が `node_monitoring_contract:<id>` 形式で
+  解決し、当該 Node/System の行が `active=1` かつ非 superseded である
+  ことを要求(`NodeFacts.monitoring_contract_valid`、fail-closed——
+  テーブル欠如や他 Node の contract も拒否)。拒否コード
+  `monitoring_contract_invalid` を追加し、Phase 1 evaluator は 13 行の
+  first-match 表になった(`monitoring_contract_missing` とは別コード——
+  「未配線」と「配線済みだが検証不能」は別の事実)。
+- **Operations API の公開**: `app/routes/node_operations.py` を新設し
+  `main.py` に配線(`/node-operations` 配下 7 エンドポイント:
+  monitoring contract 作成 / observation 記録 / anomaly 記録(dedupe は
+  200 + `created:false`)/ reopen-scope 取得 / reopen plan 作成 / plan
+  approve / operations projection)。承認者は Principal 由来で body から
+  受けない(#337)。anomaly の `decision_method` は route が `manual` を
+  強制——HTTP 呼出元は人間駆動クライアントであり、body が
+  `deterministic`/`reasoning_llm` を名乗れると intelligence run の裏付け
+  なく system/model 産の分類を偽造できる。fail-closed の reasoning 経路は
+  ドメイン層直呼びのまま。Dashboard 画面は従来どおり #401 の統合対象。
+
+## UX Design Lineage(Epic #405, sub #406-#409)
+
+### 何が問題だったか
+
+Purpose Chain(#387-#391)は「対象者と課題 → Vision → Purpose → Capability」を
+追跡可能な因果連鎖として持てるようになった。Evolution Node(#394-#400)は
+「進化する処理単位」の契約・実装方式・成熟度を持てるようになった。しかし
+その二つの**間**が空いていた —「その Capability を、誰が、どの経路で、どう
+使うのか」「それを実現するために何が満たされていれば良いのか」「どの実現案を
+選んだのか」を保存する正本がどこにも無い。
+
+近いものは全部あるが、どれも違うものだった:
+
+| 既存 | それが答えるもの | 答えないもの |
+| --- | --- | --- |
+| `purpose_experience_hypothesis` | 成功体験の短い**価値仮説** | 具体的な利用経路、失敗と回復 |
+| `purpose_outcome_criterion` | 成果の**測定基準と証拠** | どう使われるか、何を作るか |
+| `capability_hierarchy_nodes` | snapshot 単位の Capability **理解** | 体験・要件・実現案 |
+| Flow Explorer | snapshot + entrypoint からの**実行経路** | 意図された利用経路 |
+| `evolution_node_version` | 処理単位の**技術契約** | それが誰のどの体験を支えるか |
+| Agent Role Card | Probe Cell の**実行役割** | 同上 |
+
+結果として、既存システムの改善で「現状はこう使われている → ここを変えたい →
+この案で実現する → だからこの Node と Flow が影響する」という一本の線が
+引けず、新規システムでは「実装も観測点も無い段階で設計を確定する」場所が
+無かった。
+
+### 何を作ったか
+
+`docs/ux-design-lineage.md` が正本の設計契約。実装は依存順に #406(契約)→
+#407(Journey / Step / Requirement / Artifact の永続化と API)→ #408(Solution
+Design と実装対象への link)→ #409(UX Design Studio と E2E)。
+
+### Purpose Chain と違い「保存する」理由
+
+これが Epic 全体で一番効いている判断である。Purpose Chain は行を保存しない
+projection だった —— 要素は `interview_intent_item` と `current_understanding`
+という既存正本から毎回導出でき、保存したのは「システムでは再導出できない
+人間の判断」の 2 テーブルだけだった。
+
+UX Design Lineage は逆で、**Journey / Requirement / Solution Design は
+どの既存行からも導出できない、新しく著述される内容**である。だからこの層は
+内容そのものを保存する。その代わり非対称を徹底した:
+
+* **上流(Purpose / Capability)の内容は保存しない。** 参照 + 捕捉 digest だけ。
+* **下流(Flow / Node / Component / Cell)の内容も保存しない。** 参照 + 捕捉
+  digest だけで、解決は読み取り時に kind ごとの正本 1 つに対して行う
+  (`node_design._LINK_KIND_TARGET_SOURCE` と同じ設計)。
+
+この非対称が、この Epic が「Purpose Chain の複製」ではない理由である。内容を
+コピーしていたら、元の Capability が superseded された後もコピーが current
+として読めてしまう —— #397 の handoff が既に踏んだ轍で、そこでは
+「参照だけを保存し、内容はコピーしない」で解決している。
+
+### 後から変えるときに守ること
+
+**identity を上流から導出しない。** `journey_key` / `requirement_key` /
+`design_key` は開発者が与える安定 slug である。Purpose 要素の id
+(`core_capability:<sha256(name)[:16]>`)は claim の**名前の hash** なので、
+Capability を言い直しただけで別 id になり、それを identity にすると Journey の
+履歴が切れる。行 id からも導出しない —— Understanding の再構築は
+`alignment_item` / `understanding_revision` を振り直す(#380)。これは
+Evolution Node ADR-2 が `node_key` を `component_id` から導出しないと決めたのと
+同じ判断である。
+
+**as-is / to-be は identity の属性であり、revision の属性ではない。** revision
+に `perspective` を持たせると、1 つの Journey が「現状の記述」から「目標の
+記述」へ変わり得ることになり、その revision 履歴は 2 つの別の主題の記録に
+なってしまう。現状と目標は**別の Journey** で、`to_be` 側が
+`baseline_journey_id` で as-is を指す。そして `baseline_mode` が
+`linked` / `greenfield` / `undecided` の 3 値なのは、「新規システムなので現状は
+無いと開発者が宣言した」と「まだ決めていない」を区別するためである。片方に
+畳むと、`baseline_state` が `not_applicable` なのか `absent` なのか言えなくなる。
+
+**状態は 4 つの独立した軸で、1 語に畳まない。** `design_status`(決定台帳から
+**導出**する。列に保存しない —— 保存した lifecycle 値はそれが記述する行から
+drift しうるが、導出した値はしえない。#337 / #338 / #349 と同じ規律)、
+`recheck_state`(digest 比較。**stale でも `design_status` は `confirmed` の
+まま** —— 確定を取り消すのではなく、「あの内容に対して人が確定した」事実を
+残したまま再確認を促す。#388 と同じ)、`revision_state`
+(`superseded_by_id IS NULL` かどうか。内容の版であって判断の状態ではない)、
+`authored_by_kind`(誰の声か)。`reasoning_model` が書いた revision が
+`confirmed` になることはあり得る —— それは「AI が書いた文を人が確認した」で
+あって、執筆者が `developer` に変わるのではない(#337 の
+`origin_role` / `producer_kind` / `actor_kind` を 3 軸に分けたのと同じ理由)。
+
+**Capability 参照は `understanding_capability_entity.id`。** コードベースには
+Capability が 2 系統ある: `capability_hierarchy_nodes`(#56、snapshot ごとに
+再生成される。snapshot を跨いで残るのは docstring 由来の自由文字列
+`capability_key` だけ)と `understanding_capability_entity`(#312、System-scoped
+の整数 id で、確認ごとに `understanding_capability_entity_version` として
+版が付く)。数か月生きる Journey の参照先として耐えるのは後者だけであり、
+`node_design._resolve_capability` も既に後者を使っている。Purpose Chain の
+`core_capability:<sha>` id を参照することも `ref_kind` 上は可能だが、その弱さは
+`target_resolution` に正直に出る(名前が動けば `unresolved`)。
+
+**`static_flow` と `runtime_flow` を 1 語にまとめない。** Flow には永続テーブルが
+無い。静的な経路は `(system_id, snapshot_id, entrypoint_ref)` から毎回計算され、
+`flow_graph` が振る `flow-{i}` は**1 回の導出内でしか安定しない**(link の
+target にならない)。実行時の `trace_spans.flow_id` は SDK が付けた correlation
+文字列で、こちらは System-scoped に安定だが「意図された経路」ではない。片方が
+current でももう片方は何も言っていないので、1 つの表示語に 2 つの事実を持たせ
+ない(#366)。`static_flow` の link は `captured_snapshot_id` 無しでは作れない。
+
+**設計案の採用は実装ではない。** Option の `adopt` が変えないものを 5 つ、
+テストで明示的に assert する: `evolution_node.maturity`、Cell Improvement の
+状態、`components.mode`(SDK policy)、patch の生成・適用と publish job、
+Probe Plan / Pattern の承認。これは Evolution Node ADR-9(自動 maturity 遷移は
+存在しない)と同じ境界を、設計層の側から守るものである。
+
+**採用の排他性は拒否で表現し、自動 withdraw をしない。** 既に `adopted` の
+option があるとき別 option の `adopt` は 409 で拒否する。自動で前案を
+`withdraw` すると、システムが人間の名前で「取り下げた」という決定を捏造する
+ことになる。開発者が明示的に withdraw してから採用する。同じ理由で、要件の
+`confirm`(非排他)と案の `adopt`(N 案から 1 つを選ぶ排他)は**別テーブルの
+別語彙**にしてある —— 同じ台帳に入れると排他性がどこにも表現されない。
+
+**artifact は本文を持たず、任意の URI を fetch しない。** 本文の列は存在
+しない(規約ではなく構造で禁じる。#397 が score 列を作らないことで合成 score を
+禁じたのと同じ手法)。`verification_state='verified'` に到達できるのは、
+pin された snapshot 上で `git show <sha>:<path>` として解決できる `repo:<path>`
+だけである。外部 URI(社内 Wiki、Figma、任意の http(s))は**取りに行かない** ——
+SSRF であり、「対象リポジトリは Git から読む」という Principle 5 の境界でも
+ある。したがって外部 artifact の hash は常に**開発者の申告値**で、
+`unverified` として表示する。一度 verified だった repo path が解決しなくなったら
+`unreachable` で、`unverified` とは別の事実である。
+
+**変更伝播は下流方向のみ。** Requirement を直しても Journey は stale に
+ならない。ここを対称にすると、下流の作業が上流の確定を勝手に無効化する
+(#388 が同じ理由で下流限定にしている)。
+
+**`unknown` / `unavailable` / `not_applicable` を丸めない。** 決めていない /
+読めなかった / 構造上不要 は 3 つの別の答えで、別の文言で表示する。
+
+**runtime trace だけから利用者の成功を推論しない。** Journey Step の
+`evidence_source_kind` は「何が観測できれば成功と言えるか」という**期待の
+宣言**であって、成果ではない。`runtime_trace` を選んでも、trace が出たことを
+成功として表示してはならない。成果の正本は `purpose_outcome_criterion` の
+ままで、この層は 2 つ目を作らない(#391 の規律)。
+
+**用語**: 既存の「Issue #397 — Phase 2: Design Studio」は Evolution Node の
+設計層を指す。#409 の画面は **UX Design Studio**(`/ux-design-studio`)であり、
+別物である。
+
+### Epic #405 検証ラウンド(2026-08-19)
+
+実装(#406-#409)の完成後にレビューと動作検証を行い、以下を確認・修正した。
+
+**動作検証で確認できたこと。**
+
+* `test_ux_design.py` / `test_solution_design.py` / `test_interview_type_parity.py`
+  118 件、Dashboard の vitest 802 件(35 file)が通る。TypeScript の
+  `tsc -b` も clean。
+* **既存 DB への migration は無害。** #405 以前(`b455dd7`)の `db.py` で作った
+  SQLite ファイルに対して新しい `init_db()` を実行すると、テーブルは 180 →
+  195 に増え、既存行はそのまま残る。`ALTER TABLE` は既存正本に対しては 1 つも
+  発行されない。
+* **既存正本への書き込みが無い。** 新しい 4 モジュールの INSERT/UPDATE/DELETE
+  の対象を全列挙すると、すべて `ux_*` / `solution_design*` の新規テーブルで
+  ある。`interview_*` / `purpose_*` / `understanding_*` / `evolution_node*` /
+  `cell_*` / `components` / `probe_points` への書き込みは 0(§5 の境界)。
+* **provenance は request body から入らない。** #405 が追加した `*Request`
+  モデルはいずれも `created_by` / `decided_by` / `decision_method` /
+  `authored_by_kind` を持たず、`ConfigDict(extra="forbid")` を持つ。
+* **有限語彙の型 parity が完全。** #405 が追加した 28 個の `Literal` alias は
+  すべて `test_interview_type_parity.py` の `FINITE_TYPE_NAMES` に載っている。
+* `content_digest` の入力列は §2.6 の表と完全一致(`created_by` /
+  `created_at` / `revision_number` / `change_note` は除外、`step_order` は
+  Journey revision digest にのみ入る)。
+* `add_option` は**旧行を先に retire してから** 新行を insert する。
+  `ux_solution_design_option_current` は `superseded_by_id IS NULL` を条件と
+  する partial unique index なので、insert を先にすると訂正そのものが拒否
+  される。この順序は契約である。
+
+**修正した欠陥。**
+
+1. **handoff が別 Node の decomposition を継承していた。**
+   `get_handoff` は `adopted_node_ids_json LIKE '%<id>%'` で候補を引いていた。
+   これは JSON 配列に対する部分文字列一致なので、`evolution_node` 行 id が 1 の
+   Node を target にした設計の handoff が、node 11 を採用した decomposition
+   candidate を自分のものとして報告する。実際に再現し、修正後は報告されない
+   ことを確認した。LIKE は prefilter として残し、所属判定は parse した id 集合
+   への完全一致で行う(Principle 6)。あわせて Node の解決を保存済みの
+   `target_row_id` ではなく `target_ref`(`node_key`)からの読み取り時解決に
+   変えた —— §3.3 の「`target_row_id` は join の近道であって単独では信用
+   しない」に従い、削除して同じ key で作り直された Node を元の Node と取り
+   違えないため。
+2. **読めなかった section を持つ handoff が `complete` を名乗っていた。**
+   `handoff_state` の分岐が `unresolved_references` だけを見ており、
+   `degraded_sections` が非空でも `complete` を返した。`requirements` の読み
+   取りが失敗した bundle が `requirements: []` + `complete` として返るので、
+   Requirement link を 1 つも持たない設計と区別できない —— §3.7 と §0
+   invariant 8 がまさに禁じている合流である。first match を
+   `degraded_sections` → `unavailable`、`unresolved_references` →
+   `incomplete`、それ以外 → `complete` に変えた。
+
+  どちらも回帰テストを `TestHandoff` に追加し、修正前のコードに対して確実に
+  落ちることを確認済み。
+
+**補った実装。**
+
+* **§4.2 の「今決めるべきこと」が画面に無かった。** 4 階層の段階的開示は
+  実装されていたが、「1 つだけ提示する次の 1 操作」が存在しなかった。
+  `components/ux-design/model.ts` に `decideNextDesignAction` を追加した ——
+  server が既に決めた値(`design_status` / `recheck_state` /
+  `adopted_option_key` / `option_count`)だけを入力に、因果順に走る 11 行の
+  first-match 表で、tie-break は key 昇順。#358 の `CockpitModel.nextStep` と
+  同じ形であり、client 側で状態を再導出するものではない。CTA は tab と対象を
+  選ぶだけの **navigate** で、実行は移動先 panel の primary action のまま。
+  一覧が読めないとき(`unavailable`)と決めることが無いとき(`settled`)は
+  CTA を出さず文で答える(#342 原則 P3)。
+
+**契約文書の訂正。** §5 は「`ALTER TABLE` も backfill も不要」と書いていたが、
+`db._migrate_solution_design_option_unique` という #405 自身のテーブルに対する
+migration が実在する(最初の形の table-level UNIQUE が append-only 訂正を
+不可能にしていたのを、テーブル 1 度きりの再構築で直すもの)。既存正本への変更
+ではないが、文書が実装に無い不変条件を主張していたので §5 に明記した。§3.7 と
+§4.2 も上記の規則を追記してある。
+
+---
+
+## Epic #418 — Stakeholder Value Network と UX・機能の統合可視化
+
+canonical contract は `docs/stakeholder-value-network.md`。§0 を読んでから
+この領域に触ること。ここには「なぜその設計にしたか」のうち、契約文書に
+書ききらなかった判断だけを残す。
+
+### なぜ #405 の一部にしなかったか
+
+#405 は「この体験を実現するための要件と実現案」を持つ層で、主語は
+**システム**である。Stakeholder Value Network の主語は**当事者**で、
+「誰が誰へ何を渡すか」は Journey が 1 本も無い段階でも成立する。同じ層に
+入れると、Journey が無い System では Stakeholder を語れず、Journey が
+複数の Stakeholder にまたがると `ux_journey_revision.beneficiary` という
+単一の自由記述に押し込むことになる。Evolution Node ADR-1 が Cell と Node を
+分けたのと同じ理由 —— 一つの行に二つの identity owner を置くと、この Epic の
+中心的分離 (支払者 ≠ 受益者) がそもそも表現できない。
+
+### なぜ Need と Problem を 1 テーブルにしたか
+
+`need_kind` の有限値で区別する。別テーブルにすると、作成時に「これは要望か
+痛みか」という開発者が往々にして決められない判断を強制し、下流の link kind が
+全部 2 倍になる。実際に効く区別は「それに対して何かが行われているか」であって、
+それは Need の**リンク**が答えることであり、テーブルの別れ方ではない。
+
+### なぜ Environment Observation に revision chain が無いか
+
+観測は「ある時点の世界についての言明」なので、訂正は編集ではなく**新しい
+観測**である (`supersedes_observation_key`)。#329 が Finding を append-only に
+したのと同じ規律で、元の観測は消さない —— 「当時そう見えていた」ことは
+後から誤りと分かっても事実である。
+
+### なぜ Stakeholder の digest に role assignment を含めないか
+
+ある Journey で役割を 1 つ足したことが、「この当事者が誰であるか」という
+確認を無効化してはならない。role assignment は自分の decision 行を持つ。
+#308 が `confirmation_id` を、#337 が Intent の `status` を digest から
+外したのと同じ「意味の変化でだけ期限切れにする」規則である。
+
+### `validity_state` を `design_status` と分けた理由
+
+期限切れの Exchange は「却下された」ではなく「終わった履歴」である。
+#412 の EM-ADR-2 が `expired` と `revoked` を分けたのと同じ —— 時間の経過で
+到達する状態と、人間が決めた状態を同じ語に載せない。`validity_state` は
+時計から**導出**し、列に保存しない。
+
+### `payer_differs_from_beneficiary` を「警告」にしなかった理由
+
+買い手と利用者が違うシステムは山ほどあり、それ自体は欠陥ではない。この
+notice の価値は開発者が**見えること**であって、ツールが良し悪しを判定する
+ことではない。§7.2 の notice は全て「link が無い」という構造的事実の陳述で
+あり、重要度や価値の判定ではない (Epic 不変条件 7)。
+
+### static Flow / Evolution Node / Component を ref kind に入れなかった理由
+
+この層はそれらへ #405 と #394 が既に持つ link を**通って**到達する。ここに
+2 本目の経路を作ると「この Node がこれを実装している」に二つの異なる答えが
+生まれる。#412 が `flow-1` を恒久 ID として保存しないと決め、#405 が static と
+runtime の Flow identity を混同しないと決めた境界を、上流側から守るための
+制約である。
+
+### Issue #421 — 参照解決と staleness 伝播、Exchange lineage
+
+`app/stakeholder_network.py::_resolve_target` は #420 が残した明示的な seam
+だった。全ての `StakeholderRefKind` を実際に解決するようにし、`purpose_element`
+/ `purpose_relation` は `purpose_chain.derive_purpose_chain` を、
+`capability_entity` は `understanding_capability_entity` を(#312 の
+System-scoped 安定 id、`capability_hierarchy_nodes.id` ではない)、`ux_journey`
+/ `ux_journey_step` / `ux_requirement` は `ux_design.py` と同じ正本テーブルを
+直接読む。各 resolver は `node_design.py` が `_resolve_capability` を
+`ux_design._resolve_capability_entity` から独立に複製しているのと同じ流儀で
+ローカルに複製した (private helper を跨いで import しない)。resolver が
+**例外を投げた**場合のみ `unavailable`、正常に読めて見つからなかった場合は
+`unresolved` — この二つを畳まないことが §5.1 の核心。
+
+**役割割当の `journey_step` scope は #405 の Step と同じ完全一致で検証する。**
+`scope_ref` は `"journey_step:<journey_key>#<step_key>"` — `journey:`
+scope の既存の prefix 規約 (`scope_ref` は常に prefix 付きで保存する、#412 と
+同じ規則) を踏襲し、body は §5.1 の `ux_journey_step` `target_ref` 形式を
+そのまま再利用した (二つ目の綴りを発明しない)。存在しない Step / Journey /
+prefix なしの不正な形式は全て 404 `journey_step_not_found` に畳む —
+`stakeholder_ref` と違い、これは Epic 自身が両方を所有する 2 つのエンティティ
+を結びつけるリンクなので、`stakeholder_ref` のように願望的に何も無い先を
+指すことはできない。
+
+**Journey Step scope の役割割当は 2 つの独立した staleness を持つ。**
+`stakeholder_role_assignment.captured_digest` は元々 Stakeholder 自身の
+content_digest しか捉えていなかった(#420)。§4 の「Step → Stakeholder role
+links for removed steps」の行を満たすには、scope が指す Step 自体が解決
+できなくなったことも `recheck_state` に反映する必要がある — ただし Step 用の
+digest 列を新設せず、`ux_journey_step` の READ 時解決結果 (`resolved !=
+"resolved"`) だけで十分と判断した。存在しない Step には比較対象となる digest
+がそもそも無いので、resolution 自体が signal になる。
+
+**Requirement → Solution Design は #405 の既存リンクだけを通る。**
+`get_exchange_lineage` は Requirement を 2 経路で集める —
+`stakeholder_ref(ref_kind='ux_requirement')` の直接参照と、
+`ux_journey_step` 参照から `ux_requirement_step_link` を辿る間接参照 — が、
+Solution Design へはどちらの Requirement からも
+`solution_design_requirement_link` + `solution_design_decision` (最新の
+`adopt`) だけを読む。Flow / Evolution Node / Component への 2 本目の経路は
+追加していない (§5.2)。
+
+**lineage の各セクションは独立した guarded loader。** `_degrade` は
+`ux_design._degrade` / `purpose_chain._degrade` と同じ挙動 — 失敗した
+セクションは `degraded_sections` に記録され、表示から**落ちる**だけで、
+`0` や空配列や推測値には決してならない。`exchange` セクション自体が失敗した
+場合は `provider`/`receiver` も連鎖的に `degraded_sections` へ入れる —
+存在しない Exchange 内容から provider/receiver を計算し続けて「provider が
+いない」という誤った表示を作らないため。
+
+**§13 の "文字列一致からリンクを自動生成しない" は回帰テストで守る。** この
+モジュールには Stakeholder の `display_name` と Journey の `beneficiary`
+文字列を比較するコードは一行も無い — テストはその不在を確認するだけで、
+振る舞いを実装しているわけではない。

@@ -17,8 +17,12 @@ services:
     build:
       context: .
       dockerfile: apps/control-server/Dockerfile
+    # Local build output: publish it first when a registry digest is required.
     image: probe-agent/control-server:latest
     container_name: probe-control-server
+    # Issue #315: one container using the Dockerfile's `--workers 1` command
+    # is the supported topology. Do not scale this service while
+    # interview_refresh_job still uses process-local session locks.
     environment:
       PROBE_API_KEY: ${PROBE_API_KEY:-}
       PROBE_DB_PATH: /data/probe.db
@@ -33,6 +37,21 @@ services:
       # Fail startup instead of silently running without authentication.
       # Forced on for CONTROL_ENV=production anyway; kept explicit here.
       CONTROL_REQUIRE_AUTH: "true"
+      # Issue #273: production has no implicit resource-limit defaults.
+      CONTROL_TRACE_RATE_LIMIT_PER_SECOND: ${CONTROL_TRACE_RATE_LIMIT_PER_SECOND:?Set CONTROL_TRACE_RATE_LIMIT_PER_SECOND}
+      CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE: ${CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE:?Set CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE}
+      CONTROL_LLM_DAILY_EXECUTION_LIMIT: ${CONTROL_LLM_DAILY_EXECUTION_LIMIT:?Set CONTROL_LLM_DAILY_EXECUTION_LIMIT}
+      CONTROL_TRACE_MAX_ROWS_PER_SYSTEM: ${CONTROL_TRACE_MAX_ROWS_PER_SYSTEM:?Set CONTROL_TRACE_MAX_ROWS_PER_SYSTEM}
+      CONTROL_TRACE_MAX_BYTES_PER_SYSTEM: ${CONTROL_TRACE_MAX_BYTES_PER_SYSTEM:?Set CONTROL_TRACE_MAX_BYTES_PER_SYSTEM}
+      # Issue #270: code execution is handed off through shared volumes; the
+      # Control Server never receives the Docker socket.
+      PROBE_EXECUTION_BACKEND: "worker"
+      PROBE_EXECUTION_SPOOL_ROOT: /execution-spool
+      PROBE_EXECUTION_WORKSPACE_ROOT: /execution-workspaces
+      PROBE_EXECUTION_WORKER_UID: "65534"
+      PROBE_WORKTREE_BASE: /execution-workspaces/validation
+      PROBE_REPLAY_WORKSPACE_BASE: /execution-workspaces/replay
+      PROBE_EXPERIMENT_WORKSPACE_BASE: /execution-workspaces/experiments
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
@@ -70,6 +89,8 @@ services:
     volumes:
       - probe-data:/data
       - ${PROBE_REPOSITORY_HOST_ROOT:?Set PROBE_REPOSITORY_HOST_ROOT}:/repositories:rw
+      - execution-spool:/execution-spool
+      - execution-workspaces:/execution-workspaces
     secrets:
       - github_app_private_key
     # No `ports:` — only Caddy is reachable from outside the compose network.
@@ -83,9 +104,45 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  execution-worker:
+    build:
+      context: .
+      dockerfile: apps/control-server/Dockerfile
+    # Same locally built artifact as control-server; no fabricated digest.
+    image: probe-agent/control-server:latest
+    container_name: probe-execution-worker
+    user: "65534:65534"
+    command: ["python", "-m", "app.execution_worker"]
+    environment:
+      PROBE_EXECUTION_SPOOL_ROOT: /execution-spool
+      PROBE_EXECUTION_WORKSPACE_ROOT: /execution-workspaces
+      PROBE_EXECUTION_WORKER_POLL_SECONDS: "0.05"
+      PROBE_EXECUTION_MAX_OUTPUT_BYTES: "65536"
+    volumes:
+      - execution-spool:/execution-spool
+      - execution-workspaces:/execution-workspaces
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # Docker's default seccomp profile conditionally blocks unshare(2)
+      # without CAP_SYS_ADMIN. The worker has no capabilities; bwrap needs
+      # this syscall solely to create its unprivileged user/mount namespace.
+      # The remaining outer and inner isolation controls stay enforced.
+      - seccomp:unconfined
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: "1.0"
+    restart: unless-stopped
+
   dashboard:
     build:
       context: ./apps/dashboard
+    # Local build output: publish it first when a registry digest is required.
     image: probe-agent/dashboard:latest
     container_name: probe-dashboard
     environment:
@@ -100,7 +157,7 @@ services:
     restart: unless-stopped
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     container_name: probe-caddy
     ports:
       - "80:80"
@@ -118,6 +175,8 @@ services:
 
 volumes:
   probe-data:
+  execution-spool:
+  execution-workspaces:
   caddy-data:
   caddy-config:
 

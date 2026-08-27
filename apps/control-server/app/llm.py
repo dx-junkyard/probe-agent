@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
+from .llm_secret_redaction import redact_messages
+
 
 Message = Dict[str, str]
 
@@ -26,6 +28,11 @@ PROVIDER_KEY_ENV: Dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
 }
+
+# Finite set of recognized `LLM_PROVIDER` values (also used by
+# system_diagnostics and bootstrap_status). "mock" is a real, supported
+# value (deterministic test/local-smoke output), not an error state.
+KNOWN_PROVIDERS = frozenset(PROVIDER_KEY_ENV) | {"mock"}
 
 
 @dataclass(frozen=True)
@@ -114,12 +121,48 @@ class LLMClient(ABC):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
-        """Generate a text response from chat-style messages."""
+        """Generate a text response from chat-style messages.
+
+        ``timeout`` overrides the provider's configured socket timeout for
+        THIS call only (Issue #339). An iterative loop with an overall time
+        budget needs the individual call to be interruptible: checking the
+        clock between rounds bounds the loop's own bookkeeping, not the round
+        trip that actually consumes the time, so a single hung call could
+        overrun the whole budget while every between-round check passed.
+        """
 
 
 class LLMError(RuntimeError):
     pass
+
+
+def _effective_timeout(config: LLMConfig, override: Optional[float]) -> float:
+    """The socket timeout for one call: the override when it is usable.
+
+    A non-positive override means the caller has no time left, which is a bug
+    on their side (they should not call at all) -- falling back to the full
+    configured timeout would silently turn a spent budget into a fresh one, so
+    the smallest positive value is used instead and the call fails fast.
+    """
+    if override is None:
+        return config.timeout
+    return max(0.001, min(float(override), config.timeout))
+
+
+class LLMResourceLimitError(RuntimeError):
+    code = "llm_resource_limit_error"
+
+
+class LLMQuotaExceeded(LLMResourceLimitError):
+    """The current System exhausted its durable daily LLM allowance."""
+
+    code = "llm_daily_limit_exceeded"
+
+
+class LLMSystemContextMissing(LLMResourceLimitError):
+    code = "llm_system_context_required"
 
 
 def is_reasoning_model(provider: str, model: str) -> bool:
@@ -185,6 +228,7 @@ class OpenAIChatClient(LLMClient):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         payload: Dict[str, Any] = {
             "model": self.config.model,
@@ -203,7 +247,7 @@ class OpenAIChatClient(LLMClient):
             + "/chat/completions",
             payload,
             headers={"Authorization": f"Bearer {self.config.api_key}"},
-            timeout=self.config.timeout,
+            timeout=_effective_timeout(self.config, timeout),
         )
         try:
             return response["choices"][0]["message"]["content"] or ""
@@ -223,6 +267,7 @@ class AnthropicClient(LLMClient):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         system_parts = [m["content"] for m in messages if m.get("role") == "system"]
         non_system = [m for m in messages if m.get("role") != "system"]
@@ -243,7 +288,7 @@ class AnthropicClient(LLMClient):
                 "x-api-key": self.config.api_key,
                 "anthropic-version": "2023-06-01",
             },
-            timeout=self.config.timeout,
+            timeout=_effective_timeout(self.config, timeout),
         )
         try:
             parts = response.get("content") or []
@@ -264,6 +309,7 @@ class GeminiClient(LLMClient):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         system_instructions = [
             {"parts": [{"text": m["content"]}]}
@@ -297,7 +343,7 @@ class GeminiClient(LLMClient):
             f"{base.rstrip('/')}/models/{self.config.model}:generateContent?key={self.config.api_key}",
             payload,
             headers={},
-            timeout=self.config.timeout,
+            timeout=_effective_timeout(self.config, timeout),
         )
         try:
             # When finishReason is MAX_TOKENS, content can be missing or empty.
@@ -320,6 +366,7 @@ class MockLLMClient(LLMClient):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
         joined = "\n".join(m.get("content", "") for m in messages)
         if "CANDIDATE_STUDIO_PROPOSAL_JSON" in joined:
@@ -339,6 +386,121 @@ class MockLLMClient(LLMClient):
                     "suggested_tests": [
                         "Assert candidate('a') == 'A' against recorded traces."
                     ],
+                }
+            )
+        if "FLOW_EXPERIMENT_DRAFT_RESPONSE_JSON" in joined:
+            # Issue #415 §7.7. The node keys are echoed back OUT OF THE
+            # PROMPT rather than invented: `_parse_draft_response` refuses a
+            # Node outside the requested set, and a mock that fabricated one
+            # would exercise the refusal path instead of the success path.
+            node_keys = [
+                line[2:].split("/", 1)[0].strip()
+                for line in joined.splitlines()
+                if line.startswith("- ") and "/" in line
+            ]
+            node_keys = [key for key in node_keys if key]
+            # Same discipline for the evidence catalogue (#415 defect 1):
+            # `_parse_draft_response` refuses an `evidence_ref` the projection
+            # never produced, so the mock echoes real ids back OUT OF THE
+            # PROMPT. A mock that fabricated one would only ever exercise the
+            # refusal path. The catalogue lines are the `* [<id>] ...` bullets.
+            evidence_ids = [
+                line.split("[", 1)[1].split("]", 1)[0].strip()
+                for line in joined.splitlines()
+                if line.startswith("* [") and "]" in line
+            ]
+            evidence_ids = [ref for ref in evidence_ids if ref][:3]
+            return json.dumps(
+                {
+                    "title": "Mock Flow experiment draft",
+                    "purpose": (
+                        "Mock purpose: no external LLM was called; this is "
+                        "deterministic mock output."
+                    ),
+                    "hypothesis": (
+                        "Mock hypothesis: the candidate implementation keeps "
+                        "the baseline contract at lower cost."
+                    ),
+                    "comparison_scope": (
+                        "sub_pipeline" if len(node_keys) > 1 else "single_node"
+                    ),
+                    "target_node_keys": node_keys,
+                    "baseline_ref": "baseline:current_stable_implementation",
+                    "candidate_refs": ["candidate:mock-1"],
+                    "evaluation_axes": [
+                        {"level": "node", "name": "output_match", "metric": "match_rate"},
+                        {
+                            "level": "flow_capability",
+                            "name": "flow_success",
+                            "metric": "completed_flow_rate",
+                        },
+                    ],
+                    "quality_floor": {"output_match": "no regression vs baseline"},
+                    "isolation_strategy": "isolated_workspace",
+                    "isolation_detail": (
+                        "Network-off worktree sandbox; the baseline production "
+                        "path is untouched."
+                    ),
+                    "cost_cap": {"max_runs": 20},
+                    "stop_conditions": [
+                        "Any quality floor is broken.",
+                        "The cost cap is reached.",
+                    ],
+                    "rollback_plan": (
+                        "Nothing is applied: discard the candidate and keep "
+                        "the pinned stable implementation."
+                    ),
+                    # Deliberately falls back to a fabricated id when the
+                    # prompt carried no catalogue: that call is refused, which
+                    # is the correct outcome for an ungrounded draft.
+                    "evidence_refs": evidence_ids or ["mock:evidence-1"],
+                    "risks": [
+                        "Mock draft -- review every element before proposing it."
+                    ],
+                }
+            )
+        if "CELL_TRIAGE_RESPONSE_JSON" in joined:
+            return json.dumps(
+                {
+                    "classification": "individual",
+                    "reasoning_summary": (
+                        "Mock triage: no external LLM was called; this is "
+                        "deterministic mock output."
+                    ),
+                    "affected_cell_ids": [],
+                    "proposed_ask": (
+                        "Mock proposed ask -- review the digest facts manually "
+                        "before acting."
+                    ),
+                }
+            )
+        if "CELL_IMPROVEMENT_RESPONSE_JSON" in joined:
+            return json.dumps(
+                {
+                    "hypothesis": (
+                        "Mock hypothesis: no external LLM was called; this is "
+                        "deterministic mock output grounded only in the "
+                        "observed facts refs supplied."
+                    ),
+                    "expected_effect": (
+                        "Mock expected effect: improved outcome on the "
+                        "sampled failure pattern."
+                    ),
+                    "risk": "Mock risk: review canary evidence before adoption.",
+                    "rollback_plan": (
+                        "Mock rollback plan: revert to the previously pinned "
+                        "Role Card version / patch."
+                    ),
+                }
+            )
+        if "CELL_QUALITY_AUDIT_RESPONSE_JSON" in joined:
+            return json.dumps(
+                {
+                    "explanation": (
+                        "Mock quality-audit explanation: no external LLM was "
+                        "called; this is deterministic mock output describing "
+                        "the failed criteria pattern."
+                    )
                 }
             )
         if "REGRESSION_SCAFFOLD_RESPONSE_JSON" in joined:
@@ -372,6 +534,67 @@ class MockLLMClient(LLMClient):
         )
 
 
+class _QuotaLLMClient(LLMClient):
+    """Consume the current request/job System quota immediately before a call."""
+
+    def __init__(self, delegate: LLMClient):
+        self._delegate = delegate
+
+    def generate_text(
+        self,
+        messages: List[Message],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> str:
+        _consume_current_system_quota()
+        return self._delegate.generate_text(
+            redact_messages(messages),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+
+
+class _QuotaMockLLMClient(MockLLMClient):
+    """Mock-preserving wrapper so existing isinstance audit logic stays valid."""
+
+    def generate_text(
+        self,
+        messages: List[Message],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> str:
+        _consume_current_system_quota()
+        return super().generate_text(
+            redact_messages(messages),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+
+
+def _consume_current_system_quota() -> None:
+    from .resource_limits import (
+        ResourceLimitExceeded,
+        consume_llm_execution,
+        current_system_id,
+    )
+
+    system_id = current_system_id()
+    if system_id is None:
+        raise LLMSystemContextMissing(
+            "A System quota context is required before every LLM execution"
+        )
+    try:
+        consume_llm_execution(system_id)
+    except ResourceLimitExceeded as exc:
+        raise LLMQuotaExceeded(str(exc)) from exc
+
+
 @lru_cache(maxsize=1)
 def get_llm_client() -> LLMClient:
     config = LLMConfig.from_env()
@@ -380,9 +603,9 @@ def get_llm_client() -> LLMClient:
 
 def create_llm_client(config: LLMConfig) -> LLMClient:
     if config.provider == "mock":
-        return MockLLMClient()
+        return _QuotaMockLLMClient()
     if config.provider == "anthropic":
-        return AnthropicClient(config)
+        return _QuotaLLMClient(AnthropicClient(config))
     if config.provider == "gemini":
-        return GeminiClient(config)
-    return OpenAIChatClient(config)
+        return _QuotaLLMClient(GeminiClient(config))
+    return _QuotaLLMClient(OpenAIChatClient(config))

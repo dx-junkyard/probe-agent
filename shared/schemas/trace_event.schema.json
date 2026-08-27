@@ -10,13 +10,14 @@
     "mode":         { "type": ["string", "null"], "enum": ["off", "trace", "shadow", null] },
     "input": {
       "type": ["object", "null"],
+      "description": "Rendered call arguments. Both redaction layers (Issue #367) have already been applied by the SDK, and the Control Server applies them again before storing: a denylisted key/attribute name is masked with the SDK marker, and a documented credential shape is replaced by a [REDACTED_SECRET:<rule>] marker. See docs/secret-redaction.md.",
       "properties": {
         "args":   { "type": "array", "items": { "type": "string" } },
         "kwargs": { "type": "object", "additionalProperties": { "type": "string" } }
       }
     },
-    "output":      { "type": ["string", "null"] },
-    "error":       { "type": ["string", "null"] },
+    "output":      { "type": ["string", "null"], "description": "Rendered return value; redacted on the same two-layer contract as `input` (Issue #367)." },
+    "error":       { "type": ["string", "null"], "description": "Exception type name, or (PROBE_PAYLOAD_MODE=full) the message and traceback. Free-form text, so only the credential-shape layer protects it — and it is applied unconditionally (Issue #367)." },
     "duration_ms": { "type": "number", "minimum": 0 },
     "timestamp":   { "type": "number" },
 
@@ -87,7 +88,20 @@
           "redaction_blocked"
         ]
       }
-    }
+    },
+    "sdk_transport": {
+      "type": ["object", "null"],
+      "description": "Bounded queue/circuit-breaker loss summary acknowledged by the Control Server (Issues #272/#273).",
+      "required": ["dropped_count", "failure_count", "state"],
+      "properties": {
+        "dropped_count": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "failure_count": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "state": { "type": "string", "enum": ["closed", "open", "half_open"] }
+      },
+      "additionalProperties": false
+    },
+    "environment": { "type": ["string", "null"], "description": "Optional deployment environment tag reported by the SDK (PROBE_ENVIRONMENT), e.g. 'production'. Null when unset (Issue #290 Finding 5) — never inferred." },
+    "git_sha": { "type": ["string", "null"], "description": "Optional deployed commit sha reported by the SDK (PROBE_GIT_SHA). Null when unset (Issue #290 Finding 5) — never inferred from the pinned analysis snapshot." }
   },
   "additionalProperties": false
 }

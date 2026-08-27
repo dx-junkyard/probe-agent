@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/evolution_node.json",
+  "title": "EvolutionNodeProjection",
+  "description": "The canonical read projection of one Evolution Node (Epic #394 Phase 1, Issue #396), built deterministically at read time by app/evolution_node.py's build_node_projection from evolution_node / evolution_node_version / evolution_node_implementation / evolution_node_link / evolution_node_event -- it is never a separately cached document. An Evolution Node is a NEW entity distinct from a Probe Cell (cell_state.schema.json): the Cell owns the execution role, the Node owns the unit of processing that evolves (its business I/O contract, implementation modality, maturity, and rollback pin). `maturity` / `improvement_status` / `policy_mode` are three deliberately independent axes, each read from its own canonical source (this module's own event log, cell_improvements, components) and never derived from one another; a `workflow_phase` axis is intentionally NOT a property of this document in Phase 1 -- it is added only once Phase 6 of this Epic wires a canonical workflow-phase source. `maturity` is the stored column and `folded_maturity` is what the Node's own append-only transition events fold to (ADR-4: the log is the authority, the column is its cache); `maturity_consistent` reports whether they agree, so a drifted cache is visible to every reader of this document rather than only to an auditor who refolds the log by hand. `availability` marks any block that could not be genuinely read as unavailable rather than substituting a default for it -- a `null` value paired with `availability.<key> = true` means the fact is genuinely absent, while `availability.<key> = false` means it could not be determined.",
+  "type": "object",
+  "required": [
+    "schema_version", "system_id", "node_id", "node_key", "display_name",
+    "maturity", "folded_maturity", "maturity_consistent",
+    "current_version", "current_implementation",
+    "stable_implementation", "rollback_implementation", "links", "events",
+    "improvement_status", "policy_mode", "availability", "updated_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "evolution-node-projection-v1" },
+    "system_id": { "type": "integer", "minimum": 1 },
+    "node_id": { "type": "integer", "minimum": 1 },
+    "node_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Developer-supplied stable slug, unique per System. Never derived from a component_id -- a Node may be designed before instrumentation exists and must survive a Component rename."
+    },
+    "display_name": { "type": "string" },
+    "maturity": { "$ref": "#/$defs/maturity_state" },
+    "folded_maturity": {
+      "description": "The maturity obtained by folding ALL of this Node's transition events (never the bounded `events` page above). ADR-4 makes the event log the authority and `maturity` its cache, so both are reported. null means either the Node has never transitioned -- consistent with the stored creation state 'exploring' -- or the log could not be read, which availability.maturity_lineage distinguishes.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/maturity_state" }]
+    },
+    "maturity_consistent": {
+      "description": "Whether `maturity` equals `folded_maturity` (a null fold paired with stored 'exploring' is consistent). null ONLY when availability.maturity_lineage is false: an unread log proves neither agreement nor drift.",
+      "type": ["boolean", "null"]
+    },
+    "current_version": {
+      "description": "The Node's current business I/O contract, or null when none has been recorded yet.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/version" }]
+    },
+    "current_implementation": {
+      "description": "How the Node currently keeps its contract's promise, or null when none has been recorded yet. NOT necessarily the same row as stable_implementation.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/implementation" }]
+    },
+    "stable_implementation": {
+      "description": "The pinned production implementation, or null when nothing has ever been pinned. `reopened` maturity deliberately never clears this.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/implementation" }]
+    },
+    "rollback_implementation": {
+      "description": "The implementation that was stable immediately before the current stable pin, or null when the Node has never had a second stable implementation.",
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/implementation" }]
+    },
+    "links": {
+      "type": "array",
+      "description": "Current (non-superseded) links to existing assets, most recent first.",
+      "items": { "$ref": "#/$defs/link" }
+    },
+    "events": {
+      "type": "array",
+      "description": "The most recent lineage events for this Node, most recent first (bounded by the projection's event_limit).",
+      "items": { "$ref": "#/$defs/event" }
+    },
+    "improvement_status": {
+      "description": "The latest app/cell_improvement.py status (Issue #304) of the Cell this Node links to, read from the EXISTING cell_improvements table. null means either no Cell is linked or the linked Cell has never had an improvement recorded -- availability.improvement_status is the only signal distinguishing an unreadable link from either legitimate case.",
+      "type": ["string", "null"]
+    },
+    "policy_mode": {
+      "description": "The SDK policy mode of the linked Component, read from the EXISTING components table. null means either no Component is linked, or one is linked but has no recorded policy row yet (never traced / never set).",
+      "enum": ["off", "trace", "shadow", null]
+    },
+    "availability": { "$ref": "#/$defs/availability" },
+    "updated_at": { "type": "number" }
+  },
+  "$defs": {
+    "maturity_state": {
+      "enum": ["exploring", "validating", "established", "monitoring", "reopened", "suspended"]
+    },
+    "implementation_modality": {
+      "enum": [
+        "reasoning_llm", "lm_program", "retrieval", "router", "small_model",
+        "rule", "deterministic_code", "workflow", "manual", "hybrid"
+      ]
+    },
+    "link_kind": {
+      "enum": [
+        "component", "probe_point", "cell_binding", "capability",
+        "flow", "purpose_element", "feature"
+      ]
+    },
+    "side_effect_class": {
+      "enum": ["pure", "read_only", "local_write", "external_write", "irreversible"]
+    },
+    "trust_boundary": {
+      "enum": ["internal", "external_input", "external_output", "third_party"]
+    },
+    "actor_kind": { "enum": ["developer", "system"] },
+    "decision_method": { "enum": ["deterministic", "reasoning_llm", "manual"] },
+    "event_kind": {
+      "enum": [
+        "transition", "version_created", "implementation_created",
+        "link_created", "stable_pinned", "rollback_pinned"
+      ]
+    },
+    "version": {
+      "type": "object",
+      "required": [
+        "id", "version_number", "mission", "scope", "out_of_scope",
+        "input_contract", "output_contract", "side_effect_class", "trust_boundary",
+        "establishment_criteria", "reopen_criteria", "evaluation_policy_refs",
+        "decision_method", "created_by", "created_at", "superseded_by_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "version_number": { "type": "integer", "minimum": 1 },
+        "mission": { "type": "string" },
+        "scope": { "type": "string" },
+        "out_of_scope": { "type": "string" },
+        "input_contract": { "type": "object" },
+        "output_contract": { "type": "object" },
+        "side_effect_class": { "$ref": "#/$defs/side_effect_class" },
+        "trust_boundary": { "$ref": "#/$defs/trust_boundary" },
+        "establishment_criteria": { "type": "array", "items": { "type": "string" } },
+        "reopen_criteria": { "type": "array", "items": { "type": "string" } },
+        "evaluation_policy_refs": { "type": "array", "items": { "type": "string" } },
+        "decision_method": { "$ref": "#/$defs/decision_method" },
+        "created_by": { "type": ["string", "null"] },
+        "created_at": { "type": "number" },
+        "superseded_by_id": { "type": ["integer", "null"] }
+      }
+    },
+    "implementation": {
+      "type": "object",
+      "required": [
+        "id", "implementation_number", "node_version_id", "modality", "config",
+        "snapshot_id", "commit_sha", "environment_ref", "provenance",
+        "created_by", "decision_method", "created_at", "superseded_by_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "implementation_number": { "type": "integer", "minimum": 1 },
+        "node_version_id": { "type": "integer", "minimum": 1 },
+        "modality": { "$ref": "#/$defs/implementation_modality" },
+        "config": {
+          "type": "object",
+          "description": "The ONLY place a real provider/model name may appear for this implementation (Issue #298's Role Card model-alias rule, applied here)."
+        },
+        "snapshot_id": { "type": ["integer", "null"] },
+        "commit_sha": { "type": ["string", "null"] },
+        "environment_ref": { "type": ["string", "null"] },
+        "provenance": { "type": "object" },
+        "created_by": { "type": ["string", "null"] },
+        "decision_method": { "$ref": "#/$defs/decision_method" },
+        "created_at": { "type": "number" },
+        "superseded_by_id": { "type": ["integer", "null"] }
+      }
+    },
+    "link": {
+      "type": "object",
+      "required": [
+        "id", "link_kind", "target_ref", "target_row_id", "note",
+        "decision_method", "created_by", "created_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "link_kind": { "$ref": "#/$defs/link_kind" },
+        "target_ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The stable string id of the linked asset (e.g. a component_id)."
+        },
+        "target_row_id": { "type": ["integer", "null"] },
+        "note": { "type": "string" },
+        "decision_method": { "$ref": "#/$defs/decision_method" },
+        "created_by": { "type": ["string", "null"] },
+        "created_at": { "type": "number" }
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": [
+        "id", "event_kind", "from_state", "to_state",
+        "from_version_id", "to_version_id",
+        "from_implementation_id", "to_implementation_id",
+        "actor", "actor_kind", "decision_method", "reason_code", "reason",
+        "evidence", "idempotency_key", "created_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "event_kind": { "$ref": "#/$defs/event_kind" },
+        "from_state": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/maturity_state" }]
+        },
+        "to_state": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/maturity_state" }]
+        },
+        "from_version_id": { "type": ["integer", "null"] },
+        "to_version_id": { "type": ["integer", "null"] },
+        "from_implementation_id": { "type": ["integer", "null"] },
+        "to_implementation_id": { "type": ["integer", "null"] },
+        "actor": { "type": ["string", "null"] },
+        "actor_kind": { "$ref": "#/$defs/actor_kind" },
+        "decision_method": { "$ref": "#/$defs/decision_method" },
+        "reason_code": { "type": "string" },
+        "reason": { "type": "string" },
+        "evidence": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Evidence REFS only (e.g. 'component:orders-summarizer'), never raw evidence content -- the same discipline cell_improvements.canary_evidence_json uses."
+        },
+        "idempotency_key": { "type": ["string", "null"] },
+        "created_at": { "type": "number" }
+      }
+    },
+    "availability": {
+      "type": "object",
+      "required": [
+        "version", "implementation", "stable_implementation", "rollback_implementation",
+        "links", "events", "maturity_lineage", "improvement_status", "policy_mode"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "type": "boolean" },
+        "implementation": { "type": "boolean" },
+        "stable_implementation": { "type": "boolean" },
+        "rollback_implementation": { "type": "boolean" },
+        "links": { "type": "boolean" },
+        "events": { "type": "boolean" },
+        "maturity_lineage": { "type": "boolean" },
+        "improvement_status": { "type": "boolean" },
+        "policy_mode": { "type": "boolean" }
+      }
+    }
+  }
+}

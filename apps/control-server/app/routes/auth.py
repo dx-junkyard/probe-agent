@@ -3,10 +3,19 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
-from ..auth import Principal, get_principal, require_admin, require_user
+from ..auth import (
+    CSRF_COOKIE_NAME,
+    SESSION_COOKIE_NAME,
+    Principal,
+    get_principal,
+    require_admin,
+    require_user,
+)
+from ..bootstrap_status import get_bootstrap_status
 from ..db import get_conn
 from ..environment import is_production
 from ..models import (
+    BootstrapStatusOut,
     LoginRequest,
     MeResponse,
     PasswordResetRequest,
@@ -26,6 +35,7 @@ from ..security import (
     validate_production_password,
     verify_password,
 )
+from ..token_status import classify_token_status, token_expires_in_seconds
 
 router = APIRouter()
 
@@ -43,16 +53,27 @@ def _user_out(row) -> UserOut:
     )
 
 
-def _token_out(row) -> TokenOut:
+def _token_out(row, now: Optional[float] = None) -> TokenOut:
+    """Issue #368: `status` is decided here, not by the client.
+
+    `now` is passed in so every row of one response is classified against a
+    single instant -- otherwise a long list could straddle the expiry of one of
+    its own rows.
+    """
+    at = time.time() if now is None else now
+    revoked = bool(row["revoked"])
+    expires_at = row["expires_at"]
     return TokenOut(
         id=row["id"],
         name=row["name"],
         kind=row["kind"],
         user_id=row["user_id"],
         system_id=row["system_id"],
-        revoked=bool(row["revoked"]),
+        revoked=revoked,
         created_at=row["created_at"],
-        expires_at=row["expires_at"],
+        expires_at=expires_at,
+        status=classify_token_status(revoked=revoked, expires_at=expires_at, now=at),
+        expires_in_seconds=token_expires_in_seconds(expires_at=expires_at, now=at),
     )
 
 
@@ -80,8 +101,68 @@ def _issue_token(
     return raw
 
 
+@router.get("/auth/bootstrap-status", response_model=BootstrapStatusOut)
+def bootstrap_status() -> BootstrapStatusOut:
+    """Issue #265: the one endpoint reachable with no credentials and no
+    System, so the pre-login / zero-System "phase 0" screens (login page,
+    Overview/Settings/header empty states) have something deterministic to
+    show instead of a dead end. Deliberately takes no dependencies (no
+    `get_principal`, no `get_system_id`) and returns only finite facts --
+    never a username, key value, path, or hostname (see
+    `bootstrap_status.get_bootstrap_status`).
+    """
+    status = get_bootstrap_status()
+    return BootstrapStatusOut(
+        admin_exists=status.admin_exists,
+        auth_mode=status.auth_mode,
+        llm_configured=status.llm_configured,
+        environment=status.environment,
+    )
+
+
+def _set_session_cookies(response: Response, session: str, csrf: str) -> None:
+    secure = is_production()
+    common = {
+        "max_age": _SESSION_TTL_SECONDS,
+        "path": "/",
+        "secure": secure,
+        "samesite": "lax",
+    }
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session,
+        httponly=True,
+        **common,
+    )
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf,
+        httponly=False,
+        **common,
+    )
+    response.headers["Cache-Control"] = "no-store"
+
+
+def _clear_session_cookies(response: Response) -> None:
+    secure = is_production()
+    response.delete_cookie(
+        SESSION_COOKIE_NAME,
+        path="/",
+        secure=secure,
+        httponly=True,
+        samesite="lax",
+    )
+    response.delete_cookie(
+        CSRF_COOKIE_NAME,
+        path="/",
+        secure=secure,
+        httponly=False,
+        samesite="lax",
+    )
+
+
 @router.post("/auth/login", response_model=TokenResponse)
-def login(payload: LoginRequest) -> TokenResponse:
+def login(payload: LoginRequest, response: Response) -> TokenResponse:
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id, password_hash, is_active FROM users WHERE username = ?",
@@ -99,7 +180,8 @@ def login(payload: LoginRequest) -> TokenResponse:
             name="login session",
             expires_at=expires_at,
         )
-    return TokenResponse(access_token=raw, expires_at=expires_at)
+    _set_session_cookies(response, raw, generate_token())
+    return TokenResponse(expires_at=expires_at)
 
 
 @router.post("/auth/logout", status_code=204)
@@ -111,13 +193,21 @@ def logout(principal: Principal = Depends(get_principal)) -> Response:
             conn.execute(
                 "UPDATE api_tokens SET revoked = 1 WHERE id = ?", (principal.token_id,)
             )
-    return Response(status_code=204)
+    response = Response(status_code=204)
+    _clear_session_cookies(response)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @router.get("/auth/me", response_model=MeResponse)
 def me(principal: Principal = Depends(get_principal)) -> MeResponse:
     if principal.user_id is None:
-        return MeResponse(user=None, auth=principal.auth, system_id=principal.system_id)
+        return MeResponse(
+            user=None,
+            auth=principal.auth,
+            system_id=principal.system_id,
+            transport=principal.transport,
+        )
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id, username, role, is_active, created_at FROM users WHERE id = ?",
@@ -126,7 +216,10 @@ def me(principal: Principal = Depends(get_principal)) -> MeResponse:
     if row is None:
         raise HTTPException(status_code=404, detail="User not found")
     return MeResponse(
-        user=_user_out(row), auth=principal.auth, system_id=principal.system_id
+        user=_user_out(row),
+        auth=principal.auth,
+        system_id=principal.system_id,
+        transport=principal.transport,
     )
 
 
@@ -326,7 +419,8 @@ def list_my_tokens(principal: Principal = Depends(require_user)) -> List[TokenOu
             f"SELECT {_TOKEN_COLUMNS} FROM api_tokens WHERE user_id = ? ORDER BY id",
             (principal.user_id,),
         ).fetchall()
-    return [_token_out(r) for r in rows]
+    now = time.time()
+    return [_token_out(r, now) for r in rows]
 
 
 @router.post("/tokens/me", response_model=TokenCreateResponse, status_code=201)
@@ -379,7 +473,8 @@ def list_tokens(_: Principal = Depends(require_admin)) -> List[TokenOut]:
         rows = conn.execute(
             f"SELECT {_TOKEN_COLUMNS} FROM api_tokens ORDER BY id"
         ).fetchall()
-    return [_token_out(r) for r in rows]
+    now = time.time()
+    return [_token_out(r, now) for r in rows]
 
 
 @router.post("/tokens", response_model=TokenCreateResponse, status_code=201)

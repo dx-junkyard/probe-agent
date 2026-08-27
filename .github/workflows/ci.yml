@@ -1,0 +1,87 @@
+# Issue #98: PR ごとにバックエンドテスト・Dashboard build/lint/test・
+# dogfooding smoke(tests/test_dogfooding_smoke.py, mock LLM の決定的経路のみ)
+# を自動実行する。デプロイは行わない(mvp.md の非目標「CI/CD 連携」はデプロイの
+# 話であり、テスト実行の CI はこれに反しない)。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install packages (venv on PATH)
+        # 実験ワークスペースはサーバープロセスの PATH から `python` を解決する
+        # ため、venv の bin を PATH に載せた状態で pytest を起動する(README 参照)。
+        run: |
+          python -m venv .venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/pip install --require-hashes -r apps/control-server/requirements-dev.lock
+          .venv/bin/pip install --no-build-isolation --no-deps apps/control-server packages/python-probe
+      - name: Control Server tests (incl. dogfooding smoke)
+        run: python -m pytest apps/control-server/tests -q
+        env:
+          LLM_PROVIDER: mock
+      - name: Probe SDK tests
+        run: python -m pytest packages/python-probe/tests -q
+
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/dashboard
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm run test
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Verify immutable pins and lock policy
+        run: python -m unittest apps/control-server/tests/test_supply_chain.py -v
+      - name: Build pinned images
+        run: |
+          docker build -f apps/control-server/Dockerfile -t probe-agent/control-server:ci .
+          docker build -f apps/dashboard/Dockerfile -t probe-agent/dashboard:ci apps/dashboard
+      - name: Generate Control Server SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: probe-agent/control-server:ci
+          format: spdx-json
+          output-file: sbom-control-server.spdx.json
+          artifact-name: sbom-control-server.spdx.json
+          upload-artifact: false
+          syft-version: v1.48.0
+      - name: Generate Dashboard SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: probe-agent/dashboard:ci
+          format: spdx-json
+          output-file: sbom-dashboard.spdx.json
+          artifact-name: sbom-dashboard.spdx.json
+          upload-artifact: false
+          syft-version: v1.48.0
+      - name: Upload SPDX SBOMs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: spdx-sboms
+          path: sbom-*.spdx.json
+          if-no-files-found: error

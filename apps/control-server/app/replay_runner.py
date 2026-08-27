@@ -37,6 +37,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from .execution_backend import ExecutionBackend
 from .experiment_runner import _apply_patch, _load_artifact
 from .patch_generator import cleanup_worktree, create_worktree
 from .replay_harness import (
@@ -287,6 +288,7 @@ def execute_harness(
     harness_cases: List[Dict[str, Any]],
     timeout_seconds: int,
     patch_text: Optional[str] = None,
+    backend: Optional[ExecutionBackend] = None,
 ) -> ReplayExecution:
     """Run the harness against a fresh worktree; always clean the worktree up.
 
@@ -320,7 +322,12 @@ def execute_harness(
             f"{HARNESS_DIRNAME}/{RESULT_FILENAME}"
         )
         result = _run_command(
-            command, workspace, env, timeout_seconds, network=False
+            command,
+            workspace,
+            env,
+            timeout_seconds,
+            network=False,
+            backend=backend,
         )
         payload, load_error = _load_artifact(
             workspace, f"{HARNESS_DIRNAME}/{RESULT_FILENAME}"

@@ -1,0 +1,5 @@
+# Build tooling needed before installing the two local Python projects with
+# --no-build-isolation --no-deps. Runtime and test dependencies continue to
+# come from pyproject.toml; pip-compile combines this file with that source.
+setuptools>=61
+wheel>=0.45

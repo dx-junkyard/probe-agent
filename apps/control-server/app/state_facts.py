@@ -67,11 +67,27 @@ __all__ = [
     "ConnectivityFacts",
     "get_connectivity_facts",
     "classify_connectivity_state",
+    "classify_connectivity_freshness",
+    "get_freshness_thresholds",
+    "FRESHNESS_VALUES",
+    "DEFAULT_DELAYED_AFTER_SECONDS",
+    "DEFAULT_STALE_AFTER_SECONDS",
+    "CLOCK_SKEW_TOLERANCE_SECONDS",
     "count_approved_probe_plans",
     "count_undecided_completed_experiments",
     "plan_has_validated_patch",
     "count_proposed_probe_plans",
     "count_approved_probe_plans_without_validated_patch",
+    "has_applied_probe_patch",
+    "has_decided_experiment",
+    "has_completed_replay_variant_run",
+    "has_succeeded_publish_job",
+    "get_system_profile_row",
+    "get_latest_completed_capability_hierarchy_run",
+    "load_ai_purpose_view",
+    "get_latest_purpose_confirmation",
+    "get_latest_completed_understanding_build",
+    "purpose_confirmation_staleness",
 ]
 
 
@@ -216,11 +232,15 @@ def purpose_defined_in_snapshot(conn, system_id: int, snapshot_id: int) -> bool:
     ``system_profile_drafts`` row with a non-empty name/purpose exists for
     this snapshot. Does not consider any other snapshot's baseline.
     """
-    node = conn.execute(
-        "SELECT name, summary FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose' LIMIT 1",
-        (system_id, snapshot_id),
-    ).fetchone()
+    run = get_latest_completed_capability_hierarchy_run(conn, system_id, snapshot_id)
+    node = None
+    if run is not None:
+        node = conn.execute(
+            "SELECT name, summary FROM capability_hierarchy_nodes "
+            "WHERE system_id = ? AND snapshot_id = ? AND intelligence_run_id = ? "
+            "AND node_type = 'purpose' ORDER BY id LIMIT 1",
+            (system_id, snapshot_id, run["id"]),
+        ).fetchone()
     draft = conn.execute(
         "SELECT name, purpose FROM system_profile_drafts "
         "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
@@ -232,10 +252,14 @@ def purpose_defined_in_snapshot(conn, system_id: int, snapshot_id: int) -> bool:
 
 
 def capability_count_in_snapshot(conn, system_id: int, snapshot_id: int) -> int:
+    run = get_latest_completed_capability_hierarchy_run(conn, system_id, snapshot_id)
+    if run is None:
+        return 0
     return conn.execute(
         "SELECT COUNT(*) FROM capability_hierarchy_nodes "
-        "WHERE system_id = ? AND snapshot_id = ? AND node_type = 'capability'",
-        (system_id, snapshot_id),
+        "WHERE system_id = ? AND snapshot_id = ? AND intelligence_run_id = ? "
+        "AND node_type = 'capability'",
+        (system_id, snapshot_id, run["id"]),
     ).fetchone()[0]
 
 
@@ -276,6 +300,83 @@ def get_active_build(conn, system_id: int, snapshot_id: int):
 # --- SDK connectivity ------------------------------------------------------------
 
 
+# --- freshness (Issue #370) ---------------------------------------------------
+#
+# "Ever connected" and "still receiving" are different questions, and the audit
+# found the UI answering the second with the first: a system whose last trace
+# arrived 14 days ago still showed a green 受信中. Lifecycle milestones are
+# cumulative and never expire; freshness is a statement about *now* and does.
+# The two are kept as separate axes with separate vocabularies so no caller can
+# accidentally substitute one for the other.
+
+FRESHNESS_NEVER_RECEIVED = "never_received"
+FRESHNESS_RECEIVING_NOW = "receiving_now"
+FRESHNESS_DELAYED = "delayed"
+FRESHNESS_STALE = "stale"
+FRESHNESS_VALUES = (
+    FRESHNESS_NEVER_RECEIVED,
+    FRESHNESS_RECEIVING_NOW,
+    FRESHNESS_DELAYED,
+    FRESHNESS_STALE,
+)
+
+#: Defaults, in seconds. Deliberately generous: probe-agent cannot know a
+#: system's expected traffic rate, so the defaults only distinguish "clearly
+#: live" from "clearly not", and a System can narrow them (see
+#: ``get_freshness_thresholds``). Issue #370 explicitly rejects forcing one
+#: expected reception frequency on every system.
+DEFAULT_DELAYED_AFTER_SECONDS = 15 * 60
+DEFAULT_STALE_AFTER_SECONDS = 24 * 3600
+
+#: A trace timestamped slightly ahead of the server is a clock difference, not
+#: a future event. Beyond this the skew is reported so the operator can see
+#: that the freshness reading rests on a disagreeing clock.
+CLOCK_SKEW_TOLERANCE_SECONDS = 120
+
+
+def classify_connectivity_freshness(
+    *,
+    last_trace_at: Optional[float],
+    now: float,
+    delayed_after_seconds: float = DEFAULT_DELAYED_AFTER_SECONDS,
+    stale_after_seconds: float = DEFAULT_STALE_AFTER_SECONDS,
+) -> str:
+    """Deterministic 4-way freshness classification (finite set, Principle 6).
+
+    Boundaries are inclusive-at-the-threshold: an age exactly equal to
+    ``delayed_after_seconds`` is already ``delayed``, so the transition is
+    testable at a single point rather than spread across a gap.
+
+    A negative age (the trace's clock is ahead of the server's) is treated as
+    ``receiving_now``: it means data arrived, and a clock difference must not
+    be reported as staleness. The skew itself is surfaced separately.
+    """
+    if last_trace_at is None:
+        return FRESHNESS_NEVER_RECEIVED
+    age = now - last_trace_at
+    if age >= stale_after_seconds:
+        return FRESHNESS_STALE
+    if age >= delayed_after_seconds:
+        return FRESHNESS_DELAYED
+    return FRESHNESS_RECEIVING_NOW
+
+
+def get_freshness_thresholds(conn, system_id: int) -> tuple:
+    """Return ``(delayed_after_seconds, stale_after_seconds)`` for one System.
+
+    Falls back to the documented defaults when the System has not set its own,
+    so the thresholds are always explicit and always readable by the UI.
+    """
+    row = conn.execute(
+        """SELECT delayed_after_seconds, stale_after_seconds
+             FROM connectivity_freshness_policy WHERE system_id = ?""",
+        (system_id,),
+    ).fetchone()
+    if row is None:
+        return DEFAULT_DELAYED_AFTER_SECONDS, DEFAULT_STALE_AFTER_SECONDS
+    return row["delayed_after_seconds"], row["stale_after_seconds"]
+
+
 @dataclass(frozen=True)
 class ConnectivityFacts:
     total_trace_count: int
@@ -285,10 +386,34 @@ class ConnectivityFacts:
     last_trace_at: Optional[float]
     last_trace_component_id: Optional[str]
     materialized_session_ids: List[int]
+    # Issue #370: windowed counts, so "is it still running" is answered by
+    # observed arrivals in a bounded recent period rather than by a cumulative
+    # total that can never decrease.
+    real_trace_count_5m: int = 0
+    real_trace_count_1h: int = 0
+    real_trace_count_24h: int = 0
+    #: Positive when the newest trace is timestamped ahead of the server.
+    clock_skew_seconds: float = 0.0
+    #: Newest NON-smoke trace. A manual smoke check proves the transport
+    #: works; it says nothing about whether the instrumented workload is
+    #: still running, so workload freshness is measured from this and never
+    #: from ``last_trace_at``.
+    last_real_trace_at: Optional[float] = None
 
 
-def get_connectivity_facts(conn, system_id: int, smoke_component_id: str) -> ConnectivityFacts:
-    """Trace-reception counts backing the SDK connectivity status endpoint."""
+def get_connectivity_facts(
+    conn,
+    system_id: int,
+    smoke_component_id: str,
+    now: Optional[float] = None,
+) -> ConnectivityFacts:
+    """Trace-reception counts backing the SDK connectivity status endpoint.
+
+    ``now`` is injected rather than read inside so freshness boundaries are
+    testable at an exact instant.
+    """
+    if now is None:
+        now = time.time()
     counts = conn.execute(
         """
         SELECT
@@ -305,6 +430,24 @@ def get_connectivity_facts(conn, system_id: int, smoke_component_id: str) -> Con
     total = counts["total"] or 0
     smoke = counts["smoke"] or 0
     real = total - smoke
+
+    # Windowed counts exclude smoke traces: a smoke check proves the transport
+    # works, not that the instrumented workload is running.
+    windows = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS w5m,
+            SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS w1h,
+            SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS w24h,
+            MAX(timestamp) AS last_real_at
+        FROM traces
+        WHERE system_id = ? AND component_id != ?
+        """,
+        (now - 300, now - 3600, now - 86400, system_id, smoke_component_id),
+    ).fetchone()
+
+    last_at = counts["last_at"]
+    clock_skew = max(0.0, (last_at - now)) if last_at is not None else 0.0
 
     last_component = None
     if total > 0:
@@ -335,9 +478,14 @@ def get_connectivity_facts(conn, system_id: int, smoke_component_id: str) -> Con
         smoke_trace_count=smoke,
         real_trace_count=real,
         first_trace_at=counts["first_at"],
-        last_trace_at=counts["last_at"],
+        last_trace_at=last_at,
         last_trace_component_id=last_component,
         materialized_session_ids=[r["id"] for r in materialized_rows],
+        real_trace_count_5m=windows["w5m"] or 0,
+        real_trace_count_1h=windows["w1h"] or 0,
+        real_trace_count_24h=windows["w24h"] or 0,
+        clock_skew_seconds=clock_skew,
+        last_real_trace_at=windows["last_real_at"],
     )
 
 
@@ -440,3 +588,226 @@ def count_approved_probe_plans_without_validated_patch(conn, system_id: int) -> 
         (system_id,),
     ).fetchall()
     return sum(1 for r in rows if not plan_has_validated_patch(conn, r["id"]))
+
+
+# --- Instrumentation / observation / evaluation / publish milestone facts
+# (Issue #256) ---------------------------------------------------------------
+#
+# These back the four new phases derive_user_phase's PHASE_ORDER gained past
+# "preparation" (instrumentation / observation / evaluation / publish). Each
+# is a plain existence check against an already-finite persisted status
+# column -- no new table, no new decision, matching Principle 6 and the
+# "projection from existing tables only" constraint in Issue #256.
+
+
+def has_applied_probe_patch(conn, system_id: int) -> bool:
+    """Has any ``probe_patches`` row for this system reached
+    ``apply_status = 'applied'``.
+
+    ``apply_status`` is a finite column (default ``'not_applied'``; see
+    ``db.py``'s ``probe_patches`` table) written to ``'applied'`` only by the
+    explicit, commit-sha-confirmed patch-apply endpoints
+    (``routes/probe_patterns.py`` / ``routes/project_intelligence.py``, both
+    ``UPDATE probe_patches SET apply_status = 'applied', ...``) after a
+    successful apply against a clean working tree. ``probe_patches`` already
+    carries ``system_id`` directly (no join through ``probe_plans`` needed).
+    """
+    row = conn.execute(
+        "SELECT id FROM probe_patches WHERE system_id = ? AND apply_status = 'applied' LIMIT 1",
+        (system_id,),
+    ).fetchone()
+    return row is not None
+
+
+def has_decided_experiment(conn, system_id: int) -> bool:
+    """Has any ``experiments`` row for this system recorded a human decision.
+
+    ``human_decision`` defaults to ``'undecided'`` (see ``db.py``'s
+    ``experiments`` table) until a human records ``adopted`` / ``rejected`` /
+    ``needs_more_data``; this checks the finite "anything other than the
+    default" condition regardless of the experiment's own ``status``.
+    """
+    row = conn.execute(
+        "SELECT id FROM experiments WHERE system_id = ? AND human_decision != 'undecided' LIMIT 1",
+        (system_id,),
+    ).fetchone()
+    return row is not None
+
+
+def has_completed_replay_variant_run(conn, system_id: int) -> bool:
+    """Has any non-baseline ``replay_variants`` row for this system reached
+    ``status = 'completed'``.
+
+    ``replay_variants.status`` is a finite ``'running' | 'completed' |
+    'failed'`` column (``db.py``); ``routes/replay.py``'s
+    ``POST /replay-variant-runs`` sets a patched variant's row to
+    ``'completed'`` once its harness execution and case classification
+    finish. ``is_baseline = 0`` excludes the baseline row every variant run
+    also writes (``variant_key = 'baseline'``) -- the evaluation milestone is
+    "a candidate was actually replayed and evaluated", not merely "the
+    baseline replay succeeded".
+    """
+    row = conn.execute(
+        """SELECT id FROM replay_variants
+           WHERE system_id = ? AND status = 'completed' AND is_baseline = 0
+           LIMIT 1""",
+        (system_id,),
+    ).fetchone()
+    return row is not None
+
+
+def get_system_profile_row(conn, system_id: int):
+    """Raw ``system_profile`` row for one system, or ``None`` if never set.
+
+    Backs the manual ``purpose_views`` entry on ``GET
+    /repository/system-understanding`` (Issue #94/#275) and the purpose-
+    confirmation create/staleness flow -- both read the same human-entered
+    ``PUT /system-profile`` record ``routes/evaluation.py`` writes.
+    """
+    return conn.execute(
+        "SELECT * FROM system_profile WHERE system_id = ?", (system_id,)
+    ).fetchone()
+
+
+def get_latest_completed_capability_hierarchy_run(
+    conn, system_id: int, snapshot_id: int
+):
+    """Latest usable capability hierarchy run for one exact System/snapshot."""
+    return conn.execute(
+        "SELECT * FROM intelligence_runs "
+        "WHERE system_id = ? AND snapshot_id = ? "
+        "AND run_type = 'capability_hierarchy' AND status = 'completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (system_id, snapshot_id),
+    ).fetchone()
+
+
+def load_ai_purpose_view(conn, system_id: int, snapshot_id: int) -> Optional[Dict[str, Any]]:
+    """The AI/source-derived purpose view for one snapshot (Issue #94/#275).
+
+    Reads the purpose node from this System/snapshot's latest *completed*
+    capability-hierarchy run, falling back to the latest
+    ``system_profile_drafts`` row when that run has no purpose. Newer failed
+    runs and older completed-run nodes are ignored. The added ``source`` key
+    (``"capability_hierarchy"`` | ``"system_profile_draft"``) so callers can
+    tell the two apart without re-deriving it from ``provenance_kind`` (which
+    can independently be ``"structural"`` on either source).
+    ``_load_purpose`` delegates to this and drops the ``source`` key to keep
+    its own public return shape unchanged.
+    """
+    run = get_latest_completed_capability_hierarchy_run(conn, system_id, snapshot_id)
+    node = None
+    if run is not None:
+        node = conn.execute(
+            "SELECT * FROM capability_hierarchy_nodes "
+            "WHERE system_id = ? AND snapshot_id = ? AND intelligence_run_id = ? "
+            "AND node_type = 'purpose' ORDER BY id LIMIT 1",
+            (system_id, snapshot_id, run["id"]),
+        ).fetchone()
+    if node:
+        return {
+            "source": "capability_hierarchy",
+            "name": node["name"],
+            "summary": node["summary"],
+            "provenance_kind": node["provenance_kind"],
+        }
+    draft = conn.execute(
+        "SELECT * FROM system_profile_drafts "
+        "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
+        (system_id, snapshot_id),
+    ).fetchone()
+    if draft:
+        return {
+            "source": "system_profile_draft",
+            "name": draft["name"],
+            "summary": draft["purpose"],
+            "provenance_kind": "structural",
+        }
+    return None
+
+
+def get_latest_purpose_confirmation(conn, system_id: int):
+    """Most recent ``system_purpose_confirmations`` row for one system, or
+    ``None``. The table is append-only; the latest row is the current
+    confirmation (Issue #94/#275)."""
+    return conn.execute(
+        "SELECT * FROM system_purpose_confirmations WHERE system_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (system_id,),
+    ).fetchone()
+
+
+def get_latest_completed_understanding_build(conn, system_id: int, snapshot_id: int):
+    """Latest completed System Understanding build for this exact System/snapshot."""
+    return conn.execute(
+        "SELECT * FROM system_understanding_builds "
+        "WHERE system_id = ? AND snapshot_id = ? AND status = 'completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (system_id, snapshot_id),
+    ).fetchone()
+
+
+def purpose_confirmation_staleness(
+    conn, system_id: int, current_ready_snapshot_id: Optional[int]
+) -> Optional[str]:
+    """Staleness reason for the *latest* purpose confirmation, or ``None`` if
+    it is still valid (or there is no confirmation to evaluate).
+
+    Pure structural equality only (Principle 6), checked in this fixed order:
+
+    1. the confirmation's pinned ``snapshot_id`` no longer matches the
+       current latest ready snapshot id -> ``"snapshot_changed"``;
+    2. else the confirmation's stored ``manual_purpose`` no longer matches
+       the current ``system_profile.purpose`` text -> ``"profile_updated"``;
+    3. else the confirmation is legacy (no build id), or its pinned completed
+       build is no longer the latest completed build -> ``"ai_updated"``;
+    4. else the confirmation's stored AI name/summary no longer match the
+       current AI purpose view's name/summary -> ``"ai_updated"``;
+    5. else valid (``None``).
+    """
+    confirmation = get_latest_purpose_confirmation(conn, system_id)
+    if confirmation is None:
+        return None
+
+    if confirmation["snapshot_id"] != current_ready_snapshot_id:
+        return "snapshot_changed"
+
+    profile = get_system_profile_row(conn, system_id)
+    current_purpose = (profile["purpose"] or "") if profile is not None else ""
+    if (confirmation["manual_purpose"] or "") != current_purpose:
+        return "profile_updated"
+
+    current_build = get_latest_completed_understanding_build(
+        conn, system_id, current_ready_snapshot_id
+    )
+    pinned_build_id = confirmation["understanding_build_id"]
+    if (
+        pinned_build_id is None
+        or current_build is None
+        or pinned_build_id != current_build["id"]
+    ):
+        return "ai_updated"
+
+    ai_view = load_ai_purpose_view(conn, system_id, current_ready_snapshot_id)
+    ai_name = ai_view["name"] if ai_view else None
+    ai_summary = ai_view["summary"] if ai_view else None
+    if confirmation["ai_purpose_name"] != ai_name or confirmation["ai_purpose_summary"] != ai_summary:
+        return "ai_updated"
+
+    return None
+
+
+def has_succeeded_publish_job(conn, system_id: int) -> bool:
+    """Has any ``publish_jobs`` row for this system reached ``status =
+    'completed'`` -- the terminal-success value in ``publish_job.py``'s
+    status vocabulary (``pending`` -> ... -> ``pushing`` -> ``creating_pr``
+    -> ``completed``; see ``_set_status(job_id, "completed", ...)`` at the
+    end of ``_run_publish_phase`` / ``_run_reconcile_phase``). Distinct from
+    the terminal failure states (``failed`` / ``cancelled``) and from the
+    retryable states (``retryable_failed`` / ``manual_intervention_required``).
+    """
+    row = conn.execute(
+        "SELECT id FROM publish_jobs WHERE system_id = ? AND status = 'completed' LIMIT 1",
+        (system_id,),
+    ).fetchone()
+    return row is not None

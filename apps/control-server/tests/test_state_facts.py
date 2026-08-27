@@ -19,6 +19,7 @@ connectivity-with-traces) lives alongside each API's existing test file
 per this repo's existing per-API test-file convention.
 """
 
+import sqlite3
 import subprocess
 import time
 
@@ -194,6 +195,50 @@ def _insert_interview_session(get_conn, system_id, snapshot_id, *, materializati
                     materialization_diff, created_at, updated_at)
                VALUES (?, ?, '', '', 'open', 'understanding_initialized', ?, ?, ?)""",
             (system_id, snapshot_id, materialization_diff, now, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_system_profile(get_conn, system_id, *, name="", purpose=""):
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO system_profile
+                   (system_id, name, purpose, target_users, stakeholder_value,
+                    constraints, success_criteria, created_at, updated_at)
+               VALUES (?, ?, ?, '[]', '', '[]', '[]', ?, ?)
+               ON CONFLICT(system_id) DO UPDATE SET
+                   name = excluded.name, purpose = excluded.purpose, updated_at = excluded.updated_at""",
+            (system_id, name, purpose, now, now),
+        )
+
+
+_AUTO_BUILD = object()
+
+
+def _insert_purpose_confirmation(
+    get_conn, system_id, snapshot_id, *,
+    manual_purpose="Manual purpose", ai_purpose_name="AI purpose",
+    ai_purpose_summary="AI summary", ai_source="capability_hierarchy",
+    ai_provenance_kind="structural", understanding_build_id=_AUTO_BUILD,
+):
+    now = time.time()
+    if understanding_build_id is _AUTO_BUILD:
+        understanding_build_id = _insert_build(
+            get_conn, system_id, snapshot_id, status="completed"
+        )
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO system_purpose_confirmations
+                   (system_id, snapshot_id, understanding_build_id,
+                    manual_purpose, manual_profile_name,
+                    ai_purpose_name, ai_purpose_summary, ai_source, ai_provenance_kind,
+                    note, decision_method, created_at)
+               VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, NULL, 'manual', ?)""",
+            (
+                system_id, snapshot_id, understanding_build_id, manual_purpose,
+                ai_purpose_name, ai_purpose_summary, ai_source, ai_provenance_kind, now,
+            ),
         )
         return cur.lastrowid
 
@@ -773,6 +818,170 @@ class TestProbePlanReviewAndPatchFacts:
             assert state_facts.count_approved_probe_plans_without_validated_patch(conn, system_id) == 1
 
 
+# --- Instrumentation / observation / evaluation / publish milestone facts
+# (Issue #256) -----------------------------------------------------------------
+
+
+def _insert_replay_set(get_conn, system_id, *, component_id="comp-1"):
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO replay_sets
+                   (system_id, component_id, name, trace_ids_json, source, created_at)
+               VALUES (?, ?, 'set', '[]', 'manual', ?)""",
+            (system_id, component_id, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_replay_run(get_conn, system_id, replay_set_id, snapshot_id, *, component_id="comp-1"):
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO replay_runs
+                   (system_id, replay_set_id, component_id, snapshot_id, commit_sha,
+                    symbol_path, symbol_qualified_name, status, trace_set_hash, created_at)
+               VALUES (?, ?, ?, ?, 'deadbeef', 'a.py', 'mod.fn', 'completed', 'hash', ?)""",
+            (system_id, replay_set_id, component_id, snapshot_id, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_replay_variant(get_conn, system_id, replay_run_id, *, is_baseline=False, status="completed"):
+    now = time.time()
+    variant_key = "baseline" if is_baseline else "variant-1"
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO replay_variants
+                   (system_id, replay_run_id, variant_key, is_baseline, patch_hash, status, created_at)
+               VALUES (?, ?, ?, ?, 'hash', ?, ?)""",
+            (system_id, replay_run_id, variant_key, 1 if is_baseline else 0, status, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_github_connection(get_conn, system_id):
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO github_connections
+                   (system_id, api_base_url, web_base_url, owner, repo, clone_url,
+                    installation_id, status, created_at, updated_at)
+               VALUES (?, 'https://api.github.com', 'https://github.com', 'o', 'r',
+                       'https://github.com/o/r.git', 1, 'connected', ?, ?)""",
+            (system_id, now, now),
+        )
+        return cur.lastrowid
+
+
+def _insert_publish_job(get_conn, system_id, connection_id, patch_id, snapshot_id, *, status="pending"):
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO publish_jobs
+                   (system_id, connection_id, patch_id, snapshot_id, base_branch,
+                    status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'main', ?, ?, ?)""",
+            (system_id, connection_id, patch_id, snapshot_id, status, now, now),
+        )
+        return cur.lastrowid
+
+
+class TestInstrumentationEvaluationPublishFacts:
+    """Issue #256: facts backing derive_user_phase's instrumentation /
+    observation / evaluation / publish completion conditions."""
+
+    def test_has_applied_probe_patch_requires_applied_status(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        with conn_factory() as conn:
+            plan_id = conn.execute(
+                "SELECT id FROM probe_plans WHERE system_id = ?", (system_id,)
+            ).fetchone()["id"]
+            assert state_facts.has_applied_probe_patch(conn, system_id) is False
+
+        patch_id = _insert_probe_patch(conn_factory, plan_id, system_id, snapshot_id, status="generated")
+        with conn_factory() as conn:
+            # Generated but not yet applied -- does not count.
+            assert state_facts.has_applied_probe_patch(conn, system_id) is False
+
+        with conn_factory() as conn:
+            conn.execute(
+                "UPDATE probe_patches SET apply_status = 'applied' WHERE id = ?", (patch_id,)
+            )
+        with conn_factory() as conn:
+            assert state_facts.has_applied_probe_patch(conn, system_id) is True
+
+    def test_has_decided_experiment_requires_non_undecided_human_decision(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        with conn_factory() as conn:
+            assert state_facts.has_decided_experiment(conn, system_id) is False
+
+        _insert_experiment(conn_factory, system_id, snapshot_id, status="running", human_decision="undecided")
+        with conn_factory() as conn:
+            assert state_facts.has_decided_experiment(conn, system_id) is False
+
+        _insert_experiment(conn_factory, system_id, snapshot_id, status="completed", human_decision="adopted")
+        with conn_factory() as conn:
+            assert state_facts.has_decided_experiment(conn, system_id) is True
+
+    def test_has_completed_replay_variant_run_excludes_baseline_and_incomplete(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        replay_set_id = _insert_replay_set(conn_factory, system_id)
+        replay_run_id = _insert_replay_run(conn_factory, system_id, replay_set_id, snapshot_id)
+        with conn_factory() as conn:
+            assert state_facts.has_completed_replay_variant_run(conn, system_id) is False
+
+        # A completed BASELINE row alone does not count -- only a candidate
+        # (non-baseline) variant proves a candidate was actually evaluated.
+        _insert_replay_variant(conn_factory, system_id, replay_run_id, is_baseline=True, status="completed")
+        with conn_factory() as conn:
+            assert state_facts.has_completed_replay_variant_run(conn, system_id) is False
+
+        # A running (not yet completed) candidate variant does not count.
+        _insert_replay_variant(conn_factory, system_id, replay_run_id, is_baseline=False, status="running")
+        with conn_factory() as conn:
+            assert state_facts.has_completed_replay_variant_run(conn, system_id) is False
+
+        _insert_replay_variant(conn_factory, system_id, replay_run_id, is_baseline=False, status="completed")
+        with conn_factory() as conn:
+            assert state_facts.has_completed_replay_variant_run(conn, system_id) is True
+
+    def test_has_succeeded_publish_job_requires_completed_status(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "probe_plan", "completed")
+        _insert_probe_plan(conn_factory, system_id, snapshot_id, run_id, status="approved")
+        with conn_factory() as conn:
+            plan_id = conn.execute(
+                "SELECT id FROM probe_plans WHERE system_id = ?", (system_id,)
+            ).fetchone()["id"]
+        patch_id = _insert_probe_patch(conn_factory, plan_id, system_id, snapshot_id)
+        connection_id = _insert_github_connection(conn_factory, system_id)
+        with conn_factory() as conn:
+            assert state_facts.has_succeeded_publish_job(conn, system_id) is False
+
+        _insert_publish_job(conn_factory, system_id, connection_id, patch_id, snapshot_id, status="pushing")
+        with conn_factory() as conn:
+            assert state_facts.has_succeeded_publish_job(conn, system_id) is False
+
+        _insert_publish_job(conn_factory, system_id, connection_id, patch_id, snapshot_id, status="completed")
+        with conn_factory() as conn:
+            assert state_facts.has_succeeded_publish_job(conn, system_id) is True
+
+
 # --- System isolation -------------------------------------------------------------
 
 
@@ -787,17 +996,33 @@ class TestSystemIsolation:
         _set_repository_config(conn_factory, sys_a, "/repo/a")
         snapshot_a = _insert_snapshot(conn_factory, sys_a, status="ready", commit_sha="sha-a")
         run_a = _insert_intelligence_run(conn_factory, sys_a, snapshot_a, "symbol_index", "completed")
+        hierarchy_run_a = _insert_intelligence_run(
+            conn_factory, sys_a, snapshot_a, "capability_hierarchy", "completed"
+        )
         _insert_build_step(conn_factory, sys_a, snapshot_a, "documentation_index", "completed")
         _insert_code_entrypoint(conn_factory, sys_a, snapshot_a)
         _insert_understanding_graph_snapshot(conn_factory, sys_a, snapshot_a)
         _insert_code_symbol(conn_factory, sys_a, snapshot_a)
-        _insert_capability_node(conn_factory, sys_a, snapshot_a, run_a, node_type="purpose", name="Sys A")
-        _insert_capability_node(conn_factory, sys_a, snapshot_a, run_a, node_type="capability", name="Cap A")
+        _insert_capability_node(conn_factory, sys_a, snapshot_a, hierarchy_run_a, node_type="purpose", name="Sys A")
+        _insert_capability_node(conn_factory, sys_a, snapshot_a, hierarchy_run_a, node_type="capability", name="Cap A")
         _insert_build(conn_factory, sys_a, snapshot_a, status="running")
         _insert_trace(conn_factory, sys_a, "worker", "ta")
         _insert_probe_plan(conn_factory, sys_a, snapshot_a, run_a, status="approved")
         _insert_probe_plan(conn_factory, sys_a, snapshot_a, run_a, status="proposed")
         _insert_experiment(conn_factory, sys_a, snapshot_a, status="completed", human_decision="undecided")
+        _insert_experiment(conn_factory, sys_a, snapshot_a, status="completed", human_decision="adopted")
+        with conn_factory() as conn:
+            approved_plan_id = conn.execute(
+                "SELECT id FROM probe_plans WHERE system_id = ? AND status = 'approved'", (sys_a,)
+            ).fetchone()["id"]
+        patch_id_a = _insert_probe_patch(conn_factory, approved_plan_id, sys_a, snapshot_a)
+        with conn_factory() as conn:
+            conn.execute("UPDATE probe_patches SET apply_status = 'applied' WHERE id = ?", (patch_id_a,))
+        connection_id_a = _insert_github_connection(conn_factory, sys_a)
+        _insert_publish_job(conn_factory, sys_a, connection_id_a, patch_id_a, snapshot_a, status="completed")
+        replay_set_a = _insert_replay_set(conn_factory, sys_a)
+        replay_run_a = _insert_replay_run(conn_factory, sys_a, replay_set_a, snapshot_a)
+        _insert_replay_variant(conn_factory, sys_a, replay_run_a, is_baseline=False, status="completed")
 
         with conn_factory() as conn:
             # System B sees none of System A's facts.
@@ -816,6 +1041,10 @@ class TestSystemIsolation:
             assert state_facts.count_undecided_completed_experiments(conn, sys_b) == 0
             assert state_facts.count_proposed_probe_plans(conn, sys_b) == 0
             assert state_facts.count_approved_probe_plans_without_validated_patch(conn, sys_b) == 0
+            assert state_facts.has_applied_probe_patch(conn, sys_b) is False
+            assert state_facts.has_decided_experiment(conn, sys_b) is False
+            assert state_facts.has_completed_replay_variant_run(conn, sys_b) is False
+            assert state_facts.has_succeeded_publish_job(conn, sys_b) is False
 
             facts_b = state_facts.get_connectivity_facts(conn, sys_b, "probe-smoke-check")
             assert facts_b.total_trace_count == 0
@@ -828,6 +1057,10 @@ class TestSystemIsolation:
             assert state_facts.count_undecided_completed_experiments(conn, sys_a) == 1
             assert state_facts.count_proposed_probe_plans(conn, sys_a) == 1
             assert state_facts.count_approved_probe_plans_without_validated_patch(conn, sys_a) == 1
+            assert state_facts.has_applied_probe_patch(conn, sys_a) is True
+            assert state_facts.has_decided_experiment(conn, sys_a) is True
+            assert state_facts.has_completed_replay_variant_run(conn, sys_a) is True
+            assert state_facts.has_succeeded_publish_job(conn, sys_a) is True
             assert state_facts.capability_count_in_snapshot(conn, sys_a, snapshot_a) == 1
             facts_a = state_facts.get_connectivity_facts(conn, sys_a, "probe-smoke-check")
             assert facts_a.total_trace_count == 1
@@ -941,3 +1174,494 @@ class TestPurposeDefinedReductionEquivalence:
             old_purpose = None  # SystemUnderstandingSummary.purpose default
             old = bool(old_purpose and (old_purpose or {}).get("summary"))
         assert old is False
+
+
+# --- Manual purpose confirmation facts (Issue #94/#275) ---------------------
+
+
+class TestSystemProfileRowFacts:
+    def test_none_when_unset(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        with conn_factory() as conn:
+            assert state_facts.get_system_profile_row(conn, system_id) is None
+
+    def test_returns_row_when_set(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        _insert_system_profile(conn_factory, system_id, name="My System", purpose="Serve users.")
+        with conn_factory() as conn:
+            row = state_facts.get_system_profile_row(conn, system_id)
+        assert row["name"] == "My System"
+        assert row["purpose"] == "Serve users."
+
+    def test_system_isolation(self, conn_factory):
+        from app import state_facts
+
+        system_a = _create_system(conn_factory, "a")
+        system_b = _create_system(conn_factory, "b")
+        _insert_system_profile(conn_factory, system_a, purpose="A purpose")
+        with conn_factory() as conn:
+            assert state_facts.get_system_profile_row(conn, system_b) is None
+
+
+class TestLoadAiPurposeView:
+    def test_prefers_hierarchy_node_over_draft(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed")
+        _insert_capability_node(conn_factory, system_id, snapshot_id, run_id, node_type="purpose", name="Hierarchy purpose")
+        _insert_draft(conn_factory, system_id, snapshot_id, run_id, name="Draft purpose")
+
+        with conn_factory() as conn:
+            view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+        assert view["source"] == "capability_hierarchy"
+        assert view["name"] == "Hierarchy purpose"
+
+    def test_falls_back_to_draft(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(
+            conn_factory,
+            system_id,
+            snapshot_id,
+            "repository_drafts",
+            "completed",
+        )
+        _insert_draft(conn_factory, system_id, snapshot_id, run_id, name="Draft purpose", purpose="Draft summary.")
+
+        with conn_factory() as conn:
+            view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+        assert view["source"] == "system_profile_draft"
+        assert view["name"] == "Draft purpose"
+        assert view["summary"] == "Draft summary."
+        assert view["provenance_kind"] == "structural"
+
+    def test_none_when_neither_exists(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        with conn_factory() as conn:
+            assert state_facts.load_ai_purpose_view(conn, system_id, snapshot_id) is None
+
+    def test_latest_completed_run_wins_and_newer_failed_run_is_ignored(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_a = _insert_intelligence_run(
+            conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed"
+        )
+        _insert_capability_node(
+            conn_factory, system_id, snapshot_id, run_a,
+            node_type="purpose", name="Purpose A", summary="A",
+        )
+        run_b = _insert_intelligence_run(
+            conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed"
+        )
+        _insert_capability_node(
+            conn_factory, system_id, snapshot_id, run_b,
+            node_type="purpose", name="Purpose B", summary="B",
+        )
+        failed = _insert_intelligence_run(
+            conn_factory, system_id, snapshot_id, "capability_hierarchy", "failed"
+        )
+        _insert_capability_node(
+            conn_factory, system_id, snapshot_id, failed,
+            node_type="purpose", name="Failed purpose", summary="failed",
+        )
+
+        with conn_factory() as conn:
+            view = state_facts.load_ai_purpose_view(conn, system_id, snapshot_id)
+        assert view["name"] == "Purpose B"
+
+    def test_latest_completed_run_is_system_isolated(self, conn_factory):
+        from app import state_facts
+
+        system_a = _create_system(conn_factory, "purpose-a")
+        system_b = _create_system(conn_factory, "purpose-b")
+        snapshot_a = _insert_snapshot(conn_factory, system_a, status="ready")
+        snapshot_b = _insert_snapshot(conn_factory, system_b, status="ready")
+        run_a = _insert_intelligence_run(
+            conn_factory, system_a, snapshot_a, "capability_hierarchy", "completed"
+        )
+        run_b = _insert_intelligence_run(
+            conn_factory, system_b, snapshot_b, "capability_hierarchy", "completed"
+        )
+        _insert_capability_node(
+            conn_factory, system_a, snapshot_a, run_a,
+            node_type="purpose", name="Purpose A",
+        )
+        _insert_capability_node(
+            conn_factory, system_b, snapshot_b, run_b,
+            node_type="purpose", name="Purpose B",
+        )
+
+        with conn_factory() as conn:
+            assert state_facts.load_ai_purpose_view(
+                conn, system_a, snapshot_a
+            )["name"] == "Purpose A"
+
+
+def test_purpose_and_capabilities_use_same_latest_completed_run(conn_factory):
+    from app import state_facts
+    from app.system_understanding_service import _load_capabilities
+
+    system_id = _create_system(conn_factory)
+    snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+    run_a = _insert_intelligence_run(
+        conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed"
+    )
+    _insert_capability_node(
+        conn_factory, system_id, snapshot_id, run_a,
+        node_type="purpose", name="Purpose A",
+    )
+    _insert_capability_node(
+        conn_factory, system_id, snapshot_id, run_a,
+        node_type="capability", name="Capability A",
+    )
+    run_b = _insert_intelligence_run(
+        conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed"
+    )
+    _insert_capability_node(
+        conn_factory, system_id, snapshot_id, run_b,
+        node_type="purpose", name="Purpose B",
+    )
+    _insert_capability_node(
+        conn_factory, system_id, snapshot_id, run_b,
+        node_type="capability", name="Capability B",
+    )
+    failed = _insert_intelligence_run(
+        conn_factory, system_id, snapshot_id, "capability_hierarchy", "failed"
+    )
+    _insert_capability_node(
+        conn_factory, system_id, snapshot_id, failed,
+        node_type="capability", name="Failed capability",
+    )
+
+    with conn_factory() as conn:
+        assert state_facts.purpose_defined_in_snapshot(conn, system_id, snapshot_id)
+        assert state_facts.capability_count_in_snapshot(conn, system_id, snapshot_id) == 1
+        assert [c["name"] for c in _load_capabilities(conn, system_id, snapshot_id)] == [
+            "Capability B"
+        ]
+        assert state_facts.load_ai_purpose_view(
+            conn, system_id, snapshot_id
+        )["name"] == "Purpose B"
+
+
+def test_latest_completed_run_without_purpose_does_not_reuse_old_purpose(conn_factory):
+    from app import state_facts
+
+    system_id = _create_system(conn_factory)
+    snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+    old_run = _insert_intelligence_run(
+        conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed"
+    )
+    _insert_capability_node(
+        conn_factory, system_id, snapshot_id, old_run,
+        node_type="purpose", name="Old purpose",
+    )
+    _insert_intelligence_run(
+        conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed"
+    )
+
+    with conn_factory() as conn:
+        assert state_facts.load_ai_purpose_view(conn, system_id, snapshot_id) is None
+        assert not state_facts.purpose_defined_in_snapshot(conn, system_id, snapshot_id)
+
+
+class TestLatestPurposeConfirmationFacts:
+    def test_none_when_empty(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        with conn_factory() as conn:
+            assert state_facts.get_latest_purpose_confirmation(conn, system_id) is None
+
+    def test_returns_most_recent(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        _insert_purpose_confirmation(conn_factory, system_id, snapshot_id, manual_purpose="First")
+        second_id = _insert_purpose_confirmation(conn_factory, system_id, snapshot_id, manual_purpose="Second")
+
+        with conn_factory() as conn:
+            row = state_facts.get_latest_purpose_confirmation(conn, system_id)
+        assert row["id"] == second_id
+        assert row["manual_purpose"] == "Second"
+
+    def test_system_isolation(self, conn_factory):
+        from app import state_facts
+
+        system_a = _create_system(conn_factory, "a")
+        system_b = _create_system(conn_factory, "b")
+        snapshot_a = _insert_snapshot(conn_factory, system_a, status="ready")
+        _insert_purpose_confirmation(conn_factory, system_a, snapshot_a)
+
+        with conn_factory() as conn:
+            assert state_facts.get_latest_purpose_confirmation(conn, system_b) is None
+
+    def test_additive_migration_preserves_legacy_row_and_marks_it_stale(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "legacy-purpose-confirmation.db"
+        raw = sqlite3.connect(db_path)
+        raw.execute(
+            """CREATE TABLE system_purpose_confirmations (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   system_id INTEGER NOT NULL,
+                   snapshot_id INTEGER NOT NULL,
+                   manual_purpose TEXT NOT NULL,
+                   manual_profile_name TEXT,
+                   ai_purpose_name TEXT,
+                   ai_purpose_summary TEXT,
+                   ai_source TEXT,
+                   ai_provenance_kind TEXT,
+                   note TEXT,
+                   decision_method TEXT NOT NULL DEFAULT 'manual',
+                   created_at REAL NOT NULL
+               )"""
+        )
+        raw.execute(
+            """INSERT INTO system_purpose_confirmations
+                   (id, system_id, snapshot_id, manual_purpose,
+                    ai_purpose_name, ai_purpose_summary, ai_source,
+                    ai_provenance_kind, decision_method, created_at)
+               VALUES (7, 99, 123, 'Manual purpose', 'AI', 'AI summary',
+                       'capability_hierarchy', 'structural', 'manual', 1)"""
+        )
+        raw.commit()
+        raw.close()
+
+        monkeypatch.setenv("PROBE_DB_PATH", str(db_path))
+        from app import db as db_module
+        from app import state_facts
+
+        db_module.init_db()
+        with db_module.get_conn() as conn:
+            columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(system_purpose_confirmations)"
+                )
+            }
+            assert {"understanding_build_id", "decided_by_user_id"} <= columns
+            legacy = conn.execute(
+                "SELECT * FROM system_purpose_confirmations WHERE id = 7"
+            ).fetchone()
+            assert legacy["manual_purpose"] == "Manual purpose"
+            assert legacy["understanding_build_id"] is None
+            assert legacy["decided_by_user_id"] is None
+            now = time.time()
+            conn.execute(
+                """INSERT INTO systems
+                       (id, name, environment, description, owner_user_id,
+                        created_at, updated_at)
+                   VALUES (99, 'legacy-system', '', '', NULL, ?, ?)""",
+                (now, now),
+            )
+            conn.execute(
+                """INSERT INTO repository_snapshots
+                       (id, system_id, repo_path, commit_sha, status, created_at)
+                   VALUES (123, 99, '', 'sha', 'ready', ?)""",
+                (now,),
+            )
+            conn.execute(
+                """INSERT INTO system_profile
+                       (system_id, name, purpose, target_users, stakeholder_value,
+                        constraints, success_criteria, created_at, updated_at)
+                   VALUES (99, '', 'Manual purpose', '[]', '', '[]', '[]', ?, ?)""",
+                (now, now),
+            )
+            run_id = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method, status,
+                        is_mock, started_at, completed_at)
+                   VALUES (99, 123, 'capability_hierarchy', 'mock', 'mock',
+                           'test', 'test', 'deterministic', 'completed', 1, ?, ?)""",
+                (now, now),
+            ).lastrowid
+            conn.execute(
+                """INSERT INTO capability_hierarchy_nodes
+                       (system_id, snapshot_id, intelligence_run_id, node_type,
+                        name, summary, created_at)
+                   VALUES (99, 123, ?, 'purpose', 'AI', 'AI summary', ?)""",
+                (run_id, now),
+            )
+            conn.execute(
+                """INSERT INTO system_understanding_builds
+                       (system_id, snapshot_id, status, completed_at, created_at)
+                   VALUES (99, 123, 'completed', ?, ?)""",
+                (now, now),
+            )
+            assert (
+                state_facts.purpose_confirmation_staleness(conn, 99, 123)
+                == "ai_updated"
+            )
+
+
+class TestPurposeConfirmationStaleness:
+    def test_none_without_a_confirmation(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        with conn_factory() as conn:
+            assert state_facts.purpose_confirmation_staleness(conn, system_id, snapshot_id) is None
+
+    def test_valid_when_nothing_changed(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed")
+        _insert_capability_node(conn_factory, system_id, snapshot_id, run_id, node_type="purpose", name="AI", summary="AI summary")
+        _insert_system_profile(conn_factory, system_id, purpose="Manual purpose")
+        _insert_purpose_confirmation(
+            conn_factory, system_id, snapshot_id,
+            manual_purpose="Manual purpose", ai_purpose_name="AI", ai_purpose_summary="AI summary",
+            ai_source="capability_hierarchy",
+        )
+
+        with conn_factory() as conn:
+            assert state_facts.purpose_confirmation_staleness(conn, system_id, snapshot_id) is None
+
+    def test_legacy_confirmation_without_build_id_is_stale(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(
+            conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed"
+        )
+        _insert_capability_node(
+            conn_factory, system_id, snapshot_id, run_id,
+            node_type="purpose", name="AI", summary="AI summary",
+        )
+        _insert_system_profile(conn_factory, system_id, purpose="Manual purpose")
+        _insert_build(conn_factory, system_id, snapshot_id, status="completed")
+        _insert_purpose_confirmation(
+            conn_factory, system_id, snapshot_id,
+            manual_purpose="Manual purpose", ai_purpose_name="AI",
+            ai_purpose_summary="AI summary", understanding_build_id=None,
+        )
+
+        with conn_factory() as conn:
+            assert (
+                state_facts.purpose_confirmation_staleness(conn, system_id, snapshot_id)
+                == "ai_updated"
+            )
+
+    def test_same_snapshot_same_ai_text_rebuild_is_stale(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(
+            conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed"
+        )
+        _insert_capability_node(
+            conn_factory, system_id, snapshot_id, run_id,
+            node_type="purpose", name="AI", summary="AI summary",
+        )
+        _insert_system_profile(conn_factory, system_id, purpose="Manual purpose")
+        confirmed_build_id = _insert_build(
+            conn_factory, system_id, snapshot_id, status="completed"
+        )
+        _insert_purpose_confirmation(
+            conn_factory, system_id, snapshot_id,
+            manual_purpose="Manual purpose", ai_purpose_name="AI",
+            ai_purpose_summary="AI summary",
+            understanding_build_id=confirmed_build_id,
+        )
+        _insert_build(conn_factory, system_id, snapshot_id, status="completed")
+
+        with conn_factory() as conn:
+            assert (
+                state_facts.purpose_confirmation_staleness(conn, system_id, snapshot_id)
+                == "ai_updated"
+            )
+
+    def test_snapshot_changed_checked_first(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready", commit_sha="sha1")
+        _insert_system_profile(conn_factory, system_id, purpose="Manual purpose")
+        _insert_purpose_confirmation(conn_factory, system_id, snapshot_id, manual_purpose="Manual purpose")
+
+        new_snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready", commit_sha="sha2")
+        with conn_factory() as conn:
+            assert (
+                state_facts.purpose_confirmation_staleness(conn, system_id, new_snapshot_id)
+                == "snapshot_changed"
+            )
+
+    def test_profile_updated_when_manual_purpose_changes(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        _insert_system_profile(conn_factory, system_id, purpose="Original purpose")
+        _insert_purpose_confirmation(conn_factory, system_id, snapshot_id, manual_purpose="Original purpose")
+
+        _insert_system_profile(conn_factory, system_id, purpose="Changed purpose")
+
+        with conn_factory() as conn:
+            assert (
+                state_facts.purpose_confirmation_staleness(conn, system_id, snapshot_id)
+                == "profile_updated"
+            )
+
+    def test_ai_updated_when_ai_view_changes(self, conn_factory):
+        from app import state_facts
+
+        system_id = _create_system(conn_factory)
+        snapshot_id = _insert_snapshot(conn_factory, system_id, status="ready")
+        run_id = _insert_intelligence_run(conn_factory, system_id, snapshot_id, "capability_hierarchy", "completed")
+        _insert_capability_node(conn_factory, system_id, snapshot_id, run_id, node_type="purpose", name="AI v1", summary="Summary v1")
+        _insert_system_profile(conn_factory, system_id, purpose="Manual purpose")
+        _insert_purpose_confirmation(
+            conn_factory, system_id, snapshot_id,
+            manual_purpose="Manual purpose", ai_purpose_name="AI v1", ai_purpose_summary="Summary v1",
+            ai_source="capability_hierarchy",
+        )
+
+        # Simulate a rebuild that replaced the purpose node's content for the
+        # same snapshot (nodes are append-only per run, so the old one is
+        # removed and a changed one inserted for the same snapshot/run).
+        with conn_factory() as conn:
+            conn.execute(
+                "DELETE FROM capability_hierarchy_nodes WHERE system_id = ? AND snapshot_id = ? AND node_type = 'purpose'",
+                (system_id, snapshot_id),
+            )
+        _insert_capability_node(conn_factory, system_id, snapshot_id, run_id, node_type="purpose", name="AI v2", summary="Summary v2")
+
+        with conn_factory() as conn:
+            assert (
+                state_facts.purpose_confirmation_staleness(conn, system_id, snapshot_id) == "ai_updated"
+            )
+
+    def test_system_isolation(self, conn_factory):
+        from app import state_facts
+
+        system_a = _create_system(conn_factory, "a")
+        system_b = _create_system(conn_factory, "b")
+        snapshot_a = _insert_snapshot(conn_factory, system_a, status="ready")
+        _insert_system_profile(conn_factory, system_a, purpose="A purpose")
+        _insert_purpose_confirmation(conn_factory, system_a, snapshot_a, manual_purpose="A purpose")
+
+        # System B has no confirmation of its own -- always valid (None),
+        # never contaminated by system A's row.
+        with conn_factory() as conn:
+            assert state_facts.purpose_confirmation_staleness(conn, system_b, snapshot_a) is None
