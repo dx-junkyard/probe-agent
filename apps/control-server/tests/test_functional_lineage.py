@@ -351,6 +351,201 @@ def _gaps_by_code(result):
     return out
 
 
+def _build_lineage_direct(system_id):
+    """Call `fl.build_functional_lineage` directly against a raw connection
+    rather than through `GET /functional-lineage`.
+
+    Epic #427 §7.3's new node kinds (`product_objective` / `product_milestone`
+    / `product_gap` / `product_feature`) and gap codes are NOT YET in
+    `app/models.py`'s `FunctionalLineageKind` / `LineageGapCode` `Literal`s as
+    of this file (that Literal extension is owned by a concurrently-landing
+    change, per the task brief) -- so the HTTP route's
+    `response_model=FunctionalLineageOut` would reject any response that
+    actually contains one of them with a 500 `ValidationError`, even though
+    `build_functional_lineage` itself computed it correctly. Calling the
+    domain function directly is the only way to assert on this data until
+    that Literal update lands; once it does, these assertions could equally
+    well run through `_get_functional_lineage` like every other test in this
+    file.
+    """
+    from app.db import get_conn
+    from app import functional_lineage as fl_module
+
+    with get_conn() as conn:
+        return fl_module.build_functional_lineage(conn, system_id)
+
+
+def _create_objective(client, headers, objective_key, *, expect=201):
+    r = client.post("/product-objectives", json={"objective_key": objective_key}, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_objective_revision(client, headers, objective_key, *, expect=201, **fields):
+    payload = {"title": "", "intent": "", "contribution": "", "scope_note": "", "summary": "", "change_note": ""}
+    payload.update(fields)
+    r = client.post(f"/product-objectives/{objective_key}/revisions", json=payload, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _set_objective_parent(client, headers, objective_key, parent_objective_key, *, rationale="", expect=201):
+    r = client.post(
+        f"/product-objectives/{objective_key}/parent",
+        json={"parent_objective_key": parent_objective_key, "rationale": rationale},
+        headers=headers,
+    )
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_objective_upstream_ref(client, headers, objective_key, ref_kind, target_ref, *, note="", expect=201):
+    r = client.post(
+        f"/product-objectives/{objective_key}/upstream-refs",
+        json={"ref_kind": ref_kind, "target_ref": target_ref, "note": note},
+        headers=headers,
+    )
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _create_milestone(client, headers, objective_key, milestone_key, *, expect=201):
+    r = client.post(
+        "/product-milestones", json={"objective_key": objective_key, "milestone_key": milestone_key},
+        headers=headers,
+    )
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_milestone_revision(client, headers, milestone_key, *, expect=201, **fields):
+    payload = {
+        "title": "", "target_state": "", "verification_method": "unavailable",
+        "verification_note": "", "sequence_hint": 0, "summary": "", "change_note": "",
+    }
+    payload.update(fields)
+    r = client.post(f"/product-milestones/{milestone_key}/revisions", json=payload, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _create_gap(client, headers, milestone_key, gap_key, *, expect=201):
+    r = client.post("/product-gaps", json={"milestone_key": milestone_key, "gap_key": gap_key}, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_gap_source_ref(client, headers, gap_key, source_kind, *, source_ref="", note="", expect=201):
+    r = client.post(
+        f"/product-gaps/{gap_key}/source-refs",
+        json={"source_kind": source_kind, "source_ref": source_ref, "note": note},
+        headers=headers,
+    )
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_journey_upstream_ref(client, headers, journey_key, ref_kind, target_ref, *, note="", expect=201):
+    r = client.post(
+        f"/ux-design/journeys/{journey_key}/upstream-refs",
+        json={"ref_kind": ref_kind, "target_ref": target_ref, "note": note},
+        headers=headers,
+    )
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _create_feature(client, headers, feature_key, *, expect=201):
+    r = client.post("/product-features", json={"feature_key": feature_key}, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_feature_requirement_link(client, headers, feature_key, requirement_key, *, expect=201):
+    r = client.post(
+        f"/product-features/{feature_key}/requirement-links",
+        json={"requirement_key": requirement_key, "note": ""},
+        headers=headers,
+    )
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_feature_capability_link(client, headers, feature_key, capability_entity_id, *, expect=201):
+    r = client.post(
+        f"/product-features/{feature_key}/capability-links",
+        json={"capability_entity_id": capability_entity_id, "note": ""},
+        headers=headers,
+    )
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_feature_target_link(client, headers, feature_key, link_kind, target_ref, *, expect=201):
+    r = client.post(
+        f"/product-features/{feature_key}/target-links",
+        json={"link_kind": link_kind, "target_ref": target_ref, "note": ""},
+        headers=headers,
+    )
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _insert_capability_entity(system_id, name):
+    """Minimal #312 Capability identity: entity + one confirmation + one
+    version row, inserted directly (same minimal-fixture convention
+    `TestEndToEndFixture._build` already uses for `purpose_outcome_criterion`
+    below) rather than driving the full Interview build flow
+    `test_product_feature.py` uses -- this file only needs a `resolved`
+    Capability target, not Interview build behaviour."""
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        snapshot_id = conn.execute(
+            """INSERT INTO repository_snapshots (system_id, repo_path, commit_sha, status, created_at, completed_at)
+               VALUES (?, '', 'cap-sha', 'ready', ?, ?)""",
+            (system_id, now, now),
+        ).lastrowid
+        session_id = conn.execute(
+            "INSERT INTO interview_session (system_id, snapshot_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (system_id, snapshot_id, now, now),
+        ).lastrowid
+        entity_id = conn.execute(
+            "INSERT INTO understanding_capability_entity (system_id, entity_kind, created_at) VALUES (?, 'core_capability', ?)",
+            (system_id, now),
+        ).lastrowid
+        confirmation_id = conn.execute(
+            """INSERT INTO understanding_capability_confirmation
+                   (system_id, session_id, composition_digest, decided_by, decision_method, created_at)
+               VALUES (?, ?, 'd', 'root', 'manual', ?)""",
+            (system_id, session_id, now),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO understanding_capability_entity_version
+                   (system_id, confirmation_id, entity_id, entity_kind, name, summary, semantic_digest,
+                    payload_json, created_at)
+               VALUES (?, ?, ?, 'core_capability', ?, '', 'sd', '{}', ?)""",
+            (system_id, confirmation_id, entity_id, name, now),
+        )
+        conn.commit()
+        return entity_id
+
+
+def _insert_issue_draft(system_id, *, status="draft", title="draft title"):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        draft_id = conn.execute(
+            """INSERT INTO issue_drafts (system_id, source_type, title, body_markdown, status, created_at, updated_at)
+               VALUES (?, 'system_understanding_gap', ?, '', ?, ?, ?)""",
+            (system_id, title, status, now, now),
+        ).lastrowid
+        conn.commit()
+        return draft_id
+
+
 # ---------------------------------------------------------------------------
 # Part 1: fixed severity + type parity sanity
 # ---------------------------------------------------------------------------
@@ -1118,3 +1313,336 @@ class TestStaticAndRuntimeFlowAreNeverOneEntity:
         edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
         assert ("solution_design", "d1", "runtime_flow", shared_ref) in edges
         assert ("solution_design", "d1", "static_flow", shared_ref) in edges
+
+
+# ---------------------------------------------------------------------------
+# Part 7: Epic #427 §7.3 -- Product Objective / Milestone / Gap / Feature
+# ---------------------------------------------------------------------------
+#
+# `_get_functional_lineage` (the HTTP route) still works for scenarios that
+# never create any Product Objective/Milestone/Gap/Feature data, since none
+# of the new node kinds/gap codes ever appear in the response. Scenarios
+# that DO create such data go through `_build_lineage_direct` instead -- see
+# that helper's own docstring for why.
+
+
+class TestProductObjectiveLayerIsOptional:
+    """§4's explicit "a System with no Objective is not missing anything" --
+    the single most likely way this addition could break the existing
+    screen, verified directly."""
+
+    def test_system_with_no_objective_or_feature_produces_no_new_node_or_gap(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        _create_need(admin_client, headers, "need1", "sh1")
+        result = _get_functional_lineage(admin_client, headers)
+
+        assert not any(n["kind"].startswith("product_") for n in result["nodes"])
+        new_codes = {
+            "objective_without_vision_ref", "objective_without_milestone", "milestone_without_gap",
+            "milestone_without_verification", "gap_without_journey", "gap_source_unresolved",
+            "gap_source_unavailable", "gap_source_contradicted", "requirement_without_feature",
+            "feature_without_implementation_target", "feature_without_capability",
+        }
+        assert not (new_codes & {g["code"] for g in result["gaps"]})
+        assert result["degraded_sections"] == []
+
+    def test_a_requirement_with_no_feature_at_all_is_not_a_gap(self, admin_client):
+        """Feature is ALSO a new, optional layer (§0-1/§1.6) -- an ordinary
+        Journey-driven Requirement must not read as "missing a Feature"
+        until the developer has actually created at least one Feature."""
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "req_orphan")
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert "requirement_without_feature" not in by_code
+
+
+class TestProductObjectiveMilestoneLineage:
+    def test_objective_without_vision_ref_and_without_milestone(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_objective(admin_client, headers, "obj1")
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(g["subject_ref"] == "obj1" for g in by_code.get("objective_without_vision_ref", []))
+        assert any(g["subject_ref"] == "obj1" for g in by_code.get("objective_without_milestone", []))
+        assert {g["severity"] for g in by_code["objective_without_vision_ref"]} == {"attention"}
+        assert {g["severity"] for g in by_code["objective_without_milestone"]} == {"attention"}
+        assert any(n["kind"] == "product_objective" and n["ref"] == "obj1" for n in result["nodes"])
+
+    def test_vision_ref_and_milestone_clear_objective_gaps_but_milestone_stays_unverified(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+        _create_need(admin_client, headers, "need1", "sh1")
+        _create_objective(admin_client, headers, "obj2")
+        _add_objective_upstream_ref(admin_client, headers, "obj2", "stakeholder_need", "need1")
+        _create_milestone(admin_client, headers, "obj2", "ms1")
+        # No revision -> `verification_method` stays 'unavailable'.
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert not any(g["subject_ref"] == "obj2" for g in by_code.get("objective_without_vision_ref", []))
+        assert not any(g["subject_ref"] == "obj2" for g in by_code.get("objective_without_milestone", []))
+        assert any(g["subject_ref"] == "ms1" for g in by_code.get("milestone_without_verification", []))
+        assert {g["severity"] for g in by_code["milestone_without_verification"]} == {"attention"}
+        # No Gap created under this Milestone yet.
+        assert any(g["subject_ref"] == "ms1" for g in by_code.get("milestone_without_gap", []))
+        assert {g["severity"] for g in by_code["milestone_without_gap"]} == {"informational"}
+
+        edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
+        assert ("product_objective", "obj2", "product_milestone", "ms1") in edges
+
+    def test_verified_milestone_with_a_gap_clears_both_milestone_gaps(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_objective(admin_client, headers, "obj3")
+        _create_milestone(admin_client, headers, "obj3", "ms2")
+        _add_milestone_revision(admin_client, headers, "ms2", verification_method="manual_review")
+        _create_gap(admin_client, headers, "ms2", "gap0")
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert not any(g["subject_ref"] == "ms2" for g in by_code.get("milestone_without_verification", []))
+        assert not any(g["subject_ref"] == "ms2" for g in by_code.get("milestone_without_gap", []))
+
+    def test_objective_parent_edge(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_objective(admin_client, headers, "parent1")
+        _create_objective(admin_client, headers, "child1")
+        _set_objective_parent(admin_client, headers, "child1", "parent1")
+
+        result = _build_lineage_direct(system_id)
+        edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
+        assert ("product_objective", "parent1", "product_objective", "child1") in edges
+
+    def test_cleared_parent_tombstone_produces_no_dangling_edge(self, admin_client):
+        """§4.4: a `parent_objective_id IS NULL` tombstone row means "root
+        again" -- it must produce NO edge, never a dangling one."""
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_objective(admin_client, headers, "parent2")
+        _create_objective(admin_client, headers, "child2")
+        _set_objective_parent(admin_client, headers, "child2", "parent2")
+        r = admin_client.delete("/product-objectives/child2/parent", headers=headers)
+        assert r.status_code == 200, r.text
+
+        result = _build_lineage_direct(system_id)
+        edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
+        assert ("product_objective", "parent2", "product_objective", "child2") not in edges
+        # The child Objective node itself is still present.
+        assert any(n["kind"] == "product_objective" and n["ref"] == "child2" for n in result["nodes"])
+
+
+class TestProductGapJourneyLink:
+    def _make_gap(self, admin_client, headers, *, objective_key, milestone_key, gap_key):
+        _create_objective(admin_client, headers, objective_key)
+        _create_milestone(admin_client, headers, objective_key, milestone_key)
+        _create_gap(admin_client, headers, milestone_key, gap_key)
+        return gap_key
+
+    def test_gap_without_journey(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        gap_key = self._make_gap(admin_client, headers, objective_key="o1", milestone_key="m1", gap_key="g1")
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(g["subject_ref"] == gap_key for g in by_code.get("gap_without_journey", []))
+        assert {g["severity"] for g in by_code["gap_without_journey"]} == {"attention"}
+
+    def test_gap_linked_to_journey_produces_edge_and_clears_the_gap(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        gap_key = self._make_gap(admin_client, headers, objective_key="o2", milestone_key="m2", gap_key="g2")
+        _create_journey(admin_client, headers, "j1")
+        _add_journey_upstream_ref(admin_client, headers, "j1", "product_gap", gap_key)
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert not any(g["subject_ref"] == gap_key for g in by_code.get("gap_without_journey", []))
+        edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
+        assert ("product_gap", gap_key, "ux_journey", "j1") in edges
+        assert ("product_milestone", "m2", "product_gap", gap_key) in edges
+
+
+class TestProductGapSourceStates:
+    def _make_gap(self, admin_client, headers, gap_key):
+        objective_key, milestone_key = f"{gap_key}-obj", f"{gap_key}-ms"
+        _create_objective(admin_client, headers, objective_key)
+        _create_milestone(admin_client, headers, objective_key, milestone_key)
+        _create_gap(admin_client, headers, milestone_key, gap_key)
+        return gap_key
+
+    def test_gap_source_unresolved_from_a_disappeared_source(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        gap_key = self._make_gap(admin_client, headers, "gap_disappeared")
+        _add_gap_source_ref(admin_client, headers, gap_key, "issue_draft", source_ref="999999")
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(g["subject_ref"] == gap_key for g in by_code.get("gap_source_unresolved", []))
+        assert {g["severity"] for g in by_code["gap_source_unresolved"]} == {"attention"}
+
+    def test_gap_source_contradicted_from_a_closed_issue_draft(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        draft_id = _insert_issue_draft(system_id, status="closed")
+        gap_key = self._make_gap(admin_client, headers, "gap_contradicted")
+        _add_gap_source_ref(admin_client, headers, gap_key, "issue_draft", source_ref=str(draft_id))
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(g["subject_ref"] == gap_key for g in by_code.get("gap_source_contradicted", []))
+        assert {g["severity"] for g in by_code["gap_source_contradicted"]} == {"informational"}
+
+    def test_gap_source_unavailable_when_the_resolver_raises(self, admin_client, monkeypatch):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        gap_key = self._make_gap(admin_client, headers, "gap_unavailable")
+        _add_gap_source_ref(admin_client, headers, gap_key, "manual")
+
+        from app import product_gap_sources
+
+        def _boom(conn, **kwargs):
+            raise RuntimeError("simulated resolver failure")
+
+        monkeypatch.setattr(product_gap_sources, "resolve_source", _boom)
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(g["subject_ref"] == gap_key for g in by_code.get("gap_source_unavailable", []))
+        assert {g["severity"] for g in by_code["gap_source_unavailable"]} == {"informational"}
+
+
+class TestProductFeatureLineage:
+    def test_feature_without_capability_and_without_implementation_target(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_feature(admin_client, headers, "feat1")
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(g["subject_ref"] == "feat1" for g in by_code.get("feature_without_capability", []))
+        assert {g["severity"] for g in by_code["feature_without_capability"]} == {"informational"}
+        assert any(g["subject_ref"] == "feat1" for g in by_code.get("feature_without_implementation_target", []))
+        assert {g["severity"] for g in by_code["feature_without_implementation_target"]} == {"attention"}
+        assert any(n["kind"] == "product_feature" and n["ref"] == "feat1" for n in result["nodes"])
+
+    def test_requirement_without_feature_once_the_layer_is_adopted(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "req_orphan2")
+        _create_feature(admin_client, headers, "feat_unrelated")
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(g["subject_ref"] == "req_orphan2" for g in by_code.get("requirement_without_feature", []))
+        assert {g["severity"] for g in by_code["requirement_without_feature"]} == {"attention"}
+
+    def test_feature_links_produce_edges_and_clear_every_feature_gap(self, admin_client):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "req1")
+        _create_feature(admin_client, headers, "feat2")
+        _add_feature_requirement_link(admin_client, headers, "feat2", "req1")
+        cap_id = _insert_capability_entity(system_id, "Cap A")
+        _add_feature_capability_link(admin_client, headers, "feat2", cap_id)
+        _create_evolution_node(admin_client, headers, "node_f")
+        _add_feature_target_link(admin_client, headers, "feat2", "evolution_node", "node_f")
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert not any(g["subject_ref"] == "req1" for g in by_code.get("requirement_without_feature", []))
+        assert not any(g["subject_ref"] == "feat2" for g in by_code.get("feature_without_capability", []))
+        assert not any(g["subject_ref"] == "feat2" for g in by_code.get("feature_without_implementation_target", []))
+
+        edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
+        assert ("ux_requirement", "req1", "product_feature", "feat2") in edges
+        assert ("product_feature", "feat2", "capability", str(cap_id)) in edges
+        assert ("product_feature", "feat2", "evolution_node", "node_f") in edges
+
+    def test_feature_and_objective_layers_are_never_folded_together(self, admin_client):
+        """Feature is never merged into Capability/Flow/Component identity
+        (§1.2) -- its own node kind survives alongside a Capability node it
+        links to, never replacing it."""
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_feature(admin_client, headers, "feat3")
+        cap_id = _insert_capability_entity(system_id, "Cap B")
+        _add_feature_capability_link(admin_client, headers, "feat3", cap_id)
+
+        result = _build_lineage_direct(system_id)
+        kinds = {n["kind"] for n in result["nodes"] if n["ref"] in ("feat3", str(cap_id))}
+        assert kinds == {"product_feature", "capability"}
+
+
+class TestProductObjectiveLineageSystemIsolation:
+    def test_product_nodes_are_scoped_per_system(self, admin_client):
+        token = _login(admin_client)
+        system_a = _create_system(admin_client, token, "System PO A")
+        system_b = _create_system(admin_client, token, "System PO B")
+        headers_a = _headers(token, system_a)
+        headers_b = _headers(token, system_b)
+
+        _create_objective(admin_client, headers_a, "only-in-a")
+
+        result_a = _build_lineage_direct(system_a)
+        result_b = _build_lineage_direct(system_b)
+        assert any(n["kind"] == "product_objective" and n["ref"] == "only-in-a" for n in result_a["nodes"])
+        assert not any(n["kind"] == "product_objective" for n in result_b["nodes"])
+
+
+class TestProductObjectiveLayerDegradesIndependently:
+    """Each of the three new sections is its own guarded loader (§4's
+    discipline, extended from the existing five sections): a failure there
+    must not drop unrelated data, and must never silently read as `0`
+    gaps/nodes for something this module could not actually check."""
+
+    def test_product_objectives_failure_is_isolated(self, admin_client, monkeypatch):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+
+        def _boom(conn, system_id_):
+            raise RuntimeError("simulated read failure")
+
+        monkeypatch.setattr(fl.product_objective, "list_objectives", _boom)
+
+        result = _get_functional_lineage(admin_client, headers)
+        assert "product_objectives" in result["degraded_sections"]
+        assert any(n["kind"] == "stakeholder" and n["ref"] == "sh1" for n in result["nodes"])
+
+    def test_product_gaps_failure_is_isolated(self, admin_client, monkeypatch):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+
+        def _boom(conn, system_id_, milestone_key=None):
+            raise RuntimeError("simulated read failure")
+
+        monkeypatch.setattr(fl.product_objective, "list_gaps", _boom)
+
+        result = _get_functional_lineage(admin_client, headers)
+        assert "product_gaps" in result["degraded_sections"]
+        assert any(n["kind"] == "stakeholder" and n["ref"] == "sh1" for n in result["nodes"])
+
+    def test_product_features_failure_is_isolated(self, admin_client, monkeypatch):
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_stakeholder(admin_client, headers, "sh1")
+
+        def _boom(conn, system_id_):
+            raise RuntimeError("simulated read failure")
+
+        monkeypatch.setattr(fl.product_feature, "list_features", _boom)
+
+        result = _get_functional_lineage(admin_client, headers)
+        assert "product_features" in result["degraded_sections"]
+        assert any(n["kind"] == "stakeholder" and n["ref"] == "sh1" for n in result["nodes"])

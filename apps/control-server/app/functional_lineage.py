@@ -28,6 +28,15 @@ already compute:
   against #405's own per-kind dispatch, `_resolve_target`) is this module's
   ONLY path to a Flow/Node/Component/Cell/Probe Point -- exactly §5.2's "no
   second path to Flow/Node".
+* `app/product_objective.py` / `app/product_feature.py` (Epic #427, §7.3) --
+  Product Objective / Milestone / Gap / Feature identity and their DERIVED
+  `objective_state` / `design_status` / `achievement` / `assessability` /
+  `lifecycle` / `priority_band`. This module reuses `derive_objective_state`
+  / `derive_milestone_design_status` / `derive_milestone_achievement` /
+  `derive_gap_lifecycle` / `derive_gap_priority_band` (indirectly, through
+  each module's own `list_*`/`get_*_detail` output) rather than re-folding
+  any decision ledger itself -- exactly the same "no second answer" rule
+  applied to `build_value_network` above, one layer over.
 
 Three rules this module must never violate (§9.3):
 
@@ -72,7 +81,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from . import node_design, purpose_chain, solution_design, stakeholder_network as sn, ux_design
+from . import node_design, product_feature, product_objective, purpose_chain, solution_design
+from . import stakeholder_network as sn, ux_design
 from . import stakeholder_value_network as svn
 
 __all__ = ["build_functional_lineage", "trace_downstream_impact"]
@@ -108,6 +118,18 @@ _GAP_SEVERITY: Dict[str, str] = {
     "feedback_path_missing": "informational",
     "unresolved_reference": "attention",
     "unavailable_reference": "informational",
+    # --- Epic #427 §7.3: Product Objective / Milestone / Gap / Feature ---
+    "objective_without_vision_ref": "attention",
+    "objective_without_milestone": "attention",
+    "milestone_without_gap": "informational",
+    "milestone_without_verification": "attention",
+    "gap_without_journey": "attention",
+    "gap_source_unresolved": "attention",
+    "gap_source_unavailable": "informational",
+    "gap_source_contradicted": "informational",
+    "requirement_without_feature": "attention",
+    "feature_without_implementation_target": "attention",
+    "feature_without_capability": "informational",
 }
 
 #: The exact §9.2 vocabulary (kept as a tuple purely so a typo above is
@@ -503,6 +525,246 @@ def _walk_need_purpose_refs(
                 graph.add_gap("conflicting_dependency", "stakeholder_need", need_key)
 
 
+# --- Product Objective / Milestone / Gap / Feature (Epic #427 §7.3) ---------
+
+
+def _journeys_referencing_gap(conn: sqlite3.Connection, system_id: int, gap_key: str) -> List[str]:
+    """Journey keys reached through #405's `ux_journey_upstream_ref` via its
+    new `ref_kind='product_gap'` value (§7.1) -- the ONE path a Gap connects
+    to a Journey, queried locally here for the same reason
+    `_requirement_keys_for_step` above queries `ux_requirement_step_link`
+    directly rather than importing another module's private reverse-lookup:
+    no such lookup exists in `ux_design.py`, and this module owns no
+    cross-module private import."""
+    rows = conn.execute(
+        """SELECT DISTINCT j.journey_key FROM ux_journey_upstream_ref r
+           JOIN ux_journey j ON j.id = r.journey_id
+           WHERE r.system_id = ? AND r.ref_kind = 'product_gap' AND r.target_ref = ?
+             AND r.superseded_by_id IS NULL""",
+        (system_id, gap_key),
+    ).fetchall()
+    return [r["journey_key"] for r in rows]
+
+
+def _check_product_objectives(
+    conn: sqlite3.Connection,
+    system_id: int,
+    graph: _Graph,
+    degraded_sections: List[str],
+    degraded_detail: Dict[str, str],
+) -> Optional[List[str]]:
+    """§7.3's Objective -> Milestone segment. A System that has adopted no
+    Product Objective at all must produce NO new node, edge, or gap here --
+    `product_objective.list_objectives` simply returns an empty list, so the
+    loop below never runs (§4's explicit "no Objective => no new gap"
+    requirement).
+
+    Returns the flat list of every current Milestone key found (for
+    `_check_product_gaps`'s `milestone_without_gap` check below), or `None`
+    when this section itself degraded -- `None` is NOT "no milestones exist"
+    (invariant 5): asserting `milestone_without_gap` from an unreadable
+    Milestone set would be exactly the guessed value this module's own
+    docstring forbids.
+    """
+    try:
+        result = product_objective.list_objectives(conn, system_id)
+        if result["degraded_sections"]:
+            raise RuntimeError(f"objectives unavailable: {result['degraded_detail']}")
+
+        all_milestone_keys: List[str] = []
+        for obj in result["objectives"]:
+            objective_key = obj["objective_key"]
+            graph.add_node("product_objective", objective_key, name=obj.get("title"))
+            parent_key = obj.get("parent_objective_key")
+            if parent_key:
+                graph.add_edge("product_objective", parent_key, "product_objective", objective_key)
+
+            try:
+                detail = product_objective.get_objective_detail(conn, system_id, objective_key)
+                if "upstream_refs" in detail.get("degraded_sections", []):
+                    _degrade(
+                        degraded_sections, degraded_detail, f"product_objective.upstream_refs:{objective_key}",
+                        RuntimeError(detail["degraded_detail"].get("upstream_refs", "unavailable")),
+                    )
+                elif not detail.get("upstream_refs"):
+                    graph.add_gap("objective_without_vision_ref", "product_objective", objective_key)
+            except Exception as exc:  # pragma: no cover - defensive
+                _degrade(degraded_sections, degraded_detail, f"product_objective.detail:{objective_key}", exc)
+
+            ms_result = product_objective.list_milestones(conn, system_id, objective_key)
+            if ms_result["degraded_sections"]:
+                raise RuntimeError(
+                    f"milestones unavailable for {objective_key!r}: {ms_result['degraded_detail']}"
+                )
+            milestones = ms_result["milestones"]
+            if not milestones:
+                graph.add_gap("objective_without_milestone", "product_objective", objective_key)
+            for m in milestones:
+                milestone_key = m["milestone_key"]
+                all_milestone_keys.append(milestone_key)
+                graph.add_node("product_milestone", milestone_key, name=m.get("title"))
+                graph.add_edge("product_objective", objective_key, "product_milestone", milestone_key)
+                # §4.3: `assessability == "unavailable"` is reachable ONLY
+                # through `derive_milestone_assessability`'s first-match
+                # `verification_method == "unavailable"` branch -- reusing
+                # this already-derived field is exactly §7.3's "reuse
+                # derive_*, never re-fold a ledger" rule, applied to a value
+                # `_milestone_out_dict` already folds one layer over.
+                if m.get("assessability") == "unavailable":
+                    graph.add_gap("milestone_without_verification", "product_milestone", milestone_key)
+        return all_milestone_keys
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "product_objectives", exc)
+        return None
+
+
+def _check_product_gaps(
+    conn: sqlite3.Connection,
+    system_id: int,
+    graph: _Graph,
+    degraded_sections: List[str],
+    degraded_detail: Dict[str, str],
+    known_milestone_keys: Optional[List[str]],
+) -> None:
+    """§7.3's Milestone -> Gap -> UX Journey segment, plus the §5.4 source
+    federation's three read-time states this projection surfaces
+    (`disappeared` / `unavailable` / `contradicted`). `known_milestone_keys`
+    is `None` when `_check_product_objectives` itself degraded -- see that
+    function's docstring for why `milestone_without_gap` is skipped rather
+    than guessed in that case."""
+    try:
+        result = product_objective.list_gaps(conn, system_id)
+        if result["degraded_sections"]:
+            raise RuntimeError(f"gaps unavailable: {result['degraded_detail']}")
+
+        milestones_with_gaps: Set[str] = set()
+        for g in result["gaps"]:
+            gap_key = g["gap_key"]
+            milestone_key = g.get("milestone_key")
+            graph.add_node("product_gap", gap_key, name=g.get("title"))
+            if milestone_key:
+                graph.add_node("product_milestone", milestone_key)
+                graph.add_edge("product_milestone", milestone_key, "product_gap", gap_key)
+                milestones_with_gaps.add(milestone_key)
+
+            journey_keys = _journeys_referencing_gap(conn, system_id, gap_key)
+            if not journey_keys:
+                graph.add_gap("gap_without_journey", "product_gap", gap_key)
+            for journey_key in journey_keys:
+                graph.add_node("ux_journey", journey_key)
+                graph.add_edge("product_gap", gap_key, "ux_journey", journey_key)
+
+            try:
+                detail = product_objective.get_gap_detail(conn, system_id, gap_key)
+                if "source_refs" in detail.get("degraded_sections", []):
+                    _degrade(
+                        degraded_sections, degraded_detail, f"product_gap.source_refs:{gap_key}",
+                        RuntimeError(detail["degraded_detail"].get("source_refs", "unavailable")),
+                    )
+                else:
+                    # §5.4's `ProductGapSourceState`. `current`/`changed` are
+                    # not a gap here -- §7.3 lists exactly three of the five
+                    # states as reachable gap codes; `changed` already
+                    # surfaces through the Gap's own `read_flags`
+                    # (`recheck_required`), not a lineage gap.
+                    for source in detail.get("source_refs", []):
+                        state = source.get("source_state")
+                        if state == "disappeared":
+                            graph.add_gap("gap_source_unresolved", "product_gap", gap_key)
+                        elif state == "unavailable":
+                            graph.add_gap("gap_source_unavailable", "product_gap", gap_key)
+                        elif state == "contradicted":
+                            graph.add_gap("gap_source_contradicted", "product_gap", gap_key)
+            except Exception as exc:  # pragma: no cover - defensive
+                _degrade(degraded_sections, degraded_detail, f"product_gap.detail:{gap_key}", exc)
+
+        if known_milestone_keys is not None:
+            for milestone_key in known_milestone_keys:
+                if milestone_key not in milestones_with_gaps:
+                    graph.add_gap("milestone_without_gap", "product_milestone", milestone_key)
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "product_gaps", exc)
+
+
+def _check_product_features(
+    conn: sqlite3.Connection,
+    system_id: int,
+    graph: _Graph,
+    degraded_sections: List[str],
+    degraded_detail: Dict[str, str],
+) -> None:
+    """§7.3's Requirement -> Feature -> Capability/implementation-target
+    segment. `product_feature.get_feature_detail`'s already-resolved
+    `target_links` (built on `solution_design._resolve_target` /
+    `node_design._resolve_capability`, §7.2's explicit reuse instruction) is
+    this function's ONLY path to a Feature's implementation targets -- the
+    same "no second path to Flow/Node" precedent
+    `_walk_exchange_chain`'s `solution_design.get_design_detail` call
+    already sets one layer over."""
+    try:
+        result = product_feature.list_features(conn, system_id)
+        if result["degraded_sections"]:
+            raise RuntimeError(f"features unavailable: {result['degraded_detail']}")
+
+        requirement_keys_with_feature: Set[str] = set()
+        for f in result["features"]:
+            feature_key = f["feature_key"]
+            graph.add_node("product_feature", feature_key, name=f.get("title"))
+
+            try:
+                detail = product_feature.get_feature_detail(conn, system_id, feature_key)
+            except Exception as exc:  # pragma: no cover - defensive
+                _degrade(degraded_sections, degraded_detail, f"product_feature.detail:{feature_key}", exc)
+                continue
+
+            for link in detail.get("requirement_links", []):
+                req_key = link.get("requirement_key")
+                if not req_key:
+                    continue
+                requirement_keys_with_feature.add(req_key)
+                graph.add_node("ux_requirement", req_key)
+                graph.add_edge("ux_requirement", req_key, "product_feature", feature_key)
+
+            capability_links = detail.get("capability_links", [])
+            for link in capability_links:
+                cap_ref = str(link.get("capability_entity_id"))
+                graph.add_node("capability", cap_ref, name=link.get("capability_name"))
+                graph.add_edge("product_feature", feature_key, "capability", cap_ref)
+            if not capability_links:
+                graph.add_gap("feature_without_capability", "product_feature", feature_key)
+
+            target_links = detail.get("target_links", [])
+            if not target_links:
+                graph.add_gap("feature_without_implementation_target", "product_feature", feature_key)
+            for link in target_links:
+                target_kind = link.get("link_kind")
+                target_ref = link.get("target_ref")
+                if not target_kind or not target_ref:
+                    continue
+                graph.add_node(target_kind, target_ref)
+                graph.add_edge("product_feature", feature_key, target_kind, target_ref)
+
+        # Feature, like Objective/Milestone/Gap, is a new, OPTIONAL layer
+        # (§0-1/§1.6) -- a System that has created no Feature at all has not
+        # adopted it, and is not "missing" a Feature on every one of its
+        # ordinary (Journey-driven) Requirements any more than a System with
+        # no Objective is missing a Milestone (§4's explicit "layer
+        # optional" rule, applied here to Feature the same way
+        # `_check_product_objectives` applies it to Objective). Only once at
+        # least one Feature exists does an uncovered Requirement become a
+        # meaningful gap.
+        if result["features"]:
+            req_result = ux_design.list_requirements(conn, system_id)
+            if req_result["degraded_sections"]:
+                raise RuntimeError(f"requirements unavailable: {req_result['degraded_detail']}")
+            for r in req_result["requirements"]:
+                req_key = r["requirement_key"]
+                if req_key not in requirement_keys_with_feature:
+                    graph.add_gap("requirement_without_feature", "ux_requirement", req_key)
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "product_features", exc)
+
+
 # --- Top-level projection ----------------------------------------------------
 
 
@@ -604,6 +866,17 @@ def build_functional_lineage(conn: sqlite3.Connection, system_id: int) -> Dict[s
                 graph.add_gap("confirmed_without_evidence", "stakeholder_need", need_key)
     except Exception as exc:  # pragma: no cover - defensive
         _degrade(degraded_sections, degraded_detail, "needs", exc)
+
+    # 6. Product Objective / Milestone -- Epic #427 §7.3. A System that has
+    # adopted no Product Objective produces no new node/edge/gap here (§4).
+    known_milestone_keys = _check_product_objectives(conn, system_id, graph, degraded_sections, degraded_detail)
+
+    # 7. Product Gap -- Milestone -> Gap -> UX Journey, plus §5.4's source
+    # federation states.
+    _check_product_gaps(conn, system_id, graph, degraded_sections, degraded_detail, known_milestone_keys)
+
+    # 8. Product Feature -- Requirement -> Feature -> Capability/target.
+    _check_product_features(conn, system_id, graph, degraded_sections, degraded_detail)
 
     return {
         "nodes": graph.sorted_nodes(),
