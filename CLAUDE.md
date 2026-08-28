@@ -1821,6 +1821,49 @@ creating incomplete persistence or execution paths for later phases.
     Milestone / Gap / Feature の確定、Milestone 達成判定、Gap の解消・reopen・
     優先バンド設定もすべて `decision_method: manual`。
 
+    **実装状況 (2026-08-28 時点)。** #428-#433 は実装・検証済み。正本モジュールは
+    `app/product_objective.py`(Objective / Milestone / Gap の identity・revision・
+    決定台帳・導出)、`app/product_gap_sources.py`(14 個の source kind の唯一の
+    resolver。`resolve_source` はデータ起因では決して raise せず、読めなかったことは
+    `source_state='unavailable'` という**結果**である)、`app/product_feature.py`、
+    `app/product_objective_projection.py`(Objective Map / Gap Workbench /
+    Overview `objective` セクション)。実装中に見つけて直した欠陥と、後から
+    変えるときに壊しやすい点:
+    - **親 link の部分 UNIQUE index は文ごとに検査される。** 置換行を INSERT する
+      前に直前の行を自己参照で supersede して枠を空ける
+      (`solution_design.py` と同じ idiom)。逆順にすると再親付けが
+      IntegrityError になる。
+    - **親を外すのは削除ではなく tombstone の追記。** `superseded_by_id` は
+      `ON DELETE SET NULL` の自己参照 FK なので、tip 行だけ消すと直前の親が
+      current として復活する。履歴ごと消せば復活はしないが、誰がなぜ切り離したかの
+      記録が消える。`parent_objective_id` が NULL の行が「意図的に root へ戻した」
+      という決定の記録であり、`rationale` / 実行者 / 時刻を持つ。
+      **一度も親を持たない root は行が無いまま**で、この列が NULL 可なのは
+      戻ったことを記録するためだけである。
+    - **`contradicted` に到達できない検出元が 4 つある**
+      (`manual` / `understanding_review_gap` / `functional_lineage_gap` /
+      `value_network_notice`)。検出元がそれを言える語彙を持たないためで、
+      解消時に出る答えは `disappeared` である。**`disappeared` を `contradicted`
+      として報告しない** — 開発者の次の操作が違う。テストは到達不能を到達不能として
+      記録し、5 状態を埋めるために信号を合成しない。
+    - **`product_feature_draft_link` の `feature_draft_id` は NULL 可。** pin した
+      draft が消えたとき `0` や「同じ `feature_id` の別 snapshot の draft の id」を
+      返すと、呼び出し側が誰も link していない内容へ dereference できてしまう。
+      snapshot 再構築を生き延びる `feature_draft_ref` の方で link を読む。
+    - **Feature 層も Objective 層と同じく任意。** `product_feature` が 1 つも無い
+      System では `requirement_without_feature` の検査自体を走らせない。走らせると
+      無関係な fixture の Requirement まで一斉に旗が立つ。
+    - **`FunctionalLineageKind` は `LINEAGE_KIND_LABEL` だけでなく
+      `KIND_VALUES` にも足す。** URL から型を復元する `isLineageKind` の門番が
+      後者なので、片方だけだと表示は正しいのにリロードで選択だけ静かに失われる。
+    - **TypeScript の union 本体にコメントを書かない。** parity テストのパーサが
+      コメント断片をメンバーとして読む。説明は型宣言の上に置く。
+    - Overview の `next_action` と `objective.next_step` は**別フィールド**で、
+      片方が他方を上書きしない。`decide_next_action` の既存 15 行表は変更しない。
+    - `docs/product-objective-lineage.md` が canonical contract、
+      `docs/system-understanding-navigation.md` に画面導線、
+      `docs/ui-glossary.md` に状態語の対比表がある。
+
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
