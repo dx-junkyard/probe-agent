@@ -844,8 +844,10 @@ def _insert_joint_understanding_session(system_id, session_id, status="open"):
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO joint_understanding_session
-                   (session_id, system_id, origin_kind, origin_id, trigger, question_text, status, created_at, updated_at)
-               VALUES (?, ?, 'manual', 0, 'explicit_request', 'why?', ?, ?, ?)""",
+                   (session_id, system_id, origin_kind, origin_id, trigger,
+                    question_text, status, schema_version, created_at, updated_at)
+               VALUES (?, ?, 'manual', 0, 'explicit_request', 'why?', ?,
+                       'joint-understanding-v1', ?, ?)""",
             (session_id, system_id, status, now, now),
         )
         return cur.lastrowid
