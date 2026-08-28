@@ -974,6 +974,51 @@ Overview の Get Started 順序リスト（Issue #212 / #259 / #267）は削除�
 段階リストは「次の 1 操作」に置き換わり、オンボーディング導線自体は Setup
 Guide（`components/setup-next-step.ts`、Issue #374）が持つ。
 
+## Objective Map: Vision から次の 1 操作まで（Issue #427-#433)
+
+canonical contract は `docs/product-objective-lineage.md`。ここには**画面の
+導線**だけを書く。
+
+### サイドバー項目は 1 つだけ
+
+`Understand` グループへ **「Objective Map」** を 1 項目だけ足した。
+**Gap Workbench は独立ページではない** — 同じ route の第 2 レーンであり、
+`/objective-map?view=gaps&gap=<gap_key>` で単一 Gap まで deep link できる。
+サイドバーは既に 28 項目あり、#432 は「安易に 3 項目足さない情報設計」を
+完了条件にしている。
+
+### Overview の `objective` セクション
+
+`GET /overview` の `objective` が、Vision / 注力中の Objective / 次に確認する
+Milestone / 最重要 Gap / 次の 1 操作 を返す。判定は server が行い、Dashboard は
+再導出しない。
+
+**`next_action` と `next_step` は別フィールドで、片方が他方を上書きしない。**
+前者は「システムを動かすために次に何をするか」、後者は「目標に向けて次に何を
+決めるか」であり、別の問いである。`waiting` / `unavailable` は**操作を持たない**
+— 永久に disabled な CTA は主操作を無視させるので、文を出す。
+
+### 相互リンク
+
+| どこから | どこへ |
+| --- | --- |
+| Overview `objective` カード | `/objective-map`（常設の導線 1 本）＋ `next_step` に応じた lane / 選択 |
+| Functional Lineage の Objective / Milestone / Gap ノード | `/objective-map`（`lineageDeepLink`） |
+| Gap の検出元 | 各検出画面（`/system-understanding` / `/interview` / `/functional-lineage` / `/stakeholder-value-network` / `/ux-design-studio` / `/capability-map`） |
+
+`node_anomaly` 由来の Gap は **deep link を持たない**。Epic #394 Phase 5 の
+operations cockpit 画面が #401 の未着手分だからで、`deep_link_state`
+`unavailable` として理由つきで無効表示する。**もっともらしい URL を作らない。**
+
+### 表示規律
+
+* Milestone の **定義の確定 (`design_status`) と達成判定 (`achievement`) は
+  別ラベル**。1 つのバッジに畳まない。
+* Gap 件数は出すが、**件数で並べ替えない**。順序は server が決めた有限段階。
+* score・完成度・confidence percentage・進捗バーはどこにも無い。
+* `unknown` / `unavailable` / `not_applicable` / `stale` / `contradicted` は
+  色ではなく**文言**で区別する。
+
 ## Dogfooding: probe-agent 自身への System Understanding 適用
 
 probe-agent は自身の `probe-agent:` source-authored metadata を使って
