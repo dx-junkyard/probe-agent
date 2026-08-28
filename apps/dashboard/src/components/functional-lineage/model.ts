@@ -143,6 +143,12 @@ const KIND_VALUES: FunctionalLineageKind[] = [
   "ux_requirement", "solution_design", "static_flow", "runtime_flow",
   "evolution_node", "component", "cell_definition", "cell_binding",
   "probe_point", "purpose_outcome_criterion",
+  // Issue #427 §7.3. These must be listed here as well as in
+  // `LINEAGE_KIND_LABEL`: `isLineageKind` is what lets a kind survive a URL
+  // round-trip, so a kind with a label but no entry here renders fine and
+  // then silently loses its selection on reload.
+  "product_objective", "product_milestone", "product_gap", "product_feature",
+  "experiment", "replay_run",
 ];
 const SEVERITY_VALUES: LineageGapSeverity[] = ["blocking", "attention", "informational"];
 
@@ -301,6 +307,24 @@ export function lineageDeepLink(kind: FunctionalLineageKind, ref: string): strin
       return "/cell-fabric";
     case "probe_point":
       return "/probe-planner";
+    // Issue #427 §9.4: the Objective layer lives on ONE route, with the Gap
+    // Workbench as its second lane rather than a screen of its own.
+    case "product_objective":
+      return `/objective-map?objective=${encodeURIComponent(ref)}`;
+    case "product_milestone":
+      return `/objective-map?milestone=${encodeURIComponent(ref)}`;
+    case "product_gap":
+      return `/objective-map?view=gaps&gap=${encodeURIComponent(ref)}`;
+    // A Feature has no screen of its own yet, and an Experiment / Replay run
+    // reached through a Feature target link is identified here by that
+    // link's `target_ref`, which is not the id those screens select on.
+    // Returning null renders "no link" -- the honest answer, and the same
+    // one §5.8 requires for a Gap source with no owning screen. Do not
+    // substitute a plausible URL.
+    case "product_feature":
+    case "experiment":
+    case "replay_run":
+      return null;
     default:
       return null;
   }

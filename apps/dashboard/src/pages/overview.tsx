@@ -4,6 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { FindingsCard } from "@/components/overview/findings";
 import { LoopRailCard, NextActionCard } from "@/components/overview/next-action";
+import { ObjectiveCard } from "@/components/overview/objective";
 import { RuntimeHealthCard } from "@/components/overview/runtime-health";
 import { SystemBriefCard } from "@/components/overview/system-brief";
 import { targetHref } from "@/components/overview/display";
@@ -200,6 +201,7 @@ export default function OverviewPage() {
         <div className="space-y-4 xl:col-span-3">
           <NextActionCard overview={overview} />
           <LoopRailCard overview={overview} />
+          <ObjectiveCard overview={overview} />
           <RuntimeHealthCard overview={overview} />
         </div>
       </div>

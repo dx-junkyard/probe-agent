@@ -354,6 +354,7 @@ describe("Overview page (Issue #384)", () => {
       "今わかったこと",
       "次にすること",
       "改善ループの現在地",
+      "目標(Objective)",
       "Runtime health",
     ]);
   });

@@ -107,6 +107,9 @@ import type {
   JourneyStepDeliveryLinkCreateRequest, JourneyStepDeliveryLinkOut,
   JourneyStepExchangeLinkCreateRequest, JourneyStepExchangeLinkOut,
   FunctionalLineageOut,
+  ObjectiveMapOut, GapWorkbenchOut,
+  ProductGapDetailOut, ProductGapDecisionCreateRequest, ProductGapDecisionOut,
+  ProductGapArtifactLinkCreateRequest, ProductGapArtifactOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -4352,5 +4355,78 @@ export function useFunctionalLineage() {
     queryKey: sysKey("functional-lineage"),
     queryFn: () => api.get<FunctionalLineageOut>("/functional-lineage"),
     enabled: !!getSystemId(),
+  });
+}
+
+// === Epic #427 / Issue #432 — Objective Map / Gap Workbench hooks ===
+//
+// `docs/product-objective-lineage.md` §9. Both projections are read-only and
+// re-derive nothing (§0 invariant 10); `components/product-objective/model.ts`
+// is the only place that filters, labels, or walks the Objective tree. Write
+// mutations below invalidate both projections AND the Overview, whose
+// `objective` section reads the same underlying rows (§9.1).
+
+const PRODUCT_OBJECTIVE_QUERY_BASES = ["objective-map", "gap-workbench", "product-gap", "overview"] as const;
+
+function invalidateProductObjective(qc: ReturnType<typeof useQueryClient>) {
+  for (const base of PRODUCT_OBJECTIVE_QUERY_BASES) {
+    qc.invalidateQueries({ queryKey: [base] });
+  }
+}
+
+/** `GET /objective-map` (§9.1). */
+export function useObjectiveMap() {
+  return useQuery<ObjectiveMapOut>({
+    queryKey: sysKey("objective-map"),
+    queryFn: () => api.get<ObjectiveMapOut>("/objective-map"),
+    enabled: !!getSystemId(),
+  });
+}
+
+/** `GET /gap-workbench` (§9.2). */
+export function useGapWorkbench() {
+  return useQuery<GapWorkbenchOut>({
+    queryKey: sysKey("gap-workbench"),
+    queryFn: () => api.get<GapWorkbenchOut>("/gap-workbench"),
+    enabled: !!getSystemId(),
+  });
+}
+
+/** `GET /product-gaps/{gap_key}` -- the Gap detail the Workbench's own list
+ * entry does not carry (current/target state, interpretation, source refs,
+ * evidence, artifact links, decision history; §5.1's six axes). */
+export function useProductGapDetail(gapKey: string | null) {
+  return useQuery<ProductGapDetailOut>({
+    queryKey: [...sysKey("product-gap"), gapKey],
+    queryFn: () => api.get<ProductGapDetailOut>(`/product-gaps/${encodeURIComponent(gapKey ?? "")}`),
+    enabled: gapKey !== null,
+  });
+}
+
+/** Records a `acknowledge`/`defer`/`resolve`/`reject`/`retire`/`reopen`/
+ * `prioritize` decision on a Gap (§5.6/§5.7). Every one is
+ * `decision_method: manual` on the server; this hook offers every kind and
+ * lets an illegal transition come back as the server's own finite rejection
+ * code (§10.1) rather than holding a second legality table here (same
+ * discipline `useRecordUxDesignDecision` documents). */
+export function useRecordProductGapDecision(gapKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductGapDecisionCreateRequest) =>
+      api.post<ProductGapDecisionOut>(`/product-gaps/${encodeURIComponent(gapKey ?? "")}/decisions`, body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** 関連付け (§9.2): links a Gap to an Issue Draft / UX Journey / UX
+ * Requirement / Feature / Solution Design. Selecting a Gap never triggers
+ * this on its own -- it is only ever the result of the developer submitting
+ * this form (§9.2 non-goal: no automatic execution on selection). */
+export function useAddProductGapArtifactLink(gapKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductGapArtifactLinkCreateRequest) =>
+      api.post<ProductGapArtifactOut>(`/product-gaps/${encodeURIComponent(gapKey ?? "")}/artifact-links`, body),
+    onSuccess: () => invalidateProductObjective(qc),
   });
 }
