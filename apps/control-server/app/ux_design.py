@@ -654,15 +654,240 @@ def _resolve_purpose_target(
     }
 
 
+#: Issue #427/#431 §7.1's three new upstream ref kinds, each resolved
+#: against its OWN canonical identity+revision table -- never translated
+#: into `UxDesignStatus` (the #380 superset rule: `target_state` below
+#: carries `objective_state` / Milestone `design_status` / Gap `lifecycle`
+#: verbatim). `product_milestone_decision`'s fold is IDENTICAL to this
+#: module's own `_DECISION_TO_DESIGN_STATUS` (confirm/reject/retire/
+#: reinstate -> confirmed/rejected/retired/proposed), so it is reused
+#: rather than re-declared.
+#:
+#: DUPLICATION NOTE (to collapse once Issue #429's `app/product_objective.py`
+#: lands): `app/product_objective.py` is being written concurrently by
+#: another agent and did not exist yet when this resolver was written, so
+#: the objective_state (§4.3) and gap lifecycle (§5.6) ledger-folds below
+#: are reproduced locally from the contract rather than imported. Once that
+#: module exposes its own derivation helper for each, these three local
+#: fold tables/functions should be deleted and replaced with calls into it
+#: (see docs/product-objective-lineage.md §4.2/§4.3/§5.6).
+_OBJECTIVE_DECISION_TO_STATE: Dict[str, str] = {
+    "confirm": "confirmed",
+    "activate": "active",
+    "achieve": "achieved",
+    "reject": "rejected",
+    "retire": "retired",
+    "reinstate": "proposed",
+}
+
+_GAP_DECISION_TO_LIFECYCLE: Dict[str, str] = {
+    "acknowledge": "acknowledged",
+    "defer": "deferred",
+    "resolve": "resolved",
+    "reject": "rejected",
+    "retire": "obsolete",
+    "reopen": "open",
+}
+
+
+def _fold_latest_decision(
+    conn: sqlite3.Connection,
+    table: str,
+    system_id: int,
+    key_column: str,
+    key_value: str,
+    fold_table: Dict[str, str],
+    default: str,
+    exclude_decisions: Tuple[str, ...] = (),
+) -> str:
+    """The shared shape of §4.3/§5.6's ledger folds: the latest
+    non-superseded decision row for one key, mapped through a fixed table.
+    `table` / `key_column` are always one of this module's own hardcoded
+    constants below, never caller input, so building the query with an
+    f-string carries no injection risk."""
+    query = (
+        f"SELECT decision FROM {table} "  # noqa: S608 - table/key_column are fixed constants, never caller input
+        f"WHERE system_id = ? AND {key_column} = ? AND superseded_by_id IS NULL"
+    )
+    params: List[Any] = [system_id, key_value]
+    if exclude_decisions:
+        placeholders = ", ".join("?" for _ in exclude_decisions)
+        query += f" AND decision NOT IN ({placeholders})"
+        params.extend(exclude_decisions)
+    query += " ORDER BY id DESC LIMIT 1"
+    row = conn.execute(query, params).fetchone()
+    if row is None:
+        return default
+    return fold_table.get(row["decision"], default)
+
+
+def _resolve_product_objective_target(conn: sqlite3.Connection, system_id: int, target_ref: str) -> Dict[str, Any]:
+    """Resolve `product_objective` (§7.1's table): identity `(system_id,
+    objective_key)`, digest over §8's `title, intent, contribution,
+    scope_note, summary`, state folded from `product_objective_decision`
+    (§4.3, default `proposed`)."""
+    ref = (target_ref or "").strip()
+    if not ref:
+        return {"resolution": "unresolved", "name": None, "state": "unresolved", "digest": ""}
+    try:
+        row = conn.execute(
+            "SELECT * FROM product_objective WHERE system_id = ? AND objective_key = ?",
+            (system_id, ref),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {"resolution": "unavailable", "name": None, "state": "unresolved", "digest": ""}
+    if row is None:
+        return {"resolution": "unresolved", "name": None, "state": "unresolved", "digest": ""}
+    objective = dict(row)
+    revision = None
+    if objective["current_revision_id"] is not None:
+        rev_row = conn.execute(
+            "SELECT * FROM product_objective_revision WHERE id = ?",
+            (objective["current_revision_id"],),
+        ).fetchone()
+        revision = dict(rev_row) if rev_row is not None else None
+    digest = (
+        content_digest(
+            {
+                "title": revision["title"],
+                "intent": revision["intent"],
+                "contribution": revision["contribution"],
+                "scope_note": revision["scope_note"],
+                "summary": revision["summary"],
+            }
+        )
+        if revision is not None
+        else ""
+    )
+    state = _fold_latest_decision(
+        conn, "product_objective_decision", system_id, "objective_key", ref,
+        _OBJECTIVE_DECISION_TO_STATE, default="proposed",
+    )
+    name = revision["title"] if revision is not None else None
+    return {"resolution": "resolved", "name": name, "state": state, "digest": digest}
+
+
+def _resolve_product_milestone_target(conn: sqlite3.Connection, system_id: int, target_ref: str) -> Dict[str, Any]:
+    """Resolve `product_milestone` (§7.1's table): identity `(system_id,
+    milestone_key)`, digest over §8's `title, target_state,
+    verification_method, verification_note, summary`, `design_status`
+    folded from `product_milestone_decision` via this module's own
+    `_DECISION_TO_DESIGN_STATUS` (§4.3's fold is the identical
+    confirm/reject/retire/reinstate table `ux_design_decision` already
+    uses)."""
+    ref = (target_ref or "").strip()
+    if not ref:
+        return {"resolution": "unresolved", "name": None, "state": "unresolved", "digest": ""}
+    try:
+        row = conn.execute(
+            "SELECT * FROM product_milestone WHERE system_id = ? AND milestone_key = ?",
+            (system_id, ref),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {"resolution": "unavailable", "name": None, "state": "unresolved", "digest": ""}
+    if row is None:
+        return {"resolution": "unresolved", "name": None, "state": "unresolved", "digest": ""}
+    milestone = dict(row)
+    revision = None
+    if milestone["current_revision_id"] is not None:
+        rev_row = conn.execute(
+            "SELECT * FROM product_milestone_revision WHERE id = ?",
+            (milestone["current_revision_id"],),
+        ).fetchone()
+        revision = dict(rev_row) if rev_row is not None else None
+    digest = (
+        content_digest(
+            {
+                "title": revision["title"],
+                "target_state": revision["target_state"],
+                "verification_method": revision["verification_method"],
+                "verification_note": revision["verification_note"],
+                "summary": revision["summary"],
+            }
+        )
+        if revision is not None
+        else ""
+    )
+    state = _fold_latest_decision(
+        conn, "product_milestone_decision", system_id, "milestone_key", ref,
+        _DECISION_TO_DESIGN_STATUS, default="proposed",
+    )
+    name = revision["title"] if revision is not None else None
+    return {"resolution": "resolved", "name": name, "state": state, "digest": digest}
+
+
+def _resolve_product_gap_target(conn: sqlite3.Connection, system_id: int, target_ref: str) -> Dict[str, Any]:
+    """Resolve `product_gap` (§7.1's table): identity `(system_id,
+    gap_key)`, digest over §8's `title, current_state, target_state,
+    target_state_mode, interpretation`, `lifecycle` folded from
+    `product_gap_decision` (§5.6, `prioritize` rows excluded because they
+    never move lifecycle, default `open`)."""
+    ref = (target_ref or "").strip()
+    if not ref:
+        return {"resolution": "unresolved", "name": None, "state": "unresolved", "digest": ""}
+    try:
+        row = conn.execute(
+            "SELECT * FROM product_gap WHERE system_id = ? AND gap_key = ?",
+            (system_id, ref),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {"resolution": "unavailable", "name": None, "state": "unresolved", "digest": ""}
+    if row is None:
+        return {"resolution": "unresolved", "name": None, "state": "unresolved", "digest": ""}
+    gap = dict(row)
+    revision = None
+    if gap["current_revision_id"] is not None:
+        rev_row = conn.execute(
+            "SELECT * FROM product_gap_revision WHERE id = ?",
+            (gap["current_revision_id"],),
+        ).fetchone()
+        revision = dict(rev_row) if rev_row is not None else None
+    digest = (
+        content_digest(
+            {
+                "title": revision["title"],
+                "current_state": revision["current_state"],
+                "target_state": revision["target_state"],
+                "target_state_mode": revision["target_state_mode"],
+                "interpretation": revision["interpretation"],
+            }
+        )
+        if revision is not None
+        else ""
+    )
+    state = _fold_latest_decision(
+        conn, "product_gap_decision", system_id, "gap_key", ref,
+        _GAP_DECISION_TO_LIFECYCLE, default="open", exclude_decisions=("prioritize",),
+    )
+    name = revision["title"] if revision is not None else None
+    return {"resolution": "resolved", "name": name, "state": state, "digest": digest}
+
+
 def _resolve_upstream_target(
     conn: sqlite3.Connection, system_id: int, ref_kind: str, target_ref: str
 ) -> Dict[str, Any]:
-    """Dispatch to the ONE canonical source per `ref_kind` (§2.7's table)."""
+    """Dispatch to the ONE canonical source per `ref_kind` (§2.7's table,
+    extended by §7.1's three Product Objective Lineage kinds)."""
     if ref_kind in ("purpose_element", "purpose_relation"):
         return _resolve_purpose_target(conn, system_id, ref_kind, target_ref)
     if ref_kind == "capability_entity":
         try:
             return _resolve_capability_entity(conn, system_id, target_ref)
+        except Exception:  # pragma: no cover - defensive
+            return {"resolution": "unavailable", "name": None, "state": "unresolved", "digest": ""}
+    if ref_kind == "product_objective":
+        try:
+            return _resolve_product_objective_target(conn, system_id, target_ref)
+        except Exception:  # pragma: no cover - defensive
+            return {"resolution": "unavailable", "name": None, "state": "unresolved", "digest": ""}
+    if ref_kind == "product_milestone":
+        try:
+            return _resolve_product_milestone_target(conn, system_id, target_ref)
+        except Exception:  # pragma: no cover - defensive
+            return {"resolution": "unavailable", "name": None, "state": "unresolved", "digest": ""}
+    if ref_kind == "product_gap":
+        try:
+            return _resolve_product_gap_target(conn, system_id, target_ref)
         except Exception:  # pragma: no cover - defensive
             return {"resolution": "unavailable", "name": None, "state": "unresolved", "digest": ""}
     raise UxDesignValidationError(f"ref_kind must be one of {REF_KINDS}; got {ref_kind!r}")
