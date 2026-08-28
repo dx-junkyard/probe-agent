@@ -14031,7 +14031,19 @@ class ProductFeatureDraftLinkOut(BaseModel):
 
     id: int
     feature_id: int
-    feature_draft_id: int
+    #: The `feature_drafts` row the link currently resolves to, or `None`
+    #: when the pinned draft is gone. It is NULL rather than a stand-in
+    #: because a draft id names one specific analysed row: `0` is not a
+    #: draft, and the newest surviving row for the same `feature_id` is a
+    #: DIFFERENT draft from a different snapshot. Reporting either would
+    #: hand a caller an id it could dereference into content the developer
+    #: never linked -- the substituted-guess §0-8 forbids, with
+    #: `target_resolution` left to contradict it afterwards.
+    feature_draft_id: Optional[int] = None
+    #: The stable `feature_drafts.feature_id` text the link was created
+    #: against. Unlike the row id this survives a snapshot rebuild, so it
+    #: stays readable when the link is `unresolved`.
+    feature_draft_ref: str = ""
     captured_snapshot_id: Optional[int] = None
     captured_digest: str = ""
     target_resolution: ProductRefTargetResolution = "unavailable"

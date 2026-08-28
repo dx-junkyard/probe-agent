@@ -8122,7 +8122,11 @@ export interface ProductFeatureTargetLinkOut {
 export interface ProductFeatureDraftLinkOut {
   id: number;
   feature_id: number;
-  feature_draft_id: number;
+  /** null when the pinned draft is gone -- never 0 and never a different
+   * draft's id. Consult `target_resolution`, and use `feature_draft_ref`
+   * for the identity that survives a snapshot rebuild. */
+  feature_draft_id: number | null;
+  feature_draft_ref: string;
   captured_snapshot_id: number | null;
   captured_digest: string;
   target_resolution: ProductRefTargetResolution;
