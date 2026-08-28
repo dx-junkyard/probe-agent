@@ -60,9 +60,15 @@ export const LINEAGE_KIND_LABEL: Record<FunctionalLineageKind, string> = {
   cell_binding: "Probe Cell Binding",
   probe_point: "Probe Point",
   purpose_outcome_criterion: "Outcome",
+  product_objective: "Product Objective",
+  product_milestone: "Milestone",
+  product_gap: "Gap",
+  product_feature: "Feature",
+  experiment: "Experiment",
+  replay_run: "Replay 実行",
 };
 
-/** §9.2's 23 gap codes. Phrased as a STATEMENT about an absent, stale, or
+/** §9.2's 23 gap codes, plus Issue #427 §7.3's 11. Phrased as a STATEMENT about an absent, stale, or
  * conflicting link -- never a judgement of importance (same discipline as
  * `stakeholder-network/model.ts`'s `NOTICE_CODE_LABEL`). */
 export const GAP_CODE_LABEL: Record<LineageGapCode, string> = {
@@ -89,6 +95,17 @@ export const GAP_CODE_LABEL: Record<LineageGapCode, string> = {
   feedback_path_missing: "提供先からの情報 (フィードバック) がありません",
   unresolved_reference: "参照先が見つかりません",
   unavailable_reference: "参照を取得できませんでした",
+  objective_without_vision_ref: "Vision / Purpose / Capability / Need への参照がありません",
+  objective_without_milestone: "Milestone がありません",
+  milestone_without_gap: "Gap がありません",
+  milestone_without_verification: "達成を確かめる方法が決まっていません",
+  gap_without_journey: "この Gap を解消する Journey がありません",
+  gap_source_unresolved: "検出元が見つかりません",
+  gap_source_unavailable: "検出元を取得できませんでした",
+  gap_source_contradicted: "検出元がもう成り立たないと言っています",
+  requirement_without_feature: "この Requirement を満たす Feature がありません",
+  feature_without_implementation_target: "実装先への参照がありません",
+  feature_without_capability: "Capability への参照がありません",
 };
 
 /** §9.2: fixed per CODE (never per instance) -- always shown alongside the

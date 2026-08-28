@@ -4972,7 +4972,8 @@ export type OverviewSection =
   | "loop"
   | "runtime"
   | "purpose_chain"
-  | "purpose_question";
+  | "purpose_question"
+  | "objective";
 
 export interface OverviewTargetOut {
   route: string;
@@ -5098,6 +5099,13 @@ export interface OverviewOut {
    * means either "no question right now" or "could not be derived" -- told
    * apart by `"purpose_question" in degraded_sections`. */
   purpose_question?: PurposeQuestionOut | null;
+  /** Issue #427/#432 §9.1/§9.3: the Product Objective layer's own section.
+   * `null` only when its own guarded loader failed -- see `"objective"` in
+   * `degraded_sections`. A System with no Product Objective yet still
+   * renders a real `OverviewObjectiveOut` with `objective_state: null` /
+   * `next_step: "create_objective"` (§11's graceful-empty-state rule)
+   * rather than `null` here. */
+  objective?: OverviewObjectiveOut | null;
 }
 
 // --- Purpose Chain (Issue #387 Epic / #388 / #390) --------------------------
@@ -7411,14 +7419,20 @@ export interface JourneyStepExchangeLinkCreateRequest {
 
 /** §9.1's chain. Static Flow and runtime Flow are never one entity;
  * Capability, Flow, and Node are never folded together. */
+/** Issue #427 §7.3 adds the Product Objective layer's four kinds.
+ * `experiment` and `replay_run` join them because a Product Feature's
+ * target link can resolve to either, and the graph adds a target link as a
+ * node under the link's OWN kind. */
 export type FunctionalLineageKind =
   | "stakeholder" | "stakeholder_need" | "purpose_element" | "purpose_relation"
   | "capability" | "value_exchange" | "ux_journey" | "ux_journey_step"
   | "ux_requirement" | "solution_design" | "static_flow" | "runtime_flow"
   | "evolution_node" | "component" | "cell_definition" | "cell_binding"
-  | "probe_point" | "purpose_outcome_criterion";
+  | "probe_point" | "purpose_outcome_criterion"
+  | "product_objective" | "product_milestone" | "product_gap"
+  | "product_feature" | "experiment" | "replay_run";
 
-/** §9.2's 23 gap codes. Held in parity with the server's `LineageGapCode`
+/** §9.2's 23 gap codes, plus Issue #427 §7.3's 11. Held in parity with the server's `LineageGapCode`
  * by `test_interview_type_parity.py`'s `FINITE_TYPE_NAMES`. */
 export type LineageGapCode =
   | "stakeholder_without_role" | "stakeholder_without_need" | "need_without_purpose"
@@ -7429,7 +7443,12 @@ export type LineageGapCode =
   | "node_without_flow" | "subject_without_evaluation_policy"
   | "confirmed_without_evidence" | "stale_upstream" | "stale_link" | "stale_evidence"
   | "conflicting_dependency" | "rejected_dependency" | "feedback_path_missing"
-  | "unresolved_reference" | "unavailable_reference";
+  | "unresolved_reference" | "unavailable_reference"
+  | "objective_without_vision_ref" | "objective_without_milestone"
+  | "milestone_without_gap" | "milestone_without_verification"
+  | "gap_without_journey" | "gap_source_unresolved" | "gap_source_unavailable"
+  | "gap_source_contradicted" | "requirement_without_feature"
+  | "feature_without_implementation_target" | "feature_without_capability";
 
 /** §9.2: fixed per gap CODE, never per instance -- a per-instance severity
  * would be the importance score this Epic forbids everywhere. */
@@ -8288,6 +8307,19 @@ export interface GapWorkbenchSharedSourceOut {
   gap_keys: string[];
 }
 
+/** One resolved detection-source deep link on a Gap Workbench entry
+ * (§9.2/§5.8), one per current `product_gap_source_ref` on the Gap. `route`
+ * is a bare Dashboard path with no query params (a source resolver only
+ * ever names a SCREEN) and is `null` exactly when `deep_link_state` is
+ * `"unavailable"` -- never a fabricated URL for a kind with no Dashboard
+ * screen yet (`node_anomaly`). */
+export interface GapWorkbenchDeepLinkOut {
+  source_kind: ProductGapSourceKind;
+  source_ref: string;
+  deep_link_state: ProductDeepLinkState;
+  route: string | null;
+}
+
 export interface GapWorkbenchEntryOut {
   id: number;
   gap_key: string;
@@ -8300,7 +8332,7 @@ export interface GapWorkbenchEntryOut {
   priority_band: ProductGapPriorityBand;
   recheck_state: ProductRecheckState;
   read_flags: ProductGapReadFlag[];
-  deep_links: OverviewTargetOut[];
+  deep_links: GapWorkbenchDeepLinkOut[];
 }
 
 export interface GapWorkbenchOut {

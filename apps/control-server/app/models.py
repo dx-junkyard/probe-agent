@@ -7805,7 +7805,8 @@ OverviewLoopStageStatus = Literal["reached", "current", "future"]
 #: is its OWN section, separate from `purpose_chain`: a question failure
 #: must not read as the whole Purpose Frame failing, and vice versa.
 OverviewSection = Literal[
-    "brief", "findings", "next_action", "loop", "runtime", "purpose_chain", "purpose_question"
+    "brief", "findings", "next_action", "loop", "runtime", "purpose_chain", "purpose_question",
+    "objective",
 ]
 
 
@@ -7982,6 +7983,14 @@ class OverviewOut(BaseModel):
     #: either "no question right now" (§4.5's normal render) or "could not
     #: be derived" -- told apart by `"purpose_question" in degraded_sections`.
     purpose_question: Optional["PurposeQuestionOut"] = None
+    #: Issue #427/#432 §9.1/§9.3: the Product Objective layer's own section,
+    #: composed from `product_objective_projection.build_objective_overview`
+    #: -- never re-derived here. `None` only when its own guarded loader
+    #: failed (see `"objective"` in `degraded_sections`); a System with no
+    #: Product Objective yet renders a real `OverviewObjectiveOut` with
+    #: `objective_state=None` / `next_step="create_objective"` (§11's
+    #: graceful-empty-state rule) rather than `None` here.
+    objective: Optional["OverviewObjectiveOut"] = None
 
 
 # --- Purpose Chain (Issue #387 Epic / #388) -----------------------------------
@@ -12962,9 +12971,16 @@ FunctionalLineageKind = Literal[
     "ux_requirement", "solution_design", "static_flow", "runtime_flow",
     "evolution_node", "component", "cell_definition", "cell_binding",
     "probe_point", "purpose_outcome_criterion",
+    # Issue #427 §7.3's Product Objective layer. `experiment` and
+    # `replay_run` join them because a Product Feature's target link can
+    # resolve to either (`ProductFeatureLinkKind`), and the graph adds a
+    # target link as a node under the link's OWN kind -- the same pattern
+    # Solution Design target links already use.
+    "product_objective", "product_milestone", "product_gap", "product_feature",
+    "experiment", "replay_run",
 ]
 
-#: §9.2's 23 gap codes. Each carries a FIXED `LineageGapSeverity` (never
+#: §9.2's 23 gap codes, plus Issue #427 §7.3's 11. Each carries a FIXED `LineageGapSeverity` (never
 #: computed per instance -- `app.functional_lineage._GAP_SEVERITY` is the
 #: one place that mapping lives, and `test_interview_type_parity.py` and
 #: `test_functional_lineage.py` both check every code here is reachable).
@@ -12978,6 +12994,14 @@ LineageGapCode = Literal[
     "confirmed_without_evidence", "stale_upstream", "stale_link", "stale_evidence",
     "conflicting_dependency", "rejected_dependency", "feedback_path_missing",
     "unresolved_reference", "unavailable_reference",
+    # Issue #427 §7.3's 11 Product Objective codes. Their severities live in
+    # the same fixed `_GAP_SEVERITY` table as every other code -- a Gap's
+    # priority band and a source's own severity never feed them.
+    "objective_without_vision_ref", "objective_without_milestone",
+    "milestone_without_gap", "milestone_without_verification",
+    "gap_without_journey", "gap_source_unresolved", "gap_source_unavailable",
+    "gap_source_contradicted", "requirement_without_feature",
+    "feature_without_implementation_target", "feature_without_capability",
 ]
 
 #: §9.2: fixed per gap CODE, never per instance (invariant 7 -- a per-instance
@@ -14250,6 +14274,24 @@ class GapWorkbenchSharedSourceOut(BaseModel):
     gap_keys: List[str] = []
 
 
+class GapWorkbenchDeepLinkOut(BaseModel):
+    """One resolved detection-source deep link on a Gap Workbench entry
+    (§9.2/§5.8), one per current `product_gap_source_ref` on the Gap.
+    `route` is a bare Dashboard path (`product_gap_sources._DEEP_LINKS`,
+    e.g. `/system-understanding`) with no query params -- a source resolver
+    only ever names a SCREEN, never a deep-link target with fields to
+    select, so wrapping this in the heavier `OverviewTargetOut` (built for
+    a `route`+`label`+`params` navigation) would invent a `label` no
+    resolver supplies. `route` is `None` exactly when `deep_link_state` is
+    `unavailable` -- never a fabricated URL for a kind with no Dashboard
+    screen yet (`node_anomaly`, #401's unimplemented remainder)."""
+
+    source_kind: ProductGapSourceKind
+    source_ref: str
+    deep_link_state: ProductDeepLinkState = "unavailable"
+    route: Optional[str] = None
+
+
 class GapWorkbenchEntryOut(BaseModel):
     id: int
     gap_key: str
@@ -14262,12 +14304,11 @@ class GapWorkbenchEntryOut(BaseModel):
     priority_band: ProductGapPriorityBand = "unset"
     recheck_state: ProductRecheckState = "current"
     read_flags: List[ProductGapReadFlag] = []
-    #: To the detection screen, Journey, Requirement, Feature,
-    #: implementation target, and evidence -- reusing `OverviewTargetOut`
-    #: rather than a second link-shaped model. A kind with no Dashboard
-    #: screen (`node_anomaly`, §5.8) is simply absent here, never a
-    #: fabricated URL.
-    deep_links: List["OverviewTargetOut"] = []
+    #: To the detection screen behind each current source ref. A kind with
+    #: no Dashboard screen (`node_anomaly`, §5.8) is simply reported with
+    #: `deep_link_state='unavailable'`, never dropped and never a fabricated
+    #: URL.
+    deep_links: List[GapWorkbenchDeepLinkOut] = []
 
 
 class GapWorkbenchOut(BaseModel):

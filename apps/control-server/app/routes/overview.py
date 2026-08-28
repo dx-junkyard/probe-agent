@@ -47,10 +47,15 @@ from ..models import (
     OverviewActionOut,
     OverviewFindingOut,
     OverviewLoopStageOut,
+    OverviewObjectiveOut,
     OverviewOut,
     OverviewRuntimeHealthOut,
     OverviewTargetOut,
+    ProductGapOut,
+    ProductMilestoneOut,
+    ProductObjectiveOut,
     PurposeChainOut,
+    UnderstandingBriefClaimOut,
     UnderstandingBriefOut,
 )
 # `_question_out` is `routes/purpose_chain.py`'s own conversion from a
@@ -98,6 +103,46 @@ def _finding_out(finding, status: str) -> OverviewFindingOut:
         target=_target_out(finding.target),
         evidence=[dict(item) for item in finding.evidence],
         occurrence_count=finding.occurrence_count,
+    )
+
+
+def _objective_section_out(section) -> Optional[OverviewObjectiveOut]:
+    """Convert `overview_projection.OverviewResult.objective`
+    (`product_objective_projection.ObjectiveOverviewResult`) into the wire
+    model. `active_objective` / `next_milestone` / `primary_gap` are already
+    exactly `ProductObjectiveOut` / `ProductMilestoneOut` / `ProductGapOut`
+    -shaped dicts -- `product_objective_projection` builds them straight off
+    `product_objective.get_*_summary`, so no re-derivation happens here."""
+    if section is None:
+        return None
+    return OverviewObjectiveOut(
+        vision=(
+            UnderstandingBriefClaimOut(**asdict(section.vision))
+            if section.vision is not None
+            else None
+        ),
+        active_objective=(
+            ProductObjectiveOut(**section.active_objective)
+            if section.active_objective is not None
+            else None
+        ),
+        active_objective_count=section.active_objective_count,
+        next_milestone=(
+            ProductMilestoneOut(**section.next_milestone)
+            if section.next_milestone is not None
+            else None
+        ),
+        primary_gap=(
+            ProductGapOut(**section.primary_gap) if section.primary_gap is not None else None
+        ),
+        objective_state=section.objective_state,
+        next_step=section.next_step,
+        next_step_state=section.next_step_state,
+        next_step_reason=section.next_step_reason,
+        next_step_completion=section.next_step_completion,
+        next_step_value=section.next_step_value,
+        degraded_sections=list(section.degraded_sections),
+        degraded_detail=dict(section.degraded_detail),
     )
 
 
@@ -186,4 +231,5 @@ def get_overview(system_id: int = Depends(get_system_id)) -> OverviewOut:
             if result.purpose_question is not None
             else None
         ),
+        objective=_objective_section_out(result.objective),
     )

@@ -48,6 +48,7 @@ from .routes import (
     probe_patterns,
     product_features,
     product_gaps,
+    product_lineage,
     product_objectives,
     project_intelligence,
     publish_jobs,
@@ -177,6 +178,7 @@ def create_app() -> FastAPI:
     app.include_router(product_objectives.milestone_router, dependencies=_auth)
     app.include_router(product_gaps.router, dependencies=_auth)
     app.include_router(product_features.router, dependencies=_auth)
+    app.include_router(product_lineage.router, dependencies=_auth)
     return app
 
 
