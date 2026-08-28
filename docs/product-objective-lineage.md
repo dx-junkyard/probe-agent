@@ -839,18 +839,39 @@ ProductGapSourceState = Literal[
 | --- | --- | --- | --- | --- | --- |
 | `manual` | なし(開発者が直接書いた Gap) | `''` | — | なし | — |
 | `system_understanding_gap` | `system_understanding_service` の gaps + `gap_triage.annotate_gaps` | `gap_triage.gap_key(gap)` = `"{gap_type}\|{target_kind}\|{sorted_targets}"` | `captured_snapshot_id` | triage 状態が `resolved` | `/system-understanding` |
-| `understanding_review_gap` | `understanding_revision.gap_analysis`(reviewer の LLM 自己申告) | `f"{gap_type}\|{node_name}"` | `captured_revision_id` | 現在の revision の `gap_analysis` に同 ref が無い → `disappeared` | `/interview` |
+| `understanding_review_gap` | `understanding_revision.gap_analysis`(reviewer の LLM 自己申告) | `f"{gap_type}\|{node_name}"` | `captured_revision_id` | **到達不能**(§5.4.1) | `/interview` |
 | `understanding_claim_change` | `understanding_diff.diff_understanding` | `f"{section}\|{name}"` | `captured_revision_id` | 該当 claim が現在 `unchanged` | `/interview` |
-| `functional_lineage_gap` | `functional_lineage.build_functional_lineage` | `f"{code}\|{subject_kind}\|{subject_ref}"` | — | 同 ref の gap が現在の projection に無い → `disappeared` | `/functional-lineage` |
-| `value_network_notice` | `stakeholder_value_network.build_value_network` | `f"{code}\|{subject_kind}\|{subject_key}"` | — | 同上 | `/stakeholder-value-network` |
+| `functional_lineage_gap` | `functional_lineage.build_functional_lineage` | `f"{code}\|{subject_kind}\|{subject_ref}"` | — | **到達不能**(§5.4.1) | `/functional-lineage` |
+| `value_network_notice` | `stakeholder_value_network.build_value_network` | `f"{code}\|{subject_kind}\|{subject_key}"` | — | **到達不能**(§5.4.1) | `/stakeholder-value-network` |
 | `journey_baseline_diff` | `ux_design.baseline_diff_journey` | `f"{journey_key}\|{step_key}"` | — | `change_kind` が `unchanged` | `/ux-design-studio` |
-| `requirement_diff` | `ux_design.diff_requirement_revisions` | `f"{requirement_key}\|{criterion_key}"` | `captured_revision_id` | 同上 | `/ux-design-studio` |
+| `requirement_diff` | `ux_design.diff_requirement_revisions` | `f"{requirement_key}\|{criterion_key}"` | `captured_revision_id` | `change_kind` が `unchanged` | `/ux-design-studio` |
 | `capability_drift` | `drift.compute_anchor_drift` | `f"{path}\|{qualified_name}"` または `f"entrypoint:{entrypoint_id}"` | `captured_snapshot_id` + `captured_run_id` | status が `fresh` | `/capability-map` |
 | `runtime_alignment_mismatch` | `alignment_item.runtime_check` | `alignment_item.review_subject_id` | — | `runtime_check` が `match` | `/interview` |
 | `node_anomaly` | `node_anomaly` | `f"{node_key}\|{dedupe_key}"` | — | `status` が `resolved` | **なし**(§5.8) |
 | `joint_understanding_open` | `joint_understanding_session` | `id` の 10 進文字列 | — | `status` が `closed` | `/interview` |
 | `inquiry_unresolved` | `interview_inquiry` | `id` の 10 進文字列 | — | `status` が `answered` / `superseded` | `/interview` |
 | `issue_draft` | `issue_drafts` | `id` の 10 進文字列 | — | `status` が `closed` / `rejected` | `/system-understanding` |
+
+#### 5.4.1 `contradicted` に到達できない検出元がある
+
+`contradicted` は「検出元自身が『その条件はもう成り立たない』と言っている」
+状態である。したがって **検出元がそれを言える語彙を持っていなければ到達不能**
+であり、その 3 kind では合成しない:
+
+| kind | なぜ到達不能か |
+| --- | --- |
+| `understanding_review_gap` | reviewer の `gap_analysis` は JSON 配列の要素で、status 欄が無い |
+| `functional_lineage_gap` | projection が毎回作り直され、「解消した」ではなく**出てこない**という形でしか消えない |
+| `value_network_notice` | 同上 |
+
+これらで条件が解消したときに出る答えは `disappeared` である。**`disappeared` を
+`contradicted` として報告しない** — 前者は「検出元にもう無い」、後者は
+「検出元が否定している」であり、開発者が次に取る操作が違う(§0-8)。
+`manual` も同様に、外部正本を持たないので常に `current` で、
+`disappeared` にも `contradicted` にも到達しない。
+
+**この 4 kind について、テストは到達不能を到達不能として記録する。** 5 状態を
+全部埋めるために合成した信号を作らない。
 
 **`capability_drift` は `capability_hierarchy_nodes.id` を使わない。** その行 id は
 hierarchy を作り直すたび振り直される。`drift.py` 自身が現在の事実を突き合わせる
