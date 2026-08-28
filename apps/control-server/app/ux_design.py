@@ -657,68 +657,15 @@ def _resolve_purpose_target(
 #: Issue #427/#431 §7.1's three new upstream ref kinds, each resolved
 #: against its OWN canonical identity+revision table -- never translated
 #: into `UxDesignStatus` (the #380 superset rule: `target_state` below
-#: carries `objective_state` / Milestone `design_status` / Gap `lifecycle`
-#: verbatim). `product_milestone_decision`'s fold is IDENTICAL to this
-#: module's own `_DECISION_TO_DESIGN_STATUS` (confirm/reject/retire/
-#: reinstate -> confirmed/rejected/retired/proposed), so it is reused
-#: rather than re-declared.
+#: carries `objective_state` / the Milestone's `design_status` / the Gap's
+#: `lifecycle` verbatim).
 #:
-#: DUPLICATION NOTE (to collapse once Issue #429's `app/product_objective.py`
-#: lands): `app/product_objective.py` is being written concurrently by
-#: another agent and did not exist yet when this resolver was written, so
-#: the objective_state (§4.3) and gap lifecycle (§5.6) ledger-folds below
-#: are reproduced locally from the contract rather than imported. Once that
-#: module exposes its own derivation helper for each, these three local
-#: fold tables/functions should be deleted and replaced with calls into it
-#: (see docs/product-objective-lineage.md §4.2/§4.3/§5.6).
-_OBJECTIVE_DECISION_TO_STATE: Dict[str, str] = {
-    "confirm": "confirmed",
-    "activate": "active",
-    "achieve": "achieved",
-    "reject": "rejected",
-    "retire": "retired",
-    "reinstate": "proposed",
-}
-
-_GAP_DECISION_TO_LIFECYCLE: Dict[str, str] = {
-    "acknowledge": "acknowledged",
-    "defer": "deferred",
-    "resolve": "resolved",
-    "reject": "rejected",
-    "retire": "obsolete",
-    "reopen": "open",
-}
-
-
-def _fold_latest_decision(
-    conn: sqlite3.Connection,
-    table: str,
-    system_id: int,
-    key_column: str,
-    key_value: str,
-    fold_table: Dict[str, str],
-    default: str,
-    exclude_decisions: Tuple[str, ...] = (),
-) -> str:
-    """The shared shape of §4.3/§5.6's ledger folds: the latest
-    non-superseded decision row for one key, mapped through a fixed table.
-    `table` / `key_column` are always one of this module's own hardcoded
-    constants below, never caller input, so building the query with an
-    f-string carries no injection risk."""
-    query = (
-        f"SELECT decision FROM {table} "  # noqa: S608 - table/key_column are fixed constants, never caller input
-        f"WHERE system_id = ? AND {key_column} = ? AND superseded_by_id IS NULL"
-    )
-    params: List[Any] = [system_id, key_value]
-    if exclude_decisions:
-        placeholders = ", ".join("?" for _ in exclude_decisions)
-        query += f" AND decision NOT IN ({placeholders})"
-        params.extend(exclude_decisions)
-    query += " ORDER BY id DESC LIMIT 1"
-    row = conn.execute(query, params).fetchone()
-    if row is None:
-        return default
-    return fold_table.get(row["decision"], default)
+#: The ledger folds themselves live in `app/product_objective.py`, which
+#: OWNS those three vocabularies, and are imported lazily inside each
+#: resolver so this module gains no import-time dependency on it. An
+#: earlier revision reproduced the fold tables here because that module did
+#: not exist yet; a second copy of a state machine is exactly what drifts,
+#: so it was deleted rather than kept in sync.
 
 
 def _resolve_product_objective_target(conn: sqlite3.Connection, system_id: int, target_ref: str) -> Dict[str, Any]:
@@ -759,10 +706,9 @@ def _resolve_product_objective_target(conn: sqlite3.Connection, system_id: int, 
         if revision is not None
         else ""
     )
-    state = _fold_latest_decision(
-        conn, "product_objective_decision", system_id, "objective_key", ref,
-        _OBJECTIVE_DECISION_TO_STATE, default="proposed",
-    )
+    from . import product_objective  # local: see the note above the resolvers
+
+    state, _decision = product_objective.derive_objective_state(conn, system_id, ref)
     name = revision["title"] if revision is not None else None
     return {"resolution": "resolved", "name": name, "state": state, "digest": digest}
 
@@ -808,10 +754,9 @@ def _resolve_product_milestone_target(conn: sqlite3.Connection, system_id: int, 
         if revision is not None
         else ""
     )
-    state = _fold_latest_decision(
-        conn, "product_milestone_decision", system_id, "milestone_key", ref,
-        _DECISION_TO_DESIGN_STATUS, default="proposed",
-    )
+    from . import product_objective  # local: see the note above the resolvers
+
+    state, _decision = product_objective.derive_milestone_design_status(conn, system_id, ref)
     name = revision["title"] if revision is not None else None
     return {"resolution": "resolved", "name": name, "state": state, "digest": digest}
 
@@ -855,10 +800,9 @@ def _resolve_product_gap_target(conn: sqlite3.Connection, system_id: int, target
         if revision is not None
         else ""
     )
-    state = _fold_latest_decision(
-        conn, "product_gap_decision", system_id, "gap_key", ref,
-        _GAP_DECISION_TO_LIFECYCLE, default="open", exclude_decisions=("prioritize",),
-    )
+    from . import product_objective  # local: see the note above the resolvers
+
+    state, _decision = product_objective.derive_gap_lifecycle(conn, system_id, ref)
     name = revision["title"] if revision is not None else None
     return {"resolution": "resolved", "name": name, "state": state, "digest": digest}
 

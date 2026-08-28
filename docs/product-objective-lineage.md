@@ -399,6 +399,18 @@ decision の前提は `proposed`, `confirmed`)。
   行にある理由と同じ、#405 §2.3) → `product_milestone.objective_id`(NOT NULL、
   同一 System 検査、変更不可)。
 
+**root へ戻すことも記録する。** `parent_objective_id` は NULL 可で、
+NULL の行は「この Objective を意図的に切り離して root に戻した」という
+**決定の記録**である(`rationale` / `created_by` / `created_at` を持つ)。
+親を外すことは製品上の判断なので、親を付け替えたときと同じ重みで残す。
+行を削除して同じ読み(現在の親が無い)を作らない — それは誰がなぜ切り離した
+かの記録を消すことであり、§0-4 が禁じている。**削除は安全でもない**:
+`superseded_by_id` は `ON DELETE SET NULL` の自己参照 FK なので、tip の行
+だけ消すと直前の親が current として復活する。
+**一度も親を持ったことがない root は行が無いままである** — §4.4 の
+「NULL の親行を作らない」はその場合を指す。この列が NULL 可なのは、
+**戻ったことを記録できるようにするため**だけである。
+
 **循環は決定的に拒否する。**
 
 * 自己参照 → 422 `product_objective_parent_self`

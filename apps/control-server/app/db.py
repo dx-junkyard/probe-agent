@@ -7552,7 +7552,18 @@ CREATE TABLE IF NOT EXISTS product_objective_parent_link (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id           INTEGER NOT NULL,
     objective_id        INTEGER NOT NULL,
-    parent_objective_id INTEGER NOT NULL,
+    -- NULL means "this Objective was deliberately detached and is now a
+    -- root". It is a real, auditable decision row -- carrying its own
+    -- `rationale`, `created_by` and `created_at` -- not the absence of
+    -- one. Deleting the link history instead would satisfy the same read
+    -- ("no current parent") while destroying the record of who detached
+    -- it and why, which is exactly what §0-4 forbids; it also cannot be
+    -- done safely here, because `superseded_by_id`'s ON DELETE SET NULL
+    -- would resurrect the prior link as current the moment the tip row
+    -- went away. A root that never had a parent still has NO row at all
+    -- (§4.4's "NULL の親行を作らない" governs that case); this column is
+    -- nullable only so that RETURNING to root is recordable.
+    parent_objective_id INTEGER,
     rationale           TEXT NOT NULL DEFAULT '',
     decision_method     TEXT NOT NULL DEFAULT 'manual'
                             CHECK (decision_method IN ('manual', 'reasoning_llm')),

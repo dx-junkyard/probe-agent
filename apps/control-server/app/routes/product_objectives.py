@@ -263,12 +263,24 @@ def set_objective_parent_endpoint(
 @router.delete("/{objective_key}/parent", response_model=ProductObjectiveOut)
 def clear_objective_parent_endpoint(
     objective_key: str,
+    # Detaching an Objective is a product decision, so it is recorded like
+    # one (§4.4): the tombstone row carries this rationale alongside the
+    # actor and the timestamp. It rides as a query parameter because a
+    # DELETE body is not reliably transported; it is optional because the
+    # WHO and WHEN are captured either way.
+    rationale: str = "",
     system_id: int = Depends(get_system_id),
     principal: Principal = Depends(require_user),
 ) -> ProductObjectiveOut:
     with get_conn() as conn:
         try:
-            out = product_objective.clear_objective_parent(conn, system_id=system_id, objective_key=objective_key)
+            out = product_objective.clear_objective_parent(
+                conn,
+                system_id=system_id,
+                objective_key=objective_key,
+                rationale=rationale,
+                created_by=_principal_actor(principal),
+            )
         except Exception as exc:
             _raise_for_error(exc)
             raise

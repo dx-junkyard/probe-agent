@@ -1015,6 +1015,19 @@ def set_objective_parent(
                WHERE system_id = ? AND objective_id = ? AND superseded_by_id IS NULL""",
             (system_id, objective["id"]),
         ).fetchone()
+        if prior is not None:
+            # `ux_product_objective_parent_current` is a partial UNIQUE index
+            # on `objective_id WHERE superseded_by_id IS NULL` -- inserting
+            # the replacement row BEFORE freeing that slot would put two
+            # current rows in the table for the duration of the INSERT
+            # statement and SQLite checks the index immediately, not at
+            # commit. Point the prior row at ITSELF as a placeholder (the
+            # same idiom `solution_design.py`'s
+            # `_ux_solution_design_option_current` writer uses) so the slot
+            # is free the instant before the real successor id exists.
+            conn.execute(
+                "UPDATE product_objective_parent_link SET superseded_by_id = id WHERE id = ?", (prior["id"],)
+            )
         cur = conn.execute(
             """INSERT INTO product_objective_parent_link
                    (system_id, objective_id, parent_objective_id, rationale, decision_method, created_by, created_at)
@@ -1035,35 +1048,78 @@ def set_objective_parent(
 
 
 def clear_objective_parent(
-    conn: sqlite3.Connection, *, system_id: int, objective_key: str, now: Optional[float] = None
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    objective_key: str,
+    rationale: str = "",
+    decision_method: str = "manual",
+    created_by: Optional[str],
+    now: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """`DELETE .../parent` (§10). §4.4 defines "current" as `superseded_by_id
-    IS NULL` and root as the ABSENCE of a current row -- "NULL の親行を
-    作らない". Since `parent_objective_id` is `NOT NULL`, there is no row
-    shape that can represent "no parent" while still being a normal
-    append-only correction (which always supersedes into ANOTHER real
-    link row). Going back to root is therefore the one structurally
-    special case in this table: it removes the currently active link row
-    outright rather than superseding it into a placeholder, so the table
-    returns to exactly the state §4.4 describes as root (no current row).
-    A no-op (already root) is not an error -- DELETE is idempotent."""
+    """Detach an Objective from its parent, making it a root again (§4.4).
+
+    This APPENDS a tombstone row with `parent_objective_id IS NULL` rather
+    than deleting the link history. Returning to root is a product decision
+    -- someone judged that this Objective no longer belongs under that one
+    -- so it carries a `rationale`, a `created_by` and a timestamp exactly
+    like the re-parenting it reverses. Deleting the rows instead would
+    reach the same READ ("no current parent") while destroying the record
+    of who detached it and why, which is what §0-4's append-only rule
+    exists to prevent.
+
+    Deleting is also not safely available here. `superseded_by_id` is a
+    self-referencing FK with `ON DELETE SET NULL`, so removing only the
+    current tip would have SQLite reset the immediately prior row's
+    `superseded_by_id` to NULL and silently resurrect an OLD parent as
+    current; removing the whole history is the only delete that avoids
+    that, at the cost of the audit trail.
+
+    A root that never had a parent still has no row at all -- §4.4's
+    "NULL の親行を作らない" governs THAT case, and a fresh Objective is not
+    given a tombstone. Clearing an already-root Objective is a no-op and
+    is not an error.
+    """
+    now = time.time() if now is None else now
     objective = _get_objective_row(conn, system_id, objective_key)
     if objective is None:
         raise NotFound(f"Objective {objective_key!r} not found")
 
     conn.execute("BEGIN")
     try:
-        conn.execute(
-            "DELETE FROM product_objective_parent_link WHERE system_id = ? AND objective_id = ? AND superseded_by_id IS NULL",
+        prior = conn.execute(
+            """SELECT id, parent_objective_id FROM product_objective_parent_link
+               WHERE system_id = ? AND objective_id = ? AND superseded_by_id IS NULL""",
             (system_id, objective["id"]),
+        ).fetchone()
+        if prior is None or prior["parent_objective_id"] is None:
+            # Already a root -- either never parented, or already detached.
+            # Appending a second tombstone would record a decision nobody
+            # made.
+            conn.execute("COMMIT")
+            return get_objective_detail(conn, system_id, objective_key)
+        # Free the partial unique index slot before inserting the
+        # tombstone, for the same reason `set_objective_parent` does:
+        # SQLite checks `ux_product_objective_parent_current` per
+        # statement, not at commit.
+        conn.execute(
+            "UPDATE product_objective_parent_link SET superseded_by_id = id WHERE id = ?", (prior["id"],)
+        )
+        cur = conn.execute(
+            """INSERT INTO product_objective_parent_link
+                   (system_id, objective_id, parent_objective_id, rationale, decision_method, created_by, created_at)
+               VALUES (?, ?, NULL, ?, ?, ?, ?)""",
+            (system_id, objective["id"], rationale, decision_method, created_by, now),
+        )
+        conn.execute(
+            "UPDATE product_objective_parent_link SET superseded_by_id = ? WHERE id = ?",
+            (cur.lastrowid, prior["id"]),
         )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-
-    return get_objective_summary(conn, system_id, objective_key)
-
+    return get_objective_detail(conn, system_id, objective_key)
 
 def add_objective_upstream_ref(
     conn: sqlite3.Connection,
@@ -1084,7 +1140,8 @@ def add_objective_upstream_ref(
     NOW -- empty when the target does not currently resolve, exactly the
     `not_captured` case `_ref_recheck_state` treats as fail-closed."""
     now = time.time() if now is None else now
-    _check_membership(ref_kind, REF_KINDS, "ref_kind")
+    if ref_kind not in REF_KINDS:
+        raise RefKindInvalid(ref_kind)
     objective = _get_objective_row(conn, system_id, objective_key)
     if objective is None:
         raise NotFound(f"Objective {objective_key!r} not found")

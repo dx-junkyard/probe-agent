@@ -60,8 +60,16 @@ def admin_client(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
     monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "s3cret")
     monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
+    # A couple of tests below walk a several-hundred-hop parent/dependency
+    # chain to prove the cycle check is iterative rather than recursive
+    # (§4.4). That alone can exceed the default management-API rate limit
+    # within one fixed 60s window, which is an unrelated resource guard, not
+    # part of this contract -- raise it generously for this test module only.
+    monkeypatch.setenv("CONTROL_MANAGEMENT_RATE_LIMIT_PER_MINUTE", "100000")
+    from app import resource_limits  # noqa: WPS433
     from app.main import app  # noqa: WPS433
 
+    resource_limits.reset_in_memory_rate_limits()
     _register_routers(app)
     with TestClient(app) as c:
         yield c
@@ -263,8 +271,9 @@ class TestObjectiveRevisions:
         token, system_id = _setup(admin_client, None, "System Obj Recheck")
         headers = _headers(token, system_id)
         _create_objective(admin_client, headers, "grow-retention")
-        row = _add_objective_revision(admin_client, headers, "grow-retention", title="v1")
-        digest = row["current_revision"]["content_digest"]
+        _add_objective_revision(admin_client, headers, "grow-retention", title="v1")
+        detail = admin_client.get("/product-objectives/grow-retention", headers=headers).json()
+        digest = detail["current_revision"]["content_digest"]
 
         decision = _decide_objective(admin_client, headers, "grow-retention", "confirm", captured_digest=digest)
         assert decision["decision"] == "confirm"
@@ -493,6 +502,75 @@ class TestObjectiveParentCycles:
         # DELETE is idempotent when already at root.
         r2 = admin_client.delete("/product-objectives/a/parent", headers=headers)
         assert r2.status_code == 200
+
+    def test_clearing_a_parent_preserves_the_link_history_as_an_audit_record(self, admin_client):
+        """Returning to root is a product decision, not an erasure (§0-4).
+
+        The tombstone approach is load-bearing in two ways, and this test
+        pins both. Deleting the link rows would reach the same READ ("no
+        current parent") while destroying the record of who detached the
+        Objective and why -- and it is not even safe: `superseded_by_id` is
+        a self-referencing FK with ON DELETE SET NULL, so removing only the
+        current tip resurrects the PREVIOUS parent as current.
+        """
+        from app.db import get_conn
+
+        token, system_id = _setup(admin_client, None, "System Obj Parent Audit")
+        headers = _headers(token, system_id)
+        for key in ("a", "b", "c"):
+            _create_objective(admin_client, headers, key)
+        admin_client.post("/product-objectives/a/parent", json={"parent_objective_key": "b"}, headers=headers)
+        admin_client.post("/product-objectives/a/parent", json={"parent_objective_key": "c"}, headers=headers)
+        admin_client.delete(
+            "/product-objectives/a/parent?rationale=scope+moved+out", headers=headers
+        )
+
+        row = admin_client.get("/product-objectives/a", headers=headers).json()
+        assert row["parent_objective_id"] is None
+
+        with get_conn() as conn:
+            objective_id = conn.execute(
+                "SELECT id FROM product_objective WHERE system_id = ? AND objective_key = 'a'", (system_id,)
+            ).fetchone()["id"]
+            links = [
+                dict(r)
+                for r in conn.execute(
+                    """SELECT * FROM product_objective_parent_link
+                           WHERE objective_id = ? ORDER BY id ASC""",
+                    (objective_id,),
+                )
+            ]
+
+        # Both parentings AND the detachment survive: nothing is deleted.
+        assert len(links) == 3
+        assert links[0]["parent_objective_id"] is not None
+        assert links[1]["parent_objective_id"] is not None
+        # The detachment is a real decision row, with its own actor and
+        # reason -- not the absence of a row.
+        assert links[2]["parent_objective_id"] is None
+        assert links[2]["rationale"] == "scope moved out"
+        assert links[2]["created_by"]
+        assert links[2]["superseded_by_id"] is None
+        # ...and exactly one row is current, so the partial unique index
+        # still describes the graph correctly.
+        assert [link["id"] for link in links if link["superseded_by_id"] is None] == [links[2]["id"]]
+
+    def test_reparenting_after_a_clear_supersedes_the_tombstone(self, admin_client):
+        """The tombstone is a normal link row, so re-parenting after a
+        detachment is a normal append-only correction rather than a second
+        structural special case."""
+        token, system_id = _setup(admin_client, None, "System Obj Reparent After Clear")
+        headers = _headers(token, system_id)
+        for key in ("a", "b"):
+            _create_objective(admin_client, headers, key)
+        admin_client.post("/product-objectives/a/parent", json={"parent_objective_key": "b"}, headers=headers)
+        admin_client.delete("/product-objectives/a/parent", headers=headers)
+        r = admin_client.post(
+            "/product-objectives/a/parent", json={"parent_objective_key": "b"}, headers=headers
+        )
+        assert r.status_code in (200, 201), r.text
+        row = admin_client.get("/product-objectives/a", headers=headers).json()
+        assert row["parent_objective_key"] == "b"
 
     def test_cross_system_parent_is_404(self, admin_client):
         token = _login(admin_client)
