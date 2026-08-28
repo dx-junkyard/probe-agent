@@ -215,7 +215,7 @@ LOOP_STAGE_MEANINGS: Dict[str, str] = {
     "publish": "採用した変更をレビュー可能な形で公開します。",
 }
 
-LOOP_STAGE_NEXT_MILESTONE: Dict[str, str] = {
+LOOP_STAGE_COMPLETION_HINT: Dict[str, str] = {
     "setup": "解析できる snapshot が 1 件そろうこと。",
     "preparation": "System Purpose と主要機能をあなたが確認済みにすること。",
     "instrumentation": "承認済みの計測経路が 1 本できること。",
@@ -1362,7 +1362,15 @@ class OverviewLoopStageView:
     label: str
     status: str
     meaning: str
-    next_milestone: str = ""
+    #: A fixed sentence describing what completes THIS loop stage
+    #: (`LOOP_STAGE_COMPLETION_HINT`). Issue #427 renamed it away from
+    #: `next_milestone`: a canonical Milestone is a `product_milestone` row
+    #: with a stable key, a revision history and a human achievement
+    #: assessment, and this is none of those -- it is a static lookup keyed by
+    #: the loop stage. Sharing the word made the rail read as the Objective
+    #: layer's next Milestone, which is a different fact on a different
+    #: surface (contract §7.4).
+    stage_completion_hint: str = ""
     complete: bool = False
 
 
@@ -1391,8 +1399,8 @@ def build_loop_stages(
                 label=LOOP_STAGE_LABELS[stage],
                 status=status,
                 meaning=LOOP_STAGE_MEANINGS[stage],
-                next_milestone=(
-                    LOOP_STAGE_NEXT_MILESTONE[stage] if status == "current" else ""
+                stage_completion_hint=(
+                    LOOP_STAGE_COMPLETION_HINT[stage] if status == "current" else ""
                 ),
                 complete=complete,
             )

@@ -1525,9 +1525,12 @@ GET    /gap-workbench                                       -> GapWorkbenchOut
   (§7.4)。server と TS を同時に直し、`test_interview_type_parity.py` が守る。
   この 1 フィールドを読む consumer は Dashboard だけであることを #433 で確認する。
 * **Product Objective 未導入 System は graceful empty state**。
-  `GET /overview` の `objective` セクションは `objective_state='not_started'` を
-  返し、`degraded` にはしない — 「まだ作っていない」は失敗ではない。
-  Objective Map は「新規作成」の空状態を出す。
+  `GET /overview` の `objective` セクションは `objective_state=null` +
+  `next_step='create_objective'` を返し、`degraded` にはしない — 「まだ作って
+  いない」は失敗ではない。`not_started` という値を `ProductObjectiveState` へ
+  足さないのは、それが**Objective の状態ではなく Objective の不在**だからである。
+  読めなかった (`next_step_state='unavailable'`) との区別は `next_step` 側の軸が
+  付ける(§0-8)。Objective Map は「新規作成」の空状態を出す。
 * **既存 Purpose / Capability → Journey direct ref は読み書きとも不変**(§7.1)。
 * **既存 `feature_drafts` / Feature Map の snapshot lineage は不変**(§1.6)。
 * **`cell_goals` を自動移行しない**(§1.4)。

@@ -221,6 +221,45 @@ FINITE_TYPE_NAMES = (
     "FunctionalLineageKind",
     "LineageGapCode",
     "LineageGapSeverity",
+    # Epic #427 (Issues #429-#432): Product Objective / Milestone / Gap's
+    # finite vocabularies. Same drift risk as every family above -- and
+    # unusually high stakes here, because §0 invariant 7 of
+    # docs/product-objective-lineage.md structurally forbids a numeric
+    # priority/severity/completeness/confidence field anywhere in this
+    # Epic's responses. The only way `priority_band` or `lifecycle` stays a
+    # human-placed finite choice instead of quietly regrowing a score is if
+    # the Dashboard's union can never silently drift narrower or wider than
+    # the server's Literal -- a value present on one side alone would let a
+    # response accepted by Pydantic fail to type-check on the Dashboard (or
+    # vice versa) without either test suite noticing.
+    "ProductDesignStatus",
+    "ProductObjectiveState",
+    "ProductRecheckState",
+    "ProductRevisionState",
+    "ProductAuthorshipKind",
+    "ProductMilestoneAchievement",
+    "ProductMilestoneAssessability",
+    "ProductMilestoneVerificationMethod",
+    "ProductObjectiveDecisionKind",
+    "ProductMilestoneDecisionKind",
+    "ProductMilestoneAssessmentKind",
+    "ProductRefKind",
+    "ProductRefRelationStatus",
+    "ProductRefTargetResolution",
+    "ProductRefRecheckState",
+    "ProductGapTargetMode",
+    "ProductGapSourceKind",
+    "ProductGapSourceState",
+    "ProductGapLifecycle",
+    "ProductGapDecisionKind",
+    "ProductGapPriorityBand",
+    "ProductGapEvidenceKind",
+    "ProductGapArtifactLinkKind",
+    "ProductFeatureLinkKind",
+    "ProductDeepLinkState",
+    "ProductGapReadFlag",
+    "ProductObjectiveNextStepKey",
+    "ProductObjectiveNextStepState",
 )
 
 

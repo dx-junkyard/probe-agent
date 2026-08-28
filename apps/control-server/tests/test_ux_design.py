@@ -78,8 +78,13 @@ class TestFiniteVocabularies:
         assert set(ux_design.DESIGN_DECISION_KINDS) == {"confirm", "reject", "retire", "reinstate"}
         assert set(ux_design.DESIGN_RECHECK_STATES) == {"current", "stale"}
         assert set(ux_design.REVISION_STATES) == {"current", "superseded"}
+        # Issue #427 §7.1 widened this set so a Journey can name the
+        # Objective / Milestone / Gap it exists to address. The three original
+        # values are unchanged -- the widening adds vocabulary, it never
+        # rewrites or retires an existing `ref_kind`.
         assert set(ux_design.REF_KINDS) == {
             "purpose_element", "purpose_relation", "capability_entity",
+            "product_objective", "product_milestone", "product_gap",
         }
         assert set(ux_design.REF_RELATION_STATUSES) == {"confirmed", "proposed", "derived"}
         assert set(ux_design.REF_TARGET_RESOLUTIONS) == {"resolved", "unresolved", "unavailable"}

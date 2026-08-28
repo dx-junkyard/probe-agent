@@ -463,10 +463,10 @@ describe("Next action (Issue #383)", () => {
         overview={overview({
           user_phase: "instrumentation",
           loop_stages: [
-            { stage: "setup", label: "Setup", status: "reached", meaning: "m", next_milestone: "", complete: true },
-            { stage: "preparation", label: "Understand", status: "reached", meaning: "m", next_milestone: "", complete: true },
-            { stage: "instrumentation", label: "Instrument", status: "current", meaning: "計測を組み込みます。", next_milestone: "承認済みの計測経路が 1 本できること。", complete: false },
-            { stage: "observation", label: "Observe", status: "future", meaning: "m", next_milestone: "", complete: false },
+            { stage: "setup", label: "Setup", status: "reached", meaning: "m", stage_completion_hint: "", complete: true },
+            { stage: "preparation", label: "Understand", status: "reached", meaning: "m", stage_completion_hint: "", complete: true },
+            { stage: "instrumentation", label: "Instrument", status: "current", meaning: "計測を組み込みます。", stage_completion_hint: "承認済みの計測経路が 1 本できること。", complete: false },
+            { stage: "observation", label: "Observe", status: "future", meaning: "m", stage_completion_hint: "", complete: false },
           ],
         })}
       />,
@@ -489,7 +489,7 @@ describe("Next action (Issue #383)", () => {
         overview={overview({
           brief: brief({ readiness_state: "recheck_required" }),
           loop_stages: [
-            { stage: "setup", label: "Setup", status: "current", meaning: "m", next_milestone: "n", complete: false },
+            { stage: "setup", label: "Setup", status: "current", meaning: "m", stage_completion_hint: "n", complete: false },
           ],
         })}
       />,

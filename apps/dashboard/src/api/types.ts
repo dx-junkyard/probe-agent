@@ -5022,7 +5022,10 @@ export interface OverviewLoopStageOut {
   label: string;
   status: OverviewLoopStageStatus;
   meaning: string;
-  next_milestone: string;
+  /** Renamed from `next_milestone` (Issue #427 §7.4): a static per-stage
+   * display sentence, never a canonical Product Milestone -- that identity
+   * lives in `OverviewObjectiveOut.next_milestone` instead. */
+  stage_completion_hint: string;
   complete: boolean;
 }
 
@@ -5839,7 +5842,16 @@ export type UxDesignRecheckState = "current" | "stale";
 
 export type UxRevisionState = "current" | "superseded";
 
-export type UxRefKind = "purpose_element" | "purpose_relation" | "capability_entity";
+// Extended by Product Objective Lineage (Issue #427 §7.1) with
+// "product_objective" / "product_milestone" / "product_gap" via a one-time
+// table-rebuild migration that widens the CHECK without rewriting rows.
+export type UxRefKind =
+  | "purpose_element"
+  | "purpose_relation"
+  | "capability_entity"
+  | "product_objective"
+  | "product_milestone"
+  | "product_gap";
 
 export type UxRefRelationStatus = "confirmed" | "proposed" | "derived";
 
@@ -7452,6 +7464,867 @@ export interface FunctionalLineageOut {
   nodes: FunctionalLineageNodeOut[];
   edges: FunctionalLineageEdgeOut[];
   gaps: FunctionalLineageGapOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+// --- Product Objective / Milestone / Gap (Epic #427, Issues #429-#432) -------
+// See docs/product-objective-lineage.md. Mirrors app/models.py's Product*
+// Literal aliases and *Out/*Request models field-for-field; kept in sync via
+// test_interview_type_parity.py's FINITE_TYPE_NAMES.
+
+export type ProductDesignStatus = "proposed" | "confirmed" | "rejected" | "retired";
+
+export type ProductObjectiveState =
+  | "proposed"
+  | "confirmed"
+  | "active"
+  | "achieved"
+  | "rejected"
+  | "retired";
+
+export type ProductRecheckState = "current" | "stale" | "not_captured";
+
+export type ProductRevisionState = "current" | "superseded";
+
+export type ProductAuthorshipKind = "developer" | "reasoning_model";
+
+export type ProductMilestoneAchievement = "unassessed" | "met" | "not_met" | "indeterminate";
+
+export type ProductMilestoneAssessability = "assessable" | "unavailable" | "not_applicable";
+
+export type ProductMilestoneVerificationMethod =
+  | "manual_review"
+  | "runtime_observation"
+  | "external_report"
+  | "unavailable";
+
+export type ProductObjectiveDecisionKind =
+  | "confirm"
+  | "activate"
+  | "achieve"
+  | "reject"
+  | "retire"
+  | "reinstate";
+
+export type ProductMilestoneDecisionKind = "confirm" | "reject" | "retire" | "reinstate";
+
+export type ProductMilestoneAssessmentKind = "met" | "not_met" | "indeterminate" | "withdraw";
+
+export type ProductRefKind =
+  | "vision_claim"
+  | "purpose_element"
+  | "purpose_relation"
+  | "capability_entity"
+  | "stakeholder_need";
+
+export type ProductRefRelationStatus = "confirmed" | "proposed" | "derived";
+
+export type ProductRefTargetResolution = "resolved" | "unresolved" | "unavailable";
+
+export type ProductRefRecheckState = "current" | "stale" | "not_captured";
+
+export type ProductGapTargetMode = "own" | "inherited_from_milestone" | "unknown";
+
+export type ProductGapSourceKind =
+  | "manual"
+  | "system_understanding_gap"
+  | "understanding_review_gap"
+  | "understanding_claim_change"
+  | "functional_lineage_gap"
+  | "value_network_notice"
+  | "journey_baseline_diff"
+  | "requirement_diff"
+  | "capability_drift"
+  | "runtime_alignment_mismatch"
+  | "node_anomaly"
+  | "joint_understanding_open"
+  | "inquiry_unresolved"
+  | "issue_draft";
+
+export type ProductGapSourceState =
+  | "current"
+  | "changed"
+  | "contradicted"
+  | "disappeared"
+  | "unavailable";
+
+export type ProductGapLifecycle =
+  | "open"
+  | "acknowledged"
+  | "deferred"
+  | "resolved"
+  | "rejected"
+  | "obsolete";
+
+export type ProductGapDecisionKind =
+  | "acknowledge"
+  | "defer"
+  | "resolve"
+  | "reject"
+  | "retire"
+  | "reopen"
+  | "prioritize";
+
+export type ProductGapPriorityBand = "unset" | "watch" | "next" | "now";
+
+export type ProductGapEvidenceKind =
+  | "trace"
+  | "experiment"
+  | "replay_run"
+  | "human_report"
+  | "external_report"
+  | "repository_path"
+  | "other";
+
+export type ProductGapArtifactLinkKind =
+  | "issue_draft"
+  | "ux_journey"
+  | "ux_requirement"
+  | "product_feature"
+  | "solution_design";
+
+export type ProductFeatureLinkKind =
+  | "solution_design"
+  | "evolution_node"
+  | "component"
+  | "probe_point"
+  | "static_flow"
+  | "runtime_flow"
+  | "experiment"
+  | "replay_run"
+  | "purpose_outcome_criterion";
+
+export type ProductDeepLinkState = "available" | "unavailable";
+
+/** Read-time-only advisory flags (§6) -- NEVER ProductGapLifecycle values,
+ * never persisted. */
+export type ProductGapReadFlag = "recheck_required" | "reopen_candidate" | "close_candidate";
+
+export type ProductObjectiveNextStepKey =
+  | "unavailable"
+  | "confirm_vision"
+  | "create_objective"
+  | "confirm_objective"
+  | "activate_objective"
+  | "create_milestone"
+  | "confirm_milestone"
+  | "recheck_stale_decision"
+  | "review_gap_source"
+  | "create_gap"
+  | "prioritize_gap"
+  | "link_gap_to_journey"
+  | "link_requirement_to_feature"
+  | "assess_milestone"
+  | "none";
+
+export type ProductObjectiveNextStepState = "available" | "waiting" | "complete" | "unavailable";
+
+export interface ProductObjectiveRevisionOut {
+  id: number;
+  objective_id: number;
+  revision_number: number;
+  title: string;
+  intent: string;
+  contribution: string;
+  scope_note: string;
+  summary: string;
+  content_digest: string;
+  authored_by_kind: ProductAuthorshipKind;
+  decision_method: "manual" | "reasoning_llm";
+  intelligence_run_id: number | null;
+  change_note: string;
+  created_by: string | null;
+  created_at: number;
+  revision_state: ProductRevisionState;
+  superseded_by_id: number | null;
+}
+
+export interface ProductObjectiveParentLinkOut {
+  id: number;
+  objective_id: number;
+  parent_objective_id: number;
+  parent_objective_key: string | null;
+  rationale: string;
+  decision_method: "manual" | "reasoning_llm";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ProductObjectiveRefOut {
+  id: number;
+  objective_id: number;
+  ref_kind: ProductRefKind;
+  target_ref: string;
+  target_row_id: number | null;
+  target_name: string | null;
+  relation_status: ProductRefRelationStatus;
+  target_state: string;
+  target_resolution: ProductRefTargetResolution;
+  recheck_state: ProductRefRecheckState;
+  captured_digest: string;
+  captured_session_id: number | null;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ProductObjectiveDecisionOut {
+  id: number;
+  objective_id: number;
+  objective_key: string;
+  decision: ProductObjectiveDecisionKind;
+  rationale: string;
+  captured_digest: string;
+  captured_revision_id: number | null;
+  decision_method: "manual";
+  decided_by: string | null;
+  superseded_by_id: number | null;
+  created_at: number;
+}
+
+export interface ProductObjectiveOut {
+  id: number;
+  system_id: number;
+  objective_key: string;
+  current_revision_id: number | null;
+  current_revision_number: number | null;
+  title: string;
+  objective_state: ProductObjectiveState;
+  recheck_state: ProductRecheckState;
+  parent_objective_id: number | null;
+  parent_objective_key: string | null;
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProductObjectiveDetailOut extends ProductObjectiveOut {
+  current_revision: ProductObjectiveRevisionOut | null;
+  upstream_refs: ProductObjectiveRefOut[];
+  decisions: ProductObjectiveDecisionOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface ProductObjectiveListOut {
+  system_id: number;
+  generated_at: number;
+  objectives: ProductObjectiveOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+// --- #429 Objective write requests -------------------------------------------
+
+export interface ProductObjectiveCreateRequest {
+  objective_key: string;
+}
+
+export interface ProductObjectiveRevisionCreateRequest {
+  title?: string;
+  intent?: string;
+  contribution?: string;
+  scope_note?: string;
+  summary?: string;
+  change_note?: string;
+}
+
+export interface ProductObjectiveParentSetRequest {
+  parent_objective_key: string;
+  rationale?: string;
+}
+
+export interface ProductObjectiveRefCreateRequest {
+  ref_kind: ProductRefKind;
+  target_ref: string;
+  note?: string;
+}
+
+export interface ProductObjectiveDecisionCreateRequest {
+  decision: ProductObjectiveDecisionKind;
+  rationale?: string;
+  captured_digest?: string;
+}
+
+export interface ProductMilestoneRevisionOut {
+  id: number;
+  milestone_id: number;
+  revision_number: number;
+  title: string;
+  target_state: string;
+  verification_method: ProductMilestoneVerificationMethod;
+  verification_note: string;
+  sequence_hint: number;
+  summary: string;
+  content_digest: string;
+  authored_by_kind: ProductAuthorshipKind;
+  decision_method: "manual" | "reasoning_llm";
+  intelligence_run_id: number | null;
+  change_note: string;
+  created_by: string | null;
+  created_at: number;
+  revision_state: ProductRevisionState;
+  superseded_by_id: number | null;
+}
+
+export interface ProductMilestoneDependencyOut {
+  id: number;
+  milestone_id: number;
+  depends_on_milestone_id: number;
+  depends_on_milestone_key: string | null;
+  rationale: string;
+  decision_method: "manual" | "reasoning_llm";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ProductMilestoneDecisionOut {
+  id: number;
+  milestone_id: number;
+  milestone_key: string;
+  decision: ProductMilestoneDecisionKind;
+  rationale: string;
+  captured_digest: string;
+  captured_revision_id: number | null;
+  decision_method: "manual";
+  decided_by: string | null;
+  superseded_by_id: number | null;
+  created_at: number;
+}
+
+export interface ProductMilestoneAssessmentOut {
+  id: number;
+  milestone_id: number;
+  milestone_key: string;
+  assessment: ProductMilestoneAssessmentKind;
+  rationale: string;
+  evidence_note: string;
+  captured_digest: string;
+  captured_revision_id: number | null;
+  decision_method: "manual";
+  assessed_by: string | null;
+  superseded_by_id: number | null;
+  created_at: number;
+}
+
+export interface ProductMilestoneOut {
+  id: number;
+  system_id: number;
+  milestone_key: string;
+  objective_id: number;
+  objective_key: string | null;
+  current_revision_id: number | null;
+  current_revision_number: number | null;
+  title: string;
+  design_status: ProductDesignStatus;
+  achievement: ProductMilestoneAchievement;
+  assessability: ProductMilestoneAssessability;
+  recheck_state: ProductRecheckState;
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProductMilestoneDetailOut extends ProductMilestoneOut {
+  current_revision: ProductMilestoneRevisionOut | null;
+  dependencies: ProductMilestoneDependencyOut[];
+  decisions: ProductMilestoneDecisionOut[];
+  assessments: ProductMilestoneAssessmentOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface ProductMilestoneListOut {
+  system_id: number;
+  objective_id: number | null;
+  objective_key: string | null;
+  generated_at: number;
+  milestones: ProductMilestoneOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+// --- #429 Milestone write requests -------------------------------------------
+
+export interface ProductMilestoneCreateRequest {
+  objective_key: string;
+  milestone_key: string;
+}
+
+export interface ProductMilestoneRevisionCreateRequest {
+  title?: string;
+  target_state?: string;
+  verification_method?: ProductMilestoneVerificationMethod;
+  verification_note?: string;
+  sequence_hint?: number;
+  summary?: string;
+  change_note?: string;
+}
+
+export interface ProductMilestoneDependencyCreateRequest {
+  depends_on_milestone_key: string;
+  rationale?: string;
+}
+
+export interface ProductMilestoneDecisionCreateRequest {
+  decision: ProductMilestoneDecisionKind;
+  rationale?: string;
+  captured_digest?: string;
+}
+
+export interface ProductMilestoneAssessmentCreateRequest {
+  assessment: ProductMilestoneAssessmentKind;
+  rationale?: string;
+  evidence_note?: string;
+  captured_digest?: string;
+}
+
+export interface ProductGapRevisionOut {
+  id: number;
+  gap_id: number;
+  revision_number: number;
+  title: string;
+  current_state: string;
+  target_state: string;
+  target_state_mode: ProductGapTargetMode;
+  interpretation: string;
+  suggested_priority_note: string;
+  content_digest: string;
+  authored_by_kind: ProductAuthorshipKind;
+  decision_method: "manual" | "reasoning_llm";
+  intelligence_run_id: number | null;
+  change_note: string;
+  created_by: string | null;
+  created_at: number;
+  revision_state: ProductRevisionState;
+  superseded_by_id: number | null;
+}
+
+export interface ProductGapSourceOut {
+  id: number;
+  gap_id: number;
+  source_kind: ProductGapSourceKind;
+  source_ref: string;
+  source_state: ProductGapSourceState;
+  title: string | null;
+  detail: string | null;
+  severity: string | null;
+  severity_vocabulary: string | null;
+  deep_link: string | null;
+  deep_link_state: ProductDeepLinkState;
+  captured_digest: string;
+  captured_snapshot_id: number | null;
+  captured_run_id: number | null;
+  captured_revision_id: number | null;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ProductGapEvidenceOut {
+  id: number;
+  gap_id: number;
+  evidence_kind: ProductGapEvidenceKind;
+  evidence_ref: string;
+  captured_snapshot_id: number | null;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ProductGapArtifactOut {
+  id: number;
+  gap_id: number;
+  link_kind: ProductGapArtifactLinkKind;
+  target_ref: string;
+  target_row_id: number | null;
+  captured_digest: string;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ProductGapDecisionOut {
+  id: number;
+  gap_id: number;
+  gap_key: string;
+  decision: ProductGapDecisionKind;
+  priority_band: ProductGapPriorityBand;
+  rationale: string;
+  captured_digest: string;
+  captured_revision_id: number | null;
+  decision_method: "manual";
+  decided_by: string | null;
+  superseded_by_id: number | null;
+  created_at: number;
+}
+
+export interface ProductGapOut {
+  id: number;
+  system_id: number;
+  gap_key: string;
+  milestone_id: number;
+  milestone_key: string | null;
+  objective_id: number | null;
+  objective_key: string | null;
+  current_revision_id: number | null;
+  current_revision_number: number | null;
+  title: string;
+  lifecycle: ProductGapLifecycle;
+  priority_band: ProductGapPriorityBand;
+  recheck_state: ProductRecheckState;
+  read_flags: ProductGapReadFlag[];
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProductGapDetailOut extends ProductGapOut {
+  current_revision: ProductGapRevisionOut | null;
+  source_refs: ProductGapSourceOut[];
+  evidence_refs: ProductGapEvidenceOut[];
+  artifact_links: ProductGapArtifactOut[];
+  decisions: ProductGapDecisionOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface ProductGapListOut {
+  system_id: number;
+  milestone_id: number | null;
+  milestone_key: string | null;
+  generated_at: number;
+  gaps: ProductGapOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+// --- #429/#430 Gap write requests ---------------------------------------------
+
+export interface ProductGapCreateRequest {
+  milestone_key: string;
+  gap_key: string;
+}
+
+export interface ProductGapRevisionCreateRequest {
+  title?: string;
+  current_state?: string;
+  target_state?: string;
+  target_state_mode?: ProductGapTargetMode;
+  interpretation?: string;
+  suggested_priority_note?: string;
+  change_note?: string;
+}
+
+export interface ProductGapSourceRefCreateRequest {
+  source_kind: ProductGapSourceKind;
+  source_ref?: string;
+  note?: string;
+}
+
+export interface ProductGapEvidenceRefCreateRequest {
+  evidence_kind: ProductGapEvidenceKind;
+  evidence_ref: string;
+  note?: string;
+}
+
+export interface ProductGapArtifactLinkCreateRequest {
+  link_kind: ProductGapArtifactLinkKind;
+  target_ref: string;
+  note?: string;
+}
+
+export interface ProductGapDecisionCreateRequest {
+  decision: ProductGapDecisionKind;
+  priority_band?: ProductGapPriorityBand;
+  rationale?: string;
+  captured_digest?: string;
+}
+
+export interface ProductFeatureRevisionOut {
+  id: number;
+  feature_id: number;
+  revision_number: number;
+  title: string;
+  statement: string;
+  rationale: string;
+  scope_note: string;
+  summary: string;
+  content_digest: string;
+  authored_by_kind: ProductAuthorshipKind;
+  decision_method: "manual" | "reasoning_llm";
+  intelligence_run_id: number | null;
+  change_note: string;
+  created_by: string | null;
+  created_at: number;
+  revision_state: ProductRevisionState;
+  superseded_by_id: number | null;
+}
+
+export interface ProductFeatureRequirementLinkOut {
+  id: number;
+  feature_id: number;
+  requirement_id: number;
+  requirement_key: string | null;
+  captured_requirement_revision_id: number | null;
+  captured_digest: string;
+  recheck_state: ProductRecheckState;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ProductFeatureCapabilityLinkOut {
+  id: number;
+  feature_id: number;
+  capability_entity_id: number;
+  capability_name: string | null;
+  target_state: string | null;
+  target_resolution: ProductRefTargetResolution;
+  recheck_state: ProductRecheckState;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ProductFeatureTargetLinkOut {
+  id: number;
+  feature_id: number;
+  link_kind: ProductFeatureLinkKind;
+  target_ref: string;
+  target_row_id: number | null;
+  target_state: string | null;
+  target_resolution: ProductRefTargetResolution;
+  recheck_state: ProductRecheckState;
+  captured_digest: string;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ProductFeatureDraftLinkOut {
+  id: number;
+  feature_id: number;
+  feature_draft_id: number;
+  captured_snapshot_id: number | null;
+  captured_digest: string;
+  target_resolution: ProductRefTargetResolution;
+  note: string;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  created_by: string | null;
+  created_at: number;
+  superseded_by_id: number | null;
+}
+
+export interface ProductFeatureDecisionOut {
+  id: number;
+  feature_id: number;
+  feature_key: string;
+  decision: ProductMilestoneDecisionKind;
+  rationale: string;
+  captured_digest: string;
+  captured_revision_id: number | null;
+  decision_method: "manual";
+  decided_by: string | null;
+  superseded_by_id: number | null;
+  created_at: number;
+}
+
+export interface ProductFeatureOut {
+  id: number;
+  system_id: number;
+  feature_key: string;
+  current_revision_id: number | null;
+  current_revision_number: number | null;
+  title: string;
+  design_status: ProductDesignStatus;
+  recheck_state: ProductRecheckState;
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProductFeatureDetailOut extends ProductFeatureOut {
+  current_revision: ProductFeatureRevisionOut | null;
+  requirement_links: ProductFeatureRequirementLinkOut[];
+  capability_links: ProductFeatureCapabilityLinkOut[];
+  target_links: ProductFeatureTargetLinkOut[];
+  draft_links: ProductFeatureDraftLinkOut[];
+  decisions: ProductFeatureDecisionOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface ProductFeatureListOut {
+  system_id: number;
+  generated_at: number;
+  features: ProductFeatureOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+// --- #431 Feature write requests ----------------------------------------------
+
+export interface ProductFeatureCreateRequest {
+  feature_key: string;
+}
+
+export interface ProductFeatureRevisionCreateRequest {
+  title?: string;
+  statement?: string;
+  rationale?: string;
+  scope_note?: string;
+  summary?: string;
+  change_note?: string;
+}
+
+export interface ProductFeatureRequirementLinkCreateRequest {
+  requirement_key: string;
+  note?: string;
+}
+
+export interface ProductFeatureCapabilityLinkCreateRequest {
+  capability_entity_id: number;
+  note?: string;
+}
+
+export interface ProductFeatureTargetLinkCreateRequest {
+  link_kind: ProductFeatureLinkKind;
+  target_ref: string;
+  note?: string;
+}
+
+export interface ProductFeatureDraftLinkCreateRequest {
+  feature_draft_id: number;
+  note?: string;
+}
+
+export interface ProductFeatureDecisionCreateRequest {
+  decision: ProductMilestoneDecisionKind;
+  rationale?: string;
+  captured_digest?: string;
+}
+
+// --- #432 projection: Objective Map / Gap Workbench / Overview section -------
+// Best-effort mechanical rendering of §9.1/§9.2's prose (no DDL of its own);
+// confirm against app/product_objective_projection.py before relying on
+// exact shape.
+
+export interface ObjectiveMapGapSummaryOut {
+  open_count: number;
+  acknowledged_count: number;
+  deferred_count: number;
+  resolved_count: number;
+  rejected_count: number;
+  obsolete_count: number;
+  recheck_required_count: number;
+  reopen_candidate_count: number;
+  close_candidate_count: number;
+}
+
+export interface ObjectiveMapMilestoneOut {
+  id: number;
+  milestone_key: string;
+  title: string;
+  design_status: ProductDesignStatus;
+  achievement: ProductMilestoneAchievement;
+  assessability: ProductMilestoneAssessability;
+  recheck_state: ProductRecheckState;
+  sequence_hint: number;
+  gap_summary: ObjectiveMapGapSummaryOut;
+}
+
+export interface ObjectiveMapNodeOut {
+  id: number;
+  objective_key: string;
+  title: string;
+  objective_state: ProductObjectiveState;
+  recheck_state: ProductRecheckState;
+  parent_objective_id: number | null;
+  parent_objective_key: string | null;
+  child_objective_ids: number[];
+  milestones: ObjectiveMapMilestoneOut[];
+}
+
+export interface ObjectiveMapOut {
+  system_id: number;
+  generated_at: number;
+  nodes: ObjectiveMapNodeOut[];
+  root_objective_ids: number[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface GapWorkbenchSourceBucketOut {
+  source_kind: ProductGapSourceKind;
+  gap_count: number;
+}
+
+export interface GapWorkbenchSharedSourceOut {
+  source_kind: ProductGapSourceKind;
+  source_ref: string;
+  gap_ids: number[];
+  gap_keys: string[];
+}
+
+export interface GapWorkbenchEntryOut {
+  id: number;
+  gap_key: string;
+  milestone_id: number;
+  milestone_key: string | null;
+  objective_id: number | null;
+  objective_key: string | null;
+  title: string;
+  lifecycle: ProductGapLifecycle;
+  priority_band: ProductGapPriorityBand;
+  recheck_state: ProductRecheckState;
+  read_flags: ProductGapReadFlag[];
+  deep_links: OverviewTargetOut[];
+}
+
+export interface GapWorkbenchOut {
+  system_id: number;
+  generated_at: number;
+  entries: GapWorkbenchEntryOut[];
+  source_kind_breakdown: GapWorkbenchSourceBucketOut[];
+  shared_sources: GapWorkbenchSharedSourceOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface OverviewObjectiveOut {
+  vision: UnderstandingBriefClaimOut | null;
+  active_objective: ProductObjectiveOut | null;
+  active_objective_count: number;
+  next_milestone: ProductMilestoneOut | null;
+  primary_gap: ProductGapOut | null;
+  /** `null` for a System with no Product Objective yet (§11's graceful
+   * empty-state rule) -- read as "not started". Deliberately not a member
+   * of ProductObjectiveState itself, which describes one Objective's own
+   * lifecycle, never "no Objective exists". */
+  objective_state: ProductObjectiveState | null;
+  next_step: ProductObjectiveNextStepKey;
+  next_step_state: ProductObjectiveNextStepState;
+  next_step_reason: string;
+  next_step_completion: string;
+  next_step_value: string;
   degraded_sections: string[];
   degraded_detail: Record<string, string>;
 }

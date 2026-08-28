@@ -7876,8 +7876,12 @@ class OverviewLoopStageOut(BaseModel):
     status: OverviewLoopStageStatus
     #: What reaching this stage means, in the developer's terms.
     meaning: str
-    #: The next semantic milestone; only set on the current stage.
-    next_milestone: str = ""
+    #: The static display sentence describing what completing this stage
+    #: looks like; only set on the current stage. Renamed from
+    #: `next_milestone` (Issue #427 §7.4): it is `overview_projection`'s
+    #: fixed per-stage text, never a canonical Product Milestone -- that
+    #: identity now lives in `OverviewObjectiveOut.next_milestone` instead.
+    stage_completion_hint: str = ""
     complete: bool = False
 
 
@@ -8758,12 +8762,20 @@ UxDesignRecheckState = Literal["current", "stale"]
 #: A content axis, not a judgement axis -- orthogonal to `design_status`.
 UxRevisionState = Literal["current", "superseded"]
 
-#: Which of the three canonical upstream sources a `ux_journey_upstream_ref`
-#: resolves against (§2.7's table): the Purpose Chain's elements, the same
+#: Which canonical upstream source a `ux_journey_upstream_ref` resolves
+#: against (§2.7's table): the Purpose Chain's elements, the same
 #: projection's relations, or `understanding_capability_entity`'s current
 #: head. Exactly one canonical source per kind, resolved fresh at read time
-#: -- never a copy of the target's content (§1).
-UxRefKind = Literal["purpose_element", "purpose_relation", "capability_entity"]
+#: -- never a copy of the target's content (§1). Extended by Product
+#: Objective Lineage (docs/product-objective-lineage.md §7.1) with three
+#: more kinds -- `product_objective` / `product_milestone` / `product_gap` --
+#: via a one-time, structurally-detected, idempotent table-rebuild migration
+#: (`db._migrate_ux_journey_upstream_ref_kinds`) that widens the CHECK
+#: without rewriting any existing row's `ref_kind` value.
+UxRefKind = Literal[
+    "purpose_element", "purpose_relation", "capability_entity",
+    "product_objective", "product_milestone", "product_gap",
+]
 
 #: WHO ASSERTED an upstream/downstream reference, mapped from the
 #: reference's own `decision_method` through a fixed table (§2.7, the same
@@ -13018,5 +13030,1290 @@ class FunctionalLineageOut(BaseModel):
     nodes: List[FunctionalLineageNodeOut] = []
     edges: List[FunctionalLineageEdgeOut] = []
     gaps: List[FunctionalLineageGapOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+# ---------------------------------------------------------------------------
+# Product Objective / Milestone / Gap (Epic #427, Issues #429-#432). See
+# docs/product-objective-lineage.md for the full contract -- these `Literal`
+# aliases and their `*Out`/`*Request` models are re-declared here (never
+# imported from `app/product_objective.py` / `app/product_gap_sources.py` /
+# `app/product_feature.py`) for the same reason the UX Design Lineage and
+# Purpose Chain vocabularies are: FastAPI needs a real enum in the OpenAPI
+# schema, and `test_interview_type_parity.py`'s `FINITE_TYPE_NAMES` is what
+# keeps the Dashboard's TypeScript unions from silently drifting away from
+# these.
+#
+# Objective / Milestone / Gap / Feature are the four new PERSISTED layers
+# this Epic adds (§2: unlike Purpose Chain, this content cannot be
+# re-derived from any existing row). Every Out model that reports a status
+# computed by folding an append-only decision ledger (`objective_state`,
+# `design_status`, `achievement`, `lifecycle`, `priority_band`, ...) exposes
+# that status as a field but the UNDERLYING TABLES never store it as a
+# column -- see the table comments in `app/db.py` for why. Every Request
+# model omits `decision_method` / `decided_by` / `assessed_by` /
+# `created_by` / `authored_by_kind`: those come from the authenticated
+# `Principal` and the route, never from the caller (§10's route contract,
+# the same rule `routes/purpose_chain.py` and `routes/ux_design.py` state
+# for their own layers).
+#
+# No model in this section carries a numeric priority, severity,
+# completeness, confidence, or percentage field (§0 invariant 7 / §5.7):
+# counts (`int`) are allowed, scores are not -- structurally, not by
+# convention.
+# ---------------------------------------------------------------------------
+
+#: DERIVED (§4.2), never a stored column: the latest non-superseded
+#: `product_*_decision` row for a Journey/Requirement/Solution-Design-Option-
+#: shaped confirm/reject/retire/reinstate ledger -- the same fold
+#: `UxDesignStatus` uses, reused here for Feature (§7.2). Milestone's own
+#: `design_status` folds through this identical vocabulary.
+ProductDesignStatus = Literal["proposed", "confirmed", "rejected", "retired"]
+
+#: DERIVED (§4.2), never a stored column: the latest non-superseded
+#: `product_objective_decision` row for `(system_id, objective_key)`, or
+#: `proposed` when no such row exists. A stored lifecycle value can drift
+#: from the rows it describes; a derived one cannot (#337 / #338 / #349's
+#: discipline, applied to this layer). `achieve`'s only precondition is
+#: `active` -- a merely-confirmed Objective can never become `achieved`
+#: (§4.3), and `achieve` never reads Milestone `achievement` (§6: achievement
+#: never propagates upward).
+ProductObjectiveState = Literal[
+    "proposed", "confirmed", "active", "achieved", "rejected", "retired"
+]
+
+#: Whether a currently-effective confirming decision's `captured_digest`
+#: still matches the subject's current `content_digest` (§4.2). Independent
+#: of `objective_state`/`design_status`/`lifecycle`: a stale confirmed item
+#: STAYS confirmed -- re-confirmation is invited, not forced, and the
+#: original decision row survives untouched (the same discipline
+#: `UxDesignRecheckState` and `PurposeRecheckState` already use one layer
+#: up). `not_captured` is the fail-closed value for a decision whose
+#: `captured_digest` was never recorded (#337's `premise_not_captured`) --
+#: it is never silently promoted to `current`.
+ProductRecheckState = Literal["current", "stale", "not_captured"]
+
+#: Whether a revision row (`product_objective_revision` /
+#: `product_milestone_revision` / `product_gap_revision` /
+#: `product_feature_revision`) is the current head of its append-only
+#: chain. A content axis, not a judgement axis -- orthogonal to
+#: `objective_state` / `design_status` / `lifecycle` (§4.2, mirroring
+#: `UxRevisionState`).
+ProductRevisionState = Literal["current", "superseded"]
+
+#: Whose voice authored a revision's TEXT -- independent of
+#: `decision_method` (who chose to record it) and of the decision ledger
+#: (who later confirmed/activated/achieved it). §0 invariant 3 / §4.2: three
+#: separate axes, never folded into one. A `reasoning_model`-authored
+#: revision CAN later be `confirmed` -- that means a human approved
+#: AI-written text, not that authorship changed.
+ProductAuthorshipKind = Literal["developer", "reasoning_model"]
+
+#: Whether a Milestone has been judged to have been REACHED. DERIVED from
+#: the latest non-superseded `product_milestone_assessment` row, or
+#: `unassessed` when none exists (§4.2). `indeterminate` is "a human looked
+#: and could not tell" -- a different fact from `unassessed` ("nobody has
+#: looked yet"). Never auto-set from Gap resolution or runtime traces (§6).
+ProductMilestoneAchievement = Literal["unassessed", "met", "not_met", "indeterminate"]
+
+#: Whether a Milestone COULD be assessed at all, kept apart from whether it
+#: HAS BEEN (§4.2/§1.3): `unavailable` when `verification_method` is itself
+#: `unavailable`; `not_applicable` once `design_status` is `rejected`/
+#: `retired`; `assessable` otherwise. Never substitutes for `achievement` --
+#: being unassessable is not the same fact as not having been met.
+ProductMilestoneAssessability = Literal["assessable", "unavailable", "not_applicable"]
+
+#: How a Milestone's `achievement` COULD be checked -- a finite
+#: classification of method, never a record that it WAS checked (§4.2,
+#: mirroring `UxVerificationMethod`'s same distinction one layer up).
+#: `unavailable` is the honest default for a Milestone nobody has thought
+#: through verification for yet, and is what drives `assessability` to
+#: `unavailable` in turn.
+ProductMilestoneVerificationMethod = Literal[
+    "manual_review", "runtime_observation", "external_report", "unavailable"
+]
+
+#: The finite actions recorded in `product_objective_decision` (§4.3's
+#: table). `achieve`'s only precondition is `active`; `reinstate` is the
+#: only way back from `rejected`/`retired` to `proposed` -- there is no
+#: silent un-reject, and the prior decision row is never deleted (§0
+#: invariant 4).
+ProductObjectiveDecisionKind = Literal[
+    "confirm", "activate", "achieve", "reject", "retire", "reinstate"
+]
+
+#: The finite actions recorded in `product_milestone_decision` (§4.3): a
+#: Milestone's DEFINITION ledger, folding into `ProductDesignStatus`
+#: exactly like `UxDesignDecisionKind` -- never the achievement ledger,
+#: which is `ProductMilestoneAssessmentKind` below (§1.3's two-axis rule).
+ProductMilestoneDecisionKind = Literal["confirm", "reject", "retire", "reinstate"]
+
+#: The finite actions recorded in `product_milestone_assessment` (§4.3).
+#: `withdraw` folds to `achievement="unassessed"` -- it retracts a prior
+#: assessment without asserting a new verdict, and (like every decision
+#: here) the withdrawn row itself is never deleted (§0 invariant 4). Only
+#: reachable when `design_status="confirmed"` (422
+#: `product_milestone_not_assessable` otherwise, §4.3): recording an
+#: achievement verdict against an undefined target names nothing.
+ProductMilestoneAssessmentKind = Literal["met", "not_met", "indeterminate", "withdraw"]
+
+#: The five canonical upstream sources a `product_objective_upstream_ref`
+#: resolves against (§4.6's table): the confirmed Vision claim, a Purpose
+#: Chain element or relation, `understanding_capability_entity`'s current
+#: head, or a Stakeholder Need. Exactly one canonical source per kind,
+#: resolved fresh at read time -- never a copy of the target's content (§0
+#: invariant 1). `vision_claim` carries the structural weakness §4.6
+#: documents: Vision has no row identity, so renaming its text makes the
+#: reference `unresolved` -- that weakness is reported honestly through
+#: `target_resolution`, never hidden by copying the Vision text into this
+#: layer.
+ProductRefKind = Literal[
+    "vision_claim", "purpose_element", "purpose_relation",
+    "capability_entity", "stakeholder_need",
+]
+
+#: WHO ASSERTED an upstream reference, mapped from the reference's own
+#: `decision_method` through a fixed table (§4.6, the same
+#: `node_design._DECISION_METHOD_TO_RELATION_STATUS` translation
+#: `UxRefRelationStatus` already reuses) -- `manual -> confirmed`,
+#: `reasoning_llm -> proposed`, `deterministic -> derived`. Never a second
+#: stored status column; read straight off `decision_method`.
+ProductRefRelationStatus = Literal["confirmed", "proposed", "derived"]
+
+#: Whether the referenced row could be found at all, kept apart from
+#: `target_state` (§4.6): `resolved` means the canonical source was read
+#: and the target exists there now; `unresolved` means the source was read
+#: but the target is gone (e.g. Vision text that was reworded);
+#: `unavailable` means the canonical source itself could not be read for
+#: THIS request. An unreadable source must never render as "the target does
+#: not exist".
+ProductRefTargetResolution = Literal["resolved", "unresolved", "unavailable"]
+
+#: Whether a reference's `captured_digest` still matches the target's
+#: current digest (§4.6). `not_captured` is the fail-closed value for a
+#: reference with an empty `captured_digest` -- never silently treated as
+#: "nothing has changed" (mirrors `UxRefRecheckState` / #337's
+#: `premise_not_captured`).
+ProductRefRecheckState = Literal["current", "stale", "not_captured"]
+
+#: Whether a Gap's `target_state` is its own text or inherited from its
+#: owning Milestone's current `target_state` (§5.3). `inherited_from_
+#: milestone` never copies the Milestone's text -- it is resolved fresh at
+#: read time, and the Gap's `recheck_state` goes `stale` when the Milestone
+#: revision moves. `unknown` is the honest "not decided yet" default,
+#: distinct from `own` with an empty string (§0 invariant 8).
+ProductGapTargetMode = Literal["own", "inherited_from_milestone", "unknown"]
+
+#: The 14 finite detector kinds a `product_gap_source_ref` can federate to
+#: (§5.4's table), each dispatching to exactly ONE canonical resolver in
+#: `app/product_gap_sources.py`. Existing detection logic is never
+#: reimplemented here -- this layer only reads it (§0 invariant 1 / #430
+#: non-goal).
+ProductGapSourceKind = Literal[
+    "manual",
+    "system_understanding_gap",
+    "understanding_review_gap",
+    "understanding_claim_change",
+    "functional_lineage_gap",
+    "value_network_notice",
+    "journey_baseline_diff",
+    "requirement_diff",
+    "capability_drift",
+    "runtime_alignment_mismatch",
+    "node_anomaly",
+    "joint_understanding_open",
+    "inquiry_unresolved",
+    "issue_draft",
+]
+
+#: A resolved source's read-time state (§5.4), five values on purpose:
+#: `current` (matches captured digest), `changed` (resolved, content
+#: moved -- never auto-resolves or reopens the Gap), `contradicted`
+#: (resolved, and the detector ITSELF says the condition no longer holds --
+#: a close CANDIDATE, never an automatic close), `disappeared` (resolved
+#: source, but this `source_ref` no longer exists there), `unavailable`
+#: (the source itself could not be read for THIS request -- a fact about
+#: the request, never folded into `disappeared`). `source_state` never
+#: moves `ProductGapLifecycle` by itself (§5.6 / §6).
+ProductGapSourceState = Literal[
+    "current", "changed", "contradicted", "disappeared", "unavailable",
+]
+
+#: The finite lifecycle values a Gap can occupy, DERIVED (§5.6) from the
+#: latest non-superseded `product_gap_decision` row, folding through
+#: §5.6's table. Moved ONLY by a human `product_gap_decision` row -- never
+#: by `source_state`, by a Milestone's `achievement`, or by any Trace/
+#: Experiment/Replay result (§0 invariant 6 / §6).
+ProductGapLifecycle = Literal[
+    "open", "acknowledged", "deferred", "resolved", "rejected", "obsolete",
+]
+
+#: The finite actions recorded in `product_gap_decision` (§5.6). `prioritize`
+#: is the ONLY decision that touches `priority_band`, and it never moves
+#: `lifecycle` by itself.
+ProductGapDecisionKind = Literal[
+    "acknowledge", "defer", "resolve", "reject", "retire", "reopen", "prioritize",
+]
+
+#: A human-placed finite band, never a computed score (§5.7 / §0 invariant
+#: 7). DERIVED from the latest non-superseded `prioritize` decision's
+#: `priority_band`, or `unset` when none exists. AI may only ever write a
+#: free-text SUGGESTION (`product_gap_revision.suggested_priority_note`) --
+#: never this ledger, whose `decision_method` is CHECK-fixed to `manual`.
+ProductGapPriorityBand = Literal["unset", "watch", "next", "now"]
+
+#: The finite kinds of evidence a `product_gap_evidence_ref` can point at
+#: (§5.9's CHECK). No body column exists anywhere on this model --
+#: structurally, not by convention (mirrors `UxArtifactKind`'s discipline).
+ProductGapEvidenceKind = Literal[
+    "trace", "experiment", "replay_run", "human_report",
+    "external_report", "repository_path", "other",
+]
+
+#: The finite kinds of downstream artifact a `product_gap_artifact_link`
+#: can point at (§5.9's CHECK). Issue Draft is a DOWNSTREAM artifact of a
+#: Gap here, never its detection source (§1.5) -- `issue_draft` also
+#: appears in `ProductGapSourceKind` above, and which table a given
+#: `issue_draft` reference lives in is what records which role it played.
+ProductGapArtifactLinkKind = Literal[
+    "issue_draft", "ux_journey", "ux_requirement", "product_feature", "solution_design",
+]
+
+#: The 9 kinds of existing downstream entity a Feature's
+#: `product_feature_target_link` can point at (§7.2). Resolvers are reused
+#: from `solution_design._resolve_target` / `node_design._resolve_capability`
+#: / `node_design._resolve_flow` -- never reimplemented (§0 invariant 1).
+#: `static_flow` (a snapshot-pinned entry-point path) and `runtime_flow` (an
+#: SDK-assigned execution correlation id) are kept separate on purpose, the
+#: same #366 discipline `SolutionTargetKind` already applies.
+ProductFeatureLinkKind = Literal[
+    "solution_design", "evolution_node", "component", "probe_point",
+    "static_flow", "runtime_flow", "experiment", "replay_run",
+    "purpose_outcome_criterion",
+]
+
+#: `GET /objective-map` / `GET /gap-workbench`'s deep-link availability
+#: (§5.8). `node_anomaly` sources have no Dashboard screen today (Epic #394
+#: Phase 5's cockpit is #401's unimplemented remainder), so their
+#: `deep_link` is `None` with this set to `unavailable` -- never a
+#: fabricated URL. Distinct from "the link is broken": this says the
+#: destination does not exist yet.
+ProductDeepLinkState = Literal["available", "unavailable"]
+
+#: Read-time-only advisory flags a Gap can carry (§6's "candidate, not
+#: state" rule) -- NEVER `ProductGapLifecycle` values, and never persisted.
+#: `recheck_required` follows a `changed` source; `reopen_candidate` /
+#: `close_candidate` follow a `contradicted` or `disappeared` source. A
+#: human must still make an explicit `reopen` / `resolve` / new-revision
+#: decision before the Gap's actual state moves.
+ProductGapReadFlag = Literal["recheck_required", "reopen_candidate", "close_candidate"]
+
+#: `OverviewObjectiveOut.next_step`'s 15-row first-match table (§9.3),
+#: deliberately its OWN vocabulary and its OWN first-match table --
+#: separate from `overview_projection.decide_next_action`'s 14-row table
+#: (`OverviewActionKey`). "What to do to keep the system running" and "what
+#: to decide next toward the goal" are different questions, and neither
+#: overrides the other's answer.
+ProductObjectiveNextStepKey = Literal[
+    "unavailable",
+    "confirm_vision",
+    "create_objective",
+    "confirm_objective",
+    "activate_objective",
+    "create_milestone",
+    "confirm_milestone",
+    "recheck_stale_decision",
+    "review_gap_source",
+    "create_gap",
+    "prioritize_gap",
+    "link_gap_to_journey",
+    "link_requirement_to_feature",
+    "assess_milestone",
+    "none",
+]
+
+#: Mirrors `OverviewActionState` (§9.3 / #383's discipline): `waiting` /
+#: `unavailable` carry NO action at all -- never a permanently disabled
+#: control, a sentence instead.
+ProductObjectiveNextStepState = Literal["available", "waiting", "complete", "unavailable"]
+
+
+class ProductObjectiveRevisionOut(BaseModel):
+    """Append-only Objective content (§4.5's `product_objective_revision`).
+    `decision_method` records who chose to persist this revision;
+    `authored_by_kind` records whose words it is -- the two are independent
+    (§0 invariant 3)."""
+
+    id: int
+    objective_id: int
+    revision_number: int
+    title: str = ""
+    intent: str = ""
+    contribution: str = ""
+    scope_note: str = ""
+    summary: str = ""
+    content_digest: str
+    authored_by_kind: ProductAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    change_note: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    revision_state: ProductRevisionState = "current"
+    superseded_by_id: Optional[int] = None
+
+
+class ProductObjectiveParentLinkOut(BaseModel):
+    """One append-only re-parenting record (§4.4's
+    `product_objective_parent_link`). Root Objectives have no current row
+    here at all -- root is represented by absence, never a NULL-parent
+    row."""
+
+    id: int
+    objective_id: int
+    parent_objective_id: int
+    parent_objective_key: Optional[str] = None
+    rationale: str = ""
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class ProductObjectiveRefOut(BaseModel):
+    """An Objective's reference to a Vision claim / Purpose element or
+    relation / Capability entity / Stakeholder Need, carrying the 4
+    independent axes §4.6 requires (`relation_status` / `target_state` /
+    `target_resolution` / `recheck_state`) rather than one merged status.
+    `target_state` is the target's OWN vocabulary value copied verbatim --
+    never translated (#380's superset rule)."""
+
+    id: int
+    objective_id: int
+    ref_kind: ProductRefKind
+    target_ref: str
+    target_row_id: Optional[int] = None
+    target_name: Optional[str] = None
+    relation_status: ProductRefRelationStatus
+    target_state: str
+    target_resolution: ProductRefTargetResolution
+    recheck_state: ProductRefRecheckState
+    captured_digest: str = ""
+    captured_session_id: Optional[int] = None
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class ProductObjectiveDecisionOut(BaseModel):
+    """One row of the confirm/activate/achieve/reject/retire/reinstate
+    ledger (§4.3). `decision_method` is CHECK-fixed to `manual` -- there is
+    no path that writes anything else here (§0 invariant 3: AI cannot
+    confirm its own proposal)."""
+
+    id: int
+    objective_id: int
+    objective_key: str
+    decision: ProductObjectiveDecisionKind
+    rationale: str = ""
+    captured_digest: str = ""
+    captured_revision_id: Optional[int] = None
+    decision_method: Literal["manual"] = "manual"
+    decided_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+
+
+class ProductObjectiveOut(BaseModel):
+    """Objective summary: the identity row plus its DERIVED axes
+    (`objective_state`, `recheck_state`) -- neither is a column on
+    `product_objective` (§4.2)."""
+
+    id: int
+    system_id: int
+    objective_key: str
+    current_revision_id: Optional[int] = None
+    current_revision_number: Optional[int] = None
+    title: str = ""
+    objective_state: ProductObjectiveState = "proposed"
+    recheck_state: ProductRecheckState = "current"
+    #: The currently-effective parent link, if any (§4.4). Absence means
+    #: root, never "not yet loaded".
+    parent_objective_id: Optional[int] = None
+    parent_objective_key: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class ProductObjectiveDetailOut(ProductObjectiveOut):
+    current_revision: Optional[ProductObjectiveRevisionOut] = None
+    upstream_refs: List[ProductObjectiveRefOut] = []
+    decisions: List[ProductObjectiveDecisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class ProductObjectiveListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    objectives: List[ProductObjectiveOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+# --- #429 Objective write requests ------------------------------------------
+# None of these accept `decision_method` / `decided_by` / `created_by` /
+# `authored_by_kind` -- the route derives all four from the `Principal` and
+# from which write path was called (§10).
+
+
+class ProductObjectiveCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    objective_key: str
+
+
+class ProductObjectiveRevisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = ""
+    intent: str = ""
+    contribution: str = ""
+    scope_note: str = ""
+    summary: str = ""
+    change_note: str = ""
+
+
+class ProductObjectiveParentSetRequest(BaseModel):
+    """`POST .../parent` (§4.4). Cycle/self-reference rejection
+    (`product_objective_parent_self` / `product_objective_parent_cycle`) is
+    evaluated over the CURRENT parent-link graph only, by iteration with a
+    visited set -- never recursion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    parent_objective_key: str
+    rationale: str = ""
+
+
+class ProductObjectiveRefCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref_kind: ProductRefKind
+    target_ref: str
+    note: str = ""
+
+
+class ProductObjectiveDecisionCreateRequest(BaseModel):
+    """`captured_digest` lets the caller show what content it is judging;
+    the route (409 `product_objective_decision_stale_digest`) refuses a
+    mismatch against the subject's CURRENT digest rather than silently
+    confirming different content than the developer saw. Empty means the
+    decision is recorded as `recheck_state="not_captured"` rather than
+    checked (§10.1)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: ProductObjectiveDecisionKind
+    rationale: str = ""
+    captured_digest: str = ""
+
+
+class ProductMilestoneRevisionOut(BaseModel):
+    """Append-only Milestone content (§4.5's `product_milestone_revision`).
+    `target_state` is "what must hold to say this was reached";
+    `verification_method` is "how that would be checked". No progress-
+    percentage column exists anywhere on this model -- structurally
+    (§1.3)."""
+
+    id: int
+    milestone_id: int
+    revision_number: int
+    title: str = ""
+    target_state: str = ""
+    verification_method: ProductMilestoneVerificationMethod = "unavailable"
+    verification_note: str = ""
+    #: Display order only -- never an achievement precondition (§4.4).
+    sequence_hint: int = 0
+    summary: str = ""
+    content_digest: str
+    authored_by_kind: ProductAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    change_note: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    revision_state: ProductRevisionState = "current"
+    superseded_by_id: Optional[int] = None
+
+
+class ProductMilestoneDependencyOut(BaseModel):
+    """An ORDERING relationship, never an achievement gate (§4.4): the
+    depended-on Milestone need not be `met` for this one to become `met`."""
+
+    id: int
+    milestone_id: int
+    depends_on_milestone_id: int
+    depends_on_milestone_key: Optional[str] = None
+    rationale: str = ""
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class ProductMilestoneDecisionOut(BaseModel):
+    """One row of the Milestone DEFINITION ledger (§4.3) -- confirming,
+    rejecting, retiring, or reinstating what the Milestone MEANS. Never the
+    achievement ledger (`ProductMilestoneAssessmentOut` below); §1.3's two-
+    axis rule keeps them in separate tables entirely."""
+
+    id: int
+    milestone_id: int
+    milestone_key: str
+    decision: ProductMilestoneDecisionKind
+    rationale: str = ""
+    captured_digest: str = ""
+    captured_revision_id: Optional[int] = None
+    decision_method: Literal["manual"] = "manual"
+    decided_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+
+
+class ProductMilestoneAssessmentOut(BaseModel):
+    """One row of the ACHIEVEMENT ledger (§4.3/§1.3). `evidence_note` is
+    what a human reports having seen -- Trace/Experiment/Replay results
+    never write this row automatically (§0 invariant 6 / §6). Only
+    reachable when the Milestone's `design_status` is `confirmed` (422
+    `product_milestone_not_assessable` otherwise)."""
+
+    id: int
+    milestone_id: int
+    milestone_key: str
+    assessment: ProductMilestoneAssessmentKind
+    rationale: str = ""
+    evidence_note: str = ""
+    captured_digest: str = ""
+    captured_revision_id: Optional[int] = None
+    decision_method: Literal["manual"] = "manual"
+    assessed_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+
+
+class ProductMilestoneOut(BaseModel):
+    """Milestone summary: the identity row plus its DERIVED axes --
+    `design_status` (definition confirmed?) and `achievement` /
+    `assessability` (reached?) are independent (§1.3/§4.2), and none of the
+    three is a column on `product_milestone`."""
+
+    id: int
+    system_id: int
+    milestone_key: str
+    #: NOT NULL, same System, never changeable after creation (§4.4) --
+    #: which Objective this is a milestone TOWARD is part of its identity.
+    objective_id: int
+    objective_key: Optional[str] = None
+    current_revision_id: Optional[int] = None
+    current_revision_number: Optional[int] = None
+    title: str = ""
+    design_status: ProductDesignStatus = "proposed"
+    achievement: ProductMilestoneAchievement = "unassessed"
+    assessability: ProductMilestoneAssessability = "assessable"
+    recheck_state: ProductRecheckState = "current"
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class ProductMilestoneDetailOut(ProductMilestoneOut):
+    current_revision: Optional[ProductMilestoneRevisionOut] = None
+    dependencies: List[ProductMilestoneDependencyOut] = []
+    decisions: List[ProductMilestoneDecisionOut] = []
+    assessments: List[ProductMilestoneAssessmentOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class ProductMilestoneListOut(BaseModel):
+    system_id: int
+    objective_id: Optional[int] = None
+    objective_key: Optional[str] = None
+    generated_at: float
+    milestones: List[ProductMilestoneOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+# --- #429 Milestone write requests ------------------------------------------
+
+
+class ProductMilestoneCreateRequest(BaseModel):
+    """The owning Objective is required at creation and never changes
+    afterward (§4.4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    objective_key: str
+    milestone_key: str
+
+
+class ProductMilestoneRevisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = ""
+    target_state: str = ""
+    verification_method: ProductMilestoneVerificationMethod = "unavailable"
+    verification_note: str = ""
+    sequence_hint: int = 0
+    summary: str = ""
+    change_note: str = ""
+
+
+class ProductMilestoneDependencyCreateRequest(BaseModel):
+    """Self-reference / cycle rejection (§4.4) is evaluated the same way as
+    Objective parenting: iteration with a visited set over the CURRENT
+    dependency graph, never recursion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    depends_on_milestone_key: str
+    rationale: str = ""
+
+
+class ProductMilestoneDecisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: ProductMilestoneDecisionKind
+    rationale: str = ""
+    captured_digest: str = ""
+
+
+class ProductMilestoneAssessmentCreateRequest(BaseModel):
+    """422 `product_milestone_not_assessable` when the Milestone's
+    `design_status` is not `confirmed` (§4.3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    assessment: ProductMilestoneAssessmentKind
+    rationale: str = ""
+    evidence_note: str = ""
+    captured_digest: str = ""
+
+
+class ProductGapRevisionOut(BaseModel):
+    """Append-only Gap content (§5.9's `product_gap_revision`). No
+    `severity` column and no score column exist anywhere on this model --
+    structurally (§5.1/§0 invariant 7). `suggested_priority_note` is an
+    AI SUGGESTION only; it is excluded from `content_digest` so it moving
+    never stales a human's confirmed decision (§8)."""
+
+    id: int
+    gap_id: int
+    revision_number: int
+    title: str = ""
+    current_state: str = ""
+    target_state: str = ""
+    target_state_mode: ProductGapTargetMode = "unknown"
+    interpretation: str = ""
+    suggested_priority_note: str = ""
+    content_digest: str
+    authored_by_kind: ProductAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    change_note: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    revision_state: ProductRevisionState = "current"
+    superseded_by_id: Optional[int] = None
+
+
+class ProductGapSourceOut(BaseModel):
+    """A resolved read of one `product_gap_source_ref` row, federated
+    through the §5.4 kind-specific resolver. `title` / `detail` /
+    `severity` / `deep_link` are resolved fresh at READ time from the
+    owning detector -- never stored on the Gap (§0 invariant 9). `severity`
+    carries the detector's OWN vocabulary verbatim, with
+    `severity_vocabulary` naming which one -- never normalized across
+    sources into a single scale (§5.1, #430 non-goal)."""
+
+    id: int
+    gap_id: int
+    source_kind: ProductGapSourceKind
+    source_ref: str
+    source_state: ProductGapSourceState
+    title: Optional[str] = None
+    detail: Optional[str] = None
+    severity: Optional[str] = None
+    severity_vocabulary: Optional[str] = None
+    deep_link: Optional[str] = None
+    deep_link_state: ProductDeepLinkState = "unavailable"
+    captured_digest: str = ""
+    captured_snapshot_id: Optional[int] = None
+    captured_run_id: Optional[int] = None
+    captured_revision_id: Optional[int] = None
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class ProductGapEvidenceOut(BaseModel):
+    """A pointer to what a human saw -- no body column (§0 invariant 1)."""
+
+    id: int
+    gap_id: int
+    evidence_kind: ProductGapEvidenceKind
+    evidence_ref: str
+    captured_snapshot_id: Optional[int] = None
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class ProductGapArtifactOut(BaseModel):
+    """A Gap's downstream externalization/execution candidate (§1.5). An
+    Issue Draft referenced here is a DOWNSTREAM artifact, never this Gap's
+    detection source."""
+
+    id: int
+    gap_id: int
+    link_kind: ProductGapArtifactLinkKind
+    target_ref: str
+    target_row_id: Optional[int] = None
+    captured_digest: str = ""
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class ProductGapDecisionOut(BaseModel):
+    """One row of the Gap lifecycle/priority ledger (§5.6/§5.7).
+    `priority_band` is meaningful only when `decision="prioritize"`; every
+    other decision leaves it at `"unset"` on THIS row (the derived
+    `ProductGapOut.priority_band` still reads the latest `prioritize` row
+    regardless of later lifecycle decisions -- the audit survives a
+    `resolve`)."""
+
+    id: int
+    gap_id: int
+    gap_key: str
+    decision: ProductGapDecisionKind
+    priority_band: ProductGapPriorityBand = "unset"
+    rationale: str = ""
+    captured_digest: str = ""
+    captured_revision_id: Optional[int] = None
+    decision_method: Literal["manual"] = "manual"
+    decided_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+
+
+class ProductGapOut(BaseModel):
+    """Gap summary: the identity row plus its DERIVED axes (`lifecycle`,
+    `priority_band`) -- neither is a column on `product_gap` (§5.6/§5.7).
+    `read_flags` are the §6 read-time advisories
+    (`recheck_required`/`reopen_candidate`/`close_candidate`); they are
+    NEVER `ProductGapLifecycle` values and are recomputed on every read,
+    never persisted."""
+
+    id: int
+    system_id: int
+    gap_key: str
+    #: NOT NULL, same System, never changeable after creation (§5.2) --
+    #: which Milestone this is a difference AGAINST is part of its
+    #: identity.
+    milestone_id: int
+    milestone_key: Optional[str] = None
+    objective_id: Optional[int] = None
+    objective_key: Optional[str] = None
+    current_revision_id: Optional[int] = None
+    current_revision_number: Optional[int] = None
+    title: str = ""
+    lifecycle: ProductGapLifecycle = "open"
+    priority_band: ProductGapPriorityBand = "unset"
+    recheck_state: ProductRecheckState = "current"
+    read_flags: List[ProductGapReadFlag] = []
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class ProductGapDetailOut(ProductGapOut):
+    current_revision: Optional[ProductGapRevisionOut] = None
+    source_refs: List[ProductGapSourceOut] = []
+    evidence_refs: List[ProductGapEvidenceOut] = []
+    artifact_links: List[ProductGapArtifactOut] = []
+    decisions: List[ProductGapDecisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class ProductGapListOut(BaseModel):
+    system_id: int
+    milestone_id: Optional[int] = None
+    milestone_key: Optional[str] = None
+    generated_at: float
+    gaps: List[ProductGapOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+# --- #429/#430 Gap write requests -------------------------------------------
+
+
+class ProductGapCreateRequest(BaseModel):
+    """The owning Milestone is required at creation and never changes
+    afterward (§5.2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    milestone_key: str
+    gap_key: str
+
+
+class ProductGapRevisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = ""
+    current_state: str = ""
+    target_state: str = ""
+    target_state_mode: ProductGapTargetMode = "unknown"
+    interpretation: str = ""
+    suggested_priority_note: str = ""
+    change_note: str = ""
+
+
+class ProductGapSourceRefCreateRequest(BaseModel):
+    """`captured_digest` / `captured_snapshot_id` / `captured_run_id` /
+    `captured_revision_id` are NOT accepted from the caller -- the route
+    resolves the source through §5.4's kind-specific resolver and captures
+    those pins itself at creation time. 409
+    `product_gap_source_duplicate` when this exact
+    `(source_kind, source_ref)` is already current on this Gap (§5.2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_kind: ProductGapSourceKind
+    source_ref: str = ""
+    note: str = ""
+
+
+class ProductGapEvidenceRefCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_kind: ProductGapEvidenceKind
+    evidence_ref: str
+    note: str = ""
+
+
+class ProductGapArtifactLinkCreateRequest(BaseModel):
+    """409 `product_gap_artifact_duplicate` when this exact
+    `(link_kind, target_ref)` is already current on this Gap."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    link_kind: ProductGapArtifactLinkKind
+    target_ref: str
+    note: str = ""
+
+
+class ProductGapDecisionCreateRequest(BaseModel):
+    """`priority_band` is read only when `decision="prioritize"`; the route
+    ignores it for every other decision rather than silently storing a
+    priority alongside an unrelated lifecycle move."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: ProductGapDecisionKind
+    priority_band: ProductGapPriorityBand = "unset"
+    rationale: str = ""
+    captured_digest: str = ""
+
+
+class ProductFeatureRevisionOut(BaseModel):
+    """Append-only Feature content (§7.2, same shape as
+    `product_objective_revision` / `product_milestone_revision`)."""
+
+    id: int
+    feature_id: int
+    revision_number: int
+    title: str = ""
+    statement: str = ""
+    rationale: str = ""
+    scope_note: str = ""
+    summary: str = ""
+    content_digest: str
+    authored_by_kind: ProductAuthorshipKind = "developer"
+    decision_method: Literal["manual", "reasoning_llm"] = "manual"
+    intelligence_run_id: Optional[int] = None
+    change_note: str = ""
+    created_by: Optional[str] = None
+    created_at: float
+    revision_state: ProductRevisionState = "current"
+    superseded_by_id: Optional[int] = None
+
+
+class ProductFeatureRequirementLinkOut(BaseModel):
+    """A many-to-many Feature<->Requirement bridge (§7.2's
+    `product_feature_requirement_link`). Never a name/similarity match --
+    always an explicit `manual` or `reasoning_llm`-proposed link (§7.2)."""
+
+    id: int
+    feature_id: int
+    requirement_id: int
+    requirement_key: Optional[str] = None
+    captured_requirement_revision_id: Optional[int] = None
+    captured_digest: str = ""
+    recheck_state: ProductRecheckState = "current"
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class ProductFeatureCapabilityLinkOut(BaseModel):
+    """An EXPLICIT link to `understanding_capability_entity` (#312's
+    current head). Feature and Capability stay separate entities (§1.2);
+    this link is never a substitute for either."""
+
+    id: int
+    feature_id: int
+    capability_entity_id: int
+    capability_name: Optional[str] = None
+    target_state: Optional[str] = None
+    target_resolution: ProductRefTargetResolution = "unavailable"
+    recheck_state: ProductRecheckState = "current"
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class ProductFeatureTargetLinkOut(BaseModel):
+    """A Feature's link to an existing implementation target (§7.2's 9-kind
+    table). Resolvers are reused from `solution_design.py` / `node_design.py`
+    -- never reimplemented (§0 invariant 1)."""
+
+    id: int
+    feature_id: int
+    link_kind: ProductFeatureLinkKind
+    target_ref: str
+    target_row_id: Optional[int] = None
+    target_state: Optional[str] = None
+    target_resolution: ProductRefTargetResolution = "unavailable"
+    recheck_state: ProductRecheckState = "current"
+    captured_digest: str = ""
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class ProductFeatureDraftLinkOut(BaseModel):
+    """A link to a snapshot-bound `feature_drafts` row (§1.6). The draft's
+    body is never copied onto this row -- only the reference plus a
+    captured digest, resolved fresh at read time. `feature_drafts` and the
+    Feature Map screen it feeds are unchanged by this Epic."""
+
+    id: int
+    feature_id: int
+    feature_draft_id: int
+    captured_snapshot_id: Optional[int] = None
+    captured_digest: str = ""
+    target_resolution: ProductRefTargetResolution = "unavailable"
+    note: str = ""
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+    superseded_by_id: Optional[int] = None
+
+
+class ProductFeatureDecisionOut(BaseModel):
+    """One row of the Feature confirm/reject/retire/reinstate ledger
+    (§7.2), folding into `ProductDesignStatus` -- reuses
+    `ProductMilestoneDecisionKind`'s identical 4-value vocabulary rather
+    than declaring a redundant fifth Literal for the same finite set."""
+
+    id: int
+    feature_id: int
+    feature_key: str
+    decision: ProductMilestoneDecisionKind
+    rationale: str = ""
+    captured_digest: str = ""
+    captured_revision_id: Optional[int] = None
+    decision_method: Literal["manual"] = "manual"
+    decided_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+
+
+class ProductFeatureOut(BaseModel):
+    """Feature summary: the identity row plus its DERIVED `design_status`
+    (§7.2, not a column on `product_feature`)."""
+
+    id: int
+    system_id: int
+    feature_key: str
+    current_revision_id: Optional[int] = None
+    current_revision_number: Optional[int] = None
+    title: str = ""
+    design_status: ProductDesignStatus = "proposed"
+    recheck_state: ProductRecheckState = "current"
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+
+
+class ProductFeatureDetailOut(ProductFeatureOut):
+    current_revision: Optional[ProductFeatureRevisionOut] = None
+    requirement_links: List[ProductFeatureRequirementLinkOut] = []
+    capability_links: List[ProductFeatureCapabilityLinkOut] = []
+    target_links: List[ProductFeatureTargetLinkOut] = []
+    draft_links: List[ProductFeatureDraftLinkOut] = []
+    decisions: List[ProductFeatureDecisionOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class ProductFeatureListOut(BaseModel):
+    system_id: int
+    generated_at: float
+    features: List[ProductFeatureOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+# --- #431 Feature write requests --------------------------------------------
+
+
+class ProductFeatureCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    feature_key: str
+
+
+class ProductFeatureRevisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = ""
+    statement: str = ""
+    rationale: str = ""
+    scope_note: str = ""
+    summary: str = ""
+    change_note: str = ""
+
+
+class ProductFeatureRequirementLinkCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requirement_key: str
+    note: str = ""
+
+
+class ProductFeatureCapabilityLinkCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    capability_entity_id: int
+    note: str = ""
+
+
+class ProductFeatureTargetLinkCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    link_kind: ProductFeatureLinkKind
+    target_ref: str
+    note: str = ""
+
+
+class ProductFeatureDraftLinkCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    feature_draft_id: int
+    note: str = ""
+
+
+class ProductFeatureDecisionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: ProductMilestoneDecisionKind
+    rationale: str = ""
+    captured_digest: str = ""
+
+
+# --- #432 projection: Objective Map / Gap Workbench / Overview section -----
+#
+# §9's projection layer has no DDL of its own (it reads the tables above);
+# the shapes below are this task's best-effort mechanical rendering of §9.1
+# / §9.2's prose bullets, not a verbatim transcription of contract DDL like
+# the models above. Flagged in the implementing report -- the agent wiring
+# `app/product_objective_projection.py` / `routes/product_lineage.py`
+# should treat these as a starting point to confirm, not a settled contract.
+
+
+class ObjectiveMapGapSummaryOut(BaseModel):
+    """Per-Milestone Gap counts by `ProductGapLifecycle` plus the §6 read-
+    time flags. Counts only -- never a ranking signal (§0 invariant 7 /
+    §5.7): the Objective Map may show these numbers but must never sort by
+    them."""
+
+    open_count: int = 0
+    acknowledged_count: int = 0
+    deferred_count: int = 0
+    resolved_count: int = 0
+    rejected_count: int = 0
+    obsolete_count: int = 0
+    recheck_required_count: int = 0
+    reopen_candidate_count: int = 0
+    close_candidate_count: int = 0
+
+
+class ObjectiveMapMilestoneOut(BaseModel):
+    id: int
+    milestone_key: str
+    title: str = ""
+    design_status: ProductDesignStatus = "proposed"
+    achievement: ProductMilestoneAchievement = "unassessed"
+    assessability: ProductMilestoneAssessability = "assessable"
+    recheck_state: ProductRecheckState = "current"
+    sequence_hint: int = 0
+    gap_summary: ObjectiveMapGapSummaryOut = ObjectiveMapGapSummaryOut()
+
+
+class ObjectiveMapNodeOut(BaseModel):
+    """One Objective in the progressive-disclosure tree (§9.5): full
+    expansion is never forced. `child_objective_ids` lets the Dashboard
+    render the hierarchy without a second request per level."""
+
+    id: int
+    objective_key: str
+    title: str = ""
+    objective_state: ProductObjectiveState = "proposed"
+    recheck_state: ProductRecheckState = "current"
+    parent_objective_id: Optional[int] = None
+    parent_objective_key: Optional[str] = None
+    child_objective_ids: List[int] = []
+    milestones: List[ObjectiveMapMilestoneOut] = []
+
+
+class ObjectiveMapOut(BaseModel):
+    system_id: int
+    generated_at: float
+    nodes: List[ObjectiveMapNodeOut] = []
+    root_objective_ids: List[int] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class GapWorkbenchSourceBucketOut(BaseModel):
+    """A count of Gaps whose current source_ref set includes this
+    `source_kind`, never a priority signal (§0 invariant 7)."""
+
+    source_kind: ProductGapSourceKind
+    gap_count: int = 0
+
+
+class GapWorkbenchSharedSourceOut(BaseModel):
+    """§5.2's many-to-many read: every Gap, across every Objective/
+    Milestone, currently referencing the SAME `(source_kind, source_ref)`.
+    Two Gaps sharing a detector is a deliberately valid state (§5.2), never
+    a duplicate to collapse."""
+
+    source_kind: ProductGapSourceKind
+    source_ref: str
+    gap_ids: List[int] = []
+    gap_keys: List[str] = []
+
+
+class GapWorkbenchEntryOut(BaseModel):
+    id: int
+    gap_key: str
+    milestone_id: int
+    milestone_key: Optional[str] = None
+    objective_id: Optional[int] = None
+    objective_key: Optional[str] = None
+    title: str = ""
+    lifecycle: ProductGapLifecycle = "open"
+    priority_band: ProductGapPriorityBand = "unset"
+    recheck_state: ProductRecheckState = "current"
+    read_flags: List[ProductGapReadFlag] = []
+    #: To the detection screen, Journey, Requirement, Feature,
+    #: implementation target, and evidence -- reusing `OverviewTargetOut`
+    #: rather than a second link-shaped model. A kind with no Dashboard
+    #: screen (`node_anomaly`, §5.8) is simply absent here, never a
+    #: fabricated URL.
+    deep_links: List["OverviewTargetOut"] = []
+
+
+class GapWorkbenchOut(BaseModel):
+    """`GET /gap-workbench` (§9.2). Confirming / associating / deferring /
+    resolving / reopening / prioritizing are manual actions the Dashboard
+    offers from this projection -- selecting a Gap here never auto-executes
+    anything (§9.2 non-goal)."""
+
+    system_id: int
+    generated_at: float
+    entries: List[GapWorkbenchEntryOut] = []
+    source_kind_breakdown: List[GapWorkbenchSourceBucketOut] = []
+    shared_sources: List[GapWorkbenchSharedSourceOut] = []
+    degraded_sections: List[str] = []
+    degraded_detail: Dict[str, str] = {}
+
+
+class OverviewObjectiveOut(BaseModel):
+    """`GET /overview`'s single `objective` section (§9.1). Composes
+    existing/above projections and adds no new understanding model; the
+    server-side builder (`build_objective_overview`, not owned by this
+    file) calls no persisting function -- Overview writes nothing (#380's
+    rule, restated here for this section).
+
+    `next_step` / `next_step_state` / `next_step_reason` /
+    `next_step_completion` / `next_step_value` follow the
+    `OverviewActionOut` precedent (reason/completion_condition/value as
+    display strings the server composes) for §9.3's OWN 15-row first-match
+    table -- deliberately separate from `OverviewOut.next_action`: "what
+    keeps the system running" and "what to decide next toward the goal" are
+    different questions, and neither overrides the other's answer.
+
+    `objective_state` is `None` for a System with no Product Objective yet
+    (§11's graceful-empty-state rule) -- read as "not started", which is
+    deliberately NOT a member of `ProductObjectiveState` itself (that
+    Literal describes one Objective's own lifecycle, never "no Objective
+    exists"). This section is never placed in `degraded_sections` for that
+    reason alone.
+    """
+
+    #: The confirmed Intent `goal` / reviewer Vision claim, read once from
+    #: `understanding_brief` and never re-derived here (§9.1).
+    vision: Optional["UnderstandingBriefClaimOut"] = None
+    active_objective: Optional[ProductObjectiveOut] = None
+    #: >1 only when more than one Objective is `active`; the extra ones are
+    #: never chosen "by Gap count" or any other computed signal (§0
+    #: invariant 7) -- only by most-recently-confirmed.
+    active_objective_count: int = 0
+    next_milestone: Optional[ProductMilestoneOut] = None
+    primary_gap: Optional[ProductGapOut] = None
+    objective_state: Optional[ProductObjectiveState] = None
+    next_step: ProductObjectiveNextStepKey = "unavailable"
+    next_step_state: ProductObjectiveNextStepState = "unavailable"
+    #: 選定理由 -- which fact put this next step first.
+    next_step_reason: str = ""
+    #: 完了条件 -- how the developer knows it is done.
+    next_step_completion: str = ""
+    #: 完了後に得られる価値 / 次に開く判断.
+    next_step_value: str = ""
     degraded_sections: List[str] = []
     degraded_detail: Dict[str, str] = {}
