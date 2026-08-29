@@ -276,13 +276,15 @@ export function traceDownstreamImpact(
  * everywhere. `null` means no canonical screen exists yet for that kind. */
 export function lineageDeepLink(kind: FunctionalLineageKind, ref: string): string | null {
   switch (kind) {
+    // A Vision claim has no row identity of its own (§4.6) -- it is named by
+    // its text -- so the Understanding screen that owns the claim is its
+    // destination, the same one Purpose elements use. The note sits above
+    // the group rather than between two cases: a comment there reads as an
+    // intentional-fallthrough marker to `no-fallthrough` and fails lint.
+    case "vision_claim":
     case "purpose_element":
     case "purpose_relation":
     case "purpose_outcome_criterion":
-    // A Vision claim has no row identity of its own (§4.6) -- it is named
-    // by its text -- so the Understanding screen that owns the claim is
-    // the correct destination, the same one Purpose elements use.
-    case "vision_claim":
       return "/system-understanding";
     case "capability":
       return "/capability-map";
