@@ -527,6 +527,34 @@ def _walk_need_purpose_refs(
 
 # --- Product Objective / Milestone / Gap / Feature (Epic #427 §7.3) ---------
 
+#: §7.3's ref-kind -> graph-node-kind mapping for an Objective's upstream
+#: ref (`ProductRefKind`, `app/product_objective.py`). `vision_claim` has no
+#: FunctionalLineageKind of its own -- Vision has no row identity (§4.6), so
+#: this module never invents a fifth "vision" node kind for it (that Literal
+#: lives in `models.py`, which this Epic's fix does not own). It is mapped
+#: onto the existing `purpose_element` node kind instead: a `vision_claim`
+#: ref and a `purpose_element` ref are both "a claim in the Purpose Chain's
+#: own vocabulary" from this graph's point of view, and `purpose_element`
+#: already carries arbitrary string refs (a Purpose Chain element id), so a
+#: Vision's name-keyed ref shares the node kind without colliding in
+#: practice (a Vision's target_ref is free text; a Purpose element id is a
+#: fixed slug such as `beneficiary_problem`). `purpose_relation` keeps its
+#: own distinct kind, matching how the graph already treats an element and a
+#: relation as two different kinds everywhere else.
+_OBJECTIVE_REF_NODE_KIND: Dict[str, str] = {
+    "vision_claim": "purpose_element",
+    "purpose_element": "purpose_element",
+    "purpose_relation": "purpose_relation",
+    "capability_entity": "capability",
+    "stakeholder_need": "stakeholder_need",
+}
+
+#: The three ref kinds that answer "what the Objective is FOR" (§1.2) --
+#: only a RESOLVED ref of one of these clears `objective_without_vision_ref`.
+#: `capability_entity` / `stakeholder_need` answer "what it can do" / "whose
+#: need it addresses", never a substitute for a Vision/Purpose connection.
+_OBJECTIVE_VISION_REF_KINDS: Set[str] = {"vision_claim", "purpose_element", "purpose_relation"}
+
 
 def _journeys_referencing_gap(conn: sqlite3.Connection, system_id: int, gap_key: str) -> List[str]:
     """Journey keys reached through #405's `ux_journey_upstream_ref` via its
@@ -586,8 +614,28 @@ def _check_product_objectives(
                         degraded_sections, degraded_detail, f"product_objective.upstream_refs:{objective_key}",
                         RuntimeError(detail["degraded_detail"].get("upstream_refs", "unavailable")),
                     )
-                elif not detail.get("upstream_refs"):
-                    graph.add_gap("objective_without_vision_ref", "product_objective", objective_key)
+                else:
+                    has_vision_ref = False
+                    for ref in detail.get("upstream_refs", []):
+                        ref_kind = ref["ref_kind"]
+                        node_kind = _OBJECTIVE_REF_NODE_KIND.get(ref_kind)
+                        target_ref = ref["target_ref"]
+                        resolution = ref["target_resolution"]
+                        # §7.3: only a RESOLVED ref becomes an edge -- a
+                        # deleted/cross-System/unresolved target would
+                        # otherwise become a phantom node and silently clear
+                        # `objective_without_vision_ref`.
+                        if node_kind and resolution == "resolved":
+                            graph.add_node(node_kind, target_ref, name=ref.get("target_name"))
+                            graph.add_edge(node_kind, target_ref, "product_objective", objective_key)
+                            if ref_kind in _OBJECTIVE_VISION_REF_KINDS:
+                                has_vision_ref = True
+                        graph.add_reference_gaps(
+                            "product_objective", objective_key,
+                            resolution=resolution, recheck_state=ref["recheck_state"],
+                        )
+                    if not has_vision_ref:
+                        graph.add_gap("objective_without_vision_ref", "product_objective", objective_key)
             except Exception as exc:  # pragma: no cover - defensive
                 _degrade(degraded_sections, degraded_detail, f"product_objective.detail:{objective_key}", exc)
 
@@ -686,6 +734,33 @@ def _check_product_gaps(
         _degrade(degraded_sections, degraded_detail, "product_gaps", exc)
 
 
+def _requirement_link_resolved(conn: sqlite3.Connection, system_id: int, requirement_key: str) -> bool:
+    """Whether a Feature's Requirement link target actually resolves --
+    i.e. the Requirement identity row still exists in THIS System.
+
+    `product_feature.py` exposes no `target_resolution` field for a
+    requirement link (unlike its Capability/target-link siblings): it folds
+    resolution straight into `recheck_state`, which conflates "gone" and
+    "content changed" into one `stale` value (see
+    `_requirement_link_out_dict`'s own docstring), so that field cannot
+    tell a deleted Requirement apart from one whose revision merely moved.
+    This queries the identity row directly instead, matching the SAME
+    "row exists" resolution convention `stakeholder_network.
+    _resolve_requirement_target` already uses for a Requirement reference
+    elsewhere in this exact chain (a Requirement with no revision yet is
+    still a real, current entity -- not a phantom) -- the same "own local
+    copy of a target-kind dispatch" precedent `_requirement_keys_for_step`
+    above already sets for this module."""
+    try:
+        row = conn.execute(
+            "SELECT id FROM ux_requirement WHERE system_id = ? AND requirement_key = ?",
+            (system_id, requirement_key),
+        ).fetchone()
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return row is not None
+
+
 def _check_product_features(
     conn: sqlite3.Connection,
     system_id: int,
@@ -700,7 +775,14 @@ def _check_product_features(
     this function's ONLY path to a Feature's implementation targets -- the
     same "no second path to Flow/Node" precedent
     `_walk_exchange_chain`'s `solution_design.get_design_detail` call
-    already sets one layer over."""
+    already sets one layer over.
+
+    Only a RESOLVED link becomes an edge, for all three link kinds -- an
+    unresolved/unavailable/stale target maps onto the same
+    `unresolved_reference` / `unavailable_reference` / `stale_link` codes
+    every other hop in this module already uses, with the FEATURE (the
+    link's owner) as the gap subject, never a phantom node for the missing
+    target (§7.3)."""
     try:
         result = product_feature.list_features(conn, system_id)
         if result["degraded_sections"]:
@@ -717,32 +799,61 @@ def _check_product_features(
                 _degrade(degraded_sections, degraded_detail, f"product_feature.detail:{feature_key}", exc)
                 continue
 
+            for section in ("requirement_links", "capability_links", "target_links"):
+                if section in detail.get("degraded_sections", []):
+                    _degrade(
+                        degraded_sections, degraded_detail, f"product_feature.{section}:{feature_key}",
+                        RuntimeError(detail["degraded_detail"].get(section, "unavailable")),
+                    )
+
             for link in detail.get("requirement_links", []):
                 req_key = link.get("requirement_key")
                 if not req_key:
                     continue
-                requirement_keys_with_feature.add(req_key)
-                graph.add_node("ux_requirement", req_key)
-                graph.add_edge("ux_requirement", req_key, "product_feature", feature_key)
+                resolved = _requirement_link_resolved(conn, system_id, req_key)
+                if resolved:
+                    requirement_keys_with_feature.add(req_key)
+                    graph.add_node("ux_requirement", req_key)
+                    graph.add_edge("ux_requirement", req_key, "product_feature", feature_key)
+                # `ProductRecheckState` has no separate `unavailable` value
+                # for a requirement link (see `_requirement_link_resolved`'s
+                # docstring), so this hop's resolution is binary.
+                graph.add_reference_gaps(
+                    "product_feature", feature_key,
+                    resolution="resolved" if resolved else "unresolved",
+                    recheck_state=link.get("recheck_state", "current"),
+                )
 
-            capability_links = detail.get("capability_links", [])
-            for link in capability_links:
-                cap_ref = str(link.get("capability_entity_id"))
-                graph.add_node("capability", cap_ref, name=link.get("capability_name"))
-                graph.add_edge("product_feature", feature_key, "capability", cap_ref)
-            if not capability_links:
+            has_capability = False
+            for link in detail.get("capability_links", []):
+                resolution = link.get("target_resolution")
+                graph.add_reference_gaps(
+                    "product_feature", feature_key,
+                    resolution=resolution, recheck_state=link.get("recheck_state", "current"),
+                )
+                if resolution == "resolved":
+                    has_capability = True
+                    cap_ref = str(link.get("capability_entity_id"))
+                    graph.add_node("capability", cap_ref, name=link.get("capability_name"))
+                    graph.add_edge("product_feature", feature_key, "capability", cap_ref)
+            if not has_capability:
                 graph.add_gap("feature_without_capability", "product_feature", feature_key)
 
-            target_links = detail.get("target_links", [])
-            if not target_links:
-                graph.add_gap("feature_without_implementation_target", "product_feature", feature_key)
-            for link in target_links:
+            has_target = False
+            for link in detail.get("target_links", []):
+                resolution = link.get("target_resolution")
+                graph.add_reference_gaps(
+                    "product_feature", feature_key,
+                    resolution=resolution, recheck_state=link.get("recheck_state", "current"),
+                )
                 target_kind = link.get("link_kind")
                 target_ref = link.get("target_ref")
-                if not target_kind or not target_ref:
-                    continue
-                graph.add_node(target_kind, target_ref)
-                graph.add_edge("product_feature", feature_key, target_kind, target_ref)
+                if resolution == "resolved" and target_kind and target_ref:
+                    has_target = True
+                    graph.add_node(target_kind, target_ref)
+                    graph.add_edge("product_feature", feature_key, target_kind, target_ref)
+            if not has_target:
+                graph.add_gap("feature_without_implementation_target", "product_feature", feature_key)
 
         # Feature, like Objective/Milestone/Gap, is a new, OPTIONAL layer
         # (§0-1/§1.6) -- a System that has created no Feature at all has not

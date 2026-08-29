@@ -1374,7 +1374,12 @@ class TestProductObjectiveMilestoneLineage:
         assert {g["severity"] for g in by_code["objective_without_milestone"]} == {"attention"}
         assert any(n["kind"] == "product_objective" and n["ref"] == "obj1" for n in result["nodes"])
 
-    def test_vision_ref_and_milestone_clear_objective_gaps_but_milestone_stays_unverified(self, admin_client):
+    def test_need_only_ref_produces_an_edge_but_never_clears_the_vision_gap(self, admin_client):
+        """§7.3's fix: a resolved upstream ref of ANY kind produces a node
+        and an edge (forward traversal from Vision/Need to Objective must
+        exist), but `objective_without_vision_ref` answers "what is this
+        FOR" (§1.2) -- a Capability or Need reference never satisfies it,
+        no matter how many exist."""
         token, system_id = _setup(admin_client)
         headers = _headers(token, system_id)
         _create_stakeholder(admin_client, headers, "sh1")
@@ -1386,7 +1391,7 @@ class TestProductObjectiveMilestoneLineage:
 
         result = _build_lineage_direct(system_id)
         by_code = _gaps_by_code(result)
-        assert not any(g["subject_ref"] == "obj2" for g in by_code.get("objective_without_vision_ref", []))
+        assert any(g["subject_ref"] == "obj2" for g in by_code.get("objective_without_vision_ref", []))
         assert not any(g["subject_ref"] == "obj2" for g in by_code.get("objective_without_milestone", []))
         assert any(g["subject_ref"] == "ms1" for g in by_code.get("milestone_without_verification", []))
         assert {g["severity"] for g in by_code["milestone_without_verification"]} == {"attention"}
@@ -1396,6 +1401,47 @@ class TestProductObjectiveMilestoneLineage:
 
         edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
         assert ("product_objective", "obj2", "product_milestone", "ms1") in edges
+        # The resolved Need ref itself now produces a forward edge into the
+        # Objective -- this is the bug being fixed: it used to produce
+        # nothing at all.
+        assert ("stakeholder_need", "need1", "product_objective", "obj2") in edges
+
+    def test_resolved_purpose_element_ref_clears_the_vision_gap_and_produces_an_edge(self, admin_client):
+        """A resolved `purpose_element` ref DOES answer "what this Objective
+        is FOR" and clears `objective_without_vision_ref` -- `beneficiary_problem`
+        is a fixed Purpose Frame element id that always resolves, even with
+        no Intent Brief authored yet (see `TestValueExchangeChain.
+        test_conflicting_dependency`'s identical precedent one layer up)."""
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_objective(admin_client, headers, "obj2b")
+        _add_objective_upstream_ref(admin_client, headers, "obj2b", "purpose_element", "beneficiary_problem")
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert not any(g["subject_ref"] == "obj2b" for g in by_code.get("objective_without_vision_ref", []))
+
+        edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
+        assert ("purpose_element", "beneficiary_problem", "product_objective", "obj2b") in edges
+
+    def test_unresolved_objective_ref_produces_no_edge_and_no_phantom_node(self, admin_client):
+        """§7.3: only a RESOLVED ref becomes an edge -- an unresolvable
+        Capability reference must not create a phantom `capability` node,
+        and must still leave `objective_without_vision_ref` in place (it was
+        never a vision-kind ref to begin with, and it does not resolve
+        either)."""
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_objective(admin_client, headers, "obj2c")
+        _add_objective_upstream_ref(admin_client, headers, "obj2c", "capability_entity", "999999")
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(g["subject_ref"] == "obj2c" for g in by_code.get("objective_without_vision_ref", []))
+        assert any(g["subject_ref"] == "obj2c" for g in by_code.get("unresolved_reference", []))
+        assert not any(n["kind"] == "capability" and n["ref"] == "999999" for n in result["nodes"])
+        edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
+        assert not any(e[3] == "obj2c" and e[0] == "capability" for e in edges)
 
     def test_verified_milestone_with_a_gap_clears_both_milestone_gaps(self, admin_client):
         token, system_id = _setup(admin_client)
@@ -1567,6 +1613,88 @@ class TestProductFeatureLineage:
         assert ("ux_requirement", "req1", "product_feature", "feat2") in edges
         assert ("product_feature", "feat2", "capability", str(cap_id)) in edges
         assert ("product_feature", "feat2", "evolution_node", "node_f") in edges
+
+    def test_unresolved_feature_target_link_produces_no_phantom_node(self, admin_client):
+        """A target link is permitted to point at something that does not
+        currently resolve (`add_target_link` is explicitly permissive) --
+        §7.3's fix is that such a link must never become a phantom node/edge,
+        and must leave `feature_without_implementation_target` in place."""
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_feature(admin_client, headers, "feat_unresolved_target")
+        _add_feature_target_link(admin_client, headers, "feat_unresolved_target", "component", "no-such-component")
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(
+            g["subject_ref"] == "feat_unresolved_target"
+            for g in by_code.get("feature_without_implementation_target", [])
+        )
+        assert not any(n["kind"] == "component" and n["ref"] == "no-such-component" for n in result["nodes"])
+        edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
+        assert not any(e[0] == "product_feature" and e[1] == "feat_unresolved_target" and e[2] == "component" for e in edges)
+
+    def test_feature_requirement_link_to_a_deleted_requirement_produces_no_edge(self, admin_client):
+        """A Requirement can only be LINKED while it exists (404 otherwise),
+        so `unresolved` is reached by making a previously-linked Requirement
+        disappear afterward -- the same "make it stop resolving" convention
+        `test_unresolved_reference` above uses one layer up. The deleted
+        Requirement must not become a phantom `ux_requirement` node/edge, and
+        must not silently clear `requirement_without_feature` for anything
+        else."""
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "req_will_vanish")
+        _create_feature(admin_client, headers, "feat_dangling_req")
+        _add_feature_requirement_link(admin_client, headers, "feat_dangling_req", "req_will_vanish")
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            conn.execute(
+                "DELETE FROM ux_requirement WHERE system_id = ? AND requirement_key = ?",
+                (system_id, "req_will_vanish"),
+            )
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(g["subject_ref"] == "feat_dangling_req" for g in by_code.get("unresolved_reference", []))
+        assert not any(n["kind"] == "ux_requirement" and n["ref"] == "req_will_vanish" for n in result["nodes"])
+        edges = {(e["from_kind"], e["from_ref"], e["to_kind"], e["to_ref"]) for e in result["edges"]}
+        assert ("ux_requirement", "req_will_vanish", "product_feature", "feat_dangling_req") not in edges
+
+    def test_feature_capability_link_that_never_resolves_produces_no_edge(self, admin_client):
+        """`add_capability_link` requires the Capability to resolve AT LINK
+        TIME (404 otherwise), so an unresolved link row is inserted directly
+        here rather than through the endpoint -- the same "manipulate the
+        row directly to simulate a target that does not resolve" convention
+        `_insert_capability_entity` already uses for its own minimal
+        fixture. §7.3's fix: `feature_without_capability` must still fire
+        (the layer HAS a link row, but nothing about it currently
+        resolves), and no phantom `capability` node may appear."""
+        token, system_id = _setup(admin_client)
+        headers = _headers(token, system_id)
+        _create_feature(admin_client, headers, "feat_dangling_cap")
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            feature_id = conn.execute(
+                "SELECT id FROM product_feature WHERE system_id = ? AND feature_key = ?",
+                (system_id, "feat_dangling_cap"),
+            ).fetchone()["id"]
+            conn.execute(
+                """INSERT INTO product_feature_capability_link
+                       (system_id, feature_id, capability_entity_id, target_ref, captured_digest,
+                        note, decision_method, created_by, created_at)
+                   VALUES (?, ?, NULL, '999999', '', '', 'manual', 'root', ?)""",
+                (system_id, feature_id, time.time()),
+            )
+
+        result = _build_lineage_direct(system_id)
+        by_code = _gaps_by_code(result)
+        assert any(g["subject_ref"] == "feat_dangling_cap" for g in by_code.get("feature_without_capability", []))
+        assert not any(n["kind"] == "capability" and n["ref"] == "999999" for n in result["nodes"])
 
     def test_feature_and_objective_layers_are_never_folded_together(self, admin_client):
         """Feature is never merged into Capability/Flow/Component identity
