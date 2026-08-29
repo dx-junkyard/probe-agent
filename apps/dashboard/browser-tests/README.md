@@ -1,4 +1,4 @@
-# Overview browser tests (Issue #384)
+# Browser tests (Issues #384, #427/#432)
 
 `vitest` runs in jsdom, which has no layout, no clock-driven refetch and no
 real navigation. Three of #384's acceptance conditions cannot be verified there
@@ -17,6 +17,27 @@ Scenario 1 uses the real server end to end. Scenarios 2 and 3 control the
 RESPONSE by route interception — what they test is the browser's own behaviour
 (router, reload, render), not the server's projection, which the pytest suite
 already covers.
+
+## Objective Map (`objective-map.cjs`, Issue #427/#432 review §4.1)
+
+Six guarantees of the Objective Map screen that jsdom cannot check, each one a
+way the screen fails while its unit tests stay green:
+
+| Scenario | Why it needs a real browser |
+| --- | --- |
+| Nested deep link + reload | A link to a CHILD Objective is only visible if its ancestor is force-opened. jsdom has no real navigation or reload to lose the selection in. |
+| An unreadable Gap read is not `0 件` | The server returns an all-zero summary and signals the failure only in `degraded_sections`, so the zeros are indistinguishable from a real "no Gaps" unless the reader checks. Verified on the shape the server actually sends. |
+| back/forward re-syncs selection AND filters | Selection uses `replace: true` (a tree click is not a navigation), so this drives the URL directly. The Gap filter is the half that used to drift: it was seeded from the URL on first render only. |
+| One lane pending does not block the other | The Gap panel mounts only when its tab is active, and a short delay would race the fetch and pass for the wrong reason — so the delay is 20s and the tab is opened first. |
+| WAI-ARIA tabs | Roles, `aria-selected`, `aria-controls`, and arrow-key roving focus need a real focus model. |
+| 390px viewport | Needs real layout to detect horizontal overflow. |
+
+Auth and System creation run against the real server; only the two projections
+are intercepted, for the reason given above.
+
+```bash
+NODE_PATH=/tmp/pw/node_modules node browser-tests/objective-map.cjs /tmp/out
+```
 
 ## Running
 
