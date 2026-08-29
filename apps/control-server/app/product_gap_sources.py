@@ -70,6 +70,18 @@ class ResolvedSource:
     deep_link: Optional[str]
     deep_link_state: str
     extra: Dict[str, Any] = field(default_factory=dict)
+    #: §5.4/§5.10's per-kind pins, decided by THIS resolver from the
+    #: canonical rows it already read -- never accepted from a caller
+    #: (`add_gap_source_ref` never takes a pin in its request body). A kind
+    #: with no required/optional pin (§5.10's table) leaves these `None`.
+    #: `capability_drift` needs `resolved_snapshot_id` AND
+    #: `resolved_run_id`; `system_understanding_gap` needs only
+    #: `resolved_snapshot_id`; `understanding_review_gap` /
+    #: `understanding_claim_change` / `requirement_diff` need only
+    #: `resolved_revision_id`.
+    resolved_snapshot_id: Optional[int] = None
+    resolved_run_id: Optional[int] = None
+    resolved_revision_id: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +199,7 @@ def _resolve_system_understanding_gap(
             source_state="contradicted", title=match.get("title") or "", detail=match.get("notes") or "",
             severity=match.get("severity"), severity_vocabulary="gap_triage",
             current_digest=current_digest, deep_link=None, deep_link_state="unavailable",
-            extra={"triage_status": triage_status},
+            extra={"triage_status": triage_status}, resolved_snapshot_id=snapshot_id,
         )
 
     state = _digest_state(captured_digest, current_digest)
@@ -195,7 +207,7 @@ def _resolve_system_understanding_gap(
         source_state=state, title=match.get("title") or "", detail=match.get("notes") or "",
         severity=match.get("severity"), severity_vocabulary="gap_triage",
         current_digest=current_digest, deep_link=None, deep_link_state="unavailable",
-        extra={"triage_status": triage_status},
+        extra={"triage_status": triage_status}, resolved_snapshot_id=snapshot_id,
     )
 
 
@@ -219,12 +231,13 @@ def _resolve_understanding_review_gap(
         return _unavailable("no Interview session for this System")
 
     row = conn.execute(
-        """SELECT gap_analysis FROM understanding_revision
+        """SELECT id, gap_analysis FROM understanding_revision
            WHERE session_id = ? AND system_id = ? ORDER BY id DESC LIMIT 1""",
         (session_id, system_id),
     ).fetchone()
     if row is None or not row["gap_analysis"]:
         return _disappeared()
+    revision_id = row["id"]
 
     try:
         items = json.loads(row["gap_analysis"])
@@ -252,6 +265,7 @@ def _resolve_understanding_review_gap(
         source_state=state, title=f"{gap_type}: {node_name}", detail=match.get("summary") or "",
         severity=match.get("severity"), severity_vocabulary="understanding_review",
         current_digest=current_digest, deep_link=None, deep_link_state="unavailable", extra={},
+        resolved_revision_id=revision_id,
     )
 
 
@@ -329,6 +343,7 @@ def _resolve_understanding_claim_change(
             source_state="contradicted", title=f"{section}: {name}", detail="",
             severity=None, severity_vocabulary=None, current_digest=current_digest,
             deep_link=None, deep_link_state="unavailable", extra={"buckets": buckets},
+            resolved_revision_id=to_row["id"],
         )
 
     state = _digest_state(captured_digest, current_digest)
@@ -336,6 +351,7 @@ def _resolve_understanding_claim_change(
         source_state=state, title=f"{section}: {name}", detail=f"change_kind={'+'.join(buckets)}",
         severity=None, severity_vocabulary=None, current_digest=current_digest,
         deep_link=None, deep_link_state="unavailable", extra={"buckets": buckets},
+        resolved_revision_id=to_row["id"],
     )
 
 
@@ -491,13 +507,17 @@ def _resolve_requirement_diff(
         # `journey_baseline_diff`'s no-parameter "current" reading);
         # `captured_revision_id` is accepted for audit/display but does not
         # change which transition is diffed (documented interpretation --
-        # see the task report).
+        # see the task report). `to_revision_id` is the revision this
+        # resolution actually read, so it is what gets stored as
+        # `resolved_revision_id` at add time (§5.10).
         diff = ux_design.diff_requirement_revisions(conn, system_id, requirement_key)
     except ux_design.NotFound:
         return _disappeared()
 
     if diff.get("diff_state") != "available":
         return _disappeared(extra={"diff_state": diff.get("diff_state")})
+
+    resolved_revision_id = diff.get("to_revision_id")
 
     entry = next((e for e in diff.get("criteria", []) if e.get("criterion_key") == criterion_key), None)
     if entry is None:
@@ -508,6 +528,7 @@ def _resolve_requirement_diff(
             source_state="contradicted", title=f"{requirement_key} / {criterion_key}", detail="change_kind=unchanged",
             severity=None, severity_vocabulary=None, current_digest="",
             deep_link=None, deep_link_state="unavailable", extra={},
+            resolved_revision_id=resolved_revision_id,
         )
 
     current_digest = _digest({
@@ -520,6 +541,7 @@ def _resolve_requirement_diff(
         source_state=state, title=f"{requirement_key} / {criterion_key}", detail=f"change_kind={entry.get('change_kind')}",
         severity=None, severity_vocabulary=None, current_digest=current_digest,
         deep_link=None, deep_link_state="unavailable", extra={},
+        resolved_revision_id=resolved_revision_id,
     )
 
 
@@ -538,6 +560,20 @@ def _latest_indexed_ready_snapshot_id(conn: sqlite3.Connection, system_id: int) 
                    AND ir.run_type = 'symbol_index' AND ir.status = 'completed'
              )
            ORDER BY rs.id DESC LIMIT 1""",
+        (system_id,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def _latest_completed_capability_hierarchy_run_id(conn: sqlite3.Connection, system_id: int) -> Optional[int]:
+    """The base run `capability_drift` compares against when no pin has been
+    captured yet -- the latest completed Capability Hierarchy build for this
+    System (the same "latest completed run of the relevant run_type" pattern
+    `_latest_indexed_ready_snapshot_id` below uses for `symbol_index`)."""
+    row = conn.execute(
+        """SELECT id FROM intelligence_runs
+           WHERE system_id = ? AND run_type = 'capability_hierarchy' AND status = 'completed'
+           ORDER BY id DESC LIMIT 1""",
         (system_id,),
     ).fetchone()
     return row["id"] if row else None
@@ -566,12 +602,26 @@ def _resolve_capability_drift(
     captured_snapshot_id: Optional[int], captured_run_id: Optional[int],
     captured_revision_id: Optional[int],
 ) -> ResolvedSource:
-    if captured_run_id is None:
-        return _unavailable("capability_drift requires captured_run_id", extra={"reason": "missing_captured_run_id"})
+    # §5.10: `capability_drift` REQUIRES a pinned base run. `add_gap_source_ref`
+    # never accepts a pin from the request body, so the FIRST resolution (at
+    # add time) always arrives with `captured_run_id=None` -- the resolver
+    # decides the pin itself here, from the canon it already reads: the
+    # latest completed Capability Hierarchy build for this System. A pin
+    # that WAS already captured is re-read as-is; if it no longer resolves
+    # this stays `unavailable` rather than silently substituting a
+    # different run (that would make the stored pin meaningless).
+    run_id = captured_run_id
+    if run_id is None:
+        run_id = _latest_completed_capability_hierarchy_run_id(conn, system_id)
+        if run_id is None:
+            return _unavailable(
+                "no capability_hierarchy run has completed for this System",
+                extra={"reason": "no_capability_hierarchy_run"},
+            )
 
     run_row = conn.execute(
         "SELECT id, snapshot_id FROM intelligence_runs WHERE id = ? AND system_id = ?",
-        (captured_run_id, system_id),
+        (run_id, system_id),
     ).fetchone()
     if run_row is None:
         return _unavailable("captured intelligence run not found", extra={"reason": "captured_run_not_found"})
@@ -585,7 +635,7 @@ def _resolve_capability_drift(
         node_row = conn.execute(
             """SELECT * FROM capability_hierarchy_nodes
                WHERE intelligence_run_id = ? AND system_id = ? AND entrypoint_id = ?""",
-            (captured_run_id, system_id, entrypoint_id),
+            (run_row["id"], system_id, entrypoint_id),
         ).fetchone()
     else:
         parts = _split2(source_ref)
@@ -595,7 +645,7 @@ def _resolve_capability_drift(
         node_row = conn.execute(
             """SELECT * FROM capability_hierarchy_nodes
                WHERE intelligence_run_id = ? AND system_id = ? AND path = ? AND qualified_name = ?""",
-            (captured_run_id, system_id, path, qualified_name),
+            (run_row["id"], system_id, path, qualified_name),
         ).fetchone()
 
     if node_row is None:
@@ -615,12 +665,15 @@ def _resolve_capability_drift(
     result = drift.compute_anchor_drift(anchor, facts)
 
     if result.status == drift.MISSING_SOURCE:
-        return _disappeared(title=node_row["name"] or "", extra={"drift_status": result.status})
+        return _disappeared(
+            title=node_row["name"] or "", extra={"drift_status": result.status},
+        )
     if result.status == drift.FRESH:
         return ResolvedSource(
             source_state="contradicted", title=node_row["name"] or "", detail="drift status: fresh",
             severity=None, severity_vocabulary=None, current_digest="",
             deep_link=None, deep_link_state="unavailable", extra={"drift_status": result.status},
+            resolved_snapshot_id=target_snapshot_id, resolved_run_id=run_row["id"],
         )
 
     current_digest = _digest({
@@ -634,6 +687,7 @@ def _resolve_capability_drift(
         severity=None, severity_vocabulary=None, current_digest=current_digest,
         deep_link=None, deep_link_state="unavailable",
         extra={"drift_status": result.status, "changed_hashes": result.changed_hashes},
+        resolved_snapshot_id=target_snapshot_id, resolved_run_id=run_row["id"],
     )
 
 

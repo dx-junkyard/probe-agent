@@ -65,6 +65,7 @@ export const LINEAGE_KIND_LABEL: Record<FunctionalLineageKind, string> = {
   product_gap: "Gap",
   product_feature: "Feature",
   experiment: "Experiment",
+  vision_claim: "Vision",
   replay_run: "Replay 実行",
 };
 
@@ -148,7 +149,7 @@ const KIND_VALUES: FunctionalLineageKind[] = [
   // round-trip, so a kind with a label but no entry here renders fine and
   // then silently loses its selection on reload.
   "product_objective", "product_milestone", "product_gap", "product_feature",
-  "experiment", "replay_run",
+  "experiment", "replay_run", "vision_claim",
 ];
 const SEVERITY_VALUES: LineageGapSeverity[] = ["blocking", "attention", "informational"];
 
@@ -278,6 +279,10 @@ export function lineageDeepLink(kind: FunctionalLineageKind, ref: string): strin
     case "purpose_element":
     case "purpose_relation":
     case "purpose_outcome_criterion":
+    // A Vision claim has no row identity of its own (§4.6) -- it is named
+    // by its text -- so the Understanding screen that owns the claim is
+    // the correct destination, the same one Purpose elements use.
+    case "vision_claim":
       return "/system-understanding";
     case "capability":
       return "/capability-map";

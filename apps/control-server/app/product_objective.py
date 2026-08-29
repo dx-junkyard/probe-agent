@@ -992,8 +992,20 @@ def set_objective_parent(
     """§4.4: append-only re-parenting. Self-reference and cycle rejection
     are evaluated over the CURRENTLY ACTIVE parent-link graph only, by
     iteration with a visited set (`_would_create_cycle`) -- never
-    recursion, and no depth limit (§4.4 sets none)."""
+    recursion, and no depth limit (§4.4 sets none).
+
+    The cycle check, the re-read of both subject rows, and the INSERT all
+    happen INSIDE one `BEGIN IMMEDIATE` (§4.4: "循環検査と INSERT は同じ
+    排他 transaction の中で行う"). Checking before opening the transaction
+    let two writers requesting opposite edges each see "no cycle" against
+    the pre-write graph and both commit, leaving an actual cycle in the
+    link table. `BEGIN IMMEDIATE` takes the write lock before anything is
+    re-read, so the loser's cycle check runs against the winner's already
+    committed edge."""
     now = time.time() if now is None else now
+    # Fast-fail outside the transaction for the common case (missing rows,
+    # obvious self-reference) -- re-checked under the lock below since a
+    # race can only change the LINK GRAPH, never these facts twice cheaply.
     objective = _get_objective_row(conn, system_id, objective_key)
     if objective is None:
         raise NotFound(f"Objective {objective_key!r} not found")
@@ -1002,14 +1014,26 @@ def set_objective_parent(
         raise NotFound(f"Objective {parent_objective_key!r} not found")
     if objective["id"] == parent["id"]:
         raise ParentSelfReference(objective_key)
-    if _would_create_cycle(
-        conn, "product_objective_parent_link", "objective_id", "parent_objective_id",
-        subject_id=objective["id"], candidate_target_id=parent["id"],
-    ):
-        raise ParentCycle(objective_key)
 
-    conn.execute("BEGIN")
+    conn.execute("BEGIN IMMEDIATE")
     try:
+        # Re-read the subject rows now that the write lock is held, so the
+        # cycle check below runs against the state this transaction will
+        # actually write into, never a stale pre-lock snapshot.
+        objective = _get_objective_row(conn, system_id, objective_key)
+        if objective is None:
+            raise NotFound(f"Objective {objective_key!r} not found")
+        parent = _get_objective_row(conn, system_id, parent_objective_key)
+        if parent is None:
+            raise NotFound(f"Objective {parent_objective_key!r} not found")
+        if objective["id"] == parent["id"]:
+            raise ParentSelfReference(objective_key)
+        if _would_create_cycle(
+            conn, "product_objective_parent_link", "objective_id", "parent_objective_id",
+            subject_id=objective["id"], candidate_target_id=parent["id"],
+        ):
+            raise ParentCycle(objective_key)
+
         prior = conn.execute(
             """SELECT id FROM product_objective_parent_link
                WHERE system_id = ? AND objective_id = ? AND superseded_by_id IS NULL""",
@@ -1525,8 +1549,14 @@ def add_milestone_dependency(
 ) -> Dict[str, Any]:
     """§4.4: an ORDERING relationship, never an achievement gate (§6). Self-
     reference / cycle rejection uses the same iterative visited-set walk as
-    `set_objective_parent`."""
+    `set_objective_parent`, and for the same reason carries the cycle check,
+    the duplicate check, the re-read of both subject rows, and the INSERT
+    inside one `BEGIN IMMEDIATE` -- this function previously had NO
+    transaction at all, so two writers requesting opposite edges could each
+    see "no cycle" against the pre-write graph and both commit a real cycle
+    into `product_milestone_dependency`."""
     now = time.time() if now is None else now
+    # Fast-fail outside the transaction for the common case.
     milestone = _get_milestone_row(conn, system_id, milestone_key)
     if milestone is None:
         raise NotFound(f"Milestone {milestone_key!r} not found")
@@ -1535,26 +1565,45 @@ def add_milestone_dependency(
         raise NotFound(f"Milestone {depends_on_milestone_key!r} not found")
     if milestone["id"] == depends_on["id"]:
         raise DependencySelfReference(milestone_key)
-    if _would_create_cycle(
-        conn, "product_milestone_dependency", "milestone_id", "depends_on_milestone_id",
-        subject_id=milestone["id"], candidate_target_id=depends_on["id"],
-    ):
-        raise DependencyCycle(milestone_key)
 
-    existing = conn.execute(
-        """SELECT id FROM product_milestone_dependency
-           WHERE system_id = ? AND milestone_id = ? AND depends_on_milestone_id = ? AND superseded_by_id IS NULL""",
-        (system_id, milestone["id"], depends_on["id"]),
-    ).fetchone()
-    if existing is not None:
-        raise DependencyDuplicate(milestone_key)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-read under the write lock -- the cycle/duplicate checks below
+        # must run against the state this transaction will actually write
+        # into, never a stale pre-lock snapshot.
+        milestone = _get_milestone_row(conn, system_id, milestone_key)
+        if milestone is None:
+            raise NotFound(f"Milestone {milestone_key!r} not found")
+        depends_on = _get_milestone_row(conn, system_id, depends_on_milestone_key)
+        if depends_on is None:
+            raise NotFound(f"Milestone {depends_on_milestone_key!r} not found")
+        if milestone["id"] == depends_on["id"]:
+            raise DependencySelfReference(milestone_key)
+        if _would_create_cycle(
+            conn, "product_milestone_dependency", "milestone_id", "depends_on_milestone_id",
+            subject_id=milestone["id"], candidate_target_id=depends_on["id"],
+        ):
+            raise DependencyCycle(milestone_key)
 
-    conn.execute(
-        """INSERT INTO product_milestone_dependency
-               (system_id, milestone_id, depends_on_milestone_id, rationale, decision_method, created_by, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (system_id, milestone["id"], depends_on["id"], rationale, decision_method, created_by, now),
-    )
+        existing = conn.execute(
+            """SELECT id FROM product_milestone_dependency
+               WHERE system_id = ? AND milestone_id = ? AND depends_on_milestone_id = ? AND superseded_by_id IS NULL""",
+            (system_id, milestone["id"], depends_on["id"]),
+        ).fetchone()
+        if existing is not None:
+            raise DependencyDuplicate(milestone_key)
+
+        conn.execute(
+            """INSERT INTO product_milestone_dependency
+                   (system_id, milestone_id, depends_on_milestone_id, rationale, decision_method, created_by, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (system_id, milestone["id"], depends_on["id"], rationale, decision_method, created_by, now),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
     return get_milestone_detail(conn, system_id, milestone_key)
 
 
@@ -1872,6 +1921,38 @@ def create_gap(
     return dict(row)
 
 
+#: §5.3: fed into the effective digest ONLY when the Milestone (or its
+#: current revision) could not be read, so an unreadable Milestone never
+#: digests identically to a Milestone that was read and legitimately has an
+#: empty `target_state` (§0-8's "`unavailable` を空文字として丸めない",
+#: applied to the digest input rather than the displayed value). Never a
+#: value real `target_state` text could ever equal.
+_INHERITED_TARGET_UNAVAILABLE_SENTINEL = "\x00product_gap_inherited_target_unavailable\x00"
+
+
+def _resolve_inherited_target_state(conn: sqlite3.Connection, milestone_id: int) -> Tuple[Optional[str], str]:
+    """§5.3: resolve the target text an `inherited_from_milestone` Gap is
+    measured against, straight from the Milestone's CURRENT revision at read
+    time -- never copied onto the Gap row (§0 invariant 1).
+
+    Returns `(effective_target_state, availability)` where `availability` is
+    `"resolved"` when the Milestone's current revision was actually read
+    (even when its `target_state` is legitimately the empty string) or
+    `"unavailable"` when the Milestone row or its current revision could not
+    be read at all -- the exact distinction §5.3 requires the API to keep
+    separate from a real empty target."""
+    row = conn.execute(
+        """SELECT m.current_revision_id AS current_revision_id, r.target_state AS target_state
+           FROM product_milestone m
+           LEFT JOIN product_milestone_revision r ON r.id = m.current_revision_id
+           WHERE m.id = ?""",
+        (milestone_id,),
+    ).fetchone()
+    if row is None or row["current_revision_id"] is None:
+        return None, "unavailable"
+    return row["target_state"] or "", "resolved"
+
+
 def _gap_current_digest(conn: sqlite3.Connection, gap: Dict[str, Any]) -> str:
     """The Gap's EFFECTIVE content digest -- what a human is actually
     judging when they decide about this Gap.
@@ -1904,18 +1985,13 @@ def _gap_current_digest(conn: sqlite3.Connection, gap: Dict[str, Any]) -> str:
     if row["target_state_mode"] != "inherited_from_milestone":
         return own_digest
 
-    # The inherited half. A Milestone that cannot be read contributes the
-    # empty string rather than being skipped: "the target could not be
-    # read" must not digest identically to "the target is empty", or an
-    # unreadable Milestone would silently look unchanged.
-    milestone = conn.execute(
-        """SELECT r.target_state AS target_state
-           FROM product_milestone m
-           LEFT JOIN product_milestone_revision r ON r.id = m.current_revision_id
-           WHERE m.id = ?""",
-        (gap["milestone_id"],),
-    ).fetchone()
-    inherited = (milestone["target_state"] if milestone is not None else None) or ""
+    # The inherited half. A Milestone that cannot be read feeds the
+    # dedicated sentinel, NEVER the empty string: "the target could not be
+    # read" must not digest identically to "the target is legitimately
+    # empty", or an unreadable Milestone that later turns out to have an
+    # empty target would silently look unchanged (§5.3).
+    inherited_state, availability = _resolve_inherited_target_state(conn, gap["milestone_id"])
+    inherited = inherited_state if availability == "resolved" else _INHERITED_TARGET_UNAVAILABLE_SENTINEL
     return content_digest(
         {"gap": own_digest, "inherited_target_state": inherited}
     )
@@ -2115,21 +2191,26 @@ def add_gap_source_ref(
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """§5.4/§5.10: creates a new `product_gap_source_ref` row. `captured_*`
-    pins are deliberately NEVER supplied by the caller (§10.1's model
-    docstring) -- this function determines `captured_digest` itself by
-    resolving the source through `product_gap_sources.resolve_source` at
-    creation time with no prior capture (`captured_digest=""`), which by
+    pins are deliberately NEVER supplied by the CALLER (§10.1's model
+    docstring, §5.10 "pin は resolver が決め、caller は受け取らない") -- this
+    function determines `captured_digest` AND the pins by resolving the
+    source through `product_gap_sources.resolve_source` at creation time
+    with no prior capture (`captured_digest=""`, pins `None`), which by
     §5.10's first-match table can only produce `unavailable` / `disappeared`
     / `contradicted` / `current` (never `changed`, since nothing was
     captured yet to have changed FROM).
 
-    `captured_snapshot_id`/`captured_run_id`/`captured_revision_id` are left
-    `None` here: determining the CORRECT pin for a given `source_kind`
-    (§5.4's "追加 pin" column) is exactly the per-source-kind branching this
-    module is not allowed to implement (`resolve_source` owns that). `None`
-    pins are a legal call per §5.10's signature, and a source kind that
-    genuinely needs a specific pin still degrades honestly through
-    `source_state` rather than silently pinning the wrong point in time.
+    The resolver's OWN pins (`resolved_snapshot_id` / `resolved_run_id` /
+    `resolved_revision_id`) are stored verbatim, in this same call, alongside
+    the digest -- never a caller-supplied value (§5.10's last bullets). A
+    kind with no required/optional pin resolves them as `None`, which is the
+    correct stored value for that kind, not a missing fact. A kind that
+    DOES require a pin (`capability_drift`'s `snapshot_id`+`run_id`) but
+    whose resolver could not determine one this time (e.g. no
+    `capability_hierarchy` run has ever completed for this System) legally
+    stores `None` pins too -- that source then reads `unavailable` at
+    display time until such a run exists, which is honest degradation, never
+    a guessed pin (§5.10 "pin を推測して埋めない").
     """
     now = time.time() if now is None else now
     if source_kind not in GAP_SOURCE_KINDS:
@@ -2147,6 +2228,9 @@ def add_gap_source_ref(
         raise SourceDuplicate(gap_key)
 
     captured_digest = ""
+    resolved_snapshot_id: Optional[int] = None
+    resolved_run_id: Optional[int] = None
+    resolved_revision_id: Optional[int] = None
     try:
         from . import product_gap_sources
 
@@ -2154,14 +2238,23 @@ def add_gap_source_ref(
             conn, system_id=system_id, source_kind=source_kind, source_ref=source_ref, captured_digest=""
         )
         captured_digest = resolved.current_digest
+        resolved_snapshot_id = resolved.resolved_snapshot_id
+        resolved_run_id = resolved.resolved_run_id
+        resolved_revision_id = resolved.resolved_revision_id
     except Exception:
         captured_digest = ""
 
     cur = conn.execute(
         """INSERT INTO product_gap_source_ref
-               (system_id, gap_id, source_kind, source_ref, captured_digest, note, decision_method, created_by, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'manual', ?, ?)""",
-        (system_id, gap["id"], source_kind, source_ref, captured_digest, note, created_by, now),
+               (system_id, gap_id, source_kind, source_ref, captured_digest,
+                captured_snapshot_id, captured_run_id, captured_revision_id,
+                note, decision_method, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?)""",
+        (
+            system_id, gap["id"], source_kind, source_ref, captured_digest,
+            resolved_snapshot_id, resolved_run_id, resolved_revision_id,
+            note, created_by, now,
+        ),
     )
     row = dict(conn.execute("SELECT * FROM product_gap_source_ref WHERE id = ?", (cur.lastrowid,)).fetchone())
     out, _err = _gap_source_out_dict(conn, system_id, row)
@@ -2357,6 +2450,29 @@ def _gap_out_dict(conn: sqlite3.Connection, system_id: int, gap: Dict[str, Any])
     recheck_state = derive_recheck_state(current_digest, lifecycle_row)
     read_flags = _gap_read_flags(conn, system_id, gap, lifecycle)
 
+    # §5.3: the target this Gap is actually measured against, resolved for
+    # display -- an `inherited_from_milestone` Gap stores no target text of
+    # its own, so without this the developer has no way to see what the Gap
+    # is a gap FROM.
+    effective_target_state: Optional[str] = None
+    effective_target_availability: str = "unknown"
+    if revision is not None:
+        mode = revision["target_state_mode"]
+        if mode == "own":
+            effective_target_state = revision["target_state"]
+            effective_target_availability = "own"
+        elif mode == "inherited_from_milestone":
+            inherited_state, availability = _resolve_inherited_target_state(conn, gap["milestone_id"])
+            if availability == "resolved":
+                effective_target_state = inherited_state
+                effective_target_availability = "resolved"
+            else:
+                # Never an empty string standing in for "could not be read"
+                # (§0-8).
+                effective_target_state = None
+                effective_target_availability = "unavailable"
+        # mode == "unknown": leave the None/"unknown" defaults above.
+
     milestone_row = conn.execute(
         "SELECT milestone_key, objective_id FROM product_milestone WHERE id = ?", (gap["milestone_id"],)
     ).fetchone()
@@ -2378,6 +2494,8 @@ def _gap_out_dict(conn: sqlite3.Connection, system_id: int, gap: Dict[str, Any])
         "current_revision_number": revision["revision_number"] if revision else None,
         "decision_digest": current_digest,
         "title": revision["title"] if revision else "",
+        "effective_target_state": effective_target_state,
+        "effective_target_availability": effective_target_availability,
         "lifecycle": lifecycle,
         "priority_band": priority_band,
         "recheck_state": recheck_state,

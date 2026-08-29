@@ -248,6 +248,7 @@ FINITE_TYPE_NAMES = (
     "ProductRefTargetResolution",
     "ProductRefRecheckState",
     "ProductGapTargetMode",
+    "ProductGapEffectiveTargetAvailability",
     "ProductGapSourceKind",
     "ProductGapSourceState",
     "ProductGapLifecycle",

@@ -7430,7 +7430,8 @@ export type FunctionalLineageKind =
   | "evolution_node" | "component" | "cell_definition" | "cell_binding"
   | "probe_point" | "purpose_outcome_criterion"
   | "product_objective" | "product_milestone" | "product_gap"
-  | "product_feature" | "experiment" | "replay_run";
+  | "product_feature" | "experiment" | "replay_run"
+  | "vision_claim";
 
 /** §9.2's 23 gap codes, plus Issue #427 §7.3's 11. Held in parity with the server's `LineageGapCode`
  * by `test_interview_type_parity.py`'s `FINITE_TYPE_NAMES`. */
@@ -7545,6 +7546,13 @@ export type ProductRefRecheckState = "current" | "stale" | "not_captured";
 
 export type ProductGapTargetMode = "own" | "inherited_from_milestone" | "unknown";
 
+// §5.3: the resolution outcome behind `ProductGapOut.effective_target_state`.
+// `own` -- the Gap's own `target_state` IS the target, always available.
+// `resolved` -- `inherited_from_milestone` and the Milestone's current
+// revision was read successfully (even if empty). `unavailable` -- could not
+// be read; NEVER rendered as an empty string. `unknown` -- not decided yet.
+export type ProductGapEffectiveTargetAvailability = "own" | "resolved" | "unavailable" | "unknown";
+
 export type ProductGapSourceKind =
   | "manual"
   | "system_understanding_gap"
@@ -7596,9 +7604,11 @@ export type ProductGapEvidenceKind =
   | "repository_path"
   | "other";
 
+// `ux_journey` is deliberately absent (§5.11): a Gap's Journey connection
+// has exactly one writable home, `ux_journey_upstream_ref
+// (ref_kind='product_gap')` -- never this link kind.
 export type ProductGapArtifactLinkKind =
   | "issue_draft"
-  | "ux_journey"
   | "ux_requirement"
   | "product_feature"
   | "solution_design";
@@ -8005,6 +8015,12 @@ export interface ProductGapOut {
    * read time, so half of what was judged lives on another row. */
   decision_digest: string;
   title: string;
+  /** §5.3: the target text this Gap is actually measured against, resolved
+   * for display. `null` unless `effective_target_availability` is `own` or
+   * `resolved` -- never an empty string standing in for "could not be
+   * read". */
+  effective_target_state: string | null;
+  effective_target_availability: ProductGapEffectiveTargetAvailability;
   lifecycle: ProductGapLifecycle;
   priority_band: ProductGapPriorityBand;
   recheck_state: ProductRecheckState;
@@ -8103,6 +8119,9 @@ export interface ProductFeatureRequirementLinkOut {
   requirement_key: string | null;
   captured_requirement_revision_id: number | null;
   captured_digest: string;
+  /** Independent of `recheck_state`, which has no `unresolved` member and
+   * so reports a deleted Requirement the same way as a changed one. */
+  target_resolution: ProductRefTargetResolution;
   recheck_state: ProductRecheckState;
   note: string;
   decision_method: "manual" | "reasoning_llm" | "deterministic";

@@ -32,6 +32,8 @@ fixture across many tests in this session does not double-register routes.
 
 from __future__ import annotations
 
+import sqlite3
+import threading
 import time
 
 import pytest
@@ -98,6 +100,24 @@ def _setup(client, tmp_path, name="System Objective"):
     token = _login(client)
     system_id = _create_system(client, token, name)
     return token, system_id
+
+
+def _raw_conn():
+    """A second, INDEPENDENT connection to the same on-disk DB the
+    `admin_client` fixture created (`PROBE_DB_PATH`). `db.get_conn()` holds
+    a process-wide lock, so it can never produce two concurrent
+    connections -- a genuine two-writer race needs its own connection,
+    mirroring `test_evolution_node.py`'s `_raw_conn` (same settings, plus a
+    busy timeout so the loser waits for the write lock instead of failing
+    instantly with SQLITE_BUSY)."""
+    from app import db
+
+    conn = sqlite3.connect(db.db_path(), check_same_thread=False, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
 
 
 # --- Objective/Milestone helpers --------------------------------------------------
@@ -584,6 +604,90 @@ class TestObjectiveParentCycles:
         assert r.status_code == 404
 
 
+class TestObjectiveParentConcurrency:
+    def test_two_connections_racing_opposite_edges_leave_no_cycle(self, admin_client):
+        """§4.4: the cycle check, the duplicate/prior-link check, the
+        re-read of both subject rows, and the INSERT must all sit inside
+        ONE `BEGIN IMMEDIATE` -- otherwise two writers requesting OPPOSITE
+        edges (a's parent := b, and b's parent := a) could each evaluate
+        the cycle check against the pre-write graph, both see "no cycle",
+        and both commit, leaving an actual cycle in
+        `product_objective_parent_link`.
+
+        Connection A stands in for a writer already mid-transition: it
+        takes the write lock with a raw `BEGIN IMMEDIATE` and inserts
+        EXACTLY the row `set_objective_parent(a, parent=b)` would insert.
+        While A holds the lock, a second THREAD calls the real
+        `set_objective_parent(b, parent=a)` on an independent connection --
+        it must block on its own `BEGIN IMMEDIATE` until A commits, and
+        only THEN run its cycle check, which must now see A's just-
+        committed edge and refuse."""
+        from app.db import get_conn
+
+        token, system_id = _setup(admin_client, None, "System Obj Parent Race")
+        headers = _headers(token, system_id)
+        _create_objective(admin_client, headers, "a")
+        _create_objective(admin_client, headers, "b")
+
+        with get_conn() as conn:
+            a_id = conn.execute(
+                "SELECT id FROM product_objective WHERE system_id = ? AND objective_key = 'a'", (system_id,)
+            ).fetchone()["id"]
+            b_id = conn.execute(
+                "SELECT id FROM product_objective WHERE system_id = ? AND objective_key = 'b'", (system_id,)
+            ).fetchone()["id"]
+
+        conn_a = _raw_conn()
+        conn_b = _raw_conn()
+        outcome = {}
+        try:
+            # A is mid-transition: it already holds the write lock.
+            conn_a.execute("BEGIN IMMEDIATE")
+
+            def run_b():
+                try:
+                    outcome["result"] = product_objective.set_objective_parent(
+                        conn_b, system_id=system_id, objective_key="b", parent_objective_key="a",
+                        created_by="bob",
+                    )
+                except Exception as exc:  # pragma: no cover - reported below
+                    outcome["error"] = exc
+
+            thread = threading.Thread(target=run_b)
+            thread.start()
+            thread.join(0.5)
+            # B cannot have decided anything yet: it is waiting for the
+            # write lock, which is the whole point of taking it before
+            # re-reading the graph.
+            assert thread.is_alive(), outcome
+
+            conn_a.execute(
+                """INSERT INTO product_objective_parent_link
+                       (system_id, objective_id, parent_objective_id, rationale, decision_method, created_by, created_at)
+                   VALUES (?, ?, ?, '', 'manual', 'alice', ?)""",
+                (system_id, a_id, b_id, time.time()),
+            )
+            conn_a.execute("COMMIT")
+
+            thread.join(10)
+            assert not thread.is_alive()
+            assert "error" in outcome, outcome.get("result")
+            assert isinstance(outcome["error"], product_objective.ParentCycle)
+
+            rows = conn_a.execute(
+                """SELECT objective_id, parent_objective_id FROM product_objective_parent_link
+                   WHERE system_id = ? AND superseded_by_id IS NULL""",
+                (system_id,),
+            ).fetchall()
+            edges = {(r["objective_id"], r["parent_objective_id"]) for r in rows}
+            # Exactly A's edge committed -- B's opposite edge never landed,
+            # so the graph never contains a cycle.
+            assert edges == {(a_id, b_id)}
+        finally:
+            conn_a.close()
+            conn_b.close()
+
+
 # ---------------------------------------------------------------------------
 # §4/Milestone
 # ---------------------------------------------------------------------------
@@ -791,6 +895,77 @@ class TestMilestoneDependencyCycles:
         assert ok["assessment"] == "met"
         b_row = admin_client.get("/product-milestones/b", headers=headers).json()
         assert b_row["achievement"] == "unassessed"
+
+
+class TestMilestoneDependencyConcurrency:
+    def test_two_connections_racing_opposite_edges_leave_no_cycle(self, admin_client):
+        """§4.4: the same discipline as
+        `TestObjectiveParentConcurrency`, for `product_milestone_dependency`
+        -- this function previously had NO transaction at all around its
+        cycle/duplicate checks and its INSERT, so two writers requesting
+        opposite edges (a depends_on b, and b depends_on a) could each pass
+        the cycle check and both commit a real cycle."""
+        from app.db import get_conn
+
+        token, system_id = _setup(admin_client, None, "System Ms Dep Race")
+        headers = _headers(token, system_id)
+        _create_objective(admin_client, headers, "o1")
+        _create_milestone(admin_client, headers, "o1", "a")
+        _create_milestone(admin_client, headers, "o1", "b")
+
+        with get_conn() as conn:
+            a_id = conn.execute(
+                "SELECT id FROM product_milestone WHERE system_id = ? AND milestone_key = 'a'", (system_id,)
+            ).fetchone()["id"]
+            b_id = conn.execute(
+                "SELECT id FROM product_milestone WHERE system_id = ? AND milestone_key = 'b'", (system_id,)
+            ).fetchone()["id"]
+
+        conn_a = _raw_conn()
+        conn_b = _raw_conn()
+        outcome = {}
+        try:
+            # A is mid-transition: it already holds the write lock, standing
+            # in for `add_milestone_dependency(a, depends_on=b)`.
+            conn_a.execute("BEGIN IMMEDIATE")
+
+            def run_b():
+                try:
+                    outcome["result"] = product_objective.add_milestone_dependency(
+                        conn_b, system_id=system_id, milestone_key="b", depends_on_milestone_key="a",
+                        created_by="bob",
+                    )
+                except Exception as exc:  # pragma: no cover - reported below
+                    outcome["error"] = exc
+
+            thread = threading.Thread(target=run_b)
+            thread.start()
+            thread.join(0.5)
+            assert thread.is_alive(), outcome
+
+            conn_a.execute(
+                """INSERT INTO product_milestone_dependency
+                       (system_id, milestone_id, depends_on_milestone_id, rationale, decision_method, created_by, created_at)
+                   VALUES (?, ?, ?, '', 'manual', 'alice', ?)""",
+                (system_id, a_id, b_id, time.time()),
+            )
+            conn_a.execute("COMMIT")
+
+            thread.join(10)
+            assert not thread.is_alive()
+            assert "error" in outcome, outcome.get("result")
+            assert isinstance(outcome["error"], product_objective.DependencyCycle)
+
+            rows = conn_a.execute(
+                """SELECT milestone_id, depends_on_milestone_id FROM product_milestone_dependency
+                   WHERE system_id = ? AND superseded_by_id IS NULL""",
+                (system_id,),
+            ).fetchall()
+            edges = {(r["milestone_id"], r["depends_on_milestone_id"]) for r in rows}
+            assert edges == {(a_id, b_id)}
+        finally:
+            conn_a.close()
+            conn_b.close()
 
 
 # ---------------------------------------------------------------------------

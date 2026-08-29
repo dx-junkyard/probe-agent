@@ -12978,6 +12978,12 @@ FunctionalLineageKind = Literal[
     # Solution Design target links already use.
     "product_objective", "product_milestone", "product_gap", "product_feature",
     "experiment", "replay_run",
+    # A Vision claim is its OWN kind, not a Purpose element. The two are
+    # referenced differently -- a Vision claim by its name (it has no row
+    # identity, §4.6), a Purpose element by a stable hashed id -- and
+    # rendering a Vision under the Purpose label is the one-word-two-facts
+    # conflation this Epic exists to avoid.
+    "vision_claim",
 ]
 
 #: §9.2's 23 gap codes, plus Issue #427 §7.3's 11. Each carries a FIXED `LineageGapSeverity` (never
@@ -13229,6 +13235,16 @@ ProductRefRecheckState = Literal["current", "stale", "not_captured"]
 #: distinct from `own` with an empty string (§0 invariant 8).
 ProductGapTargetMode = Literal["own", "inherited_from_milestone", "unknown"]
 
+#: §5.3: the resolution outcome behind `ProductGapOut.effective_target_state`.
+#: `own` -- the Gap's own `target_state` IS the target, always available.
+#: `resolved` -- `inherited_from_milestone` and the Milestone's current
+#: revision was read successfully (even if its `target_state` is
+#: legitimately the empty string). `unavailable` -- `inherited_from_milestone`
+#: but the Milestone or its current revision could not be read; NEVER
+#: rendered as an empty string (§0 invariant 8). `unknown` --
+#: `target_state_mode='unknown'`, i.e. not decided yet.
+ProductGapEffectiveTargetAvailability = Literal["own", "resolved", "unavailable", "unknown"]
+
 #: The 14 finite detector kinds a `product_gap_source_ref` can federate to
 #: (§5.4's table), each dispatching to exactly ONE canonical resolver in
 #: `app/product_gap_sources.py`. Existing detection logic is never
@@ -13300,8 +13316,12 @@ ProductGapEvidenceKind = Literal[
 #: Gap here, never its detection source (§1.5) -- `issue_draft` also
 #: appears in `ProductGapSourceKind` above, and which table a given
 #: `issue_draft` reference lives in is what records which role it played.
+#: `ux_journey` is deliberately absent (§5.11): a Gap's Journey connection
+#: has exactly one writable home, `ux_journey_upstream_ref
+#: (ref_kind='product_gap')` -- never this table, which would let the two
+#: disagree.
 ProductGapArtifactLinkKind = Literal[
-    "issue_draft", "ux_journey", "ux_requirement", "product_feature", "solution_design",
+    "issue_draft", "ux_requirement", "product_feature", "solution_design",
 ]
 
 #: The 9 kinds of existing downstream entity a Feature's
@@ -13875,6 +13895,12 @@ class ProductGapOut(BaseModel):
     #: because only the Gap inherits content it does not store.
     decision_digest: str = ""
     title: str = ""
+    #: §5.3: the target text this Gap is actually measured against, resolved
+    #: for display. `None` unless `effective_target_availability` is `own`
+    #: or `resolved` -- an unresolved Milestone target is NEVER an empty
+    #: string standing in for "could not be read" (§0 invariant 8).
+    effective_target_state: Optional[str] = None
+    effective_target_availability: ProductGapEffectiveTargetAvailability = "unknown"
     lifecycle: ProductGapLifecycle = "open"
     priority_band: ProductGapPriorityBand = "unset"
     recheck_state: ProductRecheckState = "current"
@@ -14010,6 +14036,13 @@ class ProductFeatureRequirementLinkOut(BaseModel):
     requirement_key: Optional[str] = None
     captured_requirement_revision_id: Optional[int] = None
     captured_digest: str = ""
+    #: Whether the linked Requirement still resolves, reported separately
+    #: from `recheck_state` because they are independent axes (§4.6). The
+    #: recheck value alone cannot carry it: it has no `unresolved` member,
+    #: so a deleted Requirement and one whose revision merely moved both
+    #: read `stale`. Functional Lineage needs the distinction to decide
+    #: whether this link may become an edge at all.
+    target_resolution: ProductRefTargetResolution = "resolved"
     recheck_state: ProductRecheckState = "current"
     note: str = ""
     decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"

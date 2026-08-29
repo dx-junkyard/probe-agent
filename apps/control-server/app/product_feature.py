@@ -514,20 +514,44 @@ def _requirement_current_revision(conn: sqlite3.Connection, requirement_id: Opti
 
 
 def _requirement_link_out_dict(conn: sqlite3.Connection, system_id: int, row: Dict[str, Any]) -> Dict[str, Any]:
-    """§7.2: `recheck_state` folds BOTH "the Requirement is gone" and "its
-    revision moved" into `stale` -- `ProductRecheckState` carries no
-    separate `unresolved` value (unlike the target/capability links below,
-    which report resolution and recheck as two independent axes), so a
-    missing Requirement is reported the same way a changed one is: the
-    captured content can no longer be trusted as current."""
-    requirement = _requirement_by_key(conn, system_id, row["requirement_key"])
-    if requirement is None:
+    """§7.2/§4.6: resolution and recheck are two INDEPENDENT axes, and this
+    link now reports both, like its Capability and target siblings.
+
+    `recheck_state` alone cannot carry the distinction: it folds "the
+    Requirement is gone" and "its revision moved" into one `stale` value,
+    because `ProductRecheckState` has no `unresolved` member. A consumer
+    that needs to know whether the target still exists -- Functional
+    Lineage, deciding whether this link may become a graph edge -- was
+    left querying `ux_requirement` itself to find out.
+
+    `unavailable` is the third answer and is never folded into
+    `unresolved`: "the Requirement is not there" and "we could not read
+    whether it is there" send a developer to different places (§0-8)."""
+    try:
+        requirement = _requirement_by_key(conn, system_id, row["requirement_key"])
+    except sqlite3.OperationalError:  # pragma: no cover - defensive
+        requirement = None
+        resolution = "unavailable"
         current_digest = ""
-        resolution = "unresolved"
     else:
-        revision = _requirement_current_revision(conn, requirement["id"])
-        current_digest = revision["content_digest"] if revision is not None else ""
-        resolution = "resolved" if revision is not None else "unresolved"
+        resolution = ""
+    if not resolution:
+        if requirement is None:
+            current_digest = ""
+            resolution = "unresolved"
+        else:
+            # `resolved` means the IDENTITY ROW exists, independent of
+            # whether it has content yet -- the same rule every sibling
+            # resolver uses (`node_design._resolve_capability` resolves on
+            # the entity row alone). A Requirement whose first revision has
+            # not been written is a real, current entity, not a phantom, and
+            # calling it `unresolved` would drop it out of the lineage graph
+            # entirely. Whether its content can be trusted is the SEPARATE
+            # `recheck_state` axis, which goes `stale` on the empty digest
+            # below (§4.6: resolution and recheck never fold together).
+            revision = _requirement_current_revision(conn, requirement["id"])
+            current_digest = revision["content_digest"] if revision is not None else ""
+            resolution = "resolved"
     return {
         "id": row["id"],
         "feature_id": row["feature_id"],
@@ -535,6 +559,7 @@ def _requirement_link_out_dict(conn: sqlite3.Connection, system_id: int, row: Di
         "requirement_key": row["requirement_key"],
         "captured_requirement_revision_id": row["captured_requirement_revision_id"],
         "captured_digest": row["captured_digest"],
+        "target_resolution": resolution,
         "recheck_state": _recheck_state(row["captured_digest"], resolution, current_digest),
         "note": row["note"],
         "decision_method": row["decision_method"],

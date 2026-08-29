@@ -432,6 +432,50 @@ class TestGapSourceRefs:
         assert d1["source_refs"][0]["source_ref"] == "shared-ref"
         assert d2["source_refs"][0]["source_ref"] == "shared-ref"
 
+    def test_system_understanding_gap_pin_is_resolver_owned_not_caller_supplied(self, admin_client):
+        """§5.10: `add_gap_source_ref` never accepts a pin from the request
+        body (`ProductGapSourceRefCreateRequest` has no such field), but the
+        resolver still determines and stores its OWN pin
+        (`resolved_snapshot_id` -> `captured_snapshot_id`) in the same call
+        that computes `captured_digest` -- so a re-check later reads back
+        against the exact snapshot this source was created against, not
+        `None`."""
+        from app import gap_triage
+        from app import system_understanding_service as sus
+        from app.db import get_conn
+
+        token, system_id = _setup(admin_client, "System Gap Source Pin")
+        headers = _headers(token, system_id)
+        milestone_key = _make_objective_and_milestone(admin_client, headers)
+        _create_gap(admin_client, headers, milestone_key, "g1")
+
+        with get_conn() as conn:
+            snapshot_id = conn.execute(
+                """INSERT INTO repository_snapshots (system_id, repo_path, commit_sha, status, created_at, completed_at)
+                   VALUES (?, '/tmp/x', 'sha1', 'ready', 0, 0)""",
+                (system_id,),
+            ).lastrowid
+            conn.execute(
+                """INSERT INTO code_entrypoints
+                       (system_id, snapshot_id, entrypoint_type, entrypoint_id, category, label,
+                        handler_path, handler_qualified_name, line_start, line_end, route_method, route_path,
+                        created_at)
+                   VALUES (?, ?, 'api', 'GET /widgets', 'http', 'widgets', 'app/widgets.py',
+                           'app.widgets.list_widgets', 1, 5, 'GET', '/widgets', 0)""",
+                (system_id, snapshot_id),
+            )
+            gaps = sus._load_gaps_from_reconciler(conn, system_id, snapshot_id)
+            gap_triage.annotate_gaps(conn, system_id, snapshot_id, gaps)
+            assert len(gaps) == 1
+            ref = gap_triage.gap_key(gaps[0])
+
+        out = _add_source_ref(admin_client, headers, "g1", "system_understanding_gap", ref)
+        assert out["source_state"] == "current"
+        assert out["captured_snapshot_id"] == snapshot_id
+
+        detail = admin_client.get("/product-gaps/g1", headers=headers).json()
+        assert detail["source_refs"][0]["captured_snapshot_id"] == snapshot_id
+
     def test_resolve_source_signature_is_never_called_with_a_held_connection_error(self, admin_client):
         """A resolver contract sanity check at the domain layer: calling
         `add_gap_source_ref` for every finite `source_kind` never raises out
@@ -492,6 +536,47 @@ class TestGapEvidenceAndArtifactLinks:
         )
         assert r2.status_code == 409
         assert r2.json()["detail"]["code"] == "product_gap_artifact_duplicate"
+
+    def test_ux_journey_is_rejected_as_an_artifact_link_kind(self, admin_client):
+        """§5.11: a Gap's Journey connection has exactly ONE writable home
+        (`ux_journey_upstream_ref(ref_kind='product_gap')`, on the Journey
+        side). `product_gap_artifact_link` no longer accepts `ux_journey` at
+        all -- writing it there too would let the two disagree.
+
+        `ux_journey` is outside `ProductGapArtifactLinkKind` itself now, so
+        FastAPI/pydantic reject the request body before it ever reaches
+        `add_gap_artifact_link` -- a structural 422 rather than the app's
+        `product_link_kind_invalid` code, but still a 422, and the field
+        this rejects is named in the response either way."""
+        token, system_id = _setup(admin_client, "System Gap Artifact No UxJourney")
+        headers = _headers(token, system_id)
+        milestone_key = _make_objective_and_milestone(admin_client, headers)
+        _create_gap(admin_client, headers, milestone_key, "g1")
+        r = admin_client.post(
+            "/product-gaps/g1/artifact-links",
+            json={"link_kind": "ux_journey", "target_ref": "some-journey"},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        assert "link_kind" in r.text
+
+    def test_domain_layer_also_rejects_ux_journey_with_the_app_error_code(self, admin_client):
+        """The domain-level `LinkKindInvalid` -> `product_link_kind_invalid`
+        path stays correct in its own right (exercised directly, since
+        pydantic's Literal now blocks the value before an HTTP request could
+        reach it -- see the test above)."""
+        token, system_id = _setup(admin_client, "System Gap Artifact No UxJourney Domain")
+        headers = _headers(token, system_id)
+        milestone_key = _make_objective_and_milestone(admin_client, headers)
+        _create_gap(admin_client, headers, milestone_key, "g1")
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            with pytest.raises(product_objective.LinkKindInvalid):
+                product_objective.add_gap_artifact_link(
+                    conn, system_id=system_id, gap_key="g1", link_kind="ux_journey",
+                    target_ref="some-journey", created_by="dev",
+                )
 
     def test_closing_the_linked_issue_draft_does_not_resolve_the_gap(self, admin_client):
         """§1.5/§6: linking an Issue Draft is recording a downstream

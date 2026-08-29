@@ -251,7 +251,7 @@ describe("product-objective/model: Overview next_step -> Objective Map CTA", () 
   it("prioritize_gap navigates to the gaps lane with the primary Gap selected", () => {
     const href = objectiveNextStepHref(overviewObjective({
       next_step: "prioritize_gap",
-      primary_gap: { id: 1, system_id: 1, gap_key: "g9", milestone_id: 1, milestone_key: "m1", objective_id: 1, objective_key: "o1", current_revision_id: null, current_revision_number: null, decision_digest: "", title: "", lifecycle: "open", priority_band: "unset", recheck_state: "current", read_flags: [], created_by: null, created_at: 0, updated_at: 0 },
+      primary_gap: { id: 1, system_id: 1, gap_key: "g9", milestone_id: 1, milestone_key: "m1", objective_id: 1, objective_key: "o1", current_revision_id: null, current_revision_number: null, decision_digest: "", title: "", effective_target_state: null, effective_target_availability: "unknown", lifecycle: "open", priority_band: "unset", recheck_state: "current", read_flags: [], created_by: null, created_at: 0, updated_at: 0 },
     }));
     expect(href).toBe("/objective-map?view=gaps&gap=g9");
   });

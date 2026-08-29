@@ -542,7 +542,7 @@ def _walk_need_purpose_refs(
 #: own distinct kind, matching how the graph already treats an element and a
 #: relation as two different kinds everywhere else.
 _OBJECTIVE_REF_NODE_KIND: Dict[str, str] = {
-    "vision_claim": "purpose_element",
+    "vision_claim": "vision_claim",
     "purpose_element": "purpose_element",
     "purpose_relation": "purpose_relation",
     "capability_entity": "capability",
@@ -734,33 +734,6 @@ def _check_product_gaps(
         _degrade(degraded_sections, degraded_detail, "product_gaps", exc)
 
 
-def _requirement_link_resolved(conn: sqlite3.Connection, system_id: int, requirement_key: str) -> bool:
-    """Whether a Feature's Requirement link target actually resolves --
-    i.e. the Requirement identity row still exists in THIS System.
-
-    `product_feature.py` exposes no `target_resolution` field for a
-    requirement link (unlike its Capability/target-link siblings): it folds
-    resolution straight into `recheck_state`, which conflates "gone" and
-    "content changed" into one `stale` value (see
-    `_requirement_link_out_dict`'s own docstring), so that field cannot
-    tell a deleted Requirement apart from one whose revision merely moved.
-    This queries the identity row directly instead, matching the SAME
-    "row exists" resolution convention `stakeholder_network.
-    _resolve_requirement_target` already uses for a Requirement reference
-    elsewhere in this exact chain (a Requirement with no revision yet is
-    still a real, current entity -- not a phantom) -- the same "own local
-    copy of a target-kind dispatch" precedent `_requirement_keys_for_step`
-    above already sets for this module."""
-    try:
-        row = conn.execute(
-            "SELECT id FROM ux_requirement WHERE system_id = ? AND requirement_key = ?",
-            (system_id, requirement_key),
-        ).fetchone()
-    except Exception:  # pragma: no cover - defensive
-        return False
-    return row is not None
-
-
 def _check_product_features(
     conn: sqlite3.Connection,
     system_id: int,
@@ -810,17 +783,19 @@ def _check_product_features(
                 req_key = link.get("requirement_key")
                 if not req_key:
                     continue
-                resolved = _requirement_link_resolved(conn, system_id, req_key)
-                if resolved:
+                # `target_resolution` is the link's own published axis, the
+                # same one the Capability and target links below report.
+                # `recheck_state` cannot stand in for it: it has no
+                # `unresolved` member, so a deleted Requirement and one whose
+                # revision merely moved both read `stale`.
+                resolution = link.get("target_resolution", "unavailable")
+                if resolution == "resolved":
                     requirement_keys_with_feature.add(req_key)
                     graph.add_node("ux_requirement", req_key)
                     graph.add_edge("ux_requirement", req_key, "product_feature", feature_key)
-                # `ProductRecheckState` has no separate `unavailable` value
-                # for a requirement link (see `_requirement_link_resolved`'s
-                # docstring), so this hop's resolution is binary.
                 graph.add_reference_gaps(
                     "product_feature", feature_key,
-                    resolution="resolved" if resolved else "unresolved",
+                    resolution=resolution,
                     recheck_state=link.get("recheck_state", "current"),
                 )
 

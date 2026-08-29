@@ -8067,12 +8067,16 @@ CREATE INDEX IF NOT EXISTS idx_product_gap_evidence_ref_gap
 -- which TABLE the link lives in, never inferred (§1.5). Closing the linked
 -- Issue Draft does NOT resolve the Gap automatically (§6) -- there is no
 -- trigger or foreign-key cascade here that could do that.
+-- `ux_journey` is deliberately NOT a valid `link_kind` (§5.11): a Gap's
+-- Journey connection lives ONLY in `ux_journey_upstream_ref
+-- (ref_kind='product_gap')`, so it can be written and read from exactly one
+-- place instead of two tables silently disagreeing.
 CREATE TABLE IF NOT EXISTS product_gap_artifact_link (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id        INTEGER NOT NULL,
     gap_id           INTEGER NOT NULL,
     link_kind        TEXT NOT NULL CHECK (link_kind IN
-                         ('issue_draft', 'ux_journey', 'ux_requirement',
+                         ('issue_draft', 'ux_requirement',
                           'product_feature', 'solution_design')),
     target_ref       TEXT NOT NULL,
     target_row_id    INTEGER,

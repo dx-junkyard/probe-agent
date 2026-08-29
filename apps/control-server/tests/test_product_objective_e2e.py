@@ -676,6 +676,54 @@ def _insert_evolution_node(system_id, node_key, display_name=""):
         return cur.lastrowid
 
 
+def _insert_capability_hierarchy_source(
+    system_id, snapshot_id, *, path="a.py", qualified_name="a",
+    file_hash="F1", symbol_hash="S1", explanation_hash="E1",
+):
+    """A `capability_hierarchy` intelligence run plus a matching
+    `capability_hierarchy_nodes` anchor AND current `snapshot_files` /
+    `code_symbols` / `symbol_source_metadata` rows carrying the SAME
+    hashes -- the exact-match fixture `test_product_gap_sources.
+    TestCapabilityDrift._fixture` uses, so `capability_drift` resolves to a
+    real `contradicted` ("fresh") outcome rather than `unavailable`
+    (§5.10). Returns the intelligence run id."""
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        run_id = conn.execute(
+            """INSERT INTO intelligence_runs
+                   (system_id, snapshot_id, run_type, provider, model, prompt_version, schema_version,
+                    decision_method, status, started_at, completed_at)
+               VALUES (?, ?, 'capability_hierarchy', 'mock', 'mock', 'v1', 'v1', 'deterministic', 'completed', ?, ?)""",
+            (system_id, snapshot_id, now, now),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO capability_hierarchy_nodes
+                   (system_id, snapshot_id, intelligence_run_id, node_type, name, path, qualified_name,
+                    file_content_hash, symbol_source_hash, explanation_hash, created_at)
+               VALUES (?, ?, ?, 'element', 'A', ?, ?, ?, ?, ?, ?)""",
+            (system_id, snapshot_id, run_id, path, qualified_name, file_hash, symbol_hash, explanation_hash, now),
+        )
+        conn.execute(
+            """INSERT INTO snapshot_files (snapshot_id, path, source_type, size_bytes, content_hash, content, inclusion_status)
+               VALUES (?, ?, 'source', 10, ?, X'', 'indexed')""",
+            (snapshot_id, path, file_hash),
+        )
+        sym_id = conn.execute(
+            """INSERT INTO code_symbols (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line, symbol_source_hash)
+               VALUES (?, ?, ?, ?, 'function', 1, 2, ?)""",
+            (snapshot_id, system_id, path, qualified_name, symbol_hash),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO symbol_source_metadata
+                   (snapshot_id, system_id, symbol_id, path, qualified_name, start_line, end_line, raw_block, explanation_hash)
+               VALUES (?, ?, ?, ?, ?, 1, 2, '', ?)""",
+            (snapshot_id, system_id, sym_id, path, qualified_name, explanation_hash),
+        )
+        return run_id
+
+
 def _insert_intelligence_run(system_id, snapshot_id):
     from app.db import get_conn
 
@@ -1016,8 +1064,11 @@ def _build_chain(client, tmp_path, *, name="System PO E2E") -> Chain:
         client, headers, journey_to_be_key,
         steps=[_step("step-1", 1)], title="改善後の決済フロー",
     )
+    # §5.11: the Gap -> Journey connection is written ONCE, on the Journey
+    # side (`ux_journey_upstream_ref(ref_kind='product_gap')`). Writing it a
+    # second time via `product_gap_artifact_link` is no longer possible --
+    # that `link_kind` was removed to close the twin-canon this created.
     _add_journey_upstream_ref(client, headers, journey_to_be_key, "product_gap", "gap-main")
-    _add_gap_artifact_link(client, headers, "gap-main", "ux_journey", journey_to_be_key)
 
     # --- Requirement + acceptance criterion ---
     requirement_key = "req-main"
@@ -1134,9 +1185,14 @@ class TestForwardWalk:
         assert gap["evidence_refs"][0]["evidence_kind"] == "trace"
 
     def test_gap_to_journey(self, chain: Chain):
+        """§5.11: the Gap -> Journey connection has exactly ONE writable
+        home -- `ux_journey_upstream_ref(ref_kind='product_gap')` on the
+        Journey side. `product_gap_artifact_link` no longer accepts
+        `ux_journey` at all (see `TestArtifactLinkKind` below), so this hop
+        is read forward from the Journey only, never from the Gap's
+        `artifact_links`."""
         gap = _get_gap(chain.client, chain.headers, chain.gap_main_key)
-        journey_link = next(a for a in gap["artifact_links"] if a["link_kind"] == "ux_journey")
-        assert journey_link["target_ref"] == chain.journey_to_be_key
+        assert not any(a["link_kind"] == "ux_journey" for a in gap["artifact_links"])
 
         journey = _get_journey(chain.client, chain.headers, chain.journey_to_be_key)
         ref = next(r for r in journey["upstream_refs"] if r["ref_kind"] == "product_gap")
@@ -1269,16 +1325,42 @@ class TestGapSourceFederation:
         source = detail["source_refs"][0]
         assert source["source_state"] == "disappeared"
 
-    def test_capability_drift_via_the_http_endpoint_is_unavailable(self, chain: Chain):
-        """`POST /product-gaps/{key}/source-refs` never accepts a
-        `captured_run_id` pin (SS10.1's Create model carries none), and
-        `capability_drift` requires one -- so through this endpoint it is
-        deterministically `unavailable`, never a guessed state."""
+    def test_capability_drift_resolves_via_the_http_endpoint(self, chain: Chain):
+        """§5.10: `POST /product-gaps/{key}/source-refs` never accepts a
+        `captured_run_id` pin (§10.1's Create model carries none) -- but
+        `capability_drift` still resolves for real through this endpoint,
+        because the resolver decides its OWN base run (the latest completed
+        Capability Hierarchy build for this System) and `add_gap_source_ref`
+        stores that resolved pin in the same call. This replaces the pre-fix
+        behaviour, which pinned `unavailable` as the PERMANENT answer for
+        every `capability_drift` source ever created through the public
+        API, because no pin was ever captured for it to re-resolve against."""
         gap_key = "gap-src-drift"
+        self._gap(chain, gap_key)
+        _insert_capability_hierarchy_source(chain.system_id, chain.snapshot_id, path="a.py", qualified_name="a")
+        _add_gap_source_ref(chain.client, chain.headers, gap_key, "capability_drift", "a.py|a")
+        detail = _get_gap(chain.client, chain.headers, gap_key)
+        source = detail["source_refs"][0]
+        # Exact-hash fixture -> `drift.compute_anchor_drift` reports FRESH,
+        # which is capability_drift's own `contradicted` condition (§5.4) --
+        # a real resolution, not the structural `unavailable` this endpoint
+        # used to be stuck at.
+        assert source["source_state"] == "contradicted"
+        assert source["captured_snapshot_id"] == chain.snapshot_id
+        assert source["captured_run_id"] is not None
+
+    def test_capability_drift_is_unavailable_with_no_capability_hierarchy_run(self, chain: Chain):
+        """The one legitimate `unavailable`: no `capability_hierarchy` run
+        has EVER completed for this System, so the resolver has no base run
+        to decide on -- honest degradation, never a guessed pin (§5.10)."""
+        gap_key = "gap-src-drift-none"
         self._gap(chain, gap_key)
         _add_gap_source_ref(chain.client, chain.headers, gap_key, "capability_drift", "a.py|a")
         detail = _get_gap(chain.client, chain.headers, gap_key)
-        assert detail["source_refs"][0]["source_state"] == "unavailable"
+        source = detail["source_refs"][0]
+        assert source["source_state"] == "unavailable"
+        assert source["captured_run_id"] is None
+        assert source["captured_snapshot_id"] is None
 
     def test_several_kinds_together_on_one_gap(self, chain: Chain):
         gap_key = "gap-src-multi"
@@ -1331,6 +1413,11 @@ class TestDownstreamOnlyPropagation:
         # what the server compares: this Gap inherits its target from the
         # Milestone, so half of what is being judged lives on that row.
         before = _get_gap(chain.client, chain.headers, "gap-inherit")
+        # §5.3: an `inherited_from_milestone` Gap does not store a target of
+        # its own -- the response must resolve and show what it is actually
+        # measured against.
+        assert before["effective_target_state"] == "v1"
+        assert before["effective_target_availability"] == "resolved"
         _record_gap_decision(
             chain.client, chain.headers, "gap-inherit", "acknowledge",
             captured_digest=before["decision_digest"],
@@ -1349,6 +1436,66 @@ class TestDownstreamOnlyPropagation:
         # one).
         assert after["recheck_state"] == "stale"
         assert after["lifecycle"] == "acknowledged"
+        assert after["effective_target_state"] == "v2"
+        assert after["effective_target_availability"] == "resolved"
+
+    def test_effective_target_state_for_own_and_unknown_modes(self, chain: Chain):
+        """§5.3: `own` always resolves (even an intentionally empty string
+        is still `own`, never `unknown`); `unknown` never fabricates a
+        target text."""
+        gap = _get_gap(chain.client, chain.headers, chain.gap_main_key)
+        assert gap["current_revision"]["target_state_mode"] == "own"
+        assert gap["effective_target_state"] == gap["current_revision"]["target_state"]
+        assert gap["effective_target_availability"] == "own"
+
+        _create_gap(chain.client, chain.headers, chain.milestone_src_key, "gap-target-unknown")
+        _add_gap_revision(
+            chain.client, chain.headers, "gap-target-unknown", title="unknown target",
+            target_state_mode="unknown",
+        )
+        unknown_gap = _get_gap(chain.client, chain.headers, "gap-target-unknown")
+        assert unknown_gap["effective_target_state"] is None
+        assert unknown_gap["effective_target_availability"] == "unknown"
+
+    def test_effective_target_state_is_unavailable_not_empty_when_milestone_has_no_revision(self, chain: Chain):
+        """§5.3/§0-8: a Milestone with no revision yet cannot be read for its
+        target -- this must be `unavailable`, NEVER an empty string that
+        would be indistinguishable from a legitimately empty target."""
+        _create_milestone(chain.client, chain.headers, chain.objective_child_key, "ms-no-revision")
+        _create_gap(chain.client, chain.headers, "ms-no-revision", "gap-unreadable-target")
+        _add_gap_revision(
+            chain.client, chain.headers, "gap-unreadable-target", title="unreadable target",
+            target_state_mode="inherited_from_milestone",
+        )
+        gap = _get_gap(chain.client, chain.headers, "gap-unreadable-target")
+        assert gap["effective_target_state"] is None
+        assert gap["effective_target_availability"] == "unavailable"
+
+    def test_unreadable_milestone_target_digest_differs_from_a_real_empty_target(self, chain: Chain):
+        """§5.3: `decision_digest` must not conflate "the Milestone could
+        not be read" with "the target is legitimately empty string" -- an
+        unreadable Milestone that is later given a revision with an EMPTY
+        `target_state` must still register as a content change, never as
+        "unchanged"."""
+        _create_milestone(chain.client, chain.headers, chain.objective_child_key, "ms-empty-later")
+        _create_gap(chain.client, chain.headers, "ms-empty-later", "gap-empty-later")
+        _add_gap_revision(
+            chain.client, chain.headers, "gap-empty-later", title="empty later",
+            target_state_mode="inherited_from_milestone",
+        )
+        before = _get_gap(chain.client, chain.headers, "gap-empty-later")
+        assert before["effective_target_availability"] == "unavailable"
+        digest_before = before["decision_digest"]
+
+        # Give the Milestone a real (empty-string) target_state.
+        _add_milestone_revision(
+            chain.client, chain.headers, "ms-empty-later", title="ms-empty-later", target_state="",
+            verification_method="manual_review",
+        )
+        after = _get_gap(chain.client, chain.headers, "gap-empty-later")
+        assert after["effective_target_availability"] == "resolved"
+        assert after["effective_target_state"] == ""
+        assert after["decision_digest"] != digest_before
 
     def test_moving_gap_does_not_stale_the_milestone(self, chain: Chain):
         before = _get_milestone(chain.client, chain.headers, chain.milestone_a_key)
@@ -1742,7 +1889,9 @@ class TestNoWriteToExistingCanon:
         _add_gap_revision(chain.client, chain.headers, "gap-nowrite", title="t")
         _add_gap_source_ref(chain.client, chain.headers, "gap-nowrite", "manual", "")
         _add_gap_evidence_ref(chain.client, chain.headers, "gap-nowrite", "human_report", "ref")
-        _add_gap_artifact_link(chain.client, chain.headers, "gap-nowrite", "ux_journey", chain.journey_to_be_key)
+        # `ux_journey` is not a valid `link_kind` (§5.11) -- the Gap ->
+        # Journey connection lives only in `ux_journey_upstream_ref`.
+        _add_gap_artifact_link(chain.client, chain.headers, "gap-nowrite", "ux_requirement", chain.requirement_key)
         _record_gap_decision(chain.client, chain.headers, "gap-nowrite", "acknowledge")
         _record_gap_decision(chain.client, chain.headers, "gap-nowrite", "prioritize", priority_band="now")
 

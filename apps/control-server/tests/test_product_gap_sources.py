@@ -183,7 +183,7 @@ class TestSystemUnderstandingGap:
 
     def test_current_when_captured_digest_matches(self, db):
         with db() as conn:
-            system_id, _snap, _gap, ref, fingerprint = self._fixture(conn)
+            system_id, snap, _gap, ref, fingerprint = self._fixture(conn)
             result = pgs.resolve_source(
                 conn, system_id=system_id, source_kind="system_understanding_gap",
                 source_ref=ref, captured_digest=fingerprint,
@@ -192,6 +192,8 @@ class TestSystemUnderstandingGap:
         assert result.severity_vocabulary == "gap_triage"
         assert result.severity == "info"
         assert result.current_digest == fingerprint
+        # §5.10's pin: the resolver reports which snapshot it actually read.
+        assert result.resolved_snapshot_id == snap
 
     def test_changed_when_captured_digest_differs(self, db):
         with db() as conn:
@@ -278,6 +280,8 @@ class TestUnderstandingReviewGap:
         assert second.source_state == "current"
         assert second.severity == "medium"
         assert second.severity_vocabulary == "understanding_review"
+        # §5.10's pin: which `understanding_revision` row was actually read.
+        assert second.resolved_revision_id is not None
 
     def test_changed_when_captured_digest_differs(self, db):
         with db() as conn:
@@ -343,6 +347,8 @@ class TestUnderstandingClaimChange:
             )
         assert first.source_state == "current"
         assert "summary_changed" in first.extra["buckets"]
+        # §5.10's pin: which `understanding_revision` row was actually read.
+        assert first.resolved_revision_id is not None
 
         with db() as conn:
             changed = pgs.resolve_source(
@@ -617,6 +623,8 @@ class TestRequirementDiff:
                 conn, system_id=system_id, source_kind="requirement_diff", source_ref="req-1|c1",
             )
         assert result.source_state == "current"
+        # §5.10's pin: the revision this resolution actually diffed against.
+        assert result.resolved_revision_id is not None
 
         with db() as conn:
             changed = pgs.resolve_source(
@@ -744,14 +752,52 @@ class TestCapabilityDrift:
             )
         assert result.source_state == "disappeared"
 
-    def test_unavailable_when_captured_run_id_missing(self, db):
+    def test_auto_discovers_the_latest_capability_hierarchy_run_when_no_pin_is_captured(self, db):
+        """§5.10: `capability_drift` REQUIRES a `run_id` pin, but the
+        resolver decides it itself when none has been captured yet (the
+        first resolution, from `add_gap_source_ref`) -- the latest
+        completed `capability_hierarchy` run for the System, which is
+        exactly what this fixture set up. This is the fix for the defect
+        the OLD `test_unavailable_when_captured_run_id_missing` pinned:
+        every `capability_drift` source created through the public API
+        (which never supplies `captured_run_id`) was permanently
+        `unavailable`."""
         with db() as conn:
-            system_id, _run_id = self._fixture(conn, current_symbol_hash="S1")
+            system_id, run_id = self._fixture(conn, current_symbol_hash="S1", current_file_hash="F1")
+            result = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="capability_drift", source_ref="app/foo.py|foo.bar",
+            )
+        assert result.source_state == "contradicted"
+        assert result.extra["drift_status"] == "fresh"
+        assert result.resolved_run_id == run_id
+        assert result.resolved_snapshot_id is not None
+
+    def test_unavailable_when_no_capability_hierarchy_run_exists_at_all(self, db):
+        """The one legitimate `unavailable` for this kind: nothing for the
+        resolver to autonomously pick, and it never guesses a pin (§5.10)."""
+        with db() as conn:
+            system_id = _make_system(conn)
             result = pgs.resolve_source(
                 conn, system_id=system_id, source_kind="capability_drift", source_ref="app/foo.py|foo.bar",
             )
         assert result.source_state == "unavailable"
-        assert result.extra["reason"] == "missing_captured_run_id"
+        assert result.extra["reason"] == "no_capability_hierarchy_run"
+        assert result.resolved_run_id is None
+        assert result.resolved_snapshot_id is None
+
+    def test_a_previously_captured_run_that_vanished_stays_unavailable_not_reresolved(self, db):
+        """A pin that WAS captured (a re-check, not the first resolution) is
+        re-read as-is -- if it no longer resolves, this is `unavailable`,
+        never silently re-pointed at a different run (§5.10: "違う状態へ書き
+        込まない" / never substitute a guessed pin)."""
+        with db() as conn:
+            system_id, _run_id = self._fixture(conn, current_symbol_hash="S1", current_file_hash="F1")
+            result = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="capability_drift", source_ref="app/foo.py|foo.bar",
+                captured_run_id=999999,
+            )
+        assert result.source_state == "unavailable"
+        assert result.extra["reason"] == "captured_run_not_found"
 
     def test_unavailable_when_anchor_not_found_in_captured_run(self, db):
         with db() as conn:

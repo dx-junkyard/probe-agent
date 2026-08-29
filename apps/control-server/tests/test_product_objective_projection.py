@@ -152,6 +152,31 @@ def _make_gap(
         po.record_gap_decision(conn, system_id=system_id, gap_key=gap_key, decision=lifecycle_decision, decided_by="dev")
 
 
+def _link_gap_to_journey(conn, system_id: int, gap_key: str, journey_key: str) -> None:
+    """§5.11: a Gap's Journey connection has exactly ONE writable home,
+    `ux_journey_upstream_ref(ref_kind='product_gap')` on the JOURNEY side --
+    never `product_gap_artifact_link`. Creates the Journey row if it does
+    not exist yet (the FK requires a real `journey_id`)."""
+    now = _now()
+    journey = conn.execute(
+        "SELECT id FROM ux_journey WHERE system_id = ? AND journey_key = ?", (system_id, journey_key)
+    ).fetchone()
+    if journey is None:
+        journey_id = conn.execute(
+            """INSERT INTO ux_journey (system_id, journey_key, perspective, created_at, updated_at)
+               VALUES (?, ?, 'to_be', ?, ?)""",
+            (system_id, journey_key, now, now),
+        ).lastrowid
+    else:
+        journey_id = journey["id"]
+    conn.execute(
+        """INSERT INTO ux_journey_upstream_ref
+               (system_id, journey_id, ref_kind, target_ref, created_by, created_at)
+           VALUES (?, ?, 'product_gap', ?, 'dev', ?)""",
+        (system_id, journey_id, gap_key, now),
+    )
+
+
 def _full_scaffold(conn, system_id: int) -> None:
     """One Objective / Milestone -- the minimum a `next_step` walk needs
     past row #8."""
@@ -424,10 +449,7 @@ class TestNextStepReachability:
             sid = _make_system(conn)
             _full_scaffold(conn, sid)
             _make_gap(conn, sid, "m1", "g1", priority_band="now")
-            po.add_gap_artifact_link(
-                conn, system_id=sid, gap_key="g1", link_kind="ux_journey",
-                target_ref="journey-x", created_by="dev",
-            )
+            _link_gap_to_journey(conn, sid, "g1", "journey-x")
             conn.commit()
             result = pop.build_objective_overview(conn, sid, brief=_fake_brief())
             assert result.next_step == "link_requirement_to_feature"
@@ -437,16 +459,11 @@ class TestNextStepReachability:
             sid = _make_system(conn)
             _full_scaffold(conn, sid)
             _make_gap(conn, sid, "m1", "g1", priority_band="now", lifecycle_decision="resolve")
-            po.add_gap_artifact_link(
-                conn, system_id=sid, gap_key="g1", link_kind="ux_journey",
-                target_ref="journey-x", created_by="dev",
-            )
+            _link_gap_to_journey(conn, sid, "g1", "journey-x")
             now = _now()
             journey_id = conn.execute(
-                """INSERT INTO ux_journey (system_id, journey_key, perspective, created_at, updated_at)
-                   VALUES (?, 'journey-x', 'to_be', ?, ?)""",
-                (sid, now, now),
-            ).lastrowid
+                "SELECT id FROM ux_journey WHERE system_id = ? AND journey_key = 'journey-x'", (sid,)
+            ).fetchone()["id"]
             requirement_id = conn.execute(
                 """INSERT INTO ux_requirement (system_id, requirement_key, requirement_kind, created_at, updated_at)
                    VALUES (?, 'req-x', 'functional', ?, ?)""",

@@ -482,6 +482,26 @@ def _pick_active_objective(
     return ordered[0], len(active_objectives)
 
 
+def _journeys_referencing_gap(conn: sqlite3.Connection, system_id: int, gap_key: str) -> List[str]:
+    """§5.11: a Gap's Journey connection has exactly ONE writable home,
+    `ux_journey_upstream_ref(ref_kind='product_gap')` -- never
+    `product_gap_artifact_link`, which would let the two disagree. This is
+    the identical reverse-lookup query `functional_lineage.
+    _journeys_referencing_gap` uses, kept local for the same reason
+    `_journey_has_feature_link` above queries `ux_requirement_step_link`
+    directly rather than importing another module's private helper: no
+    shared lookup exists in `ux_design.py`, and this module owns no
+    cross-module private import."""
+    rows = conn.execute(
+        """SELECT DISTINCT j.journey_key FROM ux_journey_upstream_ref r
+           JOIN ux_journey j ON j.id = r.journey_id
+           WHERE r.system_id = ? AND r.ref_kind = 'product_gap' AND r.target_ref = ?
+             AND r.superseded_by_id IS NULL""",
+        (system_id, gap_key),
+    ).fetchall()
+    return [r["journey_key"] for r in rows]
+
+
 def _journey_has_feature_link(conn: sqlite3.Connection, system_id: int, journey_key: str) -> bool:
     """Row #13's "Requirement -> Feature が繋がっていない" check, read
     directly off the existing `ux_requirement_step_link` /
@@ -705,8 +725,10 @@ def _decide_next_step(
             "どの Gap から着手すべきかが分かるようになります。",
         )
 
-    # Rows 12/13 need each Gap's artifact links -- fetched once, reused by
-    # both rows.
+    # Rows 12/13 need each Gap's linked Journeys -- fetched once, reused by
+    # both rows. §5.11: the ONE canonical home for this relation is
+    # `ux_journey_upstream_ref(ref_kind='product_gap')`, read via
+    # `_journeys_referencing_gap`, never `product_gap_artifact_link`.
     now_next_open_gaps = [
         g for g in all_gaps if g["lifecycle"] == "open" and g["priority_band"] in ("now", "next")
     ]
@@ -714,17 +736,14 @@ def _decide_next_step(
     unlinked_now_next_gap = False
     for gap in now_next_open_gaps:
         try:
-            gap_detail = product_objective.get_gap_detail(conn, system_id, gap["gap_key"])
+            journey_keys = _journeys_referencing_gap(conn, system_id, gap["gap_key"])
         except Exception as exc:  # pragma: no cover - defensive
-            _degrade(result.degraded_sections, result.degraded_detail, f"artifact_links:{gap['gap_key']}", exc)
+            _degrade(result.degraded_sections, result.degraded_detail, f"journey_links:{gap['gap_key']}", exc)
             continue
-        links = [
-            link for link in gap_detail.get("artifact_links", []) or [] if link["link_kind"] == "ux_journey"
-        ]
-        if not links:
+        if not journey_keys:
             unlinked_now_next_gap = True
         else:
-            journey_keys_linked.update(link["target_ref"] for link in links)
+            journey_keys_linked.update(journey_keys)
 
     # Row 12: a now/next open Gap with no Journey link at all.
     if unlinked_now_next_gap:
@@ -744,13 +763,10 @@ def _decide_next_step(
         if gap in now_next_open_gaps:
             continue  # already fetched above
         try:
-            gap_detail = product_objective.get_gap_detail(conn, system_id, gap["gap_key"])
+            all_journey_keys.update(_journeys_referencing_gap(conn, system_id, gap["gap_key"]))
         except Exception as exc:  # pragma: no cover - defensive
-            _degrade(result.degraded_sections, result.degraded_detail, f"artifact_links:{gap['gap_key']}", exc)
+            _degrade(result.degraded_sections, result.degraded_detail, f"journey_links:{gap['gap_key']}", exc)
             continue
-        for link in gap_detail.get("artifact_links", []) or []:
-            if link["link_kind"] == "ux_journey":
-                all_journey_keys.add(link["target_ref"])
 
     # Row 13: a linked Journey exists, but none of them reaches a Feature
     # through Requirement -> Feature.
