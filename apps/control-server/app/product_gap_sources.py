@@ -354,7 +354,14 @@ def _resolve_functional_lineage_gap(
         return _disappeared()
     code, subject_kind, subject_ref = parts
 
-    result = functional_lineage.build_functional_lineage(conn, system_id)
+    # The Product Objective sections are DOWNSTREAM of this Gap and would
+    # re-enter this very resolver through `get_gap_detail`, so the
+    # projection would never return (see `build_functional_lineage`'s
+    # docstring). Sections 1-5 -- the detector that emitted this gap code --
+    # answer in full, which is the whole of what a detection source needs.
+    result = functional_lineage.build_functional_lineage(
+        conn, system_id, include_product_objective_layer=False
+    )
     match = next(
         (g for g in result["gaps"] if g["code"] == code and g["subject_kind"] == subject_kind and g["subject_ref"] == subject_ref),
         None,

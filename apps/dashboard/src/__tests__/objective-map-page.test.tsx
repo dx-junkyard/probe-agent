@@ -120,7 +120,7 @@ function gapDetail(overrides: Partial<ProductGapDetailOut> = {}): ProductGapDeta
     objective_id: 1, objective_key: "o1", title: "初回決済フォームでの離脱",
     lifecycle: "open", priority_band: "unset", recheck_state: "current",
     read_flags: [], created_by: null, created_at: 1000, updated_at: 1000,
-    current_revision_id: 1, current_revision_number: 1,
+    current_revision_id: 1, current_revision_number: 1, decision_digest: "abc",
     current_revision: {
       id: 1, gap_id: 1, revision_number: 1, title: "初回決済フォームでの離脱",
       current_state: "40% が離脱している", target_state: "10% 未満",

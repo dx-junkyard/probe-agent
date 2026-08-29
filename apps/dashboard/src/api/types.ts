@@ -7999,6 +7999,11 @@ export interface ProductGapOut {
   objective_key: string | null;
   current_revision_id: number | null;
   current_revision_number: number | null;
+  /** The digest a decision must capture, and the one `recheck_state` comes
+   * from. Not always `current_revision.content_digest`: an
+   * `inherited_from_milestone` Gap resolves its target from the Milestone at
+   * read time, so half of what was judged lives on another row. */
+  decision_digest: string;
   title: string;
   lifecycle: ProductGapLifecycle;
   priority_band: ProductGapPriorityBand;

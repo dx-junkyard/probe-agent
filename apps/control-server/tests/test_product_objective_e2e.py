@@ -378,7 +378,16 @@ def _add_objective_upstream_ref(client, headers, objective_key, ref_kind, target
     return r.json()
 
 
-def _record_objective_decision(client, headers, objective_key, decision, rationale="", captured_digest="", expect=201):
+def _record_objective_decision(client, headers, objective_key, decision, rationale="", captured_digest=None, expect=201):
+    """`captured_digest=None` means "behave like a real client": read the
+    Objective and send back the digest it displayed. Passing `""`
+    explicitly still records an uncaptured decision (which reads as
+    `recheck_state='not_captured'`, §4.2's fail-closed case), and passing a
+    wrong value exercises the stale-digest 409."""
+    if captured_digest is None:
+        current = _get_objective(client, headers, objective_key)
+        revision = current.get("current_revision")
+        captured_digest = revision["content_digest"] if revision else ""
     r = client.post(
         f"/product-objectives/{objective_key}/decisions",
         json={"decision": decision, "rationale": rationale, "captured_digest": captured_digest},
@@ -429,7 +438,12 @@ def _add_milestone_dependency(client, headers, milestone_key, depends_on_milesto
     return r.json()
 
 
-def _record_milestone_decision(client, headers, milestone_key, decision, rationale="", captured_digest="", expect=201):
+def _record_milestone_decision(client, headers, milestone_key, decision, rationale="", captured_digest=None, expect=201):
+    """See `_record_objective_decision` for what `None` vs `""` means."""
+    if captured_digest is None:
+        current = _get_milestone(client, headers, milestone_key)
+        revision = current.get("current_revision")
+        captured_digest = revision["content_digest"] if revision else ""
     r = client.post(
         f"/product-milestones/{milestone_key}/decisions",
         json={"decision": decision, "rationale": rationale, "captured_digest": captured_digest},
@@ -517,7 +531,13 @@ def _add_gap_artifact_link(client, headers, gap_key, link_kind, target_ref, note
     return r.json()
 
 
-def _record_gap_decision(client, headers, gap_key, decision, priority_band="unset", rationale="", captured_digest="", expect=201):
+def _record_gap_decision(client, headers, gap_key, decision, priority_band="unset", rationale="", captured_digest=None, expect=201):
+    """See `_record_objective_decision`. A Gap reports `decision_digest`
+    rather than its revision's `content_digest`, because an
+    `inherited_from_milestone` Gap is judged partly against the Milestone's
+    target (§5.3)."""
+    if captured_digest is None:
+        captured_digest = _get_gap(client, headers, gap_key)["decision_digest"]
     r = client.post(
         f"/product-gaps/{gap_key}/decisions",
         json={"decision": decision, "priority_band": priority_band, "rationale": rationale, "captured_digest": captured_digest},
@@ -1305,6 +1325,16 @@ class TestDownstreamOnlyPropagation:
             chain.client, chain.headers, "gap-inherit", title="継承 Gap",
             target_state_mode="inherited_from_milestone",
         )
+        # `recheck_state` re-checks a HUMAN DECISION against the content it
+        # was made on, so the Gap needs one before there is anything to go
+        # stale. `decision_digest` (not `current_revision.content_digest`) is
+        # what the server compares: this Gap inherits its target from the
+        # Milestone, so half of what is being judged lives on that row.
+        before = _get_gap(chain.client, chain.headers, "gap-inherit")
+        _record_gap_decision(
+            chain.client, chain.headers, "gap-inherit", "acknowledge",
+            captured_digest=before["decision_digest"],
+        )
         before = _get_gap(chain.client, chain.headers, "gap-inherit")
         assert before["recheck_state"] == "current"
 
@@ -1313,7 +1343,12 @@ class TestDownstreamOnlyPropagation:
             verification_method="manual_review",
         )
         after = _get_gap(chain.client, chain.headers, "gap-inherit")
+        # The target the developer acknowledged this Gap against moved, so
+        # the acknowledgement is up for re-check -- while the lifecycle
+        # itself is untouched (§6: a stale confirmation is not a reversed
+        # one).
         assert after["recheck_state"] == "stale"
+        assert after["lifecycle"] == "acknowledged"
 
     def test_moving_gap_does_not_stale_the_milestone(self, chain: Chain):
         before = _get_milestone(chain.client, chain.headers, chain.milestone_a_key)
@@ -1745,25 +1780,30 @@ class TestPartialFailure:
         never reaches `degraded_sections` -- `product_objective.
         _gap_source_out_dict`'s `except Exception` guard is for a failure of
         `resolve_source` ITSELF (an unresolvable import, or a bug in the
-        dispatcher), which is exactly what is simulated here: `resolve_source`
-        is patched to raise outright on its second call, so the first Gap's
-        read (the "ok" Gap) still succeeds and only the second Gap's read
-        degrades."""
+        dispatcher), which is what is simulated here.
+
+        The failure is keyed on the SOURCE KIND, not on a call counter. A
+        single Gap read resolves its sources twice -- once to derive
+        `read_flags` and once to render `source_refs` -- so "raise on the
+        second call" does not mean "raise for the second Gap", and a
+        counter-based fake would report the first Gap as unavailable while
+        appearing to test isolation."""
         gap_ok_key = "gap-partial-ok"
         gap_bad_key = "gap-partial-bad"
-        for key in (gap_ok_key, gap_bad_key):
-            _create_gap(chain.client, chain.headers, chain.milestone_src_key, key)
-            _add_gap_revision(chain.client, chain.headers, key, title=key)
-            _add_gap_source_ref(chain.client, chain.headers, key, "manual", "")
+        _create_gap(chain.client, chain.headers, chain.milestone_src_key, gap_ok_key)
+        _add_gap_revision(chain.client, chain.headers, gap_ok_key, title=gap_ok_key)
+        _add_gap_source_ref(chain.client, chain.headers, gap_ok_key, "manual", "")
+
+        _create_gap(chain.client, chain.headers, chain.milestone_src_key, gap_bad_key)
+        _add_gap_revision(chain.client, chain.headers, gap_bad_key, title=gap_bad_key)
+        _add_gap_source_ref(chain.client, chain.headers, gap_bad_key, "issue_draft", "999999")
 
         from app import product_gap_sources
 
         original = product_gap_sources.resolve_source
-        calls = {"n": 0}
 
         def _flaky_resolve_source(conn, **kwargs):
-            calls["n"] += 1
-            if calls["n"] > 1:
+            if kwargs.get("source_kind") == "issue_draft":
                 raise RuntimeError("resolver exploded")
             return original(conn, **kwargs)
 

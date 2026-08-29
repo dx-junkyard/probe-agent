@@ -1873,12 +1873,52 @@ def create_gap(
 
 
 def _gap_current_digest(conn: sqlite3.Connection, gap: Dict[str, Any]) -> str:
+    """The Gap's EFFECTIVE content digest -- what a human is actually
+    judging when they decide about this Gap.
+
+    For `target_state_mode='own'` and `'unknown'` that is exactly the
+    revision's stored `content_digest`. For `'inherited_from_milestone'` it
+    is that digest combined with the Milestone's current `target_state`,
+    because the Gap deliberately does NOT copy the target (§5.3) -- it
+    resolves it at read time, so half of what the developer read is not in
+    the Gap's own row.
+
+    Without this, moving the Milestone's target left an inheriting Gap
+    reading `recheck_state='current'`: the confirmation survived a change
+    to the very target it was judged against, which is the §6 row
+    "Milestone revision が動く -> `inherited_from_milestone` の Gap が
+    `stale`" going unenforced. The stored column is untouched -- it remains
+    the revision's own content identity, and this is a separate read-time
+    value used for the recheck comparison and the stale-digest gate, so
+    both answer from the same fact."""
     if gap["current_revision_id"] is None:
         return ""
     row = conn.execute(
-        "SELECT content_digest FROM product_gap_revision WHERE id = ?", (gap["current_revision_id"],)
+        """SELECT content_digest, target_state_mode FROM product_gap_revision
+           WHERE id = ?""",
+        (gap["current_revision_id"],),
     ).fetchone()
-    return row["content_digest"] if row is not None else ""
+    if row is None:
+        return ""
+    own_digest = row["content_digest"]
+    if row["target_state_mode"] != "inherited_from_milestone":
+        return own_digest
+
+    # The inherited half. A Milestone that cannot be read contributes the
+    # empty string rather than being skipped: "the target could not be
+    # read" must not digest identically to "the target is empty", or an
+    # unreadable Milestone would silently look unchanged.
+    milestone = conn.execute(
+        """SELECT r.target_state AS target_state
+           FROM product_milestone m
+           LEFT JOIN product_milestone_revision r ON r.id = m.current_revision_id
+           WHERE m.id = ?""",
+        (gap["milestone_id"],),
+    ).fetchone()
+    inherited = (milestone["target_state"] if milestone is not None else None) or ""
+    return content_digest(
+        {"gap": own_digest, "inherited_target_state": inherited}
+    )
 
 
 def derive_gap_lifecycle(conn: sqlite3.Connection, system_id: int, gap_key: str) -> Tuple[str, Optional[Dict[str, Any]]]:
@@ -2308,7 +2348,12 @@ def _gap_out_dict(conn: sqlite3.Connection, system_id: int, gap: Dict[str, Any])
 
     lifecycle, lifecycle_row = derive_gap_lifecycle(conn, system_id, gap["gap_key"])
     priority_band = derive_gap_priority_band(conn, system_id, gap["gap_key"])
-    current_digest = revision["content_digest"] if revision else ""
+    # The EFFECTIVE digest, not the revision's own column: an
+    # `inherited_from_milestone` Gap is judged against a target that lives
+    # on the Milestone (§5.3), so its recheck has to see that target move.
+    # This is the same value `record_gap_decision` captures and compares,
+    # so the decision gate and the displayed state answer from one fact.
+    current_digest = _gap_current_digest(conn, gap)
     recheck_state = derive_recheck_state(current_digest, lifecycle_row)
     read_flags = _gap_read_flags(conn, system_id, gap, lifecycle)
 
@@ -2331,6 +2376,7 @@ def _gap_out_dict(conn: sqlite3.Connection, system_id: int, gap: Dict[str, Any])
         "objective_key": objective_key,
         "current_revision_id": gap["current_revision_id"],
         "current_revision_number": revision["revision_number"] if revision else None,
+        "decision_digest": current_digest,
         "title": revision["title"] if revision else "",
         "lifecycle": lifecycle,
         "priority_band": priority_band,

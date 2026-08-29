@@ -768,13 +768,42 @@ def _check_product_features(
 # --- Top-level projection ----------------------------------------------------
 
 
-def build_functional_lineage(conn: sqlite3.Connection, system_id: int) -> Dict[str, Any]:
+def build_functional_lineage(
+    conn: sqlite3.Connection,
+    system_id: int,
+    *,
+    include_product_objective_layer: bool = True,
+) -> Dict[str, Any]:
     """§9's Functional Lineage View + Gap/Impact Overlay. Read-only,
     deterministic, no LLM, writes nothing. Every major section is its own
     guarded loader (#380's discipline): a failure records the section in
     `degraded_sections` and stops that section's own traversal -- never
     substituting a guessed value or reporting `unavailable` as `missing`
-    (invariant 5)."""
+    (invariant 5).
+
+    `include_product_objective_layer=False` drops sections 6-8 (Issue #427's
+    Objective / Gap / Feature). It exists to break a genuine cycle, not as a
+    performance switch:
+
+        _check_product_gaps
+          -> product_objective.get_gap_detail   (resolves the Gap's sources)
+            -> product_gap_sources.resolve_source('functional_lineage_gap')
+              -> build_functional_lineage
+                -> _check_product_gaps ...
+
+    A Gap can be DETECTED BY this projection and can also be REPORTED ON by
+    it, so the two directions meet. The cycle is broken on the resolver's
+    side because that is the side with the answer: a Gap's detection source
+    is UPSTREAM of the Gap, while sections 6-8 are DOWNSTREAM of it, and a
+    source resolution that re-entered them would be asking the projection
+    about the very rows whose state it is in the middle of computing.
+    Sections 1-5 -- the detector that actually emitted the gap code -- are
+    unaffected and still answer in full, so the resolver loses nothing it
+    needs.
+
+    Left unbroken this does not raise; each level does real work, so it
+    simply never returns. That is how it reached CI as a six-hour job
+    cancellation rather than an error."""
     graph = _Graph()
     degraded_sections: List[str] = []
     degraded_detail: Dict[str, str] = {}
@@ -867,16 +896,22 @@ def build_functional_lineage(conn: sqlite3.Connection, system_id: int) -> Dict[s
     except Exception as exc:  # pragma: no cover - defensive
         _degrade(degraded_sections, degraded_detail, "needs", exc)
 
-    # 6. Product Objective / Milestone -- Epic #427 §7.3. A System that has
-    # adopted no Product Objective produces no new node/edge/gap here (§4).
-    known_milestone_keys = _check_product_objectives(conn, system_id, graph, degraded_sections, degraded_detail)
+    if include_product_objective_layer:
+        # 6. Product Objective / Milestone -- Epic #427 §7.3. A System that
+        # has adopted no Product Objective produces no new node/edge/gap
+        # here (§4).
+        known_milestone_keys = _check_product_objectives(
+            conn, system_id, graph, degraded_sections, degraded_detail
+        )
 
-    # 7. Product Gap -- Milestone -> Gap -> UX Journey, plus §5.4's source
-    # federation states.
-    _check_product_gaps(conn, system_id, graph, degraded_sections, degraded_detail, known_milestone_keys)
+        # 7. Product Gap -- Milestone -> Gap -> UX Journey, plus §5.4's
+        # source federation states.
+        _check_product_gaps(
+            conn, system_id, graph, degraded_sections, degraded_detail, known_milestone_keys
+        )
 
-    # 8. Product Feature -- Requirement -> Feature -> Capability/target.
-    _check_product_features(conn, system_id, graph, degraded_sections, degraded_detail)
+        # 8. Product Feature -- Requirement -> Feature -> Capability/target.
+        _check_product_features(conn, system_id, graph, degraded_sections, degraded_detail)
 
     return {
         "nodes": graph.sorted_nodes(),

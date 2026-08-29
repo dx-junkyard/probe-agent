@@ -13863,6 +13863,17 @@ class ProductGapOut(BaseModel):
     objective_key: Optional[str] = None
     current_revision_id: Optional[int] = None
     current_revision_number: Optional[int] = None
+    #: The digest a decision on this Gap must capture, and the one
+    #: `recheck_state` is derived from. It is NOT always
+    #: `current_revision.content_digest`: a Gap whose `target_state_mode` is
+    #: `inherited_from_milestone` deliberately does not store its target
+    #: (§5.3) and resolves it from the Milestone at read time, so half of
+    #: what the developer judged lives on another row. Exposing it is what
+    #: lets a client send back the same value the server compares -- without
+    #: it, every decision on an inheriting Gap would 409 against a digest the
+    #: client had no way to compute. Only the Gap carries this field,
+    #: because only the Gap inherits content it does not store.
+    decision_digest: str = ""
     title: str = ""
     lifecycle: ProductGapLifecycle = "open"
     priority_band: ProductGapPriorityBand = "unset"
