@@ -39,7 +39,12 @@ import pytest
 
 from app import gap_triage, product_gap_sources as pgs
 from app import system_understanding_service as sus
-from app.models import ProductGapSourceKind, ProductGapSourceState
+from app.models import (
+    ProductGapArtifactLinkKind,
+    ProductGapEvidenceKind,
+    ProductGapSourceKind,
+    ProductGapSourceState,
+)
 from typing import get_args
 
 
@@ -124,6 +129,55 @@ class TestVocabulariesAndDispatch:
 
     def test_every_source_kind_has_a_deep_link_entry(self):
         assert set(pgs._DEEP_LINKS) == set(pgs.SOURCE_KINDS)
+
+
+class TestEvidenceAndArtifactDeepLinks:
+    """§5.8: the SAME per-kind table discipline covers a Gap's other two
+    reference kinds. The Dashboard never assembles one of these URLs."""
+
+    def test_vocabularies_match_the_models_literals(self):
+        assert set(pgs.EVIDENCE_KINDS) == set(get_args(ProductGapEvidenceKind))
+        assert set(pgs.ARTIFACT_KINDS) == set(get_args(ProductGapArtifactLinkKind))
+
+    def test_every_kind_has_exactly_one_table_entry(self):
+        assert set(pgs._EVIDENCE_DEEP_LINKS) == set(pgs.EVIDENCE_KINDS)
+        assert set(pgs._ARTIFACT_DEEP_LINKS) == set(pgs.ARTIFACT_KINDS)
+
+    @pytest.mark.parametrize("kind", get_args(ProductGapEvidenceKind))
+    def test_evidence_route_is_none_exactly_when_unavailable(self, kind):
+        route, state = pgs.evidence_deep_link(kind)
+        assert state in ("available", "unavailable")
+        assert (route is None) == (state == "unavailable")
+        if route is not None:
+            assert route.startswith("/")
+
+    @pytest.mark.parametrize("kind", get_args(ProductGapArtifactLinkKind))
+    def test_artifact_route_is_none_exactly_when_unavailable(self, kind):
+        route, state = pgs.artifact_deep_link(kind)
+        assert state in ("available", "unavailable")
+        assert (route is None) == (state == "unavailable")
+        if route is not None:
+            assert route.startswith("/")
+
+    @pytest.mark.parametrize("kind", ["human_report", "external_report", "other"])
+    def test_kinds_probe_agent_owns_no_screen_for_say_so(self, kind):
+        """A free-text report and an outside URI have no probe-agent screen.
+        Inventing one would be the fabricated URL §5.8 forbids."""
+        assert pgs.evidence_deep_link(kind) == (None, "unavailable")
+
+    def test_product_feature_has_an_api_but_no_screen(self):
+        """`GET /product-features` exists; no Dashboard screen owns a Feature.
+        Appearing as a node inside the Functional Lineage graph answers a
+        different question and is not a route to the Feature (§5.8)."""
+        assert pgs.artifact_deep_link("product_feature") == (None, "unavailable")
+
+    def test_out_of_vocabulary_kinds_raise_value_error(self):
+        """A programming error, not data -- the same rule `resolve_source`
+        applies to an unknown `source_kind`."""
+        with pytest.raises(ValueError):
+            pgs.evidence_deep_link("not_a_real_kind")
+        with pytest.raises(ValueError):
+            pgs.artifact_deep_link("ux_journey")
 
 
 class TestUnknownSourceKind:

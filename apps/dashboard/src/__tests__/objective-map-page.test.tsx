@@ -627,3 +627,50 @@ describe("ObjectiveMapPage empty/error states", () => {
     await waitFor(() => expect(screen.getByTestId("gap-workbench-lane-error")).toBeInTheDocument());
   });
 });
+
+describe("ObjectiveMapPage: evidence / artifact deep links (§5.8)", () => {
+  beforeEach(() => mockApi.get.mockReset());
+
+  it("links a kind that has a screen and states the reason for one that has none", async () => {
+    // The route comes from the server's per-kind table; the page never
+    // assembles one. A kind with no screen renders as unavailable, never as
+    // a plausible URL.
+    mockRoutes({
+      objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(),
+      gap: gapDetail({
+        evidence_refs: [
+          {
+            id: 1, gap_id: 1, evidence_kind: "trace", evidence_ref: "t-1",
+            deep_link: "/components", deep_link_state: "available",
+            captured_snapshot_id: null, note: "", decision_method: "manual",
+            created_by: null, created_at: 1000, superseded_by_id: null,
+          },
+          {
+            id: 2, gap_id: 1, evidence_kind: "human_report", evidence_ref: "ops report",
+            deep_link: null, deep_link_state: "unavailable",
+            captured_snapshot_id: null, note: "", decision_method: "manual",
+            created_by: null, created_at: 1000, superseded_by_id: null,
+          },
+        ],
+        artifact_links: [
+          {
+            id: 3, gap_id: 1, link_kind: "product_feature", target_ref: "feat-a",
+            target_row_id: null, deep_link: null, deep_link_state: "unavailable",
+            captured_digest: "", note: "", decision_method: "manual",
+            created_by: null, created_at: 1000, superseded_by_id: null,
+          },
+        ],
+      }),
+    });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+
+    const link = await screen.findByTestId("gap-evidence-deep-link-1");
+    expect(link).toHaveAttribute("href", "/components");
+    expect(screen.getByTestId("gap-evidence-deep-link-unavailable-2")).toBeInTheDocument();
+    expect(screen.queryByTestId("gap-evidence-deep-link-2")).toBeNull();
+    expect(screen.getByTestId("gap-artifact-link-deep-link-unavailable-3")).toBeInTheDocument();
+    expect(screen.queryByTestId("gap-artifact-link-deep-link-3")).toBeNull();
+  });
+});

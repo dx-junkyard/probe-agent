@@ -528,19 +528,15 @@ def _walk_need_purpose_refs(
 # --- Product Objective / Milestone / Gap / Feature (Epic #427 §7.3) ---------
 
 #: §7.3's ref-kind -> graph-node-kind mapping for an Objective's upstream
-#: ref (`ProductRefKind`, `app/product_objective.py`). `vision_claim` has no
-#: FunctionalLineageKind of its own -- Vision has no row identity (§4.6), so
-#: this module never invents a fifth "vision" node kind for it (that Literal
-#: lives in `models.py`, which this Epic's fix does not own). It is mapped
-#: onto the existing `purpose_element` node kind instead: a `vision_claim`
-#: ref and a `purpose_element` ref are both "a claim in the Purpose Chain's
-#: own vocabulary" from this graph's point of view, and `purpose_element`
-#: already carries arbitrary string refs (a Purpose Chain element id), so a
-#: Vision's name-keyed ref shares the node kind without colliding in
-#: practice (a Vision's target_ref is free text; a Purpose element id is a
-#: fixed slug such as `beneficiary_problem`). `purpose_relation` keeps its
-#: own distinct kind, matching how the graph already treats an element and a
-#: relation as two different kinds everywhere else.
+#: ref (`ProductRefKind`, `app/product_objective.py`). `vision_claim` maps to
+#: its OWN `FunctionalLineageKind`, not onto `purpose_element`: a Vision claim
+#: is referenced by NAME (it has no row identity, §4.6) while a Purpose
+#: element is referenced by a fixed slug such as `beneficiary_problem`, and
+#: rendering the two under one label is the one-word-two-facts conflation this
+#: Epic exists to avoid (#380's superset rule -- a downstream vocabulary may
+#: add values, never collapse them). `purpose_relation` likewise keeps its own
+#: kind, matching how the graph already treats an element and a relation as
+#: two different kinds everywhere else.
 _OBJECTIVE_REF_NODE_KIND: Dict[str, str] = {
     "vision_claim": "vision_claim",
     "purpose_element": "purpose_element",

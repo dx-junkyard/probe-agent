@@ -58,6 +58,7 @@ import type {
   ProductGapArtifactLinkKind,
   ProductGapEffectiveTargetAvailability,
   ProductGapDecisionKind,
+  ProductGapEvidenceKind,
   ProductGapLifecycle,
   ProductGapPriorityBand,
   ProductGapReadFlag,
@@ -249,6 +250,19 @@ export const MILESTONE_ASSESSMENT_ACTION_LABEL: Record<ProductMilestoneAssessmen
  * has exactly one writable home, `ux_journey_upstream_ref
  * (ref_kind='product_gap')`, written through the Journey's own endpoint
  * (`useLinkProductGapToJourney`), never through this artifact-link table. */
+/** Technical identifiers (Trace / Experiment / Replay) stay in their
+ * canonical form; the rest is Japanese, so the 証跡 list does not mix
+ * languages with the 関連付け済み list right below it. */
+export const GAP_EVIDENCE_KIND_LABEL: Record<ProductGapEvidenceKind, string> = {
+  trace: "Trace",
+  experiment: "Experiment",
+  replay_run: "Replay",
+  human_report: "人からの報告",
+  external_report: "外部の報告",
+  repository_path: "リポジトリ内のパス",
+  other: "その他",
+};
+
 export const GAP_ARTIFACT_LINK_KIND_LABEL: Record<ProductGapArtifactLinkKind, string> = {
   issue_draft: "Issue Draft",
   ux_requirement: "UX Requirement",

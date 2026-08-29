@@ -2261,6 +2261,31 @@ def add_gap_source_ref(
     return out
 
 
+def _with_reference_deep_link(item: Dict[str, Any], kind_field: str) -> Dict[str, Any]:
+    """Attach §5.8's `deep_link` / `deep_link_state` to one evidence or
+    artifact row from the per-kind table in `product_gap_sources`.
+
+    The CREATE endpoints go through here too, not just the detail read: a
+    201 that omitted these would serialize the model defaults
+    (`None` / `unavailable`), i.e. it would tell the client "no screen
+    exists for this kind" about a `trace` -- a different fact from the one
+    the table holds (§0-8). The import is lazy for the same circular-import
+    reason as `_gap_source_out_dict`, and is deliberately NOT guarded here:
+    a failure to read the table must never be REPORTED as a kind with no
+    screen, so it propagates -- to a 500 on the create path, and to the
+    caller's own per-section `_degrade` on the detail read."""
+    from . import product_gap_sources
+
+    kind = item[kind_field]
+    if kind_field == "evidence_kind":
+        route, state = product_gap_sources.evidence_deep_link(kind)
+    else:
+        route, state = product_gap_sources.artifact_deep_link(kind)
+    item["deep_link"] = route
+    item["deep_link_state"] = state
+    return item
+
+
 def add_gap_evidence_ref(
     conn: sqlite3.Connection,
     *,
@@ -2284,7 +2309,7 @@ def add_gap_evidence_ref(
         (system_id, gap["id"], evidence_kind, evidence_ref, note, created_by, now),
     )
     row = conn.execute("SELECT * FROM product_gap_evidence_ref WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return dict(row)
+    return _with_reference_deep_link(dict(row), "evidence_kind")
 
 
 def add_gap_artifact_link(
@@ -2320,7 +2345,7 @@ def add_gap_artifact_link(
         (system_id, gap["id"], link_kind, target_ref, note, created_by, now),
     )
     row = conn.execute("SELECT * FROM product_gap_artifact_link WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return dict(row)
+    return _with_reference_deep_link(dict(row), "link_kind")
 
 
 def record_gap_decision(
@@ -2586,7 +2611,13 @@ def get_gap_detail(conn: sqlite3.Connection, system_id: int, gap_key: str) -> Di
                WHERE system_id = ? AND gap_id = ? AND superseded_by_id IS NULL ORDER BY id DESC""",
             (system_id, gap["id"]),
         ).fetchall()
-        evidence_refs = [dict(r) for r in rows]
+        # §5.8's per-kind table, attached by the same helper the create path
+        # uses. It is INSIDE the try on purpose: a failure to read the table
+        # degrades this section (and says so in `degraded_detail`) instead of
+        # letting every row claim `unavailable`, which asserts "no screen
+        # exists for this kind" -- a different fact from "we could not tell"
+        # (§0-8). `ProductDeepLinkState` has no third value on purpose.
+        evidence_refs = [_with_reference_deep_link(dict(r), "evidence_kind") for r in rows]
     except Exception as exc:  # pragma: no cover - defensive
         _degrade(degraded_sections, degraded_detail, "evidence_refs", exc)
 
@@ -2597,7 +2628,7 @@ def get_gap_detail(conn: sqlite3.Connection, system_id: int, gap_key: str) -> Di
                WHERE system_id = ? AND gap_id = ? AND superseded_by_id IS NULL ORDER BY id DESC""",
             (system_id, gap["id"]),
         ).fetchall()
-        artifact_links = [dict(r) for r in rows]
+        artifact_links = [_with_reference_deep_link(dict(r), "link_kind") for r in rows]
     except Exception as exc:  # pragma: no cover - defensive
         _degrade(degraded_sections, degraded_detail, "artifact_links", exc)
 

@@ -30,6 +30,17 @@ KIND, not of one resolution's outcome. `node_anomaly` has no Dashboard screen
 at all (Epic #394 Phase 5's cockpit is #401's unimplemented remainder), so it
 is always `deep_link=None` / `deep_link_state='unavailable'` -- never a
 fabricated URL.
+
+The same table-driven rule covers a Gap's OTHER two reference kinds -- its
+evidence refs and its downstream artifact links (`evidence_deep_link` /
+`artifact_deep_link`). They are here, next to the source table, because
+"which Dashboard screen owns this kind" is one question and must have one
+answer: a Gap's screen would otherwise be free to build its own URLs, which
+is exactly the second opinion this Epic exists to prevent (§0-1). Both
+tables are per-KIND and carry no resolution: unlike a source ref, an
+evidence or artifact ref is not resolved against a canonical detector here,
+so `deep_link_state` says only whether a screen exists -- never whether the
+referenced row still does.
 """
 
 from __future__ import annotations
@@ -41,7 +52,12 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Optional, Tuple, get_args
 
 from . import drift, functional_lineage, gap_triage, stakeholder_value_network, ux_design
-from .models import ProductGapSourceKind, ProductGapSourceState
+from .models import (
+    ProductGapArtifactLinkKind,
+    ProductGapEvidenceKind,
+    ProductGapSourceKind,
+    ProductGapSourceState,
+)
 
 #: `get_args(ProductGapSourceKind)` (§5.10's exact contract).
 SOURCE_KINDS: Tuple[str, ...] = get_args(ProductGapSourceKind)
@@ -996,3 +1012,69 @@ def resolve_source(
         )
 
     return replace(result, deep_link=deep_link, deep_link_state=deep_link_state)
+
+
+# ---------------------------------------------------------------------------
+# Evidence / artifact deep links (§5.8)
+# ---------------------------------------------------------------------------
+
+#: `get_args(ProductGapEvidenceKind)`.
+EVIDENCE_KINDS: Tuple[str, ...] = get_args(ProductGapEvidenceKind)
+
+#: `get_args(ProductGapArtifactLinkKind)`.
+ARTIFACT_KINDS: Tuple[str, ...] = get_args(ProductGapArtifactLinkKind)
+
+#: §5.8 for a Gap's evidence refs. `human_report` / `external_report` /
+#: `other` are `None` because probe-agent owns no screen for them at all --
+#: the reference is free text or an outside URI, and inventing a route for
+#: it would be the fabricated URL §5.8 forbids. `repository_path` names the
+#: Repository screen; the route is a bare SCREEN path, never a deep-link
+#: target with the path pre-selected, because nothing here resolves the
+#: reference against a snapshot.
+_EVIDENCE_DEEP_LINKS: Dict[str, Optional[str]] = {
+    "trace": "/components",
+    "experiment": "/experiments",
+    "replay_run": "/simulation-workbench",
+    "human_report": None,
+    "external_report": None,
+    "repository_path": "/repository",
+    "other": None,
+}
+
+assert set(_EVIDENCE_DEEP_LINKS) == set(EVIDENCE_KINDS)
+
+#: §5.8 for a Gap's downstream artifact links. `product_feature` is `None`
+#: on purpose: `GET /product-features` exists but no Dashboard screen owns a
+#: Product Feature yet -- it appears only as a node inside the Functional
+#: Lineage graph, which is a different question ("what is connected to what")
+#: from "open this Feature". This is the same honest `unavailable` that
+#: `node_anomaly` carries in `_DEEP_LINKS`, and it is fixed by editing one
+#: row once a screen exists.
+_ARTIFACT_DEEP_LINKS: Dict[str, Optional[str]] = {
+    "issue_draft": "/system-understanding",
+    "ux_requirement": "/ux-design-studio",
+    "product_feature": None,
+    "solution_design": "/ux-design-studio",
+}
+
+assert set(_ARTIFACT_DEEP_LINKS) == set(ARTIFACT_KINDS)
+
+
+def _deep_link(table: Dict[str, Optional[str]], kind: str, label: str) -> Tuple[Optional[str], str]:
+    if kind not in table:
+        raise ValueError(f"Unknown {label}: {kind!r}")
+    route = table[kind]
+    return route, ("available" if route else "unavailable")
+
+
+def evidence_deep_link(evidence_kind: str) -> Tuple[Optional[str], str]:
+    """`(route, deep_link_state)` for one `ProductGapEvidenceKind` (§5.8).
+
+    Raises `ValueError` outside the finite vocabulary -- a programming
+    error, not data, exactly as `resolve_source` does."""
+    return _deep_link(_EVIDENCE_DEEP_LINKS, evidence_kind, "ProductGapEvidenceKind")
+
+
+def artifact_deep_link(link_kind: str) -> Tuple[Optional[str], str]:
+    """`(route, deep_link_state)` for one `ProductGapArtifactLinkKind` (§5.8)."""
+    return _deep_link(_ARTIFACT_DEEP_LINKS, link_kind, "ProductGapArtifactLinkKind")

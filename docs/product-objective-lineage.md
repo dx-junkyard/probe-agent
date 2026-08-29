@@ -990,15 +990,52 @@ ProductGapPriorityBand = Literal["unset", "watch", "next", "now"]
   `priority_band` → `lifecycle` → `milestone.sequence_hint` → `gap_key` の
   有限段階で、すべて有限語彙か開発者が置いた値である。
 
-### 5.8 deep link が無い検出元
+### 5.8 deep link は kind ごとの表でサーバーが決める
 
-`node_anomaly` は API(`GET /nodes/{node_id}`)はあるが Dashboard 画面が無い
+Gap が持つ 3 種類の参照(検出元 / 証跡 / 下流成果物 link)はどれも、
+「どの Dashboard 画面がこの kind を所有するか」を `app/product_gap_sources.py`
+の **kind ごとの静的な表**から解決する。解決の結果ではなく **kind の性質**
+なので、resolver の中ではなく表で持つ。
+
+まず検出元。`node_anomaly` は API(`GET /nodes/{node_id}`)はあるが Dashboard 画面が無い
 (Epic #394 Phase 5 の cockpit 画面は #401 の未着手分)。したがって:
 
 * `deep_link` は `None` を返し、`deep_link_state='unavailable'` を添える。
 * **偽の URL を組み立てない。** 「画面が無い」と「リンクが壊れている」は別の
   事実で、前者は正直に表示する。
 * #401 が画面を作った時点で表を 1 行直せば済む。
+
+同じ規律を Gap の**残り 2 種類の参照**にも適用する。証跡
+(`product_gap_evidence_ref`) と下流成果物 link (`product_gap_artifact_link`)
+も `app/product_gap_sources.py` の per-kind 表
+(`_EVIDENCE_DEEP_LINKS` / `_ARTIFACT_DEEP_LINKS`、公開関数は
+`evidence_deep_link` / `artifact_deep_link`) から**サーバー側で**解決し、
+`deep_link` + `deep_link_state` として返す。**Dashboard は URL を組み立てない**
+— 「どの画面がこの kind を所有するか」に 2 つ目の答えを作ることであり、
+この Epic が排除してきた欠陥そのものだからである(§0-1)。
+
+| 参照 | kind | route |
+| --- | --- | --- |
+| 証跡 | `trace` | `/components` |
+| 証跡 | `experiment` | `/experiments` |
+| 証跡 | `replay_run` | `/simulation-workbench` |
+| 証跡 | `repository_path` | `/repository` |
+| 証跡 | `human_report` / `external_report` / `other` | **なし** |
+| 成果物 | `issue_draft` | `/system-understanding` |
+| 成果物 | `ux_requirement` / `solution_design` | `/ux-design-studio` |
+| 成果物 | `product_feature` | **なし** |
+
+`product_feature` は `GET /product-features` があるが**専用画面が無い**
+(Functional Lineage のグラフに node として現れるだけで、それは「何と何が
+つながっているか」であって「この Feature を開く」ではない)。`node_anomaly` と
+同じ正直な `unavailable` であり、画面ができた時点で表を 1 行直せば済む。
+
+**この 2 つは source ref と違い、正本に対する解決を行わない。** したがって
+`deep_link_state` が言うのは「画面が存在するか」だけで、「その参照先の行が
+まだ存在するか」ではない。両者を 1 つの値に畳まない(§0-8)。
+`ProductDeepLinkState` に 3 つ目の値は作らない — 表が読めなかった場合は
+その section を `degraded_sections` に落とし、`unavailable`(=画面が無い)と
+名乗らせない。
 
 ### 5.11 Gap → Journey の正本は 1 つだけ
 

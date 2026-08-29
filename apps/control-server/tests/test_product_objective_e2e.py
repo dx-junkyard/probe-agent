@@ -1258,6 +1258,19 @@ class TestGapSourceFederation:
         _add_gap_revision(chain.client, chain.headers, gap_key, title=gap_key, target_state_mode="unknown")
         return _get_gap(chain.client, chain.headers, gap_key)
 
+    def test_every_reference_kind_reports_its_screen_from_the_server(self, chain: Chain):
+        """SS5.8: all three reference kinds carry a server-resolved
+        `deep_link`. The chain's Gap has a `trace` evidence ref (a kind with
+        a screen) and a `product_feature` artifact link (a kind with an API
+        but no screen), so one walk shows both answers side by side."""
+        detail = _get_gap(chain.client, chain.headers, chain.gap_main_key)
+        evidence = {e["evidence_kind"]: e for e in detail["evidence_refs"]}
+        assert evidence["trace"]["deep_link"] == "/components"
+        assert evidence["trace"]["deep_link_state"] == "available"
+        artifacts = {a["link_kind"]: a for a in detail["artifact_links"]}
+        assert artifacts["product_feature"]["deep_link"] is None
+        assert artifacts["product_feature"]["deep_link_state"] == "unavailable"
+
     def test_manual_is_always_current(self, chain: Chain):
         gap_key = "gap-src-manual"
         self._gap(chain, gap_key)

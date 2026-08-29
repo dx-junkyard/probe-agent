@@ -7968,14 +7968,13 @@ export interface ProductGapEvidenceOut {
   created_by: string | null;
   created_at: number;
   superseded_by_id: number | null;
-  /** NOT YET provided by the Control Server (§3.5 review finding). The
-   * Objective Map screen needs a per-kind `route` + `deep_link_state`, mirroring
-   * `GapWorkbenchDeepLinkOut`'s already-shipped `ProductGapSourceOut` pattern,
-   * resolved server-side (never a client-built URL, §5.8). Optional so this
-   * type does not lie about what the server sends today; the Dashboard falls
-   * back to plain text rendering while these are absent. */
-  deep_link_state?: ProductDeepLinkState;
-  route?: string | null;
+  /** §5.8: the Dashboard SCREEN owning this evidence kind, resolved
+   * server-side from `product_gap_sources._EVIDENCE_DEEP_LINKS` -- never a
+   * client-built URL. `null` exactly when `deep_link_state` is
+   * `"unavailable"`. It says a screen EXISTS, never that this
+   * `evidence_ref` still resolves there. */
+  deep_link: string | null;
+  deep_link_state: ProductDeepLinkState;
 }
 
 export interface ProductGapArtifactOut {
@@ -7990,10 +7989,11 @@ export interface ProductGapArtifactOut {
   created_by: string | null;
   created_at: number;
   superseded_by_id: number | null;
-  /** NOT YET provided by the Control Server -- see `ProductGapEvidenceOut`'s
-   * matching fields (§3.5). */
-  deep_link_state?: ProductDeepLinkState;
-  route?: string | null;
+  /** §5.8, same contract as `ProductGapEvidenceOut.deep_link`.
+   * `product_feature` is `"unavailable"` today: it has an API but no
+   * Dashboard screen of its own. */
+  deep_link: string | null;
+  deep_link_state: ProductDeepLinkState;
 }
 
 export interface ProductGapDecisionOut {

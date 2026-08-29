@@ -518,6 +518,65 @@ class TestGapEvidenceAndArtifactLinks:
         assert len(detail["evidence_refs"]) == 1
         assert detail["evidence_refs"][0]["evidence_ref"] == "trace-123"
 
+    def test_evidence_and_artifact_deep_links_are_resolved_server_side(self, admin_client):
+        """§5.8: the Gap detail carries the screen for each reference kind,
+        resolved from `product_gap_sources`' per-kind tables. The Dashboard
+        must never build one of these URLs itself -- that would be a second
+        answer to "which screen owns this kind" (§0-1)."""
+        token, system_id = _setup(admin_client, "System Gap Deep Links")
+        headers = _headers(token, system_id)
+        milestone_key = _make_objective_and_milestone(admin_client, headers)
+        _create_gap(admin_client, headers, milestone_key, "g1")
+        for kind, ref in (("trace", "t-1"), ("human_report", "reported by ops")):
+            assert admin_client.post(
+                "/product-gaps/g1/evidence-refs",
+                json={"evidence_kind": kind, "evidence_ref": ref},
+                headers=headers,
+            ).status_code == 201
+        for kind, ref in (("ux_requirement", "req-a"), ("product_feature", "feat-a")):
+            assert admin_client.post(
+                "/product-gaps/g1/artifact-links",
+                json={"link_kind": kind, "target_ref": ref},
+                headers=headers,
+            ).status_code == 201
+
+        # The 201 body carries the same resolved link the detail read does.
+        # Without this, a create response would serialize the model defaults
+        # and tell the client "no screen exists" about a `trace`.
+        created = admin_client.post(
+            "/product-gaps/g1/evidence-refs",
+            json={"evidence_kind": "experiment", "evidence_ref": "e-9"},
+            headers=headers,
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["deep_link"] == "/experiments"
+        assert created.json()["deep_link_state"] == "available"
+        created_link = admin_client.post(
+            "/product-gaps/g1/artifact-links",
+            json={"link_kind": "product_feature", "target_ref": "feat-b"},
+            headers=headers,
+        )
+        assert created_link.status_code == 201, created_link.text
+        assert created_link.json()["deep_link"] is None
+        assert created_link.json()["deep_link_state"] == "unavailable"
+
+        detail = admin_client.get("/product-gaps/g1", headers=headers).json()
+        evidence = {e["evidence_kind"]: e for e in detail["evidence_refs"]}
+        assert evidence["trace"]["deep_link"] == "/components"
+        assert evidence["trace"]["deep_link_state"] == "available"
+        # No probe-agent screen owns a free-text human report. "No screen"
+        # is reported honestly, never as a plausible URL (§5.8).
+        assert evidence["human_report"]["deep_link"] is None
+        assert evidence["human_report"]["deep_link_state"] == "unavailable"
+
+        artifacts = {a["link_kind"]: a for a in detail["artifact_links"]}
+        assert artifacts["ux_requirement"]["deep_link"] == "/ux-design-studio"
+        assert artifacts["ux_requirement"]["deep_link_state"] == "available"
+        # A Product Feature has an API but no screen of its own -- the same
+        # honest `unavailable` `node_anomaly` carries.
+        assert artifacts["product_feature"]["deep_link"] is None
+        assert artifacts["product_feature"]["deep_link_state"] == "unavailable"
+
     def test_artifact_link_duplicate_is_409(self, admin_client):
         token, system_id = _setup(admin_client, "System Gap Artifact Dup")
         headers = _headers(token, system_id)

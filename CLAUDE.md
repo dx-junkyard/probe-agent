@@ -1858,6 +1858,15 @@ creating incomplete persistence or execution paths for later phases.
       後者なので、片方だけだと表示は正しいのにリロードで選択だけ静かに失われる。
     - **TypeScript の union 本体にコメントを書かない。** parity テストのパーサが
       コメント断片をメンバーとして読む。説明は型宣言の上に置く。
+    - **deep link は Gap の 3 種類の参照すべてで server 側の per-kind 表から
+      決める。** 検出元 (`_DEEP_LINKS`) だけでなく証跡 (`_EVIDENCE_DEEP_LINKS`)
+      と下流成果物 link (`_ARTIFACT_DEEP_LINKS`) も `product_gap_sources.py` に
+      あり、Dashboard は URL を組み立てない — 「どの画面がこの kind を所有
+      するか」に 2 つ目の答えを作らないため。画面が無い kind
+      (`human_report` / `external_report` / `other` / `product_feature` /
+      `node_anomaly`) は `deep_link=None` + `unavailable` と正直に言う。この
+      2 表は正本に対する解決を行わないので、`deep_link_state` が言うのは
+      「画面が存在するか」だけで「参照先の行がまだ存在するか」ではない。
     - Overview の `next_action` と `objective.next_step` は**別フィールド**で、
       片方が他方を上書きしない。`decide_next_action` の既存 15 行表は変更しない。
     - `docs/product-objective-lineage.md` が canonical contract、

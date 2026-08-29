@@ -13815,6 +13815,16 @@ class ProductGapEvidenceOut(BaseModel):
     gap_id: int
     evidence_kind: ProductGapEvidenceKind
     evidence_ref: str
+    #: §5.8: the Dashboard SCREEN that owns this evidence kind, from
+    #: `product_gap_sources._EVIDENCE_DEEP_LINKS`. `None` exactly when
+    #: `deep_link_state` is `unavailable` -- for `human_report` /
+    #: `external_report` / `other`, which probe-agent owns no screen for at
+    #: all. It says a screen EXISTS, never that this `evidence_ref` still
+    #: resolves there: nothing on this row is resolved against a canon, and
+    #: reporting the two as one value would be the one-word-two-facts
+    #: conflation (§0-8).
+    deep_link: Optional[str] = None
+    deep_link_state: ProductDeepLinkState = "unavailable"
     captured_snapshot_id: Optional[int] = None
     note: str = ""
     decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
@@ -13833,6 +13843,12 @@ class ProductGapArtifactOut(BaseModel):
     link_kind: ProductGapArtifactLinkKind
     target_ref: str
     target_row_id: Optional[int] = None
+    #: §5.8, same contract as `ProductGapEvidenceOut.deep_link`:
+    #: `product_gap_sources._ARTIFACT_DEEP_LINKS`, `None` exactly when
+    #: `deep_link_state` is `unavailable`. `product_feature` is
+    #: `unavailable` today -- it has an API but no screen of its own.
+    deep_link: Optional[str] = None
+    deep_link_state: ProductDeepLinkState = "unavailable"
     captured_digest: str = ""
     note: str = ""
     decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
