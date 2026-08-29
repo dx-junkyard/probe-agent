@@ -422,6 +422,12 @@ NULL の行は「この Objective を意図的に切り離して root に戻し�
 違い、構造的な上限を主張できる根拠がない)。ただし循環検査は必ず訪問済み集合を
 持つ反復で行い、再帰で書かない。
 
+**循環検査と INSERT は同じ排他 transaction の中で行う** (`BEGIN IMMEDIATE`)。
+検査の後に transaction を開くと、逆向きの 2 本を同時に要求した 2 つの writer が
+どちらも「循環なし」と判定してから両方 commit でき、**DB に循環が残る**。
+重複検査と対象行の再取得も同じ transaction の中へ入れる — 検査したのと違う
+状態へ書き込まないため。Milestone の依存も同じ規律に従う。
+
 Milestone の依存 (`product_milestone_dependency`) も同じ規律:
 append-only、自己参照 422 `product_milestone_dependency_self`、循環 422
 `product_milestone_dependency_cycle`、cross-System は 404、重複した現在有効な
@@ -802,6 +808,29 @@ ProductGapTargetMode = Literal["own", "inherited_from_milestone", "unknown"]
 * `unknown` — まだ決めていない。`own` で空文字を入れることと区別する
   (§0-8)。
 
+**継承した目標は response で見えなければならない。** `inherited_from_milestone`
+の Gap は目標本文を保存しないので、API は読み取り時に解決した本文と、その
+解決の可否を返す:
+
+```
+effective_target_state: Optional[str]        # 解決できた本文。できなければ None
+effective_target_availability: Literal["own", "resolved", "unavailable", "unknown"]
+```
+
+* `own` — Gap 自身の `target_state` がそのまま目標。
+* `resolved` — Milestone の current revision から解決できた。
+* `unavailable` — Milestone またはその current revision が読めなかった。
+  **空文字として返さない**(§0-8)。
+* `unknown` — `target_state_mode='unknown'`。
+
+**画面はこの本文を出す。** 出さなければ開発者は「何との差なのか」を見ないまま
+Gap を解消できてしまい、この層の存在理由が消える。
+
+**`decision_digest` も同じ区別を持つ。** Milestone が読めない場合と目標が
+正当に空文字である場合を同じ digest 入力へ丸めない — 丸めると、読めなかった
+Milestone が後から空の目標として現れても「変わっていない」と読める。
+実装は前者を専用の sentinel として digest へ入れる。
+
 ### 5.4 検出元の federation(#430)
 
 **既存検出ロジックは置換も再実装もしない。** `product_gap_source_ref` は
@@ -971,6 +1000,28 @@ ProductGapPriorityBand = Literal["unset", "watch", "next", "now"]
   事実で、前者は正直に表示する。
 * #401 が画面を作った時点で表を 1 行直せば済む。
 
+### 5.11 Gap → Journey の正本は 1 つだけ
+
+「この Gap を解消する体験はどれか」を書ける場所は **`ux_journey_upstream_ref`
+(`ref_kind='product_gap'`) だけ**である。`product_gap_artifact_link` に
+`ux_journey` を置かない。
+
+二か所に書けると、片方だけ登録した System で Overview は「Journey 接続済み」、
+Functional Lineage は `gap_without_journey` と答える。**同じ問いに 2 つの答えが
+出る状態を構造的に作れないようにする**のがこの Epic の中心的な規律であり
+(§0-1)、これはその規律を自分自身の中で破った例である。
+
+`ux_journey_upstream_ref` を正本に選ぶ理由:
+
+* #405 の upstream ref は既に「その Journey は何のために存在するのか」を
+  Journey 側が所有するモデルであり、Objective / Milestone / Gap を同じ形で
+  参照できる(§7.1 が既に 3 kind を足している)。
+* Functional Lineage は既にこの表を読んでいる。
+* Gap 側から引くときは逆引きするだけで、新しい保存は要らない。
+
+Objective Map / Gap Workbench の「この Gap を解消する Journey」も、この表を
+**逆引き**して表示する。Gap 側に link 行を作らない。
+
 ### 5.10 resolver の呼び出し契約
 
 `app/product_gap_sources.py` は Gap の CRUD から独立した pure な解決層である。
@@ -991,6 +1042,11 @@ class ResolvedSource:
     current_digest: str                # captured_digest と比較する対象
     deep_link: Optional[str]           # 画面が無ければ None
     deep_link_state: str               # ProductDeepLinkState
+    # resolver が**正本から決めた** pin (§5.4 の「追加 pin」列)。作成時に
+    # そのまま保存する。
+    resolved_snapshot_id: Optional[int]
+    resolved_run_id: Optional[int]
+    resolved_revision_id: Optional[int]
     extra: Dict[str, Any]              # kind 固有の表示用事実。判定には使わない
 
 def resolve_source(
@@ -1015,6 +1071,27 @@ def resolve_source(
 * `severity` を翻訳・正規化しない。`severity_vocabulary` を必ず添えて、
   どの語彙の値なのかを表示側が言えるようにする(#380 superset 規則)。
 * `extra` は表示のためだけにある。**projection はここから状態を決めない。**
+* **pin は resolver が決め、caller は受け取らない。** `source_kind` ごとに
+  どの snapshot / run / revision を指すべきかを知っているのは resolver だけで
+  ある(§5.4 の表)。`add_gap_source_ref` は request body から pin を受け取らず
+  (受け取ると「開発者が申告した時点」と「システムが読んだ時点」が混ざる)、
+  `resolve_source` が返した pin を **digest と同じ transaction で**保存する。
+* **pin を保存しないと解決できない kind がある。** `capability_drift` は
+  base run と対象 snapshot の両方が無ければ drift を計算できないので、pin が
+  無いままだと公開 API から作った source は**常に** `unavailable` になる。
+  これは「読めなかった」ではなく「そもそも記録していない」であり、
+  §0-8 が禁じている取り違えである。
+* pin の必須性は kind ごとに有限:
+
+  | `source_kind` | 必須 pin | 任意 pin |
+  | --- | --- | --- |
+  | `capability_drift` | `snapshot_id` + `run_id` | — |
+  | `system_understanding_gap` | `snapshot_id` | — |
+  | `understanding_review_gap` / `understanding_claim_change` / `requirement_diff` | `revision_id` | — |
+  | 上記以外 | なし | なし |
+
+  必須 pin を resolver が決められなかった場合は、その source を作成した時点で
+  `source_state='unavailable'` として読める。**pin を推測して埋めない。**
 
 ### 5.9 テーブル(#429 / #430)
 
@@ -1135,8 +1212,11 @@ CREATE TABLE IF NOT EXISTS product_gap_artifact_link (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id        INTEGER NOT NULL,
     gap_id           INTEGER NOT NULL,
+    -- `ux_journey` is deliberately NOT here (§5.11). A Gap's Journey lives
+    -- in `ux_journey_upstream_ref(ref_kind='product_gap')`, and two
+    -- writable homes for one relation is the twin-canon this Epic forbids.
     link_kind        TEXT NOT NULL CHECK (link_kind IN
-                         ('issue_draft', 'ux_journey', 'ux_requirement',
+                         ('issue_draft', 'ux_requirement',
                           'product_feature', 'solution_design')),
     target_ref       TEXT NOT NULL,
     target_row_id    INTEGER,
@@ -1316,6 +1396,24 @@ gap code へ次を足す。既存 code の意味は**変えない**。
 | `requirement_without_feature` | `attention` | Requirement を満たす Feature が無い |
 | `feature_without_implementation_target` | `attention` | Feature に実装対象 link が無い |
 | `feature_without_capability` | `informational` | Feature が Capability を参照していない |
+
+**参照は解決できたものだけが edge になる。** Objective の upstream ref も
+Feature の requirement / capability / target link も、`target_resolution` が
+`resolved` の行だけを graph の edge として足す。`unresolved` / `unavailable` /
+`stale` は既存の `unresolved_reference` / `unavailable_reference` /
+`stale_link` として出す(この 3 つは既に `_GAP_SEVERITY` にあり、
+`add_reference_gaps` が他の hop で使っている形をそのまま使う)。
+
+解決できない参照を通常の edge として足すと、**消えた対象・別 System の対象が
+phantom node として図に出て**、`feature_without_implementation_target` も
+消える。lineage の完成度を過大評価することになり、この Epic が答えたい
+「どこが繋がっていないか」を隠す。
+
+**`objective_without_vision_ref` は「ref 行があるか」では判定しない。**
+Vision / Purpose(`vision_claim` / `purpose_element` / `purpose_relation`)への
+**解決できた**参照があるかで判定する。Capability や Need への参照は
+Vision 参照の代わりにならない — Capability は「何ができるか」であって
+「何のためか」ではない(§1.2)。
 
 ### 7.4 Overview `next_milestone` の扱い
 
