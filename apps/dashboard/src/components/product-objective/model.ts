@@ -393,17 +393,74 @@ export function objectiveMapMilestoneByKey(
   return null;
 }
 
-/** A COUNT across every Milestone's `gap_summary`, never a score
- * (§0 invariant 7) -- displayed as "N 件", never used to reorder anything. */
-export function objectiveGapTotal(node: ObjectiveMapNodeOut): number {
-  return node.milestones.reduce((sum, m) => {
+/** §3.2/§5.5: `GET /objective-map` degrades PER MILESTONE --
+ * `degraded_sections` carries `gaps:<milestone_key>` when that one
+ * Milestone's own Gap read failed -- and substitutes an all-zero
+ * `gap_summary` so the response shape stays valid. An all-zero summary is
+ * therefore ambiguous by itself ("no Gaps" vs "could not read Gaps"); this
+ * is the one place that disambiguates it, by consulting the SAME
+ * `degraded_sections` list the page's own banner already reads. Never
+ * render a Milestone's `gap_summary` counts without checking this first
+ * (§0 invariant 8 / §9.5 -- unavailable must never render as 0 件). */
+export function isMilestoneGapSummaryUnavailable(map: ObjectiveMapOut, milestoneKey: string): boolean {
+  return map.degraded_sections.includes(`gaps:${milestoneKey}`);
+}
+
+/** Shared copy for every place a Milestone/Objective Gap count could not be
+ * read -- never "0 件", never silently omitted (§3.2). */
+export const GAP_SUMMARY_UNAVAILABLE_LABEL = "Gap 情報を取得できませんでした";
+
+/** A COUNT across every Milestone's `gap_summary`, never a score (§0
+ * invariant 7) -- displayed as "N 件", never used to reorder anything.
+ * `unavailable` is true when at least one Milestone's own summary could not
+ * be read (`isMilestoneGapSummaryUnavailable`): that Milestone's zero is
+ * EXCLUDED from `count` rather than folded in as a real zero, and the
+ * caller must render the "取得できませんでした" sentence instead of a number
+ * that would otherwise silently understate the real total (§3.2). */
+export function objectiveGapTotal(
+  map: ObjectiveMapOut, node: ObjectiveMapNodeOut,
+): { count: number; unavailable: boolean } {
+  let count = 0;
+  let unavailable = false;
+  for (const m of node.milestones) {
+    if (isMilestoneGapSummaryUnavailable(map, m.milestone_key)) { unavailable = true; continue; }
     const s = m.gap_summary;
-    return (
-      sum
-      + s.open_count + s.acknowledged_count + s.deferred_count
-      + s.resolved_count + s.rejected_count + s.obsolete_count
-    );
-  }, 0);
+    count += s.open_count + s.acknowledged_count + s.deferred_count
+      + s.resolved_count + s.rejected_count + s.obsolete_count;
+  }
+  return { count, unavailable };
+}
+
+/**
+ * §3.1: the set of Objective keys that must be force-expanded to reveal a
+ * selected Objective or Milestone -- the node itself (if an Objective is
+ * selected, or the node owning the selected Milestone) plus every ancestor
+ * up to the root, walked via `parent_objective_key`. Pure structural lookup,
+ * no re-derivation of anything the server decided; the CALLER (`ObjectiveTree`)
+ * decides what "force expand" means for already-collapsed nodes (§3.1's
+ * documented rule: a new selection always re-opens its ancestor path, even
+ * over a manual collapse, and never touches unrelated nodes).
+ */
+export function objectiveMapForceExpandedKeys(
+  map: ObjectiveMapOut,
+  selectedObjectiveKey: string | null,
+  selectedMilestoneKey: string | null,
+): string[] {
+  const byKey = new Map(map.nodes.map((n) => [n.objective_key, n]));
+  const keys = new Set<string>();
+  function addPath(startKey: string | null) {
+    let current = startKey ? byKey.get(startKey) ?? null : null;
+    while (current) {
+      keys.add(current.objective_key);
+      current = current.parent_objective_key ? byKey.get(current.parent_objective_key) ?? null : null;
+    }
+  }
+  addPath(selectedObjectiveKey);
+  if (selectedMilestoneKey) {
+    const found = objectiveMapMilestoneByKey(map, selectedMilestoneKey);
+    if (found) addPath(found.node.objective_key);
+  }
+  return [...keys];
 }
 
 /** §9.5's two distinct empty states: a brand-new System with no Objective at

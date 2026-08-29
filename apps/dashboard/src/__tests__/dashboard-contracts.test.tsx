@@ -10321,7 +10321,7 @@ describe("Dashboard action gating (Issue #255)", () => {
 
     // The Symbols tab's button must be gated the same way instead of being
     // clickable with nothing to index.
-    fireEvent.click(screen.getByRole("button", { name: "Symbols" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Symbols" }));
     expect(await screen.findByTestId("index-symbols-no-snapshot-reason")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Index Symbols" })).toBeDisabled();
   });
@@ -10723,7 +10723,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     const { default: RepositoryPage } = await import("@/pages/repository");
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
-    fireEvent.click(await screen.findByRole("button", { name: "Snapshots" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Snapshots" }));
     const button = await screen.findByRole("button", { name: /Snapshotのみ作成/ });
     await waitFor(() => expect(button).toBeDisabled());
     expect(await screen.findByTestId("create-snapshot-not-configured-reason")).toBeInTheDocument();
@@ -10737,7 +10737,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     const { default: RepositoryPage } = await import("@/pages/repository");
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
-    fireEvent.click(await screen.findByRole("button", { name: "Snapshots" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Snapshots" }));
     const button = await screen.findByRole("button", { name: /Snapshotのみ作成/ });
     await waitFor(() => expect(button).not.toBeDisabled());
     expect(screen.queryByTestId("create-snapshot-not-configured-reason")).not.toBeInTheDocument();

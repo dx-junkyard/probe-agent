@@ -19,6 +19,14 @@ import type {
 
 const mockApi = { get: vi.fn(), post: vi.fn(), put: vi.fn(), patch: vi.fn(), delete: vi.fn() };
 
+// §3.4: objective-map.tsx reads `useAuth().systemId` to detect a System
+// switch (Epic #427 P2 review). `mockSystemId` is mutable so a test can
+// simulate a switch; `@/api/client`'s `getSystemId()` shares the same value
+// since `sysKey()` (the react-query cache key) reads it too -- following the
+// same `vi.mock("@/api/client")` / `vi.mock("@/api/auth")` pattern
+// `phase0-empty-states.test.tsx` establishes.
+let mockSystemId: number | null = 1;
+
 class ApiError extends Error {
   status: number;
   detail: string;
@@ -33,9 +41,24 @@ class ApiError extends Error {
 
 vi.mock("@/api/client", () => ({
   api: mockApi,
-  getSystemId: () => 1,
-  setSystemId: vi.fn(),
+  getSystemId: () => mockSystemId,
+  setSystemId: (id: number | null) => { mockSystemId = id; },
   ApiError,
+}));
+
+vi.mock("@/api/auth", () => ({
+  useAuth: () => ({
+    user: { id: 1, username: "dev", role: "admin" },
+    isAdmin: true,
+    loading: false,
+    systemId: mockSystemId,
+    systems: [],
+    login: vi.fn(),
+    logout: vi.fn(),
+    selectSystem: vi.fn(),
+    refreshSystems: vi.fn(),
+  }),
+  AuthProvider: ({ children }: { children: ReactNode }) => children,
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -189,6 +212,11 @@ function mockRoutes(routes: { objectiveMap?: ObjectiveMapOut; gapWorkbench?: Gap
 
 // --- rendering ---------------------------------------------------------------
 
+// Every describe block below resets the API mock itself; `mockSystemId`
+// (§3.4's System-switch detection) is reset here once so no test leaks its
+// own simulated System switch into the next.
+beforeEach(() => { mockSystemId = 1; });
+
 describe("ObjectiveMapPage rendering", () => {
   beforeEach(() => mockApi.get.mockReset());
 
@@ -208,8 +236,10 @@ describe("ObjectiveMapPage rendering", () => {
 
     fireEvent.click(within(screen.getByTestId("objective-node-o1")).getByText("決済の離脱率を下げる"));
     await waitFor(() => expect(screen.getByTestId("objective-detail-o1")).toBeInTheDocument());
+    // §3.1: selecting an Objective force-opens its path, so its Milestones
+    // are visible without a further toggle. (Clicking the toggle here would
+    // now COLLAPSE it -- that is the fix working, not a regression.)
     // Milestone/design_status and achievement are two separate labels (§1.3).
-    fireEvent.click(screen.getByTestId("objective-node-toggle-o1"));
     await waitFor(() => expect(screen.getByTestId("milestone-node-m1")).toBeInTheDocument());
     const milestoneRow = screen.getByTestId("milestone-node-m1");
     expect(within(milestoneRow).getByText("確定済み")).toBeInTheDocument();
@@ -534,7 +564,8 @@ describe("ObjectiveMapPage: Objective/Milestone/Gap forms reach a usable operati
 
     await renderPage();
     fireEvent.click(within(await screen.findByTestId("objective-node-o1")).getByText("決済の離脱率を下げる"));
-    fireEvent.click(screen.getByTestId("objective-node-toggle-o1"));
+    // §3.1: selecting the Objective already reveals its Milestones; a toggle
+    // click here would collapse them again.
     fireEvent.click(await screen.findByTestId("milestone-node-m1"));
     fireEvent.click(await screen.findByTestId("milestone-assessment-met"));
 

@@ -595,9 +595,26 @@ export function GapDetailPanel({ gapKey, workbench }: { gapKey: string; workbenc
       {gap.evidence_refs.length > 0 && (
         <div>
           <h4 className="text-xs font-semibold">証跡</h4>
-          <ul className="mt-1 space-y-1 text-xs">
+          {/* §3.5: the server does not yet resolve a route for evidence
+              (`ProductGapEvidenceOut.route`/`deep_link_state` are optional
+              and unpopulated today -- see the field comment in api/types.ts).
+              Never build a client-side URL for it (§5.8) -- render plain
+              text until the server adds these, and pick the fields up the
+              moment it does. */}
+          <ul className="mt-1 space-y-1 text-xs" data-testid="gap-evidence-list">
             {gap.evidence_refs.map((ev) => (
-              <li key={ev.id}>{ev.evidence_kind}: {ev.evidence_ref}</li>
+              <li key={ev.id} data-testid={`gap-evidence-${ev.id}`}>
+                <span>{ev.evidence_kind}: {ev.evidence_ref}</span>
+                {ev.deep_link_state === "available" && ev.route ? (
+                  <Link to={ev.route} className="ml-2 text-primary underline" data-testid={`gap-evidence-deep-link-${ev.id}`}>
+                    画面を開く
+                  </Link>
+                ) : ev.deep_link_state === "unavailable" ? (
+                  <span className="ml-2 text-muted-foreground" data-testid={`gap-evidence-deep-link-unavailable-${ev.id}`}>
+                    {DEEP_LINK_STATE_LABEL.unavailable}
+                  </span>
+                ) : null}
+              </li>
             ))}
           </ul>
         </div>
@@ -606,9 +623,23 @@ export function GapDetailPanel({ gapKey, workbench }: { gapKey: string; workbenc
       {gap.artifact_links.length > 0 && (
         <div>
           <h4 className="text-xs font-semibold">関連付け済み</h4>
-          <ul className="mt-1 space-y-1 text-xs">
+          {/* §3.5: same NOT-YET-PROVIDED situation as evidence above --
+              `ProductGapArtifactOut.route`/`deep_link_state` are optional and
+              unpopulated today. */}
+          <ul className="mt-1 space-y-1 text-xs" data-testid="gap-artifact-link-list">
             {gap.artifact_links.map((link) => (
-              <li key={link.id}>{GAP_ARTIFACT_LINK_KIND_LABEL[link.link_kind]}: {link.target_ref}</li>
+              <li key={link.id} data-testid={`gap-artifact-link-${link.id}`}>
+                <span>{GAP_ARTIFACT_LINK_KIND_LABEL[link.link_kind]}: {link.target_ref}</span>
+                {link.deep_link_state === "available" && link.route ? (
+                  <Link to={link.route} className="ml-2 text-primary underline" data-testid={`gap-artifact-link-deep-link-${link.id}`}>
+                    画面を開く
+                  </Link>
+                ) : link.deep_link_state === "unavailable" ? (
+                  <span className="ml-2 text-muted-foreground" data-testid={`gap-artifact-link-deep-link-unavailable-${link.id}`}>
+                    {DEEP_LINK_STATE_LABEL.unavailable}
+                  </span>
+                ) : null}
+              </li>
             ))}
           </ul>
         </div>

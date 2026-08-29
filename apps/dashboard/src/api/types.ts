@@ -7968,6 +7968,14 @@ export interface ProductGapEvidenceOut {
   created_by: string | null;
   created_at: number;
   superseded_by_id: number | null;
+  /** NOT YET provided by the Control Server (§3.5 review finding). The
+   * Objective Map screen needs a per-kind `route` + `deep_link_state`, mirroring
+   * `GapWorkbenchDeepLinkOut`'s already-shipped `ProductGapSourceOut` pattern,
+   * resolved server-side (never a client-built URL, §5.8). Optional so this
+   * type does not lie about what the server sends today; the Dashboard falls
+   * back to plain text rendering while these are absent. */
+  deep_link_state?: ProductDeepLinkState;
+  route?: string | null;
 }
 
 export interface ProductGapArtifactOut {
@@ -7982,6 +7990,10 @@ export interface ProductGapArtifactOut {
   created_by: string | null;
   created_at: number;
   superseded_by_id: number | null;
+  /** NOT YET provided by the Control Server -- see `ProductGapEvidenceOut`'s
+   * matching fields (§3.5). */
+  deep_link_state?: ProductDeepLinkState;
+  route?: string | null;
 }
 
 export interface ProductGapDecisionOut {

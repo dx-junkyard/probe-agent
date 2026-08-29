@@ -8,10 +8,12 @@ import {
   applyObjectiveMapSelectionToSearchParams,
   filterGapWorkbenchEntries,
   gapWorkbenchEntryByKey,
+  isMilestoneGapSummaryUnavailable,
   isStaleDigestErrorCode,
   objectiveGapTotal,
   objectiveMapChildren,
   objectiveMapEmptyState,
+  objectiveMapForceExpandedKeys,
   objectiveMapMilestoneByKey,
   objectiveMapNodeByKey,
   objectiveMapRoots,
@@ -53,7 +55,14 @@ const MAP: ObjectiveMapOut = {
   generated_at: 0,
   nodes: [
     node({ id: 1, objective_key: "o1", child_objective_ids: [2], milestones: [milestone({ id: 10, milestone_key: "m1", gap_summary: gapSummary({ open_count: 2, resolved_count: 1 }) })] }),
-    node({ id: 2, objective_key: "o2", title: "Objective 2", parent_objective_id: 1, parent_objective_key: "o1" }),
+    node({
+      id: 2, objective_key: "o2", title: "Objective 2", parent_objective_id: 1, parent_objective_key: "o1",
+      child_objective_ids: [3],
+    }),
+    node({
+      id: 3, objective_key: "o3", title: "Objective 3", parent_objective_id: 2, parent_objective_key: "o2",
+      milestones: [milestone({ id: 30, milestone_key: "m3" })],
+    }),
   ],
   root_objective_ids: [1],
   degraded_sections: [],
@@ -168,8 +177,51 @@ describe("product-objective/model: Objective Map structural lookups", () => {
   });
 
   it("sums Gap counts across a node's Milestones as a plain count, not a score", () => {
-    expect(objectiveGapTotal(MAP.nodes[0])).toBe(3);
-    expect(objectiveGapTotal(MAP.nodes[1])).toBe(0);
+    expect(objectiveGapTotal(MAP, MAP.nodes[0])).toEqual({ count: 3, unavailable: false });
+    expect(objectiveGapTotal(MAP, MAP.nodes[1])).toEqual({ count: 0, unavailable: false });
+  });
+});
+
+describe("product-objective/model: unreadable Gap count is never 0 (§3.2)", () => {
+  it("isMilestoneGapSummaryUnavailable reads the milestone-scoped degraded_sections entry", () => {
+    const degraded: ObjectiveMapOut = { ...MAP, degraded_sections: ["gaps:m1"] };
+    expect(isMilestoneGapSummaryUnavailable(degraded, "m1")).toBe(true);
+    expect(isMilestoneGapSummaryUnavailable(degraded, "m3")).toBe(false);
+    expect(isMilestoneGapSummaryUnavailable(MAP, "m1")).toBe(false);
+  });
+
+  it("excludes an unavailable Milestone's zero from the Objective total and flags it unavailable", () => {
+    // m1's Gap read failed server-side -- its gap_summary substituted an
+    // all-zero shape, but `degraded_sections` still names it.
+    const degraded: ObjectiveMapOut = { ...MAP, degraded_sections: ["gaps:m1"] };
+    expect(objectiveGapTotal(degraded, degraded.nodes[0])).toEqual({ count: 0, unavailable: true });
+    // An unrelated node with no unavailable Milestone is unaffected.
+    expect(objectiveGapTotal(degraded, degraded.nodes[2])).toEqual({ count: 0, unavailable: false });
+  });
+});
+
+describe("product-objective/model: deep-link ancestor path (§3.1)", () => {
+  it("returns the node itself plus every ancestor up to the root for a selected Objective", () => {
+    expect(objectiveMapForceExpandedKeys(MAP, "o3", null)).toEqual(
+      expect.arrayContaining(["o3", "o2", "o1"]),
+    );
+    expect(objectiveMapForceExpandedKeys(MAP, "o3", null)).toHaveLength(3);
+  });
+
+  it("resolves the owning Objective's ancestor path for a selected Milestone alone", () => {
+    // m3 belongs to o3; selecting only the Milestone (no Objective in the
+    // URL) must still force o3/o2/o1 open so the Milestone is reachable.
+    expect(objectiveMapForceExpandedKeys(MAP, null, "m3")).toEqual(
+      expect.arrayContaining(["o3", "o2", "o1"]),
+    );
+  });
+
+  it("returns nothing for no selection", () => {
+    expect(objectiveMapForceExpandedKeys(MAP, null, null)).toEqual([]);
+  });
+
+  it("returns nothing for an unknown key rather than throwing", () => {
+    expect(objectiveMapForceExpandedKeys(MAP, "does-not-exist", null)).toEqual([]);
   });
 });
 
