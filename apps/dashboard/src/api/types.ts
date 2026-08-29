@@ -8030,9 +8030,19 @@ export interface ProductGapOut {
   updated_at: number;
 }
 
+/** A Journey that names this Gap as its reason to exist, read by reverse
+ * lookup from the relation's one writable home. The Dashboard never derives
+ * this itself. */
+export interface ProductGapJourneyLinkOut {
+  journey_key: string;
+  perspective: UxJourneyPerspective;
+  title: string;
+}
+
 export interface ProductGapDetailOut extends ProductGapOut {
   current_revision: ProductGapRevisionOut | null;
   source_refs: ProductGapSourceOut[];
+  journey_links: ProductGapJourneyLinkOut[];
   evidence_refs: ProductGapEvidenceOut[];
   artifact_links: ProductGapArtifactOut[];
   decisions: ProductGapDecisionOut[];

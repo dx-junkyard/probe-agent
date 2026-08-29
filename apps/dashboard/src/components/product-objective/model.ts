@@ -56,6 +56,7 @@ import type {
   ProductDeepLinkState,
   ProductDesignStatus,
   ProductGapArtifactLinkKind,
+  ProductGapEffectiveTargetAvailability,
   ProductGapDecisionKind,
   ProductGapLifecycle,
   ProductGapPriorityBand,
@@ -64,6 +65,9 @@ import type {
   ProductGapSourceState,
   ProductMilestoneAchievement,
   ProductMilestoneAssessability,
+  ProductMilestoneAssessmentKind,
+  ProductMilestoneDecisionKind,
+  ProductObjectiveDecisionKind,
   ProductObjectiveNextStepKey,
   ProductObjectiveNextStepState,
   ProductObjectiveState,
@@ -123,6 +127,18 @@ export const MILESTONE_ASSESSABILITY_LABEL: Record<ProductMilestoneAssessability
   assessable: "評価可能",
   unavailable: "評価方法が未設定",
   not_applicable: "評価対象外",
+};
+
+/** §5.3/§0 invariant 8: the four DISTINCT sentences behind
+ * `ProductGapOut.effective_target_availability`. `unavailable` must never
+ * render as an empty target or "目標なし" -- it means the Milestone (or its
+ * current revision) could not be read, which is a fact about THIS request,
+ * not about whether a target was ever set (that is `unknown`). */
+export const GAP_EFFECTIVE_TARGET_AVAILABILITY_LABEL: Record<ProductGapEffectiveTargetAvailability, string> = {
+  own: "この Gap 自身の目標状態",
+  resolved: "Milestone の目標状態を継承",
+  unavailable: "Milestone の目標状態を取得できませんでした",
+  unknown: "まだ決めていません",
 };
 
 export const GAP_LIFECYCLE_LABEL: Record<ProductGapLifecycle, string> = {
@@ -193,13 +209,61 @@ export const GAP_DECISION_LABEL: Record<ProductGapDecisionKind, string> = {
   prioritize: "優先バンドを設定する",
 };
 
+/** §4.3's Objective decision vocabulary (D: Objective Map's own
+ * confirm/activate/achieve/reject/retire/reinstate form). Every kind is
+ * offered regardless of the Objective's current state -- an illegal
+ * transition comes back as the server's own `product_objective_not_decidable`
+ * (§0 invariant 10: no second legality table here). */
+export const OBJECTIVE_DECISION_LABEL: Record<ProductObjectiveDecisionKind, string> = {
+  confirm: "確定する",
+  activate: "活性化する",
+  achieve: "達成として記録する",
+  reject: "却下する",
+  retire: "廃止する",
+  reinstate: "再提案に戻す",
+};
+
+/** §4.3's Milestone DEFINITION decision vocabulary -- separate from
+ * `MILESTONE_ASSESSMENT_ACTION_LABEL`, which judges ACHIEVEMENT (§1.3). */
+export const MILESTONE_DECISION_LABEL: Record<ProductMilestoneDecisionKind, string> = {
+  confirm: "確定する",
+  reject: "却下する",
+  retire: "廃止する",
+  reinstate: "再提案に戻す",
+};
+
+/** §4.3's Milestone ACHIEVEMENT assessment vocabulary. Deliberately a
+ * DIFFERENT label set from `MILESTONE_ACHIEVEMENT_LABEL` (which labels the
+ * derived STATE `unassessed`/`met`/`not_met`/`indeterminate`) even though
+ * three values overlap in spelling -- these are the ACTIONS a developer
+ * takes to record that state, plus `withdraw`, which has no achievement
+ * state of its own. */
+export const MILESTONE_ASSESSMENT_ACTION_LABEL: Record<ProductMilestoneAssessmentKind, string> = {
+  met: "達成と判定する",
+  not_met: "未達成と判定する",
+  indeterminate: "判定不能として記録する",
+  withdraw: "判定を取り下げる",
+};
+
+/** §5.11: `ux_journey` is deliberately absent -- a Gap's Journey connection
+ * has exactly one writable home, `ux_journey_upstream_ref
+ * (ref_kind='product_gap')`, written through the Journey's own endpoint
+ * (`useLinkProductGapToJourney`), never through this artifact-link table. */
 export const GAP_ARTIFACT_LINK_KIND_LABEL: Record<ProductGapArtifactLinkKind, string> = {
   issue_draft: "Issue Draft",
-  ux_journey: "UX Journey",
   ux_requirement: "UX Requirement",
   product_feature: "Feature",
   solution_design: "Solution Design",
 };
+
+/** Every `*_decision_stale_digest` rejection code (§10.1) shares one shape:
+ * the developer's submitted `captured_digest` no longer matches the current
+ * content. A pure string check, not an API concern -- lets every decision/
+ * assessment form (Objective/Milestone/Gap) share one recoverable-error
+ * rendering without a second definition of what "stale" means per entity. */
+export function isStaleDigestErrorCode(code: string | undefined): boolean {
+  return !!code && code.endsWith("_decision_stale_digest");
+}
 
 /** §9.3's 15-key next-step vocabulary, for the Overview objective card's CTA
  * label ONLY -- the KEY, state, reason/completion/value text all arrive

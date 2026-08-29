@@ -2548,6 +2548,37 @@ def get_gap_detail(conn: sqlite3.Connection, system_id: int, gap_key: str) -> Di
     except Exception as exc:  # pragma: no cover - defensive
         _degrade(degraded_sections, degraded_detail, "source_refs", exc)
 
+    # §5.11: the Gap's Journey connection lives in ONE writable place,
+    # `ux_journey_upstream_ref(ref_kind='product_gap')`. Reading it here is
+    # what makes that single home usable from the Gap side -- without it the
+    # relation is writable but invisible to the screen that owns the Gap,
+    # and a developer cannot see whether the Journey they just linked took
+    # effect. The Dashboard must never reverse-derive this itself.
+    journey_links: List[Dict[str, Any]] = []
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT j.journey_key AS journey_key,
+                      j.perspective AS perspective,
+                      rev.title AS title
+               FROM ux_journey_upstream_ref r
+               JOIN ux_journey j ON j.id = r.journey_id
+               LEFT JOIN ux_journey_revision rev ON rev.id = j.current_revision_id
+               WHERE r.system_id = ? AND r.ref_kind = 'product_gap'
+                 AND r.target_ref = ? AND r.superseded_by_id IS NULL
+               ORDER BY j.journey_key""",
+            (system_id, gap_key),
+        ).fetchall()
+        journey_links = [
+            {
+                "journey_key": r["journey_key"],
+                "perspective": r["perspective"],
+                "title": r["title"] or "",
+            }
+            for r in rows
+        ]
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "journey_links", exc)
+
     evidence_refs: List[Dict[str, Any]] = []
     try:
         rows = conn.execute(
@@ -2584,6 +2615,7 @@ def get_gap_detail(conn: sqlite3.Connection, system_id: int, gap_key: str) -> Di
         {
             "current_revision": revision_out,
             "source_refs": source_refs,
+            "journey_links": journey_links,
             "evidence_refs": evidence_refs,
             "artifact_links": artifact_links,
             "decisions": decisions,

@@ -14,7 +14,7 @@ import { vi } from "vitest";
 import type { ReactNode } from "react";
 import type {
   GapWorkbenchEntryOut, GapWorkbenchOut, ObjectiveMapMilestoneOut, ObjectiveMapNodeOut,
-  ObjectiveMapOut, ProductGapDetailOut,
+  ObjectiveMapOut, ProductGapDetailOut, ProductMilestoneDetailOut, ProductObjectiveDetailOut,
 } from "@/api/types";
 
 const mockApi = { get: vi.fn(), post: vi.fn(), put: vi.fn(), patch: vi.fn(), delete: vi.fn() };
@@ -131,8 +131,42 @@ function gapDetail(overrides: Partial<ProductGapDetailOut> = {}): ProductGapDeta
       change_note: "", created_by: "dev", created_at: 1000, revision_state: "current",
       superseded_by_id: null,
     },
-    source_refs: [], evidence_refs: [], artifact_links: [], decisions: [],
+    source_refs: [], journey_links: [], evidence_refs: [], artifact_links: [], decisions: [],
     degraded_sections: [], degraded_detail: {},
+    ...overrides,
+  };
+}
+
+function objectiveDetail(overrides: Partial<ProductObjectiveDetailOut> = {}): ProductObjectiveDetailOut {
+  return {
+    id: 1, system_id: 1, objective_key: "o1", current_revision_id: 1, current_revision_number: 1,
+    title: "決済の離脱率を下げる", objective_state: "confirmed", recheck_state: "current",
+    parent_objective_id: null, parent_objective_key: null, created_by: "dev", created_at: 1000, updated_at: 1000,
+    current_revision: {
+      id: 1, objective_id: 1, revision_number: 1, title: "決済の離脱率を下げる", intent: "", contribution: "",
+      scope_note: "", summary: "", content_digest: "obj-digest", authored_by_kind: "developer",
+      decision_method: "manual", intelligence_run_id: null, change_note: "", created_by: "dev",
+      created_at: 1000, revision_state: "current", superseded_by_id: null,
+    },
+    upstream_refs: [], decisions: [], degraded_sections: [], degraded_detail: {},
+    ...overrides,
+  };
+}
+
+function milestoneDetail(overrides: Partial<ProductMilestoneDetailOut> = {}): ProductMilestoneDetailOut {
+  return {
+    id: 1, system_id: 1, milestone_key: "m1", objective_id: 1, objective_key: "o1",
+    current_revision_id: 1, current_revision_number: 1, title: "初回決済を完了させる",
+    design_status: "confirmed", achievement: "unassessed", assessability: "assessable",
+    recheck_state: "current", created_by: "dev", created_at: 1000, updated_at: 1000,
+    current_revision: {
+      id: 1, milestone_id: 1, revision_number: 1, title: "初回決済を完了させる", target_state: "10% 未満",
+      verification_method: "manual_review", verification_note: "", sequence_hint: 0, summary: "",
+      content_digest: "ms-digest", authored_by_kind: "developer", decision_method: "manual",
+      intelligence_run_id: null, change_note: "", created_by: "dev", created_at: 1000,
+      revision_state: "current", superseded_by_id: null,
+    },
+    dependencies: [], decisions: [], assessments: [], degraded_sections: [], degraded_detail: {},
     ...overrides,
   };
 }
@@ -269,6 +303,265 @@ describe("ObjectiveMapPage rendering", () => {
 
     await waitFor(() => expect(screen.getByTestId("gap-source-deep-link-unavailable-1")).toBeInTheDocument());
     expect(screen.queryByTestId("gap-source-deep-link-1")).not.toBeInTheDocument();
+  });
+});
+
+describe("ObjectiveMapPage: Gap decision digest (§B)", () => {
+  beforeEach(() => { mockApi.get.mockReset(); mockApi.post.mockReset(); });
+
+  it("sends the Gap's decision_digest (not current_revision.content_digest) on a decision", async () => {
+    mockRoutes({
+      objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(),
+      gap: gapDetail({ decision_digest: "gap-decision-digest" }),
+    });
+    mockApi.post.mockResolvedValue({
+      id: 1, gap_id: 1, gap_key: "g1", decision: "acknowledge", priority_band: "unset",
+      rationale: "", captured_digest: "gap-decision-digest", captured_revision_id: null,
+      decision_method: "manual", decided_by: "dev", superseded_by_id: null, created_at: 2000,
+    });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+    fireEvent.click(await screen.findByTestId("gap-decision-acknowledge"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-gaps/g1/decisions",
+      expect.objectContaining({ decision: "acknowledge", captured_digest: "gap-decision-digest" }),
+    ));
+  });
+
+  it("sends decision_digest on prioritize too", async () => {
+    mockRoutes({
+      objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(),
+      gap: gapDetail({ decision_digest: "gap-decision-digest" }),
+    });
+    mockApi.post.mockResolvedValue({
+      id: 1, gap_id: 1, gap_key: "g1", decision: "prioritize", priority_band: "now",
+      rationale: "", captured_digest: "gap-decision-digest", captured_revision_id: null,
+      decision_method: "manual", decided_by: "dev", superseded_by_id: null, created_at: 2000,
+    });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+    fireEvent.click(await screen.findByTestId("gap-decision-prioritize"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-gaps/g1/decisions",
+      expect.objectContaining({ decision: "prioritize", captured_digest: "gap-decision-digest" }),
+    ));
+  });
+
+  it("shows a recoverable notice (never a silent retry) on a stale-digest 409, and its control refetches the Gap", async () => {
+    mockRoutes({
+      objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(),
+      gap: gapDetail({ decision_digest: "stale-digest" }),
+    });
+    mockApi.post.mockRejectedValue(new ApiError(
+      409, "指定された digest が現在の内容と一致しません。", "product_gap_decision_stale_digest",
+    ));
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+
+    const getCallsBeforeRetry = mockApi.get.mock.calls.length;
+    fireEvent.click(await screen.findByTestId("gap-decision-acknowledge"));
+
+    await waitFor(() => expect(screen.getByTestId("stale-digest-notice")).toBeInTheDocument());
+    // Never a silent/automatic retry with the new digest.
+    expect(mockApi.post).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("gap-decision-rejected")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("stale-digest-reload"));
+    await waitFor(() => expect(mockApi.get.mock.calls.length).toBeGreaterThan(getCallsBeforeRetry));
+  });
+});
+
+describe("ObjectiveMapPage: effective target display (§C)", () => {
+  beforeEach(() => mockApi.get.mockReset());
+
+  it("renders 'own' target text", async () => {
+    mockRoutes({
+      objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(),
+      gap: gapDetail({ effective_target_state: "10% 未満", effective_target_availability: "own" }),
+    });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+    const dd = await screen.findByTestId("gap-detail-target-state");
+    expect(dd.textContent).toContain("10% 未満");
+  });
+
+  it("renders a resolved (inherited) target distinctly", async () => {
+    mockRoutes({
+      objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(),
+      gap: gapDetail({ effective_target_state: "Milestone の目標", effective_target_availability: "resolved" }),
+    });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+    const dd = await screen.findByTestId("gap-detail-target-state");
+    expect(dd.textContent).toContain("Milestone の目標");
+    expect(dd.getAttribute("data-target-availability")).toBe("resolved");
+  });
+
+  it("never renders 'unavailable' as an empty target or 'no target set'", async () => {
+    mockRoutes({
+      objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(),
+      gap: gapDetail({ effective_target_state: null, effective_target_availability: "unavailable" }),
+    });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+    const dd = await screen.findByTestId("gap-detail-target-state");
+    expect(dd.textContent).not.toBe("");
+    expect(dd.textContent).not.toContain("(未記入)");
+    expect(dd.textContent).toContain("取得できませんでした");
+  });
+
+  it("renders 'unknown' distinctly from 'unavailable'", async () => {
+    mockRoutes({
+      objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(),
+      gap: gapDetail({ effective_target_state: null, effective_target_availability: "unknown" }),
+    });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+    const dd = await screen.findByTestId("gap-detail-target-state");
+    expect(dd.textContent).toContain("まだ決めていません");
+    expect(dd.textContent).not.toContain("取得できませんでした");
+  });
+});
+
+describe("ObjectiveMapPage: Gap to Journey link writes through the Journey endpoint (§A)", () => {
+  beforeEach(() => { mockApi.get.mockReset(); mockApi.post.mockReset(); });
+
+  it("posts to /ux-design/journeys/{journey_key}/upstream-refs with ref_kind=product_gap", async () => {
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(objectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      if (path === "/product-gaps/g1") return Promise.resolve(gapDetail());
+      if (path === "/ux-design/journeys") {
+        return Promise.resolve({
+          system_id: 1, generated_at: 0,
+          journeys: [{
+            id: 1, system_id: 1, journey_key: "j1", perspective: "as_is", baseline_mode: "undecided",
+            baseline_journey_id: null, baseline_journey_key: null, baseline_state: "not_applicable",
+            current_revision_id: null, current_revision_number: null, title: "初回決済ジャーニー",
+            design_status: "proposed", recheck_state: "current", created_by: null, created_at: 0, updated_at: 0,
+          }],
+          degraded_sections: [], degraded_detail: {},
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue({
+      id: 1, journey_id: 1, ref_kind: "product_gap", target_ref: "g1", target_row_id: null, target_name: null,
+      relation_status: "confirmed", target_state: "", target_resolution: "resolved", recheck_state: "current",
+      captured_digest: "", captured_session_id: null, note: "", decision_method: "manual",
+      created_by: "dev", created_at: 2000, superseded_by_id: null,
+    });
+
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+    fireEvent.change(await screen.findByLabelText("関連付ける Journey"), { target: { value: "j1" } });
+    fireEvent.click(screen.getByTestId("gap-journey-link-submit"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/ux-design/journeys/j1/upstream-refs",
+      expect.objectContaining({ ref_kind: "product_gap", target_ref: "g1" }),
+    ));
+  });
+});
+
+describe("ObjectiveMapPage: Objective/Milestone/Gap forms reach a usable operation (§D)", () => {
+  beforeEach(() => { mockApi.get.mockReset(); mockApi.post.mockReset(); });
+
+  it("create_objective posts to /product-objectives with the developer-entered key", async () => {
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(objectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue({ ...objectiveDetail(), objective_key: "o2" });
+
+    await renderPage();
+    await screen.findByTestId("create-objective-form");
+    fireEvent.change(screen.getByLabelText("objective_key"), { target: { value: "o2" } });
+    fireEvent.click(screen.getByTestId("create-objective-submit"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-objectives", { objective_key: "o2" },
+    ));
+  });
+
+  it("confirming an Objective sends current_revision.content_digest as captured_digest", async () => {
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(objectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      if (path === "/product-objectives/o1") return Promise.resolve(objectiveDetail());
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue({
+      id: 1, objective_id: 1, objective_key: "o1", decision: "confirm", rationale: "",
+      captured_digest: "obj-digest", captured_revision_id: 1, decision_method: "manual",
+      decided_by: "dev", superseded_by_id: null, created_at: 2000,
+    });
+
+    await renderPage();
+    fireEvent.click(within(await screen.findByTestId("objective-node-o1")).getByText("決済の離脱率を下げる"));
+    fireEvent.click(await screen.findByTestId("objective-decision-confirm"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-objectives/o1/decisions",
+      expect.objectContaining({ decision: "confirm", captured_digest: "obj-digest" }),
+    ));
+  });
+
+  it("assessing a Milestone as met sends the Milestone's own content_digest", async () => {
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(objectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      if (path === "/product-objectives/o1") return Promise.resolve(objectiveDetail());
+      if (path === "/product-milestones/m1") return Promise.resolve(milestoneDetail());
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue({
+      id: 1, milestone_id: 1, milestone_key: "m1", assessment: "met", rationale: "", evidence_note: "",
+      captured_digest: "ms-digest", captured_revision_id: 1, decision_method: "manual",
+      assessed_by: "dev", superseded_by_id: null, created_at: 2000,
+    });
+
+    await renderPage();
+    fireEvent.click(within(await screen.findByTestId("objective-node-o1")).getByText("決済の離脱率を下げる"));
+    fireEvent.click(screen.getByTestId("objective-node-toggle-o1"));
+    fireEvent.click(await screen.findByTestId("milestone-node-m1"));
+    fireEvent.click(await screen.findByTestId("milestone-assessment-met"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-milestones/m1/assessments",
+      expect.objectContaining({ assessment: "met", captured_digest: "ms-digest" }),
+    ));
+  });
+
+  it("create_gap posts to /product-gaps with the selected Milestone and the developer-entered key", async () => {
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(objectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      if (path === "/product-gaps/g1") return Promise.resolve(gapDetail());
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue({ ...gapDetail(), gap_key: "g2" });
+
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    await screen.findByTestId("create-gap-form");
+    fireEvent.change(screen.getByLabelText("gap_key"), { target: { value: "g2" } });
+    fireEvent.click(screen.getByTestId("create-gap-submit"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-gaps", { milestone_key: "m1", gap_key: "g2" },
+    ));
   });
 });
 

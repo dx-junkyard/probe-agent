@@ -13910,9 +13910,26 @@ class ProductGapOut(BaseModel):
     updated_at: float
 
 
+class ProductGapJourneyLinkOut(BaseModel):
+    """A Journey that names this Gap as its reason to exist.
+
+    Read by REVERSE LOOKUP from `ux_journey_upstream_ref`, the relation's one
+    writable home (§5.11). It is reported here so the Gap's own screen can
+    show the connection: the relation being writable in one place only is
+    what stops two screens contradicting each other, but it also means the
+    Gap side has nothing of its own to display, and a developer who has just
+    linked a Journey would otherwise see no evidence that it worked. The
+    Dashboard must not reverse-derive this itself."""
+
+    journey_key: str
+    perspective: UxJourneyPerspective
+    title: str = ""
+
+
 class ProductGapDetailOut(ProductGapOut):
     current_revision: Optional[ProductGapRevisionOut] = None
     source_refs: List[ProductGapSourceOut] = []
+    journey_links: List[ProductGapJourneyLinkOut] = []
     evidence_refs: List[ProductGapEvidenceOut] = []
     artifact_links: List[ProductGapArtifactOut] = []
     decisions: List[ProductGapDecisionOut] = []

@@ -29,8 +29,11 @@ import {
 } from "@/components/product-objective/model";
 import { ObjectiveDetailCard, ObjectiveTree } from "@/components/product-objective/objective-tree";
 import {
-  GapDetailPanel, GapEntryList, GapWorkbenchFiltersBar, SourceKindBreakdown,
+  CreateGapForm, GapDetailPanel, GapEntryList, GapWorkbenchFiltersBar, SourceKindBreakdown,
 } from "@/components/product-objective/gap-workbench-panel";
+import {
+  CreateMilestoneForm, CreateObjectiveForm, MilestoneWorkPanel, ObjectiveWorkPanel,
+} from "@/components/product-objective/objective-forms";
 
 export default function ObjectiveMapPage() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -139,7 +142,8 @@ export default function ObjectiveMapPage() {
                 <CardHeader>
                   <CardTitle as="h2" className="text-base">Objective 階層</CardTitle>
                 </CardHeader>
-                <CardContent>
+                <CardContent className="space-y-3">
+                  <CreateObjectiveForm onCreated={(key) => updateSelection({ objectiveKey: key, milestoneKey: null })} />
                   <ObjectiveTree
                     map={map}
                     selectedObjectiveKey={selection.objectiveKey}
@@ -157,15 +161,23 @@ export default function ObjectiveMapPage() {
                   {selectedNode ? (
                     <>
                       <ObjectiveDetailCard node={selectedNode} />
+                      <ObjectiveWorkPanel objectiveKey={selectedNode.objective_key} />
+                      <CreateMilestoneForm
+                        objectiveKey={selectedNode.objective_key}
+                        onCreated={(key) => updateSelection({ milestoneKey: key })}
+                      />
                       {selection.milestoneKey && (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => updateSelection({ view: "gaps", milestoneKey: selection.milestoneKey })}
-                          data-testid="objective-map-go-to-milestone-gaps"
-                        >
-                          この Milestone の Gap を Gap Workbench で見る
-                        </Button>
+                        <>
+                          <MilestoneWorkPanel milestoneKey={selection.milestoneKey} />
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => updateSelection({ view: "gaps", milestoneKey: selection.milestoneKey })}
+                            data-testid="objective-map-go-to-milestone-gaps"
+                          >
+                            この Milestone の Gap を Gap Workbench で見る
+                          </Button>
+                        </>
                       )}
                     </>
                   ) : (
@@ -189,6 +201,11 @@ export default function ObjectiveMapPage() {
           {workbench && (
             <div className="space-y-3">
               <SourceKindBreakdown workbench={workbench} />
+              <CreateGapForm
+                map={map}
+                defaultMilestoneKey={gapFilters.milestoneKey ?? selection.milestoneKey}
+                onCreated={(gapKey) => updateSelection({ view: "gaps", gapKey })}
+              />
               <GapWorkbenchFiltersBar filters={gapFilters} onChange={setGapFilters} map={map} />
               <div className="grid gap-4 md:grid-cols-2">
                 <Card>

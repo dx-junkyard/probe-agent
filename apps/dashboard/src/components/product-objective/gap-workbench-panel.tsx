@@ -14,28 +14,39 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ApiError } from "@/api/client";
 import {
-  useAddProductGapArtifactLink, useProductGapDetail, useRecordProductGapDecision,
+  useAddProductGapArtifactLink, useAddProductGapRevision, useCreateProductGap,
+  useLinkProductGapToJourney, useProductGapDetail, useRecordProductGapDecision,
+  useUxJourneys,
 } from "@/api/hooks";
 import type {
   GapWorkbenchEntryOut, GapWorkbenchOut, ObjectiveMapOut,
   ProductGapArtifactLinkKind, ProductGapLifecycle, ProductGapPriorityBand,
+  ProductGapTargetMode,
 } from "@/api/types";
 import { formatTimestamp } from "@/lib/utils";
 import {
   AUTHORSHIP_LABEL, DEEP_LINK_STATE_LABEL, GAP_ARTIFACT_LINK_KIND_LABEL,
-  GAP_DECISION_LABEL, GAP_LIFECYCLE_LABEL, GAP_PRIORITY_BAND_LABEL,
-  GAP_READ_FLAG_LABEL, GAP_SOURCE_KIND_LABEL, GAP_SOURCE_STATE_LABEL,
-  RECHECK_STATE_LABEL, sharedGapKeysForSource,
+  GAP_DECISION_LABEL, GAP_EFFECTIVE_TARGET_AVAILABILITY_LABEL, GAP_LIFECYCLE_LABEL,
+  GAP_PRIORITY_BAND_LABEL, GAP_READ_FLAG_LABEL, GAP_SOURCE_KIND_LABEL,
+  GAP_SOURCE_STATE_LABEL, RECHECK_STATE_LABEL, sharedGapKeysForSource,
+  isStaleDigestErrorCode,
   type GapWorkbenchFilters,
 } from "./model";
+import { StaleDigestNotice } from "./objective-forms";
 
 const LIFECYCLE_VALUES: ProductGapLifecycle[] = [
   "open", "acknowledged", "deferred", "resolved", "rejected", "obsolete",
 ];
 const PRIORITY_BAND_VALUES: ProductGapPriorityBand[] = ["unset", "watch", "next", "now"];
 const ARTIFACT_LINK_KINDS: ProductGapArtifactLinkKind[] = [
-  "issue_draft", "ux_journey", "ux_requirement", "product_feature", "solution_design",
+  "issue_draft", "ux_requirement", "product_feature", "solution_design",
 ];
+const TARGET_MODE_VALUES: ProductGapTargetMode[] = ["own", "inherited_from_milestone", "unknown"];
+const TARGET_MODE_LABEL: Record<ProductGapTargetMode, string> = {
+  own: "この Gap 自身の目標状態を書く",
+  inherited_from_milestone: "Milestone の目標状態を継承する",
+  unknown: "まだ決めていない",
+};
 
 export function GapWorkbenchFiltersBar({
   filters, onChange, map,
@@ -155,15 +166,30 @@ export function GapEntryList({
   );
 }
 
-function DecisionRationaleControls({ gapKey }: { gapKey: string }) {
+/** Every decision/assessment on this screen sends `decisionDigest` -- read
+ * from the Gap's OWN `decision_digest` field (§B/§10.1), NEVER
+ * `current_revision.content_digest`: an `inherited_from_milestone` Gap is
+ * judged partly against the Milestone's target, so the two differ and the
+ * revision digest would 409 on every decision. A stale-digest 409 renders
+ * `StaleDigestNotice` -- reload and re-read, never a silent/automatic
+ * retry. */
+function DecisionRationaleControls({
+  gapKey, decisionDigest, onStale,
+}: {
+  gapKey: string;
+  decisionDigest: string;
+  onStale: () => void;
+}) {
   const record = useRecordProductGapDecision(gapKey);
   const [rationale, setRationale] = useState("");
   const [rejection, setRejection] = useState<{ code: string; message: string } | null>(null);
+  const [stale, setStale] = useState(false);
 
   function submit(decision: "acknowledge" | "defer" | "resolve" | "reopen") {
     setRejection(null);
+    setStale(false);
     record.mutate(
-      { decision, rationale },
+      { decision, rationale, captured_digest: decisionDigest },
       {
         onSuccess: () => {
           setRationale("");
@@ -171,6 +197,7 @@ function DecisionRationaleControls({ gapKey }: { gapKey: string }) {
         },
         onError: (error) => {
           const apiError = error as ApiError;
+          if (isStaleDigestErrorCode(apiError.code)) { setStale(true); return; }
           setRejection({ code: apiError.code ?? "unknown", message: apiError.detail || "記録できませんでした" });
         },
       },
@@ -187,6 +214,7 @@ function DecisionRationaleControls({ gapKey }: { gapKey: string }) {
           </Button>
         ))}
       </div>
+      {stale && <StaleDigestNotice onRetry={() => { setStale(false); onStale(); }} />}
       {rejection && (
         <div className="rounded border border-destructive p-2 text-xs" data-testid="gap-decision-rejected">
           <span className="font-mono text-destructive">{rejection.code}</span>
@@ -197,35 +225,195 @@ function DecisionRationaleControls({ gapKey }: { gapKey: string }) {
   );
 }
 
-function PrioritizeControls({ gapKey, currentBand }: { gapKey: string; currentBand: ProductGapPriorityBand }) {
+function PrioritizeControls({
+  gapKey, currentBand, decisionDigest, onStale,
+}: {
+  gapKey: string;
+  currentBand: ProductGapPriorityBand;
+  decisionDigest: string;
+  onStale: () => void;
+}) {
   const record = useRecordProductGapDecision(gapKey);
   const [band, setBand] = useState<ProductGapPriorityBand>(currentBand);
+  const [stale, setStale] = useState(false);
 
   function submit() {
+    setStale(false);
     record.mutate(
-      { decision: "prioritize", priority_band: band },
+      { decision: "prioritize", priority_band: band, captured_digest: decisionDigest },
       {
         onSuccess: () => toast.success("優先バンドを記録しました"),
+        onError: (error) => {
+          const apiError = error as ApiError;
+          if (isStaleDigestErrorCode(apiError.code)) { setStale(true); return; }
+          toast.error(apiError.detail || "記録できませんでした");
+        },
+      },
+    );
+  }
+
+  return (
+    <div className="space-y-2" data-testid="gap-prioritize-controls">
+      <div className="flex flex-wrap items-center gap-2">
+        <Select aria-label="優先バンド" value={band} onChange={(e) => setBand(e.target.value as ProductGapPriorityBand)}>
+          {PRIORITY_BAND_VALUES.map((v) => <option key={v} value={v}>{GAP_PRIORITY_BAND_LABEL[v]}</option>)}
+        </Select>
+        <Button size="sm" variant="outline" disabled={record.isPending} onClick={submit} data-testid="gap-decision-prioritize">
+          {GAP_DECISION_LABEL.prioritize}
+        </Button>
+      </div>
+      {stale && <StaleDigestNotice onRetry={() => { setStale(false); onStale(); }} />}
+    </div>
+  );
+}
+
+/** §427 D: creates the Gap identity row under a Milestone. `defaultMilestoneKey`
+ * prefills from the current selection/filter (§9.4's deep link), but any
+ * Milestone in this Objective Map may be chosen. */
+export function CreateGapForm({
+  map, defaultMilestoneKey, onCreated,
+}: {
+  map: ObjectiveMapOut | undefined;
+  defaultMilestoneKey: string | null;
+  onCreated: (gapKey: string) => void;
+}) {
+  const create = useCreateProductGap();
+  const milestoneKeys = (map?.nodes ?? []).flatMap((n) => n.milestones.map((m) => m.milestone_key));
+  const [milestoneKey, setMilestoneKey] = useState(defaultMilestoneKey ?? milestoneKeys[0] ?? "");
+  const [gapKey, setGapKey] = useState("");
+  const [rejection, setRejection] = useState<{ code: string; message: string } | null>(null);
+
+  function submit() {
+    setRejection(null);
+    create.mutate(
+      { milestone_key: milestoneKey, gap_key: gapKey.trim() },
+      {
+        onSuccess: (out) => { setGapKey(""); toast.success("Gap を作成しました"); onCreated(out.gap_key); },
+        onError: (error) => {
+          const apiError = error as ApiError;
+          setRejection({ code: apiError.code ?? "unknown", message: apiError.detail || "作成できませんでした" });
+        },
+      },
+    );
+  }
+
+  return (
+    <div className="space-y-2 rounded border p-2" data-testid="create-gap-form">
+      <p className="text-xs font-semibold">Gap を作成する</p>
+      <div className="flex flex-wrap gap-2">
+        <Select aria-label="所属する Milestone" value={milestoneKey} onChange={(e) => setMilestoneKey(e.target.value)}>
+          {milestoneKeys.length === 0 && <option value="">Milestone がありません</option>}
+          {milestoneKeys.map((k) => <option key={k} value={k}>{k}</option>)}
+        </Select>
+        <Input aria-label="gap_key" placeholder="gap_key" value={gapKey} onChange={(e) => setGapKey(e.target.value)} className="max-w-xs" />
+        <Button size="sm" variant="outline" disabled={!milestoneKey || !gapKey.trim() || create.isPending} onClick={submit} data-testid="create-gap-submit">
+          作成する
+        </Button>
+      </div>
+      {rejection && (
+        <div className="rounded border border-destructive p-2 text-xs" data-testid="create-gap-rejected">
+          <span className="font-mono text-destructive">{rejection.code}</span>
+          <span className="ml-2">{rejection.message}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GapRevisionForm({ gapKey }: { gapKey: string }) {
+  const add = useAddProductGapRevision(gapKey);
+  const [title, setTitle] = useState("");
+  const [currentState, setCurrentState] = useState("");
+  const [targetState, setTargetState] = useState("");
+  const [targetStateMode, setTargetStateMode] = useState<ProductGapTargetMode>("unknown");
+  const [interpretation, setInterpretation] = useState("");
+
+  function submit() {
+    add.mutate(
+      {
+        title, current_state: currentState, target_state: targetState,
+        target_state_mode: targetStateMode, interpretation,
+      },
+      {
+        onSuccess: () => toast.success("内容を記録しました"),
         onError: (error) => toast.error((error as ApiError).detail || "記録できませんでした"),
       },
     );
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-2" data-testid="gap-prioritize-controls">
-      <Select aria-label="優先バンド" value={band} onChange={(e) => setBand(e.target.value as ProductGapPriorityBand)}>
-        {PRIORITY_BAND_VALUES.map((v) => <option key={v} value={v}>{GAP_PRIORITY_BAND_LABEL[v]}</option>)}
-      </Select>
-      <Button size="sm" variant="outline" disabled={record.isPending} onClick={submit} data-testid="gap-decision-prioritize">
-        {GAP_DECISION_LABEL.prioritize}
+    <div className="space-y-2 rounded border p-2" data-testid="gap-revision-form">
+      <p className="text-xs font-semibold">内容を記録する(新しい版として追記されます)</p>
+      <Input aria-label="タイトル" placeholder="タイトル" value={title} onChange={(e) => setTitle(e.target.value)} />
+      <Textarea aria-label="現在状態" placeholder="現在状態" value={currentState} onChange={(e) => setCurrentState(e.target.value)} rows={2} />
+      <div className="flex flex-wrap items-center gap-2">
+        <Select aria-label="目標状態の扱い" value={targetStateMode} onChange={(e) => setTargetStateMode(e.target.value as ProductGapTargetMode)}>
+          {TARGET_MODE_VALUES.map((v) => <option key={v} value={v}>{TARGET_MODE_LABEL[v]}</option>)}
+        </Select>
+      </div>
+      {targetStateMode === "own" && (
+        <Textarea aria-label="目標状態" placeholder="目標状態" value={targetState} onChange={(e) => setTargetState(e.target.value)} rows={2} />
+      )}
+      <Textarea aria-label="解釈" placeholder="解釈" value={interpretation} onChange={(e) => setInterpretation(e.target.value)} rows={2} />
+      <Button size="sm" variant="outline" disabled={add.isPending} onClick={submit} data-testid="gap-revision-submit">
+        記録する
       </Button>
+    </div>
+  );
+}
+
+/** §5.11/§A: writes the Gap's Journey connection through the Journey's OWN
+ * endpoint (`ux_journey_upstream_ref(ref_kind='product_gap')`) -- the one
+ * writable home for this relation. Never `product_gap_artifact_link`, which
+ * would let the two disagree (the twin-canon this Epic forbids). The
+ * server-side reverse lookup this write feeds is not currently exposed on
+ * the Gap response, so this screen cannot yet list a Gap's already-linked
+ * Journeys -- only add one. */
+function JourneyLinkForm({ gapKey }: { gapKey: string }) {
+  const journeys = useUxJourneys();
+  const link = useLinkProductGapToJourney(gapKey);
+  const [journeyKey, setJourneyKey] = useState("");
+  const [note, setNote] = useState("");
+
+  const options = journeys.data?.journeys ?? [];
+
+  function submit() {
+    if (!journeyKey) return;
+    link.mutate(
+      { journeyKey, note },
+      {
+        onSuccess: () => { setNote(""); toast.success("Journey へ関連付けました"); },
+        onError: (error) => toast.error((error as ApiError).detail || "関連付けできませんでした"),
+      },
+    );
+  }
+
+  return (
+    <div className="space-y-2 rounded border p-2" data-testid="gap-journey-link-form">
+      <p className="text-xs font-semibold">UX Journey へ関連付ける</p>
+      {journeys.isLoading ? (
+        <p className="text-xs text-muted-foreground">Journey を読み込んでいます…</p>
+      ) : options.length === 0 ? (
+        <p className="text-xs text-muted-foreground">この System にはまだ UX Journey がありません。</p>
+      ) : (
+        <div className="flex flex-wrap gap-2">
+          <Select aria-label="関連付ける Journey" value={journeyKey} onChange={(e) => setJourneyKey(e.target.value)}>
+            <option value="">選択してください</option>
+            {options.map((j) => <option key={j.journey_key} value={j.journey_key}>{j.title || j.journey_key}</option>)}
+          </Select>
+          <Input aria-label="関連付けの note" placeholder="note(任意)" value={note} onChange={(e) => setNote(e.target.value)} className="max-w-xs" />
+          <Button size="sm" variant="outline" disabled={!journeyKey || link.isPending} onClick={submit} data-testid="gap-journey-link-submit">
+            関連付ける
+          </Button>
+        </div>
+      )}
     </div>
   );
 }
 
 function ArtifactLinkForm({ gapKey }: { gapKey: string }) {
   const add = useAddProductGapArtifactLink(gapKey);
-  const [linkKind, setLinkKind] = useState<ProductGapArtifactLinkKind>("ux_journey");
+  const [linkKind, setLinkKind] = useState<ProductGapArtifactLinkKind>("issue_draft");
   const [targetRef, setTargetRef] = useState("");
 
   function submit() {
@@ -303,18 +491,54 @@ export function GapDetailPanel({ gapKey, workbench }: { gapKey: string; workbenc
             <dd data-testid="gap-detail-current-state">{revision.current_state || "(未記入)"}</dd>
           </div>
           <div>
+            {/* §C: the EFFECTIVE target (`gap.effective_target_state` /
+                `effective_target_availability`), not the revision's own
+                (possibly-empty) `target_state` column -- an
+                `inherited_from_milestone` Gap stores no target text of its
+                own (§5.3), and `unavailable` must never render as an empty
+                target or "no target set" (§0 invariant 8). */}
             <dt className="text-xs font-medium text-muted-foreground">
-              目標状態
-              {revision.target_state_mode === "inherited_from_milestone" && "(Milestone から継承)"}
-              {revision.target_state_mode === "unknown" && "(未定)"}
+              目標状態({GAP_EFFECTIVE_TARGET_AVAILABILITY_LABEL[gap.effective_target_availability]})
             </dt>
-            <dd data-testid="gap-detail-target-state">
-              {revision.target_state_mode === "unknown" ? "まだ決めていません" : revision.target_state || "(未記入)"}
+            <dd data-testid="gap-detail-target-state" data-target-availability={gap.effective_target_availability}>
+              {gap.effective_target_availability === "unavailable"
+                ? "Milestone の目標状態を取得できませんでした。Milestone 側の内容を確認してください。"
+                : gap.effective_target_availability === "unknown"
+                  ? "まだ決めていません"
+                  : gap.effective_target_state || "(未記入)"}
             </dd>
           </div>
           <div>
             <dt className="text-xs font-medium text-muted-foreground">解釈</dt>
             <dd data-testid="gap-detail-interpretation">{revision.interpretation || "(未記入)"}</dd>
+          </div>
+          {/* §5.11: the Gap's Journey connection has ONE writable home,
+              `ux_journey_upstream_ref`, so the Gap side has no link rows of
+              its own to show. The server reads it back by reverse lookup and
+              reports it here; this list is never derived client-side. */}
+          <div>
+            <dt className="text-xs font-medium text-muted-foreground">この Gap を解消する Journey</dt>
+            <dd data-testid="gap-detail-journey-links">
+              {gap.journey_links.length === 0 ? (
+                <span className="text-muted-foreground">まだ紐づいていません</span>
+              ) : (
+                <ul className="space-y-1">
+                  {gap.journey_links.map((link) => (
+                    <li key={link.journey_key} data-testid={`gap-journey-link-${link.journey_key}`}>
+                      <Link
+                        className="underline"
+                        to={`/ux-design-studio?tab=journeys&journey=${encodeURIComponent(link.journey_key)}`}
+                      >
+                        {link.title || link.journey_key}
+                      </Link>
+                      <span className="ml-2 text-xs text-muted-foreground">
+                        {link.perspective === "as_is" ? "現状" : "目標"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </dd>
           </div>
           <div className="text-xs text-muted-foreground">
             執筆: {AUTHORSHIP_LABEL[revision.authored_by_kind]}
@@ -390,11 +614,20 @@ export function GapDetailPanel({ gapKey, workbench }: { gapKey: string; workbenc
         </div>
       )}
 
+      <GapRevisionForm gapKey={gap.gap_key} />
+
       <div className="space-y-2 rounded border p-2">
         <p className="text-xs font-semibold">解消状態を変える(人間の判断として記録されます)</p>
-        <DecisionRationaleControls gapKey={gap.gap_key} />
-        <PrioritizeControls gapKey={gap.gap_key} currentBand={gap.priority_band} />
+        <DecisionRationaleControls
+          gapKey={gap.gap_key} decisionDigest={gap.decision_digest} onStale={() => detail.refetch()}
+        />
+        <PrioritizeControls
+          gapKey={gap.gap_key} currentBand={gap.priority_band} decisionDigest={gap.decision_digest}
+          onStale={() => detail.refetch()}
+        />
       </div>
+
+      <JourneyLinkForm gapKey={gap.gap_key} />
 
       <ArtifactLinkForm gapKey={gap.gap_key} />
 

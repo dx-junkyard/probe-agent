@@ -110,6 +110,14 @@ import type {
   ObjectiveMapOut, GapWorkbenchOut,
   ProductGapDetailOut, ProductGapDecisionCreateRequest, ProductGapDecisionOut,
   ProductGapArtifactLinkCreateRequest, ProductGapArtifactOut,
+  ProductGapOut, ProductGapCreateRequest, ProductGapRevisionCreateRequest,
+  ProductObjectiveOut, ProductObjectiveDetailOut, ProductObjectiveCreateRequest,
+  ProductObjectiveRevisionCreateRequest, ProductObjectiveDecisionCreateRequest,
+  ProductObjectiveDecisionOut,
+  ProductMilestoneOut, ProductMilestoneDetailOut, ProductMilestoneCreateRequest,
+  ProductMilestoneRevisionCreateRequest, ProductMilestoneDecisionCreateRequest,
+  ProductMilestoneDecisionOut, ProductMilestoneAssessmentCreateRequest,
+  ProductMilestoneAssessmentOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -4366,7 +4374,9 @@ export function useFunctionalLineage() {
 // mutations below invalidate both projections AND the Overview, whose
 // `objective` section reads the same underlying rows (§9.1).
 
-const PRODUCT_OBJECTIVE_QUERY_BASES = ["objective-map", "gap-workbench", "product-gap", "overview"] as const;
+const PRODUCT_OBJECTIVE_QUERY_BASES = [
+  "objective-map", "gap-workbench", "product-gap", "product-objective", "product-milestone", "overview",
+] as const;
 
 function invalidateProductObjective(qc: ReturnType<typeof useQueryClient>) {
   for (const base of PRODUCT_OBJECTIVE_QUERY_BASES) {
@@ -4427,6 +4437,157 @@ export function useAddProductGapArtifactLink(gapKey: string | null) {
   return useMutation({
     mutationFn: (body: ProductGapArtifactLinkCreateRequest) =>
       api.post<ProductGapArtifactOut>(`/product-gaps/${encodeURIComponent(gapKey ?? "")}/artifact-links`, body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** §5.11: a Gap's Journey connection has exactly ONE writable home,
+ * `ux_journey_upstream_ref(ref_kind='product_gap')` -- never
+ * `product_gap_artifact_link`. This is the SAME endpoint
+ * `useAddUxJourneyUpstreamRef` calls; a dedicated hook exists here (rather
+ * than reusing that one directly from the Gap Workbench) only so the
+ * success handler invalidates the Objective Map / Gap Workbench projections
+ * TOO -- `link_gap_to_journey`'s §9.3 next-step reads this exact relation,
+ * so writing it must not leave those two screens showing the pre-link
+ * state until an unrelated refetch. */
+export function useLinkProductGapToJourney(gapKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ journeyKey, note }: { journeyKey: string; note?: string }) =>
+      api.post<UxJourneyUpstreamRefOut>(
+        `/ux-design/journeys/${encodeURIComponent(journeyKey)}/upstream-refs`,
+        { ref_kind: "product_gap", target_ref: gapKey ?? "", note: note ?? "" } satisfies UxJourneyUpstreamRefCreateRequest,
+      ),
+    onSuccess: () => {
+      invalidateProductObjective(qc);
+      invalidateUxDesign(qc);
+    },
+  });
+}
+
+/** `POST /product-gaps` (§4.1/§10): creates the Gap identity row under a
+ * Milestone. Content (current/target state, interpretation) is a SEPARATE
+ * revision write (`useAddProductGapRevision`), matching every sibling
+ * identity/content split in this Epic (§2). */
+export function useCreateProductGap() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductGapCreateRequest) => api.post<ProductGapOut>("/product-gaps", body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** `POST /product-gaps/{gap_key}/revisions` -- append-only content (§5.1/§5.9).
+ * `authored_by_kind`/`decision_method` are always `developer`/`manual` for a
+ * Dashboard-submitted revision; the server never accepts them from the
+ * request body. */
+export function useAddProductGapRevision(gapKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductGapRevisionCreateRequest) =>
+      api.post<ProductGapOut>(`/product-gaps/${encodeURIComponent(gapKey ?? "")}/revisions`, body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+// --- #429 Objective ---------------------------------------------------------
+
+/** `GET /product-objectives/{objective_key}` -- the full detail (current
+ * revision's `content_digest`, upstream refs, decision history) the
+ * Objective Map's tree node does not carry. Every Objective decision must
+ * send this `current_revision`'s `content_digest` as `captured_digest`
+ * (§4.2/§10.1's stale-digest gate; unlike a Gap, an Objective/Milestone
+ * decision is judged against its OWN revision, never an inherited one). */
+export function useProductObjectiveDetail(objectiveKey: string | null) {
+  return useQuery<ProductObjectiveDetailOut>({
+    queryKey: [...sysKey("product-objective"), objectiveKey],
+    queryFn: () => api.get<ProductObjectiveDetailOut>(`/product-objectives/${encodeURIComponent(objectiveKey ?? "")}`),
+    enabled: objectiveKey !== null,
+  });
+}
+
+export function useCreateProductObjective() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductObjectiveCreateRequest) => api.post<ProductObjectiveOut>("/product-objectives", body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+export function useAddProductObjectiveRevision(objectiveKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductObjectiveRevisionCreateRequest) =>
+      api.post<ProductObjectiveOut>(`/product-objectives/${encodeURIComponent(objectiveKey ?? "")}/revisions`, body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** Records a `confirm`/`activate`/`achieve`/`reject`/`retire`/`reinstate`
+ * decision (§4.3). Every kind is offered; an illegal transition comes back
+ * as the server's own finite `product_objective_not_decidable` rejection
+ * rather than a second legality table here (same discipline
+ * `useRecordProductGapDecision` documents). */
+export function useRecordProductObjectiveDecision(objectiveKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductObjectiveDecisionCreateRequest) =>
+      api.post<ProductObjectiveDecisionOut>(`/product-objectives/${encodeURIComponent(objectiveKey ?? "")}/decisions`, body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+// --- #429 Milestone ----------------------------------------------------------
+
+/** `GET /product-milestones/{milestone_key}` -- current revision's
+ * `content_digest` for the same reason `useProductObjectiveDetail`
+ * documents. */
+export function useProductMilestoneDetail(milestoneKey: string | null) {
+  return useQuery<ProductMilestoneDetailOut>({
+    queryKey: [...sysKey("product-milestone"), milestoneKey],
+    queryFn: () => api.get<ProductMilestoneDetailOut>(`/product-milestones/${encodeURIComponent(milestoneKey ?? "")}`),
+    enabled: milestoneKey !== null,
+  });
+}
+
+export function useCreateProductMilestone() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductMilestoneCreateRequest) => api.post<ProductMilestoneOut>("/product-milestones", body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+export function useAddProductMilestoneRevision(milestoneKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductMilestoneRevisionCreateRequest) =>
+      api.post<ProductMilestoneOut>(`/product-milestones/${encodeURIComponent(milestoneKey ?? "")}/revisions`, body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** Records a `confirm`/`reject`/`retire`/`reinstate` decision on the
+ * Milestone's DEFINITION (§4.2 `design_status`) -- separate from
+ * `useRecordProductMilestoneAssessment`, which judges ACHIEVEMENT. */
+export function useRecordProductMilestoneDecision(milestoneKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductMilestoneDecisionCreateRequest) =>
+      api.post<ProductMilestoneDecisionOut>(`/product-milestones/${encodeURIComponent(milestoneKey ?? "")}/decisions`, body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** Records a `met`/`not_met`/`indeterminate`/`withdraw` assessment (§4.3).
+ * The server refuses (422 `product_milestone_not_assessable`) while
+ * `design_status !== "confirmed"` -- this hook does not pre-check that
+ * client-side (§0 invariant 10). */
+export function useRecordProductMilestoneAssessment(milestoneKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductMilestoneAssessmentCreateRequest) =>
+      api.post<ProductMilestoneAssessmentOut>(`/product-milestones/${encodeURIComponent(milestoneKey ?? "")}/assessments`, body),
     onSuccess: () => invalidateProductObjective(qc),
   });
 }

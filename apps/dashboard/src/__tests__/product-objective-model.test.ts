@@ -8,6 +8,7 @@ import {
   applyObjectiveMapSelectionToSearchParams,
   filterGapWorkbenchEntries,
   gapWorkbenchEntryByKey,
+  isStaleDigestErrorCode,
   objectiveGapTotal,
   objectiveMapChildren,
   objectiveMapEmptyState,
@@ -267,5 +268,19 @@ describe("product-objective/model: Overview next_step -> Objective Map CTA", () 
 
   it("confirm_vision navigates to the bare Objective Map (no Objective row exists yet to select)", () => {
     expect(objectiveNextStepHref(overviewObjective({ next_step: "confirm_vision" }))).toBe("/objective-map");
+  });
+});
+
+describe("product-objective/model: isStaleDigestErrorCode (§B)", () => {
+  it("matches every entity's stale-digest rejection code", () => {
+    expect(isStaleDigestErrorCode("product_objective_decision_stale_digest")).toBe(true);
+    expect(isStaleDigestErrorCode("product_milestone_decision_stale_digest")).toBe(true);
+    expect(isStaleDigestErrorCode("product_gap_decision_stale_digest")).toBe(true);
+    expect(isStaleDigestErrorCode("product_feature_decision_stale_digest")).toBe(true);
+  });
+
+  it("does not match an unrelated rejection code", () => {
+    expect(isStaleDigestErrorCode("product_gap_not_decidable")).toBe(false);
+    expect(isStaleDigestErrorCode(undefined)).toBe(false);
   });
 });
