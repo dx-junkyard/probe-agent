@@ -448,7 +448,7 @@ const API = "http://127.0.0.1:8099";
   expectTrue("and no longer describes the previously selected Objective",
     !(await page.isVisible('[data-testid="objective-detail-o-root"]')));
   const afterSwitch = new URL(page.url()).searchParams;
-  expect("the URL names both halves", 
+  expect("the URL names both halves",
     [afterSwitch.get("objective"), afterSwitch.get("milestone")], ["o-child", "m-first"]);
 
   // --- 10. Requirement -> Feature is COMPLETABLE, not just reachable --------
