@@ -20,8 +20,9 @@ already covers.
 
 ## Objective Map (`objective-map.cjs`, Issue #427/#432 review §4.1)
 
-Six guarantees of the Objective Map screen that jsdom cannot check, each one a
-way the screen fails while its unit tests stay green:
+Ten guarantees of the Objective Map screen (and the CTA destination it hands
+off to) that jsdom cannot check, each one a way the screen fails while its
+unit tests stay green:
 
 | Scenario | Why it needs a real browser |
 | --- | --- |
@@ -31,9 +32,15 @@ way the screen fails while its unit tests stay green:
 | One lane pending does not block the other | The Gap panel mounts only when its tab is active, and a short delay would race the fetch and pass for the wrong reason — so the delay is 20s and the tab is opened first. |
 | WAI-ARIA tabs | Roles, `aria-selected`, `aria-controls`, and arrow-key roving focus need a real focus model. |
 | 390px viewport | Needs real layout to detect horizontal overflow. |
+| Milestone-only deep link reaches the WORK pane | The tree already reveals such a Milestone, so a "is it in the DOM" check passes either way. What fails without normalization is the pane the link exists for -- `objectiveKey` stays null, so `MilestoneWorkPanel` never mounts -- and asserting that the URL is CORRECTED needs a real history stack. |
+| Form state never travels between entities, and is not discarded silently | The wrong-entity write: text typed for Objective A still on screen after selecting B, and 「記録する」 saving it as B's revision. The remount, the refetch and the controlled inputs only interact for real in a browser — and the discard prompt is a `window.confirm`, which exists nowhere else. |
+| A Milestone under another Objective moves the Objective selection | The pane is keyed off `objectiveKey`; without normalization it keeps describing the previously selected Objective while the Milestone panel underneath acts on a different one's. Needs a real expand, click and URL rewrite. |
+| Requirement → Feature completes by explicit submit | Review 0.3 asks for proof the operation can be FINISHED, not that a screen opened. Drives the Overview CTA's own URL (target included) and asserts the recorded POST — and that selecting alone records nothing. |
 
-Auth and System creation run against the real server; only the two projections
-are intercepted, for the reason given above.
+Auth and System creation run against the real server; the two projections plus
+the Objective/Milestone/Gap detail reads are intercepted, for the reason given
+above. Scenarios 7-8 need those detail responses to exist and to DIFFER per
+entity -- that difference is exactly what a carried-over form would hide.
 
 ```bash
 NODE_PATH=/tmp/pw/node_modules node browser-tests/objective-map.cjs /tmp/out

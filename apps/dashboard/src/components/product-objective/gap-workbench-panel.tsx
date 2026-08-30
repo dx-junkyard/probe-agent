@@ -13,6 +13,7 @@ import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ApiError } from "@/api/client";
+import { useDirtyGuard } from "./unsaved-work";
 import {
   useAddProductGapArtifactLink, useAddProductGapRevision, useCreateProductGap,
   useLinkProductGapToJourney, useProductGapDetail, useRecordProductGapDecision,
@@ -20,12 +21,14 @@ import {
 } from "@/api/hooks";
 import type {
   GapWorkbenchEntryOut, GapWorkbenchOut, ObjectiveMapOut,
+  ProductDeepLinkState, ProductDeepLinkTargetState,
   ProductGapArtifactLinkKind, ProductGapLifecycle, ProductGapPriorityBand,
+  ProductGapRevisionOut,
   ProductGapTargetMode,
 } from "@/api/types";
 import { formatTimestamp } from "@/lib/utils";
 import {
-  AUTHORSHIP_LABEL, DEEP_LINK_STATE_LABEL, GAP_ARTIFACT_LINK_KIND_LABEL,
+  AUTHORSHIP_LABEL, DEEP_LINK_STATE_LABEL, DEEP_LINK_TARGET_STATE_LABEL, GAP_ARTIFACT_LINK_KIND_LABEL,
   GAP_EVIDENCE_KIND_LABEL,
   GAP_DECISION_LABEL, GAP_EFFECTIVE_TARGET_AVAILABILITY_LABEL, GAP_LIFECYCLE_LABEL,
   GAP_PRIORITY_BAND_LABEL, GAP_READ_FLAG_LABEL, GAP_SOURCE_KIND_LABEL,
@@ -184,6 +187,7 @@ function DecisionRationaleControls({
   const record = useRecordProductGapDecision(gapKey);
   const [rationale, setRationale] = useState("");
   const [rejection, setRejection] = useState<{ code: string; message: string } | null>(null);
+  useDirtyGuard(`gap-decision:${gapKey}`, rationale !== "");
   const [stale, setStale] = useState(false);
 
   function submit(decision: "acknowledge" | "defer" | "resolve" | "reopen") {
@@ -236,6 +240,7 @@ function PrioritizeControls({
 }) {
   const record = useRecordProductGapDecision(gapKey);
   const [band, setBand] = useState<ProductGapPriorityBand>(currentBand);
+  useDirtyGuard(`gap-prioritize:${gapKey}`, band !== currentBand);
   const [stale, setStale] = useState(false);
 
   function submit() {
@@ -284,10 +289,38 @@ export function CreateGapForm({
   const [gapKey, setGapKey] = useState("");
   const [rejection, setRejection] = useState<{ code: string; message: string } | null>(null);
 
+  // `useState` seeds ONCE, so a default that arrives later never lands: the
+  // Objective Map loads async, and the deep link / filter / System can all
+  // change afterwards. Two separate ways that produced a wrong owner:
+  // creating under whatever Milestone happened to be first when the map was
+  // still empty, and -- because these slugs are unique only WITHIN a System
+  // (§1's identity rule) -- keeping a same-named key across a System switch,
+  // which creates the Gap under a different System's Milestone entirely.
+  //
+  // Adjusted during render (React's "reacting to a changed input" pattern),
+  // the same discipline `objective-tree.tsx` documents: an effect would paint
+  // once with the stale Milestone selected. It follows the DEFAULT, not every
+  // render -- a Milestone the developer picked here by hand survives until
+  // the default itself moves.
+  const [lastDefault, setLastDefault] = useState(defaultMilestoneKey);
+  if (lastDefault !== defaultMilestoneKey) {
+    setLastDefault(defaultMilestoneKey);
+    if (defaultMilestoneKey) setMilestoneKey(defaultMilestoneKey);
+  }
+  // A key that is not in the CURRENT map belongs to a Milestone this screen
+  // is not showing (a System switch, or a deleted Milestone). Creating under
+  // it would either fail or -- worse -- succeed against something the
+  // developer cannot see, so fall back to a Milestone that IS on offer.
+  const selectableMilestoneKey = milestoneKeys.includes(milestoneKey)
+    ? milestoneKey
+    : (defaultMilestoneKey && milestoneKeys.includes(defaultMilestoneKey)
+        ? defaultMilestoneKey
+        : milestoneKeys[0] ?? "");
+
   function submit() {
     setRejection(null);
     create.mutate(
-      { milestone_key: milestoneKey, gap_key: gapKey.trim() },
+      { milestone_key: selectableMilestoneKey, gap_key: gapKey.trim() },
       {
         onSuccess: (out) => { setGapKey(""); toast.success("Gap を作成しました"); onCreated(out.gap_key); },
         onError: (error) => {
@@ -302,12 +335,12 @@ export function CreateGapForm({
     <div className="space-y-2 rounded border p-2" data-testid="create-gap-form">
       <p className="text-xs font-semibold">Gap を作成する</p>
       <div className="flex flex-wrap gap-2">
-        <Select aria-label="所属する Milestone" value={milestoneKey} onChange={(e) => setMilestoneKey(e.target.value)}>
+        <Select aria-label="所属する Milestone" value={selectableMilestoneKey} onChange={(e) => setMilestoneKey(e.target.value)}>
           {milestoneKeys.length === 0 && <option value="">Milestone がありません</option>}
           {milestoneKeys.map((k) => <option key={k} value={k}>{k}</option>)}
         </Select>
         <Input aria-label="gap_key" placeholder="gap_key" value={gapKey} onChange={(e) => setGapKey(e.target.value)} className="max-w-xs" />
-        <Button size="sm" variant="outline" disabled={!milestoneKey || !gapKey.trim() || create.isPending} onClick={submit} data-testid="create-gap-submit">
+        <Button size="sm" variant="outline" disabled={!selectableMilestoneKey || !gapKey.trim() || create.isPending} onClick={submit} data-testid="create-gap-submit">
           作成する
         </Button>
       </div>
@@ -321,13 +354,33 @@ export function CreateGapForm({
   );
 }
 
-function GapRevisionForm({ gapKey }: { gapKey: string }) {
+/** Seeded from the current revision: the endpoint appends a FULL snapshot,
+ * so a blank form turns 「1 項目だけ直す」 into 「他を全部空へ戻す」, and
+ * makes 「意図的に空にする」 indistinguishable from 「触っていない」.
+ * `useState` seeds once per mount, which is correct because the Gap detail
+ * pane is remounted per `(system_id, gap_key)`. */
+function GapRevisionForm({
+  gapKey, current,
+}: {
+  gapKey: string;
+  current: ProductGapRevisionOut | null;
+}) {
   const add = useAddProductGapRevision(gapKey);
-  const [title, setTitle] = useState("");
-  const [currentState, setCurrentState] = useState("");
-  const [targetState, setTargetState] = useState("");
-  const [targetStateMode, setTargetStateMode] = useState<ProductGapTargetMode>("unknown");
-  const [interpretation, setInterpretation] = useState("");
+  const [title, setTitle] = useState(current?.title ?? "");
+  const [currentState, setCurrentState] = useState(current?.current_state ?? "");
+  const [targetState, setTargetState] = useState(current?.target_state ?? "");
+  const [targetStateMode, setTargetStateMode] = useState<ProductGapTargetMode>(
+    current?.target_state_mode ?? "unknown",
+  );
+  const [interpretation, setInterpretation] = useState(current?.interpretation ?? "");
+  useDirtyGuard(
+    `gap-revision:${gapKey}`,
+    title !== (current?.title ?? "")
+      || currentState !== (current?.current_state ?? "")
+      || targetState !== (current?.target_state ?? "")
+      || targetStateMode !== (current?.target_state_mode ?? "unknown")
+      || interpretation !== (current?.interpretation ?? ""),
+  );
 
   function submit() {
     add.mutate(
@@ -375,6 +428,7 @@ function JourneyLinkForm({ gapKey }: { gapKey: string }) {
   const link = useLinkProductGapToJourney(gapKey);
   const [journeyKey, setJourneyKey] = useState("");
   const [note, setNote] = useState("");
+  useDirtyGuard(`gap-journey-link:${gapKey}`, journeyKey !== "" || note !== "");
 
   const options = journeys.data?.journeys ?? [];
 
@@ -416,6 +470,7 @@ function ArtifactLinkForm({ gapKey }: { gapKey: string }) {
   const add = useAddProductGapArtifactLink(gapKey);
   const [linkKind, setLinkKind] = useState<ProductGapArtifactLinkKind>("issue_draft");
   const [targetRef, setTargetRef] = useState("");
+  useDirtyGuard(`gap-artifact-link:${gapKey}`, targetRef !== "");
 
   function submit() {
     add.mutate(
@@ -453,6 +508,53 @@ function ArtifactLinkForm({ gapKey }: { gapKey: string }) {
  * manual action controls (§9.2). Fetches `GET /product-gaps/{key}`
  * separately from the Workbench list, since the six axes (§5.1) live on the
  * detail response, not the list entry. */
+/**
+ * §5.8/§5.8.1's two axes, rendered as two facts wherever a Gap reference
+ * offers a link: whether a screen exists, and whether that URL opens ON the
+ * subject. A `screen_only` link says so, so the developer knows they still
+ * have to find the subject there -- one label promising both is the #366
+ * one-word-two-facts defect.
+ *
+ * The route ALWAYS comes from the server's per-kind table. Never build one
+ * here: "which screen owns this kind" must have one answer, and a second one
+ * assembled client-side is the defect this Epic exists to prevent (§0-1).
+ */
+function ReferenceDeepLink({
+  route, state, targetState, testIdBase, rowId, unavailableNote,
+}: {
+  route: string | null;
+  state: ProductDeepLinkState;
+  targetState: ProductDeepLinkTargetState;
+  testIdBase: string;
+  rowId: number;
+  unavailableNote?: string;
+}) {
+  if (state !== "available" || !route) {
+    return (
+      <span className="text-muted-foreground" data-testid={`${testIdBase}-unavailable-${rowId}`}>
+        {DEEP_LINK_STATE_LABEL.unavailable}{unavailableNote}
+      </span>
+    );
+  }
+  return (
+    <>
+      <Link
+        to={route}
+        className="text-primary underline"
+        data-testid={`${testIdBase}-${rowId}`}
+        data-target-state={targetState}
+      >
+        {targetState === "selected" ? "対象を開く" : "画面を開く"}
+      </Link>
+      {targetState === "screen_only" && (
+        <span className="ml-2 text-muted-foreground" data-testid={`${testIdBase}-screen-only-${rowId}`}>
+          {DEEP_LINK_TARGET_STATE_LABEL.screen_only}
+        </span>
+      )}
+    </>
+  );
+}
+
 export function GapDetailPanel({ gapKey, workbench }: { gapKey: string; workbench: GapWorkbenchOut }) {
   const detail = useProductGapDetail(gapKey);
 
@@ -571,15 +673,14 @@ export function GapDetailPanel({ gapKey, workbench }: { gapKey: string; workbenc
                   </div>
                   {s.detail && <p className="mt-1 text-muted-foreground">{s.detail}</p>}
                   <div className="mt-1">
-                    {deepLink?.deep_link_state === "available" && deepLink.route ? (
-                      <Link to={deepLink.route} className="text-primary underline" data-testid={`gap-source-deep-link-${s.id}`}>
-                        検出元の画面を開く
-                      </Link>
-                    ) : (
-                      <span className="text-muted-foreground" data-testid={`gap-source-deep-link-unavailable-${s.id}`}>
-                        {DEEP_LINK_STATE_LABEL.unavailable}(この検出元にはまだ専用の画面がありません)
-                      </span>
-                    )}
+                    <ReferenceDeepLink
+                      route={deepLink?.route ?? null}
+                      state={deepLink?.deep_link_state ?? "unavailable"}
+                      targetState={deepLink?.deep_link_target_state ?? "unavailable"}
+                      testIdBase="gap-source-deep-link"
+                      rowId={s.id}
+                      unavailableNote="(この検出元にはまだ専用の画面がありません)"
+                    />
                   </div>
                   {shared.length > 0 && (
                     <p className="mt-1 text-muted-foreground">
@@ -605,15 +706,15 @@ export function GapDetailPanel({ gapKey, workbench }: { gapKey: string; workbenc
             {gap.evidence_refs.map((ev) => (
               <li key={ev.id} data-testid={`gap-evidence-${ev.id}`}>
                 <span>{GAP_EVIDENCE_KIND_LABEL[ev.evidence_kind]}: {ev.evidence_ref}</span>
-                {ev.deep_link_state === "available" && ev.deep_link ? (
-                  <Link to={ev.deep_link} className="ml-2 text-primary underline" data-testid={`gap-evidence-deep-link-${ev.id}`}>
-                    画面を開く
-                  </Link>
-                ) : ev.deep_link_state === "unavailable" ? (
-                  <span className="ml-2 text-muted-foreground" data-testid={`gap-evidence-deep-link-unavailable-${ev.id}`}>
-                    {DEEP_LINK_STATE_LABEL.unavailable}
-                  </span>
-                ) : null}
+                <span className="ml-2">
+                  <ReferenceDeepLink
+                    route={ev.deep_link}
+                    state={ev.deep_link_state}
+                    targetState={ev.deep_link_target_state}
+                    testIdBase="gap-evidence-deep-link"
+                    rowId={ev.id}
+                  />
+                </span>
               </li>
             ))}
           </ul>
@@ -630,22 +731,22 @@ export function GapDetailPanel({ gapKey, workbench }: { gapKey: string; workbenc
             {gap.artifact_links.map((link) => (
               <li key={link.id} data-testid={`gap-artifact-link-${link.id}`}>
                 <span>{GAP_ARTIFACT_LINK_KIND_LABEL[link.link_kind]}: {link.target_ref}</span>
-                {link.deep_link_state === "available" && link.deep_link ? (
-                  <Link to={link.deep_link} className="ml-2 text-primary underline" data-testid={`gap-artifact-link-deep-link-${link.id}`}>
-                    画面を開く
-                  </Link>
-                ) : link.deep_link_state === "unavailable" ? (
-                  <span className="ml-2 text-muted-foreground" data-testid={`gap-artifact-link-deep-link-unavailable-${link.id}`}>
-                    {DEEP_LINK_STATE_LABEL.unavailable}
-                  </span>
-                ) : null}
+                <span className="ml-2">
+                  <ReferenceDeepLink
+                    route={link.deep_link}
+                    state={link.deep_link_state}
+                    targetState={link.deep_link_target_state}
+                    testIdBase="gap-artifact-link-deep-link"
+                    rowId={link.id}
+                  />
+                </span>
               </li>
             ))}
           </ul>
         </div>
       )}
 
-      <GapRevisionForm gapKey={gap.gap_key} />
+      <GapRevisionForm gapKey={gap.gap_key} current={gap.current_revision} />
 
       <div className="space-y-2 rounded border p-2">
         <p className="text-xs font-semibold">解消状態を変える(人間の判断として記録されます)</p>

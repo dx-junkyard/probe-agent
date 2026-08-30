@@ -16,6 +16,8 @@ import {
   useUxRequirements, useUxRequirementDetail, useCreateUxRequirement,
   useAddUxRequirementRevision, useAddUxRequirementStepLink,
   useUxJourneys, useUxJourneyDetail, useSolutionDesigns, useSolutionDesignDetailsBatch,
+  useProductFeatures, useProductFeatureDetailsBatch, useCreateProductFeature,
+  useAddProductFeatureRequirementLink,
 } from "@/api/hooks";
 import type {
   UxAcceptanceCriterionInput, UxRequirementKind, UxVerificationMethod,
@@ -23,9 +25,18 @@ import type {
 import {
   DESIGN_STATUS_LABEL, DESIGN_RECHECK_STATE_LABEL, REQUIREMENT_KIND_LABEL,
   REF_RECHECK_STATE_LABEL, REF_TARGET_RESOLUTION_LABEL, VERIFICATION_METHOD_LABEL,
-  requirementAcceptsTargetLink, solutionDesignsForRequirement,
+  featuresForRequirement, requirementAcceptsTargetLink, solutionDesignsForRequirement,
   sortRequirements, stepsInOrder,
 } from "./model";
+// The Product layer's OWN finite vocabularies (`ProductDesignStatus` /
+// `ProductRecheckState`), reused verbatim rather than re-typed here: they are
+// separate unions from `UxDesignStatus` / `UxDesignRecheckState` even where
+// the values coincide, and a second copy of a label map is how the two drift.
+import {
+  DESIGN_STATUS_LABEL as PRODUCT_DESIGN_STATUS_LABEL,
+  RECHECK_STATE_LABEL as PRODUCT_RECHECK_STATE_LABEL,
+  REF_TARGET_RESOLUTION_LABEL as PRODUCT_REF_TARGET_RESOLUTION_LABEL,
+} from "@/components/product-objective/model";
 import {
   ArtifactReferencesCard, DegradedNote, DesignDecisionControls, EmptyNote,
   LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
@@ -347,6 +358,177 @@ function SolutionDesignsForRequirement({
   );
 }
 
+/**
+ * Epic #427 §7.2's Requirement -> Feature link, and the ONLY editing surface
+ * for it (`POST /product-features/{key}/requirement-links`). It lives on the
+ * Requirement because that is the subject the developer has open; the link
+ * itself is stored on the FEATURE, which is why the linked set is computed by
+ * reading every Feature's own links (`featuresForRequirement`).
+ *
+ * This is the operation the Overview's `link_requirement_to_feature` next
+ * step names, so it has to be COMPLETABLE here -- an explicit submit that
+ * records the link, not merely a screen that mentions Features. Before this
+ * existed the Feature layer had a complete server and no surface at all, so
+ * that CTA could only ever open a screen.
+ *
+ * Creating a Feature and linking it are two separate explicit submissions,
+ * both `decision_method: manual` server-side. Neither adopts, applies, or
+ * publishes anything (§0: the design layer never touches implementation).
+ */
+function FeaturesForRequirement({
+  requirementKey,
+  requirementId,
+}: {
+  requirementKey: string;
+  requirementId: number;
+}) {
+  const features = useProductFeatures();
+  const allKeys = (features.data?.features ?? []).map((f) => f.feature_key);
+  const details = useProductFeatureDetailsBatch(allKeys);
+  const loaded = details.filter((d) => d.data).map((d) => d.data!);
+  const anyLoading = features.isLoading || details.some((d) => d.isLoading);
+  const anyError = features.isError || details.some((d) => d.isError);
+  const linked = featuresForRequirement(loaded, requirementId);
+  const linkedKeys = new Set(linked.map((l) => l.feature.feature_key));
+  const linkable = allKeys.filter((k) => !linkedKeys.has(k));
+
+  const [featureKey, setFeatureKey] = useState("");
+  const [newFeatureKey, setNewFeatureKey] = useState("");
+  const addLink = useAddProductFeatureRequirementLink(featureKey || null);
+  const createFeature = useCreateProductFeature();
+
+  function submitLink() {
+    addLink.mutate(
+      { requirement_key: requirementKey },
+      {
+        onSuccess: () => {
+          setFeatureKey("");
+          toast.success("Feature との対応を記録しました");
+        },
+        onError: (error) => toast.error((error as ApiError).detail || "記録できませんでした"),
+      },
+    );
+  }
+
+  function submitCreate() {
+    const key = newFeatureKey.trim();
+    createFeature.mutate(
+      { feature_key: key },
+      {
+        onSuccess: () => {
+          setNewFeatureKey("");
+          // Preselect the Feature just created: the developer's next step is
+          // linking it, and making them find it again in the list is the
+          // dead end this whole section exists to remove.
+          setFeatureKey(key);
+          toast.success("Feature を作成しました");
+        },
+        onError: (error) => toast.error((error as ApiError).detail || "作成できませんでした"),
+      },
+    );
+  }
+
+  return (
+    <div className="space-y-2" data-testid="ux-requirement-features">
+      <SectionHeading as="h3">この Requirement を実現する Feature</SectionHeading>
+      {anyLoading ? (
+        <LoadingBlock testId="ux-requirement-features-loading" />
+      ) : anyError ? (
+        // 「取得できなかった」と「1 件もない」は別の答え (§0 invariant 8)。
+        <EmptyNote testId="ux-requirement-features-unavailable">
+          Feature の一部を取得できなかったため、対応を完全には表示できません。
+        </EmptyNote>
+      ) : linked.length === 0 ? (
+        <EmptyNote testId="ux-requirement-features-empty">
+          まだこの Requirement に対応する Feature がありません。
+        </EmptyNote>
+      ) : (
+        <ul className="space-y-1 text-xs" data-testid="ux-requirement-feature-list">
+          {linked.map(({ feature, link }) => (
+            <li key={link.id} className="rounded border p-2" data-testid={`ux-requirement-feature-${feature.feature_key}`}>
+              <div className="font-mono">{feature.feature_key}</div>
+              {feature.title && <div className="mt-0.5">{feature.title}</div>}
+              <div className="mt-1 flex flex-wrap gap-1">
+                <StateBadge
+                  label={PRODUCT_DESIGN_STATUS_LABEL[feature.design_status]}
+                  tone={feature.design_status === "confirmed" ? "success" : "outline"}
+                />
+                {/* `target_resolution` and `recheck_state` are two axes
+                    (§7.2): the first says whether the link still reaches this
+                    Requirement at all, the second whether its content moved
+                    since. `recheck_state` has no `unresolved` member, so it
+                    cannot stand in -- an unresolved link would read merely
+                    「再確認が必要」. */}
+                <StateBadge
+                  label={PRODUCT_REF_TARGET_RESOLUTION_LABEL[link.target_resolution]}
+                  tone={link.target_resolution === "resolved" ? "success" : "destructive"}
+                />
+                <StateBadge
+                  label={PRODUCT_RECHECK_STATE_LABEL[link.recheck_state]}
+                  tone={link.recheck_state === "current" ? "outline" : "warning"}
+                />
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {!anyLoading && !anyError && (
+        <div className="space-y-2 rounded border p-2" data-testid="ux-requirement-feature-link-form">
+          <p className="text-xs font-semibold">Feature に対応づける</p>
+          {linkable.length === 0 ? (
+            <p className="text-xs text-muted-foreground" data-testid="ux-requirement-feature-none-linkable">
+              {allKeys.length === 0
+                ? "この System にはまだ Feature がありません。下で作成してください。"
+                : "この System の Feature はすべてこの Requirement に対応づけ済みです。"}
+            </p>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              <Select
+                aria-label="対応づける Feature"
+                value={featureKey}
+                onChange={(e) => setFeatureKey(e.target.value)}
+              >
+                <option value="">Feature を選択</option>
+                {linkable.map((k) => (
+                  <option key={k} value={k}>
+                    {k}
+                  </option>
+                ))}
+              </Select>
+              <Button
+                size="sm"
+                disabled={!featureKey || addLink.isPending}
+                onClick={submitLink}
+                data-testid="ux-requirement-feature-link-submit"
+              >
+                {addLink.isPending ? "記録中…" : "対応づける"}
+              </Button>
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-2 border-t pt-2">
+            <Input
+              placeholder="feature_key(例: single-page-checkout)"
+              value={newFeatureKey}
+              onChange={(e) => setNewFeatureKey(e.target.value)}
+              className="max-w-xs"
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!newFeatureKey.trim() || createFeature.isPending}
+              onClick={submitCreate}
+              data-testid="ux-requirement-feature-create-submit"
+            >
+              {createFeature.isPending ? "作成中…" : "Feature を作成する"}
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RequirementDetail({
   requirementKey,
   onOpenSolutionDesign,
@@ -440,6 +622,8 @@ function RequirementDetail({
       </div>
 
       <RequirementRevisionHistoryCard requirementKey={requirementKey} />
+
+      <FeaturesForRequirement requirementKey={requirementKey} requirementId={r.id} />
 
       <SolutionDesignsForRequirement requirementId={r.id} onOpenSolutionDesign={onOpenSolutionDesign} />
 

@@ -1821,6 +1821,64 @@ creating incomplete persistence or execution paths for later phases.
     Milestone / Gap / Feature の確定、Milestone 達成判定、Gap の解消・reopen・
     優先バンド設定もすべて `decision_method: manual`。
 
+    **レビュー対応 (2026-08-30)。** 実装後レビューの残件を修正した。いずれも
+    「表示または記録が、確かめられていないことを確かめられたことのように扱って
+    いた」型の欠陥である。後から変えるときに守ること:
+    - **狭めた語彙には upgrade migration が要る。** §5.11 が
+      `product_gap_artifact_link.link_kind` から `ux_journey` を外したが、
+      `CREATE TABLE IF NOT EXISTS` は既存の表を直せない。migration が無ければ
+      既存 DB は古い CHECK と `ux_journey` 行を保持し、その行は narrowed
+      `Literal` の外なので `GET /product-gaps/{key}` が response validation で
+      落ち、記録された接続は正本へ移った読み手から見えないままになる —
+      **新規 DB だけのテストでは 1 つも検出できない**。
+      `db._migrate_product_gap_artifact_link_kinds` が 1 度だけ移し、
+      同一 System 内でちょうど 1 つの Journey に解決できる行だけを正本へ移して、
+      未解決・競合・重複は `product_gap_artifact_migration_report` へ残す
+      (推測しない)。あわせて UX Design Studio の ref kind 選択肢が #427 以前の
+      3 値のままで正本を書ける UI が無かったので広げた。
+    - **解決できない gap code は作成時に拒否する。**
+      `functional_lineage_gap` の resolver は Objective 層を除外して呼ぶので、
+      その層だけが出す 11 個の code は決して一致しない。422
+      `product_gap_source_ref_unresolvable` で拒否し、gate 以前の行は
+      `unavailable` と読む — `disappeared` は §6 の `close_candidate` 入力なので、
+      誰も集めていない証拠で人間を close へ押すことになる。
+    - **重複の 2 つ目の検出器も同じ 1 コードを返す。** 事前 SELECT と
+      partial unique index は同じ条件を検出する。SQLite は違反した index を
+      **列名**で報告するので index 名で match すると黙って発火しない。
+      事前チェック・pin 解決・INSERT は 1 transaction。
+    - **deep link は 2 軸。** `deep_link_state` は「その kind の画面があるか」、
+      `deep_link_target_state` (`selected` / `screen_only` / `unavailable`) は
+      「その URL が対象を選択して開くか」。検出元・証跡・成果物 link の 3 種類
+      すべてに適用する。`selected` を返すのは遷移先が**実際に読む param 名**へ
+      ref から曖昧さなく写せる kind だけ (§5.8.1 の表)。
+    - **Overview の CTA は操作を完了できる面へ飛ばす。** `confirm_vision` は
+      `/interview?session=<id>#cockpit-aux-intent`、
+      `link_requirement_to_feature` は `/ux-design-studio?tab=requirements`。
+      後者のために **UX Design Studio の Requirement 詳細へ Requirement →
+      Feature の編集面を新設した** (§7.2.1) — Feature 層は server が完成して
+      いるのに編集面が 1 つも無く、CTA は画面を開くことしかできなかった。
+    - **Objective Map の選択は正規化し、entity ごとに remount する。**
+      Milestone は所有 Objective 抜きで表示しない (tree は既に展開できるが、
+      詳細・操作ペインは `objectiveKey` を見るので `MilestoneWorkPanel` が
+      mount されない)。Objective / Milestone / Gap の各作業パネルは
+      `(system_id, <kind>_key)` で remount する — revision・判断・関連付けは
+      すべて local state なので、A へ入力した内容が B の事実として保存される。
+    - **revision form は current revision から seed する。** revision API は
+      全項目の snapshot を追記する契約なので、空欄から始めると「1 項目だけ
+      直す」が「他を全部空へ戻す」になる。CreateGap の default Milestone も
+      後から届いた既定値・System 切替へ追従させる。
+    - **CTA は対象まで選択して着地する。** 「その操作を完了できる面」の次の
+      段階として、server が `next_step_requirement_key` で対象を名指しし、
+      `link_requirement_to_feature` はその Requirement を選択した URL へ飛ぶ。
+      特定できなければ `None` を返して plain な tab へ落ちる — **推測した key を
+      付けない**。
+    - **remount は入力を黙って捨てるので、破棄確認を出す。** 各 form は自分が
+      dirty かどうかだけを宣言し (`useDirtyGuard`)、page が選択変更の瞬間に
+      一度だけ問い合わせる (`components/product-objective/unsaved-work.tsx`)。
+      dirty は **seed との差**であって「中身があるか」ではない (form は current
+      revision から seed されるため)。lane の切り替えは entity の変更では
+      ないので確認しない。断れば選択も入力も残る。
+
     **実装状況 (2026-08-28 時点)。** #428-#433 は実装・検証済み。正本モジュールは
     `app/product_objective.py`(Objective / Milestone / Gap の identity・revision・
     決定台帳・導出)、`app/product_gap_sources.py`(14 個の source kind の唯一の

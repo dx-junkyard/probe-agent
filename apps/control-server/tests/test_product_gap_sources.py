@@ -145,17 +145,21 @@ class TestEvidenceAndArtifactDeepLinks:
 
     @pytest.mark.parametrize("kind", get_args(ProductGapEvidenceKind))
     def test_evidence_route_is_none_exactly_when_unavailable(self, kind):
-        route, state = pgs.evidence_deep_link(kind)
+        route, state, target_state = pgs.evidence_deep_link(kind)
         assert state in ("available", "unavailable")
         assert (route is None) == (state == "unavailable")
+        # §5.8.1: `unavailable` on one axis implies it on the other -- there
+        # is no "selected target on a screen that does not exist".
+        assert (target_state == "unavailable") == (state == "unavailable")
         if route is not None:
             assert route.startswith("/")
 
     @pytest.mark.parametrize("kind", get_args(ProductGapArtifactLinkKind))
     def test_artifact_route_is_none_exactly_when_unavailable(self, kind):
-        route, state = pgs.artifact_deep_link(kind)
+        route, state, target_state = pgs.artifact_deep_link(kind)
         assert state in ("available", "unavailable")
         assert (route is None) == (state == "unavailable")
+        assert (target_state == "unavailable") == (state == "unavailable")
         if route is not None:
             assert route.startswith("/")
 
@@ -163,13 +167,47 @@ class TestEvidenceAndArtifactDeepLinks:
     def test_kinds_probe_agent_owns_no_screen_for_say_so(self, kind):
         """A free-text report and an outside URI have no probe-agent screen.
         Inventing one would be the fabricated URL §5.8 forbids."""
-        assert pgs.evidence_deep_link(kind) == (None, "unavailable")
+        assert pgs.evidence_deep_link(kind) == (None, "unavailable", "unavailable")
 
     def test_product_feature_has_an_api_but_no_screen(self):
         """`GET /product-features` exists; no Dashboard screen owns a Feature.
         Appearing as a node inside the Functional Lineage graph answers a
         different question and is not a route to the Feature (§5.8)."""
-        assert pgs.artifact_deep_link("product_feature") == (None, "unavailable")
+        assert pgs.artifact_deep_link("product_feature") == (None, "unavailable", "unavailable")
+
+    def test_a_ref_selects_the_subject_where_the_destination_has_a_param(self):
+        """§5.8.1: "a screen exists" and "the URL opens ON this subject" are
+        two facts, and a single label promised the second while often
+        delivering only the first."""
+        assert pgs.evidence_deep_link("trace", "trace-42") == (
+            "/components?trace=trace-42", "available", "selected",
+        )
+        assert pgs.artifact_deep_link("ux_requirement", "single-page-checkout") == (
+            "/ux-design-studio?tab=requirements&requirement=single-page-checkout",
+            "available", "selected",
+        )
+        assert pgs.artifact_deep_link("solution_design", "d1") == (
+            "/ux-design-studio?tab=solutions&design=d1", "available", "selected",
+        )
+
+    def test_a_screen_with_no_matching_param_stays_screen_only(self):
+        # `/system-understanding` reads no selection param, so a ref cannot
+        # make this land anywhere more specific.
+        assert pgs.artifact_deep_link("issue_draft", "42") == (
+            "/system-understanding", "available", "screen_only",
+        )
+        assert pgs.evidence_deep_link("repository_path", "src/app.py") == (
+            "/repository", "available", "screen_only",
+        )
+
+    def test_an_omitted_ref_degrades_to_the_plain_screen(self):
+        """Never a fabricated param the destination would ignore."""
+        assert pgs.evidence_deep_link("trace") == ("/components", "available", "screen_only")
+
+    def test_refs_are_url_encoded(self):
+        route, _state, target_state = pgs.artifact_deep_link("ux_requirement", "a b&c=d")
+        assert route == "/ux-design-studio?tab=requirements&requirement=a%20b%26c%3Dd"
+        assert target_state == "selected"
 
     def test_out_of_vocabulary_kinds_raise_value_error(self):
         """A programming error, not data -- the same rule `resolve_source`
@@ -178,6 +216,97 @@ class TestEvidenceAndArtifactDeepLinks:
             pgs.evidence_deep_link("not_a_real_kind")
         with pytest.raises(ValueError):
             pgs.artifact_deep_link("ux_journey")
+
+
+class TestSourceDeepLinkTargetIsASeparateAxis:
+    """§5.8.1 on the SOURCE side. `deep_link_state` answers "does a screen for
+    this kind exist"; `deep_link_target_state` answers "does that URL open on
+    this subject". Different questions, different next moves (#366)."""
+
+    def test_every_kind_reports_both_axes_consistently(self, db):
+        with db() as conn:
+            system_id = _make_system(conn, name="Deep Link Axes")
+            for kind in pgs.SOURCE_KINDS:
+                resolved = pgs.resolve_source(
+                    conn, system_id=system_id, source_kind=kind, source_ref="x|y|z",
+                )
+                assert resolved.deep_link_target_state in {"selected", "screen_only", "unavailable"}
+                if resolved.deep_link_state == "unavailable":
+                    assert resolved.deep_link is None
+                    assert resolved.deep_link_target_state == "unavailable"
+                else:
+                    assert resolved.deep_link is not None
+                    assert resolved.deep_link_target_state != "unavailable"
+
+    def test_functional_lineage_gap_selects_its_subject(self, db):
+        with db() as conn:
+            system_id = _make_system(conn, name="FL Target")
+            resolved = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="functional_lineage_gap",
+                source_ref="need_without_exchange|stakeholder_need|need-1",
+            )
+        assert resolved.deep_link_target_state == "selected"
+        # The destination's OWN param names (`readSharedSelection`).
+        assert resolved.deep_link == "/functional-lineage?ref_kind=stakeholder_need&ref=need-1"
+
+    def test_value_network_notice_picks_the_param_its_subject_kind_uses(self, db):
+        with db() as conn:
+            system_id = _make_system(conn, name="VN Target")
+            stakeholder = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="value_network_notice",
+                source_ref="stakeholder_without_need|stakeholder|sh-1",
+            )
+            exchange = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="value_network_notice",
+                source_ref="exchange_without_journey|value_exchange|ex-1",
+            )
+        assert stakeholder.deep_link == "/stakeholder-value-network?node=sh-1"
+        assert exchange.deep_link == "/stakeholder-value-network?edge=ex-1"
+
+    def test_studio_kinds_select_what_their_screen_can_select(self, db):
+        with db() as conn:
+            system_id = _make_system(conn, name="Studio Target")
+            journey = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="journey_baseline_diff",
+                source_ref="checkout-to-be|step-2",
+            )
+            requirement = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="requirement_diff",
+                source_ref="single-page-checkout|crit-1",
+            )
+        # The Studio has no Step or criterion param, so neither is claimed.
+        assert journey.deep_link == "/ux-design-studio?tab=journeys&journey=checkout-to-be"
+        assert requirement.deep_link == "/ux-design-studio?tab=requirements&requirement=single-page-checkout"
+
+    def test_a_kind_whose_screen_has_no_matching_param_is_screen_only(self, db):
+        with db() as conn:
+            system_id = _make_system(conn, name="Screen Only")
+            resolved = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="understanding_review_gap",
+                source_ref="missing_capability|Checkout",
+            )
+        assert resolved.deep_link == "/interview"
+        assert resolved.deep_link_target_state == "screen_only"
+
+    def test_a_malformed_ref_degrades_to_the_plain_screen(self, db):
+        with db() as conn:
+            system_id = _make_system(conn, name="Malformed Ref")
+            resolved = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="functional_lineage_gap",
+                source_ref="not-a-three-part-ref",
+            )
+        assert resolved.deep_link == "/functional-lineage"
+        assert resolved.deep_link_target_state == "screen_only"
+
+    def test_a_kind_with_no_screen_never_gets_a_target(self, db):
+        with db() as conn:
+            system_id = _make_system(conn, name="No Screen")
+            resolved = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="node_anomaly", source_ref="n1|d1",
+            )
+        assert resolved.deep_link is None
+        assert resolved.deep_link_state == "unavailable"
+        assert resolved.deep_link_target_state == "unavailable"
 
 
 class TestUnknownSourceKind:

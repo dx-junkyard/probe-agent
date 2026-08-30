@@ -40,7 +40,14 @@ const BASELINE_MODES: UxJourneyBaselineMode[] = ["linked", "greenfield", "undeci
 const EVIDENCE_KINDS: UxEvidenceSourceKind[] = [
   "runtime_trace", "human_report", "external_analytics", "none",
 ];
-const REF_KINDS: UxRefKind[] = ["purpose_element", "purpose_relation", "capability_entity"];
+// Epic #427 §7.1 widened `ux_journey_upstream_ref.ref_kind` with the three
+// Product-layer kinds -- and §5.11 then made that table the ONE home of a
+// Gap's Journey connection -- but this selector kept the pre-#427 list, so
+// the canonical link could not be written from anywhere in the Dashboard.
+const REF_KINDS: UxRefKind[] = [
+  "purpose_element", "purpose_relation", "capability_entity",
+  "product_objective", "product_milestone", "product_gap",
+];
 
 function JourneyCreateForm() {
   const create = useCreateUxJourney();
@@ -361,7 +368,7 @@ function UpstreamRefsCard({ journeyKey, refs }: { journeyKey: string; refs: UxJo
 
   return (
     <div className="space-y-2" data-testid="ux-journey-upstream-refs">
-      <SectionHeading>Purpose / Capability への参照</SectionHeading>
+      <SectionHeading>Purpose / Capability / Objective への参照</SectionHeading>
       {refs.length === 0 ? (
         <EmptyNote>参照はまだありません。</EmptyNote>
       ) : (
@@ -401,7 +408,7 @@ function UpstreamRefsCard({ journeyKey, refs }: { journeyKey: string; refs: UxJo
             ))}
           </Select>
           <Input
-            placeholder="target_ref(例: Capability の id、または要素の stable id)"
+            placeholder="target_ref(例: Capability の id、objective_key / milestone_key / gap_key、または要素の stable id)"
             value={targetRef}
             onChange={(e) => setTargetRef(e.target.value)}
           />

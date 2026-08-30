@@ -26,8 +26,12 @@ import { useGapWorkbench, useObjectiveMap } from "@/api/hooks";
 import {
   EMPTY_GAP_WORKBENCH_FILTERS, filterGapWorkbenchEntries, objectiveMapEmptyState,
   objectiveMapNodeByKey, objectiveMapSelectionFromSearchParams,
+  normalizeObjectiveMapSelection,
   applyObjectiveMapSelectionToSearchParams, type GapWorkbenchFilters,
 } from "@/components/product-objective/model";
+import {
+  UnsavedWorkProvider, confirmDiscardUnsavedWork, useUnsavedWork,
+} from "@/components/product-objective/unsaved-work";
 import { useSlowPending } from "@/components/product-objective/use-slow-pending";
 import { ObjectiveDetailCard, ObjectiveTree } from "@/components/product-objective/objective-tree";
 import {
@@ -92,25 +96,79 @@ function Lane({ query, pendingTestId, errorTestId, label, children }: {
   return <>{children}</>;
 }
 
+/** The provider must sit ABOVE the component that asks the question, so the
+ * page body is one level in. */
 export default function ObjectiveMapPage() {
+  return (
+    <UnsavedWorkProvider>
+      <ObjectiveMapPageBody />
+    </UnsavedWorkProvider>
+  );
+}
+
+function ObjectiveMapPageBody() {
   const [searchParams, setSearchParams] = useSearchParams();
   const { systemId } = useAuth();
   const objectiveMap = useObjectiveMap();
   const gapWorkbench = useGapWorkbench();
 
-  const selection = objectiveMapSelectionFromSearchParams(searchParams);
+  // A Milestone is never shown without the Objective that owns it: a
+  // Milestone-only deep link resolves its owner from the SERVER's own map,
+  // and selecting a Milestone under a manually expanded Objective moves the
+  // Objective selection with it. See `normalizeObjectiveMapSelection` -- the
+  // tree already reveals such a Milestone, but the detail/action pane is
+  // keyed off `objectiveKey`, so without this it never mounts.
+  const selection = normalizeObjectiveMapSelection(
+    objectiveMap.data, objectiveMapSelectionFromSearchParams(searchParams),
+  );
   const [gapFilters, setGapFilters] = useState<GapWorkbenchFilters>({
     ...EMPTY_GAP_WORKBENCH_FILTERS,
     objectiveKey: selection.objectiveKey,
     milestoneKey: selection.milestoneKey,
   });
 
+  // Review 0.4's other half. Keying the work panels per entity stopped text
+  // typed for A from being SUBMITTED as B's, but a remount discards it
+  // silently -- so clicking the next row in a list still loses work without
+  // warning. Ask before an ENTITY changes; a lane switch is not an entity
+  // change and never prompts.
+  const unsavedWork = useUnsavedWork();
+  function changesEntity(patch: Partial<typeof selection>): boolean {
+    return (
+      (patch.objectiveKey !== undefined && patch.objectiveKey !== selection.objectiveKey)
+      || (patch.milestoneKey !== undefined && patch.milestoneKey !== selection.milestoneKey)
+      || (patch.gapKey !== undefined && patch.gapKey !== selection.gapKey)
+    );
+  }
+
   function updateSelection(patch: Partial<typeof selection>) {
-    const next = { ...selection, ...patch };
+    if (changesEntity(patch) && unsavedWork?.hasUnsavedWork() && !confirmDiscardUnsavedWork()) {
+      return;
+    }
+    const next = normalizeObjectiveMapSelection(objectiveMap.data, { ...selection, ...patch });
     const params = new URLSearchParams(searchParams);
     applyObjectiveMapSelectionToSearchParams(params, next);
     setSearchParams(params, { replace: true });
   }
+
+  // The normalized selection is what the page acts on, so the URL must say
+  // the same thing -- otherwise a reload or a shared link reopens the
+  // un-normalized (Objective-less, or wrong-Objective) view. This one IS an
+  // effect rather than a during-render adjustment: it writes to the ROUTER,
+  // an external system, not to this component's own state, and the render
+  // already uses the normalized value, so nothing is painted wrong while it
+  // catches up. `replace` keeps it out of the history stack -- it corrects
+  // the entry the developer arrived on, it is not a navigation of their own.
+  const canonicalSearch = (() => {
+    const params = new URLSearchParams(searchParams);
+    applyObjectiveMapSelectionToSearchParams(params, selection);
+    return params.toString();
+  })();
+  useEffect(() => {
+    if (canonicalSearch !== searchParams.toString()) {
+      setSearchParams(new URLSearchParams(canonicalSearch), { replace: true });
+    }
+  }, [canonicalSearch, searchParams, setSearchParams]);
 
   // §3.4 rule (documented here because it decides what "single source of
   // truth" means for the two representations of the same value): the URL
@@ -263,14 +321,28 @@ export default function ObjectiveMapPage() {
                   {selectedNode ? (
                     <>
                       <ObjectiveDetailCard node={selectedNode} />
-                      <ObjectiveWorkPanel objectiveKey={selectedNode.objective_key} />
+                      {/* `key` is contract, not a hint: the revision and
+                          decision forms inside hold local `useState`, so
+                          without a remount per entity, text typed for
+                          Objective A stays on screen after selecting B and
+                          「記録する」 saves it as B's revision -- a wrong-entity
+                          write, not a cosmetic leftover. The System id is part
+                          of the key because these slugs are unique only WITHIN
+                          a System (§1's `(system_id, <kind>_key)` identity). */}
+                      <ObjectiveWorkPanel
+                        key={`${systemId ?? "none"}:${selectedNode.objective_key}`}
+                        objectiveKey={selectedNode.objective_key}
+                      />
                       <CreateMilestoneForm
                         objectiveKey={selectedNode.objective_key}
                         onCreated={(key) => updateSelection({ milestoneKey: key })}
                       />
                       {selection.milestoneKey && (
                         <>
-                          <MilestoneWorkPanel milestoneKey={selection.milestoneKey} />
+                          <MilestoneWorkPanel
+                            key={`${systemId ?? "none"}:${selection.milestoneKey}`}
+                            milestoneKey={selection.milestoneKey}
+                          />
                           <Button
                             variant="ghost"
                             size="sm"
@@ -332,7 +404,11 @@ export default function ObjectiveMapPage() {
                   </CardHeader>
                   <CardContent>
                     {selection.gapKey ? (
-                      <GapDetailPanel gapKey={selection.gapKey} workbench={workbench} />
+                      <GapDetailPanel
+                        key={`${systemId ?? "none"}:${selection.gapKey}`}
+                        gapKey={selection.gapKey}
+                        workbench={workbench}
+                      />
                     ) : (
                       <p className="text-sm text-muted-foreground" data-testid="gap-detail-empty">
                         Gap を選択すると詳細と操作が表示されます。

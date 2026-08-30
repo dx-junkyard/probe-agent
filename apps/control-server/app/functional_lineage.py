@@ -85,7 +85,11 @@ from . import node_design, product_feature, product_objective, purpose_chain, so
 from . import stakeholder_network as sn, ux_design
 from . import stakeholder_value_network as svn
 
-__all__ = ["build_functional_lineage", "trace_downstream_impact"]
+__all__ = [
+    "build_functional_lineage",
+    "PRODUCT_OBJECTIVE_LAYER_GAP_CODES",
+    "trace_downstream_impact",
+]
 
 
 # --- Fixed gap severity (§9.2 -- never computed per instance, invariant 7) ---
@@ -136,6 +140,39 @@ _GAP_SEVERITY: Dict[str, str] = {
 #: caught the moment this module is imported, rather than silently returning
 #: a `KeyError` deep inside a projection call).
 GAP_CODES: Tuple[str, ...] = tuple(_GAP_SEVERITY)
+
+#: The gap codes emitted ONLY by sections 6-8 (`_check_product_objectives` /
+#: `_check_product_gaps` / `_check_product_features`), i.e. exactly the codes
+#: that `include_product_objective_layer=False` makes unreachable.
+#:
+#: `product_gap_sources._resolve_functional_lineage_gap` runs with that flag
+#: off (it must, or the cycle documented on `build_functional_lineage`
+#: returns), so a `functional_lineage_gap` source naming one of these can
+#: never match. Without this set it reported `disappeared` -- "the detector
+#: no longer emits this gap" -- which is a claim about the WORLD, when the
+#: fact is only that this projection does not answer that question from
+#: inside a Gap's own source resolution. Naming the set here rather than in
+#: the resolver keeps it beside the sections that emit it, so adding a code
+#: to one of them without adding it here is a single-file mistake to spot.
+#:
+#: `unresolved_reference` / `unavailable_reference` / `stale_link` are
+#: deliberately NOT members: sections 1-5 emit them too, so they remain
+#: resolvable.
+PRODUCT_OBJECTIVE_LAYER_GAP_CODES: frozenset = frozenset({
+    "objective_without_vision_ref",
+    "objective_without_milestone",
+    "milestone_without_gap",
+    "milestone_without_verification",
+    "gap_without_journey",
+    "gap_source_unresolved",
+    "gap_source_unavailable",
+    "gap_source_contradicted",
+    "requirement_without_feature",
+    "feature_without_implementation_target",
+    "feature_without_capability",
+})
+
+assert PRODUCT_OBJECTIVE_LAYER_GAP_CODES <= set(GAP_CODES)
 
 #: §7.2's Value Network notice codes that mean exactly the same fact as one
 #: of THIS projection's own gap codes. `stale_confirmation` maps to

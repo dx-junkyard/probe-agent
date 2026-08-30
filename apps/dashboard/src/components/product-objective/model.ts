@@ -54,6 +54,7 @@ import type {
   OverviewObjectiveOut,
   ProductAuthorshipKind,
   ProductDeepLinkState,
+  ProductDeepLinkTargetState,
   ProductDesignStatus,
   ProductGapArtifactLinkKind,
   ProductGapEffectiveTargetAvailability,
@@ -73,6 +74,7 @@ import type {
   ProductObjectiveNextStepState,
   ProductObjectiveState,
   ProductRecheckState,
+  ProductRefTargetResolution,
   ProductRevisionState,
 } from "@/api/types";
 
@@ -197,6 +199,26 @@ export const GAP_READ_FLAG_LABEL: Record<ProductGapReadFlag, string> = {
 
 export const DEEP_LINK_STATE_LABEL: Record<ProductDeepLinkState, string> = {
   available: "対応する画面があります",
+  unavailable: "対応する画面はまだありません",
+};
+
+/** §7.2's own resolution axis, kept SEPARATE from `RECHECK_STATE_LABEL`:
+ * `ProductRecheckState` has no `unresolved` member, so it reports a deleted
+ * target the same way as one whose content merely moved. Three states, three
+ * sentences -- an unresolved link must never read as a working connection. */
+export const REF_TARGET_RESOLUTION_LABEL: Record<ProductRefTargetResolution, string> = {
+  resolved: "参照先を解決済み",
+  unresolved: "参照先が見つかりません",
+  unavailable: "参照先を確認できませんでした",
+};
+
+/** §5.8.1's second axis. The three sentences are deliberately different:
+ * 「開いた先で対象が選択済み」「画面は開くが対象は自分で探す」「画面自体が
+ * ない」 are three different next moves, and 「検出元を開く」 alone promised
+ * the first while often delivering the second. */
+export const DEEP_LINK_TARGET_STATE_LABEL: Record<ProductDeepLinkTargetState, string> = {
+  selected: "対象を選択した状態で開きます",
+  screen_only: "画面は開きますが、対象はご自身で選択してください",
   unavailable: "対応する画面はまだありません",
 };
 
@@ -455,6 +477,47 @@ export function objectiveGapTotal(
  * documented rule: a new selection always re-opens its ancestor path, even
  * over a manual collapse, and never touches unrelated nodes).
  */
+/**
+ * §9.4/§9.5: normalizes a selection against the loaded map so a Milestone is
+ * never shown without the Objective that OWNS it.
+ *
+ * `objectiveMapForceExpandedKeys` already reveals a deep-linked Milestone in
+ * the TREE, but the detail/action pane is keyed off `objectiveKey`, so two
+ * defects survive that:
+ *
+ * 1. A Milestone-only deep link (`/objective-map?milestone=<key>`, which
+ *    `functional-lineage/model.ts` generates for `product_milestone`, and
+ *    which the shared `ref_kind=product_milestone` convention also produces)
+ *    carries no `objective`, so `objectiveMapNodeByKey` resolves nothing and
+ *    the pane renders 「Objective を選択すると詳細が表示されます」 -- with
+ *    `MilestoneWorkPanel`, the whole point of the link, never mounted.
+ * 2. Clicking a Milestone under a MANUALLY expanded Objective B while
+ *    Objective A is selected leaves `objective=A` beside `milestone=B`, so
+ *    the pane describes A and carries A's work panel while the Milestone
+ *    panel under it acts on B's Milestone.
+ *
+ * The owner is looked up in the SERVER's own map by exact key equality --
+ * never inferred from a naming convention. A `milestoneKey` that resolves to
+ * nothing (another System's key, a deleted Milestone) is DROPPED rather than
+ * kept beside an unrelated Objective: "this Milestone is not in this map" and
+ * "this Milestone belongs to the selected Objective" are different answers.
+ * A `null` map (that lane failed to load) is left untouched -- an unreadable
+ * map is not evidence about the selection.
+ */
+export function normalizeObjectiveMapSelection(
+  map: ObjectiveMapOut | null | undefined,
+  selection: ProductObjectiveMapSelection,
+): ProductObjectiveMapSelection {
+  if (!map || !selection.milestoneKey) return selection;
+  const owner = objectiveMapMilestoneByKey(map, selection.milestoneKey);
+  if (!owner) {
+    if (selection.objectiveKey === null) return selection;
+    return { ...selection, milestoneKey: null };
+  }
+  if (selection.objectiveKey === owner.node.objective_key) return selection;
+  return { ...selection, objectiveKey: owner.node.objective_key };
+}
+
 export function objectiveMapForceExpandedKeys(
   map: ObjectiveMapOut,
   selectedObjectiveKey: string | null,
@@ -555,7 +618,39 @@ export function objectiveNextStepHasAction(state: ProductObjectiveNextStepState)
  * lane/selection this screen can already show; nothing here performs a
  * write.
  */
-export function objectiveNextStepHref(overview: OverviewObjectiveOut): string {
+export function objectiveNextStepHref(
+  overview: OverviewObjectiveOut, interviewSessionId?: number | null,
+): string {
+  // Two of the 15 keys are NOT Objective Map targets, because Objective Map
+  // has no control for them and a CTA must land where its operation can
+  // actually be COMPLETED -- not merely on the screen that owns the topic.
+  if (overview.next_step === "confirm_vision") {
+    // Vision is confirmed on the Interview screen, in the Intent Brief. This
+    // is the SAME target the Overview's own 「Vision を定義する」 lead already
+    // uses (`pages/overview.tsx`'s `visionHref`); reusing it rather than
+    // inventing a second one keeps both leads on one destination. The session
+    // id is optional -- the Interview page auto-selects the System's newest
+    // session by the same rule the Overview reads it with (#380).
+    const session = interviewSessionId ? `?session=${encodeURIComponent(String(interviewSessionId))}` : "";
+    return `/interview${session}#cockpit-aux-intent`;
+  }
+  if (overview.next_step === "link_requirement_to_feature") {
+    // The Requirement -> Feature link is written through
+    // `POST /product-features/{key}/requirement-links`, whose only editing
+    // surface is the UX Design Studio's Requirement detail. The Gap
+    // Workbench's 関連付け records a Gap -> artifact link, a different fact.
+    // The server names the Requirement whose Feature link is missing
+    // (`next_step_requirement_key`), so the CTA lands ON it rather than
+    // opening the tab and leaving the developer to find it. When the server
+    // could not identify one it sends `null` and this falls back to the plain
+    // tab -- never a guessed key, and never a param the Studio does not read
+    // (#366's `loopSearchParams` rule).
+    const params = new URLSearchParams({ tab: "requirements" });
+    if (overview.next_step_requirement_key) {
+      params.set("requirement", overview.next_step_requirement_key);
+    }
+    return `/ux-design-studio?${params.toString()}`;
+  }
   const params = new URLSearchParams();
   switch (overview.next_step) {
     case "confirm_objective":
@@ -578,11 +673,6 @@ export function objectiveNextStepHref(overview: OverviewObjectiveOut): string {
       if (overview.primary_gap) params.set("gap", overview.primary_gap.gap_key);
       else if (overview.next_milestone) params.set("milestone", overview.next_milestone.milestone_key);
       break;
-    case "link_requirement_to_feature":
-      params.set("view", "gaps");
-      if (overview.primary_gap) params.set("gap", overview.primary_gap.gap_key);
-      break;
-    case "confirm_vision":
     case "create_objective":
     case "unavailable":
     case "none":

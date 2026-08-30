@@ -709,6 +709,7 @@ function objectiveSection(overrides: Partial<OverviewObjectiveOut> = {}): Overvi
     active_objective_count: 0,
     next_milestone: null,
     primary_gap: null,
+    next_step_requirement_key: null,
     objective_state: null,
     next_step: "create_objective",
     next_step_state: "available",

@@ -16,6 +16,7 @@ import type {
   UxJourneyDetailOut, UxJourneyDiffOut, UxJourneyListOut, UxJourneyOut,
   UxRequirementDetailOut, UxRequirementListOut, UxRequirementOut,
   SolutionDesignDetailOut, SolutionDesignHandoffOut, SolutionDesignListOut, SolutionDesignOut,
+  ProductFeatureDetailOut, ProductFeatureListOut, ProductFeatureOut,
 } from "@/api/types";
 import {
   AUTHORSHIP_LABEL, DIFF_CHANGE_KIND_LABEL, REVISION_STATE_LABEL,
@@ -231,6 +232,36 @@ function handoffOut(overrides: Partial<SolutionDesignHandoffOut> = {}): Solution
  * sensible empty defaults so components that always fetch (e.g. the
  * Requirement detail's Solution Design lookup) do not need to be mocked in
  * every test that never opens that panel. */
+function productFeatureListOut(
+  features: ProductFeatureOut[], overrides: Partial<ProductFeatureListOut> = {},
+): ProductFeatureListOut {
+  return {
+    system_id: 1, generated_at: 1000, features, degraded_sections: [], degraded_detail: {}, ...overrides,
+  };
+}
+
+function productFeatureOut(overrides: Partial<ProductFeatureOut> = {}): ProductFeatureOut {
+  return {
+    id: 30, system_id: 1, feature_key: "single-page-checkout-feature",
+    current_revision_id: null, current_revision_number: null, title: "",
+    design_status: "proposed", recheck_state: "not_captured",
+    created_by: null, created_at: 1000, updated_at: 1000,
+    ...overrides,
+  };
+}
+
+function productFeatureDetailOut(
+  overrides: Partial<ProductFeatureDetailOut> = {},
+): ProductFeatureDetailOut {
+  return {
+    ...productFeatureOut(),
+    current_revision: null,
+    requirement_links: [], capability_links: [], target_links: [], draft_links: [], decisions: [],
+    degraded_sections: [], degraded_detail: {},
+    ...overrides,
+  };
+}
+
 function mockGet(overrides: Record<string, unknown>) {
   mockApi.get.mockImplementation((path: string) => {
     if (path in overrides) {
@@ -240,6 +271,9 @@ function mockGet(overrides: Record<string, unknown>) {
     if (path === "/ux-design/journeys") return Promise.resolve(journeyListOut([]));
     if (path === "/ux-design/requirements") return Promise.resolve(requirementListOut([]));
     if (path === "/solution-designs") return Promise.resolve(solutionDesignListOut([]));
+    // Epic #427 §7.2: the Requirement detail always asks for the Feature set,
+    // the same way it always asks for the Solution Design set.
+    if (path === "/product-features") return Promise.resolve(productFeatureListOut([]));
     return new Promise(() => {}); // never resolves -> renders as "loading"
   });
 }
@@ -980,5 +1014,135 @@ describe("次に決めること (§4.2)", () => {
     await waitFor(() =>
       expect(screen.getByTestId("ux-design-studio-panel-journeys")).toBeInTheDocument(),
     );
+  });
+});
+
+// --- Epic #427 §7.2: Requirement -> Feature -----------------------------------
+//
+// The Overview's `link_requirement_to_feature` next step names an operation
+// that must be COMPLETABLE somewhere. Before this section existed the Feature
+// layer had a complete server and no editing surface at all, so every CTA for
+// it could only open a screen. These tests assert the submit, not the arrival.
+
+describe("Requirement -> Feature の対応づけ", () => {
+  const requirement = requirementOut({ id: 10, requirement_key: "single-page-checkout" });
+
+  function openRequirement() {
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+    return screen.findByTestId("ux-requirement-item-single-page-checkout");
+  }
+
+  test("対応する Feature が無いときは「まだ無い」と明示し、対応づけフォームを出す", async () => {
+    mockGet({
+      "/ux-design/requirements": requirementListOut([requirement]),
+      "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+      "/product-features": productFeatureListOut([productFeatureOut()]),
+      "/product-features/single-page-checkout-feature": productFeatureDetailOut(),
+    });
+    await renderPage();
+    fireEvent.click(await openRequirement());
+
+    expect(await screen.findByTestId("ux-requirement-features-empty")).toBeInTheDocument();
+    expect(screen.getByTestId("ux-requirement-feature-link-form")).toBeInTheDocument();
+  });
+
+  test("Feature を選んで送信すると requirement-links へ記録される", async () => {
+    mockGet({
+      "/ux-design/requirements": requirementListOut([requirement]),
+      "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+      "/product-features": productFeatureListOut([productFeatureOut()]),
+      "/product-features/single-page-checkout-feature": productFeatureDetailOut(),
+    });
+    mockApi.post.mockResolvedValue({ id: 1 });
+    await renderPage();
+    fireEvent.click(await openRequirement());
+
+    fireEvent.change(await screen.findByLabelText("対応づける Feature"), {
+      target: { value: "single-page-checkout-feature" },
+    });
+    fireEvent.click(screen.getByTestId("ux-requirement-feature-link-submit"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-features/single-page-checkout-feature/requirement-links",
+      { requirement_key: "single-page-checkout" },
+    ));
+  });
+
+  test("選択しただけでは書き込まない(明示 submit のみ)", async () => {
+    mockGet({
+      "/ux-design/requirements": requirementListOut([requirement]),
+      "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+      "/product-features": productFeatureListOut([productFeatureOut()]),
+      "/product-features/single-page-checkout-feature": productFeatureDetailOut(),
+    });
+    await renderPage();
+    fireEvent.click(await openRequirement());
+
+    fireEvent.change(await screen.findByLabelText("対応づける Feature"), {
+      target: { value: "single-page-checkout-feature" },
+    });
+    expect(mockApi.post).not.toHaveBeenCalled();
+  });
+
+  test("既に対応づけ済みの Feature は一覧に出て、選択肢からは消える", async () => {
+    mockGet({
+      "/ux-design/requirements": requirementListOut([requirement]),
+      "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+      "/product-features": productFeatureListOut([productFeatureOut()]),
+      "/product-features/single-page-checkout-feature": productFeatureDetailOut({
+        requirement_links: [
+          {
+            id: 500, feature_id: 30, requirement_id: 10, requirement_key: "single-page-checkout",
+            captured_requirement_revision_id: 1, captured_digest: "d",
+            target_resolution: "resolved", recheck_state: "current",
+            note: "", decision_method: "manual", created_by: "dev", created_at: 1000,
+            superseded_by_id: null,
+          },
+        ],
+      }),
+    });
+    await renderPage();
+    fireEvent.click(await openRequirement());
+
+    expect(await screen.findByTestId("ux-requirement-feature-single-page-checkout-feature")).toBeInTheDocument();
+    expect(screen.getByTestId("ux-requirement-feature-none-linkable")).toBeInTheDocument();
+  });
+
+  test("Feature を作成できる。作成は対応づけとは別の明示操作", async () => {
+    mockGet({
+      "/ux-design/requirements": requirementListOut([requirement]),
+      "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+      "/product-features": productFeatureListOut([]),
+    });
+    mockApi.post.mockResolvedValue(productFeatureDetailOut({ feature_key: "new-feature" }));
+    await renderPage();
+    fireEvent.click(await openRequirement());
+
+    fireEvent.change(await screen.findByPlaceholderText("feature_key(例: single-page-checkout)"), {
+      target: { value: "new-feature" },
+    });
+    fireEvent.click(screen.getByTestId("ux-requirement-feature-create-submit"));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-features", { feature_key: "new-feature" },
+    ));
+    // Creating is NOT linking: exactly one write happened.
+    expect(mockApi.post).toHaveBeenCalledTimes(1);
+  });
+
+  test("Feature を取得できなかったときは「1 件もない」ではなく「取得できなかった」と言う", async () => {
+    mockGet({
+      "/ux-design/requirements": requirementListOut([requirement]),
+      "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+      "/product-features": new ApiError(500, "failed"),
+    });
+    await renderPage();
+    fireEvent.click(await openRequirement());
+
+    expect(await screen.findByTestId("ux-requirement-features-unavailable")).toBeInTheDocument();
+    expect(screen.queryByTestId("ux-requirement-features-empty")).toBeNull();
+    // A surface that could not read the Feature set must not offer a link
+    // form whose options are a lower bound.
+    expect(screen.queryByTestId("ux-requirement-feature-link-form")).toBeNull();
   });
 });

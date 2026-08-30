@@ -454,6 +454,62 @@ class TestNextStepReachability:
             result = pop.build_objective_overview(conn, sid, brief=_fake_brief())
             assert result.next_step == "link_requirement_to_feature"
 
+    def test_row13_names_the_requirement_whose_feature_link_is_missing(self, db):
+        """§9.3: the CTA must land ON the Requirement, not merely open the
+        Studio's Requirement tab and leave the developer to find it."""
+        with db() as conn:
+            sid = _make_system(conn)
+            _full_scaffold(conn, sid)
+            _make_gap(conn, sid, "m1", "g1", priority_band="now")
+            _link_gap_to_journey(conn, sid, "g1", "journey-x")
+            now = _now()
+            journey_id = conn.execute(
+                "SELECT id FROM ux_journey WHERE system_id = ? AND journey_key = 'journey-x'", (sid,)
+            ).fetchone()["id"]
+            # Two Requirements on the Journey, neither reaching a Feature.
+            # The named one is the first by `requirement_key`, so the same
+            # state always points the CTA at the same Requirement.
+            for key in ("req-b", "req-a"):
+                requirement_id = conn.execute(
+                    """INSERT INTO ux_requirement (system_id, requirement_key, requirement_kind, created_at, updated_at)
+                       VALUES (?, ?, 'functional', ?, ?)""",
+                    (sid, key, now, now),
+                ).lastrowid
+                conn.execute(
+                    """INSERT INTO ux_requirement_step_link
+                           (system_id, requirement_id, journey_id, step_key, created_at)
+                       VALUES (?, ?, ?, 'step-1', ?)""",
+                    (sid, requirement_id, journey_id, now),
+                )
+            conn.commit()
+            result = pop.build_objective_overview(conn, sid, brief=_fake_brief())
+            assert result.next_step == "link_requirement_to_feature"
+            assert result.next_step_requirement_key == "req-a"
+
+    def test_row13_leaves_the_requirement_unnamed_when_the_journey_has_none(self, db):
+        """No Requirement to name -> `None`, so the CTA falls back to the
+        plain tab rather than guessing one."""
+        with db() as conn:
+            sid = _make_system(conn)
+            _full_scaffold(conn, sid)
+            _make_gap(conn, sid, "m1", "g1", priority_band="now")
+            _link_gap_to_journey(conn, sid, "g1", "journey-x")
+            conn.commit()
+            result = pop.build_objective_overview(conn, sid, brief=_fake_brief())
+            assert result.next_step == "link_requirement_to_feature"
+            assert result.next_step_requirement_key is None
+
+    def test_no_other_row_names_a_requirement(self, db):
+        """It is row #13's subject only -- never a general-purpose target."""
+        with db() as conn:
+            sid = _make_system(conn)
+            _full_scaffold(conn, sid)
+            _make_gap(conn, sid, "m1", "g1", priority_band="now")
+            conn.commit()
+            result = pop.build_objective_overview(conn, sid, brief=_fake_brief())
+            assert result.next_step == "link_gap_to_journey"
+            assert result.next_step_requirement_key is None
+
     def test_row13_clears_once_requirement_reaches_a_feature(self, db):
         with db() as conn:
             sid = _make_system(conn)

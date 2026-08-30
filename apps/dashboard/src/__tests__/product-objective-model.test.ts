@@ -277,6 +277,7 @@ function overviewObjective(overrides: Partial<OverviewObjectiveOut> = {}): Overv
     active_objective_count: 0,
     next_milestone: null,
     primary_gap: null,
+    next_step_requirement_key: null,
     objective_state: null,
     next_step: "create_objective",
     next_step_state: "available",
@@ -318,8 +319,37 @@ describe("product-objective/model: Overview next_step -> Objective Map CTA", () 
     expect(href).toBe("/objective-map?view=objectives&objective=o1&milestone=m1");
   });
 
-  it("confirm_vision navigates to the bare Objective Map (no Objective row exists yet to select)", () => {
-    expect(objectiveNextStepHref(overviewObjective({ next_step: "confirm_vision" }))).toBe("/objective-map");
+  it("confirm_vision navigates to the Interview screen's Intent Brief, where Vision is actually confirmed", () => {
+    // Objective Map has no Vision-confirmation control at all, so landing
+    // there is a dead end. This is the SAME target the Overview's own
+    // 「Vision を定義する」 lead uses (`pages/overview.tsx`'s `visionHref`).
+    expect(objectiveNextStepHref(overviewObjective({ next_step: "confirm_vision" }), 7))
+      .toBe("/interview?session=7#cockpit-aux-intent");
+  });
+
+  it("confirm_vision still links without a session id (the Interview page auto-selects)", () => {
+    expect(objectiveNextStepHref(overviewObjective({ next_step: "confirm_vision" })))
+      .toBe("/interview#cockpit-aux-intent");
+    expect(objectiveNextStepHref(overviewObjective({ next_step: "confirm_vision" }), null))
+      .toBe("/interview#cockpit-aux-intent");
+  });
+
+  it("link_requirement_to_feature lands ON the Requirement whose Feature link is missing", () => {
+    // The Gap Workbench's 関連付け records a Gap -> artifact link; the
+    // Requirement -> Feature link is a different fact, written through
+    // `POST /product-features/{key}/requirement-links`, whose only editing
+    // surface is the Requirement detail in the Studio. The server names the
+    // subject so the CTA arrives with it selected.
+    expect(objectiveNextStepHref(overviewObjective({
+      next_step: "link_requirement_to_feature",
+      next_step_requirement_key: "single-page-checkout",
+    }))).toBe("/ux-design-studio?tab=requirements&requirement=single-page-checkout");
+  });
+
+  it("falls back to the plain Requirement tab when the server named no Requirement", () => {
+    // Never a guessed key: `null` means the server could not identify one.
+    expect(objectiveNextStepHref(overviewObjective({ next_step: "link_requirement_to_feature" })))
+      .toBe("/ux-design-studio?tab=requirements");
   });
 });
 

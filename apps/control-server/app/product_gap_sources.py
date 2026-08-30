@@ -48,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import urllib.parse
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Optional, Tuple, get_args
 
@@ -85,6 +86,12 @@ class ResolvedSource:
     current_digest: str
     deep_link: Optional[str]
     deep_link_state: str
+    #: §5.8.1's SECOND axis -- `selected` when `deep_link` opens the
+    #: destination WITH this subject selected, `screen_only` when it opens
+    #: the owning screen and the subject must be found there, `unavailable`
+    #: when no screen exists. Attached uniformly by `resolve_source`, never
+    #: by a per-kind resolver.
+    deep_link_target_state: str = "unavailable"
     extra: Dict[str, Any] = field(default_factory=dict)
     #: §5.4/§5.10's per-kind pins, decided by THIS resolver from the
     #: canonical rows it already read -- never accepted from a caller
@@ -385,6 +392,25 @@ def _resolve_functional_lineage_gap(
     if parts is None:
         return _disappeared()
     code, subject_kind, subject_ref = parts
+
+    # Because sections 6-8 are excluded below, the codes they alone emit can
+    # never match here. Reporting that as `disappeared` would be a claim
+    # about the world ("the detector no longer emits this gap") when the fact
+    # is only that this projection does not answer that question from inside
+    # a Gap's own source resolution -- and `disappeared` is a `close_
+    # candidate` input (§6), so it would nudge a human toward closing a Gap on
+    # evidence that was never gathered. `unavailable` is the honest answer
+    # (§0-8), and it is permanent rather than transient, which the reason says
+    # outright. `add_gap_source_ref` refuses such a ref at creation, so this
+    # branch only ever sees rows stored before that gate existed.
+    if code in functional_lineage.PRODUCT_OBJECTIVE_LAYER_GAP_CODES:
+        return _unavailable(
+            "this gap code is emitted only by the Functional Lineage view's "
+            "Product Objective sections, which a Gap's own source resolution "
+            "cannot read (it would re-enter the projection); resolve it on "
+            "/functional-lineage instead",
+            extra={"reason": "product_objective_layer_code", "code": code},
+        )
 
     # The Product Objective sections are DOWNSTREAM of this Gap and would
     # re-enter this very resolver through `get_gap_detail`, so the
@@ -981,6 +1007,111 @@ _DEEP_LINKS: Dict[str, Optional[str]] = {
 assert set(_DEEP_LINKS) == set(SOURCE_KINDS)
 
 
+def _q(value: str) -> str:
+    return urllib.parse.quote(value, safe="")
+
+
+def _functional_lineage_target(ref: str) -> Optional[str]:
+    """`code|subject_kind|subject_ref` -> Functional Lineage's OWN shared
+    selection pair (`ref_kind`/`ref`, `readSharedSelection`)."""
+    parts = _split3(ref)
+    if parts is None:
+        return None
+    _code, subject_kind, subject_ref = parts
+    if not subject_kind or not subject_ref:
+        return None
+    return f"/functional-lineage?ref_kind={_q(subject_kind)}&ref={_q(subject_ref)}"
+
+
+def _value_network_target(ref: str) -> Optional[str]:
+    """`code|subject_kind|subject_key` -> the Value Network's own `node` /
+    `edge` params."""
+    parts = _split3(ref)
+    if parts is None:
+        return None
+    _code, subject_kind, subject_key = parts
+    if not subject_key:
+        return None
+    if subject_kind == "stakeholder":
+        return f"/stakeholder-value-network?node={_q(subject_key)}"
+    if subject_kind == "value_exchange":
+        return f"/stakeholder-value-network?edge={_q(subject_key)}"
+    return None
+
+
+def _journey_target(ref: str) -> Optional[str]:
+    """`journey_key|step_key` -> the Studio's Journey tab with that Journey
+    selected. The Studio has no Step param, so the Step is not claimed."""
+    parts = _split2(ref)
+    if parts is None:
+        return None
+    journey_key, _step_key = parts
+    return f"/ux-design-studio?tab=journeys&journey={_q(journey_key)}" if journey_key else None
+
+
+def _requirement_diff_target(ref: str) -> Optional[str]:
+    """`requirement_key|criterion_key` -> the Studio's Requirement tab (there
+    is no criterion param)."""
+    parts = _split2(ref)
+    if parts is None:
+        return None
+    requirement_key, _criterion_key = parts
+    return (
+        f"/ux-design-studio?tab=requirements&requirement={_q(requirement_key)}"
+        if requirement_key else None
+    )
+
+
+#: §5.8.1's SECOND axis: whether the destination can be opened WITH the
+#: subject selected, or only as a screen the developer must then search.
+#:
+#: `deep_link_state` answers "does a screen for this kind exist at all" and is
+#: a property of the KIND. Whether the SUBJECT can be selected is a different
+#: question with a per-kind answer -- it depends on the params that screen
+#: actually reads and on the shape of this kind's ref -- and collapsing the
+#: two made 「検出元の画面を開く」 promise more than it delivered wherever the
+#: destination has no matching param (#366's one-word-two-facts rule).
+#:
+#: A builder returns `None` when THIS ref cannot be turned into a selection
+#: (a malformed ref, a subject kind the screen has no param for); the result
+#: then degrades to the kind's plain screen route -- never to a fabricated
+#: param the destination would ignore (#366's `loopSearchParams` rule).
+_DEEP_LINK_TARGETS: Dict[str, Callable[[str], Optional[str]]] = {
+    "functional_lineage_gap": _functional_lineage_target,
+    "value_network_notice": _value_network_target,
+    "journey_baseline_diff": _journey_target,
+    "requirement_diff": _requirement_diff_target,
+}
+
+#: Every other source kind is screen-only TODAY, each for a stated reason
+#: rather than by omission:
+#:
+#: * `system_understanding_gap` / `issue_draft` -- `/system-understanding`
+#:   reads no selection param.
+#: * `understanding_review_gap` / `understanding_claim_change` /
+#:   `runtime_alignment_mismatch` / `joint_understanding_open` /
+#:   `inquiry_unresolved` -- `/interview` selects a SESSION (plus fixed
+#:   anchors), not one review item / claim / Inquiry, and this layer has no
+#:   session id to name.
+#: * `capability_drift` -- `/capability-map`'s `?capability=` matches a
+#:   Capability NAME, while this kind's subject is a code anchor
+#:   (`path|qualified_name` or `entrypoint:<id>`). Those are different
+#:   identities, and matching them would be the similarity guess Principle 6
+#:   forbids.
+#: * `manual` / `node_anomaly` -- no screen at all.
+
+
+def _targeted(table: Dict[str, Callable[[str], Optional[str]]], kind: str, ref: str, screen: Optional[str]):
+    """`(deep_link, deep_link_target_state)` for one kind+ref (§5.8.1)."""
+    if not screen:
+        return None, "unavailable"
+    builder = table.get(kind)
+    targeted = builder(ref) if builder else None
+    if targeted:
+        return targeted, "selected"
+    return screen, "screen_only"
+
+
 def resolve_source(
     conn: sqlite3.Connection, *, system_id: int, source_kind: str, source_ref: str,
     captured_digest: str = "",
@@ -995,8 +1126,9 @@ def resolve_source(
     if source_kind not in _RESOLVERS:
         raise ValueError(f"Unknown ProductGapSourceKind: {source_kind!r}")
 
-    deep_link = _DEEP_LINKS[source_kind]
-    deep_link_state: str = "available" if deep_link else "unavailable"
+    screen = _DEEP_LINKS[source_kind]
+    deep_link_state: str = "available" if screen else "unavailable"
+    deep_link, deep_link_target_state = _targeted(_DEEP_LINK_TARGETS, source_kind, source_ref, screen)
 
     try:
         result = _RESOLVERS[source_kind](
@@ -1008,10 +1140,14 @@ def resolve_source(
         return ResolvedSource(
             source_state="unavailable", title="", detail=str(exc), severity=None,
             severity_vocabulary=None, current_digest="", deep_link=deep_link,
-            deep_link_state=deep_link_state, extra={"error": type(exc).__name__},
+            deep_link_state=deep_link_state, deep_link_target_state=deep_link_target_state,
+            extra={"error": type(exc).__name__},
         )
 
-    return replace(result, deep_link=deep_link, deep_link_state=deep_link_state)
+    return replace(
+        result, deep_link=deep_link, deep_link_state=deep_link_state,
+        deep_link_target_state=deep_link_target_state,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1060,21 +1196,63 @@ _ARTIFACT_DEEP_LINKS: Dict[str, Optional[str]] = {
 assert set(_ARTIFACT_DEEP_LINKS) == set(ARTIFACT_KINDS)
 
 
-def _deep_link(table: Dict[str, Optional[str]], kind: str, label: str) -> Tuple[Optional[str], str]:
+#: §5.8.1 for evidence. Each entry emits the DESTINATION's own param names.
+#: `human_report` / `external_report` / `other` have no screen at all;
+#: `repository_path` has one (`/repository`) that reads no path param, so it
+#: stays `screen_only` rather than gaining a param the page would ignore.
+_EVIDENCE_DEEP_LINK_TARGETS: Dict[str, Callable[[str], Optional[str]]] = {
+    "trace": lambda ref: f"/components?trace={_q(ref)}" if ref else None,
+    "experiment": lambda ref: f"/experiments?experiment={_q(ref)}" if ref else None,
+    "replay_run": lambda ref: f"/simulation-workbench?replay_run_id={_q(ref)}" if ref else None,
+}
+
+#: §5.8.1 for downstream artifact links. `issue_draft`'s screen
+#: (`/system-understanding`) reads no selection param, so it stays
+#: `screen_only`.
+_ARTIFACT_DEEP_LINK_TARGETS: Dict[str, Callable[[str], Optional[str]]] = {
+    "ux_requirement": lambda ref: (
+        f"/ux-design-studio?tab=requirements&requirement={_q(ref)}" if ref else None
+    ),
+    "solution_design": lambda ref: (
+        f"/ux-design-studio?tab=solutions&design={_q(ref)}" if ref else None
+    ),
+}
+
+
+def _deep_link(
+    table: Dict[str, Optional[str]],
+    targets: Dict[str, Callable[[str], Optional[str]]],
+    kind: str,
+    ref: str,
+    label: str,
+) -> Tuple[Optional[str], str, str]:
     if kind not in table:
         raise ValueError(f"Unknown {label}: {kind!r}")
-    route = table[kind]
-    return route, ("available" if route else "unavailable")
+    screen = table[kind]
+    route, target_state = _targeted(targets, kind, ref, screen)
+    return route, ("available" if screen else "unavailable"), target_state
 
 
-def evidence_deep_link(evidence_kind: str) -> Tuple[Optional[str], str]:
-    """`(route, deep_link_state)` for one `ProductGapEvidenceKind` (§5.8).
+def evidence_deep_link(evidence_kind: str, evidence_ref: str = "") -> Tuple[Optional[str], str, str]:
+    """`(route, deep_link_state, deep_link_target_state)` for one
+    `ProductGapEvidenceKind` (§5.8/§5.8.1).
+
+    `evidence_ref` is what makes the difference between opening the owning
+    screen and opening it ON this evidence; omitting it yields the plain
+    screen route with `screen_only`, never a fabricated param.
 
     Raises `ValueError` outside the finite vocabulary -- a programming
     error, not data, exactly as `resolve_source` does."""
-    return _deep_link(_EVIDENCE_DEEP_LINKS, evidence_kind, "ProductGapEvidenceKind")
+    return _deep_link(
+        _EVIDENCE_DEEP_LINKS, _EVIDENCE_DEEP_LINK_TARGETS,
+        evidence_kind, evidence_ref, "ProductGapEvidenceKind",
+    )
 
 
-def artifact_deep_link(link_kind: str) -> Tuple[Optional[str], str]:
-    """`(route, deep_link_state)` for one `ProductGapArtifactLinkKind` (§5.8)."""
-    return _deep_link(_ARTIFACT_DEEP_LINKS, link_kind, "ProductGapArtifactLinkKind")
+def artifact_deep_link(link_kind: str, target_ref: str = "") -> Tuple[Optional[str], str, str]:
+    """`(route, deep_link_state, deep_link_target_state)` for one
+    `ProductGapArtifactLinkKind` (§5.8/§5.8.1)."""
+    return _deep_link(
+        _ARTIFACT_DEEP_LINKS, _ARTIFACT_DEEP_LINK_TARGETS,
+        link_kind, target_ref, "ProductGapArtifactLinkKind",
+    )

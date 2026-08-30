@@ -55,6 +55,7 @@ from ..product_objective import (
     NotFound,
     ProductObjectiveValidationError,
     SourceDuplicate,
+    SourceRefUnresolvable,
 )
 
 router = APIRouter(prefix="/product-gaps", tags=["product-gap"])
@@ -78,6 +79,9 @@ _MESSAGES = {
     "product_gap_decision_stale_digest": "指定された digest が現在の内容と一致しません。",
     "product_gap_not_decidable": "この状態からはその決定を記録できません。",
     "product_source_kind_invalid": "source_kind が不正です。",
+    "product_gap_source_ref_unresolvable":
+        "この gap code は Functional Lineage の Objective 層でのみ検出されるため、"
+        "Gap の検出元としては解決できません。Functional Lineage 画面で確認してください。",
     "product_link_kind_invalid": "link_kind が不正です。",
 }
 
@@ -93,6 +97,8 @@ def _raise_for_error(exc: Exception) -> None:
         raise _reject(f"product_{exc.kind}_key_required", 422)
     if isinstance(exc, KeyConflict):
         raise _reject(f"product_{exc.kind}_key_conflict", 409)
+    if isinstance(exc, SourceRefUnresolvable):
+        raise _reject("product_gap_source_ref_unresolvable", 422)
     if isinstance(exc, SourceDuplicate):
         raise _reject("product_gap_source_duplicate", 409)
     if isinstance(exc, ArtifactDuplicate):

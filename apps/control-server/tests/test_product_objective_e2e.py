@@ -1265,11 +1265,18 @@ class TestGapSourceFederation:
         but no screen), so one walk shows both answers side by side."""
         detail = _get_gap(chain.client, chain.headers, chain.gap_main_key)
         evidence = {e["evidence_kind"]: e for e in detail["evidence_refs"]}
-        assert evidence["trace"]["deep_link"] == "/components"
+        # §5.8.1's two axes: a screen exists AND, because `/components` reads
+        # a `trace` param, the link lands on this evidence rather than making
+        # the developer find it.
+        assert evidence["trace"]["deep_link"] == (
+            f"/components?trace={evidence['trace']['evidence_ref']}"
+        )
         assert evidence["trace"]["deep_link_state"] == "available"
+        assert evidence["trace"]["deep_link_target_state"] == "selected"
         artifacts = {a["link_kind"]: a for a in detail["artifact_links"]}
         assert artifacts["product_feature"]["deep_link"] is None
         assert artifacts["product_feature"]["deep_link_state"] == "unavailable"
+        assert artifacts["product_feature"]["deep_link_target_state"] == "unavailable"
 
     def test_manual_is_always_current(self, chain: Chain):
         gap_key = "gap-src-manual"

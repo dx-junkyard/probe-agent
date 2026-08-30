@@ -13345,6 +13345,16 @@ ProductFeatureLinkKind = Literal[
 #: destination does not exist yet.
 ProductDeepLinkState = Literal["available", "unavailable"]
 
+#: §5.8.1's SECOND axis, kept separate from `ProductDeepLinkState` for the
+#: #366 reason one displayed word must not carry two facts: "a screen for
+#: this kind exists" and "that URL opens with this subject selected" are
+#: independent, and the developer's next move differs. `selected` lands on
+#: the subject; `screen_only` opens the owning screen with the subject still
+#: to be found (the destination has no param for it, or this ref cannot be
+#: turned into one); `unavailable` means there is no screen at all, and is
+#: the only value that pairs with `deep_link_state='unavailable'`.
+ProductDeepLinkTargetState = Literal["selected", "screen_only", "unavailable"]
+
 #: Read-time-only advisory flags a Gap can carry (§6's "candidate, not
 #: state" rule) -- NEVER `ProductGapLifecycle` values, and never persisted.
 #: `recheck_required` follows a `changed` source; `reopen_candidate` /
@@ -13797,6 +13807,7 @@ class ProductGapSourceOut(BaseModel):
     severity_vocabulary: Optional[str] = None
     deep_link: Optional[str] = None
     deep_link_state: ProductDeepLinkState = "unavailable"
+    deep_link_target_state: ProductDeepLinkTargetState = "unavailable"
     captured_digest: str = ""
     captured_snapshot_id: Optional[int] = None
     captured_run_id: Optional[int] = None
@@ -13825,6 +13836,7 @@ class ProductGapEvidenceOut(BaseModel):
     #: conflation (§0-8).
     deep_link: Optional[str] = None
     deep_link_state: ProductDeepLinkState = "unavailable"
+    deep_link_target_state: ProductDeepLinkTargetState = "unavailable"
     captured_snapshot_id: Optional[int] = None
     note: str = ""
     decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
@@ -13849,6 +13861,7 @@ class ProductGapArtifactOut(BaseModel):
     #: `unavailable` today -- it has an API but no screen of its own.
     deep_link: Optional[str] = None
     deep_link_state: ProductDeepLinkState = "unavailable"
+    deep_link_target_state: ProductDeepLinkTargetState = "unavailable"
     captured_digest: str = ""
     note: str = ""
     decision_method: Literal["manual", "reasoning_llm", "deterministic"] = "manual"
@@ -14366,6 +14379,7 @@ class GapWorkbenchDeepLinkOut(BaseModel):
     source_kind: ProductGapSourceKind
     source_ref: str
     deep_link_state: ProductDeepLinkState = "unavailable"
+    deep_link_target_state: ProductDeepLinkTargetState = "unavailable"
     route: Optional[str] = None
 
 
@@ -14445,5 +14459,17 @@ class OverviewObjectiveOut(BaseModel):
     next_step_completion: str = ""
     #: 完了後に得られる価値 / 次に開く判断.
     next_step_value: str = ""
+    #: The Requirement the `link_requirement_to_feature` step is about, so
+    #: its CTA can land ON that Requirement instead of merely opening the
+    #: Studio's Requirement tab and leaving the developer to find it (§9.3's
+    #: "CTA の遷移先は、その操作を実際に完了できる面でなければならない",
+    #: taken one step further to the subject itself).
+    #:
+    #: `None` for every other `next_step`, and also for that step when the
+    #: Requirement could not be identified -- the CTA then falls back to the
+    #: plain tab. It is NOT a general-purpose target field: only row #13 has
+    #: a subject that none of `active_objective` / `next_milestone` /
+    #: `primary_gap` already names.
+    next_step_requirement_key: Optional[str] = None
     degraded_sections: List[str] = []
     degraded_detail: Dict[str, str] = {}

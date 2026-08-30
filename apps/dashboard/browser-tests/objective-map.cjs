@@ -105,6 +105,41 @@ const gapWorkbench = {
   degraded_sections: [], degraded_detail: {},
 };
 
+const requirementList = {
+  system_id: 1, generated_at: 1000,
+  requirements: [{
+    id: 10, system_id: 1, requirement_key: "checkout-requirement",
+    requirement_kind: "functional", current_revision_id: 1, current_revision_number: 1,
+    design_status: "proposed", recheck_state: "current",
+    created_by: "dev", created_at: 1000, updated_at: 1000,
+  }],
+  degraded_sections: [], degraded_detail: {},
+};
+
+const requirementDetail = {
+  ...requirementList.requirements[0],
+  current_revision: null, step_links: [], artifact_references: [], decisions: [],
+  degraded_sections: [], degraded_detail: {},
+};
+
+const featureList = {
+  system_id: 1, generated_at: 1000,
+  features: [{
+    id: 30, system_id: 1, feature_key: "checkout-feature",
+    current_revision_id: null, current_revision_number: null, title: "",
+    design_status: "proposed", recheck_state: "not_captured",
+    created_by: null, created_at: 1000, updated_at: 1000,
+  }],
+  degraded_sections: [], degraded_detail: {},
+};
+
+const featureDetail = {
+  ...featureList.features[0],
+  current_revision: null, requirement_links: [], capability_links: [],
+  target_links: [], draft_links: [], decisions: [],
+  degraded_sections: [], degraded_detail: {},
+};
+
 const API = "http://127.0.0.1:8099";
 
 (async () => {
@@ -160,6 +195,50 @@ const API = "http://127.0.0.1:8099";
       source_refs: [], journey_links: [], evidence_refs: [], artifact_links: [], decisions: [],
       degraded_sections: [], degraded_detail: {},
     }) }));
+
+  // The work panels fetch their own detail. Scenarios 7-8 assert that they
+  // MOUNT and that their form state does not travel between entities, so the
+  // detail responses have to exist and to DIFFER per entity.
+  await page.route("**/api/product-objectives/*", (route) => {
+    const key = decodeURIComponent(route.request().url().split("/").pop().split("?")[0]);
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      id: key === "o-root" ? 1 : 2, system_id: 1, objective_key: key,
+      current_revision_id: 1, current_revision_number: 1, title: key,
+      objective_state: "active", recheck_state: "current",
+      parent_objective_id: null, parent_objective_key: null,
+      created_by: "dev", created_at: 1000, updated_at: 1000, decision_digest: `d-${key}`,
+      current_revision: {
+        id: 1, objective_id: key === "o-root" ? 1 : 2, revision_number: 1, title: key,
+        intent: `${key} の意図`, contribution: "", scope_note: "", summary: "",
+        content_digest: `d-${key}`, authored_by_kind: "developer", decision_method: "manual",
+        intelligence_run_id: null, change_note: "", created_by: "dev", created_at: 1000,
+        revision_state: "current", superseded_by_id: null,
+      },
+      milestones: [], decisions: [], upstream_refs: [],
+      degraded_sections: [], degraded_detail: {},
+    }) });
+  });
+  await page.route("**/api/product-milestones/*", (route) => {
+    const key = decodeURIComponent(route.request().url().split("/").pop().split("?")[0]);
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      id: key === "m-first" ? 1 : 2, system_id: 1, milestone_key: key,
+      objective_id: 2, objective_key: "o-child",
+      current_revision_id: 1, current_revision_number: 1, title: key,
+      design_status: "confirmed", achievement: "unassessed", assessability: "assessable",
+      recheck_state: "current", created_by: "dev", created_at: 1000, updated_at: 1000,
+      decision_digest: `d-${key}`,
+      current_revision: {
+        id: 1, milestone_id: key === "m-first" ? 1 : 2, revision_number: 1, title: key,
+        target_state: `${key} の目標状態`, verification_method: "manual_review",
+        verification_note: "", sequence_hint: 0, summary: "", content_digest: `d-${key}`,
+        authored_by_kind: "developer", decision_method: "manual", intelligence_run_id: null,
+        change_note: "", created_by: "dev", created_at: 1000, revision_state: "current",
+        superseded_by_id: null,
+      },
+      dependencies: [], decisions: [], assessments: [],
+      degraded_sections: [], degraded_detail: {},
+    }) });
+  });
 
   await page.goto(APP + "/");
   await page.evaluate((id) => localStorage.setItem("probe_system_id", String(id)), system.id);
@@ -288,6 +367,136 @@ const API = "http://127.0.0.1:8099";
   expectTrue(`no horizontal page scroll (${narrow.scrollW} vs ${narrow.clientW})`,
     narrow.scrollW <= narrow.clientW + 1);
   await page.screenshot({ path: `${OUT}/objective-map-390.png`, fullPage: true });
+
+  await page.setViewportSize({ width: 1280, height: 720 });
+
+  // --- 7. a Milestone-only deep link reaches the WORK pane (§9.4) ------------
+  //
+  // The tree already reveals such a Milestone, so jsdom's "is it in the DOM"
+  // check passes either way. What fails without normalization is the pane the
+  // link exists for: `objectiveKey` stays null, so `MilestoneWorkPanel` never
+  // mounts. This also asserts the URL is CORRECTED, which needs a real
+  // history stack.
+  console.log("\n[7] milestone-only deep link");
+  await page.goto(APP + "/objective-map?milestone=m-first");
+  await page.waitForSelector('[data-testid="milestone-work-panel-m-first"]', { timeout: 20000 });
+  expectTrue("the owning Objective's detail is shown",
+    await page.isVisible('[data-testid="objective-detail-o-child"]'));
+  expectTrue("the Milestone's work pane is mounted",
+    await page.isVisible('[data-testid="milestone-work-panel-m-first"]'));
+  expect("the URL now names the owner too",
+    new URL(page.url()).searchParams.get("objective"), "o-child");
+
+  await page.reload();
+  await page.waitForSelector('[data-testid="milestone-work-panel-m-first"]', { timeout: 20000 });
+  expectTrue("it survives a real reload",
+    await page.isVisible('[data-testid="milestone-work-panel-m-first"]'));
+
+  // --- 8. form state never travels between entities (§9.5) ------------------
+  //
+  // The wrong-entity write this guards against: text typed for Objective A
+  // still on screen after selecting B, and 「記録する」 saving it as B's
+  // revision. A real browser is where the remount, the refetch and the
+  // controlled inputs actually interact.
+  console.log("\n[8] switching entity does not carry the form over");
+  await page.goto(APP + "/objective-map?objective=o-child");
+  await page.waitForSelector('[data-testid="objective-work-panel-o-child"]', { timeout: 20000 });
+  const intent = '[data-testid="objective-revision-form"] textarea[aria-label="Vision への意図"]';
+  expect("the form is seeded from the CURRENT revision",
+    await page.inputValue(intent), "o-child の意図");
+
+  await page.fill(intent, "o-child についての未保存の入力");
+
+  // Review 0.4's other half, and the reason this scenario needs a real
+  // browser twice over: unsaved input now asks before it is discarded, and
+  // `window.confirm` only exists here. Playwright auto-DISMISSES dialogs, so
+  // the first switch is refused -- which is itself the assertion.
+  let dialogMessage = null;
+  const dismissOnce = (dialog) => { dialogMessage = dialog.message(); dialog.dismiss(); };
+  page.once("dialog", dismissOnce);
+  await page.click('[data-testid="objective-node-o-root"] button:not([data-testid^="objective-node-toggle"])');
+  for (let i = 0; i < 30 && dialogMessage === null; i += 1) await sleep(100);
+  expectTrue("switching with unsaved input asks first",
+    dialogMessage !== null && dialogMessage.includes("保存していない入力"));
+  expectTrue("declining keeps the Objective and the typed text",
+    (await page.isVisible('[data-testid="objective-work-panel-o-child"]'))
+      && (await page.inputValue(intent)) === "o-child についての未保存の入力");
+
+  // Accepting is the developer saying "discard it" -- and THEN the switch
+  // must land on the other Objective's own revision, never the typed text.
+  page.on("dialog", (dialog) => dialog.accept());
+  await page.click('[data-testid="objective-node-o-root"] button:not([data-testid^="objective-node-toggle"])');
+  await page.waitForSelector('[data-testid="objective-work-panel-o-root"]', { timeout: 20000 });
+  expect("the other Objective's form shows ITS revision, not the typed text",
+    await page.inputValue(intent), "o-root の意図");
+
+  // --- 9. a Milestone under ANOTHER Objective moves the selection (§9.4) -----
+  //
+  // The pane is keyed off `objectiveKey`, so without normalization clicking
+  // Objective B's Milestone while A is selected leaves the pane describing A
+  // with B's Milestone panel underneath it. jsdom can assert the DOM, but the
+  // manual expand, the click and the URL rewrite only interact for real here.
+  console.log("\n[9] a Milestone under another Objective moves the Objective selection");
+  await page.goto(APP + "/objective-map?objective=o-root");
+  await page.waitForSelector('[data-testid="objective-detail-o-root"]', { timeout: 20000 });
+  await page.click('[data-testid="objective-node-toggle-o-child"]').catch(() => {});
+  await page.waitForSelector('[data-testid="milestone-node-m-first"]', { timeout: 20000 });
+  await page.click('[data-testid="milestone-node-m-first"]');
+  await page.waitForSelector('[data-testid="objective-detail-o-child"]', { timeout: 20000 });
+  expectTrue("the pane follows the Milestone to its owner",
+    await page.isVisible('[data-testid="objective-detail-o-child"]'));
+  expectTrue("and no longer describes the previously selected Objective",
+    !(await page.isVisible('[data-testid="objective-detail-o-root"]')));
+  const afterSwitch = new URL(page.url()).searchParams;
+  expect("the URL names both halves",
+    [afterSwitch.get("objective"), afterSwitch.get("milestone")], ["o-child", "m-first"]);
+
+  // --- 10. Requirement -> Feature is COMPLETABLE, not just reachable --------
+  //
+  // Review 0.3 asks for proof that the operation can be finished by an
+  // explicit submit in a real browser -- "the screen opened" is what the old
+  // CTA already did. The Studio is a different page, so this drives it
+  // directly and asserts the POST that records the link.
+  console.log("\n[10] Requirement -> Feature link completes by explicit submit");
+  let linkPost = null;
+  await page.route("**/api/product-features**", async (route) => {
+    const req = route.request();
+    if (req.method() === "POST" && req.url().includes("/requirement-links")) {
+      linkPost = { url: req.url(), body: req.postDataJSON() };
+      return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({ id: 1 }) });
+    }
+    if (req.method() === "GET" && req.url().includes("/product-features/")) {
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(featureDetail) });
+    }
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(featureList) });
+  });
+  await page.route("**/api/ux-design/requirements**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(
+      route.request().url().includes("/requirements/") ? requirementDetail : requirementList,
+    ) }));
+  await page.route("**/api/ux-design/journeys**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(
+      { system_id: 1, generated_at: 1000, journeys: [], degraded_sections: [], degraded_detail: {} },
+    ) }));
+  await page.route("**/api/solution-designs**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(
+      { system_id: 1, generated_at: 1000, designs: [], degraded_sections: [], degraded_detail: {} },
+    ) }));
+
+  // The Overview CTA's own destination, target included.
+  await page.goto(APP + "/ux-design-studio?tab=requirements&requirement=checkout-requirement");
+  await page.waitForSelector('[data-testid="ux-requirement-detail"]', { timeout: 20000 });
+  expectTrue("the CTA's URL arrives with the Requirement already selected",
+    await page.isVisible('[data-testid="ux-requirement-features-empty"]'));
+
+  await page.selectOption('select[aria-label="対応づける Feature"]', "checkout-feature");
+  expect("selecting alone records nothing", linkPost, null);
+  await page.click('[data-testid="ux-requirement-feature-link-submit"]');
+  for (let i = 0; i < 50 && linkPost === null; i += 1) await sleep(100);
+  expectTrue("the explicit submit records the link",
+    linkPost !== null && linkPost.url.includes("/product-features/checkout-feature/requirement-links"));
+  expect("against the Requirement the CTA named",
+    linkPost && linkPost.body, { requirement_key: "checkout-requirement" });
 
   await browser.close();
 

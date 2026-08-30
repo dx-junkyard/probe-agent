@@ -135,6 +135,41 @@ CREATE INDEX IF NOT EXISTS idx_solution_design_option_design
 # rebuilt once (`_migrate_ux_journey_upstream_ref_kinds` below), and the
 # rebuild and the fresh-DB `SCHEMA` string must create byte-for-byte the same
 # table rather than two definitions that can drift apart.
+_PRODUCT_GAP_ARTIFACT_LINK_DDL = """
+CREATE TABLE IF NOT EXISTS product_gap_artifact_link (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    gap_id           INTEGER NOT NULL,
+    link_kind        TEXT NOT NULL CHECK (link_kind IN
+                         ('issue_draft', 'ux_requirement',
+                          'product_feature', 'solution_design')),
+    target_ref       TEXT NOT NULL,
+    target_row_id    INTEGER,
+    captured_digest  TEXT NOT NULL DEFAULT '',
+    note             TEXT NOT NULL DEFAULT '',
+    decision_method  TEXT NOT NULL DEFAULT 'manual'
+                         CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by       TEXT,
+    created_at       REAL NOT NULL,
+    superseded_by_id INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (gap_id) REFERENCES product_gap (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_gap_artifact_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_artifact_link_system
+    ON product_gap_artifact_link (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_artifact_link_gap
+    ON product_gap_artifact_link (gap_id, id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_gap_artifact_current
+    ON product_gap_artifact_link (gap_id, link_kind, target_ref)
+    WHERE superseded_by_id IS NULL;
+"""
+
+
 _UX_JOURNEY_UPSTREAM_REF_DDL = """
 -- ux_journey_upstream_ref: a Journey's reference to a Purpose element,
 -- Purpose relation, Capability entity, Product Objective, Product Milestone,
@@ -8071,37 +8106,8 @@ CREATE INDEX IF NOT EXISTS idx_product_gap_evidence_ref_gap
 -- Journey connection lives ONLY in `ux_journey_upstream_ref
 -- (ref_kind='product_gap')`, so it can be written and read from exactly one
 -- place instead of two tables silently disagreeing.
-CREATE TABLE IF NOT EXISTS product_gap_artifact_link (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    system_id        INTEGER NOT NULL,
-    gap_id           INTEGER NOT NULL,
-    link_kind        TEXT NOT NULL CHECK (link_kind IN
-                         ('issue_draft', 'ux_requirement',
-                          'product_feature', 'solution_design')),
-    target_ref       TEXT NOT NULL,
-    target_row_id    INTEGER,
-    captured_digest  TEXT NOT NULL DEFAULT '',
-    note             TEXT NOT NULL DEFAULT '',
-    decision_method  TEXT NOT NULL DEFAULT 'manual'
-                         CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
-    created_by       TEXT,
-    created_at       REAL NOT NULL,
-    superseded_by_id INTEGER,
-    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
-    FOREIGN KEY (gap_id) REFERENCES product_gap (id) ON DELETE CASCADE,
-    FOREIGN KEY (superseded_by_id)
-        REFERENCES product_gap_artifact_link (id) ON DELETE SET NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_product_gap_artifact_link_system
-    ON product_gap_artifact_link (system_id, id DESC);
-
-CREATE INDEX IF NOT EXISTS idx_product_gap_artifact_link_gap
-    ON product_gap_artifact_link (gap_id, id DESC);
-
-CREATE UNIQUE INDEX IF NOT EXISTS ux_product_gap_artifact_current
-    ON product_gap_artifact_link (gap_id, link_kind, target_ref)
-    WHERE superseded_by_id IS NULL;
+-- (DDL: `_PRODUCT_GAP_ARTIFACT_LINK_DDL`, appended to SCHEMA below so the
+-- rebuild migration and the initial create share one definition.)
 
 -- product_gap_decision: the human-only ledger BOTH `lifecycle` (open /
 -- acknowledged / deferred / resolved / rejected / obsolete) AND
@@ -8427,7 +8433,7 @@ CREATE INDEX IF NOT EXISTS idx_product_feature_decision_system
 CREATE INDEX IF NOT EXISTS idx_product_feature_decision_feature
     ON product_feature_decision (feature_id, id DESC);
 
-"""
+""" + _PRODUCT_GAP_ARTIFACT_LINK_DDL
 
 
 _SCOPED_TABLES = [
@@ -8926,6 +8932,246 @@ def _migrate_solution_design_option_unique(conn: sqlite3.Connection) -> None:
     )
 
 
+_PRODUCT_GAP_ARTIFACT_MIGRATION_REPORT_DDL = """
+-- product_gap_artifact_migration_report: what the `ux_journey` artifact-link
+-- migration below could NOT move, and why. Written once per rebuilt row that
+-- did not have exactly one destination.
+--
+-- It exists because the alternative to recording an unresolvable row is
+-- guessing one, and a guess here would fabricate a human's design decision:
+-- the row says "a developer connected this Gap to a Journey", and moving it
+-- to the wrong Journey (or inventing a Journey for a key nothing matches)
+-- keeps that claim while changing what it claims. `outcome` is finite --
+-- `moved` / `unresolved` / `conflict` / `duplicate` -- and the row's whole
+-- original content travels with it, so an operator can complete the move by
+-- hand from this table alone.
+CREATE TABLE IF NOT EXISTS product_gap_artifact_migration_report (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER,
+    legacy_id         INTEGER NOT NULL,
+    gap_id            INTEGER NOT NULL,
+    gap_key           TEXT NOT NULL DEFAULT '',
+    link_kind         TEXT NOT NULL,
+    target_ref        TEXT NOT NULL,
+    outcome           TEXT NOT NULL CHECK (outcome IN
+                          ('moved', 'unresolved', 'conflict', 'duplicate')),
+    detail            TEXT NOT NULL DEFAULT '',
+    moved_to_ref_id   INTEGER,
+    note              TEXT NOT NULL DEFAULT '',
+    decision_method   TEXT NOT NULL DEFAULT 'manual',
+    created_by        TEXT,
+    original_created_at REAL NOT NULL,
+    migrated_at       REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_artifact_migration_report_system
+    ON product_gap_artifact_migration_report (system_id, id DESC);
+"""
+
+
+def _migrate_product_gap_artifact_link_kinds(conn: sqlite3.Connection) -> None:
+    """Drop `ux_journey` from `product_gap_artifact_link.link_kind`, moving
+    the rows that already used it into the one canonical home
+    (`ux_journey_upstream_ref(ref_kind='product_gap')`, §5.11).
+
+    §5.11 settled that a Gap's Journey connection lives in exactly ONE table,
+    and the schema, the API `Literal` and the Dashboard control were all
+    narrowed accordingly. `CREATE TABLE IF NOT EXISTS` cannot repair a table
+    that already exists, so without this an existing database keeps the old
+    CHECK **and its `ux_journey` rows** -- rows that are now outside
+    `ProductGapArtifactLinkKind`, so `GET /product-gaps/{key}` fails response
+    validation on them, while the connection they record stays invisible to
+    every reader that was moved to the canonical table. A fresh-database test
+    suite cannot see any of that.
+
+    Detection is STRUCTURAL and idempotent, the same discipline
+    `_migrate_ux_journey_upstream_ref_kinds` uses: read the stored SQL from
+    `sqlite_master` and no-op the moment `'ux_journey'` is absent from the
+    CHECK. No version flag to drift from the schema it describes.
+
+    The move is deliberately conservative, and every rule below exists to
+    keep the migration from ASSERTING something no one recorded:
+
+    * A legacy row is moved only when its `target_ref` resolves to EXACTLY
+      ONE `ux_journey` in the SAME System. `journey_key` is unique per System
+      (§1's identity rule), so "exactly one" is the normal case and anything
+      else means the ref never named a Journey this database has.
+    * A row whose key resolves to nothing is `unresolved`; it is NOT invented
+      into a new Journey and NOT silently dropped.
+    * A row that would collide with an upstream ref that already records the
+      same connection is `duplicate` -- the connection survives, in the
+      canonical table, exactly once.
+    * A Gap whose own row is gone (`gap_id` dangling) is `conflict`.
+
+    Everything that is not moved lands in
+    `product_gap_artifact_migration_report` with its full original content,
+    so an operator can finish by hand. Non-`ux_journey` rows are copied
+    across untouched, ids included, so the append-only `superseded_by_id`
+    history stays intact.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'product_gap_artifact_link'"
+    ).fetchone()
+    if row is None or row["sql"] is None:
+        return
+    if "'ux_journey'" not in row["sql"]:
+        return
+
+    conn.executescript(_PRODUCT_GAP_ARTIFACT_MIGRATION_REPORT_DDL)
+    now = time.time()
+
+    # This function reaches here only while the OLD schema is still in place,
+    # so a second arrival means a previous attempt did not finish the rebuild
+    # (the process died between the row move and the `DROP TABLE`). Its report
+    # rows describe the same `legacy_id`s this run is about to describe again,
+    # and the row move itself is already replay-safe (a connection the earlier
+    # attempt moved is found by the `already` check and reported `duplicate`).
+    # Clearing them keeps the report a statement about the migration's final
+    # outcome rather than an accumulation of its attempts.
+    conn.execute("DELETE FROM product_gap_artifact_migration_report")
+
+    legacy_journey_rows = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM product_gap_artifact_link WHERE link_kind = 'ux_journey'"
+        ).fetchall()
+    ]
+
+    moved_ids: set = set()
+    for legacy in legacy_journey_rows:
+        gap = conn.execute(
+            "SELECT id, gap_key, system_id FROM product_gap WHERE id = ?",
+            (legacy["gap_id"],),
+        ).fetchone()
+        if gap is None:
+            _report_artifact_migration(
+                conn, legacy, "", "conflict",
+                "the Gap this link belonged to no longer exists", None, now,
+            )
+            continue
+        gap_key = gap["gap_key"]
+
+        journeys = conn.execute(
+            "SELECT id FROM ux_journey WHERE system_id = ? AND journey_key = ?",
+            (legacy["system_id"], legacy["target_ref"]),
+        ).fetchall()
+        if len(journeys) != 1:
+            _report_artifact_migration(
+                conn, legacy, gap_key, "unresolved",
+                f"{len(journeys)} Journey rows match journey_key "
+                f"{legacy['target_ref']!r} in this System; a unique match is required",
+                None, now,
+            )
+            continue
+        journey_id = journeys[0]["id"]
+
+        already = conn.execute(
+            """SELECT id FROM ux_journey_upstream_ref
+               WHERE system_id = ? AND journey_id = ? AND ref_kind = 'product_gap'
+                 AND target_ref = ? AND superseded_by_id IS NULL""",
+            (legacy["system_id"], journey_id, gap_key),
+        ).fetchone()
+        if already is not None:
+            _report_artifact_migration(
+                conn, legacy, gap_key, "duplicate",
+                "the canonical table already records this Gap -> Journey connection",
+                already["id"], now,
+            )
+            moved_ids.add(legacy["id"])
+            continue
+
+        cur = conn.execute(
+            """INSERT INTO ux_journey_upstream_ref
+                   (system_id, journey_id, ref_kind, target_ref, target_row_id,
+                    captured_digest, note, decision_method, created_by, created_at)
+               VALUES (?, ?, 'product_gap', ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                legacy["system_id"], journey_id, gap_key, legacy["gap_id"],
+                legacy["captured_digest"], legacy["note"], legacy["decision_method"],
+                legacy["created_by"], legacy["created_at"],
+            ),
+        )
+        _report_artifact_migration(
+            conn, legacy, gap_key, "moved",
+            "moved to ux_journey_upstream_ref(ref_kind='product_gap')",
+            cur.lastrowid, now,
+        )
+        moved_ids.add(legacy["id"])
+
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE product_gap_artifact_link RENAME TO product_gap_artifact_link_legacy;
+        -- A rename carries the indexes with it, so their names stay taken and
+        -- the DDL's `CREATE INDEX IF NOT EXISTS` below would silently do
+        -- nothing, leaving the rebuilt table unindexed. Free the names first
+        -- (the same reason `_migrate_ux_journey_upstream_ref_kinds` does).
+        DROP INDEX IF EXISTS idx_product_gap_artifact_link_system;
+        DROP INDEX IF EXISTS idx_product_gap_artifact_link_gap;
+        DROP INDEX IF EXISTS ux_product_gap_artifact_current;
+        """
+    )
+    conn.executescript(_PRODUCT_GAP_ARTIFACT_LINK_DDL)
+    # Ids are preserved so the append-only `superseded_by_id` chain still
+    # points at the rows it always did.
+    conn.execute(
+        """
+        INSERT INTO product_gap_artifact_link (
+            id, system_id, gap_id, link_kind, target_ref, target_row_id,
+            captured_digest, note, decision_method, created_by, created_at,
+            superseded_by_id
+        )
+        SELECT
+            id, system_id, gap_id, link_kind, target_ref, target_row_id,
+            captured_digest, note, decision_method, created_by, created_at,
+            superseded_by_id
+        FROM product_gap_artifact_link_legacy
+        WHERE link_kind <> 'ux_journey'
+        """
+    )
+    # A dropped `ux_journey` row may still be the target of a surviving row's
+    # `superseded_by_id`. Leaving that pointer would name a row that no longer
+    # exists; `NULL` says "nothing supersedes this", which is what the
+    # surviving row's own state now is.
+    conn.execute(
+        """UPDATE product_gap_artifact_link
+              SET superseded_by_id = NULL
+            WHERE superseded_by_id IS NOT NULL
+              AND superseded_by_id NOT IN (SELECT id FROM product_gap_artifact_link)"""
+    )
+    conn.executescript(
+        """
+        DROP TABLE product_gap_artifact_link_legacy;
+        PRAGMA foreign_keys = ON;
+        """
+    )
+
+
+def _report_artifact_migration(
+    conn: sqlite3.Connection,
+    legacy: dict,
+    gap_key: str,
+    outcome: str,
+    detail: str,
+    moved_to_ref_id,
+    now: float,
+) -> None:
+    conn.execute(
+        """INSERT INTO product_gap_artifact_migration_report
+               (system_id, legacy_id, gap_id, gap_key, link_kind, target_ref,
+                outcome, detail, moved_to_ref_id, note, decision_method,
+                created_by, original_created_at, migrated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            legacy["system_id"], legacy["id"], legacy["gap_id"], gap_key,
+            legacy["link_kind"], legacy["target_ref"], outcome, detail,
+            moved_to_ref_id, legacy["note"], legacy["decision_method"],
+            legacy["created_by"], legacy["created_at"], now,
+        ),
+    )
+
+
 def _migrate_ux_journey_upstream_ref_kinds(conn: sqlite3.Connection) -> None:
     """Widen `ux_journey_upstream_ref.ref_kind` to accept Product Objective /
     Milestone / Gap references (Issue #427/#431,
@@ -9000,6 +9246,7 @@ def init_db() -> None:
         _migrate_flow_execution_ref_uniqueness(conn)
         _migrate_solution_design_option_unique(conn)
         _migrate_ux_journey_upstream_ref_kinds(conn)
+        _migrate_product_gap_artifact_link_kinds(conn)
         _migrate_intelligence_runs_snapshot_nullable(conn)
         install_intelligence_run_type_guards(conn)
         _migrate_cell_improvement_event_types(conn)
