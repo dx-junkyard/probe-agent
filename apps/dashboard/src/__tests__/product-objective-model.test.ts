@@ -318,8 +318,28 @@ describe("product-objective/model: Overview next_step -> Objective Map CTA", () 
     expect(href).toBe("/objective-map?view=objectives&objective=o1&milestone=m1");
   });
 
-  it("confirm_vision navigates to the bare Objective Map (no Objective row exists yet to select)", () => {
-    expect(objectiveNextStepHref(overviewObjective({ next_step: "confirm_vision" }))).toBe("/objective-map");
+  it("confirm_vision navigates to the Interview screen's Intent Brief, where Vision is actually confirmed", () => {
+    // Objective Map has no Vision-confirmation control at all, so landing
+    // there is a dead end. This is the SAME target the Overview's own
+    // 「Vision を定義する」 lead uses (`pages/overview.tsx`'s `visionHref`).
+    expect(objectiveNextStepHref(overviewObjective({ next_step: "confirm_vision" }), 7))
+      .toBe("/interview?session=7#cockpit-aux-intent");
+  });
+
+  it("confirm_vision still links without a session id (the Interview page auto-selects)", () => {
+    expect(objectiveNextStepHref(overviewObjective({ next_step: "confirm_vision" })))
+      .toBe("/interview#cockpit-aux-intent");
+    expect(objectiveNextStepHref(overviewObjective({ next_step: "confirm_vision" }), null))
+      .toBe("/interview#cockpit-aux-intent");
+  });
+
+  it("link_requirement_to_feature navigates to the UX Design Studio's Requirement tab, which owns that link", () => {
+    // The Gap Workbench's 関連付け records a Gap -> artifact link; the
+    // Requirement -> Feature link is a different fact, written through
+    // `POST /product-features/{key}/requirement-links`, whose only editing
+    // surface is the Requirement detail in the Studio.
+    expect(objectiveNextStepHref(overviewObjective({ next_step: "link_requirement_to_feature" })))
+      .toBe("/ux-design-studio?tab=requirements");
   });
 });
 

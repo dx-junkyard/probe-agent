@@ -129,7 +129,7 @@ export function ObjectiveCard({ overview }: { overview: OverviewOut }) {
           {hasAction ? (
             <>
               <Link
-                to={objectiveNextStepHref(objective)}
+                to={objectiveNextStepHref(objective, overview.interview_session_id)}
                 className="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
                 data-testid="overview-objective-cta"
                 data-next-step-key={objective.next_step}

@@ -320,7 +320,7 @@ describe("ObjectiveMapPage rendering", () => {
           {
             id: 1, gap_id: 1, source_kind: "node_anomaly", source_ref: "n1|dedupe",
             source_state: "current", title: null, detail: null, severity: null, severity_vocabulary: null,
-            deep_link: null, deep_link_state: "unavailable", captured_digest: "", captured_snapshot_id: null,
+            deep_link: null, deep_link_state: "unavailable", deep_link_target_state: "unavailable", captured_digest: "", captured_snapshot_id: null,
             captured_run_id: null, captured_revision_id: null, note: "", decision_method: "deterministic",
             created_by: null, created_at: 1000, superseded_by_id: null,
           },
@@ -641,13 +641,13 @@ describe("ObjectiveMapPage: evidence / artifact deep links (§5.8)", () => {
         evidence_refs: [
           {
             id: 1, gap_id: 1, evidence_kind: "trace", evidence_ref: "t-1",
-            deep_link: "/components", deep_link_state: "available",
+            deep_link: "/components", deep_link_state: "available", deep_link_target_state: "selected",
             captured_snapshot_id: null, note: "", decision_method: "manual",
             created_by: null, created_at: 1000, superseded_by_id: null,
           },
           {
             id: 2, gap_id: 1, evidence_kind: "human_report", evidence_ref: "ops report",
-            deep_link: null, deep_link_state: "unavailable",
+            deep_link: null, deep_link_state: "unavailable", deep_link_target_state: "unavailable",
             captured_snapshot_id: null, note: "", decision_method: "manual",
             created_by: null, created_at: 1000, superseded_by_id: null,
           },
@@ -655,7 +655,7 @@ describe("ObjectiveMapPage: evidence / artifact deep links (§5.8)", () => {
         artifact_links: [
           {
             id: 3, gap_id: 1, link_kind: "product_feature", target_ref: "feat-a",
-            target_row_id: null, deep_link: null, deep_link_state: "unavailable",
+            target_row_id: null, deep_link: null, deep_link_state: "unavailable", deep_link_target_state: "unavailable",
             captured_digest: "", note: "", decision_method: "manual",
             created_by: null, created_at: 1000, superseded_by_id: null,
           },
@@ -672,5 +672,284 @@ describe("ObjectiveMapPage: evidence / artifact deep links (§5.8)", () => {
     expect(screen.queryByTestId("gap-evidence-deep-link-2")).toBeNull();
     expect(screen.getByTestId("gap-artifact-link-deep-link-unavailable-3")).toBeInTheDocument();
     expect(screen.queryByTestId("gap-artifact-link-deep-link-3")).toBeNull();
+  });
+
+  it("distinguishes a link that selects the subject from one that only opens the screen", async () => {
+    // §5.8.1's two axes (#366): 「対象を選択して開く」 and 「画面だけ開く」
+    // are different promises, and a single label made the second look like
+    // the first.
+    mockRoutes({
+      objectiveMap: objectiveMap(),
+      gapWorkbench: gapWorkbench({
+        entries: [
+          gapEntry({
+            deep_links: [
+              {
+                source_kind: "functional_lineage_gap", source_ref: "c|stakeholder_need|need-1",
+                deep_link_state: "available", deep_link_target_state: "selected",
+                route: "/functional-lineage?ref_kind=stakeholder_need&ref=need-1",
+              },
+              {
+                source_kind: "understanding_review_gap", source_ref: "missing_capability|Checkout",
+                deep_link_state: "available", deep_link_target_state: "screen_only",
+                route: "/interview",
+              },
+            ],
+          }),
+        ],
+      }),
+      gap: gapDetail({
+        source_refs: [
+          {
+            id: 1, gap_id: 1, source_kind: "functional_lineage_gap", source_ref: "c|stakeholder_need|need-1",
+            source_state: "current", title: null, detail: null, severity: null, severity_vocabulary: null,
+            deep_link: "/functional-lineage?ref_kind=stakeholder_need&ref=need-1",
+            deep_link_state: "available", deep_link_target_state: "selected",
+            captured_digest: "", captured_snapshot_id: null,
+            captured_run_id: null, captured_revision_id: null, note: "", decision_method: "deterministic",
+            created_by: null, created_at: 1000, superseded_by_id: null,
+          },
+          {
+            id: 2, gap_id: 1, source_kind: "understanding_review_gap", source_ref: "missing_capability|Checkout",
+            source_state: "current", title: null, detail: null, severity: null, severity_vocabulary: null,
+            deep_link: "/interview", deep_link_state: "available", deep_link_target_state: "screen_only",
+            captured_digest: "", captured_snapshot_id: null,
+            captured_run_id: null, captured_revision_id: null, note: "", decision_method: "deterministic",
+            created_by: null, created_at: 1000, superseded_by_id: null,
+          },
+        ],
+      }),
+    });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+
+    const targeted = await screen.findByTestId("gap-source-deep-link-1");
+    expect(targeted).toHaveAttribute("data-target-state", "selected");
+    expect(targeted).toHaveTextContent("対象を開く");
+    expect(screen.queryByTestId("gap-source-deep-link-screen-only-1")).toBeNull();
+
+    expect(screen.getByTestId("gap-source-deep-link-2"))
+      .toHaveAttribute("data-target-state", "screen_only");
+    // The caveat is stated, not implied.
+    expect(screen.getByTestId("gap-source-deep-link-screen-only-2")).toBeInTheDocument();
+  });
+});
+
+// --- Selection normalization + per-entity form state --------------------------
+
+function twoObjectiveMap(): ObjectiveMapOut {
+  return objectiveMap({
+    nodes: [
+      node({ id: 1, objective_key: "o1", milestones: [milestone({ id: 1, milestone_key: "m1" })] }),
+      node({
+        id: 2, objective_key: "o2", title: "解約率を下げる",
+        milestones: [milestone({ id: 2, milestone_key: "m2", title: "解約導線を短くする" })],
+      }),
+    ],
+    root_objective_ids: [1, 2],
+  });
+}
+
+async function renderAt(path: string) {
+  const { default: Page } = await import("@/pages/objective-map");
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  return render(
+    <MemoryRouter initialEntries={[path]}>
+      <QueryClientProvider client={qc}>
+        <Page />
+      </QueryClientProvider>
+    </MemoryRouter>,
+  );
+}
+
+describe("ObjectiveMapPage milestone selection normalization", () => {
+  beforeEach(() => mockApi.get.mockReset());
+
+  it("resolves the owner Objective for a milestone-only deep link, so the work pane mounts", async () => {
+    // `objectiveMapForceExpandedKeys` already reveals the Milestone in the
+    // TREE, but the detail/action pane is keyed off `objectiveKey`, so
+    // without normalization `MilestoneWorkPanel` -- the whole point of the
+    // link -- never mounts.
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(twoObjectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      if (path === "/product-milestones/m2") {
+        return Promise.resolve(milestoneDetail({ id: 2, milestone_key: "m2", objective_id: 2, objective_key: "o2" }));
+      }
+      return Promise.resolve(null);
+    });
+    await renderAt("/objective-map?milestone=m2");
+
+    await waitFor(() => expect(screen.getByTestId("objective-detail-o2")).toBeInTheDocument());
+    expect(screen.queryByTestId("objective-detail-empty")).toBeNull();
+    expect(screen.getByTestId("milestone-node-m2")).toBeInTheDocument();
+    expect(await screen.findByTestId("milestone-work-panel-m2")).toBeInTheDocument();
+  });
+
+  it("also normalizes the shared ref_kind=product_milestone convention", async () => {
+    mockRoutes({ objectiveMap: twoObjectiveMap(), gapWorkbench: gapWorkbench() });
+    await renderAt("/objective-map?ref_kind=product_milestone&ref=m2");
+
+    await waitFor(() => expect(screen.getByTestId("objective-detail-o2")).toBeInTheDocument());
+  });
+
+  it("moves the Objective selection when a Milestone under a different Objective is picked", async () => {
+    mockRoutes({ objectiveMap: twoObjectiveMap(), gapWorkbench: gapWorkbench() });
+    await renderAt("/objective-map?objective=o1");
+    await waitFor(() => expect(screen.getByTestId("objective-detail-o1")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("objective-node-toggle-o2"));
+    fireEvent.click(await screen.findByTestId("milestone-node-m2"));
+
+    // The pane must follow the Milestone -- never keep describing o1 while
+    // the Milestone work panel below it acts on o2's Milestone.
+    await waitFor(() => expect(screen.getByTestId("objective-detail-o2")).toBeInTheDocument());
+    expect(screen.queryByTestId("objective-detail-o1")).toBeNull();
+  });
+
+  it("drops a Milestone key that is not in this map rather than pairing it with an unrelated Objective", async () => {
+    mockRoutes({ objectiveMap: twoObjectiveMap(), gapWorkbench: gapWorkbench() });
+    await renderAt("/objective-map?objective=o1&milestone=m-from-another-system");
+
+    await waitFor(() => expect(screen.getByTestId("objective-detail-o1")).toBeInTheDocument());
+    // "not in this map" and "belongs to o1" are different answers.
+    expect(screen.queryByTestId("objective-map-go-to-milestone-gaps")).toBeNull();
+  });
+});
+
+describe("ObjectiveMapPage per-entity form state", () => {
+  beforeEach(() => {
+    mockApi.get.mockReset();
+    mockApi.post.mockReset();
+  });
+
+  function objectiveDetail(key: string, title: string) {
+    return {
+      id: key === "o1" ? 1 : 2, system_id: 1, objective_key: key,
+      current_revision_id: 1, current_revision_number: 1, title,
+      objective_state: "active", recheck_state: "current",
+      parent_objective_id: null, parent_objective_key: null,
+      created_by: null, created_at: 0, updated_at: 0,
+      current_revision: {
+        id: 1, objective_id: key === "o1" ? 1 : 2, revision_number: 1, title,
+        intent: `${key} の意図`, contribution: "", scope_note: "", summary: "",
+        content_digest: `digest-${key}`, authored_by_kind: "developer",
+        decision_method: "manual", intelligence_run_id: null, change_note: "",
+        created_by: "dev", created_at: 0, revision_state: "current", superseded_by_id: null,
+      },
+      milestones: [], decisions: [], upstream_refs: [],
+      degraded_sections: [], degraded_detail: {},
+    };
+  }
+
+  function mockWithObjectiveDetails() {
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(twoObjectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      if (path === "/product-objectives/o1") return Promise.resolve(objectiveDetail("o1", "決済の離脱率を下げる"));
+      if (path === "/product-objectives/o2") return Promise.resolve(objectiveDetail("o2", "解約率を下げる"));
+      return Promise.resolve(null);
+    });
+  }
+
+  it("seeds the revision form from the selected Objective's CURRENT revision", async () => {
+    // The endpoint appends a FULL snapshot, so a blank form turns
+    // 「1 項目だけ直す」 into 「他を全部空へ戻す」.
+    mockWithObjectiveDetails();
+    await renderAt("/objective-map?objective=o1");
+
+    await waitFor(() => expect(screen.getByTestId("objective-revision-form")).toBeInTheDocument());
+    expect((screen.getByLabelText("Vision への意図") as HTMLTextAreaElement).value).toBe("o1 の意図");
+  });
+
+  it("does not carry a revision typed for one Objective over to another", async () => {
+    mockWithObjectiveDetails();
+    await renderAt("/objective-map?objective=o1");
+    await waitFor(() => expect(screen.getByTestId("objective-work-panel-o1")).toBeInTheDocument());
+
+    const intent = screen.getByLabelText("Vision への意図") as HTMLTextAreaElement;
+    fireEvent.change(intent, { target: { value: "o1 についての新しい意図" } });
+    expect(intent.value).toBe("o1 についての新しい意図");
+
+    fireEvent.click(within(screen.getByTestId("objective-node-o2")).getByText("解約率を下げる"));
+    await waitFor(() => expect(screen.getByTestId("objective-work-panel-o2")).toBeInTheDocument());
+
+    // Text typed for o1 must not be sitting in o2's form, where 「記録する」
+    // would save it as o2's revision -- a wrong-entity write.
+    expect((screen.getByLabelText("Vision への意図") as HTMLTextAreaElement).value).toBe("o2 の意図");
+  });
+
+  it("does not carry a Gap rationale over to another Gap", async () => {
+    const workbench = gapWorkbench({
+      entries: [gapEntry({ gap_key: "g1" }), gapEntry({ id: 2, gap_key: "g2", title: "二件目" })],
+    });
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(objectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(workbench);
+      if (path === "/product-gaps/g1") return Promise.resolve(gapDetail());
+      if (path === "/product-gaps/g2") return Promise.resolve(gapDetail({ id: 2, gap_key: "g2", title: "二件目" }));
+      return Promise.resolve(null);
+    });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+    await waitFor(() => expect(screen.getByTestId("gap-detail-g1")).toBeInTheDocument());
+
+    const rationale = screen.getByPlaceholderText("理由(任意)") as HTMLTextAreaElement;
+    fireEvent.change(rationale, { target: { value: "g1 についての理由" } });
+
+    fireEvent.click(screen.getByTestId("gap-entry-g2"));
+    await waitFor(() => expect(screen.getByTestId("gap-detail-g2")).toBeInTheDocument());
+    expect((screen.getByPlaceholderText("理由(任意)") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("re-seeds the priority band from the newly selected Gap, not the previous one", async () => {
+    const workbench = gapWorkbench({
+      entries: [
+        gapEntry({ gap_key: "g1", priority_band: "now" }),
+        gapEntry({ id: 2, gap_key: "g2", title: "二件目", priority_band: "watch" }),
+      ],
+    });
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(objectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(workbench);
+      if (path === "/product-gaps/g1") return Promise.resolve(gapDetail({ priority_band: "now" }));
+      if (path === "/product-gaps/g2") {
+        return Promise.resolve(gapDetail({ id: 2, gap_key: "g2", title: "二件目", priority_band: "watch" }));
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue({});
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+    await waitFor(() => expect(screen.getByTestId("gap-detail-g1")).toBeInTheDocument());
+    expect((screen.getByLabelText("優先バンド") as HTMLSelectElement).value).toBe("now");
+
+    fireEvent.click(screen.getByTestId("gap-entry-g2"));
+    await waitFor(() => expect(screen.getByTestId("gap-detail-g2")).toBeInTheDocument());
+    expect((screen.getByLabelText("優先バンド") as HTMLSelectElement).value).toBe("watch");
+
+    fireEvent.click(screen.getByTestId("gap-decision-prioritize"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-gaps/g2/decisions",
+      expect.objectContaining({ decision: "prioritize", priority_band: "watch" }),
+    ));
+  });
+
+  it("follows a later default Milestone in the create-Gap form", async () => {
+    // `useState` seeds once, so a default that arrives after the map loads --
+    // or after a deep link / filter change -- never landed, and the Gap was
+    // created under whatever Milestone happened to be first.
+    mockRoutes({ objectiveMap: twoObjectiveMap(), gapWorkbench: gapWorkbench({ entries: [] }) });
+    await renderAt("/objective-map?view=gaps");
+    await waitFor(() => expect(screen.getByTestId("create-gap-form")).toBeInTheDocument());
+
+    const select = screen.getByLabelText("所属する Milestone") as HTMLSelectElement;
+    expect(select.value).toBe("m1");
+
+    fireEvent.change(screen.getByLabelText("Milestone で絞り込み"), { target: { value: "m2" } });
+    await waitFor(() => expect((screen.getByLabelText("所属する Milestone") as HTMLSelectElement).value).toBe("m2"));
   });
 });

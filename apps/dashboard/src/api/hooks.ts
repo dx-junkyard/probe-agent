@@ -118,6 +118,8 @@ import type {
   ProductMilestoneRevisionCreateRequest, ProductMilestoneDecisionCreateRequest,
   ProductMilestoneDecisionOut, ProductMilestoneAssessmentCreateRequest,
   ProductMilestoneAssessmentOut,
+  ProductFeatureListOut, ProductFeatureDetailOut, ProductFeatureCreateRequest,
+  ProductFeatureRequirementLinkCreateRequest, ProductFeatureRequirementLinkOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -4363,6 +4365,76 @@ export function useFunctionalLineage() {
     queryKey: sysKey("functional-lineage"),
     queryFn: () => api.get<FunctionalLineageOut>("/functional-lineage"),
     enabled: !!getSystemId(),
+  });
+}
+
+// === Epic #427 / Issue #431 — Product Feature hooks ===
+//
+// `docs/product-objective-lineage.md` §7.2. The Feature layer had a complete
+// server (`/product-features`) and no editing surface at all, which left the
+// Overview's `link_requirement_to_feature` next step with nowhere to be
+// completed. These hooks back the Requirement -> Feature control on the UX
+// Design Studio's Requirement detail: the Requirement is the subject the
+// developer has open, while §7.2 stores the link on the FEATURE, so the
+// surface and the endpoint sit at opposite ends of the same one link.
+//
+// Every write is `decision_method: manual` server-side; nothing here adopts,
+// applies, or publishes anything.
+
+const PRODUCT_FEATURE_QUERY_BASES = [
+  "product-features", "product-feature", "functional-lineage", "overview",
+] as const;
+
+function invalidateProductFeature(qc: ReturnType<typeof useQueryClient>) {
+  for (const base of PRODUCT_FEATURE_QUERY_BASES) {
+    qc.invalidateQueries({ queryKey: [base] });
+  }
+}
+
+/** `GET /product-features` (§7.2). */
+export function useProductFeatures() {
+  return useQuery<ProductFeatureListOut>({
+    queryKey: sysKey("product-features"),
+    queryFn: () => api.get<ProductFeatureListOut>("/product-features"),
+    enabled: !!getSystemId(),
+  });
+}
+
+/** The Feature details for a set of keys. §7.2 stores the Requirement link on
+ * the Feature, so "which Features does this Requirement have" is only
+ * answerable by reading each Feature's own links -- the same shape
+ * `useSolutionDesignDetailsBatch` uses for the same question one layer over. */
+export function useProductFeatureDetailsBatch(keys: readonly string[]) {
+  return useQueries({
+    queries: keys.map((key) => ({
+      queryKey: [...sysKey("product-feature"), key],
+      queryFn: () =>
+        api.get<ProductFeatureDetailOut>(`/product-features/${encodeURIComponent(key)}`),
+    })),
+  });
+}
+
+/** `POST /product-features` (§7.2). A Feature identity is a developer-given
+ * slug, never derived from a Requirement/Capability key (§1's identity rule). */
+export function useCreateProductFeature() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductFeatureCreateRequest) =>
+      api.post<ProductFeatureDetailOut>("/product-features", body),
+    onSuccess: () => invalidateProductFeature(qc),
+  });
+}
+
+/** `POST /product-features/{feature_key}/requirement-links` (§7.2) -- the one
+ * write that completes the Overview's `link_requirement_to_feature` step. */
+export function useAddProductFeatureRequirementLink(featureKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductFeatureRequirementLinkCreateRequest) =>
+      api.post<ProductFeatureRequirementLinkOut>(
+        `/product-features/${encodeURIComponent(featureKey ?? "")}/requirement-links`, body,
+      ),
+    onSuccess: () => invalidateProductFeature(qc),
   });
 }
 

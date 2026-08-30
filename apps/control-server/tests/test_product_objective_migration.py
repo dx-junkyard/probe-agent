@@ -527,3 +527,318 @@ class TestCellGoalsAreNotMigrated:
         with get_conn() as conn:
             after = _dump(conn, "cell_goals")
         assert after == before
+
+
+# ---------------------------------------------------------------------------
+# 6. `ux_journey` is dropped from product_gap_artifact_link.link_kind
+# ---------------------------------------------------------------------------
+
+
+# The pre-§5.11 shape, reproduced verbatim: the only difference from the
+# current DDL is the extra `'ux_journey'` member of the CHECK.
+_LEGACY_ARTIFACT_LINK_DDL = """
+CREATE TABLE product_gap_artifact_link (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    gap_id           INTEGER NOT NULL,
+    link_kind        TEXT NOT NULL CHECK (link_kind IN
+                         ('issue_draft', 'ux_journey', 'ux_requirement',
+                          'product_feature', 'solution_design')),
+    target_ref       TEXT NOT NULL,
+    target_row_id    INTEGER,
+    captured_digest  TEXT NOT NULL DEFAULT '',
+    note             TEXT NOT NULL DEFAULT '',
+    decision_method  TEXT NOT NULL DEFAULT 'manual'
+                         CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by       TEXT,
+    created_at       REAL NOT NULL,
+    superseded_by_id INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (gap_id) REFERENCES product_gap (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_gap_artifact_link (id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_product_gap_artifact_link_system
+    ON product_gap_artifact_link (system_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_product_gap_artifact_link_gap
+    ON product_gap_artifact_link (gap_id, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_gap_artifact_current
+    ON product_gap_artifact_link (gap_id, link_kind, target_ref)
+    WHERE superseded_by_id IS NULL;
+"""
+
+
+def _downgrade_artifact_link_table(conn):
+    """Put `product_gap_artifact_link` back into its pre-§5.11 shape, for the
+    same reason `_downgrade_upstream_ref_table` exists: `init_db()` has
+    already run, so the narrowed table is what a test would otherwise find."""
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        DROP TABLE IF EXISTS product_gap_artifact_link;
+        DROP INDEX IF EXISTS idx_product_gap_artifact_link_system;
+        DROP INDEX IF EXISTS idx_product_gap_artifact_link_gap;
+        DROP INDEX IF EXISTS ux_product_gap_artifact_current;
+        """
+    )
+    conn.executescript(_LEGACY_ARTIFACT_LINK_DDL)
+    conn.executescript("PRAGMA foreign_keys = ON;")
+
+
+class TestArtifactLinkJourneyKindRemoval:
+    """§5.11 narrowed `link_kind` in the schema, the API `Literal` and the
+    Dashboard, but `CREATE TABLE IF NOT EXISTS` cannot repair an existing
+    table. Without the migration an existing database keeps the old CHECK AND
+    its `ux_journey` rows: those rows are outside
+    `ProductGapArtifactLinkKind`, so the Gap detail fails response validation
+    on them, and the connection they record is invisible to every reader that
+    moved to the canonical table. A fresh-database suite sees none of it.
+    """
+
+    def _seed(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "Artifact Link Migration")
+        headers = _headers(token, system_id)
+        repo, sha = _init_repo(tmp_path, "artifact-link-repo")
+        _insert_snapshot(system_id, repo, sha)
+
+        assert admin_client.post(
+            "/product-objectives", json={"objective_key": "o1"}, headers=headers,
+        ).status_code == 201
+        assert admin_client.post(
+            "/product-milestones",
+            json={"objective_key": "o1", "milestone_key": "m1"},
+            headers=headers,
+        ).status_code == 201
+        for gap_key in ("g-resolvable", "g-unresolved", "g-duplicate"):
+            assert admin_client.post(
+                "/product-gaps",
+                json={"milestone_key": "m1", "gap_key": gap_key},
+                headers=headers,
+            ).status_code == 201
+
+        r = admin_client.post(
+            "/ux-design/journeys",
+            json={"journey_key": "checkout", "perspective": "to_be", "baseline_mode": "undecided"},
+            headers=headers,
+        )
+        assert r.status_code in (200, 201), r.text
+        journey_id = r.json()["id"]
+        return token, system_id, headers, journey_id
+
+    def _insert_legacy_rows(self, conn, system_id, journey_id):
+        now = time.time()
+        gap_ids = {
+            r["gap_key"]: r["id"]
+            for r in conn.execute(
+                "SELECT id, gap_key FROM product_gap WHERE system_id = ?", (system_id,)
+            )
+        }
+        _downgrade_artifact_link_table(conn)
+
+        def _insert(gap_key, link_kind, target_ref):
+            return conn.execute(
+                """INSERT INTO product_gap_artifact_link
+                       (system_id, gap_id, link_kind, target_ref, captured_digest,
+                        note, decision_method, created_by, created_at)
+                   VALUES (?, ?, ?, ?, 'd0', 'legacy note', 'manual', 'root', ?)""",
+                (system_id, gap_ids[gap_key], link_kind, target_ref, now),
+            ).lastrowid
+
+        ids = {
+            "resolvable": _insert("g-resolvable", "ux_journey", "checkout"),
+            "unresolved": _insert("g-unresolved", "ux_journey", "no-such-journey"),
+            "duplicate": _insert("g-duplicate", "ux_journey", "checkout"),
+            "issue_draft": _insert("g-resolvable", "issue_draft", "42"),
+        }
+        # The `duplicate` Gap's connection is ALREADY in the canonical table.
+        conn.execute(
+            """INSERT INTO ux_journey_upstream_ref
+                   (system_id, journey_id, ref_kind, target_ref, captured_digest,
+                    note, decision_method, created_by, created_at)
+               VALUES (?, ?, 'product_gap', 'g-duplicate', '', '', 'manual', 'root', ?)""",
+            (system_id, journey_id, now),
+        )
+        return ids
+
+    def _run(self, admin_client, tmp_path):
+        from app.db import get_conn, init_db
+
+        token, system_id, headers, journey_id = self._seed(admin_client, tmp_path)
+        with get_conn() as conn:
+            ids = self._insert_legacy_rows(conn, system_id, journey_id)
+            assert "'ux_journey'" in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'product_gap_artifact_link'"
+            ).fetchone()["sql"]
+        init_db()
+        return token, system_id, headers, ids
+
+    def test_the_check_is_rebuilt_and_journey_rows_are_gone(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        _token, _system_id, _headers_, _ids = self._run(admin_client, tmp_path)
+        with get_conn() as conn:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'product_gap_artifact_link'"
+            ).fetchone()["sql"]
+            assert "'ux_journey'" not in sql
+            kinds = {r["link_kind"] for r in conn.execute("SELECT link_kind FROM product_gap_artifact_link")}
+            assert "ux_journey" not in kinds
+
+    def test_a_uniquely_resolvable_row_moves_to_the_canonical_table(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        _token, system_id, _headers_, _ids = self._run(admin_client, tmp_path)
+        with get_conn() as conn:
+            refs = [
+                dict(r)
+                for r in conn.execute(
+                    """SELECT * FROM ux_journey_upstream_ref
+                       WHERE system_id = ? AND ref_kind = 'product_gap' AND target_ref = 'g-resolvable'""",
+                    (system_id,),
+                )
+            ]
+        assert len(refs) == 1
+        # The developer's own note and authorship travel with the connection:
+        # the row records a human decision, and the migration moves it rather
+        # than re-authoring it.
+        assert refs[0]["note"] == "legacy note"
+        assert refs[0]["created_by"] == "root"
+        assert refs[0]["decision_method"] == "manual"
+
+    def test_non_journey_rows_survive_with_their_ids(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        _token, _system_id, _headers_, ids = self._run(admin_client, tmp_path)
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM product_gap_artifact_link WHERE id = ?", (ids["issue_draft"],)
+            ).fetchone()
+        assert row is not None
+        assert row["link_kind"] == "issue_draft"
+        assert row["target_ref"] == "42"
+        assert row["note"] == "legacy note"
+
+    def test_unresolved_and_duplicate_rows_are_reported_never_guessed(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        _token, system_id, _headers_, _ids = self._run(admin_client, tmp_path)
+        with get_conn() as conn:
+            report = {
+                r["gap_key"]: dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM product_gap_artifact_migration_report WHERE system_id = ?",
+                    (system_id,),
+                )
+            }
+            # Nothing was invented for the unresolvable key.
+            assert conn.execute(
+                """SELECT COUNT(*) AS n FROM ux_journey_upstream_ref
+                   WHERE system_id = ? AND target_ref = 'g-unresolved'""",
+                (system_id,),
+            ).fetchone()["n"] == 0
+            # And the already-recorded connection was not duplicated.
+            assert conn.execute(
+                """SELECT COUNT(*) AS n FROM ux_journey_upstream_ref
+                   WHERE system_id = ? AND ref_kind = 'product_gap' AND target_ref = 'g-duplicate'""",
+                (system_id,),
+            ).fetchone()["n"] == 1
+
+        assert report["g-resolvable"]["outcome"] == "moved"
+        assert report["g-unresolved"]["outcome"] == "unresolved"
+        assert report["g-duplicate"]["outcome"] == "duplicate"
+        # The report carries enough to finish the move by hand.
+        assert report["g-unresolved"]["target_ref"] == "no-such-journey"
+        assert report["g-unresolved"]["note"] == "legacy note"
+
+    def test_the_gap_detail_reads_after_the_upgrade(self, admin_client, tmp_path):
+        """The response-validation failure this migration exists to prevent:
+        a `ux_journey` row is outside the narrowed `Literal`."""
+        _token, _system_id, headers, _ids = self._run(admin_client, tmp_path)
+        for gap_key in ("g-resolvable", "g-unresolved", "g-duplicate"):
+            r = admin_client.get(f"/product-gaps/{gap_key}", headers=headers)
+            assert r.status_code == 200, r.text
+            assert all(
+                link["link_kind"] != "ux_journey" for link in r.json()["artifact_links"]
+            )
+
+    def test_the_migration_is_idempotent(self, admin_client, tmp_path):
+        from app.db import get_conn, init_db
+
+        _token, system_id, _headers_, _ids = self._run(admin_client, tmp_path)
+        with get_conn() as conn:
+            before = _dump(conn, "product_gap_artifact_link")
+            report_before = _dump(conn, "product_gap_artifact_migration_report")
+        init_db()
+        init_db()
+        with get_conn() as conn:
+            assert _dump(conn, "product_gap_artifact_link") == before
+            # A second run must not re-report rows it already moved.
+            assert _dump(conn, "product_gap_artifact_migration_report") == report_before
+
+    def test_a_retry_after_a_partial_failure_does_not_duplicate(self, admin_client, tmp_path):
+        """The row move happens before the table rebuild, so a process death
+        between the two leaves the OLD schema in place and this migration runs
+        again. Neither the canonical connection nor the report may accumulate."""
+        from app.db import get_conn, init_db
+
+        token, system_id, headers, journey_id = self._seed(admin_client, tmp_path)
+        with get_conn() as conn:
+            self._insert_legacy_rows(conn, system_id, journey_id)
+
+        # Simulate the interrupted attempt: move the rows, then leave the old
+        # table exactly as it was.
+        from app.db import _migrate_product_gap_artifact_link_kinds
+
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM product_gap_artifact_link WHERE link_kind = 'ux_journey' LIMIT 1"
+            ).fetchone()
+            conn.execute(
+                """INSERT INTO ux_journey_upstream_ref
+                       (system_id, journey_id, ref_kind, target_ref, captured_digest,
+                        note, decision_method, created_by, created_at)
+                   VALUES (?, ?, 'product_gap', 'g-resolvable', '', '', 'manual', 'root', ?)""",
+                (system_id, journey_id, time.time()),
+            )
+            assert row is not None
+            _ = _migrate_product_gap_artifact_link_kinds  # imported for clarity
+
+        init_db()
+
+        with get_conn() as conn:
+            # The connection exists exactly once, not twice.
+            assert conn.execute(
+                """SELECT COUNT(*) AS n FROM ux_journey_upstream_ref
+                   WHERE system_id = ? AND ref_kind = 'product_gap' AND target_ref = 'g-resolvable'""",
+                (system_id,),
+            ).fetchone()["n"] == 1
+            # And the report describes each legacy row once.
+            legacy_ids = [
+                r["legacy_id"]
+                for r in conn.execute(
+                    "SELECT legacy_id FROM product_gap_artifact_migration_report WHERE system_id = ?",
+                    (system_id,),
+                )
+            ]
+            assert len(legacy_ids) == len(set(legacy_ids))
+
+    def test_a_fresh_database_is_untouched(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "fresh-artifact.db"))
+        from app.db import get_conn, init_db
+
+        init_db()
+        init_db()
+        with get_conn() as conn:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'product_gap_artifact_link'"
+            ).fetchone()["sql"]
+            assert "'ux_journey'" not in sql
+            # The report table is only created when there is something to
+            # migrate, so a fresh database never grows one.
+            assert conn.execute(
+                "SELECT COUNT(*) AS n FROM sqlite_master "
+                "WHERE name = 'product_gap_artifact_migration_report'"
+            ).fetchone()["n"] == 0

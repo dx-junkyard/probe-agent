@@ -79,6 +79,7 @@ from ..product_objective import (
     ProductObjectiveValidationError,
     RefKindInvalid,
     SourceDuplicate,
+    SourceRefUnresolvable,
 )
 
 router = APIRouter(prefix="/product-objectives", tags=["product-objective"])
@@ -122,6 +123,9 @@ _MESSAGES = {
     "product_milestone_not_assessable": "定義が確定していない Milestone には達成判定を記録できません。",
     "product_ref_kind_invalid": "ref_kind が不正です。",
     "product_source_kind_invalid": "source_kind が不正です。",
+    "product_gap_source_ref_unresolvable":
+        "この gap code は Functional Lineage の Objective 層でのみ検出されるため、"
+        "Gap の検出元としては解決できません。Functional Lineage 画面で確認してください。",
     "product_link_kind_invalid": "link_kind が不正です。",
 }
 
@@ -148,6 +152,8 @@ def _raise_for_error(exc: Exception) -> None:
         raise _reject("product_milestone_dependency_cycle", 422)
     if isinstance(exc, DependencyDuplicate):
         raise _reject("product_milestone_dependency_duplicate", 409)
+    if isinstance(exc, SourceRefUnresolvable):
+        raise _reject("product_gap_source_ref_unresolvable", 422)
     if isinstance(exc, SourceDuplicate):
         raise _reject("product_gap_source_duplicate", 409)
     if isinstance(exc, ArtifactDuplicate):

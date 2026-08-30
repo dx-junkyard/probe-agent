@@ -327,6 +327,7 @@ def _deep_links_for_gap(
                 "source_kind": kind,
                 "source_ref": ref,
                 "deep_link_state": source_ref["deep_link_state"],
+                "deep_link_target_state": source_ref.get("deep_link_target_state", "unavailable"),
                 "route": source_ref["deep_link"],
             }
         )

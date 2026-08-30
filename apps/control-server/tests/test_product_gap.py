@@ -779,3 +779,110 @@ class TestNoWriteToExistingCanonicalTables:
                     after[table] = None
 
         assert before == after
+
+
+class TestDuplicateDetectedByTheIndexIsStillTyped:
+    """The pre-check and the partial unique index detect the SAME condition.
+    A writer landing between the two must still get §10.1's one code, never
+    an untyped 500 from the index -- and SQLite names a violated index by its
+    COLUMNS, so matching on the index name would silently never fire."""
+
+    def test_source_ref(self, admin_client, monkeypatch):
+        from app import product_objective
+
+        token, system_id = _setup(admin_client, "System Source Race")
+        headers = _headers(token, system_id)
+        milestone_key = _make_objective_and_milestone(admin_client, headers)
+        _create_gap(admin_client, headers, milestone_key, "g1")
+        _add_source_ref(admin_client, headers, "g1", "manual", "ref-a")
+
+        # Stand in for the losing side of the race: the pre-check sees
+        # nothing, so only the unique index can reject the INSERT.
+        monkeypatch.setattr(product_objective, "_current_source_ref_id", lambda *a, **k: None)
+        r = _add_source_ref(admin_client, headers, "g1", "manual", "ref-a", expect=409)
+        assert r.json()["detail"]["code"] == "product_gap_source_duplicate"
+
+        detail = admin_client.get("/product-gaps/g1", headers=headers).json()
+        assert len([x for x in detail["source_refs"] if x["source_ref"] == "ref-a"]) == 1
+
+    def test_artifact_link(self, admin_client, monkeypatch):
+        from app import product_objective
+
+        token, system_id = _setup(admin_client, "System Artifact Race")
+        headers = _headers(token, system_id)
+        milestone_key = _make_objective_and_milestone(admin_client, headers)
+        _create_gap(admin_client, headers, milestone_key, "g1")
+        body = {"link_kind": "issue_draft", "target_ref": "42"}
+        assert admin_client.post(
+            "/product-gaps/g1/artifact-links", json=body, headers=headers
+        ).status_code == 201
+
+        monkeypatch.setattr(product_objective, "_current_artifact_link_id", lambda *a, **k: None)
+        r = admin_client.post("/product-gaps/g1/artifact-links", json=body, headers=headers)
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["code"] == "product_gap_artifact_duplicate"
+
+        detail = admin_client.get("/product-gaps/g1", headers=headers).json()
+        assert len([x for x in detail["artifact_links"] if x["target_ref"] == "42"]) == 1
+
+
+class TestFunctionalLineageSourceRefResolvability:
+    """§5.4.2: a Gap's own source resolution runs the Functional Lineage
+    projection with sections 6-8 OFF (otherwise it re-enters this very
+    resolution and never returns). The codes those sections alone emit can
+    therefore never match, so such a ref is refused at CREATION rather than
+    stored as a source that is permanently `unavailable`."""
+
+    def _setup_gap(self, admin_client, name):
+        token, system_id = _setup(admin_client, name)
+        headers = _headers(token, system_id)
+        milestone_key = _make_objective_and_milestone(admin_client, headers)
+        _create_gap(admin_client, headers, milestone_key, "g1")
+        return headers
+
+    def test_an_objective_layer_code_is_refused_with_its_own_422(self, admin_client):
+        headers = self._setup_gap(admin_client, "System FL Code Refused")
+        r = _add_source_ref(
+            admin_client, headers, "g1", "functional_lineage_gap",
+            "gap_without_journey|product_gap|g1", expect=422,
+        )
+        assert r.json()["detail"]["code"] == "product_gap_source_ref_unresolvable"
+
+    def test_a_section_1_to_5_code_is_still_accepted(self, admin_client):
+        headers = self._setup_gap(admin_client, "System FL Code Accepted")
+        _add_source_ref(
+            admin_client, headers, "g1", "functional_lineage_gap",
+            "need_without_exchange|stakeholder_need|need-1",
+        )
+
+    def test_an_already_stored_objective_layer_code_reads_unavailable_not_disappeared(
+        self, admin_client
+    ):
+        """A row stored before the gate existed must not read `disappeared`:
+        that is a `close_candidate` input (§6), so it would nudge a human
+        toward closing a Gap on evidence nobody gathered."""
+        from app import product_gap_sources as pgs
+        from app.db import get_conn
+
+        token, system_id = _setup(admin_client, "System FL Legacy Code")
+        headers = _headers(token, system_id)
+        milestone_key = _make_objective_and_milestone(admin_client, headers)
+        _create_gap(admin_client, headers, milestone_key, "g1")
+
+        with get_conn() as conn:
+            resolved = pgs.resolve_source(
+                conn, system_id=system_id, source_kind="functional_lineage_gap",
+                source_ref="gap_without_journey|product_gap|g1",
+            )
+        assert resolved.source_state == "unavailable"
+        assert resolved.extra.get("reason") == "product_objective_layer_code"
+
+    def test_every_excluded_code_is_a_real_gap_code(self):
+        from app import functional_lineage as fl
+
+        assert fl.PRODUCT_OBJECTIVE_LAYER_GAP_CODES
+        assert fl.PRODUCT_OBJECTIVE_LAYER_GAP_CODES <= set(fl.GAP_CODES)
+        # The three shared reference codes stay resolvable: sections 1-5 emit
+        # them too.
+        for code in ("unresolved_reference", "unavailable_reference", "stale_link"):
+            assert code not in fl.PRODUCT_OBJECTIVE_LAYER_GAP_CODES

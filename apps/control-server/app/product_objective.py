@@ -122,6 +122,7 @@ __all__ = [
     "MilestoneNotAssessable",
     "RefKindInvalid",
     "SourceKindInvalid",
+    "SourceRefUnresolvable",
     "LinkKindInvalid",
     "content_digest",
     "objective_revision_digest",
@@ -413,6 +414,20 @@ class RefKindInvalid(ProductObjectiveValidationError):
 class SourceKindInvalid(ProductObjectiveValidationError):
     """`source_kind` is outside `ProductGapSourceKind`
     (422 `product_source_kind_invalid`)."""
+
+
+class SourceRefUnresolvable(ProductObjectiveValidationError):
+    """A `functional_lineage_gap` ref names a gap code that this Gap's own
+    source resolution structurally cannot read -- one emitted only by the
+    Functional Lineage view's Product Objective sections, which that
+    resolution must exclude to avoid re-entering the projection (422
+    `product_gap_source_ref_unresolvable`, §5.4.2).
+
+    Refused at CREATION rather than left to resolve as `unavailable` forever:
+    storing it would record a detection source whose state can never become a
+    fact, and the developer would learn that only by reading a permanently
+    degraded row later.
+    """
 
 
 class LinkKindInvalid(ProductObjectiveValidationError):
@@ -2113,6 +2128,7 @@ def _unavailable_source_out(row: Dict[str, Any]) -> Dict[str, Any]:
         "severity_vocabulary": None,
         "deep_link": None,
         "deep_link_state": "unavailable",
+        "deep_link_target_state": "unavailable",
         "captured_digest": row["captured_digest"],
         "captured_snapshot_id": row["captured_snapshot_id"],
         "captured_run_id": row["captured_run_id"],
@@ -2166,6 +2182,7 @@ def _gap_source_out_dict(
         "severity_vocabulary": resolved.severity_vocabulary,
         "deep_link": resolved.deep_link,
         "deep_link_state": resolved.deep_link_state,
+        "deep_link_target_state": resolved.deep_link_target_state,
         "captured_digest": row["captured_digest"],
         "captured_snapshot_id": row["captured_snapshot_id"],
         "captured_run_id": row["captured_run_id"],
@@ -2177,6 +2194,76 @@ def _gap_source_out_dict(
         "superseded_by_id": row["superseded_by_id"],
     }
     return out, None
+
+
+def _is_unique_violation(exc: sqlite3.IntegrityError, table: str) -> bool:
+    """True when `exc` is a UNIQUE-constraint violation on `table`. SQLite
+    reports the violated (partial) index by its COLUMNS -- "UNIQUE constraint
+    failed: product_gap_source_ref.gap_id, ..." -- and never by the index
+    name, so matching on the index name silently never fires. NOT NULL and
+    FOREIGN KEY violations are deliberately excluded: those are programming
+    errors and must keep surfacing, not be relabelled as a duplicate."""
+    message = str(exc)
+    return message.startswith("UNIQUE constraint failed:") and f"{table}." in message
+
+
+def _check_source_ref_resolvable(source_kind: str, source_ref: str) -> None:
+    """§5.4.2: refuse a `functional_lineage_gap` ref whose gap code only the
+    Functional Lineage view's Product Objective sections emit.
+
+    A Gap's own source resolution must run that projection with those
+    sections OFF (otherwise it re-enters this very resolution and never
+    returns -- see `functional_lineage.build_functional_lineage`), so such a
+    ref could never resolve to anything. Storing it would record a detection
+    source that is permanently `unavailable`: the Gap would carry a source
+    nobody can act on, and the developer would only find out by reading the
+    degraded row later.
+
+    Only this one kind has the problem, so only this one kind is checked; the
+    code set itself lives in `functional_lineage` beside the sections that
+    emit it.
+    """
+    if source_kind != "functional_lineage_gap":
+        return
+    parts = source_ref.split("|", 2)
+    if len(parts) != 3:
+        return  # a malformed ref is the resolver's `disappeared`, not this gate's business
+    from . import functional_lineage
+
+    if parts[0] in functional_lineage.PRODUCT_OBJECTIVE_LAYER_GAP_CODES:
+        raise SourceRefUnresolvable(
+            f"gap code {parts[0]!r} is emitted only by the Functional Lineage view's "
+            "Product Objective sections, which a Gap's own source resolution cannot read"
+        )
+
+
+def _current_source_ref_id(
+    conn: sqlite3.Connection, system_id: int, gap_id: int, source_kind: str, source_ref: str
+) -> Optional[int]:
+    """The pre-check behind §10.1's 409 `product_gap_source_duplicate`. Its
+    own function so a test can stand in for the LOSING side of the race the
+    `ux_product_gap_source_current` index also detects -- there is no other
+    way to reach that second detector deterministically, and an untyped 500
+    from it is exactly the defect being guarded against."""
+    row = conn.execute(
+        """SELECT id FROM product_gap_source_ref
+           WHERE system_id = ? AND gap_id = ? AND source_kind = ? AND source_ref = ? AND superseded_by_id IS NULL""",
+        (system_id, gap_id, source_kind, source_ref),
+    ).fetchone()
+    return None if row is None else row["id"]
+
+
+def _current_artifact_link_id(
+    conn: sqlite3.Connection, system_id: int, gap_id: int, link_kind: str, target_ref: str
+) -> Optional[int]:
+    """The pre-check behind §10.1's 409 `product_gap_artifact_duplicate`;
+    see `_current_source_ref_id` for why it is its own function."""
+    row = conn.execute(
+        """SELECT id FROM product_gap_artifact_link
+           WHERE system_id = ? AND gap_id = ? AND link_kind = ? AND target_ref = ? AND superseded_by_id IS NULL""",
+        (system_id, gap_id, link_kind, target_ref),
+    ).fetchone()
+    return None if row is None else row["id"]
 
 
 def add_gap_source_ref(
@@ -2215,48 +2302,67 @@ def add_gap_source_ref(
     now = time.time() if now is None else now
     if source_kind not in GAP_SOURCE_KINDS:
         raise SourceKindInvalid(source_kind)
+    _check_source_ref_resolvable(source_kind, source_ref)
     gap = _get_gap_row(conn, system_id, gap_key)
     if gap is None:
         raise NotFound(f"Gap {gap_key!r} not found")
 
-    existing = conn.execute(
-        """SELECT id FROM product_gap_source_ref
-           WHERE system_id = ? AND gap_id = ? AND source_kind = ? AND source_ref = ? AND superseded_by_id IS NULL""",
-        (system_id, gap["id"], source_kind, source_ref),
-    ).fetchone()
-    if existing is not None:
-        raise SourceDuplicate(gap_key)
-
-    captured_digest = ""
-    resolved_snapshot_id: Optional[int] = None
-    resolved_run_id: Optional[int] = None
-    resolved_revision_id: Optional[int] = None
+    # The duplicate check, the pin resolution and the INSERT are ONE
+    # transaction. Two defects otherwise: another writer landing between the
+    # check and the INSERT surfaces `ux_product_gap_source_current`'s
+    # `IntegrityError` as an untyped 500 instead of §10.1's one 409
+    # `product_gap_source_duplicate`; and the pins stored on this row could be
+    # captured from a DIFFERENT database state than the row they are stored
+    # beside, which is precisely the thing a pin exists to rule out. A
+    # DEFERRED transaction holds only a read lock until the INSERT, so the
+    # (potentially slow) `resolve_source` read blocks no other writer -- it
+    # just fixes the snapshot the pins come from.
+    conn.execute("BEGIN")
     try:
-        from . import product_gap_sources
+        if _current_source_ref_id(conn, system_id, gap["id"], source_kind, source_ref) is not None:
+            raise SourceDuplicate(gap_key)
 
-        resolved = product_gap_sources.resolve_source(
-            conn, system_id=system_id, source_kind=source_kind, source_ref=source_ref, captured_digest=""
-        )
-        captured_digest = resolved.current_digest
-        resolved_snapshot_id = resolved.resolved_snapshot_id
-        resolved_run_id = resolved.resolved_run_id
-        resolved_revision_id = resolved.resolved_revision_id
-    except Exception:
         captured_digest = ""
+        resolved_snapshot_id: Optional[int] = None
+        resolved_run_id: Optional[int] = None
+        resolved_revision_id: Optional[int] = None
+        try:
+            from . import product_gap_sources
 
-    cur = conn.execute(
-        """INSERT INTO product_gap_source_ref
-               (system_id, gap_id, source_kind, source_ref, captured_digest,
-                captured_snapshot_id, captured_run_id, captured_revision_id,
-                note, decision_method, created_by, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?)""",
-        (
-            system_id, gap["id"], source_kind, source_ref, captured_digest,
-            resolved_snapshot_id, resolved_run_id, resolved_revision_id,
-            note, created_by, now,
-        ),
-    )
-    row = dict(conn.execute("SELECT * FROM product_gap_source_ref WHERE id = ?", (cur.lastrowid,)).fetchone())
+            resolved = product_gap_sources.resolve_source(
+                conn, system_id=system_id, source_kind=source_kind, source_ref=source_ref, captured_digest=""
+            )
+            captured_digest = resolved.current_digest
+            resolved_snapshot_id = resolved.resolved_snapshot_id
+            resolved_run_id = resolved.resolved_run_id
+            resolved_revision_id = resolved.resolved_revision_id
+        except Exception:
+            captured_digest = ""
+
+        try:
+            cur = conn.execute(
+                """INSERT INTO product_gap_source_ref
+                       (system_id, gap_id, source_kind, source_ref, captured_digest,
+                        captured_snapshot_id, captured_run_id, captured_revision_id,
+                        note, decision_method, created_by, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?)""",
+                (
+                    system_id, gap["id"], source_kind, source_ref, captured_digest,
+                    resolved_snapshot_id, resolved_run_id, resolved_revision_id,
+                    note, created_by, now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            if _is_unique_violation(exc, "product_gap_source_ref"):
+                raise SourceDuplicate(gap_key) from exc
+            raise
+        new_id = cur.lastrowid
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    row = dict(conn.execute("SELECT * FROM product_gap_source_ref WHERE id = ?", (new_id,)).fetchone())
     out, _err = _gap_source_out_dict(conn, system_id, row)
     return out
 
@@ -2278,11 +2384,16 @@ def _with_reference_deep_link(item: Dict[str, Any], kind_field: str) -> Dict[str
 
     kind = item[kind_field]
     if kind_field == "evidence_kind":
-        route, state = product_gap_sources.evidence_deep_link(kind)
+        route, state, target_state = product_gap_sources.evidence_deep_link(
+            kind, item.get("evidence_ref") or "",
+        )
     else:
-        route, state = product_gap_sources.artifact_deep_link(kind)
+        route, state, target_state = product_gap_sources.artifact_deep_link(
+            kind, item.get("target_ref") or "",
+        )
     item["deep_link"] = route
     item["deep_link_state"] = state
+    item["deep_link_target_state"] = target_state
     return item
 
 
@@ -2331,20 +2442,32 @@ def add_gap_artifact_link(
     gap = _get_gap_row(conn, system_id, gap_key)
     if gap is None:
         raise NotFound(f"Gap {gap_key!r} not found")
-    existing = conn.execute(
-        """SELECT id FROM product_gap_artifact_link
-           WHERE system_id = ? AND gap_id = ? AND link_kind = ? AND target_ref = ? AND superseded_by_id IS NULL""",
-        (system_id, gap["id"], link_kind, target_ref),
-    ).fetchone()
-    if existing is not None:
-        raise ArtifactDuplicate(gap_key)
-    cur = conn.execute(
-        """INSERT INTO product_gap_artifact_link
-               (system_id, gap_id, link_kind, target_ref, captured_digest, note, decision_method, created_by, created_at)
-           VALUES (?, ?, ?, ?, '', ?, 'manual', ?, ?)""",
-        (system_id, gap["id"], link_kind, target_ref, note, created_by, now),
-    )
-    row = conn.execute("SELECT * FROM product_gap_artifact_link WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # Same reasoning as `add_gap_source_ref`: one transaction over the check
+    # and the INSERT, and `ux_product_gap_artifact_current` -- the second
+    # detector of the same condition -- answers with §10.1's one code
+    # (409 `product_gap_artifact_duplicate`), never an untyped 500.
+    conn.execute("BEGIN")
+    try:
+        if _current_artifact_link_id(conn, system_id, gap["id"], link_kind, target_ref) is not None:
+            raise ArtifactDuplicate(gap_key)
+        try:
+            cur = conn.execute(
+                """INSERT INTO product_gap_artifact_link
+                       (system_id, gap_id, link_kind, target_ref, captured_digest, note, decision_method, created_by, created_at)
+                   VALUES (?, ?, ?, ?, '', ?, 'manual', ?, ?)""",
+                (system_id, gap["id"], link_kind, target_ref, note, created_by, now),
+            )
+        except sqlite3.IntegrityError as exc:
+            if _is_unique_violation(exc, "product_gap_artifact_link"):
+                raise ArtifactDuplicate(gap_key) from exc
+            raise
+        new_id = cur.lastrowid
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    row = conn.execute("SELECT * FROM product_gap_artifact_link WHERE id = ?", (new_id,)).fetchone()
     return _with_reference_deep_link(dict(row), "link_kind")
 
 

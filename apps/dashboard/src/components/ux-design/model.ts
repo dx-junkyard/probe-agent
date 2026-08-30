@@ -68,6 +68,8 @@ import type {
   UxRequirementStepLinkOut,
   UxRevisionState,
   UxVerificationMethod,
+  ProductFeatureDetailOut,
+  ProductFeatureRequirementLinkOut,
 } from "@/api/types";
 
 // --- Fixed display order --------------------------------------------------
@@ -413,6 +415,37 @@ export function solutionDesignsForRequirement(
     }
   }
   return out.sort((a, b) => a.design.design_key.localeCompare(b.design.design_key));
+}
+
+export interface RequirementFeatureLink {
+  feature: ProductFeatureDetailOut;
+  link: ProductFeatureRequirementLinkOut;
+}
+
+/**
+ * Which Product Features link to one specific Requirement, given the
+ * already server-decided detail of every Feature in the System (Epic #427
+ * §7.2). Structural join on `requirement_id` only -- exact id equality, never
+ * a name/similarity match (Principle 6), the same discipline
+ * `solutionDesignsForRequirement` follows one layer over.
+ *
+ * The join lives here rather than on the Requirement response because §7.2
+ * stores the link on the FEATURE: "which Features does this Requirement
+ * have" is a question only the Feature rows can answer.
+ */
+export function featuresForRequirement(
+  featureDetails: readonly ProductFeatureDetailOut[],
+  requirementId: number,
+): RequirementFeatureLink[] {
+  const out: RequirementFeatureLink[] = [];
+  for (const feature of featureDetails) {
+    for (const link of feature.requirement_links) {
+      if (link.requirement_id === requirementId && link.superseded_by_id === null) {
+        out.push({ feature, link });
+      }
+    }
+  }
+  return out.sort((a, b) => a.feature.feature_key.localeCompare(b.feature.feature_key));
 }
 
 /** The adopted Option's target links only -- "adopted, never applied" (§3.6):

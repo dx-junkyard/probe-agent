@@ -7626,6 +7626,13 @@ export type ProductFeatureLinkKind =
 
 export type ProductDeepLinkState = "available" | "unavailable";
 
+/** §5.8.1's SECOND axis, kept separate from `ProductDeepLinkState` for the
+ * #366 reason one displayed word must not carry two facts: "a screen for this
+ * kind exists" and "that URL opens with this subject selected" are
+ * independent facts, and the developer's next move differs. `unavailable` is
+ * the only value that pairs with `deep_link_state: "unavailable"`. */
+export type ProductDeepLinkTargetState = "selected" | "screen_only" | "unavailable";
+
 /** Read-time-only advisory flags (§6) -- NEVER ProductGapLifecycle values,
  * never persisted. */
 export type ProductGapReadFlag = "recheck_required" | "reopen_candidate" | "close_candidate";
@@ -7946,6 +7953,7 @@ export interface ProductGapSourceOut {
   severity_vocabulary: string | null;
   deep_link: string | null;
   deep_link_state: ProductDeepLinkState;
+  deep_link_target_state: ProductDeepLinkTargetState;
   captured_digest: string;
   captured_snapshot_id: number | null;
   captured_run_id: number | null;
@@ -7975,6 +7983,7 @@ export interface ProductGapEvidenceOut {
    * `evidence_ref` still resolves there. */
   deep_link: string | null;
   deep_link_state: ProductDeepLinkState;
+  deep_link_target_state: ProductDeepLinkTargetState;
 }
 
 export interface ProductGapArtifactOut {
@@ -7994,6 +8003,7 @@ export interface ProductGapArtifactOut {
    * Dashboard screen of its own. */
   deep_link: string | null;
   deep_link_state: ProductDeepLinkState;
+  deep_link_target_state: ProductDeepLinkTargetState;
 }
 
 export interface ProductGapDecisionOut {
@@ -8363,6 +8373,7 @@ export interface GapWorkbenchDeepLinkOut {
   source_kind: ProductGapSourceKind;
   source_ref: string;
   deep_link_state: ProductDeepLinkState;
+  deep_link_target_state: ProductDeepLinkTargetState;
   route: string | null;
 }
 

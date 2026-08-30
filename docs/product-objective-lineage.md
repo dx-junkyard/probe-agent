@@ -789,7 +789,13 @@ Gap は「明示された現状」と「Milestone の目標状態」との差で
   これは Gap を複数作ることで表す — 同じ `source_kind + source_ref` を持つ
   `product_gap_source_ref` 行が、別 Milestone の別 `product_gap` にぶら下がる。
   同一 Gap 内での同一 `(source_kind, source_ref)` の重複は 409
-  `product_gap_source_duplicate` で拒否する。
+  `product_gap_source_duplicate` で拒否する。事前 SELECT と
+  `ux_product_gap_source_current` の**両方**がこの条件を検出するので、
+  どちらが検出しても §10.1 の同じ 1 コードを返す(SQLite は違反した index を
+  **列名**で報告するので、index 名で match すると黙って発火しない)。
+  事前チェック・pin の解決・INSERT は 1 transaction にまとめる — pin を別の
+  DB 状態から捕捉した行を作らないため。`product_gap_artifact_link` /
+  `product_gap_artifact_duplicate` も同じ規則。
 * この設計の含意を明記する: **同じ検出元が 2 つの Milestone で別々に議論・解消
   され得る**。それは重複ではなく、「同じ事実が二つの目標に対して別の意味を持つ」
   という正しい表現である。projection は `source_kind + source_ref` で束ねた
@@ -940,6 +946,24 @@ resolver は 1 つでも `raise` してよい。呼び出し側は kind ごと�
 **解決できた Gap は表示する**(#430 完了条件)。失敗を `disappeared` や
 「0 件」へ丸めない。
 
+### 5.5.1 解決できない gap code は作成時に拒否する
+
+`functional_lineage_gap` の resolver は Functional Lineage を
+`include_product_objective_layer=False` で呼ぶ(そうしないと Gap 自身の
+source 解決へ再入して返らない)。したがって **section 6-8 だけが出す gap
+code**(`functional_lineage.PRODUCT_OBJECTIVE_LAYER_GAP_CODES` の 11 個)は
+ここでは決して一致しない。
+
+* 作成時に 422 `product_gap_source_ref_unresolvable` で**拒否する**。
+  保存してしまうと、状態が永久に事実にならない検出元を Gap が抱え、開発者は
+  後から劣化した行を読んで初めてそれを知ることになる。
+* gate 以前に保存された行は `unavailable` と読む。**`disappeared` にしない** —
+  それは「検出器がもうこの gap を出さない」という世界についての主張であり、
+  かつ §6 の `close_candidate` 入力なので、誰も集めていない証拠を根拠に人間を
+  Gap の close へ押すことになる。
+* `unresolved_reference` / `unavailable_reference` / `stale_link` は section
+  1-5 も出すので**対象外**。
+
 ### 5.6 lifecycle は人間の決定からだけ導出する
 
 ```python
@@ -1037,6 +1061,45 @@ Gap が持つ 3 種類の参照(検出元 / 証跡 / 下流成果物 link)はど
 その section を `degraded_sections` に落とし、`unavailable`(=画面が無い)と
 名乗らせない。
 
+#### 5.8.1 「画面がある」と「対象が選択される」は別の軸
+
+`deep_link_state` は **kind の性質**(その参照を所有する画面が存在するか)で
+あり、`deep_link_target_state`(`ProductDeepLinkTargetState`)は **その URL が
+対象を選択した状態で開くか**である。1 つの語にこの 2 つの事実を持たせると
+「画面を開く」が、実際には画面を開くだけのときにも対象への着地を約束して
+しまう(#366 の「一つの表示語が二つの事実を運ぶ」欠陥)。3 種類の参照
+すべてに同じ 2 軸を適用する。
+
+| 値 | 意味 | 開発者の次の操作 |
+| --- | --- | --- |
+| `selected` | その URL が対象を選択した状態で開く | そのまま読める |
+| `screen_only` | 所有画面は開くが対象は自分で探す | 画面内で対象を探す |
+| `unavailable` | 画面自体が無い | 何もできない(§5.8) |
+
+`selected` を返せるのは、**遷移先の画面が実際に読む param 名**へ、その
+参照の ref から曖昧さなく写せる場合だけである(#366 の `loopSearchParams`
+規則:遷移先が無視する綴りを出さない)。
+
+| 参照 | kind | 遷移先の param | 生成する URL |
+| --- | --- | --- | --- |
+| 検出元 | `functional_lineage_gap` | `ref_kind` / `ref`(共有選択) | `/functional-lineage?ref_kind=<subject_kind>&ref=<subject_ref>` |
+| 検出元 | `value_network_notice` | `node`(stakeholder)/ `edge`(value_exchange) | `/stakeholder-value-network?node=…` / `?edge=…` |
+| 検出元 | `journey_baseline_diff` | `tab` / `journey` | `/ux-design-studio?tab=journeys&journey=<journey_key>` |
+| 検出元 | `requirement_diff` | `tab` / `requirement` | `/ux-design-studio?tab=requirements&requirement=<requirement_key>` |
+| 証跡 | `trace` | `trace` | `/components?trace=<ref>` |
+| 証跡 | `experiment` | `experiment` | `/experiments?experiment=<ref>` |
+| 証跡 | `replay_run` | `replay_run_id` | `/simulation-workbench?replay_run_id=<ref>` |
+| 成果物 | `ux_requirement` | `tab` / `requirement` | `/ux-design-studio?tab=requirements&requirement=<ref>` |
+| 成果物 | `solution_design` | `tab` / `design` | `/ux-design-studio?tab=solutions&design=<ref>` |
+
+それ以外は `screen_only` で、理由も列挙してある(`/system-understanding` と
+`/interview` は対象を選ぶ param を持たない、`/repository` は path param を
+持たない、`capability_drift` の subject は Capability 名ではなくコードの
+アンカーなので突き合わせは Principle 6 が禁じる類似度推測になる、など)。
+ref が壊れていて写せないときは **plain な画面 route へ落ちる**
+(`screen_only`)。遷移先が無視する param を付けた「選択されたふりの URL」は
+決して作らない。
+
 ### 5.11 Gap → Journey の正本は 1 つだけ
 
 「この Gap を解消する体験はどれか」を書ける場所は **`ux_journey_upstream_ref`
@@ -1058,6 +1121,40 @@ Functional Lineage は `gap_without_journey` と答える。**同じ問いに 2 
 
 Objective Map / Gap Workbench の「この Gap を解消する Journey」も、この表を
 **逆引き**して表示する。Gap 側に link 行を作らない。
+
+#### 5.11.1 既存 DB の upgrade migration
+
+schema / API `Literal` / Dashboard を狭めても、`CREATE TABLE IF NOT EXISTS`
+は**既に存在する表を直せない**。migration が無ければ既存 DB は古い CHECK と
+`ux_journey` 行を保持し続け、その行は `ProductGapArtifactLinkKind` の外に
+あるので `GET /product-gaps/{key}` が response validation で落ち、行が記録して
+いる接続は正本へ移った読み手すべてから見えないままになる。新規 DB だけの
+テストではどれも検出できない。
+
+`db._migrate_product_gap_artifact_link_kinds` がこれを 1 度だけ行う
+(`_migrate_ux_journey_upstream_ref_kinds` と同じ構造的・冪等な検出:
+`sqlite_master` の SQL に `'ux_journey'` が無ければ no-op)。移動は保守的で、
+どの規則も **誰も記録していないことを migration が主張しない**ためにある:
+
+* `target_ref` が **同一 System 内でちょうど 1 つの `ux_journey`** に解決
+  できる行だけを `ux_journey_upstream_ref(ref_kind='product_gap')` へ移す。
+  `journey_key` は System 内で一意(§1)なので「ちょうど 1 つ」が通常であり、
+  それ以外はその ref が Journey を指していなかったということである。
+* 解決できない行は `unresolved`。Journey を**捏造しない**し、黙って
+  **捨てない**。
+* 正本側に同じ接続が既にある行は `duplicate`。接続は正本に 1 つだけ残る。
+* `gap_id` が消えている行は `conflict`。
+
+移せなかった行は元の内容ごと `product_gap_artifact_migration_report`
+(`outcome` は `moved` / `unresolved` / `conflict` / `duplicate` の有限集合)へ
+残し、運用者が手で完了できるようにする。`ux_journey` 以外の行は **id ごと
+そのまま**移し、append-only の `superseded_by_id` 履歴を保つ(消えた行を
+指していたポインタだけ `NULL` にする — 存在しない行を名指しし続けるより、
+「これを supersede するものは無い」が今の事実である)。
+
+なお **UX Design Studio の ref kind 選択肢**も #427 以前の 3 値のままだった
+ので広げてある。正本側を書ける UI が Dashboard のどこにも無ければ、
+「正本は 1 つ」という決定は運用上成立しない。
 
 ### 5.10 resolver の呼び出し契約
 
@@ -1410,6 +1507,29 @@ ProductFeatureLinkKind = Literal[
 **Design Option の採用を Feature 実装完了や Gap 解消として扱わない**
 (§6 / #405 §3.6)。
 
+#### 7.2.1 Requirement → Feature の唯一の編集面
+
+`product_feature_requirement_link` は **Feature 側**に保存されるので、
+「この Requirement にどの Feature が対応するか」は各 Feature の link を
+読まないと答えられない(`components/ux-design/model.ts` の
+`featuresForRequirement`。`requirement_id` の**完全一致**のみで、名前や
+類似度では結ばない — Principle 6)。
+
+編集面は **UX Design Studio の Requirement 詳細**に置く:開発者が開いて
+いる主題が Requirement だからである。§9.3 行 13 の
+`link_requirement_to_feature` が名指しする操作なので、この面で **明示 submit
+によって完了できる**必要がある(画面に着いただけでは完了ではない)。
+
+* Feature の**作成**と**対応づけ**は別の明示操作で、どちらも server 側は
+  `decision_method: manual`。選択しただけでは何も書かない。
+* 対応づけ済みの Feature には `target_resolution` と `recheck_state` を
+  **別々に**出す。前者は「その link がまだこの Requirement に届くか」、
+  後者は「内容が動いたか」で、`recheck_state` に `unresolved` は無いので
+  代用できない(§7.2)。
+* Feature 一覧が読めなかったときは「1 件もない」ではなく「取得できなかった」
+  と言い、選択肢が下限にしかならない link form は**出さない**(§0-8)。
+* この面は Feature の採用・適用・publish を一切行わない。
+
 ### 7.3 Functional Lineage への追加
 
 `functional_lineage.build_functional_lineage` の node kind / edge kind /
@@ -1564,6 +1684,18 @@ Overview の既存 15 行 first-match 表(`overview_projection.decide_next_actio
 * **`waiting` / `unavailable` は action を持たない**(#380 の規律)。
   永久に disabled な CTA を出さず、理由の文を出す。
 * CTA は **navigate であって execute ではない**(#432 完了条件)。
+* **CTA の遷移先は、その操作を実際に完了できる面でなければならない。**
+  「その話題を所有する画面」ではない。15 行のうち 2 行は Objective Map に
+  その操作面が無いので、Objective Map へは飛ばさない:
+
+  | key | 遷移先 | 理由 |
+  | --- | --- | --- |
+  | `confirm_vision` | `/interview?session=<id>#cockpit-aux-intent` | Vision の確認は Interview 画面の Intent Brief で行う。Overview 自身の「Vision を定義する」lead と同じ遷移先を再利用する(2 つ目の遷移先を作らない) |
+  | `link_requirement_to_feature` | `/ux-design-studio?tab=requirements` | Requirement → Feature link は `POST /product-features/{key}/requirement-links` で書かれ、その唯一の編集面は Studio の Requirement 詳細にある(§7.2.1)。Gap Workbench の「関連付け」は Gap → artifact link であって**別の事実** |
+
+  `OverviewObjectiveOut` は Journey key も Requirement key も持たないので、
+  後者は `tab` だけを渡す。**遷移先が読まない param を付けない**
+  (#366 の `loopSearchParams` 規則)。
 
 ### 9.4 情報設計 — サイドバーに 3 項目足さない
 
@@ -1580,6 +1712,29 @@ Overview の既存 15 行 first-match 表(`overview_projection.decide_next_actio
 * Overview の `objective` セクションから Objective Map への lead を 1 本張る。
 * Purpose Chain / UX Design Studio / Functional Lineage からは、既存の
   `ref_kind` / `ref` URL パラメータ経由で相互に飛ぶ。
+* **Milestone は、それを所有する Objective 抜きで表示しない。**
+  `objectiveMapForceExpandedKeys` は既に deep-linked な Milestone を**ツリー
+  上で**見せるが、詳細・操作ペインは `objectiveKey` を見るので、
+  `/objective-map?milestone=<key>`(Functional Lineage が `product_milestone`
+  に対して生成し、共有の `ref_kind=product_milestone` も同じ形になる)では
+  `MilestoneWorkPanel` が mount されない。逆に、手で展開した別 Objective
+  配下の Milestone を選ぶと `objective=A` と `milestone=B` が並び、ペインは
+  A を説明しながらその下の Milestone 操作面は B を操作する。
+  `normalizeObjectiveMapSelection` が **server の map への完全一致**で所有
+  Objective を引き当て、URL にも同じ値を書き戻す(`replace` — 到着した URL の
+  訂正であってユーザ自身の遷移ではない)。map に無い Milestone key は**落とす**:
+  「この map に無い」と「選択中の Objective に属する」は別の答えである。
+* **Objective / Milestone / Gap の各作業パネルは `(system_id, <kind>_key)` で
+  remount する。** revision 本文・判断理由・優先バンド・関連付け先はすべて
+  local state なので、remount しなければ A へ入力した内容が B の form に残り、
+  記録すると **B の事実として保存される** — 表示上の違和感ではなくデータ整合性の
+  問題である。slug は System 内でのみ一意なので(§1)、key には System id も含める。
+* **revision form は current revision から seed する。** revision API は全項目の
+  snapshot を追記する契約なので、空欄から始めると「1 項目だけ直す」が
+  「他を全部空へ戻す」になり、「意図的に空にする」と「触っていない」も
+  区別できない。CreateGap の default Milestone も、後から届いた既定値・
+  deep link / filter の変更・System 切替へ追従させる(現在の map に無い key は
+  選択肢へ残さない)。
 
 ### 9.5 表示規律
 
@@ -1670,6 +1825,7 @@ GET    /gap-workbench                                       -> GapWorkbenchOut
 | `product_milestone_dependency_self` / `product_milestone_dependency_cycle` | 422 |
 | `product_milestone_dependency_duplicate` | 409 |
 | `product_gap_source_duplicate` / `product_gap_artifact_duplicate` | 409 |
+| `product_gap_source_ref_unresolvable` | 422 |
 | `product_objective_decision_stale_digest` / `product_milestone_decision_stale_digest` / `product_gap_decision_stale_digest` / `product_feature_decision_stale_digest` | 409 |
 | `product_objective_not_decidable` / `product_milestone_not_decidable` / `product_gap_not_decidable` / `product_feature_not_decidable` | 422 |
 | `product_milestone_not_assessable` | 422 |

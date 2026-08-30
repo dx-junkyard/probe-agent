@@ -32,6 +32,7 @@ import {
 import type {
   ProductMilestoneAssessmentKind, ProductMilestoneDecisionKind,
   ProductMilestoneVerificationMethod, ProductObjectiveDecisionKind,
+  ProductMilestoneRevisionOut, ProductObjectiveRevisionOut,
 } from "@/api/types";
 import {
   MILESTONE_ASSESSMENT_ACTION_LABEL, MILESTONE_DECISION_LABEL,
@@ -130,12 +131,32 @@ export function CreateObjectiveForm({ onCreated }: { onCreated: (objectiveKey: s
   );
 }
 
-function ObjectiveRevisionForm({ objectiveKey }: { objectiveKey: string }) {
+/**
+ * The revision endpoint appends a FULL snapshot, not a patch: whatever this
+ * form does not send is stored as empty. Starting blank therefore made
+ * 「1 項目だけ直す」 silently blank out every other field, so the form is
+ * seeded from the CURRENT revision and the developer edits from there.
+ *
+ * That also restores the difference between two intentions the blank form
+ * could not express: a field left as it was, and a field the developer
+ * deliberately cleared.
+ *
+ * `useState` seeds once per mount, which is correct because
+ * `objective-map.tsx` remounts this panel per `(system_id, objective_key)`.
+ * After a successful submit the fields keep what was just saved -- that IS
+ * the current revision.
+ */
+function ObjectiveRevisionForm({
+  objectiveKey, current,
+}: {
+  objectiveKey: string;
+  current: ProductObjectiveRevisionOut | null;
+}) {
   const add = useAddProductObjectiveRevision(objectiveKey);
-  const [title, setTitle] = useState("");
-  const [intent, setIntent] = useState("");
-  const [contribution, setContribution] = useState("");
-  const [summary, setSummary] = useState("");
+  const [title, setTitle] = useState(current?.title ?? "");
+  const [intent, setIntent] = useState(current?.intent ?? "");
+  const [contribution, setContribution] = useState(current?.contribution ?? "");
+  const [summary, setSummary] = useState(current?.summary ?? "");
 
   function submit() {
     add.mutate(
@@ -246,7 +267,10 @@ export function ObjectiveWorkPanel({ objectiveKey }: { objectiveKey: string }) {
 
   return (
     <div className="space-y-3" data-testid={`objective-work-panel-${objective.objective_key}`}>
-      <ObjectiveRevisionForm objectiveKey={objective.objective_key} />
+      <ObjectiveRevisionForm
+        objectiveKey={objective.objective_key}
+        current={objective.current_revision}
+      />
       <ObjectiveDecisionControls objectiveKey={objective.objective_key} capturedDigest={digest} onStale={() => detail.refetch()} />
     </div>
   );
@@ -295,14 +319,24 @@ export function CreateMilestoneForm({
   );
 }
 
-function MilestoneRevisionForm({ milestoneKey }: { milestoneKey: string }) {
+/** Seeded from the current revision for the same reason as
+ * `ObjectiveRevisionForm`: the endpoint appends a full snapshot, so a blank
+ * form turns 「1 項目だけ直す」 into 「他を全部空へ戻す」. */
+function MilestoneRevisionForm({
+  milestoneKey, current,
+}: {
+  milestoneKey: string;
+  current: ProductMilestoneRevisionOut | null;
+}) {
   const add = useAddProductMilestoneRevision(milestoneKey);
-  const [title, setTitle] = useState("");
-  const [targetState, setTargetState] = useState("");
-  const [verificationMethod, setVerificationMethod] = useState<ProductMilestoneVerificationMethod>("manual_review");
-  const [verificationNote, setVerificationNote] = useState("");
-  const [sequenceHint, setSequenceHint] = useState("0");
-  const [summary, setSummary] = useState("");
+  const [title, setTitle] = useState(current?.title ?? "");
+  const [targetState, setTargetState] = useState(current?.target_state ?? "");
+  const [verificationMethod, setVerificationMethod] = useState<ProductMilestoneVerificationMethod>(
+    current?.verification_method ?? "manual_review",
+  );
+  const [verificationNote, setVerificationNote] = useState(current?.verification_note ?? "");
+  const [sequenceHint, setSequenceHint] = useState(String(current?.sequence_hint ?? 0));
+  const [summary, setSummary] = useState(current?.summary ?? "");
 
   function submit() {
     const parsedSequence = Number.parseInt(sequenceHint, 10);
@@ -487,7 +521,10 @@ export function MilestoneWorkPanel({ milestoneKey }: { milestoneKey: string }) {
 
   return (
     <div className="space-y-3" data-testid={`milestone-work-panel-${milestone.milestone_key}`}>
-      <MilestoneRevisionForm milestoneKey={milestone.milestone_key} />
+      <MilestoneRevisionForm
+        milestoneKey={milestone.milestone_key}
+        current={milestone.current_revision}
+      />
       <MilestoneDecisionControls milestoneKey={milestone.milestone_key} capturedDigest={digest} onStale={() => detail.refetch()} />
       <MilestoneAssessmentControls milestoneKey={milestone.milestone_key} capturedDigest={digest} onStale={() => detail.refetch()} />
     </div>
