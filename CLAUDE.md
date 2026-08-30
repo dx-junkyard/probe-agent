@@ -1932,6 +1932,39 @@ creating incomplete persistence or execution paths for later phases.
       `docs/ui-glossary.md` に状態語の対比表がある。
 
 
+28. Issue #436 (subs #437-#441) — 画面コンテキスト対応 AI アシスタント。
+    Dashboard の AI アシスタントを、画面・設定ヘルプから「いま表示している
+    System の正規データを根拠に検討できる対話面」へ広げる。
+    `docs/assistant-discussion.md` が canonical contract で、§0 を読んで
+    からこの領域に触ること。依存順に #437 (4 画面の canonical context。
+    実装済み) → #438 (対象要素・revision 単位の thread 永続化) → #439
+    (会話結論の reviewable な変更候補化) ∥ #440 (機能解説モード) → #441
+    (音声対話 Phase 1)。後から変えるときに守ること:
+    - **新しい理解モデルを作らない。** この層が持つのは会話・変更候補・
+      UI 解説の 3 つだけで、上流の本文はコピーせず参照 + 捕捉 digest を
+      持ち、解決は kind ごとの唯一の resolver に対して読み取り時に行う。
+    - **会話は正規データを書き換えない。** 書き込みは生成された Proposal の
+      item を人が明示的に選んで apply したときだけで、常に
+      `decision_method: manual`。apply は publish / policy mode / component
+      mode / patch / deploy / experiment のどれも変えない。
+    - **thread の identity は screen_id ではなく `thread_key`**
+      (`screen_id|scope|target_kind|target_ref`)。Requirement A の会話が
+      Requirement B のコンテキストへ混入しないのはこの identity のため。
+    - **`target_state` は読み取り時に導出し、保存しない** (`current` /
+      `stale` / `unresolvable` / `not_tracked` の first match)。`stale` と
+      `unresolvable` の過去 turn は LLM コンテキストへ**自動継承しない** —
+      履歴は残るが current fact としては扱わない。
+    - **機能解説と意味分析を分ける。** help mode は versioned な製品管理下
+      レジストリの完全一致検索だけで、LLM を 1 度も呼ばず
+      `decision_method: deterministic`。説明文を捏造しない。
+    - **音声バイナリを永続保存しない。** Phase 1 の STT/TTS は
+      provider-neutral adapter としてブラウザ内に置き、音声はサーバへ
+      送らない。turn 開始時の discussion target は回答完了まで固定する。
+    - `unknown` / `unavailable` / `stale` / `not_tracked` を丸めない。
+    既存の human gate は一切緩めない。本 Epic が追加する Proposal item の
+    apply と reject も `decision_method: manual`。
+
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,
