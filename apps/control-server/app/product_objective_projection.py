@@ -441,6 +441,10 @@ class ObjectiveOverviewResult:
     next_step_reason: str = ""
     next_step_completion: str = ""
     next_step_value: str = ""
+    #: Row #13's subject, so its CTA can land ON the Requirement whose
+    #: Feature link is missing. `None` for every other row (see
+    #: `OverviewObjectiveOut.next_step_requirement_key`).
+    next_step_requirement_key: Optional[str] = None
     degraded_sections: List[str] = field(default_factory=list)
     degraded_detail: Dict[str, str] = field(default_factory=dict)
 
@@ -509,26 +513,59 @@ def _journey_has_feature_link(conn: sqlite3.Connection, system_id: int, journey_
     `product_feature_requirement_link` tables (owned by `ux_design.py` /
     `product_feature.py` respectively, neither of which this module edits or
     re-implements a fold from -- this is a plain existence read)."""
+    return _journey_feature_gap(conn, system_id, journey_key)[0]
+
+
+def _journey_feature_gap(
+    conn: sqlite3.Connection, system_id: int, journey_key: str
+) -> Tuple[bool, Optional[str]]:
+    """`(has_feature_link, first_unlinked_requirement_key)`.
+
+    The second value is what lets row #13's CTA land ON the Requirement whose
+    Feature link is missing rather than on the Studio's Requirement tab with
+    the developer left to find it. It is read from the same two tables the
+    existence check already walks -- naming the subject costs one more query,
+    and the alternative is a CTA that arrives with nothing selected.
+
+    `None` when the journey has no Requirements, when every one of them
+    already reaches a Feature, or when the unlinked one has no readable key:
+    the caller then falls back to the plain tab rather than guessing a
+    Requirement (§9.3's "遷移先が読まない param を付けない").
+
+    Requirements are ordered by `requirement_key` so the same state always
+    names the same one -- an arbitrary row order would make the CTA point
+    somewhere new on every render.
+    """
     journey = conn.execute(
         "SELECT id FROM ux_journey WHERE system_id = ? AND journey_key = ?", (system_id, journey_key)
     ).fetchone()
     if journey is None:
-        return False
+        return False, None
     requirement_rows = conn.execute(
-        """SELECT DISTINCT requirement_id FROM ux_requirement_step_link
-           WHERE system_id = ? AND journey_id = ? AND superseded_by_id IS NULL""",
+        """SELECT DISTINCT l.requirement_id AS requirement_id, r.requirement_key AS requirement_key
+             FROM ux_requirement_step_link l
+             JOIN ux_requirement r ON r.id = l.requirement_id AND r.system_id = l.system_id
+            WHERE l.system_id = ? AND l.journey_id = ? AND l.superseded_by_id IS NULL
+            ORDER BY r.requirement_key""",
         (system_id, journey["id"]),
     ).fetchall()
     requirement_ids = [row["requirement_id"] for row in requirement_rows]
     if not requirement_ids:
-        return False
+        return False, None
     placeholders = ",".join("?" for _ in requirement_ids)
-    row = conn.execute(
-        f"SELECT 1 FROM product_feature_requirement_link "  # noqa: S608 - placeholders count matches requirement_ids, values are bound params
-        f"WHERE system_id = ? AND requirement_id IN ({placeholders}) AND superseded_by_id IS NULL LIMIT 1",
-        (system_id, *requirement_ids),
-    ).fetchone()
-    return row is not None
+    linked = {
+        row["requirement_id"]
+        for row in conn.execute(
+            f"SELECT DISTINCT requirement_id FROM product_feature_requirement_link "  # noqa: S608 - placeholders count matches requirement_ids, values are bound params
+            f"WHERE system_id = ? AND requirement_id IN ({placeholders}) AND superseded_by_id IS NULL",
+            (system_id, *requirement_ids),
+        ).fetchall()
+    }
+    unlinked = next(
+        (row["requirement_key"] for row in requirement_rows if row["requirement_id"] not in linked),
+        None,
+    )
+    return bool(linked), unlinked
 
 
 def _decide_next_step(
@@ -770,16 +807,25 @@ def _decide_next_step(
             continue
 
     # Row 13: a linked Journey exists, but none of them reaches a Feature
-    # through Requirement -> Feature.
-    if all_journey_keys and not any(
-        _journey_has_feature_link(conn, system_id, journey_key) for journey_key in all_journey_keys
-    ):
-        return _set_step(
-            result, "link_requirement_to_feature", "available",
-            "Journey はありますが、Requirement から Feature へつながっていません。",
-            "Journey の Requirement を Feature へ link します。",
-            "Gap の解消経路が実装対象までたどれるようになります。",
-        )
+    # through Requirement -> Feature. The journeys are walked in a stable
+    # order so the Requirement the CTA names does not change between two
+    # renders of the same state.
+    if all_journey_keys:
+        feature_gaps = [
+            (journey_key, _journey_feature_gap(conn, system_id, journey_key))
+            for journey_key in sorted(all_journey_keys)
+        ]
+        if not any(has_link for _key, (has_link, _req) in feature_gaps):
+            unlinked_requirement = next(
+                (req for _key, (_has_link, req) in feature_gaps if req), None
+            )
+            result.next_step_requirement_key = unlinked_requirement
+            return _set_step(
+                result, "link_requirement_to_feature", "available",
+                "Journey はありますが、Requirement から Feature へつながっていません。",
+                "Journey の Requirement を Feature へ link します。",
+                "Gap の解消経路が実装対象までたどれるようになります。",
+            )
 
     # Row 14: the picked next_milestone is unassessed and every one of its
     # Gaps is resolved.

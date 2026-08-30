@@ -141,6 +141,7 @@ def _objective_section_out(section) -> Optional[OverviewObjectiveOut]:
         next_step_reason=section.next_step_reason,
         next_step_completion=section.next_step_completion,
         next_step_value=section.next_step_value,
+        next_step_requirement_key=section.next_step_requirement_key,
         degraded_sections=list(section.degraded_sections),
         degraded_detail=dict(section.degraded_detail),
     )

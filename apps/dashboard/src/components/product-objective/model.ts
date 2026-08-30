@@ -639,11 +639,17 @@ export function objectiveNextStepHref(
     // `POST /product-features/{key}/requirement-links`, whose only editing
     // surface is the UX Design Studio's Requirement detail. The Gap
     // Workbench's 関連付け records a Gap -> artifact link, a different fact.
-    // Only `tab` is emitted: `OverviewObjectiveOut` carries neither the
-    // Journey nor the Requirement key, so there is no target to select, and a
-    // param the Studio does not read would be a link that only looks targeted
+    // The server names the Requirement whose Feature link is missing
+    // (`next_step_requirement_key`), so the CTA lands ON it rather than
+    // opening the tab and leaving the developer to find it. When the server
+    // could not identify one it sends `null` and this falls back to the plain
+    // tab -- never a guessed key, and never a param the Studio does not read
     // (#366's `loopSearchParams` rule).
-    return "/ux-design-studio?tab=requirements";
+    const params = new URLSearchParams({ tab: "requirements" });
+    if (overview.next_step_requirement_key) {
+      params.set("requirement", overview.next_step_requirement_key);
+    }
+    return `/ux-design-studio?${params.toString()}`;
   }
   const params = new URLSearchParams();
   switch (overview.next_step) {

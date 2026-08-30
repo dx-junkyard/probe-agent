@@ -8418,6 +8418,10 @@ export interface OverviewObjectiveOut {
   next_step_reason: string;
   next_step_completion: string;
   next_step_value: string;
+  /** Row #13's subject: the Requirement whose Feature link is missing, so the
+   * CTA can land ON it. `null` for every other `next_step`, and for that step
+   * when no Requirement could be identified. */
+  next_step_requirement_key: string | null;
   degraded_sections: string[];
   degraded_detail: Record<string, string>;
 }

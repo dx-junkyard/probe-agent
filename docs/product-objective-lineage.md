@@ -1691,10 +1691,17 @@ Overview の既存 15 行 first-match 表(`overview_projection.decide_next_actio
   | key | 遷移先 | 理由 |
   | --- | --- | --- |
   | `confirm_vision` | `/interview?session=<id>#cockpit-aux-intent` | Vision の確認は Interview 画面の Intent Brief で行う。Overview 自身の「Vision を定義する」lead と同じ遷移先を再利用する(2 つ目の遷移先を作らない) |
-  | `link_requirement_to_feature` | `/ux-design-studio?tab=requirements` | Requirement → Feature link は `POST /product-features/{key}/requirement-links` で書かれ、その唯一の編集面は Studio の Requirement 詳細にある(§7.2.1)。Gap Workbench の「関連付け」は Gap → artifact link であって**別の事実** |
+  | `link_requirement_to_feature` | `/ux-design-studio?tab=requirements&requirement=<key>` | Requirement → Feature link は `POST /product-features/{key}/requirement-links` で書かれ、その唯一の編集面は Studio の Requirement 詳細にある(§7.2.1)。Gap Workbench の「関連付け」は Gap → artifact link であって**別の事実** |
 
-  `OverviewObjectiveOut` は Journey key も Requirement key も持たないので、
-  後者は `tab` だけを渡す。**遷移先が読まない param を付けない**
+  後者の `<key>` は server が名指しする(`OverviewObjectiveOut.
+  next_step_requirement_key`)。行 13 の判定は既に Journey 上の Requirement を
+  歩いているので、Feature へつながっていない 1 件を返すのは 1 クエリの追加で
+  済み、返さない場合の代償は「対象が選ばれないまま着地する CTA」である。
+  Requirement は `requirement_key` 順に見るので、同じ状態は常に同じ 1 件を
+  指す(行順が任意だと CTA が render ごとに別の対象を指す)。
+
+  server が 1 件も特定できなかったときは `None` を返し、CTA は plain な tab へ
+  落ちる。**推測した key を付けない**し、**遷移先が読まない param も付けない**
   (#366 の `loopSearchParams` 規則)。
 
 ### 9.4 情報設計 — サイドバーに 3 項目足さない
@@ -1729,6 +1736,17 @@ Overview の既存 15 行 first-match 表(`overview_projection.decide_next_actio
   local state なので、remount しなければ A へ入力した内容が B の form に残り、
   記録すると **B の事実として保存される** — 表示上の違和感ではなくデータ整合性の
   問題である。slug は System 内でのみ一意なので(§1)、key には System id も含める。
+* **ただし remount は入力を黙って捨てる。** それだけでは「一覧の次の行を
+  クリックしたら入力が消えた」が残るので、entity が変わる操作の前に破棄確認を
+  出す(`components/product-objective/unsaved-work.tsx`)。
+  * 各 form は自分が dirty かどうかだけを宣言し(`useDirtyGuard`)、page は
+    選択変更の瞬間に一度だけ問い合わせる。6 つの form の state を page へ
+    持ち上げると、すべての form が page の選択ロジックへ結合する。
+  * dirty は **seed との差**であって「中身があるか」ではない。form は
+    current revision から seed されるので、後者では毎回確認が出る。
+  * **lane の切り替えは entity の変更ではない**ので確認しない。
+  * 断ったときは選択も入力もそのまま残る — 確認は本物の分岐であって、
+    通過儀礼ではない。
 * **revision form は current revision から seed する。** revision API は全項目の
   snapshot を追記する契約なので、空欄から始めると「1 項目だけ直す」が
   「他を全部空へ戻す」になり、「意図的に空にする」と「触っていない」も

@@ -29,6 +29,9 @@ import {
   normalizeObjectiveMapSelection,
   applyObjectiveMapSelectionToSearchParams, type GapWorkbenchFilters,
 } from "@/components/product-objective/model";
+import {
+  UnsavedWorkProvider, confirmDiscardUnsavedWork, useUnsavedWork,
+} from "@/components/product-objective/unsaved-work";
 import { useSlowPending } from "@/components/product-objective/use-slow-pending";
 import { ObjectiveDetailCard, ObjectiveTree } from "@/components/product-objective/objective-tree";
 import {
@@ -93,7 +96,17 @@ function Lane({ query, pendingTestId, errorTestId, label, children }: {
   return <>{children}</>;
 }
 
+/** The provider must sit ABOVE the component that asks the question, so the
+ * page body is one level in. */
 export default function ObjectiveMapPage() {
+  return (
+    <UnsavedWorkProvider>
+      <ObjectiveMapPageBody />
+    </UnsavedWorkProvider>
+  );
+}
+
+function ObjectiveMapPageBody() {
   const [searchParams, setSearchParams] = useSearchParams();
   const { systemId } = useAuth();
   const objectiveMap = useObjectiveMap();
@@ -114,7 +127,24 @@ export default function ObjectiveMapPage() {
     milestoneKey: selection.milestoneKey,
   });
 
+  // Review 0.4's other half. Keying the work panels per entity stopped text
+  // typed for A from being SUBMITTED as B's, but a remount discards it
+  // silently -- so clicking the next row in a list still loses work without
+  // warning. Ask before an ENTITY changes; a lane switch is not an entity
+  // change and never prompts.
+  const unsavedWork = useUnsavedWork();
+  function changesEntity(patch: Partial<typeof selection>): boolean {
+    return (
+      (patch.objectiveKey !== undefined && patch.objectiveKey !== selection.objectiveKey)
+      || (patch.milestoneKey !== undefined && patch.milestoneKey !== selection.milestoneKey)
+      || (patch.gapKey !== undefined && patch.gapKey !== selection.gapKey)
+    );
+  }
+
   function updateSelection(patch: Partial<typeof selection>) {
+    if (changesEntity(patch) && unsavedWork?.hasUnsavedWork() && !confirmDiscardUnsavedWork()) {
+      return;
+    }
     const next = normalizeObjectiveMapSelection(objectiveMap.data, { ...selection, ...patch });
     const params = new URLSearchParams(searchParams);
     applyObjectiveMapSelectionToSearchParams(params, next);

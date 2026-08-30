@@ -277,6 +277,7 @@ function overviewObjective(overrides: Partial<OverviewObjectiveOut> = {}): Overv
     active_objective_count: 0,
     next_milestone: null,
     primary_gap: null,
+    next_step_requirement_key: null,
     objective_state: null,
     next_step: "create_objective",
     next_step_state: "available",
@@ -333,11 +334,20 @@ describe("product-objective/model: Overview next_step -> Objective Map CTA", () 
       .toBe("/interview#cockpit-aux-intent");
   });
 
-  it("link_requirement_to_feature navigates to the UX Design Studio's Requirement tab, which owns that link", () => {
+  it("link_requirement_to_feature lands ON the Requirement whose Feature link is missing", () => {
     // The Gap Workbench's 関連付け records a Gap -> artifact link; the
     // Requirement -> Feature link is a different fact, written through
     // `POST /product-features/{key}/requirement-links`, whose only editing
-    // surface is the Requirement detail in the Studio.
+    // surface is the Requirement detail in the Studio. The server names the
+    // subject so the CTA arrives with it selected.
+    expect(objectiveNextStepHref(overviewObjective({
+      next_step: "link_requirement_to_feature",
+      next_step_requirement_key: "single-page-checkout",
+    }))).toBe("/ux-design-studio?tab=requirements&requirement=single-page-checkout");
+  });
+
+  it("falls back to the plain Requirement tab when the server named no Requirement", () => {
+    // Never a guessed key: `null` means the server could not identify one.
     expect(objectiveNextStepHref(overviewObjective({ next_step: "link_requirement_to_feature" })))
       .toBe("/ux-design-studio?tab=requirements");
   });

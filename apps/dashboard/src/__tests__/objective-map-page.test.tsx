@@ -751,6 +751,25 @@ function twoObjectiveMap(): ObjectiveMapOut {
   });
 }
 
+function objectiveDetailFor(key: string) {
+  return {
+    id: key === "o1" ? 1 : 2, system_id: 1, objective_key: key,
+    current_revision_id: 1, current_revision_number: 1, title: key,
+    objective_state: "active", recheck_state: "current",
+    parent_objective_id: null, parent_objective_key: null,
+    created_by: null, created_at: 0, updated_at: 0,
+    current_revision: {
+      id: 1, objective_id: key === "o1" ? 1 : 2, revision_number: 1, title: key,
+      intent: `${key} の意図`, contribution: "", scope_note: "", summary: "",
+      content_digest: `digest-${key}`, authored_by_kind: "developer",
+      decision_method: "manual", intelligence_run_id: null, change_note: "",
+      created_by: "dev", created_at: 0, revision_state: "current", superseded_by_id: null,
+    },
+    milestones: [], decisions: [], upstream_refs: [],
+    degraded_sections: [], degraded_detail: {},
+  };
+}
+
 async function renderAt(path: string) {
   const { default: Page } = await import("@/pages/objective-map");
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
@@ -819,10 +838,19 @@ describe("ObjectiveMapPage milestone selection normalization", () => {
 });
 
 describe("ObjectiveMapPage per-entity form state", () => {
+  let confirmSpy: ReturnType<typeof vi.spyOn>;
+
   beforeEach(() => {
     mockApi.get.mockReset();
     mockApi.post.mockReset();
+    // Switching entity with unsaved input now asks before discarding
+    // (review 0.4). These tests are about what survives the switch, so they
+    // accept, which is what a developer does; the prompt itself has its own
+    // describe block below.
+    confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
   });
+
+  afterEach(() => confirmSpy.mockRestore());
 
   function objectiveDetail(key: string, title: string) {
     return {
@@ -951,5 +979,100 @@ describe("ObjectiveMapPage per-entity form state", () => {
 
     fireEvent.change(screen.getByLabelText("Milestone で絞り込み"), { target: { value: "m2" } });
     await waitFor(() => expect((screen.getByLabelText("所属する Milestone") as HTMLSelectElement).value).toBe("m2"));
+  });
+});
+
+// --- Review 0.4: the discard prompt ------------------------------------------
+//
+// Keying the panels per entity stopped a wrong-entity write, but a remount
+// discards typed text SILENTLY -- so clicking the next row in a list still
+// lost work without warning. These cover the other half.
+
+describe("ObjectiveMapPage unsaved-work guard", () => {
+  let confirmSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    mockApi.get.mockReset();
+    mockApi.post.mockReset();
+    confirmSpy = vi.spyOn(window, "confirm");
+  });
+
+  afterEach(() => confirmSpy.mockRestore());
+
+  function mockWithTwoObjectives() {
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(twoObjectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      if (path === "/product-objectives/o1") return Promise.resolve(objectiveDetailFor("o1"));
+      if (path === "/product-objectives/o2") return Promise.resolve(objectiveDetailFor("o2"));
+      return Promise.resolve(null);
+    });
+  }
+
+  it("does not prompt when nothing has been typed", async () => {
+    confirmSpy.mockReturnValue(true);
+    mockWithTwoObjectives();
+    await renderAt("/objective-map?objective=o1");
+    await waitFor(() => expect(screen.getByTestId("objective-work-panel-o1")).toBeInTheDocument());
+
+    fireEvent.click(within(screen.getByTestId("objective-node-o2")).getByText("解約率を下げる"));
+    await waitFor(() => expect(screen.getByTestId("objective-work-panel-o2")).toBeInTheDocument());
+    // A pristine form is not unsaved work -- the forms are SEEDED from the
+    // current revision, so "has content" would prompt on every switch.
+    expect(confirmSpy).not.toHaveBeenCalled();
+  });
+
+  it("prompts before discarding typed input, and declining keeps the selection", async () => {
+    confirmSpy.mockReturnValue(false);
+    mockWithTwoObjectives();
+    await renderAt("/objective-map?objective=o1");
+    await waitFor(() => expect(screen.getByTestId("objective-work-panel-o1")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText("Vision への意図"), {
+      target: { value: "まだ記録していない意図" },
+    });
+    fireEvent.click(within(screen.getByTestId("objective-node-o2")).getByText("解約率を下げる"));
+
+    expect(confirmSpy).toHaveBeenCalled();
+    // Declining is a real answer: the Objective and the typed text both stay.
+    expect(screen.getByTestId("objective-work-panel-o1")).toBeInTheDocument();
+    expect((screen.getByLabelText("Vision への意図") as HTMLTextAreaElement).value)
+      .toBe("まだ記録していない意図");
+  });
+
+  it("prompts for a Gap rationale too, not only revision text", async () => {
+    confirmSpy.mockReturnValue(false);
+    const workbench = gapWorkbench({
+      entries: [gapEntry({ gap_key: "g1" }), gapEntry({ id: 2, gap_key: "g2", title: "二件目" })],
+    });
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(objectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(workbench);
+      if (path === "/product-gaps/g1") return Promise.resolve(gapDetail());
+      if (path === "/product-gaps/g2") return Promise.resolve(gapDetail({ id: 2, gap_key: "g2" }));
+      return Promise.resolve(null);
+    });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
+    fireEvent.click(await screen.findByTestId("gap-entry-g1"));
+    await waitFor(() => expect(screen.getByTestId("gap-detail-g1")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText("理由(任意)"), { target: { value: "未保存の理由" } });
+    fireEvent.click(screen.getByTestId("gap-entry-g2"));
+
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(screen.getByTestId("gap-detail-g1")).toBeInTheDocument();
+  });
+
+  it("does not prompt when only the lane changes -- that is not an entity switch", async () => {
+    confirmSpy.mockReturnValue(true);
+    mockWithTwoObjectives();
+    await renderAt("/objective-map?objective=o1");
+    await waitFor(() => expect(screen.getByTestId("objective-work-panel-o1")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText("Vision への意図"), { target: { value: "未保存" } });
+    fireEvent.click(screen.getByTestId("objective-map-tab-gaps"));
+
+    expect(confirmSpy).not.toHaveBeenCalled();
   });
 });

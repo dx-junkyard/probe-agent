@@ -14459,5 +14459,17 @@ class OverviewObjectiveOut(BaseModel):
     next_step_completion: str = ""
     #: 完了後に得られる価値 / 次に開く判断.
     next_step_value: str = ""
+    #: The Requirement the `link_requirement_to_feature` step is about, so
+    #: its CTA can land ON that Requirement instead of merely opening the
+    #: Studio's Requirement tab and leaving the developer to find it (§9.3's
+    #: "CTA の遷移先は、その操作を実際に完了できる面でなければならない",
+    #: taken one step further to the subject itself).
+    #:
+    #: `None` for every other `next_step`, and also for that step when the
+    #: Requirement could not be identified -- the CTA then falls back to the
+    #: plain tab. It is NOT a general-purpose target field: only row #13 has
+    #: a subject that none of `active_objective` / `next_milestone` /
+    #: `primary_gap` already names.
+    next_step_requirement_key: Optional[str] = None
     degraded_sections: List[str] = []
     degraded_detail: Dict[str, str] = {}

@@ -22,6 +22,7 @@ import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { ApiError } from "@/api/client";
+import { useDirtyGuard } from "./unsaved-work";
 import {
   useAddProductMilestoneRevision, useAddProductObjectiveRevision,
   useCreateProductMilestone, useCreateProductObjective,
@@ -157,6 +158,15 @@ function ObjectiveRevisionForm({
   const [intent, setIntent] = useState(current?.intent ?? "");
   const [contribution, setContribution] = useState(current?.contribution ?? "");
   const [summary, setSummary] = useState(current?.summary ?? "");
+  // Dirty against the SEED, not against empty: the form starts pre-filled, so
+  // "has content" would report every mounted form as unsaved work.
+  useDirtyGuard(
+    `objective-revision:${objectiveKey}`,
+    title !== (current?.title ?? "")
+      || intent !== (current?.intent ?? "")
+      || contribution !== (current?.contribution ?? "")
+      || summary !== (current?.summary ?? ""),
+  );
 
   function submit() {
     add.mutate(
@@ -205,6 +215,7 @@ function ObjectiveDecisionControls({
   const [rationale, setRationale] = useState("");
   const [rejection, setRejection] = useState<Rejection | null>(null);
   const [stale, setStale] = useState(false);
+  useDirtyGuard(`objective-decision:${objectiveKey}`, rationale !== "");
 
   function submit(decision: ProductObjectiveDecisionKind) {
     setRejection(null);
@@ -337,6 +348,15 @@ function MilestoneRevisionForm({
   const [verificationNote, setVerificationNote] = useState(current?.verification_note ?? "");
   const [sequenceHint, setSequenceHint] = useState(String(current?.sequence_hint ?? 0));
   const [summary, setSummary] = useState(current?.summary ?? "");
+  useDirtyGuard(
+    `milestone-revision:${milestoneKey}`,
+    title !== (current?.title ?? "")
+      || targetState !== (current?.target_state ?? "")
+      || verificationMethod !== (current?.verification_method ?? "manual_review")
+      || verificationNote !== (current?.verification_note ?? "")
+      || sequenceHint !== String(current?.sequence_hint ?? 0)
+      || summary !== (current?.summary ?? ""),
+  );
 
   function submit() {
     const parsedSequence = Number.parseInt(sequenceHint, 10);
@@ -407,6 +427,7 @@ function MilestoneDecisionControls({
   const [rationale, setRationale] = useState("");
   const [rejection, setRejection] = useState<Rejection | null>(null);
   const [stale, setStale] = useState(false);
+  useDirtyGuard(`milestone-decision:${milestoneKey}`, rationale !== "");
 
   function submit(decision: ProductMilestoneDecisionKind) {
     setRejection(null);
@@ -456,6 +477,9 @@ function MilestoneAssessmentControls({
   const [evidenceNote, setEvidenceNote] = useState("");
   const [rejection, setRejection] = useState<Rejection | null>(null);
   const [stale, setStale] = useState(false);
+  useDirtyGuard(
+    `milestone-assessment:${milestoneKey}`, rationale !== "" || evidenceNote !== "",
+  );
 
   function submit(assessment: ProductMilestoneAssessmentKind) {
     setRejection(null);

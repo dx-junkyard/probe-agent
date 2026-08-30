@@ -13,6 +13,7 @@ import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ApiError } from "@/api/client";
+import { useDirtyGuard } from "./unsaved-work";
 import {
   useAddProductGapArtifactLink, useAddProductGapRevision, useCreateProductGap,
   useLinkProductGapToJourney, useProductGapDetail, useRecordProductGapDecision,
@@ -186,6 +187,7 @@ function DecisionRationaleControls({
   const record = useRecordProductGapDecision(gapKey);
   const [rationale, setRationale] = useState("");
   const [rejection, setRejection] = useState<{ code: string; message: string } | null>(null);
+  useDirtyGuard(`gap-decision:${gapKey}`, rationale !== "");
   const [stale, setStale] = useState(false);
 
   function submit(decision: "acknowledge" | "defer" | "resolve" | "reopen") {
@@ -238,6 +240,7 @@ function PrioritizeControls({
 }) {
   const record = useRecordProductGapDecision(gapKey);
   const [band, setBand] = useState<ProductGapPriorityBand>(currentBand);
+  useDirtyGuard(`gap-prioritize:${gapKey}`, band !== currentBand);
   const [stale, setStale] = useState(false);
 
   function submit() {
@@ -370,6 +373,14 @@ function GapRevisionForm({
     current?.target_state_mode ?? "unknown",
   );
   const [interpretation, setInterpretation] = useState(current?.interpretation ?? "");
+  useDirtyGuard(
+    `gap-revision:${gapKey}`,
+    title !== (current?.title ?? "")
+      || currentState !== (current?.current_state ?? "")
+      || targetState !== (current?.target_state ?? "")
+      || targetStateMode !== (current?.target_state_mode ?? "unknown")
+      || interpretation !== (current?.interpretation ?? ""),
+  );
 
   function submit() {
     add.mutate(
@@ -417,6 +428,7 @@ function JourneyLinkForm({ gapKey }: { gapKey: string }) {
   const link = useLinkProductGapToJourney(gapKey);
   const [journeyKey, setJourneyKey] = useState("");
   const [note, setNote] = useState("");
+  useDirtyGuard(`gap-journey-link:${gapKey}`, journeyKey !== "" || note !== "");
 
   const options = journeys.data?.journeys ?? [];
 
@@ -458,6 +470,7 @@ function ArtifactLinkForm({ gapKey }: { gapKey: string }) {
   const add = useAddProductGapArtifactLink(gapKey);
   const [linkKind, setLinkKind] = useState<ProductGapArtifactLinkKind>("issue_draft");
   const [targetRef, setTargetRef] = useState("");
+  useDirtyGuard(`gap-artifact-link:${gapKey}`, targetRef !== "");
 
   function submit() {
     add.mutate(

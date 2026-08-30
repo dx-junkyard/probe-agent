@@ -1867,6 +1867,17 @@ creating incomplete persistence or execution paths for later phases.
       全項目の snapshot を追記する契約なので、空欄から始めると「1 項目だけ
       直す」が「他を全部空へ戻す」になる。CreateGap の default Milestone も
       後から届いた既定値・System 切替へ追従させる。
+    - **CTA は対象まで選択して着地する。** 「その操作を完了できる面」の次の
+      段階として、server が `next_step_requirement_key` で対象を名指しし、
+      `link_requirement_to_feature` はその Requirement を選択した URL へ飛ぶ。
+      特定できなければ `None` を返して plain な tab へ落ちる — **推測した key を
+      付けない**。
+    - **remount は入力を黙って捨てるので、破棄確認を出す。** 各 form は自分が
+      dirty かどうかだけを宣言し (`useDirtyGuard`)、page が選択変更の瞬間に
+      一度だけ問い合わせる (`components/product-objective/unsaved-work.tsx`)。
+      dirty は **seed との差**であって「中身があるか」ではない (form は current
+      revision から seed されるため)。lane の切り替えは entity の変更では
+      ないので確認しない。断れば選択も入力も残る。
 
     **実装状況 (2026-08-28 時点)。** #428-#433 は実装・検証済み。正本モジュールは
     `app/product_objective.py`(Objective / Milestone / Gap の identity・revision・
