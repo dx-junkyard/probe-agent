@@ -549,8 +549,11 @@ class TestGapEvidenceAndArtifactLinks:
             headers=headers,
         )
         assert created.status_code == 201, created.text
-        assert created.json()["deep_link"] == "/experiments"
+        # §5.8.1: the ref makes the link land ON the evidence, not merely on
+        # the screen that owns its kind.
+        assert created.json()["deep_link"] == "/experiments?experiment=e-9"
         assert created.json()["deep_link_state"] == "available"
+        assert created.json()["deep_link_target_state"] == "selected"
         created_link = admin_client.post(
             "/product-gaps/g1/artifact-links",
             json={"link_kind": "product_feature", "target_ref": "feat-b"},
@@ -559,23 +562,30 @@ class TestGapEvidenceAndArtifactLinks:
         assert created_link.status_code == 201, created_link.text
         assert created_link.json()["deep_link"] is None
         assert created_link.json()["deep_link_state"] == "unavailable"
+        assert created_link.json()["deep_link_target_state"] == "unavailable"
 
         detail = admin_client.get("/product-gaps/g1", headers=headers).json()
         evidence = {e["evidence_kind"]: e for e in detail["evidence_refs"]}
-        assert evidence["trace"]["deep_link"] == "/components"
+        assert evidence["trace"]["deep_link"] == "/components?trace=t-1"
         assert evidence["trace"]["deep_link_state"] == "available"
+        assert evidence["trace"]["deep_link_target_state"] == "selected"
         # No probe-agent screen owns a free-text human report. "No screen"
         # is reported honestly, never as a plausible URL (§5.8).
         assert evidence["human_report"]["deep_link"] is None
         assert evidence["human_report"]["deep_link_state"] == "unavailable"
+        assert evidence["human_report"]["deep_link_target_state"] == "unavailable"
 
         artifacts = {a["link_kind"]: a for a in detail["artifact_links"]}
-        assert artifacts["ux_requirement"]["deep_link"] == "/ux-design-studio"
+        assert artifacts["ux_requirement"]["deep_link"] == (
+            "/ux-design-studio?tab=requirements&requirement=req-a"
+        )
         assert artifacts["ux_requirement"]["deep_link_state"] == "available"
+        assert artifacts["ux_requirement"]["deep_link_target_state"] == "selected"
         # A Product Feature has an API but no screen of its own -- the same
         # honest `unavailable` `node_anomaly` carries.
         assert artifacts["product_feature"]["deep_link"] is None
         assert artifacts["product_feature"]["deep_link_state"] == "unavailable"
+        assert artifacts["product_feature"]["deep_link_target_state"] == "unavailable"
 
     def test_artifact_link_duplicate_is_409(self, admin_client):
         token, system_id = _setup(admin_client, "System Gap Artifact Dup")
