@@ -216,9 +216,21 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     setQuestion("");
     appendMessages(screenId, [{ role: "user", text: trimmed }]);
     try {
+      // Keep a bounded multi-turn discussion context. The current question is
+      // sent separately, so only turns that existed before this submit belong
+      // here. Errors are UI state, never conversation evidence.
+      const conversation = messages
+        .filter((message): message is ChatMessage & { role: "user" | "assistant" } =>
+          message.role === "user" || message.role === "assistant",
+        )
+        .slice(-12)
+        .map((message) => ({ role: message.role, content: message.text.slice(0, 4000) }));
+      const routeParams = Object.fromEntries(new URLSearchParams(location.search));
       const result = await ask.mutateAsync({
         screen_id: screenId,
         question: trimmed,
+        route_params: routeParams,
+        conversation,
         visible_check_ids: failingChecks.map((c) => c.check_id),
         ...(focusedStateItem ? {
           visible_state_ids: [focusedStateItem.state_id],
@@ -399,7 +411,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         <Input
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
-          placeholder="Ask about this screen or a setting…"
+          placeholder="この画面のデータ構造や目的について質問…"
           data-testid="assistant-question-input"
         />
         <Button

@@ -7872,6 +7872,8 @@ describe("Per-screen assistant panel", () => {
       expect(mockApi.post).toHaveBeenCalledWith("/assistant/ask", {
         screen_id: "system-understanding",
         question: "What should INTELLIGENCE_LLM_MODEL be set to?",
+        route_params: {},
+        conversation: [],
         visible_check_ids: ["intelligence_llm_config"],
       });
     });
@@ -7914,6 +7916,33 @@ describe("Per-screen assistant panel", () => {
     await screen.findByTestId("assistant-panel");
     await waitFor(() => {
       expect(mockApi.get).toHaveBeenCalledWith("/assistant/screen-context/overview");
+    });
+  });
+
+  test("selected design URL context and prior turns are sent on the next discussion turn", async () => {
+    mockAssistantApi();
+    await renderPanelAt("/ux-design-studio?tab=requirements&requirement=req-1");
+    fireEvent.click(screen.getByTestId("assistant-button"));
+    await screen.findByTestId("assistant-panel");
+
+    const input = screen.getByTestId("assistant-question-input");
+    fireEvent.change(input, { target: { value: "この要件の境界を確認して" } });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+    await screen.findByTestId("assistant-answer");
+
+    fireEvent.change(input, { target: { value: "では不足は何ですか" } });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+    await waitFor(() => {
+      const calls = mockApi.post.mock.calls.filter(([path]) => path === "/assistant/ask");
+      expect(calls).toHaveLength(2);
+      expect(calls[1][1]).toEqual(expect.objectContaining({
+        screen_id: "ux-design-studio",
+        route_params: { tab: "requirements", requirement: "req-1" },
+        conversation: [
+          { role: "user", content: "この要件の境界を確認して" },
+          { role: "assistant", content: askResponse.answer },
+        ],
+      }));
     });
   });
 });

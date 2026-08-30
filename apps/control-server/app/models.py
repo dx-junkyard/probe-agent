@@ -5847,13 +5847,33 @@ class AssistantScreenContextOut(BaseModel):
     suggested_questions: List[AssistantSuggestedQuestionOut] = Field(default_factory=list)
 
 
+class AssistantConversationMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
 class AssistantAskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     screen_id: str = Field(..., min_length=1, max_length=100)
     question: str = Field(..., min_length=1, max_length=4000)
     route_params: Dict[str, str] = Field(default_factory=dict)
+    conversation: List[AssistantConversationMessage] = Field(default_factory=list, max_length=12)
     visible_check_ids: List[str] = Field(default_factory=list, max_length=50)
     visible_state_ids: List[str] = Field(default_factory=list, max_length=50)
     focused_state_id: Optional[str] = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_assistant_context_bounds(self):
+        if len(self.route_params) > 20:
+            raise ValueError("route_params must contain at most 20 entries")
+        if any(len(key) > 100 or len(value) > 500 for key, value in self.route_params.items()):
+            raise ValueError("route_params keys or values are too long")
+        if sum(len(message.content) for message in self.conversation) > 24_000:
+            raise ValueError("conversation is too long")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -5946,7 +5966,7 @@ class AssistantActionOut(BaseModel):
 
 
 class AssistantCitationOut(BaseModel):
-    type: Literal["setting", "diagnostic_check", "pipeline_step", "state_item"]
+    type: Literal["setting", "diagnostic_check", "pipeline_step", "state_item", "screen_data"]
     id: str
     title: str = ""
     detail: str = ""

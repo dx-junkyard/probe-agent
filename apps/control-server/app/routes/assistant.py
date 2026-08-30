@@ -31,6 +31,7 @@ from ..assistant import (
     suggested_questions,
     REAL_PROVIDERS,
 )
+from ..assistant_discussion_context import build_screen_discussion_context
 from ..auth import get_system_id
 from ..llm import LLMClient, LLMConfig, create_llm_client
 from ..models import (
@@ -172,6 +173,9 @@ def assistant_ask(
         state_items.insert(0, state_by_id[focused_state_id])
     config = LLMConfig.intelligence_from_env()
     client = _usable_llm_client(config)
+    discussion = build_screen_discussion_context(
+        payload.screen_id, system_id, payload.route_params
+    )
     result = answer_question(
         ctx,
         payload.question,
@@ -181,6 +185,10 @@ def assistant_ask(
         visible_check_ids=payload.visible_check_ids,
         state_items=state_items,
         focused_state_id=focused_state_id,
+        screen_data=discussion.facts if discussion else None,
+        screen_data_sources=discussion.sources if discussion else None,
+        route_params=payload.route_params,
+        conversation=[message.model_dump() for message in payload.conversation],
     )
     return AssistantAskOut(
         screen_id=ctx.screen_id,

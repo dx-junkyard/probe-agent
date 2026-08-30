@@ -106,21 +106,65 @@ export default function UxDesignStudioPage() {
 
   function openRequirement(key: string) {
     setRequirementKey(key);
-    goToTab("requirements");
+    const params = new URLSearchParams(searchParams);
+    params.set("requirement", key);
+    params.set("tab", "requirements");
+    setSearchParams(params, { replace: true });
+    setTab("requirements");
   }
 
   function openSolutionDesign(key: string) {
     setDesignKey(key);
-    goToTab("solutions");
+    const params = new URLSearchParams(searchParams);
+    params.set("design", key);
+    params.set("tab", "solutions");
+    setSearchParams(params, { replace: true });
+    setTab("solutions");
+  }
+
+  function selectJourney(key: string | null) {
+    setJourneyKey(key);
+    const params = new URLSearchParams(searchParams);
+    if (key) params.set("journey", key);
+    else params.delete("journey");
+    setSearchParams(params, { replace: true });
+  }
+
+  function selectRequirement(key: string | null) {
+    setRequirementKey(key);
+    const params = new URLSearchParams(searchParams);
+    if (key) params.set("requirement", key);
+    else params.delete("requirement");
+    setSearchParams(params, { replace: true });
+  }
+
+  function selectSolutionDesign(key: string | null) {
+    setDesignKey(key);
+    const params = new URLSearchParams(searchParams);
+    if (key) params.set("design", key);
+    else params.delete("design");
+    setSearchParams(params, { replace: true });
   }
 
   function goToNextDecision(nextTab: StudioTab, key: string | null) {
+    const params = new URLSearchParams(searchParams);
     if (key !== null) {
-      if (nextTab === "journeys") setJourneyKey(key);
-      if (nextTab === "requirements") setRequirementKey(key);
-      if (nextTab === "solutions") setDesignKey(key);
+      if (nextTab === "journeys") {
+        setJourneyKey(key);
+        params.set("journey", key);
+      }
+      if (nextTab === "requirements") {
+        setRequirementKey(key);
+        params.set("requirement", key);
+      }
+      if (nextTab === "solutions") {
+        setDesignKey(key);
+        params.set("design", key);
+      }
     }
-    goToTab(nextTab);
+    setTab(nextTab);
+    params.set("tab", nextTab);
+    setSearchParams(params, { replace: true });
   }
 
   return (
@@ -153,7 +197,7 @@ export default function UxDesignStudioPage() {
         <TabsContent value="journeys" data-testid="ux-design-studio-panel-journeys">
           <JourneyPanel
             selectedKey={journeyKey}
-            onSelect={setJourneyKey}
+            onSelect={selectJourney}
             onOpenRequirement={openRequirement}
           />
         </TabsContent>
@@ -161,13 +205,13 @@ export default function UxDesignStudioPage() {
         <TabsContent value="requirements" data-testid="ux-design-studio-panel-requirements">
           <RequirementPanel
             selectedKey={requirementKey}
-            onSelect={setRequirementKey}
+            onSelect={selectRequirement}
             onOpenSolutionDesign={openSolutionDesign}
           />
         </TabsContent>
 
         <TabsContent value="solutions" data-testid="ux-design-studio-panel-solutions">
-          <SolutionDesignPanel selectedKey={designKey} onSelect={setDesignKey} />
+          <SolutionDesignPanel selectedKey={designKey} onSelect={selectSolutionDesign} />
         </TabsContent>
       </Tabs>
     </div>
