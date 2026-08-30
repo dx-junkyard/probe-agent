@@ -125,3 +125,42 @@ describe("functional-lineage/model", () => {
     expect(readSharedSelection(params)).toEqual({ kind: null, ref: null });
   });
 });
+
+describe("lineageDeepLink for the Product Objective layer (#427 §7.3/§9.4)", () => {
+  it("routes Objective, Milestone and Gap to the single Objective Map route", () => {
+    // §9.4 keeps the Objective layer to ONE sidebar item: the Gap Workbench
+    // is that route's second lane, not a screen of its own.
+    expect(lineageDeepLink("product_objective", "checkout-speed")).toBe(
+      "/objective-map?objective=checkout-speed",
+    );
+    expect(lineageDeepLink("product_milestone", "first-pass")).toBe(
+      "/objective-map?milestone=first-pass",
+    );
+    expect(lineageDeepLink("product_gap", "retry-loop")).toBe(
+      "/objective-map?view=gaps&gap=retry-loop",
+    );
+  });
+
+  it("returns no link for kinds whose ref does not identify a screen's subject", () => {
+    // A Feature has no screen yet, and an Experiment / Replay run reached
+    // through a Feature target link is named by that link's target_ref,
+    // which is not what those screens select on. "No link" is the honest
+    // answer -- the same one §5.8 requires of a Gap source with no owning
+    // screen. A plausible-looking URL would be worse than none.
+    expect(lineageDeepLink("product_feature", "checkout")).toBeNull();
+    expect(lineageDeepLink("experiment", "12")).toBeNull();
+    expect(lineageDeepLink("replay_run", "34")).toBeNull();
+  });
+
+  it("keeps the new kinds through a shared-selection URL round trip", () => {
+    // A kind with a label but no entry in KIND_VALUES renders correctly and
+    // then silently loses its selection on reload, because isLineageKind is
+    // what guards the parse back.
+    const params = new URLSearchParams();
+    writeSharedSelection(params, { kind: "product_gap", ref: "retry-loop" });
+    expect(readSharedSelection(new URLSearchParams(params.toString()))).toEqual({
+      kind: "product_gap",
+      ref: "retry-loop",
+    });
+  });
+});

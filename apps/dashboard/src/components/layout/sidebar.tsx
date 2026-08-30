@@ -3,7 +3,7 @@ import {
   LayoutDashboard, GitBranch, Map, Crosshair, FlaskConical,
   Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight, MessageSquare,
   Workflow, Network, MessageSquareText, Brain, GitFork, Filter,
-  LifeBuoy, BookMarked, GitMerge, Beaker, Bot, Layers, PenTool, Rows3,
+  LifeBuoy, BookMarked, GitMerge, Beaker, Bot, Layers, PenTool, Rows3, Target,
 } from "lucide-react";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -81,6 +81,10 @@ const NAV_GROUPS: NavGroup[] = [
       {
         to: "/functional-lineage", icon: GitFork, label: "Functional Lineage",
         subtitle: "Purpose → Capability → 実装 → Outcome の追跡とGap",
+      },
+      {
+        to: "/objective-map", icon: Target, label: "Objective Map",
+        subtitle: "Vision へ向かうObjective/Milestone とGap Workbench",
       },
     ],
   },

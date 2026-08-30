@@ -46,6 +46,10 @@ from .routes import (
     node_operations,
     overview,
     probe_patterns,
+    product_features,
+    product_gaps,
+    product_lineage,
+    product_objectives,
     project_intelligence,
     publish_jobs,
     purpose_chain,
@@ -170,6 +174,11 @@ def create_app() -> FastAPI:
     app.include_router(cell_quality.router, dependencies=_auth)
     app.include_router(cell_root.router, dependencies=_auth)
     app.include_router(cell_improvement.router, dependencies=_auth)
+    app.include_router(product_objectives.router, dependencies=_auth)
+    app.include_router(product_objectives.milestone_router, dependencies=_auth)
+    app.include_router(product_gaps.router, dependencies=_auth)
+    app.include_router(product_features.router, dependencies=_auth)
+    app.include_router(product_lineage.router, dependencies=_auth)
     return app
 
 

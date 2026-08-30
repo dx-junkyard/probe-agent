@@ -859,8 +859,8 @@ def test_loop_stages_mark_reached_current_and_future():
     assert by_stage["instrumentation"].status == "current"
     assert by_stage["observation"].status == "future"
     # Only the current stage names the next semantic milestone.
-    assert by_stage["instrumentation"].next_milestone
-    assert by_stage["observation"].next_milestone == ""
+    assert by_stage["instrumentation"].stage_completion_hint
+    assert by_stage["observation"].stage_completion_hint == ""
     assert all(s.label and s.meaning for s in stages)
 
 

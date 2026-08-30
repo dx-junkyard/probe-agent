@@ -111,7 +111,7 @@ function overview(overrides: Partial<OverviewOut> = {}): OverviewOut {
     next_action_state: "available",
     next_action_message: "",
     loop_stages: [
-      { stage: "setup", label: "Setup: 対象を登録する", status: "current", meaning: "m", next_milestone: "n", complete: false },
+      { stage: "setup", label: "Setup: 対象を登録する", status: "current", meaning: "m", stage_completion_hint: "n", complete: false },
     ],
     user_phase: "setup",
     runtime: {
@@ -354,6 +354,7 @@ describe("Overview page (Issue #384)", () => {
       "今わかったこと",
       "次にすること",
       "改善ループの現在地",
+      "目標(Objective)",
       "Runtime health",
     ]);
   });

@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, get_args
 
 from . import (
+    product_objective_projection,
     purpose_chain,
     purpose_needs,
     replay_readiness,
@@ -215,7 +216,7 @@ LOOP_STAGE_MEANINGS: Dict[str, str] = {
     "publish": "採用した変更をレビュー可能な形で公開します。",
 }
 
-LOOP_STAGE_NEXT_MILESTONE: Dict[str, str] = {
+LOOP_STAGE_COMPLETION_HINT: Dict[str, str] = {
     "setup": "解析できる snapshot が 1 件そろうこと。",
     "preparation": "System Purpose と主要機能をあなたが確認済みにすること。",
     "instrumentation": "承認済みの計測経路が 1 本できること。",
@@ -1362,7 +1363,15 @@ class OverviewLoopStageView:
     label: str
     status: str
     meaning: str
-    next_milestone: str = ""
+    #: A fixed sentence describing what completes THIS loop stage
+    #: (`LOOP_STAGE_COMPLETION_HINT`). Issue #427 renamed it away from
+    #: `next_milestone`: a canonical Milestone is a `product_milestone` row
+    #: with a stable key, a revision history and a human achievement
+    #: assessment, and this is none of those -- it is a static lookup keyed by
+    #: the loop stage. Sharing the word made the rail read as the Objective
+    #: layer's next Milestone, which is a different fact on a different
+    #: surface (contract §7.4).
+    stage_completion_hint: str = ""
     complete: bool = False
 
 
@@ -1391,8 +1400,8 @@ def build_loop_stages(
                 label=LOOP_STAGE_LABELS[stage],
                 status=status,
                 meaning=LOOP_STAGE_MEANINGS[stage],
-                next_milestone=(
-                    LOOP_STAGE_NEXT_MILESTONE[stage] if status == "current" else ""
+                stage_completion_hint=(
+                    LOOP_STAGE_COMPLETION_HINT[stage] if status == "current" else ""
                 ),
                 complete=complete,
             )
@@ -1478,6 +1487,13 @@ class OverviewResult:
     #: be derived" -- the two are told apart by `"purpose_question" in
     #: degraded_sections`, exactly like every other guarded section here.
     purpose_question: Optional[purpose_needs.PurposeQuestion] = None
+    #: Issue #427/#432 §9.1/§9.3: the Product Objective layer's own section,
+    #: composed from `product_objective_projection.build_objective_overview`
+    #: over the SAME `brief` value above -- never a second Vision
+    #: resolution. `None` only when its own guarded loader raised; a System
+    #: with no Product Objective yet still gets a real
+    #: `ObjectiveOverviewResult` (§11's graceful-empty-state rule).
+    objective: Optional[product_objective_projection.ObjectiveOverviewResult] = None
     degraded_sections: List[str] = field(default_factory=list)
     degraded_detail: Dict[str, str] = field(default_factory=dict)
 
@@ -1974,6 +1990,20 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 _degrade(result, "purpose_question", exc)
+
+        # Issue #427/#432 §9.1/§9.3: the Product Objective layer's own
+        # section, composed over the SAME `brief` this function already
+        # built above -- never a second Vision resolution. Guarded exactly
+        # like every other section: a failure here degrades only
+        # `"objective"`, never blanking the rest of the page. This section
+        # writes nothing (`build_objective_overview` calls no persisting
+        # function), matching #380's rule for every other Overview section.
+        try:
+            result.objective = product_objective_projection.build_objective_overview(
+                conn, system_id, brief, now=now
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            _degrade(result, "objective", exc)
 
         # Each fact group is loaded under its own guard. A failure records the
         # group as unavailable and leaves its value at the conservative

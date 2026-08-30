@@ -241,6 +241,14 @@ export const REF_KIND_LABEL: Record<UxRefKind, string> = {
   purpose_element: "Purpose 要素",
   purpose_relation: "Purpose 関係",
   capability_entity: "Capability",
+  // Issue #427 §7.1 widened `UxRefKind` so a Journey can name the
+  // Objective / Milestone / Gap it exists to address. The Record is
+  // exhaustive over the union, so these are required here -- and that is
+  // the point: a widened union with a stale label map is a screen that
+  // renders `undefined` for the new kinds.
+  product_objective: "Product Objective",
+  product_milestone: "Milestone",
+  product_gap: "Gap",
 };
 
 export const REF_RELATION_STATUS_LABEL: Record<UxRefRelationStatus, string> = {

@@ -60,9 +60,16 @@ export const LINEAGE_KIND_LABEL: Record<FunctionalLineageKind, string> = {
   cell_binding: "Probe Cell Binding",
   probe_point: "Probe Point",
   purpose_outcome_criterion: "Outcome",
+  product_objective: "Product Objective",
+  product_milestone: "Milestone",
+  product_gap: "Gap",
+  product_feature: "Feature",
+  experiment: "Experiment",
+  vision_claim: "Vision",
+  replay_run: "Replay 実行",
 };
 
-/** §9.2's 23 gap codes. Phrased as a STATEMENT about an absent, stale, or
+/** §9.2's 23 gap codes, plus Issue #427 §7.3's 11. Phrased as a STATEMENT about an absent, stale, or
  * conflicting link -- never a judgement of importance (same discipline as
  * `stakeholder-network/model.ts`'s `NOTICE_CODE_LABEL`). */
 export const GAP_CODE_LABEL: Record<LineageGapCode, string> = {
@@ -89,6 +96,17 @@ export const GAP_CODE_LABEL: Record<LineageGapCode, string> = {
   feedback_path_missing: "提供先からの情報 (フィードバック) がありません",
   unresolved_reference: "参照先が見つかりません",
   unavailable_reference: "参照を取得できませんでした",
+  objective_without_vision_ref: "Vision / Purpose / Capability / Need への参照がありません",
+  objective_without_milestone: "Milestone がありません",
+  milestone_without_gap: "Gap がありません",
+  milestone_without_verification: "達成を確かめる方法が決まっていません",
+  gap_without_journey: "この Gap を解消する Journey がありません",
+  gap_source_unresolved: "検出元が見つかりません",
+  gap_source_unavailable: "検出元を取得できませんでした",
+  gap_source_contradicted: "検出元がもう成り立たないと言っています",
+  requirement_without_feature: "この Requirement を満たす Feature がありません",
+  feature_without_implementation_target: "実装先への参照がありません",
+  feature_without_capability: "Capability への参照がありません",
 };
 
 /** §9.2: fixed per CODE (never per instance) -- always shown alongside the
@@ -126,6 +144,12 @@ const KIND_VALUES: FunctionalLineageKind[] = [
   "ux_requirement", "solution_design", "static_flow", "runtime_flow",
   "evolution_node", "component", "cell_definition", "cell_binding",
   "probe_point", "purpose_outcome_criterion",
+  // Issue #427 §7.3. These must be listed here as well as in
+  // `LINEAGE_KIND_LABEL`: `isLineageKind` is what lets a kind survive a URL
+  // round-trip, so a kind with a label but no entry here renders fine and
+  // then silently loses its selection on reload.
+  "product_objective", "product_milestone", "product_gap", "product_feature",
+  "experiment", "replay_run", "vision_claim",
 ];
 const SEVERITY_VALUES: LineageGapSeverity[] = ["blocking", "attention", "informational"];
 
@@ -252,6 +276,12 @@ export function traceDownstreamImpact(
  * everywhere. `null` means no canonical screen exists yet for that kind. */
 export function lineageDeepLink(kind: FunctionalLineageKind, ref: string): string | null {
   switch (kind) {
+    // A Vision claim has no row identity of its own (§4.6) -- it is named by
+    // its text -- so the Understanding screen that owns the claim is its
+    // destination, the same one Purpose elements use. The note sits above
+    // the group rather than between two cases: a comment there reads as an
+    // intentional-fallthrough marker to `no-fallthrough` and fails lint.
+    case "vision_claim":
     case "purpose_element":
     case "purpose_relation":
     case "purpose_outcome_criterion":
@@ -284,6 +314,24 @@ export function lineageDeepLink(kind: FunctionalLineageKind, ref: string): strin
       return "/cell-fabric";
     case "probe_point":
       return "/probe-planner";
+    // Issue #427 §9.4: the Objective layer lives on ONE route, with the Gap
+    // Workbench as its second lane rather than a screen of its own.
+    case "product_objective":
+      return `/objective-map?objective=${encodeURIComponent(ref)}`;
+    case "product_milestone":
+      return `/objective-map?milestone=${encodeURIComponent(ref)}`;
+    case "product_gap":
+      return `/objective-map?view=gaps&gap=${encodeURIComponent(ref)}`;
+    // A Feature has no screen of its own yet, and an Experiment / Replay run
+    // reached through a Feature target link is identified here by that
+    // link's `target_ref`, which is not the id those screens select on.
+    // Returning null renders "no link" -- the honest answer, and the same
+    // one §5.8 requires for a Gap source with no owning screen. Do not
+    // substitute a plausible URL.
+    case "product_feature":
+    case "experiment":
+    case "replay_run":
+      return null;
     default:
       return null;
   }

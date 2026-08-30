@@ -134,9 +134,9 @@ export function LoopRailCard({ overview }: { overview: OverviewOut }) {
             </li>
           ))}
         </ol>
-        {current?.next_milestone && (
+        {current?.stage_completion_hint && (
           <p className="text-sm text-muted-foreground" data-testid="overview-loop-next-milestone">
-            次の到達点: {current.next_milestone}
+            次の到達点: {current.stage_completion_hint}
           </p>
         )}
         {/* 後退・再確認は通常の前進として見せない (#383). The Brief's own

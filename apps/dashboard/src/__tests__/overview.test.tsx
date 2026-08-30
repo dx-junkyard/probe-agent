@@ -15,10 +15,12 @@ import { MemoryRouter } from "react-router-dom";
 import { SystemBriefCard } from "@/components/overview/system-brief";
 import { FindingsCard } from "@/components/overview/findings";
 import { LoopRailCard, NextActionCard } from "@/components/overview/next-action";
+import { ObjectiveCard } from "@/components/overview/objective";
 import { RuntimeHealthCard } from "@/components/overview/runtime-health";
 import { targetHref } from "@/components/overview/display";
 import type {
   OverviewFindingOut,
+  OverviewObjectiveOut,
   OverviewOut,
   UnderstandingBriefClaimOut,
   UnderstandingBriefOut,
@@ -463,10 +465,10 @@ describe("Next action (Issue #383)", () => {
         overview={overview({
           user_phase: "instrumentation",
           loop_stages: [
-            { stage: "setup", label: "Setup", status: "reached", meaning: "m", next_milestone: "", complete: true },
-            { stage: "preparation", label: "Understand", status: "reached", meaning: "m", next_milestone: "", complete: true },
-            { stage: "instrumentation", label: "Instrument", status: "current", meaning: "計測を組み込みます。", next_milestone: "承認済みの計測経路が 1 本できること。", complete: false },
-            { stage: "observation", label: "Observe", status: "future", meaning: "m", next_milestone: "", complete: false },
+            { stage: "setup", label: "Setup", status: "reached", meaning: "m", stage_completion_hint: "", complete: true },
+            { stage: "preparation", label: "Understand", status: "reached", meaning: "m", stage_completion_hint: "", complete: true },
+            { stage: "instrumentation", label: "Instrument", status: "current", meaning: "計測を組み込みます。", stage_completion_hint: "承認済みの計測経路が 1 本できること。", complete: false },
+            { stage: "observation", label: "Observe", status: "future", meaning: "m", stage_completion_hint: "", complete: false },
           ],
         })}
       />,
@@ -489,7 +491,7 @@ describe("Next action (Issue #383)", () => {
         overview={overview({
           brief: brief({ readiness_state: "recheck_required" }),
           loop_stages: [
-            { stage: "setup", label: "Setup", status: "current", meaning: "m", next_milestone: "n", complete: false },
+            { stage: "setup", label: "Setup", status: "current", meaning: "m", stage_completion_hint: "n", complete: false },
           ],
         })}
       />,
@@ -695,6 +697,139 @@ describe("Runtime coverage entity (Issue #384)", () => {
     const line = screen.getByTestId("overview-runtime-coverage");
     expect(line).toHaveTextContent("2 / 3");
     expect(line).toHaveTextContent("対応不明の component 1 件");
+  });
+});
+
+// ── #432: Objective (Epic #427) ────────────────────────────────────────
+
+function objectiveSection(overrides: Partial<OverviewObjectiveOut> = {}): OverviewObjectiveOut {
+  return {
+    vision: null,
+    active_objective: null,
+    active_objective_count: 0,
+    next_milestone: null,
+    primary_gap: null,
+    objective_state: null,
+    next_step: "create_objective",
+    next_step_state: "available",
+    next_step_reason: "この System にはまだ Product Objective がありません。",
+    next_step_completion: "最初の Objective を作成します。",
+    next_step_value: "Vision へ近づくための中間目標を持てるようになります。",
+    degraded_sections: [],
+    degraded_detail: {},
+    ...overrides,
+  };
+}
+
+describe("Objective (Issue #432)", () => {
+  test("renders the unavailable state distinctly when the section could not be read", () => {
+    wrap(<ObjectiveCard overview={overview({ objective: undefined, degraded_sections: ["objective"] })} />);
+    expect(screen.getByTestId("overview-objective-unavailable")).toBeInTheDocument();
+  });
+
+  test("a System with no Product Objective yet reads as 'not started', not as an error", () => {
+    wrap(<ObjectiveCard overview={overview({ objective: objectiveSection() })} />);
+    expect(screen.getByTestId("overview-objective-not-started")).toBeInTheDocument();
+    expect(screen.queryByTestId("overview-objective-unavailable")).not.toBeInTheDocument();
+  });
+
+  test("the CTA navigates to the Objective Map with the server's own label -- it never executes", () => {
+    wrap(<ObjectiveCard overview={overview({ objective: objectiveSection() })} />);
+    const cta = screen.getByTestId("overview-objective-cta");
+    expect(cta.tagName).toBe("A");
+    expect(cta).toHaveAttribute("href", "/objective-map");
+    expect(cta).toHaveTextContent("Objective を作成する");
+  });
+
+  test("waiting/unavailable next_step renders only the server's sentence -- no CTA at all (§9.3)", () => {
+    wrap(
+      <ObjectiveCard
+        overview={overview({
+          objective: objectiveSection({
+            next_step: "unavailable",
+            next_step_state: "unavailable",
+            next_step_reason: "理解または Objective の一覧を取得できなかったため、次の操作を判定できませんでした。",
+            next_step_completion: "",
+            next_step_value: "",
+          }),
+        })}
+      />,
+    );
+    expect(screen.getByTestId("overview-objective-next-step-waiting")).toHaveTextContent(
+      "理解または Objective の一覧を取得できなかったため",
+    );
+    expect(screen.queryByTestId("overview-objective-cta")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-objective-next-step-completion")).not.toBeInTheDocument();
+  });
+
+  test("the header's Objective Map link is present in every state, independent of next_step (§9.4's ONE lead)", () => {
+    wrap(
+      <ObjectiveCard
+        overview={overview({
+          objective: objectiveSection({ next_step: "unavailable", next_step_state: "unavailable" }),
+        })}
+      />,
+    );
+    const lead = screen.getByTestId("overview-objective-map-link");
+    expect(lead.tagName).toBe("A");
+    expect(lead).toHaveAttribute("href", "/objective-map");
+  });
+
+  test("a complete state (next_step='none') renders a positive sentence, never the waiting copy", () => {
+    wrap(
+      <ObjectiveCard
+        overview={overview({
+          objective: objectiveSection({ next_step: "none", next_step_state: "complete", next_step_reason: "" }),
+        })}
+      />,
+    );
+    expect(screen.getByTestId("overview-objective-next-step-complete")).toHaveTextContent(
+      "現在、次に決めるべきことはありません。",
+    );
+    expect(screen.queryByTestId("overview-objective-next-step-waiting")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-objective-cta")).not.toBeInTheDocument();
+  });
+
+  test("multiple active Objectives show the count without picking a 'more important' one", () => {
+    wrap(
+      <ObjectiveCard
+        overview={overview({
+          objective: objectiveSection({
+            objective_state: "active",
+            active_objective: {
+              id: 1, system_id: 1, objective_key: "o1", current_revision_id: null, current_revision_number: null,
+              title: "決済の離脱率を下げる", objective_state: "active", recheck_state: "current",
+              parent_objective_id: null, parent_objective_key: null, created_by: null, created_at: 0, updated_at: 0,
+            },
+            active_objective_count: 3,
+            next_step: "create_milestone",
+          }),
+        })}
+      />,
+    );
+    expect(screen.getByTestId("overview-objective-active-count")).toHaveTextContent("他に 2 件");
+  });
+
+  test("Milestone design_status and achievement render as two separate labels, never merged (§1.3)", () => {
+    wrap(
+      <ObjectiveCard
+        overview={overview({
+          objective: objectiveSection({
+            objective_state: "active",
+            next_milestone: {
+              id: 1, system_id: 1, milestone_key: "m1", objective_id: 1, objective_key: "o1",
+              current_revision_id: null, current_revision_number: null, title: "初回決済を完了させる",
+              design_status: "confirmed", achievement: "unassessed", assessability: "assessable",
+              recheck_state: "current", created_by: null, created_at: 0, updated_at: 0,
+            },
+            next_step: "create_gap",
+          }),
+        })}
+      />,
+    );
+    const milestoneBlock = screen.getByTestId("overview-objective-next-milestone");
+    expect(within(milestoneBlock).getByText("確定済み")).toBeInTheDocument();
+    expect(within(milestoneBlock).getByText("未評価")).toBeInTheDocument();
   });
 });
 

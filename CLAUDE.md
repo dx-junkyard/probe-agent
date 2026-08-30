@@ -1756,6 +1756,124 @@ creating incomplete persistence or execution paths for later phases.
     Need / Observation / Exchange の確認・却下・廃止・復帰、role assignment、
     参照の確定もすべて `decision_method: manual`。
 
+27. Issue #427(subs #428-#433)— Vision と UX の間へ **Product Objective /
+    Milestone / Gap** の正本を導入する Epic。Purpose Chain(#387-#391)は
+    Vision → Purpose → Capability を、UX Design Lineage(#405-#409)と
+    Stakeholder / Functional Lineage(#418-#424)はその下流を保持できるが、
+    **「Vision へ近づくための中間目標」「その検証可能な到達点」「現状と目標状態の
+    差」を第一級の正本として持つ層が無い**。今の「目標」と「Gap」は Intent Brief
+    `goal` / Capability / Overview `next_milestone`(静的表示文)/ `cell_goals`
+    (Cell の実行委譲用)/ System Understanding Gap / Functional Lineage Gap /
+    Journey diff / runtime mismatch へ分散しており、個別の不足は検出できても
+    「どの Vision の、どの中間目標に対する Gap で、それを解消するためにどの
+    UX・Feature・実装・評価が要るか」を一続きに説明できない。
+    `docs/product-objective-lineage.md` が canonical contract で、§0 を読んで
+    からこの領域に触ること。依存順に #428(契約)→ #429(永続化 / API)→
+    #430(既存 Gap federation)→ #431(UX / Feature lineage)→ #432(Dashboard)
+    → #433(E2E / migration / dogfooding)。後から変えるときに守ること:
+    - **新しい理解モデルを作らない。** Vision / Purpose / Capability /
+      Stakeholder / Need / Journey / Requirement / Solution Design / Flow /
+      Node / Component / Cell / Outcome の正本は既存のまま。この層が持つのは
+      Objective / Milestone / Gap / Feature という新しく著述される成果物と、
+      上下への参照 (ref / link) だけ。上流・下流の内容を列へコピーしない。
+    - **identity は `(system_id, <kind>_key)`** の開発者指定 slug。Purpose 要素 id
+      (名前 hash)からも行 id からも LLM 生成 hash からも導出しない。
+    - **Objective の親は append-only link、Milestone の所属 Objective と Gap の
+      所属 Milestone は identity 行の列。** 親は任意で再親付けが正常に起き、
+      所属は必須で変われば主題自体が変わる(`ux_journey.perspective` と同じ理由)。
+      循環は訪問済み集合を持つ反復で決定的に拒否する。
+    - **Milestone の「定義の確定」と「達成判定」は別テーブル・別軸。**
+      `design_status` は `product_milestone_decision`、`achievement` は
+      `product_milestone_assessment` から導出する。進捗率の列は存在しない。
+      `unassessed`(誰も見ていない)と `indeterminate`(人が見て判定できなかった)
+      を畳まない。
+    - **Gap は 6 軸を分ける**: 検出元 / 現在状態 / 目標状態 / 解釈 / 優先判断 /
+      解消状態。Gap に severity 列も score 列も存在しない — 構造で合成を禁じる。
+      優先度は人間が置く有限バンド (`unset`/`watch`/`next`/`now`) だけ。
+    - **既存 Gap は本文コピーで移行しない。** 14 個の有限 `source_kind` それぞれに
+      唯一の resolver を持ち、読み取り時に解決する。参照は再計算に耐えるものだけ
+      (`capability_drift` は `(path, qualified_name)`、`runtime_alignment_mismatch`
+      は #321 の `review_subject_id`。再構築で振り直される
+      `capability_hierarchy_nodes.id` / `alignment_item.id` は使わない)。
+    - **`current` / `changed` / `contradicted` / `disappeared` / `unavailable` は
+      5 つの別の答え**で、source の状態は Gap の lifecycle を一切動かさない。
+      動かせるのは読み取り時の `recheck_required` / `reopen_candidate` /
+      `close_candidate` フラグだけで、状態は人間の決定でしか動かない。
+    - **達成は伝播しない。** Milestone が全部 `met` でも Objective は自動達成せず、
+      Gap が全部 `resolved` でも Milestone の `achievement` は動かない。
+      trace / experiment / replay / Design Option 採用も何も確定しない。
+    - **`cell_goals` を Product Objective へ流用しない**(#300 は Cell の実行責任、
+      本 Epic は製品の中間目標)。**Feature を Flow / Component / Capability へ
+      畳まない**。**Gap を Issue Draft の identity にしない**(Issue Draft は Gap の
+      下流の外部化候補)。
+    - **`feature_drafts` は snapshot 束縛のまま維持**し、System-scoped stable な
+      `product_feature` と `product_feature_draft_link` で結ぶ。draft の本文は
+      コピーしない。
+    - 既存テーブルへの変更は 1 つだけ:
+      `ux_journey_upstream_ref.ref_kind` へ `product_objective` /
+      `product_milestone` / `product_gap` を足すためのテーブル再構築 migration
+      (`_migrate_solution_design_option_unique` と同じ構造的検出で冪等)。
+      Overview の `OverviewLoopStageOut.next_milestone` は canonical Milestone では
+      ないので `stage_completion_hint` へ改名する。
+    - **サイドバーへ 3 項目足さない。** 新規は `Objective Map` の 1 項目だけで、
+      Gap Workbench はその第 2 レーン (`/objective-map?view=gaps`)。
+    既存の human gate は一切緩めない。この Epic が追加する Objective /
+    Milestone / Gap / Feature の確定、Milestone 達成判定、Gap の解消・reopen・
+    優先バンド設定もすべて `decision_method: manual`。
+
+    **実装状況 (2026-08-28 時点)。** #428-#433 は実装・検証済み。正本モジュールは
+    `app/product_objective.py`(Objective / Milestone / Gap の identity・revision・
+    決定台帳・導出)、`app/product_gap_sources.py`(14 個の source kind の唯一の
+    resolver。`resolve_source` はデータ起因では決して raise せず、読めなかったことは
+    `source_state='unavailable'` という**結果**である)、`app/product_feature.py`、
+    `app/product_objective_projection.py`(Objective Map / Gap Workbench /
+    Overview `objective` セクション)。実装中に見つけて直した欠陥と、後から
+    変えるときに壊しやすい点:
+    - **親 link の部分 UNIQUE index は文ごとに検査される。** 置換行を INSERT する
+      前に直前の行を自己参照で supersede して枠を空ける
+      (`solution_design.py` と同じ idiom)。逆順にすると再親付けが
+      IntegrityError になる。
+    - **親を外すのは削除ではなく tombstone の追記。** `superseded_by_id` は
+      `ON DELETE SET NULL` の自己参照 FK なので、tip 行だけ消すと直前の親が
+      current として復活する。履歴ごと消せば復活はしないが、誰がなぜ切り離したかの
+      記録が消える。`parent_objective_id` が NULL の行が「意図的に root へ戻した」
+      という決定の記録であり、`rationale` / 実行者 / 時刻を持つ。
+      **一度も親を持たない root は行が無いまま**で、この列が NULL 可なのは
+      戻ったことを記録するためだけである。
+    - **`contradicted` に到達できない検出元が 4 つある**
+      (`manual` / `understanding_review_gap` / `functional_lineage_gap` /
+      `value_network_notice`)。検出元がそれを言える語彙を持たないためで、
+      解消時に出る答えは `disappeared` である。**`disappeared` を `contradicted`
+      として報告しない** — 開発者の次の操作が違う。テストは到達不能を到達不能として
+      記録し、5 状態を埋めるために信号を合成しない。
+    - **`product_feature_draft_link` の `feature_draft_id` は NULL 可。** pin した
+      draft が消えたとき `0` や「同じ `feature_id` の別 snapshot の draft の id」を
+      返すと、呼び出し側が誰も link していない内容へ dereference できてしまう。
+      snapshot 再構築を生き延びる `feature_draft_ref` の方で link を読む。
+    - **Feature 層も Objective 層と同じく任意。** `product_feature` が 1 つも無い
+      System では `requirement_without_feature` の検査自体を走らせない。走らせると
+      無関係な fixture の Requirement まで一斉に旗が立つ。
+    - **`FunctionalLineageKind` は `LINEAGE_KIND_LABEL` だけでなく
+      `KIND_VALUES` にも足す。** URL から型を復元する `isLineageKind` の門番が
+      後者なので、片方だけだと表示は正しいのにリロードで選択だけ静かに失われる。
+    - **TypeScript の union 本体にコメントを書かない。** parity テストのパーサが
+      コメント断片をメンバーとして読む。説明は型宣言の上に置く。
+    - **deep link は Gap の 3 種類の参照すべてで server 側の per-kind 表から
+      決める。** 検出元 (`_DEEP_LINKS`) だけでなく証跡 (`_EVIDENCE_DEEP_LINKS`)
+      と下流成果物 link (`_ARTIFACT_DEEP_LINKS`) も `product_gap_sources.py` に
+      あり、Dashboard は URL を組み立てない — 「どの画面がこの kind を所有
+      するか」に 2 つ目の答えを作らないため。画面が無い kind
+      (`human_report` / `external_report` / `other` / `product_feature` /
+      `node_anomaly`) は `deep_link=None` + `unavailable` と正直に言う。この
+      2 表は正本に対する解決を行わないので、`deep_link_state` が言うのは
+      「画面が存在するか」だけで「参照先の行がまだ存在するか」ではない。
+    - Overview の `next_action` と `objective.next_step` は**別フィールド**で、
+      片方が他方を上書きしない。`decide_next_action` の既存 15 行表は変更しない。
+    - `docs/product-objective-lineage.md` が canonical contract、
+      `docs/system-understanding-navigation.md` に画面導線、
+      `docs/ui-glossary.md` に状態語の対比表がある。
+
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

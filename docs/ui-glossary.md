@@ -18,6 +18,10 @@
 | Shadow | 本番並行実行 | 本番トラフィックで候補も動かして記録する（戻り値は変えない） |
 | Experiment | 実験 | 複数 variant を隔離ワークスペースで実行し、採否を記録する単位 |
 | Snapshot | Snapshot | 固定した commit のコード一式（固有概念なのでそのまま） |
+| Product Objective | Objective | Vision へ寄与する中間目標。安定 key を持つ (#427) |
+| Milestone | Milestone | その Objective が達成へ向かったと観測・判断できる状態 |
+| Gap | Gap | 明示された現状と、その Milestone の目標状態との差 |
+| Product Feature | Feature | Requirement を満たす機能単位。Capability・Flow・Component とは別 |
 
 「Replay」「Trace」「Snapshot」「Experiment」「System」「Capability」は
 固有の製品概念なのでそのまま使う（CLAUDE.md の Dashboard UI言語規約）。
@@ -71,6 +75,20 @@ Overview の「次にすること」は 1 件だけで、操作名に加えて**
 | `publish_instrumentation` | 計測 patch を公開する | 採用した改善変更を公開する |
 | `no_baseline`（Overview） | 開発者がまだ理解を確認していない | 基準を読めなかった |
 | `unavailable`（baseline） | 基準を読めなかった | 開発者が確認していない |
+| `confirmed`（Milestone） | 到達状態の**定義**を人が確定した | 達成した |
+| `met`（Milestone） | 人が**達成した**と判定した | 定義が確定している |
+| `unassessed`（Milestone） | まだ誰も達成を評価していない | 評価して判定できなかった |
+| `indeterminate`（Milestone） | 人が評価して、判定できなかった | まだ誰も見ていない |
+| `assessability=unavailable` | 検証方法が決まっていないので評価できない | 達成していない |
+| `contradicted`（Gap source） | 検出元が「もう成り立たない」と言っている | 検出元にもう存在しない |
+| `disappeared`（Gap source） | 検出元にもう存在しない | 検出元が否定している |
+| `unavailable`（Gap source） | 検出元の読み取りに失敗した | 検出元にもう存在しない |
+| `changed`（Gap source） | 検出元の内容が動いた | Gap が解消した |
+| `resolved`（Gap） | 人が差を埋めたと判断した | 検出元が消えた |
+| `obsolete`（Gap） | 人が「問いとして成り立たない」と判断した | 差を埋めた |
+| `rejected`（Gap） | 人が「これは Gap ではない」と判断した | 差を埋めた |
+| `priority_band` | 人が置いた有限バンド | 件数や severity から計算した重要度 |
+| `objective_state=null`（Overview） | Objective がまだ 1 つも無い | 読み取りに失敗した |
 
 ## 4. 空状態・失敗状態
 

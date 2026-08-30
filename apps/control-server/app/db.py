@@ -127,6 +127,73 @@ CREATE INDEX IF NOT EXISTS idx_solution_design_option_design
 """
 
 
+# ux_journey_upstream_ref: widened once by Issue #427/#431 (contract §7.1) to
+# also accept 'product_objective' / 'product_milestone' / 'product_gap' as
+# `ref_kind` values. Pulled out to a module-level constant, the same reason
+# `_SOLUTION_DESIGN_OPTION_DDL` is: SQLite cannot ALTER a CHECK constraint in
+# place, so a database created before this widening must have the table
+# rebuilt once (`_migrate_ux_journey_upstream_ref_kinds` below), and the
+# rebuild and the fresh-DB `SCHEMA` string must create byte-for-byte the same
+# table rather than two definitions that can drift apart.
+_UX_JOURNEY_UPSTREAM_REF_DDL = """
+-- ux_journey_upstream_ref: a Journey's reference to a Purpose element,
+-- Purpose relation, Capability entity, Product Objective, Product Milestone,
+-- or Product Gap -- NEVER a copy of that thing's content (§0 invariant 1's
+-- "コピーした Capability 名は元の Capability が superseded された後も
+-- current として読めてしまう"). `ref_kind` fixes which of the canonical
+-- sources resolves `target_ref` at read time (`app/models.py`'s `UxRefKind`;
+-- §2.7's table). `captured_digest` is the source's digest AT THE TIME the
+-- reference was made, so staleness (`UxRefRecheckState`) can be detected
+-- without ever mutating the reference itself -- exactly
+-- `purpose_relation_decision`'s `source_digest` / `target_digest` pattern,
+-- applied to a reference instead of a decision. `decision_method` records
+-- who ASSERTED the reference (`manual` / `reasoning_llm` / `deterministic`),
+-- which `UxRefRelationStatus` maps through a fixed table (`confirmed` /
+-- `proposed` / `derived`) -- the same
+-- `node_design._DECISION_METHOD_TO_RELATION_STATUS` translation, never a
+-- second stored status column.
+--
+-- `ref_kind` originally only listed `purpose_element` / `purpose_relation` /
+-- `capability_entity`. Issue #427/#431 (docs/product-objective-lineage.md
+-- §7.1) widens the CHECK to add `product_objective` / `product_milestone` /
+-- `product_gap`, so a Journey can name the Objective/Milestone/Gap it exists
+-- to address without this layer growing a duplicate reference table for the
+-- same purpose (§0 invariant 1: this Epic adds new authored content --
+-- Objective/Milestone/Gap/Feature -- and refs, never a second understanding
+-- model). This is a pure VOCABULARY widening, never a row rewrite: every
+-- existing row keeps its `ref_kind` value unchanged, and the three original
+-- values keep resolving through their original resolvers unchanged (§7.1
+-- "既存の Purpose / Capability direct ref は読み書きとも不変"). Read/write
+-- behavior for the three original kinds is untouched by this widening;
+-- `ux_design._resolve_upstream_target` gains three more branches, not a
+-- rewritten one.
+CREATE TABLE IF NOT EXISTS ux_journey_upstream_ref (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id          INTEGER NOT NULL,
+    journey_id         INTEGER NOT NULL,
+    ref_kind           TEXT NOT NULL CHECK (ref_kind IN
+                           ('purpose_element', 'purpose_relation', 'capability_entity',
+                            'product_objective', 'product_milestone', 'product_gap')),
+    target_ref         TEXT NOT NULL,
+    target_row_id      INTEGER,
+    captured_digest    TEXT NOT NULL DEFAULT '',
+    captured_session_id INTEGER,
+    note               TEXT NOT NULL DEFAULT '',
+    decision_method    TEXT NOT NULL DEFAULT 'manual'
+                           CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by         TEXT,
+    created_at         REAL NOT NULL,
+    superseded_by_id   INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id) REFERENCES ux_journey_upstream_ref (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ux_journey_upstream_ref_journey
+    ON ux_journey_upstream_ref (system_id, journey_id, id DESC);
+"""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6110,44 +6177,7 @@ CREATE INDEX IF NOT EXISTS idx_ux_journey_step_revision
 CREATE INDEX IF NOT EXISTS idx_ux_journey_step_journey
     ON ux_journey_step (journey_id, step_key);
 
--- ux_journey_upstream_ref: a Journey's reference to a Purpose element,
--- Purpose relation, or Capability entity -- NEVER a copy of that thing's
--- content (§0 invariant 1's "コピーした Capability 名は元の Capability が
--- superseded された後も current として読めてしまう"). `ref_kind` fixes which
--- of the three canonical sources resolves `target_ref` at read time
--- (`app/models.py`'s `UxRefKind`; §2.7's table). `captured_digest` is the
--- source's digest AT THE TIME the reference was made, so staleness
--- (`UxRefRecheckState`) can be detected without ever mutating the reference
--- itself -- exactly `purpose_relation_decision`'s `source_digest` /
--- `target_digest` pattern, applied to a reference instead of a decision.
--- `decision_method` records who ASSERTED the reference (`manual` /
--- `reasoning_llm` / `deterministic`), which `UxRefRelationStatus` maps
--- through a fixed table (`confirmed` / `proposed` / `derived`) -- the same
--- `node_design._DECISION_METHOD_TO_RELATION_STATUS` translation, never a
--- second stored status column.
-CREATE TABLE IF NOT EXISTS ux_journey_upstream_ref (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    system_id          INTEGER NOT NULL,
-    journey_id         INTEGER NOT NULL,
-    ref_kind           TEXT NOT NULL CHECK (ref_kind IN
-                           ('purpose_element', 'purpose_relation', 'capability_entity')),
-    target_ref         TEXT NOT NULL,
-    target_row_id      INTEGER,
-    captured_digest    TEXT NOT NULL DEFAULT '',
-    captured_session_id INTEGER,
-    note               TEXT NOT NULL DEFAULT '',
-    decision_method    TEXT NOT NULL DEFAULT 'manual'
-                           CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
-    created_by         TEXT,
-    created_at         REAL NOT NULL,
-    superseded_by_id   INTEGER,
-    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
-    FOREIGN KEY (journey_id) REFERENCES ux_journey (id) ON DELETE CASCADE,
-    FOREIGN KEY (superseded_by_id) REFERENCES ux_journey_upstream_ref (id) ON DELETE SET NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_ux_journey_upstream_ref_journey
-    ON ux_journey_upstream_ref (system_id, journey_id, id DESC);
+""" + _UX_JOURNEY_UPSTREAM_REF_DDL + """
 
 -- ux_requirement: identity row for one Requirement, `(system_id,
 -- requirement_key)` UNIQUE -- the same developer-supplied-slug identity
@@ -7392,6 +7422,1011 @@ CREATE TABLE IF NOT EXISTS journey_step_exchange_link (
 CREATE INDEX IF NOT EXISTS idx_journey_step_exchange_link_step
     ON journey_step_exchange_link (system_id, journey_id, step_key);
 
+-- =============================================================================
+-- Product Objective / Milestone / Gap / Feature (Epic #427, Issues #429-#431).
+-- docs/product-objective-lineage.md is the canonical contract; §-references in
+-- the comments below point into it. This layer sits between Vision (existing,
+-- #351/#387) and UX Journey (existing, #405): it holds the "intermediate
+-- goal on the way to Vision", "the observable/judgeable arrival state for
+-- that goal", and "the gap between a stated current state and that goal" as
+-- first-class AUTHORED content -- content that cannot be derived from any
+-- existing row, unlike Purpose Chain's mostly-projected claims (§2). It adds
+-- no new understanding model: Vision / Purpose / Capability / Stakeholder /
+-- Need / Journey / Requirement / Solution Design / Flow / Node / Component /
+-- Cell / Outcome all stay exactly where they are (§0 invariant 1), and this
+-- layer holds only newly-authored Objective/Milestone/Gap/Feature rows plus
+-- ref/link rows pointing up and down -- never a copy of what they point at.
+--
+-- Every state here is derived from an append-only decision ledger, never
+-- stored on the identity/content row -- the same discipline #337/#338/#349
+-- use and for the same reason: a stored lifecycle value can drift from the
+-- rows that describe it, a derived one cannot. `*_decision` tables are
+-- CHECKed to `decision_method = 'manual'` so the structure itself (not a
+-- convention) forbids an AI proposal from confirming/adopting itself
+-- (§0 invariant 3).
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- product_objective: identity row. `(system_id, objective_key)` is a
+-- DEVELOPER-SUPPLIED stable slug (§4.1) -- never derived from a Purpose
+-- element id (a hash of a claim's NAME, so rewording the claim changes the
+-- id), never derived from a row id (Understanding rebuilds reassign
+-- `alignment_item`/`understanding_revision` ids, #380's rule), and never an
+-- LLM-generated hash (proposing "the same" Objective twice must not mint two
+-- ids). `objective_state` has no column here -- it is FOLDED from
+-- `product_objective_decision`'s latest non-superseded row at read time
+-- (§4.2), the same "derived, never stored" discipline `ux_journey`'s
+-- `design_status` and `baseline_state` already use one table over.
+-- `current_revision_id` is a denormalized pointer, written only inside the
+-- same transaction that inserts the revision it points at -- never by a bare
+-- UPDATE elsewhere -- exactly `ux_journey.current_revision_id`'s rule.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS product_objective (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    objective_key       TEXT NOT NULL,
+    current_revision_id INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'product-objective-v1',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (current_revision_id)
+        REFERENCES product_objective_revision (id) ON DELETE SET NULL,
+    UNIQUE (system_id, objective_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_objective_system
+    ON product_objective (system_id, id DESC);
+
+-- product_objective_revision: the Objective's CONTENT, append-only exactly
+-- like `ux_journey_revision` -- a correction inserts `revision_number = max+1`
+-- and marks the prior current row's `superseded_by_id`; nothing here is ever
+-- UPDATEd in place, because a `product_objective_decision` confirmation is a
+-- judgement made AGAINST one specific revision's content and that history
+-- must stay readable (§0 invariant 4: "revision の追加は過去の human
+-- decision を削除せず、recheck_state を stale にするだけ"). `content_digest`
+-- covers only the meaning-bearing fields (§8: `title, intent, contribution,
+-- scope_note, summary`) -- `created_by`/`created_at`/`revision_number`/
+-- `change_note` are deliberately excluded, the same reason #308 excludes
+-- `confirmation_id` and #337 excludes Intent's `status`: a recheck fires on a
+-- MEANING change, never on the mere existence of a new record.
+-- `authored_by_kind` and `decision_method` are two of the three independent
+-- axes §0 invariant 3 requires: an AI-authored revision
+-- (`authored_by_kind='reasoning_model'`) can still be
+-- `decision_method='manual'` if a human typed the confirming edit, and that
+-- revision later reaching `objective_state='confirmed'` is "a human
+-- confirmed AI-written text", never "AI confirmed its own text" -- the CHECK
+-- on `product_objective_decision.decision_method` (always `manual`) is what
+-- enforces that.
+CREATE TABLE IF NOT EXISTS product_objective_revision (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    objective_id        INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    revision_number     INTEGER NOT NULL,
+    title               TEXT NOT NULL DEFAULT '',
+    intent              TEXT NOT NULL DEFAULT '',   -- 何を目指すか
+    contribution        TEXT NOT NULL DEFAULT '',   -- Vision へどう寄与するか
+    scope_note          TEXT NOT NULL DEFAULT '',   -- 含む / 含まない
+    summary             TEXT NOT NULL DEFAULT '',
+    content_digest      TEXT NOT NULL,
+    authored_by_kind    TEXT NOT NULL DEFAULT 'developer'
+                            CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method     TEXT NOT NULL DEFAULT 'manual'
+                            CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id INTEGER,
+    change_note         TEXT NOT NULL DEFAULT '',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    superseded_by_id    INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'product-objective-revision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (objective_id) REFERENCES product_objective (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_objective_revision (id) ON DELETE SET NULL,
+    UNIQUE (objective_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_objective_revision_system
+    ON product_objective_revision (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_objective_revision_objective
+    ON product_objective_revision (objective_id, id DESC);
+
+-- product_objective_parent_link: re-parenting is APPEND-ONLY and stays
+-- separate from the Objective's identity row, unlike Milestone's belonging
+-- (§4.4). The asymmetry is deliberate: an Objective's parent is OPTIONAL (a
+-- root Objective exists) and re-parenting -- "a standalone goal becomes part
+-- of a bigger one" -- is a normal, auditable event that does not change what
+-- the Objective itself IS, so it lives in a link table instead of splicing
+-- two subjects' history together the way letting a revision change
+-- `perspective` would on `ux_journey` (#405 §2.3). `current` is
+-- `superseded_by_id IS NULL`; root is represented by the ABSENCE of a
+-- current row -- never a row with a NULL parent (§4.4's "root は行が無い
+-- 状態で表す"). Cycle/self-reference checks (`product_objective_parent_self`
+-- / `product_objective_parent_cycle`) walk only the currently-active link
+-- graph with a visited-set iteration, never recursion, and are enforced in
+-- `app/product_objective.py`, not here -- SQLite CHECK constraints cannot
+-- express a graph-wide invariant.
+CREATE TABLE IF NOT EXISTS product_objective_parent_link (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    objective_id        INTEGER NOT NULL,
+    -- NULL means "this Objective was deliberately detached and is now a
+    -- root". It is a real, auditable decision row -- carrying its own
+    -- `rationale`, `created_by` and `created_at` -- not the absence of
+    -- one. Deleting the link history instead would satisfy the same read
+    -- ("no current parent") while destroying the record of who detached
+    -- it and why, which is exactly what §0-4 forbids; it also cannot be
+    -- done safely here, because `superseded_by_id`'s ON DELETE SET NULL
+    -- would resurrect the prior link as current the moment the tip row
+    -- went away. A root that never had a parent still has NO row at all
+    -- (§4.4's "NULL の親行を作らない" governs that case); this column is
+    -- nullable only so that RETURNING to root is recordable.
+    parent_objective_id INTEGER,
+    rationale           TEXT NOT NULL DEFAULT '',
+    decision_method     TEXT NOT NULL DEFAULT 'manual'
+                            CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    superseded_by_id    INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (objective_id) REFERENCES product_objective (id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_objective_id)
+        REFERENCES product_objective (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_objective_parent_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_objective_parent_link_system
+    ON product_objective_parent_link (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_objective_parent_link_objective
+    ON product_objective_parent_link (objective_id, id DESC);
+
+-- The currently-active parent is at most ONE per Objective. A table-level
+-- UNIQUE would contradict the append-only re-parenting rule above the same
+-- way an unqualified UNIQUE on `solution_design_option` did
+-- (`_migrate_solution_design_option_unique`'s docstring): correcting the
+-- parent inserts a new row and supersedes the old one, so the insert would
+-- collide with the very row it replaces. A partial index keyed on
+-- `superseded_by_id IS NULL` is the same idiom as
+-- `ux_solution_design_option_current`.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_objective_parent_current
+    ON product_objective_parent_link (objective_id)
+    WHERE superseded_by_id IS NULL;
+
+-- product_objective_upstream_ref: an Objective's reference to Vision /
+-- Purpose element / Purpose relation / Capability / Stakeholder Need --
+-- NEVER a copy of that thing's content (§0 invariant 1, §4.6). `ref_kind`
+-- fixes which ONE canonical source resolves `target_ref` at read time
+-- (§4.6's table); Vision in particular has no stable row identity at all --
+-- `understanding_brief.build_understanding_brief(...).vision` is a claim
+-- identified by exact NAME equality, so a `vision_claim` ref is structurally
+-- weaker than the others and that weakness surfaces honestly as
+-- `target_resolution='unresolved'` rather than being hidden by copying the
+-- Vision text into this table to "stabilize" it (§4.6, the exact mistake
+-- #397's handoff made). `captured_digest` is the upstream source's digest AT
+-- REFERENCE TIME, so `recheck_state` can detect drift without mutating the
+-- reference itself.
+CREATE TABLE IF NOT EXISTS product_objective_upstream_ref (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    objective_id        INTEGER NOT NULL,
+    ref_kind            TEXT NOT NULL CHECK (ref_kind IN
+                            ('vision_claim', 'purpose_element', 'purpose_relation',
+                             'capability_entity', 'stakeholder_need')),
+    target_ref          TEXT NOT NULL,
+    target_row_id       INTEGER,
+    captured_digest     TEXT NOT NULL DEFAULT '',
+    captured_session_id INTEGER,
+    note                TEXT NOT NULL DEFAULT '',
+    decision_method     TEXT NOT NULL DEFAULT 'manual'
+                            CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    superseded_by_id    INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (objective_id) REFERENCES product_objective (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_objective_upstream_ref (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_objective_upstream_ref_system
+    ON product_objective_upstream_ref (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_objective_upstream_ref_objective
+    ON product_objective_upstream_ref (objective_id, id DESC);
+
+-- product_objective_decision: the human-only ledger `objective_state` folds
+-- from (§4.2, §4.3's transition table). `decision_method` is CHECKed to the
+-- SINGLE literal `'manual'` -- unlike `product_objective_upstream_ref` /
+-- `_revision` above, which may legitimately be `reasoning_llm` for an AI
+-- proposal, a row in THIS table is by construction a human decision, so an
+-- AI cannot confirm/activate/achieve/reject/retire/reinstate its own
+-- proposal by writing here (§0 invariant 3). `achieve`'s only precondition
+-- is `active` (§4.3): it deliberately does not consult Milestone
+-- `achievement` at all, because achievement never propagates upward or
+-- downward automatically (§0 invariant 6, §6) -- a human can `achieve` an
+-- Objective whose Milestones are still `unassessed`, and the `rationale`
+-- column is where that judgement call is recorded.
+CREATE TABLE IF NOT EXISTS product_objective_decision (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    objective_id         INTEGER NOT NULL,
+    objective_key        TEXT NOT NULL,
+    decision             TEXT NOT NULL CHECK (decision IN
+                             ('confirm', 'activate', 'achieve',
+                              'reject', 'retire', 'reinstate')),
+    rationale            TEXT NOT NULL DEFAULT '',
+    captured_digest      TEXT NOT NULL DEFAULT '',
+    captured_revision_id INTEGER,
+    decision_method      TEXT NOT NULL DEFAULT 'manual'
+                             CHECK (decision_method = 'manual'),
+    decided_by           TEXT,
+    superseded_by_id     INTEGER,
+    created_at           REAL NOT NULL,
+    schema_version       TEXT NOT NULL DEFAULT 'product-objective-decision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (objective_id) REFERENCES product_objective (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_objective_decision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_objective_decision_system
+    ON product_objective_decision (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_objective_decision_objective
+    ON product_objective_decision (objective_id, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- product_milestone: identity row. Unlike an Objective's OPTIONAL parent
+-- link above, a Milestone's `objective_id` lives on the identity row itself
+-- and is NOT NULL and unchangeable (§4.4): belonging is MANDATORY, and if it
+-- could change, one Milestone's revision history would silently become the
+-- record of two different subjects -- exactly why `ux_journey.perspective`
+-- lives on the identity row rather than on `ux_journey_revision` (#405
+-- §2.3). There is no "progress %" column anywhere on this table or its
+-- revision (§1.3, §0 invariant 7) -- a Milestone is an observable/judgeable
+-- ARRIVAL state, not a percentage of a process.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS product_milestone (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    milestone_key       TEXT NOT NULL,
+    objective_id        INTEGER NOT NULL,
+    current_revision_id INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'product-milestone-v1',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (objective_id) REFERENCES product_objective (id) ON DELETE CASCADE,
+    FOREIGN KEY (current_revision_id)
+        REFERENCES product_milestone_revision (id) ON DELETE SET NULL,
+    UNIQUE (system_id, milestone_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_milestone_system
+    ON product_milestone (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_milestone_objective
+    ON product_milestone (objective_id, id DESC);
+
+-- product_milestone_revision: the Milestone's CONTENT. `target_state` is
+-- "what must hold to say this was reached"; `verification_method` is "how
+-- that gets confirmed" -- both are content, not achievement itself (§1.3:
+-- "定義が確定したか" and "達成したか" are two separate axes, folded from two
+-- separate tables, §4.2). `sequence_hint` is explicitly EXCLUDED from
+-- `content_digest` (§8): reordering how Milestones display changes nothing
+-- about what any one Milestone MEANS, so reordering must never trigger a
+-- recheck. There is still no progress-percentage column here (§1.3).
+CREATE TABLE IF NOT EXISTS product_milestone_revision (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    milestone_id        INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    revision_number     INTEGER NOT NULL,
+    title               TEXT NOT NULL DEFAULT '',
+    target_state        TEXT NOT NULL DEFAULT '',   -- 到達状態
+    verification_method TEXT NOT NULL DEFAULT 'unavailable'
+                            CHECK (verification_method IN
+                                ('manual_review', 'runtime_observation',
+                                 'external_report', 'unavailable')),
+    verification_note   TEXT NOT NULL DEFAULT '',
+    sequence_hint       INTEGER NOT NULL DEFAULT 0,  -- 表示順のみ。達成の前提ではない
+    summary             TEXT NOT NULL DEFAULT '',
+    content_digest      TEXT NOT NULL,
+    authored_by_kind    TEXT NOT NULL DEFAULT 'developer'
+                            CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method     TEXT NOT NULL DEFAULT 'manual'
+                            CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id INTEGER,
+    change_note         TEXT NOT NULL DEFAULT '',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    superseded_by_id    INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'product-milestone-revision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (milestone_id) REFERENCES product_milestone (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_milestone_revision (id) ON DELETE SET NULL,
+    UNIQUE (milestone_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_milestone_revision_system
+    ON product_milestone_revision (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_milestone_revision_milestone
+    ON product_milestone_revision (milestone_id, id DESC);
+
+-- product_milestone_dependency: an append-only, human-decided ORDERING
+-- between Milestones -- never an achievement gate (§4.4's "依存は順序であって
+-- 前提条件ではない"). A Milestone whose `depends_on_milestone_id` is not yet
+-- `met` can still itself be assessed `met`; this table only explains display
+-- order and blast radius. Cycle/self-reference checks
+-- (`product_milestone_dependency_self` / `_cycle`) walk the currently-active
+-- link graph with a visited-set iteration in `app/product_objective.py`, the
+-- same discipline as the Objective parent link above.
+CREATE TABLE IF NOT EXISTS product_milestone_dependency (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                INTEGER NOT NULL,
+    milestone_id             INTEGER NOT NULL,
+    depends_on_milestone_id  INTEGER NOT NULL,
+    rationale                TEXT NOT NULL DEFAULT '',
+    decision_method          TEXT NOT NULL DEFAULT 'manual'
+                                 CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    created_by               TEXT,
+    created_at               REAL NOT NULL,
+    superseded_by_id         INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (milestone_id) REFERENCES product_milestone (id) ON DELETE CASCADE,
+    FOREIGN KEY (depends_on_milestone_id)
+        REFERENCES product_milestone (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_milestone_dependency (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_milestone_dependency_system
+    ON product_milestone_dependency (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_milestone_dependency_milestone
+    ON product_milestone_dependency (milestone_id, id DESC);
+
+-- A currently-active dependency edge is unique per (milestone, depends_on)
+-- pair -- same partial-index idiom as the Objective parent link, chosen for
+-- the same append-only-correction reason.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_milestone_dependency_current
+    ON product_milestone_dependency (milestone_id, depends_on_milestone_id)
+    WHERE superseded_by_id IS NULL;
+
+-- product_milestone_decision: the DEFINITION-confirmation ledger
+-- `design_status` folds from (§4.3) -- confirm/reject/retire/reinstate, the
+-- same `ProductDesignStatus` vocabulary as the Objective's own confirmation
+-- axis but a SEPARATE table, because a Milestone's definition being settled
+-- and a Milestone being ACHIEVED are independently-moving facts (§1.3).
+-- `decision_method` is CHECKed to the single literal `'manual'` for the same
+-- reason `product_objective_decision` is. `product_milestone_assessment`
+-- below refuses to accept an assessment while `design_status != 'confirmed'`
+-- (422 `product_milestone_not_assessable`, enforced in
+-- `app/product_objective.py`) -- recording "achieved" against an
+-- unconfirmed definition cannot say what was achieved.
+CREATE TABLE IF NOT EXISTS product_milestone_decision (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    milestone_id         INTEGER NOT NULL,
+    milestone_key        TEXT NOT NULL,
+    decision             TEXT NOT NULL CHECK (decision IN
+                             ('confirm', 'reject', 'retire', 'reinstate')),
+    rationale            TEXT NOT NULL DEFAULT '',
+    captured_digest      TEXT NOT NULL DEFAULT '',
+    captured_revision_id INTEGER,
+    decision_method      TEXT NOT NULL DEFAULT 'manual'
+                             CHECK (decision_method = 'manual'),
+    decided_by           TEXT,
+    superseded_by_id     INTEGER,
+    created_at           REAL NOT NULL,
+    schema_version       TEXT NOT NULL DEFAULT 'product-milestone-decision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (milestone_id) REFERENCES product_milestone (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_milestone_decision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_milestone_decision_system
+    ON product_milestone_decision (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_milestone_decision_milestone
+    ON product_milestone_decision (milestone_id, id DESC);
+
+-- product_milestone_assessment: the ACHIEVEMENT ledger `achievement` folds
+-- from -- a table deliberately separate from `product_milestone_decision`
+-- above (§1.3 / §4.2's central split). `indeterminate` ("a human looked and
+-- could not tell") is a real, distinct outcome from the DEFAULT
+-- `unassessed` ("nobody has looked yet") -- collapsing them would erase the
+-- difference between "no verdict exists" and "a verdict was attempted and
+-- came back inconclusive" (§0 invariant 8's `unknown`/`unavailable` split,
+-- applied here to assessment). `evidence_note` is a free-text description of
+-- what a HUMAN saw; nothing in this schema lets a runtime trace, an
+-- Experiment result, or a Replay match insert a row here automatically --
+-- achievement is a `decision_method='manual'` judgement call end to end
+-- (§0 invariant 6, §6).
+CREATE TABLE IF NOT EXISTS product_milestone_assessment (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    milestone_id         INTEGER NOT NULL,
+    milestone_key        TEXT NOT NULL,
+    assessment           TEXT NOT NULL CHECK (assessment IN
+                             ('met', 'not_met', 'indeterminate', 'withdraw')),
+    rationale            TEXT NOT NULL DEFAULT '',
+    evidence_note        TEXT NOT NULL DEFAULT '',
+    captured_digest      TEXT NOT NULL DEFAULT '',
+    captured_revision_id INTEGER,
+    decision_method      TEXT NOT NULL DEFAULT 'manual'
+                             CHECK (decision_method = 'manual'),
+    assessed_by          TEXT,
+    superseded_by_id     INTEGER,
+    created_at           REAL NOT NULL,
+    schema_version       TEXT NOT NULL DEFAULT 'product-milestone-assessment-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (milestone_id) REFERENCES product_milestone (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_milestone_assessment (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_milestone_assessment_system
+    ON product_milestone_assessment (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_milestone_assessment_milestone
+    ON product_milestone_assessment (milestone_id, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- product_gap: identity row. Belonging to a Milestone lives on the identity
+-- row, NOT NULL and unchangeable, for the same "belonging changes the
+-- subject" reason `product_milestone.objective_id` does (§5.2). A Gap
+-- carries NO `severity` column and NO `score` column anywhere in this group
+-- of tables -- that is a STRUCTURAL guarantee, not a review convention
+-- (§0 invariant 7, §5.1): severity lives with each detector in its own
+-- vocabulary and is surfaced read-time, WITH PROVENANCE, never normalized
+-- into one number (#380 superset rule). The SAME detected fact
+-- (`source_kind` + `source_ref`) may legitimately back Gap rows under
+-- DIFFERENT Milestones (§5.2) -- that is not duplication, it is "the same
+-- fact means something different against two different goals", and it is
+-- why uniqueness below is scoped to one Gap's OWN source refs
+-- (`ux_product_gap_source_current`), never to the source fact globally.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS product_gap (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    gap_key             TEXT NOT NULL,
+    milestone_id        INTEGER NOT NULL,
+    current_revision_id INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'product-gap-v1',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (milestone_id) REFERENCES product_milestone (id) ON DELETE CASCADE,
+    FOREIGN KEY (current_revision_id)
+        REFERENCES product_gap_revision (id) ON DELETE SET NULL,
+    UNIQUE (system_id, gap_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_system
+    ON product_gap (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_milestone
+    ON product_gap (milestone_id, id DESC);
+
+-- product_gap_revision: current state / target state / interpretation --
+-- three of the Gap's six independent axes (§5.1); the other three
+-- (source/priority/lifecycle) live in the tables below. `target_state_mode`
+-- (`own` / `inherited_from_milestone` / `unknown`) keeps "the Gap declares
+-- its own target" and "the Gap borrows the Milestone's target verbatim,
+-- resolved at read time, never copied" and "nobody has decided yet"
+-- (§0 invariant 8) as three distinct facts rather than collapsing an unset
+-- target and an inherited one into the same empty string.
+-- `suggested_priority_note` is a PLAIN TEXT slot for an AI's priority
+-- suggestion -- never the priority itself, which can only be set by a human
+-- `product_gap_decision(decision='prioritize')` row (§5.7) -- and is
+-- deliberately EXCLUDED from `content_digest` (§8): the AI updating its own
+-- suggestion must not stale a human's confirmed reading of the Gap.
+CREATE TABLE IF NOT EXISTS product_gap_revision (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    gap_id                 INTEGER NOT NULL,
+    system_id              INTEGER NOT NULL,
+    revision_number        INTEGER NOT NULL,
+    title                  TEXT NOT NULL DEFAULT '',
+    current_state          TEXT NOT NULL DEFAULT '',
+    target_state           TEXT NOT NULL DEFAULT '',
+    target_state_mode      TEXT NOT NULL DEFAULT 'unknown'
+                               CHECK (target_state_mode IN
+                                   ('own', 'inherited_from_milestone', 'unknown')),
+    interpretation         TEXT NOT NULL DEFAULT '',
+    suggested_priority_note TEXT NOT NULL DEFAULT '',
+    content_digest         TEXT NOT NULL,
+    authored_by_kind       TEXT NOT NULL DEFAULT 'developer'
+                               CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method        TEXT NOT NULL DEFAULT 'manual'
+                               CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id    INTEGER,
+    change_note            TEXT NOT NULL DEFAULT '',
+    created_by             TEXT,
+    created_at             REAL NOT NULL,
+    superseded_by_id       INTEGER,
+    schema_version         TEXT NOT NULL DEFAULT 'product-gap-revision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (gap_id) REFERENCES product_gap (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_gap_revision (id) ON DELETE SET NULL,
+    UNIQUE (gap_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_revision_system
+    ON product_gap_revision (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_revision_gap
+    ON product_gap_revision (gap_id, id DESC);
+
+-- product_gap_source_ref: the FOURTH axis, "where was this detected"
+-- (§5.4). No body/severity/evidence column exists here -- structurally
+-- forbidden, the same way `ux_journey_upstream_ref` holds no copy of a
+-- Purpose claim's text -- because the whole point of federation (#430) is
+-- that the one canonical detector for each finite `source_kind` stays the
+-- single source of truth and this row only PINS a re-resolvable reference to
+-- it. `source_ref` must be a reference that SURVIVES a rebuild
+-- (`capability_drift` uses `(path, qualified_name)`, never
+-- `capability_hierarchy_nodes.id`, which a hierarchy rebuild reassigns;
+-- `runtime_alignment_mismatch` uses #321's `review_subject_id`, never
+-- `alignment_item.id`, which an Alignment rebuild reassigns -- §5.4's
+-- table). `captured_snapshot_id` / `captured_run_id` / `captured_revision_id`
+-- are PINS the resolver needs to re-read the same point in time, not
+-- content, so unlike an ownership column they carry no FK here -- the same
+-- convention `product_gap_evidence_ref.captured_snapshot_id` below follows.
+CREATE TABLE IF NOT EXISTS product_gap_source_ref (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    gap_id              INTEGER NOT NULL,
+    source_kind         TEXT NOT NULL CHECK (source_kind IN
+                            ('manual', 'system_understanding_gap',
+                             'understanding_review_gap', 'understanding_claim_change',
+                             'functional_lineage_gap', 'value_network_notice',
+                             'journey_baseline_diff', 'requirement_diff',
+                             'capability_drift', 'runtime_alignment_mismatch',
+                             'node_anomaly', 'joint_understanding_open',
+                             'inquiry_unresolved', 'issue_draft')),
+    source_ref          TEXT NOT NULL DEFAULT '',
+    captured_digest     TEXT NOT NULL DEFAULT '',
+    captured_snapshot_id INTEGER,
+    captured_run_id     INTEGER,
+    captured_revision_id INTEGER,
+    note                TEXT NOT NULL DEFAULT '',
+    decision_method     TEXT NOT NULL DEFAULT 'manual'
+                            CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    superseded_by_id    INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (gap_id) REFERENCES product_gap (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_gap_source_ref (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_source_ref_system
+    ON product_gap_source_ref (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_source_ref_gap
+    ON product_gap_source_ref (gap_id, id DESC);
+
+-- The same (source_kind, source_ref) may not appear twice as CURRENTLY
+-- ACTIVE source refs on the SAME Gap (409 `product_gap_source_duplicate`,
+-- §5.2) -- again a partial index over `superseded_by_id IS NULL`, the
+-- append-only-correction idiom used throughout this file.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_gap_source_current
+    ON product_gap_source_ref (gap_id, source_kind, source_ref)
+    WHERE superseded_by_id IS NULL;
+
+-- product_gap_evidence_ref: a pointer to what a human actually looked at
+-- (trace / experiment / replay run / report / repository path) when forming
+-- their reading of the Gap. Like `product_gap_source_ref`, this stores a
+-- REFERENCE plus a capture-time pin, never the evidence's own body.
+CREATE TABLE IF NOT EXISTS product_gap_evidence_ref (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    gap_id           INTEGER NOT NULL,
+    evidence_kind    TEXT NOT NULL CHECK (evidence_kind IN
+                         ('trace', 'experiment', 'replay_run', 'human_report',
+                          'external_report', 'repository_path', 'other')),
+    evidence_ref     TEXT NOT NULL,
+    captured_snapshot_id INTEGER,
+    note             TEXT NOT NULL DEFAULT '',
+    decision_method  TEXT NOT NULL DEFAULT 'manual'
+                         CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by       TEXT,
+    created_at       REAL NOT NULL,
+    superseded_by_id INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (gap_id) REFERENCES product_gap (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_gap_evidence_ref (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_evidence_ref_system
+    ON product_gap_evidence_ref (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_evidence_ref_gap
+    ON product_gap_evidence_ref (gap_id, id DESC);
+
+-- product_gap_artifact_link: the Gap's DOWNSTREAM externalization/execution
+-- candidates -- Issue Draft lands HERE, never in `product_gap_source_ref`
+-- (§1.5): an Issue Draft is something a Gap PRODUCES, not something a Gap
+-- was DETECTED FROM. The one documented exception is a Gap deliberately
+-- opened FROM an existing Issue Draft, which uses
+-- `product_gap_source_ref(source_kind='issue_draft')` instead -- the same
+-- row's id can legitimately appear as an upstream source for one Gap and a
+-- downstream artifact for another, and which one applies is recorded by
+-- which TABLE the link lives in, never inferred (§1.5). Closing the linked
+-- Issue Draft does NOT resolve the Gap automatically (§6) -- there is no
+-- trigger or foreign-key cascade here that could do that.
+-- `ux_journey` is deliberately NOT a valid `link_kind` (§5.11): a Gap's
+-- Journey connection lives ONLY in `ux_journey_upstream_ref
+-- (ref_kind='product_gap')`, so it can be written and read from exactly one
+-- place instead of two tables silently disagreeing.
+CREATE TABLE IF NOT EXISTS product_gap_artifact_link (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    gap_id           INTEGER NOT NULL,
+    link_kind        TEXT NOT NULL CHECK (link_kind IN
+                         ('issue_draft', 'ux_requirement',
+                          'product_feature', 'solution_design')),
+    target_ref       TEXT NOT NULL,
+    target_row_id    INTEGER,
+    captured_digest  TEXT NOT NULL DEFAULT '',
+    note             TEXT NOT NULL DEFAULT '',
+    decision_method  TEXT NOT NULL DEFAULT 'manual'
+                         CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by       TEXT,
+    created_at       REAL NOT NULL,
+    superseded_by_id INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (gap_id) REFERENCES product_gap (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_gap_artifact_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_artifact_link_system
+    ON product_gap_artifact_link (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_artifact_link_gap
+    ON product_gap_artifact_link (gap_id, id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_gap_artifact_current
+    ON product_gap_artifact_link (gap_id, link_kind, target_ref)
+    WHERE superseded_by_id IS NULL;
+
+-- product_gap_decision: the human-only ledger BOTH `lifecycle` (open /
+-- acknowledged / deferred / resolved / rejected / obsolete) AND
+-- `priority_band` fold from -- two of the Gap's six axes, on ONE table,
+-- because both are exclusively human judgement calls (§5.6, §5.7).
+-- `priority_band` only carries meaning on a `decision='prioritize'` row
+-- (which never moves `lifecycle`, §5.6's fold table); `priority_band` is
+-- read from the LATEST non-superseded `prioritize` row regardless of what
+-- lifecycle decisions came after, so a `resolved` Gap still shows the last
+-- band a human placed on it (audit, §5.9). There is no numeric score column
+-- here (§0 invariant 7) -- `priority_band` is one of exactly four finite
+-- values a human places, never a computed rank. `decision_method` is
+-- CHECKed to the single literal `'manual'` for the same reason every other
+-- `*_decision` table in this group is.
+CREATE TABLE IF NOT EXISTS product_gap_decision (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    gap_id               INTEGER NOT NULL,
+    gap_key              TEXT NOT NULL,
+    decision             TEXT NOT NULL CHECK (decision IN
+                             ('acknowledge', 'defer', 'resolve', 'reject',
+                              'retire', 'reopen', 'prioritize')),
+    priority_band        TEXT NOT NULL DEFAULT 'unset'
+                             CHECK (priority_band IN ('unset', 'watch', 'next', 'now')),
+    rationale            TEXT NOT NULL DEFAULT '',
+    captured_digest      TEXT NOT NULL DEFAULT '',
+    captured_revision_id INTEGER,
+    decision_method      TEXT NOT NULL DEFAULT 'manual'
+                             CHECK (decision_method = 'manual'),
+    decided_by           TEXT,
+    superseded_by_id     INTEGER,
+    created_at           REAL NOT NULL,
+    schema_version       TEXT NOT NULL DEFAULT 'product-gap-decision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (gap_id) REFERENCES product_gap (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_gap_decision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_decision_system
+    ON product_gap_decision (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_decision_gap
+    ON product_gap_decision (gap_id, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- product_feature (Issue #431, contract §7.2). §7.2 specifies Feature's
+-- RESPONSIBILITIES (identity + revision + five link kinds) but not its DDL;
+-- the tables below derive mechanically from the exact same shape
+-- conventions as the Objective tables above (§4.5) -- identity row with a
+-- developer-supplied slug and a denormalized `current_revision_id`,
+-- append-only revision with a meaning-only `content_digest`, and a
+-- `decision_method = 'manual'`-CHECKed decision ledger `design_status`
+-- folds from. Feature is explicitly a SEPARATE entity from Flow / Component
+-- / Capability (§0 invariant 2: "Feature を Flow / Component / Capability
+-- として扱わない -- Feature は Requirement を満たす機能単位"), so it links to
+-- them rather than borrowing their identity.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS product_feature (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    feature_key         TEXT NOT NULL,
+    current_revision_id INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'product-feature-v1',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (current_revision_id)
+        REFERENCES product_feature_revision (id) ON DELETE SET NULL,
+    UNIQUE (system_id, feature_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_system
+    ON product_feature (system_id, id DESC);
+
+-- product_feature_revision: content, digested over `title, statement,
+-- rationale, scope_note, summary` (§8's pattern applied to Feature, which
+-- §8's own table does not enumerate but which follows the same
+-- "meaning-bearing fields only, never created_by/created_at/revision_number/
+-- change_note" rule every other revision table in this file uses).
+CREATE TABLE IF NOT EXISTS product_feature_revision (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature_id          INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    revision_number     INTEGER NOT NULL,
+    title               TEXT NOT NULL DEFAULT '',
+    statement           TEXT NOT NULL DEFAULT '',
+    rationale           TEXT NOT NULL DEFAULT '',
+    scope_note          TEXT NOT NULL DEFAULT '',
+    summary             TEXT NOT NULL DEFAULT '',
+    content_digest      TEXT NOT NULL,
+    authored_by_kind    TEXT NOT NULL DEFAULT 'developer'
+                            CHECK (authored_by_kind IN ('developer', 'reasoning_model')),
+    decision_method     TEXT NOT NULL DEFAULT 'manual'
+                            CHECK (decision_method IN ('manual', 'reasoning_llm')),
+    intelligence_run_id INTEGER,
+    change_note         TEXT NOT NULL DEFAULT '',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    superseded_by_id    INTEGER,
+    schema_version      TEXT NOT NULL DEFAULT 'product-feature-revision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (feature_id) REFERENCES product_feature (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_feature_revision (id) ON DELETE SET NULL,
+    UNIQUE (feature_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_revision_system
+    ON product_feature_revision (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_revision_feature
+    ON product_feature_revision (feature_id, id DESC);
+
+-- product_feature_requirement_link: MANY-TO-MANY to `ux_requirement`, the
+-- same cardinality `solution_design_requirement_link` already uses one
+-- entity over -- one Feature legitimately satisfies several Requirements and
+-- one Requirement is legitimately satisfied by several Features. `requirement_id`
+-- is a denormalized pointer resolved at READ time against the Requirement's
+-- CURRENT revision; `requirement_key` (the stable slug) is the row's
+-- identity-bearing reference and survives `requirement_id` going NULL if the
+-- Requirement identity row itself is ever removed, the same "key survives,
+-- row pointer is best-effort" split `product_objective_upstream_ref` uses
+-- between `target_ref` and `target_row_id`. `captured_requirement_revision_id`
+-- + `captured_digest` are the capture-time pin that lets a later
+-- Requirement revision degrade this link to `stale` without mutating it
+-- (§6's "Journey / Requirement / Feature / Solution が動く -> その
+-- `*_upstream_ref` / link が stale").
+CREATE TABLE IF NOT EXISTS product_feature_requirement_link (
+    id                                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                         INTEGER NOT NULL,
+    feature_id                        INTEGER NOT NULL,
+    requirement_key                   TEXT NOT NULL,
+    requirement_id                    INTEGER,
+    captured_requirement_revision_id  INTEGER,
+    captured_digest                   TEXT NOT NULL DEFAULT '',
+    note                              TEXT NOT NULL DEFAULT '',
+    decision_method                   TEXT NOT NULL DEFAULT 'manual'
+                                          CHECK (decision_method IN
+                                              ('manual', 'reasoning_llm', 'deterministic')),
+    created_by                        TEXT,
+    created_at                        REAL NOT NULL,
+    superseded_by_id                  INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (feature_id) REFERENCES product_feature (id) ON DELETE CASCADE,
+    FOREIGN KEY (requirement_id) REFERENCES ux_requirement (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_feature_requirement_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_requirement_link_system
+    ON product_feature_requirement_link (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_requirement_link_feature
+    ON product_feature_requirement_link (feature_id, id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_feature_requirement_current
+    ON product_feature_requirement_link (feature_id, requirement_key)
+    WHERE superseded_by_id IS NULL;
+
+-- product_feature_capability_link: an EXPLICIT link to
+-- `understanding_capability_entity` (#312's current head) -- Feature and
+-- Capability stay separate entities (§1.2, §0 invariant 2) and this table is
+-- the ONLY connection between them; a Feature is never inferred to "belong
+-- to" a Capability by name similarity (§7.2's "Feature 名や説明の類似から
+-- 自動 link しない"). `target_ref` carries the Capability's id as a decimal
+-- string (§4.6's `capability_entity` row, reused verbatim), and
+-- `capability_entity_id` is the same value as a denormalized FK for joins --
+-- resolution at read time still goes through `target_ref` first.
+CREATE TABLE IF NOT EXISTS product_feature_capability_link (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    feature_id            INTEGER NOT NULL,
+    capability_entity_id  INTEGER,
+    target_ref            TEXT NOT NULL,
+    captured_digest       TEXT NOT NULL DEFAULT '',
+    note                  TEXT NOT NULL DEFAULT '',
+    decision_method       TEXT NOT NULL DEFAULT 'manual'
+                              CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by            TEXT,
+    created_at            REAL NOT NULL,
+    superseded_by_id      INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (feature_id) REFERENCES product_feature (id) ON DELETE CASCADE,
+    FOREIGN KEY (capability_entity_id)
+        REFERENCES understanding_capability_entity (id) ON DELETE SET NULL,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_feature_capability_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_capability_link_system
+    ON product_feature_capability_link (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_capability_link_feature
+    ON product_feature_capability_link (feature_id, id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_feature_capability_current
+    ON product_feature_capability_link (feature_id, target_ref)
+    WHERE superseded_by_id IS NULL;
+
+-- product_feature_target_link: the Feature's DOWNSTREAM implementation
+-- target -- Solution Design / Evolution Node / Component / Probe Point /
+-- static or runtime Flow / Experiment / Replay run / Outcome criterion
+-- (`ProductFeatureLinkKind`, §7.2). `link_kind` varies across many
+-- unrelated canonical tables, so unlike the Requirement/Capability links
+-- above there is no single FK target -- `target_row_id` is a best-effort
+-- denormalized pointer only, resolved by the kind-specific resolver
+-- (`solution_design._resolve_target` / `node_design._resolve_capability` /
+-- `_resolve_flow`, REUSED rather than reimplemented, §7.2) against
+-- `target_ref` at read time, the same no-FK convention
+-- `product_gap_artifact_link.target_row_id` uses one table group over.
+-- `captured_snapshot_id` pins the snapshot the reference was captured
+-- against, for kinds whose resolution depends on which snapshot is current
+-- (e.g. `static_flow`).
+CREATE TABLE IF NOT EXISTS product_feature_target_link (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    feature_id            INTEGER NOT NULL,
+    link_kind             TEXT NOT NULL CHECK (link_kind IN
+                              ('solution_design', 'evolution_node', 'component',
+                               'probe_point', 'static_flow', 'runtime_flow',
+                               'experiment', 'replay_run', 'purpose_outcome_criterion')),
+    target_ref            TEXT NOT NULL,
+    target_row_id         INTEGER,
+    captured_digest       TEXT NOT NULL DEFAULT '',
+    captured_snapshot_id  INTEGER,
+    note                  TEXT NOT NULL DEFAULT '',
+    decision_method       TEXT NOT NULL DEFAULT 'manual'
+                              CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by            TEXT,
+    created_at            REAL NOT NULL,
+    superseded_by_id      INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (feature_id) REFERENCES product_feature (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_feature_target_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_target_link_system
+    ON product_feature_target_link (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_target_link_feature
+    ON product_feature_target_link (feature_id, id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_feature_target_current
+    ON product_feature_target_link (feature_id, link_kind, target_ref)
+    WHERE superseded_by_id IS NULL;
+
+-- product_feature_draft_link: the bridge to the existing, SNAPSHOT-BOUND
+-- `feature_drafts` (#23-#26) -- `product_feature` does NOT replace
+-- `feature_drafts` and the Feature Map screen's generation path is
+-- unchanged (§1.6). `feature_draft_ref` holds `feature_drafts.feature_id`'s
+-- own value VERBATIM (that column is a run-scoped TEXT identifier, not a row
+-- id, so it carries no FK here); `captured_snapshot_id` disambiguates which
+-- snapshot's draft is meant, since a fresh snapshot re-creates
+-- `feature_drafts` rows under the same `feature_id` text. Re-running Feature
+-- Intelligence over a new snapshot never breaks `product_feature`'s own
+-- identity or history -- this link simply becomes `unresolved` for the old
+-- snapshot's draft (§1.6's "link が unresolved になるだけである") -- and the
+-- draft's own body is never copied onto this row or onto `product_feature`.
+CREATE TABLE IF NOT EXISTS product_feature_draft_link (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    feature_id            INTEGER NOT NULL,
+    feature_draft_ref     TEXT NOT NULL,
+    captured_snapshot_id  INTEGER,
+    captured_digest       TEXT NOT NULL DEFAULT '',
+    note                  TEXT NOT NULL DEFAULT '',
+    decision_method       TEXT NOT NULL DEFAULT 'manual'
+                              CHECK (decision_method IN ('manual', 'reasoning_llm', 'deterministic')),
+    created_by            TEXT,
+    created_at            REAL NOT NULL,
+    superseded_by_id      INTEGER,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (feature_id) REFERENCES product_feature (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_feature_draft_link (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_draft_link_system
+    ON product_feature_draft_link (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_draft_link_feature
+    ON product_feature_draft_link (feature_id, id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_feature_draft_current
+    ON product_feature_draft_link (feature_id, feature_draft_ref, captured_snapshot_id)
+    WHERE superseded_by_id IS NULL;
+
+-- product_feature_decision: the human-only confirmation ledger
+-- `design_status` folds from -- the same `ProductDesignStatus` vocabulary
+-- and the same shape as `product_milestone_decision` above, scoped to
+-- Feature instead of Milestone. `decision_method` is CHECKed to the single
+-- literal `'manual'` for the same reason every other `*_decision` table in
+-- this group is: an AI-proposed Feature revision cannot confirm, reject,
+-- retire, or reinstate itself.
+CREATE TABLE IF NOT EXISTS product_feature_decision (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    feature_id           INTEGER NOT NULL,
+    feature_key          TEXT NOT NULL,
+    decision             TEXT NOT NULL CHECK (decision IN
+                             ('confirm', 'reject', 'retire', 'reinstate')),
+    rationale            TEXT NOT NULL DEFAULT '',
+    captured_digest      TEXT NOT NULL DEFAULT '',
+    captured_revision_id INTEGER,
+    decision_method      TEXT NOT NULL DEFAULT 'manual'
+                             CHECK (decision_method = 'manual'),
+    decided_by           TEXT,
+    superseded_by_id     INTEGER,
+    created_at           REAL NOT NULL,
+    schema_version       TEXT NOT NULL DEFAULT 'product-feature-decision-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (feature_id) REFERENCES product_feature (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_feature_decision (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_decision_system
+    ON product_feature_decision (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_product_feature_decision_feature
+    ON product_feature_decision (feature_id, id DESC);
+
 """
 
 
@@ -7891,6 +8926,72 @@ def _migrate_solution_design_option_unique(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_ux_journey_upstream_ref_kinds(conn: sqlite3.Connection) -> None:
+    """Widen `ux_journey_upstream_ref.ref_kind` to accept Product Objective /
+    Milestone / Gap references (Issue #427/#431,
+    docs/product-objective-lineage.md §7.1).
+
+    The table shipped with `ref_kind` CHECKed to exactly `purpose_element` /
+    `purpose_relation` / `capability_entity`. This Epic adds three more
+    values (`product_objective` / `product_milestone` / `product_gap`) so a
+    Journey can name the Objective/Milestone/Gap it exists to address.
+    SQLite cannot ALTER a CHECK constraint in place, and
+    `CREATE TABLE IF NOT EXISTS` cannot repair a table that already exists in
+    its earlier form, so the table is rebuilt once, preserving every existing
+    row and every existing `ref_kind` value unchanged -- this is a pure
+    VOCABULARY widening, never a row rewrite (§7.1's "全行がそのまま入り、
+    ref_kind の値は 1 つも変わらない").
+
+    Detection is STRUCTURAL and idempotent, the same discipline
+    `_migrate_solution_design_option_unique` uses one migration up: read the
+    table's stored SQL straight from `sqlite_master` and no-op the moment the
+    CHECK already contains `'product_gap'` (the last of the three new
+    values). There is no version flag to drift from the schema it describes.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'ux_journey_upstream_ref'"
+    ).fetchone()
+    if row is None or row["sql"] is None:
+        return
+    if "'product_gap'" in row["sql"]:
+        return
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE ux_journey_upstream_ref RENAME TO ux_journey_upstream_ref_legacy;
+        -- A rename carries the table's indexes with it, so their NAMES stay
+        -- taken and the DDL's `CREATE INDEX IF NOT EXISTS` below would
+        -- silently do nothing -- leaving the rebuilt table with no index at
+        -- all, which is worse than the old one being stale. Free the name
+        -- first, the same reason `_migrate_solution_design_option_unique`
+        -- drops its table's indexes before rebuilding.
+        DROP INDEX IF EXISTS idx_ux_journey_upstream_ref_journey;
+        """
+    )
+    conn.executescript(_UX_JOURNEY_UPSTREAM_REF_DDL)
+    conn.execute(
+        """
+        INSERT INTO ux_journey_upstream_ref (
+            id, system_id, journey_id, ref_kind, target_ref, target_row_id,
+            captured_digest, captured_session_id, note, decision_method,
+            created_by, created_at, superseded_by_id
+        )
+        SELECT
+            id, system_id, journey_id, ref_kind, target_ref, target_row_id,
+            captured_digest, captured_session_id, note, decision_method,
+            created_by, created_at, superseded_by_id
+        FROM ux_journey_upstream_ref_legacy
+        """
+    )
+    conn.executescript(
+        """
+        DROP TABLE ux_journey_upstream_ref_legacy;
+        PRAGMA foreign_keys = ON;
+        """
+    )
+
+
 def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
@@ -7898,6 +8999,7 @@ def init_db() -> None:
         _migrate_canonical_execution_authorization(conn)
         _migrate_flow_execution_ref_uniqueness(conn)
         _migrate_solution_design_option_unique(conn)
+        _migrate_ux_journey_upstream_ref_kinds(conn)
         _migrate_intelligence_runs_snapshot_nullable(conn)
         install_intelligence_run_type_guards(conn)
         _migrate_cell_improvement_event_types(conn)
