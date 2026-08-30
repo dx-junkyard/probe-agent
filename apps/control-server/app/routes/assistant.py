@@ -20,10 +20,12 @@ probe-agent:
 from __future__ import annotations
 
 import time
-from typing import Optional
+from dataclasses import asdict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from .. import assistant_discussion
 from ..assistant import (
     answer_question,
     checks_for_screen,
@@ -32,13 +34,19 @@ from ..assistant import (
     REAL_PROVIDERS,
 )
 from ..assistant_discussion_context import build_screen_discussion_context
-from ..auth import get_system_id
+from ..auth import Principal, get_principal, get_system_id
+from ..db import get_conn
 from ..llm import LLMClient, LLMConfig, create_llm_client
 from ..models import (
     AssistantActionOut,
     AssistantAskOut,
     AssistantAskRequest,
     AssistantCitationOut,
+    AssistantDiscussionTargetIn,
+    AssistantDiscussionThreadDetailOut,
+    AssistantDiscussionThreadOut,
+    AssistantDiscussionThreadsListOut,
+    AssistantDiscussionTurnOut,
     AssistantScreenContextOut,
     AssistantSuggestedQuestionOut,
     DiagnosticLastObservedErrorOut,
@@ -55,6 +63,14 @@ from ..system_diagnostics import (
 from ..system_state import build_system_state
 
 router = APIRouter()
+
+
+def _principal_actor(principal: Principal) -> str:
+    """The authenticated audit identity for a write. Never a body-supplied
+    value -- mirrors `routes/ux_design.py`'s `_principal_actor`."""
+    if principal.username:
+        return principal.username
+    return f"user:{principal.user_id}"
 
 
 def _check_out(check: DiagnosticCheck) -> SystemDiagnosticCheckOut:
@@ -153,16 +169,139 @@ def _usable_llm_client(config: LLMConfig) -> Optional[LLMClient]:
     return create_llm_client(config)
 
 
+# --- Discussion threads (Issue #438) ------------------------------------------
+
+
+def _thread_out(row: Dict[str, Any]) -> AssistantDiscussionThreadOut:
+    return AssistantDiscussionThreadOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        thread_key=row["thread_key"],
+        scope=row["scope"],
+        screen_id=row["screen_id"],
+        target_kind=row["target_kind"],
+        target_ref=row["target_ref"],
+        target_title=row["target_title"] or "",
+        captured_target_revision_id=row["captured_target_revision_id"],
+        captured_target_digest=row["captured_target_digest"] or "",
+        status=row["status"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        schema_version=row["schema_version"],
+    )
+
+
+def _turn_out(row: Dict[str, Any]) -> AssistantDiscussionTurnOut:
+    return AssistantDiscussionTurnOut(
+        id=row["id"],
+        thread_id=row["thread_id"],
+        turn_number=row["turn_number"],
+        role=row["role"],
+        content=row["content"],
+        citations=[AssistantCitationOut(**c) for c in row.get("citations") or []],
+        target_revision_id=row.get("target_revision_id"),
+        target_digest=row.get("target_digest") or "",
+        used_fallback=bool(row.get("used_fallback")),
+        decision_method=row["decision_method"],
+        input_mode=row.get("input_mode") or "text",
+        provider=row.get("provider") or "",
+        model=row.get("model") or "",
+        prompt_version=row.get("prompt_version") or "",
+        schema_version=row.get("schema_version") or "assistant-discussion-turn-v1",
+        created_by=row.get("created_by"),
+        created_at=row["created_at"],
+    )
+
+
+def _thread_detail_out(data: Dict[str, Any]) -> AssistantDiscussionThreadDetailOut:
+    return AssistantDiscussionThreadDetailOut(
+        thread=_thread_out(data["thread"]),
+        target_state=data["target_state"],
+        turns=[_turn_out(t) for t in data["turns"]],
+    )
+
+
+@router.post("/assistant/discussion-threads", response_model=AssistantDiscussionThreadDetailOut)
+def create_or_resolve_discussion_thread(
+    payload: AssistantDiscussionTargetIn,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> AssistantDiscussionThreadDetailOut:
+    """§1.5: resolve-or-create, idempotent. `thread_key` (not a body-supplied
+    id) is the identity, so calling this twice for the same target returns
+    the SAME thread."""
+    try:
+        data = assistant_discussion.resolve_or_create_thread(
+            system_id,
+            scope=payload.scope,
+            screen_id=payload.screen_id,
+            target_kind=payload.target_kind,
+            target_ref=payload.target_ref,
+            created_by=_principal_actor(principal),
+        )
+    except assistant_discussion.DiscussionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _thread_detail_out(data)
+
+
+@router.get("/assistant/discussion-threads", response_model=AssistantDiscussionThreadsListOut)
+def list_discussion_threads(
+    screen_id: Optional[str] = None,
+    scope: Optional[str] = None,
+    target_kind: Optional[str] = None,
+    target_ref: Optional[str] = None,
+    system_id: int = Depends(get_system_id),
+) -> AssistantDiscussionThreadsListOut:
+    rows = assistant_discussion.list_threads(
+        system_id,
+        screen_id=screen_id,
+        scope=scope,
+        target_kind=target_kind,
+        target_ref=target_ref,
+    )
+    return AssistantDiscussionThreadsListOut(threads=[_thread_out(r) for r in rows])
+
+
+@router.get(
+    "/assistant/discussion-threads/{thread_id}",
+    response_model=AssistantDiscussionThreadDetailOut,
+)
+def get_discussion_thread(
+    thread_id: int,
+    system_id: int = Depends(get_system_id),
+) -> AssistantDiscussionThreadDetailOut:
+    data = assistant_discussion.get_thread(system_id, thread_id)
+    if data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    return _thread_detail_out(data)
+
+
 @router.post("/assistant/ask", response_model=AssistantAskOut)
 def assistant_ask(
     payload: AssistantAskRequest,
     system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
 ) -> AssistantAskOut:
     ctx = get_screen_context(payload.screen_id)
     if ctx is None:
         raise HTTPException(
             status_code=404, detail=f"Unknown screen id: {payload.screen_id}"
         )
+
+    thread_row: Optional[Dict[str, Any]] = None
+    thread_target_state: Optional[str] = None
+    if payload.thread_id is not None:
+        thread_data = assistant_discussion.get_thread(system_id, payload.thread_id)
+        if thread_data is None:
+            raise HTTPException(
+                status_code=404, detail=f"Unknown discussion thread id: {payload.thread_id}"
+            )
+        thread_row = thread_data["thread"]
+        thread_target_state = thread_data["target_state"]
+
     report = run_system_diagnostics(system_id)
     assessment = build_system_state(system_id)
     state_by_id = {item.state_id: item for item in assessment.items}
@@ -173,9 +312,55 @@ def assistant_ask(
         state_items.insert(0, state_by_id[focused_state_id])
     config = LLMConfig.intelligence_from_env()
     client = _usable_llm_client(config)
+
+    effective_route_params: Dict[str, str] = dict(payload.route_params)
+    conversation_messages = [message.model_dump() for message in payload.conversation]
+    if thread_row is not None:
+        # The thread's own target always grounds the context pack, even if
+        # the client's route_params drifted (§1.5: "thread の対象を...route
+        # params へ注入").
+        effective_route_params.update(
+            assistant_discussion.route_params_for_target(
+                thread_row["target_kind"], thread_row["target_ref"]
+            )
+        )
+        if thread_target_state in ("current", "not_tracked"):
+            # §1.3: bounded LLM context is only ever taken from a thread
+            # whose target still matches what was captured -- a stale or
+            # unresolvable thread's history stays readable but is never
+            # auto-inherited as current fact.
+            with get_conn() as conn:
+                recent = assistant_discussion.recent_turns(conn, thread_row["id"])
+            conversation_messages = [
+                {"role": t["role"], "content": t["content"]} for t in recent
+            ]
+        else:
+            conversation_messages = []
+
     discussion = build_screen_discussion_context(
-        payload.screen_id, system_id, payload.route_params
+        payload.screen_id, system_id, effective_route_params
     )
+    screen_data: Optional[Dict[str, Any]] = dict(discussion.facts) if discussion else None
+    screen_data_sources = list(discussion.sources) if discussion else []
+    if thread_row is not None:
+        if screen_data is None:
+            screen_data = {}
+        # The thread's own target facts, so the model knows what this
+        # conversation is scoped to, and a citable source id for it (§1.5).
+        screen_data["discussion_target"] = {
+            "scope": thread_row["scope"],
+            "target_kind": thread_row["target_kind"],
+            "target_ref": thread_row["target_ref"],
+            "target_title": thread_row["target_title"],
+            "target_state": thread_target_state,
+        }
+        screen_data_sources.append(
+            {
+                "id": f"discussion_target:{thread_row['target_kind']}:{thread_row['target_ref']}",
+                "title": f"Discussion target: {thread_row['target_title'] or thread_row['target_ref']}",
+            }
+        )
+
     result = answer_question(
         ctx,
         payload.question,
@@ -185,11 +370,61 @@ def assistant_ask(
         visible_check_ids=payload.visible_check_ids,
         state_items=state_items,
         focused_state_id=focused_state_id,
-        screen_data=discussion.facts if discussion else None,
-        screen_data_sources=discussion.sources if discussion else None,
-        route_params=payload.route_params,
-        conversation=[message.model_dump() for message in payload.conversation],
+        screen_data=screen_data,
+        screen_data_sources=screen_data_sources if screen_data is not None else None,
+        route_params=effective_route_params,
+        conversation=conversation_messages,
     )
+
+    thread_id_out: Optional[int] = None
+    turn_number_out: Optional[int] = None
+    recheck_required = False
+    if thread_row is not None:
+        # Re-resolve AFTER the LLM call (never hold a `get_conn()` across an
+        # external call) so what gets persisted reflects the target as of
+        # answering, not as of the read at the top of this request.
+        resolved = assistant_discussion.resolve_target(
+            system_id, thread_row["target_kind"], thread_row["target_ref"]
+        )
+        citations_payload = [asdict(c) for c in result.citations]
+        with get_conn() as conn:
+            conn.execute("BEGIN")
+            try:
+                assistant_discussion.append_turn(
+                    conn,
+                    system_id=system_id,
+                    thread_id=thread_row["id"],
+                    role="user",
+                    content=payload.question,
+                    decision_method="manual",
+                    created_by=_principal_actor(principal),
+                )
+                assistant_turn = assistant_discussion.append_turn(
+                    conn,
+                    system_id=system_id,
+                    thread_id=thread_row["id"],
+                    role="assistant",
+                    content=result.answer,
+                    citations=citations_payload,
+                    target_revision_id=resolved.revision_id,
+                    target_digest=resolved.digest,
+                    used_fallback=result.used_fallback,
+                    decision_method=result.decision_method,
+                    provider=result.provider,
+                    model=result.model,
+                    prompt_version=result.prompt_version,
+                )
+                assistant_discussion.touch_thread_captured_target(
+                    conn, thread_row["id"], resolved
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        thread_id_out = thread_row["id"]
+        turn_number_out = assistant_turn["turn_number"]
+        recheck_required = thread_target_state not in ("current", "not_tracked")
+
     return AssistantAskOut(
         screen_id=ctx.screen_id,
         answer=result.answer,
@@ -213,4 +448,8 @@ def assistant_ask(
         prompt_version=result.prompt_version,
         schema_version=result.schema_version,
         generated_at=time.time(),
+        thread_id=thread_id_out,
+        target_state=thread_target_state,
+        recheck_required=recheck_required,
+        turn_number=turn_number_out,
     )

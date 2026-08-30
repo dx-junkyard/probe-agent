@@ -79,6 +79,8 @@ import type {
   CapabilityContextOut,
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
+  AssistantDiscussionTargetIn, AssistantDiscussionThreadDetailOut, AssistantDiscussionThreadsListOut,
+  UiHelpEntriesOut, UiHelpEntry,
   ConnectivityStatusOut,
   InstrumentationScanOut, ProbePatternsListOut, ProbePatternOut,
   ProbePatternCreateRequest, ProbePatternReconciliationOut,
@@ -2404,10 +2406,92 @@ export function useAssistantSettingsMetadata() {
   });
 }
 
+// UI 機能解説モード (Issue #440, Epic #436). Static, code-managed registry --
+// no System scoping (same as settings metadata above), long staleTime since
+// the registry only changes with a deploy.
+
+export function useUiHelpEntries(screenId: string | null) {
+  return useQuery({
+    queryKey: ["ui-help-entries", screenId],
+    queryFn: () =>
+      api.get<UiHelpEntriesOut>(
+        screenId ? `/assistant/ui-help?screen_id=${encodeURIComponent(screenId)}` : "/assistant/ui-help",
+      ),
+    staleTime: 5 * 60_000,
+  });
+}
+
+export function useUiHelpEntry(helpId: string | null) {
+  return useQuery({
+    queryKey: ["ui-help-entry", helpId],
+    queryFn: () => api.get<UiHelpEntry>(`/assistant/ui-help/${encodeURIComponent(helpId ?? "")}`),
+    enabled: !!helpId,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+}
+
 export function useAssistantAsk() {
   return useMutation({
     mutationFn: (data: AssistantAskRequest) =>
       api.post<AssistantAskOut>("/assistant/ask", data),
+  });
+}
+
+// Assistant discussion threads (Issue #438, Epic #436): target-scoped
+// conversation persistence for the 4 discussion-enabled screens
+// (overview/interview/ux-design-studio/journey-blueprint). `thread_key`
+// (screen_id|scope|target_kind|target_ref), not `screen_id` alone, is the
+// identity -- switching the selected entity/element switches thread without
+// mixing another target's history (§1.2). `retry: false` so a caller can
+// detect a failed resolve and fall back to the pre-#438 in-memory
+// conversation (the safe migration path for non-discussion screens and for
+// any failure of this endpoint).
+
+export function useAssistantDiscussionThread(target: AssistantDiscussionTargetIn | null) {
+  return useQuery({
+    queryKey: [
+      ...sysKey("assistant-discussion-thread"),
+      target?.screen_id, target?.scope, target?.target_kind, target?.target_ref,
+    ],
+    queryFn: () =>
+      api.post<AssistantDiscussionThreadDetailOut>("/assistant/discussion-threads", target),
+    enabled: !!target && !!getSystemId(),
+    staleTime: 0,
+    retry: false,
+  });
+}
+
+export function useAssistantDiscussionThreadDetail(threadId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-thread-detail"), threadId],
+    queryFn: () =>
+      api.get<AssistantDiscussionThreadDetailOut>(`/assistant/discussion-threads/${threadId}`),
+    enabled: threadId !== null && !!getSystemId(),
+    staleTime: 0,
+    retry: false,
+  });
+}
+
+export function useAssistantDiscussionThreads(filters: {
+  screenId?: string;
+  scope?: string;
+  targetKind?: string;
+  targetRef?: string;
+} = {}) {
+  const params = new URLSearchParams();
+  if (filters.screenId) params.set("screen_id", filters.screenId);
+  if (filters.scope) params.set("scope", filters.scope);
+  if (filters.targetKind) params.set("target_kind", filters.targetKind);
+  if (filters.targetRef) params.set("target_ref", filters.targetRef);
+  const query = params.toString();
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-threads"), query],
+    queryFn: () =>
+      api.get<AssistantDiscussionThreadsListOut>(
+        query ? `/assistant/discussion-threads?${query}` : "/assistant/discussion-threads",
+      ),
+    enabled: !!getSystemId(),
   });
 }
 

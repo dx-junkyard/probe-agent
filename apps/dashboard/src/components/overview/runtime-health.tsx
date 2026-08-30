@@ -26,7 +26,7 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
 
   if (overview.degraded_sections.includes("runtime") || !runtime) {
     return (
-      <Card data-testid="overview-runtime-unavailable">
+      <Card data-testid="overview-runtime-unavailable" data-help-id="overview.runtime_health">
         <CardHeader>
           <CardTitle as="h2" className="text-lg">Runtime health</CardTitle>
         </CardHeader>
@@ -43,7 +43,7 @@ export function RuntimeHealthCard({ overview }: { overview: OverviewOut }) {
     runtime.transport_freshness === "receiving_now";
 
   return (
-    <Card data-testid="overview-runtime">
+    <Card data-testid="overview-runtime" data-help-id="overview.runtime_health">
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
         <CardTitle as="h2" className="text-lg">Runtime health</CardTitle>
         <Badge

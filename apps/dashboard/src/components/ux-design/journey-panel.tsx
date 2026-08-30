@@ -133,7 +133,7 @@ function JourneyList({
               sections={journeys.data?.degraded_sections ?? []}
               detail={journeys.data?.degraded_detail ?? {}}
             />
-            <ul className="space-y-1" data-testid="ux-journey-list">
+            <ul className="space-y-1" data-testid="ux-journey-list" data-help-id="ux-design-studio.journey.list">
               {sortJourneys(journeys.data?.journeys ?? []).map((j) => (
                 <li key={j.id}>
                   <button
@@ -313,7 +313,7 @@ function BaselineDiffCard({ journeyKey, baselineMode }: { journeyKey: string; ba
   const diff = useUxJourneyBaselineDiff(journeyKey);
 
   return (
-    <div className="space-y-2" data-testid="ux-journey-baseline-diff">
+    <div className="space-y-2" data-testid="ux-journey-baseline-diff" data-help-id="ux-design-studio.journey.baseline">
       <SectionHeading>現状(as-is)との比較</SectionHeading>
       {diff.isLoading ? (
         <LoadingBlock testId="ux-journey-baseline-diff-loading" />
@@ -518,7 +518,7 @@ function JourneyDetail({
   const steps = stepsInOrder(j.current_revision);
 
   return (
-    <div className="space-y-4" data-testid="ux-journey-detail">
+    <div className="space-y-4" data-testid="ux-journey-detail" data-help-id="ux-design-studio.journey.detail">
       <DegradedNote sections={j.degraded_sections} detail={j.degraded_detail} />
       <div className="flex flex-wrap items-center gap-2">
         <h2 className="font-mono text-base font-semibold">{j.journey_key}</h2>

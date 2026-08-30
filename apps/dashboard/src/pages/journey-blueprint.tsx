@@ -91,7 +91,7 @@ export default function JourneyBlueprintPage() {
     : "/functional-lineage";
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-help-id="journey-blueprint">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Journey Service Blueprint</h1>
@@ -106,7 +106,7 @@ export default function JourneyBlueprintPage() {
         </a>
       </div>
 
-      <Card>
+      <Card data-help-id="journey-blueprint.journey_select">
         <CardHeader>
           <CardTitle as="h2" className="text-base">
             Journey を選択
@@ -127,7 +127,7 @@ export default function JourneyBlueprintPage() {
             ))}
           </Select>
 
-          <div className="flex gap-2">
+          <div className="flex gap-2" data-help-id="journey-blueprint.view_toggle">
             <Button
               size="sm"
               variant={view === "blueprint" ? "default" : "outline"}
@@ -182,16 +182,20 @@ export default function JourneyBlueprintPage() {
                 </>
               ) : null
             ) : (
-              <BlueprintDiffPanel diff={diff.data} />
+              <div data-help-id="journey-blueprint.diff">
+                <BlueprintDiffPanel diff={diff.data} />
+              </div>
             )}
           </div>
 
           {view === "blueprint" ? (
-            <BlueprintDetailPane
-              stepKey={selected?.stepKey ?? null}
-              cell={selected?.cell ?? null}
-              onOpenRequirement={openRequirement}
-            />
+            <div data-help-id="journey-blueprint.detail_pane">
+              <BlueprintDetailPane
+                stepKey={selected?.stepKey ?? null}
+                cell={selected?.cell ?? null}
+                onOpenRequirement={openRequirement}
+              />
+            </div>
           ) : null}
         </div>
       )}

@@ -115,7 +115,7 @@ function RequirementList({
               sections={requirements.data?.degraded_sections ?? []}
               detail={requirements.data?.degraded_detail ?? {}}
             />
-            <ul className="space-y-1" data-testid="ux-requirement-list">
+            <ul className="space-y-1" data-testid="ux-requirement-list" data-help-id="ux-design-studio.requirement.list">
               {sortRequirements(requirements.data?.requirements ?? []).map((r) => (
                 <li key={r.id}>
                   <button
@@ -547,7 +547,7 @@ function RequirementDetail({
   const r = detail.data;
 
   return (
-    <div className="space-y-4" data-testid="ux-requirement-detail">
+    <div className="space-y-4" data-testid="ux-requirement-detail" data-help-id="ux-design-studio.requirement.detail">
       <DegradedNote sections={r.degraded_sections} detail={r.degraded_detail} />
       <div className="flex flex-wrap items-center gap-2">
         <h2 className="font-mono text-base font-semibold">{r.requirement_key}</h2>

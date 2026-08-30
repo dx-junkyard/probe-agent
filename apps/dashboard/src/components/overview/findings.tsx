@@ -119,7 +119,7 @@ export function FindingsCard({ overview }: { overview: OverviewOut }) {
   const hidden = overview.findings.length - initial.length;
 
   return (
-    <Card data-testid="overview-findings">
+    <Card data-testid="overview-findings" data-help-id="overview.findings">
       <CardHeader>
         <CardTitle as="h2" className="text-lg">今わかったこと</CardTitle>
       </CardHeader>

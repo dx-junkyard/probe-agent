@@ -73,7 +73,7 @@ export function PurposeFrameCard({ overview, question, questionState }: PurposeF
   }
 
   return (
-    <Card data-testid="overview-purpose-frame">
+    <Card data-testid="overview-purpose-frame" data-help-id="overview.purpose_frame">
       <CardHeader>
         <CardTitle as="h2" className="text-lg">目的の連鎖 (Purpose Chain)</CardTitle>
       </CardHeader>
@@ -147,6 +147,7 @@ export function PurposeFrameCard({ overview, question, questionState }: PurposeF
           <div
             className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm space-y-1 dark:border-amber-800 dark:bg-amber-950/20"
             data-testid="overview-purpose-question"
+            data-help-id="overview.purpose_frame.question"
           >
             <p className="font-medium">{question.prompt}</p>
             <p id={`overview-purpose-question-why-${question.need_id}`} className="text-muted-foreground">

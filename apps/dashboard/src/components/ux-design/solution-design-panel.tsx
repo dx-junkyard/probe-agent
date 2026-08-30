@@ -98,7 +98,7 @@ function SolutionDesignList({
               sections={designs.data?.degraded_sections ?? []}
               detail={designs.data?.degraded_detail ?? {}}
             />
-            <ul className="space-y-1" data-testid="ux-solution-design-list">
+            <ul className="space-y-1" data-testid="ux-solution-design-list" data-help-id="ux-design-studio.solution_design.list">
               {sortSolutionDesigns(designs.data?.designs ?? []).map((d) => (
                 <li key={d.id}>
                   <button
@@ -398,7 +398,7 @@ function HandoffSection({ designKey }: { designKey: string }) {
   const groups = evaluationPolicyGroups(h.evaluation_policy_refs);
 
   return (
-    <div className="space-y-3" data-testid="ux-solution-design-handoff">
+    <div className="space-y-3" data-testid="ux-solution-design-handoff" data-help-id="ux-design-studio.solution_design.handoff">
       <div className="flex items-center gap-2">
         <SectionHeading>採用案と実装対象(handoff)</SectionHeading>
         <StateBadge
@@ -470,7 +470,7 @@ function HandoffSection({ designKey }: { designKey: string }) {
         )}
       </div>
 
-      <div className="space-y-3" data-testid="ux-solution-design-evaluation-groups">
+      <div className="space-y-3" data-testid="ux-solution-design-evaluation-groups" data-help-id="ux-design-studio.solution_design.evaluation">
         <SectionHeading as="h4">評価(level ごとに分けて表示。合成しません)</SectionHeading>
         {groups.map((g) => (
           <div key={g.level} className="rounded border p-2" data-testid={`ux-solution-design-evaluation-${g.level}`}>
@@ -520,7 +520,7 @@ function SolutionDesignDetail({ designKey }: { designKey: string }) {
   const optionKeys = d.options.filter((o) => o.superseded_by_id === null).map((o) => o.option_key);
 
   return (
-    <div className="space-y-4" data-testid="ux-solution-design-detail">
+    <div className="space-y-4" data-testid="ux-solution-design-detail" data-help-id="ux-design-studio.solution_design.detail">
       <DegradedNote sections={d.degraded_sections} detail={d.degraded_detail} />
       <h2 className="font-mono text-base font-semibold">{d.design_key}</h2>
       {d.summary && <p className="text-sm text-muted-foreground">{d.summary}</p>}

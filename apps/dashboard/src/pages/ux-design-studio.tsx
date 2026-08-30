@@ -54,7 +54,7 @@ function NextDecisionCard({
   });
 
   return (
-    <Card data-testid="ux-design-next-decision">
+    <Card data-testid="ux-design-next-decision" data-help-id="ux-design-studio.next_decision">
       <CardHeader>
         <CardTitle as="h2" className="text-base">
           次に決めること
@@ -168,7 +168,7 @@ export default function UxDesignStudioPage() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-help-id="ux-design-studio">
       <div>
         <h1 className="text-2xl font-bold tracking-tight">UX Design Studio</h1>
         <p className="mt-1 text-sm text-muted-foreground">

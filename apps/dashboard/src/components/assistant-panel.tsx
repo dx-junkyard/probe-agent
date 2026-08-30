@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { useAssistantAsk, useAssistantScreenContext } from "@/api/hooks";
+import {
+  useAssistantAsk, useAssistantDiscussionThread, useAssistantScreenContext,
+} from "@/api/hooks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -8,7 +10,11 @@ import { DiagnosticSeverityIcon } from "@/components/diagnostics-badge";
 import {
   ArrowRight, Bot, ExternalLink, Loader2, Send, Settings2, Wrench, X,
 } from "lucide-react";
-import type { AssistantAskOut, AssistantCitation, SystemStateItem } from "@/api/types";
+import type {
+  AssistantAskOut, AssistantCitation, AssistantDiscussionTargetIn,
+  AssistantDiscussionThreadDetailOut, DiscussionTargetState,
+  SystemStateItem,
+} from "@/api/types";
 import { systemStateTarget } from "@/components/system-state";
 import { useModalSurface } from "@/lib/modal-surface";
 import {
@@ -20,10 +26,124 @@ import {
 // Answers come from POST /assistant/ask and are grounded in screen context,
 // static settings metadata, and deterministic diagnostics; fallback answers
 // are visibly marked. No client-side heuristic decoration.
+//
+// Issue #438 (Epic #436): on the 4 discussion-enabled screens, the
+// conversation is keyed by the canonical target identity
+// (screen_id|scope|target_kind|target_ref), NOT by screen_id alone -- a
+// Requirement A discussion and a Requirement B discussion never share
+// history. Any other screen, or a failure of the thread endpoints, keeps the
+// pre-#438 client-only per-screen conversation (the safe migration path).
 
 function screenIdFromPath(pathname: string): string {
   if (pathname === "/") return "overview";
   return pathname.split("/")[1] ?? "overview";
+}
+
+const DISCUSSION_SCREEN_IDS = ["overview", "interview", "ux-design-studio", "journey-blueprint"] as const;
+
+function isDiscussionScreen(screenId: string): boolean {
+  return (DISCUSSION_SCREEN_IDS as readonly string[]).includes(screenId);
+}
+
+interface DiscussionCandidate {
+  target: AssistantDiscussionTargetIn;
+  label: string;
+}
+
+/** Derive the most specific selectable non-screen target from the route, if
+ * any -- purely from `screen_id` + query params, so it needs no page-level
+ * wiring beyond what each page already writes to the URL. Returns `null`
+ * when nothing more specific than "the whole screen" is selected. */
+function deriveDiscussionCandidate(screenId: string, search: string): DiscussionCandidate | null {
+  const params = new URLSearchParams(search);
+  if (screenId === "interview") {
+    const session = params.get("session");
+    if (session) {
+      return {
+        target: { scope: "entity", screen_id: screenId, target_kind: "interview_session", target_ref: session },
+        label: `セッション #${session}`,
+      };
+    }
+    return null;
+  }
+  if (screenId === "ux-design-studio") {
+    const tab = params.get("tab") || "journeys";
+    const journey = params.get("journey");
+    const step = params.get("step");
+    const requirement = params.get("requirement");
+    const design = params.get("design");
+    if (journey && step) {
+      return {
+        target: {
+          scope: "element", screen_id: screenId, target_kind: "ux_journey_step",
+          target_ref: `${journey}#${step}`,
+        },
+        label: `ステップ「${step}」`,
+      };
+    }
+    if (tab === "requirements" && requirement) {
+      return {
+        target: { scope: "entity", screen_id: screenId, target_kind: "ux_requirement", target_ref: requirement },
+        label: `Requirement「${requirement}」`,
+      };
+    }
+    if (tab === "solutions" && design) {
+      return {
+        target: { scope: "entity", screen_id: screenId, target_kind: "solution_design", target_ref: design },
+        label: `Solution Design「${design}」`,
+      };
+    }
+    if (tab === "journeys" && journey) {
+      return {
+        target: { scope: "entity", screen_id: screenId, target_kind: "ux_journey", target_ref: journey },
+        label: `Journey「${journey}」`,
+      };
+    }
+    return null;
+  }
+  if (screenId === "journey-blueprint") {
+    const journey = params.get("journey");
+    const step = params.get("step");
+    const lane = params.get("lane");
+    if (journey && step && lane) {
+      return {
+        target: {
+          scope: "element", screen_id: screenId, target_kind: "blueprint_lane_cell",
+          target_ref: `${journey}#${step}#${lane}`,
+        },
+        label: `${lane}(「${step}」)`,
+      };
+    }
+    if (journey && step) {
+      return {
+        target: {
+          scope: "element", screen_id: screenId, target_kind: "ux_journey_step",
+          target_ref: `${journey}#${step}`,
+        },
+        label: `ステップ「${step}」`,
+      };
+    }
+    if (journey) {
+      return {
+        target: { scope: "entity", screen_id: screenId, target_kind: "ux_journey", target_ref: journey },
+        label: `Journey「${journey}」`,
+      };
+    }
+    return null;
+  }
+  return null;
+}
+
+function targetKeyOf(target: AssistantDiscussionTargetIn | null): string | null {
+  if (!target) return null;
+  return `${target.screen_id}|${target.scope}|${target.target_kind}|${target.target_ref}`;
+}
+
+function staleBannerText(state: DiscussionTargetState): string {
+  if (state === "unresolvable") {
+    return "この対象は見つかりませんでした。これより前のやり取りは履歴として残りますが、最新の回答の前提には使われません。";
+  }
+  return "この対象の内容は前回の会話から変わりました。これより前のやり取りは履歴として残りますが、最新の回答の前提には使われません。";
 }
 
 interface ChatMessage {
@@ -151,11 +271,121 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   const [open, setOpen] = useState(false);
   const [question, setQuestion] = useState("");
   // Threads are kept per screen so switching pages keeps each conversation.
+  // This stays the ENTIRE mechanism for non-discussion screens, and is the
+  // fallback for discussion screens whose thread endpoints fail (#438).
   const [threads, setThreads] = useState<Record<string, ChatMessage[]>>({});
-  const messages = threads[screenId] ?? [];
   const listRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   useModalSurface({ open, onClose: () => setOpen(false), panelRef });
+
+  // --- Issue #438: target-scoped discussion threads ------------------------
+  const discussionEnabled = isDiscussionScreen(screenId);
+  const candidate = useMemo(
+    () => (discussionEnabled ? deriveDiscussionCandidate(screenId, location.search) : null),
+    [discussionEnabled, screenId, location.search],
+  );
+  // Which of the two separable threads (whole screen vs. the selected
+  // entity/element) is active. Explicit user choice wins; otherwise default
+  // to the more specific one when there is one to focus on.
+  //
+  // Both this reset and the thread mirror below adjust state DURING RENDER
+  // rather than in an effect (the pattern `cockpit/detail-panel.tsx` already
+  // uses, and the rule #423 established): an effect would first paint one
+  // frame showing the previous screen's or target's conversation, which is
+  // precisely the mixing #438 exists to prevent.
+  const [manualScope, setManualScope] = useState<"screen" | "focus" | null>(null);
+  const [scopeScreenId, setScopeScreenId] = useState(screenId);
+  if (scopeScreenId !== screenId) {
+    setScopeScreenId(screenId);
+    setManualScope(null);
+  }
+  const effectiveScope: "screen" | "focus" =
+    (scopeScreenId === screenId ? manualScope : null) ?? (candidate ? "focus" : "screen");
+  const screenTarget: AssistantDiscussionTargetIn = {
+    scope: "screen", screen_id: screenId, target_kind: "screen", target_ref: screenId,
+  };
+  const activeTarget: AssistantDiscussionTargetIn | null = !discussionEnabled
+    ? null
+    : effectiveScope === "focus" && candidate
+      ? candidate.target
+      : screenTarget;
+  const activeTargetKey = targetKeyOf(activeTarget);
+
+  const threadQuery = useAssistantDiscussionThread(activeTarget);
+
+  /** One persisted turn rendered as a panel message. */
+  function turnMessages(detail: AssistantDiscussionThreadDetailOut): ChatMessage[] {
+    return detail.turns.map((turn) => ({
+      role: turn.role,
+      text: turn.content,
+      ...(turn.role === "assistant"
+        ? {
+            result: {
+              screen_id: detail.thread.screen_id,
+              answer: turn.content,
+              suggested_actions: [],
+              citations: turn.citations,
+              used_fallback: turn.used_fallback,
+              decision_method:
+                turn.decision_method === "manual" ? "deterministic" : turn.decision_method,
+              provider: turn.provider,
+              model: turn.model,
+              prompt_version: turn.prompt_version,
+              schema_version: turn.schema_version,
+              generated_at: turn.created_at,
+            } satisfies AssistantAskOut,
+          }
+        : {}),
+    }));
+  }
+
+  // The local mirror of the persisted thread, keyed by the target identity it
+  // belongs to. The query key (`useAssistantDiscussionThread`) is what
+  // actually separates the two conversations -- a target change yields a
+  // different cache entry, so no other target's turns can be read. Carrying
+  // the key here as well means that stays true even if this query later gains
+  // `placeholderData`, which would hand a render the previous key's data.
+  interface ThreadMirror {
+    targetKey: string | null;
+    threadId: number | null;
+    messages: ChatMessage[];
+    targetState: DiscussionTargetState | null;
+  }
+  const [mirror, setMirror] = useState<ThreadMirror>({
+    targetKey: null, threadId: null, messages: [], targetState: null,
+  });
+  const threadDetail = threadQuery.data ?? null;
+  let view = mirror;
+  if (view.targetKey !== activeTargetKey) {
+    view = { targetKey: activeTargetKey, threadId: null, messages: [], targetState: null };
+  }
+  // Restoring turns from the server covers both the initial mount and a
+  // reload. It runs once per resolved thread id, so the turns appended
+  // locally during this session are not overwritten by a later refetch.
+  if (threadDetail && threadDetail.thread.id !== view.threadId) {
+    view = {
+      targetKey: activeTargetKey,
+      threadId: threadDetail.thread.id,
+      messages: turnMessages(threadDetail),
+      targetState: threadDetail.target_state,
+    };
+  }
+  if (view !== mirror) setMirror(view);
+
+  // A failed thread endpoint (network error, older server) must not break the
+  // assistant -- and neither must one that has not answered yet. Until a
+  // thread is actually resolved the panel behaves exactly as it did before
+  // #438: an in-memory per-screen conversation whose turns the client sends
+  // itself. That is the safe migration path, and it is also what every
+  // non-discussion screen keeps permanently.
+  const activeThread = view.threadId !== null ? threadDetail?.thread ?? null : null;
+  const useLegacyConversation = !discussionEnabled || activeThread === null;
+  const messages = useLegacyConversation ? (threads[screenId] ?? []) : view.messages;
+  // `null` while the thread is unavailable: 「まだ分からない」 is not
+  // 「current」 (#366), so no banner and no recheck claim in that case.
+  const targetState: DiscussionTargetState | null = useLegacyConversation
+    ? null
+    : view.targetState;
 
   // 閉じたらフォーカスを開くボタンへ戻す。
   //
@@ -200,8 +430,16 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     ? `What should I do about: ${focusedStateItem.summary}`
     : null;
 
-  const appendMessages = (id: string, msgs: ChatMessage[]) => {
-    setThreads((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...msgs] }));
+  // One append, two stores: the persisted thread's local mirror when a
+  // thread is driving this conversation, the legacy per-screen map
+  // otherwise. Writing to both would show the same turn twice the moment a
+  // thread resolves mid-conversation.
+  const appendMessages = (msgs: ChatMessage[]) => {
+    if (useLegacyConversation) {
+      setThreads((prev) => ({ ...prev, [screenId]: [...(prev[screenId] ?? []), ...msgs] }));
+    } else {
+      setMirror((prev) => ({ ...prev, messages: [...prev.messages, ...msgs] }));
+    }
     requestAnimationFrame(() => {
       const list = listRef.current;
       if (list && typeof list.scrollTo === "function") {
@@ -214,32 +452,51 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     const trimmed = q.trim();
     if (!trimmed || ask.isPending) return;
     setQuestion("");
-    appendMessages(screenId, [{ role: "user", text: trimmed }]);
+    // The target this turn is about is captured HERE and used for the whole
+    // exchange. Navigating mid-answer must not silently re-point the
+    // question that is already in flight.
+    const turnThread = useLegacyConversation ? null : activeThread;
+    appendMessages([{ role: "user", text: trimmed }]);
     try {
       // Keep a bounded multi-turn discussion context. The current question is
       // sent separately, so only turns that existed before this submit belong
       // here. Errors are UI state, never conversation evidence.
-      const conversation = messages
-        .filter((message): message is ChatMessage & { role: "user" | "assistant" } =>
-          message.role === "user" || message.role === "assistant",
-        )
-        .slice(-12)
-        .map((message) => ({ role: message.role, content: message.text.slice(0, 4000) }));
+      //
+      // With a thread the server derives that context from the persisted
+      // turns instead, and sending our own would be a second source of truth
+      // (the API rejects both together with 422).
+      const conversation = turnThread
+        ? []
+        : messages
+            .filter((message): message is ChatMessage & { role: "user" | "assistant" } =>
+              message.role === "user" || message.role === "assistant",
+            )
+            .slice(-12)
+            .map((message) => ({ role: message.role, content: message.text.slice(0, 4000) }));
       const routeParams = Object.fromEntries(new URLSearchParams(location.search));
       const result = await ask.mutateAsync({
         screen_id: screenId,
         question: trimmed,
         route_params: routeParams,
         conversation,
+        ...(turnThread ? { thread_id: turnThread.id } : {}),
         visible_check_ids: failingChecks.map((c) => c.check_id),
         ...(focusedStateItem ? {
           visible_state_ids: [focusedStateItem.state_id],
           focused_state_id: focusedStateItem.state_id,
         } : {}),
       });
-      appendMessages(screenId, [{ role: "assistant", text: result.answer, result }]);
+      appendMessages([{ role: "assistant", text: result.answer, result }]);
+      // The answer re-pins the thread to the content it was actually
+      // produced against, so a resolved recheck stops being advertised.
+      if (turnThread && result.target_state) {
+        const answered = result.target_state;
+        setMirror((prev) =>
+          prev.threadId === turnThread.id ? { ...prev, targetState: answered } : prev,
+        );
+      }
     } catch (err) {
-      appendMessages(screenId, [{ role: "error", text: String(err) }]);
+      appendMessages([{ role: "error", text: String(err) }]);
     }
   };
 
@@ -319,7 +576,52 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         </Button>
       </div>
 
+      {/* Issue #438: the two threads a discussion screen can hold are
+          separable, so which one the developer is talking in has to be
+          visible and switchable. The switch changes the conversation's
+          identity -- it never sends the other target's history. */}
+      {discussionEnabled && candidate && (
+        <div
+          className="flex flex-wrap items-center gap-1.5 border-b px-4 py-2"
+          data-testid="assistant-scope-switch"
+        >
+          <span className="text-[11px] text-muted-foreground">この会話の対象</span>
+          <Button
+            size="sm"
+            variant={effectiveScope === "screen" ? "default" : "outline"}
+            className="h-7 px-2 text-xs"
+            aria-pressed={effectiveScope === "screen"}
+            onClick={() => setManualScope("screen")}
+            data-testid="assistant-scope-screen"
+          >
+            画面全体
+          </Button>
+          <Button
+            size="sm"
+            variant={effectiveScope === "focus" ? "default" : "outline"}
+            className="h-7 px-2 text-xs"
+            aria-pressed={effectiveScope === "focus"}
+            onClick={() => setManualScope("focus")}
+            data-testid="assistant-scope-focus"
+          >
+            {candidate.label}
+          </Button>
+        </div>
+      )}
+
       <div ref={listRef} className="flex-1 overflow-y-auto p-4 space-y-3">
+        {/* §1.3: history stays readable, but it is not a current fact. The
+            server has already withheld it from the model's context; say so
+            rather than letting the transcript imply it was used. */}
+        {(targetState === "stale" || targetState === "unresolvable") && (
+          <div
+            className="rounded-lg border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950"
+            role="status"
+            data-testid="assistant-target-stale"
+          >
+            <p className="text-xs">{staleBannerText(targetState)}</p>
+          </div>
+        )}
         {focusedStateItem && (
           <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 space-y-2 dark:border-amber-800 dark:bg-amber-950" data-testid="assistant-current-issue">
             <p className="text-xs font-medium">Current issue</p>

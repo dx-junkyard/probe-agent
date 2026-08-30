@@ -88,7 +88,11 @@ export function BlueprintGrid({
         <tbody>
           {BLUEPRINT_LANE_ORDER.map((laneKind) => (
             <tr key={laneKind}>
-              <th scope="row" className="align-top text-left text-xs font-medium">
+              <th
+                scope="row"
+                className="align-top text-left text-xs font-medium"
+                data-help-id={`journey-blueprint.lane.${laneKind}`}
+              >
                 {BLUEPRINT_LANE_LABEL[laneKind]}
                 <p className="font-normal text-muted-foreground">{BLUEPRINT_LANE_LEGEND[laneKind]}</p>
               </th>

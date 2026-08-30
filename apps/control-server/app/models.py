@@ -5823,6 +5823,45 @@ class SettingsMetadataOut(BaseModel):
     settings: List[SettingMetadataOut] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# UI 機能解説モード (Issue #440, Epic #436): `app/ui_help_registry.py` の
+# static registry を verbatim に運ぶだけの response model。LLM は呼ばない
+# ので decision_method は常に "deterministic"。
+# ---------------------------------------------------------------------------
+
+
+class UiHelpDocRefOut(BaseModel):
+    doc_path: str
+    title: str
+    anchor: str = ""
+
+
+class UiHelpActionOut(BaseModel):
+    label: str
+    kind: Literal["navigate", "configure", "operate"]
+    target: str = ""
+
+
+class UiHelpEntryOut(BaseModel):
+    help_id: str
+    screen_id: str
+    scope: Literal["screen", "section", "element"]
+    title: str
+    summary: str
+    usage: str
+    doc_refs: List[UiHelpDocRefOut] = Field(default_factory=list)
+    related_actions: List[UiHelpActionOut] = Field(default_factory=list)
+    related_help_ids: List[str] = Field(default_factory=list)
+    registry_version: str
+    decision_method: Literal["deterministic"] = "deterministic"
+
+
+class UiHelpEntriesOut(BaseModel):
+    entries: List[UiHelpEntryOut] = Field(default_factory=list)
+    registry_version: str
+    decision_method: Literal["deterministic"] = "deterministic"
+
+
 class AssistantSuggestedQuestionOut(BaseModel):
     question: str
     source: Literal["diagnostics", "static"]
@@ -5864,6 +5903,11 @@ class AssistantAskRequest(BaseModel):
     visible_check_ids: List[str] = Field(default_factory=list, max_length=50)
     visible_state_ids: List[str] = Field(default_factory=list, max_length=50)
     focused_state_id: Optional[str] = Field(default=None, max_length=200)
+    # Issue #438: when set, the server owns the conversation history (the
+    # thread's own bounded recent turns) instead of the client-supplied
+    # `conversation` list -- the two are mutually exclusive so there is never
+    # a second source of truth for "what was said before" (§1.5).
+    thread_id: Optional[int] = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def validate_assistant_context_bounds(self):
@@ -5873,6 +5917,10 @@ class AssistantAskRequest(BaseModel):
             raise ValueError("route_params keys or values are too long")
         if sum(len(message.content) for message in self.conversation) > 24_000:
             raise ValueError("conversation is too long")
+        if self.thread_id is not None and len(self.conversation) > 0:
+            raise ValueError(
+                "conversation_not_settable_with_thread: conversation must be empty when thread_id is set"
+            )
         return self
 
 
@@ -5970,6 +6018,82 @@ class AssistantCitationOut(BaseModel):
     id: str
     title: str = ""
     detail: str = ""
+
+
+# --- Assistant discussion threads (Issue #438, Epic #436) --------------------
+# docs/assistant-discussion.md §1. Finite vocabularies mirror
+# app/assistant_discussion.py's module constants exactly.
+
+DiscussionScope = Literal["screen", "entity", "element"]
+DiscussionTargetKind = Literal[
+    "screen",
+    "interview_session",
+    "understanding_claim",
+    "overview_finding",
+    "ux_journey",
+    "ux_journey_step",
+    "ux_requirement",
+    "solution_design",
+    "blueprint_lane_cell",
+]
+DiscussionTargetState = Literal["current", "stale", "unresolvable", "not_tracked"]
+
+
+class AssistantDiscussionTargetIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: DiscussionScope
+    screen_id: str = Field(..., min_length=1, max_length=100)
+    target_kind: DiscussionTargetKind
+    target_ref: str = Field(..., min_length=1, max_length=500)
+
+
+class AssistantDiscussionTurnOut(BaseModel):
+    id: int
+    thread_id: int
+    turn_number: int
+    role: Literal["user", "assistant"]
+    content: str
+    citations: List[AssistantCitationOut] = Field(default_factory=list)
+    target_revision_id: Optional[int] = None
+    target_digest: str = ""
+    used_fallback: bool = False
+    decision_method: Literal["manual", "reasoning_llm", "deterministic"]
+    input_mode: Literal["text", "voice"] = "text"
+    provider: str = ""
+    model: str = ""
+    prompt_version: str = ""
+    schema_version: str = "assistant-discussion-turn-v1"
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class AssistantDiscussionThreadOut(BaseModel):
+    id: int
+    system_id: int
+    thread_key: str
+    scope: DiscussionScope
+    screen_id: str
+    target_kind: DiscussionTargetKind
+    target_ref: str
+    target_title: str = ""
+    captured_target_revision_id: Optional[int] = None
+    captured_target_digest: str = ""
+    status: Literal["open", "archived"] = "open"
+    created_by: Optional[str] = None
+    created_at: float
+    updated_at: float
+    schema_version: str = "assistant-discussion-thread-v1"
+
+
+class AssistantDiscussionThreadDetailOut(BaseModel):
+    thread: AssistantDiscussionThreadOut
+    target_state: DiscussionTargetState
+    turns: List[AssistantDiscussionTurnOut] = Field(default_factory=list)
+
+
+class AssistantDiscussionThreadsListOut(BaseModel):
+    threads: List[AssistantDiscussionThreadOut] = Field(default_factory=list)
 
 
 # GitHub App publish workflow (Issue #216, sub-task 1): connection
@@ -6149,6 +6273,14 @@ class AssistantAskOut(BaseModel):
     prompt_version: str
     schema_version: str
     generated_at: float
+    # Issue #438: present only when the request carried `thread_id`. A
+    # non-`current`/`not_tracked` `target_state` means `recheck_required` is
+    # true and the server did NOT auto-inherit the thread's prior turns as
+    # context for this answer (§1.3).
+    thread_id: Optional[int] = None
+    target_state: Optional[DiscussionTargetState] = None
+    recheck_required: bool = False
+    turn_number: Optional[int] = None
 
 
 # --- Replay engine (Issue #242 Phase B / #244) -------------------------------

@@ -115,7 +115,7 @@ export function SystemBriefCard({
   const hiddenCapabilities = brief.core_capabilities.length - capabilities.length;
 
   return (
-    <Card data-testid="overview-system-brief">
+    <Card data-testid="overview-system-brief" data-help-id="overview.brief">
       <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0">
         <CardTitle as="h2" className="text-lg">System Brief</CardTitle>
         <Badge
@@ -157,7 +157,7 @@ export function SystemBriefCard({
           </ul>
         )}
 
-        <section data-testid="overview-vision">
+        <section data-testid="overview-vision" data-help-id="overview.brief.vision">
           <h3 className="text-base font-semibold">Vision — 誰の状態をどう変えたいか</h3>
           {brief.vision ? (
             <ul className="mt-2">
@@ -187,7 +187,7 @@ export function SystemBriefCard({
           )}
         </section>
 
-        <section data-testid="overview-system-purpose">
+        <section data-testid="overview-system-purpose" data-help-id="overview.brief.system_purpose">
           <h3 className="text-base font-semibold">
             System Purpose — その Vision に対してこのシステムが担う役割
           </h3>
@@ -210,7 +210,7 @@ export function SystemBriefCard({
           )}
         </section>
 
-        <section data-testid="overview-core-capabilities">
+        <section data-testid="overview-core-capabilities" data-help-id="overview.brief.capabilities">
           <h3 className="text-base font-semibold">主要機能 (Core Capabilities)</h3>
           {capabilities.length > 0 ? (
             <ul className="mt-2 space-y-2">

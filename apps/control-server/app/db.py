@@ -229,6 +229,90 @@ CREATE INDEX IF NOT EXISTS idx_ux_journey_upstream_ref_journey
 """
 
 
+# assistant_discussion_thread / assistant_discussion_turn (Issue #438, Epic
+# #436, docs/assistant-discussion.md §1.4): the screen-context AI assistant's
+# per-target conversation persistence. Identity is `(system_id, thread_key)`
+# where `thread_key = f"{screen_id}|{scope}|{target_kind}|{target_ref}"` --
+# NOT `(system_id, screen_id)` -- so a Requirement A conversation and a
+# Requirement B conversation on the same screen never share a row, and
+# reloading the same target restores the same thread. `target_state`
+# (current/stale/unresolvable/not_tracked) is derived at READ time from
+# `captured_target_digest` vs the resolver's current digest (§1.3) and is
+# deliberately NOT a column here -- storing it would let an edited/rebuilt
+# target keep reporting a stale answer as `current` forever.
+_ASSISTANT_DISCUSSION_DDL = """
+CREATE TABLE IF NOT EXISTS assistant_discussion_thread (
+    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                    INTEGER NOT NULL,
+    thread_key                   TEXT NOT NULL,
+    scope                        TEXT NOT NULL CHECK (scope IN ('screen', 'entity', 'element')),
+    screen_id                    TEXT NOT NULL,
+    target_kind                  TEXT NOT NULL CHECK (target_kind IN (
+                                     'screen', 'interview_session', 'understanding_claim',
+                                     'overview_finding', 'ux_journey', 'ux_journey_step',
+                                     'ux_requirement', 'solution_design', 'blueprint_lane_cell')),
+    target_ref                   TEXT NOT NULL,
+    target_title                 TEXT NOT NULL DEFAULT '',
+    -- Captured at thread creation and refreshed on each successful resolve;
+    -- compared against the resolver's CURRENT digest at read time to derive
+    -- `target_state` (§1.3). A `screen` target has no digest source and
+    -- stays ''.
+    captured_target_revision_id  INTEGER,
+    captured_target_digest       TEXT NOT NULL DEFAULT '',
+    status                       TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'archived')),
+    created_by                   TEXT,
+    created_at                   REAL NOT NULL,
+    updated_at                   REAL NOT NULL,
+    schema_version               TEXT NOT NULL DEFAULT 'assistant-discussion-thread-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (system_id, thread_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_thread_system
+    ON assistant_discussion_thread (system_id, id DESC);
+
+-- assistant_discussion_turn: one message. `role='user'` turns are always
+-- `decision_method='manual'`; `role='assistant'` turns are `reasoning_llm`
+-- when a real LLM answered and `deterministic` when the rule-based fallback
+-- did (mirrors `AssistantAnswer.decision_method`). `target_revision_id` /
+-- `target_digest` capture what the target looked like WHEN THIS TURN WAS
+-- WRITTEN and are never rewritten afterwards, so a reload can show "this
+-- turn was answered against an earlier revision" even once the thread's own
+-- `captured_target_digest` has moved on (§1.3's "old turns are not treated
+-- as current fact").
+CREATE TABLE IF NOT EXISTS assistant_discussion_turn (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    thread_id           INTEGER NOT NULL,
+    turn_number         INTEGER NOT NULL,
+    role                TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content             TEXT NOT NULL,
+    citations_json      TEXT NOT NULL DEFAULT '[]',
+    target_revision_id  INTEGER,
+    target_digest       TEXT NOT NULL DEFAULT '',
+    used_fallback       INTEGER NOT NULL DEFAULT 0,
+    decision_method     TEXT NOT NULL CHECK (decision_method IN
+                             ('manual', 'reasoning_llm', 'deterministic')),
+    input_mode          TEXT NOT NULL DEFAULT 'text' CHECK (input_mode IN ('text', 'voice')),
+    provider            TEXT NOT NULL DEFAULT '',
+    model               TEXT NOT NULL DEFAULT '',
+    prompt_version      TEXT NOT NULL DEFAULT '',
+    schema_version      TEXT NOT NULL DEFAULT 'assistant-discussion-turn-v1',
+    created_by          TEXT,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (thread_id) REFERENCES assistant_discussion_thread (id) ON DELETE CASCADE,
+    UNIQUE (thread_id, turn_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_turn_system
+    ON assistant_discussion_turn (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_turn_thread
+    ON assistant_discussion_turn (thread_id, turn_number);
+"""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -8433,7 +8517,7 @@ CREATE INDEX IF NOT EXISTS idx_product_feature_decision_system
 CREATE INDEX IF NOT EXISTS idx_product_feature_decision_feature
     ON product_feature_decision (feature_id, id DESC);
 
-""" + _PRODUCT_GAP_ARTIFACT_LINK_DDL
+""" + _PRODUCT_GAP_ARTIFACT_LINK_DDL + _ASSISTANT_DISCUSSION_DDL
 
 
 _SCOPED_TABLES = [

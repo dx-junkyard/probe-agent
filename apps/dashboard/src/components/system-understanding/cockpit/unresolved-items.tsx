@@ -67,8 +67,12 @@ export function CockpitUnresolvedItems({
     }
   }, [expanded, initialVisibleGroups]);
 
+  // Issue #440: the help target is this card itself. `interview.tsx` places
+  // it as a direct child of an `items-start` Grid (#359), so wrapping it in
+  // a `<div data-help-id>` would make the wrapper the grid item and let the
+  // sibling card stretch again.
   return (
-    <Card data-testid="cockpit-unresolved-items">
+    <Card data-testid="cockpit-unresolved-items" data-help-id="interview.unresolved_items">
       <CardHeader>
         <div className="flex items-center justify-between gap-2">
           <div>

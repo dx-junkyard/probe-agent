@@ -147,7 +147,7 @@ export default function OverviewPage() {
   });
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-help-id="overview">
       <PageHeading system={system} overview={overview} />
 
       {overview.degraded_sections.length > 0 && (
@@ -251,6 +251,7 @@ function PageHeading({
         <dl
           className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground"
           data-testid="overview-context"
+          data-help-id="overview.header"
         >
           <div className="flex gap-1">
             <dt>Snapshot</dt>

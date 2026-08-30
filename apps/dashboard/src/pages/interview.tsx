@@ -2288,37 +2288,39 @@ export default function InterviewPage() {
   // よって変わるようになったので、JSX を 1 つの値にして 2 箇所から使い分ける
   // (描かれるのは常に 1 つ)。中身・表示密度・主操作の規則は #351 のまま。
   const understandingBriefPanel = session ? (
-    <UnderstandingBriefPanel
-      brief={understandingBrief}
-      state={wState}
-      primaryAction={
-        showUnderstandingWork && canConfirmStructuredUnderstanding ? (
-          <div data-testid="understanding-confirm-block">
-            <Button
-              size="sm"
-              onClick={doConfirmUnderstanding}
-              disabled={confirmUnderstanding.isPending}
-              data-testid="confirm-understanding"
-            >
-              <CheckCircle className="h-4 w-4 mr-1" />
-              {confirmUnderstanding.isPending
-                ? "確定中..."
-                : PRIMARY_ACTION_LABELS.confirm_understanding}
-            </Button>
-          </div>
-        ) : undefined
-      }
-      fullTree={
-        session.current_understanding ? (
-          <UnderstandingOverview
-            understanding={session.current_understanding}
-            gaps={session.gap_analysis}
-            openQuestions={session.open_questions}
-            nextAction={nextActionText}
-          />
-        ) : undefined
-      }
-    />
+    <div data-help-id="interview.brief">
+      <UnderstandingBriefPanel
+        brief={understandingBrief}
+        state={wState}
+        primaryAction={
+          showUnderstandingWork && canConfirmStructuredUnderstanding ? (
+            <div data-testid="understanding-confirm-block">
+              <Button
+                size="sm"
+                onClick={doConfirmUnderstanding}
+                disabled={confirmUnderstanding.isPending}
+                data-testid="confirm-understanding"
+              >
+                <CheckCircle className="h-4 w-4 mr-1" />
+                {confirmUnderstanding.isPending
+                  ? "確定中..."
+                  : PRIMARY_ACTION_LABELS.confirm_understanding}
+              </Button>
+            </div>
+          ) : undefined
+        }
+        fullTree={
+          session.current_understanding ? (
+            <UnderstandingOverview
+              understanding={session.current_understanding}
+              gaps={session.gap_analysis}
+              openQuestions={session.open_questions}
+              nextAction={nextActionText}
+            />
+          ) : undefined
+        }
+      />
+    </div>
   ) : null;
 
   // Issue #390 §3.2 の Purpose Chain Level 1。Brief と同じ「全体像」領域に、
@@ -2346,7 +2348,7 @@ export default function InterviewPage() {
     // レビュー指摘 P1: 主作業面を初期ビューポート (1280 x 720) へ入れるため、
     // 画面上部の縦余白を詰める。ここで稼いだぶんがそのまま主作業面の上端を
     // 押し上げる。
-    <div className="space-y-4">
+    <div className="space-y-4" data-help-id="interview">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
@@ -2368,7 +2370,11 @@ export default function InterviewPage() {
               情報カードからは同じ 3 つを外した)。参加者・最終更新・根拠件数・
               保存状態は補助情報の中で、このボタンから開く。 */}
           {session && (
-            <div className="mt-2 flex flex-wrap items-center gap-2" data-testid="cockpit-header-meta">
+            <div
+              className="mt-2 flex flex-wrap items-center gap-2"
+              data-testid="cockpit-header-meta"
+              data-help-id="interview.session_selector"
+            >
               <Badge variant="outline" className="font-normal">セッション #{session.id}</Badge>
               <Badge variant="outline" className="font-normal">Snapshot {session.snapshot_id}</Badge>
               <Badge variant="secondary" className="font-normal">{session.status}</Badge>
@@ -2383,7 +2389,7 @@ export default function InterviewPage() {
             </div>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2" data-help-id="interview.session_selector">
           {/* 変更履歴への既存導線 (R6 の「履歴と監査情報」) を維持する。 */}
           {session && (
             <Button
@@ -2446,8 +2452,10 @@ export default function InterviewPage() {
           画面への導線 1 つだけ。 */}
       {wState === "W0-A" && workflow && (
         <>
-          <WorkflowLocationCard workflow={workflow} />
-          <Card data-testid="work-surface-W0-A">
+          <div data-help-id="interview.workflow_state">
+            <WorkflowLocationCard workflow={workflow} />
+          </div>
+          <Card data-testid="work-surface-W0-A" data-help-id="interview.work_surface">
             <CardContent className="py-8 text-center space-y-3 text-sm">
               <p className="text-muted-foreground">
                 このリポジトリにはまだ snapshot がありません。Repository 画面で
@@ -2465,7 +2473,7 @@ export default function InterviewPage() {
           {/* Issue #354: 構築前も「現在の理解」を同じ概念で追えるようにする。
               主操作の下に短く置き、開始条件を押し下げる大きな空カードには
               しない。架空の Vision / Purpose はここでも表示しない。 */}
-          <UnderstandingBriefPanel brief={understandingBrief} state={wState} />
+          <div data-help-id="interview.brief"><UnderstandingBriefPanel brief={understandingBrief} state={wState} /></div>
         </>
       )}
 
@@ -2521,8 +2529,10 @@ export default function InterviewPage() {
            (実行できない主操作を見せない、原則 P3)。 */
         wState === "W0-B" && workflow ? (
           <>
-            <WorkflowLocationCard workflow={workflow} />
-            <Card data-testid="work-surface-W0-B">
+            <div data-help-id="interview.workflow_state">
+              <WorkflowLocationCard workflow={workflow} />
+            </div>
+            <Card data-testid="work-surface-W0-B" data-help-id="interview.work_surface">
               <CardContent className="py-10 text-center space-y-3">
                 <p className="text-sm text-muted-foreground">
                   対象 snapshot: {workflow.latest_ready_snapshot_id ?? "-"}。
@@ -2538,7 +2548,7 @@ export default function InterviewPage() {
                 </Button>
               </CardContent>
             </Card>
-            <UnderstandingBriefPanel brief={understandingBrief} state={wState} />
+            <div data-help-id="interview.brief"><UnderstandingBriefPanel brief={understandingBrief} state={wState} /></div>
           </>
         ) : null
       ) : (
@@ -2547,11 +2557,13 @@ export default function InterviewPage() {
               その状態の主操作そのもの (原則 P2)。進捗ステップも同じカードへ
               まとめる (§3.2 #9/#11/#50/#63 の統合)。 */}
           {workflow && (
-            <WorkflowLocationCard
-              workflow={workflow}
-              detail={nextActionText}
-              historyEntry={<RefreshStatusChip sessionId={selectedSessionId} />}
-            />
+            <div data-help-id="interview.workflow_state">
+              <WorkflowLocationCard
+                workflow={workflow}
+                detail={nextActionText}
+                historyEntry={<RefreshStatusChip sessionId={selectedSessionId} />}
+              />
+            </div>
           )}
 
           {/* R2 の分岐 — 確認待ちの戻り (E8)。承諾するまで表示状態は
@@ -2571,16 +2583,18 @@ export default function InterviewPage() {
 
           {/* R5 — 現在ブロッキング中 / 劣化中の例外だけを、現在地の直下に。 */}
           {workflow && (
-            <WorkflowExceptions
-              workflow={workflow}
-              // E2 (snapshot のズレ) は、更新操作そのものを内包した専用の
-              // バナー(#7/#8)が上で担っている。汎用の例外カードにも出すと
-              // 同じ対象の表示が 2 箇所になる (原則 P7)。
-              skipCodes={["E2"]}
-              retryPending={building || materialize.isPending}
-              onRetry={kind => void retryFailedProcess(kind)}
-              onLeaveSafely={() => void leaveSafely("suspended")}
-            />
+            <div data-help-id="interview.exceptions">
+              <WorkflowExceptions
+                workflow={workflow}
+                // E2 (snapshot のズレ) は、更新操作そのものを内包した専用の
+                // バナー(#7/#8)が上で担っている。汎用の例外カードにも出すと
+                // 同じ対象の表示が 2 箇所になる (原則 P7)。
+                skipCodes={["E2"]}
+                retryPending={building || materialize.isPending}
+                onRetry={kind => void retryFailedProcess(kind)}
+                onLeaveSafely={() => void leaveSafely("suspended")}
+              />
+            </div>
           )}
 
           {/* Issue #356 §2 / Issue #360 — Interview status サマリー。
@@ -2588,11 +2602,13 @@ export default function InterviewPage() {
               完成度・件数はその下の統計へ降ろした。2 カラムの外 (全幅) に
               置くのは、狭い画面で右カラムが下へ回り込んでも位置が変わらない
               ようにするため。 */}
-          <CockpitStatusSummary
-            model={cockpit}
-            actionLabel={nextStepActionLabel}
-            onRunNextStep={runNextStep}
-          />
+          <div data-help-id="interview.status_summary">
+            <CockpitStatusSummary
+              model={cockpit}
+              actionLabel={nextStepActionLabel}
+              onRunNextStep={runNextStep}
+            />
+          </div>
 
           {/* `items-start` が無いと、Grid の既定 stretch で右カラムのカードが
               メインカラムの高さまで引き伸ばされる (issue #359 の実測: Q&A
@@ -2622,7 +2638,7 @@ export default function InterviewPage() {
                 )}
 
                 {showAlignmentWork && (
-                <div className="space-y-4" data-testid="work-surface-W4">
+                <div className="space-y-4" data-testid="work-surface-W4" data-help-id="interview.work_surface">
                   <Card data-testid="alignment-review-panel">
                     <CardHeader>
                       <CardTitle className="text-sm">Alignment Review</CardTitle>
@@ -2645,7 +2661,11 @@ export default function InterviewPage() {
                 )}
 
                 {showConversationWork && (
-                <div className="space-y-4" data-testid={showUnderstandingWork ? "work-surface-W2" : "work-surface-W3"}>
+                <div
+                  className="space-y-4"
+                  data-testid={showUnderstandingWork ? "work-surface-W2" : "work-surface-W3"}
+                  data-help-id="interview.work_surface"
+                >
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">会話</CardTitle>
@@ -2942,7 +2962,7 @@ export default function InterviewPage() {
                     ため、そのボタンと前提説明 (#34) / 未生成注記 (#35) は
                     廃止した (§4.2.1、原則 P3)。 */}
                 {showProposalWork && (
-                <div className="space-y-4" data-testid="work-surface-W5">
+                <div className="space-y-4" data-testid="work-surface-W5" data-help-id="interview.work_surface">
                   <Card>
                     <CardHeader>
                       <div className="flex items-center justify-between gap-2">
@@ -3023,7 +3043,11 @@ export default function InterviewPage() {
                     手順は補助操作であり、完了条件を満たさない。
                     W7 でも差分は参照できるが、そのときは主操作ではない。 */}
                 {(showDiffWork || showTerminal) && diff && (
-                <div className="space-y-4" data-testid={showDiffWork ? "work-surface-W6" : "terminal-diff-reference"}>
+                <div
+                  className="space-y-4"
+                  data-testid={showDiffWork ? "work-surface-W6" : "terminal-diff-reference"}
+                  data-help-id="interview.work_surface"
+                >
                   <Card>
                     <CardHeader>
                       <div className="flex items-center justify-between gap-2">
@@ -3147,7 +3171,7 @@ git commit`}
                     (§5.4)。「接続セットアップへ進む」を W7 全体に置くと、
                     中断・引き継ぎ終端で意味を成さない操作が主操作になる。 */}
                 {showTerminal && workflow && (
-                <div className="space-y-4" data-testid="work-surface-W7">
+                <div className="space-y-4" data-testid="work-surface-W7" data-help-id="interview.work_surface">
                   <Card data-testid="terminal-card" data-terminal-kind={workflow.terminal_kind ?? ""}>
                     <CardHeader>
                       <CardTitle className="text-sm">
@@ -3264,14 +3288,16 @@ git commit`}
               {/* Issue #356 §3 / Issue #363 — 理解の全体マップ。カード選択は
                   詳細・修正ペインを切り替えるだけで、ワークフロー状態には
                   影響しない。 */}
-              <UnderstandingMap
-                categories={cockpit.categories}
-                selected={selectedCategoryKey}
-                qaFetchStatus={cockpit.qaFetchStatus}
-                onSelect={selectCockpitCategory}
-                onRetryQa={() => void refetchQaList()}
-                onGoToDetail={() => openCockpitTarget(["cockpit-detail-panel"])}
-              />
+              <div data-help-id="interview.understanding_map">
+                <UnderstandingMap
+                  categories={cockpit.categories}
+                  selected={selectedCategoryKey}
+                  qaFetchStatus={cockpit.qaFetchStatus}
+                  onSelect={selectCockpitCategory}
+                  onRetryQa={() => void refetchQaList()}
+                  onGoToDetail={() => openCockpitTarget(["cockpit-detail-panel"])}
+                />
+              </div>
             </div>
 
             {/* サイド: 判断に必要な根拠 (R3) と、必要時に開く詳細 (R4)。
@@ -3338,6 +3364,7 @@ git commit`}
                   これまでどおり §3.3 のマトリクス (その状態の判断に要るか) で
                   決める -- 折りたたみになっただけで、状態ごとの表示対象は
                   変えていない。 */}
+              <div data-help-id="interview.auxiliary_panel">
               <CockpitAuxiliaryPanel>
                 {/* Issue #356 §7 / #361: セッション情報。セッション番号 /
                     Snapshot / ステータスはヘッダーが正準なので再掲しない。 */}
@@ -3533,6 +3560,7 @@ git commit`}
                 </div>
               </details>
               </CockpitAuxiliaryPanel>
+              </div>
             </div>
           </div>
 
