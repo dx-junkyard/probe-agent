@@ -182,20 +182,20 @@ export default function JourneyBlueprintPage() {
                 </>
               ) : null
             ) : (
-              <div data-help-id="journey-blueprint.diff">
-                <BlueprintDiffPanel diff={diff.data} />
-              </div>
+              <BlueprintDiffPanel diff={diff.data} />
             )}
           </div>
 
           {view === "blueprint" ? (
-            <div data-help-id="journey-blueprint.detail_pane">
-              <BlueprintDetailPane
-                stepKey={selected?.stepKey ?? null}
-                cell={selected?.cell ?? null}
-                onOpenRequirement={openRequirement}
-              />
-            </div>
+            // Issue #440: the help id belongs on the pane's own root. Here
+            // the pane is a direct child of the two-column Grid, so a wrapper
+            // would become the grid item and the Card inside would stop
+            // stretching to the row.
+            <BlueprintDetailPane
+              stepKey={selected?.stepKey ?? null}
+              cell={selected?.cell ?? null}
+              onOpenRequirement={openRequirement}
+            />
           ) : null}
         </div>
       )}

@@ -19,7 +19,7 @@ export function BlueprintDetailPane({
 }) {
   if (!stepKey || !cell) {
     return (
-      <Card data-testid="blueprint-detail-empty">
+      <Card data-testid="blueprint-detail-empty" data-help-id="journey-blueprint.detail_pane">
         <CardHeader>
           <CardTitle as="h2" className="text-base">
             詳細
@@ -33,7 +33,7 @@ export function BlueprintDetailPane({
   }
 
   return (
-    <Card data-testid="blueprint-detail-pane">
+    <Card data-testid="blueprint-detail-pane" data-help-id="journey-blueprint.detail_pane">
       <CardHeader>
         <CardTitle as="h2" className="text-base">
           {stepKey} / {BLUEPRINT_LANE_LABEL[cell.lane_kind]}

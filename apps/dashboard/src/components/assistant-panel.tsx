@@ -7,16 +7,19 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { DiagnosticSeverityIcon } from "@/components/diagnostics-badge";
+import { AssistantVoice } from "@/components/assistant-voice";
 import {
-  ArrowRight, Bot, ExternalLink, Loader2, Send, Settings2, Wrench, X,
+  ArrowRight, Bot, ExternalLink, Loader2, Mic, Send, Settings2, Wrench, X,
 } from "lucide-react";
 import type {
   AssistantAskOut, AssistantCitation, AssistantDiscussionTargetIn,
-  AssistantDiscussionThreadDetailOut, DiscussionTargetState,
+  AssistantDiscussionThread, AssistantDiscussionThreadDetailOut, DiscussionTargetState,
   SystemStateItem,
 } from "@/api/types";
 import { systemStateTarget } from "@/components/system-state";
 import { useModalSurface } from "@/lib/modal-surface";
+import { useHelpMode } from "@/lib/help-mode";
+import { voicePrerequisite, VOICE_ERROR_MESSAGES, type VoiceErrorReason } from "@/lib/voice-adapter";
 import {
   OPEN_ASSISTANT_EVENT,
   type OpenAssistantDetail,
@@ -43,6 +46,36 @@ const DISCUSSION_SCREEN_IDS = ["overview", "interview", "ux-design-studio", "jou
 
 function isDiscussionScreen(screenId: string): boolean {
   return (DISCUSSION_SCREEN_IDS as readonly string[]).includes(screenId);
+}
+
+// Issue #441 (Epic #436), Phase 1: turn-based voice mode.
+//
+// The route-param key the currently hovered/selected help-mode element (if
+// any) is threaded through as, for the SAME `/assistant/ask` call every text
+// question already uses -- §4 deliberately does not add a new
+// `DiscussionTargetKind` for this ("the finite set is closed"); route_params
+// is the existing, already-arbitrary channel the server reads screen data
+// providers from.
+const VOICE_ELEMENT_HELP_ID_PARAM = "voice_element_help_id";
+
+const VOICE_PREREQUISITE_MESSAGE: Record<string, string> = {
+  insecure_context: "音声対話にはマイクを利用できる安全な接続 (HTTPS) が必要です。",
+  unsupported: "このブラウザは音声対話 (マイクの利用) に対応していません。",
+};
+
+/**
+ * 1 回の発話 (turn) が「何についてのものか」のスナップショット。turn 開始の
+ * 瞬間に `captureVoiceTurnTarget` が作り、`AssistantVoice` がその turn の
+ * 間じゅう ref に保持する -- 発話の途中で画面や選択対象が変わっても、この
+ * turn の `/assistant/ask` 呼び出しは書き換わらない (§4)。
+ */
+interface VoiceTurnTarget {
+  screenId: string;
+  useLegacy: boolean;
+  thread: AssistantDiscussionThread | null;
+  routeParams: Record<string, string>;
+  /** hover/選択中の help-mode target。null なら画面全体スコープ。 */
+  helpId: string | null;
 }
 
 interface DiscussionCandidate {
@@ -278,6 +311,28 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   const panelRef = useRef<HTMLDivElement>(null);
   useModalSurface({ open, onClose: () => setOpen(false), panelRef });
 
+  // --- Issue #441: turn-based voice mode ------------------------------------
+  // `voicePrerequisite()` reads only static browser/context capabilities
+  // (secure context + Web Speech API presence), so it is safe to compute once
+  // per mount rather than re-checking on every render.
+  const voicePrereq = useMemo(() => voicePrerequisite(), []);
+  const voiceReady = voicePrereq === "ready";
+  const [voiceActive, setVoiceActive] = useState(false);
+  const [voiceFallbackNotice, setVoiceFallbackNotice] = useState<string | null>(null);
+  // The element (if any) currently hovered/selected in help mode (#440) is
+  // reused verbatim as the voice scope signal: an element target means "this
+  // question is about that element", no target means "the whole screen"
+  // (docs/assistant-discussion.md §3/§4). `useHelpMode()` falls back to an
+  // inert no-op context when no `HelpModeProvider` is mounted, so this is
+  // safe on any screen.
+  const helpMode = useHelpMode();
+  const voiceScopeLabel = helpMode.target ? `要素「${helpMode.target}」` : "画面全体";
+  // NOTE: `POST /assistant/ask` has no `input_mode` field yet, and
+  // `assistant_discussion_turn.input_mode` defaults to `'text'`
+  // (docs/assistant-discussion.md §1.4). Persisting the voice/text
+  // distinction on the turn itself is a follow-up for whoever picks that up
+  // next -- this client deliberately does NOT claim it is recorded anywhere.
+
   // --- Issue #438: target-scoped discussion threads ------------------------
   const discussionEnabled = isDiscussionScreen(screenId);
   const candidate = useMemo(
@@ -448,14 +503,37 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     });
   };
 
-  const submit = async (q: string) => {
+  /**
+   * The single `/assistant/ask` path for both text and voice questions
+   * (Issue #441: "do not add a second ask path"). `voiceTurn`, when given,
+   * is a snapshot captured at the START of a voice utterance (see
+   * `captureVoiceTurnTarget` below) and overrides every ambient
+   * screen/thread/route value this function would otherwise read -- so a
+   * navigation or scope switch that happens while the utterance is still in
+   * flight cannot silently re-point the question that is already being
+   * asked. Returns the answer text (for voice playback) or `null` on
+   * failure; the failure itself is still recorded in the conversation
+   * history exactly as it always was.
+   */
+  const submit = async (q: string, voiceTurn?: VoiceTurnTarget): Promise<string | null> => {
     const trimmed = q.trim();
-    if (!trimmed || ask.isPending) return;
+    if (!trimmed || ask.isPending) return null;
     setQuestion("");
-    // The target this turn is about is captured HERE and used for the whole
-    // exchange. Navigating mid-answer must not silently re-point the
+    // The target this turn is about is captured HERE (or, for voice, was
+    // already captured at listening-start and handed in) and used for the
+    // whole exchange. Navigating mid-answer must not silently re-point the
     // question that is already in flight.
-    const turnThread = useLegacyConversation ? null : activeThread;
+    const turnScreenId = voiceTurn?.screenId ?? screenId;
+    const turnThread = voiceTurn
+      ? (voiceTurn.useLegacy ? null : voiceTurn.thread)
+      : (useLegacyConversation ? null : activeThread);
+    // `appendMessages` still files into whichever store is AMBIENT right now
+    // (it does not know about `voiceTurn`). The message list is hidden while
+    // voice mode is active, so this cannot show a turn under the wrong
+    // conversation while it is happening; it is a known simplification for
+    // the rare case of navigating to a different discussion target mid
+    // utterance, not a gap in the request itself (`turnThread` above is what
+    // decides what actually gets asked and persisted server-side).
     appendMessages([{ role: "user", text: trimmed }]);
     try {
       // Keep a bounded multi-turn discussion context. The current question is
@@ -473,9 +551,18 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             )
             .slice(-12)
             .map((message) => ({ role: message.role, content: message.text.slice(0, 4000) }));
-      const routeParams = Object.fromEntries(new URLSearchParams(location.search));
+      const baseRouteParams = voiceTurn?.routeParams ?? Object.fromEntries(new URLSearchParams(location.search));
+      // The hovered/selected help-mode element (#440), when there is one, is
+      // carried as an ordinary route param -- §4 deliberately does not add a
+      // new `DiscussionTargetKind` for element-scoped voice questions (the
+      // finite set in docs/assistant-discussion.md §1.1 is closed), and the
+      // server already accepts arbitrary route params for screen data
+      // providers.
+      const routeParams = voiceTurn?.helpId
+        ? { ...baseRouteParams, [VOICE_ELEMENT_HELP_ID_PARAM]: voiceTurn.helpId }
+        : baseRouteParams;
       const result = await ask.mutateAsync({
-        screen_id: screenId,
+        screen_id: turnScreenId,
         question: trimmed,
         route_params: routeParams,
         conversation,
@@ -495,9 +582,28 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           prev.threadId === turnThread.id ? { ...prev, targetState: answered } : prev,
         );
       }
+      return result.answer;
     } catch (err) {
       appendMessages([{ role: "error", text: String(err) }]);
+      return null;
     }
+  };
+
+  /** Issue #441: snapshot the whole discussion target at voice-turn start. */
+  const captureVoiceTurnTarget = (): VoiceTurnTarget => ({
+    screenId,
+    useLegacy: useLegacyConversation,
+    thread: useLegacyConversation ? null : activeThread,
+    routeParams: Object.fromEntries(new URLSearchParams(location.search)),
+    helpId: helpMode.target,
+  });
+
+  const handleVoiceAdapterError = (reason: VoiceErrorReason) => {
+    // §4: a microphone denial or an STT/TTS failure shows the reason and
+    // returns safely to text mode -- the panel stays fully usable, it does
+    // not just go blank or get stuck in a broken voice UI.
+    setVoiceActive(false);
+    setVoiceFallbackNotice(VOICE_ERROR_MESSAGES[reason]);
   };
 
   if (!open) {
@@ -565,16 +671,44 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             )}
           </div>
         </div>
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => setOpen(false)}
-          title="Close assistant"
-          data-testid="assistant-close"
-        >
-          <X className="h-4 w-4" />
-        </Button>
+        <div className="flex items-center gap-1 shrink-0">
+          {/* Issue #441: a voice-mode toggle that is disabled (with a stated
+              reason) rather than hidden when the browser/context cannot
+              support it -- the developer sees WHY, not just its absence. */}
+          <Button
+            variant={voiceActive ? "default" : "ghost"}
+            size="icon"
+            disabled={!voiceReady}
+            aria-pressed={voiceActive}
+            onClick={() => {
+              setVoiceFallbackNotice(null);
+              setVoiceActive((prev) => !prev);
+            }}
+            title={voiceReady ? "音声で質問する" : VOICE_PREREQUISITE_MESSAGE[voicePrereq]}
+            aria-label={voiceReady ? "音声で質問する" : VOICE_PREREQUISITE_MESSAGE[voicePrereq]}
+            data-testid="assistant-voice-toggle"
+          >
+            <Mic className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setOpen(false)}
+            title="Close assistant"
+            data-testid="assistant-close"
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
       </div>
+      {!voiceReady && (
+        <p
+          className="border-b bg-muted/50 px-4 py-1.5 text-[11px] text-muted-foreground"
+          data-testid="voice-unavailable-notice"
+        >
+          {VOICE_PREREQUISITE_MESSAGE[voicePrereq]}
+        </p>
+      )}
 
       {/* Issue #438: the two threads a discussion screen can hold are
           separable, so which one the developer is talking in has to be
@@ -609,7 +743,30 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         </div>
       )}
 
-      <div ref={listRef} className="flex-1 overflow-y-auto p-4 space-y-3">
+      {voiceActive ? (
+        // Issue #441: while voice mode is active the message list is
+        // replaced (not merely covered) by the voice surface -- history is
+        // untouched in state and reappears exactly as it was the moment
+        // voice mode exits.
+        <AssistantVoice
+          captureTurnTarget={captureVoiceTurnTarget}
+          onTranscript={(text, target) => submit(text, target)}
+          onAdapterError={handleVoiceAdapterError}
+          onExit={() => setVoiceActive(false)}
+          scopeLabel={voiceScopeLabel}
+        />
+      ) : (
+        <>
+      {voiceFallbackNotice && (
+        <div
+          className="mx-4 mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950"
+          role="status"
+          data-testid="voice-fallback-notice"
+        >
+          <p className="text-xs">{voiceFallbackNotice}</p>
+        </div>
+      )}
+      <div ref={listRef} className="flex-1 overflow-y-auto p-4 space-y-3" data-testid="assistant-message-list">
         {/* §1.3: history stays readable, but it is not a current fact. The
             server has already withheld it from the model's context; say so
             rather than letting the transcript imply it was used. */}
@@ -726,6 +883,8 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           <Send className="h-4 w-4" />
         </Button>
       </form>
+        </>
+      )}
       </div>
     </>
   );
