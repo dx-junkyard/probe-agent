@@ -3812,6 +3812,10 @@ export interface AssistantCitation {
 export interface AssistantAskOut {
   screen_id: string;
   answer: string;
+  /** Short overview/core projection used only for voice playback. */
+  spoken_answer?: string | null;
+  /** Reopen listening after playback because the spoken answer asks a question. */
+  voice_follow_up_expected?: boolean;
   suggested_actions: AssistantAction[];
   citations: AssistantCitation[];
   used_fallback: boolean;

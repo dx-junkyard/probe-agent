@@ -6,8 +6,8 @@
 // AC2. Switching target does not cause context drift in an utterance already
 //      in flight.
 // AC3. A microphone denial or an STT/TTS failure returns safely to text mode.
-// AC4. A voice conversation never changes data directly (only the existing
-//      `/assistant/ask` path is used; no audio ever leaves the browser).
+// AC4. A voice conversation never changes domain data directly. TTS uses the
+//      separate read-like `/assistant/speech` generation endpoint.
 //
 // Mocks follow the same `vi.mock("@/api/client")` / `vi.mock("@/api/auth")`
 // pattern as `assistant-discussion-thread.test.tsx` and `help-mode.test.tsx`.
@@ -28,7 +28,10 @@ import type { AssistantDiscussionThreadDetailOut, AssistantDiscussionTurn } from
 
 // --- shared API/auth mocks (same pattern as the other assistant-panel tests) ---
 
-const mockApi = { get: vi.fn(), post: vi.fn(), put: vi.fn(), patch: vi.fn(), delete: vi.fn() };
+const mockApi = vi.hoisted(() => ({
+  get: vi.fn(), post: vi.fn(), put: vi.fn(), patch: vi.fn(), delete: vi.fn(),
+  postBlob: vi.fn(),
+}));
 
 vi.mock("@/api/client", () => ({
   api: mockApi,
@@ -270,6 +273,62 @@ describe("AssistantVoice (state machine)", () => {
     }
   });
 
+  test("the user can interrupt playback and immediately start a new turn", async () => {
+    const fake = makeFakeAdapters();
+    fake.speak.mockReturnValue(new Promise<void>(() => {}));
+    render(
+      <AssistantVoice
+        captureTurnTarget={() => null}
+        onTranscript={vi.fn().mockResolvedValue("短い要点です。")}
+        onAdapterError={vi.fn()}
+        onExit={vi.fn()}
+        scopeLabel="画面全体"
+        adapters={fake.adapters}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("voice-talk"));
+    fake.fireResult("最初の質問");
+    await screen.findByText("話を挟む");
+
+    fireEvent.click(screen.getByText("話を挟む"));
+    expect(fake.cancel).toHaveBeenCalled();
+    expect(fake.start).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("voice-state")).toHaveAttribute("data-state", "listening");
+  });
+
+  test("a reply that asks to continue automatically listens for '説明して'", async () => {
+    const fake = makeFakeAdapters();
+    const firstPlayback = deferred<void>();
+    fake.speak.mockReturnValueOnce(firstPlayback.promise).mockResolvedValue(undefined);
+    const onTranscript = vi.fn()
+      .mockResolvedValueOnce({
+        text: "要点です。続けて詳しく説明しましょうか？",
+        listenAfterPlayback: true,
+      })
+      .mockResolvedValueOnce("詳細を説明します。");
+    render(
+      <AssistantVoice
+        captureTurnTarget={() => null}
+        onTranscript={onTranscript}
+        onAdapterError={vi.fn()}
+        onExit={vi.fn()}
+        scopeLabel="画面全体"
+        adapters={fake.adapters}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("voice-talk"));
+    fake.fireResult("概要を教えて");
+    await screen.findByText("話を挟む");
+    await act(async () => firstPlayback.resolve());
+
+    await waitFor(() => expect(fake.start).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId("voice-state")).toHaveAttribute("data-state", "listening");
+    fake.fireResult("説明して");
+    await waitFor(() => expect(onTranscript).toHaveBeenLastCalledWith("説明して", null));
+    await waitFor(() => expect(fake.speak).toHaveBeenLastCalledWith("詳細を説明します。"));
+  });
+
   test("exit is always available and calls onExit", () => {
     const onExit = vi.fn();
     render(
@@ -418,6 +477,8 @@ function askResponse(overrides: Record<string, unknown> = {}) {
   return {
     screen_id: "widgets",
     answer: "これが音声での回答です。",
+    spoken_answer: "要点だけを話します。詳しく続けますか？",
+    voice_follow_up_expected: false,
     suggested_actions: [],
     citations: [],
     used_fallback: false,
@@ -515,7 +576,7 @@ describe("Issue #441 AC1 -- a voice question can be asked in screen scope and el
       });
       expect(calls[0][1].route_params).not.toHaveProperty("voice_element_help_id");
     });
-    await waitFor(() => expect(fake.speak).toHaveBeenCalledWith("これが音声での回答です。"));
+    await waitFor(() => expect(fake.speak).toHaveBeenCalledWith("要点だけを話します。詳しく続けますか？"));
   });
 
   test("element scope: the hovered/selected help-mode target is carried as route_params, and the scope names it", async () => {
@@ -712,8 +773,8 @@ describe("Issue #441 AC3 -- a microphone denial or an STT/TTS failure returns sa
   });
 });
 
-describe("Issue #441 AC4 -- a voice conversation never changes data directly", () => {
-  test("a full voice turn issues only the existing /assistant/ask call (plus thread resolve, when applicable) and no other mutation", async () => {
+describe("Issue #441 AC4 -- a voice conversation never changes domain data directly", () => {
+  test("a full voice turn uses ask plus adapter-owned speech generation and no domain mutation", async () => {
     mockGetForScreens("widgets");
     const fake = makeFakeAdapters();
     voiceAdapterMocks.createBrowserVoiceAdapters.mockReturnValue(fake.adapters);
@@ -737,8 +798,8 @@ describe("Issue #441 AC4 -- a voice conversation never changes data directly", (
     expect(mockApi.patch).not.toHaveBeenCalled();
     expect(mockApi.delete).not.toHaveBeenCalled();
 
-    // No call anywhere carries an audio payload -- the only things that ever
-    // touch "audio" are the fake adapter's own start/stop/speak/cancel.
+    // No domain call carries recorded audio. The injected TTS adapter owns
+    // speech generation separately; ask receives only recognized text.
     for (const [, body] of mockApi.post.mock.calls) {
       expect(body).not.toBeInstanceOf(FormData);
       expect(body).not.toBeInstanceOf(Blob);

@@ -5930,6 +5930,14 @@ class AssistantAskRequest(BaseModel):
         return self
 
 
+class AssistantSpeechRequest(BaseModel):
+    """Short, server-generated text to render through OpenAI Speech API."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1, max_length=600)
+
+
 # ---------------------------------------------------------------------------
 # System State Assessment (Issue #193)
 # ---------------------------------------------------------------------------
@@ -6355,6 +6363,12 @@ class PublishAuditEventOut(BaseModel):
 class AssistantAskOut(BaseModel):
     screen_id: str
     answer: str
+    # Present for a voice turn. The full answer remains available in
+    # ``answer`` while playback gets this bounded overview/core projection.
+    spoken_answer: Optional[str] = None
+    # True only when the spoken projection ends by asking whether to continue.
+    # The client uses this explicit contract instead of parsing Japanese text.
+    voice_follow_up_expected: bool = False
     suggested_actions: List[AssistantActionOut] = Field(default_factory=list)
     citations: List[AssistantCitationOut] = Field(default_factory=list)
     used_fallback: bool

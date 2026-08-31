@@ -24,6 +24,7 @@ from dataclasses import asdict
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 
 from .. import assistant_discussion, assistant_discussion_proposal
 from ..assistant import (
@@ -54,6 +55,7 @@ from ..models import (
     AssistantDiscussionThreadsListOut,
     AssistantDiscussionTurnOut,
     AssistantScreenContextOut,
+    AssistantSpeechRequest,
     AssistantSuggestedQuestionOut,
     DiagnosticLastObservedErrorOut,
     SettingMetadataOut,
@@ -68,8 +70,34 @@ from ..system_diagnostics import (
 )
 from ..system_state import build_system_state
 from ..ui_help_registry import HELP_BY_ID, UI_HELP_REGISTRY_VERSION
+from ..voice_speech import SpeechGenerationError, project_spoken_answer, stream_speech
 
 router = APIRouter()
+
+
+@router.post("/assistant/speech")
+def assistant_speech(payload: AssistantSpeechRequest) -> StreamingResponse:
+    """Render a bounded spoken answer through OpenAI without exposing keys."""
+    try:
+        audio = stream_speech(payload.text)
+        # Advance once here so configuration/upstream connection failures are
+        # returned as JSON HTTP errors instead of a broken 200 audio stream.
+        first = next(audio)
+    except StopIteration as exc:
+        raise HTTPException(status_code=502, detail="OpenAI speech returned no audio.") from exc
+    except SpeechGenerationError as exc:
+        status = 503 if "not configured" in str(exc) else 502
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+    def with_first_chunk():
+        yield first
+        yield from audio
+
+    return StreamingResponse(
+        with_first_chunk(),
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 def _principal_actor(principal: Principal) -> str:
@@ -578,6 +606,7 @@ def assistant_ask(
         screen_data_sources=screen_data_sources if screen_data is not None else None,
         route_params=effective_route_params,
         conversation=conversation_messages,
+        voice_mode=payload.input_mode == "voice",
     )
 
     thread_id_out: Optional[int] = None
@@ -634,9 +663,14 @@ def assistant_ask(
         turn_number_out = assistant_turn["turn_number"]
         recheck_required = thread_target_state not in ("current", "not_tracked")
 
+    voice_projection = (
+        project_spoken_answer(result.answer) if payload.input_mode == "voice" else None
+    )
     return AssistantAskOut(
         screen_id=ctx.screen_id,
         answer=result.answer,
+        spoken_answer=voice_projection.text if voice_projection else None,
+        voice_follow_up_expected=bool(voice_projection and voice_projection.has_more),
         suggested_actions=[
             AssistantActionOut(
                 label=a.label, kind=a.kind, target=a.target, detail=a.detail

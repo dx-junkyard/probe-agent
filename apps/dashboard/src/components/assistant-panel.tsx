@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { DiagnosticSeverityIcon } from "@/components/diagnostics-badge";
-import { AssistantVoice } from "@/components/assistant-voice";
+import { AssistantVoice, type AssistantVoiceReply } from "@/components/assistant-voice";
 import {
   ArrowRight, Bot, ExternalLink, Loader2, Mic, Send, Settings2, Wrench, X,
 } from "lucide-react";
@@ -515,7 +515,10 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
    * failure; the failure itself is still recorded in the conversation
    * history exactly as it always was.
    */
-  const submit = async (q: string, voiceTurn?: VoiceTurnTarget): Promise<string | null> => {
+  const submit = async (
+    q: string,
+    voiceTurn?: VoiceTurnTarget,
+  ): Promise<string | AssistantVoiceReply | null> => {
     const trimmed = q.trim();
     if (!trimmed || ask.isPending) return null;
     setQuestion("");
@@ -583,7 +586,11 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           prev.threadId === turnThread.id ? { ...prev, targetState: answered } : prev,
         );
       }
-      return result.answer;
+      if (!voiceTurn) return result.answer;
+      return {
+        text: result.spoken_answer ?? result.answer,
+        listenAfterPlayback: result.voice_follow_up_expected ?? false,
+      };
     } catch (err) {
       appendMessages([{ role: "error", text: String(err) }]);
       return null;
