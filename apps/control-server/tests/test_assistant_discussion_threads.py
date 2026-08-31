@@ -633,3 +633,76 @@ def test_llm_context_is_bounded_to_the_most_recent_turns(admin_client, monkeypat
     assert "question 8" in text
     # ...and the oldest ones have fallen out of the window.
     assert "question 0" not in text
+
+
+# --- Issue #441: the entry mode is recorded on the human's turn --------------
+
+
+def test_voice_input_mode_is_recorded_on_the_user_turn_only(admin_client, monkeypatch):
+    """`input_mode` says how the DEVELOPER entered the question.
+
+    The assistant turn keeps `text` deliberately: it did not speak into a
+    microphone, and whether the client read its answer aloud is a playback
+    choice rather than a fact about the turn. Recording `voice` on both would
+    give one column two meanings.
+    """
+    token = _login(admin_client)
+    system = _create_system(admin_client, token)
+    headers = _headers(token, system["id"])
+    created = _create_thread(
+        admin_client, headers, scope="screen", screen_id="overview",
+        target_kind="screen", target_ref="overview",
+    )
+    thread_id = created["thread"]["id"]
+
+    client = _CapturingClient()
+    _enable_real_llm(monkeypatch, client)
+
+    r = admin_client.post(
+        "/assistant/ask",
+        json={
+            "screen_id": "overview",
+            "question": "声で聞いた質問",
+            "thread_id": thread_id,
+            "input_mode": "voice",
+        },
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+    detail = admin_client.get(
+        f"/assistant/discussion-threads/{thread_id}", headers=headers
+    ).json()
+    by_role = {t["role"]: t for t in detail["turns"]}
+    assert by_role["user"]["input_mode"] == "voice"
+    assert by_role["assistant"]["input_mode"] == "text"
+
+
+def test_input_mode_defaults_to_text_and_rejects_anything_else(admin_client, monkeypatch):
+    token = _login(admin_client)
+    system = _create_system(admin_client, token)
+    headers = _headers(token, system["id"])
+    created = _create_thread(
+        admin_client, headers, scope="screen", screen_id="overview",
+        target_kind="screen", target_ref="overview",
+    )
+    thread_id = created["thread"]["id"]
+
+    client = _CapturingClient()
+    _enable_real_llm(monkeypatch, client)
+
+    _ask(admin_client, headers, screen_id="overview", question="文字で聞いた", thread_id=thread_id)
+    detail = admin_client.get(
+        f"/assistant/discussion-threads/{thread_id}", headers=headers
+    ).json()
+    assert all(t["input_mode"] == "text" for t in detail["turns"])
+
+    r = admin_client.post(
+        "/assistant/ask",
+        json={
+            "screen_id": "overview", "question": "x",
+            "thread_id": thread_id, "input_mode": "telepathy",
+        },
+        headers=headers,
+    )
+    assert r.status_code == 422, r.text

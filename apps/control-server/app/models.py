@@ -5908,6 +5908,12 @@ class AssistantAskRequest(BaseModel):
     # `conversation` list -- the two are mutually exclusive so there is never
     # a second source of truth for "what was said before" (§1.5).
     thread_id: Optional[int] = Field(default=None, gt=0)
+    # Issue #441: how the developer entered THIS question. It is recorded on
+    # the user turn only -- the assistant did not speak into a microphone, so
+    # claiming its reply was "voice input" would be a second meaning for one
+    # word. Whether the answer was read aloud is a client-side playback
+    # choice and is not a fact about the turn.
+    input_mode: Literal["text", "voice"] = "text"
 
     @model_validator(mode="after")
     def validate_assistant_context_bounds(self):
@@ -6094,6 +6100,92 @@ class AssistantDiscussionThreadDetailOut(BaseModel):
 
 class AssistantDiscussionThreadsListOut(BaseModel):
     threads: List[AssistantDiscussionThreadOut] = Field(default_factory=list)
+
+
+# --- Assistant discussion proposals (Issue #439, Epic #436) ------------------
+# docs/assistant-discussion.md §2. Finite vocabularies mirror
+# app/assistant_discussion_proposal.py's module constants exactly.
+
+DiscussionProposalItemKind = Literal["field", "relation"]
+DiscussionProposalItemStatus = Literal["proposed", "applied", "rejected"]
+#: First-match order (§2.2): `forbidden` -> `stale` -> `conflict` ->
+#: `appliable`. Derived at read time from persisted facts; never stored.
+DiscussionProposalItemEligibility = Literal["appliable", "forbidden", "stale", "conflict"]
+
+
+class AssistantDiscussionProposalItemOut(BaseModel):
+    id: int
+    proposal_id: int
+    item_kind: DiscussionProposalItemKind
+    field_name: str = ""
+    relation_kind: str = ""
+    relation_target_kind: str = ""
+    relation_target_ref: str = ""
+    subject_ref: str = ""
+    current_value: str = ""
+    proposed_value: str = ""
+    rationale: str = ""
+    status: DiscussionProposalItemStatus
+    eligibility: DiscussionProposalItemEligibility
+    applied_ref: Optional[str] = None
+    decided_by: Optional[str] = None
+    decided_at: Optional[float] = None
+    decision_method: Literal["reasoning_llm", "manual"]
+    created_at: float
+    schema_version: str = "assistant-discussion-proposal-item-v1"
+
+
+class AssistantDiscussionProposalOut(BaseModel):
+    id: int
+    system_id: int
+    thread_id: int
+    screen_id: str
+    target_kind: DiscussionTargetKind
+    target_ref: str
+    captured_target_revision_id: Optional[int] = None
+    captured_target_digest: str = ""
+    summary: str = ""
+    confirmed_points: List[str] = Field(default_factory=list)
+    unresolved_questions: List[str] = Field(default_factory=list)
+    assumptions: List[str] = Field(default_factory=list)
+    evidence_refs: List[str] = Field(default_factory=list)
+    decision_method: Literal["reasoning_llm"] = "reasoning_llm"
+    intelligence_run_id: Optional[int] = None
+    provider: str = ""
+    model: str = ""
+    prompt_version: str = ""
+    schema_version: str = "assistant-discussion-proposal-v1"
+    created_by: Optional[str] = None
+    created_at: float
+    items: List[AssistantDiscussionProposalItemOut] = Field(default_factory=list)
+
+
+class AssistantDiscussionProposalsListOut(BaseModel):
+    proposals: List[AssistantDiscussionProposalOut] = Field(default_factory=list)
+
+
+class AssistantDiscussionProposalApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_ids: List[int] = Field(..., min_length=1)
+    rationale: str = ""
+
+
+class AssistantDiscussionProposalRejectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_ids: List[int] = Field(..., min_length=1)
+    rationale: str = ""
+
+
+class AssistantDiscussionProposalApplyOut(BaseModel):
+    proposal: AssistantDiscussionProposalOut
+    applied_item_ids: List[int] = Field(default_factory=list)
+
+
+class AssistantDiscussionProposalRejectOut(BaseModel):
+    proposal: AssistantDiscussionProposalOut
+    rejected_item_ids: List[int] = Field(default_factory=list)
 
 
 # GitHub App publish workflow (Issue #216, sub-task 1): connection

@@ -3637,6 +3637,9 @@ export interface AssistantAskRequest {
   // Issue #438: mutually exclusive with `conversation` -- the server owns
   // the thread's own bounded history when this is set.
   thread_id?: number;
+  // Issue #441: how this question was entered. Recorded on the user
+  // turn only -- the assistant did not speak into a microphone.
+  input_mode?: "text" | "voice";
 }
 
 // Assistant discussion threads (Issue #438, Epic #436). Finite unions mirror
@@ -3708,6 +3711,88 @@ export interface AssistantDiscussionThreadDetailOut {
 
 export interface AssistantDiscussionThreadsListOut {
   threads: AssistantDiscussionThread[];
+}
+
+// Assistant discussion proposals (Issue #439, Epic #436). Finite unions
+// mirror app/assistant_discussion_proposal.py's module constants exactly.
+
+export type DiscussionProposalItemKind = "field" | "relation";
+export type DiscussionProposalItemStatus = "proposed" | "applied" | "rejected";
+export type DiscussionProposalItemEligibility =
+  | "appliable"
+  | "forbidden"
+  | "stale"
+  | "conflict";
+
+export interface AssistantDiscussionProposalItem {
+  id: number;
+  proposal_id: number;
+  item_kind: DiscussionProposalItemKind;
+  field_name: string;
+  relation_kind: string;
+  relation_target_kind: string;
+  relation_target_ref: string;
+  subject_ref: string;
+  current_value: string;
+  proposed_value: string;
+  rationale: string;
+  status: DiscussionProposalItemStatus;
+  eligibility: DiscussionProposalItemEligibility;
+  applied_ref: string | null;
+  decided_by: string | null;
+  decided_at: number | null;
+  decision_method: "reasoning_llm" | "manual";
+  created_at: number;
+  schema_version: string;
+}
+
+export interface AssistantDiscussionProposal {
+  id: number;
+  system_id: number;
+  thread_id: number;
+  screen_id: string;
+  target_kind: DiscussionTargetKind;
+  target_ref: string;
+  captured_target_revision_id: number | null;
+  captured_target_digest: string;
+  summary: string;
+  confirmed_points: string[];
+  unresolved_questions: string[];
+  assumptions: string[];
+  evidence_refs: string[];
+  decision_method: "reasoning_llm";
+  intelligence_run_id: number | null;
+  provider: string;
+  model: string;
+  prompt_version: string;
+  schema_version: string;
+  created_by: string | null;
+  created_at: number;
+  items: AssistantDiscussionProposalItem[];
+}
+
+export interface AssistantDiscussionProposalsListOut {
+  proposals: AssistantDiscussionProposal[];
+}
+
+export interface AssistantDiscussionProposalApplyRequest {
+  item_ids: number[];
+  rationale?: string;
+}
+
+export interface AssistantDiscussionProposalRejectRequest {
+  item_ids: number[];
+  rationale?: string;
+}
+
+export interface AssistantDiscussionProposalApplyOut {
+  proposal: AssistantDiscussionProposal;
+  applied_item_ids: number[];
+}
+
+export interface AssistantDiscussionProposalRejectOut {
+  proposal: AssistantDiscussionProposal;
+  rejected_item_ids: number[];
 }
 
 export interface AssistantAction {

@@ -130,6 +130,10 @@ user turn は `decision_method='manual'`、assistant turn は LLM が答えた�
     要素自身の canonical facts が context pack に載るようにする。
   - user turn → assistant turn を 1 トランザクションで追記する。
   - 応答に `thread_id` / `target_state` / `recheck_required` / `turn_number`。
+- `POST /assistant/ask` の `input_mode` (`text` | `voice`、既定 `text`) は
+  **user turn にだけ**記録する。assistant はマイクへ話していないし、その回答を
+  読み上げたかどうかはクライアント側の再生選択であって turn の事実ではない —
+  1 列に 2 つの意味を持たせない (#366)。
 
 ## §2 会話結論の変更候補化 (#439)
 
@@ -144,7 +148,7 @@ user turn は `decision_method='manual'`、assistant turn は LLM が答えた�
 | `ux_journey`          | `title` / `beneficiary` / `usage_context` / `entry_trigger` / `value_arrival` / `summary` | `upstream_ref` |
 | `ux_journey_step`     | `user_intent` / `system_response` / `success_criteria` / `failure_mode` / `recovery_path` / `evidence_expectation` | — |
 | `ux_requirement`      | `statement` / `rationale` / `constraint_text` / `out_of_scope_note` | `journey_step_link` |
-| `solution_design`     | `title` / `summary` / `approach` 等 (実装時に `solution_design` の revision field へ厳密に一致させる) | `requirement_link` / `target_link` |
+| `solution_design`     | Option の `title` / `approach` / `tradeoffs` / `risks` (`subject_ref` に `option_key`) | `requirement_link` / `target_link` |
 | `blueprint_lane_cell` | —                                                       | `delivery_link` / `stakeholder_link` / `exchange_link` |
 | `understanding_claim` | `summary` / `why_core` / `name`                          | — |
 | `overview_finding` / `interview_session` / `screen` | — (討議のみ)          | — |
@@ -170,8 +174,13 @@ user turn は `decision_method='manual'`、assistant turn は LLM が答えた�
     人が別途叩くまで `proposed` のまま。
   - Blueprint の unknown lane → `journey_blueprint.add_delivery_link` /
     `add_stakeholder_link` / `add_exchange_link` (`decision_method='manual'`)。
-  - `understanding_claim` → 既存の Interview change-set / Intent Brief の
-    proposal API。自動確定はしない。
+  - `understanding_claim` → Intent Brief の propose 経路。`status='proposed'`
+    / `origin='ai_proposed'` / `decision_method='reasoning_llm'` の新規 item
+    として記録し、**自動確定はしない**。Intent Brief には claim 自身の
+    `summary` / `why_core` / `name` に 1:1 対応する field が無く、開発者の
+    確定済み `goal` が reviewer の Vision より上位に立つ (#351) ので、候補
+    `goal` として置き、確定は既存の confirm/correct 判断に委ねる。元の claim
+    field は `source_statement` に残す。
 - 拒否: `POST /assistant/discussion-proposals/{id}/reject` で item を
   `rejected` にする (監査記録、`decision_method: manual`)。
 
@@ -189,6 +198,7 @@ assistant_discussion_proposal(
 assistant_discussion_proposal_item(
   id, system_id, proposal_id, item_kind ('field'|'relation'),
   field_name, relation_kind, relation_target_kind, relation_target_ref,
+  subject_ref,          -- 対象内のサブアドレス (Solution Design の option_key)
   current_value, proposed_value, rationale,
   status ('proposed'|'applied'|'rejected'),
   applied_ref, decided_by, decided_at,
@@ -230,6 +240,10 @@ Phase 1 (実装対象) は **turn-based**、かつ **provider-neutral adapter �
 - `stop` / `mute` / `exit` は常時利用可能。
 - **turn 開始時の discussion target を回答完了まで固定する** — 途中で選択が
   変わっても、その turn は捕捉した target で答える。
+- element scope は `useHelpMode().target` (#440) から取り、新しい
+  `DiscussionTargetKind` は増やさない (§1.1 の有限集合は閉じている)。route
+  param `voice_element_help_id` として既存の経路で渡す。
+- 音声 turn は `input_mode: "voice"` を送り、サーバが user turn に記録する。
 - microphone 拒否 / STT 失敗 / TTS 失敗 は error 状態を示したうえで text mode
   へ安全に戻る。
 - 音声会話からも正規データは変更しない (§0)。

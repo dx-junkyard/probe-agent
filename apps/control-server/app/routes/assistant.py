@@ -25,7 +25,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from .. import assistant_discussion
+from .. import assistant_discussion, assistant_discussion_proposal
 from ..assistant import (
     answer_question,
     checks_for_screen,
@@ -42,6 +42,12 @@ from ..models import (
     AssistantAskOut,
     AssistantAskRequest,
     AssistantCitationOut,
+    AssistantDiscussionProposalApplyOut,
+    AssistantDiscussionProposalApplyRequest,
+    AssistantDiscussionProposalOut,
+    AssistantDiscussionProposalRejectOut,
+    AssistantDiscussionProposalRejectRequest,
+    AssistantDiscussionProposalsListOut,
     AssistantDiscussionTargetIn,
     AssistantDiscussionThreadDetailOut,
     AssistantDiscussionThreadOut,
@@ -279,6 +285,179 @@ def get_discussion_thread(
     return _thread_detail_out(data)
 
 
+# --- Discussion proposals (Issue #439) ----------------------------------------
+
+
+def _proposal_detail_out(data: Dict[str, Any]) -> AssistantDiscussionProposalOut:
+    return AssistantDiscussionProposalOut(**data)
+
+
+@router.post(
+    "/assistant/discussion-threads/{thread_id}/proposals",
+    response_model=AssistantDiscussionProposalOut,
+    status_code=201,
+)
+def create_discussion_proposal(
+    thread_id: int,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> AssistantDiscussionProposalOut:
+    """§2.2: summarize a thread's turns into a reviewable proposal.
+
+    Read -> reason -> persist (CLAUDE.md Implementation Constraints): the
+    deterministic reads happen first, the reasoning call runs with NO
+    `get_conn()` connection open, and the audit `intelligence_runs` row is
+    written whether the run succeeded or failed (Principle 7) -- but the
+    proposal row itself is written only on success.
+    """
+    thread_data = assistant_discussion.get_thread(system_id, thread_id)
+    if thread_data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    thread_row = thread_data["thread"]
+
+    config = LLMConfig.intelligence_from_env()
+    client = _usable_llm_client(config)
+
+    with get_conn() as conn:
+        recent = assistant_discussion.recent_turns(conn, thread_id)
+        target_facts = assistant_discussion_proposal.gather_target_context(
+            conn, system_id, thread_row["target_kind"], thread_row["target_ref"]
+        )
+    resolved = assistant_discussion.resolve_target(
+        system_id, thread_row["target_kind"], thread_row["target_ref"]
+    )
+
+    result = assistant_discussion_proposal.generate_proposal(
+        client, config,
+        target_kind=thread_row["target_kind"], target_ref=thread_row["target_ref"],
+        target_title=thread_row["target_title"] or thread_row["target_ref"],
+        turns=recent, target_facts=target_facts,
+    )
+    completed_at = time.time()
+
+    with get_conn() as conn:
+        run_status = "failed" if result.error else "completed"
+        run_cur = conn.execute(
+            """INSERT INTO intelligence_runs
+                   (system_id, snapshot_id, run_type, provider, model, prompt_version,
+                    schema_version, decision_method, status, error_details, is_mock,
+                    started_at, completed_at)
+               VALUES (?, NULL, 'discussion_proposal', ?, ?, ?, ?, 'reasoning_llm', ?, ?, ?, ?, ?)""",
+            (
+                system_id, result.provider, result.model, result.prompt_version,
+                result.schema_version, run_status, result.error, 1 if result.is_mock else 0,
+                completed_at, completed_at,
+            ),
+        )
+        run_id = run_cur.lastrowid
+
+        if result.error:
+            status_code = 503 if result.error_kind == "unavailable" else 502
+            code = "reasoning_unavailable" if status_code == 503 else "discussion_proposal_generation_failed"
+            raise HTTPException(
+                status_code=status_code, detail={"code": code, "message": result.error}
+            )
+
+        row = assistant_discussion_proposal.create_proposal(
+            conn, system_id=system_id, thread_id=thread_id, screen_id=thread_row["screen_id"],
+            target_kind=thread_row["target_kind"], target_ref=thread_row["target_ref"],
+            captured_target_revision_id=resolved.revision_id, captured_target_digest=resolved.digest,
+            result=result, intelligence_run_id=run_id, created_by=_principal_actor(principal),
+        )
+        proposal_id = row["id"]
+
+    detail = assistant_discussion_proposal.get_proposal_detail(system_id, proposal_id)
+    assert detail is not None
+    return _proposal_detail_out(detail)
+
+
+@router.get(
+    "/assistant/discussion-threads/{thread_id}/proposals",
+    response_model=AssistantDiscussionProposalsListOut,
+)
+def list_discussion_proposals(
+    thread_id: int,
+    system_id: int = Depends(get_system_id),
+) -> AssistantDiscussionProposalsListOut:
+    thread_data = assistant_discussion.get_thread(system_id, thread_id)
+    if thread_data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    rows = assistant_discussion_proposal.list_proposals(system_id, thread_id)
+    return AssistantDiscussionProposalsListOut(proposals=[_proposal_detail_out(r) for r in rows])
+
+
+@router.get(
+    "/assistant/discussion-proposals/{proposal_id}",
+    response_model=AssistantDiscussionProposalOut,
+)
+def get_discussion_proposal(
+    proposal_id: int,
+    system_id: int = Depends(get_system_id),
+) -> AssistantDiscussionProposalOut:
+    data = assistant_discussion_proposal.get_proposal_detail(system_id, proposal_id)
+    if data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion proposal id: {proposal_id}"
+        )
+    return _proposal_detail_out(data)
+
+
+@router.post(
+    "/assistant/discussion-proposals/{proposal_id}/apply",
+    response_model=AssistantDiscussionProposalApplyOut,
+)
+def apply_discussion_proposal(
+    proposal_id: int,
+    payload: AssistantDiscussionProposalApplyRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> AssistantDiscussionProposalApplyOut:
+    try:
+        detail, applied_ids = assistant_discussion_proposal.apply_items(
+            system_id, proposal_id, payload.item_ids,
+            rationale=payload.rationale, actor=_principal_actor(principal),
+        )
+    except assistant_discussion_proposal.ApplyRejected as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    except assistant_discussion_proposal.NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except assistant_discussion_proposal.DiscussionProposalError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AssistantDiscussionProposalApplyOut(
+        proposal=_proposal_detail_out(detail), applied_item_ids=applied_ids,
+    )
+
+
+@router.post(
+    "/assistant/discussion-proposals/{proposal_id}/reject",
+    response_model=AssistantDiscussionProposalRejectOut,
+)
+def reject_discussion_proposal(
+    proposal_id: int,
+    payload: AssistantDiscussionProposalRejectRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> AssistantDiscussionProposalRejectOut:
+    try:
+        detail, rejected_ids = assistant_discussion_proposal.reject_items(
+            system_id, proposal_id, payload.item_ids,
+            rationale=payload.rationale, actor=_principal_actor(principal),
+        )
+    except assistant_discussion_proposal.NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except assistant_discussion_proposal.DiscussionProposalError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AssistantDiscussionProposalRejectOut(
+        proposal=_proposal_detail_out(detail), rejected_item_ids=rejected_ids,
+    )
+
+
 @router.post("/assistant/ask", response_model=AssistantAskOut)
 def assistant_ask(
     payload: AssistantAskRequest,
@@ -397,6 +576,11 @@ def assistant_ask(
                     role="user",
                     content=payload.question,
                     decision_method="manual",
+                    # Issue #441: the entry mode belongs to the human's turn.
+                    # The assistant turn keeps the default `text`: it did not
+                    # speak into a microphone, and reading its answer aloud is
+                    # a client playback choice, not a fact about the turn.
+                    input_mode=payload.input_mode,
                     created_by=_principal_actor(principal),
                 )
                 assistant_turn = assistant_discussion.append_turn(

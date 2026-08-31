@@ -313,6 +313,127 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_turn_thread
 """
 
 
+# assistant_discussion_proposal / assistant_discussion_proposal_item (Issue
+# #439, Epic #436, docs/assistant-discussion.md §2): a reviewable, structured
+# change-set summarized from a discussion thread's (#438) turns through the
+# reasoning model, deliberately separate from the thread's own turns -- a
+# turn is what was SAID, a proposal item is a candidate CHANGE. Generating a
+# proposal never writes to any canonical table; applying one always goes
+# through the SAME existing domain service a human-authored write would use
+# (`ux_design.add_journey_revision`, `journey_blueprint.add_delivery_link`,
+# ...), with `decision_method='manual'` on the resulting row -- so an
+# accepted proposal item is indistinguishable, downstream, from a developer
+# typing the same edit directly (the target's own decision ledger, e.g. a
+# Journey's `design_status`, is untouched either way -- §2.2's "自動確定は
+# しない"). `app.assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA` is the
+# only definition of which `field_name`/`relation_kind` a given `target_kind`
+# may carry; this DDL only constrains the axes that are finite regardless of
+# `target_kind` (`item_kind`, `relation_kind`'s own closed vocabulary across
+# every target_kind, `status`). `field_name`/`relation_target_kind` validity
+# depends on `target_kind` too (a Journey's `title` is not a Requirement's),
+# which a single column CHECK cannot express without duplicating the whole
+# registry into SQL -- that cross-referential validation stays in the
+# domain module (Principle 6), covered by
+# `tests/test_assistant_discussion_proposals.py`'s registry-drift test.
+_ASSISTANT_DISCUSSION_PROPOSAL_DDL = """
+CREATE TABLE IF NOT EXISTS assistant_discussion_proposal (
+    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                    INTEGER NOT NULL,
+    thread_id                    INTEGER NOT NULL,
+    screen_id                    TEXT NOT NULL,
+    target_kind                  TEXT NOT NULL,
+    target_ref                   TEXT NOT NULL,
+    -- The target's revision id / content digest AT GENERATION TIME, never
+    -- re-stamped afterwards -- applying an item later re-resolves the
+    -- target and compares against THIS baseline to refuse a stale apply
+    -- (422 `proposal_item_stale`), the same discipline every other
+    -- reference table in this Epic uses for its own captured baseline.
+    captured_target_revision_id  INTEGER,
+    captured_target_digest       TEXT NOT NULL DEFAULT '',
+    summary                      TEXT NOT NULL DEFAULT '',
+    confirmed_points_json        TEXT NOT NULL DEFAULT '[]',
+    unresolved_questions_json    TEXT NOT NULL DEFAULT '[]',
+    assumptions_json             TEXT NOT NULL DEFAULT '[]',
+    evidence_refs_json           TEXT NOT NULL DEFAULT '[]',
+    -- Always 'reasoning_llm': a proposal is, by construction, the model's
+    -- structured read of the conversation. A mock/heuristic/no-provider
+    -- attempt never reaches this table (503 `reasoning_unavailable` before
+    -- any row is written here) -- the failed attempt is recorded only on
+    -- the audit-only `intelligence_runs` row.
+    decision_method              TEXT NOT NULL DEFAULT 'reasoning_llm'
+                                     CHECK (decision_method = 'reasoning_llm'),
+    intelligence_run_id          INTEGER,
+    provider                     TEXT NOT NULL DEFAULT '',
+    model                        TEXT NOT NULL DEFAULT '',
+    prompt_version               TEXT NOT NULL DEFAULT '',
+    schema_version               TEXT NOT NULL DEFAULT 'assistant-discussion-proposal-v1',
+    created_by                   TEXT,
+    created_at                   REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (thread_id) REFERENCES assistant_discussion_thread (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_system
+    ON assistant_discussion_proposal (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_thread
+    ON assistant_discussion_proposal (thread_id, id DESC);
+
+-- assistant_discussion_proposal_item: one candidate field/relation change.
+-- `subject_ref` is the sub-address INSIDE the target that `target_ref`
+-- alone cannot express -- today only a Solution Design's OPTION
+-- (`option_key`), because a Solution Design carries no design-level
+-- revision table (a field proposal on `solution_design` addresses an
+-- Option, applied through `solution_design.add_option`); every other
+-- target_kind leaves it ''. Eligibility (`appliable`/`forbidden`/`stale`/
+-- `conflict`) is DERIVED at read time from `status` + a live digest
+-- comparison + sibling rows
+-- (`assistant_discussion_proposal.PROPOSAL_ITEM_ELIGIBILITY`) and is never a
+-- stored column -- the same "derived, never stored" discipline #337/#338/
+-- #349/#405 apply elsewhere, so a target that changed after generation
+-- cannot keep reading as appliable.
+CREATE TABLE IF NOT EXISTS assistant_discussion_proposal_item (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id             INTEGER NOT NULL,
+    proposal_id           INTEGER NOT NULL,
+    item_kind             TEXT NOT NULL CHECK (item_kind IN ('field', 'relation')),
+    field_name            TEXT NOT NULL DEFAULT '',
+    relation_kind         TEXT NOT NULL DEFAULT '' CHECK (relation_kind IN (
+                              '', 'upstream_ref', 'journey_step_link', 'requirement_link',
+                              'target_link', 'delivery_link', 'stakeholder_link', 'exchange_link')),
+    relation_target_kind  TEXT NOT NULL DEFAULT '',
+    relation_target_ref   TEXT NOT NULL DEFAULT '',
+    subject_ref           TEXT NOT NULL DEFAULT '',
+    current_value         TEXT NOT NULL DEFAULT '',
+    proposed_value        TEXT NOT NULL DEFAULT '',
+    rationale             TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL DEFAULT 'proposed'
+                              CHECK (status IN ('proposed', 'applied', 'rejected')),
+    applied_ref           TEXT,
+    decided_by            TEXT,
+    decided_at            REAL,
+    -- The item's OWN authorship stays 'reasoning_llm' until a human decides
+    -- it (apply/reject), at which point this becomes 'manual' -- mirroring
+    -- `ux_journey_revision.decision_method` one layer up, so a reader never
+    -- has to cross-reference the parent proposal to know who decided THIS
+    -- item.
+    decision_method       TEXT NOT NULL DEFAULT 'reasoning_llm'
+                              CHECK (decision_method IN ('reasoning_llm', 'manual')),
+    created_at            REAL NOT NULL,
+    schema_version        TEXT NOT NULL DEFAULT 'assistant-discussion-proposal-item-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_id) REFERENCES assistant_discussion_proposal (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_item_system
+    ON assistant_discussion_proposal_item (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_item_proposal
+    ON assistant_discussion_proposal_item (proposal_id, id);
+"""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -8517,7 +8638,7 @@ CREATE INDEX IF NOT EXISTS idx_product_feature_decision_system
 CREATE INDEX IF NOT EXISTS idx_product_feature_decision_feature
     ON product_feature_decision (feature_id, id DESC);
 
-""" + _PRODUCT_GAP_ARTIFACT_LINK_DDL + _ASSISTANT_DISCUSSION_DDL
+""" + _PRODUCT_GAP_ARTIFACT_LINK_DDL + _ASSISTANT_DISCUSSION_DDL + _ASSISTANT_DISCUSSION_PROPOSAL_DDL
 
 
 _SCOPED_TABLES = [

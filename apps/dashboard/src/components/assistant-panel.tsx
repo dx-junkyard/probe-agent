@@ -327,11 +327,11 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   // safe on any screen.
   const helpMode = useHelpMode();
   const voiceScopeLabel = helpMode.target ? `要素「${helpMode.target}」` : "画面全体";
-  // NOTE: `POST /assistant/ask` has no `input_mode` field yet, and
-  // `assistant_discussion_turn.input_mode` defaults to `'text'`
-  // (docs/assistant-discussion.md §1.4). Persisting the voice/text
-  // distinction on the turn itself is a follow-up for whoever picks that up
-  // next -- this client deliberately does NOT claim it is recorded anywhere.
+  // A voice turn sends `input_mode: "voice"`, which the server records on the
+  // USER turn (`assistant_discussion_turn.input_mode`, §1.4). The assistant
+  // turn keeps `text`: it did not speak into a microphone, and whether its
+  // answer was read aloud is this client's playback choice, not a fact about
+  // the turn.
 
   // --- Issue #438: target-scoped discussion threads ------------------------
   const discussionEnabled = isDiscussionScreen(screenId);
@@ -566,6 +566,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         question: trimmed,
         route_params: routeParams,
         conversation,
+        ...(voiceTurn ? { input_mode: "voice" as const } : {}),
         ...(turnThread ? { thread_id: turnThread.id } : {}),
         visible_check_ids: failingChecks.map((c) => c.check_id),
         ...(focusedStateItem ? {

@@ -20,6 +20,12 @@ class IntelligenceRunType(str, Enum):
     CELL_IMPROVEMENT_DRAFT = "cell_improvement_draft"
     CELL_QUALITY_AUDIT = "cell_quality_audit"
     CELL_TRIAGE = "cell_triage"
+    # Issue #439 (Epic #436): a reasoning run that summarizes an
+    # `assistant_discussion_thread`'s turns into a reviewable
+    # `assistant_discussion_proposal`. It proposes only -- applying an item
+    # always goes through the existing target domain service with
+    # `decision_method: manual` (docs/assistant-discussion.md §2).
+    DISCUSSION_PROPOSAL = "discussion_proposal"
     ENTRYPOINT_INDEX = "entrypoint_index"
     EXPLANATION_REFRESH = "explanation_refresh"
     FEATURE_CODE_MAPPING = "feature_code_mapping"
