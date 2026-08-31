@@ -63,6 +63,35 @@ def test_registry_doc_refs_resolve_to_real_files():
     assert not missing, f"doc_refs pointing at missing files: {missing}"
 
 
+def test_registry_doc_ref_anchors_resolve_to_real_headings():
+    """A citation the reader cannot follow does not show its source.
+
+    `test_registry_doc_refs_resolve_to_real_files` only proves the file is
+    there; an anchor naming a section that does not exist still renders as a
+    source in the help panel while pointing at nothing. The anchor is written
+    as the heading's own text (with or without its `#` markers), so this
+    compares against the headings the doc actually has.
+    """
+    unresolved = []
+    heading_cache: dict = {}
+    for entry in UI_HELP_ENTRIES:
+        for doc in entry.doc_refs:
+            if not doc.anchor:
+                continue
+            path = REPO_ROOT / doc.doc_path
+            if doc.doc_path not in heading_cache:
+                heading_cache[doc.doc_path] = [
+                    line.lstrip("#").strip()
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.startswith("#")
+                ]
+            if doc.anchor.lstrip("#").strip() not in heading_cache[doc.doc_path]:
+                unresolved.append((entry.help_id, doc.doc_path, doc.anchor))
+    assert not unresolved, (
+        "doc_ref anchors naming no real heading: " + repr(unresolved)
+    )
+
+
 def test_registry_screen_ids_are_registered_assistant_screens():
     screen_ids = {e.screen_id for e in UI_HELP_ENTRIES}
     assert screen_ids == EXPECTED_SCREEN_IDS

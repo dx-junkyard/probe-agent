@@ -738,7 +738,7 @@ _UX_DESIGN_STUDIO_ENTRIES: Tuple[UiHelpEntry, ...] = (
             "5 値です。"
         ),
         doc_refs=(
-            UiHelpDocRef(_STAKEHOLDER, "as-is / to-be diff", "8.3 as-is / to-be diff"),
+            UiHelpDocRef(_STAKEHOLDER, "as-is / to-be diff", "§8.3 as-is / to-be diff"),
         ),
     ),
     UiHelpEntry(
@@ -935,7 +935,7 @@ _JOURNEY_BLUEPRINT_LANE_ENTRIES: Tuple[UiHelpEntry, ...] = tuple(
         summary=_LANE_SUMMARIES[lane_kind],
         usage=_lane_usage(lane_kind),
         doc_refs=(
-            UiHelpDocRef(_STAKEHOLDER, "The nine lanes", "8.1 The nine lanes"),
+            UiHelpDocRef(_STAKEHOLDER, "The nine lanes", "§8.1 The nine lanes"),
         ),
         related_help_ids=("journey-blueprint.detail_pane",),
     )
@@ -968,7 +968,7 @@ _JOURNEY_BLUEPRINT_ENTRIES: Tuple[UiHelpEntry, ...] = (
             "しません。セルを選ぶと右側の詳細ペインに根拠が表示されます。"
         ),
         doc_refs=(
-            UiHelpDocRef(_STAKEHOLDER, "Journey Service Blueprint projection", "8. Journey Service Blueprint projection (#423)"),
+            UiHelpDocRef(_STAKEHOLDER, "Journey Service Blueprint projection", "§8. Journey Service Blueprint projection (#423)"),
         ),
         related_help_ids=(
             "journey-blueprint.journey_select",
@@ -993,7 +993,7 @@ _JOURNEY_BLUEPRINT_ENTRIES: Tuple[UiHelpEntry, ...] = (
             "ん。"
         ),
         doc_refs=(
-            UiHelpDocRef(_STAKEHOLDER, "as-is / to-be diff", "8.3 as-is / to-be diff"),
+            UiHelpDocRef(_STAKEHOLDER, "as-is / to-be diff", "§8.3 as-is / to-be diff"),
         ),
     ),
     UiHelpEntry(
@@ -1011,7 +1011,7 @@ _JOURNEY_BLUEPRINT_ENTRIES: Tuple[UiHelpEntry, ...] = (
             "や埋め込みでの判定はありません。"
         ),
         doc_refs=(
-            UiHelpDocRef(_STAKEHOLDER, "as-is / to-be diff", "8.3 as-is / to-be diff"),
+            UiHelpDocRef(_STAKEHOLDER, "as-is / to-be diff", "§8.3 as-is / to-be diff"),
         ),
     ),
     *_JOURNEY_BLUEPRINT_LANE_ENTRIES,
@@ -1030,7 +1030,7 @@ _JOURNEY_BLUEPRINT_ENTRIES: Tuple[UiHelpEntry, ...] = (
             "ません。"
         ),
         doc_refs=(
-            UiHelpDocRef(_STAKEHOLDER, "Added links (owned here, content never copied)", "8.2 Added links (owned here, content never copied)"),
+            UiHelpDocRef(_STAKEHOLDER, "Added links (owned here, content never copied)", "§8.2 Added links (owned here, content never copied)"),
         ),
         related_actions=(
             UiHelpAction(label="Requirement を開く", kind="navigate", target="/ux-design-studio?tab=requirements"),
@@ -1052,7 +1052,7 @@ _JOURNEY_BLUEPRINT_ENTRIES: Tuple[UiHelpEntry, ...] = (
             "undecided (未決定) のときとは異なる文言になります。"
         ),
         doc_refs=(
-            UiHelpDocRef(_STAKEHOLDER, "as-is / to-be diff", "8.3 as-is / to-be diff"),
+            UiHelpDocRef(_STAKEHOLDER, "as-is / to-be diff", "§8.3 as-is / to-be diff"),
             UiHelpDocRef(_UX_LINEAGE, "既存改善の比較表示", "4.3 既存改善の比較表示"),
         ),
     ),
