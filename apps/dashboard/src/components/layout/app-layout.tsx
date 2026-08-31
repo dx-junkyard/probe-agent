@@ -7,6 +7,8 @@ import { Header } from "./header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AssistantPanel } from "@/components/assistant-panel";
 import { systemStateTarget } from "@/components/system-state";
+import { HelpModeProvider } from "@/lib/help-mode";
+import { HelpModeLayer } from "@/components/help-mode-layer";
 
 export function AppLayout() {
   const { user, loading } = useAuth();
@@ -49,36 +51,39 @@ export function AppLayout() {
   if (!user) return <Navigate to="/login" replace />;
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      <Sidebar
-        navOpen={navOpen}
-        onNavClose={closeNav}
-        drawerId={MOBILE_NAV_DRAWER_ID}
-        returnFocusRef={navToggleRef}
-      />
-      <div className="flex flex-1 flex-col overflow-hidden min-w-0">
-        <Header
+    <HelpModeProvider>
+      <div className="flex h-screen overflow-hidden">
+        <Sidebar
           navOpen={navOpen}
-          onNavToggle={toggleNav}
-          navToggleRef={navToggleRef}
-          navDrawerId={MOBILE_NAV_DRAWER_ID}
+          onNavClose={closeNav}
+          drawerId={MOBILE_NAV_DRAWER_ID}
+          returnFocusRef={navToggleRef}
         />
-        {/* `pb-24` は `AssistantPanel` の浮いているボタン (閉じているとき
-            右下に固定) のための予約領域。本文の末尾が常にボタンより上で
-            終わるので、画面の主操作がボタンに覆われることがない (#102:
-            アシスタントは画面の主操作を隠さない)。ボタン側の `bottom-*` と
-            対で意味を持つ値なので、片方だけ変えないこと。 */}
-        <main className="flex-1 overflow-y-auto p-4 pb-24 md:p-6 md:pb-24">
-          <Outlet />
-        </main>
+        <div className="flex flex-1 flex-col overflow-hidden min-w-0">
+          <Header
+            navOpen={navOpen}
+            onNavToggle={toggleNav}
+            navToggleRef={navToggleRef}
+            navDrawerId={MOBILE_NAV_DRAWER_ID}
+          />
+          {/* `pb-24` は `AssistantPanel` の浮いているボタン (閉じているとき
+              右下に固定) のための予約領域。本文の末尾が常にボタンより上で
+              終わるので、画面の主操作がボタンに覆われることがない (#102:
+              アシスタントは画面の主操作を隠さない)。ボタン側の `bottom-*` と
+              対で意味を持つ値なので、片方だけ変えないこと。 */}
+          <main className="flex-1 overflow-y-auto p-4 pb-24 md:p-6 md:pb-24">
+            <Outlet />
+          </main>
+        </div>
+        <AssistantPanel
+          focusedStateItem={primaryNotice}
+          onSnapshotNoticeClick={() => {
+            const target = primaryNotice ? systemStateTarget(primaryNotice) : null;
+            if (target) navigate(target);
+          }}
+        />
+        <HelpModeLayer />
       </div>
-      <AssistantPanel
-        focusedStateItem={primaryNotice}
-        onSnapshotNoticeClick={() => {
-          const target = primaryNotice ? systemStateTarget(primaryNotice) : null;
-          if (target) navigate(target);
-        }}
-      />
-    </div>
+    </HelpModeProvider>
   );
 }

@@ -12,6 +12,8 @@ import { ConnectivityBadge } from "@/components/connectivity-badge";
 import { UserPhaseIndicator } from "@/components/system-state";
 import { toast } from "sonner";
 import { MOBILE_NAV_DRAWER_ID } from "./sidebar";
+import { HelpCircle } from "lucide-react";
+import { useHelpMode } from "@/lib/help-mode";
 
 function initTheme() {
   const saved = localStorage.getItem("theme");
@@ -36,6 +38,26 @@ function ThemeToggle() {
   return (
     <Button variant="ghost" size="icon" onClick={toggle} title="Toggle theme">
       {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+    </Button>
+  );
+}
+
+// Issue #440 (Epic #436): 機能解説モードのトグル。再クリックと Escape の
+// どちらでも解除でき、解除後は `HelpModeLayer` がリスナーを外すので通常操作
+// へ完全に戻る (`docs/assistant-discussion.md` §3)。
+function HelpModeToggle() {
+  const { active, toggle } = useHelpMode();
+  return (
+    <Button
+      variant={active ? "default" : "ghost"}
+      size="icon"
+      onClick={toggle}
+      aria-pressed={active}
+      aria-label={active ? "解説モードを終了" : "解説モードを開始"}
+      title={active ? "解説モードを終了" : "解説モードを開始"}
+      data-testid="help-mode-toggle"
+    >
+      <HelpCircle className="h-4 w-4" />
     </Button>
   );
 }
@@ -142,6 +164,7 @@ export function Header({
         <UserPhaseIndicator />
         <ConnectivityBadge />
         <DiagnosticsBadge />
+        <HelpModeToggle />
         <ThemeToggle />
         {user && (
           <span className="text-sm text-muted-foreground">

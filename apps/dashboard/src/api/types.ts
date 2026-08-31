@@ -3627,9 +3627,172 @@ export interface AssistantAskRequest {
   screen_id: string;
   question: string;
   route_params?: Record<string, string>;
+  conversation?: Array<{
+    role: "user" | "assistant";
+    content: string;
+  }>;
   visible_check_ids?: string[];
   visible_state_ids?: string[];
   focused_state_id?: string;
+  // Issue #438: mutually exclusive with `conversation` -- the server owns
+  // the thread's own bounded history when this is set.
+  thread_id?: number;
+  // Issue #441: how this question was entered. Recorded on the user
+  // turn only -- the assistant did not speak into a microphone.
+  input_mode?: "text" | "voice";
+}
+
+// Assistant discussion threads (Issue #438, Epic #436). Finite unions mirror
+// app/assistant_discussion.py's module constants exactly -- keep them exact.
+
+export type DiscussionScope = "screen" | "entity" | "element";
+export type DiscussionTargetKind =
+  | "screen"
+  | "interview_session"
+  | "understanding_claim"
+  | "overview_finding"
+  | "ux_journey"
+  | "ux_journey_step"
+  | "ux_requirement"
+  | "solution_design"
+  | "blueprint_lane_cell";
+export type DiscussionTargetState = "current" | "stale" | "unresolvable" | "not_tracked";
+
+export interface AssistantDiscussionTargetIn {
+  scope: DiscussionScope;
+  screen_id: string;
+  target_kind: DiscussionTargetKind;
+  target_ref: string;
+}
+
+export interface AssistantDiscussionTurn {
+  id: number;
+  thread_id: number;
+  turn_number: number;
+  role: "user" | "assistant";
+  content: string;
+  citations: AssistantCitation[];
+  target_revision_id: number | null;
+  target_digest: string;
+  used_fallback: boolean;
+  decision_method: "manual" | "reasoning_llm" | "deterministic";
+  input_mode: "text" | "voice";
+  provider: string;
+  model: string;
+  prompt_version: string;
+  schema_version: string;
+  created_by: string | null;
+  created_at: number;
+}
+
+export interface AssistantDiscussionThread {
+  id: number;
+  system_id: number;
+  thread_key: string;
+  scope: DiscussionScope;
+  screen_id: string;
+  target_kind: DiscussionTargetKind;
+  target_ref: string;
+  target_title: string;
+  captured_target_revision_id: number | null;
+  captured_target_digest: string;
+  status: "open" | "archived";
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+  schema_version: string;
+}
+
+export interface AssistantDiscussionThreadDetailOut {
+  thread: AssistantDiscussionThread;
+  target_state: DiscussionTargetState;
+  turns: AssistantDiscussionTurn[];
+}
+
+export interface AssistantDiscussionThreadsListOut {
+  threads: AssistantDiscussionThread[];
+}
+
+// Assistant discussion proposals (Issue #439, Epic #436). Finite unions
+// mirror app/assistant_discussion_proposal.py's module constants exactly.
+
+export type DiscussionProposalItemKind = "field" | "relation";
+export type DiscussionProposalItemStatus = "proposed" | "applied" | "rejected";
+export type DiscussionProposalItemEligibility =
+  | "appliable"
+  | "forbidden"
+  | "stale"
+  | "conflict";
+
+export interface AssistantDiscussionProposalItem {
+  id: number;
+  proposal_id: number;
+  item_kind: DiscussionProposalItemKind;
+  field_name: string;
+  relation_kind: string;
+  relation_target_kind: string;
+  relation_target_ref: string;
+  subject_ref: string;
+  current_value: string;
+  proposed_value: string;
+  rationale: string;
+  status: DiscussionProposalItemStatus;
+  eligibility: DiscussionProposalItemEligibility;
+  applied_ref: string | null;
+  decided_by: string | null;
+  decided_at: number | null;
+  decision_method: "reasoning_llm" | "manual";
+  created_at: number;
+  schema_version: string;
+}
+
+export interface AssistantDiscussionProposal {
+  id: number;
+  system_id: number;
+  thread_id: number;
+  screen_id: string;
+  target_kind: DiscussionTargetKind;
+  target_ref: string;
+  captured_target_revision_id: number | null;
+  captured_target_digest: string;
+  summary: string;
+  confirmed_points: string[];
+  unresolved_questions: string[];
+  assumptions: string[];
+  evidence_refs: string[];
+  decision_method: "reasoning_llm";
+  intelligence_run_id: number | null;
+  provider: string;
+  model: string;
+  prompt_version: string;
+  schema_version: string;
+  created_by: string | null;
+  created_at: number;
+  items: AssistantDiscussionProposalItem[];
+}
+
+export interface AssistantDiscussionProposalsListOut {
+  proposals: AssistantDiscussionProposal[];
+}
+
+export interface AssistantDiscussionProposalApplyRequest {
+  item_ids: number[];
+  rationale?: string;
+}
+
+export interface AssistantDiscussionProposalRejectRequest {
+  item_ids: number[];
+  rationale?: string;
+}
+
+export interface AssistantDiscussionProposalApplyOut {
+  proposal: AssistantDiscussionProposal;
+  applied_item_ids: number[];
+}
+
+export interface AssistantDiscussionProposalRejectOut {
+  proposal: AssistantDiscussionProposal;
+  rejected_item_ids: number[];
 }
 
 export interface AssistantAction {
@@ -3640,7 +3803,7 @@ export interface AssistantAction {
 }
 
 export interface AssistantCitation {
-  type: "setting" | "diagnostic_check" | "pipeline_step" | "state_item";
+  type: "setting" | "diagnostic_check" | "pipeline_step" | "state_item" | "screen_data";
   id: string;
   title: string;
   detail: string;
@@ -3659,6 +3822,47 @@ export interface AssistantAskOut {
   prompt_version: string;
   schema_version: string;
   generated_at: number;
+  // Issue #438: present only when the request carried `thread_id`.
+  thread_id?: number | null;
+  target_state?: DiscussionTargetState | null;
+  recheck_required?: boolean;
+  turn_number?: number | null;
+}
+
+// UI 機能解説モード (Issue #440, Epic #436): `app/ui_help_registry.py` の
+// static registry を verbatim に運ぶ response types。LLM は呼ばないので
+// decision_method は常に "deterministic"。
+
+export interface UiHelpDocRef {
+  doc_path: string;
+  title: string;
+  anchor: string;
+}
+
+export interface UiHelpAction {
+  label: string;
+  kind: "navigate" | "configure" | "operate";
+  target: string;
+}
+
+export interface UiHelpEntry {
+  help_id: string;
+  screen_id: string;
+  scope: "screen" | "section" | "element";
+  title: string;
+  summary: string;
+  usage: string;
+  doc_refs: UiHelpDocRef[];
+  related_actions: UiHelpAction[];
+  related_help_ids: string[];
+  registry_version: string;
+  decision_method: "deterministic";
+}
+
+export interface UiHelpEntriesOut {
+  entries: UiHelpEntry[];
+  registry_version: string;
+  decision_method: "deterministic";
 }
 
 // ── GitHub App publish workflow (Issue #216) ────────────────────────

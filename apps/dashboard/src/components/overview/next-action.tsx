@@ -20,7 +20,7 @@ export function NextActionCard({ overview }: { overview: OverviewOut }) {
   const action = overview.next_action;
 
   return (
-    <Card data-testid="overview-next-action" data-action-state={overview.next_action_state}>
+    <Card data-testid="overview-next-action" data-action-state={overview.next_action_state} data-help-id="overview.next_action">
       <CardHeader>
         <CardTitle as="h2" className="text-lg">次にすること</CardTitle>
       </CardHeader>
@@ -80,7 +80,7 @@ export function NextActionCard({ overview }: { overview: OverviewOut }) {
 export function LoopRailCard({ overview }: { overview: OverviewOut }) {
   if (overview.degraded_sections.includes("loop") || overview.loop_stages.length === 0) {
     return (
-      <Card data-testid="overview-loop-unavailable">
+      <Card data-testid="overview-loop-unavailable" data-help-id="overview.loop_rail">
         <CardHeader>
           <CardTitle as="h2" className="text-lg">改善ループの現在地</CardTitle>
         </CardHeader>
@@ -94,7 +94,7 @@ export function LoopRailCard({ overview }: { overview: OverviewOut }) {
   const current = overview.loop_stages.find((stage) => stage.status === "current");
 
   return (
-    <Card data-testid="overview-loop">
+    <Card data-testid="overview-loop" data-help-id="overview.loop_rail">
       <CardHeader>
         <CardTitle as="h2" className="text-lg">改善ループの現在地</CardTitle>
       </CardHeader>

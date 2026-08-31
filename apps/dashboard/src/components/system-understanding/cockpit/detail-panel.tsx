@@ -108,8 +108,17 @@ export function CockpitDetailPanel({
     ? category.relatedDocs
     : category.relatedDocs.slice(0, Math.max(0, INITIAL_VISIBLE - category.evidence.length));
 
+  // Issue #440: the help target is the panel ITSELF, never a wrapper element.
+  // `interview.tsx`'s sticky contract (#358) requires the detail panel to be
+  // the direct child of the sticky right column, so an extra wrapper `<div
+  // data-help-id>` around it re-creates the double-sticky defect that issue
+  // fixed.
   return (
-    <Card data-testid="cockpit-detail-panel" data-category={category.key}>
+    <Card
+      data-testid="cockpit-detail-panel"
+      data-category={category.key}
+      data-help-id="interview.detail_pane"
+    >
       <CardHeader>
         <div className="flex items-start justify-between gap-2">
           <div>

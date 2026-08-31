@@ -27,7 +27,7 @@ export function BlueprintDiffPanel({ diff }: { diff: BlueprintDiffOut | null | u
   const groups = diffChangeGroups(diff);
 
   return (
-    <Card data-testid="blueprint-diff-panel">
+    <Card data-testid="blueprint-diff-panel" data-help-id="journey-blueprint.diff">
       <CardHeader>
         <CardTitle as="h2" className="text-base">
           現状 (as-is) と目標 (to-be) の Step 差分

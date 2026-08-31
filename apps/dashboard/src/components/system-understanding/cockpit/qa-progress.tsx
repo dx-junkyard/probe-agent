@@ -32,7 +32,11 @@ export function CockpitQaProgressCard({
   // エラーで適切な表示になること)。
   if (status !== "ready" || !progress) {
     return (
-      <Card data-testid="cockpit-qa-progress" data-status={status}>
+      <Card
+        data-testid="cockpit-qa-progress"
+        data-status={status}
+        data-help-id="interview.qa_progress"
+      >
         <CardHeader>
           <CardTitle className="text-sm">Q&A の進捗</CardTitle>
           <CardDescription>
@@ -99,7 +103,11 @@ export function CockpitQaProgressCard({
   ];
 
   return (
-    <Card data-testid="cockpit-qa-progress" data-status="ready">
+    <Card
+      data-testid="cockpit-qa-progress"
+      data-status="ready"
+      data-help-id="interview.qa_progress"
+    >
       <CardHeader>
         <CardTitle className="text-sm">Q&A の進捗</CardTitle>
         <CardDescription>

@@ -42,7 +42,7 @@ export function ObjectiveCard({ overview }: { overview: OverviewOut }) {
 
   if (degraded || !objective) {
     return (
-      <Card data-testid="overview-objective-unavailable">
+      <Card data-testid="overview-objective-unavailable" data-help-id="overview.objective">
         {header}
         <CardContent className="text-base text-muted-foreground">
           取得できませんでした。
@@ -54,7 +54,11 @@ export function ObjectiveCard({ overview }: { overview: OverviewOut }) {
   const hasAction = objectiveNextStepHasAction(objective.next_step_state);
 
   return (
-    <Card data-testid="overview-objective" data-next-step-state={objective.next_step_state}>
+    <Card
+      data-testid="overview-objective"
+      data-next-step-state={objective.next_step_state}
+      data-help-id="overview.objective"
+    >
       {header}
       <CardContent className="space-y-3">
         {objective.vision ? (
