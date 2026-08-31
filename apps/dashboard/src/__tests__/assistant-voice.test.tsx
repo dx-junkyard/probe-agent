@@ -199,6 +199,48 @@ describe("AssistantVoice (state machine)", () => {
     expect(fake.speak).not.toHaveBeenCalled();
   });
 
+  test("muting while thinking suppresses the late answer", async () => {
+    const fake = makeFakeAdapters();
+    const answer = deferred<string | null>();
+    render(
+      <AssistantVoice
+        captureTurnTarget={() => null}
+        onTranscript={() => answer.promise}
+        onAdapterError={vi.fn()}
+        onExit={vi.fn()}
+        scopeLabel="画面全体"
+        adapters={fake.adapters}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("voice-talk"));
+    fake.fireResult("質問");
+    fireEvent.click(screen.getByTestId("voice-mute"));
+    await act(async () => answer.resolve("遅れて返った答え"));
+    await waitFor(() => expect(screen.getByTestId("voice-state")).toHaveAttribute("data-state", "idle"));
+    expect(fake.speak).not.toHaveBeenCalled();
+  });
+
+  test("stop while thinking invalidates the late answer", async () => {
+    const fake = makeFakeAdapters();
+    const answer = deferred<string | null>();
+    render(
+      <AssistantVoice
+        captureTurnTarget={() => null}
+        onTranscript={() => answer.promise}
+        onAdapterError={vi.fn()}
+        onExit={vi.fn()}
+        scopeLabel="画面全体"
+        adapters={fake.adapters}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("voice-talk"));
+    fake.fireResult("質問");
+    fireEvent.click(screen.getByTestId("voice-stop"));
+    await act(async () => answer.resolve("停止後の答え"));
+    expect(screen.getByTestId("voice-state")).toHaveAttribute("data-state", "idle");
+    expect(fake.speak).not.toHaveBeenCalled();
+  });
+
   test("stop / mute / exit stay enabled while listening and while thinking", () => {
     const fake = makeFakeAdapters();
     // Never resolves -- keeps the component in "thinking" so the always-

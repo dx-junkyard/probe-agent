@@ -15,7 +15,7 @@
 // も、この ref の値は次の `captureTurnTarget()` 呼び出し (= 次の turn) まで
 // 変わらない。
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Bot, Mic, PhoneOff, Volume2, VolumeX } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -79,14 +79,31 @@ export function AssistantVoice<Target>({
   scopeLabel,
   adapters,
 }: AssistantVoiceProps<Target>) {
-  const resolvedAdapters = adapters !== undefined ? adapters : createBrowserVoiceAdapters();
+  const resolvedAdapters = useMemo(
+    () => (adapters !== undefined ? adapters : createBrowserVoiceAdapters()),
+    [adapters],
+  );
   const [state, setState] = useState<VoiceState>("idle");
   const [errorReason, setErrorReason] = useState<VoiceErrorReason | null>(null);
   const [muted, setMuted] = useState(false);
+  const mutedRef = useRef(false);
+  // Incrementing this invalidates callbacks belonging to an earlier turn.
+  // STT and /assistant/ask cannot always be cancelled at the platform level,
+  // so late completions must also be ignored at the state-machine boundary.
+  const generationRef = useRef(0);
   const turnTargetRef = useRef<Target | null>(null);
   const reducedMotion = usePrefersReducedMotion();
 
+  useEffect(() => () => {
+    generationRef.current += 1;
+    resolvedAdapters?.stt.stop();
+    resolvedAdapters?.tts.cancel();
+  }, [resolvedAdapters]);
+
   function fail(reason: VoiceErrorReason) {
+    generationRef.current += 1;
+    resolvedAdapters?.stt.stop();
+    resolvedAdapters?.tts.cancel();
     setState("error");
     setErrorReason(reason);
     // マイク拒否 / STT 失敗 / TTS 失敗 は、ここでエラー状態を示した後
@@ -104,43 +121,73 @@ export function AssistantVoice<Target>({
       fail("unsupported");
       return;
     }
+    const generation = ++generationRef.current;
     turnTargetRef.current = captureTurnTarget();
     setState("listening");
     resolvedAdapters.stt.start({
       onResult: (text) => {
+        if (generation !== generationRef.current) return;
         setState("thinking");
         const target = turnTargetRef.current as Target;
         onTranscript(text, target)
           .then((answer) => {
-            if (!answer || muted) {
+            if (generation !== generationRef.current) return undefined;
+            if (!answer || mutedRef.current) {
               returnToIdle();
               return undefined;
             }
             setState("speaking");
-            return resolvedAdapters.tts.speak(answer).then(returnToIdle, () => fail("tts_failed"));
+            return resolvedAdapters.tts.speak(answer).then(
+              () => {
+                if (generation === generationRef.current) returnToIdle();
+              },
+              () => {
+                if (generation === generationRef.current) fail("tts_failed");
+              },
+            );
           })
           .catch(() => {
             // /assistant/ask 自体の失敗は既存の会話履歴 (エラーメッセージ)
             // 側で扱われる普通のエラーであり、adapter の障害ではない --
             // 音声モードを終了させず、次の発話へ戻るだけにする。
-            returnToIdle();
+            if (generation === generationRef.current) returnToIdle();
           });
       },
-      onError: (reason) => fail(reason),
+      onError: (reason) => {
+        if (generation === generationRef.current) fail(reason);
+      },
       onEnd: () => {
-        setState((prev) => (prev === "listening" ? "idle" : prev));
+        if (generation === generationRef.current) {
+          setState((prev) => (prev === "listening" ? "idle" : prev));
+        }
       },
     });
   }
 
   function stop() {
+    generationRef.current += 1;
     resolvedAdapters?.stt.stop();
     resolvedAdapters?.tts.cancel();
     returnToIdle();
   }
 
   function toggleMute() {
-    setMuted((prev) => !prev);
+    const next = !mutedRef.current;
+    mutedRef.current = next;
+    setMuted(next);
+    if (next) {
+      // Muting is an immediate stop request, including while an answer is
+      // still pending.  Invalidate the turn so a late completion cannot
+      // start playback, and do not reinterpret cancellation as TTS failure.
+      generationRef.current += 1;
+      resolvedAdapters?.tts.cancel();
+      returnToIdle();
+    }
+  }
+
+  function exitVoice() {
+    stop();
+    onExit();
   }
 
   const statusText =
@@ -206,7 +253,7 @@ export function AssistantVoice<Target>({
           {muted ? <VolumeX className="mr-1.5 h-3.5 w-3.5" /> : <Volume2 className="mr-1.5 h-3.5 w-3.5" />}
           {muted ? "読み上げ: オフ" : "読み上げ: オン"}
         </Button>
-        <Button variant="outline" size="sm" onClick={onExit} data-testid="voice-exit">
+        <Button variant="outline" size="sm" onClick={exitVoice} data-testid="voice-exit">
           <PhoneOff className="mr-1.5 h-3.5 w-3.5" />
           音声モードを終了
         </Button>

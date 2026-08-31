@@ -128,7 +128,10 @@ export function voicePrerequisite(): VoicePrerequisite {
   if (w.isSecureContext === false) return "insecure_context";
   const hasStt = !!getSpeechRecognitionCtor();
   const hasTts = hasSpeechSynthesis();
-  if (!hasStt && !hasTts) return "unsupported";
+  // Turn-based voice needs both halves of the pipeline.  Advertising voice
+  // mode when only recognition or only synthesis exists merely postpones an
+  // inevitable failure until after the user has started a turn.
+  if (!hasStt || !hasTts) return "unsupported";
   return "ready";
 }
 

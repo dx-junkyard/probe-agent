@@ -67,6 +67,7 @@ from ..system_diagnostics import (
     run_system_diagnostics,
 )
 from ..system_state import build_system_state
+from ..ui_help_registry import HELP_BY_ID, UI_HELP_REGISTRY_VERSION
 
 router = APIRouter()
 
@@ -521,6 +522,30 @@ def assistant_ask(
     )
     screen_data: Optional[Dict[str, Any]] = dict(discussion.facts) if discussion else None
     screen_data_sources = list(discussion.sources) if discussion else []
+    # Issue #441 element-scope voice turns carry the deterministic help id in
+    # route params.  It is useful only after the server validates an exact
+    # registry match for this screen; arbitrary or cross-screen ids are never
+    # promoted into LLM context.
+    voice_help_id = effective_route_params.get("voice_element_help_id", "").strip()
+    voice_help = HELP_BY_ID.get(voice_help_id)
+    if voice_help is not None and voice_help.screen_id == payload.screen_id:
+        if screen_data is None:
+            screen_data = {}
+        screen_data["ui_help_target"] = {
+            "help_id": voice_help.help_id,
+            "screen_id": voice_help.screen_id,
+            "scope": voice_help.scope,
+            "title": voice_help.title,
+            "summary": voice_help.summary,
+            "usage": voice_help.usage,
+            "doc_refs": [asdict(ref) for ref in voice_help.doc_refs],
+            "registry_version": UI_HELP_REGISTRY_VERSION,
+            "context_kind": "product_documentation",
+        }
+        screen_data_sources.append({
+            "id": f"ui_help:{voice_help.help_id}",
+            "title": f"UI help: {voice_help.title}",
+        })
     if thread_row is not None:
         if screen_data is None:
             screen_data = {}
