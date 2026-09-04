@@ -5914,6 +5914,10 @@ class AssistantAskRequest(BaseModel):
     # word. Whether the answer was read aloud is a client-side playback
     # choice and is not a fact about the turn.
     input_mode: Literal["text", "voice"] = "text"
+    # Voice-surface-only state. It is bounded and used only to avoid repeating
+    # information that was actually played in this active conversation.
+    voice_continuation: bool = False
+    voice_spoken_history: List[str] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def validate_assistant_context_bounds(self):
@@ -5927,6 +5931,14 @@ class AssistantAskRequest(BaseModel):
             raise ValueError(
                 "conversation_not_settable_with_thread: conversation must be empty when thread_id is set"
             )
+        if any(not text.strip() or len(text) > 600 for text in self.voice_spoken_history):
+            raise ValueError("voice_spoken_history entries must contain 1..600 characters")
+        if sum(len(text) for text in self.voice_spoken_history) > 2_400:
+            raise ValueError("voice_spoken_history is too long")
+        if self.input_mode != "voice" and (
+            self.voice_continuation or self.voice_spoken_history
+        ):
+            raise ValueError("voice continuation state requires input_mode=voice")
         return self
 
 

@@ -13,12 +13,17 @@ import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Iterator, Optional
 
 
 SPOKEN_CONTENT_MAX_CHARS = 180
 SPOKEN_MAX_SENTENCES = 3
 DETAIL_OFFER = "続けて詳しく説明しましょうか？"
+NO_MORE_DETAILS = (
+    "この会話で、先ほどの説明に加えられる新しい内容はありません。"
+    "他に気になることはありますか？"
+)
 DEFAULT_SPEECH_INSTRUCTIONS = (
     "自然で落ち着いた日本語で話してください。短い文を使い、"
     "文と文の間にわずかな間を置いてください。説明調になりすぎず、"
@@ -45,43 +50,37 @@ def _plain_spoken_text(answer: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def spoken_summary(answer: str) -> Optional[str]:
-    """Return at most three short opening sentences plus a detail offer.
+def _sentences(text: str) -> list[str]:
+    return [
+        match.group(0).strip()
+        for match in _SENTENCE_RE.finditer(text)
+        if match.group(0).strip()
+    ]
 
-    Voice-mode prompting puts the overview first.  This deterministic bound
-    remains the final safety net for fallbacks and unexpectedly verbose model
-    output, preventing the player from launching into a long monologue.
-    """
-    text = _plain_spoken_text(answer)
-    if not text:
-        return None
 
-    selected = []
-    used = 0
-    for match in _SENTENCE_RE.finditer(text):
-        sentence = match.group(0).strip()
-        if not sentence:
+def _comparison_text(text: str) -> str:
+    return re.sub(r"[^\w一-龯ぁ-んァ-ン]", "", text).casefold()
+
+
+def _was_already_spoken(sentence: str, previous_sentences: list[str]) -> bool:
+    candidate = _comparison_text(sentence)
+    if not candidate:
+        return True
+    for previous in previous_sentences:
+        known = _comparison_text(previous)
+        if not known:
             continue
-        remaining = SPOKEN_CONTENT_MAX_CHARS - used
-        if remaining <= 0 or len(selected) >= SPOKEN_MAX_SENTENCES:
-            break
-        if len(sentence) > remaining:
-            if not selected:
-                cut = sentence[: max(1, remaining - 1)].rstrip("、, ") + "…"
-                selected.append(cut)
-                used += len(cut)
-            break
-        selected.append(sentence)
-        used += len(sentence)
+        if candidate in known or known in candidate:
+            return True
+        if SequenceMatcher(None, candidate, known).ratio() >= 0.78:
+            return True
+    return False
 
-    summary = "".join(selected).strip()
-    if not summary:
-        summary = text[: SPOKEN_CONTENT_MAX_CHARS - 1].rstrip() + "…"
 
-    consumed_all = summary == text
-    if not consumed_all:
-        summary = f"{summary} {DETAIL_OFFER}"
-    return summary
+def spoken_summary(answer: str) -> Optional[str]:
+    """Backward-compatible text-only projection for a first voice turn."""
+    projection = project_spoken_answer(answer)
+    return projection.text if projection else None
 
 
 class SpeechGenerationError(RuntimeError):
@@ -130,14 +129,68 @@ class SpeechConfig:
 class SpokenProjection:
     text: str
     has_more: bool
+    expects_reply: bool
 
 
-def project_spoken_answer(answer: str) -> Optional[SpokenProjection]:
-    """Build the speech text and expose whether a reply is being requested."""
-    summary = spoken_summary(answer)
-    if summary is None:
+def project_spoken_answer(
+    answer: str,
+    already_spoken: Optional[list[str]] = None,
+) -> Optional[SpokenProjection]:
+    """Build a short speech projection without repeating this conversation.
+
+    ``already_spoken`` is supplied by the active voice surface only. Nothing
+    is persisted globally, so the comparison naturally ends with the current
+    conversation UI instance.
+    """
+    text = _plain_spoken_text(answer)
+    if not text:
         return None
-    return SpokenProjection(text=summary, has_more=summary.endswith(DETAIL_OFFER))
+    previous_sentences = [
+        sentence
+        for previous in already_spoken or []
+        for sentence in _sentences(_plain_spoken_text(previous))
+        if sentence not in (DETAIL_OFFER, NO_MORE_DETAILS)
+    ]
+    candidates = [
+        sentence
+        for sentence in _sentences(text)
+        if not _was_already_spoken(sentence, previous_sentences)
+    ]
+    if not candidates and previous_sentences:
+        return SpokenProjection(
+            text=NO_MORE_DETAILS,
+            has_more=False,
+            expects_reply=True,
+        )
+    if not candidates:
+        return None
+
+    selected: list[str] = []
+    used = 0
+    truncated = False
+    for sentence in candidates:
+        if len(selected) >= SPOKEN_MAX_SENTENCES:
+            break
+        remaining = SPOKEN_CONTENT_MAX_CHARS - used
+        if remaining <= 0:
+            break
+        if len(sentence) > remaining:
+            if not selected:
+                selected.append(sentence[: max(1, remaining - 1)].rstrip("、, ") + "…")
+            truncated = True
+            break
+        selected.append(sentence)
+        used += len(sentence)
+
+    has_more = truncated or len(selected) < len(candidates)
+    summary = "".join(selected).strip()
+    if has_more:
+        summary = f"{summary} {DETAIL_OFFER}"
+    return SpokenProjection(
+        text=summary,
+        has_more=has_more,
+        expects_reply=has_more,
+    )
 
 
 def stream_speech(text: str, config: Optional[SpeechConfig] = None) -> Iterator[bytes]:

@@ -3640,6 +3640,8 @@ export interface AssistantAskRequest {
   // Issue #441: how this question was entered. Recorded on the user
   // turn only -- the assistant did not speak into a microphone.
   input_mode?: "text" | "voice";
+  voice_continuation?: boolean;
+  voice_spoken_history?: string[];
 }
 
 // Assistant discussion threads (Issue #438, Epic #436). Finite unions mirror

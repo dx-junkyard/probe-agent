@@ -158,7 +158,11 @@ describe("AssistantVoice (state machine)", () => {
 
     fake.fireResult("こんにちは");
     expect(screen.getByTestId("voice-state")).toHaveTextContent("考えています");
-    expect(onTranscript).toHaveBeenCalledWith("こんにちは", "captured-target");
+    expect(onTranscript).toHaveBeenCalledWith(
+      "こんにちは",
+      "captured-target",
+      { continuation: false, spokenHistory: [] },
+    );
 
     await act(async () => {
       answer.resolve("これが答えです");
@@ -325,8 +329,44 @@ describe("AssistantVoice (state machine)", () => {
     await waitFor(() => expect(fake.start).toHaveBeenCalledTimes(2));
     expect(screen.getByTestId("voice-state")).toHaveAttribute("data-state", "listening");
     fake.fireResult("説明して");
-    await waitFor(() => expect(onTranscript).toHaveBeenLastCalledWith("説明して", null));
+    await waitFor(() => expect(onTranscript).toHaveBeenLastCalledWith(
+      "説明して",
+      null,
+      {
+        continuation: true,
+        spokenHistory: ["要点です。続けて詳しく説明しましょうか？"],
+      },
+    ));
     await waitFor(() => expect(fake.speak).toHaveBeenLastCalledWith("詳細を説明します。"));
+  });
+
+  test("completed playback history is isolated by conversation key", async () => {
+    const fake = makeFakeAdapters();
+    const onTranscript = vi.fn().mockResolvedValue("会話Aの回答です。");
+    const props = {
+      captureTurnTarget: () => null,
+      onTranscript,
+      onAdapterError: vi.fn(),
+      onExit: vi.fn(),
+      scopeLabel: "画面全体",
+      adapters: fake.adapters,
+    };
+    const view = render(<AssistantVoice {...props} conversationKey="conversation-a" />);
+
+    fireEvent.click(screen.getByTestId("voice-talk"));
+    fake.fireResult("会話Aの質問");
+    await waitFor(() => expect(fake.speak).toHaveBeenCalledWith("会話Aの回答です。"));
+    await waitFor(() => expect(screen.getByTestId("voice-state")).toHaveAttribute("data-state", "idle"));
+
+    view.rerender(<AssistantVoice {...props} conversationKey="conversation-b" />);
+    fireEvent.click(screen.getByTestId("voice-talk"));
+    fake.fireResult("会話Bの質問");
+
+    await waitFor(() => expect(onTranscript).toHaveBeenLastCalledWith(
+      "会話Bの質問",
+      null,
+      { continuation: false, spokenHistory: [] },
+    ));
   });
 
   test("exit is always available and calls onExit", () => {
@@ -573,10 +613,48 @@ describe("Issue #441 AC1 -- a voice question can be asked in screen scope and el
       expect(calls[0][1]).toMatchObject({
         screen_id: "widgets",
         question: "この画面は何をするところですか",
+        input_mode: "voice",
+        voice_continuation: false,
+        voice_spoken_history: [],
       });
       expect(calls[0][1].route_params).not.toHaveProperty("voice_element_help_id");
     });
     await waitFor(() => expect(fake.speak).toHaveBeenCalledWith("要点だけを話します。詳しく続けますか？"));
+  });
+
+  test("automatic continuation sends only this conversation's completed playback history", async () => {
+    mockGetForScreens("widgets");
+    const fake = makeFakeAdapters();
+    voiceAdapterMocks.createBrowserVoiceAdapters.mockReturnValue(fake.adapters);
+    let askCount = 0;
+    mockApi.post.mockImplementation((path: string) => {
+      if (path !== "/assistant/ask") return Promise.resolve(null);
+      askCount += 1;
+      return Promise.resolve(askResponse(askCount === 1 ? {
+        spoken_answer: "最初の要点です。続けて詳しく説明しましょうか？",
+        voice_follow_up_expected: true,
+      } : {
+        spoken_answer: "重複しない追加情報です。",
+      }));
+    });
+
+    await renderPanel("/widgets");
+    await enterVoiceMode();
+    fireEvent.click(screen.getByTestId("voice-talk"));
+    fake.fireResult("概要を教えて");
+
+    await waitFor(() => expect(fake.start).toHaveBeenCalledTimes(2));
+    fake.fireResult("説明して");
+
+    await waitFor(() => {
+      const calls = mockApi.post.mock.calls.filter(([path]) => path === "/assistant/ask");
+      expect(calls).toHaveLength(2);
+      expect(calls[1][1]).toMatchObject({
+        question: "説明して",
+        voice_continuation: true,
+        voice_spoken_history: ["最初の要点です。続けて詳しく説明しましょうか？"],
+      });
+    });
   });
 
   test("element scope: the hovered/selected help-mode target is carried as route_params, and the scope names it", async () => {

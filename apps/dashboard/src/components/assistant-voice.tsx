@@ -34,6 +34,12 @@ export interface AssistantVoiceReply {
   listenAfterPlayback?: boolean;
 }
 
+export interface AssistantVoiceTurnContext {
+  continuation: boolean;
+  /** Bounded history of text actually played by this mounted voice surface. */
+  spokenHistory: string[];
+}
+
 const IDLE_STATUS_TEXT = "マイクのボタンを押して話しかけてください。";
 
 const VOICE_STATE_LABEL: Record<VoiceState, string> = {
@@ -68,6 +74,7 @@ export interface AssistantVoiceProps<Target> {
   onTranscript: (
     text: string,
     target: Target,
+    context: AssistantVoiceTurnContext,
   ) => Promise<string | AssistantVoiceReply | null>;
   /** マイク拒否 / STT / TTS の失敗。呼び出し元はテキストモードへ戻す。 */
   onAdapterError: (reason: VoiceErrorReason) => void;
@@ -75,6 +82,8 @@ export interface AssistantVoiceProps<Target> {
   onExit: () => void;
   /** 「この発話は画面全体について」か「この要素について」かの表示文言。 */
   scopeLabel: string;
+  /** 会話を識別するキー。読み上げ履歴はこのキーをまたいで共有しない。 */
+  conversationKey?: string;
   /** テスト用に差し込むための adapter。省略時はブラウザ実装を使う。 */
   adapters?: { stt: SpeechToTextAdapter; tts: TextToSpeechAdapter } | null;
 }
@@ -85,6 +94,7 @@ export function AssistantVoice<Target>({
   onAdapterError,
   onExit,
   scopeLabel,
+  conversationKey = "default",
   adapters,
 }: AssistantVoiceProps<Target>) {
   const resolvedAdapters = useMemo(
@@ -99,7 +109,7 @@ export function AssistantVoice<Target>({
   // STT and /assistant/ask cannot always be cancelled at the platform level,
   // so late completions must also be ignored at the state-machine boundary.
   const generationRef = useRef(0);
-  const turnTargetRef = useRef<Target | null>(null);
+  const spokenHistoryRef = useRef<Map<string, string[]>>(new Map());
   const reducedMotion = usePrefersReducedMotion();
 
   useEffect(() => () => {
@@ -124,7 +134,11 @@ export function AssistantVoice<Target>({
     setState("idle");
   }
 
-  function startTurn() {
+  function startTurn(
+    continuation = false,
+    continuingTarget?: Target,
+    continuingConversationKey?: string,
+  ) {
     if (!resolvedAdapters) {
       fail("unsupported");
       return;
@@ -134,14 +148,17 @@ export function AssistantVoice<Target>({
     // stop both download and playback before opening the microphone.
     resolvedAdapters.tts.cancel();
     resolvedAdapters.stt.stop();
-    turnTargetRef.current = captureTurnTarget();
+    const target = continuingTarget ?? captureTurnTarget();
+    const turnConversationKey = continuingConversationKey ?? conversationKey;
     setState("listening");
     resolvedAdapters.stt.start({
       onResult: (text) => {
         if (generation !== generationRef.current) return;
         setState("thinking");
-        const target = turnTargetRef.current as Target;
-        onTranscript(text, target)
+        onTranscript(text, target, {
+          continuation,
+          spokenHistory: [...(spokenHistoryRef.current.get(turnConversationKey) ?? [])],
+        })
           .then((answer) => {
             if (generation !== generationRef.current) return undefined;
             if (!answer || mutedRef.current) {
@@ -153,8 +170,12 @@ export function AssistantVoice<Target>({
             return resolvedAdapters.tts.speak(reply.text).then(
               () => {
                 if (generation !== generationRef.current) return;
+                spokenHistoryRef.current.set(turnConversationKey, [
+                  ...(spokenHistoryRef.current.get(turnConversationKey) ?? []),
+                  reply.text,
+                ].slice(-8));
                 if (reply.listenAfterPlayback) {
-                  startTurn();
+                  startTurn(true, target, turnConversationKey);
                 } else {
                   returnToIdle();
                 }
@@ -247,7 +268,7 @@ export function AssistantVoice<Target>({
         </div>
 
         {(state === "idle" || state === "speaking") && (
-          <Button onClick={startTurn} data-testid="voice-talk">
+          <Button onClick={() => startTurn(false)} data-testid="voice-talk">
             <Mic className="mr-1.5 h-4 w-4" />
             {state === "speaking" ? "話を挟む" : "話しかける"}
           </Button>

@@ -240,6 +240,13 @@ API key はブラウザへ渡さない。利用者の録音音声と生成音声
   `spoken_answer` を返す。長い場合は概要・中核の後に「続けて詳しく説明するか」
   を尋ね、`voice_follow_up_expected: true` を返す。クライアントは再生終了後に
   自動で STT を再開し、詳細はボタン操作なしの次の利用者 turn を待つ。
+- mounted voice surface は実際に再生完了した文だけを最大 8 件の
+  `voice_spoken_history` としてメモリ内に保持し、次の voice turn へ渡す。
+  サーバは LLM prompt と最終 spoken projection の両方で既出文を除外する。
+  新しい説明が残っていなければ、その旨を伝えて他の質問・関心を確認する。
+  この確認も返答を求めるため、再生後は自動で STT を再開する。履歴は会話の
+  target key ごとに分離され、voice surface を閉じると失われる。DB や全体設定
+  には保存しない。
 - `POST /assistant/speech` は `spoken_answer` の短いテキストを受け、OpenAI
   `audio/speech` の生成音声 (`audio/mpeg`) を `Cache-Control: no-store` で返す。
   model / voice / style / timeout / base URL は `OPENAI_TTS_*` で設定する。

@@ -931,6 +931,12 @@ standalone overview and the single most important conclusion in two or three
 short sentences. Put supporting details after that opening. Do not front-load
 long lists, URLs, citations, or implementation detail. The opening will be
 spoken separately and must leave a natural point where the user can respond.
+Use voice_turn.already_spoken only as conversation-local playback history.
+Do not repeat or paraphrase information already present there. When
+voice_turn.continuation is true, continue with the next useful, grounded
+detail instead of restating the overview. If no additional grounded detail
+remains, clearly say that there is nothing new to add in this conversation
+and ask whether the user has another question or concern.
 """
 
 
@@ -950,11 +956,18 @@ def _llm_answer(
     question: str,
     *,
     voice_mode: bool = False,
+    voice_continuation: bool = False,
+    voice_spoken_history: Optional[List[str]] = None,
 ) -> AssistantAnswer:
     payload = {
         "context": pack.to_llm_payload(report),
         "question": question,
     }
+    if voice_mode:
+        payload["voice_turn"] = {
+            "continuation": voice_continuation,
+            "already_spoken": list(voice_spoken_history or []),
+        }
     system_prompt = _SYSTEM_PROMPT
     if voice_mode:
         system_prompt += "\n\n" + _VOICE_RESPONSE_PROMPT
@@ -1246,6 +1259,8 @@ def answer_question(
     route_params: Optional[Dict[str, str]] = None,
     conversation: Optional[List[Dict[str, str]]] = None,
     voice_mode: bool = False,
+    voice_continuation: bool = False,
+    voice_spoken_history: Optional[List[str]] = None,
 ) -> AssistantAnswer:
     """Answer a screen question; LLM when available, marked fallback otherwise.
 
@@ -1284,7 +1299,14 @@ def answer_question(
         return _fallback_answer(pack, report, config, reason)
     try:
         answer = _llm_answer(
-            client, config, pack, report, question, voice_mode=voice_mode
+            client,
+            config,
+            pack,
+            report,
+            question,
+            voice_mode=voice_mode,
+            voice_continuation=voice_continuation,
+            voice_spoken_history=voice_spoken_history,
         )
         state_actions = _state_actions(pack.state_items)
         if state_actions:

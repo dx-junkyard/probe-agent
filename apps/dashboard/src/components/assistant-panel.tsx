@@ -7,7 +7,11 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { DiagnosticSeverityIcon } from "@/components/diagnostics-badge";
-import { AssistantVoice, type AssistantVoiceReply } from "@/components/assistant-voice";
+import {
+  AssistantVoice,
+  type AssistantVoiceReply,
+  type AssistantVoiceTurnContext,
+} from "@/components/assistant-voice";
 import {
   ArrowRight, Bot, ExternalLink, Loader2, Mic, Send, Settings2, Wrench, X,
 } from "lucide-react";
@@ -518,6 +522,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   const submit = async (
     q: string,
     voiceTurn?: VoiceTurnTarget,
+    voiceContext?: AssistantVoiceTurnContext,
   ): Promise<string | AssistantVoiceReply | null> => {
     const trimmed = q.trim();
     if (!trimmed || ask.isPending) return null;
@@ -570,6 +575,10 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         route_params: routeParams,
         conversation,
         ...(voiceTurn ? { input_mode: "voice" as const } : {}),
+        ...(voiceTurn ? {
+          voice_continuation: voiceContext?.continuation ?? false,
+          voice_spoken_history: voiceContext?.spokenHistory ?? [],
+        } : {}),
         ...(turnThread ? { thread_id: turnThread.id } : {}),
         visible_check_ids: failingChecks.map((c) => c.check_id),
         ...(focusedStateItem ? {
@@ -758,10 +767,11 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         // voice mode exits.
         <AssistantVoice
           captureTurnTarget={captureVoiceTurnTarget}
-          onTranscript={(text, target) => submit(text, target)}
+          onTranscript={(text, target, context) => submit(text, target, context)}
           onAdapterError={handleVoiceAdapterError}
           onExit={() => setVoiceActive(false)}
           scopeLabel={voiceScopeLabel}
+          conversationKey={activeTargetKey ?? `legacy:${screenId}`}
         />
       ) : (
         <>

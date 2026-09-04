@@ -3,6 +3,7 @@ import json
 from app.voice_speech import (
     DEFAULT_SPEECH_INSTRUCTIONS,
     DETAIL_OFFER,
+    NO_MORE_DETAILS,
     SpeechConfig,
     project_spoken_answer,
     spoken_summary,
@@ -30,6 +31,25 @@ def test_spoken_summary_strips_visual_markup_and_pauses_before_details():
 def test_spoken_summary_keeps_a_short_complete_answer_as_is():
     assert spoken_summary("結論は一つです。") == "結論は一つです。"
     assert project_spoken_answer("結論は一つです。").has_more is False
+
+
+def test_projection_skips_content_already_spoken_in_this_conversation():
+    projection = project_spoken_answer(
+        "要点は設定が必要なことです。次に、接続確認を行います。",
+        ["要点は設定が必要なことです。続けて詳しく説明しましょうか？"],
+    )
+    assert projection.text == "次に、接続確認を行います。"
+    assert projection.has_more is False
+
+
+def test_projection_says_when_no_new_detail_remains():
+    projection = project_spoken_answer(
+        "要点は設定が必要なことです。",
+        ["要点は設定が必要なことです。"],
+    )
+    assert projection.text == NO_MORE_DETAILS
+    assert projection.has_more is False
+    assert projection.expects_reply is True
 
 
 def test_empty_instruction_env_uses_the_natural_japanese_default(monkeypatch):

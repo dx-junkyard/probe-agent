@@ -607,6 +607,8 @@ def assistant_ask(
         route_params=effective_route_params,
         conversation=conversation_messages,
         voice_mode=payload.input_mode == "voice",
+        voice_continuation=payload.voice_continuation,
+        voice_spoken_history=payload.voice_spoken_history,
     )
 
     thread_id_out: Optional[int] = None
@@ -664,13 +666,17 @@ def assistant_ask(
         recheck_required = thread_target_state not in ("current", "not_tracked")
 
     voice_projection = (
-        project_spoken_answer(result.answer) if payload.input_mode == "voice" else None
+        project_spoken_answer(result.answer, payload.voice_spoken_history)
+        if payload.input_mode == "voice"
+        else None
     )
     return AssistantAskOut(
         screen_id=ctx.screen_id,
         answer=result.answer,
         spoken_answer=voice_projection.text if voice_projection else None,
-        voice_follow_up_expected=bool(voice_projection and voice_projection.has_more),
+        voice_follow_up_expected=bool(
+            voice_projection and voice_projection.expects_reply
+        ),
         suggested_actions=[
             AssistantActionOut(
                 label=a.label, kind=a.kind, target=a.target, detail=a.detail
