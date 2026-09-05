@@ -6064,6 +6064,18 @@ DiscussionTargetKind = Literal[
 ]
 DiscussionTargetState = Literal["current", "stale", "unresolvable", "not_tracked"]
 
+# docs/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived
+# from what a `DiscussionAdapter` actually declares (`app/discussion_adapters.
+# py`'s `capabilities_for`) -- never a stored column or a second constant.
+DiscussionCapability = Literal[
+    "read_canonical",
+    "read_ui_draft",
+    "propose_fields",
+    "propose_relations",
+    "prefill_form",
+    "promote_joint_understanding",
+]
+
 
 class AssistantDiscussionTargetIn(BaseModel):
     model_config = ConfigDict(extra="forbid")

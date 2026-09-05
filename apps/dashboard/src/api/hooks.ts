@@ -2478,6 +2478,10 @@ export function useAssistantDiscussionThreads(filters: {
   scope?: string;
   targetKind?: string;
   targetRef?: string;
+  // Issue #444 §1.6: the "他の画面での会話" count only wants this listing
+  // scoped to one target -- an unfiltered call is a valid use of this
+  // endpoint but must never fire implicitly just because the panel mounted.
+  enabled?: boolean;
 } = {}) {
   const params = new URLSearchParams();
   if (filters.screenId) params.set("screen_id", filters.screenId);
@@ -2491,7 +2495,7 @@ export function useAssistantDiscussionThreads(filters: {
       api.get<AssistantDiscussionThreadsListOut>(
         query ? `/assistant/discussion-threads?${query}` : "/assistant/discussion-threads",
       ),
-    enabled: !!getSystemId(),
+    enabled: (filters.enabled ?? true) && !!getSystemId(),
   });
 }
 

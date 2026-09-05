@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
-  useAssistantAsk, useAssistantDiscussionThread, useAssistantScreenContext,
+  useAssistantAsk, useAssistantDiscussionThread, useAssistantDiscussionThreads,
+  useAssistantScreenContext,
 } from "@/api/hooks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,6 +29,7 @@ import {
   OPEN_ASSISTANT_EVENT,
   type OpenAssistantDetail,
 } from "@/lib/assistant-control";
+import { DISCUSSION_ADAPTERS, resolveDiscussionCandidate } from "@/lib/discussion-adapters";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -46,10 +48,11 @@ function screenIdFromPath(pathname: string): string {
   return pathname.split("/")[1] ?? "overview";
 }
 
-const DISCUSSION_SCREEN_IDS = ["overview", "interview", "ux-design-studio", "journey-blueprint"] as const;
-
+// Issue #444 (Epic #443): which screens carry a discussion thread at all is
+// exactly the `screen` adapter's own `screen_ids` -- the registry, not a
+// second literal list here, is what decides.
 function isDiscussionScreen(screenId: string): boolean {
-  return (DISCUSSION_SCREEN_IDS as readonly string[]).includes(screenId);
+  return DISCUSSION_ADAPTERS.screen.screenIds.includes(screenId);
 }
 
 // Issue #441 (Epic #436), Phase 1: turn-based voice mode.
@@ -80,95 +83,6 @@ interface VoiceTurnTarget {
   routeParams: Record<string, string>;
   /** hover/選択中の help-mode target。null なら画面全体スコープ。 */
   helpId: string | null;
-}
-
-interface DiscussionCandidate {
-  target: AssistantDiscussionTargetIn;
-  label: string;
-}
-
-/** Derive the most specific selectable non-screen target from the route, if
- * any -- purely from `screen_id` + query params, so it needs no page-level
- * wiring beyond what each page already writes to the URL. Returns `null`
- * when nothing more specific than "the whole screen" is selected. */
-function deriveDiscussionCandidate(screenId: string, search: string): DiscussionCandidate | null {
-  const params = new URLSearchParams(search);
-  if (screenId === "interview") {
-    const session = params.get("session");
-    if (session) {
-      return {
-        target: { scope: "entity", screen_id: screenId, target_kind: "interview_session", target_ref: session },
-        label: `セッション #${session}`,
-      };
-    }
-    return null;
-  }
-  if (screenId === "ux-design-studio") {
-    const tab = params.get("tab") || "journeys";
-    const journey = params.get("journey");
-    const step = params.get("step");
-    const requirement = params.get("requirement");
-    const design = params.get("design");
-    if (journey && step) {
-      return {
-        target: {
-          scope: "element", screen_id: screenId, target_kind: "ux_journey_step",
-          target_ref: `${journey}#${step}`,
-        },
-        label: `ステップ「${step}」`,
-      };
-    }
-    if (tab === "requirements" && requirement) {
-      return {
-        target: { scope: "entity", screen_id: screenId, target_kind: "ux_requirement", target_ref: requirement },
-        label: `Requirement「${requirement}」`,
-      };
-    }
-    if (tab === "solutions" && design) {
-      return {
-        target: { scope: "entity", screen_id: screenId, target_kind: "solution_design", target_ref: design },
-        label: `Solution Design「${design}」`,
-      };
-    }
-    if (tab === "journeys" && journey) {
-      return {
-        target: { scope: "entity", screen_id: screenId, target_kind: "ux_journey", target_ref: journey },
-        label: `Journey「${journey}」`,
-      };
-    }
-    return null;
-  }
-  if (screenId === "journey-blueprint") {
-    const journey = params.get("journey");
-    const step = params.get("step");
-    const lane = params.get("lane");
-    if (journey && step && lane) {
-      return {
-        target: {
-          scope: "element", screen_id: screenId, target_kind: "blueprint_lane_cell",
-          target_ref: `${journey}#${step}#${lane}`,
-        },
-        label: `${lane}(「${step}」)`,
-      };
-    }
-    if (journey && step) {
-      return {
-        target: {
-          scope: "element", screen_id: screenId, target_kind: "ux_journey_step",
-          target_ref: `${journey}#${step}`,
-        },
-        label: `ステップ「${step}」`,
-      };
-    }
-    if (journey) {
-      return {
-        target: { scope: "entity", screen_id: screenId, target_kind: "ux_journey", target_ref: journey },
-        label: `Journey「${journey}」`,
-      };
-    }
-    return null;
-  }
-  return null;
 }
 
 function targetKeyOf(target: AssistantDiscussionTargetIn | null): string | null {
@@ -340,7 +254,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   // --- Issue #438: target-scoped discussion threads ------------------------
   const discussionEnabled = isDiscussionScreen(screenId);
   const candidate = useMemo(
-    () => (discussionEnabled ? deriveDiscussionCandidate(screenId, location.search) : null),
+    () => (discussionEnabled ? resolveDiscussionCandidate(screenId, location.search) : null),
     [discussionEnabled, screenId, location.search],
   );
   // Which of the two separable threads (whole screen vs. the selected
@@ -371,6 +285,19 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   const activeTargetKey = targetKeyOf(activeTarget);
 
   const threadQuery = useAssistantDiscussionThread(activeTarget);
+
+  // Issue #444 §1.6: the same target opened from a DIFFERENT screen has its
+  // own separate thread (thread_key includes screen_id) -- never merged into
+  // this one. This is a plain count, listed by target identity across all
+  // screens, with the CURRENT screen's own thread excluded below.
+  const otherScreenThreadsQuery = useAssistantDiscussionThreads({
+    targetKind: activeTarget?.target_kind,
+    targetRef: activeTarget?.target_ref,
+    enabled: discussionEnabled && !!activeTarget,
+  });
+  const otherScreenThreadCount = (otherScreenThreadsQuery.data?.threads ?? []).filter(
+    (t) => t.screen_id !== screenId,
+  ).length;
 
   /** One persisted turn rendered as a panel message. */
   function turnMessages(detail: AssistantDiscussionThreadDetailOut): ChatMessage[] {
@@ -758,6 +685,19 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             {candidate.label}
           </Button>
         </div>
+      )}
+
+      {/* Issue #444 §1.6: the same target has its OWN thread on every screen
+          it can be opened from -- never merged. This says so rather than
+          silently mixing them, or silently hiding that other history
+          exists. */}
+      {discussionEnabled && otherScreenThreadCount > 0 && (
+        <p
+          className="border-b px-4 py-1.5 text-[11px] text-muted-foreground"
+          data-testid="assistant-other-screen-threads"
+        >
+          他の画面での会話 {otherScreenThreadCount} 件
+        </p>
       )}
 
       {voiceActive ? (

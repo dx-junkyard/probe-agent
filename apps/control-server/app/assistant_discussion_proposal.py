@@ -1,17 +1,32 @@
 """Conversation-to-proposal changeset generation (Issue #439, Epic #436).
 
-`docs/assistant-discussion.md` §2 is the canonical contract. This module
-owns:
+`docs/assistant-discussion.md` §2 is the canonical contract. Since Issue
+#444 (Epic #443 Phase 1), the per-`target_kind` field/relation registry and
+the per-`target_kind` context-gathering logic both live in
+`discussion_adapters.py` (`docs/ai-discussion-adapter.md` §1) -- this module
+DERIVES its own compatibility surface from that registry rather than
+declaring it by hand, but keeps every function's exact signature and
+behaviour. This module owns:
 
 - `PROPOSAL_TARGET_SCHEMA`, the ONLY definition of which `field_name` /
   `relation_kind` a discussion target (`assistant_discussion.
-  DISCUSSION_TARGET_KINDS`) may carry. Every value in it is taken straight
-  from the real domain function it is applied through (`ux_design.
-  add_journey_revision`'s keyword parameters, `solution_design.add_option`'s,
-  ...) -- `tests/test_assistant_discussion_proposals.py` asserts that
-  correspondence directly so the registry cannot silently drift from the API
-  it applies through. A `field_name` / `relation_kind` outside this registry
-  is refused, fail-closed, at BOTH generation time (the whole LLM call fails
+  DISCUSSION_TARGET_KINDS`) may carry -- now a READ-ONLY view built from
+  `discussion_adapters.DISCUSSION_ADAPTERS[kind].fields` / `.relations` at
+  import time. It is still declared as a literal module-level name (not a
+  property or a function call) because `generate_proposal` /
+  `evaluate_item_eligibility` / `gather_target_context` read the bare
+  `PROPOSAL_TARGET_SCHEMA` global directly -- `tests/
+  test_assistant_discussion_proposals.py` monkeypatches this exact module
+  attribute to prove a narrowed registry is honoured at eligibility time,
+  which only works if every reader resolves the name at CALL time rather
+  than capturing a copy at import time. Every value in the underlying
+  registry is taken straight from the real domain function it is applied
+  through (`ux_design.add_journey_revision`'s keyword parameters,
+  `solution_design.add_option`'s, ...) -- `tests/
+  test_assistant_discussion_proposals.py` asserts that correspondence
+  directly so the registry cannot silently drift from the API it applies
+  through. A `field_name` / `relation_kind` outside this registry is
+  refused, fail-closed, at BOTH generation time (the whole LLM call fails
   rather than silently dropping the offending item -- a proposal containing
   an invented field is not a partially-correct proposal) and apply time
   (defense in depth for a row that reached this table some other way).
@@ -56,7 +71,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field as PydanticField, ValidationError
 
-from . import journey_blueprint, solution_design, ux_design
+from . import discussion_adapters, journey_blueprint, solution_design, ux_design
 from .db import get_conn
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 
@@ -72,63 +87,16 @@ PROPOSAL_ITEM_ELIGIBILITY: Tuple[str, ...] = ("forbidden", "stale", "conflict", 
 MAX_LISTED_PROPOSALS = 50
 
 #: §2.1's registry: `target_kind -> {"fields": (...), "relations": (...)}`.
-#: This is the ONLY place these tuples are declared -- every value is taken
-#: directly from the real domain function's own keyword parameters (see the
-#: per-target comment below), and the correspondence is asserted by
-#: `tests/test_assistant_discussion_proposals.py`.
+#: Derived from `discussion_adapters.DISCUSSION_ADAPTERS` (Issue #444) --
+#: that module is the ONLY place these tuples are declared by hand now (see
+#: its own per-target comments for the domain-function provenance), and the
+#: correspondence to the real domain functions is asserted by
+#: `tests/test_assistant_discussion_proposals.py`. This stays a literal
+#: module-level dict (not a function) because callers below read the bare
+#: `PROPOSAL_TARGET_SCHEMA` name at call time -- see the module docstring.
 PROPOSAL_TARGET_SCHEMA: Dict[str, Dict[str, Tuple[str, ...]]] = {
-    # `ux_design.add_journey_revision`'s own content keyword parameters
-    # (excluding `change_note`, `steps`, and the authorship/audit params a
-    # public write endpoint never exposes either).
-    "ux_journey": {
-        "fields": (
-            "title", "beneficiary", "usage_context", "entry_trigger",
-            "value_arrival", "summary",
-        ),
-        "relations": ("upstream_ref",),
-    },
-    # The per-step dict keys `add_journey_revision` reads via `step.get(...)`
-    # (excluding `step_key` / `step_order` / `evidence_source_kind`, which
-    # are identity/ordering/classification, not free-text content).
-    "ux_journey_step": {
-        "fields": (
-            "user_intent", "system_response", "success_criteria",
-            "failure_mode", "recovery_path", "evidence_expectation",
-        ),
-        "relations": (),
-    },
-    # `ux_design.add_requirement_revision`'s own content keyword parameters.
-    "ux_requirement": {
-        "fields": ("statement", "rationale", "constraint_text", "out_of_scope_note"),
-        "relations": ("journey_step_link",),
-    },
-    # A Solution Design carries no design-level revision table (its identity
-    # row's `title`/`summary` are set once at creation with no update path);
-    # a field proposal therefore addresses an OPTION
-    # (`solution_design.add_option`'s own content keyword parameters), keyed
-    # by `subject_ref=option_key`.
-    "solution_design": {
-        "fields": ("title", "approach", "tradeoffs", "risks"),
-        "relations": ("requirement_link", "target_link"),
-    },
-    # A lane cell has no field of its own -- only the three link kinds
-    # `journey_blueprint.py` owns can move it out of `unknown`.
-    "blueprint_lane_cell": {
-        "fields": (),
-        "relations": ("delivery_link", "stakeholder_link", "exchange_link"),
-    },
-    # `understanding_brief.BriefClaim`'s own editable content (`name` /
-    # `summary` / `contribution`, the last surfaced under its raw-item key
-    # `why_core`). Applying always goes through the Intent Brief's own
-    # propose-style path (never auto-confirmed, §2.2).
-    "understanding_claim": {
-        "fields": ("summary", "why_core", "name"),
-        "relations": (),
-    },
-    # Discussion-only targets (§2.1): no field or relation is proposable.
-    "overview_finding": {"fields": (), "relations": ()},
-    "interview_session": {"fields": (), "relations": ()},
-    "screen": {"fields": (), "relations": ()},
+    kind: {"fields": adapter.fields, "relations": adapter.relations}
+    for kind, adapter in discussion_adapters.DISCUSSION_ADAPTERS.items()
 }
 
 #: Which relation_kind a blueprint lane_kind may carry (§2.2's "unknown lane
@@ -474,71 +442,21 @@ def gather_target_context(conn, system_id: int, target_kind: str, target_ref: st
     """Best-effort, read-only canonical facts fed into the prompt. Never
     raises -- an unreadable/missing target degrades to `{}` (the actual gate
     on whether a target can be proposed against at all is the digest/
-    staleness check in `evaluate_item_eligibility`, not this helper)."""
+    staleness check in `evaluate_item_eligibility`, not this helper).
+
+    Delegates to `discussion_adapters.DISCUSSION_ADAPTERS[target_kind].
+    context_provider` (Issue #444). A kind with `context_provider=None`
+    (discussion-only: `screen` / `interview_session` / `overview_finding`)
+    degrades to `{}`, exactly as the old per-kind `if` chain did when no
+    branch matched.
+    """
+    adapter = discussion_adapters.DISCUSSION_ADAPTERS.get(target_kind)
+    if adapter is None or adapter.context_provider is None:
+        return {}
     try:
-        if target_kind == "ux_journey":
-            detail = ux_design.get_journey_detail(conn, system_id, target_ref)
-            rev = detail.get("current_revision") or {}
-            return {k: rev.get(k, "") for k in PROPOSAL_TARGET_SCHEMA["ux_journey"]["fields"]}
-        if target_kind == "ux_journey_step":
-            journey_key, _, step_key = target_ref.partition("#")
-            detail = ux_design.get_journey_detail(conn, system_id, journey_key)
-            rev = detail.get("current_revision") or {}
-            for step in rev.get("steps", []):
-                if step.get("step_key") == step_key:
-                    return {k: step.get(k, "") for k in PROPOSAL_TARGET_SCHEMA["ux_journey_step"]["fields"]}
-            return {}
-        if target_kind == "ux_requirement":
-            detail = ux_design.get_requirement_detail(conn, system_id, target_ref)
-            rev = detail.get("current_revision") or {}
-            return {k: rev.get(k, "") for k in PROPOSAL_TARGET_SCHEMA["ux_requirement"]["fields"]}
-        if target_kind == "solution_design":
-            detail = solution_design.get_design_detail(conn, system_id=system_id, design_key=target_ref)
-            fields = PROPOSAL_TARGET_SCHEMA["solution_design"]["fields"]
-            return {
-                "options": [
-                    {"option_key": opt.get("option_key", ""), **{k: opt.get(k, "") for k in fields}}
-                    for opt in detail.get("options", [])
-                ]
-            }
-        if target_kind == "blueprint_lane_cell":
-            parts = target_ref.split("#")
-            if len(parts) != 3:
-                return {}
-            journey_key, step_key, lane_kind = parts
-            blueprint = journey_blueprint.build_blueprint(conn, system_id, journey_key)
-            for step in blueprint.get("steps", []):
-                if step.get("step_key") == step_key:
-                    return {"lane_kind": lane_kind, "cell": step.get("lanes", {}).get(lane_kind, {})}
-            return {}
-        if target_kind == "understanding_claim":
-            return _understanding_claim_context(conn, system_id, target_ref)
+        return adapter.context_provider(conn, system_id, target_ref)
     except Exception:  # pragma: no cover - defensive, mirrors resolvers' own rule
         return {}
-    return {}
-
-
-def _understanding_claim_context(conn, system_id: int, target_ref: str) -> Dict[str, Any]:
-    from . import understanding_brief
-
-    section, sep, name = target_ref.partition(":")
-    if not sep:
-        return {}
-    session_row = conn.execute(
-        "SELECT id FROM interview_session WHERE system_id = ? ORDER BY id DESC LIMIT 1",
-        (system_id,),
-    ).fetchone()
-    session_id = session_row["id"] if session_row is not None else None
-    brief = understanding_brief.build_understanding_brief(conn, system_id, session_id)
-    claims = {
-        "vision": [brief.vision] if brief.vision is not None else [],
-        "system_purpose": brief.system_purpose,
-        "core_capabilities": brief.core_capabilities,
-    }.get(section, [])
-    claim = next((c for c in claims if c is not None and c.name == name), None)
-    if claim is None:
-        return {}
-    return {"name": claim.name, "summary": claim.summary, "why_core": claim.contribution}
 
 
 # --- Persistence ---------------------------------------------------------------

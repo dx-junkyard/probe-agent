@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://probe-agent.dev/schemas/joint_understanding.json",
   "title": "JointUnderstandingExchange",
-  "description": "The handoff contract between system investigation, translation, and the developer for one Joint Understanding session (Epic #328 Phase A / Issue #329). A session starts when a developer answers 「わからない」 (trigger=unknown_answer) or explicitly asks to work something out together (explicit_request) about an existing confirmation item, and accumulates append-only findings plus the finite next actions the developer chose. Three provenances are kept strictly apart and never merged into one 'answer': investigation owns technical facts and their snapshot evidence, translation owns purpose/impact wording that may only reference existing findings, and the developer owns value judgements. The session itself never writes the origin item's answer/intent/decision -- 「わからない」 is an entry point into a shared investigation, never a recorded developer intent.",
+  "description": "The handoff contract between system investigation, translation, and the developer for one Joint Understanding session (Epic #328 Phase A / Issue #329). A session starts when a developer answers 「わからない」 (trigger=unknown_answer), explicitly asks to work something out together (explicit_request) about an existing confirmation item, or responds unknown/investigate to a Purpose Need (trigger=purpose_need, Issue #389 / #444 §1.9), and accumulates append-only findings plus the finite next actions the developer chose. Three provenances are kept strictly apart and never merged into one 'answer': investigation owns technical facts and their snapshot evidence, translation owns purpose/impact wording that may only reference existing findings, and the developer owns value judgements. The session itself never writes the origin item's answer/intent/decision -- 「わからない」 is an entry point into a shared investigation, never a recorded developer intent.",
   "type": "object",
   "required": ["schema_version", "session", "findings", "actions"],
   "additionalProperties": false,
@@ -42,13 +42,13 @@
           "description": "The owning interview_session. A Joint Understanding session is always scoped to one interview session and one System."
         },
         "origin_kind": {
-          "enum": ["qa", "intent", "review_item", "inquiry"],
-          "description": "Which confirmation item the developer could not answer. The origin row is only ever READ."
+          "enum": ["qa", "intent", "review_item", "inquiry", "purpose_need"],
+          "description": "Which confirmation item the developer could not answer. The origin row is only ever READ. 'purpose_need' (Issue #389) is a computed Purpose Need target rather than a row in one of the other four origin tables -- its origin_id is the purpose_need_response id."
         },
         "origin_id": { "type": "integer", "minimum": 1 },
         "trigger": {
-          "enum": ["unknown_answer", "explicit_request"],
-          "description": "unknown_answer: the developer said 「わからない」. explicit_request: the developer asked to work it out together without having said so."
+          "enum": ["unknown_answer", "explicit_request", "purpose_need"],
+          "description": "unknown_answer: the developer said 「わからない」. explicit_request: the developer asked to work it out together without having said so. purpose_need: a Purpose Need response of unknown/investigate opened the session (Issue #389 / #444 §1.9)."
         },
         "question_text": {
           "type": "string",

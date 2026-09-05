@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/assistant_discussion.json",
+  "title": "AssistantDiscussionAdapter",
+  "description": "The finite vocabularies Epic #443 pins for the AI Discussion UI Adapter (Issue #444, Phase 1). `docs/ai-discussion-adapter.md` §1 is the canonical contract; `docs/assistant-discussion.md` §1/§2 are the canonical contract for the underlying thread/proposal persistence these vocabularies describe (unchanged by this Epic). This schema does not describe a new persisted row shape -- Phase 1 adds no database table -- it exists so `tests/test_discussion_contract_parity.py` has one machine-checkable source alongside the server `Literal`s (`app/models.py`) and the Dashboard unions (`src/api/types.ts`) for every enum this Epic's registry introduces or touches. Each `$defs` entry below is referenced elsewhere as `#/$defs/<name>` rather than restated.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "scope": { "$ref": "#/$defs/discussion_scope" },
+    "target_kind": { "$ref": "#/$defs/discussion_target_kind" },
+    "target_state": { "$ref": "#/$defs/discussion_target_state" },
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/discussion_capability" }
+    },
+    "proposal_item_kind": { "$ref": "#/$defs/discussion_proposal_item_kind" },
+    "proposal_item_status": { "$ref": "#/$defs/discussion_proposal_item_status" },
+    "proposal_item_eligibility": { "$ref": "#/$defs/discussion_proposal_item_eligibility" }
+  },
+  "$defs": {
+    "discussion_scope": {
+      "description": "docs/assistant-discussion.md §1.1. Fixed per target_kind (never chosen by the caller) via the scope -> target_kind first-match table `app/discussion_adapters.py`'s registry derives `SCOPE_TARGET_KINDS` from.",
+      "enum": ["screen", "entity", "element"]
+    },
+    "discussion_target_kind": {
+      "description": "docs/ai-discussion-adapter.md §1.1/§1.2. One `DiscussionAdapter` per value, registered in `app/discussion_adapters.DISCUSSION_ADAPTERS` -- an unregistered value is refused fail-closed (422 discussion_target_kind_unregistered) rather than silently degrading. Phase 1 (#444) covers exactly the 9 kinds Epic #436 (#438) already shipped; #447 adds Purpose/Stakeholder/Objective/Feature kinds in a later phase, additively.",
+      "enum": [
+        "screen",
+        "interview_session",
+        "understanding_claim",
+        "overview_finding",
+        "ux_journey",
+        "ux_journey_step",
+        "ux_requirement",
+        "solution_design",
+        "blueprint_lane_cell"
+      ]
+    },
+    "discussion_target_state": {
+      "description": "docs/assistant-discussion.md §1.3. Derived at read time from the captured digest vs. the target's current canonical digest -- never a stored column, so an edited target cannot keep reporting a stale answer as current.",
+      "enum": ["current", "stale", "unresolvable", "not_tracked"]
+    },
+    "discussion_capability": {
+      "description": "docs/ai-discussion-adapter.md §1.3. Derived from what a DiscussionAdapter actually declares (`fields`/`relations`/`children`/`ui_draft_forms`/`joint_understanding_bridge`) -- never a stored column or a second constant, so a capability can never drift from the adapter that is supposed to back it. In Phase 1 every adapter's `ui_draft_forms` and `children` are empty and `joint_understanding_bridge` is false, so only `read_canonical`, `propose_fields`, and `propose_relations` are ever actually derived true; `read_ui_draft`, `prefill_form`, and `promote_joint_understanding` become reachable in Phases 2/3/6 without widening this enum.",
+      "enum": [
+        "read_canonical",
+        "read_ui_draft",
+        "propose_fields",
+        "propose_relations",
+        "prefill_form",
+        "promote_joint_understanding"
+      ]
+    },
+    "discussion_proposal_item_kind": {
+      "description": "docs/assistant-discussion.md §2.3. Unchanged by Epic #443 Phase 1 -- included here so the parity test can check it alongside the adapter vocabularies above in one place.",
+      "enum": ["field", "relation"]
+    },
+    "discussion_proposal_item_status": {
+      "description": "docs/assistant-discussion.md §2.3. The item's OWN persisted lifecycle -- separate from `discussion_proposal_item_eligibility`, which is derived at read time and never stored (§2.2).",
+      "enum": ["proposed", "applied", "rejected"]
+    },
+    "discussion_proposal_item_eligibility": {
+      "description": "docs/assistant-discussion.md §2.2's first-match order: forbidden -> stale -> conflict -> appliable. Derived at read time from the target's CURRENT canonical digest and the item's own status/address, never stored.",
+      "enum": ["forbidden", "stale", "conflict", "appliable"]
+    }
+  }
+}

@@ -3660,6 +3660,17 @@ export type DiscussionTargetKind =
   | "blueprint_lane_cell";
 export type DiscussionTargetState = "current" | "stale" | "unresolvable" | "not_tracked";
 
+// docs/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived
+// server-side from what a DiscussionAdapter actually declares -- never a
+// stored column or a second constant.
+export type DiscussionCapability =
+  | "read_canonical"
+  | "read_ui_draft"
+  | "propose_fields"
+  | "propose_relations"
+  | "prefill_form"
+  | "promote_joint_understanding";
+
 export interface AssistantDiscussionTargetIn {
   scope: DiscussionScope;
   screen_id: string;
@@ -4480,8 +4491,10 @@ export interface CellAskSyncOut {
 // 「わからない」を終端回答ではなく共同で状況理解を作る工程の開始点として扱う。
 // 三つの来歴(investigation / translation / developer)は 1 つの回答へ混ぜない。
 
-export type JointUnderstandingOriginKind = "qa" | "intent" | "review_item" | "inquiry";
-export type JointUnderstandingTrigger = "unknown_answer" | "explicit_request";
+export type JointUnderstandingOriginKind = "qa" | "intent" | "review_item" | "inquiry" | "purpose_need";
+// "purpose_need" (Issue #389 / #444 §1.9): a Purpose Need response of
+// unknown/investigate opens a session the same way an unanswered Q&A does.
+export type JointUnderstandingTrigger = "unknown_answer" | "explicit_request" | "purpose_need";
 export type JointUnderstandingStatus = "open" | "held" | "closed";
 export type JointUnderstandingOutcome =
   | "understood"
