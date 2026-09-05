@@ -4,7 +4,7 @@
 // the Solution Design tab, reached via `onOpenSolutionDesign`).
 
 import { RequirementRevisionHistoryCard } from "./revision-history";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -41,6 +41,7 @@ import {
   ArtifactReferencesCard, DegradedNote, DesignDecisionControls, EmptyNote,
   LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
 } from "./shared";
+import { useUiDraftSource } from "@/lib/ui-draft";
 
 const REQUIREMENT_KINDS: UxRequirementKind[] = ["functional", "non_functional", "constraint", "out_of_scope"];
 const VERIFICATION_METHODS: UxVerificationMethod[] = [
@@ -156,11 +157,37 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
   const detail = useUxRequirementDetail(requirementKey);
   const addRevision = useAddUxRequirementRevision(requirementKey);
   const current = detail.data?.current_revision ?? null;
+  // Issue #445: frozen at mount, like `JourneyRevisionForm`'s seed -- a
+  // refetch after this form's own submit must not retroactively change what
+  // counts as "unedited" mid-session.
+  const seedRef = useRef({
+    statement: current?.statement ?? "",
+    rationale: current?.rationale ?? "",
+    constraintText: current?.constraint_text ?? "",
+    outOfScopeNote: current?.out_of_scope_note ?? "",
+  });
+  const seed = seedRef.current;
   const [statement, setStatement] = useState(current?.statement ?? "");
   const [rationale, setRationale] = useState(current?.rationale ?? "");
   const [constraintText, setConstraintText] = useState(current?.constraint_text ?? "");
   const [outOfScopeNote, setOutOfScopeNote] = useState(current?.out_of_scope_note ?? "");
   const [changeNote, setChangeNote] = useState("");
+
+  // Issue #445 (§2.2/§2.3): the `ux_requirement` draft. Acceptance criteria
+  // are a #448 (ChildSpec) concern, not a top-level field here.
+  const requirementFields = [
+    { fieldName: "statement", value: statement, dirty: statement !== seed.statement, validationError: "" },
+    { fieldName: "rationale", value: rationale, dirty: rationale !== seed.rationale, validationError: "" },
+    { fieldName: "constraint_text", value: constraintText, dirty: constraintText !== seed.constraintText, validationError: "" },
+    { fieldName: "out_of_scope_note", value: outOfScopeNote, dirty: outOfScopeNote !== seed.outOfScopeNote, validationError: "" },
+  ];
+  useUiDraftSource("ux_requirement.revision", requirementKey, () => ({
+    fields: requirementFields,
+    selectedItemRef: "",
+    activeTab: "",
+    comparisonTarget: "",
+    localRevisionToken: JSON.stringify(requirementFields.map((f) => [f.fieldName, f.value])),
+  }));
   const seedCriteria = (current?.acceptance_criteria ?? []).map((c) => ({
     criterion_key: c.criterion_key, criterion_order: c.criterion_order, statement: c.statement,
     verification_method: c.verification_method, verification_note: c.verification_note,

@@ -21,8 +21,10 @@
 - **機能解説 (help mode) と利用者データの意味分析は別物。** help mode は
   versioned な製品管理下レジストリからの完全一致検索のみで、LLM を
   1 度も呼ばない (`decision_method: deterministic`)。説明文を捏造しない。
-- **音声バイナリは永続保存しない。** Phase 1 の STT/TTS はブラウザ内の
-  provider-neutral adapter で行い、音声データはサーバへ送らない。
+- **音声バイナリは永続保存しない。** STT はブラウザ内で行い、利用者の録音
+  音声を Control Server へ送らない。TTS は短い読み上げ文だけを Control
+  Server から OpenAI Speech API へ送り、返った生成音声をストリームする。
+  入力文・生成音声は会話テーブルやファイルへ保存しない。
 - **`unknown` / `unavailable` / `stale` / `not_tracked` を丸めない** (#366)。
 - System scope を越えない。他 System の thread / proposal は 404。
 
@@ -227,17 +229,33 @@ assistant_discussion_proposal_item(
 
 ## §4 音声対話 (#441)
 
-Phase 1 (実装対象) は **turn-based**、かつ **provider-neutral adapter は
-ブラウザ内**に置く。音声はサーバへ送らず、したがって永続保存もされない。
+音声対話は **turn-based**。STT adapter はブラウザ内、TTS adapter は認証済み
+Control Server の `POST /assistant/speech` を介して OpenAI Speech API を使う。
+API key はブラウザへ渡さない。利用者の録音音声と生成音声は永続保存しない。
 
 - `src/lib/voice-adapter.ts`: `SpeechToTextAdapter` / `TextToSpeechAdapter` /
   `createBrowserVoiceAdapters()` / `voicePrerequisite()` →
-  `"ready" | "insecure_context" | "unsupported" | "permission_denied"`。
+  `"ready" | "insecure_context" | "unsupported"`。
+- `POST /assistant/ask` は voice turn に完全な `answer` と、最大 3 文・180 文字の
+  `spoken_answer` を返す。長い場合は概要・中核の後に「続けて詳しく説明するか」
+  を尋ね、`voice_follow_up_expected: true` を返す。クライアントは再生終了後に
+  自動で STT を再開し、詳細はボタン操作なしの次の利用者 turn を待つ。
+- mounted voice surface は実際に再生完了した文だけを最大 8 件の
+  `voice_spoken_history` としてメモリ内に保持し、次の voice turn へ渡す。
+  サーバは LLM prompt と最終 spoken projection の両方で既出文を除外する。
+  新しい説明が残っていなければ、その旨を伝えて他の質問・関心を確認する。
+  この確認も返答を求めるため、再生後は自動で STT を再開する。履歴は会話の
+  target key ごとに分離され、voice surface を閉じると失われる。DB や全体設定
+  には保存しない。
+- `POST /assistant/speech` は `spoken_answer` の短いテキストを受け、OpenAI
+  `audio/speech` の生成音声 (`audio/mpeg`) を `Cache-Control: no-store` で返す。
+  model / voice / style / timeout / base URL は `OPENAI_TTS_*` で設定する。
 - 状態は有限: `idle` | `listening` | `thinking` | `speaking` | `error`。
   色だけでなく text + `aria-live` で伝える。`prefers-reduced-motion` では
   点滅・脈動しない。
 - 音声モード中はメッセージ一覧を隠す (履歴自体は保持する)。
-- `stop` / `mute` / `exit` は常時利用可能。
+- `stop` / `mute` / `exit` は常時利用可能。再生中は「話を挟む」も表示し、
+  音声取得・再生を即時 cancel して次の STT turn を開始する。
 - **turn 開始時の discussion target を回答完了まで固定する** — 途中で選択が
   変わっても、その turn は捕捉した target で答える。
 - element scope は `useHelpMode().target` (#440) から取り、新しい
@@ -247,5 +265,6 @@ Phase 1 (実装対象) は **turn-based**、かつ **provider-neutral adapter �
 - microphone 拒否 / STT 失敗 / TTS 失敗 は error 状態を示したうえで text mode
   へ安全に戻る。
 - 音声会話からも正規データは変更しない (§0)。
-- Phase 2 (WebSocket / VAD / barge-in / reconnect / cost limit) は本 Epic の
-  実装対象外。着手する場合は transcript の可視性と保持方針を先に決めること。
+- Realtime の WebSocket / VAD / 自動 barge-in / reconnect は対象外。明示ボタン
+  ではなく発話検知で自動割り込みする場合は、transcript の可視性と保持方針を
+  先に決めること。

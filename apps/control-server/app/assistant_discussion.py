@@ -1,27 +1,33 @@
 """Assistant discussion threads: target-scoped conversation persistence
-(Issue #438, Epic #436).
+(Issue #438, Epic #436; registry-backed since Issue #444, Epic #443 Phase 1).
 
-`docs/assistant-discussion.md` §1 is the canonical contract. This module
-owns:
+`docs/assistant-discussion.md` §1 is the canonical contract for thread/turn
+persistence and target-state derivation; `docs/ai-discussion-adapter.md` §1
+is the canonical contract for the `DiscussionAdapter` registry this module
+now sits on top of. This module owns:
 
-- the finite vocabularies §1.1 pins (`DISCUSSION_SCOPES` /
-  `DISCUSSION_TARGET_KINDS` / `DISCUSSION_TARGET_STATES` /
-  `DISCUSSION_SCREEN_IDS`) and the `scope -> target_kind` first-match table,
 - `thread_key` construction (screen_id|scope|target_kind|target_ref) --
   thread IDENTITY, never `(system_id, screen_id)` alone, so a Requirement A
   conversation and a Requirement B conversation on the same screen can never
   share a row,
-- a per-kind resolver registry that reads the SAME canonical source the
-  corresponding Dashboard screen reads, to compute a target's current
-  title/revision/digest without ever raising on a missing target (a stale or
-  deleted deep link degrades to `resolution="unresolved"`, never a 500 --
-  the rule Issue #437 already established for screen discussion context),
 - `evaluate_target_state`, the §1.3 first-match table that derives
   `current` / `stale` / `unresolvable` / `not_tracked` at READ time -- this
   is intentionally never a stored column, so an edited target cannot keep
   reporting a stale answer as current,
 - thread/turn persistence (`resolve_or_create_thread` / `get_thread` /
   `list_threads` / `append_turn` / `recent_turns`).
+
+The finite vocabularies (`DISCUSSION_SCOPES` / `DISCUSSION_TARGET_KINDS` /
+`DISCUSSION_TARGET_STATES` / `DISCUSSION_SCREEN_IDS`), the `scope ->
+target_kind` table (`SCOPE_TARGET_KINDS`), per-kind target resolution
+(`resolve_target`), and per-kind route params (`route_params_for_target`)
+are now DERIVED from `discussion_adapters.DISCUSSION_ADAPTERS` -- the single
+registry `docs/ai-discussion-adapter.md` §1 introduces -- rather than
+declared by hand here. `SCOPE_TARGET_KINDS` keeps its exact name and shape
+(`Dict[str, Tuple[str, ...]]`) so existing importers/tests are unaffected by
+the move; `tests/test_discussion_adapter_registry.py` is what proves the
+derived values equal what they were before this move (Issue #444's
+acceptance bar: the move must not change behaviour by one bit).
 
 No LLM call anywhere in this module (Principle 6); it is a deterministic
 persistence + resolution layer. Resolvers that need the same canonical
@@ -33,29 +39,24 @@ not reentrant (CLAUDE.md Implementation Constraints).
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from . import discussion_adapters
 from .db import get_conn
 
-# --- §1.1 finite vocabularies -------------------------------------------------
+# Re-exported for backward compatibility -- callers that did
+# `from .assistant_discussion import ResolvedTarget` (there are none left in
+# this codebase, but the name stays public) keep working, and this module's
+# own resolver plumbing below uses this alias throughout.
+ResolvedTarget = discussion_adapters.ResolvedTarget
+
+# --- §1.1 finite vocabularies (derived from the registry) ---------------------
 
 DISCUSSION_SCOPES: Tuple[str, ...] = ("screen", "entity", "element")
 
-DISCUSSION_TARGET_KINDS: Tuple[str, ...] = (
-    "screen",
-    "interview_session",
-    "understanding_claim",
-    "overview_finding",
-    "ux_journey",
-    "ux_journey_step",
-    "ux_requirement",
-    "solution_design",
-    "blueprint_lane_cell",
-)
+DISCUSSION_TARGET_KINDS: Tuple[str, ...] = discussion_adapters.DISCUSSION_TARGET_KINDS
 
 DISCUSSION_TARGET_STATES: Tuple[str, ...] = (
     "current", "stale", "unresolvable", "not_tracked",
@@ -63,19 +64,20 @@ DISCUSSION_TARGET_STATES: Tuple[str, ...] = (
 
 # The 4 discussion-enabled screens (§1.1). Any other screen id keeps the
 # pre-#438 client-only conversation -- the safe migration path.
-DISCUSSION_SCREEN_IDS: Tuple[str, ...] = (
-    "overview", "interview", "ux-design-studio", "journey-blueprint",
-)
+DISCUSSION_SCREEN_IDS: Tuple[str, ...] = discussion_adapters.DISCUSSION_SCREEN_IDS
 
-# scope -> allowed target_kind, first-match (§1.1's table). A combination
+# scope -> allowed target_kind, first-match (§1.1's table), derived as the
+# INVERSE of the registry's per-adapter `scope` (Issue #444 §1.1: "delete the
+# hand-written dict; keep the exported name and its shape"). A combination
 # outside this table is a 422 `discussion_target_scope_mismatch` (fail-closed).
-SCOPE_TARGET_KINDS: Dict[str, Tuple[str, ...]] = {
-    "screen": ("screen",),
-    "entity": ("interview_session", "ux_journey", "ux_requirement", "solution_design"),
-    "element": (
-        "understanding_claim", "overview_finding", "ux_journey_step", "blueprint_lane_cell",
-    ),
-}
+def _build_scope_target_kinds() -> Dict[str, Tuple[str, ...]]:
+    by_scope: Dict[str, List[str]] = {scope: [] for scope in DISCUSSION_SCOPES}
+    for adapter in discussion_adapters.DISCUSSION_ADAPTERS.values():
+        by_scope.setdefault(adapter.scope, []).append(adapter.target_kind)
+    return {scope: tuple(kinds) for scope, kinds in by_scope.items()}
+
+
+SCOPE_TARGET_KINDS: Dict[str, Tuple[str, ...]] = _build_scope_target_kinds()
 
 THREAD_SCHEMA_VERSION = "assistant-discussion-thread-v1"
 TURN_SCHEMA_VERSION = "assistant-discussion-turn-v1"
@@ -95,6 +97,30 @@ class ScopeMismatch(DiscussionError):
     """422 discussion_target_scope_mismatch (§1.1)."""
 
 
+class UnregisteredTargetKind(DiscussionError):
+    """422 discussion_target_kind_unregistered (Issue #444 §1.7).
+
+    Reachable only when a `target_kind` string has no
+    `discussion_adapters.DiscussionAdapter` at all -- a value the
+    `DiscussionTargetKind` Literal at the API boundary already excludes for
+    every ordinary HTTP caller, so this mainly guards a future phase that
+    adds a Literal member before registering its adapter (the exact "forgot
+    one of the six tables" failure mode §1.1 of
+    `docs/ai-discussion-adapter.md` describes), and any direct Python caller
+    of `resolve_or_create_thread`.
+    """
+
+
+class ScreenMismatch(DiscussionError):
+    """422 discussion_target_screen_mismatch (Issue #444 §1.7): the
+    `target_kind`'s adapter does not list this `screen_id` among the screens
+    it may be opened from -- e.g. a `ux_journey_step` thread requested with
+    `screen_id="overview"`. Checked AFTER `UnregisteredTargetKind` (a kind
+    with no adapter has no `screen_ids` to check) and after `ScopeMismatch`
+    (§1.7's own bullet order), and only when a thread is being CREATED -- see
+    `resolve_or_create_thread`."""
+
+
 def validate_scope(scope: str, target_kind: str) -> None:
     allowed = SCOPE_TARGET_KINDS.get(scope)
     if allowed is None or target_kind not in allowed:
@@ -109,265 +135,25 @@ def thread_key(screen_id: str, scope: str, target_kind: str, target_ref: str) ->
     return f"{screen_id}|{scope}|{target_kind}|{target_ref}"
 
 
-# --- §1.2/§1.3 target resolution ----------------------------------------------
-
-
-@dataclass(frozen=True)
-class ResolvedTarget:
-    title: str
-    revision_id: Optional[int]
-    digest: str
-    resolution: str  # "resolved" | "unresolved" | "not_tracked"
-
-
-def _canonical_digest(payload: Any) -> str:
-    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _normalized_json_digest(text: Optional[str]) -> str:
-    if not text:
-        canonical: Any = None
-    else:
-        try:
-            canonical = json.loads(text)
-        except (TypeError, ValueError):
-            canonical = text
-    return _canonical_digest(canonical)
-
-
-def _resolve_screen(system_id: int, target_ref: str) -> ResolvedTarget:
-    # `screen` has no digest source (§1.2): never `stale`, always `not_tracked`.
-    return ResolvedTarget(title=target_ref, revision_id=None, digest="", resolution="not_tracked")
-
-
-def _resolve_interview_session(system_id: int, target_ref: str) -> ResolvedTarget:
-    try:
-        session_id = int(target_ref)
-    except (TypeError, ValueError):
-        return ResolvedTarget("", None, "", "unresolved")
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT id, title, current_understanding FROM interview_session "
-            "WHERE id = ? AND system_id = ?",
-            (session_id, system_id),
-        ).fetchone()
-    if row is None:
-        return ResolvedTarget("", None, "", "unresolved")
-    digest = _normalized_json_digest(row["current_understanding"])
-    title = row["title"] or f"Interview session #{session_id}"
-    return ResolvedTarget(title=title, revision_id=session_id, digest=digest, resolution="resolved")
-
-
-_CLAIM_SECTIONS: Tuple[str, ...] = ("vision", "system_purpose", "core_capabilities")
-
-
-def _resolve_understanding_claim(system_id: int, target_ref: str) -> ResolvedTarget:
-    section, sep, name = target_ref.partition(":")
-    if not sep or section not in _CLAIM_SECTIONS or not name:
-        return ResolvedTarget("", None, "", "unresolved")
-
-    from . import understanding_brief
-
-    with get_conn() as conn:
-        session_row = conn.execute(
-            "SELECT id FROM interview_session WHERE system_id = ? ORDER BY id DESC LIMIT 1",
-            (system_id,),
-        ).fetchone()
-        session_id = session_row["id"] if session_row is not None else None
-        try:
-            brief = understanding_brief.build_understanding_brief(conn, system_id, session_id)
-        except Exception:  # pragma: no cover - defensive
-            return ResolvedTarget("", None, "", "unresolved")
-
-        claims = {
-            "vision": [brief.vision] if brief.vision is not None else [],
-            "system_purpose": brief.system_purpose,
-            "core_capabilities": brief.core_capabilities,
-        }[section]
-        claim = next((c for c in claims if c.name == name), None)
-        if claim is None:
-            return ResolvedTarget("", None, "", "unresolved")
-
-        raw_item: Optional[Dict[str, Any]] = None
-        if session_id is not None:
-            understanding_row = conn.execute(
-                "SELECT current_understanding FROM interview_session WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if understanding_row is not None and understanding_row["current_understanding"]:
-                try:
-                    parsed = json.loads(understanding_row["current_understanding"])
-                except (TypeError, ValueError):
-                    parsed = None
-                if isinstance(parsed, dict):
-                    for item in parsed.get(section) or []:
-                        if isinstance(item, dict) and str(item.get("name")) == name:
-                            raw_item = item
-                            break
-
-    # A resolved claim with no findable raw item (defensive: the claim
-    # resolved successfully because the NAME matched) degrades the digest to
-    # "" rather than fabricating one that was never truly captured -- the
-    # same rule `product_objective._resolve_vision_target` applies.
-    digest = understanding_brief.claim_digest(raw_item) if raw_item is not None else ""
-    return ResolvedTarget(title=claim.name, revision_id=session_id, digest=digest, resolution="resolved")
-
-
-def _resolve_overview_finding(system_id: int, target_ref: str) -> ResolvedTarget:
-    from .overview_projection import build_overview
-
-    try:
-        overview = build_overview(system_id)
-    except Exception:  # pragma: no cover - defensive
-        return ResolvedTarget("", None, "", "unresolved")
-    finding = next((f for f in overview.findings if f.dedupe_key == target_ref), None)
-    if finding is None:
-        return ResolvedTarget("", None, "", "unresolved")
-    payload = {
-        "kind": finding.kind,
-        "severity": finding.severity,
-        "summary": finding.summary,
-        "decision_impact": finding.decision_impact,
-        "provenance": finding.provenance,
-        "dedupe_key": finding.dedupe_key,
-    }
-    return ResolvedTarget(
-        title=finding.summary,
-        revision_id=finding.revision_id,
-        digest=_canonical_digest(payload),
-        resolution="resolved",
-    )
-
-
-def _resolve_ux_journey(system_id: int, target_ref: str) -> ResolvedTarget:
-    from . import ux_design
-
-    with get_conn() as conn:
-        try:
-            detail = ux_design.get_journey_detail(conn, system_id, target_ref)
-        except ux_design.NotFound:
-            return ResolvedTarget("", None, "", "unresolved")
-    revision = detail.get("current_revision")
-    digest = revision["content_digest"] if revision else ""
-    return ResolvedTarget(
-        title=detail.get("title") or target_ref,
-        revision_id=detail.get("current_revision_id"),
-        digest=digest,
-        resolution="resolved",
-    )
-
-
-def _resolve_ux_journey_step(system_id: int, target_ref: str) -> ResolvedTarget:
-    from . import ux_design
-
-    journey_key, sep, step_key = target_ref.partition("#")
-    if not sep or not journey_key or not step_key:
-        return ResolvedTarget("", None, "", "unresolved")
-    with get_conn() as conn:
-        journey = ux_design._get_journey_row(conn, system_id, journey_key)  # noqa: SLF001 - established cross-module reuse (see product_objective.py)
-        if journey is None:
-            return ResolvedTarget("", None, "", "unresolved")
-        resolved = ux_design._resolve_step_target(conn, system_id, journey["id"], step_key)  # noqa: SLF001
-    if resolved["resolution"] != "resolved":
-        return ResolvedTarget("", None, "", "unresolved")
-    title = resolved.get("label") or step_key
-    return ResolvedTarget(
-        title=title,
-        revision_id=journey.get("current_revision_id"),
-        digest=resolved.get("digest") or "",
-        resolution="resolved",
-    )
-
-
-def _resolve_ux_requirement(system_id: int, target_ref: str) -> ResolvedTarget:
-    from . import ux_design
-
-    with get_conn() as conn:
-        try:
-            detail = ux_design.get_requirement_detail(conn, system_id, target_ref)
-        except ux_design.NotFound:
-            return ResolvedTarget("", None, "", "unresolved")
-    revision = detail.get("current_revision")
-    digest = revision["content_digest"] if revision else ""
-    return ResolvedTarget(
-        title=detail.get("statement") or target_ref,
-        revision_id=detail.get("current_revision_id"),
-        digest=digest,
-        resolution="resolved",
-    )
-
-
-def _resolve_solution_design(system_id: int, target_ref: str) -> ResolvedTarget:
-    from . import solution_design
-
-    with get_conn() as conn:
-        try:
-            detail = solution_design.get_design_detail(conn, system_id=system_id, design_key=target_ref)
-        except solution_design.SolutionDesignNotFoundError:
-            return ResolvedTarget("", None, "", "unresolved")
-    # solution_design carries no revision table (flat identity row); its
-    # content digest is over the row's own meaning-bearing fields, using its
-    # own canonicalization function (never a separate one here).
-    digest = solution_design.content_digest(
-        {"title": detail.get("title") or "", "summary": detail.get("summary") or ""}
-    )
-    return ResolvedTarget(
-        title=detail.get("title") or target_ref,
-        revision_id=detail.get("id"),
-        digest=digest,
-        resolution="resolved",
-    )
-
-
-def _resolve_blueprint_lane_cell(system_id: int, target_ref: str) -> ResolvedTarget:
-    from . import journey_blueprint
-
-    parts = target_ref.split("#")
-    if len(parts) != 3 or not all(parts):
-        return ResolvedTarget("", None, "", "unresolved")
-    journey_key, step_key, lane_kind = parts
-    if lane_kind not in journey_blueprint.LANE_KINDS:
-        return ResolvedTarget("", None, "", "unresolved")
-    with get_conn() as conn:
-        try:
-            blueprint = journey_blueprint.build_blueprint(conn, system_id, journey_key)
-        except journey_blueprint.NotFound:
-            return ResolvedTarget("", None, "", "unresolved")
-    step = next((s for s in blueprint["steps"] if s["step_key"] == step_key), None)
-    if step is None:
-        return ResolvedTarget("", None, "", "unresolved")
-    cell = step.get("lanes", {}).get(lane_kind)
-    if cell is None:
-        return ResolvedTarget("", None, "", "unresolved")
-    title = f"{lane_kind} / {step.get('user_intent') or step_key}"
-    return ResolvedTarget(
-        title=title, revision_id=None, digest=_canonical_digest(cell), resolution="resolved",
-    )
-
-
-_TARGET_RESOLVERS: Dict[str, Callable[[int, str], ResolvedTarget]] = {
-    "screen": _resolve_screen,
-    "interview_session": _resolve_interview_session,
-    "understanding_claim": _resolve_understanding_claim,
-    "overview_finding": _resolve_overview_finding,
-    "ux_journey": _resolve_ux_journey,
-    "ux_journey_step": _resolve_ux_journey_step,
-    "ux_requirement": _resolve_ux_requirement,
-    "solution_design": _resolve_solution_design,
-    "blueprint_lane_cell": _resolve_blueprint_lane_cell,
-}
+# --- §1.2/§1.3 target resolution (delegates to the DiscussionAdapter registry) --
 
 
 def resolve_target(system_id: int, target_kind: str, target_ref: str) -> ResolvedTarget:
     """Resolve one target against its canonical source. Never raises -- a
     stale/deleted/unknown target degrades to `resolution="unresolved"`
-    (#437's rule: a stale deep link must not fail the whole assistant)."""
-    resolver = _TARGET_RESOLVERS.get(target_kind)
-    if resolver is None:
+    (#437's rule: a stale deep link must not fail the whole assistant).
+
+    Delegates to `discussion_adapters.DISCUSSION_ADAPTERS[target_kind].
+    resolver` (Issue #444) -- an unregistered `target_kind` degrades exactly
+    like an unresolvable one here (the registration itself is enforced,
+    fail-closed, by `resolve_or_create_thread` below; this function's own
+    contract has always been "never raises").
+    """
+    adapter = discussion_adapters.DISCUSSION_ADAPTERS.get(target_kind)
+    if adapter is None:
         return ResolvedTarget("", None, "", "unresolved")
     try:
-        return resolver(system_id, target_ref)
+        return adapter.resolver(system_id, target_ref)
     except Exception:  # pragma: no cover - defensive
         return ResolvedTarget("", None, "", "unresolved")
 
@@ -388,22 +174,16 @@ def evaluate_target_state(captured_digest: str, resolved: ResolvedTarget) -> str
 
 def route_params_for_target(target_kind: str, target_ref: str) -> Dict[str, str]:
     """Route params `assistant_discussion_context.build_screen_discussion_context`
-    already understands, so a thread's own target lands in the context pack."""
-    if target_kind == "interview_session":
-        return {"session": target_ref}
-    if target_kind == "ux_journey":
-        return {"journey": target_ref}
-    if target_kind == "ux_journey_step":
-        journey_key, _, _step_key = target_ref.partition("#")
-        return {"journey": journey_key} if journey_key else {}
-    if target_kind == "ux_requirement":
-        return {"requirement": target_ref}
-    if target_kind == "solution_design":
-        return {"design": target_ref}
-    if target_kind == "blueprint_lane_cell":
-        journey_key = target_ref.split("#", 1)[0]
-        return {"journey": journey_key} if journey_key else {}
-    return {}
+    already understands, so a thread's own target lands in the context pack.
+
+    Delegates to `discussion_adapters.DISCUSSION_ADAPTERS[target_kind].
+    route_params` (Issue #444). An unregistered kind degrades to `{}`, same
+    as every per-kind branch this replaced defaulted to when no case matched.
+    """
+    adapter = discussion_adapters.DISCUSSION_ADAPTERS.get(target_kind)
+    if adapter is None:
+        return {}
+    return adapter.route_params(target_ref)
 
 
 # --- persistence ---------------------------------------------------------------
@@ -463,6 +243,15 @@ def resolve_or_create_thread(
         raise DiscussionError(f"unknown_screen_id: {screen_id!r}")
     if scope not in DISCUSSION_SCOPES:
         raise DiscussionError(f"unknown_scope: {scope!r}")
+    # §1.7's bullet order: an entirely unregistered kind is a different
+    # failure than a registered kind used with the wrong scope or screen --
+    # checked first because a kind with no adapter has no `scope`/
+    # `screen_ids` to compare against.
+    adapter = discussion_adapters.DISCUSSION_ADAPTERS.get(target_kind)
+    if adapter is None:
+        raise UnregisteredTargetKind(
+            f"discussion_target_kind_unregistered: target_kind={target_kind!r}"
+        )
     validate_scope(scope, target_kind)
 
     key = thread_key(screen_id, scope, target_kind, target_ref)
@@ -475,6 +264,21 @@ def resolve_or_create_thread(
             (system_id, key),
         ).fetchone()
         if row is None:
+            # §1.7's screen gate applies to CREATING a thread, not to
+            # reopening one that already exists. The gate is new in Issue
+            # #444 -- before it, any discussion-enabled screen could open any
+            # kind -- so a row stored under a combination the registry now
+            # narrows must stay reachable: refusing to reopen it protects
+            # nothing and loses a real conversation. This is #337's
+            # compatibility rule applied here (a legacy row stays READABLE;
+            # it is never promoted to something it did not satisfy), and it
+            # is why the check sits inside this branch rather than above the
+            # lookup.
+            if screen_id not in adapter.screen_ids:
+                raise ScreenMismatch(
+                    f"discussion_target_screen_mismatch: screen_id={screen_id!r} is not "
+                    f"valid for target_kind={target_kind!r} (allowed: {adapter.screen_ids!r})"
+                )
             conn.execute(
                 """INSERT INTO assistant_discussion_thread
                    (system_id, thread_key, scope, screen_id, target_kind, target_ref,
@@ -569,6 +373,14 @@ def append_turn(
     model: str = "",
     prompt_version: str = "",
     created_by: Optional[str] = None,
+    # Issue #445 §2.7: recorded on USER turns only -- callers append the
+    # assistant turn with these left at their default `None`, which is
+    # exactly what a pre-#445 row also carries (a caller that never passes
+    # them is indistinguishable from an assistant turn, which is correct:
+    # neither ever had a draft attached to it).
+    ui_draft_state: Optional[str] = None,
+    ui_draft_form_id: Optional[str] = None,
+    ui_draft_digest: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Insert one turn on an ALREADY-OPEN connection -- callers that append a
     user turn and its assistant answer wrap both calls (and any thread
@@ -579,6 +391,10 @@ def append_turn(
         raise DiscussionError(f"invalid_decision_method: {decision_method!r}")
     if input_mode not in ("text", "voice"):
         raise DiscussionError(f"invalid_input_mode: {input_mode!r}")
+    if ui_draft_state is not None and ui_draft_state not in (
+        "not_provided", "applied", "no_unsaved_changes", "unsupported", "unreadable",
+    ):
+        raise DiscussionError(f"invalid_ui_draft_state: {ui_draft_state!r}")
 
     next_row = conn.execute(
         "SELECT COALESCE(MAX(turn_number), 0) AS n FROM assistant_discussion_turn WHERE thread_id = ?",
@@ -591,14 +407,15 @@ def append_turn(
            (system_id, thread_id, turn_number, role, content, citations_json,
             target_revision_id, target_digest, used_fallback, decision_method,
             input_mode, provider, model, prompt_version, created_by, created_at,
-            schema_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            schema_version, ui_draft_state, ui_draft_form_id, ui_draft_digest)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             system_id, thread_id, turn_number, role, content,
             json.dumps(list(citations or []), ensure_ascii=False),
             target_revision_id, target_digest, 1 if used_fallback else 0,
             decision_method, input_mode, provider, model, prompt_version,
             created_by, now, TURN_SCHEMA_VERSION,
+            ui_draft_state, ui_draft_form_id, ui_draft_digest,
         ),
     )
     turn_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]

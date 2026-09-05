@@ -3623,6 +3623,40 @@ export interface AssistantScreenContext {
   suggested_questions: AssistantSuggestedQuestion[];
 }
 
+// UiDraftContext (Issue #445, Epic #443 Phase 2). docs/ai-discussion-adapter.
+// md §2.2/§2.6. Client-only -- the server never persists a draft's own
+// values, only its finite state/form_id/digest on the user turn.
+export type UiDraftState =
+  | "not_provided"
+  | "applied"
+  | "no_unsaved_changes"
+  | "unsupported"
+  | "unreadable";
+
+export interface UiDraftFieldIn {
+  field_name: string;
+  value: string;
+  dirty: boolean;
+  validation_error: string;
+}
+
+export interface UiDraftContextIn {
+  target_kind: DiscussionTargetKind;
+  target_ref: string;
+  form_id: string;
+  fields: UiDraftFieldIn[];
+  selected_item_ref: string;
+  active_tab: string;
+  comparison_target: string;
+  captured_at: number;
+  local_revision_token: string;
+  /** False = a form IS open for this target but the client could not read it
+   * (§2.6's `unreadable`). Must carry no fields. Its own wire field rather
+   * than an inference from an empty `fields` list, which is already what
+   * `no_unsaved_changes` looks like. */
+  readable: boolean;
+}
+
 export interface AssistantAskRequest {
   screen_id: string;
   question: string;
@@ -3640,6 +3674,12 @@ export interface AssistantAskRequest {
   // Issue #441: how this question was entered. Recorded on the user
   // turn only -- the assistant did not speak into a microphone.
   input_mode?: "text" | "voice";
+  voice_continuation?: boolean;
+  voice_spoken_history?: string[];
+  // Issue #445: requires `thread_id` to be set (422 `ui_draft_requires_
+  // thread` otherwise) -- a draft is about a target, and without a thread
+  // there is no target to match it against.
+  ui_draft?: UiDraftContextIn;
 }
 
 // Assistant discussion threads (Issue #438, Epic #436). Finite unions mirror
@@ -3657,6 +3697,17 @@ export type DiscussionTargetKind =
   | "solution_design"
   | "blueprint_lane_cell";
 export type DiscussionTargetState = "current" | "stale" | "unresolvable" | "not_tracked";
+
+// docs/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived
+// server-side from what a DiscussionAdapter actually declares -- never a
+// stored column or a second constant.
+export type DiscussionCapability =
+  | "read_canonical"
+  | "read_ui_draft"
+  | "propose_fields"
+  | "propose_relations"
+  | "prefill_form"
+  | "promote_joint_understanding";
 
 export interface AssistantDiscussionTargetIn {
   scope: DiscussionScope;
@@ -3683,6 +3734,12 @@ export interface AssistantDiscussionTurn {
   schema_version: string;
   created_by: string | null;
   created_at: number;
+  // Issue #445 §2.7: recorded on USER turns only. `null` on a pre-#445 row
+  // means "this server could not have recorded it" -- distinct from
+  // `ui_draft_state: "not_provided"` (the client explicitly sent none).
+  ui_draft_state?: UiDraftState | null;
+  ui_draft_form_id?: string | null;
+  ui_draft_digest?: string;
 }
 
 export interface AssistantDiscussionThread {
@@ -3803,7 +3860,15 @@ export interface AssistantAction {
 }
 
 export interface AssistantCitation {
-  type: "setting" | "diagnostic_check" | "pipeline_step" | "state_item" | "screen_data";
+  type:
+    | "setting"
+    | "diagnostic_check"
+    | "pipeline_step"
+    | "state_item"
+    | "screen_data"
+    // Issue #445 (Epic #443 Phase 2): the answer relied on an unsaved UI
+    // draft, never a persisted fact.
+    | "ui_draft";
   id: string;
   title: string;
   detail: string;
@@ -3812,6 +3877,10 @@ export interface AssistantCitation {
 export interface AssistantAskOut {
   screen_id: string;
   answer: string;
+  /** Short overview/core projection used only for voice playback. */
+  spoken_answer?: string | null;
+  /** Reopen listening after playback because the spoken answer asks a question. */
+  voice_follow_up_expected?: boolean;
   suggested_actions: AssistantAction[];
   citations: AssistantCitation[];
   used_fallback: boolean;
@@ -3827,6 +3896,10 @@ export interface AssistantAskOut {
   target_state?: DiscussionTargetState | null;
   recheck_required?: boolean;
   turn_number?: number | null;
+  // Issue #445: always present (not gated on thread_id). `ui_draft_changed`
+  // implies `recheck_required` when both are read together.
+  ui_draft_state?: UiDraftState;
+  ui_draft_changed?: boolean;
 }
 
 // UI 機能解説モード (Issue #440, Epic #436): `app/ui_help_registry.py` の
@@ -4474,8 +4547,10 @@ export interface CellAskSyncOut {
 // 「わからない」を終端回答ではなく共同で状況理解を作る工程の開始点として扱う。
 // 三つの来歴(investigation / translation / developer)は 1 つの回答へ混ぜない。
 
-export type JointUnderstandingOriginKind = "qa" | "intent" | "review_item" | "inquiry";
-export type JointUnderstandingTrigger = "unknown_answer" | "explicit_request";
+export type JointUnderstandingOriginKind = "qa" | "intent" | "review_item" | "inquiry" | "purpose_need";
+// "purpose_need" (Issue #389 / #444 §1.9): a Purpose Need response of
+// unknown/investigate opens a session the same way an unanswered Q&A does.
+export type JointUnderstandingTrigger = "unknown_answer" | "explicit_request" | "purpose_need";
 export type JointUnderstandingStatus = "open" | "held" | "closed";
 export type JointUnderstandingOutcome =
   | "understood"

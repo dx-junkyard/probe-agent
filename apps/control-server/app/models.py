@@ -5893,6 +5893,130 @@ class AssistantConversationMessage(BaseModel):
     content: str = Field(..., min_length=1, max_length=4000)
 
 
+# --- Discussion target vocabulary (Issue #438, Epic #436) --------------------
+# Moved ahead of `AssistantAskRequest` (which needs `DiscussionTargetKind` for
+# its own `ui_draft` field, Issue #445) from their original position further
+# down this file -- Python has no forward-reference resolution for Pydantic
+# field types without `from __future__ import annotations`, and this module
+# does not opt into that. Nothing between here and their original position
+# used these names before this move, so relocating changes nothing else.
+DiscussionScope = Literal["screen", "entity", "element"]
+DiscussionTargetKind = Literal[
+    "screen",
+    "interview_session",
+    "understanding_claim",
+    "overview_finding",
+    "ux_journey",
+    "ux_journey_step",
+    "ux_requirement",
+    "solution_design",
+    "blueprint_lane_cell",
+]
+
+# --- UiDraftContext (Issue #445, Epic #443 Phase 2) ---------------------------
+# docs/ai-discussion-adapter.md §2.2/§2.6/§2.7. A `ui_draft` is a client-only,
+# UNSAVED form snapshot -- it is never persisted (only its finite state, form
+# id, and a client-supplied digest are, on the USER turn -- see
+# `assistant_discussion.append_turn`). All five states are reachable:
+# `unreadable` is carried by `UiDraftContextIn.readable`, which the Dashboard
+# registry sets when a mounted form's draft getter THROWS. Folding that into
+# `not_provided` would merge two of the three answers §2.6 keeps apart --
+# "a form is open for this target but could not be read" versus "no form was
+# open" -- and an assistant that reports the second when the first is true is
+# describing a screen the developer is not looking at.
+UiDraftState = Literal[
+    "not_provided", "applied", "no_unsaved_changes", "unsupported", "unreadable",
+]
+
+
+class UiDraftFieldIn(BaseModel):
+    """§2.2. `field_name` is validated against the target's adapter-declared
+    `UiDraftFormSpec.fields` allowlist in `app/ui_draft_context.py` -- not
+    here, since that check needs the discussion-adapter registry and the
+    thread's own target, neither of which a request-body model can see."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field_name: str = Field(..., min_length=1, max_length=100)
+    # Field-level max_length is a generous safety ceiling only (10x the
+    # documented 4000-char bound) -- the EXACT bound is enforced in
+    # `UiDraftContextIn.validate_ui_draft_bounds` below so every bound
+    # violation (field count / per-value length / total payload size)
+    # reports the SAME `ui_draft_payload_too_large` code (§2.3), rather than
+    # this field's violation reporting a different, generic Pydantic message.
+    value: str = Field(default="", max_length=40_000)
+    dirty: bool = False
+    validation_error: str = Field(default="", max_length=2000)
+
+
+class UiDraftContextIn(BaseModel):
+    """§2.2. A client-only, unsaved form snapshot for one turn. Never stored
+    -- `app/ui_draft_context.py` strips this down to (state, form_id, digest)
+    before anything reaches the database (§2.7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_kind: DiscussionTargetKind
+    target_ref: str = Field(..., min_length=1, max_length=500)
+    form_id: str = Field(..., min_length=1, max_length=200)
+    # See the comment on `UiDraftFieldIn.value` above re: the generous outer
+    # ceiling vs. the exact §2.3 bound enforced below.
+    fields: List[UiDraftFieldIn] = Field(default_factory=list, max_length=400)
+    selected_item_ref: str = Field(default="", max_length=500)
+    active_tab: str = Field(default="", max_length=200)
+    comparison_target: str = Field(default="", max_length=500)
+    captured_at: float = 0.0
+    local_revision_token: str = Field(default="", max_length=200)
+    #: False = "a form IS open for this target, but the client could not read
+    #: its state" (§2.6's `unreadable`). This is deliberately its own wire
+    #: field rather than being inferred from an empty `fields` list: "the
+    #: form reported nothing" and "the form could not be asked" are two of
+    #: the three answers §2.6 keeps apart, and an empty list is already how
+    #: `no_unsaved_changes` looks. A client that omits this behaves exactly
+    #: as before it existed.
+    readable: bool = True
+
+    @model_validator(mode="after")
+    def validate_ui_draft_bounds(self):
+        # An unreadable draft carries no content by definition -- accepting
+        # fields alongside `readable: false` would mean the client both could
+        # and could not read the same form.
+        if not self.readable and self.fields:
+            raise ValueError(
+                "ui_draft_unreadable_with_fields: readable=false must carry no fields"
+            )
+        # §2.3: at most 40 fields, at most 4000 chars per value, at most 32KB
+        # total. All three report the SAME code -- the client cares whether
+        # its draft was rejected, not which of the three counters tripped --
+        # and none of them truncate (a truncated draft is not the draft the
+        # developer is looking at).
+        if len(self.fields) > 40:
+            raise ValueError(
+                "ui_draft_payload_too_large: at most 40 fields are allowed"
+            )
+        if any(len(f.value) > 4000 for f in self.fields):
+            raise ValueError(
+                "ui_draft_payload_too_large: a field value exceeds 4000 characters"
+            )
+        total_bytes = sum(
+            len(f.field_name.encode("utf-8"))
+            + len(f.value.encode("utf-8"))
+            + len(f.validation_error.encode("utf-8"))
+            for f in self.fields
+        ) + sum(
+            len(value.encode("utf-8"))
+            for value in (
+                self.form_id, self.target_ref, self.selected_item_ref,
+                self.active_tab, self.comparison_target, self.local_revision_token,
+            )
+        )
+        if total_bytes > 32 * 1024:
+            raise ValueError(
+                "ui_draft_payload_too_large: total draft payload exceeds 32KB"
+            )
+        return self
+
+
 class AssistantAskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -5914,6 +6038,14 @@ class AssistantAskRequest(BaseModel):
     # word. Whether the answer was read aloud is a client-side playback
     # choice and is not a fact about the turn.
     input_mode: Literal["text", "voice"] = "text"
+    # Voice-surface-only state. It is bounded and used only to avoid repeating
+    # information that was actually played in this active conversation.
+    voice_continuation: bool = False
+    voice_spoken_history: List[str] = Field(default_factory=list, max_length=8)
+    # Issue #445: an unsaved UI form draft, scoped to the SAME target as
+    # `thread_id` (checked in `app/ui_draft_context.py`, which also runs
+    # Principle 9 redaction before this can reach the LLM). Never persisted.
+    ui_draft: Optional[UiDraftContextIn] = None
 
     @model_validator(mode="after")
     def validate_assistant_context_bounds(self):
@@ -5927,7 +6059,33 @@ class AssistantAskRequest(BaseModel):
             raise ValueError(
                 "conversation_not_settable_with_thread: conversation must be empty when thread_id is set"
             )
+        if any(not text.strip() or len(text) > 600 for text in self.voice_spoken_history):
+            raise ValueError("voice_spoken_history entries must contain 1..600 characters")
+        if sum(len(text) for text in self.voice_spoken_history) > 2_400:
+            raise ValueError("voice_spoken_history is too long")
+        if self.input_mode != "voice" and (
+            self.voice_continuation or self.voice_spoken_history
+        ):
+            raise ValueError("voice continuation state requires input_mode=voice")
+        # §2.3: "ui_draft with no thread_id -> 422 ui_draft_requires_thread"
+        # -- a draft is about a target, and without a thread there is no
+        # target to match it against. This is a structural check on sibling
+        # fields of THIS request, so it belongs here rather than in
+        # `app/ui_draft_context.py` (which handles checks that need the
+        # discussion-adapter registry and the resolved thread row).
+        if self.ui_draft is not None and self.thread_id is None:
+            raise ValueError(
+                "ui_draft_requires_thread: ui_draft requires thread_id to be set"
+            )
         return self
+
+
+class AssistantSpeechRequest(BaseModel):
+    """Short, server-generated text to render through OpenAI Speech API."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1, max_length=600)
 
 
 # ---------------------------------------------------------------------------
@@ -6020,7 +6178,15 @@ class AssistantActionOut(BaseModel):
 
 
 class AssistantCitationOut(BaseModel):
-    type: Literal["setting", "diagnostic_check", "pipeline_step", "state_item", "screen_data"]
+    # "ui_draft" added by Issue #445 (Epic #443 Phase 2) -- also update the
+    # citation shape line inside `assistant._SYSTEM_PROMPT` and the matching
+    # `_RawCitation.type` pattern in `assistant.py`; these are the two places
+    # docs/ai-discussion-adapter.md §2.4 warns must move together, or the
+    # model's `ui_draft` citations get silently dropped by one of them.
+    type: Literal[
+        "setting", "diagnostic_check", "pipeline_step", "state_item",
+        "screen_data", "ui_draft",
+    ]
     id: str
     title: str = ""
     detail: str = ""
@@ -6029,20 +6195,23 @@ class AssistantCitationOut(BaseModel):
 # --- Assistant discussion threads (Issue #438, Epic #436) --------------------
 # docs/assistant-discussion.md §1. Finite vocabularies mirror
 # app/assistant_discussion.py's module constants exactly.
+# `DiscussionScope` / `DiscussionTargetKind` themselves now live just above
+# `AssistantAskRequest` (Issue #445 needs them for `UiDraftContextIn` before
+# this point in the file) -- see the comment there.
 
-DiscussionScope = Literal["screen", "entity", "element"]
-DiscussionTargetKind = Literal[
-    "screen",
-    "interview_session",
-    "understanding_claim",
-    "overview_finding",
-    "ux_journey",
-    "ux_journey_step",
-    "ux_requirement",
-    "solution_design",
-    "blueprint_lane_cell",
-]
 DiscussionTargetState = Literal["current", "stale", "unresolvable", "not_tracked"]
+
+# docs/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived
+# from what a `DiscussionAdapter` actually declares (`app/discussion_adapters.
+# py`'s `capabilities_for`) -- never a stored column or a second constant.
+DiscussionCapability = Literal[
+    "read_canonical",
+    "read_ui_draft",
+    "propose_fields",
+    "propose_relations",
+    "prefill_form",
+    "promote_joint_understanding",
+]
 
 
 class AssistantDiscussionTargetIn(BaseModel):
@@ -6072,6 +6241,14 @@ class AssistantDiscussionTurnOut(BaseModel):
     schema_version: str = "assistant-discussion-turn-v1"
     created_by: Optional[str] = None
     created_at: float
+    # Issue #445 §2.7: recorded on USER turns only (an assistant turn did not
+    # itself carry a draft). `None` on a pre-#445 row is a FOURTH, distinct
+    # meaning from `ui_draft_state="not_provided"` -- "this server could not
+    # have recorded it" vs. "the client explicitly sent none" -- so this is
+    # `Optional[UiDraftState]`, never defaulted to a real state value.
+    ui_draft_state: Optional[UiDraftState] = None
+    ui_draft_form_id: Optional[str] = None
+    ui_draft_digest: str = ""
 
 
 class AssistantDiscussionThreadOut(BaseModel):
@@ -6355,6 +6532,12 @@ class PublishAuditEventOut(BaseModel):
 class AssistantAskOut(BaseModel):
     screen_id: str
     answer: str
+    # Present for a voice turn. The full answer remains available in
+    # ``answer`` while playback gets this bounded overview/core projection.
+    spoken_answer: Optional[str] = None
+    # True only when the spoken projection ends by asking whether to continue.
+    # The client uses this explicit contract instead of parsing Japanese text.
+    voice_follow_up_expected: bool = False
     suggested_actions: List[AssistantActionOut] = Field(default_factory=list)
     citations: List[AssistantCitationOut] = Field(default_factory=list)
     used_fallback: bool
@@ -6373,6 +6556,14 @@ class AssistantAskOut(BaseModel):
     target_state: Optional[DiscussionTargetState] = None
     recheck_required: bool = False
     turn_number: Optional[int] = None
+    # Issue #445 §2.6/§2.7. Always present (not gated on `thread_id` being
+    # set) -- a request with no thread and no `ui_draft` is simply
+    # `not_provided`, the same additive-compatible default a pre-#445 client
+    # already gets. `ui_draft_changed=True` always implies
+    # `recheck_required=True`: the previous answer was not about the CURRENT
+    # draft (§2.6).
+    ui_draft_state: UiDraftState = "not_provided"
+    ui_draft_changed: bool = False
 
 
 # --- Replay engine (Issue #242 Phase B / #244) -------------------------------

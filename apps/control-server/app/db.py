@@ -10194,6 +10194,29 @@ def init_db() -> None:
                     conn, "stabilization_package", stabilization_cols,
                     column, definition,
                 )
+        # Issue #445 (Epic #443 Phase 2, docs/ai-discussion-adapter.md §2.7):
+        # three audit-only columns recording whether a USER turn referenced
+        # an unsaved UI draft, and which one -- never the draft's own field
+        # VALUES (the whole point of this phase is that draft content is
+        # never persisted). NULL on a pre-#445 row means "this server could
+        # not have recorded it", a FOURTH, distinct meaning from
+        # ui_draft_state='not_provided' (the client explicitly sent none)
+        # that must never be collapsed into it -- the same discipline
+        # `traces.redaction_json`'s NULL carries (CLAUDE.md Principle 9).
+        turn_cols = _columns(conn, "assistant_discussion_turn")
+        if turn_cols:
+            for column, definition in (
+                (
+                    "ui_draft_state",
+                    "TEXT CHECK (ui_draft_state IS NULL OR ui_draft_state IN "
+                    "('not_provided', 'applied', 'no_unsaved_changes', 'unsupported', 'unreadable'))",
+                ),
+                ("ui_draft_form_id", "TEXT"),
+                ("ui_draft_digest", "TEXT"),
+            ):
+                _add_column_if_missing(
+                    conn, "assistant_discussion_turn", turn_cols, column, definition
+                )
         _migrate_alignment_manual_recheck_targets(conn)
         _ensure_legacy_system(conn)
     _validate_startup_environment()

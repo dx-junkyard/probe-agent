@@ -30,6 +30,7 @@ import {
 import {
   DegradedNote, EmptyNote, LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
 } from "./shared";
+import { useUiDraftSource } from "@/lib/ui-draft";
 
 const TARGET_KINDS: SolutionTargetKind[] = [
   "capability", "static_flow", "runtime_flow", "evolution_node",
@@ -140,6 +141,25 @@ function AddOptionForm({
   const [approach, setApproach] = useState("");
   const [tradeoffs, setTradeoffs] = useState("");
   const [risks, setRisks] = useState("");
+
+  // Issue #445 (§2.2/§2.3): this form drafts a NEW option, so every field
+  // starts from "" -- there is no existing revision to seed from, and
+  // `dirty` is simply "non-empty". `option_key` is the draft's
+  // `selected_item_ref` (the identity this draft would create), not a
+  // registered field.
+  const optionFields = [
+    { fieldName: "title", value: title, dirty: title !== "", validationError: "" },
+    { fieldName: "approach", value: approach, dirty: approach !== "", validationError: "" },
+    { fieldName: "tradeoffs", value: tradeoffs, dirty: tradeoffs !== "", validationError: "" },
+    { fieldName: "risks", value: risks, dirty: risks !== "", validationError: "" },
+  ];
+  useUiDraftSource("solution_design.option", designKey, () => ({
+    fields: optionFields,
+    selectedItemRef: optionKey.trim(),
+    activeTab: "",
+    comparisonTarget: "",
+    localRevisionToken: JSON.stringify([optionKey, ...optionFields.map((f) => [f.fieldName, f.value])]),
+  }));
 
   function submit() {
     add.mutate(

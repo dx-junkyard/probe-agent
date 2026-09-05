@@ -1965,6 +1965,98 @@ creating incomplete persistence or execution paths for later phases.
     apply と reject も `decision_method: manual`。
 
 
+29. Issue #443 (subs #444-#449) — AI Discussion UI Adapter。#436 は「1 つの対象に
+    ついて会話し、変更候補を作り、適用する」を作ったが、Dashboard に Proposal の
+    生成・レビュー・反映導線が無く、画面連携は URL パラメータと画面別 `if` 分岐の
+    ままで、Assistant は未保存フォームを一切扱えず、対象は 4 画面 9 kind に限られて
+    いた。この Epic はその 3 点だけを足す — 共通 adapter registry、未保存 UI draft の
+    安全な参照、prefill-first の反映導線 — そのうえで対象を Vision〜Feature へ広げ、
+    nested/list な項目まで候補化し、証拠不足の論点を Joint Understanding へ昇格する。
+    `docs/ai-discussion-adapter.md` が canonical contract で、§0 を読んでからこの領域に
+    触ること。`docs/assistant-discussion.md` (#436) は**置き換えられない**正本のままで、
+    その §0 の境界はすべて有効。依存順に #444 (adapter contract と parity) → #445
+    (UI draft context) → #446 (Proposal レビュー UI と form draft 反映) → #447
+    (対象拡張) → #448 (nested/list な構造化 Proposal) → #449 (Joint Understanding
+    昇格と E2E)。後から変えるときに守ること:
+    - **`app/discussion_adapters.py` と `src/lib/discussion-adapters.ts` が唯一の
+      registry。** #436 時点で 1 つの `target_kind` を足すには 6 つの並行した
+      per-kind 表 (`SCOPE_TARGET_KINDS` / `_TARGET_RESOLVERS` /
+      `route_params_for_target` / `PROPOSAL_TARGET_SCHEMA` /
+      `gather_target_context` / `_apply_field`+`_apply_relation`) を同時に直す
+      必要があり、1 つ忘れても型検査もテストも緑のままだった。**忘れた場合の
+      壊れ方が拒否ではなく黙った縮退である**ことが問題 — resolver だけ足すと、
+      その対象は `digest=""` で永久に `stale` にならない thread になる。
+      registry の外に per-kind 分岐を戻さない。Assistant Panel 本体に
+      `if (screenId === ...)` を書かない。
+    - **capability は登録内容から導出し、列にも定数にも二重に書かない**
+      (#337/#338/#349 と同じ規律)。有限 6 値 (`read_canonical` /
+      `read_ui_draft` / `propose_fields` / `propose_relations` /
+      `prefill_form` / `promote_joint_understanding`)。
+    - **`unsupported` / `unavailable` / `not_applicable` は 3 つの別の答え**で、
+      `stale` / `conflict` / `unknown` / `validation_error` とも丸めない。
+      未対応 target を screen thread へ黙って縮退させない。
+    - **`thread_key` は `screen_id|scope|target_kind|target_ref` のまま**。
+      同じ entity を別画面から開けば別 thread であり、これは仕様である
+      (統合すると既存 thread の履歴が切れ、どちらの文脈で言われたことか読めなく
+      なる)。代わりに `GET /assistant/discussion-threads?target_kind=&target_ref=`
+      で別画面の会話を列挙し、「他の画面での会話 N 件」として提示する。
+      **黙って別の会話を混ぜない。**
+    - **canonical facts と未保存 UI draft を絶対に混ぜない。** 別フィールド・
+      別 provenance・prompt 内でも別セクション (「未保存の下書き」)。未保存の
+      文字列はまだ誰の判断でもなく、System についての事実ではない。draft の
+      field は adapter の form spec に**完全一致**する名前だけを受け取り、
+      外れた名前・別 target・bound 超過は**リクエスト全体を 422 で拒否**する
+      (黙って落とすと client は送ったつもりのまま回答を読む)。DOM scraping と
+      任意ページ状態の収集は禁止。Principle 9 の redaction を draft にも適用する。
+    - **未保存 draft の値を永続化しない。** turn に残すのは `ui_draft_state` /
+      `ui_draft_form_id` / `ui_draft_digest` の 3 列だけ。監査が答えるべきは
+      「この回答は下書きを見ていたか」であって「下書きに何と書いてあったか」では
+      ない。後者を保存すると、保存されていないはずの内容が DB に残る。
+    - **prefill は保存ではなく、item status は保存結果ではない。** prefill は
+      canonical row を 1 行も作らない。`assistant_discussion_proposal_prefill` が
+      意図を記録し、item の `status` は `proposed` のまま (#412 の「記録は昇格では
+      ない」と同じ)。`patch_token` の UNIQUE が二重反映を防ぐ。dirty field を
+      黙って上書きせず、field 単位の衝突プレビューで人が選ぶ。
+    - **Dashboard の標準導線は prefill-first**、既存の直接 `apply` API は互換の
+      ため残す。apply は revision を 1 版足すので、人が読んで直す機会が保存の
+      後になる。prefill なら保存された版は最初から人が確認したものになる。
+    - **人間判断軸を registry に入れない。** `priority_band` / `achievement` /
+      `lifecycle` / `design_status` / `option_status` / `resolved` / `adopted` は
+      `fields` にも `relations` にも登録しない — 登録しなければ LLM は提案できず
+      prefill 先も存在しない。構造で禁じる (#427 が Gap に severity 列を作らな
+      かったのと同じ)。
+    - **nested item は安定キーで address し、順序変更と本文変更を区別する。**
+      `child_kind` / `child_key` / `child_intent` / `child_order`。未知の
+      `field_name` / `relation_kind` / `child_kind` / `child_key` は**その item
+      だけを落とさず提案全体を失敗させる** — 1 つ捏造された field を含む提案は
+      「部分的に正しい提案」ではない。生成時と反映時の**両方**で registry 照合
+      する (間に人間の編集と時間が入る、#412 §7.1.3 と同じ理由)。
+    - **未解決質問・仮説・反証条件を field change へ無理に変換しない。**
+      答えの出ていない問いを「提案された値」にすると、提案を受け入れただけで
+      問いが消える。
+    - **反証条件の無い仮説は昇格できない。** `competing_explanations` か
+      `refutation_conditions` が空なら生成時にも昇格時にも拒否する。昇格は
+      **6 つ目の JU origin `discussion`** (`trigger='discussion_promotion'`) を
+      使う — 既存 4 origin のどれかに偽装すると Journey についての会話が
+      「Q&A の premise」を名乗ることになり、#337 の premise 評価が意味を失う。
+      元の domain item の回答・decision・status は 1 つも変えない。
+      `hypothesis_adopted` は provisional のまま運び、confirmed point へ昇格
+      させない。premise が `current` のときだけ finding を Discussion の context
+      へ載せる。Discussion と JU のテーブルは統合しない。
+    - **`purpose_need` の不一致は広い側 (`app/models.py`) に合わせて解消する。**
+      Issue #389 が実際に `origin_kind='purpose_need'` / `trigger='purpose_need'`
+      の行を書いているので、`joint_understanding.TRIGGERS` / TS union / JSON
+      Schema を 5 値 / 3 値へ広げる。**狭い側に合わせて server を狭めない** —
+      既存行が読めなくなる (#427 の「狭めた語彙には upgrade migration が要る」)。
+    - **adapter は domain rule を所有しない。** lifecycle 判定・次の操作・
+      validation・確定可否は既存 canonical module のまま。client は server が
+      決めた値を再導出しない。#394 の maturity / #304 の Cell Improvement /
+      SDK policy mode / Dashboard workflow phase のどれも読まず、書かない。
+    既存の human gate は一切緩めない。生成・prefill・保存・確定・publish は
+    5 つの別操作で、どれかが他を自動的に起こしてはならない。本 Epic が追加する
+    prefill、hypothesis の昇格・却下もすべて `decision_method: manual`。
+
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

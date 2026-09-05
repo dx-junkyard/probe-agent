@@ -1,18 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
-  useAssistantAsk, useAssistantDiscussionThread, useAssistantScreenContext,
+  useAssistantAsk, useAssistantDiscussionThread, useAssistantDiscussionThreads,
+  useAssistantScreenContext,
 } from "@/api/hooks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { DiagnosticSeverityIcon } from "@/components/diagnostics-badge";
-import { AssistantVoice } from "@/components/assistant-voice";
+import {
+  AssistantVoice,
+  type AssistantVoiceReply,
+  type AssistantVoiceTurnContext,
+} from "@/components/assistant-voice";
 import {
   ArrowRight, Bot, ExternalLink, Loader2, Mic, Send, Settings2, Wrench, X,
 } from "lucide-react";
 import type {
-  AssistantAskOut, AssistantCitation, AssistantDiscussionTargetIn,
+  AssistantAskRequest, AssistantAskOut, AssistantCitation, AssistantDiscussionTargetIn,
   AssistantDiscussionThread, AssistantDiscussionThreadDetailOut, DiscussionTargetState,
   SystemStateItem,
 } from "@/api/types";
@@ -24,6 +29,8 @@ import {
   OPEN_ASSISTANT_EVENT,
   type OpenAssistantDetail,
 } from "@/lib/assistant-control";
+import { DISCUSSION_ADAPTERS, resolveDiscussionCandidate } from "@/lib/discussion-adapters";
+import { useUiDraftRegistry } from "@/lib/ui-draft";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -42,10 +49,11 @@ function screenIdFromPath(pathname: string): string {
   return pathname.split("/")[1] ?? "overview";
 }
 
-const DISCUSSION_SCREEN_IDS = ["overview", "interview", "ux-design-studio", "journey-blueprint"] as const;
-
+// Issue #444 (Epic #443): which screens carry a discussion thread at all is
+// exactly the `screen` adapter's own `screen_ids` -- the registry, not a
+// second literal list here, is what decides.
 function isDiscussionScreen(screenId: string): boolean {
-  return (DISCUSSION_SCREEN_IDS as readonly string[]).includes(screenId);
+  return DISCUSSION_ADAPTERS.screen.screenIds.includes(screenId);
 }
 
 // Issue #441 (Epic #436), Phase 1: turn-based voice mode.
@@ -76,100 +84,71 @@ interface VoiceTurnTarget {
   routeParams: Record<string, string>;
   /** hover/選択中の help-mode target。null なら画面全体スコープ。 */
   helpId: string | null;
-}
-
-interface DiscussionCandidate {
-  target: AssistantDiscussionTargetIn;
-  label: string;
-}
-
-/** Derive the most specific selectable non-screen target from the route, if
- * any -- purely from `screen_id` + query params, so it needs no page-level
- * wiring beyond what each page already writes to the URL. Returns `null`
- * when nothing more specific than "the whole screen" is selected. */
-function deriveDiscussionCandidate(screenId: string, search: string): DiscussionCandidate | null {
-  const params = new URLSearchParams(search);
-  if (screenId === "interview") {
-    const session = params.get("session");
-    if (session) {
-      return {
-        target: { scope: "entity", screen_id: screenId, target_kind: "interview_session", target_ref: session },
-        label: `セッション #${session}`,
-      };
-    }
-    return null;
-  }
-  if (screenId === "ux-design-studio") {
-    const tab = params.get("tab") || "journeys";
-    const journey = params.get("journey");
-    const step = params.get("step");
-    const requirement = params.get("requirement");
-    const design = params.get("design");
-    if (journey && step) {
-      return {
-        target: {
-          scope: "element", screen_id: screenId, target_kind: "ux_journey_step",
-          target_ref: `${journey}#${step}`,
-        },
-        label: `ステップ「${step}」`,
-      };
-    }
-    if (tab === "requirements" && requirement) {
-      return {
-        target: { scope: "entity", screen_id: screenId, target_kind: "ux_requirement", target_ref: requirement },
-        label: `Requirement「${requirement}」`,
-      };
-    }
-    if (tab === "solutions" && design) {
-      return {
-        target: { scope: "entity", screen_id: screenId, target_kind: "solution_design", target_ref: design },
-        label: `Solution Design「${design}」`,
-      };
-    }
-    if (tab === "journeys" && journey) {
-      return {
-        target: { scope: "entity", screen_id: screenId, target_kind: "ux_journey", target_ref: journey },
-        label: `Journey「${journey}」`,
-      };
-    }
-    return null;
-  }
-  if (screenId === "journey-blueprint") {
-    const journey = params.get("journey");
-    const step = params.get("step");
-    const lane = params.get("lane");
-    if (journey && step && lane) {
-      return {
-        target: {
-          scope: "element", screen_id: screenId, target_kind: "blueprint_lane_cell",
-          target_ref: `${journey}#${step}#${lane}`,
-        },
-        label: `${lane}(「${step}」)`,
-      };
-    }
-    if (journey && step) {
-      return {
-        target: {
-          scope: "element", screen_id: screenId, target_kind: "ux_journey_step",
-          target_ref: `${journey}#${step}`,
-        },
-        label: `ステップ「${step}」`,
-      };
-    }
-    if (journey) {
-      return {
-        target: { scope: "entity", screen_id: screenId, target_kind: "ux_journey", target_ref: journey },
-        label: `Journey「${journey}」`,
-      };
-    }
-    return null;
-  }
-  return null;
+  /** Issue #445: この turn 開始の瞬間に捕まえた未保存下書き。turn 開始後に
+   * フォームが変わっても、この turn はこの内容で答える (§2.5)。 */
+  uiDraft: AssistantAskRequest["ui_draft"];
 }
 
 function targetKeyOf(target: AssistantDiscussionTargetIn | null): string | null {
   if (!target) return null;
   return `${target.screen_id}|${target.scope}|${target.target_kind}|${target.target_ref}`;
+}
+
+/**
+ * Issue #445 (§2.3/§2.5): the unsaved draft for the target a discussion
+ * thread is ABOUT, read from the registry exactly once per call site (turn
+ * start). Only a target_kind whose Dashboard adapter declares a `forms`
+ * binding is even attempted -- an adapter with none means "this target
+ * cannot have a draft", so there is nothing to look up in the registry.
+ * `undefined` (never sent) covers: no registry mounted, no thread, the
+ * adapter has no form, or no form is currently registered for this exact
+ * (formId, targetRef) -- e.g. the discussion is about a Requirement whose
+ * edit form is not open right now.
+ */
+function captureUiDraft(
+  registry: ReturnType<typeof useUiDraftRegistry>,
+  thread: AssistantDiscussionThread | null,
+): AssistantAskRequest["ui_draft"] {
+  if (!registry || !thread) return undefined;
+  const forms = DISCUSSION_ADAPTERS[thread.target_kind].forms;
+  if (forms.length === 0) return undefined;
+  // Today every adapter registers at most one form per target_kind (§1.4);
+  // taking the first is not a guess, it is the only entry there is.
+  const binding = forms[0];
+  const read = registry.read(binding.formId, thread.target_ref);
+  if (read.outcome === "absent") return undefined;
+  const base = {
+    target_kind: thread.target_kind,
+    target_ref: thread.target_ref,
+    form_id: binding.formId,
+    captured_at: Date.now() / 1000,
+  };
+  if (read.outcome === "unreadable") {
+    // §2.6: a form IS open for this target but could not be read. Reported
+    // as its own state rather than omitted -- omitting it would tell the
+    // server no form was open, which is a different fact.
+    return {
+      ...base,
+      readable: false,
+      fields: [],
+      selected_item_ref: "",
+      active_tab: "",
+      comparison_target: "",
+      local_revision_token: "",
+    };
+  }
+  const { snapshot } = read;
+  return {
+    ...base,
+    readable: true,
+    fields: snapshot.fields.map((f) => ({
+      field_name: f.fieldName, value: f.value, dirty: f.dirty, validation_error: f.validationError,
+    })),
+    selected_item_ref: snapshot.selectedItemRef,
+    active_tab: snapshot.activeTab,
+    comparison_target: snapshot.comparisonTarget,
+    local_revision_token: snapshot.localRevisionToken,
+  };
 }
 
 function staleBannerText(state: DiscussionTargetState): string {
@@ -215,9 +194,20 @@ function CitationChip({ citation }: { citation: AssistantCitation }) {
 
 function AnswerMessage({ result }: { result: AssistantAskOut }) {
   const navigate = useNavigate();
+  // Issue #445: derived from the citation list (persisted with every turn),
+  // not from `ui_draft_state` alone -- a turn reconstructed from history
+  // never carries the ASSISTANT-side `ui_draft_state` (§2.7 records it only
+  // on the user turn), but its citations are exactly what was cited when it
+  // was first answered, so this reads the same way live or after a reload.
+  const usedUiDraft = result.citations.some((c) => c.type === "ui_draft");
   return (
     <div className="rounded-lg border bg-card p-3 space-y-2" data-testid="assistant-answer">
       <p className="text-sm whitespace-pre-wrap">{result.answer}</p>
+      {usedUiDraft && (
+        <p className="text-[11px] text-muted-foreground" data-testid="assistant-used-ui-draft">
+          この回答は未保存の下書きも参照しました(保存はされていません)。
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-1.5">
         {result.used_fallback ? (
           <Badge
@@ -336,7 +326,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   // --- Issue #438: target-scoped discussion threads ------------------------
   const discussionEnabled = isDiscussionScreen(screenId);
   const candidate = useMemo(
-    () => (discussionEnabled ? deriveDiscussionCandidate(screenId, location.search) : null),
+    () => (discussionEnabled ? resolveDiscussionCandidate(screenId, location.search) : null),
     [discussionEnabled, screenId, location.search],
   );
   // Which of the two separable threads (whole screen vs. the selected
@@ -365,8 +355,30 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
       ? candidate.target
       : screenTarget;
   const activeTargetKey = targetKeyOf(activeTarget);
+  // Issue #445 §2.6: known purely from the Dashboard registry, so this can
+  // be shown before any question is even asked -- "this target has no
+  // draft to read" does not require a round trip. `null` (not `false`) when
+  // there is no focused entity/element target at all (screen scope is
+  // always canonical-only by construction and does not need a note).
+  const focusTargetSupportsUiDraft =
+    discussionEnabled && effectiveScope === "focus" && candidate
+      ? DISCUSSION_ADAPTERS[candidate.target.target_kind].forms.length > 0
+      : null;
 
   const threadQuery = useAssistantDiscussionThread(activeTarget);
+
+  // Issue #444 §1.6: the same target opened from a DIFFERENT screen has its
+  // own separate thread (thread_key includes screen_id) -- never merged into
+  // this one. This is a plain count, listed by target identity across all
+  // screens, with the CURRENT screen's own thread excluded below.
+  const otherScreenThreadsQuery = useAssistantDiscussionThreads({
+    targetKind: activeTarget?.target_kind,
+    targetRef: activeTarget?.target_ref,
+    enabled: discussionEnabled && !!activeTarget,
+  });
+  const otherScreenThreadCount = (otherScreenThreadsQuery.data?.threads ?? []).filter(
+    (t) => t.screen_id !== screenId,
+  ).length;
 
   /** One persisted turn rendered as a panel message. */
   function turnMessages(detail: AssistantDiscussionThreadDetailOut): ChatMessage[] {
@@ -458,6 +470,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
 
   const { data: ctx } = useAssistantScreenContext(screenId, open);
   const ask = useAssistantAsk();
+  const uiDraftRegistry = useUiDraftRegistry();
 
   // System Brief and other in-page review affordances can open this existing
   // conversation surface with a contextual draft. The draft is never sent
@@ -515,7 +528,11 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
    * failure; the failure itself is still recorded in the conversation
    * history exactly as it always was.
    */
-  const submit = async (q: string, voiceTurn?: VoiceTurnTarget): Promise<string | null> => {
+  const submit = async (
+    q: string,
+    voiceTurn?: VoiceTurnTarget,
+    voiceContext?: AssistantVoiceTurnContext,
+  ): Promise<string | AssistantVoiceReply | null> => {
     const trimmed = q.trim();
     if (!trimmed || ask.isPending) return null;
     setQuestion("");
@@ -561,13 +578,24 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
       const routeParams = voiceTurn?.helpId
         ? { ...baseRouteParams, [VOICE_ELEMENT_HELP_ID_PARAM]: voiceTurn.helpId }
         : baseRouteParams;
+      // Issue #445 §2.5: captured HERE (or, for voice, already captured at
+      // listening-start in `voiceTurn.uiDraft`) -- the same turn-start
+      // freezing rule `turnThread`/`turnScreenId` above already apply, so a
+      // form edited after this point cannot silently change what this turn
+      // asks about.
+      const uiDraft = voiceTurn ? voiceTurn.uiDraft : captureUiDraft(uiDraftRegistry, turnThread);
       const result = await ask.mutateAsync({
         screen_id: turnScreenId,
         question: trimmed,
         route_params: routeParams,
         conversation,
         ...(voiceTurn ? { input_mode: "voice" as const } : {}),
+        ...(voiceTurn ? {
+          voice_continuation: voiceContext?.continuation ?? false,
+          voice_spoken_history: voiceContext?.spokenHistory ?? [],
+        } : {}),
         ...(turnThread ? { thread_id: turnThread.id } : {}),
+        ...(uiDraft ? { ui_draft: uiDraft } : {}),
         visible_check_ids: failingChecks.map((c) => c.check_id),
         ...(focusedStateItem ? {
           visible_state_ids: [focusedStateItem.state_id],
@@ -583,21 +611,30 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           prev.threadId === turnThread.id ? { ...prev, targetState: answered } : prev,
         );
       }
-      return result.answer;
+      if (!voiceTurn) return result.answer;
+      return {
+        text: result.spoken_answer ?? result.answer,
+        listenAfterPlayback: result.voice_follow_up_expected ?? false,
+      };
     } catch (err) {
       appendMessages([{ role: "error", text: String(err) }]);
       return null;
     }
   };
 
-  /** Issue #441: snapshot the whole discussion target at voice-turn start. */
-  const captureVoiceTurnTarget = (): VoiceTurnTarget => ({
-    screenId,
-    useLegacy: useLegacyConversation,
-    thread: useLegacyConversation ? null : activeThread,
-    routeParams: Object.fromEntries(new URLSearchParams(location.search)),
-    helpId: helpMode.target,
-  });
+  /** Issue #441/#445: snapshot the whole discussion target (and, per §2.5,
+   * its unsaved draft) at voice-turn start. */
+  const captureVoiceTurnTarget = (): VoiceTurnTarget => {
+    const thread = useLegacyConversation ? null : activeThread;
+    return {
+      screenId,
+      useLegacy: useLegacyConversation,
+      thread,
+      routeParams: Object.fromEntries(new URLSearchParams(location.search)),
+      helpId: helpMode.target,
+      uiDraft: captureUiDraft(uiDraftRegistry, thread),
+    };
+  };
 
   const handleVoiceAdapterError = (reason: VoiceErrorReason) => {
     // §4: a microphone denial or an STT/TTS failure shows the reason and
@@ -744,6 +781,31 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         </div>
       )}
 
+      {/* Issue #445 §2.6: adapter 未対応画面では canonical-only であることを
+          明示する -- 未保存の下書きに対応していない対象だと質問前に伝え、
+          黙って省略しない。*/}
+      {effectiveScope === "focus" && focusTargetSupportsUiDraft === false && (
+        <p
+          className="border-b px-4 py-1.5 text-[11px] text-muted-foreground"
+          data-testid="assistant-ui-draft-unsupported"
+        >
+          この対象は未保存の下書きの参照に対応していません。保存済みの内容だけを根拠に回答します。
+        </p>
+      )}
+
+      {/* Issue #444 §1.6: the same target has its OWN thread on every screen
+          it can be opened from -- never merged. This says so rather than
+          silently mixing them, or silently hiding that other history
+          exists. */}
+      {discussionEnabled && otherScreenThreadCount > 0 && (
+        <p
+          className="border-b px-4 py-1.5 text-[11px] text-muted-foreground"
+          data-testid="assistant-other-screen-threads"
+        >
+          他の画面での会話 {otherScreenThreadCount} 件
+        </p>
+      )}
+
       {voiceActive ? (
         // Issue #441: while voice mode is active the message list is
         // replaced (not merely covered) by the voice surface -- history is
@@ -751,10 +813,11 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         // voice mode exits.
         <AssistantVoice
           captureTurnTarget={captureVoiceTurnTarget}
-          onTranscript={(text, target) => submit(text, target)}
+          onTranscript={(text, target, context) => submit(text, target, context)}
           onAdapterError={handleVoiceAdapterError}
           onExit={() => setVoiceActive(false)}
           scopeLabel={voiceScopeLabel}
+          conversationKey={activeTargetKey ?? `legacy:${screenId}`}
         />
       ) : (
         <>

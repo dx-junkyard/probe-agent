@@ -57,10 +57,18 @@ SCHEMA_VERSION = "joint-understanding-v1"
 # most common ways a developer discovers they do not know the answer either.
 ORIGIN_KINDS = ("qa", "intent", "review_item", "inquiry", "purpose_need")
 
-# How the session started. Deliberately only two values: whether the
-# developer said 「わからない」 or asked to work it out together changes what
-# the UI shows, but never what the server is allowed to write.
-TRIGGERS = ("unknown_answer", "explicit_request")
+# How the session started. `purpose_need` (Issue #389 / #444 §1.9) is the
+# third value: a Purpose Need response of `unknown`/`investigate` opens a
+# session the same way an unanswered Q&A does, but the origin is a computed
+# need target rather than one of the four original origin tables (see
+# `JointUnderstandingOriginKind`'s docstring in `app/models.py`). This tuple
+# previously lagged `app/models.py`'s `JointUnderstandingTrigger` Literal
+# (which already carried `purpose_need`, since `routes/purpose_chain.py`
+# writes `trigger='purpose_need'` rows directly) -- widened here rather than
+# narrowing the Literal, per Principle 6 / the #427 "narrowed vocabulary
+# needs an upgrade migration" rule (inapplicable here since there is no CHECK
+# constraint on this column to widen; see docs/ai-discussion-adapter.md §1.9).
+TRIGGERS = ("unknown_answer", "explicit_request", "purpose_need")
 
 SESSION_STATUSES = ("open", "held", "closed")
 

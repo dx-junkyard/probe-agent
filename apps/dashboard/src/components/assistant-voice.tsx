@@ -1,9 +1,8 @@
 // 音声対話 (Issue #441, Epic #436) Phase 1 の会話面。
 //
-// turn-based (発話 → 認識確定 → 応答 → (音声で読み上げ) → 待機) のみを扱う。
-// Phase 2 (WebSocket ストリーミング / VAD / barge-in / reconnect / コスト
-// 上限) は対象外 -- 着手する場合は transcript の可視性と保持方針を先に
-// 決めること (`docs/assistant-discussion.md` §4)。
+// turn-based (発話 → 認識確定 → 応答 → OpenAI 音声 → 待機) を扱う。
+// WebSocket / VAD は対象外だが、再生中の明示的な「話を挟む」は、取得・再生を
+// cancel して次の STT turn を開始する (`docs/assistant-discussion.md` §4)。
 //
 // このコンポーネント自身は「対象がどう決まるか」を一切知らない --
 // `captureTurnTarget` が turn 開始の瞬間に呼ばれ、その戻り値 (`Target`) が
@@ -28,6 +27,18 @@ import {
 } from "@/lib/voice-adapter";
 
 export type VoiceState = "idle" | "listening" | "thinking" | "speaking" | "error";
+
+export interface AssistantVoiceReply {
+  text: string;
+  /** Reopen the microphone after playback without requiring another click. */
+  listenAfterPlayback?: boolean;
+}
+
+export interface AssistantVoiceTurnContext {
+  continuation: boolean;
+  /** Bounded history of text actually played by this mounted voice surface. */
+  spokenHistory: string[];
+}
 
 const IDLE_STATUS_TEXT = "マイクのボタンを押して話しかけてください。";
 
@@ -60,13 +71,19 @@ export interface AssistantVoiceProps<Target> {
    * あれば読み上げる文面、`null` は「読み上げるものがない (失敗など、
    * 通常のエラー表示は既存の会話履歴側で行う)」。
    */
-  onTranscript: (text: string, target: Target) => Promise<string | null>;
+  onTranscript: (
+    text: string,
+    target: Target,
+    context: AssistantVoiceTurnContext,
+  ) => Promise<string | AssistantVoiceReply | null>;
   /** マイク拒否 / STT / TTS の失敗。呼び出し元はテキストモードへ戻す。 */
   onAdapterError: (reason: VoiceErrorReason) => void;
   /** 「音声モードを終了」。 */
   onExit: () => void;
   /** 「この発話は画面全体について」か「この要素について」かの表示文言。 */
   scopeLabel: string;
+  /** 会話を識別するキー。読み上げ履歴はこのキーをまたいで共有しない。 */
+  conversationKey?: string;
   /** テスト用に差し込むための adapter。省略時はブラウザ実装を使う。 */
   adapters?: { stt: SpeechToTextAdapter; tts: TextToSpeechAdapter } | null;
 }
@@ -77,6 +94,7 @@ export function AssistantVoice<Target>({
   onAdapterError,
   onExit,
   scopeLabel,
+  conversationKey = "default",
   adapters,
 }: AssistantVoiceProps<Target>) {
   const resolvedAdapters = useMemo(
@@ -91,7 +109,7 @@ export function AssistantVoice<Target>({
   // STT and /assistant/ask cannot always be cancelled at the platform level,
   // so late completions must also be ignored at the state-machine boundary.
   const generationRef = useRef(0);
-  const turnTargetRef = useRef<Target | null>(null);
+  const spokenHistoryRef = useRef<Map<string, string[]>>(new Map());
   const reducedMotion = usePrefersReducedMotion();
 
   useEffect(() => () => {
@@ -116,30 +134,51 @@ export function AssistantVoice<Target>({
     setState("idle");
   }
 
-  function startTurn() {
+  function startTurn(
+    continuation = false,
+    continuingTarget?: Target,
+    continuingConversationKey?: string,
+  ) {
     if (!resolvedAdapters) {
       fail("unsupported");
       return;
     }
     const generation = ++generationRef.current;
-    turnTargetRef.current = captureTurnTarget();
+    // Starting a turn while the answer is speaking is an explicit barge-in:
+    // stop both download and playback before opening the microphone.
+    resolvedAdapters.tts.cancel();
+    resolvedAdapters.stt.stop();
+    const target = continuingTarget ?? captureTurnTarget();
+    const turnConversationKey = continuingConversationKey ?? conversationKey;
     setState("listening");
     resolvedAdapters.stt.start({
       onResult: (text) => {
         if (generation !== generationRef.current) return;
         setState("thinking");
-        const target = turnTargetRef.current as Target;
-        onTranscript(text, target)
+        onTranscript(text, target, {
+          continuation,
+          spokenHistory: [...(spokenHistoryRef.current.get(turnConversationKey) ?? [])],
+        })
           .then((answer) => {
             if (generation !== generationRef.current) return undefined;
             if (!answer || mutedRef.current) {
               returnToIdle();
               return undefined;
             }
+            const reply = typeof answer === "string" ? { text: answer } : answer;
             setState("speaking");
-            return resolvedAdapters.tts.speak(answer).then(
+            return resolvedAdapters.tts.speak(reply.text).then(
               () => {
-                if (generation === generationRef.current) returnToIdle();
+                if (generation !== generationRef.current) return;
+                spokenHistoryRef.current.set(turnConversationKey, [
+                  ...(spokenHistoryRef.current.get(turnConversationKey) ?? []),
+                  reply.text,
+                ].slice(-8));
+                if (reply.listenAfterPlayback) {
+                  startTurn(true, target, turnConversationKey);
+                } else {
+                  returnToIdle();
+                }
               },
               () => {
                 if (generation === generationRef.current) fail("tts_failed");
@@ -228,12 +267,15 @@ export function AssistantVoice<Target>({
           {statusText}
         </div>
 
-        {state === "idle" && (
-          <Button onClick={startTurn} data-testid="voice-talk">
+        {(state === "idle" || state === "speaking") && (
+          <Button onClick={() => startTurn(false)} data-testid="voice-talk">
             <Mic className="mr-1.5 h-4 w-4" />
-            話しかける
+            {state === "speaking" ? "話を挟む" : "話しかける"}
           </Button>
         )}
+        <p className="max-w-sm text-center text-[11px] text-muted-foreground">
+          回答はOpenAIで生成したAI音声です。要点の後で止まり、続きはあなたの反応を待ちます。
+        </p>
       </div>
 
       {/* stop / mute / exit はどの状態でも常に押せる -- thinking / speaking

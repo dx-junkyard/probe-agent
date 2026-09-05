@@ -5,7 +5,7 @@
 // -- a Requirement can be satisfied by more than one Solution Design, so
 // "the" adopted design is not a property of a Journey Step.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -34,6 +34,7 @@ import {
   ArtifactReferencesCard, DegradedNote, DesignDecisionControls, EmptyNote,
   LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
 } from "./shared";
+import { useUiDraftSource } from "@/lib/ui-draft";
 
 const PERSPECTIVES: UxJourneyPerspective[] = ["as_is", "to_be"];
 const BASELINE_MODES: UxJourneyBaselineMode[] = ["linked", "greenfield", "undecided"];
@@ -174,6 +175,45 @@ function emptyStepInput(order: number): UxJourneyStepInput {
   };
 }
 
+/** Issue #445: a headless registration for one step row's `ux_journey_step`
+ * UI draft. A separate component (not a hook call inside the `.map()` below)
+ * because the number of steps can change between renders of the SAME
+ * `JourneyRevisionForm` instance, and React forbids a hook whose call COUNT
+ * varies within one component instance. */
+function StepDraftSource({
+  journeyKey,
+  step,
+  seed,
+}: {
+  journeyKey: string;
+  step: UxJourneyStepInput;
+  seed?: UxJourneyStepInput;
+}) {
+  const fields = [
+    { fieldName: "user_intent", value: step.user_intent ?? "", dirty: (step.user_intent ?? "") !== (seed?.user_intent ?? ""), validationError: "" },
+    { fieldName: "system_response", value: step.system_response ?? "", dirty: (step.system_response ?? "") !== (seed?.system_response ?? ""), validationError: "" },
+    { fieldName: "success_criteria", value: step.success_criteria ?? "", dirty: (step.success_criteria ?? "") !== (seed?.success_criteria ?? ""), validationError: "" },
+    { fieldName: "failure_mode", value: step.failure_mode ?? "", dirty: (step.failure_mode ?? "") !== (seed?.failure_mode ?? ""), validationError: "" },
+    { fieldName: "recovery_path", value: step.recovery_path ?? "", dirty: (step.recovery_path ?? "") !== (seed?.recovery_path ?? ""), validationError: "" },
+    { fieldName: "evidence_expectation", value: step.evidence_expectation ?? "", dirty: (step.evidence_expectation ?? "") !== (seed?.evidence_expectation ?? ""), validationError: "" },
+  ];
+  useUiDraftSource(
+    "ux_journey_step.revision",
+    // "" (blank step_key -- a newly added, not-yet-keyed row) is refused by
+    // the registry as a no-op registration (`src/lib/ui-draft.ts`): there is
+    // no discussion thread an unkeyed step could ever be about.
+    step.step_key ? `${journeyKey}#${step.step_key}` : "",
+    () => ({
+      fields,
+      selectedItemRef: "",
+      activeTab: "",
+      comparisonTarget: "",
+      localRevisionToken: JSON.stringify(fields.map((f) => [f.fieldName, f.value])),
+    }),
+  );
+  return null;
+}
+
 /** Adding a revision replaces the WHOLE step sequence (§2.3: Step は Journey
  * revision の内容であり、独自の revision 鎖を持たない). The form therefore
  * seeds from the current revision's steps when one exists, so revising reads
@@ -187,6 +227,19 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
     failure_mode: s.failure_mode, recovery_path: s.recovery_path,
     evidence_expectation: s.evidence_expectation, evidence_source_kind: s.evidence_source_kind,
   }));
+  // Issue #445: frozen at mount (like `useState`'s own initial value) so a
+  // later refetch (e.g. after this same form's own successful submit) does
+  // not retroactively change what counts as "unedited" mid-session.
+  const seedRef = useRef({
+    title: detail.data?.current_revision?.title ?? "",
+    beneficiary: detail.data?.current_revision?.beneficiary ?? "",
+    usageContext: detail.data?.current_revision?.usage_context ?? "",
+    entryTrigger: detail.data?.current_revision?.entry_trigger ?? "",
+    valueArrival: detail.data?.current_revision?.value_arrival ?? "",
+    summary: detail.data?.current_revision?.summary ?? "",
+    stepsByKey: new Map(seedSteps.map((s) => [s.step_key, s])),
+  });
+  const seed = seedRef.current;
   const [title, setTitle] = useState(detail.data?.current_revision?.title ?? "");
   const [beneficiary, setBeneficiary] = useState(detail.data?.current_revision?.beneficiary ?? "");
   const [usageContext, setUsageContext] = useState(detail.data?.current_revision?.usage_context ?? "");
@@ -195,6 +248,24 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
   const [summary, setSummary] = useState(detail.data?.current_revision?.summary ?? "");
   const [changeNote, setChangeNote] = useState("");
   const [steps, setSteps] = useState<UxJourneyStepInput[]>(seedSteps.length > 0 ? seedSteps : [emptyStepInput(1)]);
+
+  // Issue #445 (§2.2/§2.3): the `ux_journey` draft -- title/beneficiary/...
+  // only, the SAME allowlist `app/discussion_adapters.py` registers.
+  const journeyFields = [
+    { fieldName: "title", value: title, dirty: title !== seed.title, validationError: "" },
+    { fieldName: "beneficiary", value: beneficiary, dirty: beneficiary !== seed.beneficiary, validationError: "" },
+    { fieldName: "usage_context", value: usageContext, dirty: usageContext !== seed.usageContext, validationError: "" },
+    { fieldName: "entry_trigger", value: entryTrigger, dirty: entryTrigger !== seed.entryTrigger, validationError: "" },
+    { fieldName: "value_arrival", value: valueArrival, dirty: valueArrival !== seed.valueArrival, validationError: "" },
+    { fieldName: "summary", value: summary, dirty: summary !== seed.summary, validationError: "" },
+  ];
+  useUiDraftSource("ux_journey.revision", journeyKey, () => ({
+    fields: journeyFields,
+    selectedItemRef: "",
+    activeTab: "",
+    comparisonTarget: "",
+    localRevisionToken: JSON.stringify(journeyFields.map((f) => [f.fieldName, f.value])),
+  }));
 
   function updateStep(i: number, patch: Partial<UxJourneyStepInput>) {
     setSteps((prev) => prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s)));
@@ -232,6 +303,7 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
         <SectionHeading as="h4">Step 列</SectionHeading>
         {steps.map((s, i) => (
           <div key={i} className="space-y-1 rounded border p-2 text-xs" data-testid={`ux-journey-step-row-${i}`}>
+            <StepDraftSource journeyKey={journeyKey} step={s} seed={seed.stepsByKey.get(s.step_key)} />
             <div className="flex gap-2">
               <Input
                 placeholder="step_key"
