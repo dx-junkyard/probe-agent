@@ -42,6 +42,7 @@ ASSISTANT_DISCUSSION_SCHEMA_DEFS = {
     "DiscussionProposalItemKind": "discussion_proposal_item_kind",
     "DiscussionProposalItemStatus": "discussion_proposal_item_status",
     "DiscussionProposalItemEligibility": "discussion_proposal_item_eligibility",
+    "UiDraftState": "ui_draft_state",
 }
 
 
@@ -285,6 +286,56 @@ def test_every_kind_with_server_proposable_fields_or_relations_has_a_dashboard_a
     }
     assert proposable_kinds, "expected at least one proposable target_kind"
     assert proposable_kinds <= dashboard_kinds
+
+
+def _dashboard_adapter_forms() -> Dict[str, Dict[str, Set[str]]]:
+    """Each Dashboard adapter's declared `forms`: `form_id -> field set`,
+    parsed from the source (never imported -- no TypeScript runtime here).
+    Relies on the same fixed member order every adapter object literal in
+    this file uses (`forms`, then `invalidateKeys`, then `deepLink`)."""
+    source = DASHBOARD_ADAPTERS_PATH.read_text(encoding="utf-8")
+    out: Dict[str, Dict[str, Set[str]]] = {}
+    for block in re.finditer(
+        r"targetKind:\s*\"(?P<kind>[\w]+)\"(?P<body>.*?)\n\};",
+        source,
+        flags=re.DOTALL,
+    ):
+        forms: Dict[str, Set[str]] = {}
+        forms_match = re.search(
+            r"forms:\s*\[(?P<body>.*?)\]\s*,\s*\n\s*invalidateKeys",
+            block.group("body"),
+            flags=re.DOTALL,
+        )
+        if forms_match:
+            for entry in re.finditer(
+                r"formId:\s*\"(?P<form_id>[^\"]+)\"\s*,\s*fields:\s*\[(?P<fields>[^\]]*)\]",
+                forms_match.group("body"),
+            ):
+                forms[entry.group("form_id")] = set(
+                    re.findall(r"\"([^\"]+)\"", entry.group("fields"))
+                )
+        out[block.group("kind")] = forms
+    return out
+
+
+def test_ui_draft_forms_match_between_server_and_dashboard():
+    """Issue #445 (Epic #443 Phase 2): the server's `ui_draft_forms` field
+    allowlist and the Dashboard's declared `forms` bindings must agree --
+    the same reasoning as `test_adapter_screen_ids_match_between_server_and_
+    dashboard` above. If they disagree, the client either sends fields the
+    server refuses (422 `ui_draft_field_unregistered`) or withholds fields
+    the server would have accepted, and neither side's own tests can see it
+    because each only exercises its own declared set."""
+    from app import discussion_adapters
+
+    dashboard_forms = _dashboard_adapter_forms()
+    assert dashboard_forms, "failed to parse any forms out of discussion-adapters.ts"
+    server_forms = {
+        kind: {spec.form_id: set(spec.fields) for spec in adapter.ui_draft_forms}
+        for kind, adapter in discussion_adapters.DISCUSSION_ADAPTERS.items()
+    }
+    assert any(server_forms.values()), "expected at least one target_kind with ui_draft_forms"
+    assert dashboard_forms == server_forms
 
 
 def test_adapter_screen_ids_match_between_server_and_dashboard():

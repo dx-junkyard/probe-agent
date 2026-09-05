@@ -3623,6 +3623,40 @@ export interface AssistantScreenContext {
   suggested_questions: AssistantSuggestedQuestion[];
 }
 
+// UiDraftContext (Issue #445, Epic #443 Phase 2). docs/ai-discussion-adapter.
+// md §2.2/§2.6. Client-only -- the server never persists a draft's own
+// values, only its finite state/form_id/digest on the user turn.
+export type UiDraftState =
+  | "not_provided"
+  | "applied"
+  | "no_unsaved_changes"
+  | "unsupported"
+  | "unreadable";
+
+export interface UiDraftFieldIn {
+  field_name: string;
+  value: string;
+  dirty: boolean;
+  validation_error: string;
+}
+
+export interface UiDraftContextIn {
+  target_kind: DiscussionTargetKind;
+  target_ref: string;
+  form_id: string;
+  fields: UiDraftFieldIn[];
+  selected_item_ref: string;
+  active_tab: string;
+  comparison_target: string;
+  captured_at: number;
+  local_revision_token: string;
+  /** False = a form IS open for this target but the client could not read it
+   * (§2.6's `unreadable`). Must carry no fields. Its own wire field rather
+   * than an inference from an empty `fields` list, which is already what
+   * `no_unsaved_changes` looks like. */
+  readable: boolean;
+}
+
 export interface AssistantAskRequest {
   screen_id: string;
   question: string;
@@ -3642,6 +3676,10 @@ export interface AssistantAskRequest {
   input_mode?: "text" | "voice";
   voice_continuation?: boolean;
   voice_spoken_history?: string[];
+  // Issue #445: requires `thread_id` to be set (422 `ui_draft_requires_
+  // thread` otherwise) -- a draft is about a target, and without a thread
+  // there is no target to match it against.
+  ui_draft?: UiDraftContextIn;
 }
 
 // Assistant discussion threads (Issue #438, Epic #436). Finite unions mirror
@@ -3696,6 +3734,12 @@ export interface AssistantDiscussionTurn {
   schema_version: string;
   created_by: string | null;
   created_at: number;
+  // Issue #445 §2.7: recorded on USER turns only. `null` on a pre-#445 row
+  // means "this server could not have recorded it" -- distinct from
+  // `ui_draft_state: "not_provided"` (the client explicitly sent none).
+  ui_draft_state?: UiDraftState | null;
+  ui_draft_form_id?: string | null;
+  ui_draft_digest?: string;
 }
 
 export interface AssistantDiscussionThread {
@@ -3816,7 +3860,15 @@ export interface AssistantAction {
 }
 
 export interface AssistantCitation {
-  type: "setting" | "diagnostic_check" | "pipeline_step" | "state_item" | "screen_data";
+  type:
+    | "setting"
+    | "diagnostic_check"
+    | "pipeline_step"
+    | "state_item"
+    | "screen_data"
+    // Issue #445 (Epic #443 Phase 2): the answer relied on an unsaved UI
+    // draft, never a persisted fact.
+    | "ui_draft";
   id: string;
   title: string;
   detail: string;
@@ -3844,6 +3896,10 @@ export interface AssistantAskOut {
   target_state?: DiscussionTargetState | null;
   recheck_required?: boolean;
   turn_number?: number | null;
+  // Issue #445: always present (not gated on thread_id). `ui_draft_changed`
+  // implies `recheck_required` when both are read together.
+  ui_draft_state?: UiDraftState;
+  ui_draft_changed?: boolean;
 }
 
 // UI 機能解説モード (Issue #440, Epic #436): `app/ui_help_registry.py` の

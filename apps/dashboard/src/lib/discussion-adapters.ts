@@ -15,11 +15,13 @@
 // test.tsx` and `assistant-voice.test.tsx` are what prove the move changed
 // nothing observable.
 //
-// `forms` stays `[]` for every adapter through Phase 1-4 (#445/#446 populate
-// it later); `invalidateKeys` and `deepLink` ARE implemented now, per
-// docs/ai-discussion-adapter.md's Phase 1 scope note -- they are read-only
-// conveniences (which caches to refresh, which URL opens the target) that do
-// not depend on the unsaved-draft or prefill machinery those later phases add.
+// `forms` stayed `[]` for every adapter through Phase 1 (#446 populates the
+// prefill machinery that CONSUMES `forms` later); Phase 2 (#445) is the first
+// to populate it, for the four kinds whose Dashboard forms exist today
+// (`ux_journey` / `ux_journey_step` / `ux_requirement` / `solution_design`).
+// `invalidateKeys` and `deepLink` were implemented in Phase 1 already -- they
+// are read-only conveniences (which caches to refresh, which URL opens the
+// target) that never depended on the unsaved-draft or prefill machinery.
 
 import type {
   AssistantDiscussionTargetIn,
@@ -172,7 +174,16 @@ const uxJourneyAdapter: DashboardDiscussionAdapter = {
     }
     return null;
   },
-  forms: [],
+  // Issue #445: `components/ux-design/journey-panel.tsx`'s
+  // `JourneyRevisionForm` -- the SAME field names `_UX_JOURNEY_FIELDS`
+  // registers server-side (`app/discussion_adapters.py`), which are in turn
+  // `ux_design.add_journey_revision`'s own keyword params.
+  forms: [
+    {
+      formId: "ux_journey.revision",
+      fields: ["title", "beneficiary", "usage_context", "entry_trigger", "value_arrival", "summary"],
+    },
+  ],
   invalidateKeys: (targetRef) => [sysKey("ux-journeys"), [...sysKey("ux-journey"), targetRef]],
   deepLink: (targetRef) => `/ux-design-studio?tab=journeys&journey=${encodeURIComponent(targetRef)}`,
 };
@@ -195,7 +206,16 @@ const uxJourneyStepAdapter: DashboardDiscussionAdapter = {
       label: `ステップ「${step}」`,
     };
   },
-  forms: [],
+  // Issue #445: the step rows inside the SAME `JourneyRevisionForm`.
+  forms: [
+    {
+      formId: "ux_journey_step.revision",
+      fields: [
+        "user_intent", "system_response", "success_criteria",
+        "failure_mode", "recovery_path", "evidence_expectation",
+      ],
+    },
+  ],
   invalidateKeys: (targetRef) => [
     sysKey("ux-journeys"),
     [...sysKey("ux-journey"), journeyKeyOf(targetRef)],
@@ -219,7 +239,15 @@ const uxRequirementAdapter: DashboardDiscussionAdapter = {
       label: `Requirement「${requirement}」`,
     };
   },
-  forms: [],
+  // Issue #445: `components/ux-design/requirement-panel.tsx`'s
+  // `RequirementRevisionForm`. Acceptance criteria are a #448 concern, not a
+  // top-level field.
+  forms: [
+    {
+      formId: "ux_requirement.revision",
+      fields: ["statement", "rationale", "constraint_text", "out_of_scope_note"],
+    },
+  ],
   invalidateKeys: (targetRef) => [sysKey("ux-requirements"), [...sysKey("ux-requirement"), targetRef]],
   deepLink: (targetRef) => `/ux-design-studio?tab=requirements&requirement=${encodeURIComponent(targetRef)}`,
 };
@@ -239,7 +267,12 @@ const solutionDesignAdapter: DashboardDiscussionAdapter = {
       label: `Solution Design「${design}」`,
     };
   },
-  forms: [],
+  // Issue #445: `components/ux-design/solution-design-panel.tsx`'s
+  // `AddOptionForm` -- it drafts a NEW option, so the in-progress
+  // `option_key` is the draft's `selected_item_ref`, not a registered field.
+  forms: [
+    { formId: "solution_design.option", fields: ["title", "approach", "tradeoffs", "risks"] },
+  ],
   invalidateKeys: (targetRef) => [sysKey("solution-designs"), [...sysKey("solution-design"), targetRef]],
   deepLink: (targetRef) => `/ux-design-studio?tab=solutions&design=${encodeURIComponent(targetRef)}`,
 };

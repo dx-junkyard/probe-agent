@@ -25,13 +25,15 @@ here rather than declaring them by hand, and delegate `resolve_target` /
 adapter -- but every one of those functions keeps its own exact public
 signature and never-raises/degrades-to-empty behaviour.
 
-`ChildSpec` and `UiDraftFormSpec` are declared now, in Phase 1, with every
+`ChildSpec` and `UiDraftFormSpec` were declared in Phase 1 with every
 adapter's `children` and `ui_draft_forms` left as empty tuples and
-`joint_understanding_bridge` left `False`. This is deliberate: declaring the
-shape now is what lets Phases 2 (#445 UI draft), 3 (#446 prefill), 5 (#448
-nested/list changes) and 6 (#449 Joint Understanding bridge) be ADDITIVE --
-populating a field on an existing adapter -- rather than another schema
-change that touches every call site again.
+`joint_understanding_bridge` left `False`. This is what let Phase 2 (#445 UI
+draft) populate `ui_draft_forms` for the four kinds whose Dashboard forms
+exist today (`ux_journey` / `ux_journey_step` / `ux_requirement` /
+`solution_design`) ADDITIVELY -- filling in a field on an existing adapter --
+rather than another schema change that touches every call site again.
+Phases 3 (#446 prefill), 5 (#448 nested/list changes), and 6 (#449 Joint
+Understanding bridge) are still ahead of this module as written.
 
 Import direction (this is what avoids a circular import): this module has
 NO top-level dependency on `assistant_discussion.py` or
@@ -637,6 +639,12 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         relations=_UX_JOURNEY_RELATIONS,
         field_applier=_delegate_apply_field,
         relation_applier=_delegate_apply_relation,
+        # Issue #445: the SAME field tuple as `fields` above, on purpose --
+        # `components/ux-design/journey-panel.tsx`'s `JourneyRevisionForm`
+        # binds these exact names to `ux_design.add_journey_revision`'s own
+        # keyword params, which is what lets a future #446 prefill land
+        # without a name translation layer.
+        ui_draft_forms=(UiDraftFormSpec(form_id="ux_journey.revision", fields=_UX_JOURNEY_FIELDS),),
     ),
     "ux_journey_step": DiscussionAdapter(
         target_kind="ux_journey_step",
@@ -648,6 +656,10 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         route_params=_route_params_ux_journey_step,
         fields=_UX_JOURNEY_STEP_FIELDS,
         field_applier=_delegate_apply_field,
+        # Issue #445: the step rows inside the SAME `JourneyRevisionForm` --
+        # a different `target_kind` (and so a different discussion thread)
+        # from `ux_journey` above, but one physical form on the Dashboard.
+        ui_draft_forms=(UiDraftFormSpec(form_id="ux_journey_step.revision", fields=_UX_JOURNEY_STEP_FIELDS),),
     ),
     "ux_requirement": DiscussionAdapter(
         target_kind="ux_requirement",
@@ -661,6 +673,10 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         relations=_UX_REQUIREMENT_RELATIONS,
         field_applier=_delegate_apply_field,
         relation_applier=_delegate_apply_relation,
+        # Issue #445: `components/ux-design/requirement-panel.tsx`'s
+        # `RequirementRevisionForm`. Acceptance criteria are NOT included --
+        # they are a #448 (ChildSpec) concern, not a top-level field.
+        ui_draft_forms=(UiDraftFormSpec(form_id="ux_requirement.revision", fields=_UX_REQUIREMENT_FIELDS),),
     ),
     "solution_design": DiscussionAdapter(
         target_kind="solution_design",
@@ -674,6 +690,10 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         relations=_SOLUTION_DESIGN_RELATIONS,
         field_applier=_delegate_apply_field,
         relation_applier=_delegate_apply_relation,
+        # Issue #445: `components/ux-design/solution-design-panel.tsx`'s
+        # `AddOptionForm` -- it drafts a NEW option, so `selected_item_ref`
+        # (the in-progress `option_key`) carries the identity, not a field.
+        ui_draft_forms=(UiDraftFormSpec(form_id="solution_design.option", fields=_SOLUTION_DESIGN_FIELDS),),
     ),
     "blueprint_lane_cell": DiscussionAdapter(
         target_kind="blueprint_lane_cell",

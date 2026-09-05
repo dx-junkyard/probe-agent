@@ -202,9 +202,11 @@ export interface DashboardDiscussionAdapter {
   `discussion_target_screen_mismatch`
 - scope 不一致 → 既存の 422 `discussion_target_scope_mismatch`
 - capability を持たない操作 → 422 で、`code` は操作ごとに区別する
-  (`discussion_prefill_unsupported` / `discussion_ui_draft_unsupported` /
-  `discussion_promotion_unsupported`)。**黙って screen thread へ縮退させない**
-  (#447 受け入れ条件)。
+  (`ui_draft_unsupported` / `prefill_unsupported` / `promotion_unsupported`)。
+  code は操作の family 接頭辞に合わせる — 同じ操作の他の拒否コード
+  (`ui_draft_target_mismatch` / `ui_draft_field_unregistered` …) と並べて
+  読めることのほうが、全部に `discussion_` を付ける一貫性より有用である。
+  **黙って screen thread へ縮退させない** (#447 受け入れ条件)。
 
 ### 1.8 parity
 
@@ -265,7 +267,14 @@ UiDraftContextIn {
   comparison_target: str
   captured_at: float                -- client 時刻。表示にのみ使う
   local_revision_token: str         -- draft 内容の client 側 digest
+  readable: bool                    -- 既定 true。false は §2.6 の `unreadable`
 }
+
+`readable=false` は「この対象のフォームは開いているが、client がその状態を
+読めなかった」であり、**`fields` を伴ってはならない** (422
+`ui_draft_unreadable_with_fields`)。空の `fields` から推論せず独立した wire
+field にしてあるのは、空の `fields` が既に `no_unsaved_changes` の形だから
+である。
 
 UiDraftFieldIn {
   field_name: str                   -- form spec の allowlist 内のみ
@@ -284,7 +293,11 @@ UiDraftFieldIn {
   `ui_draft_target_mismatch`。**別対象の draft を文脈に混ぜない。**
 - bound: field 数 ≤ 40、1 field ≤ 4000 文字、全体 ≤ 32KB。超過は 422
   `ui_draft_payload_too_large` (切り詰めない — 切り詰めた draft は、利用者が
-  見ている draft ではない)。
+  見ている draft ではない)。「全体」は draft 由来の文字列の UTF-8 byte 合計で
+  あって JSON 直列化後のサイズではない — 数えているのは利用者が打ち込んだ
+  内容の量であって、構造上の overhead ではない。3 つのどれに触れても同じ code
+  を返す (client が知りたいのは拒否されたことであって、どのカウンタかでは
+  ない)。
 - secret: Principle 9 の 2 層 (key 名 + 値の形) を draft にも適用する。
   redaction は LLM へ渡す前。password / token / secret を含む field 名は
   そもそも allowlist に登録しない。
@@ -316,7 +329,11 @@ UiDraftState = "not_provided"        -- client が送らなかった
 ```
 
 `no_unsaved_changes` と `not_provided` と `unreadable` は 3 つの別の答えで、
-丸めない。応答は `ui_draft_state` と、直前 turn と `local_revision_token` が
+丸めない。**5 値すべてが到達可能でなければならない。** `unreadable` を
+`not_provided` へ畳むと、「フォームは開いているが読めなかった」ときに
+「何も編集していない」と答えることになり、利用者が見ていない画面を説明する
+ことになる。client は登録済みフォームの getter が throw したときに
+`readable=false` を送る。応答は `ui_draft_state` と、直前 turn と `local_revision_token` が
 変わったかを示す `ui_draft_changed` を返す。`ui_draft_changed` が真なら
 `recheck_required` も真になる — 前回の回答は、いまの下書きについてのものでは
 ない。
@@ -334,6 +351,11 @@ UiDraftState = "not_provided"        -- client が送らなかった
 **値そのものは保存しない** (#445 非目標)。監査が答えるべき問いは「この回答は
 未保存の下書きを見ていたか」であって、「その下書きに何と書いてあったか」では
 ない。後者を保存すると、保存されていないはずの内容が DB に残る。
+
+`ui_draft_state` が `NULL` の行は **4 つ目の別の意味**である —「この server は
+それを記録できなかった」(#445 以前の行) であって `not_provided` (client が
+明示的に送らなかった) ではない。Principle 9 の `traces.redaction_json` の
+`NULL` と同じ規律で、丸めない。
 
 ---
 

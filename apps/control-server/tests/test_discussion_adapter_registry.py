@@ -202,11 +202,24 @@ def test_capabilities_derived_for_ux_journey_has_read_and_propose_both():
     assert "read_canonical" in caps
     assert "propose_fields" in caps
     assert "propose_relations" in caps
-    # Phase 1: no adapter has ui_draft_forms, so prefill_form/read_ui_draft
-    # are never derived true yet.
+    # Phase 2 (#445): `ux_journey` now has a `ui_draft_forms` entry, so both
+    # `read_ui_draft` (form registered) and `prefill_form` (form registered
+    # AND it can propose_fields/propose_relations) are derived true.
+    # `promote_joint_understanding` is still #449's -- untouched here.
+    assert "read_ui_draft" in caps
+    assert "prefill_form" in caps
+    assert "promote_joint_understanding" not in caps
+
+
+def test_capabilities_derived_for_understanding_claim_has_no_ui_draft_yet():
+    # `understanding_claim` keeps `ui_draft_forms=()` in Phase 2 (no editable
+    # Dashboard form exists for it) -- unlike `ux_journey`, it can
+    # propose_fields but must NOT derive read_ui_draft/prefill_form.
+    adapter = discussion_adapters.DISCUSSION_ADAPTERS["understanding_claim"]
+    caps = discussion_adapters.capabilities_for(adapter)
+    assert "propose_fields" in caps
     assert "read_ui_draft" not in caps
     assert "prefill_form" not in caps
-    assert "promote_joint_understanding" not in caps
 
 
 def test_capabilities_derived_for_blueprint_lane_cell_relations_only():
@@ -230,14 +243,23 @@ def test_every_adapter_capabilities_are_a_subset_of_the_finite_vocabulary():
         assert set(caps) <= set(discussion_adapters.DISCUSSION_CAPABILITIES)
 
 
-def test_phase_1_children_and_ui_draft_forms_and_ju_bridge_are_all_empty():
-    # #444's explicit Phase 1 scope: children/ui_draft_forms stay empty and
-    # joint_understanding_bridge stays False for every adapter -- later
-    # phases populate these ADDITIVELY rather than reshaping the dataclass.
-    for adapter in discussion_adapters.DISCUSSION_ADAPTERS.values():
+_KINDS_WITH_UI_DRAFT_FORMS = frozenset(
+    {"ux_journey", "ux_journey_step", "ux_requirement", "solution_design"}
+)
+
+
+def test_phase_2_children_and_ju_bridge_stay_empty_ui_draft_forms_is_the_new_field():
+    # #448 (children) and #449 (joint_understanding_bridge) are still ahead;
+    # only #445's `ui_draft_forms` is populated in this phase, and only for
+    # the 4 kinds whose Dashboard forms exist today (docs/ai-discussion-
+    # adapter.md §1.4's "declared now, populated later" shapes).
+    for kind, adapter in discussion_adapters.DISCUSSION_ADAPTERS.items():
         assert adapter.children == ()
-        assert adapter.ui_draft_forms == ()
         assert adapter.joint_understanding_bridge is False
+        if kind in _KINDS_WITH_UI_DRAFT_FORMS:
+            assert adapter.ui_draft_forms != (), f"{kind} should have a ui_draft_forms entry"
+        else:
+            assert adapter.ui_draft_forms == (), f"{kind} should NOT have a ui_draft_forms entry yet"
 
 
 # --- fail-closed: unregistered kind / screen mismatch ------------------------

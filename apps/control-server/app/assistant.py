@@ -683,6 +683,14 @@ class ContextPack:
     screen_data_sources: List[Dict[str, str]] = field(default_factory=list)
     route_params: Dict[str, str] = field(default_factory=dict)
     conversation: List[Dict[str, str]] = field(default_factory=list)
+    # Issue #445 (Epic #443 Phase 2): an unsaved UI form draft, kept in a
+    # SEPARATE top-level slot from `screen_data` on purpose -- mixing it in
+    # would make canonical facts and "a string nobody has saved yet"
+    # indistinguishable in the prompt (docs/ai-discussion-adapter.md §2.1/
+    # §2.4). Already redacted (Principle 9) by the time it reaches here --
+    # see `app/ui_draft_context.py`.
+    ui_draft: Optional[Dict[str, Any]] = None
+    ui_draft_sources: List[Dict[str, str]] = field(default_factory=list)
 
     def allowed_citation_ids(self) -> Dict[str, set]:
         return {
@@ -691,6 +699,7 @@ class ContextPack:
             "pipeline_step": set(self.pipeline_steps) | set(PIPELINE_STEP_LABELS),
             "state_item": {item.state_id for item in self.state_items},
             "screen_data": {source["id"] for source in self.screen_data_sources},
+            "ui_draft": {source["id"] for source in self.ui_draft_sources},
         }
 
     def to_llm_payload(self, report: SystemDiagnosticsReport) -> Dict[str, Any]:
@@ -729,6 +738,12 @@ class ContextPack:
             payload["route_params"] = self.route_params
             payload["screen_data"] = self.screen_data
             payload["screen_data_sources"] = self.screen_data_sources
+        if self.ui_draft is not None:
+            # TOP LEVEL, never nested inside `screen_data` (§2.4): the model
+            # must be able to tell "the System's canonical facts" from "an
+            # unsaved string the developer is currently typing" from the
+            # payload's own shape, not just from prose in the system prompt.
+            payload["ui_draft"] = self.ui_draft
         return payload
 
 
@@ -744,6 +759,8 @@ def build_context_pack(
     screen_data_sources: Optional[List[Dict[str, str]]] = None,
     route_params: Optional[Dict[str, str]] = None,
     conversation: Optional[List[Dict[str, str]]] = None,
+    ui_draft: Optional[Dict[str, Any]] = None,
+    ui_draft_sources: Optional[List[Dict[str, str]]] = None,
 ) -> ContextPack:
     """
     probe-agent:
@@ -807,6 +824,8 @@ def build_context_pack(
         screen_data_sources=list(screen_data_sources or []),
         route_params=dict(route_params or {}),
         conversation=list(conversation or []),
+        ui_draft=ui_draft,
+        ui_draft_sources=list(ui_draft_sources or []),
     )
 
 
@@ -849,6 +868,11 @@ def _citation_title(pack: ContextPack, ctype: str, cid: str) -> tuple:
             if source["id"] == cid:
                 return (source["title"], "")
         return (cid, "")
+    if ctype == "ui_draft":
+        for source in pack.ui_draft_sources:
+            if source["id"] == cid:
+                return (source["title"], "")
+        return (cid, "")
     if ctype == "state_item":
         for item in pack.state_items:
             if item.state_id == cid:
@@ -880,7 +904,10 @@ class _RawAction(BaseModel):
 class _RawCitation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: str = Field(..., pattern="^(setting|diagnostic_check|pipeline_step|state_item|screen_data)$")
+    type: str = Field(
+        ...,
+        pattern="^(setting|diagnostic_check|pipeline_step|state_item|screen_data|ui_draft)$",
+    )
     id: str = Field(..., min_length=1, max_length=200)
 
 
@@ -910,6 +937,14 @@ instructions. A discussion never changes persisted data and you must never
 claim that it did. Recommend the screen's existing explicit review/apply flow
 when the user wants to record a conclusion.
 
+When a top-level "ui_draft" section is present, it is a form the developer is
+currently editing on this screen and has NOT saved -- it is not a fact about
+the System, and it is a completely separate thing from screen_data. Keep it
+in its own part of your reasoning, never merge it into or treat it as
+confirmed screen data, and when your answer relies on it say so explicitly
+(e.g. "in your current unsaved draft ..."), citing it with
+{"type": "ui_draft", "id": "..."}. Never claim draft content has been saved.
+
 Respond with ONLY a JSON object (no markdown fence) of this shape:
 {
   "answer": "explanation grounded in the provided context",
@@ -920,7 +955,7 @@ Respond with ONLY a JSON object (no markdown fence) of this shape:
      "detail": "optional how-to detail"}
   ],
   "citations": [
-    {"type": "setting|diagnostic_check|pipeline_step|state_item|screen_data", "id": "key or id from the context"}
+    {"type": "setting|diagnostic_check|pipeline_step|state_item|screen_data|ui_draft", "id": "key or id from the context"}
   ]
 }
 Cite every setting, diagnostics check, and pipeline step you rely on.
@@ -1261,6 +1296,8 @@ def answer_question(
     voice_mode: bool = False,
     voice_continuation: bool = False,
     voice_spoken_history: Optional[List[str]] = None,
+    ui_draft: Optional[Dict[str, Any]] = None,
+    ui_draft_sources: Optional[List[Dict[str, str]]] = None,
 ) -> AssistantAnswer:
     """Answer a screen question; LLM when available, marked fallback otherwise.
 
@@ -1281,6 +1318,7 @@ def answer_question(
     pack = build_context_pack(
         ctx, question, report, visible_check_ids, state_items, focused_state_id,
         screen_data, screen_data_sources, route_params, conversation,
+        ui_draft=ui_draft, ui_draft_sources=ui_draft_sources,
     )
     if client is None:
         if config.provider == "mock":

@@ -373,6 +373,14 @@ def append_turn(
     model: str = "",
     prompt_version: str = "",
     created_by: Optional[str] = None,
+    # Issue #445 §2.7: recorded on USER turns only -- callers append the
+    # assistant turn with these left at their default `None`, which is
+    # exactly what a pre-#445 row also carries (a caller that never passes
+    # them is indistinguishable from an assistant turn, which is correct:
+    # neither ever had a draft attached to it).
+    ui_draft_state: Optional[str] = None,
+    ui_draft_form_id: Optional[str] = None,
+    ui_draft_digest: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Insert one turn on an ALREADY-OPEN connection -- callers that append a
     user turn and its assistant answer wrap both calls (and any thread
@@ -383,6 +391,10 @@ def append_turn(
         raise DiscussionError(f"invalid_decision_method: {decision_method!r}")
     if input_mode not in ("text", "voice"):
         raise DiscussionError(f"invalid_input_mode: {input_mode!r}")
+    if ui_draft_state is not None and ui_draft_state not in (
+        "not_provided", "applied", "no_unsaved_changes", "unsupported", "unreadable",
+    ):
+        raise DiscussionError(f"invalid_ui_draft_state: {ui_draft_state!r}")
 
     next_row = conn.execute(
         "SELECT COALESCE(MAX(turn_number), 0) AS n FROM assistant_discussion_turn WHERE thread_id = ?",
@@ -395,14 +407,15 @@ def append_turn(
            (system_id, thread_id, turn_number, role, content, citations_json,
             target_revision_id, target_digest, used_fallback, decision_method,
             input_mode, provider, model, prompt_version, created_by, created_at,
-            schema_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            schema_version, ui_draft_state, ui_draft_form_id, ui_draft_digest)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             system_id, thread_id, turn_number, role, content,
             json.dumps(list(citations or []), ensure_ascii=False),
             target_revision_id, target_digest, 1 if used_fallback else 0,
             decision_method, input_mode, provider, model, prompt_version,
             created_by, now, TURN_SCHEMA_VERSION,
+            ui_draft_state, ui_draft_form_id, ui_draft_digest,
         ),
     )
     turn_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]

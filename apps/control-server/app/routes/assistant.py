@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
-from .. import assistant_discussion, assistant_discussion_proposal
+from .. import assistant_discussion, assistant_discussion_proposal, ui_draft_context
 from ..assistant import (
     answer_question,
     checks_for_screen,
@@ -246,6 +246,9 @@ def _turn_out(row: Dict[str, Any]) -> AssistantDiscussionTurnOut:
         schema_version=row.get("schema_version") or "assistant-discussion-turn-v1",
         created_by=row.get("created_by"),
         created_at=row["created_at"],
+        ui_draft_state=row.get("ui_draft_state"),
+        ui_draft_form_id=row.get("ui_draft_form_id"),
+        ui_draft_digest=row.get("ui_draft_digest") or "",
     )
 
 
@@ -510,6 +513,28 @@ def assistant_ask(
         thread_row = thread_data["thread"]
         thread_target_state = thread_data["target_state"]
 
+    # Issue #445: validate the (optional) UI draft against the thread's own
+    # target and the target_kind's adapter registry, fail-closed, BEFORE the
+    # LLM call below. `resolved_draft.payload` is already redacted
+    # (Principle 9) and carries no draft VALUES past this point except what
+    # is about to go into the LLM prompt -- nothing here is persisted yet.
+    try:
+        resolved_draft = ui_draft_context.validate_and_prepare_ui_draft(payload.ui_draft, thread_row)
+    except ui_draft_context.UiDraftValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+
+    ui_draft_changed = False
+    if payload.ui_draft is not None and thread_row is not None:
+        with get_conn() as conn:
+            ui_draft_changed = ui_draft_context.compute_ui_draft_changed(
+                conn,
+                thread_id=thread_row["id"],
+                form_id=resolved_draft.form_id,
+                local_revision_token=resolved_draft.digest,
+            )
+
     report = run_system_diagnostics(system_id)
     assessment = build_system_state(system_id)
     state_by_id = {item.state_id: item for item in assessment.items}
@@ -609,6 +634,8 @@ def assistant_ask(
         voice_mode=payload.input_mode == "voice",
         voice_continuation=payload.voice_continuation,
         voice_spoken_history=payload.voice_spoken_history,
+        ui_draft=resolved_draft.payload,
+        ui_draft_sources=resolved_draft.sources,
     )
 
     thread_id_out: Optional[int] = None
@@ -638,6 +665,12 @@ def assistant_ask(
                     # a client playback choice, not a fact about the turn.
                     input_mode=payload.input_mode,
                     created_by=_principal_actor(principal),
+                    # Issue #445 §2.7: recorded on the USER turn only, and
+                    # never the draft's field VALUES -- see
+                    # `ui_draft_context.ResolvedUiDraft`.
+                    ui_draft_state=resolved_draft.state,
+                    ui_draft_form_id=resolved_draft.form_id or None,
+                    ui_draft_digest=resolved_draft.digest or None,
                 )
                 assistant_turn = assistant_discussion.append_turn(
                     conn,
@@ -663,7 +696,11 @@ def assistant_ask(
                 raise
         thread_id_out = thread_row["id"]
         turn_number_out = assistant_turn["turn_number"]
-        recheck_required = thread_target_state not in ("current", "not_tracked")
+        # §2.6: a changed draft also forces a recheck -- the previous answer,
+        # if any, was not about the draft as it reads now.
+        recheck_required = (
+            thread_target_state not in ("current", "not_tracked") or ui_draft_changed
+        )
 
     voice_projection = (
         project_spoken_answer(result.answer, payload.voice_spoken_history)
@@ -701,4 +738,6 @@ def assistant_ask(
         target_state=thread_target_state,
         recheck_required=recheck_required,
         turn_number=turn_number_out,
+        ui_draft_state=resolved_draft.state,
+        ui_draft_changed=ui_draft_changed,
     )

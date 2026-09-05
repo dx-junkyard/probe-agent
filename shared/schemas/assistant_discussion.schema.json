@@ -15,7 +15,8 @@
     },
     "proposal_item_kind": { "$ref": "#/$defs/discussion_proposal_item_kind" },
     "proposal_item_status": { "$ref": "#/$defs/discussion_proposal_item_status" },
-    "proposal_item_eligibility": { "$ref": "#/$defs/discussion_proposal_item_eligibility" }
+    "proposal_item_eligibility": { "$ref": "#/$defs/discussion_proposal_item_eligibility" },
+    "ui_draft_state": { "$ref": "#/$defs/ui_draft_state" }
   },
   "$defs": {
     "discussion_scope": {
@@ -62,6 +63,10 @@
     "discussion_proposal_item_eligibility": {
       "description": "docs/assistant-discussion.md §2.2's first-match order: forbidden -> stale -> conflict -> appliable. Derived at read time from the target's CURRENT canonical digest and the item's own status/address, never stored.",
       "enum": ["forbidden", "stale", "conflict", "appliable"]
+    },
+    "ui_draft_state": {
+      "description": "docs/ai-discussion-adapter.md §2.6 (Issue #445, Epic #443 Phase 2). `not_provided` (client sent none) and `unreadable` (a form IS open for this target but the client could not read it, self-reported via `UiDraftContextIn.readable`) are deliberately distinct answers: an assistant that reports the former when the latter is true is describing a screen the developer is not looking at. Recorded on the USER turn only (`assistant_discussion_turn.ui_draft_state`); `NULL` on a pre-#445 row is a FOURTH, distinct meaning ('this server could not have recorded it') that this enum does not cover.",
+      "enum": ["not_provided", "applied", "no_unsaved_changes", "unsupported", "unreadable"]
     }
   }
 }
