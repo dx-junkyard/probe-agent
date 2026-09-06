@@ -31,6 +31,8 @@ import {
   DegradedNote, EmptyNote, LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
 } from "./shared";
 import { useUiDraftSource } from "@/lib/ui-draft";
+import { peekPendingFormDraftPatch, useFormDraftReceiver } from "@/lib/form-draft-inbox";
+import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
 
 const TARGET_KINDS: SolutionTargetKind[] = [
   "capability", "static_flow", "runtime_flow", "evolution_node",
@@ -161,6 +163,24 @@ function AddOptionForm({
     localRevisionToken: JSON.stringify([optionKey, ...optionFields.map((f) => [f.fieldName, f.value])]),
   }));
 
+  // Issue #446 (§3.2/§3.3): a solution_design field item is sub-addressed by
+  // the Option's own `option_key` (the item's `subject_ref`), carried as the
+  // patch's `selectedItemRef`. The `identity` binding below both fills in
+  // `optionKey` from a patch (when the developer has not typed one yet) and
+  // refuses to apply title/approach/tradeoffs/risks from a patch addressed
+  // at a DIFFERENT option_key than the one already being drafted.
+  const draftReceiver = useFormDraftReceiver(
+    "solution_design.option",
+    designKey,
+    {
+      title: { value: title, dirty: title !== "", setValue: setTitle },
+      approach: { value: approach, dirty: approach !== "", setValue: setApproach },
+      tradeoffs: { value: tradeoffs, dirty: tradeoffs !== "", setValue: setTradeoffs },
+      risks: { value: risks, dirty: risks !== "", setValue: setRisks },
+    },
+    { value: optionKey, dirty: optionKey.trim() !== "", setValue: setOptionKey },
+  );
+
   function submit() {
     add.mutate(
       { option_key: optionKey.trim(), option_order: nextOrder, title, approach, tradeoffs, risks },
@@ -176,6 +196,7 @@ function AddOptionForm({
 
   return (
     <div className="space-y-2 rounded border p-2" data-testid="ux-solution-design-add-option-form">
+      <FormDraftConflictBanner conflicts={draftReceiver.conflicts} onResolve={draftReceiver.resolveField} />
       <Input placeholder="option_key" value={optionKey} onChange={(e) => setOptionKey(e.target.value)} />
       <Input placeholder="タイトル" value={title} onChange={(e) => setTitle(e.target.value)} />
       <Textarea placeholder="アプローチ(approach)" value={approach} onChange={(e) => setApproach(e.target.value)} rows={2} />

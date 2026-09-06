@@ -203,13 +203,21 @@ export function useFormDraftReceiver(
   targetRef: string,
   fields: Record<string, FormDraftFieldBinding>,
   /** Optional: a form that drafts a new keyed sub-object (today only
-   * `solution_design.option`'s `option_key`) reads the patch's
-   * `selectedItemRef` through this binding -- written ONLY when the
-   * developer has not already typed an identity of their own (`!dirty`),
-   * exactly like any other field's conflict rule, but with no proposed
-   * counterpart to preview: there is nothing to CONFLICT with an identity
-   * the developer has not chosen yet, and once they have, prefill must
-   * never silently redirect the draft to a different key. */
+   * `solution_design.option`'s `option_key`, carried via a proposal item's
+   * `subject_ref`) reads the patch's `selectedItemRef` through this
+   * binding. Two rules, both required by the same "honour the sub-address"
+   * contract:
+   * - Not yet dirty (the developer has typed no key of their own): the
+   *   identity is written from the patch, exactly like any other clean
+   *   field -- there is nothing to CONFLICT with an identity nobody chose
+   *   yet.
+   * - Already dirty AND it disagrees with the patch's `selectedItemRef`:
+   *   the WHOLE patch is ignored, fields included. A patch for Option
+   *   "opt-1" must never land its title/approach/etc. onto whatever option
+   *   the developer happens to have open as "opt-2" -- silently applying
+   *   fields addressed at a different sub-object is the same defect as
+   *   delivering a patch to the wrong target_ref (§3.2).
+   */
   identity?: FormDraftFieldBinding,
 ): { conflicts: FieldConflict[]; resolveField: (fieldName: string, resolution: FieldResolution) => void } {
   const [patch, setPatch] = useState<FormDraftPatch | null>(null);
@@ -221,8 +229,15 @@ export function useFormDraftReceiver(
 
   useFormDraftInbox(formId, targetRef, (incoming) => {
     const currentIdentity = identityRef.current;
-    if (currentIdentity && !currentIdentity.dirty && incoming.selectedItemRef) {
-      currentIdentity.setValue(incoming.selectedItemRef);
+    if (currentIdentity) {
+      if (currentIdentity.dirty) {
+        if (incoming.selectedItemRef && incoming.selectedItemRef !== currentIdentity.value) {
+          // Addressed at a different sub-object -- not for this draft.
+          return;
+        }
+      } else if (incoming.selectedItemRef) {
+        currentIdentity.setValue(incoming.selectedItemRef);
+      }
     }
     const currentValues: Record<string, string> = {};
     const dirtyFields: Record<string, boolean> = {};
