@@ -5,7 +5,7 @@
 // -- a Requirement can be satisfied by more than one Solution Design, so
 // "the" adopted design is not a property of a Journey Step.
 
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -229,10 +229,13 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
     failure_mode: s.failure_mode, recovery_path: s.recovery_path,
     evidence_expectation: s.evidence_expectation, evidence_source_kind: s.evidence_source_kind,
   }));
-  // Issue #445: frozen at mount (like `useState`'s own initial value) so a
-  // later refetch (e.g. after this same form's own successful submit) does
-  // not retroactively change what counts as "unedited" mid-session.
-  const seedRef = useRef({
+  // Issue #445: frozen at mount so a later refetch (e.g. after this same
+  // form's own successful submit) does not retroactively change what counts
+  // as "unedited" mid-session. A lazy `useState` initialiser rather than a
+  // ref: freezing a value at mount IS what that expresses, it is readable
+  // during render (a ref is not -- `react-hooks/refs`), and the initialiser
+  // runs once instead of rebuilding the Map on every render.
+  const [seed] = useState(() => ({
     title: detail.data?.current_revision?.title ?? "",
     beneficiary: detail.data?.current_revision?.beneficiary ?? "",
     usageContext: detail.data?.current_revision?.usage_context ?? "",
@@ -240,8 +243,7 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
     valueArrival: detail.data?.current_revision?.value_arrival ?? "",
     summary: detail.data?.current_revision?.summary ?? "",
     stepsByKey: new Map(seedSteps.map((s) => [s.step_key, s])),
-  });
-  const seed = seedRef.current;
+  }));
   const [title, setTitle] = useState(detail.data?.current_revision?.title ?? "");
   const [beneficiary, setBeneficiary] = useState(detail.data?.current_revision?.beneficiary ?? "");
   const [usageContext, setUsageContext] = useState(detail.data?.current_revision?.usage_context ?? "");

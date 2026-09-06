@@ -4,7 +4,7 @@
 // the Solution Design tab, reached via `onOpenSolutionDesign`).
 
 import { RequirementRevisionHistoryCard } from "./revision-history";
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -162,13 +162,12 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
   // Issue #445: frozen at mount, like `JourneyRevisionForm`'s seed -- a
   // refetch after this form's own submit must not retroactively change what
   // counts as "unedited" mid-session.
-  const seedRef = useRef({
+  const [seed] = useState(() => ({
     statement: current?.statement ?? "",
     rationale: current?.rationale ?? "",
     constraintText: current?.constraint_text ?? "",
     outOfScopeNote: current?.out_of_scope_note ?? "",
-  });
-  const seed = seedRef.current;
+  }));
   const [statement, setStatement] = useState(current?.statement ?? "");
   const [rationale, setRationale] = useState(current?.rationale ?? "");
   const [constraintText, setConstraintText] = useState(current?.constraint_text ?? "");

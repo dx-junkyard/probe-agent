@@ -167,7 +167,16 @@ export function useUiDraftSource(
 ): void {
   const api = useUiDraftRegistry();
   const getterRef = useRef(getDraft);
-  getterRef.current = getDraft;
+  // Written in an effect, never during render: a ref is not a render input,
+  // and React forbids mutating one while rendering. This is the same fix
+  // `components/product-objective/unsaved-work.tsx` documents for
+  // `useDirtyGuard`. Declared BEFORE the registration effect so it flushes
+  // first -- the registered getter must never be called with a stale
+  // closure. No dependency array: the latest getter is wanted after every
+  // render, and the read itself only happens later, at turn start.
+  useEffect(() => {
+    getterRef.current = getDraft;
+  });
   useEffect(() => {
     if (!api) return;
     return api.register(formId, targetRef, () => getterRef.current());

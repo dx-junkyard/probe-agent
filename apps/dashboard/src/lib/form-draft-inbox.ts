@@ -110,8 +110,16 @@ export function useFormDraftInbox(
   onPatch: (patch: FormDraftPatch) => void,
 ): void {
   const handlerRef = useRef(onPatch);
-  handlerRef.current = onPatch;
   const seenTokens = useRef(new Set<string>());
+
+  // See `lib/ui-draft.tsx`'s `useUiDraftSource`: refs are written in an
+  // effect, never during render. Declared BEFORE the subscription effect so
+  // it flushes first -- the subscription can consume a patch that was
+  // queued before this form mounted, and that consumption must see the
+  // current handler rather than the one from the first render.
+  useEffect(() => {
+    handlerRef.current = onPatch;
+  });
 
   useEffect(() => {
     if (!formId || !targetRef) return;
@@ -223,9 +231,14 @@ export function useFormDraftReceiver(
   const [patch, setPatch] = useState<FormDraftPatch | null>(null);
   const [resolvedFields, setResolvedFields] = useState<Set<string>>(new Set());
   const fieldsRef = useRef(fields);
-  fieldsRef.current = fields;
   const identityRef = useRef(identity);
-  identityRef.current = identity;
+  // Same rule as above, and the same ordering reason: this effect is
+  // declared before `useFormDraftInbox` so a patch queued before mount is
+  // matched against the form's current values, not the first render's.
+  useEffect(() => {
+    fieldsRef.current = fields;
+    identityRef.current = identity;
+  });
 
   useFormDraftInbox(formId, targetRef, (incoming) => {
     const currentIdentity = identityRef.current;
