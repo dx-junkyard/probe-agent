@@ -35,6 +35,8 @@ import {
   LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
 } from "./shared";
 import { useUiDraftSource } from "@/lib/ui-draft";
+import { peekPendingFormDraftPatch, useFormDraftReceiver } from "@/lib/form-draft-inbox";
+import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
 
 const PERSPECTIVES: UxJourneyPerspective[] = ["as_is", "to_be"];
 const BASELINE_MODES: UxJourneyBaselineMode[] = ["linked", "greenfield", "undecided"];
@@ -267,6 +269,17 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
     localRevisionToken: JSON.stringify(journeyFields.map((f) => [f.fieldName, f.value])),
   }));
 
+  // Issue #446 (§3.2/§3.3): only the top-level Journey fields -- Step-level
+  // prefill is a #448 (nested/list) concern, out of scope for this phase.
+  const draftReceiver = useFormDraftReceiver("ux_journey.revision", journeyKey, {
+    title: { value: title, dirty: title !== seed.title, setValue: setTitle },
+    beneficiary: { value: beneficiary, dirty: beneficiary !== seed.beneficiary, setValue: setBeneficiary },
+    usage_context: { value: usageContext, dirty: usageContext !== seed.usageContext, setValue: setUsageContext },
+    entry_trigger: { value: entryTrigger, dirty: entryTrigger !== seed.entryTrigger, setValue: setEntryTrigger },
+    value_arrival: { value: valueArrival, dirty: valueArrival !== seed.valueArrival, setValue: setValueArrival },
+    summary: { value: summary, dirty: summary !== seed.summary, setValue: setSummary },
+  });
+
   function updateStep(i: number, patch: Partial<UxJourneyStepInput>) {
     setSteps((prev) => prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s)));
   }
@@ -289,6 +302,7 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
 
   return (
     <div className="space-y-3 rounded border p-3" data-testid="ux-journey-revision-form">
+      <FormDraftConflictBanner conflicts={draftReceiver.conflicts} onResolve={draftReceiver.resolveField} />
       <div className="grid gap-2 sm:grid-cols-2">
         <Input placeholder="タイトル" value={title} onChange={(e) => setTitle(e.target.value)} />
         <Input placeholder="対象者" value={beneficiary} onChange={(e) => setBeneficiary(e.target.value)} />
@@ -579,7 +593,11 @@ function JourneyDetail({
   onOpenRequirement: (key: string) => void;
 }) {
   const detail = useUxJourneyDetail(journeyKey);
-  const [revisionOpen, setRevisionOpen] = useState(false);
+  // Issue #446: auto-open the revision form when a prefill patch for THIS
+  // Journey is already waiting (see `RequirementDetail`'s identical rule).
+  const [revisionOpen, setRevisionOpen] = useState(() =>
+    peekPendingFormDraftPatch("ux_journey.revision", journeyKey),
+  );
   const [stepKey, setStepKey] = useState<string | null>(null);
 
   if (detail.isLoading) return <LoadingBlock testId="ux-journey-detail-loading" />;

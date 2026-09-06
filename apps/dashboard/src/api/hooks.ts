@@ -80,6 +80,9 @@ import type {
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
   AssistantDiscussionTargetIn, AssistantDiscussionThreadDetailOut, AssistantDiscussionThreadsListOut,
+  AssistantDiscussionProposal, AssistantDiscussionProposalsListOut,
+  AssistantDiscussionProposalApplyOut, AssistantDiscussionProposalRejectOut,
+  AssistantDiscussionProposalPrefillOut,
   UiHelpEntriesOut, UiHelpEntry,
   ConnectivityStatusOut,
   InstrumentationScanOut, ProbePatternsListOut, ProbePatternOut,
@@ -2496,6 +2499,89 @@ export function useAssistantDiscussionThreads(filters: {
         query ? `/assistant/discussion-threads?${query}` : "/assistant/discussion-threads",
       ),
     enabled: (filters.enabled ?? true) && !!getSystemId(),
+  });
+}
+
+// Assistant discussion proposals (Issue #439, Epic #436; #446 adds prefill,
+// Epic #443 Phase 3). docs/ai-discussion-adapter.md §3.1: the Dashboard's
+// STANDARD route is generate -> review -> prefill; `useApplyDiscussionProposal
+// Items` is kept for the compatibility direct-apply path (§2.2 of
+// docs/assistant-discussion.md), not the one the UI leads with.
+
+export function useDiscussionProposals(threadId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-proposals"), threadId],
+    queryFn: () =>
+      api.get<AssistantDiscussionProposalsListOut>(
+        `/assistant/discussion-threads/${threadId}/proposals`,
+      ),
+    enabled: threadId !== null && !!getSystemId(),
+  });
+}
+
+export function useDiscussionProposal(proposalId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-proposal"), proposalId],
+    queryFn: () => api.get<AssistantDiscussionProposal>(`/assistant/discussion-proposals/${proposalId}`),
+    enabled: proposalId !== null && !!getSystemId(),
+  });
+}
+
+export function useCreateDiscussionProposal(threadId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<AssistantDiscussionProposal>(`/assistant/discussion-threads/${threadId}/proposals`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposals"), threadId] });
+    },
+  });
+}
+
+export function useApplyDiscussionProposalItems(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { item_ids: number[]; rationale?: string }) =>
+      api.post<AssistantDiscussionProposalApplyOut>(
+        `/assistant/discussion-proposals/${proposalId}/apply`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+    },
+  });
+}
+
+export function useRejectDiscussionProposalItems(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { item_ids: number[]; rationale?: string }) =>
+      api.post<AssistantDiscussionProposalRejectOut>(
+        `/assistant/discussion-proposals/${proposalId}/reject`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+    },
+  });
+}
+
+// §3.4: the prefill AUDIT call -- writes only the audit row, the item's own
+// `status` stays `proposed`. The caller (the review UI) still invalidates
+// the DESTINATION target's own queries via `adapter.invalidateKeys` after a
+// successful dispatch; this hook only refreshes the proposal itself so its
+// `prefill_count`/`last_prefilled_at` reflect the just-made dispatch.
+export function usePrefillDiscussionProposalItems(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { item_ids: number[]; form_id: string; patch_token: string }) =>
+      api.post<AssistantDiscussionProposalPrefillOut>(
+        `/assistant/discussion-proposals/${proposalId}/prefill`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+    },
   });
 }
 

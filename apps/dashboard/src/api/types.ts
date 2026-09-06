@@ -3801,6 +3801,12 @@ export interface AssistantDiscussionProposalItem {
   decision_method: "reasoning_llm" | "manual";
   created_at: number;
   schema_version: string;
+  // Issue #446 (Epic #443 Phase 3), §3.4: the prefill AUDIT summary, kept
+  // deliberately separate from `status` above -- prefilling this item into
+  // an unsaved Dashboard form is intent, never completion, so `status` stays
+  // `proposed` no matter how many times this item was prefilled.
+  prefill_count: number;
+  last_prefilled_at: number | null;
 }
 
 export interface AssistantDiscussionProposal {
@@ -3850,6 +3856,22 @@ export interface AssistantDiscussionProposalApplyOut {
 export interface AssistantDiscussionProposalRejectOut {
   proposal: AssistantDiscussionProposal;
   rejected_item_ids: number[];
+}
+
+// Discussion proposal prefill (Issue #446, Epic #443 Phase 3).
+// docs/ai-discussion-adapter.md §3.4. `patch_token` is the client-generated
+// idempotency token backing the server's own
+// `UNIQUE (proposal_id, patch_token, item_id)`.
+
+export interface AssistantDiscussionProposalPrefillRequest {
+  item_ids: number[];
+  form_id: string;
+  patch_token: string;
+}
+
+export interface AssistantDiscussionProposalPrefillOut {
+  proposal: AssistantDiscussionProposal;
+  prefilled_item_ids: number[];
 }
 
 export interface AssistantAction {

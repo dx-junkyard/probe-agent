@@ -24,11 +24,13 @@
 // target) that never depended on the unsaved-draft or prefill machinery.
 
 import type {
+  AssistantDiscussionProposal,
   AssistantDiscussionTargetIn,
   DiscussionScope,
   DiscussionTargetKind,
 } from "@/api/types";
 import { sysKey } from "@/api/hooks";
+import type { FormDraftPatch } from "@/lib/form-draft-inbox";
 
 export interface DiscussionCandidate {
   target: AssistantDiscussionTargetIn;
@@ -352,4 +354,81 @@ export function resolveDiscussionCandidate(screenId: string, search: string): Di
     if (candidate) return candidate;
   }
   return null;
+}
+
+// --- Proposal -> form draft patch (Issue #446, Epic #443 Phase 3) ------------
+// docs/ai-discussion-adapter.md §3.2. Maps SELECTED proposal items onto the
+// adapter's own registered form field allowlist -- never the field names a
+// server registry drift might have introduced. An item whose `field_name`
+// falls outside the form's allowlist is reported (`unregisteredFieldNames`),
+// never silently dropped: the developer selected it, so the review UI must
+// say it could not be carried rather than deliver a partial patch that looks
+// complete.
+
+function generatePatchToken(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `patch-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+export interface ProposalToDraftResult {
+  /** `null` when the adapter has no registered form at all -- there is
+   * nothing to prefill into, distinct from "some fields were rejected". */
+  patch: FormDraftPatch | null;
+  formId: string | null;
+  unregisteredFieldNames: string[];
+}
+
+/** Builds a `FormDraftPatch` from the proposal's items whose `id` is in
+ * `itemIds`. Today every adapter registers at most one form per target_kind
+ * (the same assumption `assistant-panel.tsx`'s `captureUiDraft` already
+ * makes), so the first `forms` entry is not a guess -- it is the only entry
+ * there is. */
+export function proposalToDraft(
+  adapter: DashboardDiscussionAdapter,
+  proposal: AssistantDiscussionProposal,
+  itemIds: readonly number[],
+): ProposalToDraftResult {
+  if (adapter.forms.length === 0) {
+    return { patch: null, formId: null, unregisteredFieldNames: [] };
+  }
+  const binding = adapter.forms[0];
+  const idSet = new Set(itemIds);
+  const selected = proposal.items.filter((item) => idSet.has(item.id));
+
+  const fields: FormDraftPatch["fields"] = [];
+  const relations: FormDraftPatch["relations"] = [];
+  const unregisteredFieldNames: string[] = [];
+  let selectedItemRef = "";
+
+  for (const item of selected) {
+    if (item.item_kind === "field") {
+      if (!binding.fields.includes(item.field_name)) {
+        unregisteredFieldNames.push(item.field_name);
+        continue;
+      }
+      fields.push({ fieldName: item.field_name, value: item.proposed_value, rationale: item.rationale });
+      if (item.subject_ref) selectedItemRef = item.subject_ref;
+    } else {
+      relations.push({
+        relationKind: item.relation_kind,
+        targetKind: item.relation_target_kind,
+        targetRef: item.relation_target_ref,
+        note: item.rationale,
+      });
+    }
+  }
+
+  const patch: FormDraftPatch = {
+    patchToken: generatePatchToken(),
+    targetKind: proposal.target_kind,
+    targetRef: proposal.target_ref,
+    formId: binding.formId,
+    selectedItemRef,
+    fields,
+    childOps: [],
+    relations,
+  };
+  return { patch, formId: binding.formId, unregisteredFieldNames };
 }

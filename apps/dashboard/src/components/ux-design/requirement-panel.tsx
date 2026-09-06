@@ -42,6 +42,8 @@ import {
   LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
 } from "./shared";
 import { useUiDraftSource } from "@/lib/ui-draft";
+import { peekPendingFormDraftPatch, useFormDraftReceiver } from "@/lib/form-draft-inbox";
+import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
 
 const REQUIREMENT_KINDS: UxRequirementKind[] = ["functional", "non_functional", "constraint", "out_of_scope"];
 const VERIFICATION_METHODS: UxVerificationMethod[] = [
@@ -188,6 +190,18 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
     comparisonTarget: "",
     localRevisionToken: JSON.stringify(requirementFields.map((f) => [f.fieldName, f.value])),
   }));
+
+  // Issue #446 (§3.2/§3.3): receive a prefilled change candidate. Every
+  // clean field lands immediately through its own setter; a field that is
+  // dirty AND differs from the proposal is held back until the developer
+  // picks 「このまま」/「提案で置き換える」 for it.
+  const draftReceiver = useFormDraftReceiver("ux_requirement.revision", requirementKey, {
+    statement: { value: statement, dirty: statement !== seed.statement, setValue: setStatement },
+    rationale: { value: rationale, dirty: rationale !== seed.rationale, setValue: setRationale },
+    constraint_text: { value: constraintText, dirty: constraintText !== seed.constraintText, setValue: setConstraintText },
+    out_of_scope_note: { value: outOfScopeNote, dirty: outOfScopeNote !== seed.outOfScopeNote, setValue: setOutOfScopeNote },
+  });
+
   const seedCriteria = (current?.acceptance_criteria ?? []).map((c) => ({
     criterion_key: c.criterion_key, criterion_order: c.criterion_order, statement: c.statement,
     verification_method: c.verification_method, verification_note: c.verification_note,
@@ -218,6 +232,7 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
 
   return (
     <div className="space-y-3 rounded border p-3" data-testid="ux-requirement-revision-form">
+      <FormDraftConflictBanner conflicts={draftReceiver.conflicts} onResolve={draftReceiver.resolveField} />
       <Textarea placeholder="要件の文" value={statement} onChange={(e) => setStatement(e.target.value)} rows={2} />
       <Textarea placeholder="理由(rationale)" value={rationale} onChange={(e) => setRationale(e.target.value)} rows={2} />
       <Input placeholder="制約(constraint_text)" value={constraintText} onChange={(e) => setConstraintText(e.target.value)} />
@@ -564,7 +579,13 @@ function RequirementDetail({
   onOpenSolutionDesign: (key: string) => void;
 }) {
   const detail = useUxRequirementDetail(requirementKey);
-  const [revisionOpen, setRevisionOpen] = useState(false);
+  // Issue #446: auto-open the revision form when the review UI just
+  // delivered a prefill patch for THIS Requirement (the normal "navigate,
+  // then the destination form is ready" case, §3.6) -- otherwise the patch
+  // would sit unconsumed until the developer manually opens 「版を追加する」.
+  const [revisionOpen, setRevisionOpen] = useState(() =>
+    peekPendingFormDraftPatch("ux_requirement.revision", requirementKey),
+  );
   const [linkOpen, setLinkOpen] = useState(false);
 
   if (detail.isLoading) return <LoadingBlock testId="ux-requirement-detail-loading" />;

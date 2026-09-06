@@ -143,12 +143,27 @@ class ApplyRejected(DiscussionProposalError):
     """One selected item was not `appliable` (§2.2's all-or-nothing gate).
     Carries the finite rejection `code` (`proposal_item_forbidden` /
     `proposal_item_stale` / `proposal_item_conflict`) and the offending
-    `item_id` so the route can report both."""
+    `item_id` so the route can report both.
+
+    Reused verbatim by `prefill_items` (Issue #446, §3.4): "a
+    forbidden/stale/conflict item cannot be prefilled either" means prefill
+    reports the SAME finite codes apply does, not a second copy of the rule.
+    """
 
     def __init__(self, code: str, item_id: int):
         super().__init__(f"{code}: item {item_id}")
         self.code = code
         self.item_id = item_id
+
+
+class PrefillUnsupported(DiscussionProposalError):
+    """§1.7/§3.4: the target's adapter cannot be prefilled at all
+    (`prefill_unsupported`, no `ui_draft_forms`) or the requested `form_id`
+    is not one of them (`prefill_form_unregistered`)."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
 
 
 def _subject_ref_required(target_kind: str, item_kind: str, relation_kind: str = "") -> bool:
@@ -487,6 +502,19 @@ def _items_for(conn, proposal_id: int) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def _prefill_stats(conn, proposal_id: int) -> Dict[int, Dict[str, Any]]:
+    """§3.4: `prefill_count` / `last_prefilled_at` per item, read fresh every
+    time (never cached on the item row itself) so a reload always reflects
+    every prefill dispatch recorded so far -- including ones made from a
+    different client/session."""
+    rows = conn.execute(
+        "SELECT item_id, COUNT(*) AS n, MAX(created_at) AS last_at "
+        "FROM assistant_discussion_proposal_prefill WHERE proposal_id = ? GROUP BY item_id",
+        (proposal_id,),
+    ).fetchall()
+    return {r["item_id"]: {"prefill_count": r["n"], "last_prefilled_at": r["last_at"]} for r in rows}
+
+
 def _item_address(item: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
     return (
         item.get("subject_ref") or "",
@@ -606,21 +634,29 @@ def create_proposal(
     return row
 
 
+_NO_PREFILL: Dict[str, Any] = {"prefill_count": 0, "last_prefilled_at": None}
+
+
 def get_proposal_detail(system_id: int, proposal_id: int) -> Optional[Dict[str, Any]]:
     """§2.2's `GET /assistant/discussion-proposals/{id}`: the proposal plus
-    each item's read-time eligibility."""
+    each item's read-time eligibility and (§3.4) prefill audit summary."""
     with get_conn() as conn:
         row = get_proposal_row(conn, system_id, proposal_id)
         if row is None:
             return None
         items = _items_for(conn, proposal_id)
+        prefill_stats = _prefill_stats(conn, proposal_id)
 
     from . import assistant_discussion
 
     resolved = assistant_discussion.resolve_target(system_id, row["target_kind"], row["target_ref"])
     out = _proposal_out(row)
     out["items"] = [
-        {**item, "eligibility": evaluate_item_eligibility(row, item, items, resolved)}
+        {
+            **item,
+            "eligibility": evaluate_item_eligibility(row, item, items, resolved),
+            **prefill_stats.get(item["id"], _NO_PREFILL),
+        }
         for item in items
     ]
     return out
@@ -635,16 +671,22 @@ def list_proposals(system_id: int, thread_id: int) -> List[Dict[str, Any]]:
             "ORDER BY id DESC LIMIT ?",
             (system_id, thread_id, MAX_LISTED_PROPOSALS),
         ).fetchall()
-        proposals = [(dict(r), _items_for(conn, r["id"])) for r in rows]
+        proposals = [
+            (dict(r), _items_for(conn, r["id"]), _prefill_stats(conn, r["id"])) for r in rows
+        ]
 
     from . import assistant_discussion
 
     out: List[Dict[str, Any]] = []
-    for row, items in proposals:
+    for row, items, prefill_stats in proposals:
         resolved = assistant_discussion.resolve_target(system_id, row["target_kind"], row["target_ref"])
         d = _proposal_out(row)
         d["items"] = [
-            {**item, "eligibility": evaluate_item_eligibility(row, item, items, resolved)}
+            {
+                **item,
+                "eligibility": evaluate_item_eligibility(row, item, items, resolved),
+                **prefill_stats.get(item["id"], _NO_PREFILL),
+            }
             for item in items
         ]
         out.append(d)
@@ -916,6 +958,78 @@ def apply_items(
     detail = get_proposal_detail(system_id, proposal_id)
     assert detail is not None
     return detail, applied_ids
+
+
+def prefill_items(
+    system_id: int,
+    proposal_id: int,
+    item_ids: Sequence[int],
+    *,
+    form_id: str,
+    patch_token: str,
+    actor: Optional[str],
+) -> Tuple[Dict[str, Any], List[int]]:
+    """§3.4's `POST /assistant/discussion-proposals/{id}/prefill`.
+
+    Prefill is intent, never completion: it writes only an AUDIT row
+    (`assistant_discussion_proposal_prefill`) and the selected items' own
+    `status` stays `proposed` -- whether the developer went on to actually
+    save the destination form is not a fact this layer observes (#412's
+    "recording is not promotion"). Eligibility is checked with the SAME
+    `evaluate_item_eligibility` gate and the SAME finite codes `apply_items`
+    uses (`ApplyRejected`) -- a `forbidden`/`stale`/`conflict` item cannot be
+    prefilled either. `form_id` must be registered on the target's adapter
+    (`PrefillUnsupported`, fail-closed). Idempotent: the
+    `UNIQUE (proposal_id, patch_token, item_id)` constraint makes a repeated
+    dispatch of the same client-generated `patch_token` a no-op success.
+    """
+    from . import assistant_discussion
+
+    with get_conn() as conn:
+        proposal = get_proposal_row(conn, system_id, proposal_id)
+        if proposal is None:
+            raise NotFound(f"discussion proposal {proposal_id} not found")
+        all_items = _items_for(conn, proposal_id)
+        by_id = {item["id"]: item for item in all_items}
+        selected: List[Dict[str, Any]] = []
+        for item_id in item_ids:
+            item = by_id.get(item_id)
+            if item is None:
+                raise NotFound(f"proposal item {item_id} not found")
+            selected.append(item)
+
+    adapter = discussion_adapters.DISCUSSION_ADAPTERS.get(proposal["target_kind"])
+    if adapter is None or not adapter.ui_draft_forms:
+        raise PrefillUnsupported(
+            "prefill_unsupported",
+            f"target_kind={proposal['target_kind']!r} has no registered ui_draft_forms",
+        )
+    if not any(f.form_id == form_id for f in adapter.ui_draft_forms):
+        raise PrefillUnsupported(
+            "prefill_form_unregistered",
+            f"form_id={form_id!r} is not registered for target_kind={proposal['target_kind']!r}",
+        )
+
+    resolved = assistant_discussion.resolve_target(system_id, proposal["target_kind"], proposal["target_ref"])
+    for item in selected:
+        eligibility = evaluate_item_eligibility(proposal, item, all_items, resolved)
+        if eligibility != "appliable":
+            raise ApplyRejected(f"proposal_item_{eligibility}", item["id"])
+
+    now = time.time()
+    with get_conn() as conn:
+        for item in selected:
+            conn.execute(
+                """INSERT OR IGNORE INTO assistant_discussion_proposal_prefill
+                       (system_id, proposal_id, item_id, form_id, patch_token,
+                        decision_method, created_by, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'manual', ?, ?)""",
+                (system_id, proposal_id, item["id"], form_id, patch_token, actor, now),
+            )
+
+    detail = get_proposal_detail(system_id, proposal_id)
+    assert detail is not None
+    return detail, [item["id"] for item in selected]
 
 
 def reject_items(

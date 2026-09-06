@@ -46,6 +46,8 @@ from ..models import (
     AssistantDiscussionProposalApplyOut,
     AssistantDiscussionProposalApplyRequest,
     AssistantDiscussionProposalOut,
+    AssistantDiscussionProposalPrefillOut,
+    AssistantDiscussionProposalPrefillRequest,
     AssistantDiscussionProposalRejectOut,
     AssistantDiscussionProposalRejectRequest,
     AssistantDiscussionProposalsListOut,
@@ -463,6 +465,42 @@ def apply_discussion_proposal(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return AssistantDiscussionProposalApplyOut(
         proposal=_proposal_detail_out(detail), applied_item_ids=applied_ids,
+    )
+
+
+@router.post(
+    "/assistant/discussion-proposals/{proposal_id}/prefill",
+    response_model=AssistantDiscussionProposalPrefillOut,
+)
+def prefill_discussion_proposal(
+    proposal_id: int,
+    payload: AssistantDiscussionProposalPrefillRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> AssistantDiscussionProposalPrefillOut:
+    """§3.4: land selected proposal items into an unsaved Dashboard form as a
+    reviewable draft patch. Writes ONLY the audit row -- the item's own
+    `status` never changes here."""
+    try:
+        detail, prefilled_ids = assistant_discussion_proposal.prefill_items(
+            system_id, proposal_id, payload.item_ids,
+            form_id=payload.form_id, patch_token=payload.patch_token,
+            actor=_principal_actor(principal),
+        )
+    except assistant_discussion_proposal.ApplyRejected as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    except assistant_discussion_proposal.PrefillUnsupported as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    except assistant_discussion_proposal.NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except assistant_discussion_proposal.DiscussionProposalError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AssistantDiscussionProposalPrefillOut(
+        proposal=_proposal_detail_out(detail), prefilled_item_ids=prefilled_ids,
     )
 
 

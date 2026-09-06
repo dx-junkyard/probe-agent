@@ -6310,6 +6310,12 @@ class AssistantDiscussionProposalItemOut(BaseModel):
     decision_method: Literal["reasoning_llm", "manual"]
     created_at: float
     schema_version: str = "assistant-discussion-proposal-item-v1"
+    # Issue #446 (Epic #443 Phase 3), §3.4: the prefill AUDIT summary, kept
+    # deliberately separate from `status` above -- prefilling this item into
+    # an unsaved Dashboard form is intent, never completion, so `status`
+    # stays `proposed` no matter how many times this item was prefilled.
+    prefill_count: int = 0
+    last_prefilled_at: Optional[float] = None
 
 
 class AssistantDiscussionProposalOut(BaseModel):
@@ -6363,6 +6369,25 @@ class AssistantDiscussionProposalApplyOut(BaseModel):
 class AssistantDiscussionProposalRejectOut(BaseModel):
     proposal: AssistantDiscussionProposalOut
     rejected_item_ids: List[int] = Field(default_factory=list)
+
+
+# --- Discussion proposal prefill (Issue #446, Epic #443 Phase 3) -------------
+# docs/ai-discussion-adapter.md §3.4. `patch_token` is the client-generated
+# idempotency token that also backs the DB's own
+# `UNIQUE (proposal_id, patch_token, item_id)`.
+
+
+class AssistantDiscussionProposalPrefillRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_ids: List[int] = Field(..., min_length=1)
+    form_id: str = Field(..., min_length=1, max_length=200)
+    patch_token: str = Field(..., min_length=1, max_length=200)
+
+
+class AssistantDiscussionProposalPrefillOut(BaseModel):
+    proposal: AssistantDiscussionProposalOut
+    prefilled_item_ids: List[int] = Field(default_factory=list)
 
 
 # GitHub App publish workflow (Issue #216, sub-task 1): connection

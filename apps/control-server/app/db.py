@@ -431,6 +431,42 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_item_system
 
 CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_item_proposal
     ON assistant_discussion_proposal_item (proposal_id, id);
+
+-- assistant_discussion_proposal_prefill (Issue #446, Epic #443 Phase 3,
+-- docs/ai-discussion-adapter.md §3.4): the prefill AUDIT trail, deliberately
+-- separate from the item's own `status`. Prefilling a candidate into an
+-- unsaved Dashboard form is intent, never completion -- whether the
+-- developer went on to actually save the form is not a fact this layer can
+-- observe (#412's "recording is not promotion"), so a row here NEVER moves
+-- `assistant_discussion_proposal_item.status` off `proposed`. The
+-- `UNIQUE (proposal_id, patch_token, item_id)` constraint is what makes a
+-- repeated dispatch of the SAME client-generated patch idempotent -- a
+-- retried `POST .../prefill` with the same `patch_token` is a no-op success,
+-- never a duplicate row or a 500.
+CREATE TABLE IF NOT EXISTS assistant_discussion_proposal_prefill (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    proposal_id       INTEGER NOT NULL,
+    item_id           INTEGER NOT NULL,
+    form_id           TEXT NOT NULL,
+    patch_token       TEXT NOT NULL,
+    -- Always 'manual': prefilling is a developer action dispatched from the
+    -- Proposal review UI, never something a reasoning model or another
+    -- system decides on its own.
+    decision_method   TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_id) REFERENCES assistant_discussion_proposal (id) ON DELETE CASCADE,
+    FOREIGN KEY (item_id) REFERENCES assistant_discussion_proposal_item (id) ON DELETE CASCADE,
+    UNIQUE (proposal_id, patch_token, item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_prefill_system
+    ON assistant_discussion_proposal_prefill (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_prefill_item
+    ON assistant_discussion_proposal_prefill (item_id, created_at DESC);
 """
 
 
