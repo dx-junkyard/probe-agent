@@ -60,6 +60,7 @@ Vision / Stakeholder Value
 | [System Interview Workflow UX](01-specifications/ux/system-interview-workflow-ux.md) | 状態駆動のインタビュー、情報階層、復旧フロー |
 | [System Understanding Navigation](01-specifications/ux/system-understanding-navigation.md) | 画面間導線、用語、次の操作、Overview projection |
 | [UI Glossary](01-specifications/ux/ui-glossary.md) | 利用者向けラベル、状態語、操作ラベル |
+| [共同検討UX](01-specifications/ux/decision-discussion-workflow.md) | Gapを起点にVision・UX・機能を照合し、仮説調査から設計へ還流する目標導線 |
 
 ### Core capabilities
 
@@ -93,6 +94,7 @@ canonical contract を確認する。
 | --- | --- |
 | [Purpose Chain Dogfooding](03-validation/dogfooding-purpose-chain.md) | Purpose Chain の理解度検証プロトコルと結果 |
 | [System Understanding Scenario](03-validation/dogfooding-system-understanding-scenario.md) | end-to-end 導線の再現可能な検証シナリオ |
+| [共同検討UXの検証・引継ぎ](03-validation/decision-discussion-handoff.md) | 操作Mock、Issue分担、実装時の検証シナリオと未検証範囲 |
 
 ## 04-operations — 運用ガイド
 
