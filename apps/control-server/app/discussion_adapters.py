@@ -40,7 +40,7 @@ NO top-level dependency on `assistant_discussion.py` or
 `assistant_discussion_proposal.py` -- it is a leaf. Those two modules import
 this one instead. The one place this module needs `assistant_discussion_
 proposal`'s `_apply_field` / `_apply_relation` (the field/relation applier
-dispatchers `apply_items` already calls directly and unchanged) is deferred
+dispatchers reached through the registered delegates) is deferred
 to CALL TIME via a local import inside `_delegate_apply_field` /
 `_delegate_apply_relation` -- by the time those run, both modules have long
 finished loading.
@@ -542,11 +542,11 @@ def _context_understanding_claim(conn: Any, system_id: int, target_ref: str) -> 
 
 
 # --- field/relation appliers: deferred-import delegates -----------------------
-# `apply_items` in `assistant_discussion_proposal.py` calls `_apply_field` /
-# `_apply_relation` directly and unchanged (they are big per-target_kind
-# dispatchers that keep living there, per docs/ai-discussion-adapter.md §1.1:
-# "Keep the existing `_apply_*` helper functions; the registry just names
-# which one handles which kind"). These two adapters exist so the registry
+# `apply_items` in `assistant_discussion_proposal.py` calls these registered
+# delegates after checking every selected item against the current registry.
+# The existing `_apply_*` helpers keep their domain-service dispatch logic;
+# the registry selects which handler is permitted for each kind. These
+# delegates ensure the registry
 # itself carries a non-`None` `field_applier`/`relation_applier` for every
 # kind that supports one -- the import of `assistant_discussion_proposal` is
 # deferred to CALL TIME specifically so this module never depends on it at

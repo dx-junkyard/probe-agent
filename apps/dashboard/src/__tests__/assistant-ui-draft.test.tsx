@@ -214,6 +214,28 @@ beforeEach(() => {
   voiceAdapterMocks.createBrowserVoiceAdapters.mockReturnValue(null);
 });
 
+test.each(["server", "in-flight"])("shows a draft recheck warning for %s changes", async (source) => {
+  mockGetForScreens("ux-design-studio");
+  let finish!: (value: ReturnType<typeof askResponse>) => void;
+  mockApi.post.mockImplementation((path: string) => {
+    if (path === "/assistant/discussion-threads") {
+      return Promise.resolve(threadDetail(11, "ux_journey", "jny-1", "ux-design-studio"));
+    }
+    if (path === "/assistant/ask") return new Promise((resolve) => { finish = resolve; });
+    return Promise.resolve(null);
+  });
+  await renderWithForm("/ux-design-studio?tab=journeys&journey=jny-1", <FakeJourneyForm journeyKey="jny-1" />);
+  await screen.findByText("jny-1 の話");
+  fireEvent.change(screen.getByTestId("assistant-question-input"), { target: { value: "下書きを確認" } });
+  fireEvent.click(screen.getByTestId("assistant-send"));
+  await waitFor(() => expect(finish).toBeDefined());
+  if (source === "in-flight") {
+    fireEvent.change(screen.getByTestId("fake-journey-title"), { target: { value: "changed draft" } });
+  }
+  finish(askResponse({ ui_draft_changed: source === "server", recheck_required: source === "server" }));
+  expect(await screen.findByTestId("assistant-recheck")).toHaveTextContent("下書きが変わっています");
+});
+
 describe("Issue #445 -- a mounted form's draft is sent with a text question about the same target", () => {
   test("ui_draft carries the registered field, formId, and target", async () => {
     mockGetForScreens("ux-design-studio");

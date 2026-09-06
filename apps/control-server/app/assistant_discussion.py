@@ -213,8 +213,17 @@ def recent_turns(conn, thread_id: int, limit: int = MAX_CONTEXT_TURNS) -> List[D
     `not_tracked` (§1.3): a stale/unresolvable thread's history is readable
     but never auto-inherited as current fact."""
     rows = conn.execute(
-        "SELECT * FROM assistant_discussion_turn WHERE thread_id = ? "
-        "ORDER BY turn_number DESC LIMIT ?",
+        # Neither an unsaved-draft question nor its assistant answer may
+        # become canonical conversation context on a later turn/proposal.
+        # Keep both rows available through the separate history-read path.
+        "SELECT t.* FROM assistant_discussion_turn t WHERE t.thread_id = ? "
+        "AND t.ui_draft_form_id IS NULL "
+        "AND NOT (t.role = 'assistant' AND EXISTS ("
+        "SELECT 1 FROM assistant_discussion_turn previous "
+        "WHERE previous.thread_id = t.thread_id AND previous.role = 'user' "
+        "AND previous.turn_number = t.turn_number - 1 "
+        "AND previous.ui_draft_form_id IS NOT NULL)) "
+        "ORDER BY t.turn_number DESC LIMIT ?",
         (thread_id, limit),
     ).fetchall()
     return [_turn_out(r) for r in reversed(rows)]

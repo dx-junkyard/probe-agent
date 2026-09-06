@@ -409,3 +409,10 @@ def test_purpose_need_widened_consistently_across_all_four_contracts():
             f"TRIGGERS={sorted(joint_understanding_triggers)}"
         )
     assert not mismatches, "\n".join(mismatches)
+
+
+def test_runtime_capability_vocabulary_matches_server_literal():
+    from app import discussion_adapters
+
+    server_types = _server_finite_types(SERVER_MODELS_PATH)
+    assert set(discussion_adapters.DISCUSSION_CAPABILITIES) == server_types["DiscussionCapability"]

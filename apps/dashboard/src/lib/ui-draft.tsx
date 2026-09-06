@@ -49,10 +49,11 @@ export interface UiDraftSnapshot {
   selectedItemRef: string;
   activeTab: string;
   comparisonTarget: string;
-  /** A client-side digest of THIS draft's content, compared turn-to-turn by
-   * the server to derive `ui_draft_changed` (§2.6). Any stable string that
+  /** A client-side change hint for THIS draft's content. The server derives
+   * its own content digest for `ui_draft_changed` (§2.6). Any stable string that
    * changes exactly when the content does is sufficient -- it is never
-   * cryptographic, only a change signal. */
+   * cryptographic, only a change signal. This source hint stays in memory;
+   * the registry replaces it with an opaque token before returning a read. */
   localRevisionToken: string;
 }
 
@@ -97,12 +98,29 @@ export function UiDraftProvider({ children }: { children: ReactNode }) {
           return () => {};
         }
         const key = registryKey(formId, targetRef);
-        registry.current.set(key, getDraft);
+        let previousSignature: string | undefined;
+        let token = "";
+        const readDraft = () => {
+          const snapshot = getDraft();
+          if (!snapshot) return null;
+          // Never send a form's source token: existing forms use their raw
+          // field JSON as a change hint, which can contain secrets and exceed
+          // the API token bound. Compare only in memory and send an opaque
+          // revision id, including dirty/validation/selection changes.
+          const signature = JSON.stringify(snapshot);
+          if (signature !== previousSignature) {
+            token = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+              (byte) => byte.toString(16).padStart(2, "0")).join("");
+            previousSignature = signature;
+          }
+          return { ...snapshot, localRevisionToken: token };
+        };
+        registry.current.set(key, readDraft);
         return () => {
           // Only clear the slot if it still belongs to THIS registration --
           // a fast remount (e.g. React StrictMode) can register the
           // replacement before the old cleanup runs.
-          if (registry.current.get(key) === getDraft) {
+          if (registry.current.get(key) === readDraft) {
             registry.current.delete(key);
           }
         };

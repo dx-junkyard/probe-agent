@@ -2012,6 +2012,13 @@ creating incomplete persistence or execution paths for later phases.
       `ui_draft_form_id` / `ui_draft_digest` の 3 列だけ。監査が答えるべきは
       「この回答は下書きを見ていたか」であって「下書きに何と書いてあったか」では
       ない。後者を保存すると、保存されていないはずの内容が DB に残る。
+      client の revision token も信用せず、server で draft 内容から導出した
+      一方向 digest だけを監査へ保存する。JSON 化したフォーム値を token と
+      呼び替えて保存しない。dirty / validation error は本文と別に redaction
+      して prompt へ渡し、canonical facts と混ぜない。
+      draft を渡した回答は引用・言い換えにも値を含みうるため、その場だけに表示し、
+      永続 assistant turn には固定の案内文だけを残す。過去の draft 参照 turn を
+      次の LLM context へ自動継承しない。
     - **prefill は保存ではなく、item status は保存結果ではない。** prefill は
       canonical row を 1 行も作らない。`assistant_discussion_proposal_prefill` が
       意図を記録し、item の `status` は `proposed` のまま (#412 の「記録は昇格では

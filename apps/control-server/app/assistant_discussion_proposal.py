@@ -508,14 +508,18 @@ def evaluate_item_eligibility(
     freshly re-resolved against the target's CURRENT canonical source --
     never the proposal's own captured baseline."""
     target_kind = proposal["target_kind"]
-    schema = PROPOSAL_TARGET_SCHEMA.get(target_kind, {"fields": (), "relations": ()})
+    adapter = discussion_adapters.get_adapter(target_kind)
+    if adapter is None:
+        return "forbidden"
     if item["item_kind"] == "field":
-        allowed = bool(item["field_name"]) and item["field_name"] in schema["fields"]
-    else:
-        allowed = bool(item["relation_kind"]) and item["relation_kind"] in schema["relations"]
+        allowed = adapter.field_applier is not None and item["field_name"] in adapter.fields
+    elif item["item_kind"] == "relation":
+        allowed = adapter.relation_applier is not None and item["relation_kind"] in adapter.relations
         if allowed and target_kind == "blueprint_lane_cell":
             lane_kind = proposal["target_ref"].rsplit("#", 1)[-1]
             allowed = item["relation_kind"] in _LANE_RELATION_COMPAT.get(lane_kind, ())
+    else:
+        allowed = False
     if not allowed:
         return "forbidden"
 
@@ -896,14 +900,17 @@ def apply_items(
         if eligibility != "appliable":
             raise ApplyRejected(f"proposal_item_{eligibility}", item["id"])
 
+    adapter = discussion_adapters.get_adapter(proposal["target_kind"])
     applied_ids: List[int] = []
     with get_conn() as conn:
         now = time.time()
         for item in selected:
             if item["item_kind"] == "field":
-                applied_ref = _apply_field(conn, system_id, proposal["target_kind"], proposal["target_ref"], item, actor, resolved)
+                assert adapter is not None and adapter.field_applier is not None
+                applied_ref = adapter.field_applier(conn, system_id, proposal["target_kind"], proposal["target_ref"], item, actor, resolved)
             else:
-                applied_ref = _apply_relation(conn, system_id, proposal["target_kind"], proposal["target_ref"], item, actor)
+                assert adapter is not None and adapter.relation_applier is not None
+                applied_ref = adapter.relation_applier(conn, system_id, proposal["target_kind"], proposal["target_ref"], item, actor)
             conn.execute(
                 """UPDATE assistant_discussion_proposal_item
                        SET status = 'applied', applied_ref = ?, decided_by = ?,

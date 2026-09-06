@@ -5916,7 +5916,7 @@ DiscussionTargetKind = Literal[
 # --- UiDraftContext (Issue #445, Epic #443 Phase 2) ---------------------------
 # docs/ai-discussion-adapter.md §2.2/§2.6/§2.7. A `ui_draft` is a client-only,
 # UNSAVED form snapshot -- it is never persisted (only its finite state, form
-# id, and a client-supplied digest are, on the USER turn -- see
+# id, and a server-derived content digest are, on the USER turn -- see
 # `assistant_discussion.append_turn`). All five states are reachable:
 # `unreadable` is carried by `UiDraftContextIn.readable`, which the Dashboard
 # registry sets when a mounted form's draft getter THROWS. Folding that into

@@ -1,5 +1,34 @@
 # AI Discussion UI Adapter (Epic #443) — canonical contract
 
+## 実装状況（2026-09-06 監査）
+
+本書は目標契約を含み、記載された機能がすべて実装済みという意味ではない。
+PR #450 の Phase 1 は旧9 target kind / 4画面の registry と契約 parity を実装した。
+監査では、Proposal apply が登録 handler を迂回する不具合と、step/lane の
+deep link が対象 identity を失う不具合を修正した。apply は現在の registry の
+allowlist と handler を全選択 item について検査してから、登録 handler を呼ぶ。
+未登録・handler 欠落時は canonical revision / relation / item status を変更しない。
+
+| 元 issue | 実装と残件 | 引き継ぎ先 |
+| --- | --- | --- |
+| #444 | registry / parity は実装。操作結果の3状態の伝搬は未実装 | #456 |
+| #445 | Phase 2 (`fea4fe1`) を統合。draft の保存防止・System分離・変更警告を修正。実フォームのvalidation診断連携が残る | #451 |
+| #446 | Proposal review UI / prefill / 保存との接続は未実装 | #452 |
+| #447 | 追加8 kind と live selection / context は未実装 | #453 |
+| #448 | nested item / Acceptance Criteria / Feature Proposal は未実装 | #454 |
+| #449 | 仮説の JU 昇格・還流と代表 E2E は未実装 | #455 |
+
+元 issue は実装完了と残件移管を区別して整理する。prefill、JU bridge
+は拡張用定義だけであり、代表 E2E や screen reader / narrow viewport の
+実利用検証が完了したとは扱わない。既存の backend direct apply は利用可能だが、
+フォームへの prefill ではない。Blueprint の表示選択・focus との接続も #452 で扱う。
+
+検証: server の registry / parity / thread / Proposal / Assistant / UI draft /
+DB lock / interview parity は119 passed、DB lock の3ケースはreasoning呼び出し前に
+fail-closedするためskip。Dashboardの関連7ファイルは62 passed。
+追加実装を取り込む前の既存JU関連5ファイルは106 passed。
+実LLM・音声機器・screen readerによるdogfoodingの完了証明ではない。
+
 本書は Epic #443 (sub-issues #444-#449) の正本契約である。この領域に触れる前に
 §0 を読むこと。上流の会話・Proposal・音声の契約は
 `docs/assistant-discussion.md` (Epic #436) が正本であり、本書はそれを**置き換え
@@ -85,7 +114,9 @@
 `app/discussion_adapters.py` はこの 6 つを 1 つの `DiscussionAdapter` へまとめ、
 `tests/test_discussion_adapter_registry.py` が
 「`DISCUSSION_TARGET_KINDS` のすべてに adapter がちょうど 1 つある」ことと
-「registry の外に per-kind 分岐が残っていない」ことを直接表明する。
+登録された target / scope / proposal schema の整合を直接表明する。
+既存の domain service を呼ぶ `_apply_*` の分岐は登録 handler の内側に残るが、
+適用可否と handler の選択は registry を経由する。
 
 ### 1.2 adapter identity
 
@@ -317,6 +348,9 @@ turn 開始時に draft snapshot を取り、その turn の `/assistant/ask` �
 snapshot で答える。途中でフォームが変わっても差し替えない (#436 §4 が音声で
 すでに確立した規律を、text にも同じ形で適用する)。text / voice で同じ contract
 を使う。
+応答時に client の現在の snapshot token とも照合し、turn 中の変更は再確認の
+案内を表示する。System / user 切替時はフォーム・registry・Assistantをまとめて
+再マウントし、同じtarget_refでも前のSystemの下書きを引き継がない。
 
 ### 2.6 有限状態
 
@@ -333,8 +367,8 @@ UiDraftState = "not_provided"        -- client が送らなかった
 `not_provided` へ畳むと、「フォームは開いているが読めなかった」ときに
 「何も編集していない」と答えることになり、利用者が見ていない画面を説明する
 ことになる。client は登録済みフォームの getter が throw したときに
-`readable=false` を送る。応答は `ui_draft_state` と、直前 turn と `local_revision_token` が
-変わったかを示す `ui_draft_changed` を返す。`ui_draft_changed` が真なら
+`readable=false` を送る。応答は `ui_draft_state` と、直前 turn と server が導出した
+draft digest が変わったかを示す `ui_draft_changed` を返す。`ui_draft_changed` が真なら
 `recheck_required` も真になる — 前回の回答は、いまの下書きについてのものでは
 ない。
 
@@ -346,11 +380,27 @@ UiDraftState = "not_provided"        -- client が送らなかった
 | --- | --- |
 | `ui_draft_state` | §2.6 の有限値 |
 | `ui_draft_form_id` | どのフォームの下書きか |
-| `ui_draft_digest` | client の `local_revision_token` |
+| `ui_draft_digest` | server が draft 内容から導出した一方向 digest |
 
 **値そのものは保存しない** (#445 非目標)。監査が答えるべき問いは「この回答は
 未保存の下書きを見ていたか」であって、「その下書きに何と書いてあったか」では
 ない。後者を保存すると、保存されていないはずの内容が DB に残る。
+
+client の `local_revision_token` は非信頼入力であり、そのまま監査へ保存しない。
+フォーム値の JSON を token として送る client があっても、server が検証済み
+draft 内容から一方向 digest を作る。changed 判定もこの digest を比較する。
+対象・form・値・dirty・validation・readable・選択情報を digest に含め、
+captured timestamp と client token 自体は除外する。client は内容変更時だけ変わる
+短い opaque token を送り、フォーム値の JSON を送らない。
+LLM には field 値と別に dirty / validation error / readable を明示し、
+validation の自由文字列にも既存の redaction を適用する。
+
+draft を含む prompt への回答は値を引用・言い換えする可能性があるため、
+現在の応答としてのみ表示し、永続 assistant turn には固定の案内文を記録する。
+reload 後は監査情報と案内文を表示し、回答本文を復元しない。利用者自身が明示的に
+送った質問は通常どおり保存する。過去の draft 参照 turn は次の LLM context へ
+自動継承しない。これは digest 列だけを安全にしても回答本文から未保存値が
+永続化することを防ぐための境界である。
 
 `ui_draft_state` が `NULL` の行は **4 つ目の別の意味**である —「この server は
 それを記録できなかった」(#445 以前の行) であって `not_provided` (client が

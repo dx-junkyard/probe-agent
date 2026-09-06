@@ -54,6 +54,28 @@ function Probe({ onReady }: { onReady: (registry: ReturnType<typeof useUiDraftRe
 }
 
 describe("UiDraftProvider / useUiDraftSource registry", () => {
+  test("revision tokens are compact, opaque, stable, and track metadata changes", () => {
+    let registry: ReturnType<typeof useUiDraftRegistry> = null;
+    render(<UiDraftProvider><Probe onReady={(r) => { registry = r; }} /></UiDraftProvider>);
+    const draft = snapshot("private-secret-".repeat(250));
+    registry!.register("ux_journey.revision", "jny-1", () => draft);
+    const readToken = () => {
+      const result = registry!.read("ux_journey.revision", "jny-1");
+      if (result.outcome !== "readable") throw new Error("expected readable draft");
+      return result.snapshot.localRevisionToken;
+    };
+    const initial = readToken();
+    expect(initial).toMatch(/^[0-9a-f]{32}$/);
+    expect(initial).not.toContain("private-secret");
+    expect(readToken()).toBe(initial);
+    draft.fields[0].validationError = "required";
+    const invalid = readToken();
+    expect(invalid).not.toBe(initial);
+    expect(readToken()).toBe(invalid);
+    draft.fields[0].dirty = false;
+    expect(readToken()).not.toBe(invalid);
+  });
+
   test("a mounted source is readable by (formId, targetRef)", () => {
     let registry: ReturnType<typeof useUiDraftRegistry> = null;
     render(
@@ -63,7 +85,7 @@ describe("UiDraftProvider / useUiDraftSource registry", () => {
       </UiDraftProvider>,
     );
     expect(registry!.read("ux_journey.revision", "jny-1")).toEqual({
-      outcome: "readable", snapshot: snapshot("hello"),
+      outcome: "readable", snapshot: { ...snapshot("hello"), localRevisionToken: expect.stringMatching(/^[0-9a-f]{32}$/) },
     });
   });
 
@@ -94,11 +116,11 @@ describe("UiDraftProvider / useUiDraftSource registry", () => {
       </UiDraftProvider>,
     );
     expect(registry!.read("ux_journey.revision", "jny-1")).toEqual({
-      outcome: "readable", snapshot: snapshot("first"),
+      outcome: "readable", snapshot: { ...snapshot("first"), localRevisionToken: expect.stringMatching(/^[0-9a-f]{32}$/) },
     });
     act(() => setValue!("second"));
     expect(registry!.read("ux_journey.revision", "jny-1")).toEqual({
-      outcome: "readable", snapshot: snapshot("second"),
+      outcome: "readable", snapshot: { ...snapshot("second"), localRevisionToken: expect.stringMatching(/^[0-9a-f]{32}$/) },
     });
   });
 

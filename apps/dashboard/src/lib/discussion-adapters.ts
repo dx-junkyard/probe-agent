@@ -220,8 +220,12 @@ const uxJourneyStepAdapter: DashboardDiscussionAdapter = {
     sysKey("ux-journeys"),
     [...sysKey("ux-journey"), journeyKeyOf(targetRef)],
   ],
-  deepLink: (targetRef) =>
-    `/ux-design-studio?tab=journeys&journey=${encodeURIComponent(journeyKeyOf(targetRef))}`,
+  deepLink: (targetRef) => {
+    const parts = targetRef.split("#");
+    if (parts.length !== 2 || parts.some((part) => !part)) return null;
+    const [journey, step] = parts;
+    return `/ux-design-studio?tab=journeys&journey=${encodeURIComponent(journey)}&step=${encodeURIComponent(step)}`;
+  },
 };
 
 const uxRequirementAdapter: DashboardDiscussionAdapter = {
@@ -304,7 +308,12 @@ const blueprintLaneCellAdapter: DashboardDiscussionAdapter = {
       [...sysKey("journey-blueprint-diff"), journeyKey],
     ];
   },
-  deepLink: (targetRef) => `/journey-blueprint?journey=${encodeURIComponent(journeyKeyOf(targetRef))}`,
+  deepLink: (targetRef) => {
+    const parts = targetRef.split("#");
+    if (parts.length !== 3 || parts.some((part) => !part)) return null;
+    const [journey, step, lane] = parts;
+    return `/journey-blueprint?journey=${encodeURIComponent(journey)}&step=${encodeURIComponent(step)}&lane=${encodeURIComponent(lane)}`;
+  },
 };
 
 /** §1.4/§1.5's registry: exactly one adapter per `DiscussionTargetKind`.
