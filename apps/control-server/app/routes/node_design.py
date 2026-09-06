@@ -3,7 +3,7 @@ evaluation contracts, and the Phase 3 handoff
 (Issue #397, Phase 2 of the evolution control plane Epic #394).
 
 The domain layer is `app/node_design.py`; the canonical contract is
-`docs/evolutionary-pipeline.md`. Two boundary rules are load-bearing here:
+`docs/01-specifications/capabilities/evolutionary-pipeline.md`. Two boundary rules are load-bearing here:
 
 - **The decomposition endpoint reads, closes the connection, calls the model,
   then reopens to persist.** Holding `get_conn()` across an LLM round trip

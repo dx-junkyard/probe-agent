@@ -1,6 +1,6 @@
 """Tests for Issue #445 (Epic #443 Phase 2): UiDraftContext.
 
-`docs/ai-discussion-adapter.md` §2 is the canonical contract. Acceptance
+`docs/01-specifications/capabilities/ai-discussion-adapter.md` §2 is the canonical contract. Acceptance
 criteria under test:
 
 1. canonical facts and the UI draft are distinguishable in the LLM payload
@@ -177,6 +177,8 @@ def test_ui_draft_is_top_level_not_inside_screen_data(admin_client, monkeypatch)
     context = payload["context"]
     assert "ui_draft" in context
     assert context["ui_draft"]["fields"] == {"title": "draft title"}
+    assert context["ui_draft"]["field_metadata"] == {"title": {"dirty": True, "validation_error": ""}}
+    assert context["ui_draft"]["readable"] is True
     # Never nested inside screen_data, however screen_data itself is shaped.
     screen_data = context.get("screen_data") or {}
     assert "ui_draft" not in screen_data
@@ -448,12 +450,14 @@ def test_ui_draft_secret_shaped_value_is_redacted_before_the_llm_call(admin_clie
         admin_client, headers, thread_id=thread_id,
         ui_draft=_ui_draft(
             target_kind="ux_journey", target_ref="journey-1",
-            fields=[{"field_name": "summary", "value": f"key={secret}", "dirty": True, "validation_error": ""}],
+            fields=[{"field_name": "summary", "value": f"key={secret}", "dirty": True, "validation_error": f"Invalid key: {secret}"}],
         ),
     )
     sent = json.dumps(fake.calls[0])
     assert secret not in sent
     assert "REDACTED_SECRET" in sent
+    assert "validation_error" in sent
+    assert "Invalid key:" in sent
 
 
 # --- 4. no draft VALUES are ever persisted -----------------------------------
@@ -473,6 +477,7 @@ def test_no_ui_draft_values_are_persisted(admin_client):
         ui_draft=_ui_draft(
             target_kind="ux_journey", target_ref="journey-1",
             fields=[{"field_name": "title", "value": distinctive_value, "dirty": True, "validation_error": ""}],
+            local_revision_token=json.dumps({"title": distinctive_value}),
         ),
     )
     with get_conn() as conn:
@@ -487,7 +492,8 @@ def test_no_ui_draft_values_are_persisted(admin_client):
     user_turn = next(r for r in rows if r["role"] == "user")
     assert user_turn["ui_draft_state"] == "applied"
     assert user_turn["ui_draft_form_id"] == "ux_journey.revision"
-    assert user_turn["ui_draft_digest"] == "token-1"
+    assert len(user_turn["ui_draft_digest"]) == 64
+    assert all(c in "0123456789abcdef" for c in user_turn["ui_draft_digest"])
     assistant_turn = next(r for r in rows if r["role"] == "assistant")
     # §2.7: recorded on the USER turn only.
     assert assistant_turn["ui_draft_state"] is None
@@ -496,7 +502,7 @@ def test_no_ui_draft_values_are_persisted(admin_client):
 # --- 5. ui_draft_changed / recheck_required ----------------------------------
 
 
-def test_ui_draft_changed_true_across_two_turns_with_different_tokens(admin_client):
+def test_ui_draft_changed_uses_content_not_client_revision_token(admin_client):
     token = _login(admin_client)
     system = _create_system(admin_client, token)
     headers = _headers(token, system["id"])
@@ -510,14 +516,14 @@ def test_ui_draft_changed_true_across_two_turns_with_different_tokens(admin_clie
 
     second = _ask(
         admin_client, headers, thread_id=thread_id,
-        ui_draft=_ui_draft(target_kind="ux_journey", target_ref="journey-1", local_revision_token="token-b"),
+        ui_draft=_ui_draft(target_kind="ux_journey", target_ref="journey-1", local_revision_token="token-a", fields=[{"field_name": "title", "value": "changed draft", "dirty": True}]),
     )
     assert second["ui_draft_changed"] is True
     assert second["recheck_required"] is True
 
     third_same_token = _ask(
         admin_client, headers, thread_id=thread_id,
-        ui_draft=_ui_draft(target_kind="ux_journey", target_ref="journey-1", local_revision_token="token-b"),
+        ui_draft=_ui_draft(target_kind="ux_journey", target_ref="journey-1", local_revision_token="different-token", captured_at=1_800_000_000.0, fields=[{"field_name": "title", "value": "changed draft", "dirty": True}]),
     )
     assert third_same_token["ui_draft_changed"] is False
 
@@ -614,3 +620,54 @@ def test_solution_design_ui_draft_form_matches_registered_fields(admin_client):
         ),
     )
     assert result["ui_draft_state"] == "applied"
+
+
+def test_draft_derived_answers_are_ephemeral_and_not_inherited(admin_client, monkeypatch):
+    from app.db import get_conn
+    from app import assistant_discussion
+
+    token = _login(admin_client)
+    system = _create_system(admin_client, token)
+    headers = _headers(token, system["id"])
+    thread_id = _make_journey_thread(admin_client, headers)
+    draft_value = "unsaved-private-plan-71829"
+    secret = "AKIA" + "B" * 16
+    question = "この下書きの説明をお願いします"
+
+    class EchoClient(_CapturingClient):
+        def generate_text(self, messages, **kwargs):
+            self.calls.append(messages)
+            return json.dumps({"answer": f"{draft_value} / {secret}", "suggested_actions": [], "citations": []})
+
+    fake = EchoClient()
+    _enable_real_llm(monkeypatch, fake)
+    answer = _ask(
+        admin_client, headers, thread_id=thread_id, question=question,
+        ui_draft=_ui_draft(
+            target_kind="ux_journey", target_ref="journey-1",
+            fields=[{"field_name": "title", "value": f"{draft_value} {secret}", "dirty": True}],
+            local_revision_token=f"{draft_value} {secret}",
+        ),
+    )
+    assert draft_value in answer["answer"]  # available in the live response
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM assistant_discussion_turn").fetchall()]
+        assert assistant_discussion.recent_turns(conn, thread_id) == []
+    persisted = json.dumps(rows, ensure_ascii=False)
+    assert draft_value not in persisted
+    assert secret not in persisted
+    assert question in persisted  # explicit manual question remains in readable history
+    assert "回答本文は履歴に残していません" in persisted
+
+    # An old server may have already saved an answer derived from a draft.
+    # Provenance filtering must cover those existing rows too, not just the
+    # new placeholder text, including the proposal-generation history path.
+    with get_conn() as conn:
+        conn.execute("UPDATE assistant_discussion_turn SET content = ? WHERE thread_id = ? AND role = 'assistant'",
+                     (draft_value, thread_id))
+        assert assistant_discussion.recent_turns(conn, thread_id) == []
+    _ask(admin_client, headers, thread_id=thread_id, question="保存済みの内容を説明してください")
+    inherited = json.dumps(fake.calls[-1], ensure_ascii=False)
+    assert draft_value not in inherited
+    assert question not in inherited
+    assert "回答本文は履歴に残していません" not in inherited

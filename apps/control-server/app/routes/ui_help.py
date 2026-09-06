@@ -6,7 +6,7 @@
 
 `app/ui_help_registry.py` の static registry を verbatim に返すだけで、
 LLM は一切呼ばない。応答は常に `registry_version` と
-`decision_method: "deterministic"` を含む (`docs/assistant-discussion.md`
+`decision_method: "deterministic"` を含む (`docs/01-specifications/capabilities/assistant-discussion.md`
 §3)。
 
 probe-agent:

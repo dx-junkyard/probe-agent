@@ -1,8 +1,37 @@
 # AI Discussion UI Adapter (Epic #443) — canonical contract
 
+## 実装状況（2026-09-06 監査）
+
+本書は目標契約を含み、記載された機能がすべて実装済みという意味ではない。
+PR #450 の Phase 1 は旧9 target kind / 4画面の registry と契約 parity を実装した。
+監査では、Proposal apply が登録 handler を迂回する不具合と、step/lane の
+deep link が対象 identity を失う不具合を修正した。apply は現在の registry の
+allowlist と handler を全選択 item について検査してから、登録 handler を呼ぶ。
+未登録・handler 欠落時は canonical revision / relation / item status を変更しない。
+
+| 元 issue | 実装と残件 | 引き継ぎ先 |
+| --- | --- | --- |
+| #444 | registry / parity は実装。操作結果の3状態と、実行handlerに基づくprefill capabilityの判定は未実装 | #456 |
+| #445 | Phase 2 (`fea4fe1`) を統合。draft の保存防止・System分離・変更警告を修正。実フォームのvalidation診断連携が残る | #451 |
+| #446 | Proposal review UI / prefill / 保存との接続は未実装 | #452 |
+| #447 | 追加8 kind と live selection / context は未実装 | #453 |
+| #448 | nested item / Acceptance Criteria / Feature Proposal は未実装 | #454 |
+| #449 | 仮説の JU 昇格・還流と代表 E2E は未実装 | #455 |
+
+元 issue は実装完了と残件移管を区別して整理する。prefill、JU bridge
+は拡張用定義だけであり、代表 E2E や screen reader / narrow viewport の
+実利用検証が完了したとは扱わない。既存の backend direct apply は利用可能だが、
+フォームへの prefill ではない。Blueprint の表示選択・focus との接続も #452 で扱う。
+
+検証: server の registry / parity / thread / Proposal / Assistant / UI draft /
+DB lock / interview parity は119 passed、DB lock の3ケースはreasoning呼び出し前に
+fail-closedするためskip。Dashboardの関連7ファイルは62 passed。
+追加実装を取り込む前の既存JU関連5ファイルは106 passed。
+実LLM・音声機器・screen readerによるdogfoodingの完了証明ではない。
+
 本書は Epic #443 (sub-issues #444-#449) の正本契約である。この領域に触れる前に
 §0 を読むこと。上流の会話・Proposal・音声の契約は
-`docs/assistant-discussion.md` (Epic #436) が正本であり、本書はそれを**置き換え
+`docs/01-specifications/capabilities/assistant-discussion.md` (Epic #436) が正本であり、本書はそれを**置き換え
 ない**。#436 が「1 つの対象について会話し、変更候補を作り、適用する」を定義した
 のに対し、#443 は次の 3 つだけを足す。
 
@@ -19,7 +48,7 @@
 
 ## §0 境界 — 後から変えるときに必ず守ること
 
-`docs/assistant-discussion.md` §0 の境界はすべてそのまま有効である。本 Epic が
+`docs/01-specifications/capabilities/assistant-discussion.md` §0 の境界はすべてそのまま有効である。本 Epic が
 足す境界は次のとおり。
 
 - **adapter は UI state の読み書き境界であって、domain rule を所有しない。**
@@ -85,7 +114,9 @@
 `app/discussion_adapters.py` はこの 6 つを 1 つの `DiscussionAdapter` へまとめ、
 `tests/test_discussion_adapter_registry.py` が
 「`DISCUSSION_TARGET_KINDS` のすべてに adapter がちょうど 1 つある」ことと
-「registry の外に per-kind 分岐が残っていない」ことを直接表明する。
+登録された target / scope / proposal schema の整合を直接表明する。
+既存の domain service を呼ぶ `_apply_*` の分岐は登録 handler の内側に残るが、
+適用可否と handler の選択は registry を経由する。
 
 ### 1.2 adapter identity
 
@@ -119,8 +150,13 @@ capability は adapter が実際に持つ登録内容から**導出**する。�
 | `read_ui_draft` | `ui_draft_forms` が空でない |
 | `propose_fields` | `fields` が空でない、または `children` が空でない |
 | `propose_relations` | `relations` が空でない |
-| `prefill_form` | `ui_draft_forms` が空でなく、かつ `propose_fields` か `propose_relations` |
+| `prefill_form` | `ui_draft_forms` が空でなく、提案可能で、対象フォームの反映handler・配送・結果応答が実装されている |
 | `promote_joint_understanding` | `joint_understanding_bridge` が真 |
+
+`prefill_form` の上記条件は目標契約である。2026-09-06現在の実装はform定義と提案schemaだけで
+導出しており、実行可能性を保証しない。#456で実装済みhandlerの登録を条件に加え、#452で
+接続を検証する。対象が対応済みでも一時的に配送できなければ操作結果は `unavailable`。
+未対応と一時失敗を同一のcapability booleanへ畳まない。
 
 ### 1.4 server 側 `DiscussionAdapter`
 
@@ -317,6 +353,9 @@ turn 開始時に draft snapshot を取り、その turn の `/assistant/ask` �
 snapshot で答える。途中でフォームが変わっても差し替えない (#436 §4 が音声で
 すでに確立した規律を、text にも同じ形で適用する)。text / voice で同じ contract
 を使う。
+応答時に client の現在の snapshot token とも照合し、turn 中の変更は再確認の
+案内を表示する。System / user 切替時はフォーム・registry・Assistantをまとめて
+再マウントし、同じtarget_refでも前のSystemの下書きを引き継がない。
 
 ### 2.6 有限状態
 
@@ -333,8 +372,8 @@ UiDraftState = "not_provided"        -- client が送らなかった
 `not_provided` へ畳むと、「フォームは開いているが読めなかった」ときに
 「何も編集していない」と答えることになり、利用者が見ていない画面を説明する
 ことになる。client は登録済みフォームの getter が throw したときに
-`readable=false` を送る。応答は `ui_draft_state` と、直前 turn と `local_revision_token` が
-変わったかを示す `ui_draft_changed` を返す。`ui_draft_changed` が真なら
+`readable=false` を送る。応答は `ui_draft_state` と、直前 turn と server が導出した
+draft digest が変わったかを示す `ui_draft_changed` を返す。`ui_draft_changed` が真なら
 `recheck_required` も真になる — 前回の回答は、いまの下書きについてのものでは
 ない。
 
@@ -346,11 +385,27 @@ UiDraftState = "not_provided"        -- client が送らなかった
 | --- | --- |
 | `ui_draft_state` | §2.6 の有限値 |
 | `ui_draft_form_id` | どのフォームの下書きか |
-| `ui_draft_digest` | client の `local_revision_token` |
+| `ui_draft_digest` | server が draft 内容から導出した一方向 digest |
 
 **値そのものは保存しない** (#445 非目標)。監査が答えるべき問いは「この回答は
 未保存の下書きを見ていたか」であって、「その下書きに何と書いてあったか」では
 ない。後者を保存すると、保存されていないはずの内容が DB に残る。
+
+client の `local_revision_token` は非信頼入力であり、そのまま監査へ保存しない。
+フォーム値の JSON を token として送る client があっても、server が検証済み
+draft 内容から一方向 digest を作る。changed 判定もこの digest を比較する。
+対象・form・値・dirty・validation・readable・選択情報を digest に含め、
+captured timestamp と client token 自体は除外する。client は内容変更時だけ変わる
+短い opaque token を送り、フォーム値の JSON を送らない。
+LLM には field 値と別に dirty / validation error / readable を明示し、
+validation の自由文字列にも既存の redaction を適用する。
+
+draft を含む prompt への回答は値を引用・言い換えする可能性があるため、
+現在の応答としてのみ表示し、永続 assistant turn には固定の案内文を記録する。
+reload 後は監査情報と案内文を表示し、回答本文を復元しない。利用者自身が明示的に
+送った質問は通常どおり保存する。過去の draft 参照 turn は次の LLM context へ
+自動継承しない。これは digest 列だけを安全にしても回答本文から未保存値が
+永続化することを防ぐための境界である。
 
 `ui_draft_state` が `NULL` の行は **4 つ目の別の意味**である —「この server は
 それを記録できなかった」(#445 以前の行) であって `not_provided` (client が
@@ -618,3 +673,105 @@ additive (新テーブルと NULL 許容列) で、旧行は
 `ui_draft_state = NULL` / `child_kind = ''` として読める — **旧行を「満たした」
 ことにはしない** (#337 の互換性規則)。ある Phase を戻す場合は、その Phase が
 足したテーブル・列・registry entry を使う UI を外せば、残りは動き続ける。
+
+---
+
+## §9 判断のための横断contextと確認範囲（目標契約）
+
+利用者の導線・状態・受入条件は[共同検討UX](../ux/decision-discussion-workflow.md)が所有する。
+本節は新規実装予定であり、既存の画面contextが既に横断調査できるという意味ではない。
+既存 `/assistant/ask` に渡すcontextを拡張し、別の汎用チャットAPIや理解モデルを作らない。
+
+### 9.1 Context bundle
+
+DD-CTX-01: serverは選択対象と既存canonical serviceを起点に、必要な上下流参照を取得する。
+Overviewでは画面の `objective` projectionも文脈へ含める。登録されたrelation resolverだけを
+使い、名前一致による結合、別System探索、LLMが指定した任意SQL・URL・ファイル読出しは禁止する。
+
+目標wire shape（未実装。Python / TS / JSON Schemaを実装issueで同時に追加）:
+
+```text
+discussion_context {
+  schema_version, bundle_digest,
+  root: {target_kind, target_ref, revision_id, digest},
+  snapshot: {id, commit_sha},
+  sections: [{
+    section_id,
+    operation_state: available | unsupported | unavailable | not_applicable,
+    facts: [...],
+    coverage: {
+      returned_count, total_count: integer | null,
+      completeness: complete | partial | unknown,
+      stop_reason: complete | item_budget | byte_budget | depth_budget | provider_error | unsupported | not_applicable,
+      continuation: opaque_token | null
+    }
+  }],
+  sources: [{source_id, target_kind, target_ref, revision_id, digest,
+             snapshot_id, freshness, deep_link, deep_link_state}],
+  dependencies: [{target_kind, target_ref, digest}],
+  next_action: {kind, target, enabled, reason}
+}
+```
+
+factsは一時的な正本の読取結果。参照・digestを監査に持ち、正本本文を新テーブルへ複製しない。
+`operation_state` は取得処理の成否、`freshness` は正本resolverの状態であり、別軸。
+取得成功でも古い証拠はあり得る。取得失敗時の `total_count=null` は0件を意味しない。
+未対応・対象外は対応する終了理由を返し、完全取得と偽らない。
+
+DD-CTX-02: 初期budgetは関連方向ごと深さ2、section最大50件、全体200件・UTF-8 JSON 64KiB。
+selected rootを優先し、登録relation順・stable key順で再現可能に探索し、cycleはidentityで打ち切る。
+巨大rootも無制限に通さず本文詳細を参照に置換してpartialとする。暗黙切捨ては禁止する。
+budget値はversion付きserver設定とし、UIで独自上限を再計算しない。
+
+DD-CTX-03: 「関連情報を追加確認」は、server発行のcontinuationで未取得範囲を限定して取得する。
+cursorはSystem、root、snapshot、bundleの前提、relation範囲にbindし、有効期限を持つ。
+未知・改ざん・別Systemは拒否、premise変更は409相当の再確認。再取得も予算内で行う。
+初期リリースは利用者の明示操作のみ。Agentの自律的な無制限探索は非目標。
+
+API案は `POST /assistant/discussion-threads/{id}/context-expansions`。
+入力は `bundle_digest` と `continuation`、返却は更新bundleとsectionごとの結果。
+既存askは未指定なら従来動作。追加contextを後続turnへ渡す際もthread/System/bundleをserverで再検証する。
+UIはレスポンス順序ではなく要求時のroot/bundleにbindし、遅延した別対象の応答を表示しない。
+必要な監査・短期bundle保持はcontext実装issueが所有し、期限とcleanup・互換性を定義する。
+LLM呼出しをDB connection内で行わない。
+
+### 9.2 ギャップの読み違いを防ぐ
+
+DD-CTX-04: 出力では次を区別する。既存Product Gapに新しいlifecycleやseverityを加えず、
+照合結果の解釈として参照元を添える。
+
+| 観察・解釈 | 言えること | 次の確認 |
+| --- | --- | --- |
+| relation未登録 | 正本に関連付けがない | 対象の対応関係を確認 |
+| evidence不足 | 実現を裏付ける証拠が不足 | コード・テスト・観測を調査 |
+| 実装不足の仮説 | 確認範囲では必要な動作が見つからない | 競合説明と反証条件を置く |
+| unavailable / 省略 | その範囲を確認できていない | 再取得・範囲の追加確認 |
+| 期待との矛盾 | どの期待とどの観察が食い違うか | premiseと再現条件を確認 |
+
+取得結果だけで機能不存在を確定しない。未知と対象外も区別する。構造的な未登録は決定的に導出し、
+意味的な不足はAI解釈として `fact / inference / hypothesis / unknown / conflict` と根拠参照で返す。
+source IDを許可集合で照合し、存在しない引用がある重要claimは再生成または明示失敗とする。
+引用を落として根拠のない断言を成功扱いしない。最低一つのsourceと、確認範囲・時点を照合結果に付ける。
+
+### 9.3 複数正本の更新
+
+DD-CTX-05: rootだけでなく回答に使った各dependency digestをbundleに固定する。
+読出し時点が揃わない場合は再確認を要求し、整合したsnapshotだと偽らない。
+根拠側の更新でもProposal生成・JU昇格・prefill前に再検証する。旧turnは履歴として保持するが
+最新の事実として自動継承しない。JU側のpremise verdictを再定義しない。
+引用先は正本のdeep linkを使い、削除・権限・stale時の理由を表示する。
+
+## §10 横断導線の接続境界（目標契約）
+
+既存§3/5/6の型、保存責務、gateを変えず、[共同検討UX](../ux/decision-discussion-workflow.md)へ
+接続する。統合層が保持するのは起点target、thread/proposal/JU/保存revisionの参照のみ。
+独立した「総合進捗」DBやAIによるGap解消処理を追加しない。
+
+DD-INT-01: prefill結果の成功、対象formの受領、domain保存成功は別々に表示する。
+フォーム未mount・配送失敗は成功扱いしない。保存応答不明時はdomain側の結果を照合してから再試行。
+既存§3.4のitem statusは変更せず、保存先revisionへの参照で実際の保存を説明する。
+永続的な保存参照が必要なら#452がadditiveな監査拡張・System隔離・冪等性を所有する。
+
+DD-INT-02: 旧clientは新しいcontext/参照を送らなくても既存の機能を利用できる。
+新clientは未対応serverに架空の成功を返さず、利用可能な既存画面への移動を示す。
+新経路を無効化しても既存thread、Proposal direct apply、JUの履歴はそのまま読める。

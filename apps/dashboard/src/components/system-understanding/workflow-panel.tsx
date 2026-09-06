@@ -1,6 +1,6 @@
 // Issue #349: 状態駆動ワークフローの現在地 (R1) と例外表示 (R5)。
 //
-// docs/system-interview-workflow-ux.md の実装。表示状態・主操作・例外は
+// docs/01-specifications/ux/system-interview-workflow-ux.md の実装。表示状態・主操作・例外は
 // すべてサーバー (GET /interview/workflow-state) が決定した値であり、
 // このファイルは「決まったものを描く」だけである。クライアント限定状態
 // (タブ選択・mutation の isPending) から状態を導出してはならない (原則 P9)。

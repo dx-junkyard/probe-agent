@@ -2,7 +2,7 @@
 Value Exchange persistence (Issue #420) plus reference resolution, staleness
 propagation, and the Exchange lineage projection (Issue #421), Epic #418.
 
-`docs/stakeholder-value-network.md` is the canonical contract; §1-§6, §10,
+`docs/01-specifications/product/stakeholder-value-network.md` is the canonical contract; §1-§6, §10,
 §14 are Issue #420's specification and §4-§5.1 are Issue #421's. This is a
 deterministic domain service -- **no LLM call anywhere in this module**
 (invariant 9). Every public function here takes an already-open `conn` and

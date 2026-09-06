@@ -1,7 +1,7 @@
 """UiDraftContext validation and LLM-payload preparation (Issue #445, Epic
 #443 Phase 2).
 
-`docs/ai-discussion-adapter.md` §2 is the canonical contract. This module is
+`docs/01-specifications/capabilities/ai-discussion-adapter.md` §2 is the canonical contract. This module is
 the SINGLE place that decides whether an incoming `UiDraftContextIn`
 (`app/models.py`) may reach the LLM context pack, and in what shape. It does
 NOT live in `routes/assistant.py` (per the phase instructions) because the
@@ -24,6 +24,9 @@ Three things this module explicitly does NOT do, on purpose:
 """
 
 from __future__ import annotations
+
+import hashlib
+import json
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -165,8 +168,21 @@ def validate_and_prepare_ui_draft(
         payload=payload,
         sources=[{"id": source_id, "title": f"未保存の下書き: {ui_draft.form_id}"}],
         form_id=ui_draft.form_id,
-        digest=ui_draft.local_revision_token,
+        digest=_draft_content_digest(ui_draft),
     )
+
+
+def _draft_content_digest(ui_draft: UiDraftContextIn) -> str:
+    """Persist a one-way digest, never the untrusted client revision token.
+
+    A caller may put literal draft values or credentials in that token.
+    Change detection uses the actual bounded snapshot, excluding capture
+    time and the caller's token so recapturing unchanged content is stable.
+    """
+    content = ui_draft.model_dump(exclude={"captured_at", "local_revision_token"})
+    content["fields"] = sorted(content["fields"], key=lambda field: field["field_name"])
+    canonical = json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _build_redacted_payload(ui_draft: UiDraftContextIn) -> Dict[str, Any]:
@@ -190,6 +206,11 @@ def _build_redacted_payload(ui_draft: UiDraftContextIn) -> Dict[str, Any]:
     return {
         "form_id": ui_draft.form_id,
         "fields": redacted_fields,
+        "field_metadata": {
+            f.field_name: {"dirty": f.dirty, "validation_error": _redact_meta(f.validation_error)}
+            for f in ui_draft.fields
+        },
+        "readable": ui_draft.readable,
         "selected_item_ref": _redact_meta(ui_draft.selected_item_ref),
         "active_tab": _redact_meta(ui_draft.active_tab),
         "comparison_target": _redact_meta(ui_draft.comparison_target),
@@ -198,9 +219,9 @@ def _build_redacted_payload(ui_draft: UiDraftContextIn) -> Dict[str, Any]:
 
 
 def compute_ui_draft_changed(
-    conn: Any, *, thread_id: int, form_id: str, local_revision_token: str
+    conn: Any, *, thread_id: int, form_id: str, draft_digest: str
 ) -> bool:
-    """§2.6: `true` when `local_revision_token` differs from the most recent
+    """§2.6: `true` when the prepared server content digest differs from the most recent
     PRIOR USER turn's stored `ui_draft_digest` for the SAME `form_id` on this
     thread. Deliberately derived at read time on every call rather than
     stored (the same discipline #337/#338/#349 apply to every other derived
@@ -211,7 +232,7 @@ def compute_ui_draft_changed(
     thread/form) is `False`, not `True`: there is nothing to have changed
     FROM.
     """
-    if not form_id or not local_revision_token:
+    if not form_id or not draft_digest:
         return False
     row = conn.execute(
         "SELECT ui_draft_digest FROM assistant_discussion_turn "
@@ -221,4 +242,4 @@ def compute_ui_draft_changed(
     ).fetchone()
     if row is None or row["ui_draft_digest"] is None:
         return False
-    return row["ui_draft_digest"] != local_revision_token
+    return row["ui_draft_digest"] != draft_digest

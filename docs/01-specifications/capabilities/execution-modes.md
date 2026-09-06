@@ -35,8 +35,8 @@ Parent epic: #394(進化型パイプライン制御基盤)
 
 ### 0.3 上位関係
 
-`CLAUDE.md` の Core Design Principles、`docs/evolutionary-pipeline.md` の
-ADR-1〜ADR-9、`docs/purpose-chain.md`、`docs/ux-design-lineage.md` が引き続き
+`CLAUDE.md` の Core Design Principles、`docs/01-specifications/capabilities/evolutionary-pipeline.md` の
+ADR-1〜ADR-9、`docs/01-specifications/product/purpose-chain.md`、`docs/01-specifications/ux/ux-design-lineage.md` が引き続き
 正本である。この文書はそれらと矛盾しない。矛盾して見える箇所があれば #412 の
 側が誤りであり、既存の安全境界を優先する。
 

@@ -794,7 +794,7 @@ GET /solution-designs/{design_key}/handoff -> SolutionDesignHandoffOut
 
 Dashboard のみ。**新しい endpoint を追加せず、server の判定を再導出しない。**
 
-> 用語注意: 既存の `docs/project-intelligence.md` 「Issue #397 — Phase 2:
+> 用語注意: 既存の `docs/90-history/project-intelligence.md` 「Issue #397 — Phase 2:
 > Design Studio」は Evolution Node の設計層を指す。#409 の画面は
 > **UX Design Studio**(`/ux-design-studio`)と呼び、#397 の概念と混同しない。
 

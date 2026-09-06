@@ -570,7 +570,7 @@ def assistant_ask(
                 conn,
                 thread_id=thread_row["id"],
                 form_id=resolved_draft.form_id,
-                local_revision_token=resolved_draft.digest,
+                draft_digest=resolved_draft.digest,
             )
 
     report = run_system_diagnostics(system_id)
@@ -715,7 +715,12 @@ def assistant_ask(
                     system_id=system_id,
                     thread_id=thread_row["id"],
                     role="assistant",
-                    content=result.answer,
+                    # Draft-derived answers may quote unsaved values. Return
+                    # the live answer, but persist only a neutral history marker.
+                    content=(
+                        "未保存の下書きを参照した回答です。下書きの内容を保存しないため、回答本文は履歴に残していません。"
+                        if resolved_draft.payload is not None else result.answer
+                    ),
                     citations=citations_payload,
                     target_revision_id=resolved.revision_id,
                     target_digest=resolved.digest,

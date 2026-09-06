@@ -1,6 +1,6 @@
 # probe-agent Dogfooding: Purpose Chain 理解度検証プロトコル
 
-`docs/purpose-chain.md` §4.5 で定義された検証手順。Epic #387 の核心的な問いは
+`docs/01-specifications/product/purpose-chain.md` §4.5 で定義された検証手順。Epic #387 の核心的な問いは
 「Overview を見た開発者が、実装を見ずに『対象者と現在の課題』『望ましい変化』
 『システムの介入』を言えるか」であり、これはコードレビューでは検証できない
 (「動いている」ことと「伝わっている」ことは別の事実)。この文書は、その検証を
@@ -36,7 +36,7 @@ Purpose Frame カード(`data-testid="overview-purpose-frame"`)と、
 その下に続く System Brief 以下の各カード。
 
 被験者は **実装内容を知らない開発者** であること。実装者本人、このコード
-レビューに関わった者、`docs/purpose-chain.md` を読んだ者は被験者にできない
+レビューに関わった者、`docs/01-specifications/product/purpose-chain.md` を読んだ者は被験者にできない
 (質問の答えを知っている状態でのセッションは検証にならない)。
 
 対象システムは probe-agent 自身でよいが、Vision / System Purpose /
@@ -181,7 +181,7 @@ Q1〜Q4 の文言はいずれも Purpose Frame ブロックから読み取った
 Intent Brief / 変更セット / 明示適用 が初見では分からない、`Snapshot` /
 `replayable` などの英語の技術用語に説明がない、`観測済み component 0 / 0` の
 直後に「カバレッジは算出していません」と書かれていて 0/0 の意味が取れない。
-`docs/ui-glossary.md` の用語契約に関わる既存画面の課題であり、Purpose Chain
+`docs/01-specifications/ux/ui-glossary.md` の用語契約に関わる既存画面の課題であり、Purpose Chain
 の情報設計とは別に扱う。
 
 ### 4.1 合否基準に達しなかった場合の対応
@@ -196,5 +196,5 @@ Intent Brief / 変更セット / 明示適用 が初見では分からない、`
 - Purpose Frame カードが System Brief より上に来ているという配置そのもの
   (§3.1 の契約)
 
-いずれの修正も `docs/purpose-chain.md` の §0/§3 の不変条件(サーバー側の
+いずれの修正も `docs/01-specifications/product/purpose-chain.md` の §0/§3 の不変条件(サーバー側の
 判定をクライアントで再導出しない、有限集合のみ、等)を破らない範囲で行う。

@@ -1,6 +1,6 @@
 // Issue #423 (Epic #418): the Journey Service Blueprint screen.
 //
-// `docs/stakeholder-value-network.md` §8/§9.4. Dashboard-only rendering of
+// `docs/01-specifications/product/stakeholder-value-network.md` §8/§9.4. Dashboard-only rendering of
 // `GET /journey-blueprint` / `GET /journey-blueprint/diff` -- the server
 // decides every lane state, staleness, and diff entry; this page and
 // `components/journey-blueprint/*` never re-derive any of them (§0

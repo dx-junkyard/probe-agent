@@ -44,7 +44,7 @@ services:
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       # Local dev: a plain host path is fine (no Compose secret needed).
       # docker-compose.prod.yml fixes this to a Compose secret path instead
-      # (Issue #224) -- see the comment there and docs/github-app-deployment.md.
+      # (Issue #224) -- see the comment there and docs/04-operations/github-app-deployment.md.
       GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
       GITHUB_PUBLISH_ENABLED: ${GITHUB_PUBLISH_ENABLED:-false}
       GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-}

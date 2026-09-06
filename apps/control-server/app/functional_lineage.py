@@ -1,6 +1,6 @@
 """Functional Lineage View + Gap / Impact Overlay (Issue #424, Epic #418).
 
-`docs/stakeholder-value-network.md` §9 is the canonical contract for
+`docs/01-specifications/product/stakeholder-value-network.md` §9 is the canonical contract for
 `GET /functional-lineage`. Read-only, deterministic, **no LLM call anywhere
 in this module** (invariant 9); it writes nothing (#382's rule). It COMPOSES
 the three existing canonical modules rather than re-deriving anything they

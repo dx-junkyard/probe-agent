@@ -44,11 +44,11 @@ Issue #395 の非目標をそのまま踏襲する。
 
 ### 0.3 上位関係
 
-`CLAUDE.md` の Core Design Principles と `docs/project-intelligence.md` の
+`CLAUDE.md` の Core Design Principles と `docs/90-history/project-intelligence.md` の
 既存の Issue ごとの設計判断が引き続き正本である。この文書はそれらに矛盾する
 決定をしない——矛盾するように見える箇所があれば、それは #394 が誤りである
 ことを意味し、この文書の記述ではなく既存の安全境界の方を優先する(§9)。
-`docs/purpose-chain.md` と `docs/system-understanding-ideal-state.md` の
+`docs/01-specifications/product/purpose-chain.md` と `docs/00-product/system-understanding-ideal-state.md` の
 「新しい理解モデルを作らない」という規律は、Evolution Node にも同じ強さで
 適用される(ADR-1)。
 
@@ -617,11 +617,11 @@ projection/adapter を追加する)/ `migrate`(データそのものを新しい
 
 | doc | 現在の役割 | 分類 | 移行先 | 互換期間 | rollback | 検証方法 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `docs/project-intelligence.md` | 全 Issue の実装判断の正本ログ | `keep_canonical`(この PR で Epic #394 節を追記するのみ) | — | 無期限 | 該当なし | 既存節が無変更であることの diff レビュー |
-| `docs/purpose-chain.md` | Purpose Chain の設計契約(#387〜#391) | `keep_canonical` | Phase 2 から参照 | 無期限 | 該当なし | 内容無変更 |
-| `docs/system-interview-workflow-ux.md` | System Interview の状態モデル契約(#342/#349) | `keep_canonical` | user phase 軸の参照先として維持 | 無期限 | 該当なし | 内容無変更 |
-| `docs/system-understanding-ideal-state.md` | System Understanding の理想状態(#327) | `keep_canonical` | 変更なし | 無期限 | 該当なし | 内容無変更 |
-| `docs/evolutionary-pipeline.md`(この文書) | Evolution Node の canonical doctrine | 新設 | — | — | — | この文書自体の受け入れ条件(Issue #395) |
+| `docs/90-history/project-intelligence.md` | 全 Issue の時系列な設計・実装判断ログ | `keep_historical`（新しい現行仕様は本書など該当 contract に置く） | — | 無期限 | 該当なし | 既存節が無変更であることの diff レビュー |
+| `docs/01-specifications/product/purpose-chain.md` | Purpose Chain の設計契約(#387〜#391) | `keep_canonical` | Phase 2 から参照 | 無期限 | 該当なし | 内容無変更 |
+| `docs/01-specifications/ux/system-interview-workflow-ux.md` | System Interview の状態モデル契約(#342/#349) | `keep_canonical` | user phase 軸の参照先として維持 | 無期限 | 該当なし | 内容無変更 |
+| `docs/00-product/system-understanding-ideal-state.md` | System Understanding の理想状態(#327) | `keep_canonical` | 変更なし | 無期限 | 該当なし | 内容無変更 |
+| `docs/01-specifications/capabilities/evolutionary-pipeline.md`(この文書) | Evolution Node の canonical doctrine | 新設 | — | — | — | この文書自体の受け入れ条件(Issue #395) |
 
 ---
 
@@ -903,7 +903,7 @@ Dashboard 上で独立したフィールドとして表示され、1 つのバ�
   まま(Principle 7)。ADR-9 は Evolution Node の maturity 遷移にも
   同じ規律を課す。
 - **SDK の非侵入性**: non-blocking、bounded capture、redaction
-  (CLAUDE.md Principle 9、`docs/secret-redaction.md`)。Evolution Node
+  (CLAUDE.md Principle 9、`docs/01-specifications/platform/secret-redaction.md`)。Evolution Node
   は SDK のトレース収集・redaction ロジックを一切変更しない(§6.1 の
   `components`/`traces` 行は `keep_canonical`)。
 - **隔離 worktree・network-off sandbox**: Instrumentation・source
@@ -945,7 +945,7 @@ ADR-7/ADR-5 が禁じている「早すぎる合成」を設計レベルで先�
 この文書は Phase 0 で凍結された設計契約であり、ADR-1〜9 と §1〜§10 の
 内容は変更しない。ただし Phase 1〜5(#396〜#400)の実装が §6/§8 の
 文字通りの記述と異なった点を、正本の側から追認する。実装判断の詳細は
-`docs/project-intelligence.md` の Issue #396〜#400 節と検証ラウンド節が
+`docs/90-history/project-intelligence.md` の Issue #396〜#400 節と検証ラウンド節が
 正本である。
 
 - **モジュール名**: §6.2/§6.4 が仮置きした `routes/evolution.py` は
@@ -961,11 +961,11 @@ ADR-7/ADR-5 が禁じている「早すぎる合成」を設計レベルで先�
   実装では maturity / improvement_status / policy_mode の 3 フィールド +
   user phase 軸の**意図的な欠落**として実現された。理由は #380 の
   「読み取りが書き込んではならない」規則(`evaluate_session_workflow`
-  は checkpoint を永続化する)。`docs/project-intelligence.md` #396 節に
+  は checkpoint を永続化する)。`docs/90-history/project-intelligence.md` #396 節に
   記録済み。
 - **検証ラウンド(2026-08-17)**: Phase 0〜5 の実装を本文書・各 Issue
   受け入れ条件に対して照合し、ADR-2(未承認 Probe Point リンクの拒否)、
   ADR-4(承認の原子性)、ADR-9(provenance の偽装不能性、固定化ゲートの
   迂回不能性)、§6.1 の「完了済み run のみを引用する」等の実装漏れを
-  修正した。一覧は `docs/project-intelligence.md` の「Epic #394 検証
+  修正した。一覧は `docs/90-history/project-intelligence.md` の「Epic #394 検証
   ラウンド」節。

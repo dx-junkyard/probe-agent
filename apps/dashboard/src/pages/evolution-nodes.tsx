@@ -38,7 +38,7 @@ import type {
 
 // Canonical state names stay in English (they are the server's vocabulary and
 // appear in the API, the event log and the docs); the Japanese gloss is what
-// the developer reads. Following docs/ui-glossary.md's 初出のみ併記 rule, both
+// the developer reads. Following docs/01-specifications/ux/ui-glossary.md's 初出のみ併記 rule, both
 // are shown wherever the state is the subject of the line.
 const MATURITY_LABEL: Record<EvolutionMaturityState, string> = {
   exploring: "探索中",

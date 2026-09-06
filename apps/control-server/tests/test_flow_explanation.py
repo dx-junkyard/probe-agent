@@ -1,6 +1,6 @@
 """Tests for Epic #412 Issue #414: the read-only Flow explanation projection.
 
-Canonical contract: `docs/execution-modes.md` §6, test requirements §9.2.
+Canonical contract: `docs/01-specifications/capabilities/execution-modes.md` §6, test requirements §9.2.
 What must hold:
 
 1. Purpose -> Capability -> Flow -> Node -> evidence is reachable in BOTH

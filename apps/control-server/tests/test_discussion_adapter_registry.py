@@ -1,6 +1,6 @@
 """Tests for the `DiscussionAdapter` registry (Issue #444, Epic #443 Phase 1).
 
-`docs/ai-discussion-adapter.md` §1 is the canonical contract. This is the
+`docs/01-specifications/capabilities/ai-discussion-adapter.md` §1 is the canonical contract. This is the
 test that proves the Phase 1 move -- six parallel per-kind tables collapsed
 into one `app/discussion_adapters.py` registry -- did not change behaviour
 by one bit: `SCOPE_TARGET_KINDS` and `PROPOSAL_TARGET_SCHEMA` are now DERIVED
@@ -276,7 +276,7 @@ def test_unregistered_target_kind_is_refused_fail_closed():
 
 def test_screen_mismatch_is_refused_fail_closed(admin_client):
     # `ux_journey_step` lives on ux-design-studio / journey-blueprint
-    # (docs/ai-discussion-adapter.md §1.4) -- "overview" must be refused
+    # (docs/01-specifications/capabilities/ai-discussion-adapter.md §1.4) -- "overview" must be refused
     # rather than silently accepted. Needs the DB fixture because the gate
     # deliberately sits on the CREATE branch, after the existing-thread
     # lookup (see the next test).
@@ -357,7 +357,7 @@ def test_screen_kind_is_reachable_from_all_4_discussion_screens():
 
 
 def test_shared_kinds_are_reachable_from_both_their_screens():
-    # docs/ai-discussion-adapter.md §1.4's verification note: `ux_journey`
+    # docs/01-specifications/capabilities/ai-discussion-adapter.md §1.4's verification note: `ux_journey`
     # and `ux_journey_step` are reachable from BOTH ux-design-studio and
     # journey-blueprint.
     for kind in ("ux_journey", "ux_journey_step"):

@@ -5914,9 +5914,9 @@ DiscussionTargetKind = Literal[
 ]
 
 # --- UiDraftContext (Issue #445, Epic #443 Phase 2) ---------------------------
-# docs/ai-discussion-adapter.md §2.2/§2.6/§2.7. A `ui_draft` is a client-only,
+# docs/01-specifications/capabilities/ai-discussion-adapter.md §2.2/§2.6/§2.7. A `ui_draft` is a client-only,
 # UNSAVED form snapshot -- it is never persisted (only its finite state, form
-# id, and a client-supplied digest are, on the USER turn -- see
+# id, and a server-derived content digest are, on the USER turn -- see
 # `assistant_discussion.append_turn`). All five states are reachable:
 # `unreadable` is carried by `UiDraftContextIn.readable`, which the Dashboard
 # registry sets when a mounted form's draft getter THROWS. Folding that into
@@ -6181,7 +6181,7 @@ class AssistantCitationOut(BaseModel):
     # "ui_draft" added by Issue #445 (Epic #443 Phase 2) -- also update the
     # citation shape line inside `assistant._SYSTEM_PROMPT` and the matching
     # `_RawCitation.type` pattern in `assistant.py`; these are the two places
-    # docs/ai-discussion-adapter.md §2.4 warns must move together, or the
+    # docs/01-specifications/capabilities/ai-discussion-adapter.md §2.4 warns must move together, or the
     # model's `ui_draft` citations get silently dropped by one of them.
     type: Literal[
         "setting", "diagnostic_check", "pipeline_step", "state_item",
@@ -6193,7 +6193,7 @@ class AssistantCitationOut(BaseModel):
 
 
 # --- Assistant discussion threads (Issue #438, Epic #436) --------------------
-# docs/assistant-discussion.md §1. Finite vocabularies mirror
+# docs/01-specifications/capabilities/assistant-discussion.md §1. Finite vocabularies mirror
 # app/assistant_discussion.py's module constants exactly.
 # `DiscussionScope` / `DiscussionTargetKind` themselves now live just above
 # `AssistantAskRequest` (Issue #445 needs them for `UiDraftContextIn` before
@@ -6201,7 +6201,7 @@ class AssistantCitationOut(BaseModel):
 
 DiscussionTargetState = Literal["current", "stale", "unresolvable", "not_tracked"]
 
-# docs/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived
+# docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived
 # from what a `DiscussionAdapter` actually declares (`app/discussion_adapters.
 # py`'s `capabilities_for`) -- never a stored column or a second constant.
 DiscussionCapability = Literal[
@@ -6280,7 +6280,7 @@ class AssistantDiscussionThreadsListOut(BaseModel):
 
 
 # --- Assistant discussion proposals (Issue #439, Epic #436) ------------------
-# docs/assistant-discussion.md §2. Finite vocabularies mirror
+# docs/01-specifications/capabilities/assistant-discussion.md §2. Finite vocabularies mirror
 # app/assistant_discussion_proposal.py's module constants exactly.
 
 DiscussionProposalItemKind = Literal["field", "relation"]
@@ -7139,7 +7139,7 @@ class CandidateEventsOut(BaseModel):
 # CellDefinitionContract) so FastAPI's own request validation enforces the
 # fail-closed unknown-field / enum / schema_version rules; these are only the
 # server-assigned "Out" projections (id, system_id, timestamps, audit
-# fields). See docs/project-intelligence.md's "Probe Cell Fabric(Issue
+# fields). See docs/90-history/project-intelligence.md's "Probe Cell Fabric(Issue
 # #297)" section.
 
 
@@ -7860,7 +7860,7 @@ class CellShadowDecideIn(BaseModel):
 
 # --- State-driven System Interview workflow (Issue #349) ---------------------
 #
-# Response/request contracts for docs/system-interview-workflow-ux.md. Every
+# Response/request contracts for docs/01-specifications/ux/system-interview-workflow-ux.md. Every
 # field is either a persisted fact or a value the canonical engine
 # (app/interview_workflow.py) derived from persisted facts -- the Dashboard
 # never re-derives a workflow state of its own (spec principle P9).
@@ -8455,7 +8455,7 @@ class OverviewOut(BaseModel):
 
 # --- Purpose Chain (Issue #387 Epic / #388) -----------------------------------
 #
-# docs/purpose-chain.md is the canonical design contract; §0 and §1 are the
+# docs/01-specifications/product/purpose-chain.md is the canonical design contract; §0 and §1 are the
 # specification this module implements. Two things §0 makes non-negotiable:
 #
 # 1. **No new understanding model.** `desired_change` IS
@@ -8656,7 +8656,7 @@ class PurposeRelationDecisionRequest(BaseModel):
 
 # --- Purpose Needs / adaptive next-question (Issue #389) ----------------------
 #
-# `docs/purpose-chain.md` §2 is the specification. A "need" is never "this
+# `docs/01-specifications/product/purpose-chain.md` §2 is the specification. A "need" is never "this
 # optional field is empty" -- every value below is derived deterministically
 # from the Purpose Chain projection (`app/purpose_needs.py`): an element that
 # is `unknown`, or a relation that is `unknown` / `conflicting` / `stale`.
@@ -8817,7 +8817,7 @@ class PurposeNeedResponseOut(BaseModel):
 
 # --- Purpose Verification / Experience-Outcome-Reuse (Issue #391) ------------
 #
-# `docs/purpose-chain.md` §4 is the specification. Three OPTIONAL concepts a
+# `docs/01-specifications/product/purpose-chain.md` §4 is the specification. Three OPTIONAL concepts a
 # developer may attach to a Purpose Chain element or relation, by the SAME
 # stable string identity `app/purpose_chain.py` already uses -- never a row
 # id, and never required for every System (§4.1: "全 System へ一律に要求しな
@@ -8835,7 +8835,7 @@ class PurposeNeedResponseOut(BaseModel):
 # (§4.2).
 
 #: `experience_hypothesis` and `reuse_hypothesis` share this exact lifecycle
-#: (`docs/purpose-chain.md` §4.1: "state は experience と同じ") -- one
+#: (`docs/01-specifications/product/purpose-chain.md` §4.1: "state は experience と同じ") -- one
 #: `Literal` for both, since defining it twice would let the two drift apart
 #: for no reason.  `retired` is a manual withdrawal (the developer decided
 #: the hypothesis was wrong or no longer relevant); it is NEVER a synonym for
@@ -9125,7 +9125,7 @@ class PurposeOutcomeUnavailableRequest(BaseModel):
 
 # ---------------------------------------------------------------------------
 # UX Design Lineage (Epic #405, Issues #407/#408). See
-# docs/ux-design-lineage.md for the full contract -- these `Literal` aliases
+# docs/01-specifications/ux/ux-design-lineage.md for the full contract -- these `Literal` aliases
 # and their `*Out`/`*Request` models are re-declared here (never imported
 # from `app/ux_design.py` / `app/solution_design.py`) for the same reason
 # `EvolutionMaturityState` and the Purpose Chain vocabularies are: FastAPI
@@ -9236,7 +9236,7 @@ UxRevisionState = Literal["current", "superseded"]
 #: projection's relations, or `understanding_capability_entity`'s current
 #: head. Exactly one canonical source per kind, resolved fresh at read time
 #: -- never a copy of the target's content (§1). Extended by Product
-#: Objective Lineage (docs/product-objective-lineage.md §7.1) with three
+#: Objective Lineage (docs/01-specifications/product/product-objective-lineage.md §7.1) with three
 #: more kinds -- `product_objective` / `product_milestone` / `product_gap` --
 #: via a one-time, structurally-detected, idempotent table-rebuild migration
 #: (`db._migrate_ux_journey_upstream_ref_kinds`) that widens the CHECK
@@ -9827,7 +9827,7 @@ class UxDesignDecisionCreateRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Solution Design (Epic #405, Issue #408). docs/ux-design-lineage.md §3.
+# Solution Design (Epic #405, Issue #408). docs/01-specifications/ux/ux-design-lineage.md §3.
 # ---------------------------------------------------------------------------
 
 
@@ -11334,7 +11334,7 @@ class NodeOperationsProjectionOut(BaseModel):
 # ---------------------------------------------------------------------------
 # Execution modes (Epic #412, Issue #413)
 #
-# Canonical contract: `docs/execution-modes.md`; the domain layer is
+# Canonical contract: `docs/01-specifications/capabilities/execution-modes.md`; the domain layer is
 # `app/execution_mode.py`, which mirrors every alias below with `get_args`.
 # The `Literal`s live here so FastAPI puts a real enum in the OpenAPI schema
 # instead of a bare string -- a Dashboard union then cannot silently drift
@@ -11888,7 +11888,7 @@ class FlowSubjectListOut(BaseModel):
 # Flow experiment orchestration (Epic #412, Issue #415)
 # ---------------------------------------------------------------------------
 #
-# Canonical contract: `docs/execution-modes.md` §7 (§8.4 for persistence, §9.3
+# Canonical contract: `docs/01-specifications/capabilities/execution-modes.md` §7 (§8.4 for persistence, §9.3
 # for the test requirements). The domain layer is `app/flow_orchestration.py`,
 # which mirrors every alias below with `get_args` -- so the API vocabulary and
 # the domain vocabulary can never disagree (the same shape #413's aliases use).
@@ -12287,7 +12287,7 @@ class FlowExperimentDraftOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stakeholder Value Network (Epic #418, Issue #420). docs/stakeholder-value-network.md
+# Stakeholder Value Network (Epic #418, Issue #420). docs/01-specifications/product/stakeholder-value-network.md
 # is the canonical contract; this section implements exactly its §1/§2. Every
 # write request model below is `ConfigDict(extra="forbid")` and omits
 # `created_by` / `decided_by` / `decision_method` / `authored_by_kind` --
@@ -13191,7 +13191,7 @@ class ValueNetworkOut(BaseModel):
 # === Epic #418 / Issue #423 — Journey Service Blueprint projection models ===
 # (Issue #423 owns everything below this marker.)
 #
-# `docs/stakeholder-value-network.md` §8 is the canonical contract. This
+# `docs/01-specifications/product/stakeholder-value-network.md` §8 is the canonical contract. This
 # module is read-only / deterministic / no-LLM (§0 invariant 9); every write
 # request model below is `ConfigDict(extra="forbid")` and omits `created_by`
 # / `decision_method` -- those come from the route and the authenticated
@@ -13526,7 +13526,7 @@ class FunctionalLineageOut(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Product Objective / Milestone / Gap (Epic #427, Issues #429-#432). See
-# docs/product-objective-lineage.md for the full contract -- these `Literal`
+# docs/01-specifications/product/product-objective-lineage.md for the full contract -- these `Literal`
 # aliases and their `*Out`/`*Request` models are re-declared here (never
 # imported from `app/product_objective.py` / `app/product_gap_sources.py` /
 # `app/product_feature.py`) for the same reason the UX Design Lineage and

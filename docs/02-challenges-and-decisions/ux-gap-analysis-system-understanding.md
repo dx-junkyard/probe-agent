@@ -100,7 +100,7 @@ pipeline 全 complete かつ purpose 未定義のとき `Define System Purpose`
   `SystemStateBanner` と ヘッダーの `DiagnosticsBadge`。
 
 前者は baseline 非対応、後者は対応、優先順位付けも別。docstring と
-`docs/system-understanding-navigation.md`（Issue #201 節）自身が
+`docs/01-specifications/ux/system-understanding-navigation.md`（Issue #201 節）自身が
 「将来 `system_state.py`（#193）へ統合する。本 issue ではしない」と明記しており、
 今回の症状はこの未統合の負債が表面化したもの。
 
@@ -118,7 +118,7 @@ pipeline 全 complete かつ purpose 未定義のとき `Define System Purpose`
 - ~~**`Generate capability hierarchy` Next Action の行き止まりリンク**~~
   【訂正】当初「Capability Map は閲覧専用で生成操作がない」と報告したが誤り。
   Capability Map には `Generate capability hierarchy` ボタンが実在する
-  （`capability-map.tsx:568, 615`、`docs/project-intelligence.md` にも記載）。
+  （`capability-map.tsx:568, 615`、`docs/90-history/project-intelligence.md` にも記載）。
   `link="/capability-map"` は機能する導線であり、行き止まりではない。
   checklist の step CTA（全体 Build）と Capability Map の個別生成という
   2 経路が併存する点は #206/#207 の一本化で扱う。
@@ -263,7 +263,7 @@ action_label、pipeline step / stage / gap の表示文言、成功サマリ）�
 ### 付随タスク
 
 - CLAUDE.md の「explicit mocks」記述の更新。**（対応済み。commit `7967ccb`）**
-- `docs/system-understanding-navigation.md` への状態モデル統合方針の追記。
+- `docs/01-specifications/ux/system-understanding-navigation.md` への状態モデル統合方針の追記。
 - §3 テスト不足シナリオの回帰テスト追加。
 
 ## 5. 提案する issue 分割

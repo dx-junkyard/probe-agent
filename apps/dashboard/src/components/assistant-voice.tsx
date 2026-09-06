@@ -2,7 +2,7 @@
 //
 // turn-based (発話 → 認識確定 → 応答 → OpenAI 音声 → 待機) を扱う。
 // WebSocket / VAD は対象外だが、再生中の明示的な「話を挟む」は、取得・再生を
-// cancel して次の STT turn を開始する (`docs/assistant-discussion.md` §4)。
+// cancel して次の STT turn を開始する (`docs/01-specifications/capabilities/assistant-discussion.md` §4)。
 //
 // このコンポーネント自身は「対象がどう決まるか」を一切知らない --
 // `captureTurnTarget` が turn 開始の瞬間に呼ばれ、その戻り値 (`Target`) が

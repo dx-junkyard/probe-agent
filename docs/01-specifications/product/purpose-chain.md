@@ -496,7 +496,7 @@ outcome criterion が measure / baseline / target / observation window をすべ
 
 ### 4.5 dogfooding
 
-`docs/dogfooding-purpose-chain.md` に、実装者以外の確認者へ Overview を提示し、
+`docs/03-validation/dogfooding-purpose-chain.md` に、実装者以外の確認者へ Overview を提示し、
 事前説明なしで 4 問 (対象者と課題 / 望ましい変化 / システムの介入 / 最重要 unknown)
 に答えてもらった結果を記録する。「viewport に入った」を「理解できた」の代替に
 しない。誤読・迷った要素・回答時間を残し、失敗したら情報階層を直して再試験する。

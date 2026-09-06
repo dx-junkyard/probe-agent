@@ -1,6 +1,6 @@
 """Objective Map / Gap Workbench projection routes (Issue #432, Epic #427).
 
-`docs/product-objective-lineage.md` §10/§3 is the routing contract: these
+`docs/01-specifications/product/product-objective-lineage.md` §10/§3 is the routing contract: these
 two GETs are declared as INDEPENDENT top-level paths, never nested under
 `/product-objectives/...` -- `GET /product-objectives/{objective_key}` is
 already registered with a path param and would swallow

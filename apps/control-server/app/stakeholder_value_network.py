@@ -1,6 +1,6 @@
 """Stakeholder Value Network projection (Issue #422, Epic #418).
 
-`docs/stakeholder-value-network.md` §7.1-§7.3 is the canonical contract for
+`docs/01-specifications/product/stakeholder-value-network.md` §7.1-§7.3 is the canonical contract for
 `GET /stakeholder-value-network`. Read-only, deterministic, **no LLM call
 anywhere in this module** (invariant 9); it writes nothing (#382's rule). It
 composes `app/stakeholder_network.py`'s existing public functions

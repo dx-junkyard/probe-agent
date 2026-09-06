@@ -203,6 +203,13 @@ function AnswerMessage({ result }: { result: AssistantAskOut }) {
   return (
     <div className="rounded-lg border bg-card p-3 space-y-2" data-testid="assistant-answer">
       <p className="text-sm whitespace-pre-wrap">{result.answer}</p>
+      {(result.ui_draft_changed || result.recheck_required) && (
+        <p role="status" className="text-sm text-amber-700" data-testid="assistant-recheck">
+          {result.ui_draft_changed
+            ? "下書きが変わっています。現在の内容を確認して、必要ならもう一度質問してください。"
+            : "回答の前提が変わっています。対象の最新内容を確認してください。"}
+        </p>
+      )}
       {usedUiDraft && (
         <p className="text-[11px] text-muted-foreground" data-testid="assistant-used-ui-draft">
           この回答は未保存の下書きも参照しました(保存はされていません)。
@@ -312,7 +319,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   // The element (if any) currently hovered/selected in help mode (#440) is
   // reused verbatim as the voice scope signal: an element target means "this
   // question is about that element", no target means "the whole screen"
-  // (docs/assistant-discussion.md §3/§4). `useHelpMode()` falls back to an
+  // (docs/01-specifications/capabilities/assistant-discussion.md §3/§4). `useHelpMode()` falls back to an
   // inert no-op context when no `HelpModeProvider` is mounted, so this is
   // safe on any screen.
   const helpMode = useHelpMode();
@@ -572,7 +579,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
       // The hovered/selected help-mode element (#440), when there is one, is
       // carried as an ordinary route param -- §4 deliberately does not add a
       // new `DiscussionTargetKind` for element-scoped voice questions (the
-      // finite set in docs/assistant-discussion.md §1.1 is closed), and the
+      // finite set in docs/01-specifications/capabilities/assistant-discussion.md §1.1 is closed), and the
       // server already accepts arbitrary route params for screen data
       // providers.
       const routeParams = voiceTurn?.helpId
@@ -602,6 +609,12 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           focused_state_id: focusedStateItem.state_id,
         } : {}),
       });
+      const currentDraft = captureUiDraft(uiDraftRegistry, turnThread);
+      if (uiDraft?.local_revision_token !== currentDraft?.local_revision_token ||
+          uiDraft?.readable !== currentDraft?.readable) {
+        result.ui_draft_changed = true;
+        result.recheck_required = true;
+      }
       appendMessages([{ role: "assistant", text: result.answer, result }]);
       // The answer re-pins the thread to the content it was actually
       // produced against, so a resolved recheck stops being advertised.

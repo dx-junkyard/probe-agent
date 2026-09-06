@@ -24,7 +24,7 @@ class IntelligenceRunType(str, Enum):
     # `assistant_discussion_thread`'s turns into a reviewable
     # `assistant_discussion_proposal`. It proposes only -- applying an item
     # always goes through the existing target domain service with
-    # `decision_method: manual` (docs/assistant-discussion.md §2).
+    # `decision_method: manual` (docs/01-specifications/capabilities/assistant-discussion.md §2).
     DISCUSSION_PROPOSAL = "discussion_proposal"
     ENTRYPOINT_INDEX = "entrypoint_index"
     EXPLANATION_REFRESH = "explanation_refresh"

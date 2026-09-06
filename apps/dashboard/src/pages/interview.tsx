@@ -1537,7 +1537,7 @@ export default function InterviewPage() {
   const updateUnderstanding = useUpdateInterviewUnderstanding();
   const confirmUnderstanding = useConfirmInterviewUnderstanding(selectedSessionId);
   // Issue #349: the canonical developer-facing state. The server evaluates
-  // docs/system-interview-workflow-ux.md §2.2 (13-row first-match rule table
+  // docs/01-specifications/ux/system-interview-workflow-ux.md §2.2 (13-row first-match rule table
   // + backward hold) over persisted facts only, and returns the state, its
   // single primary action, and the currently-active exceptions. This page
   // must not re-derive a workflow state from client-only values (a chosen

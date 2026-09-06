@@ -1,6 +1,6 @@
 """Flow / agent-group explanation projection (Epic #412, Issue #414).
 
-Canonical contract: `docs/execution-modes.md` §6 (plus §1.2, §2 and §9.2).
+Canonical contract: `docs/01-specifications/capabilities/execution-modes.md` §6 (plus §1.2, §2 and §9.2).
 This module is the ONLY authority for the aggregated explanation of a Flow;
 neither the Dashboard nor an LLM re-derives any of it.
 

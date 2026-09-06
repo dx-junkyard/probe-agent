@@ -20,7 +20,7 @@ export interface ComponentSummary {
 
 // Replay capture (Issue #242 Phase A / #243): deterministic, finite-set
 // classification of whether a trace's structured input capture can
-// mechanically restore the call inputs. See docs/project-intelligence.md's
+// mechanically restore the call inputs. See docs/90-history/project-intelligence.md's
 // Replay / Simulation section for the full reason-code semantics.
 export type Replayability = "replayable" | "partial" | "unreplayable";
 export type ReplayReason =
@@ -3698,7 +3698,7 @@ export type DiscussionTargetKind =
   | "blueprint_lane_cell";
 export type DiscussionTargetState = "current" | "stale" | "unresolvable" | "not_tracked";
 
-// docs/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived
 // server-side from what a DiscussionAdapter actually declares -- never a
 // stored column or a second constant.
 export type DiscussionCapability =
@@ -4946,7 +4946,7 @@ export interface JointUnderstandingRefluxResultOut {
 // --- State-driven System Interview workflow (Issue #349) ---------------------
 //
 // The canonical developer-facing workflow contract of
-// docs/system-interview-workflow-ux.md. The dashboard renders these values;
+// docs/01-specifications/ux/system-interview-workflow-ux.md. The dashboard renders these values;
 // it never re-derives a workflow state of its own (spec principle P9).
 
 export type InterviewWorkflowState =
@@ -5411,7 +5411,7 @@ export interface OverviewOut {
 
 // --- Purpose Chain (Issue #387 Epic / #388 / #390) --------------------------
 //
-// `docs/purpose-chain.md` is the canonical design contract; §0 and §1 are the
+// `docs/01-specifications/product/purpose-chain.md` is the canonical design contract; §0 and §1 are the
 // server specification this mirrors. Two rules carry over unchanged from the
 // server (`app/models.py`'s own comment) and bind the Dashboard too:
 //
@@ -5605,7 +5605,7 @@ export interface PurposeRelationDecisionRequest {
 
 // --- Issue #389 need/question contract --------------------------------------
 //
-// Pinned in `docs/purpose-chain.md` §2 and binding for both #389 (server) and
+// Pinned in `docs/01-specifications/product/purpose-chain.md` §2 and binding for both #389 (server) and
 // #390 (this Dashboard) regardless of implementation order -- #390's own
 // component tests mock `fetch` directly, so they do not depend on the server
 // module landing first. `app/purpose_needs.py` is the server-side owner.
@@ -5742,7 +5742,7 @@ export interface PurposeNeedRespondRequest {
 
 // --- Purpose Verification: Experience / Outcome / Reuse (Issue #391) --------
 //
-// `docs/purpose-chain.md` §4 is the specification. Three OPTIONAL concepts a
+// `docs/01-specifications/product/purpose-chain.md` §4 is the specification. Three OPTIONAL concepts a
 // developer may attach to a Purpose Chain element/relation, by the SAME
 // stable string identity (`target_kind`/`target_id`) #388 already uses --
 // never a row id. Creation is offered only alongside a currently-available
@@ -6114,7 +6114,7 @@ export interface EvolutionNodeTransitionOut {
 // --- UX Design Lineage (Epic #405, Issues #407/#408) --------------------------
 //
 // TypeScript mirror of app/models.py's "UX Design Lineage" section. See
-// docs/ux-design-lineage.md for the contract. Journey / Requirement /
+// docs/01-specifications/ux/ux-design-lineage.md for the contract. Journey / Requirement /
 // Solution Design are the two new PERSISTED design layers this Epic adds;
 // every derived axis (design_status, option_status, link_state, ...) is
 // computed server-side and rendered here, never recomputed by the
@@ -7386,7 +7386,7 @@ export interface FlowExperimentDecisionRequest {
 // === Epic #418 / Issue #422 — Stakeholder Value Network types ===
 // (Issue #422 owns everything between this marker and the #423 marker below.)
 //
-// `GET /stakeholder-value-network` (`docs/stakeholder-value-network.md`
+// `GET /stakeholder-value-network` (`docs/01-specifications/product/stakeholder-value-network.md`
 // §7.1). Read-only, deterministic, no LLM; the Dashboard renders this
 // exactly as returned and re-derives nothing (§0 invariant 9). No
 // coordinate/layout field exists on any type below (invariant 10), and no
@@ -7521,7 +7521,7 @@ export interface ValueNetworkOut {
 // === Epic #418 / Issue #423 — Journey Service Blueprint types ===
 // (Issue #423 owns everything below this marker.)
 //
-// `GET /journey-blueprint` (`docs/stakeholder-value-network.md` §8).
+// `GET /journey-blueprint` (`docs/01-specifications/product/stakeholder-value-network.md` §8).
 // Read-only, deterministic, no LLM; the Dashboard renders this exactly as
 // returned and re-derives nothing (§0 invariant 9). These types are
 // self-contained, mirroring the `ValueNetwork*` section above's own
@@ -7713,7 +7713,7 @@ export interface JourneyStepExchangeLinkCreateRequest {
 // === Epic #418 / Issue #424 — Functional Lineage View + Gap/Impact Overlay ===
 // (Issue #424 owns everything below this marker.)
 //
-// `GET /functional-lineage` (`docs/stakeholder-value-network.md` §9).
+// `GET /functional-lineage` (`docs/01-specifications/product/stakeholder-value-network.md` §9).
 // Read-only, deterministic, no LLM; the Dashboard renders this exactly as
 // returned and re-derives nothing (§0 invariant 9). No score, no
 // completeness percentage, no ranking field exists here, structurally.
@@ -7790,7 +7790,7 @@ export interface FunctionalLineageOut {
 }
 
 // --- Product Objective / Milestone / Gap (Epic #427, Issues #429-#432) -------
-// See docs/product-objective-lineage.md. Mirrors app/models.py's Product*
+// See docs/01-specifications/product/product-objective-lineage.md. Mirrors app/models.py's Product*
 // Literal aliases and *Out/*Request models field-for-field; kept in sync via
 // test_interview_type_parity.py's FINITE_TYPE_NAMES.
 

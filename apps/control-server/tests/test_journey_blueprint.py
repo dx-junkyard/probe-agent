@@ -1,6 +1,6 @@
 """Tests for Issue #423 -- Journey Service Blueprint projection (Epic #418).
 
-`docs/stakeholder-value-network.md` §8/§15 is the bar this file is
+`docs/01-specifications/product/stakeholder-value-network.md` §8/§15 is the bar this file is
 organized around:
 
 1. a deterministic blueprint built from a current Journey revision, with

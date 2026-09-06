@@ -67,7 +67,7 @@ shadow スレッドを join する。
 対象 repo は filesystem から直接読まず、特定 commit の tracked file を
 `git show` で読む。probe と source patch は対象 repo へ直接適用せず、一時
 worktree で baseline と比較する。詳細は
-[`project-intelligence.md`](project-intelligence.md) を参照。
+[`../../90-history/project-intelligence.md`](../../90-history/project-intelligence.md) を参照。
 
 決定的ルールは、少数の明示的な有限集合に閉じる分類・検証に限定する。
 Feature 抽出、code mapping、probe planning、experiment interpretation は

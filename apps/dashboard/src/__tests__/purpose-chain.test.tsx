@@ -5,7 +5,7 @@
 // Everything semantic is decided server-side (`GET /purpose-chain`,
 // `GET /purpose-chain/next-question`); these tests assert the Dashboard
 // renders the server's conclusions without losing, conflating, or silently
-// re-deciding any of them, and cover the 12 states `docs/purpose-chain.md`
+// re-deciding any of them, and cover the 12 states `docs/01-specifications/product/purpose-chain.md`
 // §3.3 lists.
 
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -279,7 +279,7 @@ describe("PurposeFrameCard (Overview Level 0, §3.1)", () => {
 
   // State 3: Vision confirmed, Purpose hypothesis (mixed confirmation)
   test("state 3: every element states BOTH its 確認状態 and its 出所, confirmed ones included", () => {
-    // Dogfooding finding (`docs/dogfooding-purpose-chain.md`): showing the
+    // Dogfooding finding (`docs/03-validation/dogfooding-purpose-chain.md`): showing the
     // badge only for unconfirmed elements expresses 「確認済み」 as the
     // ABSENCE of a badge, which a first-time reader cannot tell apart from
     // 「表示が出ていないだけ」 -- and with 出所 missing entirely they could not

@@ -1,7 +1,7 @@
 """Tests for Issue #438 (Epic #436): target-scoped assistant discussion
 thread persistence.
 
-`docs/assistant-discussion.md` §1 is the canonical contract. Acceptance
+`docs/01-specifications/capabilities/assistant-discussion.md` §1 is the canonical contract. Acceptance
 criteria under test:
 
 1. Requirement A/B and Journey Step A/B conversations never mix

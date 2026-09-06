@@ -686,7 +686,7 @@ class ContextPack:
     # Issue #445 (Epic #443 Phase 2): an unsaved UI form draft, kept in a
     # SEPARATE top-level slot from `screen_data` on purpose -- mixing it in
     # would make canonical facts and "a string nobody has saved yet"
-    # indistinguishable in the prompt (docs/ai-discussion-adapter.md §2.1/
+    # indistinguishable in the prompt (docs/01-specifications/capabilities/ai-discussion-adapter.md §2.1/
     # §2.4). Already redacted (Principle 9) by the time it reaches here --
     # see `app/ui_draft_context.py`.
     ui_draft: Optional[Dict[str, Any]] = None

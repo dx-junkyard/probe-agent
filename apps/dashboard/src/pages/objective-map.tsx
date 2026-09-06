@@ -1,5 +1,5 @@
 // Issue #432 (Epic #427): the Objective Map, with the Gap Workbench as its
-// second lane (`docs/product-objective-lineage.md` §9.4 -- "Gap Workbench は
+// second lane (`docs/01-specifications/product/product-objective-lineage.md` §9.4 -- "Gap Workbench は
 // 独立ページを作らない").
 //
 // This screen re-derives NOTHING: `objective_state` / `design_status` /

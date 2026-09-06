@@ -1,10 +1,10 @@
 # GitHub App 秘密鍵の配置とローテーション（Issue #224）
 
 GitHub App 公開ワークフロー（Issue #216、設計は
-[`docs/project-intelligence.md`](project-intelligence.md) の
+[`docs/90-history/project-intelligence.md`](../90-history/project-intelligence.md) の
 「GitHub App 公開ワークフロー（Issue #216）」参照）を有効にするための、
 GitHub App の登録から本番デプロイ（`docker-compose.prod.yml`、
-[`docs/deployment-https.md`](deployment-https.md) 参照）での秘密鍵の
+[`docs/04-operations/deployment-https.md`](deployment-https.md) 参照）での秘密鍵の
 配置・ローテーションまでの手順。
 
 ## GitHub App の登録
@@ -130,7 +130,7 @@ GitHub App は複数の秘密鍵を同時に有効な状態で保持できる（
 
 ## 関連ドキュメント
 
-- 本番 HTTPS デプロイ全体の手順: [`docs/deployment-https.md`](deployment-https.md)
+- 本番 HTTPS デプロイ全体の手順: [`docs/04-operations/deployment-https.md`](deployment-https.md)
 - GitHub App 公開ワークフローの設計・状態遷移:
-  [`docs/project-intelligence.md`](project-intelligence.md) の
+  [`docs/90-history/project-intelligence.md`](../90-history/project-intelligence.md) の
   「GitHub App 公開ワークフロー（Issue #216）」

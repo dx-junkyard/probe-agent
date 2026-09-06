@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 // Issue #349: 状態駆動ワークフローの表示規約テスト。
 //
-// docs/system-interview-workflow-ux.md の §3.1(情報役割)・§4.3(主操作)・
+// docs/01-specifications/ux/system-interview-workflow-ux.md の §3.1(情報役割)・§4.3(主操作)・
 // §5.1〜§5.3(例外の区分と表示規則)が、コンポーネント側で守られていること
 // を確認する。状態そのものの決定はサーバー(app/interview_workflow.py と
 // その pytest)側の責務で、ここではその結果の描き方だけを見る。

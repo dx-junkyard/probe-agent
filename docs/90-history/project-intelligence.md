@@ -1,4 +1,13 @@
-# Feature Intelligence / Experiment Workspace 設計
+# Feature Intelligence / Experiment Workspace — 設計・実装履歴
+
+> **文書の役割:** historical journal / legacy composite log
+> **状態:** historical（各セクションの記録時点における設計・実装情報）
+> **現行仕様の入口:** [`../README.md`](../README.md) と
+> [`../01-specifications/`](../01-specifications/)
+>
+> この文書は Issue ごとの設計判断、実装状態、レビュー修正を保存する。来歴を保つため
+> 維持するが、新しい横断仕様の正本は該当する `01-specifications/` の文書へ置く。
+> セクション内の「実装済み」「正本」という記述は、その記録時点の文脈で読むこと。
 
 ## 目的
 
@@ -86,7 +95,7 @@ Dashboard ではこの配下から検出されたGit Repositoryを選択する�
 - `ProbePlan` / `ProbePoint`: 観測理由、mode、副作用リスク、承認状態
 - `ExperimentSummary` / `ExperimentVariant`: baseline、variant、metrics、状態
 
-JSON Schema は [`shared/schemas/project_intelligence.schema.json`](../shared/schemas/project_intelligence.schema.json)
+JSON Schema は [`shared/schemas/project_intelligence.schema.json`](../../shared/schemas/project_intelligence.schema.json)
 を参照する。
 
 ## 実装状態
@@ -102,7 +111,7 @@ System Understanding パイプラインが実装されている（Issues #77–#
 - Metadata coverage: symbol/entrypoint 単位のメタデータ付与率
 - Cross-page navigation: System Understanding ↔ Capability Map ↔ Feature Map ↔ Flow Explorer
 - Source-authored `probe-agent:` metadata による dogfooding（15 ファイル）
-- 詳細は [`docs/system-understanding-navigation.md`](system-understanding-navigation.md) を参照
+- 詳細は [`docs/01-specifications/ux/system-understanding-navigation.md`](../01-specifications/ux/system-understanding-navigation.md) を参照
 
 ## 実装フェーズ
 
@@ -801,7 +810,7 @@ diff/PRフローは別issueのスコープであり、#62 のCapability Mapペ�
   worktree materialize は対象外。
 
 合わせた proposal ペイロードの共有スキーマは
-[`shared/schemas/project_intelligence.schema.json`](../shared/schemas/project_intelligence.schema.json)
+[`shared/schemas/project_intelligence.schema.json`](../../shared/schemas/project_intelligence.schema.json)
 の `InterviewCombinedProposal` / `InterviewProposal` / `InterviewSession` などを参照。
 
 ## インタビュー用コンテキストパック（Issue #68）
@@ -837,7 +846,7 @@ Decision Workspace の #36（Context Pack Builder）と同じ位置づけ。pin 
 - エンドポイント: `GET /interview/sessions/{id}/context-pack?budget=60000`。
 - 共有スキーマ: `InterviewContextPack` / `InterviewSymbolItem` / `InterviewEntrypointItem`
   / `InterviewEvidenceLocation`
-  （[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
+  （[shared/schemas/project_intelligence.schema.json](../../shared/schemas/project_intelligence.schema.json)）。
 
 ## インタビューの構造化 Q&A（Issue #129）
 
@@ -897,7 +906,7 @@ dedupe)、`open_questions` JSON のエントリに `qa_id` を付与する。ま
 自動再生成・自動無効化。
 
 共有スキーマ: `InterviewQA` / `InterviewQaEvidenceRef` / `InterviewQaAnswerOut`
-（[shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json)）。
+（[shared/schemas/project_intelligence.schema.json](../../shared/schemas/project_intelligence.schema.json)）。
 
 ## Q&A パネル回答の理解レビューへの還流とゲート拡張(Issue #263)
 
@@ -1073,7 +1082,7 @@ deterministic。読んだスニペットは raw fact として保存され、LLM
 
 共有スキーマ: `UnderstandingRevision` / `UnderstandingRevisionList` /
 `UnderstandingDiff` / `UnderstandingDiffSection` / `UnderstandingDiffConfidenceChange`
-([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+([shared/schemas/project_intelligence.schema.json](../../shared/schemas/project_intelligence.schema.json))。
 
 ## Runtime Reality Check（Issue #135）
 
@@ -1132,7 +1141,7 @@ probe_value / state_effects / recommended_mode)と、同じ component_id のト�
 共有スキーマ: `RuntimeTraceFacts` / `RuntimeRealityCheckItem` / `RuntimeRealityFacts`
 / `RuntimeRealityCheckRun`、`InterviewQA.question_source` への `"runtime"` の追加、
 `IntelligenceRun.run_type` への `"runtime_reality_check"` の追加
-([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+([shared/schemas/project_intelligence.schema.json](../../shared/schemas/project_intelligence.schema.json))。
 
 ## パス1で読んだエビデンス全件の監査永続化(Issue #137)
 
@@ -1162,7 +1171,7 @@ probe_value / state_effects / recommended_mode)と、同じ component_id のト�
 
 共有スキーマ: `IntelligenceRunEvidence` / `IntelligenceRunEvidenceList`、
 `InterviewDialogueTurnOut.evidence_reads`
-([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+([shared/schemas/project_intelligence.schema.json](../../shared/schemas/project_intelligence.schema.json))。
 
 ## 不明回答の継続と仮説の再確認(Issue #142)
 
@@ -1199,7 +1208,7 @@ probe_value / state_effects / recommended_mode)と、同じ component_id のト�
 `current_understanding` に反映すること、不正 `evidence_refs` の作り直し。
 
 共有スキーマ: `InterviewQA.status` への `"unconfirmed"` の追加
-([shared/schemas/project_intelligence.schema.json](../shared/schemas/project_intelligence.schema.json))。
+([shared/schemas/project_intelligence.schema.json](../../shared/schemas/project_intelligence.schema.json))。
 
 ## 提案生成ターンの空提案と絞り込み継続
 
@@ -2101,7 +2110,7 @@ regression-test scaffold 下書きで、独立した `reasoning_llm` 境界と�
 
 ## リポジトリ設定案
 
-設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。
+設定例は [`probe-agent.example.yml`](../../probe-agent.example.yml) を参照する。
 実行コマンドは自動推測せず、この設定で明示する。
 
 ## AI Candidate Studio（Issue #252）
@@ -4783,7 +4792,7 @@ joint-understanding-v1`)が、1 セッション分の受け渡し契約 —
   戻れるように、同一セッション内の Finding id 参照のみを許す(他セッション・
   存在しない id は 422)。
 - `investigation` の `hypothesis` は競合説明と反証条件を必須にする(仮説は
-  単なる低 confidence claim ではない — `docs/system-understanding-ideal-state.md`
+  単なる低 confidence claim ではない — `docs/00-product/system-understanding-ideal-state.md`
   §3.4)。
 - `reasoning_llm` の Finding は必ず `intelligence_run_id` を持つ(Principle 7)。
 - Finding は**追記のみ**。更新・削除エンドポイントは存在せず、訂正は
@@ -5447,7 +5456,7 @@ Issue である。4 つの sub-issue はいずれも 対象外 に「Dashboard �
 の変更」「API・DB・状態管理の具体設計」「テスト実装」を明記しており、
 成果物は仕様そのものになる。
 
-仕様本体は `docs/system-interview-workflow-ux.md`。本節はその要点と、
+仕様本体は `docs/01-specifications/ux/system-interview-workflow-ux.md`。本節はその要点と、
 仕様策定の過程で確定した設計判断だけを記録する。
 
 ### 決めたこと
@@ -5600,7 +5609,7 @@ A〜D は表示状態の決定にのみ用い、人間のゲートを増やし�
 
 ## 状態駆動 System Interview の実装(Issue #349)
 
-Issue #349 は上の #342 仕様(`docs/system-interview-workflow-ux.md`)を実際の
+Issue #349 は上の #342 仕様(`docs/01-specifications/ux/system-interview-workflow-ux.md`)を実際の
 プロダクトへ落とした実装 Issue である。#342〜#346 の「コンポーネント・API・
 DB・状態管理・テストは対象外」という制約は仕様策定 Issue のスコープにだけ
 かかるもので、本 Issue には適用されない。以下は、後から読む人が「なぜこの
@@ -6230,7 +6239,7 @@ Epic の North Star は「開いた瞬間に、このシステムについて前
 | replayability の内訳 | `replay_readiness.count_replayability`(#372) |
 
 画面順・rule table・finding 契約の詳細は
-`docs/system-understanding-navigation.md` の「Overview: System Intelligence
+`docs/01-specifications/ux/system-understanding-navigation.md` の「Overview: System Intelligence
 Brief / 意思決定コックピット」節が正本。ここでは、後から変えるときに
 壊してはいけない判断だけを残す。
 
@@ -6539,7 +6548,7 @@ Purpose を「並んだ2つの文章」として同時に表示できていた�
 
 ### 何を作ったか
 
-`docs/purpose-chain.md` が正本の設計契約。実装は依存順に #388(canonical
+`docs/01-specifications/product/purpose-chain.md` が正本の設計契約。実装は依存順に #388(canonical
 projection と lineage)→ #389(判断必要性に基づく適応的な次の質問)→
 #390(Overview / Interview の段階的開示 UX)。#391(Experience / Outcome /
 Reuse による検証)はこの Epic の最終段だが、この時点ではまだ実装されて
@@ -6697,7 +6706,7 @@ Candidate Studio / Replay / Experiment(#242〜#252)、System Interview の
 
 ### 何を作ったか(Phase 0、Issue #395)
 
-`docs/evolutionary-pipeline.md` が正本。**この Phase ではコードを一切
+`docs/01-specifications/capabilities/evolutionary-pipeline.md` が正本。**この Phase ではコードを一切
 変更していない**(DB / API / UI いずれも無変更)——ADR・concept map・
 migration inventory・pilot 定義のみの設計文書。
 
@@ -6754,7 +6763,7 @@ Pilot(同文書 §7)はいずれも現時点で Probe Point/Component/Cell の
 
 ### 後から変えるときに守ること
 
-**Phase 1〜6(#396〜#401)は `docs/evolutionary-pipeline.md` が確定した
+**Phase 1〜6(#396〜#401)は `docs/01-specifications/capabilities/evolutionary-pipeline.md` が確定した
 語彙・境界の内側でのみ実装する。** ADR-1〜9 は再検討の対象ではなく、
 実装の前提として扱う——再検討したい場合は、この文書自体の改訂を先に
 行う(§0.1 の位置づけ通り)。
@@ -6776,7 +6785,7 @@ CLAUDE.md #366 が定式化した「1 つの表示語が 2 つの事実を兼ね
 ### 検証
 
 Phase 0 は DB/API/UI を変更していないため、既存のテストスイートは
-無変更のまま通る。`docs/evolutionary-pipeline.md` 自体が Issue #395 の
+無変更のまま通る。`docs/01-specifications/capabilities/evolutionary-pipeline.md` 自体が Issue #395 の
 受け入れ条件(product thesis の確定、主要概念の identity owner の一意性、
 4 軸の非混同、Vision→Node runtime evidence の lineage 定義、migration
 inventory、compatibility seam と rollback、既存安全境界の維持明記、
@@ -6785,7 +6794,7 @@ owner・期限付きの未決事項)を満たす。
 
 ## Issue #396 — Phase 1: Evolution Node 契約と canonical lifecycle
 
-`docs/evolutionary-pipeline.md` の ADR-1〜ADR-9 をコードにした Phase。
+`docs/01-specifications/capabilities/evolutionary-pipeline.md` の ADR-1〜ADR-9 をコードにした Phase。
 新規テーブル 5 つ、pure evaluator 1 つ、API 1 本、読み取り中心の
 inspector 1 画面。**既存の Component / Probe Cell / Cell Improvement /
 Cell Binding は 1 行も変更していない** — 読むだけで、書かない。
@@ -7089,7 +7098,7 @@ scope)とそのテストまで。operations cockpit の API/画面は Phase 6(#4
 
 ## Epic #394 検証ラウンド(2026-08-17)
 
-Phase 0〜5(#395〜#400)の実装を、`docs/evolutionary-pipeline.md`
+Phase 0〜5(#395〜#400)の実装を、`docs/01-specifications/capabilities/evolutionary-pipeline.md`
 (ADR-1〜9)・各 Issue の受け入れ条件・CLAUDE.md Core Design Principles に
 対して照合した。中核規律(純粋 evaluator、append-only lineage、3 軸独立
 projection、fail-closed 推論、3 評価契約の非合成、欠測の非丸め、System
@@ -7384,7 +7393,7 @@ Purpose Chain(#387-#391)は「対象者と課題 → Vision → Purpose → Capa
 
 ### 何を作ったか
 
-`docs/ux-design-lineage.md` が正本の設計契約。実装は依存順に #406(契約)→
+`docs/01-specifications/ux/ux-design-lineage.md` が正本の設計契約。実装は依存順に #406(契約)→
 #407(Journey / Step / Requirement / Artifact の永続化と API)→ #408(Solution
 Design と実装対象への link)→ #409(UX Design Studio と E2E)。
 
@@ -7578,7 +7587,7 @@ migration が実在する(最初の形の table-level UNIQUE が append-only 訂
 
 ## Epic #418 — Stakeholder Value Network と UX・機能の統合可視化
 
-canonical contract は `docs/stakeholder-value-network.md`。§0 を読んでから
+canonical contract は `docs/01-specifications/product/stakeholder-value-network.md`。§0 を読んでから
 この領域に触ること。ここには「なぜその設計にしたか」のうち、契約文書に
 書ききらなかった判断だけを残す。
 
