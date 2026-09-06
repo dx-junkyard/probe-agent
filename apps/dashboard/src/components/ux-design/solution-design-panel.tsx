@@ -549,7 +549,13 @@ function HandoffSection({ designKey }: { designKey: string }) {
 
 function SolutionDesignDetail({ designKey }: { designKey: string }) {
   const detail = useSolutionDesignDetail(designKey);
-  const [optionFormOpen, setOptionFormOpen] = useState(false);
+  // Issue #446: auto-open the Option form when a prefill patch for THIS
+  // design is already waiting. The form is behind a collapsed toggle, so
+  // without this the patch sits in the inbox forever -- a mounted form is
+  // what consumes it. Same rule as `JourneyDetail` / `RequirementDetail`.
+  const [optionFormOpen, setOptionFormOpen] = useState(() =>
+    peekPendingFormDraftPatch("solution_design.option", designKey),
+  );
   const [reqLinkOpen, setReqLinkOpen] = useState(false);
   const [targetLinkOpen, setTargetLinkOpen] = useState(false);
 

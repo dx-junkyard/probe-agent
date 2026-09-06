@@ -205,13 +205,22 @@ class TestPrefillEligibilityGate:
         system, headers, proposal = _make_journey_proposal(admin_client, monkeypatch)
         item = _item_by_field(proposal, "summary")
 
-        from app import assistant_discussion_proposal as module
+        # Narrow the ADAPTER REGISTRY, not the derived
+        # `PROPOSAL_TARGET_SCHEMA` view: `evaluate_item_eligibility` reads
+        # `discussion_adapters` directly, so patching the view would leave
+        # the gate reading the real registry and this test would pass while
+        # asserting nothing. Same seam as
+        # `test_assistant_discussion_proposals.py`'s
+        # `test_a_narrowed_registry_forbids_an_already_stored_item`.
+        from dataclasses import replace
 
-        narrowed = dict(module.PROPOSAL_TARGET_SCHEMA)
-        journey = dict(narrowed["ux_journey"])
-        journey["fields"] = tuple(f for f in journey["fields"] if f != "summary")
-        narrowed["ux_journey"] = journey
-        monkeypatch.setattr(module, "PROPOSAL_TARGET_SCHEMA", narrowed)
+        from app import discussion_adapters
+
+        journey = discussion_adapters.DISCUSSION_ADAPTERS["ux_journey"]
+        monkeypatch.setitem(
+            discussion_adapters.DISCUSSION_ADAPTERS, "ux_journey",
+            replace(journey, fields=tuple(f for f in journey.fields if f != "summary")),
+        )
 
         r = _prefill(
             admin_client, headers, proposal["id"], [item["id"]],
