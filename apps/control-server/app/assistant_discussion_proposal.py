@@ -1,9 +1,9 @@
 """Conversation-to-proposal changeset generation (Issue #439, Epic #436).
 
-`docs/assistant-discussion.md` §2 is the canonical contract. Since Issue
+`docs/01-specifications/capabilities/assistant-discussion.md` §2 is the canonical contract. Since Issue
 #444 (Epic #443 Phase 1), the per-`target_kind` field/relation registry and
 the per-`target_kind` context-gathering logic both live in
-`discussion_adapters.py` (`docs/ai-discussion-adapter.md` §1) -- this module
+`discussion_adapters.py` (`docs/01-specifications/capabilities/ai-discussion-adapter.md` §1) -- this module
 DERIVES its own compatibility surface from that registry rather than
 declaring it by hand, but keeps every function's exact signature and
 behaviour. This module owns:

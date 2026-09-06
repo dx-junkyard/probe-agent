@@ -7,8 +7,10 @@
 
 個別機能の詳細仕様や実装順序を決める文書ではない。今後の Issue や設計が局所的な
 改善に偏り、System Understanding の本来の目的から外れることを防ぐための上位方針で
-ある。既存の安全境界、承認ゲート、各機能の詳細仕様は引き続き
-`docs/project-intelligence.md` などを正とする。
+ある。製品全体の上位方針は
+[`vision-and-core-requirements.md`](vision-and-core-requirements.md)、既存の安全境界、
+承認ゲート、各機能の詳細仕様は [`../01-specifications/`](../01-specifications/) 配下の
+該当する canonical contract を正とする。
 
 追跡 Issue: [#327](https://github.com/dx-junkyard/probe-agent/issues/327)
 

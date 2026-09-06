@@ -8,8 +8,8 @@ Owning issues: #418 (Epic) / #419 (this contract) / #420 (persistence + API) /
 Impact Overlay + E2E).
 
 Related canonical contracts, none of which this layer replaces:
-`docs/purpose-chain.md` (#387–#391), `docs/ux-design-lineage.md` (#405),
-`docs/evolutionary-pipeline.md` (#394), `docs/execution-modes.md` (#412).
+`docs/01-specifications/product/purpose-chain.md` (#387–#391), `docs/01-specifications/ux/ux-design-lineage.md` (#405),
+`docs/01-specifications/capabilities/evolutionary-pipeline.md` (#394), `docs/01-specifications/capabilities/execution-modes.md` (#412).
 
 ---
 

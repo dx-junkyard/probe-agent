@@ -1,6 +1,6 @@
 """The single DiscussionAdapter registry (Issue #444, Epic #443 Phase 1).
 
-`docs/ai-discussion-adapter.md` §1 is the canonical contract. Before this
+`docs/01-specifications/capabilities/ai-discussion-adapter.md` §1 is the canonical contract. Before this
 module existed, adding one `target_kind` meant touching SIX parallel
 per-kind tables spread across `assistant_discussion.py` and
 `assistant_discussion_proposal.py` (`SCOPE_TARGET_KINDS` /
@@ -456,7 +456,7 @@ _BLUEPRINT_LANE_CELL_RELATIONS: Tuple[str, ...] = (
 # `understanding_brief.BriefClaim`'s own editable content (`name` / `summary`
 # / `contribution`, the last surfaced under its raw-item key `why_core`).
 # Applying always goes through the Intent Brief's own propose-style path
-# (never auto-confirmed, §2.2 of docs/assistant-discussion.md).
+# (never auto-confirmed, §2.2 of docs/01-specifications/capabilities/assistant-discussion.md).
 _UNDERSTANDING_CLAIM_FIELDS: Tuple[str, ...] = ("summary", "why_core", "name")
 
 

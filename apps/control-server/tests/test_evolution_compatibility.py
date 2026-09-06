@@ -1,6 +1,6 @@
 """Compatibility and completion-gate tests for Epic #394 Phase 1 (#396).
 
-Three promises from `docs/evolutionary-pipeline.md` that live outside the
+Three promises from `docs/01-specifications/capabilities/evolutionary-pipeline.md` that live outside the
 Node contract itself:
 
 1. ADR-1 検証方法 -- the Evolution Node implementation changes NOTHING about
@@ -170,7 +170,7 @@ class TestCellDdlUnchanged:
 # 2. §8.1 完了ゲート: the three §7 pilots register without runtime writes
 # ---------------------------------------------------------------------------
 
-# node_key slug / modality per docs/evolutionary-pipeline.md §7 and §5:
+# node_key slug / modality per docs/01-specifications/capabilities/evolutionary-pipeline.md §7 and §5:
 # pilot 1 stays reasoning_llm (open-ended intent classification), pilot 2 is
 # already-stabilized deterministic code, pilot 3 stays reasoning_llm (open
 # natural-language translation).

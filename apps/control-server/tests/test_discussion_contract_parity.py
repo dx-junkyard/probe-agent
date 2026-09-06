@@ -1,12 +1,12 @@
 """Mechanical parity checks for the AI Discussion UI Adapter contracts
 (Issue #444, Epic #443 Phase 1).
 
-`docs/ai-discussion-adapter.md` §1.8 is the canonical contract. Historically
+`docs/01-specifications/capabilities/ai-discussion-adapter.md` §1.8 is the canonical contract. Historically
 a finite vocabulary here could drift between the server `Literal`
 (`app/models.py`), the Dashboard union (`src/api/types.ts`), and the shared
 JSON Schema (`shared/schemas/assistant_discussion.schema.json`) without any
 test noticing -- exactly the "forgot one of N parallel tables" failure mode
-`docs/ai-discussion-adapter.md` §1.1 describes for the adapter registry
+`docs/01-specifications/capabilities/ai-discussion-adapter.md` §1.1 describes for the adapter registry
 itself. This file parses the three source files directly (imitating
 `test_interview_type_parity.py`'s AST/regex approach) instead of restating
 the vocabularies here, so a value present on only one side fails loudly.

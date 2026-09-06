@@ -124,7 +124,7 @@ describe("UiDraftProvider / useUiDraftSource registry", () => {
     });
   });
 
-  // docs/ai-discussion-adapter.md §2.6: a registered form that cannot answer
+  // docs/01-specifications/capabilities/ai-discussion-adapter.md §2.6: a registered form that cannot answer
   // is `unreadable`, which is NOT the same answer as "no form was open" --
   // folding them would make the assistant describe a screen the developer is
   // not looking at. The throw is still never propagated, and no draft content

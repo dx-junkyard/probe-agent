@@ -3,7 +3,7 @@
 本書は Epic #436 (sub-issues #437-#441) の正本契約である。この領域に触れる前に
 §0 を読むこと。#437 は実装済み (`app/assistant_discussion_context.py`)。
 
-Epic #443 の追加契約と実装状況は `docs/ai-discussion-adapter.md` を参照。
+Epic #443 の追加契約と実装状況は `docs/01-specifications/capabilities/ai-discussion-adapter.md` を参照。
 2026-09-06 の監査時点では共通 adapter registry と parity が実装済みで、
 UI draft は監査中の Phase 2 追加を取り込んで検証し、form prefill /
 対象拡張 / nested Proposal / JU 昇格は #452〜#455、

@@ -1,6 +1,6 @@
 """Tests for Issue #439 (Epic #436): conversation-to-proposal changesets.
 
-`docs/assistant-discussion.md` §2 is the canonical contract. Acceptance
+`docs/01-specifications/capabilities/assistant-discussion.md` §2 is the canonical contract. Acceptance
 criteria under test:
 
 1. A reviewable proposal can be made for the Overview's Vision / Purpose /

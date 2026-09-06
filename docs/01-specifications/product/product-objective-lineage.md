@@ -247,7 +247,7 @@ kind ごとの正本 1 つに対して行う(`node_design._LINK_KIND_TARGET_SOUR
 
 | file | 役割 | issue |
 | --- | --- | --- |
-| `docs/product-objective-lineage.md` | 本書。canonical contract | #428 |
+| `docs/01-specifications/product/product-objective-lineage.md` | 本書。canonical contract | #428 |
 | `apps/control-server/app/product_objective.py` | Objective / Milestone / Gap の決定的 domain service。LLM を呼ばない | #429 |
 | `apps/control-server/app/product_gap_sources.py` | `source_kind` ごとの唯一の resolver。既存検出ロジックを**再実装しない** | #430 |
 | `apps/control-server/app/product_feature.py` | Feature identity と link | #431 |

@@ -93,7 +93,8 @@ LLM 呼び出しは `app.llm` に集約し、`openai` / `anthropic` / `gemini` /
 
 ## Phase 6-9: Feature Intelligence / Experiment Workspace — MVP 実装済み
 
-詳細設計は [`project-intelligence.md`](project-intelligence.md) を参照。
+詳細設計の履歴は
+[`../90-history/project-intelligence.md`](../90-history/project-intelligence.md) を参照。
 
 - pinned commit の tracked files だけを snapshot として読み取る
 - Feature Map、code mapping、Probe Plan、temporary instrumentation patch を永続化する

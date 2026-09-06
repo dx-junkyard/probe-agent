@@ -1,7 +1,7 @@
 """Tests for Issue #407 -- UX Design Lineage: Journey / Step / Requirement /
 Acceptance Criterion / Artifact Reference (Epic #405).
 
-`docs/ux-design-lineage.md` §2.11 is the acceptance list this file is
+`docs/01-specifications/ux/ux-design-lineage.md` §2.11 is the acceptance list this file is
 organized around:
 
 1. revision / supersede / manual decision / `created_by` / source digest

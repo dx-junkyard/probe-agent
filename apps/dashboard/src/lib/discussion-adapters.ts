@@ -1,6 +1,6 @@
 // The single DiscussionAdapter registry (Issue #444, Epic #443 Phase 1).
 //
-// docs/ai-discussion-adapter.md §1.5/§1.6 is the canonical contract. Before
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §1.5/§1.6 is the canonical contract. Before
 // this module existed, `components/assistant-panel.tsx`'s
 // `deriveDiscussionCandidate` had one `if (screenId === "...")` branch per
 // discussion-enabled screen, each hand-listing which route params make which
@@ -47,7 +47,7 @@ export interface DashboardDiscussionAdapter {
   scope: DiscussionScope;
   screenIds: readonly string[];
   /** Japanese display name (singular noun) -- mirrors the server adapter's
-   * own `label` (docs/ai-discussion-adapter.md §1.4). Established
+   * own `label` (docs/01-specifications/capabilities/ai-discussion-adapter.md §1.4). Established
    * product-concept terms (Journey, Requirement, Solution Design) stay
    * English per CLAUDE.md's Dashboard UI言語規約 initial-mention rule. */
   label: string;
@@ -61,7 +61,7 @@ export interface DashboardDiscussionAdapter {
    * the target_ref still invalidates every variant of that query). */
   invalidateKeys(targetRef: string): readonly (readonly unknown[])[];
   /** The URL that opens this target on its (primary) screen. Navigates --
-   * never executes (docs/ai-discussion-adapter.md §3.6 / #358 / #427's CTA
+   * never executes (docs/01-specifications/capabilities/ai-discussion-adapter.md §3.6 / #358 / #427's CTA
    * rule carried over from the parent Epic). `null` when no screen can
    * plausibly render this ref. */
   deepLink(targetRef: string): string | null;
@@ -333,7 +333,7 @@ export const DISCUSSION_ADAPTERS: Record<DiscussionTargetKind, DashboardDiscussi
 };
 
 /**
- * Per-screen candidate priority (docs/ai-discussion-adapter.md §1.5: "a
+ * Per-screen candidate priority (docs/01-specifications/capabilities/ai-discussion-adapter.md §1.5: "a
  * fixed priority within one adapter set -- keep the existing precedence
  * exactly"). This is the ONLY place screen identity governs which adapter
  * wins -- `assistant-panel.tsx` itself never branches on `screenId` for

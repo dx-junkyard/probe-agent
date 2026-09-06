@@ -1,6 +1,6 @@
 """Purpose Chain: canonical Purpose Frame contract + lineage (Issue #388).
 
-`docs/purpose-chain.md` is the design contract this module implements; §0 and
+`docs/01-specifications/product/purpose-chain.md` is the design contract this module implements; §0 and
 §1 are its specification. probe-agent can already show Vision and System
 Purpose as "two sentences side by side", but nothing connects them into a
 causal, auditable chain the developer can trust. This module is that chain:
@@ -57,7 +57,7 @@ lead review, see the implementation report):
    (`None` is "not unknown/unavailable" so L1 still holds, but never equals
    `"confirmed"` so L2 requires at least one confirmed downstream relation).
 2. **Staleness propagates via priority, not raw symmetric comparison.**
-   Reading §1.3's example propagation table closely (`docs/purpose-chain.md`
+   Reading §1.3's example propagation table closely (`docs/01-specifications/product/purpose-chain.md`
    §1.3): when `intervention` changes, `change_to_intervention` (its
    incoming relation) reports `target_changed` directly, but
    `intervention_to_capability` -- whose SOURCE is also literally

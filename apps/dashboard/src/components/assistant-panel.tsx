@@ -319,7 +319,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   // The element (if any) currently hovered/selected in help mode (#440) is
   // reused verbatim as the voice scope signal: an element target means "this
   // question is about that element", no target means "the whole screen"
-  // (docs/assistant-discussion.md §3/§4). `useHelpMode()` falls back to an
+  // (docs/01-specifications/capabilities/assistant-discussion.md §3/§4). `useHelpMode()` falls back to an
   // inert no-op context when no `HelpModeProvider` is mounted, so this is
   // safe on any screen.
   const helpMode = useHelpMode();
@@ -579,7 +579,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
       // The hovered/selected help-mode element (#440), when there is one, is
       // carried as an ordinary route param -- §4 deliberately does not add a
       // new `DiscussionTargetKind` for element-scoped voice questions (the
-      // finite set in docs/assistant-discussion.md §1.1 is closed), and the
+      // finite set in docs/01-specifications/capabilities/assistant-discussion.md §1.1 is closed), and the
       // server already accepts arbitrary route params for screen data
       // providers.
       const routeParams = voiceTurn?.helpId

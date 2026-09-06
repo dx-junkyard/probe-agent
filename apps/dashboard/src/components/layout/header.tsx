@@ -44,7 +44,7 @@ function ThemeToggle() {
 
 // Issue #440 (Epic #436): 機能解説モードのトグル。再クリックと Escape の
 // どちらでも解除でき、解除後は `HelpModeLayer` がリスナーを外すので通常操作
-// へ完全に戻る (`docs/assistant-discussion.md` §3)。
+// へ完全に戻る (`docs/01-specifications/capabilities/assistant-discussion.md` §3)。
 function HelpModeToggle() {
   const { active, toggle } = useHelpMode();
   return (

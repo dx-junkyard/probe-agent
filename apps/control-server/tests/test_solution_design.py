@@ -1,7 +1,7 @@
 """Contract tests for Epic #405 (UX Design Lineage), Issue #408: Solution
 Design.
 
-The canonical contract is `docs/ux-design-lineage.md` Section 3, and the
+The canonical contract is `docs/01-specifications/ux/ux-design-lineage.md` Section 3, and the
 implementation under test is `app/solution_design.py` +
 `app/routes/solution_design.py`. Section 3.8 lists 7 acceptance conditions;
 each test class below states, in its docstring, which condition(s) it
@@ -1061,7 +1061,7 @@ class TestOptionStatusDerivation:
 #
 # `solution_design_option` is documented (this module's own docstring,
 # `add_option`'s docstring, the schema comment in `app/db.py`, and
-# `docs/ux-design-lineage.md` §3.2: "append-only(訂正は superseded_by_id)")
+# `docs/01-specifications/ux/ux-design-lineage.md` §3.2: "append-only(訂正は superseded_by_id)")
 # as append-only: posting an Option with an `option_key` that already has a
 # CURRENT row is supposed to supersede the old row and insert a new current
 # one. The table's schema instead declares a plain

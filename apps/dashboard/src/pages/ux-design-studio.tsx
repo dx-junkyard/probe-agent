@@ -1,7 +1,7 @@
 // Issue #409 (Epic #405): the UX Design Studio.
 //
 // Dashboard-only -- no new endpoint, no server judgement re-derived here
-// (`docs/ux-design-lineage.md` §0 invariant 9). Four levels of progressive
+// (`docs/01-specifications/ux/ux-design-lineage.md` §0 invariant 9). Four levels of progressive
 // disclosure (§4.2): Journey list -> a Journey's Step sequence ->
 // the Requirements linked to a Step -> the adopted Solution Design and its
 // implementation targets. The three tabs below are the three top-level

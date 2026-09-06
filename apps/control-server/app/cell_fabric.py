@@ -9,7 +9,7 @@ is rejected fail-closed (Principle 6), a finite task-status transition table,
 a delegation payload validator, Role Card semver helpers, and model-alias
 resolution.
 
-Design notes carried over from ``docs/project-intelligence.md``'s "Probe Cell
+Design notes carried over from ``docs/90-history/project-intelligence.md``'s "Probe Cell
 Fabric(Issue #297)" section:
 
 - Worker and orchestrator Cells are NOT modeled as separate kinds. The same

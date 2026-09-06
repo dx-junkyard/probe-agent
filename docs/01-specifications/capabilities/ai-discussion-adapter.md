@@ -31,7 +31,7 @@ fail-closedするためskip。Dashboardの関連7ファイルは62 passed。
 
 本書は Epic #443 (sub-issues #444-#449) の正本契約である。この領域に触れる前に
 §0 を読むこと。上流の会話・Proposal・音声の契約は
-`docs/assistant-discussion.md` (Epic #436) が正本であり、本書はそれを**置き換え
+`docs/01-specifications/capabilities/assistant-discussion.md` (Epic #436) が正本であり、本書はそれを**置き換え
 ない**。#436 が「1 つの対象について会話し、変更候補を作り、適用する」を定義した
 のに対し、#443 は次の 3 つだけを足す。
 
@@ -48,7 +48,7 @@ fail-closedするためskip。Dashboardの関連7ファイルは62 passed。
 
 ## §0 境界 — 後から変えるときに必ず守ること
 
-`docs/assistant-discussion.md` §0 の境界はすべてそのまま有効である。本 Epic が
+`docs/01-specifications/capabilities/assistant-discussion.md` §0 の境界はすべてそのまま有効である。本 Epic が
 足す境界は次のとおり。
 
 - **adapter は UI state の読み書き境界であって、domain rule を所有しない。**

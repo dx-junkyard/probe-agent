@@ -213,7 +213,7 @@ error_to_success 等）と実行時間差を即座に返す（目標: N≤20 で
 本番相当ではない旨のディスクレーマーが結果に常設される。ここで問題なしと判断
 できた候補だけを Step 6 の live shadow 登録に進める、または Workbench から直接
 Experiment へ昇格して Step 7 相当の判断記録を残す。詳細は
-`docs/project-intelligence.md`の「Replay / Simulation（Issue #242）」Phase D
+`docs/90-history/project-intelligence.md`の「Replay / Simulation（Issue #242）」Phase D
 節を参照。live shadow（Step 6）自体の挙動やSDK APIは変更されていない。
 
 ### Step 1: ベースラインを固定する
@@ -473,8 +473,8 @@ AIエージェントは変更ごとに、最低限以下を作業記録へ残す
 
 ## 10. 関連資料
 
-- プロジェクト全体とDocker導入: [`../README.md`](../README.md)
-- MVPの機能境界: [`mvp.md`](mvp.md)
-- Python SDK: [`../packages/python-probe/README.md`](../packages/python-probe/README.md)
-- Control Server API: [`../apps/control-server/README.md`](../apps/control-server/README.md)
-- 最小サンプル: [`../examples/simple-pipeline/README.md`](../examples/simple-pipeline/README.md)
+- プロジェクト全体とDocker導入: [`../../README.md`](../../README.md)
+- MVPの機能境界: [`../00-product/mvp.md`](../00-product/mvp.md)
+- Python SDK: [`../../packages/python-probe/README.md`](../../packages/python-probe/README.md)
+- Control Server API: [`../../apps/control-server/README.md`](../../apps/control-server/README.md)
+- 最小サンプル: [`../../examples/simple-pipeline/README.md`](../../examples/simple-pipeline/README.md)

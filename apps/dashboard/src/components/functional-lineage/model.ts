@@ -5,7 +5,7 @@
 // `components/journey-blueprint/model.ts` one layer over: a pure module (no
 // React, no API client). Every `kind` / gap `code` / `severity` arrives
 // already decided by `GET /functional-lineage`
-// (`docs/stakeholder-value-network.md` §9, §0 invariant 9). What is left
+// (`docs/01-specifications/product/stakeholder-value-network.md` §9, §0 invariant 9). What is left
 // here is genuinely presentational:
 //
 //   1. Fixed Japanese labels for every finite value (§9.1/§9.2), one map per

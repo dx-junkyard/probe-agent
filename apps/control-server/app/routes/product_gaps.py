@@ -1,6 +1,6 @@
 """Product Gap API (Issue #429/#430, Epic #427).
 
-`docs/product-objective-lineage.md` §10 is the endpoint contract this
+`docs/01-specifications/product/product-objective-lineage.md` §10 is the endpoint contract this
 module implements against `app/product_objective.py`'s deterministic domain
 service. Follows `routes/ux_design.py` / `routes/product_objectives.py`
 exactly: `Depends(get_system_id)` on every route, `Depends(require_user)` on

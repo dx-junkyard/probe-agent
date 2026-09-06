@@ -314,7 +314,7 @@ probe plans / experiments を同じ分析文脈で返す。
 ## 状態通知の構成（Issue #239 で system-state に統一済み）
 
 かつてはユーザー向けの「次の一歩」表示が 2 系統併存していた（Issue #215
-調査、`docs/ux-gap-analysis-system-understanding.md` §2.4:
+調査、`docs/02-challenges-and-decisions/ux-gap-analysis-system-understanding.md` §2.4:
 `_derive_primary_action` → `primary_action` → `PrimaryActionCard` と、
 `select_primary_item` → `primary_item` → `SystemStateBanner`）。Issue #239
 で全通知面のデータソースは `GET /system-state` のみに統一され、面ごとの
@@ -820,7 +820,7 @@ Overview は「接続できたか・データがあるか」を確認する稼�
 次にすること + 改善ループ + Runtime health 3)。積み上げると 1280 × 720 で
 findings が 824px、CTA が 1066px に落ち、#384 の「Vision / Purpose /
 findings / next action が通常 desktop の初期 viewport で把握できる」を
-満たせなかったためである(実測値は `docs/project-intelligence.md`)。DOM 順は
+満たせなかったためである(実測値は `docs/90-history/project-intelligence.md`)。DOM 順は
 分割で変わらないので、1 カラム時の読み順は下表のままである。
 
 | # | 領域 | 答える問い | testid |
@@ -976,7 +976,7 @@ Guide（`components/setup-next-step.ts`、Issue #374）が持つ。
 
 ## Objective Map: Vision から次の 1 操作まで（Issue #427-#433)
 
-canonical contract は `docs/product-objective-lineage.md`。ここには**画面の
+canonical contract は `docs/01-specifications/product/product-objective-lineage.md`。ここには**画面の
 導線**だけを書く。
 
 ### サイドバー項目は 1 つだけ

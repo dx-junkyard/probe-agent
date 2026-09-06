@@ -204,7 +204,7 @@ GitHub App 公開ワークフロー（Issue #216）を使う場合は、秘密�
 Compose secret としてマウントする必要がある（Issue #224）。GitHub App の
 登録手順、秘密鍵のホスト配置、`GITHUB_PUBLISH_ENABLED` の起動時検証、
 鍵ローテーションの runbook は
-[`docs/github-app-deployment.md`](github-app-deployment.md) を参照。
+[`docs/04-operations/github-app-deployment.md`](github-app-deployment.md) を参照。
 使わない場合はこの節は無視してよい（`GITHUB_APP_PRIVATE_KEY_HOST_PATH` /
 `GITHUB_PUBLISH_ENABLED` とも未設定のままで安全に起動できる）。
 
@@ -231,7 +231,7 @@ curl -sS https://<PUBLIC_HOST>/api/health
 1. ブラウザで `https://<PUBLIC_HOST>/` を開き、Dashboard が表示されることを
    確認する（現状 Dashboard にブラウザ上のログイン画面はない。admin
    ユーザーでの API token 発行手順は README の
-   [認証と Dashboard のログイン方式](../README.md#認証と-dashboard-のログイン方式)
+   [認証と Dashboard のログイン方式](../../README.md#認証と-dashboard-のログイン方式)
    を参照）。
 2. SDK から trace を送る場合は `PROBE_SERVER_URL` を公開 URL に向ける。
 

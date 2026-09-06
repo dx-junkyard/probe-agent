@@ -1,7 +1,7 @@
 """Tests for Issue #391 -- Purpose Verification (Experience Hypothesis /
 Outcome Criterion / Reuse Hypothesis).
 
-`docs/purpose-chain.md` §4 is the acceptance list this file is organized
+`docs/01-specifications/product/purpose-chain.md` §4 is the acceptance list this file is organized
 around:
 
 * creation is only ever offered alongside a currently-available justifying

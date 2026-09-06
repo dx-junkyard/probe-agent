@@ -1,6 +1,6 @@
 """Tests for Issue #445 (Epic #443 Phase 2): UiDraftContext.
 
-`docs/ai-discussion-adapter.md` §2 is the canonical contract. Acceptance
+`docs/01-specifications/capabilities/ai-discussion-adapter.md` §2 is the canonical contract. Acceptance
 criteria under test:
 
 1. canonical facts and the UI draft are distinguishable in the LLM payload

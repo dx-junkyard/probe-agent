@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 // Issue #432 (Epic #427): Objective Map / Gap Workbench screen tests.
 //
-// `docs/product-objective-lineage.md` §0 invariant 10 is what every test
+// `docs/01-specifications/product/product-objective-lineage.md` §0 invariant 10 is what every test
 // here protects: the client re-derives nothing. `GET /objective-map` and
 // `GET /gap-workbench` are two independent endpoints (`useObjectiveMap` /
 // `useGapWorkbench`), both rendered by the ONE `/objective-map` route with

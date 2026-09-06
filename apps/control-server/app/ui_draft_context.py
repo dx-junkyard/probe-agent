@@ -1,7 +1,7 @@
 """UiDraftContext validation and LLM-payload preparation (Issue #445, Epic
 #443 Phase 2).
 
-`docs/ai-discussion-adapter.md` §2 is the canonical contract. This module is
+`docs/01-specifications/capabilities/ai-discussion-adapter.md` §2 is the canonical contract. This module is
 the SINGLE place that decides whether an incoming `UiDraftContextIn`
 (`app/models.py`) may reach the LLM context pack, and in what shape. It does
 NOT live in `routes/assistant.py` (per the phase instructions) because the

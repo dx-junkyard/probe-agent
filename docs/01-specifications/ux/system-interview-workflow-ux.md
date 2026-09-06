@@ -7,7 +7,7 @@ Status: UX 仕様（Issue #342 / #343 / #344 / #345 / #346 の成果物）。
 **実装状況: 本仕様は Issue #349 で実装済み。** 本書はこれから作るものの
 計画ではなく、システムインタビュー画面が現に満たしている仕様として読むこと。
 実装側の設計判断（正準実装の所在、承諾の消費方法、「未解消」の導出、実行中
-レコードを持たない処理の扱い）は `docs/project-intelligence.md` の
+レコードを持たない処理の扱い）は `docs/90-history/project-intelligence.md` の
 「状態駆動 System Interview の実装(Issue #349)」節にある。
 
 Scope: `apps/dashboard/src/pages/interview.tsx` と
@@ -25,10 +25,10 @@ Scope: `apps/dashboard/src/pages/interview.tsx` と
 
 関連文書:
 
-- `docs/system-understanding-navigation.md` — 用語定義と画面間導線
-- `docs/ux-gap-analysis-system-understanding.md` — System Understanding 側の
+- `docs/01-specifications/ux/system-understanding-navigation.md` — 用語定義と画面間導線
+- `docs/02-challenges-and-decisions/ux-gap-analysis-system-understanding.md` — System Understanding 側の
   同種ギャップ調査（状態モデルの二系統問題）
-- `docs/project-intelligence.md` — Issue #283〜#295 / #308〜#313 / #328〜#334 の
+- `docs/90-history/project-intelligence.md` — Issue #283〜#295 / #308〜#313 / #328〜#334 の
   設計判断（Inquiry / Alignment / Question Router / 共同理解）
 - `CLAUDE.md`「Dashboard UI言語規約」, `.claude/skills/dashboard/SKILL.md`
 

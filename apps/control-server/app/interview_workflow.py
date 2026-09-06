@@ -1,6 +1,6 @@
 """Canonical state-driven System Interview workflow engine (Issue #349).
 
-Implements `docs/system-interview-workflow-ux.md` §2.2 -- the ONE place the
+Implements `docs/01-specifications/ux/system-interview-workflow-ux.md` §2.2 -- the ONE place the
 developer-facing workflow state is decided. The Dashboard renders what this
 module returns; it never re-derives a state of its own (spec principle P9,
 §2.6).

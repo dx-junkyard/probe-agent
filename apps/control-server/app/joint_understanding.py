@@ -67,7 +67,7 @@ ORIGIN_KINDS = ("qa", "intent", "review_item", "inquiry", "purpose_need")
 # writes `trigger='purpose_need'` rows directly) -- widened here rather than
 # narrowing the Literal, per Principle 6 / the #427 "narrowed vocabulary
 # needs an upgrade migration" rule (inapplicable here since there is no CHECK
-# constraint on this column to widen; see docs/ai-discussion-adapter.md §1.9).
+# constraint on this column to widen; see docs/01-specifications/capabilities/ai-discussion-adapter.md §1.9).
 TRIGGERS = ("unknown_answer", "explicit_request", "purpose_need")
 
 SESSION_STATUSES = ("open", "held", "closed")
@@ -278,7 +278,7 @@ def validate_finding(
 
     if origin_role == "investigation" and claim_kind == "hypothesis":
         # A hypothesis is not merely a low-confidence claim (see
-        # docs/system-understanding-ideal-state.md 3.4).
+        # docs/00-product/system-understanding-ideal-state.md 3.4).
         if not competing_explanations:
             raise JointUnderstandingValidationError(
                 "An investigation hypothesis must list at least one competing explanation"

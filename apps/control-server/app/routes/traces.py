@@ -474,7 +474,7 @@ def trace_redaction_rescan(
 
     Deliberately a separate, explicit operation rather than a startup
     migration: it destroys data (that is the point), and rotating the exposed
-    credential must happen too -- see ``docs/secret-redaction.md``. Rewriting
+    credential must happen too -- see ``docs/01-specifications/platform/secret-redaction.md``. Rewriting
     is idempotent, and a row that needed no change keeps its bytes.
     """
     rewritten = 0

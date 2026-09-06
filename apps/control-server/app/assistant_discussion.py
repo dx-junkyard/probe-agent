@@ -1,8 +1,8 @@
 """Assistant discussion threads: target-scoped conversation persistence
 (Issue #438, Epic #436; registry-backed since Issue #444, Epic #443 Phase 1).
 
-`docs/assistant-discussion.md` §1 is the canonical contract for thread/turn
-persistence and target-state derivation; `docs/ai-discussion-adapter.md` §1
+`docs/01-specifications/capabilities/assistant-discussion.md` §1 is the canonical contract for thread/turn
+persistence and target-state derivation; `docs/01-specifications/capabilities/ai-discussion-adapter.md` §1
 is the canonical contract for the `DiscussionAdapter` registry this module
 now sits on top of. This module owns:
 
@@ -22,7 +22,7 @@ The finite vocabularies (`DISCUSSION_SCOPES` / `DISCUSSION_TARGET_KINDS` /
 target_kind` table (`SCOPE_TARGET_KINDS`), per-kind target resolution
 (`resolve_target`), and per-kind route params (`route_params_for_target`)
 are now DERIVED from `discussion_adapters.DISCUSSION_ADAPTERS` -- the single
-registry `docs/ai-discussion-adapter.md` §1 introduces -- rather than
+registry `docs/01-specifications/capabilities/ai-discussion-adapter.md` §1 introduces -- rather than
 declared by hand here. `SCOPE_TARGET_KINDS` keeps its exact name and shape
 (`Dict[str, Tuple[str, ...]]`) so existing importers/tests are unaffected by
 the move; `tests/test_discussion_adapter_registry.py` is what proves the
@@ -106,7 +106,7 @@ class UnregisteredTargetKind(DiscussionError):
     every ordinary HTTP caller, so this mainly guards a future phase that
     adds a Literal member before registering its adapter (the exact "forgot
     one of the six tables" failure mode §1.1 of
-    `docs/ai-discussion-adapter.md` describes), and any direct Python caller
+    `docs/01-specifications/capabilities/ai-discussion-adapter.md` describes), and any direct Python caller
     of `resolve_or_create_thread`.
     """
 

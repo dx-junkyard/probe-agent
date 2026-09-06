@@ -1,6 +1,6 @@
 // UI draft registry (Issue #445, Epic #443 Phase 2).
 //
-// docs/ai-discussion-adapter.md §2.3/§2.5 is the canonical contract. Shaped
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §2.3/§2.5 is the canonical contract. Shaped
 // exactly like `components/product-objective/unsaved-work.tsx`'s
 // `UnsavedWorkProvider` / `useDirtyGuard`: each form declares its own draft
 // state via a getter, and the registry lives in a ref (registering must not
