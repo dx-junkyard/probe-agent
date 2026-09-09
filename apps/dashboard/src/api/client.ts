@@ -89,10 +89,32 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return data as T;
 }
 
+async function requestBlob(
+  method: string,
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: headers(method),
+    credentials: "include",
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new ApiError(res.status, data.detail ?? res.statusText);
+  }
+  return res.blob();
+}
+
 export const api = {
   get: <T>(path: string) => request<T>("GET", path),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
   put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
   patch: <T>(path: string, body?: unknown) => request<T>("PATCH", path, body),
   delete: <T>(path: string) => request<T>("DELETE", path),
+  postBlob: (path: string, body?: unknown, signal?: AbortSignal) =>
+    requestBlob("POST", path, body, signal),
 };

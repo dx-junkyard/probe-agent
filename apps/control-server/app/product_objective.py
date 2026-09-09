@@ -1,6 +1,6 @@
 """Product Objective / Milestone / Gap (Issue #429, Epic #427).
 
-`docs/product-objective-lineage.md` §4/§5/§8/§10 is the canonical contract
+`docs/01-specifications/product/product-objective-lineage.md` §4/§5/§8/§10 is the canonical contract
 this module implements. This is a deterministic domain service -- **no LLM
 call anywhere in this module** (Principle 6). Everything here is either a
 direct read of a persisted row, a first-match classification over a small

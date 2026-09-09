@@ -1,7 +1,7 @@
 """UX Design Lineage: Journey / Requirement / Artifact API (Issue #407,
 Epic #405).
 
-`docs/ux-design-lineage.md` §2.10 is the endpoint contract this module
+`docs/01-specifications/ux/ux-design-lineage.md` §2.10 is the endpoint contract this module
 implements against `app/ux_design.py`'s deterministic domain service. What
 this boundary deliberately does NOT do:
 

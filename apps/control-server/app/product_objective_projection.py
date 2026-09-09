@@ -1,7 +1,7 @@
 """Objective Map / Gap Workbench / Overview `objective` section projection
 (Issue #432, Epic #427).
 
-`docs/product-objective-lineage.md` §9 (plus §0, §5.4, §5.10, §6) is the
+`docs/01-specifications/product/product-objective-lineage.md` §9 (plus §0, §5.4, §5.10, §6) is the
 canonical contract this module implements. Three rules carried over from
 `app/overview_projection.py` verbatim, because this is the same kind of
 composed, read-only projection one layer over the Product Objective domain:

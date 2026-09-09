@@ -453,7 +453,7 @@ def evaluate_transition(facts: NodeFacts, request: TransitionRequest) -> Transit
     # `reopened` deliberately does NOT require or clear this -- production
     # keeps running the established implementation while exploration
     # proceeds (see the module docstring / ADR note in
-    # docs/evolutionary-pipeline.md).
+    # docs/01-specifications/capabilities/evolutionary-pipeline.md).
     if to_state in ("established", "monitoring") and not facts.has_stable_implementation:
         return TransitionDecision(
             False, "stable_implementation_missing",
@@ -508,7 +508,7 @@ def fold_events(events: Sequence[Mapping[str, Any]]) -> Optional[str]:
     """Replay `event_kind='transition'` rows (in `id` order) and return the
     resulting maturity, or `None` if the sequence contains no transition.
 
-    This is the reconciliation ADR-4 requires (docs/evolutionary-pipeline.md):
+    This is the reconciliation ADR-4 requires (docs/01-specifications/capabilities/evolutionary-pipeline.md):
     the stored `evolution_node.maturity` column is a cache of exactly this
     fold, so a drifted cache is detectable by comparing the two.
     """
@@ -1650,7 +1650,7 @@ def build_node_projection(
 
 def build_legacy_projection(conn, *, system_id: int, node_id: int) -> Dict[str, Any]:
     """A small, honest Component/Cell-shaped compatibility view of a Node
-    (ADR-8, docs/evolutionary-pipeline.md), so an existing consumer written
+    (ADR-8, docs/01-specifications/capabilities/evolutionary-pipeline.md), so an existing consumer written
     against Component/Cell fields keeps working during migration. This is
     NOT a second canonical projection -- `build_node_projection` remains the
     only authority for anything beyond these four fields."""

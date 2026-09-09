@@ -1,7 +1,7 @@
 // Issue #432 (Epic #427): the Objective Map / Gap Workbench Dashboard-side
 // display helpers, and NOTHING semantic.
 //
-// `docs/product-objective-lineage.md` §9 (plus §0) is the canonical contract.
+// `docs/01-specifications/product/product-objective-lineage.md` §9 (plus §0) is the canonical contract.
 // Same discipline as `components/functional-lineage/model.ts` and
 // `components/ux-design/model.ts` one layer over: a pure module (no React, no
 // API client). Every `objective_state` / `design_status` / `achievement` /

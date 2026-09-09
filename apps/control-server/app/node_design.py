@@ -1,7 +1,7 @@
 """Design Studio: Vision -> Outcome -> Capability -> Flow -> Evolution Node
 (Issue #397, Phase 2 of the evolution control plane Epic #394).
 
-The canonical contract is `docs/evolutionary-pipeline.md` (§4 ADR-7 for the
+The canonical contract is `docs/01-specifications/capabilities/evolutionary-pipeline.md` (§4 ADR-7 for the
 evaluation hierarchy, §8.2 for this phase's gate). Four things live here:
 
 1. **Purpose-to-Node lineage** (`derive_node_lineage`). Phase 2 creates NO

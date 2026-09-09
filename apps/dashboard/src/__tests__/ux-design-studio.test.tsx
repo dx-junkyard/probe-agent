@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 // Issue #409 (Epic #405): UX Design Studio tests.
 //
-// `docs/ux-design-lineage.md` §0 invariant 9 is the thing every test here
+// `docs/01-specifications/ux/ux-design-lineage.md` §0 invariant 9 is the thing every test here
 // ultimately protects: the client re-derives no state. Everything below
 // exercises what the Studio does with values the server already decided --
 // never a computation the Studio performs itself (that discipline lives in

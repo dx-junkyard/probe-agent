@@ -1,7 +1,7 @@
 """UX Design Lineage: Solution Design API (Epic #405, Issue #408).
 
 The domain layer is `app/solution_design.py`; the canonical contract is
-`docs/ux-design-lineage.md` §3. This module is a thin I/O boundary:
+`docs/01-specifications/ux/ux-design-lineage.md` §3. This module is a thin I/O boundary:
 
 * `system_id` always comes from `Depends(get_system_id)`; every write also
   depends on `Depends(require_user)` and derives its actor from the

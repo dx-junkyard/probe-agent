@@ -1,6 +1,6 @@
 """Tests for Issue #429 -- Product Objective / Milestone (Epic #427).
 
-`docs/product-objective-lineage.md` §12 is the acceptance list this file is
+`docs/01-specifications/product/product-objective-lineage.md` §12 is the acceptance list this file is
 organized (together with `test_product_gap.py`) around. This file covers:
 
 1. identity: key required (422) / key conflict (409) / cross-System 404.

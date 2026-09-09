@@ -1,6 +1,6 @@
 """Tests for Issue #439 (Epic #436): conversation-to-proposal changesets.
 
-`docs/assistant-discussion.md` §2 is the canonical contract. Acceptance
+`docs/01-specifications/capabilities/assistant-discussion.md` §2 is the canonical contract. Acceptance
 criteria under test:
 
 1. A reviewable proposal can be made for the Overview's Vision / Purpose /
@@ -488,8 +488,27 @@ class TestUxJourneyProposal:
         assert field_item["eligibility"] == "appliable"
         assert relation_item["eligibility"] == "appliable"
 
+        from dataclasses import replace
+        from app import discussion_adapters
+
+        adapter = discussion_adapters.DISCUSSION_ADAPTERS["ux_journey"]
+        dispatched = []
+
+        def registered_field(*args):
+            dispatched.append("field")
+            return adapter.field_applier(*args)
+
+        def registered_relation(*args):
+            dispatched.append("relation")
+            return adapter.relation_applier(*args)
+
+        monkeypatch.setitem(
+            discussion_adapters.DISCUSSION_ADAPTERS, "ux_journey",
+            replace(adapter, field_applier=registered_field, relation_applier=registered_relation),
+        )
         applied = _apply(admin_client, headers, proposal["id"], [field_item["id"], relation_item["id"]])
         assert set(applied["applied_item_ids"]) == {field_item["id"], relation_item["id"]}
+        assert dispatched == ["field", "relation"]
 
         detail = _get_journey(admin_client, headers, "checkout")
         assert detail["current_revision"]["beneficiary"] == "Shoppers checking out"
@@ -880,13 +899,14 @@ class TestOutOfRegistryFailsClosed:
         # The registry narrows: `summary` is no longer a proposable Journey
         # field. The stored item is untouched -- what changes is whether it
         # may still be applied.
-        from app import assistant_discussion_proposal as module
+        from dataclasses import replace
+        from app import discussion_adapters
 
-        narrowed = dict(module.PROPOSAL_TARGET_SCHEMA)
-        journey = dict(narrowed["ux_journey"])
-        journey["fields"] = tuple(f for f in journey["fields"] if f != "summary")
-        narrowed["ux_journey"] = journey
-        monkeypatch.setattr(module, "PROPOSAL_TARGET_SCHEMA", narrowed)
+        journey = discussion_adapters.DISCUSSION_ADAPTERS["ux_journey"]
+        monkeypatch.setitem(
+            discussion_adapters.DISCUSSION_ADAPTERS, "ux_journey",
+            replace(journey, fields=tuple(f for f in journey.fields if f != "summary")),
+        )
 
         detail = _get_proposal(admin_client, headers, proposal["id"])
         stored = next(i for i in detail["items"] if i["id"] == item["id"])
@@ -1017,3 +1037,49 @@ class TestReject:
 
         revisions = admin_client.get("/ux-design/journeys/checkout/revisions", headers=headers).json()
         assert len(revisions["revisions"]) == 1
+
+
+@pytest.mark.parametrize("missing", ["adapter", "field_applier", "relation_applier", "fields", "relations"])
+def test_apply_refuses_missing_adapter_registration_before_any_write(admin_client, monkeypatch, missing):
+    """A previously generated proposal cannot bypass a removed registry entry.
+
+    The field is first in the batch, so a missing relation handler also
+    proves that no earlier item was written before the refusal.
+    """
+    from dataclasses import replace
+    from app import discussion_adapters
+
+    token = _login(admin_client)
+    system = _create_system(admin_client, token)
+    headers = _headers(token, system["id"])
+    _create_journey(admin_client, headers, "checkout")
+    _add_journey_revision(admin_client, headers, "checkout", title="Checkout")
+    thread = _create_thread(
+        admin_client, headers, scope="entity", screen_id="ux-design-studio",
+        target_kind="ux_journey", target_ref="checkout",
+    )["thread"]
+    client = _FixedResponseClient({
+        "summary": "Clarify checkout", "confirmed_points": [], "unresolved_questions": [],
+        "assumptions": [], "evidence_refs": [],
+        "field_changes": [{"field_name": "beneficiary", "subject_ref": "", "current_value": "",
+                           "proposed_value": "Shoppers", "rationale": "discussed"}],
+        "relation_changes": [{"relation_kind": "upstream_ref", "subject_ref": "",
+                              "relation_target_kind": "purpose_element", "relation_target_ref": "cap-checkout",
+                              "proposed_value": "", "rationale": "discussed"}],
+    })
+    _enable_real_llm(monkeypatch, client)
+    proposal = _generate_proposal(admin_client, headers, thread["id"])
+    before = _get_journey(admin_client, headers, "checkout")
+    registry = discussion_adapters.DISCUSSION_ADAPTERS
+    if missing == "adapter":
+        monkeypatch.delitem(registry, "ux_journey")
+    else:
+        value = () if missing in ("fields", "relations") else None
+        monkeypatch.setitem(registry, "ux_journey", replace(registry["ux_journey"], **{missing: value}))
+
+    rejected = _apply(admin_client, headers, proposal["id"], [i["id"] for i in proposal["items"]], expect=422)
+    assert "proposal_item_forbidden" in rejected.text
+    after = _get_journey(admin_client, headers, "checkout")
+    assert after["current_revision_id"] == before["current_revision_id"]
+    assert after["upstream_refs"] == before["upstream_refs"]
+    assert all(i["status"] == "proposed" for i in _get_proposal(admin_client, headers, proposal["id"])["items"])

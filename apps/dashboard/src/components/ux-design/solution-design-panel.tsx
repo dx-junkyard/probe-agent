@@ -30,6 +30,9 @@ import {
 import {
   DegradedNote, EmptyNote, LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
 } from "./shared";
+import { useUiDraftSource } from "@/lib/ui-draft";
+import { peekPendingFormDraftPatch, useFormDraftReceiver } from "@/lib/form-draft-inbox";
+import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
 
 const TARGET_KINDS: SolutionTargetKind[] = [
   "capability", "static_flow", "runtime_flow", "evolution_node",
@@ -141,6 +144,43 @@ function AddOptionForm({
   const [tradeoffs, setTradeoffs] = useState("");
   const [risks, setRisks] = useState("");
 
+  // Issue #445 (§2.2/§2.3): this form drafts a NEW option, so every field
+  // starts from "" -- there is no existing revision to seed from, and
+  // `dirty` is simply "non-empty". `option_key` is the draft's
+  // `selected_item_ref` (the identity this draft would create), not a
+  // registered field.
+  const optionFields = [
+    { fieldName: "title", value: title, dirty: title !== "", validationError: "" },
+    { fieldName: "approach", value: approach, dirty: approach !== "", validationError: "" },
+    { fieldName: "tradeoffs", value: tradeoffs, dirty: tradeoffs !== "", validationError: "" },
+    { fieldName: "risks", value: risks, dirty: risks !== "", validationError: "" },
+  ];
+  useUiDraftSource("solution_design.option", designKey, () => ({
+    fields: optionFields,
+    selectedItemRef: optionKey.trim(),
+    activeTab: "",
+    comparisonTarget: "",
+    localRevisionToken: JSON.stringify([optionKey, ...optionFields.map((f) => [f.fieldName, f.value])]),
+  }));
+
+  // Issue #446 (§3.2/§3.3): a solution_design field item is sub-addressed by
+  // the Option's own `option_key` (the item's `subject_ref`), carried as the
+  // patch's `selectedItemRef`. The `identity` binding below both fills in
+  // `optionKey` from a patch (when the developer has not typed one yet) and
+  // refuses to apply title/approach/tradeoffs/risks from a patch addressed
+  // at a DIFFERENT option_key than the one already being drafted.
+  const draftReceiver = useFormDraftReceiver(
+    "solution_design.option",
+    designKey,
+    {
+      title: { value: title, dirty: title !== "", setValue: setTitle },
+      approach: { value: approach, dirty: approach !== "", setValue: setApproach },
+      tradeoffs: { value: tradeoffs, dirty: tradeoffs !== "", setValue: setTradeoffs },
+      risks: { value: risks, dirty: risks !== "", setValue: setRisks },
+    },
+    { value: optionKey, dirty: optionKey.trim() !== "", setValue: setOptionKey },
+  );
+
   function submit() {
     add.mutate(
       { option_key: optionKey.trim(), option_order: nextOrder, title, approach, tradeoffs, risks },
@@ -156,6 +196,7 @@ function AddOptionForm({
 
   return (
     <div className="space-y-2 rounded border p-2" data-testid="ux-solution-design-add-option-form">
+      <FormDraftConflictBanner conflicts={draftReceiver.conflicts} onResolve={draftReceiver.resolveField} />
       <Input placeholder="option_key" value={optionKey} onChange={(e) => setOptionKey(e.target.value)} />
       <Input placeholder="タイトル" value={title} onChange={(e) => setTitle(e.target.value)} />
       <Textarea placeholder="アプローチ(approach)" value={approach} onChange={(e) => setApproach(e.target.value)} rows={2} />
@@ -508,7 +549,13 @@ function HandoffSection({ designKey }: { designKey: string }) {
 
 function SolutionDesignDetail({ designKey }: { designKey: string }) {
   const detail = useSolutionDesignDetail(designKey);
-  const [optionFormOpen, setOptionFormOpen] = useState(false);
+  // Issue #446: auto-open the Option form when a prefill patch for THIS
+  // design is already waiting. The form is behind a collapsed toggle, so
+  // without this the patch sits in the inbox forever -- a mounted form is
+  // what consumes it. Same rule as `JourneyDetail` / `RequirementDetail`.
+  const [optionFormOpen, setOptionFormOpen] = useState(() =>
+    peekPendingFormDraftPatch("solution_design.option", designKey),
+  );
   const [reqLinkOpen, setReqLinkOpen] = useState(false);
   const [targetLinkOpen, setTargetLinkOpen] = useState(false);
 

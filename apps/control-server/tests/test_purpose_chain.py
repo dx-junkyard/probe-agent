@@ -1,6 +1,6 @@
 """Tests for Issue #388 -- Purpose Chain canonical contract and lineage.
 
-`docs/purpose-chain.md` §1.7 is the acceptance list this file is organized
+`docs/01-specifications/product/purpose-chain.md` §1.7 is the acceptance list this file is organized
 around:
 
 * all 4 element kinds are reachable, and every source is an existing row;
@@ -839,7 +839,7 @@ def test_relation_exposes_created_and_current_revision_lineage(admin_client, tmp
     assert refreshed_relation.current_understanding_revision_id == understanding_revision_id
 
 
-# --- change propagation table (docs/purpose-chain.md §1.3) -------------------
+# --- change propagation table (docs/01-specifications/product/purpose-chain.md §1.3) -------------------
 
 
 def test_capability_change_only_staleifies_its_own_relation(admin_client, tmp_path):

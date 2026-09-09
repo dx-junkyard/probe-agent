@@ -20,7 +20,7 @@ export interface ComponentSummary {
 
 // Replay capture (Issue #242 Phase A / #243): deterministic, finite-set
 // classification of whether a trace's structured input capture can
-// mechanically restore the call inputs. See docs/project-intelligence.md's
+// mechanically restore the call inputs. See docs/90-history/project-intelligence.md's
 // Replay / Simulation section for the full reason-code semantics.
 export type Replayability = "replayable" | "partial" | "unreplayable";
 export type ReplayReason =
@@ -3623,6 +3623,40 @@ export interface AssistantScreenContext {
   suggested_questions: AssistantSuggestedQuestion[];
 }
 
+// UiDraftContext (Issue #445, Epic #443 Phase 2). docs/ai-discussion-adapter.
+// md §2.2/§2.6. Client-only -- the server never persists a draft's own
+// values, only its finite state/form_id/digest on the user turn.
+export type UiDraftState =
+  | "not_provided"
+  | "applied"
+  | "no_unsaved_changes"
+  | "unsupported"
+  | "unreadable";
+
+export interface UiDraftFieldIn {
+  field_name: string;
+  value: string;
+  dirty: boolean;
+  validation_error: string;
+}
+
+export interface UiDraftContextIn {
+  target_kind: DiscussionTargetKind;
+  target_ref: string;
+  form_id: string;
+  fields: UiDraftFieldIn[];
+  selected_item_ref: string;
+  active_tab: string;
+  comparison_target: string;
+  captured_at: number;
+  local_revision_token: string;
+  /** False = a form IS open for this target but the client could not read it
+   * (§2.6's `unreadable`). Must carry no fields. Its own wire field rather
+   * than an inference from an empty `fields` list, which is already what
+   * `no_unsaved_changes` looks like. */
+  readable: boolean;
+}
+
 export interface AssistantAskRequest {
   screen_id: string;
   question: string;
@@ -3640,6 +3674,12 @@ export interface AssistantAskRequest {
   // Issue #441: how this question was entered. Recorded on the user
   // turn only -- the assistant did not speak into a microphone.
   input_mode?: "text" | "voice";
+  voice_continuation?: boolean;
+  voice_spoken_history?: string[];
+  // Issue #445: requires `thread_id` to be set (422 `ui_draft_requires_
+  // thread` otherwise) -- a draft is about a target, and without a thread
+  // there is no target to match it against.
+  ui_draft?: UiDraftContextIn;
 }
 
 // Assistant discussion threads (Issue #438, Epic #436). Finite unions mirror
@@ -3657,6 +3697,17 @@ export type DiscussionTargetKind =
   | "solution_design"
   | "blueprint_lane_cell";
 export type DiscussionTargetState = "current" | "stale" | "unresolvable" | "not_tracked";
+
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived
+// server-side from what a DiscussionAdapter actually declares -- never a
+// stored column or a second constant.
+export type DiscussionCapability =
+  | "read_canonical"
+  | "read_ui_draft"
+  | "propose_fields"
+  | "propose_relations"
+  | "prefill_form"
+  | "promote_joint_understanding";
 
 export interface AssistantDiscussionTargetIn {
   scope: DiscussionScope;
@@ -3683,6 +3734,12 @@ export interface AssistantDiscussionTurn {
   schema_version: string;
   created_by: string | null;
   created_at: number;
+  // Issue #445 §2.7: recorded on USER turns only. `null` on a pre-#445 row
+  // means "this server could not have recorded it" -- distinct from
+  // `ui_draft_state: "not_provided"` (the client explicitly sent none).
+  ui_draft_state?: UiDraftState | null;
+  ui_draft_form_id?: string | null;
+  ui_draft_digest?: string;
 }
 
 export interface AssistantDiscussionThread {
@@ -3744,6 +3801,12 @@ export interface AssistantDiscussionProposalItem {
   decision_method: "reasoning_llm" | "manual";
   created_at: number;
   schema_version: string;
+  // Issue #446 (Epic #443 Phase 3), §3.4: the prefill AUDIT summary, kept
+  // deliberately separate from `status` above -- prefilling this item into
+  // an unsaved Dashboard form is intent, never completion, so `status` stays
+  // `proposed` no matter how many times this item was prefilled.
+  prefill_count: number;
+  last_prefilled_at: number | null;
 }
 
 export interface AssistantDiscussionProposal {
@@ -3795,6 +3858,22 @@ export interface AssistantDiscussionProposalRejectOut {
   rejected_item_ids: number[];
 }
 
+// Discussion proposal prefill (Issue #446, Epic #443 Phase 3).
+// docs/ai-discussion-adapter.md §3.4. `patch_token` is the client-generated
+// idempotency token backing the server's own
+// `UNIQUE (proposal_id, patch_token, item_id)`.
+
+export interface AssistantDiscussionProposalPrefillRequest {
+  item_ids: number[];
+  form_id: string;
+  patch_token: string;
+}
+
+export interface AssistantDiscussionProposalPrefillOut {
+  proposal: AssistantDiscussionProposal;
+  prefilled_item_ids: number[];
+}
+
 export interface AssistantAction {
   label: string;
   kind: "navigate" | "configure" | "operate";
@@ -3803,7 +3882,15 @@ export interface AssistantAction {
 }
 
 export interface AssistantCitation {
-  type: "setting" | "diagnostic_check" | "pipeline_step" | "state_item" | "screen_data";
+  type:
+    | "setting"
+    | "diagnostic_check"
+    | "pipeline_step"
+    | "state_item"
+    | "screen_data"
+    // Issue #445 (Epic #443 Phase 2): the answer relied on an unsaved UI
+    // draft, never a persisted fact.
+    | "ui_draft";
   id: string;
   title: string;
   detail: string;
@@ -3812,6 +3899,10 @@ export interface AssistantCitation {
 export interface AssistantAskOut {
   screen_id: string;
   answer: string;
+  /** Short overview/core projection used only for voice playback. */
+  spoken_answer?: string | null;
+  /** Reopen listening after playback because the spoken answer asks a question. */
+  voice_follow_up_expected?: boolean;
   suggested_actions: AssistantAction[];
   citations: AssistantCitation[];
   used_fallback: boolean;
@@ -3827,6 +3918,10 @@ export interface AssistantAskOut {
   target_state?: DiscussionTargetState | null;
   recheck_required?: boolean;
   turn_number?: number | null;
+  // Issue #445: always present (not gated on thread_id). `ui_draft_changed`
+  // implies `recheck_required` when both are read together.
+  ui_draft_state?: UiDraftState;
+  ui_draft_changed?: boolean;
 }
 
 // UI 機能解説モード (Issue #440, Epic #436): `app/ui_help_registry.py` の
@@ -4474,8 +4569,10 @@ export interface CellAskSyncOut {
 // 「わからない」を終端回答ではなく共同で状況理解を作る工程の開始点として扱う。
 // 三つの来歴(investigation / translation / developer)は 1 つの回答へ混ぜない。
 
-export type JointUnderstandingOriginKind = "qa" | "intent" | "review_item" | "inquiry";
-export type JointUnderstandingTrigger = "unknown_answer" | "explicit_request";
+export type JointUnderstandingOriginKind = "qa" | "intent" | "review_item" | "inquiry" | "purpose_need";
+// "purpose_need" (Issue #389 / #444 §1.9): a Purpose Need response of
+// unknown/investigate opens a session the same way an unanswered Q&A does.
+export type JointUnderstandingTrigger = "unknown_answer" | "explicit_request" | "purpose_need";
 export type JointUnderstandingStatus = "open" | "held" | "closed";
 export type JointUnderstandingOutcome =
   | "understood"
@@ -4849,7 +4946,7 @@ export interface JointUnderstandingRefluxResultOut {
 // --- State-driven System Interview workflow (Issue #349) ---------------------
 //
 // The canonical developer-facing workflow contract of
-// docs/system-interview-workflow-ux.md. The dashboard renders these values;
+// docs/01-specifications/ux/system-interview-workflow-ux.md. The dashboard renders these values;
 // it never re-derives a workflow state of its own (spec principle P9).
 
 export type InterviewWorkflowState =
@@ -5314,7 +5411,7 @@ export interface OverviewOut {
 
 // --- Purpose Chain (Issue #387 Epic / #388 / #390) --------------------------
 //
-// `docs/purpose-chain.md` is the canonical design contract; §0 and §1 are the
+// `docs/01-specifications/product/purpose-chain.md` is the canonical design contract; §0 and §1 are the
 // server specification this mirrors. Two rules carry over unchanged from the
 // server (`app/models.py`'s own comment) and bind the Dashboard too:
 //
@@ -5508,7 +5605,7 @@ export interface PurposeRelationDecisionRequest {
 
 // --- Issue #389 need/question contract --------------------------------------
 //
-// Pinned in `docs/purpose-chain.md` §2 and binding for both #389 (server) and
+// Pinned in `docs/01-specifications/product/purpose-chain.md` §2 and binding for both #389 (server) and
 // #390 (this Dashboard) regardless of implementation order -- #390's own
 // component tests mock `fetch` directly, so they do not depend on the server
 // module landing first. `app/purpose_needs.py` is the server-side owner.
@@ -5645,7 +5742,7 @@ export interface PurposeNeedRespondRequest {
 
 // --- Purpose Verification: Experience / Outcome / Reuse (Issue #391) --------
 //
-// `docs/purpose-chain.md` §4 is the specification. Three OPTIONAL concepts a
+// `docs/01-specifications/product/purpose-chain.md` §4 is the specification. Three OPTIONAL concepts a
 // developer may attach to a Purpose Chain element/relation, by the SAME
 // stable string identity (`target_kind`/`target_id`) #388 already uses --
 // never a row id. Creation is offered only alongside a currently-available
@@ -6017,7 +6114,7 @@ export interface EvolutionNodeTransitionOut {
 // --- UX Design Lineage (Epic #405, Issues #407/#408) --------------------------
 //
 // TypeScript mirror of app/models.py's "UX Design Lineage" section. See
-// docs/ux-design-lineage.md for the contract. Journey / Requirement /
+// docs/01-specifications/ux/ux-design-lineage.md for the contract. Journey / Requirement /
 // Solution Design are the two new PERSISTED design layers this Epic adds;
 // every derived axis (design_status, option_status, link_state, ...) is
 // computed server-side and rendered here, never recomputed by the
@@ -7289,7 +7386,7 @@ export interface FlowExperimentDecisionRequest {
 // === Epic #418 / Issue #422 — Stakeholder Value Network types ===
 // (Issue #422 owns everything between this marker and the #423 marker below.)
 //
-// `GET /stakeholder-value-network` (`docs/stakeholder-value-network.md`
+// `GET /stakeholder-value-network` (`docs/01-specifications/product/stakeholder-value-network.md`
 // §7.1). Read-only, deterministic, no LLM; the Dashboard renders this
 // exactly as returned and re-derives nothing (§0 invariant 9). No
 // coordinate/layout field exists on any type below (invariant 10), and no
@@ -7424,7 +7521,7 @@ export interface ValueNetworkOut {
 // === Epic #418 / Issue #423 — Journey Service Blueprint types ===
 // (Issue #423 owns everything below this marker.)
 //
-// `GET /journey-blueprint` (`docs/stakeholder-value-network.md` §8).
+// `GET /journey-blueprint` (`docs/01-specifications/product/stakeholder-value-network.md` §8).
 // Read-only, deterministic, no LLM; the Dashboard renders this exactly as
 // returned and re-derives nothing (§0 invariant 9). These types are
 // self-contained, mirroring the `ValueNetwork*` section above's own
@@ -7616,7 +7713,7 @@ export interface JourneyStepExchangeLinkCreateRequest {
 // === Epic #418 / Issue #424 — Functional Lineage View + Gap/Impact Overlay ===
 // (Issue #424 owns everything below this marker.)
 //
-// `GET /functional-lineage` (`docs/stakeholder-value-network.md` §9).
+// `GET /functional-lineage` (`docs/01-specifications/product/stakeholder-value-network.md` §9).
 // Read-only, deterministic, no LLM; the Dashboard renders this exactly as
 // returned and re-derives nothing (§0 invariant 9). No score, no
 // completeness percentage, no ranking field exists here, structurally.
@@ -7693,7 +7790,7 @@ export interface FunctionalLineageOut {
 }
 
 // --- Product Objective / Milestone / Gap (Epic #427, Issues #429-#432) -------
-// See docs/product-objective-lineage.md. Mirrors app/models.py's Product*
+// See docs/01-specifications/product/product-objective-lineage.md. Mirrors app/models.py's Product*
 // Literal aliases and *Out/*Request models field-for-field; kept in sync via
 // test_interview_type_parity.py's FINITE_TYPE_NAMES.
 

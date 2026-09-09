@@ -9,9 +9,10 @@ import { AssistantPanel } from "@/components/assistant-panel";
 import { systemStateTarget } from "@/components/system-state";
 import { HelpModeProvider } from "@/lib/help-mode";
 import { HelpModeLayer } from "@/components/help-mode-layer";
+import { UiDraftProvider } from "@/lib/ui-draft";
 
 export function AppLayout() {
-  const { user, loading } = useAuth();
+  const { user, loading, systemId } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const { data: systemState } = useSystemState();
@@ -51,6 +52,14 @@ export function AppLayout() {
   if (!user) return <Navigate to="/login" replace />;
 
   return (
+    // Issue #445: mounted here (not per-page, unlike `UnsavedWorkProvider`)
+    // because its two sides live in different trees -- the forms that
+    // register a draft live under <Outlet /> while the one reader
+    // (`AssistantPanel`) is a sibling of it, not a descendant.
+    // Reset forms, draft registrations, and in-flight voice UI together when
+    // the principal/System changes; identical target refs are not identities
+    // across Systems.
+    <UiDraftProvider key={`${user.id}:${systemId}`}>
     <HelpModeProvider>
       <div className="flex h-screen overflow-hidden">
         <Sidebar
@@ -85,5 +94,6 @@ export function AppLayout() {
         <HelpModeLayer />
       </div>
     </HelpModeProvider>
+    </UiDraftProvider>
   );
 }

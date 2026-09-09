@@ -8,7 +8,7 @@ reuse the latest persisted revision and rebuild Alignment/Review Queue.
 Saved answers are never coupled to refresh success, execution is idempotent,
 and stale/superseded results never overwrite newer state.
 
-Design (see the Issue #288 section of ``docs/project-intelligence.md`` for
+Design (see the Issue #288 section of ``docs/90-history/project-intelligence.md`` for
 the full write-up):
 
 - One ``interview_refresh_job`` row per refresh attempt.

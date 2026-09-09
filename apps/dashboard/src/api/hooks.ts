@@ -80,6 +80,9 @@ import type {
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
   AssistantDiscussionTargetIn, AssistantDiscussionThreadDetailOut, AssistantDiscussionThreadsListOut,
+  AssistantDiscussionProposal, AssistantDiscussionProposalsListOut,
+  AssistantDiscussionProposalApplyOut, AssistantDiscussionProposalRejectOut,
+  AssistantDiscussionProposalPrefillOut,
   UiHelpEntriesOut, UiHelpEntry,
   ConnectivityStatusOut,
   InstrumentationScanOut, ProbePatternsListOut, ProbePatternOut,
@@ -2478,6 +2481,10 @@ export function useAssistantDiscussionThreads(filters: {
   scope?: string;
   targetKind?: string;
   targetRef?: string;
+  // Issue #444 §1.6: the "他の画面での会話" count only wants this listing
+  // scoped to one target -- an unfiltered call is a valid use of this
+  // endpoint but must never fire implicitly just because the panel mounted.
+  enabled?: boolean;
 } = {}) {
   const params = new URLSearchParams();
   if (filters.screenId) params.set("screen_id", filters.screenId);
@@ -2491,7 +2498,90 @@ export function useAssistantDiscussionThreads(filters: {
       api.get<AssistantDiscussionThreadsListOut>(
         query ? `/assistant/discussion-threads?${query}` : "/assistant/discussion-threads",
       ),
-    enabled: !!getSystemId(),
+    enabled: (filters.enabled ?? true) && !!getSystemId(),
+  });
+}
+
+// Assistant discussion proposals (Issue #439, Epic #436; #446 adds prefill,
+// Epic #443 Phase 3). docs/ai-discussion-adapter.md §3.1: the Dashboard's
+// STANDARD route is generate -> review -> prefill; `useApplyDiscussionProposal
+// Items` is kept for the compatibility direct-apply path (§2.2 of
+// docs/assistant-discussion.md), not the one the UI leads with.
+
+export function useDiscussionProposals(threadId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-proposals"), threadId],
+    queryFn: () =>
+      api.get<AssistantDiscussionProposalsListOut>(
+        `/assistant/discussion-threads/${threadId}/proposals`,
+      ),
+    enabled: threadId !== null && !!getSystemId(),
+  });
+}
+
+export function useDiscussionProposal(proposalId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-proposal"), proposalId],
+    queryFn: () => api.get<AssistantDiscussionProposal>(`/assistant/discussion-proposals/${proposalId}`),
+    enabled: proposalId !== null && !!getSystemId(),
+  });
+}
+
+export function useCreateDiscussionProposal(threadId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<AssistantDiscussionProposal>(`/assistant/discussion-threads/${threadId}/proposals`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposals"), threadId] });
+    },
+  });
+}
+
+export function useApplyDiscussionProposalItems(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { item_ids: number[]; rationale?: string }) =>
+      api.post<AssistantDiscussionProposalApplyOut>(
+        `/assistant/discussion-proposals/${proposalId}/apply`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+    },
+  });
+}
+
+export function useRejectDiscussionProposalItems(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { item_ids: number[]; rationale?: string }) =>
+      api.post<AssistantDiscussionProposalRejectOut>(
+        `/assistant/discussion-proposals/${proposalId}/reject`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+    },
+  });
+}
+
+// §3.4: the prefill AUDIT call -- writes only the audit row, the item's own
+// `status` stays `proposed`. The caller (the review UI) still invalidates
+// the DESTINATION target's own queries via `adapter.invalidateKeys` after a
+// successful dispatch; this hook only refreshes the proposal itself so its
+// `prefill_count`/`last_prefilled_at` reflect the just-made dispatch.
+export function usePrefillDiscussionProposalItems(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { item_ids: number[]; form_id: string; patch_token: string }) =>
+      api.post<AssistantDiscussionProposalPrefillOut>(
+        `/assistant/discussion-proposals/${proposalId}/prefill`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+    },
   });
 }
 
@@ -3361,7 +3451,7 @@ export function useResumeJointUnderstanding(sessionId: number | null) {
 // --- State-driven System Interview workflow (Issue #349) ---------------------
 //
 // One query owns the developer-facing state: the server evaluates
-// docs/system-interview-workflow-ux.md §2.2 and returns the state, its single
+// docs/01-specifications/ux/system-interview-workflow-ux.md §2.2 and returns the state, its single
 // primary action, and the currently-active exceptions. The dashboard must not
 // compute a workflow state from a mutation's `isPending` or any other
 // client-only value -- those disappear on reload (spec §2.6).
@@ -3563,7 +3653,7 @@ export function useOverview() {
 
 // --- Purpose Chain (Issue #387 Epic / #388 / #389 / #390) -------------------
 //
-// `docs/purpose-chain.md` §0 invariant 2: the client re-derives no Purpose
+// `docs/01-specifications/product/purpose-chain.md` §0 invariant 2: the client re-derives no Purpose
 // Chain judgement. These queries fetch the server's canonical projection
 // verbatim; `components/purpose-chain/model.ts` only orders and labels what
 // the server already decided.
@@ -3678,7 +3768,7 @@ export function useRespondPurposeNeed(sessionId: number | null) {
 //
 // §4.5's restraint: ONE query for the at-most-one prompt, ONE mutation to
 // create the concept the prompt named. There is no listing/dashboard hook
-// here on purpose -- `docs/purpose-chain.md` §4.5 and this Epic's non-goals
+// here on purpose -- `docs/01-specifications/product/purpose-chain.md` §4.5 and this Epic's non-goals
 // explicitly rule out an outcome dashboard or a retention chart; the only
 // UI surface is the single prompt inside the Purpose Frame panel.
 
@@ -3863,7 +3953,7 @@ export function useTransitionEvolutionNode(nodeId: number | null) {
 
 // --- UX Design Lineage (Epic #405, Issues #407/#408/#409) --------------------
 //
-// `docs/ux-design-lineage.md` §0 invariant 9: the client re-derives no
+// `docs/01-specifications/ux/ux-design-lineage.md` §0 invariant 9: the client re-derives no
 // state. Every `Ux*Out` / `SolutionDesign*Out` field below (design_status,
 // recheck_state, revision_state, every ref/link state, diffs, and the
 // change-origin classification) arrives already decided by these endpoints;
@@ -4454,7 +4544,7 @@ export function useFunctionalLineage() {
 
 // === Epic #427 / Issue #431 — Product Feature hooks ===
 //
-// `docs/product-objective-lineage.md` §7.2. The Feature layer had a complete
+// `docs/01-specifications/product/product-objective-lineage.md` §7.2. The Feature layer had a complete
 // server (`/product-features`) and no editing surface at all, which left the
 // Overview's `link_requirement_to_feature` next step with nowhere to be
 // completed. These hooks back the Requirement -> Feature control on the UX
@@ -4524,7 +4614,7 @@ export function useAddProductFeatureRequirementLink(featureKey: string | null) {
 
 // === Epic #427 / Issue #432 — Objective Map / Gap Workbench hooks ===
 //
-// `docs/product-objective-lineage.md` §9. Both projections are read-only and
+// `docs/01-specifications/product/product-objective-lineage.md` §9. Both projections are read-only and
 // re-derive nothing (§0 invariant 10); `components/product-objective/model.ts`
 // is the only place that filters, labels, or walks the Objective tree. Write
 // mutations below invalidate both projections AND the Overview, whose

@@ -1,7 +1,7 @@
 // Issue #422 (Epic #418): the Stakeholder Value Network screen.
 //
 // Dashboard-only rendering of `GET /stakeholder-value-network`
-// (`docs/stakeholder-value-network.md` §7). This screen re-derives NOTHING:
+// (`docs/01-specifications/product/stakeholder-value-network.md` §7). This screen re-derives NOTHING:
 // `design_status` / `recheck_state` / `validity_state` / `evidence_state` /
 // every notice arrive already decided by the server, and
 // `components/stakeholder-network/model.ts` (pure, no React, no API client)

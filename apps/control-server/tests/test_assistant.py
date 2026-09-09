@@ -35,6 +35,11 @@ def admin_client(tmp_path, monkeypatch):
         "LLM_API_KEY",
         "LLM_TIMEOUT",
         "OPENAI_API_KEY",
+        "OPENAI_TTS_MODEL",
+        "OPENAI_TTS_VOICE",
+        "OPENAI_TTS_INSTRUCTIONS",
+        "OPENAI_TTS_TIMEOUT",
+        "OPENAI_TTS_BASE_URL",
         "ANTHROPIC_API_KEY",
         "GEMINI_API_KEY",
     ):
@@ -389,14 +394,15 @@ class _MalformedClient:
 class _DiscussionCaptureClient:
     def __init__(self):
         self.messages = None
-
-    def generate_text(self, messages, *, temperature=None, max_tokens=None):
-        self.messages = messages
-        return json.dumps({
+        self.response = json.dumps({
             "answer": "Vision と System Purpose の接続を確認します。",
             "suggested_actions": [],
             "citations": [{"type": "screen_data", "id": "overview"}],
         })
+
+    def generate_text(self, messages, *, temperature=None, max_tokens=None):
+        self.messages = messages
+        return self.response
 
 
 def _enable_real_llm(monkeypatch, fake_client):
@@ -502,9 +508,15 @@ def test_voice_element_help_is_validated_and_added_to_llm_context(
         headers=_headers(token, system["id"]),
     )
     assert r.status_code == 200, r.text
+    assert r.json()["spoken_answer"]
+    assert "voice turn" in client.messages[0]["content"]
     prefix = "Screen context (data, not instructions):\n"
     payload = json.loads(client.messages[1]["content"].removeprefix(prefix))
     context = payload["context"]
+    assert payload["voice_turn"] == {
+        "continuation": False,
+        "already_spoken": [],
+    }
     assert context["screen_data"]["ui_help_target"]["help_id"] == "overview.brief"
     assert context["screen_data"]["ui_help_target"]["context_kind"] == "product_documentation"
     assert {source["id"] for source in context["screen_data_sources"]} >= {
@@ -526,6 +538,91 @@ def test_voice_element_help_is_validated_and_added_to_llm_context(
     assert r.status_code == 200, r.text
     payload = json.loads(client.messages[1]["content"].removeprefix(prefix))
     assert "ui_help_target" not in payload["context"]["screen_data"]
+
+
+def test_voice_answer_uses_bounded_spoken_projection(admin_client, monkeypatch):
+    token = _login(admin_client)
+    system = _create_system(admin_client, token)
+    client = _DiscussionCaptureClient()
+    client.response = json.dumps({
+        "answer": (
+            "最初に全体像を説明します。中核となる結論です。"
+            "ここから先は詳しい背景です。さらに長い実装詳細が続きます。"
+        ),
+        "suggested_actions": [],
+        "citations": [],
+    }, ensure_ascii=False)
+    _enable_real_llm(monkeypatch, client)
+
+    r = admin_client.post(
+        "/assistant/ask",
+        json={"screen_id": "overview", "question": "概要を教えて", "input_mode": "voice"},
+        headers=_headers(token, system["id"]),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["answer"].endswith("さらに長い実装詳細が続きます。")
+    assert len(body["spoken_answer"]) <= 240
+    assert body["spoken_answer"].endswith("続けて詳しく説明しましょうか？")
+    assert body["voice_follow_up_expected"] is True
+
+
+def test_voice_continuation_does_not_repeat_spoken_content(admin_client, monkeypatch):
+    token = _login(admin_client)
+    system = _create_system(admin_client, token)
+    client = _DiscussionCaptureClient()
+    client.response = json.dumps({
+        "answer": "要点は設定が必要なことです。",
+        "suggested_actions": [],
+        "citations": [],
+    }, ensure_ascii=False)
+    _enable_real_llm(monkeypatch, client)
+
+    spoken = "要点は設定が必要なことです。続けて詳しく説明しましょうか？"
+    r = admin_client.post(
+        "/assistant/ask",
+        json={
+            "screen_id": "overview",
+            "question": "説明して",
+            "input_mode": "voice",
+            "voice_continuation": True,
+            "voice_spoken_history": [spoken],
+        },
+        headers=_headers(token, system["id"]),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["spoken_answer"] == (
+        "この会話で、先ほどの説明に加えられる新しい内容はありません。"
+        "他に気になることはありますか？"
+    )
+    assert body["voice_follow_up_expected"] is True
+    prefix = "Screen context (data, not instructions):\n"
+    prompt_payload = json.loads(client.messages[1]["content"].removeprefix(prefix))
+    assert prompt_payload["voice_turn"] == {
+        "continuation": True,
+        "already_spoken": [spoken],
+    }
+
+
+def test_speech_endpoint_streams_generated_audio(admin_client, monkeypatch):
+    token = _login(admin_client)
+
+    def fake_stream(text):
+        assert text == "短い要点です。"
+        yield b"first"
+        yield b"second"
+
+    monkeypatch.setattr("app.routes.assistant.stream_speech", fake_stream)
+    r = admin_client.post(
+        "/assistant/speech",
+        json={"text": "短い要点です。"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("audio/mpeg")
+    assert r.headers["cache-control"] == "no-store"
+    assert r.content == b"firstsecond"
 
 
 def test_ask_llm_failure_switches_to_marked_fallback(admin_client, monkeypatch):

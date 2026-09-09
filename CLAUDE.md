@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`probe-agent` is a runtime probe and evaluation platform for tracing, comparing, and evolving software components.
+`probe-agent` is an evidence-driven platform for understanding, evaluating, and safely evolving software systems. Product direction and cross-cutting requirements live in `docs/00-product/vision-and-core-requirements.md`; use `docs/README.md` as the documentation entry point.
 
 The MVP focuses on Python functions and supports:
 
@@ -16,8 +16,10 @@ The MVP focuses on Python functions and supports:
 - System-scoped repositories and runtime data
 - LLM-backed candidate generation and evaluation
 
-The next phases add a Feature Intelligence Layer and an isolated Experiment
-Workspace. See `docs/project-intelligence.md`.
+Feature Intelligence and the isolated Experiment Workspace are part of that
+lineage. Historical issue-by-issue decisions remain in
+`docs/90-history/project-intelligence.md`; current contracts live under
+`docs/01-specifications/`.
 
 Do not implement unsafe automatic replacement in the MVP.
 
@@ -42,9 +44,13 @@ examples/
   simple-pipeline/    Example app for validating the MVP
 
 docs/
-  design.md
-  mvp.md
-  project-intelligence.md
+  README.md                    Documentation map and source-of-truth order
+  00-product/                  Vision, UX principles, and product scope
+  01-specifications/           Current canonical contracts
+  02-challenges-and-decisions/ Time-bounded gaps, audits, and decisions
+  03-validation/               Reproducible validation and dogfooding evidence
+  04-operations/               Guides and runbooks
+  90-history/                  Historical design and implementation journals
 ```
 
 ---
@@ -70,14 +76,14 @@ creating incomplete persistence or execution paths for later phases.
    - entity/correlation/flow lineage, bounded projections, review-gated
      analyzers, shadow subset diffs, Flow Explorer runtime overlay
    - implement sub-issues in dependency order; see the Issue #144 section in
-     `docs/project-intelligence.md` for the breakdown and design decisions
+     `docs/90-history/project-intelligence.md` for the breakdown and design decisions
 6. Issue #168 — Probe Pattern lifecycle
    - deterministic instrumentation scan, pre-release removal patches with an
      explicit apply boundary, pattern reconciliation against the latest
      snapshot (deterministic structural checks first, reasoning model for
      moved/split/missing, no heuristic fallback), and plan creation that
      reuses the #25 approval/patch/validate/apply gates
-   - see the Issue #168 section in `docs/project-intelligence.md`
+   - see the Issue #168 section in `docs/90-history/project-intelligence.md`
 7. Issue #216 — GitHub App publish workflow: GitHub App auth / Installation
    Token broker / connection persistence, then a repository manager
    (mirror clone/fetch/worktree/cleanup), a publish job state machine
@@ -107,7 +113,7 @@ creating incomplete persistence or execution paths for later phases.
    - #246 (Phase D): the Simulation Workbench UI (`/simulation-workbench`),
      trace-row actions + replayability badges, and two deterministic
      source/diff endpoints for the edit→diff flow.
-   See the Issue #242 section in `docs/project-intelligence.md`. Recorded-error
+   See the Issue #242 section in `docs/90-history/project-intelligence.md`. Recorded-error
    traces are executed against candidates on the OFFLINE side only; the live
    SDK shadow asymmetry (`decorator.py`'s `run_shadow and raised is None`) is
    intentionally unchanged. Replay never runs an unapproved component, never
@@ -130,7 +136,7 @@ creating incomplete persistence or execution paths for later phases.
    the target repo, opens/merges a PR, deploys, or enables live shadow. Only a
    successfully generated & validated patch creates a `CandidateVersion`; chat
    messages never do. See the Issue #252 section in
-   `docs/project-intelligence.md`.
+   `docs/90-history/project-intelligence.md`.
 
 10. Issue #282 — Interview Alignment UX (sub-issues #283-#292): the AI
     investigates implementation facts first and asks the user only what
@@ -152,7 +158,7 @@ creating incomplete persistence or execution paths for later phases.
     via manual-approval proposals that never touch policies), #291 knowledge
     areas + handoff (answerable areas chosen by the user, handoff answers
     never recorded as the original user's answer). Per-issue design notes
-    live in `docs/project-intelligence.md`.
+    live in `docs/90-history/project-intelligence.md`.
     **Status: #282 and #283-#291 are implemented, verified, and closed.**
     **#292 (低リスク提案の一括承認) is intentionally NOT implemented** and was
     closed as `not_planned`, superseded by #311: its start condition — observed
@@ -199,7 +205,7 @@ creating incomplete persistence or execution paths for later phases.
     artifact with version/digest provenance on every new Alignment item. #292 remains NOT
     implemented (superseded by #311). The Inquiry status set stays at the
     current 5 values and Intent Brief field names stay as-is — see the
-    Issue #295 section in `docs/project-intelligence.md` for why.
+    Issue #295 section in `docs/90-history/project-intelligence.md` for why.
 
 12. Issue #297 — Probe Cell Fabric (sub-issues #298-#304): assign a logical
     Probe Cell to each approved Probe Point / Component (1 probe = 1 logical
@@ -230,7 +236,7 @@ creating incomplete persistence or execution paths for later phases.
     #242/#252 human gates. Keep the three structures separate: System
     Topology Graph (existing, referenced read-only), Goal/Accountability
     Tree, and Cell Runtime State. See the Issue #297 section in
-    `docs/project-intelligence.md`.
+    `docs/90-history/project-intelligence.md`.
     **Status: #297 and #298-#304 are implemented, verified, and closed.**
     #314 additionally closes the final operational-proof gap with a 3-Cell
     end-to-end read-only pilot fixture: one approved Feature/Probe Plan binds
@@ -321,10 +327,10 @@ creating incomplete persistence or execution paths for later phases.
     Question Router integration). #328-#334 were then closed in favor of
     those narrower follow-ups.
     #327 was closed `not_planned` and fully absorbed into this Epic; its
-    design notes remain valid in `docs/system-understanding-ideal-state.md`.
+    design notes remain valid in `docs/00-product/system-understanding-ideal-state.md`.
     #311 (低リスク提案の一括承認) is still NOT implemented and is not a
     prerequisite of this Epic. See the Issue #328 section in
-    `docs/project-intelligence.md`.
+    `docs/90-history/project-intelligence.md`.
 
 15. Issues #337 / #336 / #339 / #338 — 共同理解フロー統合. The follow-ups
     #328-#334 were closed in favour of, implemented in dependency order:
@@ -332,7 +338,7 @@ creating incomplete persistence or execution paths for later phases.
     reflux) → #339 (exploration + router + hard budgets) → #338 (outcome
     lineage + quality metrics). Do not add a new origin or Finding producer
     before #337's contract is settled. Per-issue design notes live in
-    `docs/project-intelligence.md`.
+    `docs/90-history/project-intelligence.md`.
 
     **#337 (implemented).** What it added, and what any later change must
     preserve:
@@ -569,7 +575,7 @@ creating incomplete persistence or execution paths for later phases.
     再設計する (sub-issues #343-#346). This is a **UX specification** issue:
     every sub-issue lists Dashboard component changes, API/DB/state-management
     design, and test implementation as 対象外, so the deliverable is the spec,
-    not code. The spec lives in `docs/system-interview-workflow-ux.md` and
+    not code. The spec lives in `docs/01-specifications/ux/system-interview-workflow-ux.md` and
     defines: developer-facing states `W0-A`/`W0-B`/`W1`-`W7` decided by a
     **two-stage evaluation** — a first-match rule table over persisted facts,
     then a backward-transition hold (#343); information roles `R1`-`R6`, one
@@ -611,9 +617,9 @@ creating incomplete persistence or execution paths for later phases.
     reopening restores `status=open` and resurfaces unresolved failures.
     Everything else is derivable from
     existing persisted facts. See the Issue #342 section in
-    `docs/project-intelligence.md`.
+    `docs/90-history/project-intelligence.md`.
     **Status: the spec is implemented by Issue #349 (below). Treat
-    `docs/system-interview-workflow-ux.md` as the canonical description of
+    `docs/01-specifications/ux/system-interview-workflow-ux.md` as the canonical description of
     the interview screen's behaviour, not as a future plan.**
 
 17. Issue #349 — the implementation of the #342 spec. Unlike #343-#346, this
@@ -839,7 +845,7 @@ creating incomplete persistence or execution paths for later phases.
       implementation. Do not reintroduce a static mock page.
     Human gates, the #349 state machine, and the #351 Brief rules are
     unchanged. See the Issue #356 sections in
-    `docs/project-intelligence.md` and `docs/system-interview-workflow-ux.md`.
+    `docs/90-history/project-intelligence.md` and `docs/01-specifications/ux/system-interview-workflow-ux.md`.
 
 20. Issue #358 (subs #359-#363) — the cockpit's information design and its
     main route through the screen. A UX review on real data (self-test,
@@ -936,7 +942,7 @@ creating incomplete persistence or execution paths for later phases.
     the #356 cockpit contracts (3-value category status, the separate
     `qaFetchStatus` axis, 0 件 ≠ 取得できていない, aggregation only in
     `model.ts`) are all unchanged. See the Issue #358 sections in
-    `docs/project-intelligence.md` and `docs/system-interview-workflow-ux.md`.
+    `docs/90-history/project-intelligence.md` and `docs/01-specifications/ux/system-interview-workflow-ux.md`.
 
 21. Issue #366 — 設定から候補評価までのエンドツーエンド UX (subs #367-#374).
     A 2026-08-11 audit walked the whole loop (Repository/Settings → Connect
@@ -946,7 +952,7 @@ creating incomplete persistence or execution paths for later phases.
     - #367 (P0) — secret redaction across the Trace / Replay / candidate
       paths. This is now **Core Design Principle 9**; read it before touching
       any payload-rendering or trace-ingestion code, and see
-      `docs/secret-redaction.md` for the operational procedure.
+      `docs/01-specifications/platform/secret-redaction.md` for the operational procedure.
     - #370 / #368 / #369 (P1) — make the displayed state match the persisted
       fact: Trace freshness separate from "ever connected", token expiry
       evaluated against the clock, and Snapshot `ready` (analysis finished)
@@ -1061,7 +1067,7 @@ creating incomplete persistence or execution paths for later phases.
       facts, reading `freshness` (not `state`) so a system that has gone
       silent gets the recovery step rather than a completion message. The
       8-step flow, troubleshooting, and the env-var reference disclose on
-      demand; the actionable lead stays open. `docs/ui-glossary.md` is the
+      demand; the actionable lead stays open. `docs/01-specifications/ux/ui-glossary.md` is the
       terminology and label contract — most importantly the rule this whole
       epic exists to enforce: one displayed word must not carry two facts.
 
@@ -1227,15 +1233,15 @@ creating incomplete persistence or execution paths for later phases.
     Human gates are unchanged: 理解の確認 / Alignment 項目の確定 / 提案の
     承認・編集・却下 / 差分の適用 / 観測の開始 / 採否の記録 / publish all
     stay `decision_method: manual` on their own screens. See the Issue #380
-    sections in `docs/project-intelligence.md` and
-    `docs/system-understanding-navigation.md`.
+    sections in `docs/90-history/project-intelligence.md` and
+    `docs/01-specifications/ux/system-understanding-navigation.md`.
 
 23. Issue #387 (subs #388-#391) — the Purpose Chain. probe-agent could
     already display Vision and System Purpose as two claims; it could not
     explain one FROM the other. This Epic connects 対象者と現在の課題 →
     望ましい変化 → システムの介入 → Capabilities as a traceable chain, while
     keeping what the developer is asked for on first use down to the three
-    Purpose Frame elements. `docs/purpose-chain.md` is the canonical
+    Purpose Frame elements. `docs/01-specifications/product/purpose-chain.md` is the canonical
     contract; read §0 before touching anything in this area. Implement in
     dependency order #388 → #389 → #390 → #391. What must be preserved:
     - **It adds no fifth understanding model.** The elements ARE existing
@@ -1307,7 +1313,7 @@ creating incomplete persistence or execution paths for later phases.
     承認・編集・却下 / 差分の適用 / 観測の開始 / 採否の記録 / publish, plus
     the new relation decision and need response, all stay
     `decision_method: manual`. See the Issue #387 section in
-    `docs/project-intelligence.md` and the contract in `docs/purpose-chain.md`.
+    `docs/90-history/project-intelligence.md` and the contract in `docs/01-specifications/product/purpose-chain.md`.
 
 24. Issue #394 (subs #395-#401) — probe-agent を進化型パイプラインの制御基盤
     (evolution control plane) へ再設計する Epic。probe-agent はすでに
@@ -1316,7 +1322,7 @@ creating incomplete persistence or execution paths for later phases.
     gate を持つが、それらが「分からない処理を探索する → 実データで検証する →
     分かった処理を安定した実装へ定着させる → 低コストで監視する → 前提が
     崩れた箇所だけ再探索へ戻す」という一つのライフサイクルとして接続されて
-    いない。この Epic はその接続を作る。`docs/evolutionary-pipeline.md` が
+    いない。この Epic はその接続を作る。`docs/01-specifications/capabilities/evolutionary-pipeline.md` が
     canonical contract で、§0 を読んでからこの領域に触ること。Phase は
     #395 → #396 → (#397 ∥ #398) → #399 → #400 → #401 の依存順で実装する。
     - **Evolution Node は新しい正本エンティティであり、Probe Cell 契約の
@@ -1384,7 +1390,7 @@ creating incomplete persistence or execution paths for later phases.
     Principle 5 の「target repo へ直接書かない」境界も不変。
 
     **実装状況 (2026-08-17 時点)。** Phase 0〜5 (#395-#400) は実装・検証済み
-    で、各 Phase の設計判断は `docs/project-intelligence.md` の該当セクションに
+    で、各 Phase の設計判断は `docs/90-history/project-intelligence.md` の該当セクションに
     記録してある。実装された正本モジュールは順に `app/evolution_node.py`
     (Node 契約 / 13 個の有限拒否コードを持つ純粋な遷移 evaluator /
     append-only lineage)、`app/node_design.py` (Purpose-to-Node lineage /
@@ -1407,7 +1413,7 @@ creating incomplete persistence or execution paths for later phases.
     parent/human 承認の分離・monitoring contract の実解決検証
     (`monitoring_contract_invalid`)・Operations API 公開を修正済み。
     修正一覧と #401 が引き継ぐ明示的な残件は
-    `docs/project-intelligence.md` の「Epic #394 検証ラウンド」
+    `docs/90-history/project-intelligence.md` の「Epic #394 検証ラウンド」
     「Epic #394 検証ラウンド2」節が正本。
     **#401 Phase 6 (lifecycle UX 統合 / migration 完了 / dogfooding) は
     未着手。** Phase 5 の operations cockpit 画面 (API は公開済み) も #401
@@ -1426,7 +1432,7 @@ creating incomplete persistence or execution paths for later phases.
     どれも「この体験を実現するための要件と実現案」ではない。この Epic は
     Purpose Chain の下流に `UX Journey / Journey Step → Requirement →
     Solution Design → Flow / Evolution Node / Component / Probe Cell` の
-    一層だけを足す。`docs/ux-design-lineage.md` が canonical contract で、
+    一層だけを足す。`docs/01-specifications/ux/ux-design-lineage.md` が canonical contract で、
     §0 を読んでからこの領域に触ること。依存順に #406 (契約) → #407
     (Journey/Step/Requirement/Artifact の永続化と API) → #408 (Solution
     Design と実装対象への link) → #409 (UX Design Studio と E2E)。
@@ -1511,14 +1517,14 @@ creating incomplete persistence or execution paths for later phases.
     `unavailable` / `settled` は CTA を持たない。`db.py` には #405 自身の
     `solution_design_option` を 1 度だけ再構築する
     `_migrate_solution_design_option_unique` が存在する (既存正本への変更では
-    ない)。詳細は `docs/project-intelligence.md` の
+    ない)。詳細は `docs/90-history/project-intelligence.md` の
     「Epic #405 検証ラウンド」節が正本。
 
 26. Issue #412 (subs #413-#415) — 実行モード切替と説明可能なエージェント群。
     通常運用は LLM を呼ばない固定処理として安全に動かし、実験が必要なときだけ
     LLM に候補・比較・実験計画を**提案**させる。あわせて、関連する Evolution
     Node を Flow / エージェント群として集約し、その目的・状態・根拠・次の提案を
-    人が追えるようにする。`docs/execution-modes.md` が canonical contract で、
+    人が追えるようにする。`docs/01-specifications/capabilities/execution-modes.md` が canonical contract で、
     §0 を読んでからこの領域に触ること。依存順に #413 (実行モードの正本契約と
     fail-closed 制御) → #414 (Flow・エージェント群の説明可能な集約 projection)
     → #415 (提案・Shadow 実験・人間承認のオーケストレーション統合)。
@@ -1700,7 +1706,7 @@ creating incomplete persistence or execution paths for later phases.
     経路が無い」「Need に対応する Journey が無い」はどれも表現不能である。
     この Epic は #405 の 1 つ上流に Stakeholder / Need / Environment
     Observation / Value Exchange の層だけを足す。
-    `docs/stakeholder-value-network.md` が canonical contract で、§0 を
+    `docs/01-specifications/product/stakeholder-value-network.md` が canonical contract で、§0 を
     読んでからこの領域に触ること。依存順に #419 (契約) → #420 (永続化と
     API) → #421 (lineage と staleness 伝播) → #422 ∥ #423 (Value Network /
     Service Blueprint projection と Dashboard) → #424 (Functional Lineage
@@ -1767,7 +1773,7 @@ creating incomplete persistence or execution paths for later phases.
     Journey diff / runtime mismatch へ分散しており、個別の不足は検出できても
     「どの Vision の、どの中間目標に対する Gap で、それを解消するためにどの
     UX・Feature・実装・評価が要るか」を一続きに説明できない。
-    `docs/product-objective-lineage.md` が canonical contract で、§0 を読んで
+    `docs/01-specifications/product/product-objective-lineage.md` が canonical contract で、§0 を読んで
     からこの領域に触ること。依存順に #428(契約)→ #429(永続化 / API)→
     #430(既存 Gap federation)→ #431(UX / Feature lineage)→ #432(Dashboard)
     → #433(E2E / migration / dogfooding)。後から変えるときに守ること:
@@ -1927,15 +1933,15 @@ creating incomplete persistence or execution paths for later phases.
       「画面が存在するか」だけで「参照先の行がまだ存在するか」ではない。
     - Overview の `next_action` と `objective.next_step` は**別フィールド**で、
       片方が他方を上書きしない。`decide_next_action` の既存 15 行表は変更しない。
-    - `docs/product-objective-lineage.md` が canonical contract、
-      `docs/system-understanding-navigation.md` に画面導線、
-      `docs/ui-glossary.md` に状態語の対比表がある。
+    - `docs/01-specifications/product/product-objective-lineage.md` が canonical contract、
+      `docs/01-specifications/ux/system-understanding-navigation.md` に画面導線、
+      `docs/01-specifications/ux/ui-glossary.md` に状態語の対比表がある。
 
 
 28. Issue #436 (subs #437-#441) — 画面コンテキスト対応 AI アシスタント。
     Dashboard の AI アシスタントを、画面・設定ヘルプから「いま表示している
     System の正規データを根拠に検討できる対話面」へ広げる。
-    `docs/assistant-discussion.md` が canonical contract で、§0 を読んで
+    `docs/01-specifications/capabilities/assistant-discussion.md` が canonical contract で、§0 を読んで
     からこの領域に触ること。依存順に #437 (4 画面の canonical context。
     実装済み) → #438 (対象要素・revision 単位の thread 永続化) → #439
     (会話結論の reviewable な変更候補化) ∥ #440 (機能解説モード) → #441
@@ -1963,6 +1969,105 @@ creating incomplete persistence or execution paths for later phases.
     - `unknown` / `unavailable` / `stale` / `not_tracked` を丸めない。
     既存の human gate は一切緩めない。本 Epic が追加する Proposal item の
     apply と reject も `decision_method: manual`。
+
+
+29. Issue #443 (subs #444-#449) — AI Discussion UI Adapter。#436 は「1 つの対象に
+    ついて会話し、変更候補を作り、適用する」を作ったが、Dashboard に Proposal の
+    生成・レビュー・反映導線が無く、画面連携は URL パラメータと画面別 `if` 分岐の
+    ままで、Assistant は未保存フォームを一切扱えず、対象は 4 画面 9 kind に限られて
+    いた。この Epic はその 3 点だけを足す — 共通 adapter registry、未保存 UI draft の
+    安全な参照、prefill-first の反映導線 — そのうえで対象を Vision〜Feature へ広げ、
+    nested/list な項目まで候補化し、証拠不足の論点を Joint Understanding へ昇格する。
+    `docs/01-specifications/capabilities/ai-discussion-adapter.md` が canonical contract で、§0 を読んでからこの領域に
+    触ること。`docs/01-specifications/capabilities/assistant-discussion.md` (#436) は**置き換えられない**正本のままで、
+    その §0 の境界はすべて有効。依存順に #444 (adapter contract と parity) → #445
+    (UI draft context) → #446 (Proposal レビュー UI と form draft 反映) → #447
+    (対象拡張) → #448 (nested/list な構造化 Proposal) → #449 (Joint Understanding
+    昇格と E2E)。後から変えるときに守ること:
+    - **`app/discussion_adapters.py` と `src/lib/discussion-adapters.ts` が唯一の
+      registry。** #436 時点で 1 つの `target_kind` を足すには 6 つの並行した
+      per-kind 表 (`SCOPE_TARGET_KINDS` / `_TARGET_RESOLVERS` /
+      `route_params_for_target` / `PROPOSAL_TARGET_SCHEMA` /
+      `gather_target_context` / `_apply_field`+`_apply_relation`) を同時に直す
+      必要があり、1 つ忘れても型検査もテストも緑のままだった。**忘れた場合の
+      壊れ方が拒否ではなく黙った縮退である**ことが問題 — resolver だけ足すと、
+      その対象は `digest=""` で永久に `stale` にならない thread になる。
+      registry の外に per-kind 分岐を戻さない。Assistant Panel 本体に
+      `if (screenId === ...)` を書かない。
+    - **capability は登録内容から導出し、列にも定数にも二重に書かない**
+      (#337/#338/#349 と同じ規律)。有限 6 値 (`read_canonical` /
+      `read_ui_draft` / `propose_fields` / `propose_relations` /
+      `prefill_form` / `promote_joint_understanding`)。
+    - **`unsupported` / `unavailable` / `not_applicable` は 3 つの別の答え**で、
+      `stale` / `conflict` / `unknown` / `validation_error` とも丸めない。
+      未対応 target を screen thread へ黙って縮退させない。
+    - **`thread_key` は `screen_id|scope|target_kind|target_ref` のまま**。
+      同じ entity を別画面から開けば別 thread であり、これは仕様である
+      (統合すると既存 thread の履歴が切れ、どちらの文脈で言われたことか読めなく
+      なる)。代わりに `GET /assistant/discussion-threads?target_kind=&target_ref=`
+      で別画面の会話を列挙し、「他の画面での会話 N 件」として提示する。
+      **黙って別の会話を混ぜない。**
+    - **canonical facts と未保存 UI draft を絶対に混ぜない。** 別フィールド・
+      別 provenance・prompt 内でも別セクション (「未保存の下書き」)。未保存の
+      文字列はまだ誰の判断でもなく、System についての事実ではない。draft の
+      field は adapter の form spec に**完全一致**する名前だけを受け取り、
+      外れた名前・別 target・bound 超過は**リクエスト全体を 422 で拒否**する
+      (黙って落とすと client は送ったつもりのまま回答を読む)。DOM scraping と
+      任意ページ状態の収集は禁止。Principle 9 の redaction を draft にも適用する。
+    - **未保存 draft の値を永続化しない。** turn に残すのは `ui_draft_state` /
+      `ui_draft_form_id` / `ui_draft_digest` の 3 列だけ。監査が答えるべきは
+      「この回答は下書きを見ていたか」であって「下書きに何と書いてあったか」では
+      ない。後者を保存すると、保存されていないはずの内容が DB に残る。
+      client の revision token も信用せず、server で draft 内容から導出した
+      一方向 digest だけを監査へ保存する。JSON 化したフォーム値を token と
+      呼び替えて保存しない。dirty / validation error は本文と別に redaction
+      して prompt へ渡し、canonical facts と混ぜない。
+      draft を渡した回答は引用・言い換えにも値を含みうるため、その場だけに表示し、
+      永続 assistant turn には固定の案内文だけを残す。過去の draft 参照 turn を
+      次の LLM context へ自動継承しない。
+    - **prefill は保存ではなく、item status は保存結果ではない。** prefill は
+      canonical row を 1 行も作らない。`assistant_discussion_proposal_prefill` が
+      意図を記録し、item の `status` は `proposed` のまま (#412 の「記録は昇格では
+      ない」と同じ)。`patch_token` の UNIQUE が二重反映を防ぐ。dirty field を
+      黙って上書きせず、field 単位の衝突プレビューで人が選ぶ。
+    - **Dashboard の標準導線は prefill-first**、既存の直接 `apply` API は互換の
+      ため残す。apply は revision を 1 版足すので、人が読んで直す機会が保存の
+      後になる。prefill なら保存された版は最初から人が確認したものになる。
+    - **人間判断軸を registry に入れない。** `priority_band` / `achievement` /
+      `lifecycle` / `design_status` / `option_status` / `resolved` / `adopted` は
+      `fields` にも `relations` にも登録しない — 登録しなければ LLM は提案できず
+      prefill 先も存在しない。構造で禁じる (#427 が Gap に severity 列を作らな
+      かったのと同じ)。
+    - **nested item は安定キーで address し、順序変更と本文変更を区別する。**
+      `child_kind` / `child_key` / `child_intent` / `child_order`。未知の
+      `field_name` / `relation_kind` / `child_kind` / `child_key` は**その item
+      だけを落とさず提案全体を失敗させる** — 1 つ捏造された field を含む提案は
+      「部分的に正しい提案」ではない。生成時と反映時の**両方**で registry 照合
+      する (間に人間の編集と時間が入る、#412 §7.1.3 と同じ理由)。
+    - **未解決質問・仮説・反証条件を field change へ無理に変換しない。**
+      答えの出ていない問いを「提案された値」にすると、提案を受け入れただけで
+      問いが消える。
+    - **反証条件の無い仮説は昇格できない。** `competing_explanations` か
+      `refutation_conditions` が空なら生成時にも昇格時にも拒否する。昇格は
+      **6 つ目の JU origin `discussion`** (`trigger='discussion_promotion'`) を
+      使う — 既存 4 origin のどれかに偽装すると Journey についての会話が
+      「Q&A の premise」を名乗ることになり、#337 の premise 評価が意味を失う。
+      元の domain item の回答・decision・status は 1 つも変えない。
+      `hypothesis_adopted` は provisional のまま運び、confirmed point へ昇格
+      させない。premise が `current` のときだけ finding を Discussion の context
+      へ載せる。Discussion と JU のテーブルは統合しない。
+    - **`purpose_need` の不一致は広い側 (`app/models.py`) に合わせて解消する。**
+      Issue #389 が実際に `origin_kind='purpose_need'` / `trigger='purpose_need'`
+      の行を書いているので、`joint_understanding.TRIGGERS` / TS union / JSON
+      Schema を 5 値 / 3 値へ広げる。**狭い側に合わせて server を狭めない** —
+      既存行が読めなくなる (#427 の「狭めた語彙には upgrade migration が要る」)。
+    - **adapter は domain rule を所有しない。** lifecycle 判定・次の操作・
+      validation・確定可否は既存 canonical module のまま。client は server が
+      決めた値を再導出しない。#394 の maturity / #304 の Cell Improvement /
+      SDK policy mode / Dashboard workflow phase のどれも読まず、書かない。
+    既存の human gate は一切緩めない。生成・prefill・保存・確定・publish は
+    5 つの別操作で、どれかが他を自動的に起こしてはならない。本 Epic が追加する
+    prefill、hypothesis の昇格・却下もすべて `decision_method: manual`。
 
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
@@ -2112,7 +2217,7 @@ instead of being bolted onto an unrelated issue's scope.
      SDK classification.
    - Existing leaked data has an operational procedure, not a migration:
      `GET /traces/redaction-audit` → rotate the credential → `POST
-     /traces/redaction-rescan`. See `docs/secret-redaction.md`.
+     /traces/redaction-rescan`. See `docs/01-specifications/platform/secret-redaction.md`.
 
 ---
 
@@ -2135,7 +2240,7 @@ For issues #23-#26, always load:
 - `.claude/skills/reasoning-llm/SKILL.md` when any non-finite inference is involved
 - the area-specific skills for Control Server, Dashboard, schema, and testing
 
-Read the owning GitHub issue and `docs/project-intelligence.md` before coding.
+Read the owning GitHub issue and `docs/90-history/project-intelligence.md` before coding.
 Treat later issues as non-goals unless the current issue explicitly expands scope.
 
 If the change affects behavior, add or update tests unless there is a clear reason not to. If tests are not added, explain why.
@@ -2207,7 +2312,7 @@ toast.
   status codes, env var names. Established product-concept names (e.g.
   Capability Map, Flow Explorer, AI Candidate Studio) may remain as-is when
   they ARE the concept, following the 初出のみ併記 style already used in
-  `docs/system-understanding-navigation.md`'s terminology table (English term
+  `docs/01-specifications/ux/system-understanding-navigation.md`'s terminology table (English term
   once at first mention, Japanese prose around it).
 - `state_messages.py`-supplied server strings remain the canonical source of
   truth; any client-side fallback string (used only when a server field is

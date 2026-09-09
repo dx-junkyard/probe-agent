@@ -1,7 +1,7 @@
 """Tests for Issue #432 -- the Objective Map / Gap Workbench / Overview
 `objective` section projection (Epic #427).
 
-`docs/product-objective-lineage.md` §9 (plus §0, §5.4, §5.10, §6) is the
+`docs/01-specifications/product/product-objective-lineage.md` §9 (plus §0, §5.4, §5.10, §6) is the
 canonical contract this file is organized around. Coverage map:
 
 1. The deterministic Gap ordering ladder (`priority_band` -> `lifecycle` ->
