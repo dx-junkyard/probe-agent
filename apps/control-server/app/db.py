@@ -470,6 +470,123 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_prefill_item
 """
 
 
+# joint_understanding_session (Epic #328 Phase A / Issue #329, extended by
+# Issue #461). Pulled out to a module-level constant for the same reason
+# `_SOLUTION_DESIGN_OPTION_DDL` / `_PRODUCT_GAP_ARTIFACT_LINK_DDL` are:
+# SQLite cannot add a CHECK constraint or drop a NOT NULL in place, so a
+# database created before Issue #461 must have this ONE table rebuilt once
+# (`_migrate_joint_understanding_session_owner_scope` below), and the rebuild
+# and the fresh-DB `SCHEMA` string must create byte-for-byte the same table
+# rather than two definitions that can drift apart.
+#
+# Issue #461 adds exactly two things here, both additive to the Issue #337
+# premise bundle this table already carried:
+#
+# - `owner_scope` / `discussion_thread_id`: a Joint Understanding session no
+#   longer has to belong to an `interview_session`. Every session Epic #328
+#   through #339 ever created is `owner_scope='interview'` with `session_id`
+#   resolving and `discussion_thread_id` NULL; a session opened from a
+#   Discussion hypothesis (Issue #455) is `owner_scope='discussion'` with
+#   `session_id` NULL and `discussion_thread_id` resolving instead. The CHECK
+#   below makes "both set" and "both missing" structurally unrepresentable --
+#   not merely rejected by the route that creates a row -- because a second
+#   insert path (a future migration, a script, #455's own endpoint) would
+#   otherwise have to remember to re-derive the same rule. `discussion_thread_
+#   id` carries no `ON DELETE` action: with `PRAGMA foreign_keys=ON` (the
+#   default connection setting) SQLite refuses to delete an
+#   `assistant_discussion_thread` row that a Joint Understanding session still
+#   references, the same "never silently lose judgement history" discipline
+#   Issue #461 decision 8 asks for, expressed structurally rather than by a
+#   cascade that would otherwise have to leave the CHECK's `discussion_thread_
+#   id IS NOT NULL` half unsatisfied.
+# - `premise_dependency_manifest_json` / `premise_dependency_manifest_digest`:
+#   an ADDITIONAL premise fact -- a manifest of `[{target_kind, target_ref,
+#   digest}]` references the investigation relied on beyond the origin
+#   itself, normalized/sorted/dedupe-rejected by
+#   `app/joint_premise.normalize_premise_manifest` and compared at read time
+#   by `app/joint_premise.evaluate_joint_premise` so that a changed dependency
+#   makes the session `stale` even when its own origin content did not move.
+#   Empty (`'[]'`) for every session that predates Issue #461 and for every
+#   one that never populates it (Issue #458 is what actually fills it), so
+#   the manifest check is a no-op for them -- exactly the pre-#461 behavior.
+_JOINT_UNDERSTANDING_SESSION_DDL = """
+CREATE TABLE IF NOT EXISTS joint_understanding_session (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_scope         TEXT NOT NULL DEFAULT 'interview',
+    session_id          INTEGER,
+    discussion_thread_id INTEGER,
+    system_id           INTEGER NOT NULL,
+    origin_kind         TEXT NOT NULL,
+    origin_id           INTEGER NOT NULL,
+    trigger             TEXT NOT NULL,
+    question_text       TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'open',
+    outcome             TEXT,
+    outcome_reason      TEXT,
+    -- Issue #332: which findings the recorded outcome rests on, and the
+    -- premise state evaluated at close time ('fresh' | 'stale'). An outcome
+    -- that adopts a hypothesis or records a decision must name its basis;
+    -- a stale premise (the interview session moved to a newer snapshot than
+    -- the one this session pinned) blocks adopt/decide entirely.
+    outcome_finding_ids TEXT NOT NULL DEFAULT '[]',
+    outcome_premise_state TEXT,
+    -- Issue #337: the reason code behind outcome_premise_state, and WHO
+    -- closed the session. A close is a manual decision, so the deciding
+    -- human and their stated reason must both survive a reload -- an
+    -- outcome with no recoverable decider is not an audit record.
+    outcome_premise_reason TEXT,
+    closed_by_actor_kind  TEXT,
+    closed_by_user_id     INTEGER,
+    closed_by_username    TEXT,
+    -- The premise bundle (Issue #337), sharing Issue #308's column names
+    -- because it is the same bundle: snapshot + pinned commit + origin
+    -- revision + origin content hash + confirmed Capability scope digest
+    -- (+ the linked Intent digest and the review-subject anchor where the
+    -- origin has them). premise_snapshot_id alone was never enough -- an
+    -- Intent correction or an Alignment rebuild moves the ground without
+    -- moving the snapshot, and a NULL premise was previously read as a
+    -- satisfied one. app/joint_premise.py evaluates them into the finite
+    -- current | stale | missing | invalid verdict; a bundle that cannot be
+    -- compared is 'invalid' and blocks the asserting outcomes.
+    premise_snapshot_id INTEGER,
+    premise_commit_sha  TEXT,
+    premise_revision_id INTEGER,
+    premise_content_hash TEXT,
+    premise_capability_digest TEXT,
+    premise_intent_digest TEXT,
+    premise_review_subject_id TEXT,
+    premise_tracking_version TEXT,
+    premise_captured_at REAL,
+    premise_dependency_manifest_json   TEXT NOT NULL DEFAULT '[]',
+    premise_dependency_manifest_digest TEXT,
+    schema_version      TEXT NOT NULL,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    closed_at           REAL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (discussion_thread_id) REFERENCES assistant_discussion_thread (id),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (premise_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (premise_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL,
+    CHECK (owner_scope IN ('interview', 'discussion')),
+    CHECK (
+        (owner_scope = 'interview' AND session_id IS NOT NULL AND discussion_thread_id IS NULL)
+        OR
+        (owner_scope = 'discussion' AND session_id IS NULL AND discussion_thread_id IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_session
+    ON joint_understanding_session (session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_origin
+    ON joint_understanding_session (system_id, origin_kind, origin_id);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_discussion_thread
+    ON joint_understanding_session (discussion_thread_id, status);
+"""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3231,66 +3348,12 @@ CREATE INDEX IF NOT EXISTS idx_interview_inquiry_transition_inquiry
 -- (origin_kind/trigger/status/outcome/origin_role/claim_kind/action_kind/
 -- decision_method) is validated against the finite sets in
 -- app/joint_understanding.py before insert (Principle 6).
-CREATE TABLE IF NOT EXISTS joint_understanding_session (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id          INTEGER NOT NULL,
-    system_id           INTEGER NOT NULL,
-    origin_kind         TEXT NOT NULL,
-    origin_id           INTEGER NOT NULL,
-    trigger             TEXT NOT NULL,
-    question_text       TEXT NOT NULL,
-    status              TEXT NOT NULL DEFAULT 'open',
-    outcome             TEXT,
-    outcome_reason      TEXT,
-    -- Issue #332: which findings the recorded outcome rests on, and the
-    -- premise state evaluated at close time ('fresh' | 'stale'). An outcome
-    -- that adopts a hypothesis or records a decision must name its basis;
-    -- a stale premise (the interview session moved to a newer snapshot than
-    -- the one this session pinned) blocks adopt/decide entirely.
-    outcome_finding_ids TEXT NOT NULL DEFAULT '[]',
-    outcome_premise_state TEXT,
-    -- Issue #337: the reason code behind outcome_premise_state, and WHO
-    -- closed the session. A close is a manual decision, so the deciding
-    -- human and their stated reason must both survive a reload -- an
-    -- outcome with no recoverable decider is not an audit record.
-    outcome_premise_reason TEXT,
-    closed_by_actor_kind  TEXT,
-    closed_by_user_id     INTEGER,
-    closed_by_username    TEXT,
-    -- The premise bundle (Issue #337), sharing Issue #308's column names
-    -- because it is the same bundle: snapshot + pinned commit + origin
-    -- revision + origin content hash + confirmed Capability scope digest
-    -- (+ the linked Intent digest and the review-subject anchor where the
-    -- origin has them). premise_snapshot_id alone was never enough -- an
-    -- Intent correction or an Alignment rebuild moves the ground without
-    -- moving the snapshot, and a NULL premise was previously read as a
-    -- satisfied one. app/joint_premise.py evaluates them into the finite
-    -- current | stale | missing | invalid verdict; a bundle that cannot be
-    -- compared is 'invalid' and blocks the asserting outcomes.
-    premise_snapshot_id INTEGER,
-    premise_commit_sha  TEXT,
-    premise_revision_id INTEGER,
-    premise_content_hash TEXT,
-    premise_capability_digest TEXT,
-    premise_intent_digest TEXT,
-    premise_review_subject_id TEXT,
-    premise_tracking_version TEXT,
-    premise_captured_at REAL,
-    schema_version      TEXT NOT NULL,
-    created_at          REAL NOT NULL,
-    updated_at          REAL NOT NULL,
-    closed_at           REAL,
-    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
-    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
-    FOREIGN KEY (premise_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
-    FOREIGN KEY (premise_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_session
-    ON joint_understanding_session (session_id, status);
-
-CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_origin
-    ON joint_understanding_session (system_id, origin_kind, origin_id);
+--
+-- Issue #461 extends this table with `owner_scope` / `discussion_thread_id`
+-- (a session may belong to a Discussion instead of an Interview) and a
+-- dependency reference manifest on the premise bundle; see
+-- `_JOINT_UNDERSTANDING_SESSION_DDL`'s own comment for the detail.
+""" + _JOINT_UNDERSTANDING_SESSION_DDL + """
 
 -- Append-only. A correction is a NEW row carrying supersedes_finding_id;
 -- existing rows are never UPDATEd or DELETEd, so an explanation can always
@@ -9479,9 +9542,116 @@ def _migrate_ux_journey_upstream_ref_kinds(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_joint_understanding_session_owner_scope(conn: sqlite3.Connection) -> None:
+    """Add `owner_scope` / `discussion_thread_id`, drop `session_id`'s NOT
+    NULL, and add the dependency-manifest premise columns (Issue #461).
+
+    Every pre-#461 row is `owner_scope='interview'`: its `session_id`
+    already resolves an `interview_session`, so nothing about what the row
+    MEANS changes. `CREATE TABLE IF NOT EXISTS` cannot add a CHECK
+    constraint or relax a NOT NULL on a table that already exists, so a
+    database created before Issue #461 must have this table rebuilt once,
+    preserving every id, every FK target, and every existing column value
+    exactly.
+
+    Detection is STRUCTURAL and idempotent, the same discipline
+    `_migrate_solution_design_option_unique` /
+    `_migrate_ux_journey_upstream_ref_kinds` use: read the table's stored SQL
+    straight from `sqlite_master` and no-op the moment it already declares
+    `owner_scope`. There is no version flag to drift from the schema it
+    describes.
+
+    Seven other tables carry a `joint_understanding_id REFERENCES
+    joint_understanding_session (id) ON DELETE CASCADE` FK (finding / action /
+    hypothesis_adoption / investigation_round / exploration_source /
+    translation / reflux). By default SQLite's `ALTER TABLE ... RENAME TO`
+    rewrites every OTHER table's stored FK clause to keep pointing at the
+    renamed table under its NEW name -- so a plain rename-then-recreate here
+    would leave all seven referencing the `_legacy` table this function is
+    about to drop, silently breaking their cascade delete without touching a
+    single row of THEIRS (verified empirically: the child rows survive a
+    parent delete once its FK target no longer exists). `PRAGMA
+    legacy_alter_table=ON` for the rename alone disables that rewrite, so the
+    child tables keep referencing the bare, unqualified name
+    `joint_understanding_session` -- which resolves to the newly (re)created
+    table the moment this function creates it, with no fix-up needed on the
+    seven child tables at all.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'joint_understanding_session'"
+    ).fetchone()
+    if row is None or row["sql"] is None:
+        return
+    if "owner_scope" in row["sql"]:
+        return
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        PRAGMA legacy_alter_table = ON;
+        ALTER TABLE joint_understanding_session RENAME TO joint_understanding_session_legacy;
+        PRAGMA legacy_alter_table = OFF;
+        -- A rename carries the table's indexes with it, so their NAMES stay
+        -- taken and the DDL's `CREATE INDEX IF NOT EXISTS` below would
+        -- silently do nothing -- leaving the rebuilt table with no index at
+        -- all, which is worse than the old one being stale. Free the names
+        -- first, the same reason every other table-rebuild migration here
+        -- does.
+        DROP INDEX IF EXISTS idx_joint_understanding_session_session;
+        DROP INDEX IF EXISTS idx_joint_understanding_session_origin;
+        """
+    )
+    conn.executescript(_JOINT_UNDERSTANDING_SESSION_DDL)
+    conn.execute(
+        """
+        INSERT INTO joint_understanding_session (
+            id, owner_scope, session_id, discussion_thread_id, system_id,
+            origin_kind, origin_id, trigger, question_text, status, outcome,
+            outcome_reason, outcome_finding_ids, outcome_premise_state,
+            outcome_premise_reason, closed_by_actor_kind, closed_by_user_id,
+            closed_by_username, premise_snapshot_id, premise_commit_sha,
+            premise_revision_id, premise_content_hash,
+            premise_capability_digest, premise_intent_digest,
+            premise_review_subject_id, premise_tracking_version,
+            premise_captured_at, premise_dependency_manifest_json,
+            premise_dependency_manifest_digest, schema_version, created_at,
+            updated_at, closed_at
+        )
+        SELECT
+            id, 'interview', session_id, NULL, system_id,
+            origin_kind, origin_id, trigger, question_text, status, outcome,
+            outcome_reason, outcome_finding_ids, outcome_premise_state,
+            outcome_premise_reason, closed_by_actor_kind, closed_by_user_id,
+            closed_by_username, premise_snapshot_id, premise_commit_sha,
+            premise_revision_id, premise_content_hash,
+            premise_capability_digest, premise_intent_digest,
+            premise_review_subject_id, premise_tracking_version,
+            premise_captured_at, '[]',
+            NULL, schema_version, created_at,
+            updated_at, closed_at
+        FROM joint_understanding_session_legacy
+        """
+    )
+    conn.executescript(
+        """
+        DROP TABLE joint_understanding_session_legacy;
+        PRAGMA foreign_keys = ON;
+        """
+    )
+
+
 def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
+        # Must run BEFORE `executescript(SCHEMA)`: the rebuilt table's own
+        # `_JOINT_UNDERSTANDING_SESSION_DDL` declares a NEW index on the NEW
+        # `discussion_thread_id` column, and `CREATE INDEX IF NOT EXISTS`
+        # against a legacy table that does not have that column yet is an
+        # OperationalError -- unlike a CHECK-only widening, this migration
+        # adds a column an index depends on, so it cannot wait until after
+        # the unconditional schema pass the way the other rebuild migrations
+        # below do.
+        _migrate_joint_understanding_session_owner_scope(conn)
         conn.executescript(SCHEMA)
         _migrate_canonical_execution_authorization(conn)
         _migrate_flow_execution_ref_uniqueness(conn)

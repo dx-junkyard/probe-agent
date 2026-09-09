@@ -459,19 +459,18 @@ def gather_target_context(conn, system_id: int, target_kind: str, target_ref: st
     on whether a target can be proposed against at all is the digest/
     staleness check in `evaluate_item_eligibility`, not this helper).
 
-    Delegates to `discussion_adapters.DISCUSSION_ADAPTERS[target_kind].
-    context_provider` (Issue #444). A kind with `context_provider=None`
-    (discussion-only: `screen` / `interview_session` / `overview_finding`)
-    degrades to `{}`, exactly as the old per-kind `if` chain did when no
-    branch matched.
+    Delegates to `discussion_adapters.gather_context` (Issue #444/#456),
+    which is the canonical place the `unsupported` (no adapter/handler) /
+    `unavailable` (registered handler raised) / `available` distinction is
+    computed and separately tested. This function keeps its OWN pre-#456
+    signature and return shape (a bare facts dict, no operation_state) on
+    purpose: `generate_proposal`'s prompt has no separate slot for "this read
+    failed" today, and stuffing that into the facts dict itself would be
+    exactly the "operation result mixed into facts" #456 forbids. A caller
+    that needs the operation_state should call `discussion_adapters.
+    gather_context` directly instead of this compatibility wrapper.
     """
-    adapter = discussion_adapters.DISCUSSION_ADAPTERS.get(target_kind)
-    if adapter is None or adapter.context_provider is None:
-        return {}
-    try:
-        return adapter.context_provider(conn, system_id, target_ref)
-    except Exception:  # pragma: no cover - defensive, mirrors resolvers' own rule
-        return {}
+    return discussion_adapters.gather_context(conn, system_id, target_kind, target_ref).facts
 
 
 # --- Persistence ---------------------------------------------------------------

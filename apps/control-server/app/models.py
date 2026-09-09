@@ -3733,8 +3733,16 @@ class InterviewInquiryTransitionRequest(BaseModel):
 # `trigger='purpose_need'`, mirroring the 'unknown_answer' rule immediately
 # below: `trigger` records WHICH PATH opened the session, never a request
 # body's claim.
-JointUnderstandingOriginKind = Literal["qa", "intent", "review_item", "inquiry", "purpose_need"]
+JointUnderstandingOriginKind = Literal[
+    "qa", "intent", "review_item", "inquiry", "purpose_need", "discussion",
+]
 JointUnderstandingTrigger = Literal["unknown_answer", "explicit_request", "purpose_need"]
+# Issue #461: a session's owner is either an Interview (every session Epic
+# #328 through #339 ever created) or a Discussion (Issue #455, no owning
+# Interview at all). Exactly one of `session_id` / `discussion_thread_id`
+# resolves, fixed by this value -- see `app/joint_understanding.
+# validate_owner_scope`.
+JointUnderstandingOwnerScope = Literal["interview", "discussion"]
 JointUnderstandingStatus = Literal["open", "held", "closed"]
 # hypothesis_adopted is explicitly PROVISIONAL (never a fact); decided is the
 # only final human value judgement. See SESSION_OUTCOMES.
@@ -3771,6 +3779,9 @@ JointUnderstandingPremiseReason = Literal[
     "pinned_snapshot_removed", "origin_removed",
     "origin_superseded", "pinned_commit_changed", "origin_content_changed",
     "capability_scope_changed", "linked_intent_changed",
+    # Issue #461: the dependency reference manifest axis.
+    "dependency_manifest_unresolved", "dependency_target_removed",
+    "dependency_content_changed",
 ]
 # Issue #337: WHICH code path produced a finding, as distinct from whose voice
 # it speaks in (origin_role). 'legacy' is read-only -- what a row written
@@ -3913,10 +3924,22 @@ class JointUnderstandingActionCreate(BaseModel):
     note: Optional[str] = Field(default=None, max_length=2_000)
 
 
+class JointUnderstandingPremiseDependencyRefOut(BaseModel):
+    """One entry of the Issue #461 dependency reference manifest."""
+
+    target_kind: str
+    target_ref: str
+    digest: str
+
+
 class JointUnderstandingOut(BaseModel):
     id: int
-    session_id: int
+    # Issue #461: NULL for `owner_scope='discussion'`, which has no owning
+    # Interview at all -- `discussion_thread_id` resolves instead.
+    session_id: Optional[int] = None
     system_id: int
+    owner_scope: JointUnderstandingOwnerScope = "interview"
+    discussion_thread_id: Optional[int] = None
     origin_kind: JointUnderstandingOriginKind
     origin_id: int
     trigger: JointUnderstandingTrigger
@@ -3956,6 +3979,14 @@ class JointUnderstandingOut(BaseModel):
     premise_revision_id: Optional[int] = None
     premise_tracking_version: Optional[str] = None
     premise_captured_at: Optional[float] = None
+    # Issue #461: additional [{target_kind, target_ref, digest}] references
+    # the investigation relied on beyond the origin itself. Empty for every
+    # session that predates this field and for every one that never
+    # populates it.
+    premise_dependency_manifest: List[JointUnderstandingPremiseDependencyRefOut] = Field(
+        default_factory=list,
+    )
+    premise_dependency_manifest_digest: Optional[str] = None
     schema_version: str
     created_at: float
     updated_at: float
@@ -4286,7 +4317,9 @@ class JointUnderstandingLineageEventOut(BaseModel):
     # A finding id for an unknown/hypothesis; a Joint Understanding session id
     # for a question/decision/classification.
     subject_id: int
-    session_id: int
+    # Issue #461: NULL for a discussion-scope session, which has no owning
+    # Interview session id to report.
+    session_id: Optional[int] = None
     joint_understanding_id: int
     at: float
     # The successor that closed this subject's lineage, where there is one. This
@@ -4298,7 +4331,7 @@ class JointUnderstandingLineageEventOut(BaseModel):
 
 class JointUnderstandingSessionBurdenOut(BaseModel):
     joint_understanding_id: int
-    session_id: int
+    session_id: Optional[int] = None
     rounds: int = 0
     developer_actions: int = 0
     developer_findings: int = 0
@@ -6213,6 +6246,22 @@ DiscussionCapability = Literal[
     "promote_joint_understanding",
 ]
 
+# Issue #456 (Epic #443 Phase 1 follow-up). The finite operation-result
+# contract a discussion-adapter READ operation (canonical context gathering,
+# prefill readiness, ...) reports ALONGSIDE its facts -- never folded into
+# them, and never merged with `DiscussionTargetState` (freshness) or with
+# `unknown` / `stale` / `conflict` / `validation_error`, which stay separate
+# facts of their own. First-match assignment (`app/discussion_adapters.py`):
+# `unsupported` (no adapter/handler is registered for this operation at all --
+# a structural gap in the current catalog), `unavailable` (a registered
+# handler exists but THIS attempt failed -- exception, transient read
+# failure), `not_applicable` (this kind of target can never carry this
+# operation, independent of whether a handler could someday be registered).
+# A deleted/inaccessible target stays on the EXISTING resolver/404 contract
+# (`DiscussionTargetState.unresolvable`, or a 404) rather than being
+# reclassified into this vocabulary.
+DiscussionOperationResult = Literal["available", "unsupported", "unavailable", "not_applicable"]
+
 
 class AssistantDiscussionTargetIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -6272,6 +6321,14 @@ class AssistantDiscussionThreadOut(BaseModel):
 class AssistantDiscussionThreadDetailOut(BaseModel):
     thread: AssistantDiscussionThreadOut
     target_state: DiscussionTargetState
+    # Issue #456: the target's adapter-derived capability set (§1.3), read
+    # fresh from the CURRENT registry every time -- never stored on the
+    # thread row, so a narrowed registry is reflected immediately rather than
+    # describing whatever was true when the thread was created. Separate
+    # field from `target_state` (freshness) on purpose (#366's rule): a
+    # thread can be `current` and still lack `prefill_form`, or be `stale`
+    # and still support it.
+    capabilities: List[DiscussionCapability] = Field(default_factory=list)
     turns: List[AssistantDiscussionTurnOut] = Field(default_factory=list)
 
 
@@ -6589,6 +6646,24 @@ class AssistantAskOut(BaseModel):
     # draft (§2.6).
     ui_draft_state: UiDraftState = "not_provided"
     ui_draft_changed: bool = False
+    # Issue #456 follow-up: the finite operation-result of THIS turn's screen
+    # canonical-context read (`assistant_discussion_context.build_screen_
+    # discussion_context`), reported as its OWN field -- never folded into
+    # `screen_data`/facts (the LLM prompt keeps the same separation, see
+    # `app/assistant.py`'s `ContextPack.screen_data_state`) and never merged
+    # with `target_state` (freshness, a DIFFERENT axis). `unsupported`: this
+    # screen_id has no discussion-context concept at all (`build_screen_
+    # discussion_context` returned `None`) -- distinct from the PRE-#456 wire
+    # shape, where that case was indistinguishable from "canonical read
+    # failed" because neither reached the client. `unavailable`: the screen
+    # is discussion-enabled but this turn's read failed; `screen_data` is
+    # still whatever the LAST successful read happened to leave (typically
+    # absent) rather than a claim about the System's current facts.
+    # `available`: the read succeeded (an EMPTY result is still `available`,
+    # not `unavailable` -- a genuinely empty canonical projection is real
+    # data, not a failed read).
+    screen_context_state: DiscussionOperationResult = "unsupported"
+    screen_context_reason: Optional[str] = None
 
 
 # --- Replay engine (Issue #242 Phase B / #244) -------------------------------

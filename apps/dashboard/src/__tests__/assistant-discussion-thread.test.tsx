@@ -387,4 +387,65 @@ describe("Issue #438 — target-scoped discussion threads", () => {
     const calls = mockApi.post.mock.calls.filter(([path]) => path === "/assistant/ask");
     expect(calls[0][1]).not.toHaveProperty("thread_id");
   });
+
+  // Issue #456: docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3/§9's UI display contract --
+  // "未対応時は理由と既存画面への移動を示し、失敗時には再試行を示す".
+  test("a structurally-unsupported ask failure shows a reason with no retry button", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path.startsWith("/assistant/screen-context/")
+        ? Promise.resolve(screenContext)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/assistant/discussion-threads") return Promise.resolve(null);
+      if (path === "/assistant/ask") {
+        return Promise.reject({ code: "discussion_target_kind_unregistered" });
+      }
+      return Promise.resolve(null);
+    });
+    await renderPanelAt("/ux-design-studio?tab=requirements&requirement=req-a");
+
+    fireEvent.change(screen.getByTestId("assistant-question-input"), {
+      target: { value: "この Requirement について" },
+    });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+
+    const error = await screen.findByTestId("assistant-error");
+    expect(error.textContent).toContain("対応していません");
+    expect(screen.queryByTestId("assistant-error-retry")).toBeNull();
+  });
+
+  test("an unrecognised ask failure offers a retry that resends the same question", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path.startsWith("/assistant/screen-context/")
+        ? Promise.resolve(screenContext)
+        : Promise.resolve(null),
+    );
+    let askCalls = 0;
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/assistant/discussion-threads") return Promise.resolve(null);
+      if (path === "/assistant/ask") {
+        askCalls += 1;
+        return askCalls === 1
+          ? Promise.reject(new Error("network hiccup"))
+          : Promise.resolve(askResponse);
+      }
+      return Promise.resolve(null);
+    });
+    await renderPanelAt("/ux-design-studio?tab=requirements&requirement=req-a");
+
+    fireEvent.change(screen.getByTestId("assistant-question-input"), {
+      target: { value: "もう一度聞きます" },
+    });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+    await screen.findByTestId("assistant-error");
+
+    fireEvent.click(screen.getByTestId("assistant-error-retry"));
+    await screen.findByTestId("assistant-answer");
+
+    const askBodies = mockApi.post.mock.calls
+      .filter(([path]) => path === "/assistant/ask")
+      .map(([, body]) => (body as { question: string }).question);
+    expect(askBodies).toEqual(["もう一度聞きます", "もう一度聞きます"]);
+  });
 });

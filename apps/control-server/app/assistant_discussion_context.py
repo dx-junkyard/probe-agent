@@ -21,6 +21,16 @@ MAX_LIST_ITEMS = 50
 class ScreenDiscussionContext:
     facts: Dict[str, Any]
     sources: List[Dict[str, str]]
+    # Issue #456: the finite `DiscussionOperationResult` (`app/models.py`)
+    # this READ attempt reports, kept as its OWN field -- never folded into
+    # `facts`. Every existing constructor call below builds a SUCCESSFUL
+    # context and leaves this at its default, so the field is additive.
+    # `build_screen_discussion_context` is the only place that produces the
+    # other values, on a caught exception (§1.3: a diagnostics-gathering
+    # failure must degrade, never take down the whole `/assistant/ask`
+    # request -- see its own docstring).
+    operation_state: str = "available"  # DiscussionOperationResult
+    reason: str = ""
 
 
 def _selected_or_none(loader) -> tuple[Optional[Dict[str, Any]], bool]:
@@ -223,17 +233,41 @@ def _journey_blueprint_context(
     )
 
 
+_SCREEN_CONTEXT_PROVIDERS: Dict[str, Any] = {
+    "overview": lambda system_id, params: _overview_context(system_id),
+    "interview": _interview_context,
+    "ux-design-studio": _ux_design_context,
+    "journey-blueprint": _journey_blueprint_context,
+}
+
+
 def build_screen_discussion_context(
     screen_id: str, system_id: int, route_params: Optional[Dict[str, str]] = None
 ) -> Optional[ScreenDiscussionContext]:
-    """Return canonical facts only for discussion-enabled screens."""
+    """Return canonical facts only for discussion-enabled screens.
+
+    `None` means `screen_id` is not one of the discussion-enabled screens at
+    all -- `unsupported` at the screen level, unchanged from before #456 (the
+    caller already treats `None` as "no screen_data" and this is not the bug
+    #456 fixes).
+
+    A REGISTERED screen's provider used to run with no safety net: an
+    exception inside `_overview_context` / `_interview_context` / ... (e.g. a
+    guarded canonical projection raising) propagated all the way out of
+    `POST /assistant/ask` as a 500, destroying the whole assistant turn over
+    one screen's context read (§1.3: "診断取得失敗で会話全体を不要に壊さ
+    ない"). It now degrades to an `unavailable` context with no facts/
+    sources instead -- the assistant still answers, just without this
+    screen's canonical facts for this turn.
+    """
     params = route_params or {}
-    if screen_id == "overview":
-        return _overview_context(system_id)
-    if screen_id == "interview":
-        return _interview_context(system_id, params)
-    if screen_id == "ux-design-studio":
-        return _ux_design_context(system_id, params)
-    if screen_id == "journey-blueprint":
-        return _journey_blueprint_context(system_id, params)
-    return None
+    provider = _SCREEN_CONTEXT_PROVIDERS.get(screen_id)
+    if provider is None:
+        return None
+    try:
+        return provider(system_id, params)
+    except Exception:  # pragma: no cover - defensive, mirrors the adapter registry's own rule
+        return ScreenDiscussionContext(
+            facts={}, sources=[], operation_state="unavailable",
+            reason="screen_discussion_context_provider_error",
+        )

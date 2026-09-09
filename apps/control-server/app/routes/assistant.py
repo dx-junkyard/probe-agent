@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
-from .. import assistant_discussion, assistant_discussion_proposal, ui_draft_context
+from .. import assistant_discussion, assistant_discussion_proposal, discussion_adapters, ui_draft_context
 from ..assistant import (
     answer_question,
     checks_for_screen,
@@ -255,9 +255,19 @@ def _turn_out(row: Dict[str, Any]) -> AssistantDiscussionTurnOut:
 
 
 def _thread_detail_out(data: Dict[str, Any]) -> AssistantDiscussionThreadDetailOut:
+    # Issue #456: read fresh from the CURRENT registry every time (never
+    # stored on the thread row), so a narrowed/widened registry is reflected
+    # immediately -- the same "never a stored column" discipline `discussion_
+    # adapters.capabilities_for` itself documents. An adapter that no longer
+    # exists (a legacy row's `target_kind` was removed from the registry,
+    # `tests/test_discussion_adapter_registry.py`'s own compatibility test)
+    # reports zero capabilities rather than raising.
+    adapter = discussion_adapters.get_adapter(data["thread"]["target_kind"])
+    capabilities = list(discussion_adapters.capabilities_for(adapter)) if adapter is not None else []
     return AssistantDiscussionThreadDetailOut(
         thread=_thread_out(data["thread"]),
         target_state=data["target_state"],
+        capabilities=capabilities,
         turns=[_turn_out(t) for t in data["turns"]],
     )
 

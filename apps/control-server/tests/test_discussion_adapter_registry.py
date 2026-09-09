@@ -202,13 +202,50 @@ def test_capabilities_derived_for_ux_journey_has_read_and_propose_both():
     assert "read_canonical" in caps
     assert "propose_fields" in caps
     assert "propose_relations" in caps
-    # Phase 2 (#445): `ux_journey` now has a `ui_draft_forms` entry, so both
-    # `read_ui_draft` (form registered) and `prefill_form` (form registered
-    # AND it can propose_fields/propose_relations) are derived true.
-    # `promote_joint_understanding` is still #449's -- untouched here.
+    # Phase 2 (#445): `ux_journey` now has a `ui_draft_forms` entry, so
+    # `read_ui_draft` (form registered) is derived true. `prefill_form` is
+    # NOT (Issue #456): a declared form only says a destination EXISTS, not
+    # that anything can deliver to it -- that additionally requires a
+    # registered `prefill_handler_id`, which stays `None` for every adapter
+    # until #452 wires the first real handler. `promote_joint_understanding`
+    # is still #449's -- untouched here.
     assert "read_ui_draft" in caps
-    assert "prefill_form" in caps
+    assert "prefill_form" not in caps
     assert "promote_joint_understanding" not in caps
+
+
+def test_prefill_form_becomes_true_only_once_a_handler_is_registered():
+    """Issue #456 §1.3: `prefill_form` must not be derivable from `ui_draft_
+    forms`/`fields` alone. This proves the WIRING actually flips it true once
+    a handler is registered (`fixture 接続時のみ対応済みになる`) -- using a
+    `dataclasses.replace`d copy so the REAL, unmodified registry (asserted
+    unaffected below) stays the honest "no handler wired yet" state that is
+    #456's own correct completion condition."""
+    from dataclasses import replace
+
+    journey = discussion_adapters.DISCUSSION_ADAPTERS["ux_journey"]
+    assert "prefill_form" not in discussion_adapters.capabilities_for(journey)
+
+    fixture_connected = replace(journey, prefill_handler_id="ux_journey.revision@v1")
+    assert "prefill_form" in discussion_adapters.capabilities_for(fixture_connected)
+
+    # The real registry entry is untouched by building the fixture copy.
+    assert discussion_adapters.DISCUSSION_ADAPTERS["ux_journey"].prefill_handler_id is None
+    assert "prefill_form" not in discussion_adapters.capabilities_for(
+        discussion_adapters.DISCUSSION_ADAPTERS["ux_journey"]
+    )
+
+
+def test_prefill_form_still_requires_ui_draft_forms_and_propose_capability():
+    """A `prefill_handler_id` alone (a handler with nowhere to deliver, or a
+    kind that cannot propose anything) must not be sufficient -- all THREE
+    preconditions are required together."""
+    from dataclasses import replace
+
+    overview_finding = discussion_adapters.DISCUSSION_ADAPTERS["overview_finding"]
+    assert overview_finding.ui_draft_forms == ()
+    handler_but_no_form = replace(overview_finding, prefill_handler_id="overview_finding.x@v1")
+    assert "prefill_form" not in discussion_adapters.capabilities_for(handler_but_no_form)
 
 
 def test_capabilities_derived_for_understanding_claim_has_no_ui_draft_yet():

@@ -55,7 +55,28 @@ SCHEMA_VERSION = "joint-understanding-v1"
 # Which confirmation item the developer could not answer. 'inquiry' is
 # included because a doubt conversation that ends 'unresolved' is one of the
 # most common ways a developer discovers they do not know the answer either.
-ORIGIN_KINDS = ("qa", "intent", "review_item", "inquiry", "purpose_need")
+# 'discussion' (Issue #461) is the odd one out: every other origin lives
+# inside an Interview (its `origin_id` resolves through `interview_session`),
+# while a 'discussion' origin's `origin_id` is a Discussion hypothesis
+# (Issue #455) that has no owning Interview at all -- see `OWNER_SCOPES` and
+# `owner_scope_for_origin_kind` below, which is what keeps that difference
+# from being re-derived ad hoc at each call site.
+ORIGIN_KINDS = ("qa", "intent", "review_item", "inquiry", "purpose_need", "discussion")
+
+# The origin kinds whose `origin_id` resolves with NO owning Interview at
+# all. Kept as its own finite set (rather than a single hardcoded string
+# compared inline) so a future second discussion-shaped origin does not have
+# to be found and updated in every place that currently spells out
+# 'discussion'.
+DISCUSSION_ORIGIN_KINDS = ("discussion",)
+
+# Issue #461: a session no longer has to belong to an `interview_session`.
+# 'interview' is every session Epic #328 through #339 ever created;
+# 'discussion' is opened from a Discussion hypothesis (Issue #455) with no
+# owning Interview. Exactly one of `session_id` / `discussion_thread_id` is
+# set, fixed by this value -- see `validate_owner_scope` below, and the
+# table-level CHECK in `app/db.py` that makes the same rule structural.
+OWNER_SCOPES = ("interview", "discussion")
 
 # How the session started. `purpose_need` (Issue #389 / #444 §1.9) is the
 # third value: a Purpose Need response of `unknown`/`investigate` opens a
@@ -193,6 +214,67 @@ class JointUnderstandingValidationError(ValueError):
 def outcome_is_provisional(outcome: Optional[str]) -> bool:
     """True exactly for outcomes that must not be treated as fact."""
     return outcome in PROVISIONAL_OUTCOMES
+
+
+def owner_scope_for_origin_kind(origin_kind: str) -> str:
+    """The single `owner_scope` an `origin_kind` is compatible with.
+
+    A closed 1:1 mapping, deliberately: it is what keeps a caller from ever
+    building an `owner_scope='discussion'` session whose origin resolution
+    silently assumes an `interview_session` exists (the way the
+    `purpose_need` branch of `app/joint_premise._origin_facts` already does
+    for its OWN origin kind, by needing a session id to re-derive the
+    Purpose Chain).
+    """
+    _require_member(origin_kind, ORIGIN_KINDS, "origin_kind")
+    return "discussion" if origin_kind in DISCUSSION_ORIGIN_KINDS else "interview"
+
+
+def require_owner_origin_consistency(*, owner_scope: str, origin_kind: str) -> None:
+    """Raise unless `origin_kind` is the one this `owner_scope` may carry."""
+    expected = owner_scope_for_origin_kind(origin_kind)
+    if owner_scope != expected:
+        raise JointUnderstandingValidationError(
+            f"origin_kind={origin_kind!r} requires owner_scope={expected!r}, "
+            f"got {owner_scope!r}"
+        )
+
+
+def validate_owner_scope(
+    *,
+    owner_scope: str,
+    session_id: Optional[int],
+    discussion_thread_id: Optional[int],
+) -> None:
+    """Fail-closed check of Issue #461's owner_scope invariant.
+
+    Exactly one of `session_id` / `discussion_thread_id` may be set, and
+    which one is fixed by `owner_scope` -- "both set" and "both missing" are
+    rejected here rather than merely discouraged, and the same rule is
+    additionally a table-level CHECK constraint on
+    `joint_understanding_session` (belt-and-braces: a caller that reaches the
+    database through a path other than this function still cannot write an
+    inconsistent row).
+    """
+    _require_member(owner_scope, OWNER_SCOPES, "owner_scope")
+    if owner_scope == "interview":
+        if session_id is None:
+            raise JointUnderstandingValidationError(
+                "owner_scope='interview' requires session_id"
+            )
+        if discussion_thread_id is not None:
+            raise JointUnderstandingValidationError(
+                "owner_scope='interview' forbids discussion_thread_id"
+            )
+    else:
+        if discussion_thread_id is None:
+            raise JointUnderstandingValidationError(
+                "owner_scope='discussion' requires discussion_thread_id"
+            )
+        if session_id is not None:
+            raise JointUnderstandingValidationError(
+                "owner_scope='discussion' forbids session_id"
+            )
 
 
 def validate_transition(current: str, target: str) -> None:

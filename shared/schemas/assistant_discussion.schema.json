@@ -13,6 +13,7 @@
       "type": "array",
       "items": { "$ref": "#/$defs/discussion_capability" }
     },
+    "operation_state": { "$ref": "#/$defs/discussion_operation_result" },
     "proposal_item_kind": { "$ref": "#/$defs/discussion_proposal_item_kind" },
     "proposal_item_status": { "$ref": "#/$defs/discussion_proposal_item_status" },
     "proposal_item_eligibility": { "$ref": "#/$defs/discussion_proposal_item_eligibility" },
@@ -67,6 +68,10 @@
     "ui_draft_state": {
       "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §2.6 (Issue #445, Epic #443 Phase 2). `not_provided` (client sent none) and `unreadable` (a form IS open for this target but the client could not read it, self-reported via `UiDraftContextIn.readable`) are deliberately distinct answers: an assistant that reports the former when the latter is true is describing a screen the developer is not looking at. Recorded on the USER turn only (`assistant_discussion_turn.ui_draft_state`); `NULL` on a pre-#445 row is a FOURTH, distinct meaning ('this server could not have recorded it') that this enum does not cover.",
       "enum": ["not_provided", "applied", "no_unsaved_changes", "unsupported", "unreadable"]
+    },
+    "discussion_operation_result": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3/§1.7/§9 (Issue #456). What a discussion-adapter READ operation (canonical context gathering, prefill readiness, ...) reports about ITSELF, kept in a field separate from the facts/capabilities it accompanies and separate from `discussion_target_state` (freshness). First-match: `unsupported` (no adapter/handler registered for this operation -- a structural gap in the current catalog), `unavailable` (a registered handler exists but this specific attempt failed), `not_applicable` (this kind of target can never carry this operation, independent of registration state). A deleted/inaccessible target stays on the existing resolver/404 contract rather than being reclassified into this vocabulary.",
+      "enum": ["available", "unsupported", "unavailable", "not_applicable"]
     }
   }
 }

@@ -11,7 +11,7 @@ allowlist と handler を全選択 item について検査してから、登録 
 
 | 元 issue | 実装と残件 | 引き継ぎ先 |
 | --- | --- | --- |
-| #444 | registry / parity は実装。操作結果の3状態と、実行handlerに基づくprefill capabilityの判定は未実装 | #456 |
+| #444 | registry / parity は実装。操作結果の3状態と、実行handlerに基づくprefill capabilityの判定は実装済み (#456) | - |
 | #445 | Phase 2 (`fea4fe1`) を統合。draft の保存防止・System分離・変更警告を修正。実フォームのvalidation診断連携が残る | #451 |
 | #446 | Proposal review UI / prefill / 保存との接続は未実装 | #452 |
 | #447 | 追加8 kind と live selection / context は未実装 | #453 |
@@ -150,13 +150,27 @@ capability は adapter が実際に持つ登録内容から**導出**する。�
 | `read_ui_draft` | `ui_draft_forms` が空でない |
 | `propose_fields` | `fields` が空でない、または `children` が空でない |
 | `propose_relations` | `relations` が空でない |
-| `prefill_form` | `ui_draft_forms` が空でなく、提案可能で、対象フォームの反映handler・配送・結果応答が実装されている |
+| `prefill_form` | `ui_draft_forms` が空でなく、提案可能で、`prefill_handler_id` が非 `None` |
 | `promote_joint_understanding` | `joint_understanding_bridge` が真 |
 
-`prefill_form` の上記条件は目標契約である。2026-09-06現在の実装はform定義と提案schemaだけで
-導出しており、実行可能性を保証しない。#456で実装済みhandlerの登録を条件に加え、#452で
-接続を検証する。対象が対応済みでも一時的に配送できなければ操作結果は `unavailable`。
-未対応と一時失敗を同一のcapability booleanへ畳まない。
+`prefill_form` は `DiscussionAdapter.prefill_handler_id`(versioned な実装 handler の id)が
+非 `None` の場合のみ true になる(Issue #456)。`ui_draft_forms` の宣言は「反映先のフォームが
+存在する」宣言にすぎず、配送できる handler の存在を意味しない — 2026-09 時点で
+`prefill_handler_id` は全 target_kind で `None` のままであり、これが正しい完了状態である
+(実 handler は #452 が最初の接続を行う)。Dashboard 側は `src/lib/discussion-adapters.ts` の
+各 adapter が持つ `prefillHandlerId` で、`tests/test_discussion_contract_parity.py` の
+`test_prefill_handler_id_parity_between_server_and_dashboard` が server/Dashboard 双方の
+宣言一致(現状は両方とも空)を機械的に固定する。**client の自己申告だけでは有効化しない** —
+`capabilities_for` は server 側の `prefill_handler_id` だけを読み、リクエストのどのフィールド
+からも導出しない。`tests/test_discussion_adapter_registry.py` の
+`test_prefill_form_becomes_true_only_once_a_handler_is_registered` が、
+`dataclasses.replace` で作った fixture 接続時にのみ true になること(実登録は false のまま)
+を証明する。
+
+対象が対応済みでも一時的に配送できなければ操作結果は `unavailable`。未対応と一時失敗を
+同一の capability boolean へ畳まない — `app/discussion_adapters.resolve_prefill_operation_state`
+が `not_applicable`(screen scope の対象 / 未登録 form_id)/ `unsupported`(forms 自体が無い /
+handler 未登録)/ `available` を個別に返す(§9 参照)。
 
 ### 1.4 server 側 `DiscussionAdapter`
 
@@ -179,6 +193,7 @@ class DiscussionAdapter:
     field_applier: Optional[FieldApplier]
     relation_applier: Optional[RelationApplier]
     joint_understanding_bridge: bool
+    prefill_handler_id: Optional[str]  # #456。実装済み handler の id。無ければ None
 ```
 
 - `scope` は kind ごとに 1 つに固定する。#436 の `SCOPE_TARGET_KINDS` は
@@ -205,6 +220,8 @@ export interface DashboardDiscussionAdapter {
   resolveFromRoute(screenId: string, params: URLSearchParams): DiscussionCandidate | null;
   /** prefill 先のフォーム。空なら prefill 不可。 */
   forms: readonly UiDraftFormBinding[];
+  /** #456。実装済み handler の id。無ければ null (server 側 parity 必須)。 */
+  prefillHandlerId: string | null;
   /** 反映後に無効化する React Query key の prefix。 */
   invalidateKeys(targetRef: string): readonly (readonly unknown[])[];
   /** 対象を画面上で開く URL (navigate 用。execute しない)。 */
@@ -244,16 +261,72 @@ export interface DashboardDiscussionAdapter {
   読めることのほうが、全部に `discussion_` を付ける一貫性より有用である。
   **黙って screen thread へ縮退させない** (#447 受け入れ条件)。
 
+`GET /assistant/discussion-threads/{id}` および thread 作成応答は
+`capabilities: DiscussionCapability[]` を返す (Issue #456)。**現在の registry
+から毎回読み直し、thread 行には保存しない** — narrowed/widened された registry
+は次の読み取りへ即座に反映される。`target_state` (freshness) とは別 field で
+あり、混ぜない (#366): `current` な thread が `prefill_form` を持たないことも、
+`stale` な thread が `prefill_form` を持つことも、どちらも起こりうる。
+
+Issue #456 はさらに、discussion-adapter の READ 操作 (canonical context の
+取得、prefill readiness の判定) 自体の成否を、facts と別 field で報告する
+finite 契約を導入する (`app/models.py` の `DiscussionOperationResult`:
+`available` / `unsupported` / `unavailable` / `not_applicable`)。
+
+- **割り当て規則 (first-match)**: 未登録 adapter/handler は `unsupported`
+  (現在の catalog の構造的な欠落)、登録済み handler の一時的な読み取り失敗は
+  `unavailable`、その種類の対象には構造上決して存在しえない操作は
+  `not_applicable`。対象削除/別 System は既存の resolver/404 契約
+  (`DiscussionTargetState.unresolvable` や 404) のままで、この 4 値へ
+  再分類しない。
+- **`app/discussion_adapters.gather_context`** が canonical context 取得の
+  正本実装。旧 `assistant_discussion_proposal.gather_target_context` は
+  「adapter 不在・provider 不在・provider 例外」の 3 つを区別なく `{}` へ
+  丸めていたが、いまはこの関数へ委譲し、`{unsupported, unavailable,
+  available}` を個別に返した上で `.facts` だけを取り出す (LLM プロンプトの
+  facts 欄へ operation_state を混ぜ込まない -- 別レイヤーで読みたい呼び出し元は
+  `gather_context` を直接呼ぶ)。
+- **`app/discussion_adapters.resolve_prefill_operation_state(adapter,
+  form_id=None)`** が prefill readiness の正本判定
+  (`scope=="screen"` → `not_applicable`、`ui_draft_forms` 無し →
+  `unsupported`、`form_id` が対象の登録フォームでない → `not_applicable`
+  (`prefill_form_unregistered`)、`prefill_handler_id` 未登録 → `unsupported`
+  (`prefill_handler_not_registered`)、それ以外 → `available`)。フォームが
+  **mount されているか** はこの判定条件に含まれない (#456 決定事項: 「mount
+  状態を capability 条件にしない」) — 一時的な配送失敗は #452 が扱う
+  `unavailable` の領域である。
+- **`app/assistant_discussion_context.build_screen_discussion_context`** の
+  各画面 provider は try/except で保護されており、`_overview_context` /
+  `_interview_context` / ... が例外を送出しても `/assistant/ask` 全体が
+  500 で壊れることはなく、`ScreenDiscussionContext(operation_state=
+  "unavailable")` へ縮退する (§1.3 の「診断取得失敗で会話全体を不要に壊さ
+  ない」の実装)。未登録の `screen_id` は従来どおり `None` (画面レベルの
+  `unsupported` に相当し、この変更の対象ではない)。
+- Dashboard 側 (`src/lib/discussion-adapters.ts`) は
+  `classifyDiscussionError(err)` が §1.7 の 422 code を
+  `DiscussionOperationResult` + 日本語メッセージ + `retryable` へ変換する。
+  `unsupported` / `not_applicable` と判定された code は `retryable: false`
+  (再試行しても解決しない理由を示す) で、未知の code / ネットワーク由来の
+  失敗は `unavailable` + `retryable: true`。`components/assistant-panel.tsx`
+  のエラー表示 (`data-testid="assistant-error"`) がこれを使い、retryable な
+  場合のみ「再試行」ボタン (`assistant-error-retry`) を出す。
+
 ### 1.8 parity
 
 `tests/test_discussion_contract_parity.py` が次を機械的に照合する。
 
 - server `Literal` (`app/models.py`) ↔ Dashboard union (`src/api/types.ts`) ↔
   共有 JSON Schema (`shared/schemas/assistant_discussion.schema.json`)
+  (`DiscussionOperationResult` を含む、Issue #456)
 - registry の `target_kind` 集合 ↔ `DISCUSSION_TARGET_KINDS`
 - server adapter の `fields` / `relations` ↔ Dashboard adapter が prefill
   できる field 集合 (Dashboard 側が知らない field を server が提案できると、
   その item は永久に prefill されない)
+- server adapter の `prefill_handler_id` ↔ Dashboard adapter の
+  `prefillHandlerId` (Issue #456)。現状は双方とも全 kind で未登録 (`None` /
+  `null`) であることも `test_prefill_handler_id_parity_between_server_and_
+  dashboard` が固定する — 片方だけが handler を宣言した状態を、実装が半分
+  しか繋がっていないまま出荷させない。
 
 既存の `tests/test_interview_type_parity.py` の `FINITE_TYPE_NAMES` 方式に
 そろえる。
@@ -681,6 +754,12 @@ additive (新テーブルと NULL 許容列) で、旧行は
 利用者の導線・状態・受入条件は[共同検討UX](../ux/decision-discussion-workflow.md)が所有する。
 本節は新規実装予定であり、既存の画面contextが既に横断調査できるという意味ではない。
 既存 `/assistant/ask` に渡すcontextを拡張し、別の汎用チャットAPIや理解モデルを作らない。
+本節の `discussion_context.sections[].operation_state` が使う予定の
+`available` / `unsupported` / `unavailable` / `not_applicable` 語彙自体は
+Issue #456 が `DiscussionOperationResult` として先行実装済みで、
+`app/discussion_adapters.gather_context` / `resolve_prefill_operation_state`
+がその最初の 2 つの適用先である (§1.3/§1.7 参照)。§9 の bundle 形状・
+continuation・複数正本更新 (DD-CTX-01〜05) 自体はまだ実装されていない。
 
 ### 9.1 Context bundle
 

@@ -29,7 +29,9 @@ import {
   OPEN_ASSISTANT_EVENT,
   type OpenAssistantDetail,
 } from "@/lib/assistant-control";
-import { DISCUSSION_ADAPTERS, resolveDiscussionCandidate } from "@/lib/discussion-adapters";
+import {
+  classifyDiscussionError, DISCUSSION_ADAPTERS, resolveDiscussionCandidate,
+} from "@/lib/discussion-adapters";
 import { useUiDraftRegistry } from "@/lib/ui-draft";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
@@ -162,6 +164,11 @@ interface ChatMessage {
   role: "user" | "assistant" | "error";
   text: string;
   result?: AssistantAskOut;
+  // Issue #456: set on an `error` message only when the failure is NOT a
+  // recognised structurally-unsupported/not_applicable discussion code --
+  // i.e. it may be transient, so offering a retry (of the same question
+  // text) is honest. See `classifyDiscussionError`.
+  retryQuestion?: string;
 }
 
 function CitationChip({ citation }: { citation: AssistantCitation }) {
@@ -630,7 +637,17 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         listenAfterPlayback: result.voice_follow_up_expected ?? false,
       };
     } catch (err) {
-      appendMessages([{ role: "error", text: String(err) }]);
+      // Issue #456 (docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3/§9's UI display
+      // contract): a structurally unsupported/not_applicable discussion
+      // failure gets its own Japanese reason and no retry (retrying would
+      // not help); anything else is shown as a possibly-transient failure
+      // with a retry that resends the SAME question text.
+      const classified = classifyDiscussionError(err);
+      appendMessages([{
+        role: "error",
+        text: classified.message,
+        retryQuestion: classified.retryable ? trimmed : undefined,
+      }]);
       return null;
     }
   };
@@ -925,9 +942,21 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           ) : m.role === "assistant" && m.result ? (
             <AnswerMessage key={i} result={m.result} />
           ) : (
-            <p key={i} className="text-xs text-destructive" data-testid="assistant-error">
-              {m.text}
-            </p>
+            <div key={i} className="space-y-1">
+              <p className="text-xs text-destructive" data-testid="assistant-error">
+                {m.text}
+              </p>
+              {m.retryQuestion && (
+                <button
+                  type="button"
+                  className="text-xs text-primary hover:underline cursor-pointer"
+                  data-testid="assistant-error-retry"
+                  onClick={() => submit(m.retryQuestion!)}
+                >
+                  再試行
+                </button>
+              )}
+            </div>
           ),
         )}
         {ask.isPending && (

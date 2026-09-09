@@ -156,6 +156,17 @@ class DiscussionAdapter:
     field_applier: Optional[FieldApplier] = None
     relation_applier: Optional[RelationApplier] = None
     joint_understanding_bridge: bool = False
+    # Issue #456: the versioned id of the IMPLEMENTATION handler that can
+    # actually carry out a prefill dispatch for this kind's `ui_draft_forms`
+    # (navigate -> mount -> deliver -> ack, #452's job). `None` means "no
+    # handler is wired yet" -- declaring a `UiDraftFormSpec` only says a
+    # destination form EXISTS, not that anything can deliver to it. This is
+    # the server's own half of the parity `tests/test_discussion_contract_
+    # parity.py` checks against the Dashboard's `prefillHandlerId` -- the
+    # capability boolean below is derived from THIS field alone, never from
+    # anything a client claims at request time (§1.3: "client の自己申告
+    # だけでは有効化しない").
+    prefill_handler_id: Optional[str] = None
 
 
 # --- §1.2/§1.3 per-kind resolvers (moved verbatim from assistant_discussion.py) ---
@@ -740,8 +751,124 @@ def capabilities_for(adapter: DiscussionAdapter) -> Tuple[str, ...]:
         caps.append("propose_fields")
     if can_propose_relations:
         caps.append("propose_relations")
-    if adapter.ui_draft_forms and (can_propose_fields or can_propose_relations):
+    # Issue #456: a declared `ui_draft_forms` entry only says a destination
+    # form EXISTS -- it is not proof anything can deliver to it. `prefill_
+    # form` additionally requires a registered `prefill_handler_id`, which is
+    # `None` for every kind as of this Issue (see the field's own docstring):
+    # the correct, honest state today is that NO adapter derives this
+    # capability true yet. #452 wires the first real handler; from that
+    # point on this same rule flips it true for that one kind, with no
+    # further change here.
+    if (
+        adapter.ui_draft_forms
+        and (can_propose_fields or can_propose_relations)
+        and adapter.prefill_handler_id is not None
+    ):
         caps.append("prefill_form")
     if adapter.joint_understanding_bridge:
         caps.append("promote_joint_understanding")
     return tuple(caps)
+
+
+# --- §9's operation-result contract (Issue #456) ------------------------------
+# `docs/01-specifications/capabilities/ai-discussion-adapter.md` §1.3/§1.7's target: every discussion-adapter
+# READ operation reports a `DiscussionOperationResult` (`app/models.py`)
+# ALONGSIDE its own facts, never folded into them and never merged with
+# `DiscussionTargetState` (freshness). The two functions below are the first
+# two operations this applies to; `evaluate_item_eligibility` (proposal
+# apply/prefill gating) keeps its own pre-existing, separately tested
+# `forbidden` / `stale` / `conflict` / `appliable` vocabulary unchanged --
+# that is a DIFFERENT question ("can THIS item be written") from "did the
+# read succeed", and folding the two would erase the distinction #456 exists
+# to keep.
+
+
+@dataclass(frozen=True)
+class TargetContextResult:
+    """The result of gathering a target's canonical context for a prompt.
+    `operation_state` and `facts` are deliberately separate fields -- an
+    `unavailable` read and a genuinely empty-but-successful read must never
+    look the same to a caller that only inspects `facts`."""
+
+    operation_state: str  # DiscussionOperationResult
+    facts: Dict[str, Any] = field(default_factory=dict)
+    reason: str = ""
+
+
+def gather_context(conn: Any, system_id: int, target_kind: str, target_ref: str) -> TargetContextResult:
+    """Replaces the old "adapter missing / no provider / provider raised ->
+    all collapse to `{}`" behaviour with three DISTINCT, honestly labelled
+    outcomes (§1.3's assignment rule):
+
+    - no adapter registered for `target_kind` (defense in depth -- a live
+      thread's own `target_kind` was validated at creation, but the registry
+      can be narrowed in between, exactly as `tests/test_assistant_discussion_
+      proposals.py`'s `test_a_narrowed_registry_forbids_an_already_stored_
+      item` already exercises for eligibility) -> `unsupported`.
+    - the adapter is registered but declares no `context_provider` at all
+      (`screen` / `interview_session` / `overview_finding` today) ->
+      `unsupported`. This is a structural gap in the CURRENT catalog, not a
+      permanent architectural impossibility -- a future phase could add one.
+    - the registered provider raises -> `unavailable`. The read was
+      attempted and failed; the caller should not treat the empty result as
+      "there is nothing to say" the way `unsupported` means.
+    - the registered provider succeeds -> `available`, with its facts.
+
+    A deleted/inaccessible target is NOT reclassified into this vocabulary
+    (§1.3's own rule): a provider reading a gone target typically raises, so
+    it degrades to `unavailable` here -- exactly the existing resolver/404
+    contract's own territory, not a new fourth meaning.
+    """
+    adapter = DISCUSSION_ADAPTERS.get(target_kind)
+    if adapter is None:
+        return TargetContextResult(
+            operation_state="unsupported", facts={}, reason="discussion_target_kind_unregistered",
+        )
+    if adapter.context_provider is None:
+        return TargetContextResult(
+            operation_state="unsupported", facts={}, reason="discussion_context_provider_not_registered",
+        )
+    try:
+        facts = adapter.context_provider(conn, system_id, target_ref)
+    except Exception:  # pragma: no cover - defensive, mirrors resolvers' own rule
+        return TargetContextResult(
+            operation_state="unavailable", facts={}, reason="discussion_context_provider_error",
+        )
+    return TargetContextResult(operation_state="available", facts=facts, reason="")
+
+
+def resolve_prefill_operation_state(
+    adapter: DiscussionAdapter, form_id: Optional[str] = None,
+) -> Tuple[str, str]:
+    """§1.3/§1.7's prefill readiness, as a `(DiscussionOperationResult,
+    reason)` pair -- structural, static, and independent of whether any
+    Dashboard form happens to be MOUNTED right now (§1.3: "mount 状態を
+    capability 条件にしない"; a transient delivery failure at dispatch time
+    is `unavailable`, a #452 concern this function does not decide).
+
+    First match:
+    - `adapter.scope == "screen"` -> `not_applicable`. A whole-screen
+      conversation is not addressed at one entity, so it can never carry a
+      single form to prefill -- true regardless of how much of #452 gets
+      built later, unlike the other branches below.
+    - no `ui_draft_forms` registered at all -> `unsupported` (reuses the
+      existing `prefill_unsupported` code `PrefillUnsupported` already
+      raises in `assistant_discussion_proposal.prefill_items`).
+    - a `form_id` was given and is not one of the adapter's registered forms
+      -> `not_applicable` (reuses `prefill_form_unregistered`): the adapter
+      DOES support prefill in general, but this specific request addresses a
+      form that structurally does not belong to this target.
+    - no `prefill_handler_id` registered -> `unsupported`
+      (`prefill_handler_not_registered`): the form's SHAPE is declared, but
+      nothing can deliver to it yet.
+    - otherwise -> `available`.
+    """
+    if adapter.scope == "screen":
+        return "not_applicable", "discussion_prefill_not_applicable_to_screen_scope"
+    if not adapter.ui_draft_forms:
+        return "unsupported", "prefill_unsupported"
+    if form_id is not None and not any(f.form_id == form_id for f in adapter.ui_draft_forms):
+        return "not_applicable", "prefill_form_unregistered"
+    if adapter.prefill_handler_id is None:
+        return "unsupported", "prefill_handler_not_registered"
+    return "available", ""

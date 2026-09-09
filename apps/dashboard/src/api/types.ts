@@ -3709,6 +3709,19 @@ export type DiscussionCapability =
   | "prefill_form"
   | "promote_joint_understanding";
 
+// Issue #456. What a discussion-adapter READ operation (context gathering,
+// prefill readiness, ...) reports about itself -- a field of its own, never
+// folded into the facts it accompanies and never merged with
+// DiscussionTargetState (freshness). `unsupported`: no adapter/handler
+// registered. `unavailable`: a registered handler exists but this attempt
+// failed. `not_applicable`: this kind of target can never carry this
+// operation, independent of registration state.
+export type DiscussionOperationResult =
+  | "available"
+  | "unsupported"
+  | "unavailable"
+  | "not_applicable";
+
 export interface AssistantDiscussionTargetIn {
   scope: DiscussionScope;
   screen_id: string;
@@ -3763,6 +3776,12 @@ export interface AssistantDiscussionThread {
 export interface AssistantDiscussionThreadDetailOut {
   thread: AssistantDiscussionThread;
   target_state: DiscussionTargetState;
+  // Issue #456: the target's adapter-derived capability set, read fresh from
+  // the current server registry -- a separate field from `target_state`
+  // (freshness) on purpose (#366's rule). Optional on the wire type only so
+  // pre-#456 test fixtures built as object literals of this interface stay
+  // valid; the server always sends it (`Field(default_factory=list)`).
+  capabilities?: DiscussionCapability[];
   turns: AssistantDiscussionTurn[];
 }
 

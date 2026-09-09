@@ -26,6 +26,7 @@
 import type {
   AssistantDiscussionProposal,
   AssistantDiscussionTargetIn,
+  DiscussionOperationResult,
   DiscussionScope,
   DiscussionTargetKind,
 } from "@/api/types";
@@ -56,6 +57,17 @@ export interface DashboardDiscussionAdapter {
   /** Resolve the most specific selectable target from the URL + screen id.
    * `null` = nothing more specific than "the whole screen" is selected. */
   resolveFromRoute(screenId: string, params: URLSearchParams): DiscussionCandidate | null;
+  /** Issue #456: the versioned id of the client-side IMPLEMENTATION handler
+   * that can actually carry out a prefill dispatch (navigate -> mount ->
+   * deliver -> ack, #452's job) for this kind. `null` means "no handler is
+   * wired yet" -- declaring `forms` below only says a destination form
+   * EXISTS, not that anything can deliver to it. `tests/
+   * test_discussion_contract_parity.py` checks this against the server
+   * adapter's own `prefill_handler_id`: the derived `prefill_form`
+   * capability is `true` only when BOTH sides declare a MATCHING id, never
+   * from this field alone (a client cannot self-report the capability on).
+   */
+  prefillHandlerId: string | null;
   /** Prefill destinations (Issue #446). Empty through Phase 1-4. */
   forms: readonly UiDraftFormBinding[];
   /** React Query key PREFIXES to invalidate after a canonical write against
@@ -93,6 +105,7 @@ const screenAdapter: DashboardDiscussionAdapter = {
   // DiscussionTargetKind has exactly one adapter) rather than for candidate
   // resolution, so it never wins a `resolveDiscussionCandidate` scan.
   resolveFromRoute: () => null,
+  prefillHandlerId: null,
   forms: [],
   invalidateKeys: () => [],
   deepLink: (targetRef) => SCREEN_PATH[targetRef] ?? null,
@@ -112,6 +125,7 @@ const interviewSessionAdapter: DashboardDiscussionAdapter = {
       label: `セッション #${session}`,
     };
   },
+  prefillHandlerId: null,
   forms: [],
   invalidateKeys: (targetRef) => {
     const sessionId = Number(targetRef);
@@ -136,6 +150,7 @@ const understandingClaimAdapter: DashboardDiscussionAdapter = {
   screenIds: ["overview", "interview"],
   label: "理解の主張",
   resolveFromRoute: () => null,
+  prefillHandlerId: null,
   forms: [],
   invalidateKeys: () => [sysKey("understandingBrief"), sysKey("overview")],
   deepLink: () => SCREEN_PATH.overview,
@@ -147,6 +162,7 @@ const overviewFindingAdapter: DashboardDiscussionAdapter = {
   screenIds: ["overview"],
   label: "発見事項",
   resolveFromRoute: () => null,
+  prefillHandlerId: null,
   forms: [],
   invalidateKeys: () => [sysKey("overview")],
   deepLink: () => SCREEN_PATH.overview,
@@ -180,6 +196,7 @@ const uxJourneyAdapter: DashboardDiscussionAdapter = {
   // `JourneyRevisionForm` -- the SAME field names `_UX_JOURNEY_FIELDS`
   // registers server-side (`app/discussion_adapters.py`), which are in turn
   // `ux_design.add_journey_revision`'s own keyword params.
+  prefillHandlerId: null,
   forms: [
     {
       formId: "ux_journey.revision",
@@ -209,6 +226,7 @@ const uxJourneyStepAdapter: DashboardDiscussionAdapter = {
     };
   },
   // Issue #445: the step rows inside the SAME `JourneyRevisionForm`.
+  prefillHandlerId: null,
   forms: [
     {
       formId: "ux_journey_step.revision",
@@ -248,6 +266,7 @@ const uxRequirementAdapter: DashboardDiscussionAdapter = {
   // Issue #445: `components/ux-design/requirement-panel.tsx`'s
   // `RequirementRevisionForm`. Acceptance criteria are a #448 concern, not a
   // top-level field.
+  prefillHandlerId: null,
   forms: [
     {
       formId: "ux_requirement.revision",
@@ -276,6 +295,7 @@ const solutionDesignAdapter: DashboardDiscussionAdapter = {
   // Issue #445: `components/ux-design/solution-design-panel.tsx`'s
   // `AddOptionForm` -- it drafts a NEW option, so the in-progress
   // `option_key` is the draft's `selected_item_ref`, not a registered field.
+  prefillHandlerId: null,
   forms: [
     { formId: "solution_design.option", fields: ["title", "approach", "tradeoffs", "risks"] },
   ],
@@ -302,6 +322,7 @@ const blueprintLaneCellAdapter: DashboardDiscussionAdapter = {
       label: `${lane}(「${step}」)`,
     };
   },
+  prefillHandlerId: null,
   forms: [],
   invalidateKeys: (targetRef) => {
     const journeyKey = journeyKeyOf(targetRef);
@@ -440,4 +461,83 @@ export function proposalToDraft(
     relations,
   };
   return { patch, formId: binding.formId, unregisteredFieldNames };
+}
+
+// --- Discussion error presentation (Issue #456) ------------------------------
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3/§9's UI display contract: "未対応時は
+// 理由と既存画面への移動を示し、失敗時には再試行を示す" ("show the reason and a
+// route to the existing screen when unsupported; show a retry when it merely
+// failed"). This is the single place that translates the server's finite
+// discussion-adapter 422 codes (§1.7) into that distinction -- `assistant-
+// panel.tsx`'s error bubble is the one caller today, but any future discussion
+// surface should call this rather than growing its own copy of the code list.
+
+/** The finite discussion-adapter 422 codes this module knows how to explain,
+ * each mapped to its `DiscussionOperationResult` and a Japanese message. A
+ * code NOT in this table is treated as a plain `unavailable` failure (a
+ * network error, an unrecognised/future code, ...) -- distinct from a code
+ * this module recognises as structurally unsupported/not_applicable, because
+ * only the latter is safe to tell the developer "retrying will not help". */
+const DISCUSSION_ERROR_CODES: Readonly<
+  Record<string, { operationResult: DiscussionOperationResult; message: string }>
+> = {
+  discussion_target_kind_unregistered: {
+    operationResult: "unsupported",
+    message: "この対象は会話に対応していません。",
+  },
+  discussion_target_screen_mismatch: {
+    operationResult: "unsupported",
+    message: "この画面からはこの対象について会話できません。対象の画面から開いてください。",
+  },
+  discussion_target_scope_mismatch: {
+    operationResult: "unsupported",
+    message: "この対象は会話の対象にできません。",
+  },
+  ui_draft_unsupported: {
+    operationResult: "unsupported",
+    message: "この対象は未保存フォームの下書きの参照に対応していません。",
+  },
+  prefill_unsupported: {
+    operationResult: "unsupported",
+    message: "この対象はフォームへの反映に対応していません。既存の画面から直接編集してください。",
+  },
+  prefill_form_unregistered: {
+    operationResult: "not_applicable",
+    message: "指定されたフォームはこの対象では使用できません。",
+  },
+  promotion_unsupported: {
+    operationResult: "unsupported",
+    message: "この対象は仮説の昇格に対応していません。",
+  },
+};
+
+export interface DiscussionErrorPresentation {
+  operationResult: DiscussionOperationResult;
+  message: string;
+  /** `true` only for a failure this module cannot explain as structurally
+   * unsupported/not_applicable -- i.e. it MAY be transient, so offering a
+   * retry is honest. A recognised `unsupported`/`not_applicable` code never
+   * sets this: retrying an operation the target structurally cannot do would
+   * teach the developer that the button just does not work (#383's rule
+   * against a control that never succeeds). */
+  retryable: boolean;
+}
+
+/** Classify a thrown discussion-adapter request failure for display.
+ * Accepts anything error-shaped (an `ApiError`, or a plain object with a
+ * `code`) rather than importing `ApiError` itself, so callers in a mocked
+ * test environment (where `@/api/client`'s `ApiError` is stubbed) can still
+ * exercise this against a plain `{ code }` object. */
+export function classifyDiscussionError(err: unknown): DiscussionErrorPresentation {
+  const code =
+    err !== null && typeof err === "object" && "code" in err
+      ? String((err as { code?: unknown }).code ?? "")
+      : "";
+  const known = DISCUSSION_ERROR_CODES[code];
+  if (known) return { ...known, retryable: false };
+  return {
+    operationResult: "unavailable",
+    message: "一時的に取得できませんでした。もう一度お試しください。",
+    retryable: true,
+  };
 }
