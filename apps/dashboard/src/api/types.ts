@@ -4599,9 +4599,23 @@ export interface CellAskSyncOut {
 // 「わからない」を終端回答ではなく共同で状況理解を作る工程の開始点として扱う。
 // 三つの来歴(investigation / translation / developer)は 1 つの回答へ混ぜない。
 
-export type JointUnderstandingOriginKind = "qa" | "intent" | "review_item" | "inquiry" | "purpose_need";
+export type JointUnderstandingOriginKind =
+  | "qa"
+  | "intent"
+  | "review_item"
+  | "inquiry"
+  | "purpose_need"
+  | "discussion";
 // "purpose_need" (Issue #389 / #444 §1.9): a Purpose Need response of
 // unknown/investigate opens a session the same way an unanswered Q&A does.
+// "discussion" (Issue #461 / #443 §6.2): a session owned by an assistant
+// discussion thread rather than an interview session. It is the SIXTH origin
+// on purpose -- #337's premise contract requires a per-origin content hash, so
+// disguising a Journey conversation as one of the existing five would make it
+// claim a premise it does not have, and premise evaluation would stop meaning
+// anything. Its `origin_id` is the promoted hypothesis id (#455 registers the
+// provider that resolves it); until then the server answers 503
+// `joint_understanding_origin_unsupported` rather than pretending support.
 export type JointUnderstandingTrigger = "unknown_answer" | "explicit_request" | "purpose_need";
 export type JointUnderstandingStatus = "open" | "held" | "closed";
 export type JointUnderstandingOutcome =

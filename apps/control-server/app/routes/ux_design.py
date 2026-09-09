@@ -36,7 +36,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .. import ux_design
+from .. import trace_redaction, ux_design
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from ..models import (
@@ -112,9 +112,71 @@ _MESSAGES: Dict[str, str] = {
     "ux_design_not_decidable": "この状態からはその決定を記録できません。",
 }
 
+# --- §2.8 (Issue #451): domain validation diagnostics for the real Journey /
+# Requirement / Solution Design forms ---------------------------------------
+#
+# `docs/01-specifications/capabilities/ai-discussion-adapter.md` §2.8 is the canonical contract. Every 422/404/409
+# this module raises now carries `field_path` / `section` alongside the
+# existing `code` / `message`, so the Dashboard's form-level diagnostics
+# (`lib/ui-draft.tsx`'s `useFormValidation`) can attach an error to the
+# EXACT field the domain layer identified -- never by guessing a field from
+# the Japanese message text (Principle 6). `field_path`/`section` are a
+# STRUCTURAL mapping from each finite code (this table), not derived from
+# `str(exc)` content: `str(exc)` only supplies the offending VALUE (e.g.
+# which `step_key` collided), embedded into the message for the human to
+# read, and is redacted first (Principle 9) because it is developer-typed
+# content that could coincidentally look like a credential.
+#
+# A code with no entry here means "no specific field" (`("", "")`) -- the
+# client's own field allowlist (`UiDraftFormSpec.fields`) decides whether a
+# non-empty `field_path` actually names one of ITS fields; when it does not
+# (e.g. `journey_key` on a form that only drafts `title`/`beneficiary`/...),
+# the client renders the SAME whole-form diagnostic as a `("", "")` code
+# would, per §2.8's "未知 field_path はフォーム全体のエラー" rule -- this
+# table never needs to know which forms exist to stay correct.
+_FIELD_PATH_BY_CODE: Dict[str, tuple] = {
+    "journey_step_key_duplicated": ("step_key", "steps"),
+    "journey_step_not_found": ("step_key", "steps"),
+    "ux_requirement_criterion_key_duplicated": ("criterion_key", "acceptance_criteria"),
+    "out_of_scope_requirement_not_verifiable": ("", "acceptance_criteria"),
+    "artifact_uri_invalid": ("uri", ""),
+    "artifact_hash_required": ("content_hash", ""),
+    "artifact_hash_invalid": ("content_hash", ""),
+    "journey_baseline_not_as_is": ("baseline_journey_id", ""),
+    "journey_baseline_foreign_system": ("baseline_journey_id", ""),
+}
 
-def _reject(code: str, status_code: int) -> HTTPException:
-    return HTTPException(status_code=status_code, detail={"code": code, "message": _MESSAGES[code]})
+#: `KeyRequired(field_name)` already carries the exact missing field's name
+#: as its own `str(exc)` (see the raise sites in `app/ux_design.py`) -- this
+#: is the one exception type whose field_path IS its argument rather than a
+#: fixed per-code constant, so it is looked up here instead of in
+#: `_FIELD_PATH_BY_CODE`. The section is "" for identity fields that are not
+#: part of any nested collection (`journey_key` / `requirement_key`).
+_KEY_REQUIRED_SECTION = {"step_key": "steps", "criterion_key": "acceptance_criteria"}
+
+
+def _redact_offender(value: str) -> str:
+    """Principle 9 over a user-typed identifier (a `step_key` /
+    `criterion_key` value) before it is embedded into an HTTP error message.
+    Structurally the same redaction `ui_draft_context._redact_meta` applies
+    to `validation_error` text -- reused, not reimplemented."""
+    redacted, _entries = trace_redaction.redact_text(value, field_name="ux_design_error_value")
+    return redacted if redacted is not None else value
+
+
+def _reject(
+    code: str, status_code: int, *, message: Optional[str] = None, field_path: str = "", section: str = ""
+) -> HTTPException:
+    fp, sec = _FIELD_PATH_BY_CODE.get(code, (field_path, section))
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message if message is not None else _MESSAGES[code],
+            "field_path": fp,
+            "section": sec,
+        },
+    )
 
 
 def _raise_for_ux_error(exc: Exception) -> None:
@@ -122,7 +184,10 @@ def _raise_for_ux_error(exc: Exception) -> None:
     response. Subclasses of `NotFound` are checked before the generic
     `NotFound` fallback. Re-raises anything unrecognized."""
     if isinstance(exc, KeyRequired):
-        raise _reject("ux_design_key_required", 422)
+        field = str(exc)
+        raise _reject(
+            "ux_design_key_required", 422, field_path=field, section=_KEY_REQUIRED_SECTION.get(field, "")
+        )
     if isinstance(exc, KeyConflict):
         raise _reject("ux_design_key_conflict", 409)
     if isinstance(exc, BaselineNotAsIs):
@@ -130,11 +195,20 @@ def _raise_for_ux_error(exc: Exception) -> None:
     if isinstance(exc, BaselineForeignSystem):
         raise _reject("journey_baseline_foreign_system", 404)
     if isinstance(exc, StepKeyDuplicated):
-        raise _reject("journey_step_key_duplicated", 422)
+        raise _reject(
+            "journey_step_key_duplicated", 422,
+            message=f"同じ revision 内に同じ step_key({_redact_offender(str(exc))}) が指定されています。",
+        )
     if isinstance(exc, StepNotFound):
-        raise _reject("journey_step_not_found", 404)
+        raise _reject(
+            "journey_step_not_found", 404,
+            message=f"指定された step_key({_redact_offender(str(exc))}) が現在の revision に見つかりません。",
+        )
     if isinstance(exc, CriterionKeyDuplicated):
-        raise _reject("ux_requirement_criterion_key_duplicated", 422)
+        raise _reject(
+            "ux_requirement_criterion_key_duplicated", 422,
+            message=f"同じ revision 内に同じ criterion_key({_redact_offender(str(exc))}) が指定されています。",
+        )
     if isinstance(exc, OutOfScopeNotVerifiable):
         raise _reject("out_of_scope_requirement_not_verifiable", 422)
     if isinstance(exc, ArtifactUriInvalid):
@@ -150,9 +224,15 @@ def _raise_for_ux_error(exc: Exception) -> None:
     if isinstance(exc, NotDecidable):
         raise _reject("ux_design_not_decidable", 422)
     if isinstance(exc, NotFound):
-        raise HTTPException(status_code=404, detail=str(exc) or "Not found")
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "ux_design_not_found", "message": str(exc) or "Not found", "field_path": "", "section": ""},
+        )
     if isinstance(exc, UxDesignValidationError):
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "ux_design_validation_error", "message": str(exc), "field_path": "", "section": ""},
+        )
     raise
 
 

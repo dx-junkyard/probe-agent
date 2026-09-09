@@ -49,11 +49,22 @@ export class ApiError extends Error {
    * both are surfaced here rather than merged into one field. */
   denialCode?: string;
   nextAction?: string;
+  /** Issue #451 (`docs/01-specifications/capabilities/ai-discussion-adapter.md` §2.8): a domain write endpoint's
+   * validation diagnostic, structural and never text-derived. `fieldPath`
+   * names the exact offending field (empty = "no specific field" -- the
+   * caller must show it as a whole-form error rather than guess a field
+   * from `detail`, Principle 6); `section` groups it (e.g. a Journey's
+   * `"steps"`, a Requirement's `"acceptance_criteria"`). Both are `""`,
+   * never `undefined`, when the server did not send them (an older server,
+   * or a genuinely field-less failure) -- `""` is itself the documented
+   * "no specific field" value, so there is nothing to distinguish. */
+  fieldPath: string;
+  section: string;
   constructor(status: number, detail: unknown) {
     const structured = detail && typeof detail === "object"
       ? detail as {
           message?: unknown; code?: unknown; next_action?: unknown;
-          denial_code?: unknown;
+          denial_code?: unknown; field_path?: unknown; section?: unknown;
         }
       : null;
     const message = typeof structured?.message === "string"
@@ -71,6 +82,8 @@ export class ApiError extends Error {
     this.nextAction = typeof structured?.next_action === "string"
       ? structured.next_action
       : undefined;
+    this.fieldPath = typeof structured?.field_path === "string" ? structured.field_path : "";
+    this.section = typeof structured?.section === "string" ? structured.section : "";
   }
 }
 
