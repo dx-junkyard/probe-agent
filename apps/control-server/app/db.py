@@ -247,10 +247,18 @@ CREATE TABLE IF NOT EXISTS assistant_discussion_thread (
     thread_key                   TEXT NOT NULL,
     scope                        TEXT NOT NULL CHECK (scope IN ('screen', 'entity', 'element')),
     screen_id                    TEXT NOT NULL,
+    -- Issue #453 (Epic #443 Phase 4) widened this CHECK with 8
+    -- Vision-to-Feature kinds. See `_migrate_assistant_discussion_thread_
+    -- target_kinds` below for why an existing database needs this table
+    -- rebuilt once.
     target_kind                  TEXT NOT NULL CHECK (target_kind IN (
                                      'screen', 'interview_session', 'understanding_claim',
                                      'overview_finding', 'ux_journey', 'ux_journey_step',
-                                     'ux_requirement', 'solution_design', 'blueprint_lane_cell')),
+                                     'ux_requirement', 'solution_design', 'blueprint_lane_cell',
+                                     'purpose_element', 'purpose_relation',
+                                     'stakeholder', 'stakeholder_need',
+                                     'product_objective', 'product_milestone',
+                                     'product_gap', 'product_feature')),
     target_ref                   TEXT NOT NULL,
     target_title                 TEXT NOT NULL DEFAULT '',
     -- Captured at thread creation and refreshed on each successful resolve;
@@ -9542,6 +9550,75 @@ def _migrate_ux_journey_upstream_ref_kinds(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_assistant_discussion_thread_target_kinds(conn: sqlite3.Connection) -> None:
+    """Widen `assistant_discussion_thread.target_kind` with Issue #453's
+    (Epic #443 Phase 4) 8 Vision-to-Feature kinds
+    (`docs/01-specifications/capabilities/ai-discussion-adapter.md` §4.1).
+
+    The table shipped with `target_kind` CHECKed to exactly the 9 kinds
+    Epic #436/#444 registered. SQLite cannot ALTER a CHECK constraint in
+    place, and `CREATE TABLE IF NOT EXISTS` cannot repair a table that
+    already exists in its earlier form, so the table is rebuilt once,
+    preserving every existing row and every existing `target_kind` value
+    unchanged -- a pure vocabulary widening, never a row rewrite, the same
+    discipline `_migrate_ux_journey_upstream_ref_kinds` just above already
+    applies to the same defect shape.
+
+    `assistant_discussion_turn.thread_id` and `joint_understanding_session.
+    discussion_thread_id` both hold a foreign key against this table's `id`
+    -- copying every row with its ORIGINAL `id` (never re-autoincrementing)
+    is what keeps every existing turn and every existing Joint Understanding
+    session pointed at the correct thread after the rebuild.
+
+    Detection is STRUCTURAL and idempotent, the same discipline every sibling
+    migration in this file uses: read the table's stored SQL straight from
+    `sqlite_master` and no-op the moment the CHECK already contains
+    `'product_feature'` (the last of the 8 new values). There is no version
+    flag to drift from the schema it describes.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'assistant_discussion_thread'"
+    ).fetchone()
+    if row is None or row["sql"] is None:
+        return
+    if "'product_feature'" in row["sql"]:
+        return
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE assistant_discussion_thread RENAME TO assistant_discussion_thread_legacy;
+        -- A rename carries the table's indexes with it, so their NAMES stay
+        -- taken and the DDL's `CREATE INDEX IF NOT EXISTS` below would
+        -- silently do nothing -- leaving the rebuilt table with no index at
+        -- all. Free the name first (`_migrate_ux_journey_upstream_ref_kinds`'s
+        -- own reason).
+        DROP INDEX IF EXISTS idx_assistant_discussion_thread_system;
+        """
+    )
+    conn.executescript(_ASSISTANT_DISCUSSION_DDL)
+    conn.execute(
+        """
+        INSERT INTO assistant_discussion_thread (
+            id, system_id, thread_key, scope, screen_id, target_kind, target_ref,
+            target_title, captured_target_revision_id, captured_target_digest,
+            status, created_by, created_at, updated_at, schema_version
+        )
+        SELECT
+            id, system_id, thread_key, scope, screen_id, target_kind, target_ref,
+            target_title, captured_target_revision_id, captured_target_digest,
+            status, created_by, created_at, updated_at, schema_version
+        FROM assistant_discussion_thread_legacy
+        """
+    )
+    conn.executescript(
+        """
+        DROP TABLE assistant_discussion_thread_legacy;
+        PRAGMA foreign_keys = ON;
+        """
+    )
+
+
 def _migrate_joint_understanding_session_owner_scope(conn: sqlite3.Connection) -> None:
     """Add `owner_scope` / `discussion_thread_id`, drop `session_id`'s NOT
     NULL, and add the dependency-manifest premise columns (Issue #461).
@@ -9658,6 +9735,7 @@ def init_db() -> None:
         _migrate_solution_design_option_unique(conn)
         _migrate_ux_journey_upstream_ref_kinds(conn)
         _migrate_product_gap_artifact_link_kinds(conn)
+        _migrate_assistant_discussion_thread_target_kinds(conn)
         _migrate_intelligence_runs_snapshot_nullable(conn)
         install_intelligence_run_type_guards(conn)
         _migrate_cell_improvement_event_types(conn)

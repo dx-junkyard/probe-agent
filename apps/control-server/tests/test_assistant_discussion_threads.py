@@ -174,11 +174,17 @@ def test_scope_target_kind_table_matches_contract():
 
     assert set(DISCUSSION_SCOPES) == {"screen", "entity", "element"}
     assert SCOPE_TARGET_KINDS["screen"] == ("screen",)
+    # Issue #453 (Epic #443 Phase 4) added the 8 Vision-to-Feature kinds
+    # additively -- purpose_element/purpose_relation are "element" (§4.1's
+    # table); the rest are "entity".
     assert set(SCOPE_TARGET_KINDS["entity"]) == {
         "interview_session", "ux_journey", "ux_requirement", "solution_design",
+        "stakeholder", "stakeholder_need",
+        "product_objective", "product_milestone", "product_gap", "product_feature",
     }
     assert set(SCOPE_TARGET_KINDS["element"]) == {
         "understanding_claim", "overview_finding", "ux_journey_step", "blueprint_lane_cell",
+        "purpose_element", "purpose_relation",
     }
     # Every target kind is reachable from exactly one scope (first-match, no overlap).
     all_kinds = [k for kinds in SCOPE_TARGET_KINDS.values() for k in kinds]

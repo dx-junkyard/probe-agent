@@ -49,6 +49,87 @@ describe("discussion adapter prefill handler registration (Issue #456)", () => {
   });
 });
 
+// Issue #453 (Epic #443 Phase 4): the 8 Vision-to-Feature kinds' live
+// selection on the 3 new screens, mirroring the server-side
+// `test_discussion_target_expansion.py` fixtures.
+describe("Vision-to-Feature target expansion (Issue #453)", () => {
+  it("resolves a Stakeholder from ?node= on stakeholder-value-network", () => {
+    const candidate = resolveDiscussionCandidate("stakeholder-value-network", "?node=sh-1");
+    expect(candidate?.target).toEqual({
+      screen_id: "stakeholder-value-network", scope: "entity",
+      target_kind: "stakeholder", target_ref: "sh-1",
+    });
+  });
+
+  it("does not resolve a Stakeholder candidate without ?node=", () => {
+    expect(resolveDiscussionCandidate("stakeholder-value-network", "?edge=ex-1")).toBeNull();
+  });
+
+  it("resolves an Objective from ?objective= in the objectives view", () => {
+    const candidate = resolveDiscussionCandidate("objective-map", "?objective=obj-1");
+    expect(candidate?.target.target_kind).toBe("product_objective");
+    expect(candidate?.target.target_ref).toBe("obj-1");
+  });
+
+  it("resolves a Milestone over an Objective when both are present (Gap Workbench precedence)", () => {
+    const candidate = resolveDiscussionCandidate("objective-map", "?objective=obj-1&milestone=ms-1");
+    expect(candidate?.target.target_kind).toBe("product_milestone");
+    expect(candidate?.target.target_ref).toBe("ms-1");
+  });
+
+  it("resolves a Gap only in the ?view=gaps lane, never the objectives lane", () => {
+    expect(resolveDiscussionCandidate("objective-map", "?gap=gap-1")).toBeNull();
+    const candidate = resolveDiscussionCandidate("objective-map", "?view=gaps&gap=gap-1");
+    expect(candidate?.target.target_kind).toBe("product_gap");
+    expect(candidate?.target.target_ref).toBe("gap-1");
+  });
+
+  it("never resolves an Objective/Milestone candidate while in the gaps view", () => {
+    expect(resolveDiscussionCandidate("objective-map", "?view=gaps&objective=obj-1")).toBeNull();
+    expect(resolveDiscussionCandidate("objective-map", "?view=gaps&milestone=ms-1")).toBeNull();
+  });
+
+  it("has no live-selection route for purpose_element/purpose_relation/stakeholder_need/product_feature", () => {
+    for (const [screenId, search] of [
+      ["overview", "?element=beneficiary_problem"],
+      ["stakeholder-value-network", "?need=need-1"],
+      ["ux-design-studio", "?feature=feat-1"],
+    ] as const) {
+      // None of these screens declare a CANDIDATE_PRIORITY entry for these
+      // kinds, so a made-up param name must never accidentally resolve one.
+      const candidate = resolveDiscussionCandidate(screenId, search);
+      expect(candidate?.target.target_kind).not.toBe("purpose_element");
+      expect(candidate?.target.target_kind).not.toBe("purpose_relation");
+      expect(candidate?.target.target_kind).not.toBe("stakeholder_need");
+      expect(candidate?.target.target_kind).not.toBe("product_feature");
+    }
+  });
+
+  it("deep-links every new entity/element kind to a screen among its own screenIds", () => {
+    const cases: Array<[keyof typeof DISCUSSION_ADAPTERS, string]> = [
+      ["purpose_element", "beneficiary_problem"],
+      ["purpose_relation", "problem_to_change:beneficiary_problem->desired_change"],
+      ["stakeholder", "sh-1"],
+      ["stakeholder_need", "need-1"],
+      ["product_objective", "obj-1"],
+      ["product_milestone", "ms-1"],
+      ["product_gap", "gap-1"],
+    ];
+    for (const [kind, ref] of cases) {
+      const adapter = DISCUSSION_ADAPTERS[kind];
+      const link = adapter.deepLink(ref);
+      expect(link).not.toBeNull();
+      const path = new URL(link!, "http://localhost").pathname;
+      const screenIdOfPath = (p: string) => (p === "/" ? "overview" : p.slice(1));
+      expect(adapter.screenIds).toContain(screenIdOfPath(path));
+    }
+  });
+
+  it("product_feature has no screen of its own yet, so deepLink is honestly null", () => {
+    expect(DISCUSSION_ADAPTERS.product_feature.deepLink("feat-1")).toBeNull();
+  });
+});
+
 describe("classifyDiscussionError (Issue #456)", () => {
   it("maps a structurally-unsupported code to a non-retryable Japanese reason", () => {
     const result = classifyDiscussionError({ code: "discussion_target_kind_unregistered" });

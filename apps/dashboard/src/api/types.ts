@@ -3686,6 +3686,9 @@ export interface AssistantAskRequest {
 // app/assistant_discussion.py's module constants exactly -- keep them exact.
 
 export type DiscussionScope = "screen" | "entity" | "element";
+// Issue #453 (Epic #443 Phase 4): Vision-to-Feature. Each resolves against
+// an existing owning module's stable identity -- see
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §4.1.
 export type DiscussionTargetKind =
   | "screen"
   | "interview_session"
@@ -3695,7 +3698,15 @@ export type DiscussionTargetKind =
   | "ux_journey_step"
   | "ux_requirement"
   | "solution_design"
-  | "blueprint_lane_cell";
+  | "blueprint_lane_cell"
+  | "purpose_element"
+  | "purpose_relation"
+  | "stakeholder"
+  | "stakeholder_need"
+  | "product_objective"
+  | "product_milestone"
+  | "product_gap"
+  | "product_feature";
 export type DiscussionTargetState = "current" | "stale" | "unresolvable" | "not_tracked";
 
 // docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived

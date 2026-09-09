@@ -25,7 +25,7 @@
       "enum": ["screen", "entity", "element"]
     },
     "discussion_target_kind": {
-      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §1.1/§1.2. One `DiscussionAdapter` per value, registered in `app/discussion_adapters.DISCUSSION_ADAPTERS` -- an unregistered value is refused fail-closed (422 discussion_target_kind_unregistered) rather than silently degrading. Phase 1 (#444) covers exactly the 9 kinds Epic #436 (#438) already shipped; #447 adds Purpose/Stakeholder/Objective/Feature kinds in a later phase, additively.",
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §1.1/§1.2/§4.1. One `DiscussionAdapter` per value, registered in `app/discussion_adapters.DISCUSSION_ADAPTERS` -- an unregistered value is refused fail-closed (422 discussion_target_kind_unregistered) rather than silently degrading. Phase 1 (#444) covered the 9 kinds Epic #436 (#438) already shipped; Issue #453 (Phase 4, #447's follow-up) adds the Vision-to-Feature 8 kinds below, additively -- each resolves against an EXISTING owning module's stable identity (purpose_element/purpose_relation -> app/purpose_chain.py, stakeholder/stakeholder_need -> app/stakeholder_network.py, product_objective/product_milestone/product_gap -> app/product_objective.py, product_feature -> app/product_feature.py), never a new id scheme.",
       "enum": [
         "screen",
         "interview_session",
@@ -35,7 +35,15 @@
         "ux_journey_step",
         "ux_requirement",
         "solution_design",
-        "blueprint_lane_cell"
+        "blueprint_lane_cell",
+        "purpose_element",
+        "purpose_relation",
+        "stakeholder",
+        "stakeholder_need",
+        "product_objective",
+        "product_milestone",
+        "product_gap",
+        "product_feature"
       ]
     },
     "discussion_target_state": {

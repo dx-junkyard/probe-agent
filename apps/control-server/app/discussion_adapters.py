@@ -53,13 +53,25 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from .db import get_conn
 
-# --- §1.1: the 4 discussion-enabled screens -----------------------------------
+# --- §1.1: the discussion-enabled screens ---------------------------------
 # Moved here (not duplicated) because the `screen` adapter's own `screen_ids`
 # is exactly this tuple -- every discussion-enabled screen has a "whole
 # screen" conversation. `assistant_discussion.py` re-exports this name so
 # existing importers are unaffected.
+#
+# Issue #453 (Epic #443 Phase 4, §4.1's Decisions) adds three more:
+# `objective-map` / `stakeholder-value-network` / `capability-map`. Gap
+# Workbench is a VIEW inside `objective-map` (`?view=gaps`), never a screen
+# of its own (docs/01-specifications/capabilities/ai-discussion-adapter.md §4.1). `capability-map` carries no
+# entity/element target from this Issue -- none of the 8 new kinds render
+# there (the old #56/#57 AST-derived Capability Hierarchy this screen shows
+# is a different model entirely) -- so it only gains the whole-screen
+# conversation the `screen` adapter already provides to every member of this
+# tuple, which is what "Capability Map を対象とする" (the Decisions) means
+# here.
 DISCUSSION_SCREEN_IDS: Tuple[str, ...] = (
     "overview", "interview", "ux-design-studio", "journey-blueprint",
+    "objective-map", "stakeholder-value-network", "capability-map",
 )
 
 
@@ -383,6 +395,225 @@ def _resolve_blueprint_lane_cell(system_id: int, target_ref: str) -> ResolvedTar
     )
 
 
+# --- Issue #453 (Epic #443 Phase 4, #447's follow-up): Vision-to-Feature ------
+# `docs/01-specifications/capabilities/ai-discussion-adapter.md` §4.1's table. Every resolver below reads an
+# EXISTING owning module's canonical read path -- never a duplicated query or
+# a new id scheme (§4.2's "既存の canonical service / projection を読む").
+# None of the eight raises: an exception or a not-found row both degrade to
+# `resolution="unresolved"`, exactly like every resolver above.
+
+
+def _resolve_purpose_element(system_id: int, target_ref: str) -> ResolvedTarget:
+    """`app/purpose_chain.py` owns this kind (§4.1). The element id itself is
+    `purpose_chain`'s own stable id (a frame-slot kind name, or
+    `_hashed_element_id` for a repeating kind like `core_capability`) -- this
+    resolver invents no id of its own, and its digest is `purpose_chain.
+    element_digest` verbatim, never a local re-derivation."""
+    from . import purpose_chain
+
+    with get_conn() as conn:
+        try:
+            chain = purpose_chain.derive_purpose_chain(conn, system_id, None)
+        except Exception:  # pragma: no cover - defensive
+            return ResolvedTarget("", None, "", "unresolved")
+    element = next((e for e in chain.elements if e.id == target_ref), None)
+    if element is None:
+        return ResolvedTarget("", None, "", "unresolved")
+    title = element.display_statement or element.statement or element.id
+    return ResolvedTarget(
+        title=title,
+        revision_id=chain.understanding_revision_id,
+        digest=purpose_chain.element_digest(element),
+        resolution="resolved",
+    )
+
+
+def _purpose_relation_digest(relation: Any) -> str:
+    """A normalized digest over a Purpose Chain RELATION's meaning-bearing
+    fields -- `purpose_chain` exposes `element_digest` for elements but no
+    relation-level digest of its own. Identical in shape to
+    `stakeholder_network._purpose_relation_digest` /
+    `ux_design._purpose_relation_digest` (the same established pattern kept
+    local rather than cross-imported, per those modules' own docstrings) --
+    not a fourth, differently-shaped digest algorithm."""
+    return _canonical_digest(
+        {
+            "kind": relation.kind,
+            "source_id": relation.source_id,
+            "target_id": relation.target_id,
+            "status": relation.status,
+            "provenance": relation.provenance,
+        }
+    )
+
+
+def _resolve_purpose_relation(system_id: int, target_ref: str) -> ResolvedTarget:
+    """`app/purpose_chain.py` owns this kind (§4.1). `target_ref` is
+    `purpose_chain.relation_id(kind, source_id, target_id)` -- also not a new
+    id scheme."""
+    from . import purpose_chain
+
+    with get_conn() as conn:
+        try:
+            chain = purpose_chain.derive_purpose_chain(conn, system_id, None)
+        except Exception:  # pragma: no cover - defensive
+            return ResolvedTarget("", None, "", "unresolved")
+    relation = next((r for r in chain.relations if r.id == target_ref), None)
+    if relation is None:
+        return ResolvedTarget("", None, "", "unresolved")
+    return ResolvedTarget(
+        title=target_ref,
+        revision_id=chain.understanding_revision_id,
+        digest=_purpose_relation_digest(relation),
+        resolution="resolved",
+    )
+
+
+def _resolve_stakeholder(system_id: int, target_ref: str) -> ResolvedTarget:
+    """`app/stakeholder_network.py` owns this kind (§4.1): `stakeholder_key`
+    + its current revision's `content_digest`, resolved through that
+    module's own `_resolve_target` (the same private-helper reuse
+    `_resolve_ux_journey_step` already establishes for `ux_design`) rather
+    than a duplicated query."""
+    from . import stakeholder_network as sn
+
+    with get_conn() as conn:
+        try:
+            resolved = sn._resolve_target(conn, system_id, "stakeholder", target_ref)  # noqa: SLF001
+        except Exception:  # pragma: no cover - defensive
+            return ResolvedTarget("", None, "", "unresolved")
+        if resolved["resolution"] != "resolved":
+            return ResolvedTarget("", None, "", "unresolved")
+        row = conn.execute(
+            "SELECT current_revision_id FROM stakeholder WHERE system_id = ? AND stakeholder_key = ?",
+            (system_id, target_ref),
+        ).fetchone()
+    return ResolvedTarget(
+        title=resolved.get("name") or target_ref,
+        revision_id=row["current_revision_id"] if row is not None else None,
+        digest=resolved.get("digest") or "",
+        resolution="resolved",
+    )
+
+
+def _resolve_stakeholder_need(system_id: int, target_ref: str) -> ResolvedTarget:
+    """`app/stakeholder_network.py` owns this kind (§4.1): `need_key` + its
+    current revision's `content_digest`."""
+    from . import stakeholder_network as sn
+
+    with get_conn() as conn:
+        try:
+            resolved = sn._resolve_target(conn, system_id, "stakeholder_need", target_ref)  # noqa: SLF001
+        except Exception:  # pragma: no cover - defensive
+            return ResolvedTarget("", None, "", "unresolved")
+        if resolved["resolution"] != "resolved":
+            return ResolvedTarget("", None, "", "unresolved")
+        row = conn.execute(
+            "SELECT current_revision_id FROM stakeholder_need WHERE system_id = ? AND need_key = ?",
+            (system_id, target_ref),
+        ).fetchone()
+    return ResolvedTarget(
+        title=resolved.get("name") or target_ref,
+        revision_id=row["current_revision_id"] if row is not None else None,
+        digest=resolved.get("digest") or "",
+        resolution="resolved",
+    )
+
+
+def _resolve_product_objective(system_id: int, target_ref: str) -> ResolvedTarget:
+    """`app/product_objective.py` owns this kind (§4.1): `objective_key` +
+    `_objective_current_digest` (the table's own named digest source)."""
+    from . import product_objective
+
+    with get_conn() as conn:
+        try:
+            detail = product_objective.get_objective_detail(conn, system_id, target_ref)
+        except product_objective.NotFound:
+            return ResolvedTarget("", None, "", "unresolved")
+        except Exception:  # pragma: no cover - defensive
+            return ResolvedTarget("", None, "", "unresolved")
+    revision = detail.get("current_revision")
+    digest = revision["content_digest"] if revision else ""
+    return ResolvedTarget(
+        title=detail.get("title") or target_ref,
+        revision_id=detail.get("current_revision_id"),
+        digest=digest,
+        resolution="resolved",
+    )
+
+
+def _resolve_product_milestone(system_id: int, target_ref: str) -> ResolvedTarget:
+    """`app/product_objective.py` owns this kind (§4.1): `milestone_key` +
+    `_milestone_current_digest`."""
+    from . import product_objective
+
+    with get_conn() as conn:
+        try:
+            detail = product_objective.get_milestone_detail(conn, system_id, target_ref)
+        except product_objective.NotFound:
+            return ResolvedTarget("", None, "", "unresolved")
+        except Exception:  # pragma: no cover - defensive
+            return ResolvedTarget("", None, "", "unresolved")
+    revision = detail.get("current_revision")
+    digest = revision["content_digest"] if revision else ""
+    return ResolvedTarget(
+        title=detail.get("title") or target_ref,
+        revision_id=detail.get("current_revision_id"),
+        digest=digest,
+        resolution="resolved",
+    )
+
+
+def _resolve_product_gap(system_id: int, target_ref: str) -> ResolvedTarget:
+    """`app/product_objective.py` owns this kind (§4.1): `gap_key` +
+    `_gap_current_digest` -- the Gap's EFFECTIVE digest, not the raw revision
+    digest, so an `inherited_from_milestone` Gap goes `stale` when the
+    Milestone's own target moves even though the Gap's own revision row did
+    not change (`product_objective._gap_current_digest`'s own docstring).
+    This is exactly why the table names this function rather than "the
+    current revision's content_digest" the way `product_objective` /
+    `product_milestone` above read it."""
+    from . import product_objective
+
+    with get_conn() as conn:
+        try:
+            detail = product_objective.get_gap_detail(conn, system_id, target_ref)
+        except product_objective.NotFound:
+            return ResolvedTarget("", None, "", "unresolved")
+        except Exception:  # pragma: no cover - defensive
+            return ResolvedTarget("", None, "", "unresolved")
+        gap_row = product_objective._get_gap_row(conn, system_id, target_ref)  # noqa: SLF001
+        digest = product_objective._gap_current_digest(conn, gap_row) if gap_row is not None else ""  # noqa: SLF001
+    return ResolvedTarget(
+        title=detail.get("title") or target_ref,
+        revision_id=detail.get("current_revision_id"),
+        digest=digest,
+        resolution="resolved",
+    )
+
+
+def _resolve_product_feature(system_id: int, target_ref: str) -> ResolvedTarget:
+    """`app/product_feature.py` owns this kind (§4.1): `feature_key` + its
+    current revision's `content_digest`."""
+    from . import product_feature
+
+    with get_conn() as conn:
+        try:
+            detail = product_feature.get_feature_detail(conn, system_id, target_ref)
+        except product_feature.NotFound:
+            return ResolvedTarget("", None, "", "unresolved")
+        except Exception:  # pragma: no cover - defensive
+            return ResolvedTarget("", None, "", "unresolved")
+    revision = detail.get("current_revision")
+    digest = revision["content_digest"] if revision else ""
+    return ResolvedTarget(
+        title=detail.get("title") or target_ref,
+        revision_id=detail.get("current_revision_id"),
+        digest=digest,
+        resolution="resolved",
+    )
+
+
 # --- route params for the target's own canonical facts (moved from
 #     assistant_discussion.route_params_for_target's per-kind branches) -------
 
@@ -423,6 +654,19 @@ def _route_params_solution_design(target_ref: str) -> Dict[str, str]:
 def _route_params_blueprint_lane_cell(target_ref: str) -> Dict[str, str]:
     journey_key = target_ref.split("#", 1)[0]
     return {"journey": journey_key} if journey_key else {}
+
+
+# Issue #453: none of the 8 new kinds route-param-inject into an existing
+# SCREEN-level context provider the way `ux_journey`'s `{"journey": ...}`
+# does -- their own `context_provider` below (via `gather_context`) is what
+# supplies THEIR facts to a thread opened on them, and `objective-map` /
+# `stakeholder-value-network`'s own screen-level context providers
+# (`assistant_discussion_context.py`) read the SAME `objective`/`milestone`/
+# `gap`/`node`/`edge` params directly from the URL rather than through this
+# indirection. Matches `understanding_claim`/`overview_finding`'s existing
+# `{}` precedent exactly.
+def _route_params_empty(target_ref: str) -> Dict[str, str]:
+    return {}
 
 
 # --- §2.1 field/relation registries (moved from assistant_discussion_proposal.
@@ -550,6 +794,234 @@ def _context_understanding_claim(conn: Any, system_id: int, target_ref: str) -> 
     if claim is None:
         return {}
     return {"name": claim.name, "summary": claim.summary, "why_core": claim.contribution}
+
+
+# --- Issue #453: context providers for the 8 new kinds ------------------------
+# §4.2's "upstream/downstream link と、その未解決・stale 状態を context に載せる
+# -- ただし本文をコピーせず参照と digest で持つ": each provider below returns
+# the TARGET's own content (that IS what a discussion about it needs), plus
+# related entities as (kind, ref, resolution/status) references only -- never
+# a second copy of that related entity's own text.
+
+#: Mirrors `assistant_discussion_context.MAX_LIST_ITEMS` (kept local so this
+#: module has no import-time dependency on that one, matching the existing
+#: import-direction rule this module's own docstring documents).
+_MAX_CONTEXT_ITEMS = 50
+
+
+def _context_purpose_element(conn: Any, system_id: int, target_ref: str) -> Dict[str, Any]:
+    from . import purpose_chain
+
+    chain = purpose_chain.derive_purpose_chain(conn, system_id, None)
+    element = next((e for e in chain.elements if e.id == target_ref), None)
+    if element is None:
+        return {}
+    related_relations = [
+        {
+            "id": r.id, "kind": r.kind, "source_id": r.source_id, "target_id": r.target_id,
+            "status": r.status, "recheck_state": r.recheck_state,
+        }
+        for r in chain.relations
+        if r.source_id == target_ref or r.target_id == target_ref
+    ][:_MAX_CONTEXT_ITEMS]
+    return {
+        "kind": element.kind,
+        "state": element.state,
+        "display_statement": element.display_statement,
+        "statement": element.statement,
+        "confirmation": element.confirmation,
+        "provenance": element.provenance,
+        "resolution_level": element.resolution_level,
+        "source_kind": element.source_kind,
+        "source_ids": list(element.source_ids),
+        "evidence": list(element.evidence)[:_MAX_CONTEXT_ITEMS],
+        "missing_information": list(element.missing_information),
+        "related_relations": related_relations,
+    }
+
+
+def _context_purpose_relation(conn: Any, system_id: int, target_ref: str) -> Dict[str, Any]:
+    from . import purpose_chain
+
+    chain = purpose_chain.derive_purpose_chain(conn, system_id, None)
+    relation = next((r for r in chain.relations if r.id == target_ref), None)
+    if relation is None:
+        return {}
+    source = next((e for e in chain.elements if e.id == relation.source_id), None)
+    target = next((e for e in chain.elements if e.id == relation.target_id), None)
+    return {
+        "kind": relation.kind,
+        "status": relation.status,
+        "recheck_state": relation.recheck_state,
+        "stale_reason": relation.stale_reason,
+        "provenance": relation.provenance,
+        "rationale": relation.rationale,
+        "source_id": relation.source_id,
+        "source_state": source.state if source is not None else "unknown",
+        "target_id": relation.target_id,
+        "target_state": target.state if target is not None else "unknown",
+    }
+
+
+def _context_stakeholder(conn: Any, system_id: int, target_ref: str) -> Dict[str, Any]:
+    from . import stakeholder_network as sn
+
+    detail = sn.get_stakeholder_detail(conn, system_id, target_ref)
+    revision = detail.get("current_revision") or {}
+    refs_result = sn.list_refs(conn, system_id, source_kind="stakeholder", source_key=target_ref)
+    return {
+        "display_name": revision.get("display_name", ""),
+        "stakeholder_kind": revision.get("stakeholder_kind", ""),
+        "description": revision.get("description", ""),
+        "context_note": revision.get("context_note", ""),
+        "design_status": detail.get("design_status"),
+        "recheck_state": detail.get("recheck_state"),
+        "roles": [
+            {"role": r.get("role"), "scope_kind": r.get("scope_kind"), "scope_ref": r.get("scope_ref")}
+            for r in detail.get("roles", [])
+        ][:_MAX_CONTEXT_ITEMS],
+        "refs": [
+            {
+                "ref_kind": r.get("ref_kind"), "target_ref": r.get("target_ref"),
+                "target_resolution": r.get("target_resolution"), "recheck_state": r.get("recheck_state"),
+            }
+            for r in refs_result.get("refs", [])
+        ][:_MAX_CONTEXT_ITEMS],
+    }
+
+
+def _context_stakeholder_need(conn: Any, system_id: int, target_ref: str) -> Dict[str, Any]:
+    from . import stakeholder_network as sn
+
+    detail = sn.get_need_detail(conn, system_id, target_ref)
+    revision = detail.get("current_revision") or {}
+    refs_result = sn.list_refs(conn, system_id, source_kind="stakeholder_need", source_key=target_ref)
+    return {
+        "statement": revision.get("statement", ""),
+        "need_kind": revision.get("need_kind", ""),
+        "rationale": revision.get("rationale", ""),
+        "stakeholder_key": detail.get("stakeholder_key"),
+        "design_status": detail.get("design_status"),
+        "recheck_state": detail.get("recheck_state"),
+        "refs": [
+            {
+                "ref_kind": r.get("ref_kind"), "target_ref": r.get("target_ref"),
+                "target_resolution": r.get("target_resolution"), "recheck_state": r.get("recheck_state"),
+            }
+            for r in refs_result.get("refs", [])
+        ][:_MAX_CONTEXT_ITEMS],
+    }
+
+
+def _context_product_objective(conn: Any, system_id: int, target_ref: str) -> Dict[str, Any]:
+    from . import product_objective
+
+    detail = product_objective.get_objective_detail(conn, system_id, target_ref)
+    revision = detail.get("current_revision") or {}
+    return {
+        "title": detail.get("title", ""),
+        "intent": revision.get("intent", ""),
+        "contribution": revision.get("contribution", ""),
+        "scope_note": revision.get("scope_note", ""),
+        "summary": revision.get("summary", ""),
+        "objective_state": detail.get("objective_state"),
+        "recheck_state": detail.get("recheck_state"),
+        "parent_objective_key": detail.get("parent_objective_key"),
+        "upstream_refs": [
+            {
+                "ref_kind": r.get("ref_kind"), "target_ref": r.get("target_ref"),
+                "target_resolution": r.get("target_resolution"), "recheck_state": r.get("recheck_state"),
+            }
+            for r in detail.get("upstream_refs", [])
+        ][:_MAX_CONTEXT_ITEMS],
+    }
+
+
+def _context_product_milestone(conn: Any, system_id: int, target_ref: str) -> Dict[str, Any]:
+    from . import product_objective
+
+    detail = product_objective.get_milestone_detail(conn, system_id, target_ref)
+    revision = detail.get("current_revision") or {}
+    return {
+        "title": detail.get("title", ""),
+        "objective_key": detail.get("objective_key"),
+        "design_status": detail.get("design_status"),
+        "achievement": detail.get("achievement"),
+        "recheck_state": detail.get("recheck_state"),
+        "target_state": revision.get("target_state", ""),
+        "verification_method": revision.get("verification_method", ""),
+        "verification_note": revision.get("verification_note", ""),
+        "summary": revision.get("summary", ""),
+        "dependencies": [
+            {"depends_on_milestone_key": d.get("depends_on_milestone_key")}
+            for d in detail.get("dependencies", [])
+        ][:_MAX_CONTEXT_ITEMS],
+    }
+
+
+def _context_product_gap(conn: Any, system_id: int, target_ref: str) -> Dict[str, Any]:
+    from . import product_objective
+
+    detail = product_objective.get_gap_detail(conn, system_id, target_ref)
+    revision = detail.get("current_revision") or {}
+    return {
+        "title": detail.get("title", ""),
+        "lifecycle": detail.get("lifecycle"),
+        "priority_band": detail.get("priority_band"),
+        "recheck_state": detail.get("recheck_state"),
+        "current_state": revision.get("current_state", ""),
+        "interpretation": revision.get("interpretation", ""),
+        "suggested_priority_note": revision.get("suggested_priority_note", ""),
+        "effective_target_state": detail.get("effective_target_state"),
+        "effective_target_availability": detail.get("effective_target_availability"),
+        "milestone_key": detail.get("milestone_key"),
+        "source_refs": [
+            {"source_kind": r.get("source_kind"), "source_state": r.get("source_state")}
+            for r in detail.get("source_refs", [])
+        ][:_MAX_CONTEXT_ITEMS],
+        "journey_links": [
+            {"journey_key": j.get("journey_key")} for j in detail.get("journey_links", [])
+        ][:_MAX_CONTEXT_ITEMS],
+        "evidence_refs": [
+            {"evidence_kind": e.get("evidence_kind"), "deep_link_state": e.get("deep_link_state")}
+            for e in detail.get("evidence_refs", [])
+        ][:_MAX_CONTEXT_ITEMS],
+        "artifact_links": [
+            {"link_kind": a.get("link_kind"), "deep_link_state": a.get("deep_link_state")}
+            for a in detail.get("artifact_links", [])
+        ][:_MAX_CONTEXT_ITEMS],
+    }
+
+
+def _context_product_feature(conn: Any, system_id: int, target_ref: str) -> Dict[str, Any]:
+    from . import product_feature
+
+    detail = product_feature.get_feature_detail(conn, system_id, target_ref)
+    revision = detail.get("current_revision") or {}
+    return {
+        "title": detail.get("title", ""),
+        "statement": revision.get("statement", ""),
+        "rationale": revision.get("rationale", ""),
+        "scope_note": revision.get("scope_note", ""),
+        "summary": revision.get("summary", ""),
+        "design_status": detail.get("design_status"),
+        "recheck_state": detail.get("recheck_state"),
+        "requirement_links": [
+            {"requirement_key": r.get("requirement_key"), "target_resolution": r.get("target_resolution")}
+            for r in detail.get("requirement_links", [])
+        ][:_MAX_CONTEXT_ITEMS],
+        "capability_links": [
+            {"capability_entity_id": c.get("capability_entity_id"), "capability_name": c.get("capability_name")}
+            for c in detail.get("capability_links", [])
+        ][:_MAX_CONTEXT_ITEMS],
+        "target_links": [
+            {
+                "link_kind": t.get("link_kind"), "target_ref": t.get("target_ref"),
+                "target_resolution": t.get("target_resolution"),
+            }
+            for t in detail.get("target_links", [])
+        ][:_MAX_CONTEXT_ITEMS],
+    }
 
 
 # --- field/relation appliers: deferred-import delegates -----------------------
@@ -716,6 +1188,97 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         route_params=_route_params_blueprint_lane_cell,
         relations=_BLUEPRINT_LANE_CELL_RELATIONS,
         relation_applier=_delegate_apply_relation,
+    ),
+    # --- Issue #453 (Epic #443 Phase 4, #447's follow-up): Vision-to-Feature.
+    # §4.1's table. No `fields`/`relations`/appliers on any of the eight --
+    # generation/confirmation for Objective/UX/Feature content is explicitly
+    # out of this Issue's scope (its own Scope/Ownership section); each
+    # adapter here carries read-only canonical context plus the direct
+    # up/downstream refs its own `get_*_detail` already resolves.
+    "purpose_element": DiscussionAdapter(
+        target_kind="purpose_element",
+        scope="element",
+        # Rendered today by `PurposeFrameCard` (Overview) and
+        # `PurposeFramePanel` (Interview) -- the exact reachability note
+        # `understanding_claim` above already documents for the same pair of
+        # screens.
+        screen_ids=("overview", "interview"),
+        label="Purpose 要素",
+        resolver=_resolve_purpose_element,
+        context_provider=_context_purpose_element,
+        route_params=_route_params_empty,
+    ),
+    "purpose_relation": DiscussionAdapter(
+        target_kind="purpose_relation",
+        scope="element",
+        screen_ids=("overview", "interview"),
+        label="Purpose 関係",
+        resolver=_resolve_purpose_relation,
+        context_provider=_context_purpose_relation,
+        route_params=_route_params_empty,
+    ),
+    "stakeholder": DiscussionAdapter(
+        target_kind="stakeholder",
+        scope="entity",
+        screen_ids=("stakeholder-value-network",),
+        label="Stakeholder",
+        resolver=_resolve_stakeholder,
+        context_provider=_context_stakeholder,
+        route_params=_route_params_empty,
+    ),
+    "stakeholder_need": DiscussionAdapter(
+        target_kind="stakeholder_need",
+        scope="entity",
+        screen_ids=("stakeholder-value-network",),
+        label="Need",
+        resolver=_resolve_stakeholder_need,
+        context_provider=_context_stakeholder_need,
+        route_params=_route_params_empty,
+    ),
+    "product_objective": DiscussionAdapter(
+        target_kind="product_objective",
+        scope="entity",
+        # Gap Workbench is a VIEW inside `objective-map` (`?view=gaps`), not
+        # a second screen (§4.1) -- so all three Objective/Milestone/Gap
+        # kinds share this one screen_id.
+        screen_ids=("objective-map",),
+        label="Objective",
+        resolver=_resolve_product_objective,
+        context_provider=_context_product_objective,
+        route_params=_route_params_empty,
+    ),
+    "product_milestone": DiscussionAdapter(
+        target_kind="product_milestone",
+        scope="entity",
+        screen_ids=("objective-map",),
+        label="Milestone",
+        resolver=_resolve_product_milestone,
+        context_provider=_context_product_milestone,
+        route_params=_route_params_empty,
+    ),
+    "product_gap": DiscussionAdapter(
+        target_kind="product_gap",
+        scope="entity",
+        screen_ids=("objective-map",),
+        label="Gap",
+        resolver=_resolve_product_gap,
+        context_provider=_context_product_gap,
+        route_params=_route_params_empty,
+    ),
+    "product_feature": DiscussionAdapter(
+        target_kind="product_feature",
+        scope="entity",
+        # Referenced (read-only link lists) from both screens today --
+        # `requirement-panel.tsx` (ux-design-studio) and
+        # `gap-workbench-panel.tsx` (objective-map) -- neither of which has a
+        # `feature` selection route param of its own yet, so this kind's
+        # Dashboard `resolveFromRoute` stays `null` like `understanding_claim`
+        # / `overview_finding` (no live-selection UI is added by this Issue).
+        screen_ids=("ux-design-studio", "objective-map"),
+        label="Feature",
+        resolver=_resolve_product_feature,
+        context_provider=_context_product_feature,
+        route_params=_route_params_empty,
     ),
 }
 

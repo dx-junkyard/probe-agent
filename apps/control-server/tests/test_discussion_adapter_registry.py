@@ -93,9 +93,11 @@ def test_every_target_kind_has_exactly_one_adapter():
     )
 
 
-def test_target_kinds_are_exactly_the_nine_epic_436_shipped():
-    # Pinned so Phase 1 cannot silently grow or shrink the registered set --
-    # #447 adds new kinds in a LATER phase, additively.
+def test_target_kinds_are_exactly_the_nine_epic_436_shipped_plus_453s_eight():
+    # Pinned so the registered set cannot silently grow or shrink. Phase 1's
+    # original 9 plus Issue #453 (Epic #443 Phase 4)'s 8 Vision-to-Feature
+    # kinds -- #454/#455/#458/#459 add capability, not target_kind, so this
+    # set is now the ceiling until one of those genuinely needs a new kind.
     assert set(discussion_adapters.DISCUSSION_TARGET_KINDS) == {
         "screen",
         "interview_session",
@@ -106,6 +108,14 @@ def test_target_kinds_are_exactly_the_nine_epic_436_shipped():
         "ux_requirement",
         "solution_design",
         "blueprint_lane_cell",
+        "purpose_element",
+        "purpose_relation",
+        "stakeholder",
+        "stakeholder_need",
+        "product_objective",
+        "product_milestone",
+        "product_gap",
+        "product_feature",
     }
 
 
@@ -115,12 +125,21 @@ def test_target_kinds_are_exactly_the_nine_epic_436_shipped():
 def test_scope_target_kinds_equals_pre_refactor_value():
     # Hard-coded from the pre-#444 `assistant_discussion.py` (the literal
     # dict this test replaces) -- NOT read back from either module under
-    # test, so a derivation bug cannot rewrite its own expectation.
+    # test, so a derivation bug cannot rewrite its own expectation. Extended
+    # by Issue #453 (Epic #443 Phase 4) with the 8 new kinds' own `scope`
+    # (§4.1's table: purpose_element/purpose_relation are "element";
+    # stakeholder/stakeholder_need/product_objective/product_milestone/
+    # product_gap/product_feature are "entity").
     expected = {
         "screen": ("screen",),
-        "entity": ("interview_session", "ux_journey", "ux_requirement", "solution_design"),
+        "entity": (
+            "interview_session", "ux_journey", "ux_requirement", "solution_design",
+            "stakeholder", "stakeholder_need",
+            "product_objective", "product_milestone", "product_gap", "product_feature",
+        ),
         "element": (
             "understanding_claim", "overview_finding", "ux_journey_step", "blueprint_lane_cell",
+            "purpose_element", "purpose_relation",
         ),
     }
     actual = {
@@ -178,6 +197,18 @@ def test_proposal_target_schema_equals_pre_refactor_value():
         "overview_finding": {"fields": (), "relations": ()},
         "interview_session": {"fields": (), "relations": ()},
         "screen": {"fields": (), "relations": ()},
+        # Issue #453: none of the 8 new kinds register `fields`/`relations`
+        # (generation/confirmation for Objective/UX/Feature content is out
+        # of this Issue's scope) -- so each is present in the schema (every
+        # `target_kind` is) with both empty, exactly like `overview_finding`.
+        "purpose_element": {"fields": (), "relations": ()},
+        "purpose_relation": {"fields": (), "relations": ()},
+        "stakeholder": {"fields": (), "relations": ()},
+        "stakeholder_need": {"fields": (), "relations": ()},
+        "product_objective": {"fields": (), "relations": ()},
+        "product_milestone": {"fields": (), "relations": ()},
+        "product_gap": {"fields": (), "relations": ()},
+        "product_feature": {"fields": (), "relations": ()},
     }
     actual = assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA
     assert set(actual.keys()) == set(expected.keys())

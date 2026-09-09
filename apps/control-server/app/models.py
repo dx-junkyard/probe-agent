@@ -5944,6 +5944,22 @@ DiscussionTargetKind = Literal[
     "ux_requirement",
     "solution_design",
     "blueprint_lane_cell",
+    # Issue #453 (Epic #443 Phase 4, #447's target-expansion follow-up):
+    # Vision-to-Feature. Every one of these resolves against an EXISTING
+    # owning module's stable identity (never a new id scheme) --
+    # `docs/01-specifications/capabilities/ai-discussion-adapter.md` §4.1's table:
+    # `purpose_element` / `purpose_relation` -> `app/purpose_chain.py`,
+    # `stakeholder` / `stakeholder_need` -> `app/stakeholder_network.py`,
+    # `product_objective` / `product_milestone` / `product_gap` ->
+    # `app/product_objective.py`, `product_feature` -> `app/product_feature.py`.
+    "purpose_element",
+    "purpose_relation",
+    "stakeholder",
+    "stakeholder_need",
+    "product_objective",
+    "product_milestone",
+    "product_gap",
+    "product_feature",
 ]
 
 # --- UiDraftContext (Issue #445, Epic #443 Phase 2) ---------------------------

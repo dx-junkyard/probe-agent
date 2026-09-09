@@ -86,6 +86,13 @@ const SCREEN_PATH: Record<string, string> = {
   interview: "/interview",
   "ux-design-studio": "/ux-design-studio",
   "journey-blueprint": "/journey-blueprint",
+  // Issue #453 (Epic #443 Phase 4, §4.1's Decisions). `capability-map` gains
+  // only the whole-screen conversation this table already gives every
+  // member -- none of the 8 new target_kinds render there (see
+  // `discussion_adapters.py`'s own comment on `DISCUSSION_SCREEN_IDS`).
+  "objective-map": "/objective-map",
+  "stakeholder-value-network": "/stakeholder-value-network",
+  "capability-map": "/capability-map",
 };
 
 const UX_DESIGN_STUDIO_AND_BLUEPRINT = ["ux-design-studio", "journey-blueprint"] as const;
@@ -339,6 +346,164 @@ const blueprintLaneCellAdapter: DashboardDiscussionAdapter = {
   },
 };
 
+// --- Issue #453 (Epic #443 Phase 4, #447's follow-up): Vision-to-Feature ---
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §4.1's table. None of the 8 declare `forms`
+// (generation/confirmation for Objective/UX/Feature content is out of this
+// Issue's scope, its own Scope/Ownership section). `purpose_element` /
+// `purpose_relation` / `stakeholder_need` / `product_feature` have no live
+// selection on the Dashboard today, so `resolveFromRoute` stays `null` --
+// the exact `understanding_claim`/`overview_finding` precedent above.
+
+const purposeElementAdapter: DashboardDiscussionAdapter = {
+  targetKind: "purpose_element",
+  scope: "element",
+  screenIds: ["overview", "interview"],
+  label: "Purpose 要素",
+  resolveFromRoute: () => null,
+  prefillHandlerId: null,
+  forms: [],
+  invalidateKeys: () => [sysKey("purpose-chain"), sysKey("overview")],
+  deepLink: () => SCREEN_PATH.overview,
+};
+
+const purposeRelationAdapter: DashboardDiscussionAdapter = {
+  targetKind: "purpose_relation",
+  scope: "element",
+  screenIds: ["overview", "interview"],
+  label: "Purpose 関係",
+  resolveFromRoute: () => null,
+  prefillHandlerId: null,
+  forms: [],
+  invalidateKeys: () => [sysKey("purpose-chain"), sysKey("overview")],
+  deepLink: () => SCREEN_PATH.overview,
+};
+
+const stakeholderAdapter: DashboardDiscussionAdapter = {
+  targetKind: "stakeholder",
+  scope: "entity",
+  screenIds: ["stakeholder-value-network"],
+  label: "Stakeholder",
+  resolveFromRoute: (screenId, params) => {
+    if (screenId !== "stakeholder-value-network") return null;
+    const node = params.get("node");
+    if (!node) return null;
+    return {
+      target: { scope: "entity", screen_id: screenId, target_kind: "stakeholder", target_ref: node },
+      label: `Stakeholder「${node}」`,
+    };
+  },
+  prefillHandlerId: null,
+  forms: [],
+  invalidateKeys: () => [sysKey("stakeholder-value-network")],
+  deepLink: (targetRef) => `/stakeholder-value-network?node=${encodeURIComponent(targetRef)}`,
+};
+
+const stakeholderNeedAdapter: DashboardDiscussionAdapter = {
+  targetKind: "stakeholder_need",
+  scope: "entity",
+  screenIds: ["stakeholder-value-network"],
+  label: "Need",
+  // §7.1's projection folds Needs into a Stakeholder's `evidence_state`
+  // rather than listing them as their own graph node -- there is no `need`
+  // selection param to read yet.
+  resolveFromRoute: () => null,
+  prefillHandlerId: null,
+  forms: [],
+  invalidateKeys: () => [sysKey("stakeholder-value-network")],
+  deepLink: () => SCREEN_PATH["stakeholder-value-network"],
+};
+
+const productObjectiveAdapter: DashboardDiscussionAdapter = {
+  targetKind: "product_objective",
+  scope: "entity",
+  screenIds: ["objective-map"],
+  label: "Objective",
+  resolveFromRoute: (screenId, params) => {
+    if (screenId !== "objective-map") return null;
+    if ((params.get("view") || "objectives") === "gaps") return null;
+    const objective = params.get("objective");
+    if (!objective) return null;
+    return {
+      target: { scope: "entity", screen_id: screenId, target_kind: "product_objective", target_ref: objective },
+      label: `Objective「${objective}」`,
+    };
+  },
+  prefillHandlerId: null,
+  forms: [],
+  invalidateKeys: (targetRef) => [
+    sysKey("objective-map"), [...sysKey("product-objective"), targetRef],
+  ],
+  deepLink: (targetRef) => `/objective-map?objective=${encodeURIComponent(targetRef)}`,
+};
+
+const productMilestoneAdapter: DashboardDiscussionAdapter = {
+  targetKind: "product_milestone",
+  scope: "entity",
+  screenIds: ["objective-map"],
+  label: "Milestone",
+  resolveFromRoute: (screenId, params) => {
+    if (screenId !== "objective-map") return null;
+    if ((params.get("view") || "objectives") === "gaps") return null;
+    const milestone = params.get("milestone");
+    if (!milestone) return null;
+    return {
+      target: { scope: "entity", screen_id: screenId, target_kind: "product_milestone", target_ref: milestone },
+      label: `Milestone「${milestone}」`,
+    };
+  },
+  prefillHandlerId: null,
+  forms: [],
+  invalidateKeys: (targetRef) => [
+    sysKey("objective-map"), sysKey("gap-workbench"), [...sysKey("product-milestone"), targetRef],
+  ],
+  deepLink: (targetRef) => `/objective-map?milestone=${encodeURIComponent(targetRef)}`,
+};
+
+const productGapAdapter: DashboardDiscussionAdapter = {
+  targetKind: "product_gap",
+  scope: "entity",
+  // Gap Workbench is a VIEW inside `objective-map` (`?view=gaps`), never a
+  // screen of its own (§4.1's Decisions).
+  screenIds: ["objective-map"],
+  label: "Gap",
+  resolveFromRoute: (screenId, params) => {
+    if (screenId !== "objective-map") return null;
+    if ((params.get("view") || "objectives") !== "gaps") return null;
+    const gap = params.get("gap");
+    if (!gap) return null;
+    return {
+      target: { scope: "entity", screen_id: screenId, target_kind: "product_gap", target_ref: gap },
+      label: `Gap「${gap}」`,
+    };
+  },
+  prefillHandlerId: null,
+  forms: [],
+  invalidateKeys: (targetRef) => [
+    sysKey("gap-workbench"), sysKey("objective-map"), [...sysKey("product-gap"), targetRef],
+  ],
+  deepLink: (targetRef) => `/objective-map?view=gaps&gap=${encodeURIComponent(targetRef)}`,
+};
+
+const productFeatureAdapter: DashboardDiscussionAdapter = {
+  targetKind: "product_feature",
+  scope: "entity",
+  // Referenced (read-only link lists) from both screens -- neither has a
+  // `feature` selection route param of its own yet (see
+  // `requirement-panel.tsx` / `gap-workbench-panel.tsx`).
+  screenIds: ["ux-design-studio", "objective-map"],
+  label: "Feature",
+  resolveFromRoute: () => null,
+  prefillHandlerId: null,
+  forms: [],
+  invalidateKeys: (targetRef) => [
+    sysKey("product-features"), [...sysKey("product-feature"), targetRef],
+  ],
+  // No screen of its own yet -- the same honest `null`
+  // `components/functional-lineage/model.ts`'s `lineageDeepLink` already
+  // returns for this exact kind, rather than substituting a plausible URL.
+  deepLink: () => null,
+};
+
 /** §1.4/§1.5's registry: exactly one adapter per `DiscussionTargetKind`.
  * `tests/test_discussion_contract_parity.py` checks this set against the
  * server registry's `target_kind` set and against `DiscussionTargetKind`
@@ -353,6 +518,14 @@ export const DISCUSSION_ADAPTERS: Record<DiscussionTargetKind, DashboardDiscussi
   ux_requirement: uxRequirementAdapter,
   solution_design: solutionDesignAdapter,
   blueprint_lane_cell: blueprintLaneCellAdapter,
+  purpose_element: purposeElementAdapter,
+  purpose_relation: purposeRelationAdapter,
+  stakeholder: stakeholderAdapter,
+  stakeholder_need: stakeholderNeedAdapter,
+  product_objective: productObjectiveAdapter,
+  product_milestone: productMilestoneAdapter,
+  product_gap: productGapAdapter,
+  product_feature: productFeatureAdapter,
 };
 
 /**
@@ -364,12 +537,22 @@ export const DISCUSSION_ADAPTERS: Record<DiscussionTargetKind, DashboardDiscussi
  * per-screen `if` chain in `deriveDiscussionCandidate` exactly:
  *   - ux-design-studio: step > requirement > design > journey
  *   - journey-blueprint: lane cell > step > journey
+ *
+ * Issue #453 adds `objective-map` (gap > milestone > objective -- a Gap
+ * selection is only reachable in the `?view=gaps` lane, which is why each
+ * of the three's own `resolveFromRoute` already excludes the other two's
+ * view) and `stakeholder-value-network` (the only entity selectable there
+ * today is `?node=`). `capability-map` gets no entry -- no entity/element
+ * kind from this Issue renders there (whole-screen conversation still
+ * works via the `screen` adapter, which never consults this table).
  */
 const CANDIDATE_PRIORITY: Record<string, readonly DiscussionTargetKind[]> = {
   interview: ["interview_session"],
   "ux-design-studio": ["ux_journey_step", "ux_requirement", "solution_design", "ux_journey"],
   "journey-blueprint": ["blueprint_lane_cell", "ux_journey_step", "ux_journey"],
   overview: [],
+  "objective-map": ["product_gap", "product_milestone", "product_objective"],
+  "stakeholder-value-network": ["stakeholder"],
 };
 
 /** Replaces `deriveDiscussionCandidate`: the most specific selectable
