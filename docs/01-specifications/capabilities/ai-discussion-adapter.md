@@ -16,7 +16,7 @@ allowlist と handler を全選択 item について検査してから、登録 
 | #446 | Proposal review UI / prefill / 保存との接続は未実装 | #452 |
 | #447 | 追加8 kind と live selection / context は未実装 | #453 |
 | #448 | nested item / Acceptance Criteria / Feature Proposal は未実装 | #454 |
-| #449 | 仮説の JU 昇格・還流と代表 E2E は未実装 | #455 |
+| #449 | 仮説の JU 昇格・還流と代表 E2E は未実装。Issue #461 が所属・premise 基盤を先行実装済み: `joint_understanding_session.owner_scope`/`discussion_thread_id`（既存 `session_id` は interview 所属時のみ必須）、`origin_kind='discussion'`、`app/joint_premise.py` の discussion origin provider registry（`register_discussion_origin_provider`）と依存参照 manifest（`normalize_premise_manifest` / `compute_premise_manifest_digest` / `EMPTY_DEPENDENCY_MANIFEST_DIGEST`、`evaluate_joint_premise` が root 不変でも依存更新で stale と判定）。実際の hypothesis テーブル・昇格 endpoint は未実装のまま | #455 |
 
 元 issue は実装完了と残件移管を区別して整理する。prefill、JU bridge
 は拡張用定義だけであり、代表 E2E や screen reader / narrow viewport の
@@ -302,6 +302,42 @@ finite 契約を導入する (`app/models.py` の `DiscussionOperationResult`:
   "unavailable")` へ縮退する (§1.3 の「診断取得失敗で会話全体を不要に壊さ
   ない」の実装)。未登録の `screen_id` は従来どおり `None` (画面レベルの
   `unsupported` に相当し、この変更の対象ではない)。
+- **operation_state は server の外まで届く (レビュー対応)。** 最初の実装は
+  `TargetContextResult` / `ScreenDiscussionContext` の operation_state を
+  内部で導出するだけで、`/assistant/ask` の応答にも LLM prompt にも届いて
+  いなかった — 「取得に失敗した空 context」と「成功して空だった context」が
+  呼び出し側から区別できないままで、#456 が直そうとした欠陥が 1 階層外側に
+  残っていた。
+  - `AssistantAskOut.screen_context_state` (`DiscussionOperationResult`) /
+    `.screen_context_reason` が毎回の応答に乗る。`discussion is None`
+    (画面が discussion 非対応) は `unsupported`、`ScreenDiscussionContext.
+    operation_state` をそのまま運ぶ場合は `available` / `unavailable`。
+    `facts` (`screen_data`) とは別 field で、`target_state` (freshness) とも
+    混ぜない。
+  - prompt 側は `app/assistant.py` の `ContextPack.screen_data_state` /
+    `.screen_data_reason` を経由し、`to_llm_payload()` が `unavailable` の
+    ときだけ `screen_context_state` という**別のトップレベル key**を足す
+    (`screen_data` の中には入れない)。`unsupported`(この画面は元々
+    canonical context を持たない、既存の非対応画面の shape そのもの)や
+    `available` では何も足さない — 既存 client の prompt 形は不変。
+  - `assistant_discussion_proposal.generate_proposal` は
+    `context_operation_state` / `context_reason` を受け取り、
+    `unavailable` のときは **LLM を一度も呼ばずに** `error_kind=
+    "context_unavailable"` で fail-closed する (503
+    `discussion_context_unavailable`、`reasoning_unavailable` とは別 code)。
+    根拠を読めなかった上で生成された提案は「根拠があるように見えて実は
+    無い」提案になるため。`unsupported`(`screen` / `interview_session` /
+    `overview_finding` のように元々 canonical context を持たない kind)は
+    fail-closed の対象外 — これらの kind は #456 以前から会話 turn だけを
+    根拠に提案してきており、それは失敗ではなく通常運用のため。
+    `routes/assistant.py` の `create_discussion_proposal` は
+    `assistant_discussion_proposal.gather_target_context` (facts のみを
+    返す互換 shim) ではなく `discussion_adapters.gather_context` を直接
+    呼び、`TargetContextResult` 全体を `generate_proposal` へ渡す。
+  - 該当テストは `tests/test_discussion_operation_result.py` の
+    `TestScreenContextStateReachesTheWire` (「失敗したが空」と「成功したが
+    空」が応答上で区別できることを直接表明) と
+    `TestProposalGenerationFailsClosedOnUnavailableContext`。
 - Dashboard 側 (`src/lib/discussion-adapters.ts`) は
   `classifyDiscussionError(err)` が §1.7 の 422 code を
   `DiscussionOperationResult` + 日本語メッセージ + `retryable` へ変換する。
@@ -310,6 +346,16 @@ finite 契約を導入する (`app/models.py` の `DiscussionOperationResult`:
   失敗は `unavailable` + `retryable: true`。`components/assistant-panel.tsx`
   のエラー表示 (`data-testid="assistant-error"`) がこれを使い、retryable な
   場合のみ「再試行」ボタン (`assistant-error-retry`) を出す。
+  **これは `screen_context_state` とは別軸である**: `classifyDiscussionError`
+  は「リクエスト自体が失敗した (例外/HTTPエラー)」ことの分類、
+  `screen_context_state` は「200 で成功した応答の中の、この画面の canonical
+  context 取得状態」で、`AnswerMessage` コンポーネントが個別に表示する
+  (`assistant-screen-context-unsupported` / `assistant-screen-context-
+  unavailable` + `assistant-screen-context-retry`)。`unsupported` は
+  「他の画面への移動」を示さない — discussion-adapter の 422 (対象が別画面に
+  ある) と異なり、画面自身の canonical context 能力には移動先の別画面が
+  存在しないため、理由の提示のみに留める。`unavailable` は同じ質問を
+  再送する「再試行」ボタンを出す。
 
 ### 1.8 parity
 

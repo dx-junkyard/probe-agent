@@ -366,7 +366,12 @@ def create_discussion_proposal(
 
     with get_conn() as conn:
         recent = assistant_discussion.recent_turns(conn, thread_id)
-        target_facts = assistant_discussion_proposal.gather_target_context(
+        # Issue #456 follow-up: read the FULL `TargetContextResult` here
+        # (never the `.facts`-only compatibility wrapper) so the proposal
+        # generation path can see -- and fail closed on -- an `unavailable`
+        # read, rather than silently generating on an empty-because-it-
+        # failed context (§9.2: "取得結果だけで機能不存在を確定しない").
+        context_result = discussion_adapters.gather_context(
             conn, system_id, thread_row["target_kind"], thread_row["target_ref"]
         )
     resolved = assistant_discussion.resolve_target(
@@ -377,7 +382,9 @@ def create_discussion_proposal(
         client, config,
         target_kind=thread_row["target_kind"], target_ref=thread_row["target_ref"],
         target_title=thread_row["target_title"] or thread_row["target_ref"],
-        turns=recent, target_facts=target_facts,
+        turns=recent, target_facts=context_result.facts,
+        context_operation_state=context_result.operation_state,
+        context_reason=context_result.reason,
     )
     completed_at = time.time()
 
@@ -398,8 +405,21 @@ def create_discussion_proposal(
         run_id = run_cur.lastrowid
 
         if result.error:
-            status_code = 503 if result.error_kind == "unavailable" else 502
-            code = "reasoning_unavailable" if status_code == 503 else "discussion_proposal_generation_failed"
+            # Issue #456 follow-up: `context_unavailable` is a DIFFERENT
+            # cause from `unavailable` (no usable LLM) and gets its OWN code
+            # -- "the reasoning model is unreachable" and "the target's
+            # context could not be read" are different facts with different
+            # next actions (retry vs. check the target/System), and reusing
+            # `reasoning_unavailable` for both would be exactly the "one
+            # displayed word carries two facts" defect this Epic exists to
+            # fix (CLAUDE.md #366).
+            status_code = 503 if result.error_kind in ("unavailable", "context_unavailable") else 502
+            if result.error_kind == "unavailable":
+                code = "reasoning_unavailable"
+            elif result.error_kind == "context_unavailable":
+                code = "discussion_context_unavailable"
+            else:
+                code = "discussion_proposal_generation_failed"
             raise HTTPException(
                 status_code=status_code, detail={"code": code, "message": result.error}
             )
@@ -623,6 +643,20 @@ def assistant_ask(
     )
     screen_data: Optional[Dict[str, Any]] = dict(discussion.facts) if discussion else None
     screen_data_sources = list(discussion.sources) if discussion else []
+    # Issue #456 follow-up: `discussion is None` means this screen_id has no
+    # discussion-context concept at all -- `unsupported`, distinct from a
+    # registered screen whose read just failed THIS turn (`discussion.
+    # operation_state`, defaulting to `available` on a normal successful
+    # read). Threaded through BOTH to the prompt (`ContextPack.screen_data_
+    # state`, kept out of `screen_data` itself) and to the wire response
+    # (`AssistantAskOut.screen_context_state`) -- neither reached the caller
+    # before this Issue, which is exactly the "empty dict swallows the
+    # failure" defect #456 exists to fix, one layer further out.
+    screen_context_state = discussion.operation_state if discussion is not None else "unsupported"
+    screen_context_reason = (
+        discussion.reason if discussion is not None
+        else "screen_discussion_context_not_registered"
+    )
     # Issue #441 element-scope voice turns carry the deterministic help id in
     # route params.  It is useful only after the server validates an exact
     # registry match for this screen; arbitrary or cross-screen ids are never
@@ -677,6 +711,8 @@ def assistant_ask(
         focused_state_id=focused_state_id,
         screen_data=screen_data,
         screen_data_sources=screen_data_sources if screen_data is not None else None,
+        screen_data_state=screen_context_state,
+        screen_data_reason=screen_context_reason,
         route_params=effective_route_params,
         conversation=conversation_messages,
         voice_mode=payload.input_mode == "voice",
@@ -793,4 +829,6 @@ def assistant_ask(
         turn_number=turn_number_out,
         ui_draft_state=resolved_draft.state,
         ui_draft_changed=ui_draft_changed,
+        screen_context_state=screen_context_state,
+        screen_context_reason=screen_context_reason or None,
     )

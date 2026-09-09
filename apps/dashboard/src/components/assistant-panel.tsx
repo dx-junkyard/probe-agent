@@ -199,7 +199,15 @@ function CitationChip({ citation }: { citation: AssistantCitation }) {
   );
 }
 
-function AnswerMessage({ result }: { result: AssistantAskOut }) {
+function AnswerMessage({
+  result, onRetryScreenContext,
+}: {
+  result: AssistantAskOut;
+  // Issue #456 follow-up: re-ask the SAME question, for when `screen_
+  // context_state === "unavailable"`. `undefined` when the caller has no
+  // question text to retry with (e.g. a turn restored from history).
+  onRetryScreenContext?: () => void;
+}) {
   const navigate = useNavigate();
   // Issue #445: derived from the citation list (persisted with every turn),
   // not from `ui_draft_state` alone -- a turn reconstructed from history
@@ -221,6 +229,40 @@ function AnswerMessage({ result }: { result: AssistantAskOut }) {
         <p className="text-[11px] text-muted-foreground" data-testid="assistant-used-ui-draft">
           この回答は未保存の下書きも参照しました(保存はされていません)。
         </p>
+      )}
+      {/* Issue #456 follow-up: `screen_context_state` is a status INSIDE a
+       * successful (200) response, a different axis from `classifyDiscussion
+       * Error` (which classifies a THROWN request failure) -- so this reads
+       * `result.screen_context_state` directly rather than routing through
+       * that function. `unsupported` gets no "move to an existing screen"
+       * link: unlike a discussion-adapter 422 (where the target legitimately
+       * lives on a DIFFERENT screen), a screen's OWN canonical-context
+       * capability has no other screen to redirect to -- the developer is
+       * already on the only screen this answer concerns, so a reason is all
+       * there is to show. `unavailable` gets a retry (re-asks the SAME
+       * question) because the read may succeed next time; `available` (the
+       * normal case) renders nothing. */}
+      {result.screen_context_state === "unsupported" && (
+        <p className="text-[11px] text-muted-foreground" data-testid="assistant-screen-context-unsupported">
+          この画面は正規データの参照に対応していません。会話の内容のみをもとに回答しています。
+        </p>
+      )}
+      {result.screen_context_state === "unavailable" && (
+        <div className="space-y-1">
+          <p className="text-xs text-amber-700" data-testid="assistant-screen-context-unavailable">
+            この画面の正規データを取得できませんでした。この回答は不完全な可能性があります。
+          </p>
+          {onRetryScreenContext && (
+            <button
+              type="button"
+              className="text-xs text-primary hover:underline cursor-pointer"
+              data-testid="assistant-screen-context-retry"
+              onClick={onRetryScreenContext}
+            >
+              再試行
+            </button>
+          )}
+        </div>
       )}
       <div className="flex flex-wrap items-center gap-1.5">
         {result.used_fallback ? (
@@ -940,7 +982,16 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
               <p className="text-sm whitespace-pre-wrap">{m.text}</p>
             </div>
           ) : m.role === "assistant" && m.result ? (
-            <AnswerMessage key={i} result={m.result} />
+            <AnswerMessage
+              key={i}
+              result={m.result}
+              onRetryScreenContext={
+                m.result.screen_context_state === "unavailable"
+                && messages[i - 1]?.role === "user"
+                  ? () => submit(messages[i - 1].text)
+                  : undefined
+              }
+            />
           ) : (
             <div key={i} className="space-y-1">
               <p className="text-xs text-destructive" data-testid="assistant-error">

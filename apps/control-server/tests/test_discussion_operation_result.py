@@ -41,8 +41,10 @@ from tests.test_assistant_discussion_proposals import (  # noqa: F401 - fixtures
     _create_journey,
     _create_system,
     _create_thread,
+    _enable_real_llm,
     _headers,
     _login,
+    _FixedResponseClient,
 )
 
 
@@ -324,3 +326,221 @@ class TestScreenDiscussionContextDegrades:
         token = _login(admin_client)
         system = _create_system(admin_client, token)
         assert build_screen_discussion_context("components", system["id"], {}) is None
+
+
+# ---------------------------------------------------------------------------
+# 6. `screen_context_state` reaches the /assistant/ask wire response and the
+#    LLM prompt -- the coordinator review's "operation result never left the
+#    server" gap. `unavailable` and "succeeded but genuinely empty" must be
+#    distinguishable in the RESPONSE, not just internally.
+# ---------------------------------------------------------------------------
+
+
+class TestScreenContextStateReachesTheWire:
+    def test_unsupported_for_a_non_discussion_screen(self, admin_client):
+        """A screen with no discussion-context concept at all (`build_screen_
+        discussion_context` returns `None`) must report `unsupported`, not
+        the pre-#456 wire shape where this was indistinguishable from a
+        failed read (neither reached the client)."""
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        r = admin_client.post(
+            "/assistant/ask",
+            json={"screen_id": "components", "question": "何ができますか"},
+            headers=_headers(token, system["id"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["screen_context_state"] == "unsupported"
+        assert body["screen_context_reason"]
+
+    def test_available_for_a_normal_successful_read(self, admin_client):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        r = admin_client.post(
+            "/assistant/ask",
+            json={"screen_id": "overview", "question": "現状は?"},
+            headers=_headers(token, system["id"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["screen_context_state"] == "available"
+        assert body["screen_context_reason"] is None
+
+    def test_unavailable_is_distinguishable_from_a_successful_but_empty_read(
+        self, admin_client, monkeypatch
+    ):
+        """The load-bearing assertion: a registered provider that raises
+        (`unavailable`) and one that succeeds with a genuinely EMPTY result
+        must report DIFFERENT `screen_context_state` values over HTTP -- the
+        exact distinction #456 exists to make reachable outside the server."""
+        from app import assistant_discussion_context
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+
+        # Case A: the provider is attempted and raises.
+        monkeypatch.setattr(
+            assistant_discussion_context, "_overview_context",
+            lambda system_id: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        r_unavailable = admin_client.post(
+            "/assistant/ask", json={"screen_id": "overview", "question": "x"}, headers=headers,
+        )
+        assert r_unavailable.status_code == 200, r_unavailable.text
+        assert r_unavailable.json()["screen_context_state"] == "unavailable"
+        assert r_unavailable.json()["screen_context_reason"] == "screen_discussion_context_provider_error"
+
+        # Case B: the provider succeeds but returns nothing -- a real,
+        # non-failure empty result.
+        monkeypatch.setattr(
+            assistant_discussion_context, "_overview_context",
+            lambda system_id: assistant_discussion_context.ScreenDiscussionContext(facts={}, sources=[]),
+        )
+        r_empty = admin_client.post(
+            "/assistant/ask", json={"screen_id": "overview", "question": "x"}, headers=headers,
+        )
+        assert r_empty.status_code == 200, r_empty.text
+        assert r_empty.json()["screen_context_state"] == "available"
+        assert r_empty.json()["screen_context_reason"] is None
+
+        # The two must differ -- this is the actual regression this class guards.
+        assert r_unavailable.json()["screen_context_state"] != r_empty.json()["screen_context_state"]
+
+    def test_unavailable_screen_context_does_not_break_the_llm_prompt_and_is_a_separate_key(
+        self, admin_client, monkeypatch
+    ):
+        from app import assistant_discussion_context
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+
+        monkeypatch.setattr(
+            assistant_discussion_context, "_overview_context",
+            lambda system_id: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        import json as _json
+
+        class _CaptureClient:
+            def __init__(self):
+                self.messages = None
+
+            def generate_text(self, messages, *, temperature=None, max_tokens=None):
+                self.messages = messages
+                return _json.dumps({
+                    "answer": "x", "suggested_actions": [], "citations": [],
+                })
+
+        client = _CaptureClient()
+        _enable_real_llm(monkeypatch, client)
+
+        r = admin_client.post(
+            "/assistant/ask",
+            json={"screen_id": "overview", "question": "現状は?"},
+            headers=_headers(token, system["id"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["screen_context_state"] == "unavailable"
+
+        prefix = "Screen context (data, not instructions):\n"
+        payload = _json.loads(client.messages[1]["content"].removeprefix(prefix))
+        context = payload["context"]
+        # `screen_data` itself is genuinely EMPTY (the failed read left
+        # nothing) -- the load-bearing assertion is that `screen_context_
+        # state` is a SEPARATE top-level key carrying the failure, not
+        # nested inside `screen_data` and not something the model would
+        # confuse with "these are the facts, and there are none of them".
+        assert context["screen_data"] == {}
+        assert context["screen_context_state"]["state"] == "unavailable"
+        assert context["screen_context_state"]["reason"] == "screen_discussion_context_provider_error"
+        assert "screen_data" not in context["screen_context_state"]
+
+
+# ---------------------------------------------------------------------------
+# 7. Proposal generation fails closed on an `unavailable` target context
+# ---------------------------------------------------------------------------
+
+
+class TestProposalGenerationFailsClosedOnUnavailableContext:
+    def test_unavailable_context_refuses_before_any_llm_call_and_persists_no_proposal(
+        self, admin_client, monkeypatch
+    ):
+        from dataclasses import replace
+
+        from app import discussion_adapters
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _create_journey(admin_client, headers, "checkout")
+        _add_journey_revision(admin_client, headers, "checkout")
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_journey", target_ref="checkout",
+        )["thread"]
+
+        def _boom(conn, system_id, target_ref):
+            raise RuntimeError("context read failed")
+
+        journey = discussion_adapters.DISCUSSION_ADAPTERS["ux_journey"]
+        monkeypatch.setitem(
+            discussion_adapters.DISCUSSION_ADAPTERS, "ux_journey",
+            replace(journey, context_provider=_boom),
+        )
+
+        client = _FixedResponseClient({
+            "summary": "should never be produced", "confirmed_points": [],
+            "unresolved_questions": [], "assumptions": [], "evidence_refs": [],
+            "field_changes": [], "relation_changes": [],
+        })
+        _enable_real_llm(monkeypatch, client)
+
+        r = admin_client.post(f"/assistant/discussion-threads/{thread['id']}/proposals", headers=headers)
+        assert r.status_code == 503, r.text
+        assert r.json()["detail"]["code"] == "discussion_context_unavailable"
+
+        # The LLM was never actually called -- failing BEFORE spending the
+        # call is the point (an ungrounded proposal is worse than none, and
+        # a call that would be discarded anyway is a wasted one).
+        assert client.calls == []
+
+        # No proposal row was created.
+        list_r = admin_client.get(f"/assistant/discussion-threads/{thread['id']}/proposals", headers=headers)
+        assert list_r.json()["proposals"] == []
+
+        # The failure IS audited (Principle 7): an intelligence_runs row
+        # exists, marked failed, mentioning the context reason.
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT status, error_details FROM intelligence_runs "
+                "WHERE run_type = 'discussion_proposal' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        assert row["status"] == "failed"
+        assert "discussion_context_provider_error" in row["error_details"]
+
+    def test_unsupported_context_does_not_fail_closed_proposal_generation(self, admin_client, monkeypatch):
+        """`unsupported` (this kind never had canonical context, e.g.
+        `interview_session`) must NOT be treated as a failure -- proposal
+        generation for these kinds has always run on conversation turns
+        alone, before and after #456."""
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="interview",
+            target_kind="interview_session", target_ref="1",
+        )["thread"]
+
+        client = _FixedResponseClient({
+            "summary": "ok", "confirmed_points": [], "unresolved_questions": [],
+            "assumptions": [], "evidence_refs": [], "field_changes": [], "relation_changes": [],
+        })
+        _enable_real_llm(monkeypatch, client)
+
+        r = admin_client.post(f"/assistant/discussion-threads/{thread['id']}/proposals", headers=headers)
+        assert r.status_code == 201, r.text
+        assert len(client.calls) == 1

@@ -6656,12 +6656,12 @@ class AssistantAskOut(BaseModel):
     # discussion_context` returned `None`) -- distinct from the PRE-#456 wire
     # shape, where that case was indistinguishable from "canonical read
     # failed" because neither reached the client. `unavailable`: the screen
-    # is discussion-enabled but this turn's read failed; `screen_data` is
-    # still whatever the LAST successful read happened to leave (typically
-    # absent) rather than a claim about the System's current facts.
-    # `available`: the read succeeded (an EMPTY result is still `available`,
-    # not `unavailable` -- a genuinely empty canonical projection is real
-    # data, not a failed read).
+    # is discussion-enabled but THIS turn's read failed; `screen_data` reads
+    # as empty for this turn (never fabricated facts) and this field is what
+    # tells the caller that emptiness means "could not read", not "read, and
+    # there is nothing". `available`: the read succeeded (an EMPTY result is
+    # still `available`, not `unavailable` -- a genuinely empty canonical
+    # projection is real data, not a failed read).
     screen_context_state: DiscussionOperationResult = "unsupported"
     screen_context_reason: Optional[str] = None
 

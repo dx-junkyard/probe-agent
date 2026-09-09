@@ -830,7 +830,11 @@ def gather_context(conn: Any, system_id: int, target_kind: str, target_ref: str)
         )
     try:
         facts = adapter.context_provider(conn, system_id, target_ref)
-    except Exception:  # pragma: no cover - defensive, mirrors resolvers' own rule
+    except Exception:
+        # Exercised directly by `tests/test_discussion_operation_result.py`'s
+        # `TestGatherContextOperationStates` (a monkeypatched provider that
+        # raises, a deleted target, and a foreign-System read all reach this
+        # branch) -- not `pragma: no cover`.
         return TargetContextResult(
             operation_state="unavailable", facts={}, reason="discussion_context_provider_error",
         )

@@ -188,13 +188,20 @@ def _exchange(**overrides) -> dict:
     payload = {
         "schema_version": SCHEMA_VERSION,
         "session": {
-            "id": 1, "system_id": 1, "session_id": 1,
+            "id": 1, "system_id": 1,
+            # Issue #461: owner_scope/discussion_thread_id are now required
+            # alongside session_id -- every existing (interview-scope)
+            # session is owner_scope='interview' with discussion_thread_id
+            # null, reproducing the pre-#461 shape exactly.
+            "owner_scope": "interview", "session_id": 1, "discussion_thread_id": None,
             "origin_kind": "qa", "origin_id": 1, "trigger": "explicit_request",
             "question_text": "この経路は誰に影響しますか?",
             "status": "open", "outcome": None, "outcome_is_provisional": False,
             "outcome_reason": None, "outcome_finding_ids": [],
             "outcome_premise_state": None, "premise_state": "current",
-            "premise_snapshot_id": 1, "schema_version": SCHEMA_VERSION,
+            "premise_snapshot_id": 1,
+            "premise_dependency_manifest": [], "premise_dependency_manifest_digest": None,
+            "schema_version": SCHEMA_VERSION,
             "created_at": 1.0, "updated_at": 1.0, "closed_at": None,
         },
         "findings": [],

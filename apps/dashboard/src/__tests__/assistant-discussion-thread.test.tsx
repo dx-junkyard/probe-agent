@@ -14,7 +14,7 @@
 // Mocks follow the `vi.mock("@/api/client")` pattern the other panel tests
 // use, so nothing here touches a real network or a real QueryClient cache.
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
@@ -447,5 +447,109 @@ describe("Issue #438 — target-scoped discussion threads", () => {
       .filter(([path]) => path === "/assistant/ask")
       .map(([, body]) => (body as { question: string }).question);
     expect(askBodies).toEqual(["もう一度聞きます", "もう一度聞きます"]);
+  });
+
+  // Issue #456 follow-up: `screen_context_state` inside a SUCCESSFUL (200)
+  // ask response is a different axis from a thrown request failure
+  // (`classifyDiscussionError`'s territory, covered above) -- these tests
+  // are about the answer bubble itself, not the error bubble.
+  test("an unavailable screen context shows a warning with a retry that re-asks the same question", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path.startsWith("/assistant/screen-context/")
+        ? Promise.resolve(screenContext)
+        : Promise.resolve(null),
+    );
+    let askCalls = 0;
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/assistant/discussion-threads") return Promise.resolve(null);
+      if (path === "/assistant/ask") {
+        askCalls += 1;
+        return Promise.resolve({
+          ...askResponse,
+          screen_context_state: askCalls === 1 ? "unavailable" : "available",
+          screen_context_reason: askCalls === 1 ? "screen_discussion_context_provider_error" : null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+    await renderPanelAt("/ux-design-studio?tab=requirements&requirement=req-a");
+
+    fireEvent.change(screen.getByTestId("assistant-question-input"), {
+      target: { value: "現状は?" },
+    });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+
+    await screen.findByTestId("assistant-screen-context-unavailable");
+    expect(screen.queryByTestId("assistant-screen-context-unsupported")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("assistant-screen-context-retry"));
+    await waitFor(() => {
+      const askBodies = mockApi.post.mock.calls
+        .filter(([path]) => path === "/assistant/ask")
+        .map(([, body]) => (body as { question: string }).question);
+      expect(askBodies).toEqual(["現状は?", "現状は?"]);
+    });
+    // The FIRST turn's warning legitimately stays in history (that answer
+    // really was produced on an incomplete read) -- one from turn 1, but
+    // the RETRIED (second) answer bubble carries none of its own.
+    await waitFor(() => {
+      const answers = screen.getAllByTestId("assistant-answer");
+      expect(answers).toHaveLength(2);
+      expect(within(answers[1]).queryByTestId("assistant-screen-context-unavailable")).toBeNull();
+    });
+  });
+
+  test("an unsupported screen context shows a quiet reason with no retry button", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path.startsWith("/assistant/screen-context/")
+        ? Promise.resolve(screenContext)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/assistant/discussion-threads") return Promise.resolve(null);
+      if (path === "/assistant/ask") {
+        return Promise.resolve({
+          ...askResponse,
+          screen_context_state: "unsupported",
+          screen_context_reason: "screen_discussion_context_not_registered",
+        });
+      }
+      return Promise.resolve(null);
+    });
+    await renderPanelAt("/ux-design-studio?tab=requirements&requirement=req-a");
+
+    fireEvent.change(screen.getByTestId("assistant-question-input"), {
+      target: { value: "この画面は何ですか" },
+    });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+
+    await screen.findByTestId("assistant-screen-context-unsupported");
+    expect(screen.queryByTestId("assistant-screen-context-retry")).toBeNull();
+    expect(screen.queryByTestId("assistant-screen-context-unavailable")).toBeNull();
+  });
+
+  test("an available screen context (the normal case) shows neither note", async () => {
+    mockApi.get.mockImplementation((path: string) =>
+      path.startsWith("/assistant/screen-context/")
+        ? Promise.resolve(screenContext)
+        : Promise.resolve(null),
+    );
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/assistant/discussion-threads") return Promise.resolve(null);
+      if (path === "/assistant/ask") {
+        return Promise.resolve({ ...askResponse, screen_context_state: "available", screen_context_reason: null });
+      }
+      return Promise.resolve(null);
+    });
+    await renderPanelAt("/ux-design-studio?tab=requirements&requirement=req-a");
+
+    fireEvent.change(screen.getByTestId("assistant-question-input"), {
+      target: { value: "現状は?" },
+    });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+
+    await screen.findByTestId("assistant-answer");
+    expect(screen.queryByTestId("assistant-screen-context-unsupported")).toBeNull();
+    expect(screen.queryByTestId("assistant-screen-context-unavailable")).toBeNull();
   });
 });

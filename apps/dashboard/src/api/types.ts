@@ -3941,6 +3941,17 @@ export interface AssistantAskOut {
   // implies `recheck_required` when both are read together.
   ui_draft_state?: UiDraftState;
   ui_draft_changed?: boolean;
+  // Issue #456 follow-up: the operation-result of THIS turn's screen
+  // canonical-context read, separate from any facts and from `target_state`
+  // (freshness). `unsupported` (this screen_id has no discussion-context
+  // concept at all) and `unavailable` (a registered read failed just now)
+  // are different axes from `classifyDiscussionError` in `lib/discussion-
+  // adapters.ts` -- that one classifies a REQUEST failure (thrown), this one
+  // is a status INSIDE a successful (200) response. Optional so a pre-#456
+  // test fixture/mock built as a literal of this interface stays valid; the
+  // server always sends it.
+  screen_context_state?: DiscussionOperationResult;
+  screen_context_reason?: string | null;
 }
 
 // UI 機能解説モード (Issue #440, Epic #436): `app/ui_help_registry.py` の

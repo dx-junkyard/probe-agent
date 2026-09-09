@@ -2008,18 +2008,29 @@ def reflux_joint_understanding(
             # read. Before this, a non-'qa' origin's facts reached the reflux
             # ledger and stopped there -- recorded, attributable, and invisible
             # to every consumer that could have used them.
-            publish_joint_understanding_finding(
-                conn,
-                system_id=system_id,
-                session_id=ju["session_id"],
-                joint_understanding_id=ju_id,
-                origin_kind=ju["origin_kind"],
-                origin_id=target_id or ju["origin_id"],
-                finding_row=finding,
-                premise_snapshot_id=_column(ju, "premise_snapshot_id"),
-                premise_commit_sha=_column(ju, "premise_commit_sha"),
-                now=now,
-            )
+            #
+            # Issue #461: `understanding_evidence_feed.session_id` is NOT
+            # NULL (it feeds three interview-owned rebuilds --
+            # understanding_build / alignment_build / inquiry_answer -- none
+            # of which a discussion-origin session's own hypothesis content
+            # is input to), so a discussion-scope session (`session_id IS
+            # NULL`) skips this publish rather than crashing on it. The
+            # `joint_understanding_reflux` row above already recorded the
+            # attachment -- this feed is an ADDITIONAL fan-out to interview
+            # rebuild consumers a discussion-origin fact has none of.
+            if ju["session_id"] is not None:
+                publish_joint_understanding_finding(
+                    conn,
+                    system_id=system_id,
+                    session_id=ju["session_id"],
+                    joint_understanding_id=ju_id,
+                    origin_kind=ju["origin_kind"],
+                    origin_id=target_id or ju["origin_id"],
+                    finding_row=finding,
+                    premise_snapshot_id=_column(ju, "premise_snapshot_id"),
+                    premise_commit_sha=_column(ju, "premise_commit_sha"),
+                    now=now,
+                )
 
         rows = [
             conn.execute(

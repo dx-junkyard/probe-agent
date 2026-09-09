@@ -266,7 +266,12 @@ def build_screen_discussion_context(
         return None
     try:
         return provider(system_id, params)
-    except Exception:  # pragma: no cover - defensive, mirrors the adapter registry's own rule
+    except Exception:
+        # Exercised directly by `tests/test_discussion_operation_result.py`'s
+        # `TestScreenDiscussionContextDegrades` and by `tests/test_assistant.
+        # py`'s `test_a_failing_screen_context_provider_does_not_break_the_
+        # whole_ask` (which also proves `/assistant/ask` still returns 200)
+        # -- not `pragma: no cover`.
         return ScreenDiscussionContext(
             facts={}, sources=[], operation_state="unavailable",
             reason="screen_discussion_context_provider_error",

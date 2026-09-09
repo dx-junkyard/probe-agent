@@ -215,7 +215,10 @@ class ProposalGenerationResult:
     assumptions: List[str] = field(default_factory=list)
     error: Optional[str] = None
     #: One of "unavailable" (no usable reasoning-model client -- 503
-    #: `reasoning_unavailable`), "call_error" / "invalid_response" /
+    #: `reasoning_unavailable`), "context_unavailable" (Issue #456 follow-up:
+    #: the target's canonical context could not be read for THIS attempt --
+    #: 503 `discussion_context_unavailable`, a DIFFERENT reason than the LLM
+    #: itself being unavailable), "call_error" / "invalid_response" /
     #: "invalid_registry" (a real attempt failed -- 502), or `None` (success).
     error_kind: Optional[str] = None
 
@@ -334,6 +337,8 @@ def generate_proposal(
     target_title: str,
     turns: Sequence[Dict[str, Any]],
     target_facts: Dict[str, Any],
+    context_operation_state: str = "available",
+    context_reason: str = "",
 ) -> ProposalGenerationResult:
     """§2.2's generation step. Pure -- no database access -- so callers hold
     no `get_conn()` connection while this runs. Fail-closed throughout
@@ -341,7 +346,33 @@ def generate_proposal(
     an invalid structured response, or a field/relation name outside
     `PROPOSAL_TARGET_SCHEMA` all fail the WHOLE call -- a proposal containing
     one invented field is not a partially-correct proposal.
+
+    `context_operation_state` (Issue #456 follow-up, a `DiscussionOperation
+    Result`) is the caller's `discussion_adapters.gather_context(...).
+    operation_state` for this target. Only `unavailable` fails the call here
+    -- a REGISTERED context provider was attempted and failed just now, so a
+    proposal generated on top of it would be a change proposed against facts
+    the model never actually saw (the exact defect #456 exists to fix, one
+    layer further out: an ungrounded proposal that LOOKS grounded).
+    `unsupported` is deliberately NOT failed here: `screen` / `interview_
+    session` / `overview_finding` have never had canonical context (`fields`/
+    `relations` are `()` for them too), so a proposal for those kinds has
+    always run on conversation turns alone -- that is normal operation for
+    THOSE kinds, not a failure, and always was even before this Issue.
     """
+    if context_operation_state == "unavailable":
+        return ProposalGenerationResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=False,
+            error=(
+                "Target canonical context could not be read for this proposal "
+                f"({context_reason or 'discussion_context_provider_error'}); "
+                "generating a proposal without it would be ungrounded"
+            ),
+            error_kind="context_unavailable",
+        )
+
     is_mock = config.provider == "mock" or isinstance(client, MockLLMClient)
     if client is None or is_mock or not is_reasoning_model(config.provider, config.model):
         return ProposalGenerationResult(
@@ -462,13 +493,19 @@ def gather_target_context(conn, system_id: int, target_kind: str, target_ref: st
     Delegates to `discussion_adapters.gather_context` (Issue #444/#456),
     which is the canonical place the `unsupported` (no adapter/handler) /
     `unavailable` (registered handler raised) / `available` distinction is
-    computed and separately tested. This function keeps its OWN pre-#456
-    signature and return shape (a bare facts dict, no operation_state) on
-    purpose: `generate_proposal`'s prompt has no separate slot for "this read
-    failed" today, and stuffing that into the facts dict itself would be
-    exactly the "operation result mixed into facts" #456 forbids. A caller
-    that needs the operation_state should call `discussion_adapters.
-    gather_context` directly instead of this compatibility wrapper.
+    computed and separately tested, and returns only its `.facts` here.
+
+    **This is a backward-compatible SHIM, kept for any external caller of
+    this exact pre-#456 signature/shape -- it is NOT what
+    `routes/assistant.py`'s `create_discussion_proposal` calls any more.**
+    That route reads the full `TargetContextResult` from `discussion_
+    adapters.gather_context` directly, so it can fail closed on `unavailable`
+    (`generate_proposal`'s `context_operation_state` parameter) instead of
+    silently generating a proposal on top of a context read that failed just
+    now (#456 follow-up review: an operation_state discarded one layer out is
+    the same defect this Issue exists to fix). A caller that needs the
+    operation_state should call `discussion_adapters.gather_context` directly
+    instead of this wrapper.
     """
     return discussion_adapters.gather_context(conn, system_id, target_kind, target_ref).facts
 
