@@ -28,9 +28,10 @@ import {
   evaluationPolicyGroups, sortSolutionDesigns,
 } from "./model";
 import {
-  DegradedNote, EmptyNote, LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
+  DegradedNote, EmptyNote, FieldErrorText, FormErrorBanner, LoadErrorCard,
+  LoadingBlock, SectionHeading, StateBadge, useFieldRefs,
 } from "./shared";
-import { useUiDraftSource } from "@/lib/ui-draft";
+import { useFormValidation, useUiDraftSource } from "@/lib/ui-draft";
 import { peekPendingFormDraftPatch, useFormDraftReceiver } from "@/lib/form-draft-inbox";
 import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
 
@@ -44,24 +45,48 @@ function SolutionDesignCreateForm() {
   const create = useCreateSolutionDesign();
   const [key, setKey] = useState("");
   const [title, setTitle] = useState("");
+  const validation = useFormValidation();
+  const fieldRefs = useFieldRefs();
+  const KNOWN_FIELDS = ["design_key"] as const;
 
   function submit() {
+    const token = validation.begin();
     create.mutate(
       { design_key: key.trim(), title },
       {
         onSuccess: () => {
+          validation.resolveSuccess(token);
           setKey("");
           setTitle("");
           toast.success("Solution Design を作成しました");
         },
-        onError: (error) => toast.error((error as ApiError).detail || "作成できませんでした"),
+        onError: (error) => {
+          const apiError = error as ApiError;
+          validation.resolveError(token, apiError, KNOWN_FIELDS);
+          toast.error(apiError.detail || "作成できませんでした");
+        },
       },
     );
   }
 
   return (
     <div className="space-y-2" data-testid="ux-solution-design-create-form">
-      <Input placeholder="design_key" value={key} onChange={(e) => setKey(e.target.value)} />
+      <FormErrorBanner
+        error={validation.formError}
+        onFocusFirstField={
+          Object.keys(validation.fieldErrors).length > 0
+            ? () => fieldRefs.focus(Object.keys(validation.fieldErrors)[0])
+            : undefined
+        }
+        testId="ux-solution-design-create-form-error"
+      />
+      <Input
+        ref={fieldRefs.register("design_key")}
+        placeholder="design_key"
+        value={key}
+        onChange={(e) => { setKey(e.target.value); validation.clearField("design_key"); }}
+      />
+      <FieldErrorText message={validation.fieldErrors.design_key?.message} />
       <Input placeholder="タイトル(任意)" value={title} onChange={(e) => setTitle(e.target.value)} />
       <Button size="sm" disabled={!key.trim() || create.isPending} onClick={submit}>
         {create.isPending ? "作成中…" : "Solution Design を作成する"}
@@ -143,6 +168,15 @@ function AddOptionForm({
   const [approach, setApproach] = useState("");
   const [tradeoffs, setTradeoffs] = useState("");
   const [risks, setRisks] = useState("");
+  // Issue #451 (§2.8.2): this form's OWN known fields include `option_key`
+  // even though it is not part of `solution_design.option`'s ui_draft
+  // allowlist (that wire form drafts title/approach/tradeoffs/risks only,
+  // §2.2) -- `option_key` is still a real `<Input>` this component renders,
+  // so a `solution_design_option_key_required` diagnostic attaches to it
+  // inline rather than falling back to a whole-form banner.
+  const validation = useFormValidation();
+  const fieldRefs = useFieldRefs();
+  const OPTION_KNOWN_FIELDS = ["option_key", "title", "approach", "tradeoffs", "risks"] as const;
 
   // Issue #445 (§2.2/§2.3): this form drafts a NEW option, so every field
   // starts from "" -- there is no existing revision to seed from, and
@@ -150,10 +184,10 @@ function AddOptionForm({
   // `selected_item_ref` (the identity this draft would create), not a
   // registered field.
   const optionFields = [
-    { fieldName: "title", value: title, dirty: title !== "", validationError: "" },
-    { fieldName: "approach", value: approach, dirty: approach !== "", validationError: "" },
-    { fieldName: "tradeoffs", value: tradeoffs, dirty: tradeoffs !== "", validationError: "" },
-    { fieldName: "risks", value: risks, dirty: risks !== "", validationError: "" },
+    { fieldName: "title", value: title, dirty: title !== "", validationError: validation.fieldErrors.title?.message ?? "" },
+    { fieldName: "approach", value: approach, dirty: approach !== "", validationError: validation.fieldErrors.approach?.message ?? "" },
+    { fieldName: "tradeoffs", value: tradeoffs, dirty: tradeoffs !== "", validationError: validation.fieldErrors.tradeoffs?.message ?? "" },
+    { fieldName: "risks", value: risks, dirty: risks !== "", validationError: validation.fieldErrors.risks?.message ?? "" },
   ];
   useUiDraftSource("solution_design.option", designKey, () => ({
     fields: optionFields,
@@ -182,26 +216,72 @@ function AddOptionForm({
   );
 
   function submit() {
+    const token = validation.begin();
     add.mutate(
       { option_key: optionKey.trim(), option_order: nextOrder, title, approach, tradeoffs, risks },
       {
         onSuccess: () => {
+          validation.resolveSuccess(token);
           toast.success("Option を追加しました");
           onDone();
         },
-        onError: (error) => toast.error((error as ApiError).detail || "追加できませんでした"),
+        onError: (error) => {
+          const apiError = error as ApiError;
+          validation.resolveError(token, apiError, OPTION_KNOWN_FIELDS);
+          toast.error(apiError.detail || "追加できませんでした");
+        },
       },
     );
   }
 
+  const firstInvalidOptionField = OPTION_KNOWN_FIELDS.find((f) => validation.fieldErrors[f]);
+
   return (
     <div className="space-y-2 rounded border p-2" data-testid="ux-solution-design-add-option-form">
       <FormDraftConflictBanner conflicts={draftReceiver.conflicts} onResolve={draftReceiver.resolveField} />
-      <Input placeholder="option_key" value={optionKey} onChange={(e) => setOptionKey(e.target.value)} />
-      <Input placeholder="タイトル" value={title} onChange={(e) => setTitle(e.target.value)} />
-      <Textarea placeholder="アプローチ(approach)" value={approach} onChange={(e) => setApproach(e.target.value)} rows={2} />
-      <Textarea placeholder="トレードオフ" value={tradeoffs} onChange={(e) => setTradeoffs(e.target.value)} rows={2} />
-      <Textarea placeholder="リスク" value={risks} onChange={(e) => setRisks(e.target.value)} rows={2} />
+      <FormErrorBanner
+        error={validation.formError}
+        onFocusFirstField={firstInvalidOptionField ? () => fieldRefs.focus(firstInvalidOptionField) : undefined}
+        testId="ux-solution-design-add-option-form-error"
+      />
+      <Input
+        ref={fieldRefs.register("option_key")}
+        placeholder="option_key"
+        value={optionKey}
+        onChange={(e) => { setOptionKey(e.target.value); validation.clearField("option_key"); }}
+      />
+      <FieldErrorText message={validation.fieldErrors.option_key?.message} />
+      <Input
+        ref={fieldRefs.register("title")}
+        placeholder="タイトル"
+        value={title}
+        onChange={(e) => { setTitle(e.target.value); validation.clearField("title"); }}
+      />
+      <FieldErrorText message={validation.fieldErrors.title?.message} />
+      <Textarea
+        ref={fieldRefs.register("approach")}
+        placeholder="アプローチ(approach)"
+        value={approach}
+        onChange={(e) => { setApproach(e.target.value); validation.clearField("approach"); }}
+        rows={2}
+      />
+      <FieldErrorText message={validation.fieldErrors.approach?.message} />
+      <Textarea
+        ref={fieldRefs.register("tradeoffs")}
+        placeholder="トレードオフ"
+        value={tradeoffs}
+        onChange={(e) => { setTradeoffs(e.target.value); validation.clearField("tradeoffs"); }}
+        rows={2}
+      />
+      <FieldErrorText message={validation.fieldErrors.tradeoffs?.message} />
+      <Textarea
+        ref={fieldRefs.register("risks")}
+        placeholder="リスク"
+        value={risks}
+        onChange={(e) => { setRisks(e.target.value); validation.clearField("risks"); }}
+        rows={2}
+      />
+      <FieldErrorText message={validation.fieldErrors.risks?.message} />
       <Button size="sm" disabled={!optionKey.trim() || add.isPending} onClick={submit}>
         {add.isPending ? "追加中…" : "Option を追加する"}
       </Button>
@@ -261,8 +341,18 @@ function AddTargetLinkForm({
   const [targetRef, setTargetRef] = useState("");
   const [snapshotId, setSnapshotId] = useState("");
   const [note, setNote] = useState("");
+  // Issue #451 (§2.8): this form has no ui_draft form of its own (target
+  // links are a `relation`, not a `field`, in `discussion_adapters.py`'s
+  // `solution_design` registration) but still surfaces every §2.8.1
+  // diagnostic this endpoint can return -- all four of them route through
+  // `target_kind`/`target_ref`/`captured_snapshot_id`, all "target_links"
+  // section (§2.8.2).
+  const validation = useFormValidation();
+  const fieldRefs = useFieldRefs();
+  const TARGET_LINK_KNOWN_FIELDS = ["target_kind", "target_ref", "captured_snapshot_id"] as const;
 
   function submit() {
+    const token = validation.begin();
     add.mutate(
       {
         option_key: optionKey,
@@ -273,16 +363,30 @@ function AddTargetLinkForm({
       },
       {
         onSuccess: () => {
+          validation.resolveSuccess(token);
           toast.success("実装対象への紐づけを追加しました");
           onDone();
         },
-        onError: (error) => toast.error((error as ApiError).detail || "追加できませんでした"),
+        onError: (error) => {
+          const apiError = error as ApiError;
+          validation.resolveError(token, apiError, TARGET_LINK_KNOWN_FIELDS);
+          toast.error(apiError.detail || "追加できませんでした");
+        },
       },
     );
   }
 
+  const firstInvalidTargetLinkField = TARGET_LINK_KNOWN_FIELDS.find((f) => validation.fieldErrors[f]);
+
   return (
     <div className="space-y-2 rounded border p-2" data-testid="ux-solution-design-add-target-link-form">
+      <FormErrorBanner
+        error={validation.formError}
+        onFocusFirstField={
+          firstInvalidTargetLinkField ? () => fieldRefs.focus(firstInvalidTargetLinkField) : undefined
+        }
+        testId="ux-solution-design-add-target-link-form-error"
+      />
       <Select value={optionKey} onChange={(e) => setOptionKey(e.target.value)}>
         {optionKeys.map((k) => (
           <option key={k} value={k}>
@@ -290,20 +394,39 @@ function AddTargetLinkForm({
           </option>
         ))}
       </Select>
-      <Select value={targetKind} onChange={(e) => setTargetKind(e.target.value as SolutionTargetKind)}>
-        {TARGET_KINDS.map((k) => (
-          <option key={k} value={k}>
-            {TARGET_KIND_LABEL[k]}
-          </option>
-        ))}
-      </Select>
-      <Input placeholder="target_ref" value={targetRef} onChange={(e) => setTargetRef(e.target.value)} />
-      {targetKind === "static_flow" && (
+      <div>
+        <Select
+          ref={fieldRefs.register("target_kind")}
+          value={targetKind}
+          onChange={(e) => { setTargetKind(e.target.value as SolutionTargetKind); validation.clearField("target_kind"); }}
+        >
+          {TARGET_KINDS.map((k) => (
+            <option key={k} value={k}>
+              {TARGET_KIND_LABEL[k]}
+            </option>
+          ))}
+        </Select>
+        <FieldErrorText message={validation.fieldErrors.target_kind?.message} />
+      </div>
+      <div>
         <Input
-          placeholder="captured_snapshot_id(静的 Flow に必須)"
-          value={snapshotId}
-          onChange={(e) => setSnapshotId(e.target.value)}
+          ref={fieldRefs.register("target_ref")}
+          placeholder="target_ref"
+          value={targetRef}
+          onChange={(e) => { setTargetRef(e.target.value); validation.clearField("target_ref"); }}
         />
+        <FieldErrorText message={validation.fieldErrors.target_ref?.message} />
+      </div>
+      {targetKind === "static_flow" && (
+        <div>
+          <Input
+            ref={fieldRefs.register("captured_snapshot_id")}
+            placeholder="captured_snapshot_id(静的 Flow に必須)"
+            value={snapshotId}
+            onChange={(e) => { setSnapshotId(e.target.value); validation.clearField("captured_snapshot_id"); }}
+          />
+          <FieldErrorText message={validation.fieldErrors.captured_snapshot_id?.message} />
+        </div>
       )}
       <Input placeholder="メモ(任意)" value={note} onChange={(e) => setNote(e.target.value)} />
       <Button size="sm" disabled={!optionKey || !targetRef.trim() || add.isPending} onClick={submit}>

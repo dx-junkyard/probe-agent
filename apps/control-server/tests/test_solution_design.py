@@ -1660,3 +1660,133 @@ class TestSystemIsolation:
         assert _option_by_key(b_detail, "opt-2")["option_status"] == "adopted"
         a_detail = _get_design(admin_client, token, sys_a, "twin-design")
         assert _option_by_key(a_detail, "opt-1")["option_status"] == "adopted"
+
+
+# ---------------------------------------------------------------------------
+# Issue #451 / `docs/01-specifications/capabilities/ai-discussion-adapter.md` §2.8: every rejection this module
+# raises carries a structural `field_path`/`section` alongside `code`/
+# `message`, derived from the finite `code` -- never guessed from the
+# Japanese message text (Principle 6).
+# ---------------------------------------------------------------------------
+
+
+class TestFieldPathAndSectionDiagnostics:
+    def test_solution_design_key_required_names_the_design_key_with_no_section(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "SD-FieldPath-KeyRequired")
+        r = admin_client.post(
+            "/solution-designs",
+            json={"design_key": "", "title": "", "summary": ""},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["code"] == "solution_design_key_required"
+        assert detail["field_path"] == "design_key"
+        assert detail["section"] == ""
+
+    def test_solution_design_option_key_required_names_the_options_section(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "SD-FieldPath-OptionKeyRequired")
+        _create_design(admin_client, token, system_id, "design-optkey")
+        r = admin_client.post(
+            "/solution-designs/design-optkey/options",
+            json={"option_key": "", "option_order": 1, "title": "", "approach": "", "tradeoffs": "", "risks": ""},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["code"] == "solution_design_option_key_required"
+        assert detail["field_path"] == "option_key"
+        assert detail["section"] == "options"
+
+    def test_target_ref_required_names_the_target_links_section(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "SD-FieldPath-TargetRefRequired")
+        _create_design(admin_client, token, system_id, "design-targetref")
+        _add_option(admin_client, token, system_id, "design-targetref", "opt-1")
+        r = admin_client.post(
+            "/solution-designs/design-targetref/target-links",
+            json={"option_key": "opt-1", "target_kind": "component", "target_ref": ""},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["code"] == "solution_design_target_ref_required"
+        assert detail["field_path"] == "target_ref"
+        assert detail["section"] == "target_links"
+
+    def test_flow_target_requires_snapshot_names_captured_snapshot_id(self, admin_client):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "SD-FieldPath-FlowSnapshot")
+        _create_design(admin_client, token, system_id, "design-flowsnap")
+        _add_option(admin_client, token, system_id, "design-flowsnap", "opt-1")
+        r = admin_client.post(
+            "/solution-designs/design-flowsnap/target-links",
+            json={"option_key": "opt-1", "target_kind": "static_flow", "target_ref": "ep-1"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["code"] == "flow_target_requires_snapshot"
+        assert detail["field_path"] == "captured_snapshot_id"
+        assert detail["section"] == "target_links"
+
+    def test_out_of_scope_not_implementable_names_the_target_links_section_with_no_specific_field(
+        self, admin_client
+    ):
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "SD-FieldPath-OOS")
+        with get_conn() as conn:
+            _make_requirement(conn, system_id, "req-oos-fp", kind="out_of_scope")
+            _insert_component(conn, system_id, "svc-oos-fp")
+        _create_design(admin_client, token, system_id, "design-oos-fp")
+        _add_requirement_link(admin_client, token, system_id, "design-oos-fp", "req-oos-fp")
+        _add_option(admin_client, token, system_id, "design-oos-fp", "opt-oos-fp")
+        r = admin_client.post(
+            "/solution-designs/design-oos-fp/target-links",
+            json={"option_key": "opt-oos-fp", "target_kind": "component", "target_ref": "svc-oos-fp"},
+            headers=_headers(token, system_id),
+        )
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["code"] == "out_of_scope_requirement_not_implementable"
+        assert detail["field_path"] == ""
+        assert detail["section"] == "target_links"
+
+    def test_generic_fallback_carries_no_specific_field(self, admin_client):
+        """A design not found by key falls through `_raise_domain_error`'s
+        generic branch (`solution_design_not_found`, absent from the
+        structural mapping table) -- it still returns `field_path`/`section`
+        as `""` rather than omitting the keys."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "SD-FieldPath-Generic")
+        r = admin_client.get("/solution-designs/does-not-exist", headers=_headers(token, system_id))
+        assert r.status_code == 404, r.text
+        detail = r.json()["detail"]
+        assert detail["code"] == "solution_design_not_found"
+        assert detail["field_path"] == ""
+        assert detail["section"] == ""
+
+    def test_invalid_target_kind_names_the_target_links_section(self):
+        """`target_kind` is a `Literal` in `SolutionDesignTargetLinkCreateRequest`,
+        so an out-of-vocabulary value never reaches `app/solution_design.py`
+        through the real HTTP route -- Pydantic itself refuses it first. The
+        structural mapping is exercised directly against the route's own
+        `_raise_domain_error`, the same helper the HTTP path calls, so this
+        still locks the field_path/section pairing for the code."""
+        from fastapi import HTTPException
+
+        from app.routes.solution_design import _raise_domain_error
+
+        with pytest.raises(HTTPException) as exc_info:
+            _raise_domain_error(
+                ValueError(
+                    "solution_design_invalid_target_kind: target_kind は次のいずれかである必要があります: "
+                    "component(got 'not-a-real-kind')"
+                )
+            )
+        detail = exc_info.value.detail
+        assert detail["code"] == "solution_design_invalid_target_kind"
+        assert detail["field_path"] == "target_kind"
+        assert detail["section"] == "target_links"

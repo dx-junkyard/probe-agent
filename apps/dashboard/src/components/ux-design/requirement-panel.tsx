@@ -39,9 +39,10 @@ import {
 } from "@/components/product-objective/model";
 import {
   ArtifactReferencesCard, DegradedNote, DesignDecisionControls, EmptyNote,
-  LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
+  FieldErrorText, FormErrorBanner, LoadErrorCard, LoadingBlock, SectionHeading,
+  StateBadge, useFieldRefs,
 } from "./shared";
-import { useUiDraftSource } from "@/lib/ui-draft";
+import { useFormValidation, useUiDraftSource } from "@/lib/ui-draft";
 import { peekPendingFormDraftPatch, useFormDraftReceiver } from "@/lib/form-draft-inbox";
 import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
 
@@ -54,27 +55,47 @@ function RequirementCreateForm() {
   const create = useCreateUxRequirement();
   const [key, setKey] = useState("");
   const [kind, setKind] = useState<UxRequirementKind>("functional");
+  const validation = useFormValidation();
+  const fieldRefs = useFieldRefs();
+  const KNOWN_FIELDS = ["requirement_key"] as const;
 
   function submit() {
+    const token = validation.begin();
     create.mutate(
       { requirement_key: key.trim(), requirement_kind: kind },
       {
         onSuccess: () => {
+          validation.resolveSuccess(token);
           setKey("");
           toast.success("Requirement を作成しました");
         },
-        onError: (error) => toast.error((error as ApiError).detail || "作成できませんでした"),
+        onError: (error) => {
+          const apiError = error as ApiError;
+          validation.resolveError(token, apiError, KNOWN_FIELDS);
+          toast.error(apiError.detail || "作成できませんでした");
+        },
       },
     );
   }
 
   return (
     <div className="space-y-2" data-testid="ux-requirement-create-form">
+      <FormErrorBanner
+        error={validation.formError}
+        onFocusFirstField={
+          Object.keys(validation.fieldErrors).length > 0
+            ? () => fieldRefs.focus(Object.keys(validation.fieldErrors)[0])
+            : undefined
+        }
+        testId="ux-requirement-create-form-error"
+      />
       <Input
+        ref={fieldRefs.register("requirement_key")}
         placeholder="requirement_key(例: checkout-single-page)"
         value={key}
-        onChange={(e) => setKey(e.target.value)}
+        onChange={(e) => { setKey(e.target.value); validation.clearField("requirement_key"); }}
       />
+      <FieldErrorText message={validation.fieldErrors.requirement_key?.message} />
       <Select value={kind} onChange={(e) => setKind(e.target.value as UxRequirementKind)}>
         {REQUIREMENT_KINDS.map((k) => (
           <option key={k} value={k}>
@@ -174,13 +195,22 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
   const [outOfScopeNote, setOutOfScopeNote] = useState(current?.out_of_scope_note ?? "");
   const [changeNote, setChangeNote] = useState("");
 
+  // Issue #451 (§2.8): a rejected `POST .../revisions` now reaches both the
+  // inline display below and (via `requirementFields[].validationError`) the
+  // ui_draft context an AI conversation reads.
+  const validation = useFormValidation();
+  const fieldRefs = useFieldRefs();
+  const REQUIREMENT_KNOWN_FIELDS = [
+    "statement", "rationale", "constraint_text", "out_of_scope_note",
+  ] as const;
+
   // Issue #445 (§2.2/§2.3): the `ux_requirement` draft. Acceptance criteria
   // are a #448 (ChildSpec) concern, not a top-level field here.
   const requirementFields = [
-    { fieldName: "statement", value: statement, dirty: statement !== seed.statement, validationError: "" },
-    { fieldName: "rationale", value: rationale, dirty: rationale !== seed.rationale, validationError: "" },
-    { fieldName: "constraint_text", value: constraintText, dirty: constraintText !== seed.constraintText, validationError: "" },
-    { fieldName: "out_of_scope_note", value: outOfScopeNote, dirty: outOfScopeNote !== seed.outOfScopeNote, validationError: "" },
+    { fieldName: "statement", value: statement, dirty: statement !== seed.statement, validationError: validation.fieldErrors.statement?.message ?? "" },
+    { fieldName: "rationale", value: rationale, dirty: rationale !== seed.rationale, validationError: validation.fieldErrors.rationale?.message ?? "" },
+    { fieldName: "constraint_text", value: constraintText, dirty: constraintText !== seed.constraintText, validationError: validation.fieldErrors.constraint_text?.message ?? "" },
+    { fieldName: "out_of_scope_note", value: outOfScopeNote, dirty: outOfScopeNote !== seed.outOfScopeNote, validationError: validation.fieldErrors.out_of_scope_note?.message ?? "" },
   ];
   useUiDraftSource("ux_requirement.revision", requirementKey, () => ({
     fields: requirementFields,
@@ -214,6 +244,7 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
   }
 
   function submit() {
+    const token = validation.begin();
     addRevision.mutate(
       {
         statement, rationale, constraint_text: constraintText, out_of_scope_note: outOfScopeNote,
@@ -221,29 +252,81 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
       },
       {
         onSuccess: () => {
+          validation.resolveSuccess(token);
           toast.success("Requirement の版を追加しました");
           onDone();
         },
-        onError: (error) => toast.error((error as ApiError).detail || "追加できませんでした"),
+        onError: (error) => {
+          const apiError = error as ApiError;
+          validation.resolveError(token, apiError, REQUIREMENT_KNOWN_FIELDS);
+          toast.error(apiError.detail || "追加できませんでした");
+        },
       },
     );
   }
 
+  // §2.8.2: `section === "acceptance_criteria"` (e.g. a duplicated
+  // criterion_key, or out_of_scope_requirement_not_verifiable which carries
+  // no specific field at all) belongs near 受入条件, not at the top.
+  const topLevelFormError =
+    validation.formError && validation.formError.section !== "acceptance_criteria" ? validation.formError : null;
+  const criteriaFormError =
+    validation.formError?.section === "acceptance_criteria" ? validation.formError : null;
+  const firstInvalidRequirementField = REQUIREMENT_KNOWN_FIELDS.find((f) => validation.fieldErrors[f]);
+
   return (
     <div className="space-y-3 rounded border p-3" data-testid="ux-requirement-revision-form">
       <FormDraftConflictBanner conflicts={draftReceiver.conflicts} onResolve={draftReceiver.resolveField} />
-      <Textarea placeholder="要件の文" value={statement} onChange={(e) => setStatement(e.target.value)} rows={2} />
-      <Textarea placeholder="理由(rationale)" value={rationale} onChange={(e) => setRationale(e.target.value)} rows={2} />
-      <Input placeholder="制約(constraint_text)" value={constraintText} onChange={(e) => setConstraintText(e.target.value)} />
-      <Input
-        placeholder="対象外にした理由(out_of_scope_note)"
-        value={outOfScopeNote}
-        onChange={(e) => setOutOfScopeNote(e.target.value)}
+      <FormErrorBanner
+        error={topLevelFormError}
+        onFocusFirstField={
+          firstInvalidRequirementField ? () => fieldRefs.focus(firstInvalidRequirementField) : undefined
+        }
+        testId="ux-requirement-revision-form-error"
       />
+      <div>
+        <Textarea
+          ref={fieldRefs.register("statement")}
+          placeholder="要件の文"
+          value={statement}
+          onChange={(e) => { setStatement(e.target.value); validation.clearField("statement"); }}
+          rows={2}
+        />
+        <FieldErrorText message={validation.fieldErrors.statement?.message} />
+      </div>
+      <div>
+        <Textarea
+          ref={fieldRefs.register("rationale")}
+          placeholder="理由(rationale)"
+          value={rationale}
+          onChange={(e) => { setRationale(e.target.value); validation.clearField("rationale"); }}
+          rows={2}
+        />
+        <FieldErrorText message={validation.fieldErrors.rationale?.message} />
+      </div>
+      <div>
+        <Input
+          ref={fieldRefs.register("constraint_text")}
+          placeholder="制約(constraint_text)"
+          value={constraintText}
+          onChange={(e) => { setConstraintText(e.target.value); validation.clearField("constraint_text"); }}
+        />
+        <FieldErrorText message={validation.fieldErrors.constraint_text?.message} />
+      </div>
+      <div>
+        <Input
+          ref={fieldRefs.register("out_of_scope_note")}
+          placeholder="対象外にした理由(out_of_scope_note)"
+          value={outOfScopeNote}
+          onChange={(e) => { setOutOfScopeNote(e.target.value); validation.clearField("out_of_scope_note"); }}
+        />
+        <FieldErrorText message={validation.fieldErrors.out_of_scope_note?.message} />
+      </div>
       <Input placeholder="変更メモ(任意)" value={changeNote} onChange={(e) => setChangeNote(e.target.value)} />
 
       <div className="space-y-2">
         <SectionHeading as="h4">受入条件</SectionHeading>
+        <FormErrorBanner error={criteriaFormError} testId="ux-requirement-criteria-form-error" />
         {criteria.map((c, i) => (
           <div key={i} className="space-y-1 rounded border p-2 text-xs">
             <div className="flex gap-2">

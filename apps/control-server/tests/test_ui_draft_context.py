@@ -418,8 +418,22 @@ def test_ui_draft_unsupported_for_a_kind_with_no_forms(admin_client):
             ],
             {},
         ),
+        (
+            # Issue #451 / §2.3: "全体" is the UTF-8 byte total of every
+            # draft-derived string, `validation_error` included -- not just
+            # `value`. Each field's own `value` is empty and its
+            # `validation_error` stays within the per-field 2000-char bound,
+            # yet 17 of them (17 * 2005 bytes = 34,085) still cross the 32KB
+            # ceiling. A budget check that only counted `value` would let
+            # this request through.
+            [
+                {"field_name": "title", "value": "", "dirty": True, "validation_error": "e" * 2000}
+                for _ in range(17)
+            ],
+            {},
+        ),
     ],
-    ids=["too-many-fields", "value-too-long", "total-too-large"],
+    ids=["too-many-fields", "value-too-long", "total-too-large", "validation-error-counts-toward-total"],
 )
 def test_ui_draft_payload_too_large(admin_client, fields, extra):
     token = _login(admin_client)

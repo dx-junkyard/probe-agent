@@ -1766,3 +1766,145 @@ class TestFiniteRejectCodes:
         headers = _headers(token, system_id)
         r = admin_client.get("/ux-design/journeys/does-not-exist", headers=headers)
         assert r.status_code == 404
+
+
+class TestFieldPathAndSectionDiagnostics:
+    """Issue #451 / `docs/01-specifications/capabilities/ai-discussion-adapter.md` §2.8: every rejection this
+    module raises carries `field_path`/`section` alongside `code`/`message`,
+    derived structurally from the finite `code` (never guessed from the
+    Japanese message text -- Principle 6). A code absent from the mapping
+    table reports `("", "")` -- "no specific field" -- rather than omitting
+    the keys, so the Dashboard's whole-form fallback always has something to
+    read."""
+
+    def test_journey_step_key_duplicated_names_the_steps_section(self, admin_client, tmp_path):
+        token, system_id, snapshot_id, _ = _setup(admin_client, tmp_path, "System FieldPath DupStep")
+        headers = _headers(token, system_id)
+        _create_journey(admin_client, headers, "j1", perspective="to_be")
+        r = admin_client.post(
+            "/ux-design/journeys/j1/revisions",
+            json={"steps": [_step("dup", 0), _step("dup", 1)]},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["field_path"] == "step_key"
+        assert detail["section"] == "steps"
+        # The offending value is embedded in the message for a human to
+        # read, but the structural field_path/section never depend on it.
+        assert "dup" in detail["message"]
+
+    def test_journey_step_not_found_names_the_steps_section(self, admin_client, tmp_path):
+        token, system_id, snapshot_id, _ = _setup(admin_client, tmp_path, "System FieldPath StepNotFound")
+        headers = _headers(token, system_id)
+        _create_journey(admin_client, headers, "j1", perspective="to_be")
+        _add_journey_revision(admin_client, headers, "j1", steps=[_step("s1", 0)])
+        _create_requirement(admin_client, headers, "r1")
+        r = admin_client.post(
+            "/ux-design/requirements/r1/step-links",
+            json={"journey_key": "j1", "step_key": "does-not-exist"},
+            headers=headers,
+        )
+        assert r.status_code == 404, r.text
+        detail = r.json()["detail"]
+        assert detail["field_path"] == "step_key"
+        assert detail["section"] == "steps"
+
+    def test_criterion_key_duplicated_names_the_acceptance_criteria_section(self, admin_client, tmp_path):
+        token, system_id, snapshot_id, _ = _setup(admin_client, tmp_path, "System FieldPath DupCriterion")
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "r1")
+        r = admin_client.post(
+            "/ux-design/requirements/r1/revisions",
+            json={"acceptance_criteria": [_criterion("dup", 0), _criterion("dup", 1)]},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["field_path"] == "criterion_key"
+        assert detail["section"] == "acceptance_criteria"
+
+    def test_out_of_scope_not_verifiable_names_the_acceptance_criteria_section_with_no_specific_field(
+        self, admin_client, tmp_path
+    ):
+        token, system_id, snapshot_id, _ = _setup(admin_client, tmp_path, "System FieldPath OOSVerify")
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "r1", requirement_kind="out_of_scope")
+        r = admin_client.post(
+            "/ux-design/requirements/r1/revisions",
+            json={"acceptance_criteria": [_criterion("c1", 0)]},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["code"] == "out_of_scope_requirement_not_verifiable"
+        assert detail["field_path"] == ""
+        assert detail["section"] == "acceptance_criteria"
+
+    def test_key_required_names_the_missing_field_with_no_section_for_a_top_level_key(
+        self, admin_client, tmp_path
+    ):
+        """`journey_key` is an identity field, not part of any nested
+        collection -- its section is `""`, unlike `step_key`/`criterion_key`
+        which fall inside `steps`/`acceptance_criteria`."""
+        token, system_id, snapshot_id, _ = _setup(admin_client, tmp_path, "System FieldPath KeyRequired")
+        headers = _headers(token, system_id)
+        r = admin_client.post(
+            "/ux-design/journeys",
+            json={"journey_key": "", "perspective": "to_be"},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["field_path"] == "journey_key"
+        assert detail["section"] == ""
+
+    def test_artifact_diagnostics_name_their_own_field_with_no_section(self, admin_client, tmp_path):
+        token, system_id, snapshot_id, _ = _setup(admin_client, tmp_path, "System FieldPath Artifact")
+        headers = _headers(token, system_id)
+        _create_journey(admin_client, headers, "j1", perspective="to_be")
+
+        r = admin_client.post(
+            "/ux-design/artifact-references",
+            json={
+                "subject_kind": "journey", "subject_key": "j1", "artifact_kind": "spec",
+                "title": "", "uri": "repo:../escape.md", "media_type": "", "content_hash": "a" * 64,
+                "byte_size": None,
+            },
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert detail["code"] == "artifact_uri_invalid"
+        assert detail["field_path"] == "uri"
+        assert detail["section"] == ""
+
+        r2 = admin_client.post(
+            "/ux-design/artifact-references",
+            json={
+                "subject_kind": "journey", "subject_key": "j1", "artifact_kind": "spec",
+                "title": "", "uri": "repo:docs/x.md", "media_type": "", "content_hash": "",
+                "byte_size": None,
+            },
+            headers=headers,
+        )
+        assert r2.status_code == 422, r2.text
+        detail2 = r2.json()["detail"]
+        assert detail2["code"] == "artifact_hash_required"
+        assert detail2["field_path"] == "content_hash"
+        assert detail2["section"] == ""
+
+    def test_not_found_and_generic_validation_error_carry_no_specific_field(self, admin_client, tmp_path):
+        """A code absent from the structural mapping table -- the generic
+        `NotFound`/`UxDesignValidationError` fallbacks -- still returns
+        `field_path`/`section` as `""` rather than omitting the keys, so a
+        client that always reads them never has to special-case an older
+        shape."""
+        token, system_id, snapshot_id, _ = _setup(admin_client, tmp_path, "System FieldPath PlainNotFound")
+        headers = _headers(token, system_id)
+        r = admin_client.get("/ux-design/journeys/does-not-exist", headers=headers)
+        assert r.status_code == 404
+        detail = r.json()["detail"]
+        assert detail["code"] == "ux_design_not_found"
+        assert detail["field_path"] == ""
+        assert detail["section"] == ""

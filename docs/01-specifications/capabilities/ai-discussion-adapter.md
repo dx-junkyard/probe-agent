@@ -12,7 +12,7 @@ allowlist と handler を全選択 item について検査してから、登録 
 | 元 issue | 実装と残件 | 引き継ぎ先 |
 | --- | --- | --- |
 | #444 | registry / parity は実装。操作結果の3状態と、実行handlerに基づくprefill capabilityの判定は実装済み (#456) | - |
-| #445 | Phase 2 (`fea4fe1`) を統合。draft の保存防止・System分離・変更警告を修正。実フォームのvalidation診断連携が残る | #451 |
+| #445 | Phase 2 (`fea4fe1`) を統合。draft の保存防止・System分離・変更警告を修正。実フォームのvalidation診断連携(§2.8)は #451 で実装済み | - |
 | #446 | Proposal review UI / prefill / 保存との接続は未実装 | #452 |
 | #447 | 追加8 kind と live selection / context は未実装 | #453 |
 | #448 | nested item / Acceptance Criteria / Feature Proposal は未実装 | #454 |
@@ -530,6 +530,125 @@ reload 後は監査情報と案内文を表示し、回答本文を復元しな�
 それを記録できなかった」(#445 以前の行) であって `not_provided` (client が
 明示的に送らなかった) ではない。Principle 9 の `traces.redaction_json` の
 `NULL` と同じ規律で、丸めない。
+
+---
+
+### 2.8 実フォームへの validation error 接続 (#451)
+
+§2.2/§2.6/§2.7 は「draft を AI へどう見せるか」を定義した。ここまでは
+`UiDraftFieldIn.validation_error` を Journey / Requirement / Solution Design
+の実フォームが実際に埋めることを前提にしていたが、#445 実装時点ではどの
+フォームも `validation_error: ""` を固定で送っていた(保存失敗は toast の
+みで、draft へは何も伝わらない)。#451 はこの欠落を接続する。
+
+#### 2.8.1 wire 契約: code / field_path / section / message
+
+`POST /ux-design/...` / `POST /solution-designs/...` の書き込みが返す
+422/404/409 は、既存の `{code, message}` に **`field_path` / `section`**
+を必ず加える(4 キーとも常に存在し、無関係なキーが省略されることはない)。
+
+```
+{
+  "code": string,          -- 既存の finite reject code (§1.7 等)
+  "message": string,       -- 人間向け日本語文言 (redaction 済み)
+  "field_path": string,    -- "" = 特定の field なし
+  "section": string        -- "" = 特定の section なし
+}
+```
+
+`field_path`/`section` は **有限 code からの構造的な写像**であり、
+`message` の文言から推測しない (Principle 6)。`routes/ux_design.py` /
+`routes/solution_design.py` それぞれが持つ `_FIELD_PATH_BY_CODE` がその
+唯一の写像表で、表にない code は `("", "")` を返す(「未対応診断」も同じ
+形で表現され、フォーム全体のエラーとして扱われる — §2.8.7)。`message` に
+developer 入力値を埋め込む箇所(重複した `step_key` の値など)は埋め込み前
+に Principle 9 の redaction を通す(`_redact_offender`。
+`ui_draft_context._build_redacted_payload._redact_meta` と同じ
+`trace_redaction` の再利用で、二重実装しない)。
+
+`src/api/client.ts` の `ApiError` は `fieldPath: string` /
+`section: string` を持つ。サーバが送らなかった場合(旧サーバ、または本当に
+field を持たない失敗)は `undefined` ではなく `""` を格納する — `""` 自体が
+「特定の field なし」の正規値であり、区別すべき第三の状態はない。
+
+#### 2.8.2 未知 field_path はフォーム全体のエラー
+
+`field_path` は **そのフォームの `knownFields`(実際にレンダリングして
+いる入力欄の名前の集合)に対してのみ**解決する。この集合は
+`UiDraftFormSpec.fields`(AI へ送る draft の allowlist)と必ずしも同じでは
+ない — 例えば Journey revision フォームは `step_key` を編集できる
+`<Input>` を持つが、`step_key` は `ux_journey.revision` の draft フィールド
+(title/beneficiary/usage_context/entry_trigger/value_arrival/summary)には
+含まれない。そのため `journey_step_key_duplicated`
+(`field_path="step_key"`)はこのフォームの `knownFields` に含まれず、
+**フォーム全体のエラー**として扱われ、`section`(`"steps"`)を使って画面上
+の該当セクション見出しの近くに表示する。`field_path` がそもそも `""` の
+code(例: `out_of_scope_requirement_not_verifiable`)も同じ経路を通る。
+**文言から field を推測することは決してしない** — 一致しなければ機械的に
+フォーム全体のエラーになる。
+
+#### 2.8.3 状態: idle / validating / invalid と readable / dirty
+
+2 つの軸は独立である。
+
+| 軸 | 値 | 意味 |
+| --- | --- | --- |
+| 保存 validation の lifecycle | `idle` / `validating` / `invalid` | 直近の保存試行が無い/実行中/拒否された |
+| フィールドの入力状態 (§2.2 の既存契約) | `readable` / `dirty` | draft 全体を読めたか / このフィールドが読み込み時の値から変わっているか |
+
+`idle`/`validating`/`invalid` は `lib/ui-draft.tsx` の `useFormValidation`
+フックが保持する **client-only** の状態で、`UiDraftContextIn` の wire には
+含まれない — draft 自体は「いま何が入力されているか」であり、「直前の保存が
+どうなったか」は別の事実だからである(#366 と同じ「一語二事実」の回避)。
+`useUiDraftSource` へ渡す `fields` の `validationError` は、この
+`useFormValidation` の `fieldErrors` から該当 field 名を引いた文字列を
+そのまま使う(§2.2 の wire 定義どおり、"" はエラーなし)。
+
+#### 2.8.4 編集による解除と未変更 field の保持
+
+`useFormValidation` の `fieldErrors` は field 名をキーとする map で、
+`resolveError` は名指しされた field(または未知 field_path の場合は
+`formError`)だけを更新し、**他の field の診断はそのまま残す**。developer
+がエラーの出た field を編集した瞬間、呼び出し側は `clearField(fieldName)`
+を呼んで**その field だけ**の診断を消す(「解除」を採用する — 値が変わった
+時点で古い診断はいまの内容について何も言っておらず、表示を残す「再検証待ち」
+より安全側に倒れる)。編集していない field の診断は保持されたままになる。
+
+#### 2.8.5 遅延応答の bind
+
+`begin()` は保存試行ごとに増分 token を発行し、状態を `validating` にする。
+`resolveError(token, error, knownFields)` / `resolveSuccess(token)` は、
+渡された token が **その hook インスタンスの最新の token と一致する場合の
+み**状態を書き換える — 一致しなければ無条件に無視する。これは 2 つの意味で
+「遅延応答が新しい draft を汚さない」を保証する:
+
+1. 同じ対象へ 2 回連続で保存した場合、古い方の応答が後から届いても新しい
+   試行の結果を上書きしない(再試行の安全性)。
+2. 別の対象へ切り替えた場合、Journey/Requirement/Solution Design 各画面は
+   `key={selectedKey}` で detail コンポーネントごと再マウントする既存の
+   idiom(`JourneyDetail`/`RequirementDetail`/`SolutionDesignDetail`)を
+   使っているため、`useFormValidation` の state は対象ごとに完全に独立した
+   インスタンスになる。token 照合はその上に載る防御的な二重の保証であり、
+   何らかの理由で同じ hook インスタンスが複数の対象をまたいで使い回されて
+   も、遅延応答が新しい対象の diagnostic を汚すことはない。
+
+#### 2.8.6 redaction と 32KB budget
+
+`validation_error` は `UiDraftFieldIn` の一部として既に redaction
+(`ui_draft_context._build_redacted_payload` の `_redact_meta`)と 32KB
+budget(`UiDraftContextIn.validate_ui_draft_bounds`)の対象である — 診断
+文字列も他の draft 由来の文字列と同じ UTF-8 byte 合計に算入され、超過は
+切り詰めずに 422 `ui_draft_payload_too_large` で拒否される(§2.3 と同じ
+契約。`tests/test_ui_draft_context.py` の
+`validation-error-counts-toward-total` ケースがこれを固定する)。
+
+#### 2.8.7 未対応診断は成功にしない
+
+`useFormValidation` を保存操作の呼び出し箇所へ配線している限り、**未知の
+code / field_path であっても必ず `formError`(またはその `section`)へ入り、
+黙って消えたり成功表示になったりすることはない**(§2.8.2)。入力は保持
+され(フォームの state は保存失敗時に一切リセットしない)、フォーム全体
+エラーの概要から該当 field へ focus できる。
 
 ---
 
