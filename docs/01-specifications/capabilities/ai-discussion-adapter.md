@@ -14,7 +14,7 @@ allowlist と handler を全選択 item について検査してから、登録 
 | #444 | registry / parity は実装。操作結果の3状態と、実行handlerに基づくprefill capabilityの判定は実装済み (#456) | - |
 | #445 | Phase 2 (`fea4fe1`) を統合。draft の保存防止・System分離・変更警告を修正。実フォームのvalidation診断連携(§2.8)は #451 で実装済み | - |
 | #446 | Proposal review UI / prefill / 保存との接続は未実装 | #452 |
-| #447 | 追加8 kind と live selection / context は未実装 | #453 |
+| #447 | 追加8 kind と live selection / context は Issue #453 が実装済み（§4 参照）。nested/list な構造化提案・JU 昇格は未実装のまま | #454 / #455 |
 | #448 | nested item / Acceptance Criteria / Feature Proposal は未実装 | #454 |
 | #449 | 仮説の JU 昇格・還流と代表 E2E は未実装。Issue #461 が所属・premise 基盤を先行実装済み: `joint_understanding_session.owner_scope`/`discussion_thread_id`（既存 `session_id` は interview 所属時のみ必須）、`origin_kind='discussion'`、`app/joint_premise.py` の discussion origin provider registry（`register_discussion_origin_provider`）と依存参照 manifest（`normalize_premise_manifest` / `compute_premise_manifest_digest` / `EMPTY_DEPENDENCY_MANIFEST_DIGEST`、`evaluate_joint_premise` が root 不変でも依存更新で stale と判定）。実際の hypothesis テーブル・昇格 endpoint は未実装のまま | #455 |
 
@@ -728,7 +728,54 @@ execute ではない** (#358 / #427 の CTA 規則)。
 
 ---
 
-## §4 対象拡張 (#447)
+## §4 対象拡張 (#447, Issue #453 で実装済み)
+
+**実装状況 (2026-09-09)。** 8 target_kind すべてを `app/discussion_adapters.py` /
+`src/lib/discussion-adapters.ts` / `app/models.py` / `src/api/types.ts` /
+`shared/schemas/assistant_discussion.schema.json` へ追加した。既存 9 kind の
+挙動・screen_ids は変更していない。実装にあたり確定した設計判断:
+
+- **画面と kind の対応は「実際にその画面がその内容を描画しているか」で決めた**、
+  この節の当初案 (capability-map に purpose_element を割り当てる案) ではない。
+  `purpose_element` / `purpose_relation` は `PurposeFrameCard` (Overview) /
+  `PurposeFramePanel` (Interview) が既に描画している既存 2 画面のみを
+  `screen_ids` とする — `capability-map` は #56/#57 の AST 由来 Capability
+  Hierarchy (別モデル) を表示するだけで、Purpose Chain 要素は描画していない。
+  `capability-map` は `screen` adapter (全画面会話) の対象に加えるだけで、
+  この Issue が追加する 8 kind のうちどれもそこには live selection を持たない。
+- **Gap Workbench は screen_id を持たない** — `objective-map` 内の
+  `?view=gaps` レーンなので、`product_objective`/`product_milestone`/
+  `product_gap` は 3 つとも `screen_ids=("objective-map",)`。
+- **`product_feature` は live selection を持たない** — `ux-design-studio`
+  (Requirement 詳細の Feature link 一覧) と `objective-map` (Gap Workbench の
+  Feature link 一覧) の両方に読み取り専用の一覧として現れるが、どちらの画面も
+  まだ `feature` という選択用 URL パラメータを持たないため
+  (`resolveFromRoute` は `understanding_claim`/`overview_finding` と同じ
+  `null` のまま)。`deepLink` も `functional-lineage/model.ts` の
+  `lineageDeepLink` が既に返す `null` に揃えた — 存在しない画面を捏造しない。
+- **`stakeholder_need` にも live selection は無い** — §7.1 の Stakeholder
+  Value Network projection は Need をグラフノードとして持たず
+  Stakeholder の `evidence_state` へ畳み込むだけなので、`?need=` という
+  選択パラメータ自体が画面に存在しない。
+- **digest は既存 canonical モジュールの「意味が変わったときだけ動く」定義を
+  そのまま使う** — 新しい正規化ロジックを足していない。
+  `product_gap` だけは `_gap_current_digest` (Milestone 継承時の
+  effective digest) を明示的に使う — 生の revision digest では
+  `inherited_from_milestone` な Gap が Milestone 側の target 変更で
+  stale にならない。
+  `purpose_relation` の digest は `stakeholder_network._purpose_relation_digest`
+  / `ux_design._purpose_relation_digest` と同じ形の正規化 (kind/source_id/
+  target_id/status/provenance) を `discussion_adapters.py` にもう 1 つ増やした
+  だけで、4 つ目の異なるアルゴリズムではない。
+- **`context_provider` は対象自身のフィールドは含み、上下流は参照 + 状態だけ**
+  (`related_relations` / `refs` / `upstream_refs` / `source_refs` /
+  `journey_links` / `requirement_links` / `capability_links` /
+  `target_links` はいずれも id・kind・resolution/recheck state のみで、
+  相手側の本文は積まない)。
+- **既存 DB 変更は 1 つだけ**: `assistant_discussion_thread.target_kind` の
+  CHECK 制約を 8 値広げる `_migrate_assistant_discussion_thread_target_kinds`
+  (`app/db.py`) — `_migrate_ux_journey_upstream_ref_kinds` と同じ、行を 1 つも
+  書き換えない再構築 migration。新しい DB テーブルは追加していない。
 
 ### 4.1 追加する target_kind
 
