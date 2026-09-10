@@ -15053,3 +15053,190 @@ class OverviewObjectiveOut(BaseModel):
     next_step_requirement_key: Optional[str] = None
     degraded_sections: List[str] = []
     degraded_detail: Dict[str, str] = {}
+
+
+# --- Discussion context bundle (Issue #458, Epic #443 §9, DD-CTX-01..05) -----
+# `docs/01-specifications/capabilities/ai-discussion-adapter.md` §9.1 is the canonical wire shape;
+# `app/discussion_context_bundle.py` is the only producer of these values --
+# this section is a pure Pydantic mirror of its dataclasses (never a second,
+# hand-maintained shape), converted via `discussion_context_bundle.
+# bundle_to_dict`.
+
+#: DD-CTX-02's finite coverage vocabulary. `unknown` means the walk was cut
+#: off before even the candidate COUNT could be established (never a guessed
+#: lower bound reported as `partial`).
+DiscussionContextCompleteness = Literal["complete", "partial", "unknown"]
+
+#: Why a section's coverage stopped short of `complete`. `complete` here
+#: doubles as "nothing stopped it" (paired with `completeness="complete"`),
+#: matching `discussion_context_bundle.BundleCoverage`'s own values exactly.
+DiscussionContextStopReason = Literal[
+    "complete", "item_budget", "byte_budget", "depth_budget",
+    "provider_error", "unsupported", "not_applicable",
+]
+
+#: One bundle entry's own resolution -- mirrors `discussion_adapters.
+#: ResolvedTarget.resolution` (never a fourth value invented here).
+DiscussionContextResolution = Literal["resolved", "unresolved", "not_tracked"]
+
+DiscussionContextDeepLinkState = Literal["selected", "screen_only", "unavailable"]
+
+DiscussionContextNextActionKind = Literal["expand_context", "none"]
+
+#: §9.3's durable audit consumer kinds -- mirrors `discussion_context_bundle.
+#: CONTEXT_AUDIT_CONSUMER_KINDS` exactly.
+DiscussionContextAuditConsumerKind = Literal["turn", "proposal", "ju_session"]
+
+
+class DiscussionContextRootOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_kind: str
+    target_ref: str
+    revision_id: Optional[int] = None
+    digest: str = ""
+
+
+class DiscussionContextSnapshotOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Optional[int] = None
+    commit_sha: Optional[str] = None
+
+
+class DiscussionContextEntryOut(BaseModel):
+    """One entity read into a bundle -- the root's own `self` entry, the
+    Overview's `objective` stub, or one `related` neighbour."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_kind: str
+    target_ref: str
+    title: str
+    revision_id: Optional[int] = None
+    digest: str = ""
+    resolution: DiscussionContextResolution
+    facts: Dict[str, Any] = Field(default_factory=dict)
+    #: True when `facts` was replaced by an empty stub because including it
+    #: would have exceeded the bundle-wide byte budget -- identity
+    #: (target_kind/target_ref/digest/resolution) is never dropped, only the
+    #: body. §9.1: "取得失敗時のtotal_count=nullは0件を意味しない" applies at
+    #: the section level; this is the entry-level analogue -- `truncated`
+    #: never means "this entity has no facts", only "not included here".
+    truncated: bool = False
+
+
+class DiscussionContextCoverageOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    returned_count: int
+    #: `None` on any incomplete/failed sweep -- never a guessed lower bound
+    #: (§9.1: "取得失敗時のtotal_count=nullは0件を意味しない").
+    total_count: Optional[int] = None
+    completeness: DiscussionContextCompleteness
+    stop_reason: DiscussionContextStopReason
+    #: Opaque token for `POST .../context-expansions`. `None` when there is
+    #: nothing more to fetch for this section, or when this section's own
+    #: state (`unsupported`/`unavailable`/`not_applicable`) has no partial
+    #: progress to resume.
+    continuation: Optional[str] = None
+
+
+class DiscussionContextSectionOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    #: `"self"` | `"objective"` (Overview root only) | `"related"`.
+    section_id: str
+    #: DD-CTX-01/§9.1: the FETCH's own success/failure -- separate from any
+    #: individual entry's `resolution` (freshness), per #366's rule.
+    operation_state: DiscussionOperationResult
+    facts: List[DiscussionContextEntryOut] = Field(default_factory=list)
+    coverage: DiscussionContextCoverageOut
+
+
+class DiscussionContextSourceOut(BaseModel):
+    """One citable entity across the whole bundle -- the flat catalog
+    `sources[]` a semantic claim's citation (§9.2) resolves against, kept
+    separate from the section tree so a citation never has to name a
+    section/depth path to be checked against the allow-list."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str
+    target_kind: str
+    target_ref: str
+    revision_id: Optional[int] = None
+    digest: str = ""
+    snapshot_id: Optional[int] = None
+    #: A subset of `DiscussionTargetState` (`current`/`not_tracked`/
+    #: `unresolvable`) -- a bundle source is always read fresh, so `stale`
+    #: (a comparison against a PRIOR capture) does not arise here; the wider
+    #: type is kept so a future caller comparing against its own capture is
+    #: never boxed out.
+    freshness: DiscussionTargetState
+    deep_link: Optional[str] = None
+    deep_link_state: DiscussionContextDeepLinkState
+
+
+class DiscussionContextDependencyOut(BaseModel):
+    """One `dependencies[]` entry -- the DD-CTX-05 manifest of what this
+    bundle's answer actually relied on, pinned by digest. Field-for-field
+    identical to `joint_premise.PremiseDependencyRef` (Issue #461's shared
+    shape) -- never redefined independently."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_kind: str
+    target_ref: str
+    digest: str
+
+
+class DiscussionContextNextActionOut(BaseModel):
+    """§8: the ONLY action this Issue's bundle carries is "fetch more
+    context" -- never a domain action. #459 owns the discussion's own main
+    operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: DiscussionContextNextActionKind
+    target: str = ""
+    enabled: bool = False
+    reason: str = ""
+
+
+class DiscussionContextBundleOut(BaseModel):
+    """§9.1's full wire shape. Every field here traces to one bundle
+    dataclass in `app/discussion_context_bundle.py` -- see that module's own
+    docstring for the section/budget/cursor contract this mirrors."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str
+    bundle_digest: str
+    root: DiscussionContextRootOut
+    snapshot: DiscussionContextSnapshotOut
+    sections: List[DiscussionContextSectionOut] = Field(default_factory=list)
+    sources: List[DiscussionContextSourceOut] = Field(default_factory=list)
+    dependencies: List[DiscussionContextDependencyOut] = Field(default_factory=list)
+    next_action: DiscussionContextNextActionOut
+
+
+class DiscussionContextExpansionRequest(BaseModel):
+    """`POST /assistant/discussion-threads/{id}/context-expansions` body.
+    Both fields are required -- an unspecified `bundle_digest`/`continuation`
+    is not "expand the current bundle", it is a different, unsupported
+    request shape (§9.1: "既存askは未指定なら従来動作" describes `/assistant/
+    ask` staying unaffected by this Issue, not this endpoint growing
+    optional fields)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bundle_digest: str = Field(..., min_length=1, max_length=200)
+    continuation: str = Field(..., min_length=1, max_length=200)
+
+
+class DiscussionContextExpansionOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    bundle: DiscussionContextBundleOut
+    expanded_section_ids: List[str] = Field(default_factory=list)

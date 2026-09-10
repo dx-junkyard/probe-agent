@@ -549,11 +549,23 @@ def _build_related_section(
     budget: ContextBudget,
     *,
     extra_seeds: Sequence[Tuple[str, str]] = (),
-) -> Tuple[BundleSection, List[Tuple[str, str, str]]]:
-    """DD-CTX-02's bounded, depth<=2, identity-cycle-cut BFS. Returns the
-    section plus the `(target_kind, target_ref, digest)` triples of every
-    entry it actually included (for the bundle-wide `dependencies` manifest
-    and `sources` catalog).
+) -> Tuple[BundleSection, List[Tuple[str, str, str]], Tuple[Tuple[str, str], ...]]:
+    """DD-CTX-02's bounded, depth<=2, identity-cycle-cut BFS. Returns
+    `(section, included, returned_keys)`:
+
+    - `included`: the `(target_kind, target_ref, digest)` triples of every
+      RESOLVED entry actually included (for the bundle-wide `dependencies`
+      staleness manifest and `sources` catalog -- an unresolved/not_tracked
+      entry carries no digest worth pinning).
+    - `returned_keys`: the `(target_kind, target_ref)` identity of EVERY
+      entry actually placed on this section (resolved or not), in the exact
+      order emitted. This is deliberately a DIFFERENT set from `included`:
+      it is what `create_context_cursor` persists so a later "追加取得"
+      never re-emits an entry this call already returned, regardless of
+      whether that entry resolved. A candidate merely DISCOVERED but cut off
+      by the budget before being fetched (an `_dedupe_new`-claimed pair with
+      no corresponding entry) is intentionally NOT in `returned_keys`, so
+      the next continuation call still offers it.
 
     Depth-1 candidate refs are always fully enumerable up front (they come
     from the ROOT's already-fetched facts, a cheap in-memory read); reaching
@@ -574,12 +586,13 @@ def _build_related_section(
         return (
             BundleSection("related", "unavailable", (), BundleCoverage(0, None, "unknown", "provider_error", None)),
             [],
+            (),
         )
     if extractor is None and not extra_seeds:
         state = "not_applicable" if adapter is not None and adapter.scope == "screen" else "unsupported"
         total = 0 if state == "not_applicable" else None
         completeness = "complete" if state == "not_applicable" else "unknown"
-        return BundleSection("related", state, (), BundleCoverage(0, total, completeness, state, None)), []
+        return BundleSection("related", state, (), BundleCoverage(0, total, completeness, state, None)), [], ()
 
     d1_raw: List[Tuple[str, str]] = list(extra_seeds)
     if extractor is not None and root_context.operation_state == "available":
@@ -651,16 +664,21 @@ def _build_related_section(
         else:
             coverage = BundleCoverage(returned_count, total_count, "complete", "complete", None)
 
-    return BundleSection("related", "available", tuple(entries), coverage), included
+    returned_keys = tuple((e.target_kind, e.target_ref) for e in entries)
+    return BundleSection("related", "available", tuple(entries), coverage), included, returned_keys
 
 
 # --- Bundle assembly -----------------------------------------------------------
 
 
 def build_context_bundle(
-    system_id: int, root_target_kind: str, root_target_ref: str, *, budget: ContextBudget = DEFAULT_BUDGET,
+    system_id: int, root_target_kind: str, root_target_ref: str, *,
+    thread_id: int, budget: ContextBudget = DEFAULT_BUDGET,
 ) -> DiscussionContextBundle:
-    """DD-CTX-01/02's full bundle for one root. Raises `ContextBundleError`
+    """DD-CTX-01/02's full bundle for one root, scoped to `thread_id` (the
+    discussion thread this bundle's continuations, if any, will be resumed
+    through -- DD-CTX-03's cursor binds to System/root/snapshot/thread, so a
+    bundle always needs one). Raises `ContextBundleError`
     (`discussion_target_kind_unregistered` / `discussion_context_root_not_
     found`) instead of ever returning a bundle for a target that does not
     exist -- the route maps those to 422 / 404 respectively, matching every
@@ -707,7 +725,7 @@ def build_context_bundle(
         sections.append(objective_section)
         extra_seeds = seeds
 
-    related_section, related_included = _build_related_section(
+    related_section, related_included, related_returned_keys = _build_related_section(
         system_id, root_target_kind, root_context, tracker, visited, budget, extra_seeds=extra_seeds,
     )
     sections.append(related_section)
@@ -723,6 +741,29 @@ def build_context_bundle(
     )
     root_ref_out = BundleRootRef(root_target_kind, root_target_ref, root_resolved.revision_id, root_resolved.digest)
     bundle_digest = _compute_bundle_digest(root_ref_out, manifest)
+
+    # DD-CTX-03: mint a continuation ONLY for the `related` section, and ONLY
+    # when it was actually walked (`available`) but not fully covered -- an
+    # `unavailable`/`unsupported`/`not_applicable` related section has no
+    # partial progress to resume; "再取得" for those means calling this
+    # function again from scratch, not continuing a cursor. `self`/
+    # `objective` truncation (a single oversized entry replaced by a stub)
+    # has no "next batch" either -- there is nothing paginated to continue.
+    if related_section.operation_state == "available" and related_section.coverage.completeness != "complete":
+        with get_conn() as conn:
+            token = create_context_cursor(
+                conn, system_id=system_id, thread_id=thread_id, root=root_ref_out, snapshot=snapshot,
+                bundle_digest=bundle_digest, section_id="related",
+                dependency_manifest=manifest, visited_keys=related_returned_keys,
+            )
+        related_section = BundleSection(
+            related_section.section_id, related_section.operation_state, related_section.facts,
+            BundleCoverage(
+                related_section.coverage.returned_count, related_section.coverage.total_count,
+                related_section.coverage.completeness, related_section.coverage.stop_reason, token,
+            ),
+        )
+        sections[-1] = related_section
 
     needs_more = any(s.coverage.completeness != "complete" for s in sections)
     next_action = BundleNextAction(
@@ -761,11 +802,18 @@ def _cleanup_expired_cursors(conn) -> None:
 
 def create_context_cursor(
     conn, *, system_id: int, thread_id: int, root: BundleRootRef, snapshot: BundleSnapshotRef,
-    bundle_digest: str, section_id: str, resume_offset: int,
+    bundle_digest: str, section_id: str,
     dependency_manifest: Sequence[PremiseDependencyRef],
+    visited_keys: Sequence[Tuple[str, str]],
 ) -> str:
     """Persist a resumable continuation for one section. Returns the opaque
-    token to hand to the client as `coverage.continuation`."""
+    token to hand to the client as `coverage.continuation`.
+
+    `visited_keys` is the identity of every entry ALREADY RETURNED for this
+    section (resolved or not) -- the actual continuation state a resume
+    filters the re-derived candidate list by (see `_build_related_section`'s
+    own docstring for why this must be a different set from
+    `dependency_manifest`, which is resolved-only)."""
     now = time.time()
     _cleanup_expired_cursors(conn)
     token = secrets.token_urlsafe(32)
@@ -773,12 +821,13 @@ def create_context_cursor(
     conn.execute(
         """INSERT INTO discussion_context_cursor
                (token, system_id, thread_id, root_target_kind, root_target_ref, root_digest,
-                snapshot_id, bundle_digest, section_id, resume_offset,
+                snapshot_id, bundle_digest, section_id, resume_offset, visited_keys_json,
                 dependency_manifest_json, dependency_manifest_digest, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             token, system_id, thread_id, root.target_kind, root.target_ref, root.digest,
-            snapshot.id, bundle_digest, section_id, resume_offset,
+            snapshot.id, bundle_digest, section_id, len(visited_keys),
+            json.dumps([list(pair) for pair in visited_keys], ensure_ascii=False),
             json.dumps([d.as_dict() for d in dependency_manifest], ensure_ascii=False),
             manifest_digest, now, now + CONTEXT_CURSOR_TTL_SECONDS,
         ),
@@ -856,30 +905,36 @@ def resolve_context_expansion(
             "discussion_context_continuation_stale", 409, "The pinned snapshot has changed.",
         )
 
-    # The cursor's premise held: re-run the SAME deterministic extraction and
-    # return only the batch starting at `resume_offset` (DD-CTX-03's "未取得
-    # 範囲を限定して取得する"). Re-deriving is cheap and reproducible
-    # (`_RELATION_EXTRACTORS` + `_dedupe_new`'s stable sort), never a second,
-    # independently-drifting source of the candidate order.
+    # The cursor's premise held: re-run the SAME deterministic extraction,
+    # seeded with EVERY identity this cursor's chain has already returned
+    # (`visited_keys_json`), and take the freshly-derived section's entries
+    # AS the new batch directly -- never a positional slice of a
+    # re-derived list. A candidate cut off by the budget on a PRIOR call was
+    # deliberately never added to `visited_keys_json` (see
+    # `_build_related_section`'s docstring), so it naturally reappears as a
+    # fresh candidate here; one already returned is filtered out by
+    # `_dedupe_new` before it can be counted or fetched again. This is what
+    # keeps pagination correct across an arbitrary number of budget-
+    # interrupted resumes, including when earlier candidates never resolved.
     section_id = row["section_id"]
-    resume_offset = row["resume_offset"]
+    try:
+        prior_visited_keys = [tuple(pair) for pair in json.loads(row["visited_keys_json"] or "[]")]
+    except (ValueError, TypeError):
+        prior_visited_keys = []
 
     root_context = _gather(system_id, root_kind, root_ref)
     tracker = _BudgetTracker(budget)
     visited: Set[Tuple[str, str]] = {(root_kind, root_ref)}
-    for dep in stored_manifest:
-        visited.add((dep.target_kind, dep.target_ref))
+    visited.update(prior_visited_keys)
 
     extra_seeds: List[Tuple[str, str]] = []
     if root_kind == "screen" and root_ref == "overview" and section_id == "related":
         _obj_section, extra_seeds = _objective_section(system_id, _BudgetTracker(budget))
 
-    full_section, included = _build_related_section(
+    full_section, included, batch_returned_keys = _build_related_section(
         system_id, root_kind, root_context, tracker, visited, budget, extra_seeds=extra_seeds,
     )
-    # Skip entries the caller already has (everything up to `resume_offset`);
-    # return only the newly-visible batch.
-    new_entries = full_section.facts[resume_offset:]
+    new_entries = full_section.facts
     new_coverage = BundleCoverage(
         returned_count=len(new_entries),
         total_count=full_section.coverage.total_count,
@@ -887,7 +942,7 @@ def resolve_context_expansion(
         stop_reason=full_section.coverage.stop_reason,
         continuation=None,
     )
-    next_offset = resume_offset + len(new_entries)
+    combined_visited_keys: Tuple[Tuple[str, str], ...] = tuple(prior_visited_keys) + batch_returned_keys
     root_ref_out = BundleRootRef(root_kind, root_ref, current_root.revision_id, current_root.digest)
     combined_manifest = normalize_premise_manifest(
         [d.as_dict() for d in stored_manifest]
@@ -899,8 +954,8 @@ def resolve_context_expansion(
                 conn, system_id=system_id, thread_id=thread_id, root=root_ref_out,
                 snapshot=BundleSnapshotRef(current_snapshot_id, None),
                 bundle_digest=_compute_bundle_digest(root_ref_out, combined_manifest),
-                section_id=section_id, resume_offset=next_offset,
-                dependency_manifest=combined_manifest,
+                section_id=section_id, dependency_manifest=combined_manifest,
+                visited_keys=combined_visited_keys,
             )
         new_coverage = BundleCoverage(
             new_coverage.returned_count, new_coverage.total_count,
@@ -921,3 +976,77 @@ def resolve_context_expansion(
         ),
     )
     return ContextExpansionResult(bundle=bundle, expanded_section_ids=(section_id,))
+
+
+# --- Wire conversion -----------------------------------------------------------
+
+
+def bundle_to_dict(bundle: DiscussionContextBundle) -> Dict[str, Any]:
+    """The exact §9.1 wire shape as a plain, JSON-serializable dict --
+    `asdict` recurses through every nested dataclass here (`BundleRootRef`,
+    `BundleSnapshotRef`, `BundleSection`, `BundleEntry`, `BundleCoverage`,
+    `BundleSource`, `PremiseDependencyRef`, `BundleNextAction`), so this
+    module never maintains a second, hand-written field list a route could
+    let drift from the dataclasses above. `routes/assistant.py` passes the
+    result straight into `models.DiscussionContextBundleOut(**...)`."""
+    return asdict(bundle)
+
+
+# --- DD-CTX-05 / §9.3: durable evidence-manifest audit --------------------------
+#
+# Deliberately separate from `discussion_context_cursor` (short-lived,
+# cleaned up after 30 minutes): once a turn/Proposal/Joint Understanding
+# session is written on the strength of a bundle, WHAT that bundle's
+# dependencies were at the time must survive the cursor's own expiry. This
+# module only provides the write path; #455 (JU session origin) and #459
+# (the discussion's own main operation) call it at the point THEY persist
+# their own durable row, naming which kind of row it was.
+
+CONTEXT_AUDIT_CONSUMER_KINDS: Tuple[str, ...] = ("turn", "proposal", "ju_session")
+
+
+def persist_context_audit(
+    conn, *, system_id: int, consumer_kind: str, consumer_ref: str, bundle: DiscussionContextBundle,
+) -> int:
+    """Insert one durable audit row for the dependency manifest a bundle
+    contributed to `consumer_ref` (e.g. `"thread:3:turn:7"`,
+    `f"proposal:{proposal_id}"`, `f"ju_session:{session_id}"`).
+
+    Raises `ContextBundleError('discussion_context_audit_consumer_kind_
+    invalid')` for anything outside `CONTEXT_AUDIT_CONSUMER_KINDS` --
+    fail-closed rather than relying solely on the DB's own CHECK constraint,
+    so a caller gets the same typed error this module raises everywhere
+    else. Never deleted by this module; retention is a later Issue's
+    decision, not an implicit side effect of writing here."""
+    if consumer_kind not in CONTEXT_AUDIT_CONSUMER_KINDS:
+        raise ContextBundleError(
+            "discussion_context_audit_consumer_kind_invalid", consumer_kind,
+        )
+    manifest_digest = compute_premise_manifest_digest(bundle.dependencies)
+    cur = conn.execute(
+        """INSERT INTO discussion_context_audit
+               (system_id, consumer_kind, consumer_ref, root_target_kind, root_target_ref,
+                root_revision_id, root_digest, snapshot_id, snapshot_commit_sha, bundle_digest,
+                dependency_manifest_json, dependency_manifest_digest, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            system_id, consumer_kind, consumer_ref, bundle.root.target_kind, bundle.root.target_ref,
+            bundle.root.revision_id, bundle.root.digest, bundle.snapshot.id, bundle.snapshot.commit_sha,
+            bundle.bundle_digest,
+            json.dumps([d.as_dict() for d in bundle.dependencies], ensure_ascii=False),
+            manifest_digest, time.time(),
+        ),
+    )
+    return cur.lastrowid
+
+
+def get_context_audit(conn, *, system_id: int, consumer_kind: str, consumer_ref: str):
+    """Most recent durable audit row for one consumer, or `None`. System-
+    scoped like every other read in this module -- a foreign System's row
+    never matches."""
+    return conn.execute(
+        """SELECT * FROM discussion_context_audit
+               WHERE system_id = ? AND consumer_kind = ? AND consumer_ref = ?
+               ORDER BY id DESC LIMIT 1""",
+        (system_id, consumer_kind, consumer_ref),
+    ).fetchone()

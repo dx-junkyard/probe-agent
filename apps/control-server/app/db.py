@@ -521,6 +521,96 @@ CREATE INDEX IF NOT EXISTS idx_discussion_save_receipt_target
     ON discussion_save_receipt (system_id, target_kind, target_ref, id DESC);
 """
 
+# discussion_context_cursor / discussion_context_audit (Issue #458, Epic
+# #443 §9, DD-CTX-01..05): owned entirely by `app/discussion_context_bundle.
+# py` -- no other module writes either table. Canonical contract: docs/01-
+# specifications/capabilities/ai-discussion-adapter.md §9.1/§9.3.
+#
+# `discussion_context_cursor` is the SHORT-LIVED continuation for "関連情報を
+# 追加確認" (DD-CTX-03): one row per in-flight pagination position for one
+# section of one bundle, bound to System/thread/root/snapshot/dependency
+# manifest so a tampered, expired, foreign-System, or premise-moved token can
+# never silently resume as if nothing changed. The token itself carries no
+# client-decodable state (`secrets.token_urlsafe`) -- everything resumable
+# lives in this row, keyed by the token. Rows past `expires_at` (30 minutes,
+# `discussion_context_bundle.CONTEXT_CURSOR_TTL_SECONDS`) are deleted lazily
+# on the next mint (`_cleanup_expired_cursors`), the same lazy-cleanup
+# discipline `publish_connection_leases` already uses -- no separate cron.
+#
+# `discussion_context_audit` is the DURABLE record of "what dependency
+# manifest actually backed this turn/proposal/JU session's answer", kept
+# deliberately separate from the cursor above: a cursor's 30-minute expiry
+# must never delete the evidence a already-persisted turn/Proposal/Joint
+# Understanding session was built on (§9.3's "cursorとは別の監査として保持し、
+# 期限切れで監査を消さない"). `discussion_context_bundle.persist_context_
+# audit` is the only writer; #455/#459 call it when THEY persist their own
+# durable row, passing the finite `consumer_kind` of what they just wrote.
+# Rows here are never deleted by this Epic -- retention is an operational
+# decision for a later Issue, not an implicit side effect of this one.
+_DISCUSSION_CONTEXT_DDL = """
+CREATE TABLE IF NOT EXISTS discussion_context_cursor (
+    token                       TEXT PRIMARY KEY,
+    system_id                   INTEGER NOT NULL,
+    thread_id                   INTEGER NOT NULL,
+    root_target_kind            TEXT NOT NULL,
+    root_target_ref             TEXT NOT NULL,
+    root_digest                 TEXT NOT NULL DEFAULT '',
+    snapshot_id                 INTEGER,
+    bundle_digest               TEXT NOT NULL,
+    section_id                  TEXT NOT NULL,
+    -- Total entries returned for this section across every batch up to and
+    -- including this cursor's mint point -- informational bookkeeping only
+    -- (§9.1's `coverage.returned_count` on the NEXT response is computed
+    -- fresh from `visited_keys_json`, never by trusting this counter as an
+    -- offset to slice a re-derived list by position).
+    resume_offset               INTEGER NOT NULL DEFAULT 0,
+    -- Identity (`target_kind:target_ref`) of EVERY entry already returned
+    -- for this section, resolved or not -- the actual continuation state.
+    -- Re-deriving the candidate order at resume time and filtering by THIS
+    -- set (rather than slicing a fresh list by `resume_offset`) is what
+    -- keeps pagination correct when the walk is budget-interrupted between
+    -- calls: a candidate merely discovered-but-not-yet-fetched must stay
+    -- eligible for the next batch, while one already returned must not
+    -- reappear.
+    visited_keys_json           TEXT NOT NULL DEFAULT '[]',
+    dependency_manifest_json    TEXT NOT NULL DEFAULT '[]',
+    dependency_manifest_digest  TEXT NOT NULL DEFAULT '',
+    created_at                  REAL NOT NULL,
+    expires_at                  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (thread_id) REFERENCES assistant_discussion_thread (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_discussion_context_cursor_expires
+    ON discussion_context_cursor (expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_discussion_context_cursor_thread
+    ON discussion_context_cursor (thread_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS discussion_context_audit (
+    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                    INTEGER NOT NULL,
+    consumer_kind                TEXT NOT NULL CHECK (consumer_kind IN (
+                                      'turn', 'proposal', 'ju_session')),
+    consumer_ref                 TEXT NOT NULL,
+    root_target_kind             TEXT NOT NULL,
+    root_target_ref              TEXT NOT NULL,
+    root_revision_id             INTEGER,
+    root_digest                  TEXT NOT NULL DEFAULT '',
+    snapshot_id                  INTEGER,
+    snapshot_commit_sha          TEXT,
+    bundle_digest                TEXT NOT NULL,
+    dependency_manifest_json     TEXT NOT NULL DEFAULT '[]',
+    dependency_manifest_digest   TEXT NOT NULL DEFAULT '',
+    created_at                   REAL NOT NULL,
+    schema_version                TEXT NOT NULL DEFAULT 'discussion-context-audit-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_discussion_context_audit_consumer
+    ON discussion_context_audit (system_id, consumer_kind, consumer_ref, id DESC);
+"""
+
 
 # joint_understanding_session (Epic #328 Phase A / Issue #329, extended by
 # Issue #461). Pulled out to a module-level constant for the same reason
@@ -8790,7 +8880,7 @@ CREATE INDEX IF NOT EXISTS idx_product_feature_decision_feature
     ON product_feature_decision (feature_id, id DESC);
 
 """ + _PRODUCT_GAP_ARTIFACT_LINK_DDL + _ASSISTANT_DISCUSSION_DDL + _ASSISTANT_DISCUSSION_PROPOSAL_DDL \
-    + _DISCUSSION_SAVE_RECEIPT_DDL
+    + _DISCUSSION_SAVE_RECEIPT_DDL + _DISCUSSION_CONTEXT_DDL
 
 
 _SCOPED_TABLES = [

@@ -26,7 +26,13 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
-from .. import assistant_discussion, assistant_discussion_proposal, discussion_adapters, ui_draft_context
+from .. import (
+    assistant_discussion,
+    assistant_discussion_proposal,
+    discussion_adapters,
+    discussion_context_bundle,
+    ui_draft_context,
+)
 from ..assistant import (
     answer_question,
     checks_for_screen,
@@ -60,6 +66,9 @@ from ..models import (
     AssistantSpeechRequest,
     AssistantSuggestedQuestionOut,
     DiagnosticLastObservedErrorOut,
+    DiscussionContextBundleOut,
+    DiscussionContextExpansionOut,
+    DiscussionContextExpansionRequest,
     SettingMetadataOut,
     SettingsMetadataOut,
     SystemDiagnosticCheckOut,
@@ -327,6 +336,88 @@ def get_discussion_thread(
             status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
         )
     return _thread_detail_out(data)
+
+
+# --- Discussion context bundle (Issue #458, Epic #443 §9, DD-CTX-01..05) -----
+# `docs/01-specifications/capabilities/ai-discussion-adapter.md` §9.1. Two endpoints: the initial bundle for
+# a thread's own target (registered relation resolvers only, bounded/
+# budgeted, DD-CTX-01/02), and the explicit "追加取得" continuation
+# (DD-CTX-03). Neither endpoint touches `/assistant/ask` -- see this
+# module's own docstring for why that stays untouched by this Issue.
+
+
+@router.get(
+    "/assistant/discussion-threads/{thread_id}/context-bundle",
+    response_model=DiscussionContextBundleOut,
+)
+def get_discussion_context_bundle(
+    thread_id: int,
+    system_id: int = Depends(get_system_id),
+) -> DiscussionContextBundleOut:
+    """The bundle is always built fresh for the thread's CURRENT target
+    (never the digest captured when the thread was created) -- a stale
+    thread still gets a bundle describing what the target looks like NOW,
+    the same "read fresh every time" discipline `_thread_detail_out`'s
+    capabilities already follow. Any section left `partial`/`unknown`
+    carries its own minted `coverage.continuation` for `POST .../context-
+    expansions` -- there is nothing else for the caller to bind to."""
+    thread_data = assistant_discussion.get_thread(system_id, thread_id)
+    if thread_data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    thread_row = thread_data["thread"]
+    try:
+        bundle = discussion_context_bundle.build_context_bundle(
+            system_id, thread_row["target_kind"], thread_row["target_ref"], thread_id=thread_id,
+            # Read fresh from the module every call (never captured as a
+            # function-default reference) -- DD-CTX-02: "budget値はversion
+            # 付きserver設定とし" implies a later tuning pass can change it
+            # without this route needing to change too.
+            budget=discussion_context_bundle.DEFAULT_BUDGET,
+        )
+    except discussion_context_bundle.ContextBundleError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    return DiscussionContextBundleOut(**discussion_context_bundle.bundle_to_dict(bundle))
+
+
+@router.post(
+    "/assistant/discussion-threads/{thread_id}/context-expansions",
+    response_model=DiscussionContextExpansionOut,
+)
+def create_discussion_context_expansion(
+    thread_id: int,
+    payload: DiscussionContextExpansionRequest,
+    system_id: int = Depends(get_system_id),
+) -> DiscussionContextExpansionOut:
+    """DD-CTX-03: fetch the next bounded batch for one section's own
+    continuation. Fail-closed, first-match: unknown/tampered/foreign-System/
+    foreign-thread token -> 404; expired -> 410; the bundle's own premise
+    (root digest, any dependency already relied on, the pinned snapshot)
+    having moved since the token was minted -> 409, so the caller re-fetches
+    the initial bundle rather than silently continuing on a stale premise
+    (§9.3: "root不変でも使った依存根拠更新はstale")."""
+    thread_data = assistant_discussion.get_thread(system_id, thread_id)
+    if thread_data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    try:
+        result = discussion_context_bundle.resolve_context_expansion(
+            system_id, thread_id,
+            bundle_digest=payload.bundle_digest, continuation=payload.continuation,
+            budget=discussion_context_bundle.DEFAULT_BUDGET,
+        )
+    except discussion_context_bundle.ContextExpansionError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    return DiscussionContextExpansionOut(
+        bundle=DiscussionContextBundleOut(**discussion_context_bundle.bundle_to_dict(result.bundle)),
+        expanded_section_ids=list(result.expanded_section_ids),
+    )
 
 
 # --- Discussion proposals (Issue #439) ----------------------------------------
