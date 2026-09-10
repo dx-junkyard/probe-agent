@@ -606,3 +606,217 @@ class TestNoSideEffects:
 
         requirement = admin_client.get("/ux-design/requirements/req-1", headers=headers).json()
         assert requirement["current_revision"] is None or requirement["current_revision"]["statement"] != "changed"
+
+
+# ---------------------------------------------------------------------------
+# 7. Premise must fail CLOSED, never OPEN, for an unsupported or unresolved
+#    root (review-round fix: `_target_digest_with_conn`'s `_UNSUPPORTED`
+#    branch used to feed a CONSTANT sentinel string into the content hash,
+#    which made premise permanently `current` regardless of real drift).
+# ---------------------------------------------------------------------------
+
+
+class TestPremiseFailClosedForUnsupportedRoot:
+    def test_target_digest_with_conn_reports_unsupported_for_an_uncovered_kind(self):
+        from app import discussion_hypothesis as dh
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            result = dh._target_digest_with_conn(conn, 1, "some_future_kind", "ref-1")
+        assert result is dh._UNSUPPORTED
+
+    def test_origin_provider_reports_no_content_hash_for_an_unsupported_root(
+        self, admin_client, monkeypatch,
+    ):
+        """The provider must return `content_hash=None` (never a constant
+        string) when the root's digest cannot be verified -- `None` makes
+        `PremiseBundle.is_complete` False FOREVER for this session, which is
+        the finite `invalid` verdict, never `current`."""
+        from app import discussion_hypothesis as dh
+
+        monkeypatch.setattr(dh, "_target_digest_with_conn", lambda *a, **k: dh._UNSUPPORTED)
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token)
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "req-1")
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )
+        proposal = _generate_with_hypothesis(admin_client, headers, thread["thread"]["id"], monkeypatch)
+        hyp_id = proposal["hypotheses"][0]["id"]
+        promoted = _promote(admin_client, headers, proposal["id"], hyp_id, "req-A")
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            ju_row = conn.execute(
+                "SELECT * FROM joint_understanding_session WHERE id = ?",
+                (promoted["joint_understanding_session_id"],),
+            ).fetchone()
+            facts = dh._discussion_origin_provider(conn, origin_id=hyp_id, system_id=system_id)
+        assert facts.content_hash is None
+        assert ju_row["premise_content_hash"] is None
+
+    def test_reflux_never_reads_current_when_the_root_kind_cannot_be_verified(
+        self, admin_client, monkeypatch,
+    ):
+        """Regression for the fail-open defect: forcing `_target_digest_
+        with_conn` to always report `_UNSUPPORTED` must make the premise
+        `invalid` from the FIRST read onward, never `current` -- not even
+        once, and not only after some later "change" is detected (there is
+        nothing to compare against at all)."""
+        from app import discussion_hypothesis as dh
+
+        monkeypatch.setattr(dh, "_target_digest_with_conn", lambda *a, **k: dh._UNSUPPORTED)
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token)
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "req-1")
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )
+        proposal = _generate_with_hypothesis(admin_client, headers, thread["thread"]["id"], monkeypatch)
+        hyp_id = proposal["hypotheses"][0]["id"]
+        _promote(admin_client, headers, proposal["id"], hyp_id, "req-A")
+
+        for _ in range(2):
+            data = _reflux(admin_client, headers, thread["thread"]["id"])
+            link = data["links"][0]
+            assert link["session"]["premise_state"] != "current"
+            assert link["session"]["premise_state"] == "invalid"
+            assert link["session"]["premise_reason"] == "premise_incomplete"
+            assert link["reconfirmation_required"] is True
+            assert link["current_findings"] == []
+
+
+class TestJointUnderstandingBridgeCapability:
+    def test_overview_finding_bridge_is_false_and_promotion_is_refused(self, admin_client, monkeypatch):
+        """Issue #455 review: a kind whose premise this bridge cannot verify
+        (`overview_finding` -- `_resolve_overview_finding` calls
+        `build_overview(system_id)`, not conn-parametrized) must declare
+        `joint_understanding_bridge=False`, and the bridge ENDPOINT must
+        actually enforce it -- a capability flag with no backing check would
+        be the same "declares supported, cannot back it" defect one layer
+        further out. Nothing is persisted on refusal."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token)
+        headers = _headers(token, system_id)
+        thread = _create_thread(
+            admin_client, headers, scope="element", screen_id="overview",
+            target_kind="overview_finding", target_ref="finding-x",
+        )
+        proposal = _generate_with_hypothesis(admin_client, headers, thread["thread"]["id"], monkeypatch)
+        hyp_id = proposal["hypotheses"][0]["id"]
+
+        r = _promote(admin_client, headers, proposal["id"], hyp_id, "req-A", expect=422)
+        assert r.json()["detail"]["code"] == "discussion_hypothesis_bridge_unsupported"
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM assistant_discussion_hypothesis_promotion WHERE hypothesis_id = ?",
+                (hyp_id,),
+            ).fetchone()["n"]
+            assert count == 0
+            hyp_row = conn.execute(
+                "SELECT status FROM assistant_discussion_proposal_hypothesis WHERE id = ?", (hyp_id,),
+            ).fetchone()
+            assert hyp_row["status"] == "proposed"
+
+    def test_every_covered_kind_except_overview_finding_declares_the_bridge(self):
+        from app import discussion_adapters
+
+        for kind, adapter in discussion_adapters.DISCUSSION_ADAPTERS.items():
+            if kind == "overview_finding":
+                assert adapter.joint_understanding_bridge is False, kind
+            else:
+                assert adapter.joint_understanding_bridge is True, kind
+
+
+# ---------------------------------------------------------------------------
+# 8. Root cause fix: a resolved-but-revision-less related entity's empty
+#    digest must never make `normalize_premise_manifest` reject the
+#    dependency manifest (and must never be silently dropped either).
+# ---------------------------------------------------------------------------
+
+
+class TestNoRevisionDigestSentinel:
+    def test_a_revision_less_related_entity_gets_a_stable_sentinel_not_empty(self, admin_client):
+        """`_build_chain` in `TestRepresentativeChainE2E` always adds a
+        revision to every fixture entity -- this test proves the OPPOSITE
+        case (no revision yet) no longer crashes `build_context_bundle` and
+        no longer needs a silent empty-manifest fallback."""
+        from app import discussion_context_bundle
+
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token)
+        headers = _headers(token, system_id)
+        admin_client.post("/product-objectives", json={"objective_key": "obj-1"}, headers=headers)
+        admin_client.post(
+            "/product-milestones", json={"objective_key": "obj-1", "milestone_key": "ms-1"}, headers=headers,
+        )
+        r = admin_client.post(
+            "/product-gaps", json={"milestone_key": "ms-1", "gap_key": "gap-1"}, headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        # Deliberately NO revision on "ms-1" -- it resolves (identity
+        # exists) but has no comparable content yet.
+
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="objective-map",
+            target_kind="product_gap", target_ref="gap-1",
+        )
+        bundle = discussion_context_bundle.build_context_bundle(
+            system_id, "product_gap", "gap-1", thread_id=thread["thread"]["id"],
+        )
+        deps = {(d.target_kind, d.target_ref): d.digest for d in bundle.dependencies}
+        assert deps.get(("product_milestone", "ms-1")) == discussion_context_bundle.NO_REVISION_DIGEST
+
+    def test_promotion_captures_the_dependency_and_a_later_revision_makes_it_stale(
+        self, admin_client, monkeypatch,
+    ):
+        """The sentinel is a REAL, comparable value: once "ms-1" gets its
+        first revision, the dependency digest changes away from the
+        sentinel and premise correctly goes stale -- proving the fix is not
+        merely "does not crash" but "still detects the eventual change"."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token)
+        headers = _headers(token, system_id)
+        admin_client.post("/product-objectives", json={"objective_key": "obj-1"}, headers=headers)
+        admin_client.post(
+            "/product-milestones", json={"objective_key": "obj-1", "milestone_key": "ms-1"}, headers=headers,
+        )
+        admin_client.post(
+            "/product-gaps", json={"milestone_key": "ms-1", "gap_key": "gap-1"}, headers=headers,
+        )
+        admin_client.post(
+            "/product-gaps/gap-1/revisions",
+            json={"title": "Gap 1", "current_state": "", "target_state": "", "target_state_mode": "unknown",
+                  "interpretation": "", "suggested_priority_note": "", "change_note": ""},
+            headers=headers,
+        )
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="objective-map",
+            target_kind="product_gap", target_ref="gap-1",
+        )
+        proposal = _generate_with_hypothesis(admin_client, headers, thread["thread"]["id"], monkeypatch)
+        hyp_id = proposal["hypotheses"][0]["id"]
+        promoted = _promote(admin_client, headers, proposal["id"], hyp_id, "req-A")
+
+        data = _reflux(admin_client, headers, thread["thread"]["id"])
+        assert data["links"][0]["session"]["premise_state"] == "current"
+
+        admin_client.post(
+            "/product-milestones/ms-1/revisions",
+            json={"title": "Milestone 1", "target_state": "", "verification_method": "unavailable",
+                  "verification_note": "", "sequence_hint": 0, "summary": "", "change_note": ""},
+            headers=headers,
+        )
+        data = _reflux(admin_client, headers, thread["thread"]["id"])
+        link = data["links"][0]
+        assert link["session"]["premise_state"] == "stale"
+        assert link["session"]["premise_reason"] == "dependency_content_changed"
+        assert link["promotion"]["joint_understanding_session_id"] == promoted["joint_understanding_session_id"]

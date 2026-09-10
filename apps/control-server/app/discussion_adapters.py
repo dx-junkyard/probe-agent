@@ -1200,6 +1200,16 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         resolver=_resolve_overview_finding,
         context_provider=None,
         route_params=_route_params_overview_finding,
+        # Issue #455: the one kind whose JU bridge is deliberately `False`.
+        # `app/discussion_hypothesis._target_digest_with_conn` cannot verify
+        # this kind's root content from an already-open connection
+        # (`_resolve_overview_finding` calls `overview_projection.
+        # build_overview(system_id)`, which is not conn-parametrized and
+        # re-derives a whole System-wide projection) -- declaring the
+        # capability `True` here without a working premise check would be
+        # exactly the "declares supported, cannot actually back it" defect
+        # #456 exists to prevent, one layer further out.
+        joint_understanding_bridge=False,
     ),
     "ux_journey": DiscussionAdapter(
         target_kind="ux_journey",

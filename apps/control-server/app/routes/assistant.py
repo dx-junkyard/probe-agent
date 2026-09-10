@@ -702,6 +702,14 @@ def promote_discussion_hypothesis(
         raise HTTPException(
             status_code=422, detail={"code": exc.code, "message": str(exc)}
         ) from exc
+    except discussion_hypothesis.BridgeNotSupported as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "discussion_hypothesis_bridge_unsupported",
+                "message": str(exc),
+            },
+        ) from exc
     except discussion_hypothesis.PromotionConflict as exc:
         raise HTTPException(
             status_code=409,

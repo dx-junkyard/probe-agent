@@ -26,21 +26,45 @@ get_conn()` connection (every existing premise-evaluation call site --
 `routes/joint_understanding.py` -- holds one open around the call). Calling
 `discussion_adapters.get_adapter(kind).resolver(...)` from there would
 re-enter `get_conn()` and raise `db.DatabaseReentrancyError` (CLAUDE.md: the
-connection lock is process-wide and non-reentrant). `_target_digest_with_conn`
-below therefore reimplements each covered target_kind's digest formula
-against the CALLER'S OWN `conn` -- reading the exact same domain functions
-(`product_objective.get_gap_detail`, `ux_design.get_journey_detail`, ...)
-`discussion_adapters._resolve_<kind>` reads, just without that function's own
-`with get_conn():` wrapper, so the two never compute a different digest for
-the same content. A target_kind reachable via `discussion_context_bundle`'s
-open `_extract_generic_refs` enumeration but NOT one of the ones covered here
-(`ux_journey_step`, `blueprint_lane_cell`, `interview_session`,
-`overview_finding`, ...) is `_UNSUPPORTED`: `_dependency_digest_resolver`
-reports it as `None` (the existing "target removed" reading, never a false
-"current") and the discussion-origin content hash folds it in as a fixed
-sentinel (never silently treated as unchanged root content, and never a
-crash) -- a documented, fail-closed simplification; extending coverage to a
-new kind is additive.
+connection lock is process-wide and non-reentrant). `_raw_target_digest_
+with_conn` below therefore reimplements each covered target_kind's digest
+formula against the CALLER'S OWN `conn` -- reading the exact same domain
+functions (`product_objective.get_gap_detail`, `ux_design.get_journey_detail`,
+...) `discussion_adapters._resolve_<kind>` reads, just without that
+function's own `with get_conn():` wrapper, so the two never compute a
+different digest for the same content. `_target_digest_with_conn` wraps it
+to substitute an empty ("no revision recorded yet") digest with
+`discussion_context_bundle.NO_REVISION_DIGEST` -- the SAME sentinel
+`build_context_bundle` now substitutes when building the dependency
+manifest, so a captured reference and its later re-resolution always agree.
+
+16 of the 17 registered `target_kind`s are covered (`screen`,
+`purpose_element`, `purpose_relation`, `stakeholder`, `stakeholder_need`,
+`product_objective`, `product_milestone`, `product_gap`, `product_feature`,
+`ux_journey`, `ux_requirement`, `solution_design`, `interview_session`,
+`understanding_claim`, `ux_journey_step`, `blueprint_lane_cell`).
+`overview_finding` is not: `discussion_adapters._resolve_overview_finding`
+calls `overview_projection.build_overview(system_id)`, which is not
+conn-parametrized and re-derives a whole System-wide projection --
+reimplementing it against a caller-supplied `conn` is well beyond this
+bridge's scope. `_raw_target_digest_with_conn` reports it (and any future
+uncovered kind) as `_UNSUPPORTED`.
+
+**`_UNSUPPORTED` must never become a digest.** A constant sentinel string
+fed into the discussion-origin content hash would make premise verdict
+PERMANENTLY `current` for that root regardless of how much its real content
+actually drifts -- fail-OPEN, the exact defect Issue #337's premise contract
+exists to prevent (this module's own earlier draft made exactly this
+mistake with a literal `"__unsupported__"` string; caught on review). The
+fix is structural on two levels: `_discussion_origin_provider` returns
+`content_hash=None` for an unsupported root (never a string), which makes
+`PremiseBundle.is_complete` `False` FOREVER for that session -- the finite
+`invalid`/`premise_incomplete` verdict, honest about "cannot verify" rather
+than lying "unchanged" -- and `DISCUSSION_ADAPTERS["overview_finding"]
+.joint_understanding_bridge` is `False`, enforced by `promote_hypothesis`
+itself (`BridgeNotSupported`, 422), so a promotion whose premise this
+bridge cannot back is refused up front rather than silently created in a
+permanently-`invalid` state.
 
 probe-agent:
   role: hypothesis persistence, manual promotion into Joint Understanding,
@@ -60,7 +84,7 @@ import json
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from . import discussion_context_bundle, joint_premise
+from . import discussion_adapters, discussion_context_bundle, joint_premise
 from .db import get_conn
 from .discussion_save_receipts import compute_request_digest
 from .joint_premise import DiscussionOriginFacts
@@ -92,6 +116,24 @@ class HypothesisIncomplete(DiscussionHypothesisError):
     def __init__(self, message: str, code: str):
         super().__init__(message)
         self.code = code
+
+
+class BridgeNotSupported(DiscussionHypothesisError):
+    """The discussion's root `target_kind` declares
+    `joint_understanding_bridge=False` (Issue #455: today only
+    `overview_finding`, whose premise cannot be verified from an
+    already-open connection -- see `DISCUSSION_ADAPTERS["overview_finding"]`'s
+    own comment). The capability flag is read here, not merely displayed:
+    a `True` declaration with no enforcing check behind it would be the
+    exact "declares supported, cannot back it" defect #456 exists to
+    prevent, one layer further out."""
+
+    def __init__(self, target_kind: str):
+        super().__init__(
+            f"target_kind={target_kind!r} does not support Joint Understanding "
+            "promotion (joint_understanding_bridge=False)"
+        )
+        self.target_kind = target_kind
 
 
 class PromotionConflict(DiscussionHypothesisError):
@@ -206,7 +248,28 @@ def _target_digest_with_conn(conn, system_id: int, target_kind: str, target_ref:
     computed directly against `conn` (never opening a nested `get_conn()`).
     Returns the digest string, `None` when the target genuinely no longer
     resolves, or `_UNSUPPORTED` for a target_kind this bridge cannot verify
-    from an already-open connection."""
+    from an already-open connection.
+
+    A resolved-but-revision-less entity's raw digest is `""` (several
+    `discussion_adapters._resolve_<kind>` formulas return `revision[...] if
+    revision else ""`) -- substituted here to
+    `discussion_context_bundle.NO_REVISION_DIGEST`, the SAME sentinel
+    `build_context_bundle` now substitutes when building the dependency
+    manifest (see that constant's own docstring for why `""` cannot be
+    allowed to survive: `normalize_premise_manifest` refuses it, and a
+    caller that instead silently dropped the manifest would be a second,
+    quieter fail-open). Applying it here too -- once, at this function's
+    single choke point, rather than in each branch below -- is what keeps a
+    dependency captured via `build_context_bundle` and the SAME reference
+    re-resolved later via `_dependency_digest_resolver` comparing equal when
+    nothing has changed."""
+    raw = _raw_target_digest_with_conn(conn, system_id, target_kind, target_ref)
+    if raw is _UNSUPPORTED or raw is None:
+        return raw
+    return raw or discussion_context_bundle.NO_REVISION_DIGEST
+
+
+def _raw_target_digest_with_conn(conn, system_id: int, target_kind: str, target_ref: str):
     if target_kind == "screen":
         return ""
     if target_kind == "purpose_element":
@@ -312,7 +375,113 @@ def _target_digest_with_conn(conn, system_id: int, target_kind: str, target_ref:
         return solution_design.content_digest(
             {"title": detail.get("title") or "", "summary": detail.get("summary") or ""}
         )
+    if target_kind == "interview_session":
+        from .discussion_adapters import _normalized_json_digest  # noqa: SLF001
+
+        try:
+            session_id = int(target_ref)
+        except (TypeError, ValueError):
+            return None
+        row = conn.execute(
+            "SELECT id, current_understanding FROM interview_session WHERE id = ? AND system_id = ?",
+            (session_id, system_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return _normalized_json_digest(row["current_understanding"])
+    if target_kind == "understanding_claim":
+        return _resolve_understanding_claim_digest_with_conn(conn, system_id, target_ref)
+    if target_kind == "ux_journey_step":
+        from . import ux_design
+
+        journey_key, sep, step_key = target_ref.partition("#")
+        if not sep or not journey_key or not step_key:
+            return None
+        journey = ux_design._get_journey_row(conn, system_id, journey_key)  # noqa: SLF001
+        if journey is None:
+            return None
+        resolved = ux_design._resolve_step_target(conn, system_id, journey["id"], step_key)  # noqa: SLF001
+        if resolved["resolution"] != "resolved":
+            return None
+        return resolved.get("digest") or ""
+    if target_kind == "blueprint_lane_cell":
+        from . import journey_blueprint
+        from .discussion_adapters import _canonical_digest as _adapters_canonical_digest  # noqa: SLF001
+
+        parts = target_ref.split("#")
+        if len(parts) != 3 or not all(parts):
+            return None
+        journey_key, step_key, lane_kind = parts
+        if lane_kind not in journey_blueprint.LANE_KINDS:
+            return None
+        try:
+            blueprint = journey_blueprint.build_blueprint(conn, system_id, journey_key)
+        except journey_blueprint.NotFound:
+            return None
+        step = next((s for s in blueprint["steps"] if s["step_key"] == step_key), None)
+        if step is None:
+            return None
+        cell = step.get("lanes", {}).get(lane_kind)
+        if cell is None:
+            return None
+        return _adapters_canonical_digest(cell)
+    # `overview_finding` is the one remaining registered kind with no
+    # conn-safe digest here: `discussion_adapters._resolve_overview_finding`
+    # calls `overview_projection.build_overview(system_id)`, which is not
+    # conn-parametrized and re-derives a System-wide projection (Purpose
+    # Chain, runtime health, findings, ...) -- reimplementing it against a
+    # caller-supplied `conn` is a much larger undertaking than this bridge's
+    # scope. `DISCUSSION_ADAPTERS["overview_finding"].joint_understanding_
+    # bridge` is `False` for exactly this reason (see its own comment).
     return _UNSUPPORTED
+
+
+def _resolve_understanding_claim_digest_with_conn(
+    conn, system_id: int, target_ref: str,
+) -> Optional[str]:
+    """Mirrors `discussion_adapters._resolve_understanding_claim`'s digest
+    formula exactly (same `understanding_brief.build_understanding_brief` +
+    `claim_digest`), against the caller's own `conn` -- see this module's
+    docstring for why the original cannot be called directly here."""
+    from . import understanding_brief
+
+    section, sep, name = target_ref.partition(":")
+    if not sep or section not in ("vision", "system_purpose", "core_capabilities") or not name:
+        return None
+    session_row = conn.execute(
+        "SELECT id FROM interview_session WHERE system_id = ? ORDER BY id DESC LIMIT 1",
+        (system_id,),
+    ).fetchone()
+    session_id = session_row["id"] if session_row is not None else None
+    try:
+        brief = understanding_brief.build_understanding_brief(conn, system_id, session_id)
+    except Exception:  # pragma: no cover - defensive, mirrors the adapter's own guard
+        return None
+    claims = {
+        "vision": [brief.vision] if brief.vision is not None else [],
+        "system_purpose": brief.system_purpose,
+        "core_capabilities": brief.core_capabilities,
+    }[section]
+    claim = next((c for c in claims if c.name == name), None)
+    if claim is None:
+        return None
+    raw_item = None
+    if session_id is not None:
+        understanding_row = conn.execute(
+            "SELECT current_understanding FROM interview_session WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if understanding_row is not None and understanding_row["current_understanding"]:
+            try:
+                parsed = json.loads(understanding_row["current_understanding"])
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                for item in parsed.get(section) or []:
+                    if isinstance(item, dict) and str(item.get("name")) == name:
+                        raw_item = item
+                        break
+    return understanding_brief.claim_digest(raw_item) if raw_item is not None else ""
 
 
 # --- app.joint_premise provider registrations ---------------------------------
@@ -330,22 +499,43 @@ def _discussion_origin_provider(
     axis (Issue #461), populated at promotion time from the same
     `discussion_context_bundle` call -- folding it into this hash too would
     make `dependency_content_changed` unreachable (`origin_content_changed`
-    would always fire first)."""
+    would always fire first).
+
+    ``content_hash=None`` (never a constant sentinel string) is returned
+    whenever the root's current content cannot actually be determined --
+    the root no longer has a resolvable proposal (`_root_target_for_
+    hypothesis` returns `None`) or its `target_kind` is outside
+    `_target_digest_with_conn`'s covered set (`_UNSUPPORTED`). A constant
+    string there would make `PremiseBundle.is_complete` (and therefore the
+    stored, CAPTURED `premise_content_hash`) look the same on every future
+    read regardless of how much the real root actually changed -- fail-OPEN,
+    the exact defect #337 exists to prevent (an unreadable/incomputable fact
+    must never read as "unchanged", #380). `content_hash=None` instead makes
+    `PremiseBundle.is_complete` `False` FOREVER for this session (captured
+    once, at promotion time) -- the finite `invalid`/`premise_incomplete`
+    verdict, which blocks `hypothesis_adopted`/`decided` and always asks for
+    reconfirmation in reflux, exactly like a session that never captured a
+    comparable premise at all. A genuinely REMOVED (but supported-kind)
+    target still gets a real, comparable digest (the `"__removed__"`
+    sentinel) -- returning to existence moves it away from that sentinel and
+    is correctly detected as a change; that case is not fail-open."""
     hyp = _hypothesis_row(conn, system_id, origin_id)
     if hyp is None:
         return None
+    incomplete = DiscussionOriginFacts(
+        current_origin_id=hyp["id"],
+        superseded=(hyp["status"] == "rejected"),
+        revision_id=None,
+        content_hash=None,
+    )
     root = _root_target_for_hypothesis(conn, system_id, hyp)
     if root is None:
-        root_kind, root_ref, root_digest = "", "", "__no_root__"
-    else:
-        root_kind, root_ref = root
-        resolved = _target_digest_with_conn(conn, system_id, root_kind, root_ref)
-        if resolved is _UNSUPPORTED:
-            root_digest = "__unsupported__"
-        elif resolved is None:
-            root_digest = "__removed__"
-        else:
-            root_digest = resolved
+        return incomplete
+    root_kind, root_ref = root
+    resolved = _target_digest_with_conn(conn, system_id, root_kind, root_ref)
+    if resolved is _UNSUPPORTED:
+        return incomplete
+    root_digest = "__removed__" if resolved is None else resolved
     payload = _hypothesis_content_payload(hyp)
     payload["root_kind"] = root_kind
     payload["root_ref"] = root_ref
@@ -423,6 +613,9 @@ def promote_hypothesis(
         if root is None:
             raise NotFound(f"proposal {proposal_id} not found")
         root_kind, root_ref = root
+        adapter = discussion_adapters.DISCUSSION_ADAPTERS.get(root_kind)
+        if adapter is None or not adapter.joint_understanding_bridge:
+            raise BridgeNotSupported(root_kind)
         thread_row = conn.execute(
             "SELECT thread_id FROM assistant_discussion_proposal WHERE id = ? AND system_id = ?",
             (proposal_id, system_id),
@@ -470,18 +663,20 @@ def promote_hypothesis(
         # hash's own `root_digest="__removed__"` branch is what actually
         # reports this as `missing` on the very first read.
         dependencies = []
-    except joint_premise.JointPremiseError:
-        # Defensive (found while building this Issue's representative-chain
-        # test): `build_context_bundle` can discover a related entity that
-        # RESOLVES but has no revision yet (a just-created Objective/
-        # Milestone/Journey with an empty digest), and
-        # `normalize_premise_manifest` rejects an empty digest outright.
-        # That is a manifest-BUILDING defect one layer down (#458), not
-        # something this bridge can repair -- but a promotion must never
-        # 500 over it. Falling back to an empty manifest costs only the
-        # dependency-staleness axis for THIS promotion; the discussion-
-        # origin content hash (root digest) still detects a root change.
-        dependencies = []
+    # No `except JointPremiseError` here (deliberately removed on review): a
+    # resolved-but-revision-less related entity used to make
+    # `normalize_premise_manifest` reject the whole manifest, and silently
+    # falling back to an empty one here would have dropped the entire
+    # dependency-staleness axis for this promotion WITHOUT recording that it
+    # happened -- a second, quieter fail-open stacked on top of the first.
+    # The root cause is fixed instead, at the one place a resolved entity's
+    # digest becomes a manifest reference
+    # (`discussion_context_bundle.NO_REVISION_DIGEST`), so
+    # `normalize_premise_manifest` never sees an empty digest from a
+    # legitimately resolved entity any more. A `JointPremiseError` reaching
+    # here now means the manifest is malformed for a reason that fix does
+    # NOT cover -- that must fail this call loudly (500, surfaced to the
+    # caller), never be swallowed into a degraded, unrecorded promotion.
 
     with get_conn() as conn:
         # Defense in depth: another request for the SAME request_id may have

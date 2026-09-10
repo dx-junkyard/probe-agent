@@ -98,6 +98,39 @@ SCHEMA_VERSION = "discussion-context-bundle-v1"
 # Cursor lifetime (DD-CTX-03): "有効期限30分".
 CONTEXT_CURSOR_TTL_SECONDS = 30 * 60
 
+# A RESOLVED related entity's digest can legitimately be "" today for a
+# reason that has NOTHING to do with staleness: several `discussion_adapters.
+# _resolve_<kind>` resolvers (`ux_journey`, `ux_requirement`,
+# `product_objective`, `product_milestone`, `product_feature`,
+# `product_gap` via `product_objective._gap_current_digest`,
+# `understanding_claim`, ...) return `revision["content_digest"] if revision
+# else ""` -- an entity that RESOLVES (it exists, with a stable identity) but
+# has no revision recorded yet reads identically to "".
+#
+# `app.joint_premise.normalize_premise_manifest` refuses an empty digest
+# outright (Issue #461's own contract: "target_kind/target_ref/digest are
+# non-empty"), so a dependency manifest entry naming a real, resolved,
+# revision-less entity made `build_context_bundle` raise `JointPremiseError`
+# for every caller that populates `dependencies` from it (Issue #455 found
+# this while building its representative Gap -> Journey -> Requirement ->
+# Feature chain fixture). Silently degrading to an empty manifest at the
+# CALLER (dropping the whole dependency-staleness axis for that promotion,
+# unrecorded) would be a second, quieter fail-open on top of the first --
+# root cause belongs HERE, at the one place a resolved entity's digest is
+# turned into a comparable manifest reference.
+#
+# This sentinel is a STABLE, real value (never "" and never `None`) standing
+# in for "resolved, no revision recorded yet". It participates in every
+# later digest comparison exactly like a real digest: capturing it now and
+# later finding a REAL digest (once a revision exists) is correctly detected
+# as a change; capturing it now and finding it again unchanged reads as
+# `current`, precisely the honest answer for an entity that still has not
+# moved. It is deliberately NOT `""` (a manifest could then re-degenerate
+# into the exact bug this fixes) and deliberately NOT reused for any OTHER
+# meaning (`"__removed__"` / `"__no_root__"` in `app/discussion_hypothesis.py`
+# are different sentinels for different facts).
+NO_REVISION_DIGEST = "__no_revision__"
+
 
 # --- DD-CTX-02: budget, version-carrying so a later tuning pass is a config
 #     bump, never a silent behaviour change the client cannot see. -----------
@@ -625,7 +658,7 @@ def _build_related_section(
             triggering_reason = triggering_reason or "byte_budget"
         entries.append(entry)
         if resolved.resolution == "resolved":
-            included.append((kind, ref, resolved.digest))
+            included.append((kind, ref, resolved.digest or NO_REVISION_DIGEST))
         if context_result.operation_state == "available":
             sub_extractor = _RELATION_EXTRACTORS.get(kind)
             if sub_extractor is not None:
@@ -651,7 +684,7 @@ def _build_related_section(
                 triggering_reason = triggering_reason or "byte_budget"
             entries.append(entry)
             if resolved.resolution == "resolved":
-                included.append((kind, ref, resolved.digest))
+                included.append((kind, ref, resolved.digest or NO_REVISION_DIGEST))
             # Depth cap: depth-2 entries' own relations are never extracted.
 
     returned_count = len(entries)

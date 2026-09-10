@@ -317,14 +317,19 @@ def test_capabilities_derived_for_blueprint_lane_cell_relations_only():
 
 
 def test_capabilities_derived_for_interview_session_and_overview_finding_discussion_only():
-    for kind in ("interview_session", "overview_finding"):
-        adapter = discussion_adapters.DISCUSSION_ADAPTERS[kind]
-        caps = discussion_adapters.capabilities_for(adapter)
-        # Phase 1 gave these kinds zero OTHER capabilities; Issue #455's JU
-        # bridge is the one capability every kind carries regardless.
-        assert caps == ("promote_joint_understanding",), (
-            f"{kind} should have only the JU bridge capability, got {caps}"
-        )
+    # Phase 1 gave both kinds zero OTHER capabilities. Issue #455's JU bridge
+    # is the one capability MOST kinds carry regardless -- but `overview_
+    # finding` is the one exception (see its own `joint_understanding_
+    # bridge=False` comment: its premise cannot be verified from an
+    # already-open connection, so declaring the capability true would be
+    # exactly #456's "declares supported, cannot back it" defect one layer
+    # further out).
+    interview_session = discussion_adapters.DISCUSSION_ADAPTERS["interview_session"]
+    assert discussion_adapters.capabilities_for(interview_session) == (
+        "promote_joint_understanding",
+    )
+    overview_finding = discussion_adapters.DISCUSSION_ADAPTERS["overview_finding"]
+    assert discussion_adapters.capabilities_for(overview_finding) == ()
 
 
 def test_every_adapter_capabilities_are_a_subset_of_the_finite_vocabulary():
@@ -339,8 +344,11 @@ _KINDS_WITH_UI_DRAFT_FORMS = frozenset(
 
 
 def test_phase_2_children_and_ju_bridge_stay_empty_ui_draft_forms_is_the_new_field():
-    # Issue #455 turns on `joint_understanding_bridge` for every kind (the
-    # bridge never special-cases target_kind). #454 (Epic #443 §5.1)
+    # Issue #455 turns on `joint_understanding_bridge` for every kind whose
+    # premise it can actually verify from an already-open connection
+    # (`app/discussion_hypothesis._target_digest_with_conn`'s covered set) --
+    # `overview_finding` is the one deliberate exception (see its own
+    # `joint_understanding_bridge=False` comment). #454 (Epic #443 §5.1)
     # populates `children` for exactly ONE kind (`ux_requirement`'s
     # `acceptance_criterion`) -- every other kind's `children` stays `()`.
     # `ui_draft_forms` stays populated only for the 4 kinds whose Dashboard
@@ -352,7 +360,10 @@ def test_phase_2_children_and_ju_bridge_stay_empty_ui_draft_forms_is_the_new_fie
             assert [c.child_kind for c in adapter.children] == ["acceptance_criterion"]
         else:
             assert adapter.children == (), f"{kind} should have no ChildSpec yet"
-        assert adapter.joint_understanding_bridge is True
+        if kind == "overview_finding":
+            assert adapter.joint_understanding_bridge is False
+        else:
+            assert adapter.joint_understanding_bridge is True, kind
         if kind in _KINDS_WITH_UI_DRAFT_FORMS:
             assert adapter.ui_draft_forms != (), f"{kind} should have a ui_draft_forms entry"
         else:

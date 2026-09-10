@@ -34,8 +34,9 @@ allowlist と handler を全選択 item について検査してから、登録 
 実LLM・音声機器・screen readerによるdogfoodingの完了証明ではない。
 
 #455 実装後、server の `tests/ -k "discussion or premise or joint_understanding"`
-は418 passed（#455 の新規テストは `test_discussion_hypothesis.py` 16件 +
-`test_joint_understanding_discussion_scope.py` への追加1件）。Dashboard
+は425 passed（#455 の新規テストは `test_discussion_hypothesis.py` 23件 +
+`test_joint_understanding_discussion_scope.py` への追加1件。レビューで
+premise の fail-open 欠陥2件を修正し、7件を追加済み）。Dashboard
 `npx vitest run` は53ファイル1144 passed、`npx tsc -b --noEmit` は exit 0。
 これも実LLM・音声機器・screen readerによるdogfoodingの完了証明ではない。
 
@@ -1068,14 +1069,65 @@ child_changes と同じ fail-closed 規律 — その hypothesis だけを落と
   `db.get_conn()` の中から呼ばれる (`resolve_dependency_digests(conn, ...)`)
   ため、**`discussion_adapters._resolve_<kind>` を直接呼べない**
   (それ自身が `with get_conn():` を持ち、再入で `DatabaseReentrancyError`
-  になる)。`_target_digest_with_conn` は同じ digest 式を `conn` を直接使って
-  再実装する (`purpose_element` / `purpose_relation` / `stakeholder` /
+  になる)。`_raw_target_digest_with_conn` は同じ digest 式を `conn` を直接
+  使って再実装する (`purpose_element` / `purpose_relation` / `stakeholder` /
   `stakeholder_need` / `product_objective` / `product_milestone` /
   `product_gap` / `product_feature` / `ux_journey` / `ux_requirement` /
-  `solution_design` / `screen` の 12 kind をカバー)。カバー外の kind は
-  `_UNSUPPORTED` として `None` (「解決できない」= 依存が `missing` 側へ倒れる、
-  `current` に倒れることは無い) を返す — fail-closed な既知の簡略化であり、
-  対応拡大は additive。
+  `solution_design` / `screen` / `interview_session` / `understanding_claim`
+  / `ux_journey_step` / `blueprint_lane_cell` の 16 kind をカバー、17 kind 中
+  `overview_finding` だけが未対応 — 下記参照)。
+- **カバー外の kind は `_UNSUPPORTED`、premise は必ず `invalid` に倒れる
+  (fail-closed であって fail-open ではない)。** レビューで、`_UNSUPPORTED` を
+  定数文字列 `"__unsupported__"` として content hash に混ぜていた版が
+  **fail-open だった**ことが判明した: 定数はどう評価しても一致するため、
+  premise が永久に `current` になり、実際には変わり続ける root に対して
+  `hypothesis_adopted`/`decided`/還流が通ってしまっていた。
+  `_target_digest_with_conn`(公開関数、`_raw_target_digest_with_conn`の
+  wrapper)が `_UNSUPPORTED` を返す root は、`_discussion_origin_provider` が
+  **`content_hash=None`** を返す — 定数文字列ではなく `None` であることが
+  本質で、`PremiseBundle.is_complete`（`tracking_version` /`commit_sha`/
+  `content_hash`/`capability_digest` の非空を要求）を昇格の**その瞬間から
+  永久に** False にし、`invalid`/`premise_incomplete` verdict へ固定する。
+  `evaluate_joint_premise` はこのチェックを他のどの比較よりも先に行うため、
+  以後の再評価が何度実行されても `current` へは絶対に到達しない
+  (`tests/test_discussion_hypothesis.py`
+  `TestPremiseFailClosedForUnsupportedRoot` が直接表明)。
+  `_dependency_digest_resolver` も同じ `_UNSUPPORTED` を `None`
+  (「解決できない」= 依存が `missing` 側へ倒れる、`current` に倒れることは
+  無い)として返す。
+- **capability は宣言だけでなく実施される。** `DiscussionAdapter.
+  joint_understanding_bridge` は `overview_finding` だけ `False`
+  (`_resolve_overview_finding` は `overview_projection.build_overview
+  (system_id)` を呼び、conn 引数を取らず System 全体の projection を
+  再導出するため、`conn` 直渡しでの再実装が本 Issue の範囲を大きく超える)。
+  他 16 kind は `True`。`promote_hypothesis` は root の
+  `adapter.joint_understanding_bridge` を実際に読み、`False` なら
+  昇格を **422 `discussion_hypothesis_bridge_unsupported`** で拒否し、
+  hypothesis の status も何も変更しない — capability フラグが
+  「実装の無い対応済み宣言」(#456 が閉じた欠陥) にならないよう、
+  宣言と同じファイルに強制チェックを持たせている。
+- **resolve できるが revision がまだ無い関連 entity は、空文字列ではなく
+  `discussion_context_bundle.NO_REVISION_DIGEST`(`"__no_revision__"`)という
+  安定した sentinel digest を持つ。** `ux_journey`/`ux_requirement`/
+  `product_objective`/`product_milestone`/`product_feature`/`product_gap`
+  (`product_objective._gap_current_digest` 経由)/`understanding_claim` の
+  digest 式はどれも「revision が無ければ `""`」という形をしており、
+  `app.joint_premise.normalize_premise_manifest` は空 digest を無条件で
+  拒否するため、依存 manifest にこの手のエンティティが 1 つでも入ると
+  `build_context_bundle` 全体が例外で落ちていた(レビューで発覚)。
+  最初の修正案 — `promote_hypothesis` 側で例外を握りつぶし空 manifest へ
+  degrade — は**依存 staleness 軸を無記録のまま無効化する**別の fail-open
+  だったため採らない。正しい直し方は根本(`discussion_context_bundle.
+  _build_related_section` が `included`/`dependencies` を組み立てる
+  唯一の箇所)で、`resolved.digest or NO_REVISION_DIGEST` に置き換える
+  こと。sentinel は本物の比較可能な値なので、後から revision が付いて
+  digest が変われば正しく `dependency_content_changed` で stale になる。
+  `app/discussion_hypothesis._target_digest_with_conn` も同じ sentinel を
+  同じ判断基準(空文字列なら置換)で返すので、bundle 側で capture した値と
+  resolver 側で再計算した値が一致し続ける。`promote_hypothesis` の
+  `except JointPremiseError` フォールバックは削除済み — 正規化がここで
+  例外を投げるなら、それは既知の原因ではない別の欠陥であり、黙って
+  劣化させず呼び出し元へそのまま伝播させる。
 - **昇格要求 ID (`request_id`) は `(system_id, request_id)` で UNIQUE**
   (hypothesis_id では区切らない)。同一 `request_id` を別 hypothesis へ使うと
   `request_digest` (hypothesis_id を含む canonical hash) が食い違い 409
