@@ -65,13 +65,14 @@ combines a DB read with an LLM call.
 from __future__ import annotations
 
 import json
+import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field as PydanticField, ValidationError
 
-from . import discussion_adapters, journey_blueprint, solution_design, ux_design
+from . import discussion_adapters, journey_blueprint, product_feature, product_objective, solution_design, ux_design
 from .db import get_conn
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 
@@ -94,8 +95,13 @@ MAX_LISTED_PROPOSALS = 50
 #: `tests/test_assistant_discussion_proposals.py`. This stays a literal
 #: module-level dict (not a function) because callers below read the bare
 #: `PROPOSAL_TARGET_SCHEMA` name at call time -- see the module docstring.
-PROPOSAL_TARGET_SCHEMA: Dict[str, Dict[str, Tuple[str, ...]]] = {
-    kind: {"fields": adapter.fields, "relations": adapter.relations}
+#: Issue #454 (§5.1/§5.3): each entry also carries `"children"`, the
+#: adapter's `ChildSpec` tuple -- `generate_proposal`'s child-change
+#: validation reads it the same way it reads `"fields"`/`"relations"`, so a
+#: narrowed/widened `children` registry is honoured immediately without a
+#: second schema dict to keep in sync.
+PROPOSAL_TARGET_SCHEMA: Dict[str, Dict[str, Any]] = {
+    kind: {"fields": adapter.fields, "relations": adapter.relations, "children": adapter.children}
     for kind, adapter in discussion_adapters.DISCUSSION_ADAPTERS.items()
 }
 
@@ -200,6 +206,29 @@ class ProposedRelationChange:
 
 
 @dataclass
+class ProposedChildChange:
+    """§5.1 (Issue #454): one row of a nested/list change against a
+    `ChildSpec`. Mirrors a single `assistant_discussion_proposal_item`
+    row's own child columns -- `create_proposal` persists one of these
+    per raw model entry, never grouping several into one row. `child_key`
+    is populated (a REAL existing key, already validated in
+    `generate_proposal`) for `update`/`remove`; it is empty for `add`,
+    where `client_temp_key` is the model's own in-generation correlation id
+    and `create_proposal` mints the real, stable `child_key` (the
+    "reserved key", §5.1's Decisions) at persistence time."""
+
+    child_kind: str
+    child_intent: str
+    child_key: str = ""
+    client_temp_key: str = ""
+    child_order: Optional[int] = None
+    field_name: str = ""
+    current_value: str = ""
+    proposed_value: str = ""
+    rationale: str = ""
+
+
+@dataclass
 class ProposalGenerationResult:
     provider: str
     model: str
@@ -211,6 +240,11 @@ class ProposalGenerationResult:
     unresolved_questions: List[str] = field(default_factory=list)
     field_changes: List[ProposedFieldChange] = field(default_factory=list)
     relation_changes: List[ProposedRelationChange] = field(default_factory=list)
+    #: Issue #454. Deliberately NOT a place for `unresolved_questions` /
+    #: `assumptions` / a hypothesis -- §5.5 keeps those independent types;
+    #: only actual add/update/remove/reorder changes against a registered
+    #: `ChildSpec` land here.
+    child_changes: List[ProposedChildChange] = field(default_factory=list)
     evidence_refs: List[str] = field(default_factory=list)
     assumptions: List[str] = field(default_factory=list)
     error: Optional[str] = None
@@ -244,6 +278,27 @@ class _RawRelationChange(BaseModel):
     rationale: str = PydanticField(default="", max_length=2000)
 
 
+class _RawChildChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    child_kind: str
+    child_intent: str
+    #: Required for `update`/`remove`; must be empty for `add` -- checked in
+    #: `generate_proposal`, not here, since "empty depends on `child_intent`"
+    #: is a cross-field rule Pydantic's per-field validation cannot express
+    #: as cleanly as an explicit branch (matches this module's existing
+    #: `_subject_ref_required` cross-field checks below).
+    child_key: str = ""
+    #: Required for `add` (the model's own in-generation correlation id, so
+    #: several field rows can name the SAME new child); ignored otherwise.
+    client_temp_key: str = ""
+    child_order: Optional[int] = None
+    field_name: str = ""
+    current_value: str = ""
+    proposed_value: str = PydanticField(default="", max_length=8000)
+    rationale: str = PydanticField(default="", max_length=2000)
+
+
 class _RawProposalResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -254,6 +309,7 @@ class _RawProposalResponse(BaseModel):
     evidence_refs: List[str] = PydanticField(default_factory=list, max_length=20)
     field_changes: List[_RawFieldChange] = PydanticField(default_factory=list, max_length=20)
     relation_changes: List[_RawRelationChange] = PydanticField(default_factory=list, max_length=20)
+    child_changes: List[_RawChildChange] = PydanticField(default_factory=list, max_length=40)
 
 
 def _strip_fences(raw: str) -> str:
@@ -270,10 +326,10 @@ def _strip_fences(raw: str) -> str:
 _SYSTEM_PROMPT = """\
 You are summarizing a scoped discussion thread about ONE specific design
 target into a REVIEWABLE, STRUCTURED change proposal. You never invent a
-fact the conversation does not support, and you never propose a field name
-or relation kind outside the ones explicitly listed for this target -- an
-unlisted name fails the ENTIRE proposal, so when in doubt, omit it rather
-than guess.
+fact the conversation does not support, and you never propose a field name,
+relation kind, or child_kind outside the ones explicitly listed for this
+target -- an unlisted name fails the ENTIRE proposal, so when in doubt, omit
+it rather than guess.
 
 Respond with a single JSON object and nothing else (no markdown fences, no
 commentary), matching exactly this shape:
@@ -291,6 +347,12 @@ commentary), matching exactly this shape:
   "relation_changes": [
     {"relation_kind": "...", "subject_ref": "", "relation_target_kind": "...",
      "relation_target_ref": "...", "proposed_value": "...", "rationale": "..."}
+  ],
+  "child_changes": [
+    {"child_kind": "...", "child_intent": "add|update|remove",
+     "child_key": "", "client_temp_key": "...", "child_order": null,
+     "field_name": "...", "current_value": "...", "proposed_value": "...",
+     "rationale": "..."}
   ]
 }
 
@@ -300,9 +362,29 @@ Rules:
 - "subject_ref" is a sub-address INSIDE the target (only meaningful for a
   Solution Design Option's own key); leave it "" unless the target facts
   name one.
+- A "child_changes" entry addresses ONE row of a nested/list collection
+  named in "allowed_children" below (e.g. one Acceptance Criterion).
+  "child_kind" must be exactly one of "allowed_children"'s own kinds.
+  "child_intent" is exactly one of "add" / "update" / "remove".
+  For "update"/"remove": "child_key" MUST be one of the existing keys shown
+  in "target_current_facts" for that child_kind -- never invent one, and
+  leave "client_temp_key" "".
+  For "add": leave "child_key" "" (the server assigns the real key) and set
+  "client_temp_key" to any string of YOUR choosing that is unique within
+  THIS response, so several rows describing the SAME new child (e.g. its
+  "statement" and its "verification_method") can reuse the same
+  "client_temp_key" to be recognized as one new child.
+  "field_name" (when non-empty) must be one of that child_kind's own
+  "fields" in "allowed_children". Use "" for a row that changes ONLY
+  "child_order" (a pure reorder, with no field content change) -- put a
+  reorder and a content change in SEPARATE rows so either can be reviewed
+  and applied on its own.
+  Never propose a child_change for an unresolved question, a hypothesis, or
+  something the conversation has not actually decided -- leave those in
+  "unresolved_questions"/"assumptions" instead.
 - Never propose a change the conversation does not actually support.
-- If nothing can be proposed, return empty "field_changes" and
-  "relation_changes" arrays -- do not guess.
+- If nothing can be proposed, return empty "field_changes",
+  "relation_changes", and "child_changes" arrays -- do not guess.
 """
 
 
@@ -312,15 +394,20 @@ def _build_user_prompt(
     target_title: str,
     turns: Sequence[Dict[str, Any]],
     target_facts: Dict[str, Any],
-    schema: Dict[str, Tuple[str, ...]],
+    schema: Dict[str, Any],
 ) -> str:
     convo = "\n".join(f"{t.get('role', '?')}: {t.get('content', '')}" for t in turns)
+    allowed_children = [
+        {"child_kind": c.child_kind, "fields": list(c.fields)}
+        for c in schema.get("children", ())
+    ]
     parts = [
         f"target_kind: {target_kind}",
         f"target_ref: {target_ref}",
         f"target_title: {target_title}",
         f"allowed_fields: {json.dumps(list(schema.get('fields', ())))}",
         f"allowed_relations: {json.dumps(list(schema.get('relations', ())))}",
+        f"allowed_children: {json.dumps(allowed_children, ensure_ascii=False)}",
         f"target_current_facts: {json.dumps(target_facts, ensure_ascii=False)}",
         "conversation:",
         convo or "(no messages yet)",
@@ -386,7 +473,7 @@ def generate_proposal(
             error_kind="unavailable",
         )
 
-    schema = PROPOSAL_TARGET_SCHEMA.get(target_kind, {"fields": (), "relations": ()})
+    schema = PROPOSAL_TARGET_SCHEMA.get(target_kind, {"fields": (), "relations": (), "children": ()})
     prompt = _build_user_prompt(target_kind, target_ref, target_title, turns, target_facts, schema)
 
     try:
@@ -472,12 +559,91 @@ def generate_proposal(
             )
         )
 
+    # --- Issue #454 §5.1/§5.4: child (nested/list) changes ---------------------
+    # Fail-closed exactly like field_changes/relation_changes above: an
+    # unknown child_kind/field_name, a malformed intent, or an update/remove
+    # naming a child_key that does not ACTUALLY exist right now fails the
+    # WHOLE proposal (never dropped silently) -- and a legitimate `add`
+    # (empty child_key + a client_temp_key) is never caught by the
+    # unknown-key check below, since that check only runs for update/remove.
+    child_specs = {c.child_kind: c for c in schema.get("children", ())}
+    existing_child_keys: Dict[str, Set[str]] = {}
+    for kind, spec in child_specs.items():
+        existing_child_keys[kind] = {
+            str(row.get(spec.key_field))
+            for row in (target_facts.get(spec.context_list_key) or [])
+            if isinstance(row, dict) and row.get(spec.key_field)
+        }
+
+    child_changes: List[ProposedChildChange] = []
+    for raw_item in validated.child_changes:
+        spec = child_specs.get(raw_item.child_kind)
+        if spec is None:
+            return ProposalGenerationResult(
+                provider=config.provider, model=config.model, is_mock=False,
+                error=f"Model proposed a child_kind outside the registry: {raw_item.child_kind!r}",
+                error_kind="invalid_registry",
+            )
+        if raw_item.child_intent not in ("add", "update", "remove"):
+            return ProposalGenerationResult(
+                provider=config.provider, model=config.model, is_mock=False,
+                error=f"Model proposed an unknown child_intent: {raw_item.child_intent!r}",
+                error_kind="invalid_registry",
+            )
+        if raw_item.field_name and raw_item.field_name not in spec.fields:
+            return ProposalGenerationResult(
+                provider=config.provider, model=config.model, is_mock=False,
+                error=(
+                    f"Model proposed a child field outside the registry: "
+                    f"{raw_item.field_name!r} for child_kind {raw_item.child_kind!r}"
+                ),
+                error_kind="invalid_registry",
+            )
+        if raw_item.child_intent == "add":
+            if raw_item.child_key.strip():
+                return ProposalGenerationResult(
+                    provider=config.provider, model=config.model, is_mock=False,
+                    error=(
+                        f"child_kind {raw_item.child_kind!r} 'add' must not supply a "
+                        "child_key -- the server assigns it"
+                    ),
+                    error_kind="invalid_registry",
+                )
+            if not raw_item.client_temp_key.strip():
+                return ProposalGenerationResult(
+                    provider=config.provider, model=config.model, is_mock=False,
+                    error=f"child_kind {raw_item.child_kind!r} 'add' requires client_temp_key",
+                    error_kind="invalid_registry",
+                )
+        else:  # update / remove
+            if not raw_item.child_key.strip() or raw_item.child_key not in existing_child_keys.get(
+                raw_item.child_kind, set()
+            ):
+                return ProposalGenerationResult(
+                    provider=config.provider, model=config.model, is_mock=False,
+                    error=(
+                        f"child_kind {raw_item.child_kind!r} {raw_item.child_intent!r} named an "
+                        f"unknown child_key: {raw_item.child_key!r}"
+                    ),
+                    error_kind="invalid_registry",
+                )
+        child_changes.append(
+            ProposedChildChange(
+                child_kind=raw_item.child_kind, child_intent=raw_item.child_intent,
+                child_key=raw_item.child_key, client_temp_key=raw_item.client_temp_key,
+                child_order=raw_item.child_order, field_name=raw_item.field_name,
+                current_value=raw_item.current_value, proposed_value=raw_item.proposed_value,
+                rationale=raw_item.rationale,
+            )
+        )
+
     return ProposalGenerationResult(
         provider=config.provider, model=config.model, is_mock=False,
         summary=validated.summary, confirmed_points=list(validated.confirmed_points),
         unresolved_questions=list(validated.unresolved_questions),
         assumptions=list(validated.assumptions), evidence_refs=list(validated.evidence_refs),
         field_changes=field_changes, relation_changes=relation_changes,
+        child_changes=child_changes,
     )
 
 
@@ -551,13 +717,23 @@ def _prefill_stats(conn, proposal_id: int) -> Dict[int, Dict[str, Any]]:
     return {r["item_id"]: {"prefill_count": r["n"], "last_prefilled_at": r["last_at"]} for r in rows}
 
 
-def _item_address(item: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
+def _item_address(item: Dict[str, Any]) -> Tuple[str, str, str, str, str, str, str, str]:
+    """Issue #454: extended with `(child_kind, child_key, child_intent)` so
+    two rows addressing the SAME child through DIFFERENT `field_name`s (one
+    row per field, §5.1) are correctly treated as different addresses --
+    while two rows that somehow named the exact same
+    `(child_kind, child_key, child_intent, field_name)` are still caught as
+    a duplicate/conflicting apply, the same protection the original 5-tuple
+    already gave field/relation items."""
     return (
         item.get("subject_ref") or "",
         item.get("field_name") or "",
         item.get("relation_kind") or "",
         item.get("relation_target_kind") or "",
         item.get("relation_target_ref") or "",
+        item.get("child_kind") or "",
+        item.get("child_key") or "",
+        item.get("child_intent") or "",
     )
 
 
@@ -576,7 +752,24 @@ def evaluate_item_eligibility(
     if adapter is None:
         return "forbidden"
     if item["item_kind"] == "field":
-        allowed = adapter.field_applier is not None and item["field_name"] in adapter.fields
+        child_kind = item.get("child_kind") or ""
+        if child_kind:
+            # Issue #454 §5.1/§5.3: the SECOND (apply-time) registry check a
+            # child item gets, independent of the generation-time check
+            # `generate_proposal` already ran -- a `ChildSpec` removed from
+            # the adapter (or narrowed to drop this `field_name`) after
+            # generation makes an already-stored item `forbidden`, the same
+            # narrowed-registry defense `TestOutOfRegistryFailsClosed`
+            # already exercises for plain fields.
+            spec = next((c for c in adapter.children if c.child_kind == child_kind), None)
+            allowed = (
+                adapter.field_applier is not None
+                and spec is not None
+                and item.get("child_intent") in ("add", "update", "remove")
+                and (not item["field_name"] or item["field_name"] in spec.fields)
+            )
+        else:
+            allowed = adapter.field_applier is not None and item["field_name"] in adapter.fields
     elif item["item_kind"] == "relation":
         allowed = adapter.relation_applier is not None and item["relation_kind"] in adapter.relations
         if allowed and target_kind == "blueprint_lane_cell":
@@ -663,6 +856,31 @@ def create_proposal(
                 (
                     system_id, proposal_id, rc.relation_kind, rc.relation_target_kind,
                     rc.relation_target_ref, rc.subject_ref, rc.proposed_value, rc.rationale, now,
+                ),
+            )
+        # Issue #454 §5.1's Decisions: an `add`'s real, stable `child_key`
+        # (the "reserved key") is minted HERE, once, keyed by the model's own
+        # `client_temp_key` -- every row sharing the same `client_temp_key`
+        # (e.g. one new Acceptance Criterion's `statement` and `verification_
+        # method` on two separate rows) gets the SAME reserved key, and that
+        # key never changes again once persisted (it is simply read off this
+        # item row on every later apply/prefill attempt/retry).
+        reserved_by_temp_key: Dict[str, str] = {}
+        for cc in result.child_changes:
+            child_key = cc.child_key
+            if cc.child_intent == "add":
+                if cc.client_temp_key not in reserved_by_temp_key:
+                    reserved_by_temp_key[cc.client_temp_key] = f"disc-{secrets.token_urlsafe(9)}"
+                child_key = reserved_by_temp_key[cc.client_temp_key]
+            conn.execute(
+                """INSERT INTO assistant_discussion_proposal_item
+                       (system_id, proposal_id, item_kind, field_name, current_value,
+                        proposed_value, rationale, child_kind, child_key, child_intent,
+                        child_order, created_at)
+                   VALUES (?, ?, 'field', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    system_id, proposal_id, cc.field_name, cc.current_value, cc.proposed_value,
+                    cc.rationale, cc.child_kind, child_key, cc.child_intent, cc.child_order, now,
                 ),
             )
         conn.execute("COMMIT")
@@ -795,6 +1013,148 @@ def _apply_ux_requirement_field(conn, system_id: int, requirement_key: str, fiel
     return f"requirement_revision:{new_detail['current_revision_id']}"
 
 
+def _apply_ux_requirement_child(conn, system_id: int, requirement_key: str, item: Dict[str, Any], actor: Optional[str]) -> str:
+    """Issue #454 §5.1: the ONE ChildSpec applier this Issue wires end to
+    end (`ux_requirement` / `acceptance_criterion`). Reads the FULL current
+    criteria list, applies exactly this one item's add/update/remove (and,
+    independently, its `child_order` move), and writes a whole new
+    Requirement revision through the SAME existing `add_requirement_revision`
+    a human-authored write would use -- never a direct write to
+    `ux_requirement_acceptance_criterion`.
+
+    This is the SECOND (apply-time, §5.3) validation layer for `update`/
+    `remove`: `generate_proposal` already checked the `child_key` existed
+    against the context SNAPSHOT taken at generation time; this re-reads the
+    LIVE table and raises `NotFound` if the key is gone now -- defense in
+    depth on top of the digest-staleness check `evaluate_item_eligibility`
+    already performs before ANY item in the proposal is applied (removing
+    or editing an Acceptance Criterion always produces a new Requirement
+    revision, which changes the Requirement's overall `content_digest`, so a
+    genuinely concurrent edit is caught THERE, before any write in this
+    apply batch happens at all).
+    """
+    child_key = item["child_key"]
+    child_intent = item["child_intent"]
+    child_order = item.get("child_order")
+    field_name = item.get("field_name") or ""
+    proposed_value = item.get("proposed_value") or ""
+
+    detail = ux_design.get_requirement_detail(conn, system_id, requirement_key)
+    rev = detail.get("current_revision") or {}
+    req_fields = {f: rev.get(f, "") for f in PROPOSAL_TARGET_SCHEMA["ux_requirement"]["fields"]}
+    criteria = [{k: c.get(k, "") for k in _CRITERION_KEYS} for c in rev.get("acceptance_criteria", [])]
+    by_key = {c["criterion_key"]: c for c in criteria}
+
+    if child_intent == "remove":
+        if child_key not in by_key:
+            raise NotFound(f"acceptance_criterion {child_key!r} not found in {requirement_key!r}")
+        criteria = [c for c in criteria if c["criterion_key"] != child_key]
+    elif child_intent == "update":
+        target = by_key.get(child_key)
+        if target is None:
+            raise NotFound(f"acceptance_criterion {child_key!r} not found in {requirement_key!r}")
+        if field_name:
+            target[field_name] = proposed_value
+        if child_order is not None:
+            target["criterion_order"] = child_order
+    elif child_intent == "add":
+        existing = by_key.get(child_key)
+        if existing is None:
+            new_criterion = {k: "" for k in _CRITERION_KEYS}
+            new_criterion["criterion_key"] = child_key
+            new_criterion["criterion_order"] = child_order if child_order is not None else len(criteria)
+            # `verification_method` has a restricted, non-empty finite
+            # vocabulary (`add_requirement_revision`'s own `_check_
+            # membership`, via `criterion.get("verification_method",
+            # "manual_review")`) -- that function's own default only
+            # applies when the KEY IS ABSENT, so a brand new criterion must
+            # seed it here rather than leave the initializer's blank "".
+            new_criterion["verification_method"] = "manual_review"
+            if field_name:
+                new_criterion[field_name] = proposed_value
+            criteria.append(new_criterion)
+        else:
+            # A sibling item for the SAME reserved key already ran in this
+            # same `apply_items` batch (e.g. this new criterion's
+            # `statement` was applied a moment ago and this row carries its
+            # `verification_method`) -- compound onto it rather than
+            # duplicating the row.
+            if field_name:
+                existing[field_name] = proposed_value
+            if child_order is not None:
+                existing["criterion_order"] = child_order
+    else:
+        raise InvalidField(f"unknown child_intent {child_intent!r}")
+
+    new_detail = ux_design.add_requirement_revision(
+        conn, system_id=system_id, requirement_key=requirement_key, acceptance_criteria=criteria,
+        authored_by_kind="reasoning_model", decision_method="manual", created_by=actor, **req_fields,
+    )
+    return f"requirement_revision:{new_detail['current_revision_id']}"
+
+
+def _apply_product_objective_field(conn, system_id: int, objective_key: str, field_name: str, proposed_value: str, actor: Optional[str]) -> str:
+    detail = product_objective.get_objective_detail(conn, system_id, objective_key)
+    rev = detail.get("current_revision") or {}
+    kwargs = {f: rev.get(f, "") for f in PROPOSAL_TARGET_SCHEMA["product_objective"]["fields"]}
+    kwargs[field_name] = proposed_value
+    new_detail = product_objective.add_objective_revision(
+        conn, system_id=system_id, objective_key=objective_key,
+        authored_by_kind="reasoning_model", decision_method="manual", created_by=actor, **kwargs,
+    )
+    return f"product_objective_revision:{new_detail['current_revision_id']}"
+
+
+def _apply_product_milestone_field(conn, system_id: int, milestone_key: str, field_name: str, proposed_value: str, actor: Optional[str]) -> str:
+    detail = product_objective.get_milestone_detail(conn, system_id, milestone_key)
+    rev = detail.get("current_revision") or {}
+    kwargs = {f: rev.get(f, "") for f in PROPOSAL_TARGET_SCHEMA["product_milestone"]["fields"]}
+    # `verification_method` has a restricted, non-empty finite vocabulary
+    # (`add_milestone_revision`'s own `_check_membership`) -- when there is
+    # no current revision yet (or it somehow carries ""), fall back to the
+    # function's own default rather than propagating an empty string that
+    # membership-checking would reject outright.
+    if not kwargs.get("verification_method"):
+        kwargs["verification_method"] = "unavailable"
+    kwargs[field_name] = proposed_value
+    new_detail = product_objective.add_milestone_revision(
+        conn, system_id=system_id, milestone_key=milestone_key,
+        authored_by_kind="reasoning_model", decision_method="manual", created_by=actor, **kwargs,
+    )
+    return f"product_milestone_revision:{new_detail['current_revision_id']}"
+
+
+def _apply_product_gap_field(conn, system_id: int, gap_key: str, field_name: str, proposed_value: str, actor: Optional[str]) -> str:
+    detail = product_objective.get_gap_detail(conn, system_id, gap_key)
+    rev = detail.get("current_revision") or {}
+    kwargs = {f: rev.get(f, "") for f in PROPOSAL_TARGET_SCHEMA["product_gap"]["fields"]}
+    # `target_state_mode` is a structural axis, not proposable free-text
+    # content (§5.2 keeps it out of `_PRODUCT_GAP_FIELDS`) -- it MUST still
+    # be threaded through from the current revision, since
+    # `add_gap_revision` would otherwise silently reset an
+    # `inherited_from_milestone`/`own` Gap back to its own default
+    # (`"unknown"`) on every unrelated field proposal.
+    kwargs["target_state_mode"] = rev.get("target_state_mode", "unknown")
+    kwargs[field_name] = proposed_value
+    new_detail = product_objective.add_gap_revision(
+        conn, system_id=system_id, gap_key=gap_key,
+        authored_by_kind="reasoning_model", decision_method="manual", created_by=actor, **kwargs,
+    )
+    return f"product_gap_revision:{new_detail['current_revision_id']}"
+
+
+def _apply_product_feature_field(conn, system_id: int, feature_key: str, field_name: str, proposed_value: str, actor: Optional[str]) -> str:
+    detail = product_feature.get_feature_detail(conn, system_id, feature_key)
+    rev = detail.get("current_revision") or {}
+    kwargs = {f: rev.get(f, "") for f in PROPOSAL_TARGET_SCHEMA["product_feature"]["fields"]}
+    kwargs[field_name] = proposed_value
+    new_detail = product_feature.add_feature_revision(
+        conn, system_id=system_id, feature_key=feature_key,
+        authored_by_kind="reasoning_model", decision_method="manual", created_by=actor, **kwargs,
+    )
+    return f"product_feature_revision:{new_detail['current_revision_id']}"
+
+
 def _apply_solution_design_field(conn, system_id: int, design_key: str, item: Dict[str, Any], actor: Optional[str]) -> str:
     option_key = (item.get("subject_ref") or "").strip()
     if not option_key:
@@ -854,6 +1214,13 @@ def _apply_understanding_claim_field(
 def _apply_field(conn, system_id: int, target_kind: str, target_ref: str, item: Dict[str, Any], actor: Optional[str], resolved: Any) -> str:
     field_name = item["field_name"]
     proposed_value = item["proposed_value"]
+    # Issue #454: a child item is still `item_kind='field'`, distinguished
+    # by a non-empty `child_kind` -- routed to its own child applier BEFORE
+    # the plain per-target_kind dispatch below, since the two addressing
+    # schemes (top-level field vs. nested child) never overlap for the same
+    # target_kind.
+    if target_kind == "ux_requirement" and (item.get("child_kind") or ""):
+        return _apply_ux_requirement_child(conn, system_id, target_ref, item, actor)
     if target_kind == "ux_journey":
         return _apply_ux_journey_field(conn, system_id, target_ref, field_name, proposed_value, actor)
     if target_kind == "ux_journey_step":
@@ -864,6 +1231,14 @@ def _apply_field(conn, system_id: int, target_kind: str, target_ref: str, item: 
         return _apply_solution_design_field(conn, system_id, target_ref, item, actor)
     if target_kind == "understanding_claim":
         return _apply_understanding_claim_field(conn, system_id, target_ref, item, actor, resolved)
+    if target_kind == "product_objective":
+        return _apply_product_objective_field(conn, system_id, target_ref, field_name, proposed_value, actor)
+    if target_kind == "product_milestone":
+        return _apply_product_milestone_field(conn, system_id, target_ref, field_name, proposed_value, actor)
+    if target_kind == "product_gap":
+        return _apply_product_gap_field(conn, system_id, target_ref, field_name, proposed_value, actor)
+    if target_kind == "product_feature":
+        return _apply_product_feature_field(conn, system_id, target_ref, field_name, proposed_value, actor)
     raise InvalidField(f"{target_kind} has no proposable field {field_name!r}")
 
 
@@ -938,6 +1313,67 @@ def _apply_relation(conn, system_id: int, target_kind: str, target_ref: str, ite
                 created_by=actor,
             )
             return f"journey_step_exchange_link:{row['id']}"
+
+    # Issue #454 (Epic #443 §5.2). `product_objective.ProductObjectiveError`
+    # / `product_feature.ProductFeatureError` are the domain's OWN
+    # validation vocabulary (unresolved ref kind, self-reference, a real
+    # dependency cycle, a duplicate dependency edge) -- translated to
+    # `InvalidField` (already caught by `routes/assistant.py`'s apply/
+    # prefill endpoints as 422) rather than left to propagate as an
+    # unhandled 500, so a duplicate/cyclic link proposal is REFUSED, never
+    # crashes the request.
+    if target_kind == "product_objective" and relation_kind == "upstream_ref":
+        try:
+            row = product_objective.add_objective_upstream_ref(
+                conn, system_id=system_id, objective_key=target_ref, ref_kind=relation_target_kind,
+                target_ref=relation_target_ref, note=rationale, decision_method="manual", created_by=actor,
+            )
+        except product_objective.ProductObjectiveError as exc:
+            raise InvalidField(str(exc)) from exc
+        return f"product_objective_upstream_ref:{row['id']}"
+
+    if target_kind == "product_milestone" and relation_kind == "milestone_dependency":
+        try:
+            product_objective.add_milestone_dependency(
+                conn, system_id=system_id, milestone_key=target_ref,
+                depends_on_milestone_key=relation_target_ref, rationale=rationale,
+                created_by=actor,
+            )
+        except product_objective.ProductObjectiveError as exc:
+            raise InvalidField(str(exc)) from exc
+        return f"product_milestone_dependency:{target_ref}->{relation_target_ref}"
+
+    if target_kind == "product_feature":
+        try:
+            if relation_kind == "requirement_link":
+                row = product_feature.add_requirement_link(
+                    conn, system_id=system_id, feature_key=target_ref, requirement_key=relation_target_ref,
+                    note=rationale, decision_method="manual", created_by=actor,
+                )
+                return f"product_feature_requirement_link:{row['id']}"
+            if relation_kind == "capability_link":
+                try:
+                    capability_entity_id = int(relation_target_ref)
+                except (TypeError, ValueError) as exc:
+                    raise InvalidField(
+                        f"capability_link relation_target_ref must be a capability_entity_id: "
+                        f"{relation_target_ref!r}"
+                    ) from exc
+                row = product_feature.add_capability_link(
+                    conn, system_id=system_id, feature_key=target_ref,
+                    capability_entity_id=capability_entity_id, note=rationale, decision_method="manual",
+                    created_by=actor,
+                )
+                return f"product_feature_capability_link:{row['id']}"
+            if relation_kind == "target_link":
+                row = product_feature.add_target_link(
+                    conn, system_id=system_id, feature_key=target_ref, link_kind=relation_target_kind,
+                    target_ref=relation_target_ref, note=rationale, decision_method="manual",
+                    created_by=actor,
+                )
+                return f"product_feature_target_link:{row['id']}"
+        except product_feature.ProductFeatureError as exc:
+            raise InvalidField(str(exc)) from exc
 
     raise InvalidField(f"{target_kind}/{relation_kind} relation is not applicable")
 

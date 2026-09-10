@@ -271,8 +271,13 @@ const uxRequirementAdapter: DashboardDiscussionAdapter = {
     };
   },
   // Issue #445: `components/ux-design/requirement-panel.tsx`'s
-  // `RequirementRevisionForm`. Acceptance criteria are a #448 concern, not a
-  // top-level field.
+  // `RequirementRevisionForm`. Acceptance Criteria are a ChildSpec (#454),
+  // not a top-level field -- this `fields` list intentionally still does
+  // not carry them, since `RequirementRevisionForm` has no destination for
+  // a `childOps` patch yet (extending prefill to children is out of #454's
+  // scope; `proposalToDraft` still correctly SEPARATES a selected
+  // Acceptance Criterion item into `childOps` rather than misreading it as
+  // a top-level field of the same name, e.g. "statement").
   // Issue #452: the first real prefill delivery handler, matching the
   // server adapter's own `prefill_handler_id` (parity-checked by
   // `tests/test_discussion_contract_parity.py`). The handler itself is
@@ -617,25 +622,60 @@ export function proposalToDraft(
 
   const fields: FormDraftPatch["fields"] = [];
   const relations: FormDraftPatch["relations"] = [];
+  // Issue #454: keyed by `childKind|childKey|intent` so every SELECTED
+  // item that addresses the same child (e.g. one Acceptance Criterion's
+  // `statement` and `verification_method`, proposed as two separate item
+  // rows -- §5.1) lands on ONE `childOps` entry rather than one per field.
+  const childOpsByAddress = new Map<string, FormDraftPatch["childOps"][number]>();
   const unregisteredFieldNames: string[] = [];
   let selectedItemRef = "";
 
   for (const item of selected) {
-    if (item.item_kind === "field") {
-      if (!binding.fields.includes(item.field_name)) {
-        unregisteredFieldNames.push(item.field_name);
-        continue;
-      }
-      fields.push({ fieldName: item.field_name, value: item.proposed_value, rationale: item.rationale });
-      if (item.subject_ref) selectedItemRef = item.subject_ref;
-    } else {
+    if (item.item_kind !== "field") {
       relations.push({
         relationKind: item.relation_kind,
         targetKind: item.relation_target_kind,
         targetRef: item.relation_target_ref,
         note: item.rationale,
       });
+      continue;
     }
+    // A child item is STILL `item_kind === "field"`, distinguished by a
+    // non-empty `child_kind` -- it must never be matched against the
+    // top-level `binding.fields` allowlist, since a child field name
+    // (e.g. an Acceptance Criterion's own "statement") can collide by
+    // NAME with an unrelated top-level field of the same target_kind
+    // (the Requirement's own "statement"). Routing it into `childOps`
+    // here, before the top-level check, is what keeps the two apart.
+    if (item.child_kind) {
+      const address = `${item.child_kind}|${item.child_key}|${item.child_intent}`;
+      let op = childOpsByAddress.get(address);
+      if (!op) {
+        op = {
+          childKind: item.child_kind,
+          childKey: item.child_key,
+          intent: (item.child_intent || "update") as "add" | "update" | "remove",
+          order: item.child_order,
+          fields: [],
+        };
+        childOpsByAddress.set(address, op);
+      }
+      // A later-selected item's own `child_order` (a pure reorder row,
+      // §5.1) still applies even though this address's FIRST item did not
+      // carry one -- `??` only fills a still-unset order, never clobbers
+      // one already captured from an earlier item at this same address.
+      if (op.order === null && item.child_order !== null) op.order = item.child_order;
+      if (item.field_name) {
+        op.fields.push({ fieldName: item.field_name, value: item.proposed_value });
+      }
+      continue;
+    }
+    if (!binding.fields.includes(item.field_name)) {
+      unregisteredFieldNames.push(item.field_name);
+      continue;
+    }
+    fields.push({ fieldName: item.field_name, value: item.proposed_value, rationale: item.rationale });
+    if (item.subject_ref) selectedItemRef = item.subject_ref;
   }
 
   const patch: FormDraftPatch = {
@@ -645,7 +685,7 @@ export function proposalToDraft(
     formId: binding.formId,
     selectedItemRef,
     fields,
-    childOps: [],
+    childOps: Array.from(childOpsByAddress.values()),
     relations,
   };
   return { patch, formId: binding.formId, unregisteredFieldNames };

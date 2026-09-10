@@ -865,20 +865,26 @@ execute ではない** (#358 / #427 の CTA 規則)。
 
 ---
 
-## §5 nested / list な変更候補 (#448)
+## §5 nested / list な変更候補 (#448, 実装は #454)
 
 ### 5.1 ChildSpec
 
 ```python
 @dataclass(frozen=True)
 class ChildSpec:
-    child_kind: str        # "acceptance_criterion" | "journey_step" | "solution_option"
-    key_field: str         # "criterion_key" / "step_key" / "option_key"
-    order_field: str       # "criterion_order" / "step_order" / "option_order"
+    child_kind: str          # "acceptance_criterion"
+    key_field: str           # "criterion_key"
+    order_field: str         # "criterion_order"
     fields: Tuple[str, ...]
+    context_list_key: str    # "acceptance_criteria" -- context_provider が返す
+                              # dict の中で、この child_kind の現在行リストを
+                              # 持つキー名 (#454 で追加)
 ```
 
-proposal item に 3 列を足す。
+proposal item に 4 列を足す (`app/db.py`
+`_migrate_assistant_discussion_proposal_item_children`、既存行は
+`child_kind=''`/`child_key=''`/`child_intent=''`/`child_order=NULL` のまま
+互換)。
 
 | 列 | 意味 |
 | --- | --- |
@@ -887,28 +893,68 @@ proposal item に 3 列を足す。
 | `child_intent` | `add` / `update` / `remove` |
 | `child_order` | 並び替えの意図。`NULL` は「順序は変えない」 |
 
+item_kind は増やさない -- child な item も `item_kind='field'` のままで、
+`child_kind` が非空かどうかで区別する。1 つの child は複数 item 行に分かれる
+(1 field 1 行、`child_order` だけの行は `field_name=''`)。
+
 **順序変更と本文変更を区別する。** `child_order` だけが変わった item と、
-`fields` が変わった item は別の item であり、片方だけを採ることができる。
+`fields` が変わった item は別の item であり、片方だけを採ることができる —
+`apply_items` は選択された item だけを順に書くので、片方だけを選べば片方だけ
+反映される。
+
+**add の reserved key (#454 の確定方針)。** `update`/`remove` は
+LLM が返す `child_key` が生成時点の `context_list_key` 一覧に実在することを
+要求する。`add` は逆に `child_key` を**要求しない** — LLM は
+`client_temp_key` (この生成結果の中だけで一意な自己申告 id) で「同じ新規
+child の複数 field 行」を束ねるだけで、`assistant_discussion_proposal.
+create_proposal` が `client_temp_key` ごとに 1 つの安定した `reserved_child_
+key` (`f"disc-{secrets.token_urlsafe(9)}"`) を発行し、それを永続化された行の
+`child_key` として書く。以後この値はその item 行に保存されているだけなので、
+prefill/apply の再試行では常に同じ値が読める (「retry では同一」)。
 
 ### 5.2 人間判断軸は registry に入れない
 
 `priority_band` / `achievement` / `lifecycle` / `design_status` /
 `option_status` / `resolved` / `adopted` は **`fields` にも `relations` にも
-登録しない**。登録しなければ LLM は提案できず、prefill 先も存在しない —
-構造で禁じる (#427 が Gap に severity 列を作らなかったのと同じ)。
+`children` にも登録しない**。登録しなければ LLM は提案できず、prefill 先も
+存在しない — 構造で禁じる (#427 が Gap に severity 列を作らなかったのと同じ)。
 
 ### 5.3 二重 validation
 
-生成時 (`generate_proposal`) と反映時 (`proposalToDraft` / `apply_items`) の
-両方で registry 照合する。間に人間の編集と時間の経過が入るので、生成時に有効
-だった child key が反映時には消えていることがある (#412 §7.1.3 と同じ理由)。
+生成時 (`generate_proposal`) と反映時 (`apply_items`、child applier 自身の
+再読み込み) の両方で registry 照合する。間に人間の編集と時間の経過が入るので、
+生成時に有効だった child key が反映時には消えていることがある
+(#412 §7.1.3 と同じ理由)。
+
+`ux_requirement`/`acceptance_criterion` での実装:
+- **生成時**: `child_kind` が登録済みか、`field_name` がその ChildSpec の
+  `fields` に入っているか、`child_intent` が `add`/`update`/`remove` の
+  いずれかか、`update`/`remove` の `child_key` が `context_list_key`
+  (`acceptance_criteria`) の現在の一覧に実在するか、`add` が `child_key` を
+  自称していないか・`client_temp_key` を持っているか、をすべて検証する。
+  1 つでも外れれば `error_kind="invalid_registry"` で **提案全体を失敗**
+  させる (§5.4)。
+- **反映時**: `evaluate_item_eligibility` が narrowed registry (`ChildSpec`
+  が消えた/`field_name` が外れた) を `forbidden` として検出し (§2.1 の
+  narrowed-registry 防御を child にも拡張)、`_apply_ux_requirement_child`
+  自身が現在の Requirement を再読込みして `update`/`remove` の `child_key`
+  が今も存在するかを再確認する (`NotFound`)。加えて、Acceptance Criteria の
+  変更は必ず Requirement の revision digest を動かすので、**並行編集は
+  digest staleness (`proposal_item_stale`) が生成時に有効だった全 item を
+  一括で無効化し、apply の write loop へ到達する前に全体を拒否する** —
+  child 専用の追加ロックは不要だった。
 
 ### 5.4 未知の値は全体を拒否する
 
-LLM が未知の `field_name` / `relation_kind` / `child_kind` / `child_key` を
-返したら、**その item だけを落とさず、提案全体を失敗させる**。1 つ捏造された
-field を含む提案は「部分的に正しい提案」ではない (#436 §2.1 が既に確立した
-規律を child にも広げる)。
+LLM が未知の `field_name` / `relation_kind` / `child_kind` / `child_intent` /
+`update`・`remove` の未知 `child_key` / `add` に対する不正な `child_key`
+(自称した場合) を返したら、**その item だけを落とさず、提案全体を失敗させる**
+(`error_kind="invalid_registry"` → route は 502
+`discussion_proposal_generation_failed`)。1 つ捏造された field を含む提案は
+「部分的に正しい提案」ではない (#436 §2.1 が既に確立した規律を child にも
+広げる)。**正当な `add` はこの検査に巻き込まれない** — `add` は
+`child_key` を自称しないことが正当性の条件そのものなので、`update`/`remove`
+専用の「未知 key」チェックは `add` の分岐に到達しない。
 
 ### 5.5 Proposal に変換しないもの
 
@@ -916,6 +962,44 @@ field を含む提案は「部分的に正しい提案」ではない (#436 §2.
 `unresolved_questions` / `assumptions` / §6 の hypothesis として別の型のまま
 保持する。答えの出ていない問いを「提案された値」にすると、提案を受け入れた
 だけで問いが消える。
+
+### 5.6 実装状況 (#454)
+
+**実装済み。** `ChildSpec` は `ux_requirement` の `acceptance_criterion`
+1 つにだけ実体化した (`statement`/`verification_method`/
+`verification_note`。`criterion_key`/`criterion_order` は `child_key`/
+`child_order` で扱うので `fields` から除外)。
+
+Objective/Milestone/Gap/Feature は `children` を持たず、代わりに
+**`fields`/`relations` を登録**した (これらは「入れ子コレクション」ではなく
+「1 つの revision の中の複数フィールド」または「1 対 1 の link」なので
+ChildSpec の対象ではない):
+
+| target_kind | fields | relations |
+| --- | --- | --- |
+| `product_objective` | `title`/`intent`/`contribution`/`scope_note`/`summary` | `upstream_ref` (`product_objective.add_objective_upstream_ref`) |
+| `product_milestone` | `title`/`target_state`/`verification_method`/`verification_note`/`summary` | `milestone_dependency` (`product_objective.add_milestone_dependency`。順序関係であり達成判定ではない) |
+| `product_gap` | `title`/`current_state`/`target_state`/`interpretation`/`suggested_priority_note` | (なし。`source_ref`/`evidence_ref`/`artifact_link` は今回のスコープ外として明示的に見送った) |
+| `product_feature` | `title`/`statement`/`rationale`/`scope_note`/`summary` | `requirement_link` / `capability_link` / `target_link` (`product_feature.add_*`) |
+
+いずれも `objective_state`/`achievement`/`lifecycle`/`priority_band` を
+一切含まない (§5.2)。`product_milestone.milestone_dependency` の重複
+(`DependencyDuplicate`) は `InvalidField` (422) へ変換され、他の item を
+書く前に拒否される (all-or-nothing は既存の eligibility 事前チェックのまま)。
+
+Dashboard 側は `proposalToDraft` (`lib/discussion-adapters.ts`) を、
+child item (`item.child_kind` が非空) を top-level `fields` へ**絶対に
+混ぜない**よう修正した -- Acceptance Criterion の `field_name` (`statement`
+等) が Requirement 自身の `field_name` (`statement` も存在する) と衝突する
+ため、修正前は名前の一致だけで誤って top-level field 扱いされ得た。
+`FormDraftPatch.childOps` は child item を `(childKind, childKey, intent)`
+でグルーピングして生成するが、`ux_requirement` の `ui_draft_forms` は
+Acceptance Criteria 用の受け口をまだ持たないため、既存の
+`RequirementRevisionForm` はこの `childOps` を消費しない (#454 のスコープ外
+-- prefill を child まで広げるのは後続 Issue)。`components/discussion-
+proposal-review.tsx` は child item を「受入条件 [key] 追加/更新/削除」+
+順序変更を別行として一覧表示し、通常の item と同じ選択/apply/reject 導線に
+乗せる。
 
 ---
 
@@ -1017,17 +1101,23 @@ additive (新テーブルと NULL 許容列) で、旧行は
 
 ---
 
-## §9 判断のための横断contextと確認範囲（目標契約）
+## §9 判断のための横断contextと確認範囲（Issue #458 実装済み）
 
 利用者の導線・状態・受入条件は[共同検討UX](../ux/decision-discussion-workflow.md)が所有する。
-本節は新規実装予定であり、既存の画面contextが既に横断調査できるという意味ではない。
-既存 `/assistant/ask` に渡すcontextを拡張し、別の汎用チャットAPIや理解モデルを作らない。
-本節の `discussion_context.sections[].operation_state` が使う予定の
-`available` / `unsupported` / `unavailable` / `not_applicable` 語彙自体は
-Issue #456 が `DiscussionOperationResult` として先行実装済みで、
-`app/discussion_adapters.gather_context` / `resolve_prefill_operation_state`
-がその最初の 2 つの適用先である (§1.3/§1.7 参照)。§9 の bundle 形状・
-continuation・複数正本更新 (DD-CTX-01〜05) 自体はまだ実装されていない。
+既存 `/assistant/ask` の会話フロー自体は変えず、別の汎用チャットAPIや理解モデルを作らない --
+本節が追加するのはスレッドの対象を起点にした、既存 `discussion_adapters` の登録
+resolver だけを辿る**別の読み取り専用API**である。
+`discussion_context.sections[].operation_state` が使う
+`available` / `unsupported` / `unavailable` / `not_applicable` 語彙は
+Issue #456 の `DiscussionOperationResult` をそのまま再利用する
+(`app/discussion_adapters.gather_context` がその内部で使われる)。
+
+正本モジュールは `app/discussion_context_bundle.py`。API は
+`GET /assistant/discussion-threads/{id}/context-bundle`（新規bundleの取得。
+未取得区間があるsectionには自動でcursorが付く）と
+`POST /assistant/discussion-threads/{id}/context-expansions`（DD-CTX-03の
+「追加取得」）の2本。どちらも thread の**現在の**対象
+(`target_kind`/`target_ref`) を起点にし、thread が無ければ404。
 
 ### 9.1 Context bundle
 
@@ -1035,7 +1125,10 @@ DD-CTX-01: serverは選択対象と既存canonical serviceを起点に、必要�
 Overviewでは画面の `objective` projectionも文脈へ含める。登録されたrelation resolverだけを
 使い、名前一致による結合、別System探索、LLMが指定した任意SQL・URL・ファイル読出しは禁止する。
 
-目標wire shape（未実装。Python / TS / JSON Schemaを実装issueで同時に追加）:
+wire shape（実装済み。`app/models.py` の `DiscussionContextBundleOut` /
+`src/api/types.ts` の `DiscussionContextBundle` /
+`shared/schemas/assistant_discussion.schema.json` の
+`discussion_context_*` `$defs` が同じ形を持つ）:
 
 ```text
 discussion_context {
@@ -1065,22 +1158,21 @@ factsは一時的な正本の読取結果。参照・digestを監査に持ち、
 取得成功でも古い証拠はあり得る。取得失敗時の `total_count=null` は0件を意味しない。
 未対応・対象外は対応する終了理由を返し、完全取得と偽らない。
 
-DD-CTX-02: 初期budgetは関連方向ごと深さ2、section最大50件、全体200件・UTF-8 JSON 64KiB。
-selected rootを優先し、登録relation順・stable key順で再現可能に探索し、cycleはidentityで打ち切る。
-巨大rootも無制限に通さず本文詳細を参照に置換してpartialとする。暗黙切捨ては禁止する。
-budget値はversion付きserver設定とし、UIで独自上限を再計算しない。
-
-DD-CTX-03: 「関連情報を追加確認」は、server発行のcontinuationで未取得範囲を限定して取得する。
-cursorはSystem、root、snapshot、bundleの前提、relation範囲にbindし、有効期限を持つ。
-未知・改ざん・別Systemは拒否、premise変更は409相当の再確認。再取得も予算内で行う。
-初期リリースは利用者の明示操作のみ。Agentの自律的な無制限探索は非目標。
-
-API案は `POST /assistant/discussion-threads/{id}/context-expansions`。
-入力は `bundle_digest` と `continuation`、返却は更新bundleとsectionごとの結果。
-既存askは未指定なら従来動作。追加contextを後続turnへ渡す際もthread/System/bundleをserverで再検証する。
-UIはレスポンス順序ではなく要求時のroot/bundleにbindし、遅延した別対象の応答を表示しない。
-必要な監査・短期bundle保持はcontext実装issueが所有し、期限とcleanup・互換性を定義する。
-LLM呼出しをDB connection内で行わない。
+実装は毎回 2〜3 個の固定sectionを組み立てる: 対象自身の `self`
+(`discussion_adapters.gather_context` を1回。単体で byte budget を超える
+ときは参照のみへ縮退して `truncated: true` + `partial`)、Overview root
+だけが持つ `objective` (`overview_projection.build_overview(...).objective`
+をそのまま埋め込む -- 二重に導出しない)、そして
+`_RELATION_EXTRACTORS`（`app/discussion_context_bundle.py` 内、
+`purpose_element` / `purpose_relation` / `stakeholder` /
+`stakeholder_need` / `product_objective` / `product_milestone` /
+`product_gap` / `product_feature` の8 kind分。各関数は
+`gather_context(...).facts` の中の**すでに存在するフィールドだけ**を読み、
+`(target_kind, target_ref)` を返す -- 新しい結合や別Systemクエリを一切
+持たない）が深さ2までBFSする `related`。`_RELATION_EXTRACTORS` に無い
+`target_kind` は `unsupported`（構造的な relation 未登録。DD-CTX-04の1行目）、
+`scope="screen"` の root で `objective` 由来の seed も無ければ
+`not_applicable`（total_count=0, complete）で、この2つを混同しない。
 
 ### 9.2 ギャップの読み違いを防ぐ
 
@@ -1100,6 +1192,17 @@ DD-CTX-04: 出力では次を区別する。既存Product Gapに新しいlifecyc
 source IDを許可集合で照合し、存在しない引用がある重要claimは再生成または明示失敗とする。
 引用を落として根拠のない断言を成功扱いしない。最低一つのsourceと、確認範囲・時点を照合結果に付ける。
 
+`app/discussion_context_bundle.py` が実装するのはこの契約の**下半分**だけ:
+`fact`/`inference`/`hypothesis`/`unknown`/`conflict` の有限語彙
+(`DISCUSSION_CONTEXT_CLAIM_KINDS`、`models.DiscussionContextClaimKind`) と、
+`bundle.sources[].source_id` を唯一の許可集合として照合する
+`validate_citation_source_ids(cited_ids, bundle) -> (all_valid, invalid_ids)`
+（空の引用リストはそれ自体 invalid -- 「最低一つのsource」を構造で強制する）。
+この module 自身は LLM を一切呼ばない。実際に claim を生成し、無効引用時に
+最大1回だけ再生成して、なお不正なら明示失敗するループは、bundle を実際に
+使って回答する側（#459 の主操作）が所有する -- #458 が持つのは常に一貫した
+1つの照合先だけである。
+
 ### 9.3 複数正本の更新
 
 DD-CTX-05: rootだけでなく回答に使った各dependency digestをbundleに固定する。
@@ -1107,6 +1210,50 @@ DD-CTX-05: rootだけでなく回答に使った各dependency digestをbundleに
 根拠側の更新でもProposal生成・JU昇格・prefill前に再検証する。旧turnは履歴として保持するが
 最新の事実として自動継承しない。JU側のpremise verdictを再定義しない。
 引用先は正本のdeep linkを使い、削除・権限・stale時の理由を表示する。
+
+`dependencies[]` は `related` section で実際に**解決できた**参照だけの
+`(target_kind, target_ref, digest)` 集合で、`app/joint_premise.
+normalize_premise_manifest` / `compute_premise_manifest_digest`（#461 の
+共有 helper。二重定義しない）で正規化・digest 化する。`bundle_digest` は
+root と `dependencies` の両方から計算するので、依存側だけが動いても
+`bundle_digest` は変わる。
+
+**追加取得 (`POST .../context-expansions`)**: 入力 `bundle_digest` +
+`continuation`。first-match で fail-closed:
+不明・改ざん・別System・別thread の token は 404
+(`discussion_context_continuation_unknown`)、期限切れ（30分、
+`CONTEXT_CURSOR_TTL_SECONDS`）は 410
+(`discussion_context_continuation_expired`)、呼び出し側が持っている
+`bundle_digest` が現在の cursor 行と一致しない・root が動いた・
+`dependencies` のどれか1つでも現在の digest と一致しない・pin された
+snapshot が変わった、のいずれかは 409
+(`discussion_context_continuation_stale`) -- 「root不変でも使った依存根拠
+更新はstale」を dependencies の1件ずつの再解決で確認する。cursor 自体は
+`secrets.token_urlsafe` の乱数で、client 側で復号できる状態を一切持たない
+(改ざんは単なる lookup miss にしかならない)。
+
+**再取得の位置決め**: 予算で打ち切られた候補と、実際に返した候補を区別する
+ため、`discussion_context_cursor.visited_keys_json` に**そのsectionで実際
+に返したエントリの identity（解決できたかどうかに関わらず全件）**を積み
+上げて持つ。再開時はその集合を `visited` の種にして候補列を**再導出**し
+(cursorの正本は再現可能な決定的抽出であって、position offsetのような
+壊れやすい実装に依存しない)、budgetで発見だけされ未取得だったcandidateは
+自然に次バッチへ残る。`dependencies`（解決できたものだけの digest 台帳）
+とは別の集合であることに注意 -- 前者はstaleness判定、後者はpagination
+継続のためで、混同すると「一度も返していない候補が二度と出てこない」
+という欠陥になる。
+
+**短期保持と監査の分離**: `discussion_context_cursor` は
+`expires_at` を過ぎた行を次回mint時に lazy delete する短期テーブルで、
+探索位置と依存manifestしか持たない。durableな監査は別テーブル
+`discussion_context_audit`
+(`app/discussion_context_bundle.persist_context_audit` /
+`get_context_audit`) で、`consumer_kind` は `turn` / `proposal` /
+`ju_session` の3値のみ (`CONTEXT_AUDIT_CONSUMER_KINDS`)。cursorの期限切れは
+この監査行を一切削除しない -- turn/Proposal/JUセッションが実際に使った
+bundleの根拠は、探索の途中経過とは別の寿命を持つ。書き込みは #455/#459 が
+自分の durable row を保存する、まさにその場所で呼ぶ（#458 自身はどの
+turn/proposal/JU session にも書き込まない）。
 
 ## §10 横断導線の接続境界（目標契約）
 

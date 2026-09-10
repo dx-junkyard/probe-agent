@@ -3800,6 +3800,124 @@ export interface AssistantDiscussionThreadsListOut {
   threads: AssistantDiscussionThread[];
 }
 
+// Discussion context bundle (Issue #458, Epic #443 §9, DD-CTX-01..05).
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §9.1 is the canonical wire shape; every field
+// here traces to `app/discussion_context_bundle.py`'s dataclasses. The
+// client never re-derives coverage/completeness/freshness -- it renders
+// exactly what the server decided.
+
+export type DiscussionContextCompleteness = "complete" | "partial" | "unknown";
+
+export type DiscussionContextStopReason =
+  | "complete"
+  | "item_budget"
+  | "byte_budget"
+  | "depth_budget"
+  | "provider_error"
+  | "unsupported"
+  | "not_applicable";
+
+export type DiscussionContextResolution = "resolved" | "unresolved" | "not_tracked";
+
+export type DiscussionContextDeepLinkState = "selected" | "screen_only" | "unavailable";
+
+export type DiscussionContextNextActionKind = "expand_context" | "none";
+
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §9.3: the durable audit consumer kinds --
+// mirrors `app/discussion_context_bundle.CONTEXT_AUDIT_CONSUMER_KINDS` exactly.
+export type DiscussionContextAuditConsumerKind = "turn" | "proposal" | "ju_session";
+
+export interface DiscussionContextRoot {
+  target_kind: string;
+  target_ref: string;
+  revision_id: number | null;
+  digest: string;
+}
+
+export interface DiscussionContextSnapshot {
+  id: number | null;
+  commit_sha: string | null;
+}
+
+export interface DiscussionContextEntry {
+  target_kind: string;
+  target_ref: string;
+  title: string;
+  revision_id: number | null;
+  digest: string;
+  resolution: DiscussionContextResolution;
+  facts: Record<string, unknown>;
+  // True when `facts` was replaced by an empty stub because including it
+  // would have exceeded the bundle-wide byte budget -- identity is never
+  // dropped, only the body.
+  truncated: boolean;
+}
+
+export interface DiscussionContextCoverage {
+  returned_count: number;
+  // `null` on any incomplete/failed sweep -- never a guessed lower bound
+  // (§9.1: "取得失敗時のtotal_count=nullは0件を意味しない").
+  total_count: number | null;
+  completeness: DiscussionContextCompleteness;
+  stop_reason: DiscussionContextStopReason;
+  // Opaque token for `POST .../context-expansions`, or `null` when there is
+  // nothing more to fetch for this section.
+  continuation: string | null;
+}
+
+export interface DiscussionContextSection {
+  section_id: string;
+  operation_state: DiscussionOperationResult;
+  facts: DiscussionContextEntry[];
+  coverage: DiscussionContextCoverage;
+}
+
+export interface DiscussionContextSource {
+  source_id: string;
+  target_kind: string;
+  target_ref: string;
+  revision_id: number | null;
+  digest: string;
+  snapshot_id: number | null;
+  freshness: DiscussionTargetState;
+  deep_link: string | null;
+  deep_link_state: DiscussionContextDeepLinkState;
+}
+
+export interface DiscussionContextDependency {
+  target_kind: string;
+  target_ref: string;
+  digest: string;
+}
+
+export interface DiscussionContextNextAction {
+  kind: DiscussionContextNextActionKind;
+  target: string;
+  enabled: boolean;
+  reason: string;
+}
+
+export interface DiscussionContextBundle {
+  schema_version: string;
+  bundle_digest: string;
+  root: DiscussionContextRoot;
+  snapshot: DiscussionContextSnapshot;
+  sections: DiscussionContextSection[];
+  sources: DiscussionContextSource[];
+  dependencies: DiscussionContextDependency[];
+  next_action: DiscussionContextNextAction;
+}
+
+export interface DiscussionContextExpansionRequest {
+  bundle_digest: string;
+  continuation: string;
+}
+
+export interface DiscussionContextExpansionOut {
+  bundle: DiscussionContextBundle;
+  expanded_section_ids: string[];
+}
+
 // Assistant discussion proposals (Issue #439, Epic #436). Finite unions
 // mirror app/assistant_discussion_proposal.py's module constants exactly.
 
@@ -3823,6 +3941,14 @@ export interface AssistantDiscussionProposalItem {
   current_value: string;
   proposed_value: string;
   rationale: string;
+  // Issue #454 (Epic #443 §5.1): a ChildSpec address. `child_kind === ""`
+  // means "not a child item" (a plain top-level field/relation) -- the
+  // three fields above stay meaningful either way. `child_order === null`
+  // means "this item does not move the child's order".
+  child_kind: string;
+  child_key: string;
+  child_intent: "" | "add" | "update" | "remove";
+  child_order: number | null;
   status: DiscussionProposalItemStatus;
   eligibility: DiscussionProposalItemEligibility;
   applied_ref: string | null;

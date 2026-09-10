@@ -81,6 +81,7 @@ import type {
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
   AssistantDiscussionTargetIn, AssistantDiscussionThreadDetailOut, AssistantDiscussionThreadsListOut,
+  DiscussionContextBundle, DiscussionContextExpansionRequest, DiscussionContextExpansionOut,
   AssistantDiscussionProposal, AssistantDiscussionProposalsListOut,
   AssistantDiscussionProposalApplyOut, AssistantDiscussionProposalRejectOut,
   AssistantDiscussionProposalPrefillOut,
@@ -2500,6 +2501,44 @@ export function useAssistantDiscussionThreads(filters: {
         query ? `/assistant/discussion-threads?${query}` : "/assistant/discussion-threads",
       ),
     enabled: (filters.enabled ?? true) && !!getSystemId(),
+  });
+}
+
+// Discussion context bundle (Issue #458, Epic #443 §9, DD-CTX-01..05):
+// cross-target context for a thread's own root, built ONLY from registered
+// `discussion_adapters` relation resolvers (§9.1). `useDiscussionContextBundle`
+// is a plain query -- opening/reopening the panel always re-fetches the
+// CURRENT bundle rather than reusing a stale one. `useExpandDiscussionContext`
+// is the explicit "追加取得" action (§9's DD-CTX-03): the caller must supply
+// the EXACT `bundle_digest`/`continuation` from the bundle it currently has
+// on screen, so a delayed response for an object the developer already
+// navigated away from is bound to that stale bundle_digest and never
+// silently merged into whatever bundle is on screen now.
+
+export function useDiscussionContextBundle(threadId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-context-bundle"), threadId],
+    queryFn: () =>
+      api.get<DiscussionContextBundle>(`/assistant/discussion-threads/${threadId}/context-bundle`),
+    enabled: threadId !== null && !!getSystemId(),
+    staleTime: 0,
+    retry: false,
+  });
+}
+
+export function useExpandDiscussionContext(threadId: number | null) {
+  // Deliberately does NOT invalidate/refetch `useDiscussionContextBundle`:
+  // that would silently discard this exact merge result (returned_count for
+  // just the new batch) and refetch a brand-new initial bundle instead. The
+  // caller merges `data.bundle`'s section entries into what it already has
+  // on screen -- it owns that merge because only it knows which bundle
+  // (bound to which root) is currently displayed (§9.1: "UIは要求時の
+  // root/bundleにbindする").
+  return useMutation({
+    mutationFn: (payload: DiscussionContextExpansionRequest) =>
+      api.post<DiscussionContextExpansionOut>(
+        `/assistant/discussion-threads/${threadId}/context-expansions`, payload,
+      ),
   });
 }
 

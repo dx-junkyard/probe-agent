@@ -992,6 +992,48 @@ def bundle_to_dict(bundle: DiscussionContextBundle) -> Dict[str, Any]:
     return asdict(bundle)
 
 
+# --- §9.2 / DD-CTX-04: citation allow-list -------------------------------------
+#
+# This module does not itself call an LLM or produce a `fact` / `inference` /
+# `hypothesis` / `unknown` / `conflict` claim -- that is the semantic
+# interpretation #459's own main discussion operation performs, reading a
+# bundle this module already built. What belongs here is the ALLOW-LIST a
+# citation is checked against and the finite claim-kind vocabulary the wire
+# contract shares with that consumer, so "source IDを許可集合で照合する" has
+# exactly one implementation rather than one per caller. The "無効引用のある
+# 主要claimは再生成は最大1回だけ、なお不正なら明示失敗" retry policy is the
+# CALLER's own loop around its own LLM call (this module makes no LLM call to
+# retry) -- `validate_citation_source_ids` only ever answers "were these ids
+# real", once, for whatever attempt the caller is currently checking.
+
+DISCUSSION_CONTEXT_CLAIM_KINDS: Tuple[str, ...] = (
+    "fact", "inference", "hypothesis", "unknown", "conflict",
+)
+
+
+def allowed_source_ids(bundle: DiscussionContextBundle) -> Set[str]:
+    """The complete, exact citation allow-list for one bundle: every
+    `sources[].source_id` -- never a superset guessed from `sections[]`
+    facts directly, since `sources` is already the flat, deduplicated
+    catalog every citation is meant to resolve against (this module's own
+    `_register_source` is the only place a source is added)."""
+    return {source.source_id for source in bundle.sources}
+
+
+def validate_citation_source_ids(
+    cited_source_ids: Sequence[str], bundle: DiscussionContextBundle,
+) -> Tuple[bool, Tuple[str, ...]]:
+    """`(all_valid, invalid_ids)` for a semantic claim's cited source ids
+    against THIS bundle's own allow-list. An empty `cited_source_ids` is
+    itself invalid -- DD-CTX-04: "最低一つのsource...を照合結果に付ける",
+    so a claim citing nothing is never treated as trivially valid."""
+    if not cited_source_ids:
+        return False, ()
+    allowed = allowed_source_ids(bundle)
+    invalid = tuple(sid for sid in cited_source_ids if sid not in allowed)
+    return (not invalid), invalid
+
+
 # --- DD-CTX-05 / §9.3: durable evidence-manifest audit --------------------------
 #
 # Deliberately separate from `discussion_context_cursor` (short-lived,

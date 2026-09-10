@@ -17,7 +17,13 @@
     "proposal_item_kind": { "$ref": "#/$defs/discussion_proposal_item_kind" },
     "proposal_item_status": { "$ref": "#/$defs/discussion_proposal_item_status" },
     "proposal_item_eligibility": { "$ref": "#/$defs/discussion_proposal_item_eligibility" },
-    "ui_draft_state": { "$ref": "#/$defs/ui_draft_state" }
+    "ui_draft_state": { "$ref": "#/$defs/ui_draft_state" },
+    "context_completeness": { "$ref": "#/$defs/discussion_context_completeness" },
+    "context_stop_reason": { "$ref": "#/$defs/discussion_context_stop_reason" },
+    "context_resolution": { "$ref": "#/$defs/discussion_context_resolution" },
+    "context_deep_link_state": { "$ref": "#/$defs/discussion_context_deep_link_state" },
+    "context_next_action_kind": { "$ref": "#/$defs/discussion_context_next_action_kind" },
+    "context_audit_consumer_kind": { "$ref": "#/$defs/discussion_context_audit_consumer_kind" }
   },
   "$defs": {
     "discussion_scope": {
@@ -51,7 +57,7 @@
       "enum": ["current", "stale", "unresolvable", "not_tracked"]
     },
     "discussion_capability": {
-      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3. Derived from what a DiscussionAdapter actually declares (`fields`/`relations`/`children`/`ui_draft_forms`/`joint_understanding_bridge`) -- never a stored column or a second constant, so a capability can never drift from the adapter that is supposed to back it. In Phase 1 every adapter's `ui_draft_forms` and `children` are empty and `joint_understanding_bridge` is false, so only `read_canonical`, `propose_fields`, and `propose_relations` are ever actually derived true; `read_ui_draft`, `prefill_form`, and `promote_joint_understanding` become reachable in Phases 2/3/6 without widening this enum.",
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3. Derived from what a DiscussionAdapter actually declares (`fields`/`relations`/`children`/`ui_draft_forms`/`joint_understanding_bridge`) -- never a stored column or a second constant, so a capability can never drift from the adapter that is supposed to back it. Phase 1 derived only `read_canonical`/`propose_fields`/`propose_relations` true (every `ui_draft_forms`/`children` was empty and `joint_understanding_bridge` false); Phases 2/3/5 (#445/#452/#454) populate `ui_draft_forms` and one adapter's `children`, and `promote_joint_understanding` remains unreachable until #449 -- this enum itself does not widen for any of that.",
       "enum": [
         "read_canonical",
         "read_ui_draft",
@@ -80,6 +86,30 @@
     "discussion_operation_result": {
       "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3/§1.7/§9 (Issue #456). What a discussion-adapter READ operation (canonical context gathering, prefill readiness, ...) reports about ITSELF, kept in a field separate from the facts/capabilities it accompanies and separate from `discussion_target_state` (freshness). First-match: `unsupported` (no adapter/handler registered for this operation -- a structural gap in the current catalog), `unavailable` (a registered handler exists but this specific attempt failed), `not_applicable` (this kind of target can never carry this operation, independent of registration state). A deleted/inaccessible target stays on the existing resolver/404 contract rather than being reclassified into this vocabulary.",
       "enum": ["available", "unsupported", "unavailable", "not_applicable"]
+    },
+    "discussion_context_completeness": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.1/§9.2 (Issue #458, DD-CTX-02). `unknown` means the walk was cut off before even the candidate COUNT could be established -- never a guessed lower bound reported as `partial`.",
+      "enum": ["complete", "partial", "unknown"]
+    },
+    "discussion_context_stop_reason": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.1 (Issue #458). Why one section's coverage stopped short of `complete`; `complete` doubles as \"nothing stopped it\".",
+      "enum": ["complete", "item_budget", "byte_budget", "depth_budget", "provider_error", "unsupported", "not_applicable"]
+    },
+    "discussion_context_resolution": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.1 (Issue #458). One bundle entry's own resolution -- mirrors `discussion_adapters.ResolvedTarget.resolution` exactly.",
+      "enum": ["resolved", "unresolved", "not_tracked"]
+    },
+    "discussion_context_deep_link_state": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.1 (Issue #458). Whether a bundle source's `deep_link` both exists and selects the exact entity (`selected`), only opens the owning screen (`screen_only`), or does not exist (`unavailable`).",
+      "enum": ["selected", "screen_only", "unavailable"]
+    },
+    "discussion_context_next_action_kind": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §8/§9.1 (Issue #458). The ONLY action a context bundle itself carries is \"fetch more context\" -- never a domain action; #459 owns the discussion's own main operation.",
+      "enum": ["expand_context", "none"]
+    },
+    "discussion_context_audit_consumer_kind": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.3 (Issue #458). The durable audit table's finite `consumer_kind` -- which kind of durable row a bundle's dependency manifest backed. Mirrors `app/discussion_context_bundle.CONTEXT_AUDIT_CONSUMER_KINDS` exactly.",
+      "enum": ["turn", "proposal", "ju_session"]
     }
   }
 }

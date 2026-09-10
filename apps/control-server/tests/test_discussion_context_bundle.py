@@ -709,6 +709,38 @@ class TestDurableAudit:
         stored_deps = json.loads(row["dependency_manifest_json"])
         assert any(d["target_ref"] == milestone_key for d in stored_deps)
 
+    def test_citation_allow_list_validates_against_bundle_sources_only(self, admin_client):
+        """§9.2/DD-CTX-04: a claim's citations are checked against exactly
+        `bundle.sources[].source_id` -- a real id passes, an unknown one
+        fails, and an empty citation list is itself invalid (a claim citing
+        nothing is never treated as trivially valid)."""
+        token = _login(admin_client)
+        system_id = _create_system(admin_client, token, "ctx-citations")
+        headers = _headers(token, system_id)
+        _objective_key, milestone_key, gap_key = _setup_objective_milestone_gap(admin_client, headers, "cite")
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="objective-map",
+            target_kind="product_gap", target_ref=gap_key,
+        )
+        bundle = discussion_context_bundle.build_context_bundle(
+            system_id, "product_gap", gap_key, thread_id=thread["thread"]["id"],
+        )
+        real_source_id = f"product_milestone:{milestone_key}"
+        assert real_source_id in discussion_context_bundle.allowed_source_ids(bundle)
+
+        ok, invalid = discussion_context_bundle.validate_citation_source_ids([real_source_id], bundle)
+        assert ok is True
+        assert invalid == ()
+
+        ok, invalid = discussion_context_bundle.validate_citation_source_ids(
+            [real_source_id, "product_gap:no-such-gap"], bundle,
+        )
+        assert ok is False
+        assert invalid == ("product_gap:no-such-gap",)
+
+        ok, invalid = discussion_context_bundle.validate_citation_source_ids([], bundle)
+        assert ok is False
+
     def test_invalid_consumer_kind_is_rejected(self, admin_client):
         token = _login(admin_client)
         system_id = _create_system(admin_client, token, "ctx-audit-invalid")

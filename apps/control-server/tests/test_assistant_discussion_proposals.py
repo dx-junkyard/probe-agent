@@ -38,7 +38,10 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app import assistant_discussion_proposal, journey_blueprint, solution_design, ux_design
+from app import (
+    assistant_discussion_proposal, journey_blueprint, product_feature, product_objective,
+    solution_design, ux_design,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +332,68 @@ class TestRegistryCorrespondence:
         fields = set(assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA["solution_design"]["fields"])
         assert fields <= params
 
+    def test_product_objective_fields_are_add_objective_revision_parameters(self):
+        params = set(inspect.signature(product_objective.add_objective_revision).parameters)
+        fields = set(assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA["product_objective"]["fields"])
+        assert fields <= params
+
+    def test_product_milestone_fields_are_add_milestone_revision_parameters(self):
+        params = set(inspect.signature(product_objective.add_milestone_revision).parameters)
+        fields = set(assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA["product_milestone"]["fields"])
+        assert fields <= params
+
+    def test_product_gap_fields_are_add_gap_revision_parameters(self):
+        params = set(inspect.signature(product_objective.add_gap_revision).parameters)
+        fields = set(assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA["product_gap"]["fields"])
+        assert fields <= params
+
+    def test_product_feature_fields_are_add_feature_revision_parameters(self):
+        params = set(inspect.signature(product_feature.add_feature_revision).parameters)
+        fields = set(assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA["product_feature"]["fields"])
+        assert fields <= params
+
+    def test_no_human_judgement_axis_is_registered_anywhere(self):
+        """§5.2's Decisions: `priority_band`/`achievement`/`lifecycle`/
+        `design_status`/`option_status`/`resolved`/`adopted` must never
+        appear in ANY adapter's `fields`/`relations`/`children` -- the
+        enforcement IS that nothing registers them (never a filter applied
+        somewhere else)."""
+        forbidden = {
+            "priority_band", "achievement", "lifecycle", "design_status",
+            "option_status", "resolved", "adopted",
+        }
+        for kind, schema in assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA.items():
+            assert not (forbidden & set(schema["fields"])), kind
+            assert not (forbidden & set(schema["relations"])), kind
+            for child in schema["children"]:
+                assert not (forbidden & set(child.fields)), (kind, child.child_kind)
+
+    def test_acceptance_criterion_child_fields_are_add_requirement_revision_criterion_keys(self):
+        """`add_requirement_revision` reads each criterion dict via
+        `criterion.get("<name>", ...)` -- every proposable child field must
+        be one of those literal keys (mirrors `test_ux_journey_step_fields_
+        are_read_from_the_same_named_key`'s discipline for the Journey's own
+        nested Step fields). `criterion_key`/`criterion_order` are
+        deliberately EXCLUDED -- they are addressed through `child_key`/
+        `child_order`, never through `ChildSpec.fields` (§5.1)."""
+        source = Path(ux_design.__file__).read_text(encoding="utf-8")
+        spec = next(
+            c for c in assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA["ux_requirement"]["children"]
+            if c.child_kind == "acceptance_criterion"
+        )
+        assert "criterion_key" not in spec.fields
+        assert "criterion_order" not in spec.fields
+        for f in spec.fields:
+            # `verification_method` is read via an intermediate local (then
+            # membership-checked) rather than inline in the dict literal the
+            # way `statement`/`verification_note` are -- so this only
+            # requires `criterion.get("<name>", ...)` to appear SOMEWHERE in
+            # the function, not at one fixed dict-literal shape.
+            assert re.search(rf'criterion\.get\("{f}"', source), (
+                f"criterion field {f!r} is not read via criterion.get({f!r}, ...) in "
+                "add_requirement_revision"
+            )
+
     def test_ux_journey_step_fields_are_read_from_the_same_named_key(self):
         """`add_journey_revision` builds each Step's stored fields via
         `step.get("<name>", ...)`; every proposable field name must be one
@@ -341,20 +406,35 @@ class TestRegistryCorrespondence:
             )
 
     def test_every_relation_kind_resolves_to_a_real_domain_function(self):
+        """Registry is keyed by `(target_kind, relation_kind)`, NOT
+        `relation_kind` alone -- Issue #454 makes `"upstream_ref"` and
+        `"requirement_link"`/`"target_link"` each resolve through TWO
+        different domain functions depending on which target_kind carries
+        them (`ux_journey`'s own `ux_design.add_upstream_ref` vs.
+        `product_objective`'s `add_objective_upstream_ref`;
+        `solution_design`'s own requirement/target link functions vs.
+        `product_feature`'s), so a single relation_kind -> function map can
+        no longer express the correspondence."""
         registry = {
-            "upstream_ref": (ux_design, "add_upstream_ref"),
-            "journey_step_link": (ux_design, "add_requirement_step_link"),
-            "requirement_link": (solution_design, "add_requirement_link"),
-            "target_link": (solution_design, "add_target_link"),
-            "delivery_link": (journey_blueprint, "add_delivery_link"),
-            "stakeholder_link": (journey_blueprint, "add_stakeholder_link"),
-            "exchange_link": (journey_blueprint, "add_exchange_link"),
+            ("ux_journey", "upstream_ref"): (ux_design, "add_upstream_ref"),
+            ("ux_requirement", "journey_step_link"): (ux_design, "add_requirement_step_link"),
+            ("solution_design", "requirement_link"): (solution_design, "add_requirement_link"),
+            ("solution_design", "target_link"): (solution_design, "add_target_link"),
+            ("blueprint_lane_cell", "delivery_link"): (journey_blueprint, "add_delivery_link"),
+            ("blueprint_lane_cell", "stakeholder_link"): (journey_blueprint, "add_stakeholder_link"),
+            ("blueprint_lane_cell", "exchange_link"): (journey_blueprint, "add_exchange_link"),
+            ("product_objective", "upstream_ref"): (product_objective, "add_objective_upstream_ref"),
+            ("product_milestone", "milestone_dependency"): (product_objective, "add_milestone_dependency"),
+            ("product_feature", "requirement_link"): (product_feature, "add_requirement_link"),
+            ("product_feature", "capability_link"): (product_feature, "add_capability_link"),
+            ("product_feature", "target_link"): (product_feature, "add_target_link"),
         }
-        all_relations = set()
-        for schema in assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA.values():
-            all_relations.update(schema["relations"])
-        assert all_relations == set(registry)
-        for _relation_kind, (module, func_name) in registry.items():
+        all_pairs = set()
+        for kind, schema in assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA.items():
+            for relation_kind in schema["relations"]:
+                all_pairs.add((kind, relation_kind))
+        assert all_pairs == set(registry)
+        for _pair, (module, func_name) in registry.items():
             assert hasattr(module, func_name) and callable(getattr(module, func_name))
 
     def test_eligibility_vocabulary_matches_contract(self):
@@ -1083,3 +1163,645 @@ def test_apply_refuses_missing_adapter_registration_before_any_write(admin_clien
     assert after["current_revision_id"] == before["current_revision_id"]
     assert after["upstream_refs"] == before["upstream_refs"]
     assert all(i["status"] == "proposed" for i in _get_proposal(admin_client, headers, proposal["id"])["items"])
+
+
+# ---------------------------------------------------------------------------
+# Issue #454 (Epic #443 §5): ChildSpec + Objective/Milestone/Gap/Feature
+# ---------------------------------------------------------------------------
+
+
+def _add_objective(client, headers, objective_key, *, expect=201):
+    r = client.post("/product-objectives", json={"objective_key": objective_key}, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_objective_revision(client, headers, objective_key, *, expect=201, **fields):
+    payload = {"title": "", "intent": "", "contribution": "", "scope_note": "", "summary": "", "change_note": ""}
+    payload.update(fields)
+    r = client.post(f"/product-objectives/{objective_key}/revisions", json=payload, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _get_objective(client, headers, objective_key, expect=200):
+    r = client.get(f"/product-objectives/{objective_key}", headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json()
+
+
+def _add_milestone(client, headers, objective_key, milestone_key, *, expect=201):
+    r = client.post(
+        "/product-milestones",
+        json={"objective_key": objective_key, "milestone_key": milestone_key},
+        headers=headers,
+    )
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_milestone_revision(client, headers, milestone_key, *, expect=201, **fields):
+    payload = {
+        "title": "", "target_state": "", "verification_method": "unavailable", "verification_note": "",
+        "sequence_hint": 0, "summary": "", "change_note": "",
+    }
+    payload.update(fields)
+    r = client.post(f"/product-milestones/{milestone_key}/revisions", json=payload, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _get_milestone(client, headers, milestone_key, expect=200):
+    r = client.get(f"/product-milestones/{milestone_key}", headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json()
+
+
+def _add_gap(client, headers, milestone_key, gap_key, *, expect=201):
+    r = client.post("/product-gaps", json={"milestone_key": milestone_key, "gap_key": gap_key}, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_gap_revision(client, headers, gap_key, *, expect=201, **fields):
+    payload = {
+        "title": "", "current_state": "", "target_state": "", "target_state_mode": "unknown",
+        "interpretation": "", "suggested_priority_note": "", "change_note": "",
+    }
+    payload.update(fields)
+    r = client.post(f"/product-gaps/{gap_key}/revisions", json=payload, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _get_gap(client, headers, gap_key, expect=200):
+    r = client.get(f"/product-gaps/{gap_key}", headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json()
+
+
+def _add_feature(client, headers, feature_key, *, expect=201):
+    r = client.post("/product-features", json={"feature_key": feature_key}, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _add_feature_revision(client, headers, feature_key, *, expect=201, **fields):
+    payload = {"title": "", "statement": "", "rationale": "", "scope_note": "", "summary": "", "change_note": ""}
+    payload.update(fields)
+    r = client.post(f"/product-features/{feature_key}/revisions", json=payload, headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json() if expect < 300 else r
+
+
+def _get_feature(client, headers, feature_key, expect=200):
+    r = client.get(f"/product-features/{feature_key}", headers=headers)
+    assert r.status_code == expect, r.text
+    return r.json()
+
+
+def _child_items(proposal, child_kind=None):
+    return [
+        i for i in proposal["items"]
+        if i["item_kind"] == "field" and (i.get("child_kind") or "")
+        and (child_kind is None or i["child_kind"] == child_kind)
+    ]
+
+
+def _child_item(proposal, *, child_key, field_name=None, order_only=None):
+    for i in _child_items(proposal):
+        if i["child_key"] != child_key:
+            continue
+        if field_name is not None and i["field_name"] != field_name:
+            continue
+        if order_only is not None and (i["child_order"] is not None and not i["field_name"]) != order_only:
+            continue
+        return i
+    raise AssertionError(
+        f"no child item child_key={child_key!r} field_name={field_name!r} order_only={order_only!r} in {proposal}"
+    )
+
+
+def _child_change(child_kind, child_intent, *, child_key="", client_temp_key="", child_order=None,
+                   field_name="", proposed_value="", rationale="discussed"):
+    return {
+        "child_kind": child_kind, "child_intent": child_intent, "child_key": child_key,
+        "client_temp_key": client_temp_key, "child_order": child_order, "field_name": field_name,
+        "current_value": "", "proposed_value": proposed_value, "rationale": rationale,
+    }
+
+
+class TestAcceptanceCriterionChildProposal:
+    """§5.1's Acceptance Criteria: add/update/remove and reorder-vs-content
+    are separately selectable proposal items."""
+
+    def test_add_update_remove_and_reorder_are_separate_items(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _create_requirement(admin_client, headers, "req-1")
+        _add_requirement_revision(
+            admin_client, headers, "req-1",
+            acceptance_criteria=[
+                {"criterion_key": "c-keep", "criterion_order": 0, "statement": "Keep me",
+                 "verification_method": "manual_review", "verification_note": ""},
+                {"criterion_key": "c-remove", "criterion_order": 1, "statement": "Remove me",
+                 "verification_method": "manual_review", "verification_note": ""},
+            ],
+        )
+
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )["thread"]
+
+        client = _FixedResponseClient({
+            "summary": "Tidy up acceptance criteria", "confirmed_points": [], "unresolved_questions": [],
+            "assumptions": [], "evidence_refs": [], "field_changes": [], "relation_changes": [],
+            "child_changes": [
+                # Content change on an EXISTING key.
+                _child_change(
+                    "acceptance_criterion", "update", child_key="c-keep",
+                    field_name="statement", proposed_value="Keep me, reworded",
+                ),
+                # Pure reorder of the SAME existing key -- a SEPARATE item.
+                _child_change("acceptance_criterion", "update", child_key="c-keep", child_order=5),
+                # Remove an existing key.
+                _child_change("acceptance_criterion", "remove", child_key="c-remove"),
+                # Add a brand new criterion, split across two field rows that
+                # share one client_temp_key.
+                _child_change(
+                    "acceptance_criterion", "add", client_temp_key="tmp-1",
+                    field_name="statement", proposed_value="New criterion",
+                ),
+                _child_change(
+                    "acceptance_criterion", "add", client_temp_key="tmp-1",
+                    field_name="verification_method", proposed_value="replay",
+                ),
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        proposal = _generate_proposal(admin_client, headers, thread["id"])
+
+        update_content = _child_item(proposal, child_key="c-keep", field_name="statement")
+        update_order = _child_item(proposal, child_key="c-keep", field_name="")
+        assert update_content["id"] != update_order["id"]
+        assert update_content["child_intent"] == "update"
+        assert update_order["child_intent"] == "update"
+        assert update_order["child_order"] == 5
+
+        remove_item = _child_item(proposal, child_key="c-remove")
+        assert remove_item["child_intent"] == "remove"
+
+        add_items = [i for i in _child_items(proposal) if i["child_intent"] == "add"]
+        assert len(add_items) == 2
+        # Issue #454's reserved-key Decisions: both rows of the SAME
+        # client_temp_key share one server-assigned child_key, distinct from
+        # the human-authored keys.
+        reserved_keys = {i["child_key"] for i in add_items}
+        assert len(reserved_keys) == 1
+        reserved_key = next(iter(reserved_keys))
+        assert reserved_key not in ("c-keep", "c-remove", "")
+
+        # Select the content update and BOTH add rows (sharing the SAME
+        # reserved key) in one apply batch -- the reorder and the remove
+        # are left unselected, proving all four kinds of child item were
+        # independently selectable. (Applying items from the SAME proposal
+        # across two SEPARATE requests is deliberately not exercised here:
+        # the first apply's new revision moves the Requirement's digest, so
+        # a later attempt on the SAME proposal's remaining items correctly
+        # sees `proposal_item_stale` -- the identical, intentional rule
+        # `TestStaleApplyRefused` already covers for a plain field.)
+        add_stmt_item = next(i for i in add_items if i["field_name"] == "statement")
+        add_method_item = next(i for i in add_items if i["field_name"] == "verification_method")
+        applied = _apply(
+            admin_client, headers, proposal["id"],
+            [update_content["id"], add_stmt_item["id"], add_method_item["id"]],
+        )
+        assert set(applied["applied_item_ids"]) == {
+            update_content["id"], add_stmt_item["id"], add_method_item["id"],
+        }
+
+        detail = _get_requirement(admin_client, headers, "req-1")
+        criteria = {c["criterion_key"]: c for c in detail["current_revision"]["acceptance_criteria"]}
+        assert criteria["c-keep"]["statement"] == "Keep me, reworded"
+        assert criteria["c-keep"]["criterion_order"] == 0  # reorder item was NOT applied
+        assert "c-remove" in criteria  # remove item was NOT applied
+        assert reserved_key in criteria
+        # Both add rows shared the SAME reserved child_key and compounded
+        # onto the SAME new criterion, rather than creating two rows.
+        assert criteria[reserved_key]["statement"] == "New criterion"
+        assert criteria[reserved_key]["verification_method"] == "replay"
+        assert len(criteria) == 3  # c-keep, c-remove (unremoved), reserved_key -- no extra row
+
+    def test_remove_then_apply_removes_the_criterion(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _create_requirement(admin_client, headers, "req-1")
+        _add_requirement_revision(
+            admin_client, headers, "req-1",
+            acceptance_criteria=[
+                {"criterion_key": "c-remove", "criterion_order": 0, "statement": "Remove me",
+                 "verification_method": "manual_review", "verification_note": ""},
+            ],
+        )
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [], "field_changes": [], "relation_changes": [],
+            "child_changes": [_child_change("acceptance_criterion", "remove", child_key="c-remove")],
+        })
+        _enable_real_llm(monkeypatch, client)
+        proposal = _generate_proposal(admin_client, headers, thread["id"])
+        remove_item = _child_item(proposal, child_key="c-remove")
+        _apply(admin_client, headers, proposal["id"], [remove_item["id"]])
+        detail = _get_requirement(admin_client, headers, "req-1")
+        assert detail["current_revision"]["acceptance_criteria"] == []
+
+
+class TestChildProposalFailClosed:
+    def test_unknown_child_kind_fails_the_whole_proposal(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _create_requirement(admin_client, headers, "req-1")
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [], "field_changes": [], "relation_changes": [],
+            "child_changes": [
+                _child_change("totally_invented_child", "add", client_temp_key="tmp-1", proposed_value="x"),
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        r = _generate_proposal(admin_client, headers, thread["id"], expect=502)
+        assert r.json()["detail"]["code"] == "discussion_proposal_generation_failed"
+        assert _list_proposals(admin_client, headers, thread["id"]) == []
+
+    def test_unknown_field_name_for_a_known_child_kind_fails_the_whole_proposal(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _create_requirement(admin_client, headers, "req-1")
+        _add_requirement_revision(
+            admin_client, headers, "req-1",
+            acceptance_criteria=[
+                {"criterion_key": "c-1", "criterion_order": 0, "statement": "s",
+                 "verification_method": "manual_review", "verification_note": ""},
+            ],
+        )
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [], "field_changes": [], "relation_changes": [],
+            "child_changes": [
+                _child_change(
+                    "acceptance_criterion", "update", child_key="c-1",
+                    field_name="criterion_key", proposed_value="renamed",
+                ),
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        r = _generate_proposal(admin_client, headers, thread["id"], expect=502)
+        assert r.json()["detail"]["code"] == "discussion_proposal_generation_failed"
+
+    def test_update_on_unknown_child_key_fails_the_whole_proposal(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _create_requirement(admin_client, headers, "req-1")
+        _add_requirement_revision(admin_client, headers, "req-1")  # no criteria at all
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [], "field_changes": [], "relation_changes": [],
+            "child_changes": [
+                _child_change(
+                    "acceptance_criterion", "update", child_key="does-not-exist",
+                    field_name="statement", proposed_value="x",
+                ),
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        r = _generate_proposal(admin_client, headers, thread["id"], expect=502)
+        assert r.json()["detail"]["code"] == "discussion_proposal_generation_failed"
+
+    def test_a_legitimate_add_is_not_caught_up_in_the_unknown_key_rejection(self, admin_client, monkeypatch):
+        """§5.4's own carve-out: an `add` never supplies `child_key`, so it
+        must never be refused by the SAME check that refuses an
+        update/remove naming a key that does not exist."""
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _create_requirement(admin_client, headers, "req-1")
+        _add_requirement_revision(admin_client, headers, "req-1")  # no criteria yet
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [], "field_changes": [], "relation_changes": [],
+            "child_changes": [
+                _child_change(
+                    "acceptance_criterion", "add", client_temp_key="tmp-1",
+                    field_name="statement", proposed_value="Brand new",
+                ),
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        proposal = _generate_proposal(admin_client, headers, thread["id"])
+        add_items = [i for i in _child_items(proposal) if i["child_intent"] == "add"]
+        assert len(add_items) == 1
+        assert add_items[0]["child_key"]  # server-reserved, non-empty
+
+    def test_add_with_a_caller_supplied_child_key_fails_the_whole_proposal(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _create_requirement(admin_client, headers, "req-1")
+        _add_requirement_revision(admin_client, headers, "req-1")
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [], "field_changes": [], "relation_changes": [],
+            "child_changes": [
+                _child_change(
+                    "acceptance_criterion", "add", child_key="self-chosen-key",
+                    field_name="statement", proposed_value="x",
+                ),
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        r = _generate_proposal(admin_client, headers, thread["id"], expect=502)
+        assert r.json()["detail"]["code"] == "discussion_proposal_generation_failed"
+
+
+class TestChildStaleApplyRefused:
+    def test_concurrent_edit_refuses_apply_and_writes_nothing(self, admin_client, monkeypatch):
+        """A concurrent edit to the Requirement (through the normal write
+        path, not this proposal) changes the Requirement's overall content
+        digest -- caught by the SAME digest-staleness gate every other
+        target_kind already relies on, so a child update/remove/add is
+        refused all-or-nothing exactly like a stale plain field."""
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _create_requirement(admin_client, headers, "req-1")
+        _add_requirement_revision(
+            admin_client, headers, "req-1",
+            acceptance_criteria=[
+                {"criterion_key": "c-1", "criterion_order": 0, "statement": "s",
+                 "verification_method": "manual_review", "verification_note": ""},
+            ],
+        )
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [], "field_changes": [], "relation_changes": [],
+            "child_changes": [
+                _child_change(
+                    "acceptance_criterion", "update", child_key="c-1",
+                    field_name="statement", proposed_value="reworded",
+                ),
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        proposal = _generate_proposal(admin_client, headers, thread["id"])
+        item = _child_item(proposal, child_key="c-1")
+
+        # A concurrent, unrelated edit through the normal write path.
+        _add_requirement_revision(
+            admin_client, headers, "req-1", rationale="someone else edited this",
+            acceptance_criteria=[
+                {"criterion_key": "c-1", "criterion_order": 0, "statement": "s",
+                 "verification_method": "manual_review", "verification_note": ""},
+            ],
+        )
+
+        r = _apply(admin_client, headers, proposal["id"], [item["id"]], expect=422)
+        assert r.json()["detail"]["code"] == "proposal_item_stale"
+        revisions = admin_client.get("/ux-design/requirements/req-1/revisions", headers=headers).json()
+        assert len(revisions["revisions"]) == 2  # the manual concurrent edit only
+
+
+class TestProductObjectiveMilestoneGapFeatureProposal:
+    def test_objective_field_and_upstream_ref_relation_apply(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _add_objective(admin_client, headers, "obj-1")
+        before = _get_objective(admin_client, headers, "obj-1")
+
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="objective-map",
+            target_kind="product_objective", target_ref="obj-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [],
+            "field_changes": [
+                {"field_name": "intent", "subject_ref": "", "current_value": "",
+                 "proposed_value": "Reduce cart abandonment.", "rationale": "discussed"},
+            ],
+            "relation_changes": [
+                {"relation_kind": "upstream_ref", "subject_ref": "", "relation_target_kind": "vision_claim",
+                 "relation_target_ref": "v-1", "proposed_value": "", "rationale": "discussed"},
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        proposal = _generate_proposal(admin_client, headers, thread["id"])
+        field_item = _item_by_field(proposal, "intent")
+        relation_item = _item_by_relation(proposal, "upstream_ref")
+
+        applied = _apply(admin_client, headers, proposal["id"], [field_item["id"], relation_item["id"]])
+        assert set(applied["applied_item_ids"]) == {field_item["id"], relation_item["id"]}
+
+        detail = _get_objective(admin_client, headers, "obj-1")
+        assert detail["current_revision"]["intent"] == "Reduce cart abandonment."
+        # `objective_state` (the confirm/decision axis) is untouched by apply.
+        assert detail["objective_state"] == before["objective_state"]
+
+    def test_milestone_field_apply_and_duplicate_dependency_is_refused(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _add_objective(admin_client, headers, "obj-1")
+        _add_milestone(admin_client, headers, "obj-1", "m-1")
+        _add_milestone(admin_client, headers, "obj-1", "m-2")
+        before = _get_milestone(admin_client, headers, "m-1")
+        admin_client.post(
+            "/product-milestones/m-1/dependencies",
+            json={"depends_on_milestone_key": "m-2", "rationale": "m-1 needs m-2 first"},
+            headers=headers,
+        )
+
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="objective-map",
+            target_kind="product_milestone", target_ref="m-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [],
+            "field_changes": [
+                {"field_name": "target_state", "subject_ref": "", "current_value": "",
+                 "proposed_value": "Checkout under 60s.", "rationale": "discussed"},
+            ],
+            "relation_changes": [
+                {"relation_kind": "milestone_dependency", "subject_ref": "", "relation_target_kind": "",
+                 "relation_target_ref": "m-2", "proposed_value": "", "rationale": "already depends on m-2"},
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        proposal = _generate_proposal(admin_client, headers, thread["id"])
+        field_item = _item_by_field(proposal, "target_state")
+        dep_item = _item_by_relation(proposal, "milestone_dependency")
+
+        # The field applies fine on its own.
+        applied = _apply(admin_client, headers, proposal["id"], [field_item["id"]])
+        assert applied["applied_item_ids"] == [field_item["id"]]
+        detail = _get_milestone(admin_client, headers, "m-1")
+        assert detail["current_revision"]["target_state"] == "Checkout under 60s."
+        # `achievement` (the assessment axis) is untouched by apply.
+        assert detail["achievement"] == before["achievement"]
+
+        # The DUPLICATE dependency is refused, cleanly, with no partial
+        # write for THIS item.
+        r = _apply(admin_client, headers, proposal["id"], [dep_item["id"]], expect=422)
+        assert r.status_code == 422
+        refreshed = _get_proposal(admin_client, headers, proposal["id"])
+        refreshed_dep = next(i for i in refreshed["items"] if i["id"] == dep_item["id"])
+        assert refreshed_dep["status"] == "proposed"
+
+    def test_gap_field_apply_never_touches_lifecycle_or_priority(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _add_objective(admin_client, headers, "obj-1")
+        _add_milestone(admin_client, headers, "obj-1", "m-1")
+        _add_gap(admin_client, headers, "m-1", "gap-1")
+        before = _get_gap(admin_client, headers, "gap-1")
+
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="objective-map",
+            target_kind="product_gap", target_ref="gap-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [],
+            "field_changes": [
+                {"field_name": "current_state", "subject_ref": "", "current_value": "",
+                 "proposed_value": "No retry on failed payment.", "rationale": "discussed"},
+            ],
+            "relation_changes": [],
+        })
+        _enable_real_llm(monkeypatch, client)
+        proposal = _generate_proposal(admin_client, headers, thread["id"])
+        field_item = _item_by_field(proposal, "current_state")
+        _apply(admin_client, headers, proposal["id"], [field_item["id"]])
+
+        after = _get_gap(admin_client, headers, "gap-1")
+        assert after["current_revision"]["current_state"] == "No retry on failed payment."
+        assert after["lifecycle"] == before["lifecycle"]
+        assert after["priority_band"] == before["priority_band"]
+
+    def test_feature_field_and_three_link_kinds_apply(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token)
+        headers = _headers(token, system["id"])
+        _add_feature(admin_client, headers, "feat-1")
+        _create_requirement(admin_client, headers, "req-1")
+
+        thread = _create_thread(
+            admin_client, headers, scope="entity", screen_id="ux-design-studio",
+            target_kind="product_feature", target_ref="feat-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [],
+            "field_changes": [
+                {"field_name": "statement", "subject_ref": "", "current_value": "",
+                 "proposed_value": "One-click reorder.", "rationale": "discussed"},
+            ],
+            "relation_changes": [
+                {"relation_kind": "requirement_link", "subject_ref": "", "relation_target_kind": "",
+                 "relation_target_ref": "req-1", "proposed_value": "", "rationale": "discussed"},
+                {"relation_kind": "target_link", "subject_ref": "", "relation_target_kind": "component",
+                 "relation_target_ref": "checkout-svc", "proposed_value": "", "rationale": "discussed"},
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        proposal = _generate_proposal(admin_client, headers, thread["id"])
+        field_item = _item_by_field(proposal, "statement")
+        req_link_item = _item_by_relation(proposal, "requirement_link", "req-1")
+        target_link_item = _item_by_relation(proposal, "target_link", "checkout-svc")
+
+        applied = _apply(
+            admin_client, headers, proposal["id"],
+            [field_item["id"], req_link_item["id"], target_link_item["id"]],
+        )
+        assert len(applied["applied_item_ids"]) == 3
+
+        detail = _get_feature(admin_client, headers, "feat-1")
+        assert detail["current_revision"]["statement"] == "One-click reorder."
+        req_links = {l["requirement_key"] for l in detail["requirement_links"]}
+        assert "req-1" in req_links
+        target_links = [l for l in detail["target_links"] if l["target_ref"] == "checkout-svc"]
+        assert len(target_links) == 1
+        assert target_links[0]["link_kind"] == "component"
+
+
+class TestChildSystemIsolation:
+    def test_a_child_item_from_another_system_is_unreachable(self, admin_client, monkeypatch):
+        token = _login(admin_client)
+        system_a = _create_system(admin_client, token, name="child-sys-a")
+        system_b = _create_system(admin_client, token, name="child-sys-b")
+        headers_a = _headers(token, system_a["id"])
+        headers_b = _headers(token, system_b["id"])
+        _create_requirement(admin_client, headers_a, "req-1")
+        _add_requirement_revision(
+            admin_client, headers_a, "req-1",
+            acceptance_criteria=[
+                {"criterion_key": "c-1", "criterion_order": 0, "statement": "s",
+                 "verification_method": "manual_review", "verification_note": ""},
+            ],
+        )
+        thread = _create_thread(
+            admin_client, headers_a, scope="entity", screen_id="ux-design-studio",
+            target_kind="ux_requirement", target_ref="req-1",
+        )["thread"]
+        client = _FixedResponseClient({
+            "summary": "x", "confirmed_points": [], "unresolved_questions": [], "assumptions": [],
+            "evidence_refs": [], "field_changes": [], "relation_changes": [],
+            "child_changes": [
+                _child_change(
+                    "acceptance_criterion", "update", child_key="c-1",
+                    field_name="statement", proposed_value="reworded",
+                ),
+            ],
+        })
+        _enable_real_llm(monkeypatch, client)
+        proposal = _generate_proposal(admin_client, headers_a, thread["id"])
+        item = _child_item(proposal, child_key="c-1")
+
+        r = _apply(admin_client, headers_b, proposal["id"], [item["id"]], expect=404)
+        assert r.status_code == 404

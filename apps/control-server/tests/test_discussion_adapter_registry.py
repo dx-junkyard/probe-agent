@@ -197,18 +197,34 @@ def test_proposal_target_schema_equals_pre_refactor_value():
         "overview_finding": {"fields": (), "relations": ()},
         "interview_session": {"fields": (), "relations": ()},
         "screen": {"fields": (), "relations": ()},
-        # Issue #453: none of the 8 new kinds register `fields`/`relations`
-        # (generation/confirmation for Objective/UX/Feature content is out
-        # of this Issue's scope) -- so each is present in the schema (every
-        # `target_kind` is) with both empty, exactly like `overview_finding`.
+        # Issue #453: `purpose_element`/`purpose_relation`/`stakeholder`/
+        # `stakeholder_need` register neither `fields` nor `relations`
+        # (out of THEIR issue's scope) -- so each is present in the schema
+        # (every `target_kind` is) with both empty, exactly like
+        # `overview_finding`.
         "purpose_element": {"fields": (), "relations": ()},
         "purpose_relation": {"fields": (), "relations": ()},
         "stakeholder": {"fields": (), "relations": ()},
         "stakeholder_need": {"fields": (), "relations": ()},
-        "product_objective": {"fields": (), "relations": ()},
-        "product_milestone": {"fields": (), "relations": ()},
-        "product_gap": {"fields": (), "relations": ()},
-        "product_feature": {"fields": (), "relations": ()},
+        # Issue #454 (Epic #443 §5.2): content is proposable; every human
+        # decision-ledger axis (`objective_state`/`achievement`/`lifecycle`/
+        # `priority_band`) is STRUCTURALLY absent, never merely filtered.
+        "product_objective": {
+            "fields": ("title", "intent", "contribution", "scope_note", "summary"),
+            "relations": ("upstream_ref",),
+        },
+        "product_milestone": {
+            "fields": ("title", "target_state", "verification_method", "verification_note", "summary"),
+            "relations": ("milestone_dependency",),
+        },
+        "product_gap": {
+            "fields": ("title", "current_state", "target_state", "interpretation", "suggested_priority_note"),
+            "relations": (),
+        },
+        "product_feature": {
+            "fields": ("title", "statement", "rationale", "scope_note", "summary"),
+            "relations": ("requirement_link", "capability_link", "target_link"),
+        },
     }
     actual = assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA
     assert set(actual.keys()) == set(expected.keys())
@@ -317,12 +333,18 @@ _KINDS_WITH_UI_DRAFT_FORMS = frozenset(
 
 
 def test_phase_2_children_and_ju_bridge_stay_empty_ui_draft_forms_is_the_new_field():
-    # #448 (children) and #449 (joint_understanding_bridge) are still ahead;
-    # only #445's `ui_draft_forms` is populated in this phase, and only for
-    # the 4 kinds whose Dashboard forms exist today (docs/ai-discussion-
-    # adapter.md §1.4's "declared now, populated later" shapes).
+    # #449 (joint_understanding_bridge) is still ahead. #454 (Epic #443
+    # §5.1) populates `children` for exactly ONE kind (`ux_requirement`'s
+    # `acceptance_criterion`) -- every other kind's `children` stays `()`.
+    # `ui_draft_forms` stays populated only for the 4 kinds whose Dashboard
+    # forms exist today (docs/ai-discussion-adapter.md §1.4's "declared now,
+    # populated later" shapes) -- #454 deliberately does not extend prefill
+    # to Acceptance Criteria.
     for kind, adapter in discussion_adapters.DISCUSSION_ADAPTERS.items():
-        assert adapter.children == ()
+        if kind == "ux_requirement":
+            assert [c.child_kind for c in adapter.children] == ["acceptance_criterion"]
+        else:
+            assert adapter.children == (), f"{kind} should have no ChildSpec yet"
         assert adapter.joint_understanding_bridge is False
         if kind in _KINDS_WITH_UI_DRAFT_FORMS:
             assert adapter.ui_draft_forms != (), f"{kind} should have a ui_draft_forms entry"

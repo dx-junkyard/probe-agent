@@ -68,8 +68,29 @@ const DELIVERY_BUSY: ReadonlySet<DeliveryState> = new Set([
   "navigating", "waiting_for_form", "delivering", "recording",
 ]);
 
+// Issue #454 (Epic #443 §5.1): a child item's intent, in the same finite
+// Japanese vocabulary a save/apply action already uses elsewhere on this
+// screen -- never a raw `add`/`update`/`remove` identifier next to Japanese
+// prose (UI言語規約).
+const CHILD_INTENT_LABEL: Record<string, string> = {
+  add: "追加", update: "更新", remove: "削除",
+};
+
 function itemLabel(item: AssistantDiscussionProposalItem): string {
-  if (item.item_kind === "field") return item.field_name;
+  if (item.item_kind === "field") {
+    if (item.child_kind) {
+      // §5.1: a pure reorder (no field_name) and a content change on the
+      // SAME child are separate items -- the label makes that visible
+      // rather than showing them identically.
+      const intent = CHILD_INTENT_LABEL[item.child_intent] ?? item.child_intent;
+      const keyLabel = item.child_key || "新規";
+      if (!item.field_name && item.child_order !== null) {
+        return `${item.child_kind}[${keyLabel}] 順序変更 → ${item.child_order}`;
+      }
+      return `${item.child_kind}[${keyLabel}].${item.field_name} (${intent})`;
+    }
+    return item.field_name;
+  }
   return `${item.relation_kind} → ${item.relation_target_kind}:${item.relation_target_ref}`;
 }
 

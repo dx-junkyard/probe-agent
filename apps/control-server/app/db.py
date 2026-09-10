@@ -388,10 +388,10 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_system
 CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_thread
     ON assistant_discussion_proposal (thread_id, id DESC);
 
--- assistant_discussion_proposal_item: one candidate field/relation change.
--- `subject_ref` is the sub-address INSIDE the target that `target_ref`
--- alone cannot express -- today only a Solution Design's OPTION
--- (`option_key`), because a Solution Design carries no design-level
+-- assistant_discussion_proposal_item: one candidate field/relation/child
+-- change. `subject_ref` is the sub-address INSIDE the target that
+-- `target_ref` alone cannot express -- today only a Solution Design's
+-- OPTION (`option_key`), because a Solution Design carries no design-level
 -- revision table (a field proposal on `solution_design` addresses an
 -- Option, applied through `solution_design.add_option`); every other
 -- target_kind leaves it ''. Eligibility (`appliable`/`forbidden`/`stale`/
@@ -401,6 +401,23 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_thread
 -- stored column -- the same "derived, never stored" discipline #337/#338/
 -- #349/#405 apply elsewhere, so a target that changed after generation
 -- cannot keep reading as appliable.
+--
+-- `child_kind` / `child_key` / `child_intent` / `child_order` (Issue #454,
+-- Epic #443 §5.1) address ONE row inside a nested/list collection a
+-- `DiscussionAdapter.ChildSpec` declares (e.g. a Requirement's Acceptance
+-- Criteria) -- '' / '' / '' / NULL on every pre-#454 row and on every
+-- non-child field/relation item. A `child_kind` item still uses
+-- `item_kind='field'` (never a third `item_kind` value): the field it
+-- carries in `field_name`/`proposed_value` is one field of the addressed
+-- child, or '' when the row carries ONLY a `child_order` move -- §5.1's
+-- "順序変更と本文変更を別itemとして選択できる" is expressed as two SEPARATE
+-- rows sharing the same `(child_kind, child_key, child_intent)`, never as
+-- one row with two kinds of change bundled together. For `child_intent
+-- ='add'`, `child_key` is never caller/model-supplied: it is the STABLE
+-- `reserved_child_key` `assistant_discussion_proposal.create_proposal`
+-- mints once per distinct `client_temp_key` the model used to correlate
+-- multiple field rows of the same new child within one generation result,
+-- and is what the field applier writes as the child's real domain key.
 CREATE TABLE IF NOT EXISTS assistant_discussion_proposal_item (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id             INTEGER NOT NULL,
@@ -409,13 +426,18 @@ CREATE TABLE IF NOT EXISTS assistant_discussion_proposal_item (
     field_name            TEXT NOT NULL DEFAULT '',
     relation_kind         TEXT NOT NULL DEFAULT '' CHECK (relation_kind IN (
                               '', 'upstream_ref', 'journey_step_link', 'requirement_link',
-                              'target_link', 'delivery_link', 'stakeholder_link', 'exchange_link')),
+                              'target_link', 'delivery_link', 'stakeholder_link', 'exchange_link',
+                              'capability_link', 'milestone_dependency')),
     relation_target_kind  TEXT NOT NULL DEFAULT '',
     relation_target_ref   TEXT NOT NULL DEFAULT '',
     subject_ref           TEXT NOT NULL DEFAULT '',
     current_value         TEXT NOT NULL DEFAULT '',
     proposed_value        TEXT NOT NULL DEFAULT '',
     rationale             TEXT NOT NULL DEFAULT '',
+    child_kind            TEXT NOT NULL DEFAULT '',
+    child_key             TEXT NOT NULL DEFAULT '',
+    child_intent          TEXT NOT NULL DEFAULT '' CHECK (child_intent IN ('', 'add', 'update', 'remove')),
+    child_order           INTEGER,
     status                TEXT NOT NULL DEFAULT 'proposed'
                               CHECK (status IN ('proposed', 'applied', 'rejected')),
     applied_ref           TEXT,
@@ -9754,6 +9776,74 @@ def _migrate_assistant_discussion_thread_target_kinds(conn: sqlite3.Connection) 
     )
 
 
+def _migrate_assistant_discussion_proposal_item_children(conn: sqlite3.Connection) -> None:
+    """Add the §5.1 `child_kind`/`child_key`/`child_intent`/`child_order`
+    columns and widen `relation_kind`'s CHECK with `capability_link` /
+    `milestone_dependency` (Issue #454, Epic #443 Phase 5).
+
+    SQLite cannot ALTER a CHECK constraint in place, so -- exactly like
+    `_migrate_assistant_discussion_thread_target_kinds` just above -- the
+    table is rebuilt once, preserving every existing row's id and every
+    existing column value unchanged (a pure additive widening: every
+    pre-#454 row reads `child_kind=''` / `child_key=''` / `child_intent=''`
+    / `child_order=NULL`, which is exactly what "this item is not a child
+    change" already meant before these columns existed).
+
+    `assistant_discussion_proposal_prefill.item_id` holds a
+    `REFERENCES assistant_discussion_proposal_item (id) ON DELETE CASCADE`
+    FK -- `PRAGMA legacy_alter_table=ON` for the rename keeps that
+    referencing table pointed at the bare, unqualified table name (the same
+    `_migrate_joint_understanding_session_owner_scope` idiom), so it
+    resolves to the freshly rebuilt table with no fix-up needed on the
+    referencing table at all.
+
+    Detection is STRUCTURAL and idempotent: read the table's stored SQL
+    straight from `sqlite_master` and no-op once it already declares
+    `child_kind`.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'assistant_discussion_proposal_item'"
+    ).fetchone()
+    if row is None or row["sql"] is None:
+        return
+    if "child_kind" in row["sql"]:
+        return
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        PRAGMA legacy_alter_table = ON;
+        ALTER TABLE assistant_discussion_proposal_item RENAME TO assistant_discussion_proposal_item_legacy;
+        PRAGMA legacy_alter_table = OFF;
+        DROP INDEX IF EXISTS idx_assistant_discussion_proposal_item_system;
+        DROP INDEX IF EXISTS idx_assistant_discussion_proposal_item_proposal;
+        """
+    )
+    conn.executescript(_ASSISTANT_DISCUSSION_PROPOSAL_DDL)
+    conn.execute(
+        """
+        INSERT INTO assistant_discussion_proposal_item (
+            id, system_id, proposal_id, item_kind, field_name, relation_kind,
+            relation_target_kind, relation_target_ref, subject_ref, current_value,
+            proposed_value, rationale, status, applied_ref, decided_by, decided_at,
+            decision_method, created_at, schema_version
+        )
+        SELECT
+            id, system_id, proposal_id, item_kind, field_name, relation_kind,
+            relation_target_kind, relation_target_ref, subject_ref, current_value,
+            proposed_value, rationale, status, applied_ref, decided_by, decided_at,
+            decision_method, created_at, schema_version
+        FROM assistant_discussion_proposal_item_legacy
+        """
+    )
+    conn.executescript(
+        """
+        DROP TABLE assistant_discussion_proposal_item_legacy;
+        PRAGMA foreign_keys = ON;
+        """
+    )
+
+
 def _migrate_joint_understanding_session_owner_scope(conn: sqlite3.Connection) -> None:
     """Add `owner_scope` / `discussion_thread_id`, drop `session_id`'s NOT
     NULL, and add the dependency-manifest premise columns (Issue #461).
@@ -9871,6 +9961,7 @@ def init_db() -> None:
         _migrate_ux_journey_upstream_ref_kinds(conn)
         _migrate_product_gap_artifact_link_kinds(conn)
         _migrate_assistant_discussion_thread_target_kinds(conn)
+        _migrate_assistant_discussion_proposal_item_children(conn)
         _migrate_intelligence_runs_snapshot_nullable(conn)
         install_intelligence_run_type_guards(conn)
         _migrate_cell_improvement_event_types(conn)

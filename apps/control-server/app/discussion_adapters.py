@@ -112,16 +112,25 @@ def _normalized_json_digest(text: Optional[str]) -> str:
 
 @dataclass(frozen=True)
 class ChildSpec:
-    """§5.1 (Issue #448). A nested/list collection a proposal item may target
-    (e.g. a Journey's steps, a Requirement's acceptance criteria). Every
-    adapter's `children` stays `()` through Phase 1-4 -- declaring the shape
-    now means a later phase populates a tuple instead of adding a new field
-    to every adapter and every call site that reads one."""
+    """§5.1 (Issue #448, populated by #454). A nested/list collection a
+    proposal item may target (e.g. a Requirement's Acceptance Criteria).
+
+    `context_list_key` (added by #454) names the key under this adapter's
+    `context_provider` result that carries the CURRENT list of this child
+    kind's rows (each a dict containing at least `key_field`) -- this is
+    what lets both generation-time (`assistant_discussion_proposal.
+    generate_proposal`) and a future re-check validate an `update`/`remove`
+    proposal's `child_key` against a REAL existing key rather than trusting
+    the model. It is never used for `add`: an add's key is server-reserved
+    (see `assistant_discussion_proposal.create_proposal`'s
+    `_reserve_child_key`), not looked up here.
+    """
 
     child_kind: str
     key_field: str
     order_field: str
     fields: Tuple[str, ...] = ()
+    context_list_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -695,6 +704,25 @@ _UX_REQUIREMENT_FIELDS: Tuple[str, ...] = (
 )
 _UX_REQUIREMENT_RELATIONS: Tuple[str, ...] = ("journey_step_link",)
 
+# Issue #454 (Epic #443 §5.1): the ONE ChildSpec this Issue wires end to
+# end. `fields` is a strict SUBSET of `ux_design._CRITERION_KEYS` /
+# `assistant_discussion_proposal._CRITERION_KEYS` -- `criterion_key` and
+# `criterion_order` are addressed through `child_key`/`child_order`, never
+# through this tuple (§5.1's own table: "key" and "order" are structural
+# columns on the proposal item, not proposable content).
+_UX_REQUIREMENT_ACCEPTANCE_CRITERION_FIELDS: Tuple[str, ...] = (
+    "statement", "verification_method", "verification_note",
+)
+_UX_REQUIREMENT_CHILDREN: Tuple[ChildSpec, ...] = (
+    ChildSpec(
+        child_kind="acceptance_criterion",
+        key_field="criterion_key",
+        order_field="criterion_order",
+        fields=_UX_REQUIREMENT_ACCEPTANCE_CRITERION_FIELDS,
+        context_list_key="acceptance_criteria",
+    ),
+)
+
 # A Solution Design carries no design-level revision table (its identity row's
 # `title`/`summary` are set once at creation with no update path); a field
 # proposal therefore addresses an OPTION (`solution_design.add_option`'s own
@@ -744,7 +772,22 @@ def _context_ux_requirement(conn: Any, system_id: int, target_ref: str) -> Dict[
 
     detail = ux_design.get_requirement_detail(conn, system_id, target_ref)
     rev = detail.get("current_revision") or {}
-    return {k: rev.get(k, "") for k in _UX_REQUIREMENT_FIELDS}
+    facts = {k: rev.get(k, "") for k in _UX_REQUIREMENT_FIELDS}
+    # Issue #454: the CURRENT Acceptance Criteria list, keyed the same way
+    # `ChildSpec(child_kind="acceptance_criterion").context_list_key` names
+    # it -- this is what lets generation-time validation check an
+    # `update`/`remove` proposal's `child_key` against a real existing key
+    # (§5.4), and what lets the model see existing criteria to correct
+    # rather than blindly re-propose.
+    facts["acceptance_criteria"] = [
+        {
+            "criterion_key": c.get("criterion_key", ""),
+            "criterion_order": c.get("criterion_order", 0),
+            **{k: c.get(k, "") for k in _UX_REQUIREMENT_ACCEPTANCE_CRITERION_FIELDS},
+        }
+        for c in rev.get("acceptance_criteria", [])
+    ][:_MAX_CONTEXT_ITEMS]
+    return facts
 
 
 def _context_solution_design(conn: Any, system_id: int, target_ref: str) -> Dict[str, Any]:
@@ -911,6 +954,44 @@ def _context_stakeholder_need(conn: Any, system_id: int, target_ref: str) -> Dic
             for r in refs_result.get("refs", [])
         ][:_MAX_CONTEXT_ITEMS],
     }
+
+
+# --- Issue #454 (Epic #443 §5.2): Objective/Milestone/Gap/Feature content --
+# `docs/01-specifications/capabilities/ai-discussion-adapter.md` §5.2's rule, applied here: `priority_band` /
+# `achievement` / `lifecycle` / `design_status` / `option_status` /
+# `resolved` / `adopted` -- every human decision-ledger axis these four
+# kinds carry -- are STRUCTURALLY absent from every tuple below. Not
+# filtered out at apply time; never written into the tuple in the first
+# place, so there is no `field_name`/`relation_kind` a model or a prefill
+# dispatch could ever address them through (the same "registering nothing
+# is the enforcement" discipline #427 applies to Gap's own severity column).
+#
+# Every tuple is a strict subset of its domain revision function's own
+# keyword parameters (verified by `tests/test_discussion_adapter_registry.py`,
+# the same registry-drift protection `TestRegistryCorrespondence` already
+# gives `ux_journey`/`ux_requirement`/`solution_design`).
+_PRODUCT_OBJECTIVE_FIELDS: Tuple[str, ...] = ("title", "intent", "contribution", "scope_note", "summary")
+_PRODUCT_OBJECTIVE_RELATIONS: Tuple[str, ...] = ("upstream_ref",)
+
+_PRODUCT_MILESTONE_FIELDS: Tuple[str, ...] = (
+    "title", "target_state", "verification_method", "verification_note", "summary",
+)
+#: A milestone dependency is an ORDERING relationship (§4.4 of
+#: `docs/01-specifications/product/product-objective-lineage.md`), never an achievement gate -- proposing/
+#: applying one through this registry moves nothing on `achievement`.
+_PRODUCT_MILESTONE_RELATIONS: Tuple[str, ...] = ("milestone_dependency",)
+
+_PRODUCT_GAP_FIELDS: Tuple[str, ...] = (
+    "title", "current_state", "target_state", "interpretation", "suggested_priority_note",
+)
+
+_PRODUCT_FEATURE_FIELDS: Tuple[str, ...] = ("title", "statement", "rationale", "scope_note", "summary")
+#: The three link kinds §4.1's "Requirement/Capability/Solution/Flow/
+#: Component link" decision names -- `target_link`'s own `relation_target_
+#: kind` carries WHICH of Solution/Flow/Component (any
+#: `product_feature.TARGET_LINK_KINDS` member; the domain function's own
+#: `_check_membership` is the finite gate, never re-narrowed here).
+_PRODUCT_FEATURE_RELATIONS: Tuple[str, ...] = ("requirement_link", "capability_link", "target_link")
 
 
 def _context_product_objective(conn: Any, system_id: int, target_ref: str) -> Dict[str, Any]:
@@ -1154,11 +1235,19 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         route_params=_route_params_ux_requirement,
         fields=_UX_REQUIREMENT_FIELDS,
         relations=_UX_REQUIREMENT_RELATIONS,
+        # Issue #454: Acceptance Criteria are addressed as a ChildSpec, not
+        # a top-level field -- this is what makes `add`/`update`/`remove`
+        # and a reorder-only change distinct, individually selectable
+        # proposal items (§5.1) instead of one opaque "acceptance_criteria"
+        # blob field.
+        children=_UX_REQUIREMENT_CHILDREN,
         field_applier=_delegate_apply_field,
         relation_applier=_delegate_apply_relation,
         # Issue #445: `components/ux-design/requirement-panel.tsx`'s
-        # `RequirementRevisionForm`. Acceptance criteria are NOT included --
-        # they are a #448 (ChildSpec) concern, not a top-level field.
+        # `RequirementRevisionForm`. Acceptance criteria stay OUT of this
+        # form's `fields` allowlist (prefill dispatch is #446/#452 scope,
+        # not extended to children by this Issue) -- they are proposable
+        # (§5.1's ChildSpec) but not yet prefillable.
         ui_draft_forms=(UiDraftFormSpec(form_id="ux_requirement.revision", fields=_UX_REQUIREMENT_FIELDS),),
         # Issue #452: the FIRST real prefill delivery handler wired end to
         # end (navigate -> mount -> deliver -> ack) -- `ux_requirement` is
@@ -1260,6 +1349,13 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         resolver=_resolve_product_objective,
         context_provider=_context_product_objective,
         route_params=_route_params_empty,
+        # Issue #454: content is proposable; `objective_state` (the
+        # confirm/decision axis §4.3 owns) is not in this tuple and never
+        # will be (§5.2).
+        fields=_PRODUCT_OBJECTIVE_FIELDS,
+        relations=_PRODUCT_OBJECTIVE_RELATIONS,
+        field_applier=_delegate_apply_field,
+        relation_applier=_delegate_apply_relation,
     ),
     "product_milestone": DiscussionAdapter(
         target_kind="product_milestone",
@@ -1269,6 +1365,11 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         resolver=_resolve_product_milestone,
         context_provider=_context_product_milestone,
         route_params=_route_params_empty,
+        # Issue #454: `achievement` (the assessment axis) is absent (§5.2).
+        fields=_PRODUCT_MILESTONE_FIELDS,
+        relations=_PRODUCT_MILESTONE_RELATIONS,
+        field_applier=_delegate_apply_field,
+        relation_applier=_delegate_apply_relation,
     ),
     "product_gap": DiscussionAdapter(
         target_kind="product_gap",
@@ -1278,6 +1379,13 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         resolver=_resolve_product_gap,
         context_provider=_context_product_gap,
         route_params=_route_params_empty,
+        # Issue #454: `lifecycle`/`priority_band` (the decision axes §5.6/
+        # §5.7 own) are absent (§5.2). Gap's detection-derived reference
+        # lists (`source_refs`/`evidence_refs`/`artifact_links`) stay
+        # read-only context here -- their own finite per-list vocabularies
+        # are this Issue's explicitly deferred scope, not a #454 relation.
+        fields=_PRODUCT_GAP_FIELDS,
+        field_applier=_delegate_apply_field,
     ),
     "product_feature": DiscussionAdapter(
         target_kind="product_feature",
@@ -1293,6 +1401,10 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         resolver=_resolve_product_feature,
         context_provider=_context_product_feature,
         route_params=_route_params_empty,
+        fields=_PRODUCT_FEATURE_FIELDS,
+        relations=_PRODUCT_FEATURE_RELATIONS,
+        field_applier=_delegate_apply_field,
+        relation_applier=_delegate_apply_relation,
     ),
 }
 

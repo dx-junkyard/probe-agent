@@ -44,6 +44,13 @@ ASSISTANT_DISCUSSION_SCHEMA_DEFS = {
     "DiscussionProposalItemEligibility": "discussion_proposal_item_eligibility",
     "UiDraftState": "ui_draft_state",
     "DiscussionOperationResult": "discussion_operation_result",
+    # Issue #458 (Epic #443 §9, DD-CTX-01..05).
+    "DiscussionContextCompleteness": "discussion_context_completeness",
+    "DiscussionContextStopReason": "discussion_context_stop_reason",
+    "DiscussionContextResolution": "discussion_context_resolution",
+    "DiscussionContextDeepLinkState": "discussion_context_deep_link_state",
+    "DiscussionContextNextActionKind": "discussion_context_next_action_kind",
+    "DiscussionContextAuditConsumerKind": "discussion_context_audit_consumer_kind",
 }
 
 

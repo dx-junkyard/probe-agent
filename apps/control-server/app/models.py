@@ -6375,6 +6375,15 @@ class AssistantDiscussionProposalItemOut(BaseModel):
     current_value: str = ""
     proposed_value: str = ""
     rationale: str = ""
+    # Issue #454 (Epic #443 §5.1): a ChildSpec address. `child_kind=""`
+    # means "not a child item" (a plain top-level field/relation) -- the
+    # same three pre-#454 fields above stay meaningful either way. `child_
+    # order=None` means "this item does not move the child's order" (either
+    # it is not a reorder, or its `child_kind` is empty).
+    child_kind: str = ""
+    child_key: str = ""
+    child_intent: str = ""
+    child_order: Optional[int] = None
     status: DiscussionProposalItemStatus
     eligibility: DiscussionProposalItemEligibility
     applied_ref: Optional[str] = None
@@ -15086,6 +15095,14 @@ DiscussionContextNextActionKind = Literal["expand_context", "none"]
 #: §9.3's durable audit consumer kinds -- mirrors `discussion_context_bundle.
 #: CONTEXT_AUDIT_CONSUMER_KINDS` exactly.
 DiscussionContextAuditConsumerKind = Literal["turn", "proposal", "ju_session"]
+
+#: §9.2/DD-CTX-04: the finite semantic-claim-kind vocabulary a bundle-grounded
+#: answer's claims carry, mirroring `discussion_context_bundle.
+#: DISCUSSION_CONTEXT_CLAIM_KINDS` exactly. This module never produces a
+#: value of this type itself -- #459's own main discussion operation does,
+#: citing against `DiscussionContextBundleOut.sources[].source_id` via
+#: `discussion_context_bundle.validate_citation_source_ids`.
+DiscussionContextClaimKind = Literal["fact", "inference", "hypothesis", "unknown", "conflict"]
 
 
 class DiscussionContextRootOut(BaseModel):

@@ -25,9 +25,13 @@ import { useEffect, useRef, useState } from "react";
 import type { DiscussionTargetKind } from "@/api/types";
 
 /** §3.2's wire shape -- what `proposalToDraft` produces and a receiving form
- * consumes. `childOps` is declared now (mirrors `ChildSpec`/#448 being
- * declared-but-empty in the server registry) so a later phase populates it
- * without a new field; Phase 3 never produces a non-empty `childOps`. */
+ * consumes. `childOps` was declared empty through Phase 3 (mirroring
+ * `ChildSpec` being declared-but-empty in the server registry at the time);
+ * Issue #454 (Epic #443 §5.1) is the first phase that populates it, grouping
+ * every selected child item by `(childKind, childKey, intent)`. No Dashboard
+ * form consumes `childOps` yet (`ux_requirement`'s `ui_draft_forms` does not
+ * carry an Acceptance Criteria destination) -- extending prefill delivery to
+ * children is out of #454's scope. */
 export interface FormDraftPatch {
   /** Idempotency token -- also sent to the server's own `/prefill` audit
    * call so both sides agree on what "the same dispatch" means. */
