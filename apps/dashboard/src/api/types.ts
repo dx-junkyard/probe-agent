@@ -3764,6 +3764,11 @@ export interface AssistantDiscussionTurn {
   ui_draft_state?: UiDraftState | null;
   ui_draft_form_id?: string | null;
   ui_draft_digest?: string;
+  // Issue #459 (§9.2): `null`/absent means "not a claims turn" -- every turn
+  // before this Issue, and every ordinary /assistant/ask turn since. Never
+  // `[]`, which is structurally impossible for an actual claims turn (a
+  // claims call always returns at least one claim or fails outright).
+  claims?: DiscussionContextClaim[] | null;
 }
 
 export interface AssistantDiscussionThread {
@@ -3784,6 +3789,32 @@ export interface AssistantDiscussionThread {
   schema_version: string;
 }
 
+// Issue #459 (docs/01-specifications/ux/decision-discussion-workflow.md §3, DD-UX-01): the finite, PRIORITY-ORDERED
+// `kind` vocabulary of the single overall next_action projection for a Gap
+// discussion thread. The order below IS the priority order -- this app never
+// reimplements it; it only renders whatever the server returns (DD-UX-01:
+// "clientは同じ判定表を本番コードへ複製しない").
+export type GapDiscussionNextActionKind =
+  | "target_error"
+  | "evidence_stale"
+  | "processing"
+  | "save_unknown"
+  | "unsaved_edit"
+  | "review_proposal"
+  | "investigation_result"
+  | "review_hypothesis"
+  | "match";
+
+export interface AssistantDiscussionNextAction {
+  kind: GapDiscussionNextActionKind;
+  reason: string;
+  target_ref: string | null;
+  // Which DB-backed fact groups ("proposal" / "investigation") could not be
+  // read for THIS evaluation -- a failure here never blocks an earlier or
+  // later row that IS determinable.
+  degraded_sections: string[];
+}
+
 export interface AssistantDiscussionThreadDetailOut {
   thread: AssistantDiscussionThread;
   target_state: DiscussionTargetState;
@@ -3794,6 +3825,10 @@ export interface AssistantDiscussionThreadDetailOut {
   // valid; the server always sends it (`Field(default_factory=list)`).
   capabilities?: DiscussionCapability[];
   turns: AssistantDiscussionTurn[];
+  // Issue #459: the single overall next_action projection for this thread's
+  // whole Gap-discussion flow. Optional on the wire type only so pre-#459
+  // test fixtures stay valid; the server always sends it.
+  next_action?: AssistantDiscussionNextAction;
 }
 
 export interface AssistantDiscussionThreadsListOut {
@@ -3916,6 +3951,52 @@ export interface DiscussionContextExpansionRequest {
 export interface DiscussionContextExpansionOut {
   bundle: DiscussionContextBundle;
   expanded_section_ids: string[];
+}
+
+// §9.2 semantic claims (Issue #459). `app/discussion_claims.py` is the sole
+// producer -- mirrors `DiscussionClaim` / `ClaimsGenerationResult` exactly.
+
+export type DiscussionContextClaimKind =
+  | "fact"
+  | "inference"
+  | "hypothesis"
+  | "unknown"
+  | "conflict";
+
+export type DiscussionContextClaimBasis = "deterministic" | "reasoning_llm";
+
+export type DiscussionContextClaimErrorKind =
+  | "unavailable"
+  | "call_error"
+  | "invalid_response"
+  | "invalid_citation";
+
+export interface DiscussionContextClaim {
+  kind: DiscussionContextClaimKind;
+  statement: string;
+  cited_source_ids: string[];
+  basis: DiscussionContextClaimBasis;
+}
+
+export interface DiscussionContextClaimsRequest {
+  question?: string;
+}
+
+export interface DiscussionContextClaimsResultOut {
+  provider: string;
+  model: string;
+  is_mock: boolean;
+  prompt_version: string;
+  schema_version: string;
+  decision_method: "deterministic" | "reasoning_llm";
+  claims: DiscussionContextClaim[];
+  scope_note: string;
+  as_of_snapshot_commit: string | null;
+  retried: boolean;
+  error: string | null;
+  error_kind: DiscussionContextClaimErrorKind | null;
+  thread_id: number;
+  turn_number: number | null;
 }
 
 // Assistant discussion proposals (Issue #439, Epic #436). Finite unions

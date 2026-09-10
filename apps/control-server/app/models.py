@@ -6322,6 +6322,18 @@ class AssistantDiscussionTurnOut(BaseModel):
     ui_draft_state: Optional[UiDraftState] = None
     ui_draft_form_id: Optional[str] = None
     ui_draft_digest: str = ""
+    # Issue #459 (§9.2): `None` means "not a claims turn" (every turn before
+    # this Issue, and every ordinary `/assistant/ask` turn since) -- never
+    # defaulted to `[]`, which would be indistinguishable from "attached and
+    # empty" (structurally impossible: a claims call always returns at least
+    # one claim or fails outright, per `discussion_claims`). Kept as plain
+    # dicts (matching `DiscussionContextClaimOut`'s own shape, defined later
+    # in this module) rather than a forward-referenced model type -- this
+    # module has no `from __future__ import annotations`, and the two never
+    # drift because `routes/assistant.py` always constructs each item as
+    # `DiscussionContextClaimOut(...).model_dump()` before this turn is read
+    # back.
+    claims: Optional[List[Dict[str, Any]]] = None
 
 
 class AssistantDiscussionThreadOut(BaseModel):
@@ -6342,6 +6354,34 @@ class AssistantDiscussionThreadOut(BaseModel):
     schema_version: str = "assistant-discussion-thread-v1"
 
 
+#: Issue #459 (docs/01-specifications/ux/decision-discussion-workflow.md §3, DD-UX-01): the finite,
+#: PRIORITY-ORDERED `kind` vocabulary of the single overall next_action
+#: projection for a Gap discussion thread. Mirrors
+#: `app/discussion_next_action.NEXT_ACTION_KINDS` exactly -- the order below
+#: IS the priority order, never re-decided by the client (DD-UX-01: "client
+#: は同じ判定表を本番コードへ複製しない").
+GapDiscussionNextActionKind = Literal[
+    "target_error", "evidence_stale", "processing", "save_unknown",
+    "unsaved_edit", "review_proposal", "investigation_result",
+    "review_hypothesis", "match",
+]
+
+
+class AssistantDiscussionNextActionOut(BaseModel):
+    """`app/discussion_next_action.NextActionResult`'s wire shape."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: GapDiscussionNextActionKind
+    reason: str = ""
+    target_ref: Optional[str] = None
+    #: Which DB-backed fact groups (`"proposal"` / `"investigation"`) could
+    #: not be read for THIS evaluation -- a failure here never blocks an
+    #: earlier or later row that IS determinable (DD-INT: "任意sectionの失敗
+    #: だけで無関係な操作まで止めない").
+    degraded_sections: List[str] = Field(default_factory=list)
+
+
 class AssistantDiscussionThreadDetailOut(BaseModel):
     thread: AssistantDiscussionThreadOut
     target_state: DiscussionTargetState
@@ -6354,6 +6394,10 @@ class AssistantDiscussionThreadDetailOut(BaseModel):
     # and still support it.
     capabilities: List[DiscussionCapability] = Field(default_factory=list)
     turns: List[AssistantDiscussionTurnOut] = Field(default_factory=list)
+    #: Issue #459: the single overall next_action projection for this
+    #: thread's whole Gap-discussion flow, read fresh on every request
+    #: (never stored) -- see `AssistantDiscussionNextActionOut`.
+    next_action: AssistantDiscussionNextActionOut
 
 
 class AssistantDiscussionThreadsListOut(BaseModel):
@@ -15361,3 +15405,62 @@ class DiscussionContextExpansionOut(BaseModel):
 
     bundle: DiscussionContextBundleOut
     expanded_section_ids: List[str] = Field(default_factory=list)
+
+
+# --- §9.2 semantic claims (Issue #459) -----------------------------------------
+# `app/discussion_claims.py` is the sole producer. Mirrors
+# `discussion_claims.DiscussionClaim` / `ClaimsGenerationResult` field-for-field.
+
+#: Whether one claim came straight off a bundle's own structural field
+#: (`"deterministic"`) or the reasoning model's structured output
+#: (`"reasoning_llm"`). Mirrors `discussion_claims.CLAIM_BASIS_VALUES`.
+DiscussionContextClaimBasis = Literal["deterministic", "reasoning_llm"]
+
+#: Mirrors `discussion_claims`'s finite failure reasons for the §9.2 call.
+DiscussionContextClaimErrorKind = Literal[
+    "unavailable", "call_error", "invalid_response", "invalid_citation",
+]
+
+
+class DiscussionContextClaimsRequest(BaseModel):
+    """`POST /assistant/discussion-threads/{id}/context-claims` body. The
+    question is optional -- the primary action is a fixed
+    「目的・UX・機能を照合」 operation (docs/01-specifications/ux/decision-discussion-workflow.md §3), not a
+    free-form question every time."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(default="目的・UX・機能を照合", max_length=2000)
+
+
+class DiscussionContextClaimOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: DiscussionContextClaimKind
+    statement: str
+    cited_source_ids: List[str] = Field(default_factory=list)
+    basis: DiscussionContextClaimBasis
+
+
+class DiscussionContextClaimsResultOut(BaseModel):
+    """`discussion_claims.ClaimsGenerationResult`'s wire shape, plus the
+    turn this call's result was persisted onto (Principle 7 audit trail --
+    `None` only when persistence itself could not happen, e.g. the thread's
+    target became unresolvable between the read and the write)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    model: str
+    is_mock: bool
+    prompt_version: str
+    schema_version: str
+    decision_method: DecisionMethod
+    claims: List[DiscussionContextClaimOut] = Field(default_factory=list)
+    scope_note: str = ""
+    as_of_snapshot_commit: Optional[str] = None
+    retried: bool = False
+    error: Optional[str] = None
+    error_kind: Optional[DiscussionContextClaimErrorKind] = None
+    thread_id: int
+    turn_number: Optional[int] = None

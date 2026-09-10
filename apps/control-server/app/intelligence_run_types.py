@@ -26,6 +26,14 @@ class IntelligenceRunType(str, Enum):
     # always goes through the existing target domain service with
     # `decision_method: manual` (docs/01-specifications/capabilities/assistant-discussion.md §2).
     DISCUSSION_PROPOSAL = "discussion_proposal"
+    # Issue #459 (Epic #457, docs/01-specifications/capabilities/ai-discussion-adapter.md §9.2): a reasoning
+    # run that turns a #458 context bundle into fact/inference/hypothesis/
+    # unknown/conflict claims, citing only that bundle's own registered
+    # sources. Recorded even when no LLM call was needed at all (a bundle
+    # with nothing available to interpret) -- `decision_method` on that row
+    # is `deterministic`, matching `app/discussion_claims.
+    # ClaimsGenerationResult.decision_method`.
+    DISCUSSION_CONTEXT_CLAIM = "discussion_context_claim"
     ENTRYPOINT_INDEX = "entrypoint_index"
     EXPLANATION_REFRESH = "explanation_refresh"
     FEATURE_CODE_MAPPING = "feature_code_mapping"

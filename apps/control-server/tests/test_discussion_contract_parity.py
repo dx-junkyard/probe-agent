@@ -51,6 +51,11 @@ ASSISTANT_DISCUSSION_SCHEMA_DEFS = {
     "DiscussionContextDeepLinkState": "discussion_context_deep_link_state",
     "DiscussionContextNextActionKind": "discussion_context_next_action_kind",
     "DiscussionContextAuditConsumerKind": "discussion_context_audit_consumer_kind",
+    # Issue #459 (Epic #457).
+    "DiscussionContextClaimKind": "discussion_context_claim_kind",
+    "DiscussionContextClaimBasis": "discussion_context_claim_basis",
+    "DiscussionContextClaimErrorKind": "discussion_context_claim_error_kind",
+    "GapDiscussionNextActionKind": "gap_discussion_next_action_kind",
 }
 
 

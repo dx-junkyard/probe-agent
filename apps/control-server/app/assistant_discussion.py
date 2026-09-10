@@ -196,6 +196,17 @@ def _turn_out(row: Any) -> Dict[str, Any]:
     except (TypeError, ValueError):
         data["citations"] = []
     data["used_fallback"] = bool(data.get("used_fallback"))
+    # Issue #459: `None` (no `claims_json` column value) means "not a §9.2
+    # claims turn", kept distinct from an (impossible in practice, but never
+    # trusted) empty list -- see `append_turn`'s own docstring on `claims`.
+    raw_claims = data.pop("claims_json", None)
+    if raw_claims:
+        try:
+            data["claims"] = json.loads(raw_claims)
+        except (TypeError, ValueError):
+            data["claims"] = None
+    else:
+        data["claims"] = None
     return data
 
 
@@ -390,6 +401,11 @@ def append_turn(
     ui_draft_state: Optional[str] = None,
     ui_draft_form_id: Optional[str] = None,
     ui_draft_digest: Optional[str] = None,
+    # Issue #459 (§9.2): the ASSISTANT turn produced by a 照合 (context
+    # claims) call carries its structured claims here. `None` (the default)
+    # means "not a claims turn" -- a normal `/assistant/ask` answer never
+    # sets this, so it stays indistinguishable from a pre-#459 row.
+    claims: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Insert one turn on an ALREADY-OPEN connection -- callers that append a
     user turn and its assistant answer wrap both calls (and any thread
@@ -416,8 +432,9 @@ def append_turn(
            (system_id, thread_id, turn_number, role, content, citations_json,
             target_revision_id, target_digest, used_fallback, decision_method,
             input_mode, provider, model, prompt_version, created_by, created_at,
-            schema_version, ui_draft_state, ui_draft_form_id, ui_draft_digest)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            schema_version, ui_draft_state, ui_draft_form_id, ui_draft_digest,
+            claims_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             system_id, thread_id, turn_number, role, content,
             json.dumps(list(citations or []), ensure_ascii=False),
@@ -425,6 +442,7 @@ def append_turn(
             decision_method, input_mode, provider, model, prompt_version,
             created_by, now, TURN_SCHEMA_VERSION,
             ui_draft_state, ui_draft_form_id, ui_draft_digest,
+            json.dumps(list(claims), ensure_ascii=False) if claims is not None else None,
         ),
     )
     turn_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]

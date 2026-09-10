@@ -30,8 +30,10 @@ from .. import (
     assistant_discussion,
     assistant_discussion_proposal,
     discussion_adapters,
+    discussion_claims,
     discussion_context_bundle,
     discussion_hypothesis,
+    discussion_next_action,
     ui_draft_context,
 )
 from .. import joint_understanding as joint_understanding_domain
@@ -57,6 +59,7 @@ from ..models import (
     AssistantDiscussionHypothesisPromotionOut,
     AssistantDiscussionJointUnderstandingLinkOut,
     AssistantDiscussionJointUnderstandingListOut,
+    AssistantDiscussionNextActionOut,
     AssistantDiscussionProposalApplyOut,
     AssistantDiscussionProposalApplyRequest,
     AssistantDiscussionProposalHypothesisOut,
@@ -76,6 +79,9 @@ from ..models import (
     AssistantSuggestedQuestionOut,
     DiagnosticLastObservedErrorOut,
     DiscussionContextBundleOut,
+    DiscussionContextClaimOut,
+    DiscussionContextClaimsRequest,
+    DiscussionContextClaimsResultOut,
     DiscussionContextExpansionOut,
     DiscussionContextExpansionRequest,
     JointUnderstandingFindingOut,
@@ -273,7 +279,12 @@ def _turn_out(row: Dict[str, Any]) -> AssistantDiscussionTurnOut:
     )
 
 
-def _thread_detail_out(data: Dict[str, Any]) -> AssistantDiscussionThreadDetailOut:
+def _thread_detail_out(
+    data: Dict[str, Any], *,
+    has_unsaved_ui_draft: bool = False,
+    save_result_unknown: bool = False,
+    save_reference_id: Optional[str] = None,
+) -> AssistantDiscussionThreadDetailOut:
     # Issue #456: read fresh from the CURRENT registry every time (never
     # stored on the thread row), so a narrowed/widened registry is reflected
     # immediately -- the same "never a stored column" discipline `discussion_
@@ -281,13 +292,38 @@ def _thread_detail_out(data: Dict[str, Any]) -> AssistantDiscussionThreadDetailO
     # exists (a legacy row's `target_kind` was removed from the registry,
     # `tests/test_discussion_adapter_registry.py`'s own compatibility test)
     # reports zero capabilities rather than raising.
-    adapter = discussion_adapters.get_adapter(data["thread"]["target_kind"])
+    thread_row = data["thread"]
+    adapter = discussion_adapters.get_adapter(thread_row["target_kind"])
     capabilities = list(discussion_adapters.capabilities_for(adapter)) if adapter is not None else []
+    # Issue #459: the overall next_action projection, read fresh every time
+    # (never stored) from the SAME thread detail read -- `has_unsaved_ui_
+    # draft`/`save_result_unknown`/`save_reference_id` are the two rows only
+    # the caller (client) can observe (see `discussion_next_action`'s module
+    # docstring); everything else comes from existing owner tables.
+    with get_conn() as conn:
+        self_context = discussion_adapters.gather_context(
+            conn, thread_row["system_id"], thread_row["target_kind"], thread_row["target_ref"],
+        )
+        facts = discussion_next_action.gather_gap_discussion_facts(
+            conn, thread_row["system_id"], thread_row["id"],
+            target_state=data["target_state"],
+            self_operation_state=self_context.operation_state,
+            self_unavailable_reason=self_context.reason,
+            has_unsaved_ui_draft=has_unsaved_ui_draft,
+            save_result_unknown=save_result_unknown,
+            save_reference_id=save_reference_id,
+        )
+    next_action = discussion_next_action.evaluate_gap_discussion_next_action(facts)
     return AssistantDiscussionThreadDetailOut(
-        thread=_thread_out(data["thread"]),
+        thread=_thread_out(thread_row),
         target_state=data["target_state"],
         capabilities=capabilities,
         turns=[_turn_out(t) for t in data["turns"]],
+        next_action=AssistantDiscussionNextActionOut(
+            kind=next_action.kind, reason=next_action.reason,
+            target_ref=next_action.target_ref,
+            degraded_sections=list(next_action.degraded_sections),
+        ),
     )
 
 
@@ -338,6 +374,13 @@ def list_discussion_threads(
 )
 def get_discussion_thread(
     thread_id: int,
+    # Issue #459: the two next_action rows only the client can observe (a
+    # lost save response, an open form's own dirty state) -- see
+    # `discussion_next_action`'s module docstring. Both default to "nothing
+    # pending", matching a caller that has not yet adopted them.
+    has_unsaved_ui_draft: bool = False,
+    save_result_unknown: bool = False,
+    save_reference_id: Optional[str] = None,
     system_id: int = Depends(get_system_id),
 ) -> AssistantDiscussionThreadDetailOut:
     data = assistant_discussion.get_thread(system_id, thread_id)
@@ -345,7 +388,10 @@ def get_discussion_thread(
         raise HTTPException(
             status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
         )
-    return _thread_detail_out(data)
+    return _thread_detail_out(
+        data, has_unsaved_ui_draft=has_unsaved_ui_draft,
+        save_result_unknown=save_result_unknown, save_reference_id=save_reference_id,
+    )
 
 
 # --- Discussion context bundle (Issue #458, Epic #443 §9, DD-CTX-01..05) -----
@@ -427,6 +473,132 @@ def create_discussion_context_expansion(
     return DiscussionContextExpansionOut(
         bundle=DiscussionContextBundleOut(**discussion_context_bundle.bundle_to_dict(result.bundle)),
         expanded_section_ids=list(result.expanded_section_ids),
+    )
+
+
+# --- §9.2 semantic claims (Issue #459) ----------------------------------------
+
+
+def _claim_dict(claim: "discussion_claims.DiscussionClaim") -> Dict[str, Any]:
+    return {
+        "kind": claim.kind, "statement": claim.statement,
+        "cited_source_ids": list(claim.cited_source_ids), "basis": claim.basis,
+    }
+
+
+@router.post(
+    "/assistant/discussion-threads/{thread_id}/context-claims",
+    response_model=DiscussionContextClaimsResultOut,
+)
+def create_discussion_context_claims(
+    thread_id: int,
+    payload: DiscussionContextClaimsRequest,
+    system_id: int = Depends(get_system_id),
+) -> DiscussionContextClaimsResultOut:
+    """docs/01-specifications/ux/decision-discussion-workflow.md §3's 「照合結果」 stage / ai-discussion-adapter.md §9.2.
+
+    Read -> reason -> persist (CLAUDE.md): the bundle is built and the LLM
+    call runs with NO `get_conn()` connection open, and persistence happens
+    in one transaction afterwards.
+
+    Unlike `create_discussion_proposal` (which creates nothing and raises on
+    `result.error`), this endpoint always returns 200 with
+    `DiscussionContextClaimsResultOut` -- including on a failed/degraded
+    semantic pass. The reason: `discussion_claims.generate_context_claims`
+    always keeps whatever DETERMINISTIC claims it derived even when the LLM
+    call fails or a retry still cites an invalid source
+    (docs/01-specifications/ux/decision-discussion-workflow.md §5's "読めた範囲を残す"), and a proposal is an
+    all-or-nothing domain row while a 照合 result is not -- collapsing a
+    partial result into an HTTP error would silently discard exactly the
+    part of `docs/01-specifications/ux/decision-discussion-workflow.md §5 requires kept. `error`/`error_kind` on the
+    response make the failure explicit (Principle 6's "明示失敗") without
+    hiding what could still be read.
+    """
+    thread_data = assistant_discussion.get_thread(system_id, thread_id)
+    if thread_data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    thread_row = thread_data["thread"]
+
+    try:
+        bundle = discussion_context_bundle.build_context_bundle(
+            system_id, thread_row["target_kind"], thread_row["target_ref"], thread_id=thread_id,
+            budget=discussion_context_bundle.DEFAULT_BUDGET,
+        )
+    except discussion_context_bundle.ContextBundleError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+
+    config = LLMConfig.intelligence_from_env()
+    client = _usable_llm_client(config)
+
+    result = discussion_claims.generate_context_claims(
+        client, config, bundle=bundle, question=payload.question,
+    )
+    completed_at = time.time()
+    claim_dicts = [_claim_dict(c) for c in result.claims]
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model, prompt_version,
+                        schema_version, decision_method, status, error_details, is_mock,
+                        started_at, completed_at)
+                   VALUES (?, NULL, 'discussion_context_claim', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    system_id, result.provider, result.model, result.prompt_version,
+                    result.schema_version, result.decision_method,
+                    "failed" if result.error else "completed",
+                    result.error, 1 if result.is_mock else 0, completed_at, completed_at,
+                ),
+            )
+
+            resolved = assistant_discussion.resolve_target(
+                system_id, thread_row["target_kind"], thread_row["target_ref"]
+            )
+            assistant_discussion.append_turn(
+                conn, system_id=system_id, thread_id=thread_id, role="user",
+                content=payload.question, decision_method="manual",
+            )
+            content = result.scope_note or "照合結果"
+            if result.error:
+                content = f"{content}\n(一部の照合結果は確認できませんでした: {result.error})"
+            assistant_turn = assistant_discussion.append_turn(
+                conn, system_id=system_id, thread_id=thread_id, role="assistant",
+                content=content,
+                target_revision_id=resolved.revision_id, target_digest=resolved.digest,
+                decision_method=result.decision_method,
+                provider=result.provider, model=result.model,
+                prompt_version=result.prompt_version,
+                claims=claim_dicts,
+            )
+            assistant_discussion.touch_thread_captured_target(conn, thread_id, resolved)
+
+            # Issue #458's DD-CTX-05 durable audit: this turn is exactly the
+            # kind of "durable row a bundle's dependency manifest backed"
+            # that module's own docstring reserves for #459 to call.
+            discussion_context_bundle.persist_context_audit(
+                conn, system_id=system_id, consumer_kind="turn",
+                consumer_ref=f"thread:{thread_id}:turn:{assistant_turn['turn_number']}",
+                bundle=bundle,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return DiscussionContextClaimsResultOut(
+        provider=result.provider, model=result.model, is_mock=result.is_mock,
+        prompt_version=result.prompt_version, schema_version=result.schema_version,
+        decision_method=result.decision_method,
+        claims=[DiscussionContextClaimOut(**c) for c in claim_dicts],
+        scope_note=result.scope_note, as_of_snapshot_commit=result.as_of_snapshot_commit,
+        retried=result.retried, error=result.error, error_kind=result.error_kind,
+        thread_id=thread_id, turn_number=assistant_turn["turn_number"],
     )
 
 

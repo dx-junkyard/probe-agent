@@ -10828,6 +10828,18 @@ def init_db() -> None:
                 ),
                 ("ui_draft_form_id", "TEXT"),
                 ("ui_draft_digest", "TEXT"),
+                # Issue #459 (Epic #457, docs/01-specifications/capabilities/ai-discussion-adapter.md §9.2):
+                # the durable record of one §9.2 照合 (matching) call's
+                # structured claims, persisted on the ASSISTANT turn it
+                # produced -- so reload restores it exactly like any other
+                # turn (docs/01-specifications/ux/decision-discussion-workflow.md §5's reload row), with no
+                # second table duplicating turn history. NULL on every
+                # pre-#459 row and on a normal `/assistant/ask` turn (both
+                # mean "no §9.2 claims were ever attached to this turn",
+                # which `[]` cannot distinguish from "attached and empty" --
+                # empty is itself impossible here since a claims call always
+                # returns at least one claim or fails outright).
+                ("claims_json", "TEXT"),
             ):
                 _add_column_if_missing(
                     conn, "assistant_discussion_turn", turn_cols, column, definition

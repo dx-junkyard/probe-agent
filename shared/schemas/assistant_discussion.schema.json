@@ -23,7 +23,10 @@
     "context_resolution": { "$ref": "#/$defs/discussion_context_resolution" },
     "context_deep_link_state": { "$ref": "#/$defs/discussion_context_deep_link_state" },
     "context_next_action_kind": { "$ref": "#/$defs/discussion_context_next_action_kind" },
-    "context_audit_consumer_kind": { "$ref": "#/$defs/discussion_context_audit_consumer_kind" }
+    "context_audit_consumer_kind": { "$ref": "#/$defs/discussion_context_audit_consumer_kind" },
+    "context_claim_basis": { "$ref": "#/$defs/discussion_context_claim_basis" },
+    "context_claim_error_kind": { "$ref": "#/$defs/discussion_context_claim_error_kind" },
+    "gap_discussion_next_action_kind": { "$ref": "#/$defs/gap_discussion_next_action_kind" }
   },
   "$defs": {
     "discussion_scope": {
@@ -110,6 +113,32 @@
     "discussion_context_audit_consumer_kind": {
       "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.3 (Issue #458). The durable audit table's finite `consumer_kind` -- which kind of durable row a bundle's dependency manifest backed. Mirrors `app/discussion_context_bundle.CONTEXT_AUDIT_CONSUMER_KINDS` exactly.",
       "enum": ["turn", "proposal", "ju_session"]
+    },
+    "discussion_context_claim_kind": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.2/DD-CTX-04 (Issue #459). The finite semantic-claim-kind vocabulary a bundle-grounded 照合 answer's claims carry. Mirrors `app/discussion_context_bundle.DISCUSSION_CONTEXT_CLAIM_KINDS` / `app/models.DiscussionContextClaimKind` exactly.",
+      "enum": ["fact", "inference", "hypothesis", "unknown", "conflict"]
+    },
+    "discussion_context_claim_basis": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.2 (Issue #459). Whether one claim came straight off a bundle's own structural field (`deterministic`) or the reasoning model's structured output (`reasoning_llm`). Mirrors `app/discussion_claims.CLAIM_BASIS_VALUES` exactly.",
+      "enum": ["deterministic", "reasoning_llm"]
+    },
+    "discussion_context_claim_error_kind": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.2 (Issue #459). Why a §9.2 claims call failed or was refused, first-match: no usable reasoning-model client, a real call error, invalid structured output, or an LLM response that still cited an id outside the bundle's allow-list after one retry.",
+      "enum": ["unavailable", "call_error", "invalid_response", "invalid_citation"]
+    },
+    "gap_discussion_next_action_kind": {
+      "description": "docs/01-specifications/ux/decision-discussion-workflow.md §3, DD-UX-01 (Issue #459). The finite, PRIORITY-ORDERED `kind` vocabulary of the single overall next_action projection for a Gap discussion thread -- the enum order below IS the priority order. Mirrors `app/discussion_next_action.NEXT_ACTION_KINDS` exactly.",
+      "enum": [
+        "target_error",
+        "evidence_stale",
+        "processing",
+        "save_unknown",
+        "unsaved_edit",
+        "review_proposal",
+        "investigation_result",
+        "review_hypothesis",
+        "match"
+      ]
     }
   }
 }
