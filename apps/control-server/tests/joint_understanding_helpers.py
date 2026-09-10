@@ -148,20 +148,23 @@ def fake_discussion_origin_provider(facts_by_id: Dict[int, Any]):
 
     ``facts_by_id`` maps a (fixture) hypothesis id to the
     ``app.joint_premise.DiscussionOriginFacts`` it resolves to; an id absent
-    from it resolves to ``None`` (the hypothesis no longer exists). Always
-    restores the previous registration (typically none) on exit, so one
-    test's fixture provider can never leak into another's.
+    from it resolves to ``None`` (the hypothesis no longer exists). Restores
+    whatever provider was registered BEFORE this context (not unconditionally
+    ``None``) -- Issue #455 registers a real production provider at import
+    time, so hardcoding ``None`` here would silently unregister it for every
+    test that runs after the first one using this fixture.
     """
-    from app.joint_premise import register_discussion_origin_provider
+    import app.joint_premise as jp
 
     def _provider(conn, *, origin_id: int, system_id: int):
         return facts_by_id.get(origin_id)
 
-    register_discussion_origin_provider(_provider)
+    previous = jp._discussion_origin_provider  # noqa: SLF001
+    jp.register_discussion_origin_provider(_provider)
     try:
         yield
     finally:
-        register_discussion_origin_provider(None)
+        jp.register_discussion_origin_provider(previous)
 
 
 @contextmanager
@@ -170,19 +173,53 @@ def fake_dependency_digest_resolver(digests_by_key: Dict[str, Optional[str]]):
 
     ``digests_by_key`` maps ``"{target_kind}:{target_ref}"`` to the digest it
     should resolve to; a key absent from it resolves to ``None`` (the
-    dependency target no longer exists). Always restores the previous
-    registration (typically none) on exit.
+    dependency target no longer exists). Restores whatever resolver was
+    registered BEFORE this context, for the same reason
+    ``fake_discussion_origin_provider`` does (Issue #455 registers a real one
+    at import time).
     """
-    from app.joint_premise import register_dependency_digest_resolver
+    import app.joint_premise as jp
 
     def _resolver(conn, *, target_kind: str, target_ref: str, system_id: int):
         return digests_by_key.get(f"{target_kind}:{target_ref}")
 
-    register_dependency_digest_resolver(_resolver)
+    previous = jp._dependency_digest_resolver  # noqa: SLF001
+    jp.register_dependency_digest_resolver(_resolver)
     try:
         yield
     finally:
-        register_dependency_digest_resolver(None)
+        jp.register_dependency_digest_resolver(previous)
+
+
+@contextmanager
+def no_discussion_origin_provider():
+    """Temporarily UNREGISTER the discussion-origin provider, restoring
+    whatever was registered before on exit. Issue #455 always registers a
+    real one at import time, so a test that wants to exercise the "provider
+    unavailable" fail-closed path needs this rather than relying on nothing
+    ever being registered."""
+    import app.joint_premise as jp
+
+    previous = jp._discussion_origin_provider  # noqa: SLF001
+    jp.register_discussion_origin_provider(None)
+    try:
+        yield
+    finally:
+        jp.register_discussion_origin_provider(previous)
+
+
+@contextmanager
+def no_dependency_digest_resolver():
+    """Temporarily UNREGISTER the dependency-digest resolver. See
+    ``no_discussion_origin_provider`` -- the same reasoning applies."""
+    import app.joint_premise as jp
+
+    previous = jp._dependency_digest_resolver  # noqa: SLF001
+    jp.register_dependency_digest_resolver(None)
+    try:
+        yield
+    finally:
+        jp.register_dependency_digest_resolver(previous)
 
 
 def insert_discussion_ju_session(

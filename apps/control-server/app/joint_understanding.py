@@ -89,7 +89,12 @@ OWNER_SCOPES = ("interview", "discussion")
 # narrowing the Literal, per Principle 6 / the #427 "narrowed vocabulary
 # needs an upgrade migration" rule (inapplicable here since there is no CHECK
 # constraint on this column to widen; see docs/01-specifications/capabilities/ai-discussion-adapter.md §1.9).
-TRIGGERS = ("unknown_answer", "explicit_request", "purpose_need")
+# "discussion_promotion" (Issue #455, Epic #443 §6.2): written ONLY by the
+# hypothesis -> Joint Understanding bridge
+# (`POST /assistant/discussion-proposals/{id}/hypotheses/{hid}/promote`),
+# never by the generic create endpoint (Issue #336's rule: `trigger` records
+# WHICH PATH ran, not a request body's claim).
+TRIGGERS = ("unknown_answer", "explicit_request", "purpose_need", "discussion_promotion")
 
 SESSION_STATUSES = ("open", "held", "closed")
 

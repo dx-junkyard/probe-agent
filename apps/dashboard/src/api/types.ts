@@ -3965,6 +3965,29 @@ export interface AssistantDiscussionProposalItem {
   last_prefilled_at: number | null;
 }
 
+// Hypothesis (Issue #455, Epic #443 §6.1): an INDEPENDENT proposal item
+// type, never a field_change. competing_explanations/refutation_conditions/
+// next_investigation missing is refused server-side at generation AND
+// promotion time -- the UI never needs to (and must not) fill these in on
+// the server's behalf.
+export type AssistantDiscussionHypothesisStatus = "proposed" | "promoted" | "rejected";
+
+export interface AssistantDiscussionProposalHypothesis {
+  id: number;
+  proposal_id: number;
+  statement: string;
+  competing_explanations: string[];
+  refutation_conditions: string[];
+  next_investigation: string;
+  evidence_refs: string[];
+  uncertainty: string;
+  status: AssistantDiscussionHypothesisStatus;
+  first_turn_number: number | null;
+  last_turn_number: number | null;
+  created_at: number;
+  schema_version: string;
+}
+
 export interface AssistantDiscussionProposal {
   id: number;
   system_id: number;
@@ -3988,6 +4011,60 @@ export interface AssistantDiscussionProposal {
   created_by: string | null;
   created_at: number;
   items: AssistantDiscussionProposalItem[];
+  // Issue #455: independent from `items` -- a hypothesis is never applied
+  // through the field/relation/child apply path; it is promoted through
+  // its own bridge endpoint below.
+  hypotheses: AssistantDiscussionProposalHypothesis[];
+}
+
+// Hypothesis -> Joint Understanding bridge (Issue #455, Epic #443 §6.2).
+// `request_id` is a caller-minted idempotency key: retrying with the SAME
+// id returns the SAME `joint_understanding_session_id` (`reused: true`);
+// reusing it for a different hypothesis is refused 409.
+
+export interface AssistantDiscussionHypothesisPromoteRequest {
+  request_id: string;
+}
+
+export interface AssistantDiscussionHypothesisPromotion {
+  id: number;
+  hypothesis_id: number;
+  thread_id: number;
+  first_turn_number: number | null;
+  last_turn_number: number | null;
+  captured_target_kind: string;
+  captured_target_ref: string;
+  captured_target_digest: string;
+  joint_understanding_session_id: number;
+  request_id: string;
+  decision_method: "manual";
+  created_by: string | null;
+  created_at: number;
+}
+
+export interface AssistantDiscussionHypothesisPromoteOut {
+  hypothesis: AssistantDiscussionProposalHypothesis;
+  promotion: AssistantDiscussionHypothesisPromotion;
+  joint_understanding_session_id: number;
+  reused: boolean;
+}
+
+// Discussion <-> Joint Understanding reflux (Issue #455, Epic #443 §6.3).
+// `session` is the EXACT `JointUnderstandingOut` shape #329 already defines
+// -- `premise_state`/`outcome_is_provisional` verbatim, never re-derived on
+// the client. `current_findings` is populated ONLY when
+// `session.premise_state === "current"`.
+
+export interface AssistantDiscussionJointUnderstandingLink {
+  hypothesis: AssistantDiscussionProposalHypothesis;
+  promotion: AssistantDiscussionHypothesisPromotion;
+  session: JointUnderstandingOut;
+  current_findings: JointUnderstandingFindingOut[];
+  reconfirmation_required: boolean;
+}
+
+export interface AssistantDiscussionJointUnderstandingListOut {
+  links: AssistantDiscussionJointUnderstandingLink[];
 }
 
 export interface AssistantDiscussionProposalsListOut {
@@ -4753,7 +4830,14 @@ export type JointUnderstandingOriginKind =
 // anything. Its `origin_id` is the promoted hypothesis id (#455 registers the
 // provider that resolves it); until then the server answers 503
 // `joint_understanding_origin_unsupported` rather than pretending support.
-export type JointUnderstandingTrigger = "unknown_answer" | "explicit_request" | "purpose_need";
+// "discussion_promotion" (Issue #455, Epic #443 §6.2): written ONLY by the
+// hypothesis -> Joint Understanding bridge -- never settable through the
+// generic create request body (Issue #336's rule).
+export type JointUnderstandingTrigger =
+  | "unknown_answer"
+  | "explicit_request"
+  | "purpose_need"
+  | "discussion_promotion";
 export type JointUnderstandingStatus = "open" | "held" | "closed";
 export type JointUnderstandingOutcome =
   | "understood"

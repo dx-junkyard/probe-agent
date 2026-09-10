@@ -58,8 +58,8 @@
         },
         "origin_id": { "type": "integer", "minimum": 1 },
         "trigger": {
-          "enum": ["unknown_answer", "explicit_request", "purpose_need"],
-          "description": "unknown_answer: the developer said 「わからない」. explicit_request: the developer asked to work it out together without having said so. purpose_need: a Purpose Need response of unknown/investigate opened the session (Issue #389 / #444 §1.9)."
+          "enum": ["unknown_answer", "explicit_request", "purpose_need", "discussion_promotion"],
+          "description": "unknown_answer: the developer said 「わからない」. explicit_request: the developer asked to work it out together without having said so. purpose_need: a Purpose Need response of unknown/investigate opened the session (Issue #389 / #444 §1.9). discussion_promotion: the developer promoted a Discussion hypothesis into a Joint Understanding session (Issue #455, Epic #443 §6.2) -- written only by that bridge endpoint, never by the generic create request body."
         },
         "question_text": {
           "type": "string",

@@ -180,7 +180,13 @@ class DiscussionAdapter:
     ui_draft_forms: Tuple[UiDraftFormSpec, ...] = field(default_factory=tuple)
     field_applier: Optional[FieldApplier] = None
     relation_applier: Optional[RelationApplier] = None
-    joint_understanding_bridge: bool = False
+    # Issue #455 (§6.2): whether a hypothesis raised in a discussion on this
+    # kind may be promoted into a Joint Understanding session. `True` for
+    # every kind -- `POST /assistant/discussion-proposals/{id}/hypotheses/
+    # {hid}/promote` does not special-case `target_kind` at all; the bridge
+    # opens an `owner_scope='discussion'` session for ANY discussion target,
+    # regardless of what canonical facts (if any) that target has.
+    joint_understanding_bridge: bool = True
     # Issue #456: the versioned id of the IMPLEMENTATION handler that can
     # actually carry out a prefill dispatch for this kind's `ui_draft_forms`
     # (navigate -> mount -> deliver -> ack, #452's job). `None` means "no

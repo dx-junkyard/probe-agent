@@ -149,7 +149,7 @@ describe("proposalToDraft child items (Issue #454)", () => {
       summary: "", confirmed_points: [], unresolved_questions: [], assumptions: [],
       evidence_refs: [], decision_method: "reasoning_llm", intelligence_run_id: null,
       provider: "openai", model: "gpt-5", prompt_version: "v1", schema_version: "v1",
-      created_by: null, created_at: 0, items,
+      created_by: null, created_at: 0, items, hypotheses: [],
     };
   }
 

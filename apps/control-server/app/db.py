@@ -499,6 +499,110 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_prefill_item
     ON assistant_discussion_proposal_prefill (item_id, created_at DESC);
 """
 
+# assistant_discussion_proposal_hypothesis / assistant_discussion_hypothesis_
+# promotion (Issue #455, Epic #443 §6): the Joint Understanding bridge.
+#
+# A hypothesis is an INDEPENDENT proposal item type (docs/01-specifications/
+# capabilities/ai-discussion-adapter.md §6.1) -- never a field_change, never
+# stored in `assistant_discussion_proposal_item`. `competing_explanations_
+# json` / `refutation_conditions_json` / `next_investigation` are NOT NULL
+# with a non-empty-array/non-empty-string application-level rule enforced by
+# `assistant_discussion_proposal.generate_proposal` (generation time) and
+# `app/discussion_hypothesis.py` (promotion time) -- a hypothesis missing any
+# of the three is a claim, not a hypothesis, and is refused before it is ever
+# persisted (there is deliberately no CHECK expressing "JSON array is
+# non-empty"; SQLite cannot do that portably, so this stays an application
+# invariant enforced at both write paths, matching how #329's finding
+# contract enforces the identical rule one layer down).
+# `first_turn_number` / `last_turn_number` are the thread's own turn range
+# that produced the proposal this hypothesis belongs to (captured once, at
+# generation time, from the same `turns` `generate_proposal` read) -- so a
+# later reader can find exactly which part of the conversation this
+# hypothesis came from without re-deriving it from the proposal's
+# `created_at` timestamp.
+_ASSISTANT_DISCUSSION_HYPOTHESIS_DDL = """
+CREATE TABLE IF NOT EXISTS assistant_discussion_proposal_hypothesis (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    proposal_id                 INTEGER NOT NULL,
+    statement                   TEXT NOT NULL,
+    competing_explanations_json TEXT NOT NULL DEFAULT '[]',
+    refutation_conditions_json  TEXT NOT NULL DEFAULT '[]',
+    next_investigation          TEXT NOT NULL DEFAULT '',
+    evidence_refs_json          TEXT NOT NULL DEFAULT '[]',
+    uncertainty                 TEXT NOT NULL DEFAULT '',
+    status                      TEXT NOT NULL DEFAULT 'proposed'
+                                    CHECK (status IN ('proposed', 'promoted', 'rejected')),
+    first_turn_number           INTEGER,
+    last_turn_number            INTEGER,
+    created_at                  REAL NOT NULL,
+    schema_version              TEXT NOT NULL DEFAULT 'discussion-hypothesis-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_id) REFERENCES assistant_discussion_proposal (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_hypothesis_proposal
+    ON assistant_discussion_proposal_hypothesis (proposal_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_hypothesis_system
+    ON assistant_discussion_proposal_hypothesis (system_id, id DESC);
+
+-- assistant_discussion_hypothesis_promotion: the manual bridge from ONE
+-- selected hypothesis into ONE Joint Understanding session
+-- (`owner_scope='discussion'`, Issue #461). `UNIQUE (system_id,
+-- request_id)` IS the idempotency guarantee Issue #455's Decisions require
+-- ("同一昇格retryでJU重複作成なし"): a retried promote call with the SAME
+-- `request_id` never creates a second session -- it reads this row back and
+-- returns the SAME `joint_understanding_session_id`. Scoped by `request_id`
+-- ALONE (not also `hypothesis_id`) so that reusing the same id for a
+-- DIFFERENT hypothesis is detectable as the SAME row with a mismatched
+-- `request_digest` (checked by `app/discussion_hypothesis.py` before this
+-- row is read) rather than silently missing the conflict by finding no row
+-- under a different `hypothesis_id` key -- token reuse across different
+-- content is refused, exactly the `discussion_save_receipt` idempotency
+-- discipline (#452) applied to a promotion instead of a save. Explicitly
+-- starting a SECOND, independent investigation into the same hypothesis is
+-- not blocked: it is a deliberate new `request_id`, and therefore a second
+-- row naming a second session -- multiple promotions per hypothesis are
+-- expected, not an error.
+CREATE TABLE IF NOT EXISTS assistant_discussion_hypothesis_promotion (
+    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                       INTEGER NOT NULL,
+    hypothesis_id                   INTEGER NOT NULL,
+    thread_id                       INTEGER NOT NULL,
+    first_turn_number               INTEGER,
+    last_turn_number                INTEGER,
+    captured_target_kind            TEXT NOT NULL,
+    captured_target_ref             TEXT NOT NULL,
+    captured_target_digest          TEXT NOT NULL DEFAULT '',
+    joint_understanding_session_id  INTEGER NOT NULL,
+    request_id                      TEXT NOT NULL,
+    request_digest                  TEXT NOT NULL,
+    -- Always 'manual': promoting a hypothesis into Joint Understanding is a
+    -- developer's own decision to open an investigation, never something a
+    -- reasoning model or another system decides on its own.
+    decision_method                 TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    created_by                      TEXT,
+    created_at                      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (hypothesis_id)
+        REFERENCES assistant_discussion_proposal_hypothesis (id) ON DELETE CASCADE,
+    FOREIGN KEY (thread_id) REFERENCES assistant_discussion_thread (id) ON DELETE CASCADE,
+    FOREIGN KEY (joint_understanding_session_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    UNIQUE (system_id, request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_hypothesis_promotion_hypothesis
+    ON assistant_discussion_hypothesis_promotion (hypothesis_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_hypothesis_promotion_thread
+    ON assistant_discussion_hypothesis_promotion (thread_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_hypothesis_promotion_ju
+    ON assistant_discussion_hypothesis_promotion (joint_understanding_session_id);
+"""
+
 _DISCUSSION_SAVE_RECEIPT_DDL = """
 -- discussion_save_receipt (Issue #452, Epic #443 §3.4/§3.6-§3.7): the
 -- idempotent-save-request ledger for an EXISTING domain "save" endpoint's
@@ -8902,6 +9006,7 @@ CREATE INDEX IF NOT EXISTS idx_product_feature_decision_feature
     ON product_feature_decision (feature_id, id DESC);
 
 """ + _PRODUCT_GAP_ARTIFACT_LINK_DDL + _ASSISTANT_DISCUSSION_DDL + _ASSISTANT_DISCUSSION_PROPOSAL_DDL \
+    + _ASSISTANT_DISCUSSION_HYPOTHESIS_DDL \
     + _DISCUSSION_SAVE_RECEIPT_DDL + _DISCUSSION_CONTEXT_DDL
 
 

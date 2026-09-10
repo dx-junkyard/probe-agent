@@ -43,6 +43,8 @@ from joint_understanding_helpers import (
     fake_discussion_origin_provider,
     insert_discussion_ju_session,
     insert_discussion_thread,
+    no_dependency_digest_resolver,
+    no_discussion_origin_provider,
 )
 
 from app.joint_premise import (
@@ -345,12 +347,17 @@ def _setup_discussion(client, token, *, commit_sha="commitA", origin_id=42,
 def test_get_a_discussion_session_without_a_provider_fails_closed_with_503(admin_client):
     """Decision 4: an unregistered provider must be a clean, catchable
     failure -- never a 500, and never silently reported as some other
-    premise verdict."""
+    premise verdict. Issue #455 registers a real production provider at
+    import time, so this test explicitly UNREGISTERS it for the duration of
+    the read to exercise the fail-closed path (e.g. a rollback, or a future
+    provider that fails to import) rather than relying on nothing ever being
+    registered."""
     token = _login(admin_client)
     system_id, thread_id, ju_id = _setup_discussion(admin_client, token)
     headers = _headers(token, system_id)
 
-    r = admin_client.get(f"/joint-understanding/{ju_id}", headers=headers)
+    with no_discussion_origin_provider():
+        r = admin_client.get(f"/joint-understanding/{ju_id}", headers=headers)
     assert r.status_code == 503, r.text
     assert r.json()["detail"]["code"] == "joint_understanding_origin_unsupported"
 
@@ -649,7 +656,12 @@ def test_dependency_manifest_target_removed_is_missing(admin_client):
 def test_dependency_manifest_unresolved_without_a_resolver_never_reads_as_current(admin_client):
     """欠損はcurrentにしない: a non-empty manifest with NO resolver registered
     at all is a distinct, non-'current' verdict from an entry the resolver
-    actually reported removed."""
+    actually reported removed. Issue #455 registers a real production
+    resolver at import time, so this test explicitly UNREGISTERS it for the
+    duration of the read (see ``no_dependency_digest_resolver``'s docstring)
+    -- a genuinely-nonexistent `ux_requirement:req-1` under the REAL resolver
+    is covered separately by
+    ``test_a_real_dependency_resolver_reports_a_nonexistent_target_as_missing``."""
     token = _login(admin_client)
     system_id, thread_id, ju_id = _setup_discussion(
         admin_client, token,
@@ -658,11 +670,32 @@ def test_dependency_manifest_unresolved_without_a_resolver_never_reads_as_curren
     headers = _headers(token, system_id)
     with fake_discussion_origin_provider({
         42: DiscussionOriginFacts(current_origin_id=42, content_hash="hypothesis-hash-1"),
-    }):
+    }), no_dependency_digest_resolver():
         r = admin_client.get(f"/joint-understanding/{ju_id}", headers=headers)
         assert r.status_code == 200, r.text
         assert r.json()["session"]["premise_state"] == "stale"
         assert r.json()["session"]["premise_reason"] == "dependency_manifest_unresolved"
+
+
+def test_a_real_dependency_resolver_reports_a_nonexistent_target_as_missing(admin_client):
+    """Once Issue #455's real resolver is registered (the production
+    default), a dependency reference that never existed resolves as
+    `missing`/`dependency_target_removed` -- a MORE precise verdict than the
+    pre-#455 placeholder `stale`/`dependency_manifest_unresolved` above,
+    since a real resolver actually looked and found nothing."""
+    token = _login(admin_client)
+    system_id, thread_id, ju_id = _setup_discussion(
+        admin_client, token,
+        dependencies=[{"target_kind": "ux_requirement", "target_ref": "never-existed", "digest": "d1"}],
+    )
+    headers = _headers(token, system_id)
+    with fake_discussion_origin_provider({
+        42: DiscussionOriginFacts(current_origin_id=42, content_hash="hypothesis-hash-1"),
+    }):
+        r = admin_client.get(f"/joint-understanding/{ju_id}", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["session"]["premise_state"] == "missing"
+    assert r.json()["session"]["premise_reason"] == "dependency_target_removed"
 
 
 def test_an_empty_manifest_is_a_structural_no_op_matching_pre_461_behavior(admin_client):

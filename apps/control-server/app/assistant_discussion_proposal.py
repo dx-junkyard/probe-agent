@@ -229,6 +229,23 @@ class ProposedChildChange:
 
 
 @dataclass
+class ProposedHypothesis:
+    """§6.1 (Issue #455): an INDEPENDENT proposal item type, never a
+    field_change. `competing_explanations` / `refutation_conditions` /
+    `next_investigation` are all required -- a hypothesis missing any of the
+    three is a claim, not a hypothesis, and `generate_proposal` fails the
+    WHOLE call rather than persist it (mirrors #454's child_changes rule:
+    the offending item is never silently dropped)."""
+
+    statement: str
+    competing_explanations: List[str] = field(default_factory=list)
+    refutation_conditions: List[str] = field(default_factory=list)
+    next_investigation: str = ""
+    evidence_refs: List[str] = field(default_factory=list)
+    uncertainty: str = ""
+
+
+@dataclass
 class ProposalGenerationResult:
     provider: str
     model: str
@@ -245,6 +262,10 @@ class ProposalGenerationResult:
     #: only actual add/update/remove/reorder changes against a registered
     #: `ChildSpec` land here.
     child_changes: List[ProposedChildChange] = field(default_factory=list)
+    #: Issue #455 (§6.1). Independent from `field_changes`/`relation_changes`/
+    #: `child_changes` -- a hypothesis is never applied through
+    #: `apply_items`; it is promoted through its own bridge endpoint.
+    hypothesis_changes: List[ProposedHypothesis] = field(default_factory=list)
     evidence_refs: List[str] = field(default_factory=list)
     assumptions: List[str] = field(default_factory=list)
     error: Optional[str] = None
@@ -299,6 +320,17 @@ class _RawChildChange(BaseModel):
     rationale: str = PydanticField(default="", max_length=2000)
 
 
+class _RawHypothesis(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    statement: str = PydanticField(..., max_length=2000)
+    competing_explanations: List[str] = PydanticField(default_factory=list, max_length=10)
+    refutation_conditions: List[str] = PydanticField(default_factory=list, max_length=10)
+    next_investigation: str = PydanticField(default="", max_length=2000)
+    evidence_refs: List[str] = PydanticField(default_factory=list, max_length=20)
+    uncertainty: str = PydanticField(default="", max_length=1000)
+
+
 class _RawProposalResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -310,6 +342,7 @@ class _RawProposalResponse(BaseModel):
     field_changes: List[_RawFieldChange] = PydanticField(default_factory=list, max_length=20)
     relation_changes: List[_RawRelationChange] = PydanticField(default_factory=list, max_length=20)
     child_changes: List[_RawChildChange] = PydanticField(default_factory=list, max_length=40)
+    hypothesis_changes: List[_RawHypothesis] = PydanticField(default_factory=list, max_length=10)
 
 
 def _strip_fences(raw: str) -> str:
@@ -353,6 +386,11 @@ commentary), matching exactly this shape:
      "child_key": "", "client_temp_key": "...", "child_order": null,
      "field_name": "...", "current_value": "...", "proposed_value": "...",
      "rationale": "..."}
+  ],
+  "hypothesis_changes": [
+    {"statement": "...", "competing_explanations": ["..."],
+     "refutation_conditions": ["..."], "next_investigation": "...",
+     "evidence_refs": ["..."], "uncertainty": "..."}
   ]
 }
 
@@ -382,9 +420,19 @@ Rules:
   Never propose a child_change for an unresolved question, a hypothesis, or
   something the conversation has not actually decided -- leave those in
   "unresolved_questions"/"assumptions" instead.
+- "hypothesis_changes" is for an UNRESOLVED technical question the
+  conversation raised but did not settle -- something that still needs
+  INVESTIGATION, never something already decided (a decided point is a
+  field_change/relation_change/child_change instead, or a "confirmed_
+  points" entry). Every hypothesis MUST carry at least one
+  "competing_explanations" entry, at least one "refutation_conditions"
+  entry, and a non-empty "next_investigation" -- a hypothesis missing any of
+  the three is a claim, not a hypothesis, and fails the ENTIRE response.
+  Never invent a hypothesis the conversation does not actually raise.
 - Never propose a change the conversation does not actually support.
 - If nothing can be proposed, return empty "field_changes",
-  "relation_changes", and "child_changes" arrays -- do not guess.
+  "relation_changes", "child_changes", and "hypothesis_changes" arrays -- do
+  not guess.
 """
 
 
@@ -637,13 +685,65 @@ def generate_proposal(
             )
         )
 
+    # --- Issue #455 §6.1: hypotheses -------------------------------------------
+    # Fail-closed exactly like child_changes above: an incomplete hypothesis
+    # (missing competing_explanations / refutation_conditions /
+    # next_investigation) is refused for the WHOLE response, never silently
+    # dropped or persisted as a bare claim -- "反証条件の無い仮説は仮説では
+    # なく、ただの主張" (Issue #455 Decisions).
+    hypothesis_changes: List[ProposedHypothesis] = []
+    for raw_item in validated.hypothesis_changes:
+        if not raw_item.statement.strip():
+            return ProposalGenerationResult(
+                provider=config.provider, model=config.model, is_mock=False,
+                error="Model proposed a hypothesis with no statement",
+                error_kind="invalid_registry",
+            )
+        if not raw_item.competing_explanations:
+            return ProposalGenerationResult(
+                provider=config.provider, model=config.model, is_mock=False,
+                error=(
+                    "A hypothesis must list at least one competing_explanations "
+                    "entry -- an incomplete hypothesis is a claim, not a hypothesis"
+                ),
+                error_kind="invalid_registry",
+            )
+        if not raw_item.refutation_conditions:
+            return ProposalGenerationResult(
+                provider=config.provider, model=config.model, is_mock=False,
+                error=(
+                    "A hypothesis must list at least one refutation_conditions "
+                    "entry -- an incomplete hypothesis is a claim, not a hypothesis"
+                ),
+                error_kind="invalid_registry",
+            )
+        if not raw_item.next_investigation.strip():
+            return ProposalGenerationResult(
+                provider=config.provider, model=config.model, is_mock=False,
+                error=(
+                    "A hypothesis must name its next_investigation -- an "
+                    "incomplete hypothesis is a claim, not a hypothesis"
+                ),
+                error_kind="invalid_registry",
+            )
+        hypothesis_changes.append(
+            ProposedHypothesis(
+                statement=raw_item.statement,
+                competing_explanations=list(raw_item.competing_explanations),
+                refutation_conditions=list(raw_item.refutation_conditions),
+                next_investigation=raw_item.next_investigation,
+                evidence_refs=list(raw_item.evidence_refs),
+                uncertainty=raw_item.uncertainty,
+            )
+        )
+
     return ProposalGenerationResult(
         provider=config.provider, model=config.model, is_mock=False,
         summary=validated.summary, confirmed_points=list(validated.confirmed_points),
         unresolved_questions=list(validated.unresolved_questions),
         assumptions=list(validated.assumptions), evidence_refs=list(validated.evidence_refs),
         field_changes=field_changes, relation_changes=relation_changes,
-        child_changes=child_changes,
+        child_changes=child_changes, hypothesis_changes=hypothesis_changes,
     )
 
 
@@ -702,6 +802,25 @@ def _items_for(conn, proposal_id: int) -> List[Dict[str, Any]]:
         (proposal_id,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _hypothesis_out(row: Any) -> Dict[str, Any]:
+    d = dict(row)
+    d["competing_explanations"] = json.loads(d.pop("competing_explanations_json") or "[]")
+    d["refutation_conditions"] = json.loads(d.pop("refutation_conditions_json") or "[]")
+    d["evidence_refs"] = json.loads(d.pop("evidence_refs_json") or "[]")
+    return d
+
+
+def _hypotheses_for(conn, proposal_id: int) -> List[Dict[str, Any]]:
+    """§6.1: a proposal's independent hypotheses, oldest first (matching
+    `_items_for`'s own ordering)."""
+    rows = conn.execute(
+        "SELECT * FROM assistant_discussion_proposal_hypothesis "
+        "WHERE proposal_id = ? ORDER BY id",
+        (proposal_id,),
+    ).fetchall()
+    return [_hypothesis_out(r) for r in rows]
 
 
 def _prefill_stats(conn, proposal_id: int) -> Dict[int, Dict[str, Any]]:
@@ -809,11 +928,20 @@ def create_proposal(
     result: ProposalGenerationResult,
     intelligence_run_id: Optional[int],
     created_by: Optional[str],
+    turns: Sequence[Dict[str, Any]] = (),
 ) -> Dict[str, Any]:
     """Persist a successful `ProposalGenerationResult` (§2.3). Called on an
     already-open connection with no external call pending -- the LLM round
-    trip already happened in `generate_proposal`."""
+    trip already happened in `generate_proposal`.
+
+    ``turns`` (Issue #455 §6.2) is the SAME turn list `generate_proposal` was
+    called with -- used only to stamp each hypothesis's own
+    ``first_turn_number``/``last_turn_number`` (the conversation range the
+    promoted hypothesis traces back to), never re-fetched.
+    """
     now = time.time()
+    hyp_first_turn = turns[0]["turn_number"] if turns else None
+    hyp_last_turn = turns[-1]["turn_number"] if turns else None
     conn.execute("BEGIN")
     try:
         cur = conn.execute(
@@ -883,6 +1011,24 @@ def create_proposal(
                     cc.rationale, cc.child_kind, child_key, cc.child_intent, cc.child_order, now,
                 ),
             )
+        # Issue #455 §6.1: hypotheses are an INDEPENDENT type, persisted into
+        # their own table -- never `assistant_discussion_proposal_item`.
+        for hc in result.hypothesis_changes:
+            conn.execute(
+                """INSERT INTO assistant_discussion_proposal_hypothesis
+                       (system_id, proposal_id, statement, competing_explanations_json,
+                        refutation_conditions_json, next_investigation, evidence_refs_json,
+                        uncertainty, status, first_turn_number, last_turn_number, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?)""",
+                (
+                    system_id, proposal_id, hc.statement,
+                    json.dumps(hc.competing_explanations, ensure_ascii=False),
+                    json.dumps(hc.refutation_conditions, ensure_ascii=False),
+                    hc.next_investigation,
+                    json.dumps(hc.evidence_refs, ensure_ascii=False),
+                    hc.uncertainty, hyp_first_turn, hyp_last_turn, now,
+                ),
+            )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -904,6 +1050,7 @@ def get_proposal_detail(system_id: int, proposal_id: int) -> Optional[Dict[str, 
             return None
         items = _items_for(conn, proposal_id)
         prefill_stats = _prefill_stats(conn, proposal_id)
+        hypotheses = _hypotheses_for(conn, proposal_id)
 
     from . import assistant_discussion
 
@@ -917,6 +1064,7 @@ def get_proposal_detail(system_id: int, proposal_id: int) -> Optional[Dict[str, 
         }
         for item in items
     ]
+    out["hypotheses"] = hypotheses
     return out
 
 
@@ -930,13 +1078,17 @@ def list_proposals(system_id: int, thread_id: int) -> List[Dict[str, Any]]:
             (system_id, thread_id, MAX_LISTED_PROPOSALS),
         ).fetchall()
         proposals = [
-            (dict(r), _items_for(conn, r["id"]), _prefill_stats(conn, r["id"])) for r in rows
+            (
+                dict(r), _items_for(conn, r["id"]), _prefill_stats(conn, r["id"]),
+                _hypotheses_for(conn, r["id"]),
+            )
+            for r in rows
         ]
 
     from . import assistant_discussion
 
     out: List[Dict[str, Any]] = []
-    for row, items, prefill_stats in proposals:
+    for row, items, prefill_stats, hypotheses in proposals:
         resolved = assistant_discussion.resolve_target(system_id, row["target_kind"], row["target_ref"])
         d = _proposal_out(row)
         d["items"] = [
@@ -947,6 +1099,7 @@ def list_proposals(system_id: int, thread_id: int) -> List[Dict[str, Any]]:
             }
             for item in items
         ]
+        d["hypotheses"] = hypotheses
         out.append(d)
     return out
 

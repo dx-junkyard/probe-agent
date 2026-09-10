@@ -287,7 +287,10 @@ class TestThreadDetailCapabilities:
             admin_client, headers, scope="screen", screen_id="overview",
             target_kind="screen", target_ref="overview",
         )
-        assert thread["capabilities"] == []
+        # Issue #455: the Joint Understanding bridge is the one capability
+        # every kind carries regardless of its other (here: zero) canonical
+        # capabilities.
+        assert thread["capabilities"] == ["promote_joint_understanding"]
 
 
 # ---------------------------------------------------------------------------

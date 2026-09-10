@@ -239,8 +239,10 @@ def test_proposal_target_schema_equals_pre_refactor_value():
 def test_capabilities_derived_for_screen_adapter_is_discussion_only():
     adapter = discussion_adapters.DISCUSSION_ADAPTERS["screen"]
     # `screen` has no context provider, no fields, no relations, no ui_draft
-    # forms, no JU bridge -- Phase 1 gives it zero capabilities.
-    assert discussion_adapters.capabilities_for(adapter) == ()
+    # forms -- Phase 1 gives it zero capabilities beyond the Issue #455 JU
+    # bridge, which every kind now has regardless of its other capabilities
+    # (promoting a hypothesis never depends on the target's canonical facts).
+    assert discussion_adapters.capabilities_for(adapter) == ("promote_joint_understanding",)
 
 
 def test_capabilities_derived_for_ux_journey_has_read_and_propose_both():
@@ -255,10 +257,10 @@ def test_capabilities_derived_for_ux_journey_has_read_and_propose_both():
     # that anything can deliver to it -- that additionally requires a
     # registered `prefill_handler_id`, which stays `None` for every adapter
     # until #452 wires the first real handler. `promote_joint_understanding`
-    # is still #449's -- untouched here.
+    # is Issue #455's bridge, which every kind carries.
     assert "read_ui_draft" in caps
     assert "prefill_form" not in caps
-    assert "promote_joint_understanding" not in caps
+    assert "promote_joint_understanding" in caps
 
 
 def test_prefill_form_becomes_true_only_once_a_handler_is_registered():
@@ -318,7 +320,11 @@ def test_capabilities_derived_for_interview_session_and_overview_finding_discuss
     for kind in ("interview_session", "overview_finding"):
         adapter = discussion_adapters.DISCUSSION_ADAPTERS[kind]
         caps = discussion_adapters.capabilities_for(adapter)
-        assert caps == (), f"{kind} should have zero capabilities in Phase 1, got {caps}"
+        # Phase 1 gave these kinds zero OTHER capabilities; Issue #455's JU
+        # bridge is the one capability every kind carries regardless.
+        assert caps == ("promote_joint_understanding",), (
+            f"{kind} should have only the JU bridge capability, got {caps}"
+        )
 
 
 def test_every_adapter_capabilities_are_a_subset_of_the_finite_vocabulary():
@@ -333,8 +339,9 @@ _KINDS_WITH_UI_DRAFT_FORMS = frozenset(
 
 
 def test_phase_2_children_and_ju_bridge_stay_empty_ui_draft_forms_is_the_new_field():
-    # #449 (joint_understanding_bridge) is still ahead. #454 (Epic #443
-    # §5.1) populates `children` for exactly ONE kind (`ux_requirement`'s
+    # Issue #455 turns on `joint_understanding_bridge` for every kind (the
+    # bridge never special-cases target_kind). #454 (Epic #443 §5.1)
+    # populates `children` for exactly ONE kind (`ux_requirement`'s
     # `acceptance_criterion`) -- every other kind's `children` stays `()`.
     # `ui_draft_forms` stays populated only for the 4 kinds whose Dashboard
     # forms exist today (docs/ai-discussion-adapter.md §1.4's "declared now,
@@ -345,7 +352,7 @@ def test_phase_2_children_and_ju_bridge_stay_empty_ui_draft_forms_is_the_new_fie
             assert [c.child_kind for c in adapter.children] == ["acceptance_criterion"]
         else:
             assert adapter.children == (), f"{kind} should have no ChildSpec yet"
-        assert adapter.joint_understanding_bridge is False
+        assert adapter.joint_understanding_bridge is True
         if kind in _KINDS_WITH_UI_DRAFT_FORMS:
             assert adapter.ui_draft_forms != (), f"{kind} should have a ui_draft_forms entry"
         else:

@@ -31,8 +31,11 @@ from .. import (
     assistant_discussion_proposal,
     discussion_adapters,
     discussion_context_bundle,
+    discussion_hypothesis,
     ui_draft_context,
 )
+from .. import joint_understanding as joint_understanding_domain
+from . import joint_understanding as joint_understanding_routes
 from ..assistant import (
     answer_question,
     checks_for_screen,
@@ -49,8 +52,14 @@ from ..models import (
     AssistantAskOut,
     AssistantAskRequest,
     AssistantCitationOut,
+    AssistantDiscussionHypothesisPromoteOut,
+    AssistantDiscussionHypothesisPromoteRequest,
+    AssistantDiscussionHypothesisPromotionOut,
+    AssistantDiscussionJointUnderstandingLinkOut,
+    AssistantDiscussionJointUnderstandingListOut,
     AssistantDiscussionProposalApplyOut,
     AssistantDiscussionProposalApplyRequest,
+    AssistantDiscussionProposalHypothesisOut,
     AssistantDiscussionProposalOut,
     AssistantDiscussionProposalPrefillOut,
     AssistantDiscussionProposalPrefillRequest,
@@ -69,6 +78,7 @@ from ..models import (
     DiscussionContextBundleOut,
     DiscussionContextExpansionOut,
     DiscussionContextExpansionRequest,
+    JointUnderstandingFindingOut,
     SettingMetadataOut,
     SettingsMetadataOut,
     SystemDiagnosticCheckOut,
@@ -520,6 +530,7 @@ def create_discussion_proposal(
             target_kind=thread_row["target_kind"], target_ref=thread_row["target_ref"],
             captured_target_revision_id=resolved.revision_id, captured_target_digest=resolved.digest,
             result=result, intelligence_run_id=run_id, created_by=_principal_actor(principal),
+            turns=recent,
         )
         proposal_id = row["id"]
 
@@ -647,6 +658,135 @@ def reject_discussion_proposal(
     return AssistantDiscussionProposalRejectOut(
         proposal=_proposal_detail_out(detail), rejected_item_ids=rejected_ids,
     )
+
+
+def _hypothesis_promotion_out(
+    hyp: Dict[str, Any], promo: Dict[str, Any], *, reused: bool,
+) -> AssistantDiscussionHypothesisPromoteOut:
+    return AssistantDiscussionHypothesisPromoteOut(
+        hypothesis=AssistantDiscussionProposalHypothesisOut(**hyp),
+        promotion=AssistantDiscussionHypothesisPromotionOut(**promo),
+        joint_understanding_session_id=promo["joint_understanding_session_id"],
+        reused=reused,
+    )
+
+
+@router.post(
+    "/assistant/discussion-proposals/{proposal_id}/hypotheses/{hypothesis_id}/promote",
+    response_model=AssistantDiscussionHypothesisPromoteOut,
+)
+def promote_discussion_hypothesis(
+    proposal_id: int,
+    hypothesis_id: int,
+    payload: AssistantDiscussionHypothesisPromoteRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> AssistantDiscussionHypothesisPromoteOut:
+    """§6.2: promote ONE selected hypothesis into a `owner_scope='discussion'`
+    Joint Understanding session (Issue #461) -- no owning Interview required.
+    Always `decision_method='manual'`; never touches the origin proposal's
+    other items, the thread's turns, or starts an investigation/Replay/
+    Experiment by itself (§6.2 Decisions: 「JUへの昇格と調査実行は別操作」).
+    Idempotent on `request_id`: a retry with the same id and the same
+    hypothesis returns the SAME session (`reused=true`); reusing it for a
+    different hypothesis is 409.
+    """
+    try:
+        result = discussion_hypothesis.promote_hypothesis(
+            system_id, proposal_id, hypothesis_id,
+            request_id=payload.request_id, actor=_principal_actor(principal),
+        )
+    except discussion_hypothesis.NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except discussion_hypothesis.HypothesisIncomplete as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    except discussion_hypothesis.PromotionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "discussion_hypothesis_promotion_request_conflict",
+                "message": str(exc),
+            },
+        ) from exc
+    return _hypothesis_promotion_out(
+        result["hypothesis"], result["promotion"], reused=result["reused"],
+    )
+
+
+@router.get(
+    "/assistant/discussion-threads/{thread_id}/joint-understanding",
+    response_model=AssistantDiscussionJointUnderstandingListOut,
+)
+def get_discussion_joint_understanding(
+    thread_id: int,
+    system_id: int = Depends(get_system_id),
+) -> AssistantDiscussionJointUnderstandingListOut:
+    """§6.3's reflux read: every hypothesis promoted from THIS thread, its
+    Joint Understanding session, and -- only when that session's premise is
+    `current` -- the findings eligible to surface back into the Discussion
+    (`app.joint_understanding.can_reflux`, verbatim: `origin_role
+    ='investigation'` and `claim_kind='fact'`, never superseded). A stale/
+    missing/invalid premise carries `reconfirmation_required=true` and no
+    findings, rather than a guess. `outcome_is_provisional` on `session`
+    (Issue #337, unchanged here) is what keeps a provisionally adopted
+    hypothesis from ever reading as a confirmed fact. Never writes anything,
+    and never merges the Discussion and Joint Understanding tables."""
+    thread_data = assistant_discussion.get_thread(system_id, thread_id)
+    if thread_data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    with get_conn() as conn:
+        promotions = conn.execute(
+            "SELECT * FROM assistant_discussion_hypothesis_promotion "
+            "WHERE thread_id = ? AND system_id = ? ORDER BY id",
+            (thread_id, system_id),
+        ).fetchall()
+        links = []
+        for promo in promotions:
+            hyp_row = conn.execute(
+                "SELECT * FROM assistant_discussion_proposal_hypothesis "
+                "WHERE id = ? AND system_id = ?",
+                (promo["hypothesis_id"], system_id),
+            ).fetchone()
+            ju_row = conn.execute(
+                "SELECT * FROM joint_understanding_session WHERE id = ? AND system_id = ?",
+                (promo["joint_understanding_session_id"], system_id),
+            ).fetchone()
+            if hyp_row is None or ju_row is None:
+                continue
+            verdict = joint_understanding_routes._premise_verdict(conn, ju_row)  # noqa: SLF001
+            findings = conn.execute(
+                "SELECT * FROM joint_understanding_finding "
+                "WHERE joint_understanding_id = ? ORDER BY id",
+                (ju_row["id"],),
+            ).fetchall()
+            superseded = joint_understanding_routes._superseded_finding_ids(findings)  # noqa: SLF001
+            current_findings = []
+            if verdict.state == "current":
+                current_findings = [
+                    joint_understanding_routes._finding_out(f)  # noqa: SLF001
+                    for f in findings
+                    if f["id"] not in superseded
+                    and joint_understanding_domain.can_reflux(f["origin_role"], f["claim_kind"])
+                ]
+            links.append(
+                AssistantDiscussionJointUnderstandingLinkOut(
+                    hypothesis=AssistantDiscussionProposalHypothesisOut(
+                        **discussion_hypothesis.hypothesis_out(hyp_row)
+                    ),
+                    promotion=AssistantDiscussionHypothesisPromotionOut(**dict(promo)),
+                    session=joint_understanding_routes._session_out(  # noqa: SLF001
+                        ju_row, verdict,
+                        joint_understanding_routes._current_origin_id(conn, ju_row),  # noqa: SLF001
+                    ),
+                    current_findings=current_findings,
+                    reconfirmation_required=verdict.state != "current",
+                )
+            )
+    return AssistantDiscussionJointUnderstandingListOut(links=links)
 
 
 @router.post("/assistant/ask", response_model=AssistantAskOut)

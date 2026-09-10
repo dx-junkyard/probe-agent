@@ -85,6 +85,7 @@ import type {
   AssistantDiscussionProposal, AssistantDiscussionProposalsListOut,
   AssistantDiscussionProposalApplyOut, AssistantDiscussionProposalRejectOut,
   AssistantDiscussionProposalPrefillOut,
+  AssistantDiscussionHypothesisPromoteOut, AssistantDiscussionJointUnderstandingListOut,
   UiHelpEntriesOut, UiHelpEntry,
   ConnectivityStatusOut,
   InstrumentationScanOut, ProbePatternsListOut, ProbePatternOut,
@@ -2622,6 +2623,38 @@ export function usePrefillDiscussionProposalItems(proposalId: number | null) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
     },
+  });
+}
+
+// Hypothesis -> Joint Understanding bridge (Issue #455, Epic #443 §6.2/§6.3).
+// `usePromoteDiscussionHypothesis`'s caller mints `request_id` (an
+// idempotency key -- a retry with the SAME id is a no-op success, a
+// DIFFERENT hypothesis under the SAME id is a 409 the caller must surface,
+// never silently retried with a fresh id on its own).
+
+export function usePromoteDiscussionHypothesis(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { hypothesis_id: number; request_id: string }) =>
+      api.post<AssistantDiscussionHypothesisPromoteOut>(
+        `/assistant/discussion-proposals/${proposalId}/hypotheses/${data.hypothesis_id}/promote`,
+        { request_id: data.request_id },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+      qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-joint-understanding") });
+    },
+  });
+}
+
+export function useDiscussionJointUnderstanding(threadId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-joint-understanding"), threadId],
+    queryFn: () =>
+      api.get<AssistantDiscussionJointUnderstandingListOut>(
+        `/assistant/discussion-threads/${threadId}/joint-understanding`,
+      ),
+    enabled: threadId !== null && !!getSystemId(),
   });
 }
 

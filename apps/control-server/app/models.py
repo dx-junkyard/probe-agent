@@ -3736,7 +3736,15 @@ class InterviewInquiryTransitionRequest(BaseModel):
 JointUnderstandingOriginKind = Literal[
     "qa", "intent", "review_item", "inquiry", "purpose_need", "discussion",
 ]
-JointUnderstandingTrigger = Literal["unknown_answer", "explicit_request", "purpose_need"]
+# "discussion_promotion" (Issue #455, Epic #443 §6.2): written ONLY by
+# `POST /assistant/discussion-proposals/{id}/hypotheses/{hid}/promote`, the
+# same "trigger records WHICH PATH ran" discipline `unknown_answer` and
+# `purpose_need` already follow -- a request body can never claim it (the
+# public create endpoint under `/interview/sessions/...` still forces
+# `explicit_request`, Issue #336).
+JointUnderstandingTrigger = Literal[
+    "unknown_answer", "explicit_request", "purpose_need", "discussion_promotion",
+]
 # Issue #461: a session's owner is either an Interview (every session Epic
 # #328 through #339 ever created) or a Discussion (Issue #455, no owning
 # Interview at all). Exactly one of `session_id` / `discussion_thread_id`
@@ -6400,6 +6408,34 @@ class AssistantDiscussionProposalItemOut(BaseModel):
     last_prefilled_at: Optional[float] = None
 
 
+# --- Discussion proposal hypotheses / JU bridge (Issue #455, Epic #443 §6) --
+# docs/01-specifications/capabilities/ai-discussion-adapter.md §6.1/§6.2. A
+# hypothesis is an INDEPENDENT type, never a field_change: `statement` /
+# `competing_explanations` / `refutation_conditions` / `next_investigation` /
+# `evidence_refs` / `uncertainty`. Missing `competing_explanations` /
+# `refutation_conditions` / `next_investigation` is refused at BOTH
+# generation time (`assistant_discussion_proposal.generate_proposal`) and
+# promotion time (`app/discussion_hypothesis.py`) -- a hypothesis without a
+# refutation condition is a claim, not a hypothesis.
+AssistantDiscussionHypothesisStatus = Literal["proposed", "promoted", "rejected"]
+
+
+class AssistantDiscussionProposalHypothesisOut(BaseModel):
+    id: int
+    proposal_id: int
+    statement: str
+    competing_explanations: List[str] = Field(default_factory=list)
+    refutation_conditions: List[str] = Field(default_factory=list)
+    next_investigation: str = ""
+    evidence_refs: List[str] = Field(default_factory=list)
+    uncertainty: str = ""
+    status: AssistantDiscussionHypothesisStatus
+    first_turn_number: Optional[int] = None
+    last_turn_number: Optional[int] = None
+    created_at: float
+    schema_version: str = "discussion-hypothesis-v1"
+
+
 class AssistantDiscussionProposalOut(BaseModel):
     id: int
     system_id: int
@@ -6423,6 +6459,9 @@ class AssistantDiscussionProposalOut(BaseModel):
     created_by: Optional[str] = None
     created_at: float
     items: List[AssistantDiscussionProposalItemOut] = Field(default_factory=list)
+    # Issue #455: independent from `items` -- a hypothesis is never a
+    # field/relation/child change (§6.1).
+    hypotheses: List[AssistantDiscussionProposalHypothesisOut] = Field(default_factory=list)
 
 
 class AssistantDiscussionProposalsListOut(BaseModel):
@@ -6470,6 +6509,71 @@ class AssistantDiscussionProposalPrefillRequest(BaseModel):
 class AssistantDiscussionProposalPrefillOut(BaseModel):
     proposal: AssistantDiscussionProposalOut
     prefilled_item_ids: List[int] = Field(default_factory=list)
+
+
+# --- Hypothesis -> Joint Understanding bridge (Issue #455, Epic #443 §6.2) --
+# docs/01-specifications/capabilities/ai-discussion-adapter.md §6.2/§6.3.
+# `request_id` is the idempotency key Issue #455's Decisions require ("同一
+# 昇格requestは同じJU IDを返す"): a retry with the SAME `request_id` returns
+# the SAME `joint_understanding_session_id` (`reused=true`); the SAME id
+# reused for a DIFFERENT hypothesis is refused 409 (never silently applied to
+# the new one).
+
+
+class AssistantDiscussionHypothesisPromoteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(..., min_length=1, max_length=200)
+
+
+class AssistantDiscussionHypothesisPromotionOut(BaseModel):
+    id: int
+    hypothesis_id: int
+    thread_id: int
+    first_turn_number: Optional[int] = None
+    last_turn_number: Optional[int] = None
+    captured_target_kind: str
+    captured_target_ref: str
+    captured_target_digest: str = ""
+    joint_understanding_session_id: int
+    request_id: str
+    decision_method: Literal["manual"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class AssistantDiscussionHypothesisPromoteOut(BaseModel):
+    hypothesis: AssistantDiscussionProposalHypothesisOut
+    promotion: AssistantDiscussionHypothesisPromotionOut
+    joint_understanding_session_id: int
+    # True when this call returned an EXISTING promotion (same `request_id`,
+    # same content) rather than creating a new Joint Understanding session --
+    # the idempotent-retry case Issue #455's Decisions require.
+    reused: bool = False
+
+
+# --- Discussion <-> Joint Understanding reflux (Issue #455, Epic #443 §6.3) -
+# `GET /assistant/discussion-threads/{id}/joint-understanding`. Never a new
+# understanding model: `session` is the EXACT `JointUnderstandingOut` #329
+# already defines (premise_state / outcome_is_provisional verbatim, #337's
+# verdict is never re-derived here). `current_findings` is populated ONLY
+# when `session.premise_state == "current"` -- a stale/missing/invalid
+# premise surfaces zero findings plus its own reason, never a guess.
+
+
+class AssistantDiscussionJointUnderstandingLinkOut(BaseModel):
+    hypothesis: AssistantDiscussionProposalHypothesisOut
+    promotion: AssistantDiscussionHypothesisPromotionOut
+    session: JointUnderstandingOut
+    current_findings: List[JointUnderstandingFindingOut] = Field(default_factory=list)
+    # True whenever `session.premise_state != "current"` -- the Dashboard's
+    # single signal to offer a re-confirmation action instead of the
+    # findings list (Issue #455 Decisions: "根拠更新時に再確認する").
+    reconfirmation_required: bool = False
+
+
+class AssistantDiscussionJointUnderstandingListOut(BaseModel):
+    links: List[AssistantDiscussionJointUnderstandingLinkOut] = Field(default_factory=list)
 
 
 # GitHub App publish workflow (Issue #216, sub-task 1): connection

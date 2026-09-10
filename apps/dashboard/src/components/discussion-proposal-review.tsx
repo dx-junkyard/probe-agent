@@ -34,10 +34,11 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   useApplyDiscussionProposalItems, useCreateDiscussionProposal, useDiscussionProposal,
-  useDiscussionProposals, usePrefillDiscussionProposalItems, useRejectDiscussionProposalItems,
+  useDiscussionProposals, usePrefillDiscussionProposalItems, usePromoteDiscussionHypothesis,
+  useRejectDiscussionProposalItems,
 } from "@/api/hooks";
 import type {
-  AssistantDiscussionProposalItem, AssistantDiscussionThread,
+  AssistantDiscussionProposalHypothesis, AssistantDiscussionProposalItem, AssistantDiscussionThread,
   DiscussionProposalItemEligibility, DiscussionProposalItemStatus,
 } from "@/api/types";
 import {
@@ -60,6 +61,55 @@ const STATUS_LABEL: Record<DiscussionProposalItemStatus, string> = {
   applied: "適用済み",
   rejected: "却下済み",
 };
+
+// Issue #455 (Epic #443 §6.1): a hypothesis is an INDEPENDENT proposal item
+// type -- never a field/relation/child change, never applied through
+// `apply`/`prefill`. Its only operation is promotion into Joint
+// Understanding (§6.2).
+const HYPOTHESIS_STATUS_LABEL: Record<AssistantDiscussionProposalHypothesis["status"], string> = {
+  proposed: "未対応",
+  promoted: "調査へ昇格済み",
+  rejected: "却下済み",
+};
+
+function HypothesisRow({
+  hypothesis, onPromote, promoting, canPromote,
+}: {
+  hypothesis: AssistantDiscussionProposalHypothesis;
+  onPromote: () => void;
+  promoting: boolean;
+  canPromote: boolean;
+}) {
+  return (
+    <li
+      className="space-y-1 rounded border border-dashed p-2"
+      data-testid={`discussion-hypothesis-${hypothesis.id}`}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="text-xs font-medium">{hypothesis.statement}</p>
+        <Badge variant="outline">{HYPOTHESIS_STATUS_LABEL[hypothesis.status]}</Badge>
+      </div>
+      <ul className="list-disc space-y-0.5 pl-4 text-[11px] text-muted-foreground">
+        <li>競合する説明: {hypothesis.competing_explanations.join("、") || "(なし)"}</li>
+        <li>反証条件: {hypothesis.refutation_conditions.join("、") || "(なし)"}</li>
+        <li>次の調査: {hypothesis.next_investigation || "(なし)"}</li>
+        {hypothesis.uncertainty && <li>不確実性: {hypothesis.uncertainty}</li>}
+      </ul>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={!canPromote || promoting}
+        onClick={onPromote}
+        data-testid={`discussion-hypothesis-promote-${hypothesis.id}`}
+      >
+        {promoting ? "共同理解へ昇格中…" : "共同理解(Joint Understanding)へ昇格する"}
+      </Button>
+      <p className="text-[11px] text-muted-foreground">
+        昇格は調査・Replay・Experimentを自動で開始しません。別の操作として承認・実行してください。
+      </p>
+    </li>
+  );
+}
 
 type DeliveryState =
   | "idle" | "navigating" | "waiting_for_form" | "delivering" | "recording" | "done" | "failed";
@@ -161,6 +211,7 @@ function ProposalDetail({
   const rejectMutation = useRejectDiscussionProposalItems(proposalId);
   const applyMutation = useApplyDiscussionProposalItems(proposalId);
   const prefillMutation = usePrefillDiscussionProposalItems(proposalId);
+  const promoteMutation = usePromoteDiscussionHypothesis(proposalId);
   const uiDraftRegistry = useUiDraftRegistry();
   const navigate = useNavigate();
   const location = useLocation();
@@ -168,6 +219,13 @@ function ProposalDetail({
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [deliveryState, setDeliveryState] = useState<DeliveryState>("idle");
   const [deliveryMessage, setDeliveryMessage] = useState("");
+  // Issue #455 §6.2: a fresh idempotency key PER promote attempt (retrying
+  // the SAME attempt after a failure reuses it -- a NEW hypothesis or a
+  // deliberate second investigation mints a new one). Keyed by hypothesis
+  // id so several hypotheses in one proposal never share a key.
+  const [promotionRequestIds, setPromotionRequestIds] = useState<Record<number, string>>({});
+  const [promotingId, setPromotingId] = useState<number | null>(null);
+  const [promotionMessage, setPromotionMessage] = useState("");
 
   const proposal = detailQuery.data;
   // §1.3's derivation, read here as a display/routing choice ONLY (which
@@ -246,6 +304,30 @@ function ProposalDetail({
     }
   }
 
+  function promoteHypothesis(hypothesisId: number) {
+    setPromotionMessage("");
+    setPromotingId(hypothesisId);
+    const requestId = promotionRequestIds[hypothesisId] ?? crypto.randomUUID();
+    setPromotionRequestIds((prev) => ({ ...prev, [hypothesisId]: requestId }));
+    promoteMutation.mutate(
+      { hypothesis_id: hypothesisId, request_id: requestId },
+      {
+        onSuccess: (result) => {
+          setPromotingId(null);
+          setPromotionMessage(
+            result.reused
+              ? `既存の共同理解セッション(#${result.joint_understanding_session_id})に接続しました。`
+              : `共同理解セッション(#${result.joint_understanding_session_id})を開始しました。調査は別途実行してください。`,
+          );
+        },
+        onError: (err) => {
+          setPromotingId(null);
+          setPromotionMessage(classifyDiscussionError(err).message);
+        },
+      },
+    );
+  }
+
   if (detailQuery.isLoading) {
     return <p className="text-xs text-muted-foreground">読み込み中…</p>;
   }
@@ -293,6 +375,27 @@ function ProposalDetail({
             />
           ))}
         </ul>
+      )}
+      {proposal.hypotheses.length > 0 && (
+        <div className="space-y-2" data-testid="discussion-proposal-hypotheses">
+          <p className="text-[11px] font-medium text-muted-foreground">未解決の仮説</p>
+          <ul className="space-y-2">
+            {proposal.hypotheses.map((hypothesis) => (
+              <HypothesisRow
+                key={hypothesis.id}
+                hypothesis={hypothesis}
+                canPromote={hypothesis.status === "proposed" || hypothesis.status === "promoted"}
+                promoting={promotingId === hypothesis.id}
+                onPromote={() => promoteHypothesis(hypothesis.id)}
+              />
+            ))}
+          </ul>
+          {promotionMessage && (
+            <p className="text-[11px] text-muted-foreground" data-testid="discussion-hypothesis-promotion-status">
+              {promotionMessage}
+            </p>
+          )}
+        </div>
       )}
       <div className="flex flex-wrap gap-2">
         <Button

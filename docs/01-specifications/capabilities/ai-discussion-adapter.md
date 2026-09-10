@@ -14,16 +14,16 @@ allowlist と handler を全選択 item について検査してから、登録 
 | #444 | registry / parity は実装。操作結果の3状態と、実行handlerに基づくprefill capabilityの判定は実装済み (#456) | - |
 | #445 | Phase 2 (`fea4fe1`) を統合。draft の保存防止・System分離・変更警告を修正。実フォームのvalidation診断連携(§2.8)は #451 で実装済み | - |
 | #446 | Proposal review UI / prefill-first 導線 / 冪等 `save_request_id` / 結果照会 API は `ux_requirement` を代表対象として実装済み (#452、§3.6/§3.7)。他 target への `prefill_handler_id` 展開は未実装 | #454 |
-| #447 | 追加8 kind と live selection / context は Issue #453 が実装済み（§4 参照）。nested/list な構造化提案・JU 昇格は未実装のまま | #454 / #455 |
+| #447 | 追加8 kind と live selection / context は Issue #453 が実装済み（§4 参照）。nested/list な構造化提案は #454、JU 昇格・還流は #455 が実装済み | - |
 | #448 | nested item / Acceptance Criteria / Feature Proposal は未実装 | #454 |
-| #449 | 仮説の JU 昇格・還流と代表 E2E は未実装。Issue #461 が所属・premise 基盤を先行実装済み: `joint_understanding_session.owner_scope`/`discussion_thread_id`（既存 `session_id` は interview 所属時のみ必須）、`origin_kind='discussion'`、`app/joint_premise.py` の discussion origin provider registry（`register_discussion_origin_provider`）と依存参照 manifest（`normalize_premise_manifest` / `compute_premise_manifest_digest` / `EMPTY_DEPENDENCY_MANIFEST_DIGEST`、`evaluate_joint_premise` が root 不変でも依存更新で stale と判定）。実際の hypothesis テーブル・昇格 endpoint は未実装のまま | #455 |
+| #449 | 仮説の独立型・JU 昇格 bridge・還流 read・代表 E2E (Gap→Journey→Requirement→Feature の依存 staleness 検出込み) は Issue #455 が実装済み（§6 参照）。Issue #461 の所属・premise 基盤 (`owner_scope`/`discussion_thread_id`/`register_discussion_origin_provider`/依存参照 manifest) をそのまま利用し、#455 は discussion origin provider と dependency digest resolver の実装、`assistant_discussion_proposal_hypothesis` / `assistant_discussion_hypothesis_promotion` テーブル、promote/reflux endpoint を追加した | - |
 
 元 issue は実装完了と残件移管を区別して整理する。JU bridge は拡張用定義だけで
 あり、代表 E2E や screen reader / narrow viewport の実利用検証が完了したとは
 扱わない。既存の backend direct apply は互換のため引き続き利用可能。`ux_requirement`
 は prefill (生成→反映→保存→照会) の代表 E2E を縦に通し終えた (#452)。他 target
-への `prefill_handler_id` 展開・nested/list な構造化提案・JU 昇格は #454/#455 が
-引き継ぐ。
+への `prefill_handler_id` 展開は #459 以降が引き継ぐ。nested/list な構造化提案
+(#454) と JU 昇格・還流 (#455) は実装済み。
 
 検証: #452 実装後、server の
 `test_discussion_prefill.py`/`test_assistant_discussion_proposals.py`/
@@ -32,6 +32,12 @@ allowlist と handler を全選択 item について検査してから、登録 
 は232 passed。Dashboard `npx vitest run` は52ファイル1134 passed、`npx tsc -b --noEmit`
 はexit 0。
 実LLM・音声機器・screen readerによるdogfoodingの完了証明ではない。
+
+#455 実装後、server の `tests/ -k "discussion or premise or joint_understanding"`
+は418 passed（#455 の新規テストは `test_discussion_hypothesis.py` 16件 +
+`test_joint_understanding_discussion_scope.py` への追加1件）。Dashboard
+`npx vitest run` は53ファイル1144 passed、`npx tsc -b --noEmit` は exit 0。
+これも実LLM・音声機器・screen readerによるdogfoodingの完了証明ではない。
 
 本書は Epic #443 (sub-issues #444-#449) の正本契約である。この領域に触れる前に
 §0 を読むこと。上流の会話・Proposal・音声の契約は
@@ -1003,11 +1009,13 @@ proposal-review.tsx` は child item を「受入条件 [key] 追加/更新/削�
 
 ---
 
-## §6 Joint Understanding への昇格 (#449)
+## §6 Joint Understanding への昇格 (#449, 実装は #455)
 
 ### 6.1 hypothesis は field change ではない
 
-Proposal に hypothesis を独立した型として足す。
+Proposal に hypothesis を独立した型として足す
+(`app/assistant_discussion_proposal.py`、`ProposedHypothesis` /
+`_RawHypothesis` / `ProposalGenerationResult.hypothesis_changes`)。
 
 ```
 assistant_discussion_proposal_hypothesis(
@@ -1015,27 +1023,70 @@ assistant_discussion_proposal_hypothesis(
   competing_explanations_json, refutation_conditions_json,
   next_investigation, evidence_refs_json, uncertainty,
   status ('proposed'|'promoted'|'rejected'),
+  first_turn_number, last_turn_number,   -- proposal生成時のturn範囲
   created_at, schema_version)
 ```
 
-`competing_explanations` か `refutation_conditions` が空の hypothesis は
-**生成時にも昇格時にも拒否する** (#449 受け入れ条件)。反証条件の無い仮説は
-仮説ではなく、ただの主張である。
+`competing_explanations` か `refutation_conditions` か `next_investigation`
+のいずれかが欠けている hypothesis は **生成時にも昇格時にも拒否する**
+(#449/#455 受け入れ条件)。反証条件の無い仮説は仮説ではなく、ただの主張で
+ある。生成時は `generate_proposal` が応答全体を失敗させる (#454 の
+child_changes と同じ fail-closed 規律 — その hypothesis だけを落とさない)。
+昇格時は `app/discussion_hypothesis._validate_completeness` が同じ 3 条件を
+再検証する (defense in depth: 生成経路以外でこの表に行が入る将来の変更が
+あっても、昇格は独立して安全)。
 
 ### 6.2 bridge
 
-`POST /assistant/discussion-proposals/{id}/hypotheses/{hid}/promote` は、
-Joint Understanding session を `origin_kind='discussion'` /
-`trigger='discussion_promotion'` で開く。
+`POST /assistant/discussion-proposals/{proposal_id}/hypotheses/{hypothesis_id}/promote`
+(`app/discussion_hypothesis.promote_hypothesis` / `app/routes/assistant.py`)
+は、Joint Understanding session を `origin_kind='discussion'` /
+`trigger='discussion_promotion'` / `owner_scope='discussion'` (#461) で開く。
+`app/discussion_adapters.DiscussionAdapter.joint_understanding_bridge` は
+**全 target_kind で `True`** — 昇格は対象の canonical facts の有無に依存しない。
 
 - **6 つ目の origin を足す**理由: #337 の premise 契約は origin ごとの content
   hash を要求する。既存 4 origin のどれかに偽装すると、Journey についての会話が
   「Q&A の premise」を名乗ることになり、premise 評価が意味を失う。
-  `discussion` origin の content hash は
-  `target_kind` + `target_ref` + 昇格時の `captured_target_digest` で、
-  `premise_commit_sha` は #337 のまま。
-- 昇格は **利用者の明示操作** (`decision_method: manual`)。元の domain item の
-  回答・decision・status は 1 つも変えない (#329 の境界)。
+- **content hash は仮説の正規化内容 + root の現在 digest。**
+  `app/discussion_hypothesis._discussion_origin_provider` が
+  `app/joint_premise.register_discussion_origin_provider` に登録する provider
+  で、`{statement, competing_explanations(sorted), refutation_conditions
+  (sorted), next_investigation, evidence_refs(sorted), uncertainty,
+  root_kind, root_ref, root_digest}` の canonical JSON SHA-256。root_digest を
+  含めることで、hypothesis 自体の文言は不変でも discussion の対象
+  (Requirement 等) が編集されれば `origin_content_changed` で stale になる。
+  dependency 側の staleness は **別軸のまま** (#461 の
+  `premise_dependency_manifest`) — root digest 式に畳むと
+  `dependency_content_changed` という、より具体的な理由コードが
+  `origin_content_changed` に覆われて到達不能になる。
+- **依存 manifest は #458 の `build_context_bundle(...).dependencies` を
+  そのまま `capture_premise_bundle(..., dependencies=...)` へ渡す** — 独自の
+  manifest 構築はしない。`app/joint_premise.register_dependency_digest_
+  resolver` に登録する resolver (`app/discussion_hypothesis.
+  _dependency_digest_resolver`) は、premise 評価が既に開いている
+  `db.get_conn()` の中から呼ばれる (`resolve_dependency_digests(conn, ...)`)
+  ため、**`discussion_adapters._resolve_<kind>` を直接呼べない**
+  (それ自身が `with get_conn():` を持ち、再入で `DatabaseReentrancyError`
+  になる)。`_target_digest_with_conn` は同じ digest 式を `conn` を直接使って
+  再実装する (`purpose_element` / `purpose_relation` / `stakeholder` /
+  `stakeholder_need` / `product_objective` / `product_milestone` /
+  `product_gap` / `product_feature` / `ux_journey` / `ux_requirement` /
+  `solution_design` / `screen` の 12 kind をカバー)。カバー外の kind は
+  `_UNSUPPORTED` として `None` (「解決できない」= 依存が `missing` 側へ倒れる、
+  `current` に倒れることは無い) を返す — fail-closed な既知の簡略化であり、
+  対応拡大は additive。
+- **昇格要求 ID (`request_id`) は `(system_id, request_id)` で UNIQUE**
+  (hypothesis_id では区切らない)。同一 `request_id` を別 hypothesis へ使うと
+  `request_digest` (hypothesis_id を含む canonical hash) が食い違い 409
+  (`discussion_hypothesis_promotion_request_conflict`)。同一 hypothesis への
+  同一 `request_id` は既存 session を `reused: true` で返す。同一 hypothesis
+  への **別の** `request_id` は意図的な第二の調査として新しい session を作る
+  (拒否しない)。
+- 昇格は **利用者の明示操作** (`decision_method: manual`)。元の proposal の
+  他 item・thread の turns・hypothesis 以外の domain item の回答・decision・
+  status は 1 つも変えない (#329 の境界)。JU への昇格それ自体は調査・Replay・
+  Experiment を一切起動しない (別操作)。
 - lineage:
 
 ```
@@ -1044,23 +1095,35 @@ assistant_discussion_hypothesis_promotion(
   first_turn_number, last_turn_number,
   captured_target_kind, captured_target_ref, captured_target_digest,
   joint_understanding_session_id,
-  decision_method 'manual', created_by, created_at)
+  request_id, request_digest,
+  decision_method 'manual', created_by, created_at,
+  UNIQUE (system_id, request_id))
 ```
 
 元 thread / turn 範囲 / target premise から調査 finding・outcome まで辿れる。
 
 ### 6.3 還流
 
-`GET /assistant/discussion-threads/{id}/joint-understanding` は昇格済み session
-とその現在の findings / outcome を返す。守ること:
+`GET /assistant/discussion-threads/{thread_id}/joint-understanding`
+(`app/routes/assistant.py::get_discussion_joint_understanding`) は、その
+thread から昇格された全 hypothesis について `{hypothesis, promotion,
+session, current_findings, reconfirmation_required}` の一覧を返す。
+`session` は `routes/joint_understanding.py` の `_session_out` /
+`_premise_verdict` をそのまま再利用した `JointUnderstandingOut` — ここで
+premise verdict を再定義しない。守ること:
 
 - **provisional を confirmed fact として返さない。** `hypothesis_adopted` は
   #337 が明示的に provisional と定めており、Discussion 側でも
   `outcome_is_provisional` をそのまま運ぶ。confirmed point へ昇格させない。
-- premise が `current` のときだけ、その finding を Discussion の最新 context へ
-  参照として載せる。`stale` / `missing` / `invalid` は再確認を要求する
+- premise (`session.premise_state`) が `current` のときだけ、
+  `current_findings` に finding を載せる。フィルタは
+  `app.joint_understanding.can_reflux` そのもの (`origin_role='investigation'`
+  かつ `claim_kind='fact'`、superseded を除外) — reflux 用に別の判定を作らない。
+  `stale` / `missing` / `invalid` は `current_findings: []` +
+  `reconfirmation_required: true` を返し、理由は `session.premise_reason`
   (#337 の verdict をそのまま読む。ここで再定義しない)。
 - Discussion と Joint Understanding のテーブルは**統合しない** (#449 非目標)。
+  この endpoint は読み取り専用 (何も書き込まない)。
 
 ---
 
