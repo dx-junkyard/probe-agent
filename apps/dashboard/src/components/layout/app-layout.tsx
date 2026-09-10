@@ -6,6 +6,7 @@ import { Sidebar, MOBILE_NAV_DRAWER_ID } from "./sidebar";
 import { Header } from "./header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AssistantPanel } from "@/components/assistant-panel";
+import { ReturnToBanner } from "@/components/discussion-return-banner";
 import { systemStateTarget } from "@/components/system-state";
 import { HelpModeProvider } from "@/lib/help-mode";
 import { HelpModeLayer } from "@/components/help-mode-layer";
@@ -75,6 +76,7 @@ export function AppLayout() {
             navToggleRef={navToggleRef}
             navDrawerId={MOBILE_NAV_DRAWER_ID}
           />
+          <ReturnToBanner />
           {/* `pb-24` は `AssistantPanel` の浮いているボタン (閉じているとき
               右下に固定) のための予約領域。本文の末尾が常にボタンより上で
               終わるので、画面の主操作がボタンに覆われることがない (#102:

@@ -40,6 +40,18 @@ premise の fail-open 欠陥2件を修正し、7件を追加済み）。Dashboar
 `npx vitest run` は53ファイル1144 passed、`npx tsc -b --noEmit` は exit 0。
 これも実LLM・音声機器・screen readerによるdogfoodingの完了証明ではない。
 
+#458 (§9 の context bundle / expansions) と #459 (§9.2 の claim 生成、
+`app/discussion_next_action.py` の全体 next_action projection、
+Gap Workbench 側の `components/discussion-context-panel.tsx` /
+`components/discussion-return-banner.tsx`) 実装後、server の
+`tests/ -k "discussion or premise or joint_understanding"` は464 passed
+（#459 の新規テストは `test_discussion_claims.py` 14件 +
+`test_discussion_next_action.py` 18件 +
+`test_discussion_context_claims_route.py` 7件）。Dashboard `npx vitest run`
+は55ファイル1158 passed、`npx tsc -b --noEmit` は exit 0。これも実LLM・
+音声機器・screen readerによるdogfoodingの完了証明ではなく、390px幅の実機
+確認・キーボードのみでの主導線完走も未実測のまま残る（DD-AC-04）。
+
 本書は Epic #443 (sub-issues #444-#449) の正本契約である。この領域に触れる前に
 §0 を読むこと。上流の会話・Proposal・音声の契約は
 `docs/01-specifications/capabilities/assistant-discussion.md` (Epic #436) が正本であり、本書はそれを**置き換え
@@ -1369,6 +1381,51 @@ snapshot が変わった、のいずれかは 409
 bundleの根拠は、探索の途中経過とは別の寿命を持つ。書き込みは #455/#459 が
 自分の durable row を保存する、まさにその場所で呼ぶ（#458 自身はどの
 turn/proposal/JU session にも書き込まない）。
+
+### 9.4 §9.2 の実装（Issue #459 実装済み）
+
+正本モジュールは `app/discussion_claims.py`。API は
+`POST /assistant/discussion-threads/{id}/context-claims`
+（body: `{question?: string}`、既定値は固定操作名「目的・UX・機能を照合」）。
+`#458` の bundle を read → reason（LLM 呼び出し中は `get_conn()` を保持しない）
+→ persist の順で実行し、常に user/assistant の turn ペアを追記する
+(`assistant_discussion_turn.claims_json`。`None` は「照合結果を持たない turn」
+であり、通常の `/assistant/ask` turn と区別する)。
+
+`ClaimsGenerationResult` の wire shape (`DiscussionContextClaimsResultOut`):
+
+```text
+{ provider, model, is_mock, prompt_version, schema_version,
+  decision_method: deterministic | reasoning_llm,
+  claims: [{ kind: fact|inference|hypothesis|unknown|conflict,
+             statement, cited_source_ids: [source_id...], basis: deterministic|reasoning_llm }],
+  scope_note, as_of_snapshot_commit, retried,
+  error, error_kind: unavailable|call_error|invalid_response|invalid_citation|null,
+  thread_id, turn_number }
+```
+
+構造的な `unsupported`/`not_applicable`/`unavailable` セクションは常に
+決定的な `unknown` claim(`basis="deterministic"`)を生む。意味的判断が必要な
+`available` セクションが1つも無ければ LLM を一切呼ばず
+`decision_method="deterministic"` で返す。呼ぶ場合は fail-closed --
+mock/非reasoning modelは即座に `error_kind="unavailable"`、引用が
+`allowed_source_ids` の外を指す応答は1回だけ再生成し、なお不正なら
+`error_kind="invalid_citation"` で明示失敗する（無制限retryも
+heuristic成功もしない）。エンドポイント自体は常に200を返す --
+決定的claimだけでも「読めた範囲を残す」ため、部分結果をHTTPエラーに
+畳まない。`intelligence_runs` に `run_type="discussion_context_claim"` の
+行を必ず1本残す（LLM呼び出しをしなかった回も含む。Principle 7）。
+
+`app/discussion_next_action.py` は §3(DD-UX-01) の全体 `next_action`
+projection の正本。`evaluate_gap_discussion_next_action` は9行の
+first-match純関数で、`GET /assistant/discussion-threads/{id}` と
+`POST /assistant/discussion-threads`(スレッド作成)の両方が返す
+`AssistantDiscussionThreadDetailOut.next_action` を都度再計算する
+(保存しない)。Proposal/Joint Understanding の読み取りが個別に失敗しても
+`degraded_sections` へ記録するだけで、決定可能な他の行を止めない。
+Dashboard 側は `components/discussion-context-panel.tsx` がこの `kind` を
+固定の日本語ラベルへ写像して表示するだけで、優先順位そのものを
+再導出しない。
 
 ## §10 横断導線の接続境界（目標契約）
 

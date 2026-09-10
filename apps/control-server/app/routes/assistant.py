@@ -276,6 +276,11 @@ def _turn_out(row: Dict[str, Any]) -> AssistantDiscussionTurnOut:
         ui_draft_state=row.get("ui_draft_state"),
         ui_draft_form_id=row.get("ui_draft_form_id"),
         ui_draft_digest=row.get("ui_draft_digest") or "",
+        # Issue #459 (§9.2): `None` unless this turn is a claims turn --
+        # forgetting this field here (unlike `assistant_discussion._turn_out`,
+        # which already parses `claims_json`) would silently drop every
+        # persisted claim on reload even though the DB row carries it.
+        claims=row.get("claims"),
     )
 
 

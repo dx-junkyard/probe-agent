@@ -34,6 +34,7 @@ import {
 } from "@/lib/discussion-adapters";
 import { useUiDraftRegistry } from "@/lib/ui-draft";
 import { DiscussionProposalReview } from "@/components/discussion-proposal-review";
+import { DiscussionContextPanel } from "@/components/discussion-context-panel";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -1023,6 +1024,14 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           persisted thread -- a whole-screen conversation has no single
           target to propose changes against, and the legacy (non-persisted)
           conversation predates Proposals entirely. */}
+      {/* Issue #459 (Epic #457, docs/01-specifications/ux/decision-discussion-workflow.md): the overall
+          next_action banner + context bundle + 「目的・UX・機能を照合」
+          claims. `key={activeThread.id}` remounts this panel on a target
+          switch, discarding its in-flight question/result rather than
+          carrying them over to a different Gap/entity (DD-UX-07). */}
+      {!useLegacyConversation && activeThread && threadDetail && effectiveScope === "focus" && (
+        <DiscussionContextPanel key={activeThread.id} thread={threadDetail} />
+      )}
       {!useLegacyConversation && activeThread && effectiveScope === "focus" && (
         <DiscussionProposalReview thread={activeThread} />
       )}

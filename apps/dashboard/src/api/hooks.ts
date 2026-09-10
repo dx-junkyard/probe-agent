@@ -82,6 +82,7 @@ import type {
   AssistantSettingsMetadataOut,
   AssistantDiscussionTargetIn, AssistantDiscussionThreadDetailOut, AssistantDiscussionThreadsListOut,
   DiscussionContextBundle, DiscussionContextExpansionRequest, DiscussionContextExpansionOut,
+  DiscussionContextClaimsRequest, DiscussionContextClaimsResultOut,
   AssistantDiscussionProposal, AssistantDiscussionProposalsListOut,
   AssistantDiscussionProposalApplyOut, AssistantDiscussionProposalRejectOut,
   AssistantDiscussionProposalPrefillOut,
@@ -2540,6 +2541,25 @@ export function useExpandDiscussionContext(threadId: number | null) {
       api.post<DiscussionContextExpansionOut>(
         `/assistant/discussion-threads/${threadId}/context-expansions`, payload,
       ),
+  });
+}
+
+// §9.2 semantic claims (Issue #459). `app/discussion_claims.py` is the sole
+// producer; this call ALSO appends a user/assistant turn pair and refreshes
+// the thread's `next_action` server-side, so both thread queries are
+// invalidated on success -- the panel that triggered this is not the only
+// reader of "what turn came out of this" (the message list is).
+export function useCreateDiscussionContextClaims(threadId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: DiscussionContextClaimsRequest = {}) =>
+      api.post<DiscussionContextClaimsResultOut>(
+        `/assistant/discussion-threads/${threadId}/context-claims`, payload,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-thread") });
+      qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-thread-detail") });
+    },
   });
 }
 
