@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
-  classifyDiscussionError, DISCUSSION_ADAPTERS, resolveDiscussionCandidate,
+  classifyDiscussionError, DISCUSSION_ADAPTERS, proposalToDraft, resolveDiscussionCandidate,
 } from "@/lib/discussion-adapters";
+import type { AssistantDiscussionProposal, AssistantDiscussionProposalItem } from "@/api/types";
 
 describe("discussion adapter target links", () => {
   it.each([
@@ -132,6 +133,108 @@ describe("Vision-to-Feature target expansion (Issue #453)", () => {
 
   it("product_feature has no screen of its own yet, so deepLink is honestly null", () => {
     expect(DISCUSSION_ADAPTERS.product_feature.deepLink("feat-1")).toBeNull();
+  });
+});
+
+// Issue #454 (Epic #443 §5.1): `proposalToDraft` must route a child item
+// into `childOps`, never into the top-level `fields` array -- an Acceptance
+// Criterion's own `field_name` ("statement") can collide by NAME with the
+// Requirement's own top-level field of the same name.
+describe("proposalToDraft child items (Issue #454)", () => {
+  function baseProposal(items: AssistantDiscussionProposalItem[]): AssistantDiscussionProposal {
+    return {
+      id: 1, system_id: 1, thread_id: 1, screen_id: "ux-design-studio",
+      target_kind: "ux_requirement", target_ref: "req-1",
+      captured_target_revision_id: 1, captured_target_digest: "d",
+      summary: "", confirmed_points: [], unresolved_questions: [], assumptions: [],
+      evidence_refs: [], decision_method: "reasoning_llm", intelligence_run_id: null,
+      provider: "openai", model: "gpt-5", prompt_version: "v1", schema_version: "v1",
+      created_by: null, created_at: 0, items,
+    };
+  }
+
+  function childItem(overrides: Partial<AssistantDiscussionProposalItem>): AssistantDiscussionProposalItem {
+    return {
+      id: 1, proposal_id: 1, item_kind: "field", field_name: "", relation_kind: "",
+      relation_target_kind: "", relation_target_ref: "", subject_ref: "",
+      current_value: "", proposed_value: "", rationale: "discussed",
+      child_kind: "acceptance_criterion", child_key: "c-1", child_intent: "update",
+      child_order: null, status: "proposed", eligibility: "appliable", applied_ref: null,
+      decided_by: null, decided_at: null, decision_method: "reasoning_llm", created_at: 0,
+      schema_version: "v1", prefill_count: 0, last_prefilled_at: null,
+      ...overrides,
+    };
+  }
+
+  it("never places a child item's field into the top-level fields array", () => {
+    // "statement" is a top-level ux_requirement field AND a valid
+    // acceptance_criterion child field -- the exact name collision #454
+    // exists to keep apart.
+    const item = childItem({ id: 1, field_name: "statement", proposed_value: "Criterion text" });
+    const proposal = baseProposal([item]);
+    const result = proposalToDraft(DISCUSSION_ADAPTERS.ux_requirement, proposal, [1]);
+    expect(result.patch).not.toBeNull();
+    expect(result.patch!.fields).toEqual([]);
+    expect(result.unregisteredFieldNames).toEqual([]);
+    expect(result.patch!.childOps).toHaveLength(1);
+    expect(result.patch!.childOps[0]).toMatchObject({
+      childKind: "acceptance_criterion", childKey: "c-1", intent: "update",
+      fields: [{ fieldName: "statement", value: "Criterion text" }],
+    });
+  });
+
+  it("groups two field rows of the SAME child address into one childOp", () => {
+    const items = [
+      childItem({ id: 1, field_name: "statement", proposed_value: "New text" }),
+      childItem({ id: 2, field_name: "verification_method", proposed_value: "replay" }),
+    ];
+    const proposal = baseProposal(items);
+    const result = proposalToDraft(DISCUSSION_ADAPTERS.ux_requirement, proposal, [1, 2]);
+    expect(result.patch!.childOps).toHaveLength(1);
+    expect(result.patch!.childOps[0].fields).toEqual([
+      { fieldName: "statement", value: "New text" },
+      { fieldName: "verification_method", value: "replay" },
+    ]);
+  });
+
+  it("keeps a pure reorder item and a content item on SEPARATE childOps entries when their intent differs, and merges when identical", () => {
+    // Two rows sharing the SAME (childKind, childKey, intent) -- one a pure
+    // reorder, one a content change -- merge into one childOp carrying
+    // both the order and the field (mirrors how the server persists them
+    // as two item rows describing one logical child change).
+    const items = [
+      childItem({ id: 1, field_name: "statement", proposed_value: "text", child_order: null }),
+      childItem({ id: 2, field_name: "", proposed_value: "", child_order: 3 }),
+    ];
+    const proposal = baseProposal(items);
+    const result = proposalToDraft(DISCUSSION_ADAPTERS.ux_requirement, proposal, [1, 2]);
+    expect(result.patch!.childOps).toHaveLength(1);
+    expect(result.patch!.childOps[0].order).toBe(3);
+    expect(result.patch!.childOps[0].fields).toEqual([{ fieldName: "statement", value: "text" }]);
+  });
+
+  it("does not merge child items with different child_key or child_intent", () => {
+    const items = [
+      childItem({ id: 1, child_key: "c-1", child_intent: "update", field_name: "statement" }),
+      childItem({ id: 2, child_key: "c-2", child_intent: "update", field_name: "statement" }),
+      childItem({ id: 3, child_key: "", child_intent: "add", field_name: "statement" }),
+    ];
+    const proposal = baseProposal(items);
+    const result = proposalToDraft(DISCUSSION_ADAPTERS.ux_requirement, proposal, [1, 2, 3]);
+    expect(result.patch!.childOps).toHaveLength(3);
+  });
+
+  it("still routes a plain (non-child) field item into the top-level fields array", () => {
+    const item = childItem({
+      id: 1, child_kind: "", child_key: "", child_intent: "", field_name: "statement",
+      proposed_value: "Top-level statement",
+    });
+    const proposal = baseProposal([item]);
+    const result = proposalToDraft(DISCUSSION_ADAPTERS.ux_requirement, proposal, [1]);
+    expect(result.patch!.childOps).toEqual([]);
+    expect(result.patch!.fields).toEqual([
+      { fieldName: "statement", value: "Top-level statement", rationale: "discussed" },
+    ]);
   });
 });
 
