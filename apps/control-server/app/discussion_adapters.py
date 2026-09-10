@@ -1160,6 +1160,20 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         # `RequirementRevisionForm`. Acceptance criteria are NOT included --
         # they are a #448 (ChildSpec) concern, not a top-level field.
         ui_draft_forms=(UiDraftFormSpec(form_id="ux_requirement.revision", fields=_UX_REQUIREMENT_FIELDS),),
+        # Issue #452: the FIRST real prefill delivery handler wired end to
+        # end (navigate -> mount -> deliver -> ack) -- `ux_requirement` is
+        # the representative target the Issue's Decisions name ("既存
+        # Requirementから一往復を完成させる"). This is the ONLY adapter whose
+        # `prefill_form` capability derives `true` today; every other kind's
+        # `ui_draft_forms` still declares a destination form with nothing
+        # that can deliver to it (`#454` extends the same handler shape to
+        # the remaining three). `tests/test_discussion_contract_parity.py`'s
+        # `test_prefill_handler_id_parity_between_server_and_dashboard`
+        # pins this exact id against `lib/discussion-adapters.ts`'s matching
+        # `prefillHandlerId` -- a mismatch (or a one-sided change) fails that
+        # test, never silently shipping a half-wired capability (§1.3: "client
+        # の自己申告だけでは有効化しない").
+        prefill_handler_id="ux_requirement.revision@v1",
     ),
     "solution_design": DiscussionAdapter(
         target_kind="solution_design",

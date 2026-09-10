@@ -57,6 +57,25 @@ export interface FormDraftPatch {
 }
 
 const FORM_DRAFT_PATCH_EVENT = "probe-agent:form-draft-inbox";
+// Issue #452 §3's delivery order contract: navigate -> form ready confirm ->
+// patch delivery -> ACK -> prefill audit. `deliverFormDraftPatch` alone only
+// proves a patch was DISPATCHED (queued, or broadcast to whatever happens to
+// be listening) -- it does not prove any destination form actually consumed
+// it. This second event fires ONLY from inside `useFormDraftInbox`'s own
+// `consume()`, i.e. only once a form SUBSCRIBED to this exact
+// `(formId, targetRef)` has actually run its `onPatch` handler for THIS
+// `patchToken`. A dispatcher that gets no ack within its own timeout must
+// report the delivery as `unavailable` (docs/01-specifications/capabilities/ai-discussion-adapter.md
+// §1.3/§1.7, reused by #452's DD-INT-01: "フォーム未mount・配送失敗は成功扱い
+// しない"), never call the server prefill-audit endpoint, and never claim
+// success.
+const FORM_DRAFT_ACK_EVENT = "probe-agent:form-draft-ack";
+
+interface FormDraftAckDetail {
+  patchToken: string;
+  formId: string;
+  targetRef: string;
+}
 
 function patchKey(formId: string, targetRef: string): string {
   return `${formId}|${targetRef}`;
@@ -127,6 +146,16 @@ export function useFormDraftInbox(
       if (seenTokens.current.has(patch.patchToken)) return;
       seenTokens.current.add(patch.patchToken);
       handlerRef.current(patch);
+      // Fired AFTER the subscribed form's own handler ran -- this is the
+      // ack a dispatcher waits for (`dispatchFormDraftPrefill` below), never
+      // fired merely because `deliverFormDraftPatch` was called.
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent<FormDraftAckDetail>(FORM_DRAFT_ACK_EVENT, {
+            detail: { patchToken: patch.patchToken, formId, targetRef },
+          }),
+        );
+      }
     };
     // Pick up a patch delivered before this form mounted (the common case
     // right after navigating here from the review UI).
@@ -294,4 +323,79 @@ export function useFormDraftReceiver(
   };
 
   return { conflicts, resolveField };
+}
+
+// --- Delivery pipeline (Issue #452, §3's "配送順は契約") ---------------------
+// navigate -> form ready confirm -> patch delivery -> ack -> prefill audit.
+// The first two steps are the CALLER's job (navigating and polling readiness
+// need `useNavigate()`/`useUiDraftRegistry()`, which this module -- a plain
+// event bus -- deliberately does not depend on); these two helpers own the
+// last two, the part that is genuinely about THIS module's own event bus.
+
+/**
+ * Poll `registry.read(formId, targetRef)` until it reports something other
+ * than `"absent"` (i.e. a form has mounted and registered under this exact
+ * key -- `"unreadable"` still counts: something IS open, even if its draft
+ * cannot be read right now) or `timeoutMs` elapses. Returns whether the form
+ * became ready. Never throws.
+ */
+export function waitForFormDraftReady(
+  registry: { read: (formId: string, targetRef: string) => { outcome: string } } | null,
+  formId: string,
+  targetRef: string,
+  timeoutMs = 4000,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!registry) {
+      resolve(false);
+      return;
+    }
+    const deadline = Date.now() + timeoutMs;
+    const poll = () => {
+      if (registry.read(formId, targetRef).outcome !== "absent") {
+        resolve(true);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        resolve(false);
+        return;
+      }
+      window.setTimeout(poll, 150);
+    };
+    poll();
+  });
+}
+
+/**
+ * Delivers `patch` and resolves once the SUBSCRIBED destination form has
+ * actually consumed it (an ack, per the module-level comment above), or
+ * `timeoutMs` elapses with no ack -- e.g. the form never actually mounted
+ * (a race with `waitForFormDraftReady`), or mounted for a different
+ * `(formId, targetRef)`. A caller MUST treat `"timeout"` as a failed
+ * delivery (§1.3/§1.7's `unavailable`, DD-INT-01) -- never as success, and
+ * never call the server prefill-audit endpoint for it.
+ */
+export function dispatchFormDraftPatchAndWaitForAck(
+  patch: FormDraftPatch,
+  timeoutMs = 4000,
+): Promise<"acked" | "timeout"> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const handleAck = (event: Event) => {
+      const detail = (event as CustomEvent<FormDraftAckDetail>).detail;
+      if (!detail || detail.patchToken !== patch.patchToken) return;
+      if (settled) return;
+      settled = true;
+      window.removeEventListener(FORM_DRAFT_ACK_EVENT, handleAck);
+      resolve("acked");
+    };
+    window.addEventListener(FORM_DRAFT_ACK_EVENT, handleAck);
+    deliverFormDraftPatch(patch);
+    window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener(FORM_DRAFT_ACK_EVENT, handleAck);
+      resolve("timeout");
+    }, timeoutMs);
+  });
 }

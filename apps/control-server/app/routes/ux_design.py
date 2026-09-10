@@ -36,10 +36,11 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .. import trace_redaction, ux_design
+from .. import discussion_save_receipts, trace_redaction, ux_design
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from ..models import (
+    DiscussionSaveReceiptOut,
     UxArtifactReferenceCreateRequest,
     UxArtifactReferenceOut,
     UxDesignDecisionCreateRequest,
@@ -110,6 +111,9 @@ _MESSAGES: Dict[str, str] = {
     "ux_design_subject_not_found": "設計対象が見つかりません。",
     "ux_design_decision_stale_digest": "指定された digest が現在の内容と一致しません。",
     "ux_design_not_decidable": "この状態からはその決定を記録できません。",
+    # Issue #452 §3.6: reusing `save_request_id` with different content.
+    "discussion_save_request_conflict": "同じ保存要求 ID が別の内容で既に使われています。編集後は新しい保存要求として送信してください。",
+    "discussion_save_request_not_found": "指定された保存要求は見つかりませんでした。",
 }
 
 # --- §2.8 (Issue #451): domain validation diagnostics for the real Journey /
@@ -427,6 +431,28 @@ def get_requirement_endpoint(
     return UxRequirementDetailOut(**detail)
 
 
+#: §3.6's endpoint identity for the receipt table -- distinct from
+#: `target_kind` ("ux_requirement") because one target_kind could grow more
+#: than one save operation later (`#454`'s child extensions).
+_REQUIREMENT_REVISION_ENDPOINT_KIND = "ux_requirement.revision"
+
+
+def _requirement_revision_request_digest(payload: "UxRequirementRevisionCreateRequest") -> str:
+    """§3.6's `request_digest`: every domain-meaningful field the write
+    actually persists, and NOTHING else -- `save_request_id` itself is
+    identity, not content, and is excluded."""
+    return discussion_save_receipts.compute_request_digest(
+        {
+            "statement": payload.statement,
+            "rationale": payload.rationale,
+            "constraint_text": payload.constraint_text,
+            "out_of_scope_note": payload.out_of_scope_note,
+            "change_note": payload.change_note,
+            "acceptance_criteria": [c.model_dump() for c in payload.acceptance_criteria],
+        }
+    )
+
+
 @router.post(
     "/requirements/{requirement_key}/revisions", response_model=UxRequirementDetailOut, status_code=201
 )
@@ -436,7 +462,37 @@ def add_requirement_revision_endpoint(
     system_id: int = Depends(get_system_id),
     principal: Principal = Depends(require_user),
 ) -> UxRequirementDetailOut:
+    """§3.6/§3.7 (Issue #452): an optional `save_request_id` makes this
+    endpoint idempotent -- see `app/discussion_save_receipts.py`'s module
+    docstring for the exact calling convention this follows. Without one,
+    behaviour is byte-for-byte the pre-#452 shape."""
+    actor = _principal_actor(principal)
+    save_request_id = (payload.save_request_id or "").strip() or None
+    request_digest = _requirement_revision_request_digest(payload) if save_request_id else ""
+
     with get_conn() as conn:
+        if save_request_id:
+            try:
+                existing = discussion_save_receipts.check_reusable(
+                    conn, system_id=system_id, save_request_id=save_request_id,
+                    request_digest=request_digest,
+                )
+            except discussion_save_receipts.SaveRequestConflict:
+                raise _reject("discussion_save_request_conflict", 409)
+            if existing is not None and existing["status"] == "succeeded":
+                # §3.6: "同一ID・同一内容は同じ結果" -- a lost-response retry
+                # (or a deliberate retry click that made no edit) converges on
+                # the SAME revision, never a second one.
+                try:
+                    detail = ux_design.get_requirement_detail(conn, system_id, requirement_key)
+                except Exception as exc:
+                    _raise_for_ux_error(exc)
+                    raise
+                return UxRequirementDetailOut(**detail)
+            # `existing is None` (never attempted) or `existing["status"] ==
+            # "failed"` (nothing was persisted for this id yet) both fall
+            # through to a real attempt below.
+
         try:
             detail = ux_design.add_requirement_revision(
                 conn,
@@ -451,12 +507,74 @@ def add_requirement_revision_endpoint(
                 authored_by_kind="developer",
                 decision_method="manual",
                 intelligence_run_id=None,
-                created_by=_principal_actor(principal),
+                created_by=actor,
             )
         except Exception as exc:
-            _raise_for_ux_error(exc)
+            if not save_request_id:
+                _raise_for_ux_error(exc)
+                raise
+            # Translate first so the receipt's `error_code` is the SAME
+            # finite code the client actually receives -- never a second,
+            # independently-guessed code.
+            error_code = type(exc).__name__
+            try:
+                _raise_for_ux_error(exc)
+            except HTTPException as http_exc:
+                if isinstance(http_exc.detail, dict):
+                    error_code = http_exc.detail.get("code", error_code)
+                discussion_save_receipts.record_outcome(
+                    conn, system_id=system_id, save_request_id=save_request_id, actor=actor,
+                    target_kind="ux_requirement", target_ref=requirement_key,
+                    endpoint_kind=_REQUIREMENT_REVISION_ENDPOINT_KIND, request_digest=request_digest,
+                    status="failed", error_code=error_code,
+                )
+                raise
+            # `_raise_for_ux_error` did not recognize `exc` and returned
+            # without raising -- record it under its own type name and
+            # re-raise the ORIGINAL exception unchanged.
+            discussion_save_receipts.record_outcome(
+                conn, system_id=system_id, save_request_id=save_request_id, actor=actor,
+                target_kind="ux_requirement", target_ref=requirement_key,
+                endpoint_kind=_REQUIREMENT_REVISION_ENDPOINT_KIND, request_digest=request_digest,
+                status="failed", error_code=error_code,
+            )
             raise
+        if save_request_id:
+            revision_id = detail.get("current_revision_id")
+            discussion_save_receipts.record_outcome(
+                conn, system_id=system_id, save_request_id=save_request_id, actor=actor,
+                target_kind="ux_requirement", target_ref=requirement_key,
+                endpoint_kind=_REQUIREMENT_REVISION_ENDPOINT_KIND, request_digest=request_digest,
+                status="succeeded", result_ref=f"requirement_revision:{revision_id}",
+                revision_id=revision_id,
+            )
     return UxRequirementDetailOut(**detail)
+
+
+@router.get("/save-requests/{save_request_id}", response_model=DiscussionSaveReceiptOut)
+def get_save_request_endpoint(
+    save_request_id: str, system_id: int = Depends(get_system_id),
+) -> DiscussionSaveReceiptOut:
+    """§3.7's result-query API: "応答不明時は同じ ID で照会 / 再試行する" --
+    this is the照会 half. Scoped by System like every other read here (a
+    save request made under a different System is reported the same as one
+    that never existed, never disclosed)."""
+    with get_conn() as conn:
+        receipt = discussion_save_receipts.find_receipt(conn, system_id, save_request_id)
+    if receipt is None:
+        raise _reject("discussion_save_request_not_found", 404)
+    return DiscussionSaveReceiptOut(
+        save_request_id=receipt["save_request_id"],
+        target_kind=receipt["target_kind"],
+        target_ref=receipt["target_ref"],
+        endpoint_kind=receipt["endpoint_kind"],
+        status=receipt["status"],
+        result_ref=receipt["result_ref"],
+        revision_id=receipt["revision_id"],
+        error_code=receipt["error_code"],
+        created_at=receipt["created_at"],
+        updated_at=receipt["updated_at"],
+    )
 
 
 @router.get("/requirements/{requirement_key}/revisions", response_model=UxRequirementRevisionListOut)

@@ -6621,6 +6621,27 @@ export interface UxRequirementRevisionCreateRequest {
   out_of_scope_note?: string;
   change_note?: string;
   acceptance_criteria?: UxAcceptanceCriterionInput[];
+  /** Issue #452 (docs/01-specifications/capabilities/ai-discussion-adapter.md §3.6/§3.7): optional
+   * idempotency key. Omitted (or undefined) is the pre-#452 shape -- an
+   * ordinary save with no idempotent-retry contract. */
+  save_request_id?: string;
+}
+
+// --- Issue #452 §3.6/§3.7: idempotent save-request receipts ----------------
+
+export type DiscussionSaveReceiptStatus = "succeeded" | "failed";
+
+export interface DiscussionSaveReceiptOut {
+  save_request_id: string;
+  target_kind: string;
+  target_ref: string;
+  endpoint_kind: string;
+  status: DiscussionSaveReceiptStatus;
+  result_ref: string;
+  revision_id: number | null;
+  error_code: string;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface UxRequirementStepLinkCreateRequest {

@@ -33,6 +33,7 @@ import {
   classifyDiscussionError, DISCUSSION_ADAPTERS, resolveDiscussionCandidate,
 } from "@/lib/discussion-adapters";
 import { useUiDraftRegistry } from "@/lib/ui-draft";
+import { DiscussionProposalReview } from "@/components/discussion-proposal-review";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -1016,6 +1017,15 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           </div>
         )}
       </div>
+
+      {/* Issue #452 (docs/01-specifications/capabilities/ai-discussion-adapter.md §3): the Proposal review
+          region. Only for a specific entity/element target with a real
+          persisted thread -- a whole-screen conversation has no single
+          target to propose changes against, and the legacy (non-persisted)
+          conversation predates Proposals entirely. */}
+      {!useLegacyConversation && activeThread && effectiveScope === "focus" && (
+        <DiscussionProposalReview thread={activeThread} />
+      )}
 
       <form
         className="flex items-center gap-2 border-t p-3"

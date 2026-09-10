@@ -9878,6 +9878,35 @@ class UxRequirementRevisionCreateRequest(BaseModel):
     out_of_scope_note: str = ""
     change_note: str = ""
     acceptance_criteria: List[UxAcceptanceCriterionInput] = Field(default_factory=list)
+    # Issue #452 (docs/01-specifications/capabilities/ai-discussion-adapter.md §3.6/§3.7): optional
+    # idempotency key for the AI Discussion Adapter's prefill-to-save flow.
+    # `None` (the default) is the pre-#452 shape -- an ordinary developer save
+    # with no idempotent-retry contract. An opaque, client-generated token;
+    # never interpreted, only bound to a request digest.
+    save_request_id: Optional[str] = Field(default=None, max_length=200)
+
+
+#: Issue #452 §3.6: the finite outcome of one idempotent save request.
+DiscussionSaveReceiptStatus = Literal["succeeded", "failed"]
+
+
+class DiscussionSaveReceiptOut(BaseModel):
+    """§3.7's result-query API response: `GET /ux-design/save-requests/{id}`.
+    Read-only projection of one `discussion_save_receipt` row -- never a
+    domain row itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    save_request_id: str
+    target_kind: str
+    target_ref: str
+    endpoint_kind: str
+    status: DiscussionSaveReceiptStatus
+    result_ref: str = ""
+    revision_id: Optional[int] = None
+    error_code: str = ""
+    created_at: float
+    updated_at: float
 
 
 class UxRequirementStepLinkCreateRequest(BaseModel):

@@ -458,21 +458,28 @@ def test_prefill_handler_id_parity_between_server_and_dashboard():
         if adapter.prefill_handler_id is not None
     }
     assert dashboard_handler_ids == server_handler_ids
-    # As of #456 this is the empty dict on both sides -- #452 is what
-    # populates the first real entry. Pinned here so a future PR that adds
-    # ONE side's declaration without the other fails this test rather than
-    # silently shipping a capability that only half-exists.
-    assert server_handler_ids == {}
+    # Issue #452 populates the FIRST real entry (`ux_requirement`, the
+    # representative target its Decisions name). Pinned to the exact id
+    # (not just non-empty) so a future PR that adds ONE side's declaration
+    # without the other, or that changes one side's id without the other,
+    # fails this test rather than silently shipping a half-wired or
+    # mismatched capability.
+    assert server_handler_ids == {"ux_requirement": "ux_requirement.revision@v1"}
 
 
-def test_no_adapter_derives_prefill_form_before_a_handler_is_registered():
-    """#456's own completion condition, stated as a contract test rather
-    than only as a docstring claim: with no `prefill_handler_id` registered
-    anywhere, `prefill_form` must not be true for ANY adapter -- including
-    `ux_journey`, which has every OTHER precondition (`ui_draft_forms` and
-    `propose_fields`) satisfied already."""
+def test_only_ux_requirement_derives_prefill_form_so_far():
+    """#456's own completion condition, extended by #452's first real
+    registration: `prefill_form` is true for EXACTLY the one kind with a
+    registered handler, and still false for every other kind that has every
+    OTHER precondition (`ui_draft_forms` and `propose_fields`) satisfied
+    already -- e.g. `ux_journey`, whose handler is `#454`'s job, not this
+    Issue's."""
     from app import discussion_adapters
 
-    for adapter in discussion_adapters.DISCUSSION_ADAPTERS.values():
-        assert adapter.prefill_handler_id is None
-        assert "prefill_form" not in discussion_adapters.capabilities_for(adapter)
+    for kind, adapter in discussion_adapters.DISCUSSION_ADAPTERS.items():
+        if kind == "ux_requirement":
+            assert adapter.prefill_handler_id == "ux_requirement.revision@v1"
+            assert "prefill_form" in discussion_adapters.capabilities_for(adapter)
+        else:
+            assert adapter.prefill_handler_id is None
+            assert "prefill_form" not in discussion_adapters.capabilities_for(adapter)

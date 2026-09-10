@@ -36,15 +36,20 @@ describe("discussion adapter target links", () => {
   });
 });
 
-// Issue #456: no adapter has a wired handler yet, so the always-empty state
-// is the honest completion condition -- pinned here alongside the Python
-// side's own `test_no_adapter_derives_prefill_form_before_a_handler_is_
-// registered` so a future PR that adds ONE side's declaration without the
-// other is caught on this side too.
-describe("discussion adapter prefill handler registration (Issue #456)", () => {
-  it("has no prefillHandlerId registered on any adapter yet", () => {
-    for (const adapter of Object.values(DISCUSSION_ADAPTERS)) {
-      expect(adapter.prefillHandlerId).toBeNull();
+// Issue #456 registered no handler yet; Issue #452 wires the FIRST one
+// (`ux_requirement`, the Issue's representative target). Every OTHER kind
+// stays `null` -- pinned here alongside the Python side's own
+// `test_only_ux_requirement_derives_prefill_form_so_far` so a future PR that
+// adds ONE side's declaration without the other, or a different id, is
+// caught on this side too.
+describe("discussion adapter prefill handler registration (Issue #452)", () => {
+  it("has prefillHandlerId registered only for ux_requirement", () => {
+    for (const [kind, adapter] of Object.entries(DISCUSSION_ADAPTERS)) {
+      if (kind === "ux_requirement") {
+        expect(adapter.prefillHandlerId).toBe("ux_requirement.revision@v1");
+      } else {
+        expect(adapter.prefillHandlerId).toBeNull();
+      }
     }
   });
 });

@@ -17,7 +17,7 @@ import {
   useAddUxRequirementRevision, useAddUxRequirementStepLink,
   useUxJourneys, useUxJourneyDetail, useSolutionDesigns, useSolutionDesignDetailsBatch,
   useProductFeatures, useProductFeatureDetailsBatch, useCreateProductFeature,
-  useAddProductFeatureRequirementLink,
+  useAddProductFeatureRequirementLink, useDiscussionSaveRequest,
 } from "@/api/hooks";
 import type {
   UxAcceptanceCriterionInput, UxRequirementKind, UxVerificationMethod,
@@ -45,6 +45,7 @@ import {
 import { useFormValidation, useUiDraftSource } from "@/lib/ui-draft";
 import { peekPendingFormDraftPatch, useFormDraftReceiver } from "@/lib/form-draft-inbox";
 import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
+import { useIdempotentSaveRequest } from "@/lib/save-request";
 
 const REQUIREMENT_KINDS: UxRequirementKind[] = ["functional", "non_functional", "constraint", "out_of_scope"];
 const VERIFICATION_METHODS: UxVerificationMethod[] = [
@@ -243,26 +244,73 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
     setCriteria((prev) => prev.map((c, idx) => (idx === i ? { ...c, ...patch } : c)));
   }
 
+  // Issue #452 §3.6/§3.7: an idempotent `save_request_id` bound to this
+  // submit's exact content. A retry with UNCHANGED content (the same
+  // 「版を保存する」 click again after a failure/lost response) reuses the
+  // SAME id, so the server can recognise it as the same attempt rather than
+  // creating a second revision; editing any field first mints a fresh id
+  // (the Decisions: "ユーザーが編集を変えたら新しい保存要求として扱う").
+  const saveRequest = useIdempotentSaveRequest();
+  // Manual (`enabled: false`) -- this query only runs when the developer
+  // explicitly asks "状態を確認する" after a request whose response was
+  // lost, never automatically (§3.7: "類似本文検索で成功と推測しない" --
+  // this is the opposite of guessing: an explicit, server-confirmed check).
+  const saveRequestQuery = useDiscussionSaveRequest(saveRequest.activeId, { enabled: false });
+  const [responseLost, setResponseLost] = useState(false);
+
+  function currentSaveDigest(): string {
+    return JSON.stringify([statement, rationale, constraintText, outOfScopeNote, changeNote, criteria]);
+  }
+
   function submit() {
     const token = validation.begin();
+    const saveRequestId = saveRequest.idFor(currentSaveDigest());
+    setResponseLost(false);
     addRevision.mutate(
       {
         statement, rationale, constraint_text: constraintText, out_of_scope_note: outOfScopeNote,
-        change_note: changeNote, acceptance_criteria: criteria,
+        change_note: changeNote, acceptance_criteria: criteria, save_request_id: saveRequestId,
       },
       {
         onSuccess: () => {
           validation.resolveSuccess(token);
           toast.success("Requirement の版を追加しました");
+          saveRequest.clear();
           onDone();
         },
         onError: (error) => {
           const apiError = error as ApiError;
+          // A structured 4xx (validation, conflict, ...) is a definite
+          // outcome -- the draft stays, and a plain retry (same content,
+          // same id) is the right recovery. A network-level failure (no
+          // structured `code`) means the OUTCOME is unknown -- the domain
+          // write may have actually committed -- so offer "状態を確認する"
+          // instead of only "retry" (§3.7 / DD-UX-07's "結果不明なら先に
+          // 保存状態を再取得").
+          setResponseLost(!apiError.code);
           validation.resolveError(token, apiError, REQUIREMENT_KNOWN_FIELDS);
           toast.error(apiError.detail || "追加できませんでした");
         },
       },
     );
+  }
+
+  async function confirmSaveState() {
+    const result = await saveRequestQuery.refetch();
+    if (result.data?.status === "succeeded") {
+      toast.success("前回の保存はサーバーで完了していました。");
+      saveRequest.clear();
+      setResponseLost(false);
+      onDone();
+      return;
+    }
+    if (result.data?.status === "failed") {
+      toast.error("前回の保存要求は失敗していました。内容はそのまま保持しています。");
+      return;
+    }
+    // 404 (`discussion_save_request_not_found`): the id never reached the
+    // server -- safe to retry with the SAME id (never a new one, per §3.6).
+    toast("この保存要求はサーバーに届いていないようです。もう一度保存してください。");
   }
 
   // §2.8.2: `section === "acceptance_criteria"` (e.g. a duplicated
@@ -365,9 +413,31 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
         </Button>
       </div>
 
+      {responseLost && (
+        <div
+          className="space-y-1 rounded border border-amber-300 bg-amber-50 p-2 text-xs dark:border-amber-800 dark:bg-amber-950"
+          role="status"
+          data-testid="ux-requirement-save-response-lost"
+        >
+          <p>
+            通信状況により、保存が完了したかどうか分かりません。サーバー側の状態を確認してから、必要であれば再試行してください。
+          </p>
+          <div className="flex gap-2 pt-1">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={confirmSaveState}
+              disabled={saveRequestQuery.isFetching}
+              data-testid="ux-requirement-save-request-confirm"
+            >
+              {saveRequestQuery.isFetching ? "確認中…" : "状態を確認する"}
+            </Button>
+          </div>
+        </div>
+      )}
       <div className="flex gap-2">
-        <Button size="sm" disabled={addRevision.isPending} onClick={submit}>
-          {addRevision.isPending ? "保存中…" : "版を保存する"}
+        <Button size="sm" disabled={addRevision.isPending} onClick={submit} data-testid="ux-requirement-revision-submit">
+          {addRevision.isPending ? "保存中…" : responseLost ? "再試行する" : "版を保存する"}
         </Button>
         <Button size="sm" variant="ghost" onClick={onDone}>
           キャンセル

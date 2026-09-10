@@ -31,6 +31,7 @@ import type {
   UxRequirementListOut, UxRequirementOut, UxRequirementDetailOut,
   UxRequirementCreateRequest, UxRequirementRevisionCreateRequest,
   UxRequirementStepLinkCreateRequest, UxRequirementStepLinkOut,
+  DiscussionSaveReceiptOut,
   UxArtifactReferenceCreateRequest, UxArtifactReferenceOut,
   UxDesignDecisionCreateRequest, UxDesignDecisionOut,
   SolutionDesignListOut, SolutionDesignOut, SolutionDesignDetailOut,
@@ -4150,6 +4151,24 @@ export function useAddUxRequirementRevision(requirementKey: string | null) {
         `/ux-design/requirements/${encodeURIComponent(requirementKey ?? "")}/revisions`, body,
       ),
     onSuccess: () => invalidateUxDesign(qc),
+  });
+}
+
+/**
+ * Issue #452 §3.7's result-query API: "応答不明時は同じ ID で照会 / 再試行す
+ * る". `enabled` gating is the caller's own choice (typically "only when a
+ * save actually failed or the response was lost") -- this hook does not
+ * poll on its own. A 404 (`discussion_save_request_not_found`) means the id
+ * has never reached the server; the caller treats that as "safe to retry
+ * with a fresh attempt under the same id", never as a success.
+ */
+export function useDiscussionSaveRequest(saveRequestId: string | null, options?: { enabled?: boolean }) {
+  return useQuery<DiscussionSaveReceiptOut>({
+    queryKey: [...sysKey("discussion-save-request"), saveRequestId],
+    queryFn: () =>
+      api.get<DiscussionSaveReceiptOut>(`/ux-design/save-requests/${encodeURIComponent(saveRequestId ?? "")}`),
+    enabled: saveRequestId !== null && (options?.enabled ?? true),
+    retry: false,
   });
 }
 

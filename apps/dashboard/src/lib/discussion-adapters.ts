@@ -273,7 +273,12 @@ const uxRequirementAdapter: DashboardDiscussionAdapter = {
   // Issue #445: `components/ux-design/requirement-panel.tsx`'s
   // `RequirementRevisionForm`. Acceptance criteria are a #448 concern, not a
   // top-level field.
-  prefillHandlerId: null,
+  // Issue #452: the first real prefill delivery handler, matching the
+  // server adapter's own `prefill_handler_id` (parity-checked by
+  // `tests/test_discussion_contract_parity.py`). The handler itself is
+  // `dispatchFormDraftPrefill` in `lib/form-draft-inbox.ts`, invoked by
+  // `components/discussion-proposal-review.tsx`.
+  prefillHandlerId: "ux_requirement.revision@v1",
   forms: [
     {
       formId: "ux_requirement.revision",

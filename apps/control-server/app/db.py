@@ -477,6 +477,50 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_prefill_item
     ON assistant_discussion_proposal_prefill (item_id, created_at DESC);
 """
 
+_DISCUSSION_SAVE_RECEIPT_DDL = """
+-- discussion_save_receipt (Issue #452, Epic #443 §3.4/§3.6-§3.7): the
+-- idempotent-save-request ledger for an EXISTING domain "save" endpoint's
+-- optional `save_request_id` extension. Canonical contract: docs/01-
+-- specifications/capabilities/ai-discussion-adapter.md §3. Owned entirely by
+-- `app/discussion_save_receipts.py` -- no other module writes this table.
+--
+-- One row per `(system_id, save_request_id)` (the UNIQUE constraint IS the
+-- idempotency guarantee: two attempts under the same id can never both
+-- succeed as separate revisions). `request_digest` binds the id to ONE
+-- request body; a retry with the SAME id and a DIFFERENT digest is refused
+-- (409) rather than silently treated as a new attempt -- editing content
+-- after a failure is a NEW save request (a new id) by the Issue #452
+-- Decisions, never a reused id with different content. `revision_id` /
+-- `result_ref` are populated only once `status = 'succeeded'`, and are never
+-- cleared afterwards even if the referenced domain row is later superseded
+-- by a NEWER revision -- this row answers "what did THIS save request
+-- produce", not "what is current now".
+CREATE TABLE IF NOT EXISTS discussion_save_receipt (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    save_request_id  TEXT NOT NULL,
+    actor            TEXT,
+    target_kind      TEXT NOT NULL,
+    target_ref       TEXT NOT NULL,
+    -- Which domain save operation this id was used against (e.g.
+    -- 'ux_requirement.revision') -- never inferred from target_kind alone,
+    -- since one target_kind could grow more than one save operation later.
+    endpoint_kind    TEXT NOT NULL,
+    request_digest   TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
+    result_ref       TEXT NOT NULL DEFAULT '',
+    revision_id      INTEGER,
+    error_code       TEXT NOT NULL DEFAULT '',
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (system_id, save_request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discussion_save_receipt_target
+    ON discussion_save_receipt (system_id, target_kind, target_ref, id DESC);
+"""
+
 
 # joint_understanding_session (Epic #328 Phase A / Issue #329, extended by
 # Issue #461). Pulled out to a module-level constant for the same reason
@@ -8745,7 +8789,8 @@ CREATE INDEX IF NOT EXISTS idx_product_feature_decision_system
 CREATE INDEX IF NOT EXISTS idx_product_feature_decision_feature
     ON product_feature_decision (feature_id, id DESC);
 
-""" + _PRODUCT_GAP_ARTIFACT_LINK_DDL + _ASSISTANT_DISCUSSION_DDL + _ASSISTANT_DISCUSSION_PROPOSAL_DDL
+""" + _PRODUCT_GAP_ARTIFACT_LINK_DDL + _ASSISTANT_DISCUSSION_DDL + _ASSISTANT_DISCUSSION_PROPOSAL_DDL \
+    + _DISCUSSION_SAVE_RECEIPT_DDL
 
 
 _SCOPED_TABLES = [
