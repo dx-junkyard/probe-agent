@@ -1908,3 +1908,182 @@ class TestFieldPathAndSectionDiagnostics:
         assert detail["code"] == "ux_design_not_found"
         assert detail["field_path"] == ""
         assert detail["section"] == ""
+
+
+# --- Issue #452 (docs/01-specifications/capabilities/ai-discussion-adapter.md §3.6/§3.7): idempotent
+# `save_request_id` extension of `POST /ux-design/requirements/{key}/revisions`
+# and its `GET /ux-design/save-requests/{id}` result-query companion. --------
+
+
+class TestDiscussionSaveRequestIdempotency:
+    """§3.6's contract exactly: same id + same content converges on ONE
+    revision; same id + different content is refused (409); a retry after a
+    `failed` attempt reuses the id and can still succeed; omitting the id
+    keeps the pre-#452 (one revision per call) behaviour byte-for-byte."""
+
+    def test_same_id_same_content_returns_same_revision_without_creating_a_second_one(
+        self, admin_client, tmp_path
+    ):
+        token, system_id, _, _ = _setup(admin_client, tmp_path, "System SaveReq Idempotent")
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "r1")
+
+        first = _add_requirement_revision(
+            admin_client, headers, "r1", statement="v1", save_request_id="save-1",
+        )
+        revision_id = first["current_revision"]["id"]
+        assert first["current_revision_number"] == 1
+
+        second = _add_requirement_revision(
+            admin_client, headers, "r1", statement="v1", save_request_id="save-1",
+        )
+        assert second["current_revision"]["id"] == revision_id
+        assert second["current_revision_number"] == 1
+
+        revisions = admin_client.get("/ux-design/requirements/r1/revisions", headers=headers)
+        assert revisions.status_code == 200, revisions.text
+        assert len(revisions.json()["revisions"]) == 1
+
+    def test_same_id_different_content_is_rejected_with_409_and_makes_no_change(
+        self, admin_client, tmp_path
+    ):
+        token, system_id, _, _ = _setup(admin_client, tmp_path, "System SaveReq Conflict")
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "r1")
+        _add_requirement_revision(admin_client, headers, "r1", statement="v1", save_request_id="save-1")
+
+        r = admin_client.post(
+            "/ux-design/requirements/r1/revisions",
+            json={
+                "statement": "v2-different", "rationale": "", "constraint_text": "",
+                "out_of_scope_note": "", "change_note": "", "acceptance_criteria": [],
+                "save_request_id": "save-1",
+            },
+            headers=headers,
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["code"] == "discussion_save_request_conflict"
+
+        detail = _get_requirement(admin_client, headers, "r1")
+        assert detail["current_revision"]["statement"] == "v1"
+        assert detail["current_revision_number"] == 1
+
+    def test_failed_attempt_records_failure_and_repeating_the_same_id_and_content_fails_again_without_a_revision(
+        self, admin_client, tmp_path
+    ):
+        token, system_id, _, _ = _setup(admin_client, tmp_path, "System SaveReq Retry")
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "r1", requirement_kind="out_of_scope")
+
+        def _attempt():
+            return admin_client.post(
+                "/ux-design/requirements/r1/revisions",
+                json={
+                    "statement": "", "rationale": "", "constraint_text": "", "out_of_scope_note": "n/a",
+                    "change_note": "", "save_request_id": "save-retry",
+                    "acceptance_criteria": [_criterion("c1", 0)],
+                },
+                headers=headers,
+            )
+
+        # `out_of_scope` + non-empty acceptance_criteria -> OutOfScopeNotVerifiable (422).
+        failed = _attempt()
+        assert failed.status_code == 422, failed.text
+        assert failed.json()["detail"]["code"] == "out_of_scope_requirement_not_verifiable"
+
+        receipt = admin_client.get("/ux-design/save-requests/save-retry", headers=headers)
+        assert receipt.status_code == 200, receipt.text
+        assert receipt.json()["status"] == "failed"
+        assert receipt.json()["error_code"] == "out_of_scope_requirement_not_verifiable"
+        assert receipt.json()["revision_id"] is None
+
+        # A `failed` receipt never blocks a later attempt under the SAME id
+        # and the SAME (still-invalid) content -- it fails again the same
+        # way, and the receipt row is updated in place (never a duplicate).
+        failed_again = _attempt()
+        assert failed_again.status_code == 422, failed_again.text
+        detail = _get_requirement(admin_client, headers, "r1")
+        assert detail["current_revision"] is None
+
+    def test_editing_the_content_after_a_failure_mints_a_new_id_and_can_succeed(
+        self, admin_client, tmp_path
+    ):
+        """The Issue #452 Decisions: 「保存失敗時draft保持。retryボタンが新しい
+        request IDを作らない。ユーザーが編集を変えたら新しい保存要求として扱う」
+        -- i.e. the CLIENT (`lib/save-request.ts`) mints a fresh id once the
+        content actually changes; the server's own role is only to refuse a
+        REUSED id under different content (covered by the conflict test
+        above), never to guess that a differently-keyed request is a
+        continuation of the failed one."""
+        token, system_id, _, _ = _setup(admin_client, tmp_path, "System SaveReq Edit Retry")
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "r1", requirement_kind="out_of_scope")
+
+        failed = admin_client.post(
+            "/ux-design/requirements/r1/revisions",
+            json={
+                "statement": "", "rationale": "", "constraint_text": "", "out_of_scope_note": "n/a",
+                "change_note": "", "save_request_id": "save-retry-1",
+                "acceptance_criteria": [_criterion("c1", 0)],
+            },
+            headers=headers,
+        )
+        assert failed.status_code == 422, failed.text
+
+        fixed = admin_client.post(
+            "/ux-design/requirements/r1/revisions",
+            json={
+                "statement": "", "rationale": "", "constraint_text": "", "out_of_scope_note": "n/a",
+                "change_note": "", "save_request_id": "save-retry-2", "acceptance_criteria": [],
+            },
+            headers=headers,
+        )
+        assert fixed.status_code == 201, fixed.text
+
+        old_receipt = admin_client.get("/ux-design/save-requests/save-retry-1", headers=headers)
+        assert old_receipt.json()["status"] == "failed"
+        new_receipt = admin_client.get("/ux-design/save-requests/save-retry-2", headers=headers)
+        assert new_receipt.json()["status"] == "succeeded"
+        assert new_receipt.json()["revision_id"] is not None
+
+    def test_omitted_save_request_id_keeps_pre_452_behaviour(self, admin_client, tmp_path):
+        token, system_id, _, _ = _setup(admin_client, tmp_path, "System SaveReq Omitted")
+        headers = _headers(token, system_id)
+        _create_requirement(admin_client, headers, "r1")
+
+        _add_requirement_revision(admin_client, headers, "r1", statement="v1")
+        second = _add_requirement_revision(admin_client, headers, "r1", statement="v2")
+        assert second["current_revision_number"] == 2
+
+        revisions = admin_client.get("/ux-design/requirements/r1/revisions", headers=headers)
+        assert len(revisions.json()["revisions"]) == 2
+
+
+class TestDiscussionSaveRequestResultQuery:
+    """§3.7's `GET /ux-design/save-requests/{id}` -- an unknown id is a
+    definite, honest 404 rather than any inferred outcome, and a request
+    made under a different System is reported identically (never
+    disclosing that a different System's id exists)."""
+
+    def test_unknown_save_request_id_is_404_not_found(self, admin_client, tmp_path):
+        token, system_id, _, _ = _setup(admin_client, tmp_path, "System SaveReq Unknown")
+        headers = _headers(token, system_id)
+        r = admin_client.get("/ux-design/save-requests/never-sent", headers=headers)
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"]["code"] == "discussion_save_request_not_found"
+
+    def test_save_request_is_isolated_across_systems(self, admin_client, tmp_path):
+        token, system_a, _, _ = _setup(admin_client, tmp_path, "System SaveReq Isolation A")
+        system_b = _create_system(admin_client, token, "System SaveReq Isolation B")
+        headers_a = _headers(token, system_a)
+        headers_b = _headers(token, system_b)
+        _create_requirement(admin_client, headers_a, "r1")
+
+        _add_requirement_revision(admin_client, headers_a, "r1", statement="v1", save_request_id="save-x")
+
+        ok = admin_client.get("/ux-design/save-requests/save-x", headers=headers_a)
+        assert ok.status_code == 200, ok.text
+
+        foreign = admin_client.get("/ux-design/save-requests/save-x", headers=headers_b)
+        assert foreign.status_code == 404, foreign.text
+        assert foreign.json()["detail"]["code"] == "discussion_save_request_not_found"

@@ -13,20 +13,24 @@ allowlist と handler を全選択 item について検査してから、登録 
 | --- | --- | --- |
 | #444 | registry / parity は実装。操作結果の3状態と、実行handlerに基づくprefill capabilityの判定は実装済み (#456) | - |
 | #445 | Phase 2 (`fea4fe1`) を統合。draft の保存防止・System分離・変更警告を修正。実フォームのvalidation診断連携(§2.8)は #451 で実装済み | - |
-| #446 | Proposal review UI / prefill / 保存との接続は未実装 | #452 |
+| #446 | Proposal review UI / prefill-first 導線 / 冪等 `save_request_id` / 結果照会 API は `ux_requirement` を代表対象として実装済み (#452、§3.6/§3.7)。他 target への `prefill_handler_id` 展開は未実装 | #454 |
 | #447 | 追加8 kind と live selection / context は Issue #453 が実装済み（§4 参照）。nested/list な構造化提案・JU 昇格は未実装のまま | #454 / #455 |
 | #448 | nested item / Acceptance Criteria / Feature Proposal は未実装 | #454 |
 | #449 | 仮説の JU 昇格・還流と代表 E2E は未実装。Issue #461 が所属・premise 基盤を先行実装済み: `joint_understanding_session.owner_scope`/`discussion_thread_id`（既存 `session_id` は interview 所属時のみ必須）、`origin_kind='discussion'`、`app/joint_premise.py` の discussion origin provider registry（`register_discussion_origin_provider`）と依存参照 manifest（`normalize_premise_manifest` / `compute_premise_manifest_digest` / `EMPTY_DEPENDENCY_MANIFEST_DIGEST`、`evaluate_joint_premise` が root 不変でも依存更新で stale と判定）。実際の hypothesis テーブル・昇格 endpoint は未実装のまま | #455 |
 
-元 issue は実装完了と残件移管を区別して整理する。prefill、JU bridge
-は拡張用定義だけであり、代表 E2E や screen reader / narrow viewport の
-実利用検証が完了したとは扱わない。既存の backend direct apply は利用可能だが、
-フォームへの prefill ではない。Blueprint の表示選択・focus との接続も #452 で扱う。
+元 issue は実装完了と残件移管を区別して整理する。JU bridge は拡張用定義だけで
+あり、代表 E2E や screen reader / narrow viewport の実利用検証が完了したとは
+扱わない。既存の backend direct apply は互換のため引き続き利用可能。`ux_requirement`
+は prefill (生成→反映→保存→照会) の代表 E2E を縦に通し終えた (#452)。他 target
+への `prefill_handler_id` 展開・nested/list な構造化提案・JU 昇格は #454/#455 が
+引き継ぐ。
 
-検証: server の registry / parity / thread / Proposal / Assistant / UI draft /
-DB lock / interview parity は119 passed、DB lock の3ケースはreasoning呼び出し前に
-fail-closedするためskip。Dashboardの関連7ファイルは62 passed。
-追加実装を取り込む前の既存JU関連5ファイルは106 passed。
+検証: #452 実装後、server の
+`test_discussion_prefill.py`/`test_assistant_discussion_proposals.py`/
+`test_discussion_adapter_registry.py`/`test_discussion_contract_parity.py`/
+`test_discussion_operation_result.py`/`test_ux_design.py`/`test_solution_design.py`
+は232 passed。Dashboard `npx vitest run` は52ファイル1134 passed、`npx tsc -b --noEmit`
+はexit 0。
 実LLM・音声機器・screen readerによるdogfoodingの完了証明ではない。
 
 本書は Epic #443 (sub-issues #444-#449) の正本契約である。この領域に触れる前に
@@ -720,7 +724,59 @@ prefill 可否は adapter capability から決まる。両方を別々に表示�
 「この対象は prefill に対応していない」と「この item は stale で反映できない」は
 別の答えであり、開発者の次の操作も違う。
 
-### 3.6 反映後
+### 3.6 保存の冪等性 (`save_request_id`, #452)
+
+prefill は反映であって保存ではない — 保存は既存 domain 保存 API (例:
+`POST /ux-design/requirements/{key}/revisions`) への、フォームごとの明示操作の
+ままである。この保存操作を、配送失敗・応答消失からの安全な再試行に対応させる
+ため、既存 API に **任意の** `save_request_id` を追加する。
+
+```
+POST /ux-design/requirements/{key}/revisions
+{ ...既存の domain field..., "save_request_id"?: string }
+```
+
+`save_request_id` は client が生成する不透明トークンで、**System / actor /
+target / request body digest に bind** される (`app/discussion_save_receipts.py`
+が唯一の所有者、`discussion_save_receipt` テーブル)。契約:
+
+- **同一 ID・同一内容は同じ結果**を返す。既に `succeeded` の receipt があれば
+  domain 書き込みを再実行せず、そのとき作られた revision をそのまま返す —
+  失われた応答への再試行が 2 つ目の revision を作ることはない。
+- **同一 ID・別内容は 409** (`discussion_save_request_conflict`)。編集後の
+  再送は必ず新しい ID として扱う — ID の再利用先を推測しない。
+- 直前の attempt が `failed` (まだ何も永続化していない) なら、同じ ID のまま
+  domain 書き込みを再実行してよい。
+- 保存 revision の確定と receipt の記録は、**domain 書き込みの成功直後・
+  他の外部呼び出しを挟まず**行う。`save_request_id` を渡さない呼び出しは
+  #452 以前と byte-for-byte 同じ挙動を保つ (互換)。
+- **item の `status` (§3.4) と保存 revision は別記録**である。prefill 監査は
+  依然「反映を試みた」だけを記録し、この receipt が「保存が確定したか」を
+  記録する。
+
+client 側 (`lib/save-request.ts`'s `useIdempotentSaveRequest`) は保存対象の
+digest が前回と同じ間だけ同じ ID を返す。フォームを編集すると新しい ID になる
+— 「retry ボタンが新しい request ID を作らない」「編集したら新しい保存要求」
+という #452 の確定方針そのままの実装である。
+
+### 3.7 結果照会 API (#452)
+
+```
+GET /ux-design/save-requests/{save_request_id} -> DiscussionSaveReceiptOut
+  { save_request_id, target_kind, target_ref, endpoint_kind,
+    status: "succeeded" | "failed", result_ref, revision_id, error_code,
+    created_at, updated_at }
+```
+
+保存 API の応答が失われた (ネットワークエラーで `code` を持たない) とき、
+**類似本文検索で成功と推測しない** — 同じ `save_request_id` でこの API を
+照会するか、同じ ID のまま保存操作をもう一度送る (3.6 の冪等性がそのまま
+正しい結果に収束させる)。404 (`discussion_save_request_not_found`) は
+「この ID はまだサーバーに届いていない」であり、同じ ID での再試行が安全と
+分かる合図であって成功の兆候ではない。receipt は対応する revision の保持
+期間だけ保持し、削除後も同じ ID は新規の保存要求へ再利用しない。
+
+### 3.8 反映後
 
 `adapter.invalidateKeys(targetRef)` で対象 query を、thread/proposal query を
 それぞれ無効化する。対象フォームへ navigate + focus する。**navigate であって

@@ -515,30 +515,27 @@ def add_requirement_revision_endpoint(
                 raise
             # Translate first so the receipt's `error_code` is the SAME
             # finite code the client actually receives -- never a second,
-            # independently-guessed code.
+            # independently-guessed code. `_raise_for_ux_error` either raises
+            # an `HTTPException` (recognized) or re-raises `exc` itself
+            # (unrecognized, via its own trailing bare `raise`) -- catching
+            # plain `Exception` here (not just `HTTPException`) is required
+            # so BOTH cases still reach `record_outcome` below instead of the
+            # unrecognized case escaping this block unrecorded.
             error_code = type(exc).__name__
+            to_raise: BaseException = exc
             try:
                 _raise_for_ux_error(exc)
-            except HTTPException as http_exc:
-                if isinstance(http_exc.detail, dict):
-                    error_code = http_exc.detail.get("code", error_code)
-                discussion_save_receipts.record_outcome(
-                    conn, system_id=system_id, save_request_id=save_request_id, actor=actor,
-                    target_kind="ux_requirement", target_ref=requirement_key,
-                    endpoint_kind=_REQUIREMENT_REVISION_ENDPOINT_KIND, request_digest=request_digest,
-                    status="failed", error_code=error_code,
-                )
-                raise
-            # `_raise_for_ux_error` did not recognize `exc` and returned
-            # without raising -- record it under its own type name and
-            # re-raise the ORIGINAL exception unchanged.
+            except Exception as translated:
+                to_raise = translated
+                if isinstance(translated, HTTPException) and isinstance(translated.detail, dict):
+                    error_code = translated.detail.get("code", error_code)
             discussion_save_receipts.record_outcome(
                 conn, system_id=system_id, save_request_id=save_request_id, actor=actor,
                 target_kind="ux_requirement", target_ref=requirement_key,
                 endpoint_kind=_REQUIREMENT_REVISION_ENDPOINT_KIND, request_digest=request_digest,
                 status="failed", error_code=error_code,
             )
-            raise
+            raise to_raise
         if save_request_id:
             revision_id = detail.get("current_revision_id")
             discussion_save_receipts.record_outcome(
