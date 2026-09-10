@@ -32,8 +32,12 @@ draft) populate `ui_draft_forms` for the four kinds whose Dashboard forms
 exist today (`ux_journey` / `ux_journey_step` / `ux_requirement` /
 `solution_design`) ADDITIVELY -- filling in a field on an existing adapter --
 rather than another schema change that touches every call site again.
-Phases 3 (#446 prefill), 5 (#448 nested/list changes), and 6 (#449 Joint
-Understanding bridge) are still ahead of this module as written.
+Phase 3 (#446/#452 prefill) wired the first real `prefill_handler_id`
+(`ux_requirement`); Phase 5 (#448/#454) populated the FIRST `ChildSpec`
+(`ux_requirement`'s `acceptance_criterion`) and `fields`/`relations` for
+`product_objective`/`product_milestone`/`product_gap`/`product_feature`.
+Phase 6 (#449 Joint Understanding bridge) is still ahead of this module as
+written.
 
 Import direction (this is what avoids a circular import): this module has
 NO top-level dependency on `assistant_discussion.py` or
