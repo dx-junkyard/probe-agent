@@ -29,7 +29,7 @@
 // failure and records NOTHING server-side -- a retry (same button) can
 // deliver again from scratch.
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -462,19 +462,23 @@ export function DiscussionProposalReview({ thread }: { thread: AssistantDiscussi
   const adapter = DISCUSSION_ADAPTERS[thread.target_kind];
   const proposalsQuery = useDiscussionProposals(thread.id);
   const createProposal = useCreateDiscussionProposal(thread.id);
-  const [expandedId, setExpandedId] = useState<number | null>(null);
+  // Three states, not two. `undefined` = the developer has not chosen yet
+  // (derive the newest); `null` = they explicitly collapsed the open one
+  // (respect it -- deriving "newest" here would re-open what they just
+  // closed); a number = their choice, honoured only while it still exists.
+  const [chosenId, setChosenId] = useState<number | null | undefined>(undefined);
   const proposals = proposalsQuery.data?.proposals ?? [];
 
   // A fresh generate opens straight into review; a reload restores the
   // newest proposal expanded too (never auto-picks a stale prior selection
-  // that no longer exists in the list).
-  useEffect(() => {
-    if (proposals.length === 0) return;
-    if (expandedId === null || !proposals.some((p) => p.id === expandedId)) {
-      setExpandedId(proposals[0].id);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [proposals.map((p) => p.id).join(",")]);
+  // that no longer exists in the list). Derived during render rather than
+  // written back from an effect: a synchronous `setState` inside an effect
+  // costs a cascading render and shows one frame of the wrong row, and the
+  // value is a pure function of `chosenId` + the current list anyway.
+  const expandedId =
+    chosenId !== undefined && (chosenId === null || proposals.some((p) => p.id === chosenId))
+      ? chosenId
+      : (proposals[0]?.id ?? null);
 
   // Only a target with something proposable renders this section at all --
   // a `screen`-scope conversation has no target to change, and this mirrors
@@ -493,7 +497,7 @@ export function DiscussionProposalReview({ thread }: { thread: AssistantDiscussi
           size="sm"
           variant="outline"
           disabled={createProposal.isPending}
-          onClick={() => createProposal.mutate(undefined, { onSuccess: (p) => setExpandedId(p.id) })}
+          onClick={() => createProposal.mutate(undefined, { onSuccess: (p) => setChosenId(p.id) })}
           data-testid="discussion-proposal-generate"
         >
           {createProposal.isPending ? "生成中…" : "変更候補を生成する"}
@@ -517,7 +521,7 @@ export function DiscussionProposalReview({ thread }: { thread: AssistantDiscussi
               <button
                 type="button"
                 className="w-full rounded border p-2 text-left text-xs hover:bg-muted"
-                onClick={() => setExpandedId(expandedId === p.id ? null : p.id)}
+                onClick={() => setChosenId(expandedId === p.id ? null : p.id)}
                 data-testid={`discussion-proposal-summary-${p.id}`}
                 aria-expanded={expandedId === p.id}
               >
