@@ -1,7 +1,7 @@
 """Migration and backward-compatibility verification for Epic #427
 (Product Objective / Milestone / Gap), Issue #433.
 
-`docs/product-objective-lineage.md` §11 is the canonical contract. Its
+`docs/01-specifications/product/product-objective-lineage.md` §11 is the canonical contract. Its
 claims are narrow and checkable, and each one is a way the Epic could
 quietly break an existing installation:
 

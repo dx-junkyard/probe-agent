@@ -1,18 +1,19 @@
 # probe-agent
 
-開発対象システムの任意のコンポーネントに `@probe` を付け、入出力をトレース・可視化し、
-代替実装と shadow 比較するための最小ツールキット。
+`probe-agent` は、ソフトウェアの目的、利用者価値、UX、要件、実装、実行時の現実、
+判断履歴をつなぎ、証拠に基づいて理解・評価・改善するためのプラットフォーム。
 
 関数単位の `Component` の上にユーザー価値単位の `Feature` を置く
 **Feature Intelligence Layer** と、source patch を隔離環境で比較する
-**Experiment Workspace Layer** を提供する。設計は
-[`docs/project-intelligence.md`](docs/project-intelligence.md) を参照。
+**Experiment Workspace Layer** を提供する。製品全体の目標と要件は
+[`docs/00-product/vision-and-core-requirements.md`](docs/00-product/vision-and-core-requirements.md)、
+文書全体の入口は [`docs/README.md`](docs/README.md) を参照。
 System Understanding が長期的に目指す状態と、現在不足している構造的な要素は
-[`docs/system-understanding-ideal-state.md`](docs/system-understanding-ideal-state.md)
+[`docs/00-product/system-understanding-ideal-state.md`](docs/00-product/system-understanding-ideal-state.md)
 にまとめている。
 
-詳細は [issue #1](https://github.com/dx-junkyard/probe-agent/issues/1) と
-[`docs/mvp.md`](docs/mvp.md) を参照。
+MVP の経緯と詳細は [issue #1](https://github.com/dx-junkyard/probe-agent/issues/1) と
+[`docs/00-product/mvp.md`](docs/00-product/mvp.md) を参照。
 
 ## 構成
 
@@ -83,7 +84,7 @@ docker compose down -v       # volume (DB) も削除
 ホストへ直接公開）。インターネットから単一 FQDN + HTTPS で公開するには、
 Caddy が Automatic HTTPS で証明書取得・更新まで行う独立構成
 `docker-compose.prod.yml` を使う。手順・前提条件・公開前チェックリストは
-[`docs/deployment-https.md`](docs/deployment-https.md) を参照。
+[`docs/04-operations/deployment-https.md`](docs/04-operations/deployment-https.md) を参照。
 
 ### 依存関係とコンテナイメージの固定
 
@@ -102,7 +103,7 @@ image を registry へ publish し、得られた digest または immutable rel
 を deployment manifest に記録する。
 
 Python lock と base image digest の更新手順、検証範囲と残余リスクは
-[`docs/deployment-https.md`](docs/deployment-https.md#サプライチェーン更新手順)
+[`docs/04-operations/deployment-https.md`](docs/04-operations/deployment-https.md#サプライチェーン更新手順)
 を参照。
 
 ## クイックスタート (ローカル Python)
@@ -341,7 +342,7 @@ Probe Planner で承認・validate 済みの probe patch を、実際の GitHub
 リポジトリの default ブランチへ直接書き込むことは一切なく、常に人間の
 明示承認を経てから `probe/` 接頭辞のサーバー生成ブランチにのみ push し、
 Pull Request のマージ・クローズは開発者が GitHub 上で行う（設計の詳細は
-[`docs/project-intelligence.md`](docs/project-intelligence.md) の
+[`docs/90-history/project-intelligence.md`](docs/90-history/project-intelligence.md) の
 「GitHub App 公開ワークフロー（Issue #216）」を参照）。
 
 有効化するには、対象リポジトリに GitHub App をインストールし、Control
@@ -362,7 +363,7 @@ GIT_REPOSITORY_ROOT=/path/to/managed-git-root
 secret としてマウントし、`GITHUB_PUBLISH_ENABLED=true` を明示的に設定した
 場合のみ起動時にキーの妥当性を検証する（Issue #224）。GitHub App の登録
 手順、秘密鍵のホスト配置・ローテーション手順は
-[`docs/github-app-deployment.md`](docs/github-app-deployment.md) を参照。
+[`docs/04-operations/github-app-deployment.md`](docs/04-operations/github-app-deployment.md) を参照。
 
 Dashboard の `GitHub` ページでの操作フロー:
 
@@ -478,7 +479,7 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `CONTROL_REQUIRE_AUTH` | `false` | `true` で、認証を有効化できない状態（admin 未作成かつ `CONTROL_API_KEYS` 空）なら起動を失敗させる |
 | `PUBLIC_HOST` | _(未設定)_ | `docker-compose.prod.yml` の Caddy が HTTPS で公開する FQDN |
 | `GITHUB_APP_ID` | _(未設定)_ | Publish workflow (#216) が使う GitHub App の App ID。未設定時は GitHub App 機能全体が fail closed |
-| `GITHUB_APP_PRIVATE_KEY_PATH` | _(未設定)_ | コンテナ内から見た GitHub App 秘密鍵 PEM のパス。`docker-compose.prod.yml` では `/run/secrets/github_app_private_key` に固定（Compose外実行時のみ本変数を使う）。本番でのキー配置・ローテーション手順は [`docs/github-app-deployment.md`](docs/github-app-deployment.md) 参照 |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | _(未設定)_ | コンテナ内から見た GitHub App 秘密鍵 PEM のパス。`docker-compose.prod.yml` では `/run/secrets/github_app_private_key` に固定（Compose外実行時のみ本変数を使う）。本番でのキー配置・ローテーション手順は [`docs/04-operations/github-app-deployment.md`](docs/04-operations/github-app-deployment.md) 参照 |
 | `GITHUB_APP_PRIVATE_KEY_HOST_PATH` | _(未設定 = `/dev/null`)_ | `docker-compose.prod.yml` が secret にマウントするホスト側 PEM の絶対パス。未設定なら空ファイルがマウントされ publish workflow は無効のまま |
 | `GITHUB_PUBLISH_ENABLED` | `false` | GitHub App publish workflow を有効化する意思表示 (`true`/`false` 等の有限集合)。`true` の場合、起動時に App ID とキーの妥当性を検証し、不備があれば起動失敗 |
 | `GITHUB_APP_ALLOWED_ORGANIZATION` | _(未設定)_ | private GitHub App を所有する単一 Organization の login。Installation 登録時に GitHub から得た account login/type と照合し、不一致は拒否する |

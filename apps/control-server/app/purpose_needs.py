@@ -1,6 +1,6 @@
 """Purpose Needs: adaptive next-question over the Purpose Chain (Issue #389).
 
-`docs/purpose-chain.md` §2 is the design contract this module implements.
+`docs/01-specifications/product/purpose-chain.md` §2 is the design contract this module implements.
 Epic #387's UX principle is: ask the developer only what only the developer
 can decide, and only when something currently blocks a real judgement.
 

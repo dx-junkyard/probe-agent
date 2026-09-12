@@ -1,6 +1,6 @@
 """Tests for Issue #389 -- Purpose Needs adaptive next-question.
 
-`docs/purpose-chain.md` §2.8 is the acceptance list this file is organized
+`docs/01-specifications/product/purpose-chain.md` §2.8 is the acceptance list this file is organized
 around:
 
 * rule table 全行 reachable (every need code, every priority row);

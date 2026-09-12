@@ -3,7 +3,7 @@
 `GET /purpose-chain` is the only place the Dashboard reads the Purpose Frame
 / Purpose Chain -- three elements (beneficiary_problem / desired_change /
 intervention), their Core Capabilities, and the three relations connecting
-them, all recomputed on every read from existing rows (`docs/purpose-chain.md`
+them, all recomputed on every read from existing rows (`docs/01-specifications/product/purpose-chain.md`
 §0: no new understanding model, no cached projection). `POST
 /purpose-chain/relations/{relation_id}/decision` is #388's one write: a human
 confirming or rejecting one relation.
@@ -193,7 +193,7 @@ def get_purpose_chain(
     system_id: int = Depends(get_system_id),
 ) -> PurposeChainOut:
     """The Purpose Frame / Purpose Chain for one session, or the System's
-    newest session when `session_id` is omitted (`docs/purpose-chain.md`
+    newest session when `session_id` is omitted (`docs/01-specifications/product/purpose-chain.md`
     §1.6). A `session_id` belonging to another System reads exactly like
     "unselected" -- the same rule `GET /interview/understanding-brief`
     already applies, so the two screens can never disagree.
@@ -257,7 +257,7 @@ def decide_purpose_relation(
 
 # --- Purpose Needs / adaptive next-question (Issue #389) ---------------------
 #
-# `docs/purpose-chain.md` §2 is the specification; `app/purpose_needs.py`'s
+# `docs/01-specifications/product/purpose-chain.md` §2 is the specification; `app/purpose_needs.py`'s
 # module docstring is the design-decision record. Everything DETERMINISTIC
 # (need derivation, the answerability table, question selection, tie-break)
 # lives there as pure functions; this module is the thin I/O boundary: read
@@ -724,7 +724,7 @@ def respond_to_purpose_need(
 
 # --- Purpose Verification: Experience / Outcome / Reuse (Issue #391) ---------
 #
-# `docs/purpose-chain.md` §4 is the specification; `app/purpose_verification.py`'s
+# `docs/01-specifications/product/purpose-chain.md` §4 is the specification; `app/purpose_verification.py`'s
 # module docstring is the design-decision record -- the same split #389's
 # section above uses (deterministic gating/lineage/derivation as pure/DB
 # functions there, this module a thin I/O boundary). Every create endpoint

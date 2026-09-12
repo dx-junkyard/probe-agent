@@ -1,6 +1,6 @@
 """Product Feature API (Issue #431, Epic #427).
 
-`docs/product-objective-lineage.md` §7.2 / §10 is the endpoint contract this
+`docs/01-specifications/product/product-objective-lineage.md` §7.2 / §10 is the endpoint contract this
 module implements against `app/product_feature.py`'s deterministic domain
 service. Modelled closely on `routes/ux_design.py`:
 

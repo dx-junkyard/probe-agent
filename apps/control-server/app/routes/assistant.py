@@ -24,8 +24,20 @@ from dataclasses import asdict
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 
-from .. import assistant_discussion, assistant_discussion_proposal
+from .. import (
+    assistant_discussion,
+    assistant_discussion_proposal,
+    discussion_adapters,
+    discussion_claims,
+    discussion_context_bundle,
+    discussion_hypothesis,
+    discussion_next_action,
+    ui_draft_context,
+)
+from .. import joint_understanding as joint_understanding_domain
+from . import joint_understanding as joint_understanding_routes
 from ..assistant import (
     answer_question,
     checks_for_screen,
@@ -42,9 +54,18 @@ from ..models import (
     AssistantAskOut,
     AssistantAskRequest,
     AssistantCitationOut,
+    AssistantDiscussionHypothesisPromoteOut,
+    AssistantDiscussionHypothesisPromoteRequest,
+    AssistantDiscussionHypothesisPromotionOut,
+    AssistantDiscussionJointUnderstandingLinkOut,
+    AssistantDiscussionJointUnderstandingListOut,
+    AssistantDiscussionNextActionOut,
     AssistantDiscussionProposalApplyOut,
     AssistantDiscussionProposalApplyRequest,
+    AssistantDiscussionProposalHypothesisOut,
     AssistantDiscussionProposalOut,
+    AssistantDiscussionProposalPrefillOut,
+    AssistantDiscussionProposalPrefillRequest,
     AssistantDiscussionProposalRejectOut,
     AssistantDiscussionProposalRejectRequest,
     AssistantDiscussionProposalsListOut,
@@ -54,8 +75,16 @@ from ..models import (
     AssistantDiscussionThreadsListOut,
     AssistantDiscussionTurnOut,
     AssistantScreenContextOut,
+    AssistantSpeechRequest,
     AssistantSuggestedQuestionOut,
     DiagnosticLastObservedErrorOut,
+    DiscussionContextBundleOut,
+    DiscussionContextClaimOut,
+    DiscussionContextClaimsRequest,
+    DiscussionContextClaimsResultOut,
+    DiscussionContextExpansionOut,
+    DiscussionContextExpansionRequest,
+    JointUnderstandingFindingOut,
     SettingMetadataOut,
     SettingsMetadataOut,
     SystemDiagnosticCheckOut,
@@ -68,8 +97,34 @@ from ..system_diagnostics import (
 )
 from ..system_state import build_system_state
 from ..ui_help_registry import HELP_BY_ID, UI_HELP_REGISTRY_VERSION
+from ..voice_speech import SpeechGenerationError, project_spoken_answer, stream_speech
 
 router = APIRouter()
+
+
+@router.post("/assistant/speech")
+def assistant_speech(payload: AssistantSpeechRequest) -> StreamingResponse:
+    """Render a bounded spoken answer through OpenAI without exposing keys."""
+    try:
+        audio = stream_speech(payload.text)
+        # Advance once here so configuration/upstream connection failures are
+        # returned as JSON HTTP errors instead of a broken 200 audio stream.
+        first = next(audio)
+    except StopIteration as exc:
+        raise HTTPException(status_code=502, detail="OpenAI speech returned no audio.") from exc
+    except SpeechGenerationError as exc:
+        status = 503 if "not configured" in str(exc) else 502
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+    def with_first_chunk():
+        yield first
+        yield from audio
+
+    return StreamingResponse(
+        with_first_chunk(),
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 def _principal_actor(principal: Principal) -> str:
@@ -218,14 +273,62 @@ def _turn_out(row: Dict[str, Any]) -> AssistantDiscussionTurnOut:
         schema_version=row.get("schema_version") or "assistant-discussion-turn-v1",
         created_by=row.get("created_by"),
         created_at=row["created_at"],
+        ui_draft_state=row.get("ui_draft_state"),
+        ui_draft_form_id=row.get("ui_draft_form_id"),
+        ui_draft_digest=row.get("ui_draft_digest") or "",
+        # Issue #459 (§9.2): `None` unless this turn is a claims turn --
+        # forgetting this field here (unlike `assistant_discussion._turn_out`,
+        # which already parses `claims_json`) would silently drop every
+        # persisted claim on reload even though the DB row carries it.
+        claims=row.get("claims"),
     )
 
 
-def _thread_detail_out(data: Dict[str, Any]) -> AssistantDiscussionThreadDetailOut:
+def _thread_detail_out(
+    data: Dict[str, Any], *,
+    has_unsaved_ui_draft: bool = False,
+    save_result_unknown: bool = False,
+    save_reference_id: Optional[str] = None,
+) -> AssistantDiscussionThreadDetailOut:
+    # Issue #456: read fresh from the CURRENT registry every time (never
+    # stored on the thread row), so a narrowed/widened registry is reflected
+    # immediately -- the same "never a stored column" discipline `discussion_
+    # adapters.capabilities_for` itself documents. An adapter that no longer
+    # exists (a legacy row's `target_kind` was removed from the registry,
+    # `tests/test_discussion_adapter_registry.py`'s own compatibility test)
+    # reports zero capabilities rather than raising.
+    thread_row = data["thread"]
+    adapter = discussion_adapters.get_adapter(thread_row["target_kind"])
+    capabilities = list(discussion_adapters.capabilities_for(adapter)) if adapter is not None else []
+    # Issue #459: the overall next_action projection, read fresh every time
+    # (never stored) from the SAME thread detail read -- `has_unsaved_ui_
+    # draft`/`save_result_unknown`/`save_reference_id` are the two rows only
+    # the caller (client) can observe (see `discussion_next_action`'s module
+    # docstring); everything else comes from existing owner tables.
+    with get_conn() as conn:
+        self_context = discussion_adapters.gather_context(
+            conn, thread_row["system_id"], thread_row["target_kind"], thread_row["target_ref"],
+        )
+        facts = discussion_next_action.gather_gap_discussion_facts(
+            conn, thread_row["system_id"], thread_row["id"],
+            target_state=data["target_state"],
+            self_operation_state=self_context.operation_state,
+            self_unavailable_reason=self_context.reason,
+            has_unsaved_ui_draft=has_unsaved_ui_draft,
+            save_result_unknown=save_result_unknown,
+            save_reference_id=save_reference_id,
+        )
+    next_action = discussion_next_action.evaluate_gap_discussion_next_action(facts)
     return AssistantDiscussionThreadDetailOut(
-        thread=_thread_out(data["thread"]),
+        thread=_thread_out(thread_row),
         target_state=data["target_state"],
+        capabilities=capabilities,
         turns=[_turn_out(t) for t in data["turns"]],
+        next_action=AssistantDiscussionNextActionOut(
+            kind=next_action.kind, reason=next_action.reason,
+            target_ref=next_action.target_ref,
+            degraded_sections=list(next_action.degraded_sections),
+        ),
     )
 
 
@@ -276,6 +379,13 @@ def list_discussion_threads(
 )
 def get_discussion_thread(
     thread_id: int,
+    # Issue #459: the two next_action rows only the client can observe (a
+    # lost save response, an open form's own dirty state) -- see
+    # `discussion_next_action`'s module docstring. Both default to "nothing
+    # pending", matching a caller that has not yet adopted them.
+    has_unsaved_ui_draft: bool = False,
+    save_result_unknown: bool = False,
+    save_reference_id: Optional[str] = None,
     system_id: int = Depends(get_system_id),
 ) -> AssistantDiscussionThreadDetailOut:
     data = assistant_discussion.get_thread(system_id, thread_id)
@@ -283,7 +393,220 @@ def get_discussion_thread(
         raise HTTPException(
             status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
         )
-    return _thread_detail_out(data)
+    return _thread_detail_out(
+        data, has_unsaved_ui_draft=has_unsaved_ui_draft,
+        save_result_unknown=save_result_unknown, save_reference_id=save_reference_id,
+    )
+
+
+# --- Discussion context bundle (Issue #458, Epic #443 §9, DD-CTX-01..05) -----
+# `docs/01-specifications/capabilities/ai-discussion-adapter.md` §9.1. Two endpoints: the initial bundle for
+# a thread's own target (registered relation resolvers only, bounded/
+# budgeted, DD-CTX-01/02), and the explicit "追加取得" continuation
+# (DD-CTX-03). Neither endpoint touches `/assistant/ask` -- see this
+# module's own docstring for why that stays untouched by this Issue.
+
+
+@router.get(
+    "/assistant/discussion-threads/{thread_id}/context-bundle",
+    response_model=DiscussionContextBundleOut,
+)
+def get_discussion_context_bundle(
+    thread_id: int,
+    system_id: int = Depends(get_system_id),
+) -> DiscussionContextBundleOut:
+    """The bundle is always built fresh for the thread's CURRENT target
+    (never the digest captured when the thread was created) -- a stale
+    thread still gets a bundle describing what the target looks like NOW,
+    the same "read fresh every time" discipline `_thread_detail_out`'s
+    capabilities already follow. Any section left `partial`/`unknown`
+    carries its own minted `coverage.continuation` for `POST .../context-
+    expansions` -- there is nothing else for the caller to bind to."""
+    thread_data = assistant_discussion.get_thread(system_id, thread_id)
+    if thread_data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    thread_row = thread_data["thread"]
+    try:
+        bundle = discussion_context_bundle.build_context_bundle(
+            system_id, thread_row["target_kind"], thread_row["target_ref"], thread_id=thread_id,
+            # Read fresh from the module every call (never captured as a
+            # function-default reference) -- DD-CTX-02: "budget値はversion
+            # 付きserver設定とし" implies a later tuning pass can change it
+            # without this route needing to change too.
+            budget=discussion_context_bundle.DEFAULT_BUDGET,
+        )
+    except discussion_context_bundle.ContextBundleError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    return DiscussionContextBundleOut(**discussion_context_bundle.bundle_to_dict(bundle))
+
+
+@router.post(
+    "/assistant/discussion-threads/{thread_id}/context-expansions",
+    response_model=DiscussionContextExpansionOut,
+)
+def create_discussion_context_expansion(
+    thread_id: int,
+    payload: DiscussionContextExpansionRequest,
+    system_id: int = Depends(get_system_id),
+) -> DiscussionContextExpansionOut:
+    """DD-CTX-03: fetch the next bounded batch for one section's own
+    continuation. Fail-closed, first-match: unknown/tampered/foreign-System/
+    foreign-thread token -> 404; expired -> 410; the bundle's own premise
+    (root digest, any dependency already relied on, the pinned snapshot)
+    having moved since the token was minted -> 409, so the caller re-fetches
+    the initial bundle rather than silently continuing on a stale premise
+    (§9.3: "root不変でも使った依存根拠更新はstale")."""
+    thread_data = assistant_discussion.get_thread(system_id, thread_id)
+    if thread_data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    try:
+        result = discussion_context_bundle.resolve_context_expansion(
+            system_id, thread_id,
+            bundle_digest=payload.bundle_digest, continuation=payload.continuation,
+            budget=discussion_context_bundle.DEFAULT_BUDGET,
+        )
+    except discussion_context_bundle.ContextExpansionError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    return DiscussionContextExpansionOut(
+        bundle=DiscussionContextBundleOut(**discussion_context_bundle.bundle_to_dict(result.bundle)),
+        expanded_section_ids=list(result.expanded_section_ids),
+    )
+
+
+# --- §9.2 semantic claims (Issue #459) ----------------------------------------
+
+
+def _claim_dict(claim: "discussion_claims.DiscussionClaim") -> Dict[str, Any]:
+    return {
+        "kind": claim.kind, "statement": claim.statement,
+        "cited_source_ids": list(claim.cited_source_ids), "basis": claim.basis,
+    }
+
+
+@router.post(
+    "/assistant/discussion-threads/{thread_id}/context-claims",
+    response_model=DiscussionContextClaimsResultOut,
+)
+def create_discussion_context_claims(
+    thread_id: int,
+    payload: DiscussionContextClaimsRequest,
+    system_id: int = Depends(get_system_id),
+) -> DiscussionContextClaimsResultOut:
+    """docs/01-specifications/ux/decision-discussion-workflow.md §3's 「照合結果」 stage / ai-discussion-adapter.md §9.2.
+
+    Read -> reason -> persist (CLAUDE.md): the bundle is built and the LLM
+    call runs with NO `get_conn()` connection open, and persistence happens
+    in one transaction afterwards.
+
+    Unlike `create_discussion_proposal` (which creates nothing and raises on
+    `result.error`), this endpoint always returns 200 with
+    `DiscussionContextClaimsResultOut` -- including on a failed/degraded
+    semantic pass. The reason: `discussion_claims.generate_context_claims`
+    always keeps whatever DETERMINISTIC claims it derived even when the LLM
+    call fails or a retry still cites an invalid source
+    (docs/01-specifications/ux/decision-discussion-workflow.md §5's "読めた範囲を残す"), and a proposal is an
+    all-or-nothing domain row while a 照合 result is not -- collapsing a
+    partial result into an HTTP error would silently discard exactly the
+    part of `docs/01-specifications/ux/decision-discussion-workflow.md §5 requires kept. `error`/`error_kind` on the
+    response make the failure explicit (Principle 6's "明示失敗") without
+    hiding what could still be read.
+    """
+    thread_data = assistant_discussion.get_thread(system_id, thread_id)
+    if thread_data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    thread_row = thread_data["thread"]
+
+    try:
+        bundle = discussion_context_bundle.build_context_bundle(
+            system_id, thread_row["target_kind"], thread_row["target_ref"], thread_id=thread_id,
+            budget=discussion_context_bundle.DEFAULT_BUDGET,
+        )
+    except discussion_context_bundle.ContextBundleError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+
+    # Resolve outside the write transaction: adapters own their connections.
+    # Capture before reasoning so an update during the call remains stale.
+    resolved = assistant_discussion.resolve_target(
+        system_id, thread_row["target_kind"], thread_row["target_ref"]
+    )
+    config = LLMConfig.intelligence_from_env()
+    client = _usable_llm_client(config)
+
+    result = discussion_claims.generate_context_claims(
+        client, config, bundle=bundle, question=payload.question,
+    )
+    completed_at = time.time()
+    claim_dicts = [_claim_dict(c) for c in result.claims]
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model, prompt_version,
+                        schema_version, decision_method, status, error_details, is_mock,
+                        started_at, completed_at)
+                   VALUES (?, NULL, 'discussion_context_claim', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    system_id, result.provider, result.model, result.prompt_version,
+                    result.schema_version, result.decision_method,
+                    "failed" if result.error else "completed",
+                    result.error, 1 if result.is_mock else 0, completed_at, completed_at,
+                ),
+            )
+
+            assistant_discussion.append_turn(
+                conn, system_id=system_id, thread_id=thread_id, role="user",
+                content=payload.question, decision_method="manual",
+            )
+            content = result.scope_note or "照合結果"
+            if result.error:
+                content = f"{content}\n(一部の照合結果は確認できませんでした: {result.error})"
+            assistant_turn = assistant_discussion.append_turn(
+                conn, system_id=system_id, thread_id=thread_id, role="assistant",
+                content=content,
+                target_revision_id=resolved.revision_id, target_digest=resolved.digest,
+                decision_method=result.decision_method,
+                provider=result.provider, model=result.model,
+                prompt_version=result.prompt_version,
+                claims=claim_dicts,
+            )
+            assistant_discussion.touch_thread_captured_target(conn, thread_id, resolved)
+
+            # Issue #458's DD-CTX-05 durable audit: this turn is exactly the
+            # kind of "durable row a bundle's dependency manifest backed"
+            # that module's own docstring reserves for #459 to call.
+            discussion_context_bundle.persist_context_audit(
+                conn, system_id=system_id, consumer_kind="turn",
+                consumer_ref=f"thread:{thread_id}:turn:{assistant_turn['turn_number']}",
+                bundle=bundle,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return DiscussionContextClaimsResultOut(
+        provider=result.provider, model=result.model, is_mock=result.is_mock,
+        prompt_version=result.prompt_version, schema_version=result.schema_version,
+        decision_method=result.decision_method,
+        claims=[DiscussionContextClaimOut(**c) for c in claim_dicts],
+        scope_note=result.scope_note, as_of_snapshot_commit=result.as_of_snapshot_commit,
+        retried=result.retried, error=result.error, error_kind=result.error_kind,
+        thread_id=thread_id, turn_number=assistant_turn["turn_number"],
+    )
 
 
 # --- Discussion proposals (Issue #439) ----------------------------------------
@@ -323,18 +646,35 @@ def create_discussion_proposal(
 
     with get_conn() as conn:
         recent = assistant_discussion.recent_turns(conn, thread_id)
-        target_facts = assistant_discussion_proposal.gather_target_context(
+        # Issue #456 follow-up: read the FULL `TargetContextResult` here
+        # (never the `.facts`-only compatibility wrapper) so the proposal
+        # generation path can see -- and fail closed on -- an `unavailable`
+        # read, rather than silently generating on an empty-because-it-
+        # failed context (§9.2: "取得結果だけで機能不存在を確定しない").
+        context_result = discussion_adapters.gather_context(
             conn, system_id, thread_row["target_kind"], thread_row["target_ref"]
         )
     resolved = assistant_discussion.resolve_target(
         system_id, thread_row["target_kind"], thread_row["target_ref"]
     )
 
+    context_bundle = discussion_context_bundle.build_context_bundle(
+        system_id, thread_row["target_kind"], thread_row["target_ref"], thread_id=thread_id,
+    ) if context_result.operation_state == "available" else None
+    investigation_links = get_discussion_joint_understanding(thread_id, system_id=system_id)
+    investigation_context = {
+        "coverage_bundle": discussion_context_bundle.bundle_to_dict(context_bundle) if context_bundle is not None else None,
+        "joint_understanding": investigation_links.model_dump(),
+    }
+
     result = assistant_discussion_proposal.generate_proposal(
         client, config,
         target_kind=thread_row["target_kind"], target_ref=thread_row["target_ref"],
         target_title=thread_row["target_title"] or thread_row["target_ref"],
-        turns=recent, target_facts=target_facts,
+        turns=recent, target_facts=context_result.facts,
+        context_operation_state=context_result.operation_state,
+        context_reason=context_result.reason,
+        investigation_context=investigation_context,
     )
     completed_at = time.time()
 
@@ -355,8 +695,21 @@ def create_discussion_proposal(
         run_id = run_cur.lastrowid
 
         if result.error:
-            status_code = 503 if result.error_kind == "unavailable" else 502
-            code = "reasoning_unavailable" if status_code == 503 else "discussion_proposal_generation_failed"
+            # Issue #456 follow-up: `context_unavailable` is a DIFFERENT
+            # cause from `unavailable` (no usable LLM) and gets its OWN code
+            # -- "the reasoning model is unreachable" and "the target's
+            # context could not be read" are different facts with different
+            # next actions (retry vs. check the target/System), and reusing
+            # `reasoning_unavailable` for both would be exactly the "one
+            # displayed word carries two facts" defect this Epic exists to
+            # fix (CLAUDE.md #366).
+            status_code = 503 if result.error_kind in ("unavailable", "context_unavailable") else 502
+            if result.error_kind == "unavailable":
+                code = "reasoning_unavailable"
+            elif result.error_kind == "context_unavailable":
+                code = "discussion_context_unavailable"
+            else:
+                code = "discussion_proposal_generation_failed"
             raise HTTPException(
                 status_code=status_code, detail={"code": code, "message": result.error}
             )
@@ -366,6 +719,8 @@ def create_discussion_proposal(
             target_kind=thread_row["target_kind"], target_ref=thread_row["target_ref"],
             captured_target_revision_id=resolved.revision_id, captured_target_digest=resolved.digest,
             result=result, intelligence_run_id=run_id, created_by=_principal_actor(principal),
+            turns=recent,
+            context_bundle=context_bundle,
         )
         proposal_id = row["id"]
 
@@ -436,6 +791,42 @@ def apply_discussion_proposal(
 
 
 @router.post(
+    "/assistant/discussion-proposals/{proposal_id}/prefill",
+    response_model=AssistantDiscussionProposalPrefillOut,
+)
+def prefill_discussion_proposal(
+    proposal_id: int,
+    payload: AssistantDiscussionProposalPrefillRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> AssistantDiscussionProposalPrefillOut:
+    """§3.4: land selected proposal items into an unsaved Dashboard form as a
+    reviewable draft patch. Writes ONLY the audit row -- the item's own
+    `status` never changes here."""
+    try:
+        detail, prefilled_ids = assistant_discussion_proposal.prefill_items(
+            system_id, proposal_id, payload.item_ids,
+            form_id=payload.form_id, patch_token=payload.patch_token,
+            actor=_principal_actor(principal),
+        )
+    except assistant_discussion_proposal.ApplyRejected as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    except assistant_discussion_proposal.PrefillUnsupported as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    except assistant_discussion_proposal.NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except assistant_discussion_proposal.DiscussionProposalError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AssistantDiscussionProposalPrefillOut(
+        proposal=_proposal_detail_out(detail), prefilled_item_ids=prefilled_ids,
+    )
+
+
+@router.post(
     "/assistant/discussion-proposals/{proposal_id}/reject",
     response_model=AssistantDiscussionProposalRejectOut,
 )
@@ -457,6 +848,143 @@ def reject_discussion_proposal(
     return AssistantDiscussionProposalRejectOut(
         proposal=_proposal_detail_out(detail), rejected_item_ids=rejected_ids,
     )
+
+
+def _hypothesis_promotion_out(
+    hyp: Dict[str, Any], promo: Dict[str, Any], *, reused: bool,
+) -> AssistantDiscussionHypothesisPromoteOut:
+    return AssistantDiscussionHypothesisPromoteOut(
+        hypothesis=AssistantDiscussionProposalHypothesisOut(**hyp),
+        promotion=AssistantDiscussionHypothesisPromotionOut(**promo),
+        joint_understanding_session_id=promo["joint_understanding_session_id"],
+        reused=reused,
+    )
+
+
+@router.post(
+    "/assistant/discussion-proposals/{proposal_id}/hypotheses/{hypothesis_id}/promote",
+    response_model=AssistantDiscussionHypothesisPromoteOut,
+)
+def promote_discussion_hypothesis(
+    proposal_id: int,
+    hypothesis_id: int,
+    payload: AssistantDiscussionHypothesisPromoteRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> AssistantDiscussionHypothesisPromoteOut:
+    """§6.2: promote ONE selected hypothesis into a `owner_scope='discussion'`
+    Joint Understanding session (Issue #461) -- no owning Interview required.
+    Always `decision_method='manual'`; never touches the origin proposal's
+    other items, the thread's turns, or starts an investigation/Replay/
+    Experiment by itself (§6.2 Decisions: 「JUへの昇格と調査実行は別操作」).
+    Idempotent on `request_id`: a retry with the same id and the same
+    hypothesis returns the SAME session (`reused=true`); reusing it for a
+    different hypothesis is 409.
+    """
+    try:
+        result = discussion_hypothesis.promote_hypothesis(
+            system_id, proposal_id, hypothesis_id,
+            request_id=payload.request_id, actor=_principal_actor(principal),
+        )
+    except discussion_hypothesis.NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except discussion_hypothesis.HypothesisIncomplete as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    except discussion_hypothesis.BridgeNotSupported as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "discussion_hypothesis_bridge_unsupported",
+                "message": str(exc),
+            },
+        ) from exc
+    except discussion_hypothesis.PromotionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "discussion_hypothesis_promotion_request_conflict",
+                "message": str(exc),
+            },
+        ) from exc
+    return _hypothesis_promotion_out(
+        result["hypothesis"], result["promotion"], reused=result["reused"],
+    )
+
+
+@router.get(
+    "/assistant/discussion-threads/{thread_id}/joint-understanding",
+    response_model=AssistantDiscussionJointUnderstandingListOut,
+)
+def get_discussion_joint_understanding(
+    thread_id: int,
+    system_id: int = Depends(get_system_id),
+) -> AssistantDiscussionJointUnderstandingListOut:
+    """§6.3's reflux read: every hypothesis promoted from THIS thread, its
+    Joint Understanding session, and -- only when that session's premise is
+    `current` -- the findings eligible to surface back into the Discussion
+    (`app.joint_understanding.can_reflux`, verbatim: `origin_role
+    ='investigation'` and `claim_kind='fact'`, never superseded). A stale/
+    missing/invalid premise carries `reconfirmation_required=true` and no
+    findings, rather than a guess. `outcome_is_provisional` on `session`
+    (Issue #337, unchanged here) is what keeps a provisionally adopted
+    hypothesis from ever reading as a confirmed fact. Never writes anything,
+    and never merges the Discussion and Joint Understanding tables."""
+    thread_data = assistant_discussion.get_thread(system_id, thread_id)
+    if thread_data is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown discussion thread id: {thread_id}"
+        )
+    with get_conn() as conn:
+        promotions = conn.execute(
+            "SELECT * FROM assistant_discussion_hypothesis_promotion "
+            "WHERE thread_id = ? AND system_id = ? ORDER BY id",
+            (thread_id, system_id),
+        ).fetchall()
+        links = []
+        for promo in promotions:
+            hyp_row = conn.execute(
+                "SELECT * FROM assistant_discussion_proposal_hypothesis "
+                "WHERE id = ? AND system_id = ?",
+                (promo["hypothesis_id"], system_id),
+            ).fetchone()
+            ju_row = conn.execute(
+                "SELECT * FROM joint_understanding_session WHERE id = ? AND system_id = ?",
+                (promo["joint_understanding_session_id"], system_id),
+            ).fetchone()
+            if hyp_row is None or ju_row is None:
+                continue
+            verdict = joint_understanding_routes._premise_verdict(conn, ju_row)  # noqa: SLF001
+            findings = conn.execute(
+                "SELECT * FROM joint_understanding_finding "
+                "WHERE joint_understanding_id = ? ORDER BY id",
+                (ju_row["id"],),
+            ).fetchall()
+            superseded = joint_understanding_routes._superseded_finding_ids(findings)  # noqa: SLF001
+            current_findings = []
+            if verdict.state == "current":
+                current_findings = [
+                    joint_understanding_routes._finding_out(f)  # noqa: SLF001
+                    for f in findings
+                    if f["id"] not in superseded
+                    and joint_understanding_domain.can_reflux(f["origin_role"], f["claim_kind"])
+                ]
+            links.append(
+                AssistantDiscussionJointUnderstandingLinkOut(
+                    hypothesis=AssistantDiscussionProposalHypothesisOut(
+                        **discussion_hypothesis.hypothesis_out(hyp_row)
+                    ),
+                    promotion=AssistantDiscussionHypothesisPromotionOut(**dict(promo)),
+                    session=joint_understanding_routes._session_out(  # noqa: SLF001
+                        ju_row, verdict,
+                        joint_understanding_routes._current_origin_id(conn, ju_row),  # noqa: SLF001
+                    ),
+                    current_findings=current_findings,
+                    reconfirmation_required=verdict.state != "current",
+                )
+            )
+    return AssistantDiscussionJointUnderstandingListOut(links=links)
 
 
 @router.post("/assistant/ask", response_model=AssistantAskOut)
@@ -481,6 +1009,28 @@ def assistant_ask(
             )
         thread_row = thread_data["thread"]
         thread_target_state = thread_data["target_state"]
+
+    # Issue #445: validate the (optional) UI draft against the thread's own
+    # target and the target_kind's adapter registry, fail-closed, BEFORE the
+    # LLM call below. `resolved_draft.payload` is already redacted
+    # (Principle 9) and carries no draft VALUES past this point except what
+    # is about to go into the LLM prompt -- nothing here is persisted yet.
+    try:
+        resolved_draft = ui_draft_context.validate_and_prepare_ui_draft(payload.ui_draft, thread_row)
+    except ui_draft_context.UiDraftValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+
+    ui_draft_changed = False
+    if payload.ui_draft is not None and thread_row is not None:
+        with get_conn() as conn:
+            ui_draft_changed = ui_draft_context.compute_ui_draft_changed(
+                conn,
+                thread_id=thread_row["id"],
+                form_id=resolved_draft.form_id,
+                draft_digest=resolved_draft.digest,
+            )
 
     report = run_system_diagnostics(system_id)
     assessment = build_system_state(system_id)
@@ -522,6 +1072,20 @@ def assistant_ask(
     )
     screen_data: Optional[Dict[str, Any]] = dict(discussion.facts) if discussion else None
     screen_data_sources = list(discussion.sources) if discussion else []
+    # Issue #456 follow-up: `discussion is None` means this screen_id has no
+    # discussion-context concept at all -- `unsupported`, distinct from a
+    # registered screen whose read just failed THIS turn (`discussion.
+    # operation_state`, defaulting to `available` on a normal successful
+    # read). Threaded through BOTH to the prompt (`ContextPack.screen_data_
+    # state`, kept out of `screen_data` itself) and to the wire response
+    # (`AssistantAskOut.screen_context_state`) -- neither reached the caller
+    # before this Issue, which is exactly the "empty dict swallows the
+    # failure" defect #456 exists to fix, one layer further out.
+    screen_context_state = discussion.operation_state if discussion is not None else "unsupported"
+    screen_context_reason = (
+        discussion.reason if discussion is not None
+        else "screen_discussion_context_not_registered"
+    )
     # Issue #441 element-scope voice turns carry the deterministic help id in
     # route params.  It is useful only after the server validates an exact
     # registry match for this screen; arbitrary or cross-screen ids are never
@@ -576,8 +1140,15 @@ def assistant_ask(
         focused_state_id=focused_state_id,
         screen_data=screen_data,
         screen_data_sources=screen_data_sources if screen_data is not None else None,
+        screen_data_state=screen_context_state,
+        screen_data_reason=screen_context_reason,
         route_params=effective_route_params,
         conversation=conversation_messages,
+        voice_mode=payload.input_mode == "voice",
+        voice_continuation=payload.voice_continuation,
+        voice_spoken_history=payload.voice_spoken_history,
+        ui_draft=resolved_draft.payload,
+        ui_draft_sources=resolved_draft.sources,
     )
 
     thread_id_out: Optional[int] = None
@@ -607,13 +1178,24 @@ def assistant_ask(
                     # a client playback choice, not a fact about the turn.
                     input_mode=payload.input_mode,
                     created_by=_principal_actor(principal),
+                    # Issue #445 §2.7: recorded on the USER turn only, and
+                    # never the draft's field VALUES -- see
+                    # `ui_draft_context.ResolvedUiDraft`.
+                    ui_draft_state=resolved_draft.state,
+                    ui_draft_form_id=resolved_draft.form_id or None,
+                    ui_draft_digest=resolved_draft.digest or None,
                 )
                 assistant_turn = assistant_discussion.append_turn(
                     conn,
                     system_id=system_id,
                     thread_id=thread_row["id"],
                     role="assistant",
-                    content=result.answer,
+                    # Draft-derived answers may quote unsaved values. Return
+                    # the live answer, but persist only a neutral history marker.
+                    content=(
+                        "未保存の下書きを参照した回答です。下書きの内容を保存しないため、回答本文は履歴に残していません。"
+                        if resolved_draft.payload is not None else result.answer
+                    ),
                     citations=citations_payload,
                     target_revision_id=resolved.revision_id,
                     target_digest=resolved.digest,
@@ -632,11 +1214,24 @@ def assistant_ask(
                 raise
         thread_id_out = thread_row["id"]
         turn_number_out = assistant_turn["turn_number"]
-        recheck_required = thread_target_state not in ("current", "not_tracked")
+        # §2.6: a changed draft also forces a recheck -- the previous answer,
+        # if any, was not about the draft as it reads now.
+        recheck_required = (
+            thread_target_state not in ("current", "not_tracked") or ui_draft_changed
+        )
 
+    voice_projection = (
+        project_spoken_answer(result.answer, payload.voice_spoken_history)
+        if payload.input_mode == "voice"
+        else None
+    )
     return AssistantAskOut(
         screen_id=ctx.screen_id,
         answer=result.answer,
+        spoken_answer=voice_projection.text if voice_projection else None,
+        voice_follow_up_expected=bool(
+            voice_projection and voice_projection.expects_reply
+        ),
         suggested_actions=[
             AssistantActionOut(
                 label=a.label, kind=a.kind, target=a.target, detail=a.detail
@@ -661,4 +1256,8 @@ def assistant_ask(
         target_state=thread_target_state,
         recheck_required=recheck_required,
         turn_number=turn_number_out,
+        ui_draft_state=resolved_draft.state,
+        ui_draft_changed=ui_draft_changed,
+        screen_context_state=screen_context_state,
+        screen_context_reason=screen_context_reason or None,
     )

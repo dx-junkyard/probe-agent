@@ -21,6 +21,16 @@ MAX_LIST_ITEMS = 50
 class ScreenDiscussionContext:
     facts: Dict[str, Any]
     sources: List[Dict[str, str]]
+    # Issue #456: the finite `DiscussionOperationResult` (`app/models.py`)
+    # this READ attempt reports, kept as its OWN field -- never folded into
+    # `facts`. Every existing constructor call below builds a SUCCESSFUL
+    # context and leaves this at its default, so the field is additive.
+    # `build_screen_discussion_context` is the only place that produces the
+    # other values, on a caught exception (§1.3: a diagnostics-gathering
+    # failure must degrade, never take down the whole `/assistant/ask`
+    # request -- see its own docstring).
+    operation_state: str = "available"  # DiscussionOperationResult
+    reason: str = ""
 
 
 def _selected_or_none(loader) -> tuple[Optional[Dict[str, Any]], bool]:
@@ -223,17 +233,145 @@ def _journey_blueprint_context(
     )
 
 
+def _objective_map_context(
+    system_id: int, route_params: Dict[str, str]
+) -> ScreenDiscussionContext:
+    """Issue #453 (Epic #443 Phase 4). Reads the SAME canonical projection
+    `objective-map.tsx` itself renders (`product_objective_projection.
+    build_objective_map`) plus the selected Objective/Milestone/Gap detail --
+    never a second Objective Map model. `view`/`objective`/`milestone`/`gap`
+    are the exact query params `objectiveMapSelectionFromSearchParams`
+    (Dashboard) already reads (§4.1's live-selection contract)."""
+    from . import product_objective, product_objective_projection
+
+    view = (route_params.get("view") or "objectives").strip()
+    objective_key = (route_params.get("objective") or "").strip() or None
+    milestone_key = (route_params.get("milestone") or "").strip() or None
+    gap_key = (route_params.get("gap") or "").strip() or None
+    with get_conn() as conn:
+        obj_map = product_objective_projection.build_objective_map(conn, system_id)
+        selected_objective, objective_missing = _selected_or_none(
+            lambda: product_objective.get_objective_detail(conn, system_id, objective_key)
+        ) if objective_key else (None, False)
+        selected_milestone, milestone_missing = _selected_or_none(
+            lambda: product_objective.get_milestone_detail(conn, system_id, milestone_key)
+        ) if milestone_key else (None, False)
+        selected_gap, gap_missing = _selected_or_none(
+            lambda: product_objective.get_gap_detail(conn, system_id, gap_key)
+        ) if gap_key else (None, False)
+    sources = [{"id": "product_objective_map", "title": "Canonical Objective Map"}]
+    for kind, key in (
+        ("product_objective", objective_key),
+        ("product_milestone", milestone_key),
+        ("product_gap", gap_key),
+    ):
+        if key:
+            sources.append({"id": f"{kind}:{key}", "title": f"Selected {kind}"})
+    return ScreenDiscussionContext(
+        facts={
+            "view": view,
+            "objectives": obj_map.get("nodes", [])[:MAX_LIST_ITEMS],
+            "selected_objective": selected_objective,
+            "selected_milestone": selected_milestone,
+            "selected_gap": selected_gap,
+            "selection_not_found": {
+                "objective": objective_missing,
+                "milestone": milestone_missing,
+                "gap": gap_missing,
+            },
+            "degraded_sections": list(obj_map.get("degraded_sections", [])),
+        },
+        sources=sources,
+    )
+
+
+def _stakeholder_value_network_context(
+    system_id: int, route_params: Dict[str, str]
+) -> ScreenDiscussionContext:
+    """Issue #453. Reads `stakeholder_value_network.build_value_network` --
+    the same projection `stakeholder-value-network.tsx` renders -- plus the
+    selected `node`/`edge` detail, the exact params that page's own
+    `searchParams.get("node")`/`get("edge")` already use."""
+    from . import stakeholder_network as sn
+    from .stakeholder_value_network import build_value_network
+
+    node_key = (route_params.get("node") or "").strip() or None
+    edge_key = (route_params.get("edge") or "").strip() or None
+    with get_conn() as conn:
+        network = build_value_network(conn, system_id)
+        selected_node, node_missing = _selected_or_none(
+            lambda: sn.get_stakeholder_detail(conn, system_id, node_key)
+        ) if node_key else (None, False)
+        selected_edge, edge_missing = _selected_or_none(
+            lambda: sn.get_exchange_detail(conn, system_id, edge_key)
+        ) if edge_key else (None, False)
+    sources = [{"id": "stakeholder_value_network", "title": "Canonical Stakeholder Value Network"}]
+    for kind, key in (("stakeholder", node_key), ("value_exchange", edge_key)):
+        if key:
+            sources.append({"id": f"{kind}:{key}", "title": f"Selected {kind}"})
+    return ScreenDiscussionContext(
+        facts={
+            "nodes": network.get("nodes", [])[:MAX_LIST_ITEMS],
+            "edges": network.get("edges", [])[:MAX_LIST_ITEMS],
+            "notices": network.get("notices", [])[:MAX_LIST_ITEMS],
+            "selected_stakeholder": selected_node,
+            "selected_exchange": selected_edge,
+            "selection_not_found": {"stakeholder": node_missing, "value_exchange": edge_missing},
+            "degraded_sections": list(network.get("degraded_sections", [])),
+        },
+        sources=sources,
+    )
+
+
+# `capability-map` deliberately has NO entry here (Issue #453): none of the
+# Vision-to-Feature kinds render on that screen (it shows the older #56/#57
+# AST-derived Capability Hierarchy, a different model this Issue does not
+# touch), so a whole-screen conversation there degrades to `unsupported`
+# canonical context -- the same honest, already-established state
+# `understanding_claim`/`overview_finding` have on every screen that is not
+# in their own `screen_ids`.
+_SCREEN_CONTEXT_PROVIDERS: Dict[str, Any] = {
+    "overview": lambda system_id, params: _overview_context(system_id),
+    "interview": _interview_context,
+    "ux-design-studio": _ux_design_context,
+    "journey-blueprint": _journey_blueprint_context,
+    "objective-map": _objective_map_context,
+    "stakeholder-value-network": _stakeholder_value_network_context,
+}
+
+
 def build_screen_discussion_context(
     screen_id: str, system_id: int, route_params: Optional[Dict[str, str]] = None
 ) -> Optional[ScreenDiscussionContext]:
-    """Return canonical facts only for discussion-enabled screens."""
+    """Return canonical facts only for discussion-enabled screens.
+
+    `None` means `screen_id` is not one of the discussion-enabled screens at
+    all -- `unsupported` at the screen level, unchanged from before #456 (the
+    caller already treats `None` as "no screen_data" and this is not the bug
+    #456 fixes).
+
+    A REGISTERED screen's provider used to run with no safety net: an
+    exception inside `_overview_context` / `_interview_context` / ... (e.g. a
+    guarded canonical projection raising) propagated all the way out of
+    `POST /assistant/ask` as a 500, destroying the whole assistant turn over
+    one screen's context read (§1.3: "診断取得失敗で会話全体を不要に壊さ
+    ない"). It now degrades to an `unavailable` context with no facts/
+    sources instead -- the assistant still answers, just without this
+    screen's canonical facts for this turn.
+    """
     params = route_params or {}
-    if screen_id == "overview":
-        return _overview_context(system_id)
-    if screen_id == "interview":
-        return _interview_context(system_id, params)
-    if screen_id == "ux-design-studio":
-        return _ux_design_context(system_id, params)
-    if screen_id == "journey-blueprint":
-        return _journey_blueprint_context(system_id, params)
-    return None
+    provider = _SCREEN_CONTEXT_PROVIDERS.get(screen_id)
+    if provider is None:
+        return None
+    try:
+        return provider(system_id, params)
+    except Exception:
+        # Exercised directly by `tests/test_discussion_operation_result.py`'s
+        # `TestScreenDiscussionContextDegrades` and by `tests/test_assistant.
+        # py`'s `test_a_failing_screen_context_provider_does_not_break_the_
+        # whole_ask` (which also proves `/assistant/ask` still returns 200)
+        # -- not `pragma: no cover`.
+        return ScreenDiscussionContext(
+            facts={}, sources=[], operation_state="unavailable",
+            reason="screen_discussion_context_provider_error",
+        )

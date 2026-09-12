@@ -189,7 +189,7 @@ _UX_JOURNEY_UPSTREAM_REF_DDL = """
 -- second stored status column.
 --
 -- `ref_kind` originally only listed `purpose_element` / `purpose_relation` /
--- `capability_entity`. Issue #427/#431 (docs/product-objective-lineage.md
+-- `capability_entity`. Issue #427/#431 (docs/01-specifications/product/product-objective-lineage.md
 -- §7.1) widens the CHECK to add `product_objective` / `product_milestone` /
 -- `product_gap`, so a Journey can name the Objective/Milestone/Gap it exists
 -- to address without this layer growing a duplicate reference table for the
@@ -230,7 +230,7 @@ CREATE INDEX IF NOT EXISTS idx_ux_journey_upstream_ref_journey
 
 
 # assistant_discussion_thread / assistant_discussion_turn (Issue #438, Epic
-# #436, docs/assistant-discussion.md §1.4): the screen-context AI assistant's
+# #436, docs/01-specifications/capabilities/assistant-discussion.md §1.4): the screen-context AI assistant's
 # per-target conversation persistence. Identity is `(system_id, thread_key)`
 # where `thread_key = f"{screen_id}|{scope}|{target_kind}|{target_ref}"` --
 # NOT `(system_id, screen_id)` -- so a Requirement A conversation and a
@@ -247,10 +247,18 @@ CREATE TABLE IF NOT EXISTS assistant_discussion_thread (
     thread_key                   TEXT NOT NULL,
     scope                        TEXT NOT NULL CHECK (scope IN ('screen', 'entity', 'element')),
     screen_id                    TEXT NOT NULL,
+    -- Issue #453 (Epic #443 Phase 4) widened this CHECK with 8
+    -- Vision-to-Feature kinds. See `_migrate_assistant_discussion_thread_
+    -- target_kinds` below for why an existing database needs this table
+    -- rebuilt once.
     target_kind                  TEXT NOT NULL CHECK (target_kind IN (
                                      'screen', 'interview_session', 'understanding_claim',
                                      'overview_finding', 'ux_journey', 'ux_journey_step',
-                                     'ux_requirement', 'solution_design', 'blueprint_lane_cell')),
+                                     'ux_requirement', 'solution_design', 'blueprint_lane_cell',
+                                     'purpose_element', 'purpose_relation',
+                                     'stakeholder', 'stakeholder_need',
+                                     'product_objective', 'product_milestone',
+                                     'product_gap', 'product_feature')),
     target_ref                   TEXT NOT NULL,
     target_title                 TEXT NOT NULL DEFAULT '',
     -- Captured at thread creation and refreshed on each successful resolve;
@@ -314,7 +322,7 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_turn_thread
 
 
 # assistant_discussion_proposal / assistant_discussion_proposal_item (Issue
-# #439, Epic #436, docs/assistant-discussion.md §2): a reviewable, structured
+# #439, Epic #436, docs/01-specifications/capabilities/assistant-discussion.md §2): a reviewable, structured
 # change-set summarized from a discussion thread's (#438) turns through the
 # reasoning model, deliberately separate from the thread's own turns -- a
 # turn is what was SAID, a proposal item is a candidate CHANGE. Generating a
@@ -380,10 +388,10 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_system
 CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_thread
     ON assistant_discussion_proposal (thread_id, id DESC);
 
--- assistant_discussion_proposal_item: one candidate field/relation change.
--- `subject_ref` is the sub-address INSIDE the target that `target_ref`
--- alone cannot express -- today only a Solution Design's OPTION
--- (`option_key`), because a Solution Design carries no design-level
+-- assistant_discussion_proposal_item: one candidate field/relation/child
+-- change. `subject_ref` is the sub-address INSIDE the target that
+-- `target_ref` alone cannot express -- today only a Solution Design's
+-- OPTION (`option_key`), because a Solution Design carries no design-level
 -- revision table (a field proposal on `solution_design` addresses an
 -- Option, applied through `solution_design.add_option`); every other
 -- target_kind leaves it ''. Eligibility (`appliable`/`forbidden`/`stale`/
@@ -393,6 +401,23 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_thread
 -- stored column -- the same "derived, never stored" discipline #337/#338/
 -- #349/#405 apply elsewhere, so a target that changed after generation
 -- cannot keep reading as appliable.
+--
+-- `child_kind` / `child_key` / `child_intent` / `child_order` (Issue #454,
+-- Epic #443 §5.1) address ONE row inside a nested/list collection a
+-- `DiscussionAdapter.ChildSpec` declares (e.g. a Requirement's Acceptance
+-- Criteria) -- '' / '' / '' / NULL on every pre-#454 row and on every
+-- non-child field/relation item. A `child_kind` item still uses
+-- `item_kind='field'` (never a third `item_kind` value): the field it
+-- carries in `field_name`/`proposed_value` is one field of the addressed
+-- child, or '' when the row carries ONLY a `child_order` move -- §5.1's
+-- "順序変更と本文変更を別itemとして選択できる" is expressed as two SEPARATE
+-- rows sharing the same `(child_kind, child_key, child_intent)`, never as
+-- one row with two kinds of change bundled together. For `child_intent
+-- ='add'`, `child_key` is never caller/model-supplied: it is the STABLE
+-- `reserved_child_key` `assistant_discussion_proposal.create_proposal`
+-- mints once per distinct `client_temp_key` the model used to correlate
+-- multiple field rows of the same new child within one generation result,
+-- and is what the field applier writes as the child's real domain key.
 CREATE TABLE IF NOT EXISTS assistant_discussion_proposal_item (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id             INTEGER NOT NULL,
@@ -401,13 +426,18 @@ CREATE TABLE IF NOT EXISTS assistant_discussion_proposal_item (
     field_name            TEXT NOT NULL DEFAULT '',
     relation_kind         TEXT NOT NULL DEFAULT '' CHECK (relation_kind IN (
                               '', 'upstream_ref', 'journey_step_link', 'requirement_link',
-                              'target_link', 'delivery_link', 'stakeholder_link', 'exchange_link')),
+                              'target_link', 'delivery_link', 'stakeholder_link', 'exchange_link',
+                              'capability_link', 'milestone_dependency', 'source_ref', 'evidence_ref', 'artifact_link')),
     relation_target_kind  TEXT NOT NULL DEFAULT '',
     relation_target_ref   TEXT NOT NULL DEFAULT '',
     subject_ref           TEXT NOT NULL DEFAULT '',
     current_value         TEXT NOT NULL DEFAULT '',
     proposed_value        TEXT NOT NULL DEFAULT '',
     rationale             TEXT NOT NULL DEFAULT '',
+    child_kind            TEXT NOT NULL DEFAULT '',
+    child_key             TEXT NOT NULL DEFAULT '',
+    child_intent          TEXT NOT NULL DEFAULT '' CHECK (child_intent IN ('', 'add', 'update', 'remove')),
+    child_order           INTEGER,
     status                TEXT NOT NULL DEFAULT 'proposed'
                               CHECK (status IN ('proposed', 'applied', 'rejected')),
     applied_ref           TEXT,
@@ -431,6 +461,397 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_item_system
 
 CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_item_proposal
     ON assistant_discussion_proposal_item (proposal_id, id);
+
+-- assistant_discussion_proposal_prefill (Issue #446, Epic #443 Phase 3,
+-- docs/ai-discussion-adapter.md §3.4): the prefill AUDIT trail, deliberately
+-- separate from the item's own `status`. Prefilling a candidate into an
+-- unsaved Dashboard form is intent, never completion -- whether the
+-- developer went on to actually save the form is not a fact this layer can
+-- observe (#412's "recording is not promotion"), so a row here NEVER moves
+-- `assistant_discussion_proposal_item.status` off `proposed`. The
+-- `UNIQUE (proposal_id, patch_token, item_id)` constraint is what makes a
+-- repeated dispatch of the SAME client-generated patch idempotent -- a
+-- retried `POST .../prefill` with the same `patch_token` is a no-op success,
+-- never a duplicate row or a 500.
+CREATE TABLE IF NOT EXISTS assistant_discussion_proposal_prefill (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id         INTEGER NOT NULL,
+    proposal_id       INTEGER NOT NULL,
+    item_id           INTEGER NOT NULL,
+    form_id           TEXT NOT NULL,
+    patch_token       TEXT NOT NULL,
+    -- Always 'manual': prefilling is a developer action dispatched from the
+    -- Proposal review UI, never something a reasoning model or another
+    -- system decides on its own.
+    decision_method   TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    created_by        TEXT,
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_id) REFERENCES assistant_discussion_proposal (id) ON DELETE CASCADE,
+    FOREIGN KEY (item_id) REFERENCES assistant_discussion_proposal_item (id) ON DELETE CASCADE,
+    UNIQUE (proposal_id, patch_token, item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_prefill_system
+    ON assistant_discussion_proposal_prefill (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_prefill_item
+    ON assistant_discussion_proposal_prefill (item_id, created_at DESC);
+"""
+
+# assistant_discussion_proposal_hypothesis / assistant_discussion_hypothesis_
+# promotion (Issue #455, Epic #443 §6): the Joint Understanding bridge.
+#
+# A hypothesis is an INDEPENDENT proposal item type (docs/01-specifications/
+# capabilities/ai-discussion-adapter.md §6.1) -- never a field_change, never
+# stored in `assistant_discussion_proposal_item`. `competing_explanations_
+# json` / `refutation_conditions_json` / `next_investigation` are NOT NULL
+# with a non-empty-array/non-empty-string application-level rule enforced by
+# `assistant_discussion_proposal.generate_proposal` (generation time) and
+# `app/discussion_hypothesis.py` (promotion time) -- a hypothesis missing any
+# of the three is a claim, not a hypothesis, and is refused before it is ever
+# persisted (there is deliberately no CHECK expressing "JSON array is
+# non-empty"; SQLite cannot do that portably, so this stays an application
+# invariant enforced at both write paths, matching how #329's finding
+# contract enforces the identical rule one layer down).
+# `first_turn_number` / `last_turn_number` are the thread's own turn range
+# that produced the proposal this hypothesis belongs to (captured once, at
+# generation time, from the same `turns` `generate_proposal` read) -- so a
+# later reader can find exactly which part of the conversation this
+# hypothesis came from without re-deriving it from the proposal's
+# `created_at` timestamp.
+_ASSISTANT_DISCUSSION_HYPOTHESIS_DDL = """
+CREATE TABLE IF NOT EXISTS assistant_discussion_proposal_hypothesis (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                   INTEGER NOT NULL,
+    proposal_id                 INTEGER NOT NULL,
+    statement                   TEXT NOT NULL,
+    competing_explanations_json TEXT NOT NULL DEFAULT '[]',
+    refutation_conditions_json  TEXT NOT NULL DEFAULT '[]',
+    next_investigation          TEXT NOT NULL DEFAULT '',
+    evidence_refs_json          TEXT NOT NULL DEFAULT '[]',
+    uncertainty                 TEXT NOT NULL DEFAULT '',
+    status                      TEXT NOT NULL DEFAULT 'proposed'
+                                    CHECK (status IN ('proposed', 'promoted', 'rejected')),
+    first_turn_number           INTEGER,
+    last_turn_number            INTEGER,
+    created_at                  REAL NOT NULL,
+    schema_version              TEXT NOT NULL DEFAULT 'discussion-hypothesis-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_id) REFERENCES assistant_discussion_proposal (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_hypothesis_proposal
+    ON assistant_discussion_proposal_hypothesis (proposal_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_proposal_hypothesis_system
+    ON assistant_discussion_proposal_hypothesis (system_id, id DESC);
+
+-- assistant_discussion_hypothesis_promotion: the manual bridge from ONE
+-- selected hypothesis into ONE Joint Understanding session
+-- (`owner_scope='discussion'`, Issue #461). `UNIQUE (system_id,
+-- request_id)` IS the idempotency guarantee Issue #455's Decisions require
+-- ("同一昇格retryでJU重複作成なし"): a retried promote call with the SAME
+-- `request_id` never creates a second session -- it reads this row back and
+-- returns the SAME `joint_understanding_session_id`. Scoped by `request_id`
+-- ALONE (not also `hypothesis_id`) so that reusing the same id for a
+-- DIFFERENT hypothesis is detectable as the SAME row with a mismatched
+-- `request_digest` (checked by `app/discussion_hypothesis.py` before this
+-- row is read) rather than silently missing the conflict by finding no row
+-- under a different `hypothesis_id` key -- token reuse across different
+-- content is refused, exactly the `discussion_save_receipt` idempotency
+-- discipline (#452) applied to a promotion instead of a save. Explicitly
+-- starting a SECOND, independent investigation into the same hypothesis is
+-- not blocked: it is a deliberate new `request_id`, and therefore a second
+-- row naming a second session -- multiple promotions per hypothesis are
+-- expected, not an error.
+CREATE TABLE IF NOT EXISTS assistant_discussion_hypothesis_promotion (
+    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                       INTEGER NOT NULL,
+    hypothesis_id                   INTEGER NOT NULL,
+    thread_id                       INTEGER NOT NULL,
+    first_turn_number               INTEGER,
+    last_turn_number                INTEGER,
+    captured_target_kind            TEXT NOT NULL,
+    captured_target_ref             TEXT NOT NULL,
+    captured_target_digest          TEXT NOT NULL DEFAULT '',
+    joint_understanding_session_id  INTEGER NOT NULL,
+    request_id                      TEXT NOT NULL,
+    request_digest                  TEXT NOT NULL,
+    -- Always 'manual': promoting a hypothesis into Joint Understanding is a
+    -- developer's own decision to open an investigation, never something a
+    -- reasoning model or another system decides on its own.
+    decision_method                 TEXT NOT NULL DEFAULT 'manual' CHECK (decision_method = 'manual'),
+    created_by                      TEXT,
+    created_at                      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (hypothesis_id)
+        REFERENCES assistant_discussion_proposal_hypothesis (id) ON DELETE CASCADE,
+    FOREIGN KEY (thread_id) REFERENCES assistant_discussion_thread (id) ON DELETE CASCADE,
+    FOREIGN KEY (joint_understanding_session_id)
+        REFERENCES joint_understanding_session (id) ON DELETE CASCADE,
+    UNIQUE (system_id, request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_hypothesis_promotion_hypothesis
+    ON assistant_discussion_hypothesis_promotion (hypothesis_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_hypothesis_promotion_thread
+    ON assistant_discussion_hypothesis_promotion (thread_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_discussion_hypothesis_promotion_ju
+    ON assistant_discussion_hypothesis_promotion (joint_understanding_session_id);
+"""
+
+_DISCUSSION_SAVE_RECEIPT_DDL = """
+-- discussion_save_receipt (Issue #452, Epic #443 §3.4/§3.6-§3.7): the
+-- idempotent-save-request ledger for an EXISTING domain "save" endpoint's
+-- optional `save_request_id` extension. Canonical contract: docs/01-
+-- specifications/capabilities/ai-discussion-adapter.md §3. Owned entirely by
+-- `app/discussion_save_receipts.py` -- no other module writes this table.
+--
+-- One row per `(system_id, save_request_id)` (the UNIQUE constraint IS the
+-- idempotency guarantee: two attempts under the same id can never both
+-- succeed as separate revisions). `request_digest` binds the id to ONE
+-- request body; a retry with the SAME id and a DIFFERENT digest is refused
+-- (409) rather than silently treated as a new attempt -- editing content
+-- after a failure is a NEW save request (a new id) by the Issue #452
+-- Decisions, never a reused id with different content. `revision_id` /
+-- `result_ref` are populated only once `status = 'succeeded'`, and are never
+-- cleared afterwards even if the referenced domain row is later superseded
+-- by a NEWER revision -- this row answers "what did THIS save request
+-- produce", not "what is current now".
+CREATE TABLE IF NOT EXISTS discussion_save_receipt (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id        INTEGER NOT NULL,
+    save_request_id  TEXT NOT NULL,
+    actor            TEXT,
+    target_kind      TEXT NOT NULL,
+    target_ref       TEXT NOT NULL,
+    -- Which domain save operation this id was used against (e.g.
+    -- 'ux_requirement.revision') -- never inferred from target_kind alone,
+    -- since one target_kind could grow more than one save operation later.
+    endpoint_kind    TEXT NOT NULL,
+    request_digest   TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
+    result_ref       TEXT NOT NULL DEFAULT '',
+    revision_id      INTEGER,
+    error_code       TEXT NOT NULL DEFAULT '',
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    UNIQUE (system_id, save_request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discussion_save_receipt_target
+    ON discussion_save_receipt (system_id, target_kind, target_ref, id DESC);
+"""
+
+# discussion_context_cursor / discussion_context_audit (Issue #458, Epic
+# #443 §9, DD-CTX-01..05): owned entirely by `app/discussion_context_bundle.
+# py` -- no other module writes either table. Canonical contract: docs/01-
+# specifications/capabilities/ai-discussion-adapter.md §9.1/§9.3.
+#
+# `discussion_context_cursor` is the SHORT-LIVED continuation for "関連情報を
+# 追加確認" (DD-CTX-03): one row per in-flight pagination position for one
+# section of one bundle, bound to System/thread/root/snapshot/dependency
+# manifest so a tampered, expired, foreign-System, or premise-moved token can
+# never silently resume as if nothing changed. The token itself carries no
+# client-decodable state (`secrets.token_urlsafe`) -- everything resumable
+# lives in this row, keyed by the token. Rows past `expires_at` (30 minutes,
+# `discussion_context_bundle.CONTEXT_CURSOR_TTL_SECONDS`) are deleted lazily
+# on the next mint (`_cleanup_expired_cursors`), the same lazy-cleanup
+# discipline `publish_connection_leases` already uses -- no separate cron.
+#
+# `discussion_context_audit` is the DURABLE record of "what dependency
+# manifest actually backed this turn/proposal/JU session's answer", kept
+# deliberately separate from the cursor above: a cursor's 30-minute expiry
+# must never delete the evidence a already-persisted turn/Proposal/Joint
+# Understanding session was built on (§9.3's "cursorとは別の監査として保持し、
+# 期限切れで監査を消さない"). `discussion_context_bundle.persist_context_
+# audit` is the only writer; #455/#459 call it when THEY persist their own
+# durable row, passing the finite `consumer_kind` of what they just wrote.
+# Rows here are never deleted by this Epic -- retention is an operational
+# decision for a later Issue, not an implicit side effect of this one.
+_DISCUSSION_CONTEXT_DDL = """
+CREATE TABLE IF NOT EXISTS discussion_context_cursor (
+    token                       TEXT PRIMARY KEY,
+    system_id                   INTEGER NOT NULL,
+    thread_id                   INTEGER NOT NULL,
+    root_target_kind            TEXT NOT NULL,
+    root_target_ref             TEXT NOT NULL,
+    root_digest                 TEXT NOT NULL DEFAULT '',
+    snapshot_id                 INTEGER,
+    bundle_digest               TEXT NOT NULL,
+    section_id                  TEXT NOT NULL,
+    -- Total entries returned for this section across every batch up to and
+    -- including this cursor's mint point -- informational bookkeeping only
+    -- (§9.1's `coverage.returned_count` on the NEXT response is computed
+    -- fresh from `visited_keys_json`, never by trusting this counter as an
+    -- offset to slice a re-derived list by position).
+    resume_offset               INTEGER NOT NULL DEFAULT 0,
+    -- Identity (`target_kind:target_ref`) of EVERY entry already returned
+    -- for this section, resolved or not -- the actual continuation state.
+    -- Re-deriving the candidate order at resume time and filtering by THIS
+    -- set (rather than slicing a fresh list by `resume_offset`) is what
+    -- keeps pagination correct when the walk is budget-interrupted between
+    -- calls: a candidate merely discovered-but-not-yet-fetched must stay
+    -- eligible for the next batch, while one already returned must not
+    -- reappear.
+    visited_keys_json           TEXT NOT NULL DEFAULT '[]',
+    dependency_manifest_json    TEXT NOT NULL DEFAULT '[]',
+    dependency_manifest_digest  TEXT NOT NULL DEFAULT '',
+    created_at                  REAL NOT NULL,
+    expires_at                  REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (thread_id) REFERENCES assistant_discussion_thread (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_discussion_context_cursor_expires
+    ON discussion_context_cursor (expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_discussion_context_cursor_thread
+    ON discussion_context_cursor (thread_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS discussion_context_audit (
+    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                    INTEGER NOT NULL,
+    consumer_kind                TEXT NOT NULL CHECK (consumer_kind IN (
+                                      'turn', 'proposal', 'ju_session')),
+    consumer_ref                 TEXT NOT NULL,
+    root_target_kind             TEXT NOT NULL,
+    root_target_ref              TEXT NOT NULL,
+    root_revision_id             INTEGER,
+    root_digest                  TEXT NOT NULL DEFAULT '',
+    snapshot_id                  INTEGER,
+    snapshot_commit_sha          TEXT,
+    bundle_digest                TEXT NOT NULL,
+    dependency_manifest_json     TEXT NOT NULL DEFAULT '[]',
+    dependency_manifest_digest   TEXT NOT NULL DEFAULT '',
+    created_at                   REAL NOT NULL,
+    schema_version                TEXT NOT NULL DEFAULT 'discussion-context-audit-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_discussion_context_audit_consumer
+    ON discussion_context_audit (system_id, consumer_kind, consumer_ref, id DESC);
+"""
+
+
+# joint_understanding_session (Epic #328 Phase A / Issue #329, extended by
+# Issue #461). Pulled out to a module-level constant for the same reason
+# `_SOLUTION_DESIGN_OPTION_DDL` / `_PRODUCT_GAP_ARTIFACT_LINK_DDL` are:
+# SQLite cannot add a CHECK constraint or drop a NOT NULL in place, so a
+# database created before Issue #461 must have this ONE table rebuilt once
+# (`_migrate_joint_understanding_session_owner_scope` below), and the rebuild
+# and the fresh-DB `SCHEMA` string must create byte-for-byte the same table
+# rather than two definitions that can drift apart.
+#
+# Issue #461 adds exactly two things here, both additive to the Issue #337
+# premise bundle this table already carried:
+#
+# - `owner_scope` / `discussion_thread_id`: a Joint Understanding session no
+#   longer has to belong to an `interview_session`. Every session Epic #328
+#   through #339 ever created is `owner_scope='interview'` with `session_id`
+#   resolving and `discussion_thread_id` NULL; a session opened from a
+#   Discussion hypothesis (Issue #455) is `owner_scope='discussion'` with
+#   `session_id` NULL and `discussion_thread_id` resolving instead. The CHECK
+#   below makes "both set" and "both missing" structurally unrepresentable --
+#   not merely rejected by the route that creates a row -- because a second
+#   insert path (a future migration, a script, #455's own endpoint) would
+#   otherwise have to remember to re-derive the same rule. `discussion_thread_
+#   id` carries no `ON DELETE` action: with `PRAGMA foreign_keys=ON` (the
+#   default connection setting) SQLite refuses to delete an
+#   `assistant_discussion_thread` row that a Joint Understanding session still
+#   references, the same "never silently lose judgement history" discipline
+#   Issue #461 decision 8 asks for, expressed structurally rather than by a
+#   cascade that would otherwise have to leave the CHECK's `discussion_thread_
+#   id IS NOT NULL` half unsatisfied.
+# - `premise_dependency_manifest_json` / `premise_dependency_manifest_digest`:
+#   an ADDITIONAL premise fact -- a manifest of `[{target_kind, target_ref,
+#   digest}]` references the investigation relied on beyond the origin
+#   itself, normalized/sorted/dedupe-rejected by
+#   `app/joint_premise.normalize_premise_manifest` and compared at read time
+#   by `app/joint_premise.evaluate_joint_premise` so that a changed dependency
+#   makes the session `stale` even when its own origin content did not move.
+#   Empty (`'[]'`) for every session that predates Issue #461 and for every
+#   one that never populates it (Issue #458 is what actually fills it), so
+#   the manifest check is a no-op for them -- exactly the pre-#461 behavior.
+_JOINT_UNDERSTANDING_SESSION_DDL = """
+CREATE TABLE IF NOT EXISTS joint_understanding_session (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_scope         TEXT NOT NULL DEFAULT 'interview',
+    session_id          INTEGER,
+    discussion_thread_id INTEGER,
+    system_id           INTEGER NOT NULL,
+    origin_kind         TEXT NOT NULL,
+    origin_id           INTEGER NOT NULL,
+    trigger             TEXT NOT NULL,
+    question_text       TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'open',
+    outcome             TEXT,
+    outcome_reason      TEXT,
+    -- Issue #332: which findings the recorded outcome rests on, and the
+    -- premise state evaluated at close time ('fresh' | 'stale'). An outcome
+    -- that adopts a hypothesis or records a decision must name its basis;
+    -- a stale premise (the interview session moved to a newer snapshot than
+    -- the one this session pinned) blocks adopt/decide entirely.
+    outcome_finding_ids TEXT NOT NULL DEFAULT '[]',
+    outcome_premise_state TEXT,
+    -- Issue #337: the reason code behind outcome_premise_state, and WHO
+    -- closed the session. A close is a manual decision, so the deciding
+    -- human and their stated reason must both survive a reload -- an
+    -- outcome with no recoverable decider is not an audit record.
+    outcome_premise_reason TEXT,
+    closed_by_actor_kind  TEXT,
+    closed_by_user_id     INTEGER,
+    closed_by_username    TEXT,
+    -- The premise bundle (Issue #337), sharing Issue #308's column names
+    -- because it is the same bundle: snapshot + pinned commit + origin
+    -- revision + origin content hash + confirmed Capability scope digest
+    -- (+ the linked Intent digest and the review-subject anchor where the
+    -- origin has them). premise_snapshot_id alone was never enough -- an
+    -- Intent correction or an Alignment rebuild moves the ground without
+    -- moving the snapshot, and a NULL premise was previously read as a
+    -- satisfied one. app/joint_premise.py evaluates them into the finite
+    -- current | stale | missing | invalid verdict; a bundle that cannot be
+    -- compared is 'invalid' and blocks the asserting outcomes.
+    premise_snapshot_id INTEGER,
+    premise_commit_sha  TEXT,
+    premise_revision_id INTEGER,
+    premise_content_hash TEXT,
+    premise_capability_digest TEXT,
+    premise_intent_digest TEXT,
+    premise_review_subject_id TEXT,
+    premise_tracking_version TEXT,
+    premise_captured_at REAL,
+    premise_dependency_manifest_json   TEXT NOT NULL DEFAULT '[]',
+    premise_dependency_manifest_digest TEXT,
+    schema_version      TEXT NOT NULL,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    closed_at           REAL,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
+    FOREIGN KEY (discussion_thread_id) REFERENCES assistant_discussion_thread (id),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (premise_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
+    FOREIGN KEY (premise_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL,
+    CHECK (owner_scope IN ('interview', 'discussion')),
+    CHECK (
+        (owner_scope = 'interview' AND session_id IS NOT NULL AND discussion_thread_id IS NULL)
+        OR
+        (owner_scope = 'discussion' AND session_id IS NULL AND discussion_thread_id IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_session
+    ON joint_understanding_session (session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_origin
+    ON joint_understanding_session (system_id, origin_kind, origin_id);
+
+CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_discussion_thread
+    ON joint_understanding_session (discussion_thread_id, status);
 """
 
 
@@ -3195,66 +3616,12 @@ CREATE INDEX IF NOT EXISTS idx_interview_inquiry_transition_inquiry
 -- (origin_kind/trigger/status/outcome/origin_role/claim_kind/action_kind/
 -- decision_method) is validated against the finite sets in
 -- app/joint_understanding.py before insert (Principle 6).
-CREATE TABLE IF NOT EXISTS joint_understanding_session (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id          INTEGER NOT NULL,
-    system_id           INTEGER NOT NULL,
-    origin_kind         TEXT NOT NULL,
-    origin_id           INTEGER NOT NULL,
-    trigger             TEXT NOT NULL,
-    question_text       TEXT NOT NULL,
-    status              TEXT NOT NULL DEFAULT 'open',
-    outcome             TEXT,
-    outcome_reason      TEXT,
-    -- Issue #332: which findings the recorded outcome rests on, and the
-    -- premise state evaluated at close time ('fresh' | 'stale'). An outcome
-    -- that adopts a hypothesis or records a decision must name its basis;
-    -- a stale premise (the interview session moved to a newer snapshot than
-    -- the one this session pinned) blocks adopt/decide entirely.
-    outcome_finding_ids TEXT NOT NULL DEFAULT '[]',
-    outcome_premise_state TEXT,
-    -- Issue #337: the reason code behind outcome_premise_state, and WHO
-    -- closed the session. A close is a manual decision, so the deciding
-    -- human and their stated reason must both survive a reload -- an
-    -- outcome with no recoverable decider is not an audit record.
-    outcome_premise_reason TEXT,
-    closed_by_actor_kind  TEXT,
-    closed_by_user_id     INTEGER,
-    closed_by_username    TEXT,
-    -- The premise bundle (Issue #337), sharing Issue #308's column names
-    -- because it is the same bundle: snapshot + pinned commit + origin
-    -- revision + origin content hash + confirmed Capability scope digest
-    -- (+ the linked Intent digest and the review-subject anchor where the
-    -- origin has them). premise_snapshot_id alone was never enough -- an
-    -- Intent correction or an Alignment rebuild moves the ground without
-    -- moving the snapshot, and a NULL premise was previously read as a
-    -- satisfied one. app/joint_premise.py evaluates them into the finite
-    -- current | stale | missing | invalid verdict; a bundle that cannot be
-    -- compared is 'invalid' and blocks the asserting outcomes.
-    premise_snapshot_id INTEGER,
-    premise_commit_sha  TEXT,
-    premise_revision_id INTEGER,
-    premise_content_hash TEXT,
-    premise_capability_digest TEXT,
-    premise_intent_digest TEXT,
-    premise_review_subject_id TEXT,
-    premise_tracking_version TEXT,
-    premise_captured_at REAL,
-    schema_version      TEXT NOT NULL,
-    created_at          REAL NOT NULL,
-    updated_at          REAL NOT NULL,
-    closed_at           REAL,
-    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE CASCADE,
-    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
-    FOREIGN KEY (premise_snapshot_id) REFERENCES repository_snapshots (id) ON DELETE SET NULL,
-    FOREIGN KEY (premise_revision_id) REFERENCES understanding_revision (id) ON DELETE SET NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_session
-    ON joint_understanding_session (session_id, status);
-
-CREATE INDEX IF NOT EXISTS idx_joint_understanding_session_origin
-    ON joint_understanding_session (system_id, origin_kind, origin_id);
+--
+-- Issue #461 extends this table with `owner_scope` / `discussion_thread_id`
+-- (a session may belong to a Discussion instead of an Interview) and a
+-- dependency reference manifest on the premise bundle; see
+-- `_JOINT_UNDERSTANDING_SESSION_DDL`'s own comment for the detail.
+""" + _JOINT_UNDERSTANDING_SESSION_DDL + """
 
 -- Append-only. A correction is a NEW row carrying supersedes_finding_id;
 -- existing rows are never UPDATEd or DELETEd, so an explanation can always
@@ -4092,7 +4459,7 @@ CREATE INDEX IF NOT EXISTS idx_question_handoff_system
 -- Probe Cell Fabric (Issue #297), Sub 1: Cell contract / Role Card / common
 -- state schema (Issue #298). See app/cell_fabric.py for the Pydantic
 -- contract layer and the "Probe Cell Fabric(Issue #297)" section of
--- docs/project-intelligence.md for the full epic design.
+-- docs/90-history/project-intelligence.md for the full epic design.
 --
 -- agent_role_cards is versioned and append-only per (system_id, role_key,
 -- version): a new revision is always a new row (UNIQUE constraint below
@@ -4155,7 +4522,7 @@ CREATE INDEX IF NOT EXISTS idx_cell_definitions_system
 -- Probe Cell Fabric (Issue #297), Sub 2: versioned Cell Binding and a
 -- read-only Probe Cell pilot (Issue #299). See app/cell_binding.py for the
 -- provenance/versioning/drift logic and the "Probe Cell Fabric(Issue #297)"
--- section of docs/project-intelligence.md for the full design.
+-- section of docs/90-history/project-intelligence.md for the full design.
 --
 -- cell_bindings rows are append-only VERSIONS: creating a new binding for a
 -- Cell never UPDATEs the content of a prior version's row -- it inserts a
@@ -4374,7 +4741,7 @@ CREATE INDEX IF NOT EXISTS idx_cell_escalations_status
 -- Probe Cell Fabric (Issue #297), Sub 4: 領域オーケストレーター (Issue #301).
 -- See app/cell_orchestrator.py for guardrail validation, the deterministic
 -- digest builder, and the reasoning triage; the "Probe Cell Fabric(Issue
--- #297)" section of docs/project-intelligence.md for the full epic design.
+-- #297)" section of docs/90-history/project-intelligence.md for the full epic design.
 --
 -- cell_roster_events: append-only audit of every roster change made through
 -- the explicit PUT /cell-fabric/cells/{cell_id}/roster endpoint (creation is
@@ -4428,7 +4795,7 @@ CREATE INDEX IF NOT EXISTS idx_cell_triage_results_cell
 -- stratified sampling, the deterministic verdict + fail-closed reasoning
 -- explanation, the daily audit budget gate, and the quality-floor
 -- suspend/resume logic; the "Probe Cell Fabric(Issue #297)" section of
--- docs/project-intelligence.md for the full epic design.
+-- docs/90-history/project-intelligence.md for the full epic design.
 --
 -- cell_quality_configs: one row per (system, Cell). sample_rate/audit_rate/
 -- quality_floor are fractions in [0.0, 1.0]; strata_json is a JSON array of
@@ -4548,7 +4915,7 @@ CREATE TABLE IF NOT EXISTS cell_quality_usage (
 -- Probe Cell Fabric (Issue #297), Sub 5: Root Orchestrator と統合ダイジェスト
 -- (Issue #303). See app/cell_root.py for the deterministic digest builder and
 -- ask lifecycle, and the "Probe Cell Fabric(Issue #297)" section of
--- docs/project-intelligence.md for the full epic design.
+-- docs/90-history/project-intelligence.md for the full epic design.
 --
 -- cell_asks: a human-decidable Ask surfaced by the root digest, created from
 -- (a) an open sev1/sev2 cell_escalations row or (b) a cell_triage_results row
@@ -4603,7 +4970,7 @@ CREATE INDEX IF NOT EXISTS idx_cell_asks_status
 -- machine, the canary evidence gate, parent/human approval gates, rubric
 -- ownership, the consecutive-rejection auto-suspend circuit breaker, and the
 -- fail-closed reasoning hypothesis draft; the "Probe Cell Fabric(Issue #297)"
--- section of docs/project-intelligence.md for the full epic design.
+-- section of docs/90-history/project-intelligence.md for the full epic design.
 --
 -- cell_improvements: one row per improvement hypothesis. There is NO DELETE
 -- endpoint anywhere in this module -- a rejected row is permanent history,
@@ -4708,7 +5075,7 @@ CREATE INDEX IF NOT EXISTS idx_cell_shadow_decisions_improvement
 
 -- ---------------------------------------------------------------------------
 -- State-driven System Interview workflow (Issue #349, implementing the
--- docs/system-interview-workflow-ux.md spec written by Issue #342/#343-#346).
+-- docs/01-specifications/ux/system-interview-workflow-ux.md spec written by Issue #342/#343-#346).
 --
 -- These five tables are exactly the four persisted facts §8.1 declares
 -- missing (A: diff review completion, B: system-process running/failure
@@ -4854,7 +5221,7 @@ CREATE INDEX IF NOT EXISTS idx_interview_session_status_audit_session
     ON interview_session_status_audit (session_id, id DESC);
 
 -- ---------------------------------------------------------------------------
--- Purpose Chain relation decisions (Issue #388, docs/purpose-chain.md §1.5).
+-- Purpose Chain relation decisions (Issue #388, docs/01-specifications/product/purpose-chain.md §1.5).
 --
 -- The ONLY thing #388 persists. Elements and relations themselves are a pure
 -- projection over existing rows (Intent Brief items, understanding_revision
@@ -4870,7 +5237,7 @@ CREATE INDEX IF NOT EXISTS idx_interview_session_status_audit_session
 -- TIME, so a later content change can be detected (`recheck_state = 'stale'`)
 -- WITHOUT invalidating the decision row itself -- the audit fact "a human
 -- confirmed this relation, given these exact endpoint contents, at this
--- time" must survive every later edit, exactly as docs/purpose-chain.md
+-- time" must survive every later edit, exactly as docs/01-specifications/product/purpose-chain.md
 -- §1.5 states: "決定は上書きされず、digest が動いても削除されない".
 --
 -- `relation_id` is the STABLE string id `purpose_chain.py` derives
@@ -4911,7 +5278,7 @@ CREATE INDEX IF NOT EXISTS idx_purpose_relation_decision_session
     ON purpose_relation_decision (session_id, id DESC);
 
 -- ---------------------------------------------------------------------------
--- Purpose Needs responses (Issue #389, docs/purpose-chain.md §2.6).
+-- Purpose Needs responses (Issue #389, docs/01-specifications/product/purpose-chain.md §2.6).
 --
 -- The developer's answer/defer/investigate to ONE derived Purpose Chain need
 -- (`app/purpose_needs.py`). Needs themselves are never persisted -- they are
@@ -4984,7 +5351,7 @@ CREATE INDEX IF NOT EXISTS idx_purpose_need_response_session
 
 -- ---------------------------------------------------------------------------
 -- Purpose Verification: Experience Hypothesis / Outcome Criterion / Reuse
--- Hypothesis (Issue #391, docs/purpose-chain.md §4).
+-- Hypothesis (Issue #391, docs/01-specifications/product/purpose-chain.md §4).
 --
 -- Three OPTIONAL concepts a developer may attach to one Purpose Chain
 -- element or relation, by the same STABLE STRING identity `purpose_chain.py`
@@ -5079,7 +5446,7 @@ CREATE INDEX IF NOT EXISTS idx_purpose_reuse_hypothesis_target
 
 -- 成果証拠. `measure` / `baseline_value` / `target_value` / `observation_window`
 -- are the four fields `purpose_chain._resolution_level` checks for L3
--- (docs/purpose-chain.md §4.4) -- all plain developer-authored text.
+-- (docs/01-specifications/product/purpose-chain.md §4.4) -- all plain developer-authored text.
 --
 -- `experiment_id` / `candidate_version_id` are §4.3's explicit lineage
 -- columns: intentionally NOT enforced by a FOREIGN KEY (a deleted
@@ -5152,7 +5519,7 @@ CREATE INDEX IF NOT EXISTS idx_purpose_outcome_criterion_target
 -- Evolution Node Fabric (Epic #394 Phase 1, Issue #396). See app/evolution_node.py
 -- for the pure finite-transition evaluator and the persistence/projection
 -- layer built on these five tables, and the "Evolution Node" section of
--- docs/evolutionary-pipeline.md for the full design.
+-- docs/01-specifications/capabilities/evolutionary-pipeline.md for the full design.
 --
 -- An Evolution Node is a NEW canonical entity, deliberately NOT a version-up
 -- of the Probe Cell (cell_definitions/cell_bindings, Issue #297/#299): the
@@ -5361,7 +5728,7 @@ CREATE INDEX IF NOT EXISTS idx_evolution_node_link_lookup
 -- Node. This is what makes a drifted STORED evolution_node.maturity value
 -- detectable: app/evolution_node.py's fold_events() replays every
 -- event_kind='transition' row in id order and must reproduce the stored
--- maturity, exactly as ADR-4 (docs/evolutionary-pipeline.md) requires -- a
+-- maturity, exactly as ADR-4 (docs/01-specifications/capabilities/evolutionary-pipeline.md) requires -- a
 -- table that only stored the current maturity would have no way to notice
 -- a bad UPDATE outside the module ever happened.
 --
@@ -6223,14 +6590,14 @@ CREATE INDEX IF NOT EXISTS idx_node_reopen_handoff_event
     ON node_reopen_handoff_event (handoff_id, id ASC);
 
 -- =============================================================================
--- UX Design Lineage (Epic #405). See docs/ux-design-lineage.md for the full
+-- UX Design Lineage (Epic #405). See docs/01-specifications/ux/ux-design-lineage.md for the full
 -- contract; this comment block only orients a reader of the schema itself.
 --
 -- Issue #407 (Journey / Requirement / Artifact, 10 tables below) and Issue
 -- #408 (Solution Design, 5 tables further down) are the only new canonical
 -- entities this Epic adds. Everything above/below them in this file --
 -- Purpose Chain, Capability, Flow, Evolution Node, Component, Probe Cell --
--- is READ, never copied: `docs/ux-design-lineage.md` §0 invariant 1 forbids
+-- is READ, never copied: `docs/01-specifications/ux/ux-design-lineage.md` §0 invariant 1 forbids
 -- a second understanding model, and §1 explains why THIS layer nonetheless
 -- stores content while Purpose Chain does not -- Journey / Requirement /
 -- Solution Design text cannot be re-derived from any existing row, so it has
@@ -6638,7 +7005,7 @@ CREATE INDEX IF NOT EXISTS idx_ux_design_decision_subject
     ON ux_design_decision (system_id, subject_kind, subject_key, id DESC);
 
 -- ---------------------------------------------------------------------------
--- Solution Design (Epic #405, Issue #408). See docs/ux-design-lineage.md §3.
+-- Solution Design (Epic #405, Issue #408). See docs/01-specifications/ux/ux-design-lineage.md §3.
 --
 -- Requirement -> Solution Design -> {Capability, static_flow, runtime_flow,
 -- Evolution Node, Component, Cell, Probe Point} is the second half of this
@@ -6808,7 +7175,7 @@ CREATE INDEX IF NOT EXISTS idx_solution_design_target_link_target
 
 -- ---------------------------------------------------------------------------
 -- Execution Modes and the Flow experiment orchestrator (Epic #412).
--- Canonical contract: docs/execution-modes.md. Domain layers:
+-- Canonical contract: docs/01-specifications/capabilities/execution-modes.md. Domain layers:
 -- app/execution_mode.py (#413) and app/flow_orchestration.py (#415).
 -- Issue #414's projection is derived from existing rows and adds NO table.
 --
@@ -6823,7 +7190,7 @@ CREATE INDEX IF NOT EXISTS idx_solution_design_target_link_target
 
 -- execution_mode_assignment: append-only. Two record kinds, because "the
 -- window a human set has elapsed" and "a human explicitly ended this
--- assignment" are two different answers (docs/execution-modes.md EM-ADR-2).
+-- assignment" are two different answers (docs/01-specifications/capabilities/execution-modes.md EM-ADR-2).
 -- An `expired` assign row clamps the resolved mode to `fixed` instead of
 -- letting a broader scope's `propose` take over -- otherwise the deadline the
 -- human set would stop nothing. A `revoke` row lets normal inheritance
@@ -6908,7 +7275,7 @@ CREATE INDEX IF NOT EXISTS idx_execution_mode_observation_node
 -- Every field the completeness gate requires is NOT NULL here so a proposal
 -- that is missing its baseline, quality floor, isolation strategy, cost cap,
 -- stop conditions or rollback plan cannot exist as a row at all. The finite
--- rejection codes live in app/flow_orchestration.py (docs/execution-modes.md
+-- rejection codes live in app/flow_orchestration.py (docs/01-specifications/capabilities/execution-modes.md
 -- §7.1); the schema is the second line of that defence, not the first.
 CREATE TABLE IF NOT EXISTS flow_experiment_proposal (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7053,7 +7420,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_experiment_execution_ref_target
 -- could be attached to a hand-written proposal for Flow B and would then
 -- read as reasoning-model output about B. An unverified pointer is not
 -- provenance (Principle 7), and this is the row that makes the pointer
--- verifiable (docs/execution-modes.md §7.1.3).
+-- verifiable (docs/01-specifications/capabilities/execution-modes.md §7.1.3).
 --
 -- One row per drafting run, written for a FAILED run too: what a run was
 -- about is a fact about the attempt, not about its outcome. `input_digest`
@@ -7082,7 +7449,7 @@ CREATE INDEX IF NOT EXISTS idx_flow_experiment_draft_system
 
 -- =============================================================================
 -- Stakeholder Value Network (Epic #418, Issue #420). See
--- docs/stakeholder-value-network.md for the full contract; this comment
+-- docs/01-specifications/product/stakeholder-value-network.md for the full contract; this comment
 -- block only orients a reader of the schema itself.
 --
 -- Four new canonical entities (Stakeholder / Stakeholder Need / Environment
@@ -7664,7 +8031,7 @@ CREATE INDEX IF NOT EXISTS idx_journey_step_exchange_link_step
 
 -- =============================================================================
 -- Product Objective / Milestone / Gap / Feature (Epic #427, Issues #429-#431).
--- docs/product-objective-lineage.md is the canonical contract; §-references in
+-- docs/01-specifications/product/product-objective-lineage.md is the canonical contract; §-references in
 -- the comments below point into it. This layer sits between Vision (existing,
 -- #351/#387) and UX Journey (existing, #405): it holds the "intermediate
 -- goal on the way to Vision", "the observable/judgeable arrival state for
@@ -8638,7 +9005,9 @@ CREATE INDEX IF NOT EXISTS idx_product_feature_decision_system
 CREATE INDEX IF NOT EXISTS idx_product_feature_decision_feature
     ON product_feature_decision (feature_id, id DESC);
 
-""" + _PRODUCT_GAP_ARTIFACT_LINK_DDL + _ASSISTANT_DISCUSSION_DDL + _ASSISTANT_DISCUSSION_PROPOSAL_DDL
+""" + _PRODUCT_GAP_ARTIFACT_LINK_DDL + _ASSISTANT_DISCUSSION_DDL + _ASSISTANT_DISCUSSION_PROPOSAL_DDL \
+    + _ASSISTANT_DISCUSSION_HYPOTHESIS_DDL \
+    + _DISCUSSION_SAVE_RECEIPT_DDL + _DISCUSSION_CONTEXT_DDL
 
 
 _SCOPED_TABLES = [
@@ -9380,7 +9749,7 @@ def _report_artifact_migration(
 def _migrate_ux_journey_upstream_ref_kinds(conn: sqlite3.Connection) -> None:
     """Widen `ux_journey_upstream_ref.ref_kind` to accept Product Objective /
     Milestone / Gap references (Issue #427/#431,
-    docs/product-objective-lineage.md §7.1).
+    docs/01-specifications/product/product-objective-lineage.md §7.1).
 
     The table shipped with `ref_kind` CHECKed to exactly `purpose_element` /
     `purpose_relation` / `capability_entity`. This Epic adds three more
@@ -9443,15 +9812,225 @@ def _migrate_ux_journey_upstream_ref_kinds(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_assistant_discussion_thread_target_kinds(conn: sqlite3.Connection) -> None:
+    """Widen `assistant_discussion_thread.target_kind` with Issue #453's
+    (Epic #443 Phase 4) 8 Vision-to-Feature kinds
+    (`docs/01-specifications/capabilities/ai-discussion-adapter.md` §4.1).
+
+    The table shipped with `target_kind` CHECKed to exactly the 9 kinds
+    Epic #436/#444 registered. SQLite cannot ALTER a CHECK constraint in
+    place, and `CREATE TABLE IF NOT EXISTS` cannot repair a table that
+    already exists in its earlier form, so the table is rebuilt once,
+    preserving every existing row and every existing `target_kind` value
+    unchanged -- a pure vocabulary widening, never a row rewrite, the same
+    discipline `_migrate_ux_journey_upstream_ref_kinds` just above already
+    applies to the same defect shape.
+
+    `assistant_discussion_turn.thread_id` and `joint_understanding_session.
+    discussion_thread_id` both hold a foreign key against this table's `id`
+    -- copying every row with its ORIGINAL `id` (never re-autoincrementing)
+    is what keeps every existing turn and every existing Joint Understanding
+    session pointed at the correct thread after the rebuild.
+
+    Detection is STRUCTURAL and idempotent, the same discipline every sibling
+    migration in this file uses: read the table's stored SQL straight from
+    `sqlite_master` and no-op the moment the CHECK already contains
+    `'product_feature'` (the last of the 8 new values). There is no version
+    flag to drift from the schema it describes.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'assistant_discussion_thread'"
+    ).fetchone()
+    if row is None or row["sql"] is None:
+        return
+    if "'product_feature'" in row["sql"]:
+        return
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE assistant_discussion_thread RENAME TO assistant_discussion_thread_legacy;
+        -- A rename carries the table's indexes with it, so their NAMES stay
+        -- taken and the DDL's `CREATE INDEX IF NOT EXISTS` below would
+        -- silently do nothing -- leaving the rebuilt table with no index at
+        -- all. Free the name first (`_migrate_ux_journey_upstream_ref_kinds`'s
+        -- own reason).
+        DROP INDEX IF EXISTS idx_assistant_discussion_thread_system;
+        """
+    )
+    conn.executescript(_ASSISTANT_DISCUSSION_DDL)
+    conn.execute(
+        """
+        INSERT INTO assistant_discussion_thread (
+            id, system_id, thread_key, scope, screen_id, target_kind, target_ref,
+            target_title, captured_target_revision_id, captured_target_digest,
+            status, created_by, created_at, updated_at, schema_version
+        )
+        SELECT
+            id, system_id, thread_key, scope, screen_id, target_kind, target_ref,
+            target_title, captured_target_revision_id, captured_target_digest,
+            status, created_by, created_at, updated_at, schema_version
+        FROM assistant_discussion_thread_legacy
+        """
+    )
+    conn.executescript(
+        """
+        DROP TABLE assistant_discussion_thread_legacy;
+        PRAGMA foreign_keys = ON;
+        """
+    )
+
+
+def _migrate_assistant_discussion_proposal_item_children(conn: sqlite3.Connection) -> None:
+    """Widen the item contract while preserving child values, IDs and prefill FKs.
+
+    Both pre-child and pre-Gap-reference databases are supported. The rebuild
+    is atomic; a failed copy leaves the old table intact. No audit row is deleted.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='assistant_discussion_proposal_item'"
+    ).fetchone()
+    if row is None or not row["sql"] or "'artifact_link'" in row["sql"]:
+        return
+    columns = [r["name"] for r in conn.execute("PRAGMA table_info(assistant_discussion_proposal_item)")]
+    column_sql = ", ".join('"' + c.replace('"', '""') + '"' for c in columns)
+    try:
+        conn.executescript(
+            "PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON; BEGIN IMMEDIATE;"
+            "ALTER TABLE assistant_discussion_proposal_item RENAME TO assistant_discussion_proposal_item_legacy;"
+            "DROP INDEX IF EXISTS idx_assistant_discussion_proposal_item_system;"
+            "DROP INDEX IF EXISTS idx_assistant_discussion_proposal_item_proposal;"
+            + _ASSISTANT_DISCUSSION_PROPOSAL_DDL
+            + f"INSERT INTO assistant_discussion_proposal_item ({column_sql}) SELECT {column_sql} FROM assistant_discussion_proposal_item_legacy;"
+            "DROP TABLE assistant_discussion_proposal_item_legacy; COMMIT;"
+        )
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_joint_understanding_session_owner_scope(conn: sqlite3.Connection) -> None:
+    """Add `owner_scope` / `discussion_thread_id`, drop `session_id`'s NOT
+    NULL, and add the dependency-manifest premise columns (Issue #461).
+
+    Every pre-#461 row is `owner_scope='interview'`: its `session_id`
+    already resolves an `interview_session`, so nothing about what the row
+    MEANS changes. `CREATE TABLE IF NOT EXISTS` cannot add a CHECK
+    constraint or relax a NOT NULL on a table that already exists, so a
+    database created before Issue #461 must have this table rebuilt once,
+    preserving every id, every FK target, and every existing column value
+    exactly.
+
+    Detection is STRUCTURAL and idempotent, the same discipline
+    `_migrate_solution_design_option_unique` /
+    `_migrate_ux_journey_upstream_ref_kinds` use: read the table's stored SQL
+    straight from `sqlite_master` and no-op the moment it already declares
+    `owner_scope`. There is no version flag to drift from the schema it
+    describes.
+
+    Seven other tables carry a `joint_understanding_id REFERENCES
+    joint_understanding_session (id) ON DELETE CASCADE` FK (finding / action /
+    hypothesis_adoption / investigation_round / exploration_source /
+    translation / reflux). By default SQLite's `ALTER TABLE ... RENAME TO`
+    rewrites every OTHER table's stored FK clause to keep pointing at the
+    renamed table under its NEW name -- so a plain rename-then-recreate here
+    would leave all seven referencing the `_legacy` table this function is
+    about to drop, silently breaking their cascade delete without touching a
+    single row of THEIRS (verified empirically: the child rows survive a
+    parent delete once its FK target no longer exists). `PRAGMA
+    legacy_alter_table=ON` for the rename alone disables that rewrite, so the
+    child tables keep referencing the bare, unqualified name
+    `joint_understanding_session` -- which resolves to the newly (re)created
+    table the moment this function creates it, with no fix-up needed on the
+    seven child tables at all.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'joint_understanding_session'"
+    ).fetchone()
+    if row is None or row["sql"] is None:
+        return
+    if "owner_scope" in row["sql"]:
+        return
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        PRAGMA legacy_alter_table = ON;
+        ALTER TABLE joint_understanding_session RENAME TO joint_understanding_session_legacy;
+        PRAGMA legacy_alter_table = OFF;
+        -- A rename carries the table's indexes with it, so their NAMES stay
+        -- taken and the DDL's `CREATE INDEX IF NOT EXISTS` below would
+        -- silently do nothing -- leaving the rebuilt table with no index at
+        -- all, which is worse than the old one being stale. Free the names
+        -- first, the same reason every other table-rebuild migration here
+        -- does.
+        DROP INDEX IF EXISTS idx_joint_understanding_session_session;
+        DROP INDEX IF EXISTS idx_joint_understanding_session_origin;
+        """
+    )
+    conn.executescript(_JOINT_UNDERSTANDING_SESSION_DDL)
+    conn.execute(
+        """
+        INSERT INTO joint_understanding_session (
+            id, owner_scope, session_id, discussion_thread_id, system_id,
+            origin_kind, origin_id, trigger, question_text, status, outcome,
+            outcome_reason, outcome_finding_ids, outcome_premise_state,
+            outcome_premise_reason, closed_by_actor_kind, closed_by_user_id,
+            closed_by_username, premise_snapshot_id, premise_commit_sha,
+            premise_revision_id, premise_content_hash,
+            premise_capability_digest, premise_intent_digest,
+            premise_review_subject_id, premise_tracking_version,
+            premise_captured_at, premise_dependency_manifest_json,
+            premise_dependency_manifest_digest, schema_version, created_at,
+            updated_at, closed_at
+        )
+        SELECT
+            id, 'interview', session_id, NULL, system_id,
+            origin_kind, origin_id, trigger, question_text, status, outcome,
+            outcome_reason, outcome_finding_ids, outcome_premise_state,
+            outcome_premise_reason, closed_by_actor_kind, closed_by_user_id,
+            closed_by_username, premise_snapshot_id, premise_commit_sha,
+            premise_revision_id, premise_content_hash,
+            premise_capability_digest, premise_intent_digest,
+            premise_review_subject_id, premise_tracking_version,
+            premise_captured_at, '[]',
+            NULL, schema_version, created_at,
+            updated_at, closed_at
+        FROM joint_understanding_session_legacy
+        """
+    )
+    conn.executescript(
+        """
+        DROP TABLE joint_understanding_session_legacy;
+        PRAGMA foreign_keys = ON;
+        """
+    )
+
+
 def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
+        # Must run BEFORE `executescript(SCHEMA)`: the rebuilt table's own
+        # `_JOINT_UNDERSTANDING_SESSION_DDL` declares a NEW index on the NEW
+        # `discussion_thread_id` column, and `CREATE INDEX IF NOT EXISTS`
+        # against a legacy table that does not have that column yet is an
+        # OperationalError -- unlike a CHECK-only widening, this migration
+        # adds a column an index depends on, so it cannot wait until after
+        # the unconditional schema pass the way the other rebuild migrations
+        # below do.
+        _migrate_joint_understanding_session_owner_scope(conn)
         conn.executescript(SCHEMA)
         _migrate_canonical_execution_authorization(conn)
         _migrate_flow_execution_ref_uniqueness(conn)
         _migrate_solution_design_option_unique(conn)
         _migrate_ux_journey_upstream_ref_kinds(conn)
         _migrate_product_gap_artifact_link_kinds(conn)
+        _migrate_assistant_discussion_thread_target_kinds(conn)
+        _migrate_assistant_discussion_proposal_item_children(conn)
         _migrate_intelligence_runs_snapshot_nullable(conn)
         install_intelligence_run_type_guards(conn)
         _migrate_cell_improvement_event_types(conn)
@@ -10145,7 +10724,7 @@ def init_db() -> None:
         # Issue #367: the server-side redaction audit summary. Additive and
         # never backfilled -- an existing row's NULL means "this row was
         # stored before ingestion-time redaction existed", which is exactly
-        # the population the operational rescan in docs/secret-redaction.md
+        # the population the operational rescan in docs/01-specifications/platform/secret-redaction.md
         # is for. Backfilling it here would erase that distinction.
         trace_cols = _columns(conn, "traces")
         if trace_cols:
@@ -10193,6 +10772,41 @@ def init_db() -> None:
                 _add_column_if_missing(
                     conn, "stabilization_package", stabilization_cols,
                     column, definition,
+                )
+        # Issue #445 (Epic #443 Phase 2, docs/01-specifications/capabilities/ai-discussion-adapter.md §2.7):
+        # three audit-only columns recording whether a USER turn referenced
+        # an unsaved UI draft, and which one -- never the draft's own field
+        # VALUES (the whole point of this phase is that draft content is
+        # never persisted). NULL on a pre-#445 row means "this server could
+        # not have recorded it", a FOURTH, distinct meaning from
+        # ui_draft_state='not_provided' (the client explicitly sent none)
+        # that must never be collapsed into it -- the same discipline
+        # `traces.redaction_json`'s NULL carries (CLAUDE.md Principle 9).
+        turn_cols = _columns(conn, "assistant_discussion_turn")
+        if turn_cols:
+            for column, definition in (
+                (
+                    "ui_draft_state",
+                    "TEXT CHECK (ui_draft_state IS NULL OR ui_draft_state IN "
+                    "('not_provided', 'applied', 'no_unsaved_changes', 'unsupported', 'unreadable'))",
+                ),
+                ("ui_draft_form_id", "TEXT"),
+                ("ui_draft_digest", "TEXT"),
+                # Issue #459 (Epic #457, docs/01-specifications/capabilities/ai-discussion-adapter.md §9.2):
+                # the durable record of one §9.2 照合 (matching) call's
+                # structured claims, persisted on the ASSISTANT turn it
+                # produced -- so reload restores it exactly like any other
+                # turn (docs/01-specifications/ux/decision-discussion-workflow.md §5's reload row), with no
+                # second table duplicating turn history. NULL on every
+                # pre-#459 row and on a normal `/assistant/ask` turn (both
+                # mean "no §9.2 claims were ever attached to this turn",
+                # which `[]` cannot distinguish from "attached and empty" --
+                # empty is itself impossible here since a claims call always
+                # returns at least one claim or fails outright).
+                ("claims_json", "TEXT"),
+            ):
+                _add_column_if_missing(
+                    conn, "assistant_discussion_turn", turn_cols, column, definition
                 )
         _migrate_alignment_manual_recheck_targets(conn)
         _ensure_legacy_system(conn)
@@ -10288,7 +10902,7 @@ def _enforce_auth_requirement() -> None:
     """Fail closed on startup when auth is required but cannot be enabled.
 
     `CONTROL_REQUIRE_AUTH=true` is meant for production deployments (see
-    docs/deployment-https.md): if no admin user exists (bootstrap did not run
+    docs/04-operations/deployment-https.md): if no admin user exists (bootstrap did not run
     or already ran without credentials) and `CONTROL_API_KEYS` is empty, the
     server would otherwise start in the fail-open "no auth" MVP-compat mode.
     Refuse to start instead, with an explicit error. The default

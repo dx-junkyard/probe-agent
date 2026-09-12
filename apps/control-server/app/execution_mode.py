@@ -1,7 +1,7 @@
 """Execution modes: the canonical contract and the fail-closed capability gate
 (Epic #412, Issue #413).
 
-Canonical contract: `docs/execution-modes.md`. Read §0 before touching this
+Canonical contract: `docs/01-specifications/capabilities/execution-modes.md`. Read §0 before touching this
 area.
 
 The execution mode is the **fifth independent axis** (`docs/evolutionary-

@@ -1,7 +1,7 @@
 // Issue #409 (Epic #405): the UX Design Studio.
 //
 // Dashboard-only -- no new endpoint, no server judgement re-derived here
-// (`docs/ux-design-lineage.md` §0 invariant 9). Four levels of progressive
+// (`docs/01-specifications/ux/ux-design-lineage.md` §0 invariant 9). Four levels of progressive
 // disclosure (§4.2): Journey list -> a Journey's Step sequence ->
 // the Requirements linked to a Step -> the adopted Solution Design and its
 // implementation targets. The three tabs below are the three top-level
@@ -16,6 +16,7 @@
 // two are unrelated screens; do not merge their copy or their routes.
 
 import { useState } from "react";
+import { useUiDraftRegistry } from "@/lib/ui-draft";
 import { useSearchParams } from "react-router-dom";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
@@ -90,14 +91,26 @@ function NextDecisionCard({
 }
 
 export default function UxDesignStudioPage() {
+  const drafts = useUiDraftRegistry();
   const [searchParams, setSearchParams] = useSearchParams();
-  const initialTab = searchParams.get("tab");
+  const initialTab = searchParams.get("tab") ?? (searchParams.has("design") ? "solutions" : searchParams.has("requirement") ? "requirements" : "journeys");
   const [tab, setTab] = useState<StudioTab>(isStudioTab(initialTab) ? initialTab : "journeys");
   const [journeyKey, setJourneyKey] = useState<string | null>(searchParams.get("journey"));
   const [requirementKey, setRequirementKey] = useState<string | null>(searchParams.get("requirement"));
   const [designKey, setDesignKey] = useState<string | null>(searchParams.get("design"));
+  // An assistant deep link can change the target while this page stays mounted.
+  const [observedSearch, setObservedSearch] = useState(searchParams.toString());
+  if (observedSearch !== searchParams.toString()) {
+    setObservedSearch(searchParams.toString());
+    setTab(isStudioTab(initialTab) ? initialTab : "journeys");
+    setJourneyKey(searchParams.get("journey"));
+    setRequirementKey(searchParams.get("requirement"));
+    setDesignKey(searchParams.get("design"));
+  }
+
 
   function goToTab(next: StudioTab) {
+    if (drafts?.confirmDiscard?.() === false) return;
     setTab(next);
     const params = new URLSearchParams(searchParams);
     params.set("tab", next);
@@ -105,6 +118,7 @@ export default function UxDesignStudioPage() {
   }
 
   function openRequirement(key: string) {
+    if (drafts?.confirmDiscard?.() === false) return;
     setRequirementKey(key);
     const params = new URLSearchParams(searchParams);
     params.set("requirement", key);
@@ -114,6 +128,7 @@ export default function UxDesignStudioPage() {
   }
 
   function openSolutionDesign(key: string) {
+    if (drafts?.confirmDiscard?.() === false) return;
     setDesignKey(key);
     const params = new URLSearchParams(searchParams);
     params.set("design", key);
@@ -123,6 +138,7 @@ export default function UxDesignStudioPage() {
   }
 
   function selectJourney(key: string | null) {
+    if (drafts?.confirmDiscard?.() === false) return;
     setJourneyKey(key);
     const params = new URLSearchParams(searchParams);
     if (key) params.set("journey", key);
@@ -131,6 +147,7 @@ export default function UxDesignStudioPage() {
   }
 
   function selectRequirement(key: string | null) {
+    if (drafts?.confirmDiscard?.() === false) return;
     setRequirementKey(key);
     const params = new URLSearchParams(searchParams);
     if (key) params.set("requirement", key);
@@ -139,6 +156,7 @@ export default function UxDesignStudioPage() {
   }
 
   function selectSolutionDesign(key: string | null) {
+    if (drafts?.confirmDiscard?.() === false) return;
     setDesignKey(key);
     const params = new URLSearchParams(searchParams);
     if (key) params.set("design", key);
@@ -147,6 +165,7 @@ export default function UxDesignStudioPage() {
   }
 
   function goToNextDecision(nextTab: StudioTab, key: string | null) {
+    if (drafts?.confirmDiscard?.() === false) return;
     const params = new URLSearchParams(searchParams);
     if (key !== null) {
       if (nextTab === "journeys") {

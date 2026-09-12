@@ -31,6 +31,7 @@ import type {
   UxRequirementListOut, UxRequirementOut, UxRequirementDetailOut,
   UxRequirementCreateRequest, UxRequirementRevisionCreateRequest,
   UxRequirementStepLinkCreateRequest, UxRequirementStepLinkOut,
+  DiscussionSaveReceiptOut,
   UxArtifactReferenceCreateRequest, UxArtifactReferenceOut,
   UxDesignDecisionCreateRequest, UxDesignDecisionOut,
   SolutionDesignListOut, SolutionDesignOut, SolutionDesignDetailOut,
@@ -80,6 +81,12 @@ import type {
   AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
   AssistantSettingsMetadataOut,
   AssistantDiscussionTargetIn, AssistantDiscussionThreadDetailOut, AssistantDiscussionThreadsListOut,
+  DiscussionContextBundle, DiscussionContextExpansionRequest, DiscussionContextExpansionOut,
+  DiscussionContextClaimsRequest, DiscussionContextClaimsResultOut,
+  AssistantDiscussionProposal, AssistantDiscussionProposalsListOut,
+  AssistantDiscussionProposalApplyOut, AssistantDiscussionProposalRejectOut,
+  AssistantDiscussionProposalPrefillOut,
+  AssistantDiscussionHypothesisPromoteOut, AssistantDiscussionJointUnderstandingListOut,
   UiHelpEntriesOut, UiHelpEntry,
   ConnectivityStatusOut,
   InstrumentationScanOut, ProbePatternsListOut, ProbePatternOut,
@@ -2462,11 +2469,14 @@ export function useAssistantDiscussionThread(target: AssistantDiscussionTargetIn
   });
 }
 
-export function useAssistantDiscussionThreadDetail(threadId: number | null) {
+export function useAssistantDiscussionThreadDetail(threadId: number | null, activity?: {
+  has_unsaved_ui_draft: boolean; save_result_unknown: boolean; save_reference_id?: string;
+}) {
+  const params = activity ? new URLSearchParams(Object.entries(activity).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])) : null;
   return useQuery({
-    queryKey: [...sysKey("assistant-discussion-thread-detail"), threadId],
+    queryKey: [...sysKey("assistant-discussion-thread-detail"), threadId, ...(params ? [params.toString()] : [])],
     queryFn: () =>
-      api.get<AssistantDiscussionThreadDetailOut>(`/assistant/discussion-threads/${threadId}`),
+      api.get<AssistantDiscussionThreadDetailOut>(`/assistant/discussion-threads/${threadId}${params ? `?${params}` : ""}`),
     enabled: threadId !== null && !!getSystemId(),
     staleTime: 0,
     retry: false,
@@ -2478,6 +2488,10 @@ export function useAssistantDiscussionThreads(filters: {
   scope?: string;
   targetKind?: string;
   targetRef?: string;
+  // Issue #444 §1.6: the "他の画面での会話" count only wants this listing
+  // scoped to one target -- an unfiltered call is a valid use of this
+  // endpoint but must never fire implicitly just because the panel mounted.
+  enabled?: boolean;
 } = {}) {
   const params = new URLSearchParams();
   if (filters.screenId) params.set("screen_id", filters.screenId);
@@ -2491,7 +2505,179 @@ export function useAssistantDiscussionThreads(filters: {
       api.get<AssistantDiscussionThreadsListOut>(
         query ? `/assistant/discussion-threads?${query}` : "/assistant/discussion-threads",
       ),
-    enabled: !!getSystemId(),
+    enabled: (filters.enabled ?? true) && !!getSystemId(),
+  });
+}
+
+// Discussion context bundle (Issue #458, Epic #443 §9, DD-CTX-01..05):
+// cross-target context for a thread's own root, built ONLY from registered
+// `discussion_adapters` relation resolvers (§9.1). `useDiscussionContextBundle`
+// is a plain query -- opening/reopening the panel always re-fetches the
+// CURRENT bundle rather than reusing a stale one. `useExpandDiscussionContext`
+// is the explicit "追加取得" action (§9's DD-CTX-03): the caller must supply
+// the EXACT `bundle_digest`/`continuation` from the bundle it currently has
+// on screen, so a delayed response for an object the developer already
+// navigated away from is bound to that stale bundle_digest and never
+// silently merged into whatever bundle is on screen now.
+
+export function useDiscussionContextBundle(threadId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-context-bundle"), threadId],
+    queryFn: () =>
+      api.get<DiscussionContextBundle>(`/assistant/discussion-threads/${threadId}/context-bundle`),
+    enabled: threadId !== null && !!getSystemId(),
+    staleTime: 0,
+    retry: false,
+  });
+}
+
+export function useExpandDiscussionContext(threadId: number | null) {
+  // Deliberately does NOT invalidate/refetch `useDiscussionContextBundle`:
+  // that would silently discard this exact merge result (returned_count for
+  // just the new batch) and refetch a brand-new initial bundle instead. The
+  // caller merges `data.bundle`'s section entries into what it already has
+  // on screen -- it owns that merge because only it knows which bundle
+  // (bound to which root) is currently displayed (§9.1: "UIは要求時の
+  // root/bundleにbindする").
+  return useMutation({
+    mutationFn: (payload: DiscussionContextExpansionRequest) =>
+      api.post<DiscussionContextExpansionOut>(
+        `/assistant/discussion-threads/${threadId}/context-expansions`, payload,
+      ),
+  });
+}
+
+// §9.2 semantic claims (Issue #459). `app/discussion_claims.py` is the sole
+// producer; this call ALSO appends a user/assistant turn pair and refreshes
+// the thread's `next_action` server-side, so both thread queries are
+// invalidated on success -- the panel that triggered this is not the only
+// reader of "what turn came out of this" (the message list is).
+export function useCreateDiscussionContextClaims(threadId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: DiscussionContextClaimsRequest = {}) =>
+      api.post<DiscussionContextClaimsResultOut>(
+        `/assistant/discussion-threads/${threadId}/context-claims`, payload,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-thread") });
+      qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-thread-detail") });
+    },
+  });
+}
+
+// Assistant discussion proposals (Issue #439, Epic #436; #446 adds prefill,
+// Epic #443 Phase 3). docs/ai-discussion-adapter.md §3.1: the Dashboard's
+// STANDARD route is generate -> review -> prefill; `useApplyDiscussionProposal
+// Items` is kept for the compatibility direct-apply path (§2.2 of
+// docs/assistant-discussion.md), not the one the UI leads with.
+
+export function useDiscussionProposals(threadId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-proposals"), threadId],
+    queryFn: () =>
+      api.get<AssistantDiscussionProposalsListOut>(
+        `/assistant/discussion-threads/${threadId}/proposals`,
+      ),
+    enabled: threadId !== null && !!getSystemId(),
+  });
+}
+
+export function useDiscussionProposal(proposalId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-proposal"), proposalId],
+    queryFn: () => api.get<AssistantDiscussionProposal>(`/assistant/discussion-proposals/${proposalId}`),
+    enabled: proposalId !== null && !!getSystemId(),
+  });
+}
+
+export function useCreateDiscussionProposal(threadId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.post<AssistantDiscussionProposal>(`/assistant/discussion-threads/${threadId}/proposals`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposals"), threadId] });
+    },
+  });
+}
+
+export function useApplyDiscussionProposalItems(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { item_ids: number[]; rationale?: string }) =>
+      api.post<AssistantDiscussionProposalApplyOut>(
+        `/assistant/discussion-proposals/${proposalId}/apply`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+    },
+  });
+}
+
+export function useRejectDiscussionProposalItems(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { item_ids: number[]; rationale?: string }) =>
+      api.post<AssistantDiscussionProposalRejectOut>(
+        `/assistant/discussion-proposals/${proposalId}/reject`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+    },
+  });
+}
+
+// §3.4: the prefill AUDIT call -- writes only the audit row, the item's own
+// `status` stays `proposed`. The caller (the review UI) still invalidates
+// the DESTINATION target's own queries via `adapter.invalidateKeys` after a
+// successful dispatch; this hook only refreshes the proposal itself so its
+// `prefill_count`/`last_prefilled_at` reflect the just-made dispatch.
+export function usePrefillDiscussionProposalItems(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { item_ids: number[]; form_id: string; patch_token: string }) =>
+      api.post<AssistantDiscussionProposalPrefillOut>(
+        `/assistant/discussion-proposals/${proposalId}/prefill`,
+        data,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+    },
+  });
+}
+
+// Hypothesis -> Joint Understanding bridge (Issue #455, Epic #443 §6.2/§6.3).
+// `usePromoteDiscussionHypothesis`'s caller mints `request_id` (an
+// idempotency key -- a retry with the SAME id is a no-op success, a
+// DIFFERENT hypothesis under the SAME id is a 409 the caller must surface,
+// never silently retried with a fresh id on its own).
+
+export function usePromoteDiscussionHypothesis(proposalId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { hypothesis_id: number; request_id: string }) =>
+      api.post<AssistantDiscussionHypothesisPromoteOut>(
+        `/assistant/discussion-proposals/${proposalId}/hypotheses/${data.hypothesis_id}/promote`,
+        { request_id: data.request_id },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [...sysKey("assistant-discussion-proposal"), proposalId] });
+      qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-joint-understanding") });
+    },
+  });
+}
+
+export function useDiscussionJointUnderstanding(threadId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-discussion-joint-understanding"), threadId],
+    queryFn: () =>
+      api.get<AssistantDiscussionJointUnderstandingListOut>(
+        `/assistant/discussion-threads/${threadId}/joint-understanding`,
+      ),
+    enabled: threadId !== null && !!getSystemId(),
   });
 }
 
@@ -3213,6 +3399,9 @@ function _invalidateJointUnderstanding(
   sessionId: number | null,
   juId: number,
 ) {
+  qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-joint-understanding") });
+  qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-thread") });
+  qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-thread-detail") });
   qc.invalidateQueries({ queryKey: [...sysKey("jointUnderstanding"), juId] });
   if (sessionId) {
     qc.invalidateQueries({ queryKey: [...sysKey("jointUnderstandingList"), sessionId] });
@@ -3261,10 +3450,10 @@ export function useCreateJointUnderstanding(sessionId: number | null) {
 export function useInvestigateJointUnderstanding(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ juId, maxRounds }: { juId: number; maxRounds?: number }) =>
+    mutationFn: ({ juId, maxRounds, researchFocus }: { juId: number; maxRounds?: number; researchFocus?: string }) =>
       api.post<import("@/api/types").JointUnderstandingInvestigateOut>(
         `/joint-understanding/${juId}/investigate`,
-        maxRounds ? { max_rounds: maxRounds } : {},
+        { ...(maxRounds ? { max_rounds: maxRounds } : {}), ...(researchFocus ? { research_focus: researchFocus } : {}) },
       ),
     onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
   });
@@ -3361,7 +3550,7 @@ export function useResumeJointUnderstanding(sessionId: number | null) {
 // --- State-driven System Interview workflow (Issue #349) ---------------------
 //
 // One query owns the developer-facing state: the server evaluates
-// docs/system-interview-workflow-ux.md §2.2 and returns the state, its single
+// docs/01-specifications/ux/system-interview-workflow-ux.md §2.2 and returns the state, its single
 // primary action, and the currently-active exceptions. The dashboard must not
 // compute a workflow state from a mutation's `isPending` or any other
 // client-only value -- those disappear on reload (spec §2.6).
@@ -3563,7 +3752,7 @@ export function useOverview() {
 
 // --- Purpose Chain (Issue #387 Epic / #388 / #389 / #390) -------------------
 //
-// `docs/purpose-chain.md` §0 invariant 2: the client re-derives no Purpose
+// `docs/01-specifications/product/purpose-chain.md` §0 invariant 2: the client re-derives no Purpose
 // Chain judgement. These queries fetch the server's canonical projection
 // verbatim; `components/purpose-chain/model.ts` only orders and labels what
 // the server already decided.
@@ -3678,7 +3867,7 @@ export function useRespondPurposeNeed(sessionId: number | null) {
 //
 // §4.5's restraint: ONE query for the at-most-one prompt, ONE mutation to
 // create the concept the prompt named. There is no listing/dashboard hook
-// here on purpose -- `docs/purpose-chain.md` §4.5 and this Epic's non-goals
+// here on purpose -- `docs/01-specifications/product/purpose-chain.md` §4.5 and this Epic's non-goals
 // explicitly rule out an outcome dashboard or a retention chart; the only
 // UI surface is the single prompt inside the Purpose Frame panel.
 
@@ -3863,7 +4052,7 @@ export function useTransitionEvolutionNode(nodeId: number | null) {
 
 // --- UX Design Lineage (Epic #405, Issues #407/#408/#409) --------------------
 //
-// `docs/ux-design-lineage.md` §0 invariant 9: the client re-derives no
+// `docs/01-specifications/ux/ux-design-lineage.md` §0 invariant 9: the client re-derives no
 // state. Every `Ux*Out` / `SolutionDesign*Out` field below (design_status,
 // recheck_state, revision_state, every ref/link state, diffs, and the
 // change-origin classification) arrives already decided by these endpoints;
@@ -4059,7 +4248,29 @@ export function useAddUxRequirementRevision(requirementKey: string | null) {
       api.post<UxRequirementDetailOut>(
         `/ux-design/requirements/${encodeURIComponent(requirementKey ?? "")}/revisions`, body,
       ),
-    onSuccess: () => invalidateUxDesign(qc),
+    onSuccess: () => {
+      invalidateUxDesign(qc);
+      qc.invalidateQueries({ queryKey: sysKey("discussion-save-request") });
+      qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-thread-detail") });
+    },
+  });
+}
+
+/**
+ * Issue #452 §3.7's result-query API: "応答不明時は同じ ID で照会 / 再試行す
+ * る". `enabled` gating is the caller's own choice (typically "only when a
+ * save actually failed or the response was lost") -- this hook does not
+ * poll on its own. A 404 (`discussion_save_request_not_found`) means the id
+ * has never reached the server; the caller treats that as "safe to retry
+ * with a fresh attempt under the same id", never as a success.
+ */
+export function useDiscussionSaveRequest(saveRequestId: string | null, options?: { enabled?: boolean }) {
+  return useQuery<DiscussionSaveReceiptOut>({
+    queryKey: [...sysKey("discussion-save-request"), saveRequestId],
+    queryFn: () =>
+      api.get<DiscussionSaveReceiptOut>(`/ux-design/save-requests/${encodeURIComponent(saveRequestId ?? "")}`),
+    enabled: saveRequestId !== null && (options?.enabled ?? true),
+    retry: false,
   });
 }
 
@@ -4454,7 +4665,7 @@ export function useFunctionalLineage() {
 
 // === Epic #427 / Issue #431 — Product Feature hooks ===
 //
-// `docs/product-objective-lineage.md` §7.2. The Feature layer had a complete
+// `docs/01-specifications/product/product-objective-lineage.md` §7.2. The Feature layer had a complete
 // server (`/product-features`) and no editing surface at all, which left the
 // Overview's `link_requirement_to_feature` next step with nowhere to be
 // completed. These hooks back the Requirement -> Feature control on the UX
@@ -4524,7 +4735,7 @@ export function useAddProductFeatureRequirementLink(featureKey: string | null) {
 
 // === Epic #427 / Issue #432 — Objective Map / Gap Workbench hooks ===
 //
-// `docs/product-objective-lineage.md` §9. Both projections are read-only and
+// `docs/01-specifications/product/product-objective-lineage.md` §9. Both projections are read-only and
 // re-derive nothing (§0 invariant 10); `components/product-objective/model.ts`
 // is the only place that filters, labels, or walks the Objective tree. Write
 // mutations below invalidate both projections AND the Overview, whose

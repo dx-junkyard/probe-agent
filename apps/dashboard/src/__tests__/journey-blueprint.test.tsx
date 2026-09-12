@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 // Issue #423 (Epic #418): Journey Service Blueprint Dashboard tests.
 //
-// `docs/stakeholder-value-network.md` §0 invariant 9 is what every test here
+// `docs/01-specifications/product/stakeholder-value-network.md` §0 invariant 9 is what every test here
 // protects: the client re-derives no lane state, no diff, no staleness --
 // it only renders what `GET /journey-blueprint` / `.../diff` already
 // decided. Pure classification/grouping is unit-tested directly against

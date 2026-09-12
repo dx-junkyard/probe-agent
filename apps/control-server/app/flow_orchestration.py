@@ -1,7 +1,7 @@
 """Flow experiment orchestration: proposal, human approval, execution
 references and promotion candidates (Epic #412, Issue #415).
 
-Canonical contract: `docs/execution-modes.md` §7 (plus §1.3, §8.4, §9.3 and
+Canonical contract: `docs/01-specifications/capabilities/execution-modes.md` §7 (plus §1.3, §8.4, §9.3 and
 §10). Read §0 before touching this area.
 
 This module is the control plane's **planning ledger**, not an executor. Five

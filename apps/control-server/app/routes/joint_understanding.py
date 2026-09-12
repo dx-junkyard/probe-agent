@@ -117,6 +117,7 @@ from ..models import (
     JointUnderstandingListOut,
     JointUnderstandingOptionOut,
     JointUnderstandingOut,
+    JointUnderstandingPremiseDependencyRefOut,
     JointUnderstandingRefluxOut,
     JointUnderstandingRefluxResultOut,
     JointUnderstandingRoundOut,
@@ -204,6 +205,31 @@ def _column(row, name: str):
     return row[name] if name in row.keys() else None
 
 
+def _raise_origin_unsupported(exc: JointPremiseError):
+    """Translate an origin-resolution failure into a clean, catchable 503.
+
+    Issue #461: `origin_kind='discussion'` resolves through a pluggable
+    provider (Issue #455 registers it), and every read of a session's
+    premise now passes through that resolution. Before this, `_origin_facts`
+    could only raise on a value that never reached persistence (an unknown
+    `origin_kind`), so nothing here needed to catch it. An unregistered
+    provider is a REAL, reachable state (until #455 lands, or if it is ever
+    rolled back), and letting it surface as an unhandled 500 through every
+    endpoint that reads a session's premise -- instead of one clean, finite
+    error -- is exactly the "provider未接続を対応済みと宣言しない" failure
+    mode decision 4 exists to prevent going the other way: this must fail
+    LOUDLY, not silently, but it must still fail through the ordinary
+    HTTPException path.
+    """
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": "joint_understanding_origin_unsupported",
+            "message": str(exc),
+        },
+    )
+
+
 def _current_origin_id(conn, ju_row) -> Optional[int]:
     """The origin row that is current today, for a consumer matching the session.
 
@@ -214,7 +240,10 @@ def _current_origin_id(conn, ju_row) -> Optional[int]:
     an answer revision, which is exactly the "a later step must not cost
     something the developer already had" rule this epic is built on.
     """
-    facts = resolve_premise_facts(conn, ju_row)
+    try:
+        facts = resolve_premise_facts(conn, ju_row)
+    except JointPremiseError as exc:
+        _raise_origin_unsupported(exc)
     if facts is None or facts.current_origin_id is None:
         return ju_row["origin_id"]
     return facts.current_origin_id
@@ -232,7 +261,24 @@ def _premise_verdict(conn, ju_row):
     or a superseded Inquiry at all -- none of which move the snapshot id.
     Every consumer here now reads the same verdict from the same rows.
     """
-    return evaluate_session_premise(conn, ju_row)
+    try:
+        return evaluate_session_premise(conn, ju_row)
+    except JointPremiseError as exc:
+        _raise_origin_unsupported(exc)
+
+
+def _dependency_manifest_out(row) -> List[JointUnderstandingPremiseDependencyRefOut]:
+    raw = _column(row, "premise_dependency_manifest_json")
+    if not raw:
+        return []
+    try:
+        entries = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    try:
+        return [JointUnderstandingPremiseDependencyRefOut(**e) for e in entries]
+    except (TypeError, ValueError):
+        return []
 
 
 def _session_out(row, verdict=None, current_origin_id=None) -> JointUnderstandingOut:
@@ -240,8 +286,10 @@ def _session_out(row, verdict=None, current_origin_id=None) -> JointUnderstandin
     reason = verdict.reason_code if verdict is not None else "premise_not_captured"
     return JointUnderstandingOut(
         id=row["id"],
-        session_id=row["session_id"],
+        session_id=_column(row, "session_id"),
         system_id=row["system_id"],
+        owner_scope=_column(row, "owner_scope") or "interview",
+        discussion_thread_id=_column(row, "discussion_thread_id"),
         origin_kind=row["origin_kind"],
         origin_id=row["origin_id"],
         trigger=row["trigger"],
@@ -263,6 +311,8 @@ def _session_out(row, verdict=None, current_origin_id=None) -> JointUnderstandin
         premise_revision_id=_column(row, "premise_revision_id"),
         premise_tracking_version=_column(row, "premise_tracking_version"),
         premise_captured_at=_column(row, "premise_captured_at"),
+        premise_dependency_manifest=_dependency_manifest_out(row),
+        premise_dependency_manifest_digest=_column(row, "premise_dependency_manifest_digest"),
         schema_version=row["schema_version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -1958,18 +2008,29 @@ def reflux_joint_understanding(
             # read. Before this, a non-'qa' origin's facts reached the reflux
             # ledger and stopped there -- recorded, attributable, and invisible
             # to every consumer that could have used them.
-            publish_joint_understanding_finding(
-                conn,
-                system_id=system_id,
-                session_id=ju["session_id"],
-                joint_understanding_id=ju_id,
-                origin_kind=ju["origin_kind"],
-                origin_id=target_id or ju["origin_id"],
-                finding_row=finding,
-                premise_snapshot_id=_column(ju, "premise_snapshot_id"),
-                premise_commit_sha=_column(ju, "premise_commit_sha"),
-                now=now,
-            )
+            #
+            # Issue #461: `understanding_evidence_feed.session_id` is NOT
+            # NULL (it feeds three interview-owned rebuilds --
+            # understanding_build / alignment_build / inquiry_answer -- none
+            # of which a discussion-origin session's own hypothesis content
+            # is input to), so a discussion-scope session (`session_id IS
+            # NULL`) skips this publish rather than crashing on it. The
+            # `joint_understanding_reflux` row above already recorded the
+            # attachment -- this feed is an ADDITIONAL fan-out to interview
+            # rebuild consumers a discussion-origin fact has none of.
+            if ju["session_id"] is not None:
+                publish_joint_understanding_finding(
+                    conn,
+                    system_id=system_id,
+                    session_id=ju["session_id"],
+                    joint_understanding_id=ju_id,
+                    origin_kind=ju["origin_kind"],
+                    origin_id=target_id or ju["origin_id"],
+                    finding_row=finding,
+                    premise_snapshot_id=_column(ju, "premise_snapshot_id"),
+                    premise_commit_sha=_column(ju, "premise_commit_sha"),
+                    now=now,
+                )
 
         rows = [
             conn.execute(

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://probe-agent.dev/schemas/joint_understanding.json",
   "title": "JointUnderstandingExchange",
-  "description": "The handoff contract between system investigation, translation, and the developer for one Joint Understanding session (Epic #328 Phase A / Issue #329). A session starts when a developer answers 「わからない」 (trigger=unknown_answer) or explicitly asks to work something out together (explicit_request) about an existing confirmation item, and accumulates append-only findings plus the finite next actions the developer chose. Three provenances are kept strictly apart and never merged into one 'answer': investigation owns technical facts and their snapshot evidence, translation owns purpose/impact wording that may only reference existing findings, and the developer owns value judgements. The session itself never writes the origin item's answer/intent/decision -- 「わからない」 is an entry point into a shared investigation, never a recorded developer intent.",
+  "description": "The handoff contract between system investigation, translation, and the developer for one Joint Understanding session (Epic #328 Phase A / Issue #329). A session starts when a developer answers 「わからない」 (trigger=unknown_answer), explicitly asks to work something out together (explicit_request) about an existing confirmation item, or responds unknown/investigate to a Purpose Need (trigger=purpose_need, Issue #389 / #444 §1.9), and accumulates append-only findings plus the finite next actions the developer chose. Three provenances are kept strictly apart and never merged into one 'answer': investigation owns technical facts and their snapshot evidence, translation owns purpose/impact wording that may only reference existing findings, and the developer owns value judgements. The session itself never writes the origin item's answer/intent/decision -- 「わからない」 is an entry point into a shared investigation, never a recorded developer intent.",
   "type": "object",
   "required": ["schema_version", "session", "findings", "actions"],
   "additionalProperties": false,
@@ -26,29 +26,40 @@
     "session": {
       "type": "object",
       "required": [
-        "id", "system_id", "session_id", "origin_kind", "origin_id",
+        "id", "system_id", "owner_scope", "session_id", "discussion_thread_id",
+        "origin_kind", "origin_id",
         "trigger", "question_text", "status", "outcome", "outcome_is_provisional",
         "outcome_reason", "outcome_finding_ids", "outcome_premise_state",
-        "premise_state", "premise_snapshot_id", "schema_version",
-        "created_at", "updated_at", "closed_at"
+        "premise_state", "premise_snapshot_id",
+        "premise_dependency_manifest", "premise_dependency_manifest_digest",
+        "schema_version", "created_at", "updated_at", "closed_at"
       ],
       "additionalProperties": false,
       "properties": {
         "id": { "type": "integer", "minimum": 1 },
         "system_id": { "type": "integer", "minimum": 1 },
+        "owner_scope": {
+          "enum": ["interview", "discussion"],
+          "description": "Issue #461: a session's owner is either an Interview (session_id resolves, discussion_thread_id is null) or a Discussion (discussion_thread_id resolves, session_id is null; Issue #455, no owning Interview at all). Exactly one of session_id/discussion_thread_id is non-null, fixed by this value."
+        },
         "session_id": {
-          "type": "integer",
+          "type": ["integer", "null"],
           "minimum": 1,
-          "description": "The owning interview_session. A Joint Understanding session is always scoped to one interview session and one System."
+          "description": "The owning interview_session, when owner_scope=interview. Null when owner_scope=discussion (Issue #461) -- a Discussion-origin session has no owning Interview at all."
+        },
+        "discussion_thread_id": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Issue #461: the owning assistant_discussion_thread, when owner_scope=discussion. Null when owner_scope=interview."
         },
         "origin_kind": {
-          "enum": ["qa", "intent", "review_item", "inquiry"],
-          "description": "Which confirmation item the developer could not answer. The origin row is only ever READ."
+          "enum": ["qa", "intent", "review_item", "inquiry", "purpose_need", "discussion"],
+          "description": "Which confirmation item the developer could not answer. The origin row is only ever READ. 'purpose_need' (Issue #389) is a computed Purpose Need target rather than a row in one of the other origin tables -- its origin_id is the purpose_need_response id. 'discussion' (Issue #461) is the odd one out: its origin_id is a Discussion hypothesis (Issue #455) resolved through a pluggable provider, and it is the only origin_kind owner_scope=discussion may carry."
         },
         "origin_id": { "type": "integer", "minimum": 1 },
         "trigger": {
-          "enum": ["unknown_answer", "explicit_request"],
-          "description": "unknown_answer: the developer said 「わからない」. explicit_request: the developer asked to work it out together without having said so."
+          "enum": ["unknown_answer", "explicit_request", "purpose_need", "discussion_promotion"],
+          "description": "unknown_answer: the developer said 「わからない」. explicit_request: the developer asked to work it out together without having said so. purpose_need: a Purpose Need response of unknown/investigate opened the session (Issue #389 / #444 §1.9). discussion_promotion: the developer promoted a Discussion hypothesis into a Joint Understanding session (Issue #455, Epic #443 §6.2) -- written only by that bridge endpoint, never by the generic create request body."
         },
         "question_text": {
           "type": "string",
@@ -128,6 +139,15 @@
         },
         "premise_tracking_version": { "type": ["string", "null"], "maxLength": 64 },
         "premise_captured_at": { "type": ["number", "null"] },
+        "premise_dependency_manifest": {
+          "type": "array",
+          "description": "Issue #461: additional [{target_kind, target_ref, digest}] references the investigation relied on beyond the origin itself, stably sorted by (target_kind, target_ref) and deduplicated at capture time. Empty for every session that predates this field or never populates it -- the staleness check this feeds is then a structural no-op, matching pre-#461 behavior exactly.",
+          "items": { "$ref": "#/$defs/premise_dependency_ref" }
+        },
+        "premise_dependency_manifest_digest": {
+          "type": ["string", "null"],
+          "description": "SHA-256 of the UTF-8 canonical JSON of premise_dependency_manifest (app/joint_premise.compute_premise_manifest_digest). A real, stable value for an explicitly empty manifest too (EMPTY_DEPENDENCY_MANIFEST_DIGEST) for every session captured through this module's capture_premise_bundle. Null only on a row migrated from before Issue #461, which never computed one."
+        },
         "schema_version": { "const": "joint-understanding-v1" },
         "created_at": { "type": "number" },
         "updated_at": { "type": "number" },
@@ -171,6 +191,28 @@
           "then": {
             "properties": { "outcome_finding_ids": { "minItems": 1 } },
             "required": ["outcome_finding_ids"]
+          }
+        },
+        {
+          "if": { "properties": { "owner_scope": { "const": "interview" } }, "required": ["owner_scope"] },
+          "then": {
+            "properties": {
+              "session_id": { "type": "integer", "minimum": 1 },
+              "discussion_thread_id": { "type": "null" }
+            },
+            "required": ["session_id", "discussion_thread_id"]
+          },
+          "description": "Issue #461: exactly one owning reference resolves, fixed by owner_scope. The same rule is a table-level CHECK constraint on joint_understanding_session (app/db.py), not only a schema-level one."
+        },
+        {
+          "if": { "properties": { "owner_scope": { "const": "discussion" } }, "required": ["owner_scope"] },
+          "then": {
+            "properties": {
+              "session_id": { "type": "null" },
+              "discussion_thread_id": { "type": "integer", "minimum": 1 },
+              "origin_kind": { "const": "discussion" }
+            },
+            "required": ["session_id", "discussion_thread_id", "origin_kind"]
           }
         }
       ]
@@ -339,9 +381,23 @@
         "pinned_commit_changed",
         "origin_content_changed",
         "capability_scope_changed",
-        "linked_intent_changed"
+        "linked_intent_changed",
+        "dependency_manifest_unresolved",
+        "dependency_target_removed",
+        "dependency_content_changed"
       ],
-      "description": "Issue #337: the single finite reason behind a non-'current' premise verdict, in first-match order. Split by recovery path: a stale premise can be re-investigated, a missing one cannot be recovered at all, and an uncaptured one was never comparable."
+      "description": "Issue #337: the single finite reason behind a non-'current' premise verdict, in first-match order. Split by recovery path: a stale premise can be re-investigated, a missing one cannot be recovered at all, and an uncaptured one was never comparable. Issue #461 adds the dependency reference manifest axis: 'unresolved' means no resolver attempted the check at all (never treated as current), distinct from a resolver confirming a target changed or was removed."
+    },
+    "premise_dependency_ref": {
+      "type": "object",
+      "required": ["target_kind", "target_ref", "digest"],
+      "additionalProperties": false,
+      "description": "Issue #461: one entry of the dependency reference manifest, shared with Issue #458's context bundle via app/joint_premise.normalize_premise_manifest / compute_premise_manifest_digest.",
+      "properties": {
+        "target_kind": { "type": "string", "minLength": 1 },
+        "target_ref": { "type": "string", "minLength": 1 },
+        "digest": { "type": "string", "minLength": 1 }
+      }
     },
     "evidence": {
       "type": "object",
