@@ -425,6 +425,9 @@ class TestRegistryCorrespondence:
             ("blueprint_lane_cell", "exchange_link"): (journey_blueprint, "add_exchange_link"),
             ("product_objective", "upstream_ref"): (product_objective, "add_objective_upstream_ref"),
             ("product_milestone", "milestone_dependency"): (product_objective, "add_milestone_dependency"),
+            ("product_gap", "source_ref"): (product_objective, "add_gap_source_ref"),
+            ("product_gap", "evidence_ref"): (product_objective, "add_gap_evidence_ref"),
+            ("product_gap", "artifact_link"): (product_objective, "add_gap_artifact_link"),
             ("product_feature", "requirement_link"): (product_feature, "add_requirement_link"),
             ("product_feature", "capability_link"): (product_feature, "add_capability_link"),
             ("product_feature", "target_link"): (product_feature, "add_target_link"),
@@ -1805,3 +1808,82 @@ class TestChildSystemIsolation:
 
         r = _apply(admin_client, headers_b, proposal["id"], [item["id"]], expect=404)
         assert r.status_code == 404
+
+class TestEpic457AcceptanceAudit:
+    def _gap_proposal(self, client, monkeypatch, *, relations=()):
+        token = _login(client)
+        system = _create_system(client, token)
+        headers = _headers(token, system['id'])
+        _add_objective(client, headers, 'audit-objective')
+        _add_objective_revision(client, headers, 'audit-objective', title='目的A')
+        _add_milestone(client, headers, 'audit-objective', 'audit-milestone')
+        _add_gap(client, headers, 'audit-milestone', 'audit-gap')
+        thread = _create_thread(client, headers, scope='entity', screen_id='objective-map',
+                                target_kind='product_gap', target_ref='audit-gap')['thread']
+        llm = _FixedResponseClient({
+            'summary': '監査', 'confirmed_points': [], 'unresolved_questions': [], 'assumptions': [],
+            'evidence_refs': [], 'field_changes': [
+                {'field_name': 'current_state', 'subject_ref': '', 'current_value': '',
+                 'proposed_value': '改善対象を確認', 'rationale': '確認済みの範囲'}],
+            'relation_changes': list(relations),
+        })
+        _enable_real_llm(monkeypatch, llm)
+        proposal = _generate_proposal(client, headers, thread['id'])
+        return headers, proposal, llm
+
+    def test_dependency_change_blocks_proposal_even_when_root_is_unchanged(self, admin_client, monkeypatch):
+        headers, proposal, llm = self._gap_proposal(admin_client, monkeypatch)
+        assert 'coverage_bundle' in llm.calls[0][1]['content']
+        assert 'joint_understanding' in llm.calls[0][1]['content']
+        before = _get_gap(admin_client, headers, 'audit-gap')
+        _add_objective_revision(admin_client, headers, 'audit-objective', title='目的B')
+        updated = _get_proposal(admin_client, headers, proposal['id'])
+        assert all(i['eligibility'] == 'stale' for i in updated['items'])
+        _apply(admin_client, headers, proposal['id'], [proposal['items'][0]['id']], expect=422)
+        assert _get_gap(admin_client, headers, 'audit-gap')['current_revision_id'] == before['current_revision_id']
+
+    def test_gap_evidence_relation_uses_domain_and_does_not_resolve_gap(self, admin_client, monkeypatch):
+        headers, proposal, _ = self._gap_proposal(admin_client, monkeypatch, relations=[{
+            'relation_kind': 'evidence_ref', 'relation_target_kind': 'human_report',
+            'relation_target_ref': 'report:review-1', 'subject_ref': '', 'proposed_value': '', 'rationale': '利用者の報告',
+        }])
+        before = _get_gap(admin_client, headers, 'audit-gap')
+        item = _item_by_relation(proposal, 'evidence_ref')
+        _apply(admin_client, headers, proposal['id'], [item['id']])
+        after = _get_gap(admin_client, headers, 'audit-gap')
+        assert after['lifecycle'] == before['lifecycle']
+        assert after['priority_band'] == before['priority_band']
+        assert any(e['evidence_ref'] == 'report:review-1' for e in after['evidence_refs'])
+
+    def test_gap_artifact_requirement_is_in_bundle_and_dependency_manifest(self, admin_client, monkeypatch):
+        headers, proposal, _ = self._gap_proposal(admin_client, monkeypatch)
+        _create_requirement(admin_client, headers, 'linked-requirement')
+        _add_requirement_revision(admin_client, headers, 'linked-requirement', statement='入力を守る')
+        r = admin_client.post('/product-gaps/audit-gap/artifact-links', headers=headers,
+                              json={'link_kind': 'ux_requirement', 'target_ref': 'linked-requirement'})
+        assert r.status_code == 201, r.text
+        r = admin_client.get(f"/assistant/discussion-threads/{proposal['thread_id']}/context-bundle", headers=headers)
+        assert r.status_code == 200, r.text
+        bundle = r.json()
+        assert any(d['target_kind'] == 'ux_requirement' and d['target_ref'] == 'linked-requirement'
+                   for d in bundle['dependencies'])
+        source = next(s for s in bundle['sources'] if s['target_kind'] == 'ux_requirement')
+        assert 'tab=requirements' in source['deep_link']
+
+
+def test_translated_verification_label_is_not_an_appliable_enum():
+    from app.llm import LLMConfig
+    payload = {'summary': 'review', 'confirmed_points': [], 'unresolved_questions': [],
+               'assumptions': [], 'evidence_refs': [], 'field_changes': [], 'relation_changes': [],
+               'child_changes': [_child_change('acceptance_criterion', 'add', client_temp_key='new',
+                    field_name='verification_method', proposed_value='手動検証')]}
+    client = _FixedResponseClient(payload)
+    result = assistant_discussion_proposal.generate_proposal(
+        client, LLMConfig(provider='openai', model='gpt-5', api_key='test', base_url=None, timeout=30),
+        target_kind='ux_requirement', target_ref='req', target_title='Requirement', turns=[], target_facts={})
+    assert result.error_kind == 'invalid_registry'
+    assert 'manual_review' in client.calls[0][1]['content']
+    item = {'item_kind': 'field', 'child_kind': 'acceptance_criterion', 'child_intent': 'add',
+            'field_name': 'verification_method', 'proposed_value': '手動検証'}
+    assert assistant_discussion_proposal.evaluate_item_eligibility(
+        {'target_kind': 'ux_requirement'}, item, [item], None) == 'forbidden'

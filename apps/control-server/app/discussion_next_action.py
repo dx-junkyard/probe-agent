@@ -162,7 +162,7 @@ def evaluate_gap_discussion_next_action(facts: GapDiscussionFacts) -> NextAction
     elif facts.investigation_running:
         return NextActionResult(
             kind="processing",
-            reason="調査が進行中です。結果が出るまで開いて確認できます。",
+            reason="共同調査が開いています。調査の実行・結果を確認してください。",
             target_ref=str(facts.ju_session_id) if facts.ju_session_id else None,
             degraded_sections=tuple(degraded),
         )

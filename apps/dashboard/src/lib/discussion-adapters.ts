@@ -270,14 +270,7 @@ const uxRequirementAdapter: DashboardDiscussionAdapter = {
       label: `Requirement「${requirement}」`,
     };
   },
-  // Issue #445: `components/ux-design/requirement-panel.tsx`'s
-  // `RequirementRevisionForm`. Acceptance Criteria are a ChildSpec (#454),
-  // not a top-level field -- this `fields` list intentionally still does
-  // not carry them, since `RequirementRevisionForm` has no destination for
-  // a `childOps` patch yet (extending prefill to children is out of #454's
-  // scope; `proposalToDraft` still correctly SEPARATES a selected
-  // Acceptance Criterion item into `childOps` rather than misreading it as
-  // a top-level field of the same name, e.g. "statement").
+  // Requirement revision fields and keyed acceptance criteria have separate receivers.
   // Issue #452: the first real prefill delivery handler, matching the
   // server adapter's own `prefill_handler_id` (parity-checked by
   // `tests/test_discussion_contract_parity.py`). The handler itself is

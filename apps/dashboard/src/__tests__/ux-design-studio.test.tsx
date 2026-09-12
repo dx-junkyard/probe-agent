@@ -7,7 +7,7 @@
 // never a computation the Studio performs itself (that discipline lives in
 // `model.ts` and is unit-tested directly at the bottom of this file).
 
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
@@ -1379,4 +1379,61 @@ describe("実フォームの validation error 接続 (#451)", () => {
     await waitFor(() => expect(mockApi.post).toHaveBeenCalledTimes(2));
     expect(screen.queryByText("タイトルが不正です。")).toBeNull();
   });
+});
+
+
+describe("PR #462 prefill acceptance audit", () => {
+  test("open request mounts the real form, consumes keyed criteria once, and saves only on click", async () => {
+    const inbox = await import("@/lib/form-draft-inbox");
+    mockGet({
+      "/ux-design/requirements": requirementListOut([requirementOut()]),
+      "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+    });
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+    fireEvent.click(await screen.findByTestId("ux-requirement-item-single-page-checkout"));
+    await screen.findByTestId("ux-requirement-detail");
+    expect(screen.queryByTestId("ux-requirement-revision-form")).toBeNull();
+    act(() => inbox.requestFormDraftOpen("ux_requirement.revision", "single-page-checkout"));
+    await screen.findByTestId("ux-requirement-revision-form");
+    const patch: import("@/lib/form-draft-inbox").FormDraftPatch = {
+      patchToken: "audit-criteria-once", targetKind: "ux_requirement", targetRef: "single-page-checkout",
+      formId: "ux_requirement.revision", selectedItemRef: "", fields: [], relations: [],
+      childOps: [{ childKind: "acceptance_criterion", childKey: "reserved-42", intent: "add", order: 2,
+        fields: [{ fieldName: "statement", value: "候補を一度だけ追加" }] }],
+    };
+    await act(async () => { expect(await inbox.dispatchFormDraftPatchAndWaitForAck(patch)).toBe("acked"); });
+    await act(async () => { expect(await inbox.dispatchFormDraftPatchAndWaitForAck(patch)).toBe("acked"); });
+    expect(screen.getAllByDisplayValue("候補を一度だけ追加")).toHaveLength(1);
+    expect(screen.getByPlaceholderText("要件の文")).toHaveValue("1 画面で完了できる");
+    expect(mockApi.post).not.toHaveBeenCalled();
+    mockApi.post.mockResolvedValueOnce({});
+    fireEvent.click(screen.getByTestId("ux-requirement-revision-submit"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/ux-design/requirements/single-page-checkout/revisions",
+      expect.objectContaining({ acceptance_criteria: [expect.objectContaining({ criterion_key: "reserved-42", statement: "候補を一度だけ追加" })], save_request_id: expect.any(String) }),
+    ));
+  });
+});
+
+
+test("a late successful save preserves edits made while the request was pending", async () => {
+  const inbox = await import("@/lib/form-draft-inbox");
+  mockGet({
+    "/ux-design/requirements": requirementListOut([requirementOut()]),
+    "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+  });
+  await renderPage();
+  fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+  fireEvent.click(await screen.findByTestId("ux-requirement-item-single-page-checkout"));
+  await screen.findByTestId("ux-requirement-detail");
+  act(() => inbox.requestFormDraftOpen("ux_requirement.revision", "single-page-checkout"));
+  await screen.findByTestId("ux-requirement-revision-form");
+  let finish!: (value: object) => void;
+  mockApi.post.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  fireEvent.click(screen.getByTestId("ux-requirement-revision-submit"));
+  await waitFor(() => expect(finish).toBeDefined());
+  fireEvent.change(screen.getByPlaceholderText("要件の文"), { target: { value: "保存中の追加入力" } });
+  await act(async () => { finish({}); });
+  expect(screen.getByPlaceholderText("要件の文")).toHaveValue("保存中の追加入力");
 });

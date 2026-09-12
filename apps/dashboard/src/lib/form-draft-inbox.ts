@@ -23,15 +23,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { DiscussionTargetKind } from "@/api/types";
+import { getSystemId } from "@/api/client";
 
-/** §3.2's wire shape -- what `proposalToDraft` produces and a receiving form
- * consumes. `childOps` was declared empty through Phase 3 (mirroring
- * `ChildSpec` being declared-but-empty in the server registry at the time);
- * Issue #454 (Epic #443 §5.1) is the first phase that populates it, grouping
- * every selected child item by `(childKind, childKey, intent)`. No Dashboard
- * form consumes `childOps` yet (`ux_requirement`'s `ui_draft_forms` does not
- * carry an Acceptance Criteria destination) -- extending prefill delivery to
- * children is out of #454's scope. */
+/** Selected changes addressed to an existing form. Requirement revision forms
+ * consume acceptance-criterion child operations with per-field conflict review. */
 export interface FormDraftPatch {
   /** Idempotency token -- also sent to the server's own `/prefill` audit
    * call so both sides agree on what "the same dispatch" means. */
@@ -95,10 +90,45 @@ function patchKey(formId: string, targetRef: string): string {
  * NOT persisted anywhere (no localStorage, no server round trip) -- it is a
  * same-tab, same-session handoff, not a durable fact. */
 const pendingPatches = new Map<string, FormDraftPatch>();
+const OPEN_FORM_EVENT = "probe-agent:open-draft-form";
+const requestedForms = new Set<string>();
+let inboxSystemId = getSystemId();
+
+function syncSystem() {
+  const systemId = getSystemId();
+  if (systemId !== inboxSystemId) {
+    pendingPatches.clear();
+    requestedForms.clear();
+    inboxSystemId = systemId;
+  }
+}
+
+export function requestFormDraftOpen(formId: string, targetRef: string) {
+  syncSystem();
+  requestedForms.add(patchKey(formId, targetRef));
+  window.dispatchEvent(new CustomEvent(OPEN_FORM_EVENT));
+}
+
+export function useFormDraftOpenRequest(formId: string, targetRef: string) {
+  const [, refresh] = useState(0);
+  useEffect(() => {
+    const onRequest = () => refresh((n) => n + 1);
+    window.addEventListener(OPEN_FORM_EVENT, onRequest);
+    return () => window.removeEventListener(OPEN_FORM_EVENT, onRequest);
+  }, []);
+  syncSystem();
+  return requestedForms.has(patchKey(formId, targetRef));
+}
+
+export function clearFormDraftOpenRequest(formId: string, targetRef: string) {
+  requestedForms.delete(patchKey(formId, targetRef));
+  window.dispatchEvent(new CustomEvent(OPEN_FORM_EVENT));
+}
 
 /** Send a patch to whichever form is (or will shortly become) subscribed.
  * Never throws when nothing is listening yet. */
 export function deliverFormDraftPatch(patch: FormDraftPatch): void {
+  syncSystem();
   pendingPatches.set(patchKey(patch.formId, patch.targetRef), patch);
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent<FormDraftPatch>(FORM_DRAFT_PATCH_EVENT, { detail: patch }));
@@ -111,6 +141,7 @@ export function deliverFormDraftPatch(patch: FormDraftPatch): void {
  * itself, once mounted, still does the real (consuming) read via
  * `useFormDraftInbox`. */
 export function peekPendingFormDraftPatch(formId: string, targetRef: string): boolean {
+  syncSystem();
   if (!formId || !targetRef) return false;
   return pendingPatches.has(patchKey(formId, targetRef));
 }
@@ -130,7 +161,7 @@ export function peekPendingFormDraftPatch(formId: string, targetRef: string): bo
 export function useFormDraftInbox(
   formId: string,
   targetRef: string,
-  onPatch: (patch: FormDraftPatch) => void,
+  onPatch: (patch: FormDraftPatch) => void | boolean,
 ): void {
   const handlerRef = useRef(onPatch);
   const seenTokens = useRef(new Set<string>());
@@ -147,9 +178,11 @@ export function useFormDraftInbox(
   useEffect(() => {
     if (!formId || !targetRef) return;
     const consume = (patch: FormDraftPatch) => {
-      if (seenTokens.current.has(patch.patchToken)) return;
-      seenTokens.current.add(patch.patchToken);
-      handlerRef.current(patch);
+      if (patch.targetKind !== formId.split(".")[0]) return;
+      if (!seenTokens.current.has(patch.patchToken)) {
+        if (handlerRef.current(patch) === false) return;
+        seenTokens.current.add(patch.patchToken);
+      }
       // Fired AFTER the subscribed form's own handler ran -- this is the
       // ack a dispatcher waits for (`dispatchFormDraftPrefill` below), never
       // fired merely because `deliverFormDraftPatch` was called.
@@ -260,26 +293,42 @@ export function useFormDraftReceiver(
    *   delivering a patch to the wrong target_ref (§3.2).
    */
   identity?: FormDraftFieldBinding,
+  prepareChildren?: (patch: FormDraftPatch) => {
+    patch: FormDraftPatch; bindings: Record<string, FormDraftFieldBinding>;
+  } | null,
 ): { conflicts: FieldConflict[]; resolveField: (fieldName: string, resolution: FieldResolution) => void } {
   const [patch, setPatch] = useState<FormDraftPatch | null>(null);
   const [resolvedFields, setResolvedFields] = useState<Set<string>>(new Set());
   const fieldsRef = useRef(fields);
   const identityRef = useRef(identity);
+  const prepareRef = useRef(prepareChildren);
+  const [childBindings, setChildBindings] = useState<Record<string, FormDraftFieldBinding>>({});
   // Same rule as above, and the same ordering reason: this effect is
   // declared before `useFormDraftInbox` so a patch queued before mount is
   // matched against the form's current values, not the first render's.
   useEffect(() => {
     fieldsRef.current = fields;
     identityRef.current = identity;
+    prepareRef.current = prepareChildren;
   });
 
   useFormDraftInbox(formId, targetRef, (incoming) => {
+    let bindings = fieldsRef.current;
+    if (incoming.childOps.length) {
+      const prepared = prepareRef.current?.(incoming);
+      if (!prepared) return false;
+      incoming = prepared.patch;
+      bindings = { ...bindings, ...prepared.bindings };
+      setChildBindings(prepared.bindings);
+    }
+    if (incoming.childOps.length || incoming.relations.length ||
+        incoming.fields.some((f) => !bindings[f.fieldName])) return false;
     const currentIdentity = identityRef.current;
     if (currentIdentity) {
       if (currentIdentity.dirty) {
         if (incoming.selectedItemRef && incoming.selectedItemRef !== currentIdentity.value) {
           // Addressed at a different sub-object -- not for this draft.
-          return;
+          return false;
         }
       } else if (incoming.selectedItemRef) {
         currentIdentity.setValue(incoming.selectedItemRef);
@@ -288,12 +337,12 @@ export function useFormDraftReceiver(
     const currentValues: Record<string, string> = {};
     const dirtyFields: Record<string, boolean> = {};
     for (const f of incoming.fields) {
-      currentValues[f.fieldName] = fieldsRef.current[f.fieldName]?.value ?? "";
-      dirtyFields[f.fieldName] = fieldsRef.current[f.fieldName]?.dirty ?? false;
+      currentValues[f.fieldName] = bindings[f.fieldName]?.value ?? "";
+      dirtyFields[f.fieldName] = bindings[f.fieldName]?.dirty ?? false;
     }
     const classified = classifyFormDraftConflicts(incoming, currentValues, dirtyFields);
     for (const c of classified) {
-      if (c.state === "clean") fieldsRef.current[c.fieldName]?.setValue(c.proposedValue);
+      if (c.state === "clean") bindings[c.fieldName]?.setValue(c.proposedValue);
     }
     if (classified.some((c) => c.state === "conflict")) {
       setPatch(incoming);
@@ -302,12 +351,13 @@ export function useFormDraftReceiver(
   });
 
   const conflicts: FieldConflict[] = [];
+  const allBindings = { ...fields, ...childBindings };
   if (patch) {
     const currentValues: Record<string, string> = {};
     const dirtyFields: Record<string, boolean> = {};
     for (const f of patch.fields) {
-      currentValues[f.fieldName] = fields[f.fieldName]?.value ?? "";
-      dirtyFields[f.fieldName] = fields[f.fieldName]?.dirty ?? false;
+      currentValues[f.fieldName] = allBindings[f.fieldName]?.value ?? "";
+      dirtyFields[f.fieldName] = allBindings[f.fieldName]?.dirty ?? false;
     }
     for (const c of classifyFormDraftConflicts(patch, currentValues, dirtyFields)) {
       if (c.state === "conflict" && !resolvedFields.has(c.fieldName)) conflicts.push(c);
@@ -317,7 +367,7 @@ export function useFormDraftReceiver(
   const resolveField = (fieldName: string, resolution: FieldResolution) => {
     if (resolution === "replace") {
       const item = patch?.fields.find((f) => f.fieldName === fieldName);
-      if (item) fields[fieldName]?.setValue(item.value);
+      if (item) allBindings[fieldName]?.setValue(item.value);
     }
     setResolvedFields((prev) => {
       const next = new Set(prev);
@@ -387,7 +437,7 @@ export function dispatchFormDraftPatchAndWaitForAck(
     let settled = false;
     const handleAck = (event: Event) => {
       const detail = (event as CustomEvent<FormDraftAckDetail>).detail;
-      if (!detail || detail.patchToken !== patch.patchToken) return;
+      if (!detail || detail.patchToken !== patch.patchToken || detail.formId !== patch.formId || detail.targetRef !== patch.targetRef) return;
       if (settled) return;
       settled = true;
       window.removeEventListener(FORM_DRAFT_ACK_EVENT, handleAck);
@@ -399,6 +449,8 @@ export function dispatchFormDraftPatchAndWaitForAck(
       if (settled) return;
       settled = true;
       window.removeEventListener(FORM_DRAFT_ACK_EVENT, handleAck);
+      const key = patchKey(patch.formId, patch.targetRef);
+      if (pendingPatches.get(key)?.patchToken === patch.patchToken) pendingPatches.delete(key);
       resolve("timeout");
     }, timeoutMs);
   });

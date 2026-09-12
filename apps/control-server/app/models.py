@@ -6006,6 +6006,13 @@ class UiDraftFieldIn(BaseModel):
     validation_error: str = Field(default="", max_length=2000)
 
 
+class UiDraftSectionErrorIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    section: str = Field(default="", max_length=200)
+    code: str = Field(default="", max_length=200)
+    message: str = Field(default="", max_length=2000)
+
+
 class UiDraftContextIn(BaseModel):
     """§2.2. A client-only, unsaved form snapshot for one turn. Never stored
     -- `app/ui_draft_context.py` strips this down to (state, form_id, digest)
@@ -6032,13 +6039,15 @@ class UiDraftContextIn(BaseModel):
     #: `no_unsaved_changes` looks. A client that omits this behaves exactly
     #: as before it existed.
     readable: bool = True
+    validation_state: Literal["idle", "validating", "invalid"] = "idle"
+    section_errors: List[UiDraftSectionErrorIn] = Field(default_factory=list, max_length=40)
 
     @model_validator(mode="after")
     def validate_ui_draft_bounds(self):
         # An unreadable draft carries no content by definition -- accepting
         # fields alongside `readable: false` would mean the client both could
         # and could not read the same form.
-        if not self.readable and self.fields:
+        if not self.readable and (self.fields or self.section_errors):
             raise ValueError(
                 "ui_draft_unreadable_with_fields: readable=false must carry no fields"
             )
@@ -6067,6 +6076,7 @@ class UiDraftContextIn(BaseModel):
                 self.active_tab, self.comparison_target, self.local_revision_token,
             )
         )
+        total_bytes += sum(len(v.encode("utf-8")) for e in self.section_errors for v in (e.section, e.code, e.message))
         if total_bytes > 32 * 1024:
             raise ValueError(
                 "ui_draft_payload_too_large: total draft payload exceeds 32KB"

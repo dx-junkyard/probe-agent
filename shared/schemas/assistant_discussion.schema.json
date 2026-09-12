@@ -18,6 +18,7 @@
     "proposal_item_status": { "$ref": "#/$defs/discussion_proposal_item_status" },
     "proposal_item_eligibility": { "$ref": "#/$defs/discussion_proposal_item_eligibility" },
     "ui_draft_state": { "$ref": "#/$defs/ui_draft_state" },
+    "ui_draft_validation_state": { "$ref": "#/$defs/ui_draft_validation_state" },
     "context_completeness": { "$ref": "#/$defs/discussion_context_completeness" },
     "context_stop_reason": { "$ref": "#/$defs/discussion_context_stop_reason" },
     "context_resolution": { "$ref": "#/$defs/discussion_context_resolution" },
@@ -29,6 +30,10 @@
     "gap_discussion_next_action_kind": { "$ref": "#/$defs/gap_discussion_next_action_kind" }
   },
   "$defs": {
+    "ui_draft_validation_state": {
+      "description": "Client form validation lifecycle, independent of dirty/readable state.",
+      "enum": ["idle", "validating", "invalid"]
+    },
     "discussion_scope": {
       "description": "docs/01-specifications/capabilities/assistant-discussion.md §1.1. Fixed per target_kind (never chosen by the caller) via the scope -> target_kind first-match table `app/discussion_adapters.py`'s registry derives `SCOPE_TARGET_KINDS` from.",
       "enum": ["screen", "entity", "element"]

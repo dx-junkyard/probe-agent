@@ -443,10 +443,13 @@ def _build_user_prompt(
     turns: Sequence[Dict[str, Any]],
     target_facts: Dict[str, Any],
     schema: Dict[str, Any],
+    investigation_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     convo = "\n".join(f"{t.get('role', '?')}: {t.get('content', '')}" for t in turns)
     allowed_children = [
-        {"child_kind": c.child_kind, "fields": list(c.fields)}
+        {"child_kind": c.child_kind, "fields": list(c.fields),
+         "field_value_enums": {"verification_method": list(ux_design.VERIFICATION_METHODS)}
+         if c.child_kind == "acceptance_criterion" else {}}
         for c in schema.get("children", ())
     ]
     parts = [
@@ -457,6 +460,8 @@ def _build_user_prompt(
         f"allowed_relations: {json.dumps(list(schema.get('relations', ())))}",
         f"allowed_children: {json.dumps(allowed_children, ensure_ascii=False)}",
         f"target_current_facts: {json.dumps(target_facts, ensure_ascii=False)}",
+        "investigation_context (provenance is separate; provisional outcomes are not facts): "
+        + json.dumps(investigation_context or {}, ensure_ascii=False),
         "conversation:",
         convo or "(no messages yet)",
     ]
@@ -472,6 +477,7 @@ def generate_proposal(
     target_title: str,
     turns: Sequence[Dict[str, Any]],
     target_facts: Dict[str, Any],
+    investigation_context: Optional[Dict[str, Any]] = None,
     context_operation_state: str = "available",
     context_reason: str = "",
 ) -> ProposalGenerationResult:
@@ -522,7 +528,7 @@ def generate_proposal(
         )
 
     schema = PROPOSAL_TARGET_SCHEMA.get(target_kind, {"fields": (), "relations": (), "children": ()})
-    prompt = _build_user_prompt(target_kind, target_ref, target_title, turns, target_facts, schema)
+    prompt = _build_user_prompt(target_kind, target_ref, target_title, turns, target_facts, schema, investigation_context)
 
     try:
         raw = client.generate_text(
@@ -577,6 +583,11 @@ def generate_proposal(
                 provider=config.provider, model=config.model, is_mock=False,
                 error=f"Model proposed a relation outside the registry: {raw_item.relation_kind!r}",
                 error_kind="invalid_registry",
+            )
+        if target_kind == "product_gap" and not _gap_relation_kind_allowed(raw_item.relation_kind, raw_item.relation_target_kind):
+            return ProposalGenerationResult(
+                provider=config.provider, model=config.model, is_mock=False,
+                error="Gap relation target kind is outside the domain registry", error_kind="invalid_registry",
             )
         if target_kind == "blueprint_lane_cell":
             lane_kind = target_ref.rsplit("#", 1)[-1]
@@ -645,6 +656,13 @@ def generate_proposal(
                     f"Model proposed a child field outside the registry: "
                     f"{raw_item.field_name!r} for child_kind {raw_item.child_kind!r}"
                 ),
+                error_kind="invalid_registry",
+            )
+        if (raw_item.child_kind == "acceptance_criterion" and raw_item.field_name == "verification_method"
+                and raw_item.child_intent != "remove" and raw_item.proposed_value not in ux_design.VERIFICATION_METHODS):
+            return ProposalGenerationResult(
+                provider=config.provider, model=config.model, is_mock=False,
+                error="verification_method must use one of the supplied field_value_enums, not a translated label",
                 error_kind="invalid_registry",
             )
         if raw_item.child_intent == "add":
@@ -793,7 +811,26 @@ def get_proposal_row(conn, system_id: int, proposal_id: int) -> Optional[Dict[st
         "SELECT * FROM assistant_discussion_proposal WHERE id = ? AND system_id = ?",
         (proposal_id, system_id),
     ).fetchone()
-    return dict(row) if row is not None else None
+    if row is None:
+        return None
+    out = dict(row)
+    out["dependency_stale"] = _proposal_dependencies_stale(conn, out)
+    return out
+
+
+def _proposal_dependencies_stale(conn, proposal: Dict[str, Any]) -> bool:
+    from .discussion_context_bundle import get_context_audit
+    from .joint_premise import normalize_premise_manifest, resolve_dependency_digests
+    audit = get_context_audit(conn, system_id=proposal["system_id"], consumer_kind="proposal",
+                              consumer_ref=f"proposal:{proposal['id']}")
+    if audit is None:
+        return False  # Legacy proposals had no cross-target context.
+    try:
+        manifest = normalize_premise_manifest(json.loads(audit["dependency_manifest_json"]))
+        current = resolve_dependency_digests(conn, manifest, system_id=proposal["system_id"])
+        return current is None or any(current.get(ref.key()) != ref.digest for ref in manifest)
+    except (ValueError, KeyError, TypeError):
+        return True
 
 
 def _items_for(conn, proposal_id: int) -> List[Dict[str, Any]]:
@@ -856,6 +893,15 @@ def _item_address(item: Dict[str, Any]) -> Tuple[str, str, str, str, str, str, s
     )
 
 
+def _gap_relation_kind_allowed(relation_kind: str, target_kind: str) -> bool:
+    from . import product_objective
+    return target_kind in {
+        "source_ref": product_objective.GAP_SOURCE_KINDS,
+        "evidence_ref": product_objective.GAP_EVIDENCE_KINDS,
+        "artifact_link": product_objective.GAP_ARTIFACT_LINK_KINDS,
+    }.get(relation_kind, ())
+
+
 def evaluate_item_eligibility(
     proposal: Dict[str, Any],
     item: Dict[str, Any],
@@ -886,11 +932,15 @@ def evaluate_item_eligibility(
                 and spec is not None
                 and item.get("child_intent") in ("add", "update", "remove")
                 and (not item["field_name"] or item["field_name"] in spec.fields)
+                and (child_kind != "acceptance_criterion" or item["field_name"] != "verification_method"
+                     or item.get("child_intent") == "remove" or item["proposed_value"] in ux_design.VERIFICATION_METHODS)
             )
         else:
             allowed = adapter.field_applier is not None and item["field_name"] in adapter.fields
     elif item["item_kind"] == "relation":
         allowed = adapter.relation_applier is not None and item["relation_kind"] in adapter.relations
+        if allowed and target_kind == "product_gap":
+            allowed = _gap_relation_kind_allowed(item["relation_kind"], item["relation_target_kind"])
         if allowed and target_kind == "blueprint_lane_cell":
             lane_kind = proposal["target_ref"].rsplit("#", 1)[-1]
             allowed = item["relation_kind"] in _LANE_RELATION_COMPAT.get(lane_kind, ())
@@ -899,7 +949,7 @@ def evaluate_item_eligibility(
     if not allowed:
         return "forbidden"
 
-    if (proposal.get("captured_target_digest") or "") != (getattr(resolved, "digest", "") or ""):
+    if proposal.get("dependency_stale") or (proposal.get("captured_target_digest") or "") != (getattr(resolved, "digest", "") or ""):
         return "stale"
 
     if item["status"] != "proposed":
@@ -929,6 +979,7 @@ def create_proposal(
     intelligence_run_id: Optional[int],
     created_by: Optional[str],
     turns: Sequence[Dict[str, Any]] = (),
+    context_bundle: Any = None,
 ) -> Dict[str, Any]:
     """Persist a successful `ProposalGenerationResult` (§2.3). Called on an
     already-open connection with no external call pending -- the LLM round
@@ -1029,6 +1080,10 @@ def create_proposal(
                     hc.uncertainty, hyp_first_turn, hyp_last_turn, now,
                 ),
             )
+        if context_bundle is not None:
+            from .discussion_context_bundle import persist_context_audit
+            persist_context_audit(conn, system_id=system_id, consumer_kind="proposal",
+                                  consumer_ref=f"proposal:{proposal_id}", bundle=context_bundle)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -1079,7 +1134,7 @@ def list_proposals(system_id: int, thread_id: int) -> List[Dict[str, Any]]:
         ).fetchall()
         proposals = [
             (
-                dict(r), _items_for(conn, r["id"]), _prefill_stats(conn, r["id"]),
+                {**dict(r), "dependency_stale": _proposal_dependencies_stale(conn, dict(r))}, _items_for(conn, r["id"]), _prefill_stats(conn, r["id"]),
                 _hypotheses_for(conn, r["id"]),
             )
             for r in rows
@@ -1526,6 +1581,21 @@ def _apply_relation(conn, system_id: int, target_kind: str, target_ref: str, ite
                 )
                 return f"product_feature_target_link:{row['id']}"
         except product_feature.ProductFeatureError as exc:
+            raise InvalidField(str(exc)) from exc
+
+    if target_kind == "product_gap":
+        try:
+            common = dict(conn=conn, system_id=system_id, gap_key=target_ref, note=rationale, created_by=actor)
+            if relation_kind == "source_ref":
+                row = product_objective.add_gap_source_ref(**common, source_kind=relation_target_kind, source_ref=relation_target_ref)
+            elif relation_kind == "evidence_ref":
+                row = product_objective.add_gap_evidence_ref(**common, evidence_kind=relation_target_kind, evidence_ref=relation_target_ref)
+            elif relation_kind == "artifact_link":
+                row = product_objective.add_gap_artifact_link(**common, link_kind=relation_target_kind, target_ref=relation_target_ref)
+            else:
+                raise InvalidField(f"{target_kind}/{relation_kind} relation is not applicable")
+            return f"product_gap_{relation_kind}:{row['id']}"
+        except product_objective.ProductObjectiveError as exc:
             raise InvalidField(str(exc)) from exc
 
     raise InvalidField(f"{target_kind}/{relation_kind} relation is not applicable")

@@ -427,7 +427,7 @@ CREATE TABLE IF NOT EXISTS assistant_discussion_proposal_item (
     relation_kind         TEXT NOT NULL DEFAULT '' CHECK (relation_kind IN (
                               '', 'upstream_ref', 'journey_step_link', 'requirement_link',
                               'target_link', 'delivery_link', 'stakeholder_link', 'exchange_link',
-                              'capability_link', 'milestone_dependency')),
+                              'capability_link', 'milestone_dependency', 'source_ref', 'evidence_ref', 'artifact_link')),
     relation_target_kind  TEXT NOT NULL DEFAULT '',
     relation_target_ref   TEXT NOT NULL DEFAULT '',
     subject_ref           TEXT NOT NULL DEFAULT '',
@@ -9882,71 +9882,35 @@ def _migrate_assistant_discussion_thread_target_kinds(conn: sqlite3.Connection) 
 
 
 def _migrate_assistant_discussion_proposal_item_children(conn: sqlite3.Connection) -> None:
-    """Add the §5.1 `child_kind`/`child_key`/`child_intent`/`child_order`
-    columns and widen `relation_kind`'s CHECK with `capability_link` /
-    `milestone_dependency` (Issue #454, Epic #443 Phase 5).
+    """Widen the item contract while preserving child values, IDs and prefill FKs.
 
-    SQLite cannot ALTER a CHECK constraint in place, so -- exactly like
-    `_migrate_assistant_discussion_thread_target_kinds` just above -- the
-    table is rebuilt once, preserving every existing row's id and every
-    existing column value unchanged (a pure additive widening: every
-    pre-#454 row reads `child_kind=''` / `child_key=''` / `child_intent=''`
-    / `child_order=NULL`, which is exactly what "this item is not a child
-    change" already meant before these columns existed).
-
-    `assistant_discussion_proposal_prefill.item_id` holds a
-    `REFERENCES assistant_discussion_proposal_item (id) ON DELETE CASCADE`
-    FK -- `PRAGMA legacy_alter_table=ON` for the rename keeps that
-    referencing table pointed at the bare, unqualified table name (the same
-    `_migrate_joint_understanding_session_owner_scope` idiom), so it
-    resolves to the freshly rebuilt table with no fix-up needed on the
-    referencing table at all.
-
-    Detection is STRUCTURAL and idempotent: read the table's stored SQL
-    straight from `sqlite_master` and no-op once it already declares
-    `child_kind`.
+    Both pre-child and pre-Gap-reference databases are supported. The rebuild
+    is atomic; a failed copy leaves the old table intact. No audit row is deleted.
     """
     row = conn.execute(
-        "SELECT sql FROM sqlite_master "
-        "WHERE type = 'table' AND name = 'assistant_discussion_proposal_item'"
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='assistant_discussion_proposal_item'"
     ).fetchone()
-    if row is None or row["sql"] is None:
+    if row is None or not row["sql"] or "'artifact_link'" in row["sql"]:
         return
-    if "child_kind" in row["sql"]:
-        return
-    conn.executescript(
-        """
-        PRAGMA foreign_keys = OFF;
-        PRAGMA legacy_alter_table = ON;
-        ALTER TABLE assistant_discussion_proposal_item RENAME TO assistant_discussion_proposal_item_legacy;
-        PRAGMA legacy_alter_table = OFF;
-        DROP INDEX IF EXISTS idx_assistant_discussion_proposal_item_system;
-        DROP INDEX IF EXISTS idx_assistant_discussion_proposal_item_proposal;
-        """
-    )
-    conn.executescript(_ASSISTANT_DISCUSSION_PROPOSAL_DDL)
-    conn.execute(
-        """
-        INSERT INTO assistant_discussion_proposal_item (
-            id, system_id, proposal_id, item_kind, field_name, relation_kind,
-            relation_target_kind, relation_target_ref, subject_ref, current_value,
-            proposed_value, rationale, status, applied_ref, decided_by, decided_at,
-            decision_method, created_at, schema_version
+    columns = [r["name"] for r in conn.execute("PRAGMA table_info(assistant_discussion_proposal_item)")]
+    column_sql = ", ".join('"' + c.replace('"', '""') + '"' for c in columns)
+    try:
+        conn.executescript(
+            "PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON; BEGIN IMMEDIATE;"
+            "ALTER TABLE assistant_discussion_proposal_item RENAME TO assistant_discussion_proposal_item_legacy;"
+            "DROP INDEX IF EXISTS idx_assistant_discussion_proposal_item_system;"
+            "DROP INDEX IF EXISTS idx_assistant_discussion_proposal_item_proposal;"
+            + _ASSISTANT_DISCUSSION_PROPOSAL_DDL
+            + f"INSERT INTO assistant_discussion_proposal_item ({column_sql}) SELECT {column_sql} FROM assistant_discussion_proposal_item_legacy;"
+            "DROP TABLE assistant_discussion_proposal_item_legacy; COMMIT;"
         )
-        SELECT
-            id, system_id, proposal_id, item_kind, field_name, relation_kind,
-            relation_target_kind, relation_target_ref, subject_ref, current_value,
-            proposed_value, rationale, status, applied_ref, decided_by, decided_at,
-            decision_method, created_at, schema_version
-        FROM assistant_discussion_proposal_item_legacy
-        """
-    )
-    conn.executescript(
-        """
-        DROP TABLE assistant_discussion_proposal_item_legacy;
-        PRAGMA foreign_keys = ON;
-        """
-    )
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _migrate_joint_understanding_session_owner_scope(conn: sqlite3.Connection) -> None:

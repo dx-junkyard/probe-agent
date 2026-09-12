@@ -29,7 +29,7 @@
 // failure and records NOTHING server-side -- a retry (same button) can
 // deliver again from scratch.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -44,9 +44,11 @@ import type {
 import {
   classifyDiscussionError, DISCUSSION_ADAPTERS, proposalToDraft, type DashboardDiscussionAdapter,
 } from "@/lib/discussion-adapters";
-import { dispatchFormDraftPatchAndWaitForAck, waitForFormDraftReady } from "@/lib/form-draft-inbox";
+import { dispatchFormDraftPatchAndWaitForAck, requestFormDraftOpen, waitForFormDraftReady } from "@/lib/form-draft-inbox";
+import { appendReturnTo } from "@/components/discussion-return-banner";
 import { useUiDraftRegistry } from "@/lib/ui-draft";
 import { Badge } from "@/components/ui/badge";
+import { getSystemId } from "@/api/client";
 import { Button } from "@/components/ui/button";
 
 const ELIGIBILITY_LABEL: Record<DiscussionProposalItemEligibility, string> = {
@@ -219,6 +221,7 @@ function ProposalDetail({
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [deliveryState, setDeliveryState] = useState<DeliveryState>("idle");
   const [deliveryMessage, setDeliveryMessage] = useState("");
+  const lastDispatch = useRef<{ signature: string; token: string } | null>(null);
   // Issue #455 §6.2: a fresh idempotency key PER promote attempt (retrying
   // the SAME attempt after a failure reuses it -- a NEW hypothesis or a
   // deliberate second investigation mints a new one). Keyed by hypothesis
@@ -248,8 +251,18 @@ function ProposalDetail({
     : [];
 
   async function dispatchPrefill() {
+    const dispatchSystemId = getSystemId();
     if (!proposal || selectedAppliable.length === 0) return;
-    const draft = proposalToDraft(adapter, proposal, selectedAppliable);
+    setDeliveryState("navigating");
+    const refreshed = await detailQuery.refetch();
+    if (getSystemId() !== dispatchSystemId) return;
+    if (refreshed.isError || !refreshed.data || selectedAppliable.some((id) =>
+      !refreshed.data.items.some((item) => item.id === id && item.status === "proposed" && item.eligibility === "appliable"))) {
+      setDeliveryState("failed");
+      setDeliveryMessage("提案の前提を確認できないか更新されています。最新の提案を確認してください。");
+      return;
+    }
+    const draft = proposalToDraft(adapter, refreshed.data, selectedAppliable);
     if (!draft.patch || !draft.formId) {
       setDeliveryState("failed");
       setDeliveryMessage("この対象はフォームへの反映に対応していません。");
@@ -260,16 +273,27 @@ function ProposalDetail({
       setDeliveryMessage(`次の項目はこのフォームでは扱えません: ${draft.unregisteredFieldNames.join("、")}`);
       return;
     }
+    const signature = JSON.stringify([proposal.id, selectedAppliable.slice().sort((a, b) => a - b)]);
+    if (lastDispatch.current?.signature === signature) draft.patch.patchToken = lastDispatch.current.token;
+    else lastDispatch.current = { signature, token: draft.patch.patchToken };
     setDeliveryMessage("");
     // Step 1: navigate. Never re-navigate if already on the target screen.
     setDeliveryState("navigating");
-    const deepLink = adapter.deepLink(thread.target_ref);
+    const destination = adapter.deepLink(thread.target_ref);
+    const returnTo = new URLSearchParams(location.search).get("returnTo");
+    const deepLink = destination ? appendReturnTo(destination, returnTo) : null;
+    if (uiDraftRegistry?.read(draft.formId, thread.target_ref).outcome === "absent" && uiDraftRegistry.confirmDiscard?.() === false) {
+      setDeliveryState("idle");
+      return;
+    }
+    requestFormDraftOpen(draft.formId, thread.target_ref);
     if (deepLink && `${location.pathname}${location.search}` !== deepLink) {
       navigate(deepLink);
     }
     // Step 2: form ready confirm.
     setDeliveryState("waiting_for_form");
     const ready = await waitForFormDraftReady(uiDraftRegistry, draft.formId, thread.target_ref);
+    if (getSystemId() !== dispatchSystemId) return;
     if (!ready) {
       setDeliveryState("failed");
       setDeliveryMessage("反映先のフォームが開けませんでした。対象の画面を開いてから、もう一度お試しください。");
@@ -278,6 +302,7 @@ function ProposalDetail({
     // Step 3+4: patch delivery, then ack.
     setDeliveryState("delivering");
     const ack = await dispatchFormDraftPatchAndWaitForAck(draft.patch);
+    if (getSystemId() !== dispatchSystemId) return;
     if (ack !== "acked") {
       // DD-INT-01: a failed/unconfirmed delivery is NEVER reported as
       // success, and the server prefill-audit call below is skipped

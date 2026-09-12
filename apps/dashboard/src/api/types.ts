@@ -3641,6 +3641,8 @@ export interface UiDraftFieldIn {
 }
 
 export interface UiDraftContextIn {
+  validation_state?: "idle" | "validating" | "invalid";
+  section_errors?: { section: string; code: string; message: string }[];
   target_kind: DiscussionTargetKind;
   target_ref: string;
   form_id: string;

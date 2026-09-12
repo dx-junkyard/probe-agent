@@ -1,56 +1,32 @@
 # AI Discussion UI Adapter (Epic #443) — canonical contract
 
-## 実装状況（2026-09-06 監査）
+## 実装状況（2026-09-12、PR #462 監査）
 
-本書は目標契約を含み、記載された機能がすべて実装済みという意味ではない。
-PR #450 の Phase 1 は旧9 target kind / 4画面の registry と契約 parity を実装した。
-監査では、Proposal apply が登録 handler を迂回する不具合と、step/lane の
-deep link が対象 identity を失う不具合を修正した。apply は現在の registry の
-allowlist と handler を全選択 item について検査してから、登録 handler を呼ぶ。
-未登録・handler 欠落時は canonical revision / relation / item status を変更しない。
+Epic #457 の実装は PR #462 に統合した。対象は17 target kind / 7画面。
+operation result、実フォーム診断、Proposal review、Requirement の prefill / 冪等保存、
+nested Proposal、横断 context、Discussion 所属の Joint Understanding、保存後の Gap 復帰を接続した。
+実装対象と受入証拠の詳細は [監査記録](../ux/decision-discussion-audit-2026-09-12.md) を参照。
 
-| 元 issue | 実装と残件 | 引き継ぎ先 |
-| --- | --- | --- |
-| #444 | registry / parity は実装。操作結果の3状態と、実行handlerに基づくprefill capabilityの判定は実装済み (#456) | - |
-| #445 | Phase 2 (`fea4fe1`) を統合。draft の保存防止・System分離・変更警告を修正。実フォームのvalidation診断連携(§2.8)は #451 で実装済み | - |
-| #446 | Proposal review UI / prefill-first 導線 / 冪等 `save_request_id` / 結果照会 API は `ux_requirement` を代表対象として実装済み (#452、§3.6/§3.7)。他 target への `prefill_handler_id` 展開は未実装 | #454 |
-| #447 | 追加8 kind と live selection / context は Issue #453 が実装済み（§4 参照）。nested/list な構造化提案は #454、JU 昇格・還流は #455 が実装済み | - |
-| #448 | nested item / Acceptance Criteria / Feature Proposal は未実装 | #454 |
-| #449 | 仮説の独立型・JU 昇格 bridge・還流 read・代表 E2E (Gap→Journey→Requirement→Feature の依存 staleness 検出込み) は Issue #455 が実装済み（§6 参照）。Issue #461 の所属・premise 基盤 (`owner_scope`/`discussion_thread_id`/`register_discussion_origin_provider`/依存参照 manifest) をそのまま利用し、#455 は discussion origin provider と dependency digest resolver の実装、`assistant_discussion_proposal_hypothesis` / `assistant_discussion_hypothesis_promotion` テーブル、promote/reflux endpoint を追加した | - |
+| Issue | 実装範囲 |
+| --- | --- |
+| #451 | Journey/Step/Requirement/Solution の field/section 診断、独立した validation_state、遅延応答遮断、redaction/budget |
+| #456 | available/unsupported/unavailable/not_applicable と有限 handler parity |
+| #461 | JU の interview/discussion 所属、共通 premise manifest、旧DB互換 |
+| #452 | Proposal review、navigate→form mount→配送→ACK→監査、field競合、Requirement の明示保存・receipt・再読込 |
+| #453 | Vision〜Feature の有限対象、live selection、canonical resolver、対象を選択できる deep link |
+| #454 | 受入条件 add/update/remove/order、Feature と Objective/Milestone/Gap の許可された内容・参照、reserved key と生成/適用時検査 |
+| #458 | depth/budget/coverage/cursor/source、追加取得の画面反映、durable dependency audit と依存更新時の stale |
+| #455 | 独立仮説、Interview なしの明示昇格・調査、finding/outcome の再表示と同じ thread の Proposal context への還流 |
+| #459 | server next_action、未保存/保存不明の伝搬、未保存離脱確認、保存結果と起点Gapの復元 |
 
-元 issue は実装完了と残件移管を区別して整理する。JU bridge は拡張用定義だけで
-あり、代表 E2E や screen reader / narrow viewport の実利用検証が完了したとは
-扱わない。既存の backend direct apply は互換のため引き続き利用可能。`ux_requirement`
-は prefill (生成→反映→保存→照会) の代表 E2E を縦に通し終えた (#452)。他 target
-への `prefill_handler_id` 展開は #459 以降が引き継ぐ。nested/list な構造化提案
-(#454) と JU 昇格・還流 (#455) は実装済み。
+prefill の実 handler は `ux_requirement` の revision form。ほかの対象は registry が
+実対応する操作だけを提示し、既存 direct apply を維持する。全 target の form prefill を
+実装済みとは扱わない。提案・反映・保存・確定・調査実行・publish の境界は独立している。
 
-検証: #452 実装後、server の
-`test_discussion_prefill.py`/`test_assistant_discussion_proposals.py`/
-`test_discussion_adapter_registry.py`/`test_discussion_contract_parity.py`/
-`test_discussion_operation_result.py`/`test_ux_design.py`/`test_solution_design.py`
-は232 passed。Dashboard `npx vitest run` は52ファイル1134 passed、`npx tsc -b --noEmit`
-はexit 0。
-実LLM・音声機器・screen readerによるdogfoodingの完了証明ではない。
-
-#455 実装後、server の `tests/ -k "discussion or premise or joint_understanding"`
-は425 passed（#455 の新規テストは `test_discussion_hypothesis.py` 23件 +
-`test_joint_understanding_discussion_scope.py` への追加1件。レビューで
-premise の fail-open 欠陥2件を修正し、7件を追加済み）。Dashboard
-`npx vitest run` は53ファイル1144 passed、`npx tsc -b --noEmit` は exit 0。
-これも実LLM・音声機器・screen readerによるdogfoodingの完了証明ではない。
-
-#458 (§9 の context bundle / expansions) と #459 (§9.2 の claim 生成、
-`app/discussion_next_action.py` の全体 next_action projection、
-Gap Workbench 側の `components/discussion-context-panel.tsx` /
-`components/discussion-return-banner.tsx`) 実装後、server の
-`tests/ -k "discussion or premise or joint_understanding"` は464 passed
-（#459 の新規テストは `test_discussion_claims.py` 14件 +
-`test_discussion_next_action.py` 18件 +
-`test_discussion_context_claims_route.py` 7件）。Dashboard `npx vitest run`
-は55ファイル1158 passed、`npx tsc -b --noEmit` は exit 0。これも実LLM・
-音声機器・screen readerによるdogfoodingの完了証明ではなく、390px幅の実機
-確認・キーボードのみでの主導線完走も未実測のまま残る（DD-AC-04）。
+実LLMは承認された隔離Systemで検証した。API/自動テストとブラウザの390px・主要キーボード操作は
+実利用者のスクリーンリーダー/音声機器による完走を証明しない。代表利用者・評価課題・
+支援技術の環境決定と DD-AC-04/05 の残る実測は [#463](https://github.com/dx-junkyard/probe-agent/issues/463)
+に移管する。未測定の所要時間・状態誤認を0と記録しない。
 
 本書は Epic #443 (sub-issues #444-#449) の正本契約である。この領域に触れる前に
 §0 を読むこと。上流の会話・Proposal・音声の契約は
@@ -1012,11 +988,10 @@ child item (`item.child_kind` が非空) を top-level `fields` へ**絶対に
 等) が Requirement 自身の `field_name` (`statement` も存在する) と衝突する
 ため、修正前は名前の一致だけで誤って top-level field 扱いされ得た。
 `FormDraftPatch.childOps` は child item を `(childKind, childKey, intent)`
-でグルーピングして生成するが、`ux_requirement` の `ui_draft_forms` は
-Acceptance Criteria 用の受け口をまだ持たないため、既存の
-`RequirementRevisionForm` はこの `childOps` を消費しない (#454 のスコープ外
--- prefill を child まで広げるのは後続 Issue)。`components/discussion-
-proposal-review.tsx` は child item を「受入条件 [key] 追加/更新/削除」+
+でグルーピングして生成する。`RequirementRevisionForm` はこれを既存 key /
+reserved key に基づいて反映し、更新は field ごと、削除は対象 child ごとに
+未保存競合を解決する。未対応項目は全体を拒否し、保存まで正本は変更しない。
+`components/discussion-proposal-review.tsx` は child item を「受入条件 [key] 追加/更新/削除」+
 順序変更を別行として一覧表示し、通常の item と同じ選択/apply/reject 導線に
 乗せる。
 
@@ -1441,3 +1416,11 @@ DD-INT-01: prefill結果の成功、対象formの受領、domain保存成功は�
 DD-INT-02: 旧clientは新しいcontext/参照を送らなくても既存の機能を利用できる。
 新clientは未対応serverに架空の成功を返さず、利用可能な既存画面への移動を示す。
 新経路を無効化しても既存thread、Proposal direct apply、JUの履歴はそのまま読める。
+# PR #462 受入監査補足
+
+フォーム配送は明示的なフォーム起動要求を先に送り、登録を待ってから行う。
+同じ配送の再試行は同じ patch token を使い、受信済み token は再反映せず ACK を返す。
+受信側が扱えない field / child / relation や異なる対象への配送に成功 ACK を返してはならない。
+Requirement の受入条件は既存 key / reserved key を維持して編集し、未保存の競合は明示的に解決する。
+保存結果の照会で通信エラーが起きた場合は結果不明を維持する。未到達と表示できるのは
+保存要求不存在の明示的な応答だけである。Proposal からの遷移は起点の returnTo 参照を保持する。

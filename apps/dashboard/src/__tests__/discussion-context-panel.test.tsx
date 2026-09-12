@@ -35,6 +35,7 @@ const expandMutate = vi.fn();
 let bundle: DiscussionContextBundle | undefined;
 
 vi.mock("@/api/hooks", () => ({
+  useAssistantDiscussionThreadDetail: () => ({ data: undefined }),
   useDiscussionContextBundle: () => ({ data: bundle, isLoading: false, isError: false, refetch: vi.fn() }),
   useExpandDiscussionContext: () => ({ mutate: expandMutate, isPending: false }),
   useCreateDiscussionContextClaims: () => ({
@@ -191,4 +192,19 @@ describe("DiscussionContextPanel (Issue #459)", () => {
     renderPanel(baseThread({ kind: "match", reason: "", target_ref: null, degraded_sections: [] }));
     expect(screen.getByTestId("discussion-context-claims-error")).toHaveTextContent("根拠として存在しない引用");
   });
+  it("keeps the first page and exposes the next page and its source link", () => {
+    bundle = baseBundle();
+    bundle.sections[0].coverage = { returned_count: 1, total_count: 2, completeness: "partial", stop_reason: "item_budget", continuation: "next" };
+    const page = baseBundle();
+    page.sections[0].facts = [{ ...page.sections[0].facts[0], target_ref: "j2", title: "Journey 2" }];
+    page.sections[0].coverage = { returned_count: 1, total_count: 2, completeness: "complete", stop_reason: "complete", continuation: null };
+    page.sources = [{ ...page.sources[1], source_id: "ux_journey:j2", target_ref: "j2", deep_link: "/ux-design-studio?tab=journeys&journey=j2", deep_link_state: "selected" }];
+    expandMutate.mockImplementation((_payload, callbacks) => { callbacks.onSuccess({bundle: page, expanded_section_ids: ["related"]}); callbacks.onSettled(); });
+    renderPanel(baseThread({ kind: "match", reason: "", target_ref: null, degraded_sections: [] }));
+    fireEvent.click(screen.getByTestId("discussion-context-section-expand"));
+    expect(screen.getByText("Journey 1")).toBeInTheDocument();
+    expect(screen.getByText("Journey 2").closest("a")).toHaveAttribute("href", expect.stringContaining("returnTo="));
+    expect(screen.queryByTestId("discussion-context-section-expand")).toBeNull();
+  });
+
 });

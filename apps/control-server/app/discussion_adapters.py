@@ -1067,20 +1067,20 @@ def _context_product_gap(conn: Any, system_id: int, target_ref: str) -> Dict[str
         "effective_target_availability": detail.get("effective_target_availability"),
         "milestone_key": detail.get("milestone_key"),
         "source_refs": [
-            {"source_kind": r.get("source_kind"), "source_state": r.get("source_state")}
+            {"source_kind": r.get("source_kind"), "source_ref": r.get("source_ref"), "source_state": r.get("source_state")}
             for r in detail.get("source_refs", [])
-        ][:_MAX_CONTEXT_ITEMS],
+        ],
         "journey_links": [
             {"journey_key": j.get("journey_key")} for j in detail.get("journey_links", [])
-        ][:_MAX_CONTEXT_ITEMS],
+        ],
         "evidence_refs": [
-            {"evidence_kind": e.get("evidence_kind"), "deep_link_state": e.get("deep_link_state")}
+            {"evidence_kind": e.get("evidence_kind"), "evidence_ref": e.get("evidence_ref"), "deep_link_state": e.get("deep_link_state")}
             for e in detail.get("evidence_refs", [])
-        ][:_MAX_CONTEXT_ITEMS],
+        ],
         "artifact_links": [
-            {"link_kind": a.get("link_kind"), "deep_link_state": a.get("deep_link_state")}
+            {"link_kind": a.get("link_kind"), "target_ref": a.get("target_ref"), "deep_link_state": a.get("deep_link_state")}
             for a in detail.get("artifact_links", [])
-        ][:_MAX_CONTEXT_ITEMS],
+        ],
     }
 
 
@@ -1401,11 +1401,12 @@ DISCUSSION_ADAPTERS: Dict[str, DiscussionAdapter] = {
         route_params=_route_params_empty,
         # Issue #454: `lifecycle`/`priority_band` (the decision axes §5.6/
         # §5.7 own) are absent (§5.2). Gap's detection-derived reference
-        # lists (`source_refs`/`evidence_refs`/`artifact_links`) stay
-        # read-only context here -- their own finite per-list vocabularies
-        # are this Issue's explicitly deferred scope, not a #454 relation.
+        # lists use the existing domain functions and their finite kind vocabularies.
+        # None of these references changes a lifecycle or priority decision.
         fields=_PRODUCT_GAP_FIELDS,
         field_applier=_delegate_apply_field,
+        relations=("source_ref", "evidence_ref", "artifact_link"),
+        relation_applier=_delegate_apply_relation,
     ),
     "product_feature": DiscussionAdapter(
         target_kind="product_feature",

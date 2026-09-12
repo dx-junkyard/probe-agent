@@ -295,6 +295,12 @@ def _deep_link_for(adapter: Optional["discussion_adapters.DiscussionAdapter"], t
     client-side sibling of this same reuse rule)."""
     if adapter is None or not adapter.screen_ids:
         return None, "unavailable"
+    # Reuse domain-owned artifact links, which include the destination tab.
+    from .product_gap_sources import ARTIFACT_KINDS, artifact_deep_link
+    if adapter.target_kind in ARTIFACT_KINDS:
+        route, state, target_state = artifact_deep_link(adapter.target_kind, target_ref)
+        if state == "available" and target_state == "selected" and route:
+            return route, target_state
     screen = adapter.screen_ids[0]
     params = adapter.route_params(target_ref) or {}
     query = urlencode(sorted(params.items()))
@@ -402,13 +408,11 @@ def _extract_product_gap(facts: Dict[str, Any]) -> List[Tuple[str, str]]:
     for journey in facts.get("journey_links") or []:
         if isinstance(journey, dict) and journey.get("journey_key"):
             out.append(("ux_journey", journey["journey_key"]))
-    # `source_refs` / `evidence_refs` / `artifact_links` are deliberately NOT
-    # walked here: their `source_kind` / `evidence_kind` / `link_kind` name a
-    # DETECTION/EVIDENCE/ARTIFACT category (e.g. `capability_drift`,
-    # `repo_path`), not a `discussion_adapters` target_kind -- treating them
-    # as entity refs would resolve nonsense targets or silently drop them,
-    # neither of which is "根拠不足" (DD-CTX-04): they are simply not, today,
-    # relations this registry can walk.
+    # Follow only explicit registered entity kinds. Detection categories,
+    # repository paths and arbitrary URLs remain evidence, never resolvers.
+    out.extend(_extract_generic_refs(facts, "artifact_links", kind_field="link_kind"))
+    out.extend(_extract_generic_refs(facts, "source_refs", kind_field="source_kind", ref_field="source_ref"))
+    out.extend(_extract_generic_refs(facts, "evidence_refs", kind_field="evidence_kind", ref_field="evidence_ref"))
     return out
 
 

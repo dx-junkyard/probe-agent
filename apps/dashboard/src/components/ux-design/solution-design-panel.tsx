@@ -190,6 +190,8 @@ function AddOptionForm({
     { fieldName: "risks", value: risks, dirty: risks !== "", validationError: validation.fieldErrors.risks?.message ?? "" },
   ];
   useUiDraftSource("solution_design.option", designKey, () => ({
+    validationState: validation.status,
+    sectionErrors: validation.formError ? [validation.formError] : [],
     fields: optionFields,
     selectedItemRef: optionKey.trim(),
     activeTab: "",

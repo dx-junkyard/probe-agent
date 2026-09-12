@@ -24,6 +24,15 @@ function apiError(overrides: Partial<ApiError> = {}): ApiError {
 }
 
 describe("useFormValidation", () => {
+  test("編集前に送った保存の遅延診断は新しい draft を汚さない", () => {
+    const { result } = renderHook(() => useFormValidation());
+    let token = 0;
+    act(() => { token = result.current.begin(); });
+    act(() => { result.current.clearField("statement"); });
+    act(() => { result.current.resolveError(token, apiError({ fieldPath: "statement" }), ["statement"]); });
+    expect(result.current.status).toBe("idle");
+    expect(result.current.fieldErrors).toEqual({});
+  });
   test("初期状態は idle で診断を持たない", () => {
     const { result } = renderHook(() => useFormValidation());
     expect(result.current.status).toBe("idle");

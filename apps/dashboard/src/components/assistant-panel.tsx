@@ -35,6 +35,7 @@ import {
 import { useUiDraftRegistry } from "@/lib/ui-draft";
 import { DiscussionProposalReview } from "@/components/discussion-proposal-review";
 import { DiscussionContextPanel } from "@/components/discussion-context-panel";
+import { DiscussionInvestigationPanel } from "@/components/discussion-investigation-panel";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -145,6 +146,8 @@ function captureUiDraft(
   return {
     ...base,
     readable: true,
+    validation_state: snapshot.validationState ?? "idle",
+    section_errors: snapshot.sectionErrors ?? [],
     fields: snapshot.fields.map((f) => ({
       field_name: f.fieldName, value: f.value, dirty: f.dirty, validation_error: f.validationError,
     })),
@@ -904,7 +907,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           <p className="text-xs">{voiceFallbackNotice}</p>
         </div>
       )}
-      <div ref={listRef} className="flex-1 overflow-y-auto p-4 space-y-3" data-testid="assistant-message-list">
+      <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto p-4 space-y-3" data-testid="assistant-message-list">
         {/* §1.3: history stays readable, but it is not a current fact. The
             server has already withheld it from the model's context; say so
             rather than letting the transcript imply it was used. */}
@@ -1017,7 +1020,6 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             <Loader2 className="h-3.5 w-3.5 animate-spin" /> Thinking…
           </div>
         )}
-      </div>
 
       {/* Issue #452 (docs/01-specifications/capabilities/ai-discussion-adapter.md §3): the Proposal review
           region. Only for a specific entity/element target with a real
@@ -1033,11 +1035,15 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         <DiscussionContextPanel key={activeThread.id} thread={threadDetail} />
       )}
       {!useLegacyConversation && activeThread && effectiveScope === "focus" && (
-        <DiscussionProposalReview thread={activeThread} />
+        <>
+          <DiscussionInvestigationPanel key={activeThread.id} threadId={activeThread.id} />
+          <DiscussionProposalReview key={`proposal-${activeThread.id}`} thread={activeThread} />
+        </>
       )}
 
+      </div>
       <form
-        className="flex items-center gap-2 border-t p-3"
+        className="flex shrink-0 items-center gap-2 border-t p-3"
         onSubmit={(e) => {
           e.preventDefault();
           void submit(question);

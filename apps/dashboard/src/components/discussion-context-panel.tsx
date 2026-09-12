@@ -32,14 +32,15 @@
 // memory to reset by hand.
 
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import {
-  useCreateDiscussionContextClaims, useDiscussionContextBundle, useExpandDiscussionContext,
+  useAssistantDiscussionThreadDetail, useCreateDiscussionContextClaims, useDiscussionContextBundle, useExpandDiscussionContext,
 } from "@/api/hooks";
 import { ApiError } from "@/api/client";
+import { useUiDraftActivity } from "@/lib/ui-draft";
 import type {
   AssistantDiscussionThreadDetailOut, DiscussionContextClaimKind, DiscussionContextClaimsResultOut,
-  DiscussionContextEntry, DiscussionContextSection, DiscussionOperationResult, GapDiscussionNextActionKind,
+  DiscussionContextBundle, DiscussionContextEntry, DiscussionContextSource, DiscussionContextSection, DiscussionOperationResult, GapDiscussionNextActionKind,
 } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -54,7 +55,7 @@ import { ExternalLink, Loader2 } from "lucide-react";
 const NEXT_ACTION_LABEL: Record<GapDiscussionNextActionKind, string> = {
   target_error: "対象を確認できません",
   evidence_stale: "根拠が更新されています",
-  processing: "調査が進行中です",
+  processing: "共同調査を確認する",
   save_unknown: "保存結果が未確認です",
   unsaved_edit: "未保存の編集があります",
   review_proposal: "変更候補のレビュー待ちです",
@@ -107,9 +108,11 @@ function sectionEntryLabel(entry: DiscussionContextEntry): string {
 }
 
 function ContextSectionDisclosure({
-  section, onExpand, expanding,
+  section, onExpand, expanding, sources, returnTo,
 }: {
   section: DiscussionContextSection;
+  sources: DiscussionContextSource[];
+  returnTo: string | null;
   onExpand: (section: DiscussionContextSection) => void;
   expanding: boolean;
 }) {
@@ -138,7 +141,12 @@ function ContextSectionDisclosure({
           <ul className="space-y-0.5">
             {section.facts.map((entry) => (
               <li key={`${entry.target_kind}:${entry.target_ref}`} className="text-[11px]">
-                {sectionEntryLabel(entry)}
+                {(() => {
+                  const source = sources.find((s) => s.target_kind === entry.target_kind && s.target_ref === entry.target_ref);
+                  return source?.deep_link && source.deep_link_state === "selected"
+                    ? <Link className="text-primary hover:underline" to={appendReturnTo(source.deep_link, returnTo)}>{sectionEntryLabel(entry)}</Link>
+                    : sectionEntryLabel(entry);
+                })()}
                 {entry.truncated && <span className="ml-1 text-muted-foreground">(一部省略)</span>}
               </li>
             ))}
@@ -161,7 +169,7 @@ function ContextSectionDisclosure({
 function ClaimsResult({
   result, bundleSources, returnTo,
 }: {
-  result: DiscussionContextClaimsResultOut;
+  result: Pick<DiscussionContextClaimsResultOut, "claims" | "scope_note" | "as_of_snapshot_commit" | "error" | "error_kind">;
   bundleSources: Map<string, { deepLink: string | null; deepLinkState: string; title: string }>;
   returnTo: string | null;
 }) {
@@ -223,6 +231,10 @@ function ClaimsResult({
  * previous target's in-flight question/result (DD-UX-07's "対象切替時は
  * 破棄を明示"). */
 export function DiscussionContextPanel({ thread }: { thread: AssistantDiscussionThreadDetailOut }) {
+  const location = useLocation();
+  const formId = DISCUSSION_ADAPTERS[thread.thread.target_kind].forms[0]?.formId ?? "";
+  const activity = useUiDraftActivity(formId, thread.thread.target_ref);
+  const currentThread = useAssistantDiscussionThreadDetail(thread.thread.id, activity);
   const threadId = thread.thread.id;
   const bundleQuery = useDiscussionContextBundle(threadId);
   const expand = useExpandDiscussionContext(threadId);
@@ -232,14 +244,21 @@ export function DiscussionContextPanel({ thread }: { thread: AssistantDiscussion
   const [expandError, setExpandError] = useState<string | null>(null);
   const [claimsCallError, setClaimsCallError] = useState<string | null>(null);
 
-  const nextAction = thread.next_action;
-  const bundle = bundleQuery.data ?? null;
+  const nextAction = currentThread.data?.next_action ?? thread.next_action;
+  const [expandedBundle, setExpandedBundle] = useState<{ initial: DiscussionContextBundle; value: DiscussionContextBundle } | null>(null);
+  const bundle = expandedBundle && expandedBundle.initial === bundleQuery.data ? expandedBundle.value : bundleQuery.data ?? null;
+  const savedClaims = [...(currentThread.data?.turns ?? thread.turns ?? [])].reverse().find((turn) => turn.claims?.length);
+  const claimsResult = claims.data ?? (savedClaims ? {
+    claims: savedClaims.claims!, scope_note: `保存済みの照合: ${savedClaims.content}`,
+    as_of_snapshot_commit: null, error: null, error_kind: null,
+  } : null);
   // The current thread's OWN deep link -- the reference a citation's
   // destination carries back if it lands on a different screen. `null` when
   // this target's adapter has none (a whole-screen thread has no single
   // deep link of its own), in which case a citation simply navigates with
   // no return reference rather than a guessed one.
-  const originDeepLink = DISCUSSION_ADAPTERS[thread.thread.target_kind].deepLink(thread.thread.target_ref);
+  const originDeepLink = new URLSearchParams(location.search).get("returnTo")
+    ?? DISCUSSION_ADAPTERS[thread.thread.target_kind].deepLink(thread.thread.target_ref);
 
   const bundleSources = new Map(
     (bundle?.sources ?? []).map((s) => [
@@ -255,6 +274,21 @@ export function DiscussionContextPanel({ thread }: { thread: AssistantDiscussion
     expand.mutate(
       { bundle_digest: bundle.bundle_digest, continuation: section.coverage.continuation },
       {
+        onSuccess: (result) => {
+          const incoming = result.bundle;
+          const unique = <T,>(items: T[], key: (item: T) => string) => [...new Map(items.map((item) => [key(item), item])).values()];
+          setExpandedBundle({ initial: bundleQuery.data!, value: {
+            ...incoming,
+            sources: unique([...bundle.sources, ...incoming.sources], (source) => source.source_id),
+            dependencies: unique([...bundle.dependencies, ...incoming.dependencies], (dependency) => `${dependency.target_kind}:${dependency.target_ref}`),
+            sections: bundle.sections.map((section) => {
+              const page = incoming.sections.find((s) => s.section_id === section.section_id);
+              if (!page || !result.expanded_section_ids.includes(section.section_id)) return section;
+              const facts = unique([...section.facts, ...page.facts], (entry) => `${entry.target_kind}:${entry.target_ref}`);
+              return { ...page, facts, coverage: { ...page.coverage, returned_count: facts.length } };
+            }),
+          } });
+        },
         onSettled: () => setExpandingSection(null),
         onError: (err) => {
           const code = err instanceof ApiError ? err.code : undefined;
@@ -268,13 +302,7 @@ export function DiscussionContextPanel({ thread }: { thread: AssistantDiscussion
         },
       },
     );
-    // The merged bundle is not written back into `useDiscussionContextBundle`'s
-    // cache on purpose (that hook's own docstring: doing so would silently
-    // discard this exact "just the new batch" result and refetch a brand new
-    // initial bundle instead). `bundleQuery.refetch()` re-derives from scratch
-    // with a fresh cursor, which is the safe way to show the union again --
-    // the tradeoff this Issue accepts is that a second click before the first
-    // completes may issue a redundant fetch, never a lost one.
+
   }
 
   function handleMatch() {
@@ -359,7 +387,9 @@ export function DiscussionContextPanel({ thread }: { thread: AssistantDiscussion
                     key={section.section_id}
                     section={section}
                     onExpand={handleExpand}
-                    expanding={expandingSection === section.section_id}
+                    expanding={expandingSection !== null}
+                    sources={bundle.sources}
+                    returnTo={originDeepLink}
                   />
                 ))}
               </div>
@@ -373,8 +403,8 @@ export function DiscussionContextPanel({ thread }: { thread: AssistantDiscussion
           {claimsCallError}
         </p>
       )}
-      {claims.data && (
-        <ClaimsResult result={claims.data} bundleSources={bundleSources} returnTo={originDeepLink} />
+      {claimsResult && (
+        <ClaimsResult result={claimsResult} bundleSources={bundleSources} returnTo={originDeepLink} />
       )}
     </div>
   );

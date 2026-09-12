@@ -4,7 +4,8 @@
 // the Solution Design tab, reached via `onOpenSolutionDesign`).
 
 import { RequirementRevisionHistoryCard } from "./revision-history";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -43,8 +44,9 @@ import {
   StateBadge, useFieldRefs,
 } from "./shared";
 import { useFormValidation, useUiDraftSource } from "@/lib/ui-draft";
-import { peekPendingFormDraftPatch, useFormDraftReceiver } from "@/lib/form-draft-inbox";
+import { clearFormDraftOpenRequest, peekPendingFormDraftPatch, useFormDraftOpenRequest, useFormDraftReceiver } from "@/lib/form-draft-inbox";
 import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
+import { prepareAcceptanceCriteria } from "@/lib/acceptance-criteria-draft";
 import { useIdempotentSaveRequest } from "@/lib/save-request";
 
 const REQUIREMENT_KINDS: UxRequirementKind[] = ["functional", "non_functional", "constraint", "out_of_scope"];
@@ -178,6 +180,7 @@ function emptyCriterion(order: number): UxAcceptanceCriterionInput {
 }
 
 function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: string; onDone: () => void }) {
+  const [searchParams, setSearchParams] = useSearchParams();
   const detail = useUxRequirementDetail(requirementKey);
   const addRevision = useAddUxRequirementRevision(requirementKey);
   const current = detail.data?.current_revision ?? null;
@@ -213,13 +216,16 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
     { fieldName: "constraint_text", value: constraintText, dirty: constraintText !== seed.constraintText, validationError: validation.fieldErrors.constraint_text?.message ?? "" },
     { fieldName: "out_of_scope_note", value: outOfScopeNote, dirty: outOfScopeNote !== seed.outOfScopeNote, validationError: validation.fieldErrors.out_of_scope_note?.message ?? "" },
   ];
-  useUiDraftSource("ux_requirement.revision", requirementKey, () => ({
-    fields: requirementFields,
-    selectedItemRef: "",
-    activeTab: "",
-    comparisonTarget: "",
-    localRevisionToken: JSON.stringify(requirementFields.map((f) => [f.fieldName, f.value])),
-  }));
+
+
+  const [seedCriteria] = useState(() => (current?.acceptance_criteria ?? []).map((c) => ({
+    criterion_key: c.criterion_key, criterion_order: c.criterion_order, statement: c.statement,
+    verification_method: c.verification_method, verification_note: c.verification_note,
+  })));
+  const [criteria, setCriteria] = useState<UxAcceptanceCriterionInput[]>(
+    seedCriteria.length > 0 ? seedCriteria : [],
+  );
+
 
   // Issue #446 (§3.2/§3.3): receive a prefilled change candidate. Every
   // clean field lands immediately through its own setter; a field that is
@@ -230,17 +236,11 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
     rationale: { value: rationale, dirty: rationale !== seed.rationale, setValue: setRationale },
     constraint_text: { value: constraintText, dirty: constraintText !== seed.constraintText, setValue: setConstraintText },
     out_of_scope_note: { value: outOfScopeNote, dirty: outOfScopeNote !== seed.outOfScopeNote, setValue: setOutOfScopeNote },
-  });
+  }, undefined, (patch) => prepareAcceptanceCriteria(patch, criteria, seedCriteria, setCriteria));
 
-  const seedCriteria = (current?.acceptance_criteria ?? []).map((c) => ({
-    criterion_key: c.criterion_key, criterion_order: c.criterion_order, statement: c.statement,
-    verification_method: c.verification_method, verification_note: c.verification_note,
-  }));
-  const [criteria, setCriteria] = useState<UxAcceptanceCriterionInput[]>(
-    seedCriteria.length > 0 ? seedCriteria : [],
-  );
 
   function updateCriterion(i: number, patch: Partial<UxAcceptanceCriterionInput>) {
+    validation.clearField("acceptance_criteria");
     setCriteria((prev) => prev.map((c, idx) => (idx === i ? { ...c, ...patch } : c)));
   }
 
@@ -258,13 +258,35 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
   const saveRequestQuery = useDiscussionSaveRequest(saveRequest.activeId, { enabled: false });
   const [responseLost, setResponseLost] = useState(false);
 
+  useUiDraftSource("ux_requirement.revision", requirementKey, () => ({
+    hasUnsavedChanges: requirementFields.some((f) => f.dirty) || JSON.stringify(criteria) !== JSON.stringify(seedCriteria) || !!changeNote,
+    saveResultUnknown: responseLost,
+    saveReferenceId: saveRequest.activeId,
+    validationState: validation.status,
+    sectionErrors: validation.formError ? [validation.formError] : [],
+    fields: requirementFields,
+    selectedItemRef: "",
+    activeTab: "",
+    comparisonTarget: "",
+    localRevisionToken: JSON.stringify(requirementFields.map((f) => [f.fieldName, f.value])),
+  }));
+
   function currentSaveDigest(): string {
     return JSON.stringify([statement, rationale, constraintText, outOfScopeNote, changeNote, criteria]);
   }
 
+  const liveSaveDigest = useRef("");
+  const submittedDigest = useRef("");
+  useEffect(() => { liveSaveDigest.current = currentSaveDigest(); });
+
   function submit() {
     const token = validation.begin();
-    const saveRequestId = saveRequest.idFor(currentSaveDigest());
+    const digest = currentSaveDigest();
+    submittedDigest.current = digest;
+    const saveRequestId = saveRequest.idFor(digest);
+    const params = new URLSearchParams(searchParams);
+    params.set("save_request", saveRequestId);
+    setSearchParams(params, { replace: true });
     setResponseLost(false);
     addRevision.mutate(
       {
@@ -276,7 +298,8 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
           validation.resolveSuccess(token);
           toast.success("Requirement の版を追加しました");
           saveRequest.clear();
-          onDone();
+          if (liveSaveDigest.current === digest) onDone();
+          else toast.info("保存中に編集した入力を保持しています。追加の変更はまだ保存されていません。");
         },
         onError: (error) => {
           const apiError = error as ApiError;
@@ -297,11 +320,20 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
 
   async function confirmSaveState() {
     const result = await saveRequestQuery.refetch();
+    if (result.isError) {
+      const error = result.error as ApiError;
+      if (error.status === 404 && error.code === "discussion_save_request_not_found") {
+        toast.info("保存要求は未登録です。同じ要求でもう一度保存できます。");
+      } else {
+        toast.error("保存結果を確認できませんでした。入力を保持しています。もう一度状態を確認してください。");
+      }
+      return;
+    }
     if (result.data?.status === "succeeded") {
       toast.success("前回の保存はサーバーで完了していました。");
       saveRequest.clear();
       setResponseLost(false);
-      onDone();
+      if (liveSaveDigest.current === submittedDigest.current) onDone();
       return;
     }
     if (result.data?.status === "failed") {
@@ -310,7 +342,7 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
     }
     // 404 (`discussion_save_request_not_found`): the id never reached the
     // server -- safe to retry with the SAME id (never a new one, per §3.6).
-    toast("この保存要求はサーバーに届いていないようです。もう一度保存してください。");
+    toast.info("保存結果はまだ確定していません。もう一度状態を確認してください。");
   }
 
   // §2.8.2: `section === "acceptance_criteria"` (e.g. a duplicated
@@ -399,6 +431,10 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
               value={c.statement}
               onChange={(e) => updateCriterion(i, { statement: e.target.value })}
             />
+            <Input aria-label={`受入条件 ${c.criterion_key} の順序`} type="number" value={c.criterion_order}
+              onChange={(e) => updateCriterion(i, { criterion_order: Number(e.target.value) })} />
+            <Input aria-label={`受入条件 ${c.criterion_key} の検証メモ`} value={c.verification_note}
+              onChange={(e) => updateCriterion(i, { verification_note: e.target.value })} />
             <Button variant="ghost" size="sm" onClick={() => setCriteria((prev) => prev.filter((_, idx) => idx !== i))}>
               削除
             </Button>
@@ -436,7 +472,7 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
         </div>
       )}
       <div className="flex gap-2">
-        <Button size="sm" disabled={addRevision.isPending} onClick={submit} data-testid="ux-requirement-revision-submit">
+        <Button size="sm" disabled={addRevision.isPending || draftReceiver.conflicts.length > 0} onClick={submit} data-testid="ux-requirement-revision-submit">
           {addRevision.isPending ? "保存中…" : responseLost ? "再試行する" : "版を保存する"}
         </Button>
         <Button size="sm" variant="ghost" onClick={onDone}>
@@ -738,6 +774,7 @@ function RequirementDetail({
   const [revisionOpen, setRevisionOpen] = useState(() =>
     peekPendingFormDraftPatch("ux_requirement.revision", requirementKey),
   );
+  const revisionRequested = useFormDraftOpenRequest("ux_requirement.revision", requirementKey);
   const [linkOpen, setLinkOpen] = useState(false);
 
   if (detail.isLoading) return <LoadingBlock testId="ux-requirement-detail-loading" />;
@@ -783,11 +820,17 @@ function RequirementDetail({
       ) : (
         <EmptyNote testId="ux-requirement-no-revision">まだ版がありません。版を追加してください。</EmptyNote>
       )}
-      <Button variant="outline" size="sm" onClick={() => setRevisionOpen((v) => !v)}>
-        {revisionOpen ? "版の追加を閉じる" : r.current_revision ? "版を追加する" : "最初の版を作成する"}
+      <Button variant="outline" size="sm" onClick={() => {
+        setRevisionOpen(!(revisionOpen || revisionRequested));
+        clearFormDraftOpenRequest("ux_requirement.revision", requirementKey);
+      }}>
+        {revisionOpen || revisionRequested ? "版の追加を閉じる" : r.current_revision ? "版を追加する" : "最初の版を作成する"}
       </Button>
-      {revisionOpen && (
-        <RequirementRevisionForm requirementKey={requirementKey} onDone={() => setRevisionOpen(false)} />
+      {(revisionOpen || revisionRequested) && (
+        <RequirementRevisionForm requirementKey={requirementKey} onDone={() => {
+          setRevisionOpen(false);
+          clearFormDraftOpenRequest("ux_requirement.revision", requirementKey);
+        }} />
       )}
 
       <div>

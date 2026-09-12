@@ -219,7 +219,7 @@ def test_proposal_target_schema_equals_pre_refactor_value():
         },
         "product_gap": {
             "fields": ("title", "current_state", "target_state", "interpretation", "suggested_priority_note"),
-            "relations": (),
+            "relations": ("source_ref", "evidence_ref", "artifact_link"),
         },
         "product_feature": {
             "fields": ("title", "statement", "rationale", "scope_note", "summary"),

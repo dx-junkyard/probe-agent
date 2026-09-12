@@ -302,6 +302,8 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
     { fieldName: "summary", value: summary, dirty: summary !== seed.summary, validationError: validation.fieldErrors.summary?.message ?? "" },
   ];
   useUiDraftSource("ux_journey.revision", journeyKey, () => ({
+    validationState: validation.status,
+    sectionErrors: validation.formError ? [validation.formError] : [],
     fields: journeyFields,
     selectedItemRef: "",
     activeTab: "",

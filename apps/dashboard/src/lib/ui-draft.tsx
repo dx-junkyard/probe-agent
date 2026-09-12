@@ -29,7 +29,7 @@
 // module only provides the read; freezing the snapshot for a turn is the
 // caller's job (see `captureUiDraft` usage in `assistant-panel.tsx`).
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { ApiError } from "@/api/client";
 
 export interface UiDraftFieldSnapshot {
@@ -45,6 +45,11 @@ export interface UiDraftFieldSnapshot {
  * `app/ui_draft_context.py`, right before the LLM call; duplicating it here
  * would be a second, driftable copy of that rule). */
 export interface UiDraftSnapshot {
+  hasUnsavedChanges?: boolean;
+  saveResultUnknown?: boolean;
+  saveReferenceId?: string | null;
+  validationState?: "idle" | "validating" | "invalid";
+  sectionErrors?: { section: string; code: string; message: string }[];
   fields: UiDraftFieldSnapshot[];
   /** "" = no selection (§2.2). */
   selectedItemRef: string;
@@ -70,6 +75,8 @@ export type UiDraftReadResult =
   | { outcome: "readable"; snapshot: UiDraftSnapshot };
 
 interface UiDraftApi {
+  confirmDiscard?: () => boolean;
+  hasUnsavedWork?: () => boolean;
   /** Returns an unregister function; call it on unmount / when
    * formId+targetRef changes. */
   register: (formId: string, targetRef: string, getDraft: UiDraftGetter) => () => void;
@@ -79,6 +86,26 @@ interface UiDraftApi {
 }
 
 const UiDraftContext = createContext<UiDraftApi | null>(null);
+const DRAFT_CHANGED_EVENT = "probe-agent:draft-changed";
+const notifyDraftChanged = () => window.dispatchEvent(new Event(DRAFT_CHANGED_EVENT));
+const subscribeDraft = (listener: () => void) => {
+  window.addEventListener(DRAFT_CHANGED_EVENT, listener);
+  return () => window.removeEventListener(DRAFT_CHANGED_EVENT, listener);
+};
+
+/** Only observable local facts are sent to the server's next-action owner. */
+export function useUiDraftActivity(formId: string, targetRef: string) {
+  const registry = useUiDraftRegistry();
+  const read = () => {
+    const result = registry?.read(formId, targetRef);
+    if (result?.outcome !== "readable") return "false|false|";
+    const s = result.snapshot;
+    return `${s.hasUnsavedChanges ?? s.fields.some((f) => f.dirty)}|${s.saveResultUnknown ?? false}|${s.saveReferenceId ?? ""}`;
+  };
+  const value = useSyncExternalStore(subscribeDraft, read, () => "false|false|");
+  const [dirty, unknown, reference] = value.split("|");
+  return { has_unsaved_ui_draft: dirty === "true", save_result_unknown: unknown === "true", save_reference_id: reference || undefined };
+}
 
 function registryKey(formId: string, targetRef: string): string {
   return `${formId}|${targetRef}`;
@@ -88,6 +115,18 @@ export function UiDraftProvider({ children }: { children: ReactNode }) {
   const registry = useRef(new Map<string, UiDraftGetter>());
   const api = useMemo<UiDraftApi>(
     () => ({
+      hasUnsavedWork() {
+        for (const get of registry.current.values()) {
+          try {
+            const draft = get();
+            if (draft && (draft.hasUnsavedChanges ?? draft.fields.some((f) => f.dirty))) return true;
+          } catch { return true; }
+        }
+        return false;
+      },
+      confirmDiscard() {
+        return !this.hasUnsavedWork?.() || window.confirm("保存していない入力があります。破棄して選択を変更しますか?");
+      },
       register(formId, targetRef, getDraft) {
         if (!targetRef) {
           // A form editing a not-yet-identified row (e.g. a new Journey
@@ -117,12 +156,14 @@ export function UiDraftProvider({ children }: { children: ReactNode }) {
           return { ...snapshot, localRevisionToken: token };
         };
         registry.current.set(key, readDraft);
+        notifyDraftChanged();
         return () => {
           // Only clear the slot if it still belongs to THIS registration --
           // a fast remount (e.g. React StrictMode) can register the
           // replacement before the old cleanup runs.
           if (registry.current.get(key) === readDraft) {
             registry.current.delete(key);
+            notifyDraftChanged();
           }
         };
       },
@@ -146,6 +187,21 @@ export function UiDraftProvider({ children }: { children: ReactNode }) {
     }),
     [],
   );
+  useEffect(() => {
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (api.hasUnsavedWork?.()) { event.preventDefault(); event.returnValue = ""; }
+    };
+    const click = (event: MouseEvent) => {
+      const anchor = event.target instanceof Element ? event.target.closest("a[href]") : null;
+      if (!(anchor instanceof HTMLAnchorElement) || anchor.target === "_blank" || event.metaKey || event.ctrlKey) return;
+      const next = new URL(anchor.href);
+      if (next.origin === location.origin && next.pathname === location.pathname && next.search === location.search) return;
+      if (api.confirmDiscard?.() === false) { event.preventDefault(); event.stopPropagation(); }
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    document.addEventListener("click", click, true);
+    return () => { window.removeEventListener("beforeunload", beforeUnload); document.removeEventListener("click", click, true); };
+  }, [api]);
   return <UiDraftContext.Provider value={api}>{children}</UiDraftContext.Provider>;
 }
 
@@ -177,6 +233,7 @@ export function useUiDraftSource(
   // render, and the read itself only happens later, at turn start.
   useEffect(() => {
     getterRef.current = getDraft;
+    notifyDraftChanged();
   });
   useEffect(() => {
     if (!api) return;
@@ -311,8 +368,10 @@ export function useFormValidation(): UseFormValidationResult {
   }, []);
 
   const clearField = useCallback((fieldName: string): void => {
+    // Editing invalidates the submitted draft, even if this field did not
+    // already have a diagnostic when the request began.
+    tokenRef.current += 1;
     setSnapshot((prev) => {
-      if (!(fieldName in prev.fieldErrors)) return prev;
       const nextFieldErrors = { ...prev.fieldErrors };
       delete nextFieldErrors[fieldName];
       const stillInvalid = prev.formError !== null || Object.keys(nextFieldErrors).length > 0;

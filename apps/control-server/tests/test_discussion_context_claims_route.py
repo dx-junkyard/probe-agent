@@ -155,6 +155,7 @@ class TestNoUsableClient:
         assert result["turn_number"] is not None
 
         reread = _get_thread(admin_client, headers, thread_id)
+        assert reread["target_state"] == "current"
         turns = reread["turns"]
         assert turns[-2]["role"] == "user"
         assert turns[-2]["content"] == "十分か"

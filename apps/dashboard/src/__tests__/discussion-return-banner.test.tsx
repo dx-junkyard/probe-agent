@@ -7,6 +7,10 @@ import { describe, expect, it } from "vitest";
 import { ReturnToBanner, appendReturnTo } from "@/components/discussion-return-banner";
 
 describe("appendReturnTo", () => {
+  it("replaces a previous return target and keeps the fragment after the query", () => {
+    expect(appendReturnTo("/ux-design-studio?returnTo=old#requirement", "/objective-map"))
+      .toBe("/ux-design-studio?returnTo=%2Fobjective-map#requirement");
+  });
   it("appends as the first query param when the url has none", () => {
     expect(appendReturnTo("/ux-design-studio", "/objective-map?view=gaps&gap=g1")).toBe(
       "/ux-design-studio?returnTo=%2Fobjective-map%3Fview%3Dgaps%26gap%3Dg1",

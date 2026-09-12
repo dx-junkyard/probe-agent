@@ -536,6 +536,11 @@ def create_discussion_context_claims(
             status_code=404, detail={"code": exc.code, "message": str(exc)}
         ) from exc
 
+    # Resolve outside the write transaction: adapters own their connections.
+    # Capture before reasoning so an update during the call remains stale.
+    resolved = assistant_discussion.resolve_target(
+        system_id, thread_row["target_kind"], thread_row["target_ref"]
+    )
     config = LLMConfig.intelligence_from_env()
     client = _usable_llm_client(config)
 
@@ -562,9 +567,6 @@ def create_discussion_context_claims(
                 ),
             )
 
-            resolved = assistant_discussion.resolve_target(
-                system_id, thread_row["target_kind"], thread_row["target_ref"]
-            )
             assistant_discussion.append_turn(
                 conn, system_id=system_id, thread_id=thread_id, role="user",
                 content=payload.question, decision_method="manual",
@@ -656,6 +658,15 @@ def create_discussion_proposal(
         system_id, thread_row["target_kind"], thread_row["target_ref"]
     )
 
+    context_bundle = discussion_context_bundle.build_context_bundle(
+        system_id, thread_row["target_kind"], thread_row["target_ref"], thread_id=thread_id,
+    ) if context_result.operation_state == "available" else None
+    investigation_links = get_discussion_joint_understanding(thread_id, system_id=system_id)
+    investigation_context = {
+        "coverage_bundle": discussion_context_bundle.bundle_to_dict(context_bundle) if context_bundle is not None else None,
+        "joint_understanding": investigation_links.model_dump(),
+    }
+
     result = assistant_discussion_proposal.generate_proposal(
         client, config,
         target_kind=thread_row["target_kind"], target_ref=thread_row["target_ref"],
@@ -663,6 +674,7 @@ def create_discussion_proposal(
         turns=recent, target_facts=context_result.facts,
         context_operation_state=context_result.operation_state,
         context_reason=context_result.reason,
+        investigation_context=investigation_context,
     )
     completed_at = time.time()
 
@@ -708,6 +720,7 @@ def create_discussion_proposal(
             captured_target_revision_id=resolved.revision_id, captured_target_digest=resolved.digest,
             result=result, intelligence_run_id=run_id, created_by=_principal_actor(principal),
             turns=recent,
+            context_bundle=context_bundle,
         )
         proposal_id = row["id"]
 

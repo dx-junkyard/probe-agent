@@ -2469,11 +2469,14 @@ export function useAssistantDiscussionThread(target: AssistantDiscussionTargetIn
   });
 }
 
-export function useAssistantDiscussionThreadDetail(threadId: number | null) {
+export function useAssistantDiscussionThreadDetail(threadId: number | null, activity?: {
+  has_unsaved_ui_draft: boolean; save_result_unknown: boolean; save_reference_id?: string;
+}) {
+  const params = activity ? new URLSearchParams(Object.entries(activity).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])) : null;
   return useQuery({
-    queryKey: [...sysKey("assistant-discussion-thread-detail"), threadId],
+    queryKey: [...sysKey("assistant-discussion-thread-detail"), threadId, ...(params ? [params.toString()] : [])],
     queryFn: () =>
-      api.get<AssistantDiscussionThreadDetailOut>(`/assistant/discussion-threads/${threadId}`),
+      api.get<AssistantDiscussionThreadDetailOut>(`/assistant/discussion-threads/${threadId}${params ? `?${params}` : ""}`),
     enabled: threadId !== null && !!getSystemId(),
     staleTime: 0,
     retry: false,
@@ -3396,6 +3399,9 @@ function _invalidateJointUnderstanding(
   sessionId: number | null,
   juId: number,
 ) {
+  qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-joint-understanding") });
+  qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-thread") });
+  qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-thread-detail") });
   qc.invalidateQueries({ queryKey: [...sysKey("jointUnderstanding"), juId] });
   if (sessionId) {
     qc.invalidateQueries({ queryKey: [...sysKey("jointUnderstandingList"), sessionId] });
@@ -3444,10 +3450,10 @@ export function useCreateJointUnderstanding(sessionId: number | null) {
 export function useInvestigateJointUnderstanding(sessionId: number | null) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ juId, maxRounds }: { juId: number; maxRounds?: number }) =>
+    mutationFn: ({ juId, maxRounds, researchFocus }: { juId: number; maxRounds?: number; researchFocus?: string }) =>
       api.post<import("@/api/types").JointUnderstandingInvestigateOut>(
         `/joint-understanding/${juId}/investigate`,
-        maxRounds ? { max_rounds: maxRounds } : {},
+        { ...(maxRounds ? { max_rounds: maxRounds } : {}), ...(researchFocus ? { research_focus: researchFocus } : {}) },
       ),
     onSuccess: (_result, { juId }) => _invalidateJointUnderstanding(qc, sessionId, juId),
   });
@@ -4242,7 +4248,11 @@ export function useAddUxRequirementRevision(requirementKey: string | null) {
       api.post<UxRequirementDetailOut>(
         `/ux-design/requirements/${encodeURIComponent(requirementKey ?? "")}/revisions`, body,
       ),
-    onSuccess: () => invalidateUxDesign(qc),
+    onSuccess: () => {
+      invalidateUxDesign(qc);
+      qc.invalidateQueries({ queryKey: sysKey("discussion-save-request") });
+      qc.invalidateQueries({ queryKey: sysKey("assistant-discussion-thread-detail") });
+    },
   });
 }
 
