@@ -7799,9 +7799,16 @@ premise を**消費する** 2 経路 (dialogue-turn / update-understanding) に�
 `POST .../premise/adopt-current` という開発者の明示操作だけに限る。読み取り時に
 暗黙適用しない。
 
-Overview 側は head が無いとき `understanding_source='latest_session'` と明示して
-最新セッションの途中経過を出す。**空にしない代わりに、正準であるかのようには
-見せない** ── 3 つ目の値 `unavailable` と合わせて、3 つの別の答えである。
+Overview 側は head が無いとき canonical の枠を空にし
+(`understanding_source='not_promoted'`)、進行中の内容は `candidate_state` /
+`candidate_brief` という**別セクション**で返す。最初の実装は注記付きで canonical
+の枠へ入れていたが、注記があっても確定した主張の位置に未確定の内容が座り、
+ページの中心がセッション作成順に依存し続ける ── 受入条件が「candidate は別
+セクション」と書いているのはそのため。`not_promoted` (この System の事実) と
+`unavailable` (この要求の事実) は 3 つ目の値と合わせて 3 つの別の答えで、
+findings も前者では `not_compared`、後者では `unavailable` になる。判定順も
+契約で、読み取り失敗が「まだ確定していない」より優先される ── 壊れた読み取りを
+「まだ途中です」と報告すると故障が隠れる。
 
 ### Overview は head の内容から Brief を組む
 
@@ -7824,3 +7831,67 @@ premise は人が既に確定した内容で、混ぜると rebuild がどちら
 (#336 が investigation fact と developer answer を分けたのと同じ理由)。premise に
 別の prompt 予算を与えているのは、**切り詰められた premise が確定済みの Vision が
 静かに消える経路**だからである。
+
+### Issue #464 検証ラウンド
+
+実装後レビューで 5 点の指摘を受けて修正した。いずれも「契約として書いたことを、
+実装が別の場所で破っていた」型である。
+
+**昇格が同じセッションの不変 premise を上書きしていた (P1)。** `promote_revision`
+は候補を head にした直後、昇格元セッションの `base_understanding_revision_id` /
+`base_premise_digest` / `base_premise_json` を新しい版へ進めていた。理由は
+「そうしないと昇格した瞬間に自分が stale になる」だったが、これはその会話が
+起きた地面を書き換える操作である ── 既存メッセージはすべて旧 premise に対して
+生成されているのに、セッションは新 premise から始まったと主張することになり、
+次の turn は両者を混ぜる。**書いた契約 (§0.4「premise は不変」) を §5 が自分で
+破っていた**ので、文書も直した。
+
+今は `result_understanding_revision_id` だけを記録する。昇格元は `stale` になり、
+専用の理由コード `promoted_by_this_session` を返す ── 「他人が先へ進んだ」とは
+別の事実で、次の操作も違う (rebase 1 クリックで、昇格した版を本当に前提とする
+新しいセッションへ引き継ぐ)。判定表では**行 5 として `head_moved` より前**に
+置く必要がある: 正準 head が 1 つも無い System で始まったセッションは base を
+持たないので、そのセッションが最初の head を昇格すると「片方だけ存在する」行に
+落ちて誤ったコードを返していた。
+
+**推論後・保存直前の再検証が無かった (P1)。** Issue 本文の構造的負債 9 そのもの。
+推論呼び出しの間は DB 接続を手放しているので (CLAUDE.md の禁止事項)、その窓で
+昇格が起きうる。`premise_token` を推論の前に取り、書き込みトランザクションの
+先頭で `revalidate_premise` する。不一致なら推論結果は 1 行も保存せず、実行自体は
+`intelligence_runs` に失敗として残す。有限コードを 2 つ
+(`head_moved_during_run` / `session_premise_changed_during_run`) に分けたのは、
+「System が先へ進んだ」と「この会話の前提が差し替えられた」で開発者の次の操作が
+違うから。dialogue turn では**開発者自身のメッセージは保存する** ── それは人間の
+入力であってモデルの出力ではない (#336 と同じ規律)。
+
+**確認済み Intent が次の昇格で消え得た (P1)。** premise bundle の Intent は昇格
+対象 revision を生んだ 1 セッションからしか集めていなかった。新しいセッションは
+前 premise の確認済み Intent を**読む**が行はコピーしないので、そのセッションが
+次の版を昇格した瞬間、再確認していない継承 Intent は新 bundle に入らない ──
+開発者が確定した Vision が世代交代で静かに消える。今は現在の正準 premise の
+Intent を基底にし、昇格元セッションの決定を重ねる。重なるのは 2 つだけ:
+`confirmed` は置き換え、`not_applicable` は削除。`undecided` / `needs_review` /
+`proposed` は 1 つの会話の途中経過であって System についての決定ではないので、
+継承した内容をそのまま残す ── 質問を開き直すことと、決定を撤回することは違う。
+
+**セッション作成が 1 トランザクションでなかった (P2)。** コメントには「SAME
+transaction」と書いてあったが、`get_conn()` は autocommit で ROLLBACK もしない。
+premise 捕捉が落ちると、前提を持たないセッションと走らない build の run 記録が
+残る ── 前提はまさに「セッションがそれ無しに存在してはならない事実」なので、
+`BEGIN IMMEDIATE` / COMMIT / ROLLBACK で囲んだ。
+
+**Overview が head 未昇格時に最新セッションを正準の枠へ入れていた (P2)。**
+`latest_session` というラベルを添えてはいたが、注記があっても確定した主張の位置に
+未確定の内容が座り、ページの中心がセッション作成順に依存し続ける ── 受入条件が
+「candidate は別セクション」と書いているのはそのためである。今は canonical の枠を
+空にして `understanding_source='not_promoted'` と言い、進行中の内容は
+`candidate_state` / `candidate_brief` で返す。
+
+この分離で 2 つの落とし穴を踏んだ。(a) findings の判定順: 「まだ昇格していない」を
+先に見ると、読み取りが壊れているケースまで `not_compared` と報告してしまう ──
+**読み取り失敗が常に優先**で、そうでないと故障が「まだ途中です」に化ける。
+(b) `brief_available`: 候補 Brief を「セッションがあるときだけ」計算すると、
+セッションがまだ無い System で `next_action` が丸ごと消えた。`build_understanding_brief(None)`
+は「まだ作っていない」という**成功した読み取り**なので常に呼び、公開するのは
+`candidate_state != 'none'` のときだけにする。「まだ作っていない」と「読めなかった」の
+区別は #380 が作ったもので、ここでも同じ形で再発した。

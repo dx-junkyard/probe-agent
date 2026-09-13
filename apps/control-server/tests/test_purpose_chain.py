@@ -1147,5 +1147,8 @@ def test_overview_degrades_only_the_purpose_chain_section_on_failure(
     body = overview.json()
     assert body["purpose_chain"] is None
     assert "purpose_chain" in body["degraded_sections"]
-    # The rest of the Overview still renders.
-    assert body["brief"] is not None
+    # The rest of the Overview still renders. Nothing has been promoted here,
+    # so the canonical Understanding slot reports that fact (#464) rather than
+    # going blank -- which is what "still renders" means for this section.
+    assert body["understanding_source"] == "not_promoted"
+    assert "brief" not in body["degraded_sections"]

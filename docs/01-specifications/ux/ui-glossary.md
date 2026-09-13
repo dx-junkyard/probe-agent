@@ -95,7 +95,9 @@ Overview の「次にすること」は 1 件だけで、操作名に加えて**
 | `not_tracked`（会話の対象） | その種類には digest 源が無い（画面全体） | 変化を検出できていない |
 | `deterministic`（機能解説） | 製品管理下レジストリの完全一致結果 | LLM が生成した説明 |
 | `canonical_head`（Understanding の出所） | 人が正準として昇格した内容 | 最新の会話が作った内容 |
-| `latest_session`（Understanding の出所） | まだ誰も昇格していない、最新セッションの途中経過 | この System の確定した理解 |
+| `not_promoted`（Understanding の出所） | まだ誰も正準として確定していない | 取得できなかった（`unavailable`） |
+| `candidate_state`（Overview） | 進行中の内容が正準とどう違うか | 正準そのもの |
+| `promoted_by_this_session`（前提の理由） | この会話が確定させたので前提が古くなった | 他の誰かが先へ進めた（`head_moved`） |
 | `current`（Interview の前提） | 開始時に固定した前提が今も正準 head と一致する | 会話の内容が正しい |
 | `stale`（Interview の前提） | 開始後に正準 Understanding が動いた | 会話が間違っていた |
 | `missing`（Interview の前提） | 前提にしていたリビジョンが消えた | 前提が動いた（`stale`） |

@@ -1949,6 +1949,7 @@ export type InterviewPremiseReasonCode =
   | 'premise_matches_head'
   | 'no_canonical_head'
   | 'head_moved'
+  | 'promoted_by_this_session'
   | 'premise_content_changed'
   | 'base_revision_missing'
   | 'premise_not_captured'
@@ -1975,9 +1976,20 @@ export type UnderstandingCanonicalEventKind =
   | 'session_rebased'
   | 'session_branched';
 
-// Where a screen's displayed "current Understanding" came from. `latest_session`
-// is the pre-#464 fallback and must be labelled as such.
-export type UnderstandingSource = 'canonical_head' | 'latest_session' | 'unavailable';
+// Where a screen's displayed "current Understanding" came from. Three answers,
+// never two: `not_promoted` is a fact about the System (nobody has confirmed
+// one yet) and `unavailable` is a fact about this request (it could not be
+// read). In-progress work is reported separately as a candidate and never
+// occupies the canonical slot, however it is labelled.
+export type UnderstandingSource = 'canonical_head' | 'not_promoted' | 'unavailable';
+
+// Whether the in-progress Understanding differs from the canonical head.
+// Server-decided; never re-derived by comparing revision ids here.
+export type OverviewCandidateState =
+  | 'none'
+  | 'unpromoted'
+  | 'newer_than_head'
+  | 'same_as_head';
 
 export interface UnderstandingRevisionOut {
   id: number;
@@ -5886,6 +5898,11 @@ export interface OverviewOut {
   understanding_source: UnderstandingSource;
   canonical_revision_id: number | null;
   canonical_head_version: number | null;
+  // Issue #464: the in-progress Understanding, in its own section. Never a
+  // substitute for `brief`.
+  candidate_state: OverviewCandidateState;
+  candidate_session_id: number | null;
+  candidate_brief: UnderstandingBriefOut | null;
   findings: OverviewFindingOut[];
   findings_initial_count: number;
   findings_state: OverviewFindingsState;

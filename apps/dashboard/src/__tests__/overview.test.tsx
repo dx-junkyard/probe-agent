@@ -112,6 +112,9 @@ function overview(overrides: Partial<OverviewOut> = {}): OverviewOut {
     // Issue #464: どの規則で決まった Understanding かは省略できない
     // (`latest_session` を正準として見せないため)。
     understanding_source: "canonical_head",
+    candidate_state: "same_as_head",
+    candidate_session_id: null,
+    candidate_brief: null,
     canonical_revision_id: null,
     canonical_head_version: null,
     understanding_revision_id: 3,
@@ -310,12 +313,66 @@ describe("System Brief (Issue #381)", () => {
     wrap(
       <SystemBriefCard
         interviewHref="/interview"
-        overview={overview({ brief: null, degraded_sections: ["brief"] })}
+        overview={overview({
+          brief: null,
+          understanding_source: "unavailable",
+          degraded_sections: ["brief"],
+        })}
       />,
     );
     expect(screen.getByTestId("overview-brief-unavailable")).toHaveTextContent(
       "取得できませんでした",
     );
+    // 「まだ確定していない」 とは別の答えなので、混ざらない。
+    expect(screen.queryByTestId("overview-brief-not-promoted")).toBeNull();
+  });
+
+  // Issue #464: 正準が未確定のときは、正準の枠に候補を入れない。注記付きでも
+  // 「確定した主張」の位置に未確定の内容を置くことになる。
+  test("an unpromoted System shows no canonical Brief, and names the candidate", () => {
+    wrap(
+      <SystemBriefCard
+        interviewHref="/interview"
+        overview={overview({
+          brief: null,
+          understanding_source: "not_promoted",
+          candidate_state: "unpromoted",
+          candidate_session_id: 7,
+          candidate_brief: brief({
+            vision: claim({ kind: "vision", name: "進行中の Vision" }),
+          }),
+        })}
+      />,
+    );
+    expect(screen.getByTestId("overview-brief-not-promoted")).toBeInTheDocument();
+    expect(screen.queryByTestId("overview-system-brief")).toBeNull();
+    expect(screen.queryByTestId("overview-brief-unavailable")).toBeNull();
+    expect(
+      screen.getByText(/正準 Understanding はまだ確定していません/),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("overview-candidate-vision")).toHaveTextContent(
+      "進行中の Vision",
+    );
+    expect(screen.getByText("進行中・未確定")).toBeInTheDocument();
+  });
+
+  test("an unpromoted System with no session yet claims nothing at all", () => {
+    wrap(
+      <SystemBriefCard
+        interviewHref="/interview"
+        overview={overview({
+          brief: null,
+          understanding_source: "not_promoted",
+          candidate_state: "none",
+          candidate_brief: null,
+        })}
+      />,
+    );
+    expect(screen.getByTestId("overview-brief-not-promoted")).toBeInTheDocument();
+    expect(screen.queryByTestId("overview-candidate-brief")).toBeNull();
+    expect(
+      screen.getByText("まだシステム理解を作成していません。"),
+    ).toBeInTheDocument();
   });
 });
 

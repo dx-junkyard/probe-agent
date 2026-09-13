@@ -224,7 +224,7 @@ const SNAPSHOT_FRESHNESS_LABEL: Record<OverviewSnapshotFreshness, string> = {
 // 文言。`latest_session` を正準のように見せないことがこの表示の目的。
 const UNDERSTANDING_SOURCE_LABEL: Record<UnderstandingSource, string> = {
   canonical_head: "正準",
-  latest_session: "未確定・最新セッションの途中経過",
+  not_promoted: "未確定(正準はまだありません)",
   unavailable: "特定できません",
 };
 

@@ -771,51 +771,63 @@ def create_interview_session(
                 status_code=404,
                 detail="Snapshot not found for this system",
             )
-        cur = conn.execute(
-            """
-            INSERT INTO interview_session
-                (system_id, snapshot_id, title, focus, status, stage, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'open', 'understanding_initialized', ?, ?)
-            """,
-            (system_id, payload.snapshot_id, payload.title, payload.focus, now, now),
-        )
-        session_id = cur.lastrowid
-        # Issue #349: `W0-B` completes by "creating a session AND the system
-        # starting to investigate" (spec §2.3). Both halves happen here.
-        #
-        # The run record is opened inside this request so the new session is
-        # `W1` from its very first evaluation -- otherwise a reload before the
-        # build starts sees a session with no understanding, no questions, no
-        # proposals and no diff, which falls through the whole rule table to
-        # `W7`, a terminal the developer can never leave because every build
-        # control is exception-only.
-        #
-        # The build itself is dispatched below, outside this connection. The
-        # record is never a mere reservation waiting for the client to send a
-        # second request: a caller that creates a session and then goes away
-        # (an API client, a closed tab) still gets the investigation, and a
-        # dispatch that cannot even start is turned into a recoverable
-        # `E3-a` immediately rather than after the stale sweep.
-        initial_run_id = interview_workflow.start_process_run(
-            conn, session_id, system_id, "understanding_build"
-        )
+        # `get_conn()` is autocommit and never rolls back on its own, so
+        # "creating a session" has to own an explicit transaction to actually
+        # be one act. Without it, a failure while capturing the premise leaves
+        # behind a session that stands on nothing plus a run record for a
+        # build that will never happen -- and the premise is precisely the
+        # fact a session must never exist without (Issue #464).
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO interview_session
+                    (system_id, snapshot_id, title, focus, status, stage, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'open', 'understanding_initialized', ?, ?)
+                """,
+                (system_id, payload.snapshot_id, payload.title, payload.focus, now, now),
+            )
+            session_id = cur.lastrowid
+            # Issue #349: `W0-B` completes by "creating a session AND the system
+            # starting to investigate" (spec §2.3). Both halves happen here.
+            #
+            # The run record is opened inside this request so the new session is
+            # `W1` from its very first evaluation -- otherwise a reload before the
+            # build starts sees a session with no understanding, no questions, no
+            # proposals and no diff, which falls through the whole rule table to
+            # `W7`, a terminal the developer can never leave because every build
+            # control is exception-only.
+            #
+            # The build itself is dispatched below, outside this connection. The
+            # record is never a mere reservation waiting for the client to send a
+            # second request: a caller that creates a session and then goes away
+            # (an API client, a closed tab) still gets the investigation, and a
+            # dispatch that cannot even start is turned into a recoverable
+            # `E3-a` immediately rather than after the stale sweep.
+            initial_run_id = interview_workflow.start_process_run(
+                conn, session_id, system_id, "understanding_build"
+            )
 
-        # Issue #464, required behaviour for a new Interview (steps 1-3): pin
-        # the System's canonical head and the immutable premise bundle built
-        # from it, in the SAME transaction that created the session, so a
-        # session can never exist without a recorded decision about what it
-        # stands on.
-        #
-        # Seeding `current_understanding` from that bundle is what makes the
-        # Overview and a brand-new Interview agree on the first paint. Before
-        # this, a new session started with NULL and the Overview was reading
-        # some other session's row, which is exactly how the same project
-        # could report a Vision on one screen and none on the other. The
-        # seeded content is the canonical revision's own -- not a guess, and
-        # not a copy of another session's in-progress state.
-        canonical_understanding.capture_session_premise(
-            conn, session_id=session_id, system_id=system_id, now=now
-        )
+            # Issue #464, required behaviour for a new Interview (steps 1-3): pin
+            # the System's canonical head and the immutable premise bundle built
+            # from it, in the SAME transaction that created the session, so a
+            # session can never exist without a recorded decision about what it
+            # stands on.
+            #
+            # Seeding `current_understanding` from that bundle is what makes the
+            # Overview and a brand-new Interview agree on the first paint. Before
+            # this, a new session started with NULL and the Overview was reading
+            # some other session's row, which is exactly how the same project
+            # could report a Vision on one screen and none on the other. The
+            # seeded content is the canonical revision's own -- not a guess, and
+            # not a copy of another session's in-progress state.
+            canonical_understanding.capture_session_premise(
+                conn, session_id=session_id, system_id=system_id, now=now
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         row = _get_session_or_404(conn, session_id, system_id)
         session_out = _session_out(conn, row)
         session_row = dict(row)
@@ -1500,6 +1512,10 @@ def _interview_dialogue_turn_core(
         # capture, never re-resolved from the current head -- a premise that
         # silently refreshed mid-conversation would be no premise at all.
         canonical_premise = _premise_prompt_facts(session)
+        # Issue #464 (debt item 9): the reasoning call below runs with this
+        # connection released, so the head can move under it. Snapshot the
+        # premise facts now and check them again inside the write transaction.
+        premise_token = canonical_understanding.premise_token(conn, session)
         session_gaps = (
             json.loads(session["gap_analysis"]) if session["gap_analysis"] else None
         )
@@ -1678,6 +1694,21 @@ def _interview_dialogue_turn_core(
     with get_conn() as conn:
         conn.execute("BEGIN")
         try:
+            # Issue #464: the premise this turn was reasoned against must still
+            # be the one the session stands on. If it moved while the model was
+            # answering, the turn is failed here rather than stored -- the
+            # developer's own message is still kept (it is their input, not the
+            # model's output), and the run is recorded as the failed attempt it
+            # was, so the conflict is auditable instead of invisible.
+            premise_conflict = canonical_understanding.revalidate_premise(
+                conn, premise_token
+            )
+            turn_error = turn.error or (
+                canonical_understanding.revalidation_message(premise_conflict)
+                if premise_conflict
+                else None
+            )
+
             # Store user message.
             conn.execute(
                 """INSERT INTO interview_message
@@ -1757,7 +1788,7 @@ def _interview_dialogue_turn_core(
                     ))
 
             # Store intelligence run (success or failure).
-            run_status = "failed" if turn.error else "completed"
+            run_status = "failed" if turn_error else "completed"
             run_cur = conn.execute(
                 """INSERT INTO intelligence_runs
                     (system_id, snapshot_id, run_type, provider, model,
@@ -1773,7 +1804,7 @@ def _interview_dialogue_turn_core(
                     turn.prompt_version,
                     turn.schema_version,
                     run_status,
-                    turn.error,
+                    turn_error,
                     1 if turn.is_mock else 0,
                     now,
                     now,
@@ -1786,16 +1817,16 @@ def _interview_dialogue_turn_core(
             ).fetchone()
             intelligence_run_out = _intelligence_run_out(run_row)
 
-            if turn.error:
+            if turn_error:
                 conn.execute(
                     """UPDATE interview_session
                        SET last_error = ?, updated_at = ?
                        WHERE id = ? AND system_id = ?""",
-                    (turn.error, now, session_id, system_id),
+                    (turn_error, now, session_id, system_id),
                 )
                 conn.execute("COMMIT")
                 return InterviewDialogueTurnOut(
-                    error=turn.error,
+                    error=turn_error,
                     intelligence_run=intelligence_run_out,
                     evidence_run=evidence_run_out,
                     evidence_reads=evidence_reads_out,
@@ -3456,11 +3487,18 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
         # not from a blank slate. Read from the session's immutable capture so
         # a rebuild half-way through a conversation uses the same ground the
         # conversation started on.
-        canonical_premise = _premise_prompt_facts(
-            conn.execute(
-                "SELECT * FROM interview_session WHERE id = ? AND system_id = ?",
-                (session_id, system_id),
-            ).fetchone()
+        premise_session_row = conn.execute(
+            "SELECT * FROM interview_session WHERE id = ? AND system_id = ?",
+            (session_id, system_id),
+        ).fetchone()
+        canonical_premise = _premise_prompt_facts(premise_session_row)
+        # Issue #464 (debt item 9): the reasoning call runs with this
+        # connection released, so the premise is re-checked inside the write
+        # transaction before any of its output is stored.
+        premise_token = (
+            canonical_understanding.premise_token(conn, premise_session_row)
+            if premise_session_row is not None
+            else None
         )
 
     # Phase 2 (DB lock released): the reasoning call. The LLM client
@@ -3480,16 +3518,31 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
 
     # Phase 3 (DB lock re-acquired): persist the review outcome.
     with get_conn() as conn:
-        if review.error:
+        # Issue #464: a rebuilt Understanding is a claim about a specific
+        # premise. If the canonical head moved while the model was working,
+        # storing this candidate would attach it to a premise nobody reasoned
+        # against -- so the run is recorded as failed with the reason and
+        # nothing is written to the session or the revision history.
+        premise_conflict = (
+            canonical_understanding.revalidate_premise(conn, premise_token)
+            if premise_token is not None
+            else None
+        )
+        review_error = review.error or (
+            canonical_understanding.revalidation_message(premise_conflict)
+            if premise_conflict
+            else None
+        )
+        if review_error:
             run_id = _record_review_run(
-                conn, "failed", review.error, review.provider, review.model,
+                conn, "failed", review_error, review.provider, review.model,
                 review.is_mock,
             )
             conn.execute(
                 """UPDATE interview_session
                    SET last_error = ?, updated_at = ?
                    WHERE id = ? AND system_id = ?""",
-                (review.error, now, session_id, system_id),
+                (review_error, now, session_id, system_id),
             )
             conn.execute(
                 """INSERT INTO interview_message
@@ -3497,11 +3550,13 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
                 VALUES (?, ?, 'assistant', ?, ?, ?)""",
                 (
                     session_id, system_id,
-                    interview_message("review_failed", msg_lang, error=review.error),
+                    interview_message("review_failed", msg_lang, error=review_error),
                     run_id, now,
                 ),
             )
-            return UnderstandingRebuildResult(ok=False, error=review.error, intelligence_run_id=run_id)
+            return UnderstandingRebuildResult(
+                ok=False, error=review_error, intelligence_run_id=run_id
+            )
 
         run_id = _record_review_run(
             conn, "completed", None, review.provider, review.model, review.is_mock,

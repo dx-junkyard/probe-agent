@@ -2095,19 +2095,37 @@ creating incomplete persistence or execution paths for later phases.
       暗黙更新しない。読み取り時に現在の head から作り直したら、それはもはや
       前提ではない。**前提を固定することとそこから始めることは 1 つの行為**なので
       `current_understanding` の seed は `capture_session_premise` の中にあり、
-      既存の内容は決して上書きしない。
+      既存の内容は決して上書きしない。**昇格も例外ではない** — 昇格元セッションの
+      base premise を新しい版へ進めると、その会話が起きた地面を書き換えることに
+      なる(既存メッセージは旧 premise で生成されているのに、セッションは新
+      premise から始まったと主張する)。昇格は `result_understanding_revision_id`
+      だけを記録し、セッションは `stale` + 専用コード `promoted_by_this_session`
+      になる。判定表ではこの行を `head_moved` より**前**に置く — 正準 head が
+      無い System で始まったセッションは base を持たないので、最初の head を
+      昇格すると「片方だけ存在する」行に落ちてしまう。
     - **premise は正準 claim と「確認済み」Intent だけを運ぶ。** 未確定の Intent
       提案・セッションごとの仮説・質問順・未確認 evidence を System 共通状態に
-      しない(#464 非目標 1)。
+      しない(#464 非目標 1)。**確認済み Intent は世代を越えて継承する** — 昇格時の
+      bundle は現在の正準 premise の Intent を基底にし、昇格元セッションの決定を
+      重ねる(`confirmed` は置き換え、`not_applicable` は削除、それ以外の状態は
+      1 つの会話の途中経過なので継承を残す)。これが無いと、premise から Vision を
+      読んだだけで再確認しなかった世代が昇格した瞬間に、確定した Vision が消える。
     - **`premise_digest` は昇格時にだけ確定する。** 後から Intent を 1 つ確認した
       だけで正準 premise が静かに動くと、誰も昇格していないのに全 open session が
       `stale` になる。digest から `revision_id` は除く — 同じ内容の再昇格は同じ
       前提である(#323 が snapshot 軸で使った規則)。
     - **`interview_session.status` に premise 軸を載せない。** それは #349 の
       中断/再開軸で、中断されたセッションと前提が動いたセッションは別の事実。
-    - **ゲートは premise を消費する 2 経路にだけ置く**(`dialogue-turn` /
-      `update-understanding`)。開発者の入力を記録する経路には置かない — 前提の
-      問題で人間の回答を失うのは #336 が直した誤りと同じ。`branched` は続行でき
+    - **ゲートは premise を消費する経路にだけ置く**(`dialogue-turn` /
+      `update-understanding` / 自動 refresh)。開発者の入力を記録する経路には
+      置かない — 前提の問題で人間の回答を失うのは #336 が直した誤りと同じ。
+      **事前ゲートだけでは足りない**: 推論中は DB 接続を手放しているので、
+      `premise_token` を推論の前に取り、書き込みトランザクションの先頭で
+      `revalidate_premise` する。不一致なら推論結果は 1 行も保存せず、実行自体は
+      失敗として `intelligence_runs` に残す(dialogue では開発者自身のメッセージ
+      だけは保存する)。**セッション作成も 1 トランザクション** — `get_conn()` は
+      autocommit で ROLLBACK もしないので、`BEGIN IMMEDIATE` で囲まないと前提の
+      無いセッションが残る。`branched` は続行でき
       るが判定は `stale` のままで、その候補は昇格できない(昇格は `current`
       必須)。これが「古い premise の candidate が新しい head を上書きできない」
       の全体である。
@@ -2123,8 +2141,16 @@ creating incomplete persistence or execution paths for later phases.
       は `legacy-unbased`(= `invalid`)のままで、修復は
       `POST .../premise/adopt-current` という明示操作だけ。
     - **Overview は正準 head だけを「現在の Understanding」として表示する。**
-      head が無い System は `understanding_source='latest_session'` と明示し、
-      正準のようには見せない(`unavailable` と合わせて 3 つの別の答え)。Brief は
+      head が無い System は canonical の枠を**空にし**
+      (`understanding_source='not_promoted'`)、進行中の内容は `candidate_state` /
+      `candidate_brief` という別セクションで返す — 注記付きで canonical の枠へ
+      入れる形は採らない(注記があっても確定した主張の位置に未確定の内容が座る)。
+      `not_promoted`(System の事実)と `unavailable`(この要求の事実)は別の答えで、
+      findings も前者は `not_compared`、後者は `unavailable`。**判定順も契約**で
+      読み取り失敗が常に優先される(壊れた読み取りを「まだ途中です」と報告しない)。
+      候補 Brief は**セッションが無くても計算する** — `build_understanding_brief(None)`
+      は「まだ作っていない」という成功した読み取りで、これを省くと `next_action`
+      が丸ごと消える。Brief は
       `understanding_override` で head の内容から組む — セッションの live な
       `current_understanding` を読ませると、未確認の rebuild が Overview の
       「確定済み」表示を変えてしまう。確認済み Intent は premise から **fallback

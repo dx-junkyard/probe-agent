@@ -98,6 +98,7 @@ PREMISE_REASON_CODES = (
     "no_canonical_head",
     # stale
     "head_moved",
+    "promoted_by_this_session",
     "premise_content_changed",
     # missing
     "base_revision_missing",
@@ -124,6 +125,28 @@ CANONICAL_EVENT_KINDS = (
     "session_branched",
 )
 
+#: Why a result produced OUTSIDE the database lock may not be persisted.
+#: A reasoning call runs with the connection released (CLAUDE.md forbids
+#: holding it across an external call), so the ground can move between the
+#: pre-flight gate and the write. Two codes, because the developer's next
+#: action differs: the System moved on, versus this conversation was re-pinned
+#: underneath the run.
+REVALIDATION_CODES = (
+    "head_moved_during_run",
+    "session_premise_changed_during_run",
+)
+
+REVALIDATION_MESSAGES = {
+    "head_moved_during_run": (
+        "処理中に正準 Understanding が更新されたため、この結果は保存しませんでした。"
+        "新しい前提で実行し直してください。"
+    ),
+    "session_premise_changed_during_run": (
+        "処理中にこのセッションの前提が変更されたため、この結果は保存しませんでした。"
+        "もう一度実行してください。"
+    ),
+}
+
 #: Why a promotion was refused.  Each is a distinct next action for the
 #: developer, so they are never collapsed into one "conflict".
 PROMOTION_REJECTION_CODES = (
@@ -148,6 +171,11 @@ PREMISE_REASON_MESSAGES = {
     "head_moved": (
         "このセッションの開始後に正準 Understanding が更新されました。"
         "新規セッション・rebase・branch のいずれかを選んでください。"
+    ),
+    "promoted_by_this_session": (
+        "この会話の成果を正準 Understanding として確定しました。"
+        "この会話自体は確定前の前提のまま残ります。続きは rebase で"
+        "新しい前提のセッションへ引き継いでください。"
     ),
     "premise_content_changed": (
         "前提として固定した内容と、現在の正準 Understanding の内容が一致しません。"
@@ -330,6 +358,14 @@ def compute_content_digest(understanding: Optional[Dict[str, Any]]) -> str:
     return _canonical_digest(normalize_understanding(understanding))
 
 
+#: The one Intent status that RETRACTS a System-level confirmed statement.
+#: `undecided` / `needs_review` / `proposed` are in-progress states of ONE
+#: conversation, not decisions about the System: a session reopening a
+#: question does not un-confirm what an earlier generation settled. Dropping a
+#: confirmed Intent therefore needs its own explicit manual decision.
+INTENT_RETRACTION_STATUS = "not_applicable"
+
+
 def normalize_intent_items(rows: Any) -> List[Dict[str, Any]]:
     """The developer's confirmed Intent statements, normalized and ordered."""
     items: List[Dict[str, Any]] = []
@@ -346,6 +382,44 @@ def normalize_intent_items(rows: Any) -> List[Dict[str, Any]]:
                 "is_mock": bool(data.get("is_mock")),
             }
         )
+    items.sort(key=lambda entry: (entry["field"], entry["value_text"]))
+    return items
+
+
+def merge_intent_items(
+    inherited: List[Dict[str, Any]], session_rows: Any
+) -> List[Dict[str, Any]]:
+    """Carry the canonical Intent forward, then apply THIS session's decisions.
+
+    A confirmed Intent statement belongs to the System, so it must survive a
+    promotion made by a session that never restated it. Without this, the
+    second generation silently dropped it: the bundle was built from the
+    promoting session's own rows alone, and a session that read the goal from
+    its premise (rather than re-confirming it) had no row of its own to
+    contribute.
+
+    Only two of this session's rows change the result -- `confirmed` replaces,
+    `not_applicable` removes. Everything else is an in-progress state of one
+    conversation and leaves the inherited statement standing.
+    """
+    merged = {item["field"]: dict(item) for item in inherited}
+    for row in session_rows or []:
+        data = dict(row)
+        field = str(data.get("field") or "")
+        if not field:
+            continue
+        status = data.get("status")
+        if status == "confirmed":
+            merged[field] = {
+                "field": field,
+                "value_text": str(data.get("value_text") or ""),
+                "status": "confirmed",
+                "origin": str(data.get("origin") or ""),
+                "is_mock": bool(data.get("is_mock")),
+            }
+        elif status == INTENT_RETRACTION_STATUS:
+            merged.pop(field, None)
+    items = list(merged.values())
     items.sort(key=lambda entry: (entry["field"], entry["value_text"]))
     return items
 
@@ -424,29 +498,45 @@ def _loads(raw: Optional[str]) -> Optional[Any]:
         return None
 
 
-def confirmed_intent_rows(conn, session_id: int, system_id: int):
+def current_intent_rows(conn, session_id: int, system_id: int):
+    """Every non-superseded Intent row of one session, whatever its status.
+
+    The status filter belongs to `merge_intent_items`, not to the query: a
+    `not_applicable` row is exactly as load-bearing as a `confirmed` one,
+    because it is how a developer retracts an inherited statement.
+    """
     return conn.execute(
         """SELECT field, value_text, status, origin, is_mock
            FROM interview_intent_item
            WHERE session_id = ? AND system_id = ? AND superseded_by_id IS NULL
-             AND status = 'confirmed'
            ORDER BY id""",
         (session_id, system_id),
     ).fetchall()
 
 
-def build_premise_bundle(conn, system_id: int, revision_row) -> PremiseBundle:
+def build_premise_bundle(
+    conn,
+    system_id: int,
+    revision_row,
+    *,
+    inherited_intent: Optional[List[Dict[str, Any]]] = None,
+) -> PremiseBundle:
     """Capture the premise a revision represents, at this moment.
 
     Called exactly once per revision, at promotion.  The result is stored on
     the revision, so every session that later pins this head pins the SAME
     bytes -- confirming a new Intent item afterwards does not silently move
     the canonical premise, it becomes part of the next promoted revision.
+
+    ``inherited_intent`` is the CURRENT canonical premise's Intent. It is the
+    base the promoting session's own decisions are applied on top of, so a
+    confirmed statement survives a generation that never restated it.
     """
     understanding = _loads(revision_row["current_understanding"])
     understanding = understanding if isinstance(understanding, dict) else None
-    intent_items = normalize_intent_items(
-        confirmed_intent_rows(conn, revision_row["session_id"], system_id)
+    intent_items = merge_intent_items(
+        inherited_intent or [],
+        current_intent_rows(conn, revision_row["session_id"], system_id),
     )
     return PremiseBundle(
         premise_version=CANONICAL_PREMISE_VERSION,
@@ -721,6 +811,19 @@ def evaluate_session_premise(conn, session_row) -> PremiseVerdict:
 
     if head is None and base_revision_id is None:
         return _verdict("current", "no_canonical_head", **common)
+    # Derived, never stored: when the head this session no longer matches is the
+    # one this session itself produced, the cause is its own promotion. Same
+    # verdict, different cause, and a different next action -- so it gets its
+    # own code rather than being reported as somebody else having moved on.
+    # Checked before the asymmetric-None row below, because a session started
+    # on an empty System pins no base at all and would otherwise fall through
+    # to the generic `head_moved` after promoting the System's first head.
+    if (
+        head is not None
+        and base_revision_id != head.revision_id
+        and _column(session_row, "result_understanding_revision_id") == head.revision_id
+    ):
+        return _verdict("stale", "promoted_by_this_session", **common)
     if head is None or base_revision_id is None:
         return _verdict("stale", "head_moved", **common)
     if base_revision_id != head.revision_id:
@@ -728,6 +831,83 @@ def evaluate_session_premise(conn, session_row) -> PremiseVerdict:
     if head_digest is not None and base_digest != head_digest:
         return _verdict("stale", "premise_content_changed", **common)
     return _verdict("current", "premise_matches_head", **common)
+
+
+# --- Revalidation across an external call -------------------------------------
+
+
+@dataclass(frozen=True)
+class PremiseToken:
+    """What the premise was when a long-running job started.
+
+    Taken before the database lock is released for a reasoning call, and
+    checked again inside the write transaction. Carries the session's own
+    pinned premise AND the System head it was current against, because either
+    can move while the call is in flight.
+    """
+
+    session_id: int
+    system_id: int
+    base_revision_id: Optional[int]
+    base_premise_digest: Optional[str]
+    premise_tracking_version: Optional[str]
+    disposition: str
+    head_revision_id: Optional[int]
+    head_version: Optional[int]
+
+
+def premise_token(conn, session_row) -> PremiseToken:
+    """Snapshot the premise facts a run is about to reason against."""
+    head = load_head(conn, session_row["system_id"])
+    return PremiseToken(
+        session_id=session_row["id"],
+        system_id=session_row["system_id"],
+        base_revision_id=_column(session_row, "base_understanding_revision_id"),
+        base_premise_digest=_column(session_row, "base_premise_digest"),
+        premise_tracking_version=_column(session_row, "premise_tracking_version"),
+        disposition=_disposition(session_row),
+        head_revision_id=head.revision_id if head else None,
+        head_version=head.head_version if head else None,
+    )
+
+
+def revalidate_premise(conn, token: PremiseToken) -> Optional[str]:
+    """Has the ground moved since ``token`` was taken? Returns a finite code.
+
+    Issue #464's structural-debt item 9. The pre-flight gate cannot cover a
+    reasoning call, because the connection is released for its whole duration
+    (CLAUDE.md: never hold `get_conn()` across an external call). Without this
+    second check, a promotion that lands mid-call leaves the run's output --
+    an assistant turn, its proposals, a rebuilt Understanding -- written
+    against a premise the System has already moved past, and nothing
+    afterwards can tell that it happened.
+
+    Call it at the TOP of the write transaction, so the check and the write
+    are the same atomic act.
+    """
+    session = conn.execute(
+        "SELECT * FROM interview_session WHERE id = ? AND system_id = ?",
+        (token.session_id, token.system_id),
+    ).fetchone()
+    if session is None:
+        return "session_premise_changed_during_run"
+    if (
+        _column(session, "base_understanding_revision_id") != token.base_revision_id
+        or _column(session, "base_premise_digest") != token.base_premise_digest
+        or _column(session, "premise_tracking_version") != token.premise_tracking_version
+        or _disposition(session) != token.disposition
+    ):
+        return "session_premise_changed_during_run"
+    head = load_head(conn, token.system_id)
+    head_revision_id = head.revision_id if head else None
+    head_version = head.head_version if head else None
+    if head_revision_id != token.head_revision_id or head_version != token.head_version:
+        return "head_moved_during_run"
+    return None
+
+
+def revalidation_message(code: str) -> str:
+    return REVALIDATION_MESSAGES[code]
 
 
 # --- Audit --------------------------------------------------------------------
@@ -875,7 +1055,17 @@ def promote_revision(
             head_version=actual_head_version,
         )
 
-    bundle = build_premise_bundle(conn, system_id, revision)
+    # The Intent the CURRENT canonical premise carries is the base this
+    # promotion builds on, so a confirmed System-level statement survives a
+    # generation that never restated it.
+    inherited_intent: List[Dict[str, Any]] = []
+    if head is not None:
+        head_bundle = load_bundle(load_revision(conn, system_id, head.revision_id))
+        if head_bundle is not None:
+            inherited_intent = [dict(item) for item in head_bundle.intent_items]
+    bundle = build_premise_bundle(
+        conn, system_id, revision, inherited_intent=inherited_intent
+    )
     premise_digest = bundle.digest
 
     conn.execute(
@@ -939,22 +1129,27 @@ def promote_revision(
                 head_version=actual_head_version,
             )
 
-    # The promoting session's own premise IS the revision it just produced, so
-    # it stays continuable.  Every OTHER open session keeps its old baseline
-    # and therefore becomes `stale` -- which is the point.
+    # ONLY the outcome is recorded. The promoting session's own premise is NOT
+    # advanced to the revision it just produced.
+    #
+    # Advancing it looked convenient -- the session stayed continuable instead
+    # of immediately reading `stale` -- but it rewrote the ground the whole
+    # conversation already happened on. Every existing message was reasoned
+    # against the OLD premise while the session would then claim it had
+    # started from the new one, and the next turn would mix the two. "Continue
+    # only when the premise is the same" cannot survive silently changing the
+    # premise.
+    #
+    # The session therefore reads `stale` with its own reason code
+    # (`promoted_by_this_session`), which is the truth: what it was based on is
+    # no longer the head, BECAUSE this conversation settled it. Continuing is a
+    # rebase -- one explicit click, on a new session whose premise really is
+    # the promoted revision.
     conn.execute(
         """UPDATE interview_session
-           SET result_understanding_revision_id = ?,
-               base_understanding_revision_id = ?,
-               base_premise_digest = ?,
-               base_premise_json = ?,
-               premise_tracking_version = ?,
-               premise_captured_at = ?
+           SET result_understanding_revision_id = ?
            WHERE id = ? AND system_id = ?""",
-        (
-            revision_id, revision_id, premise_digest, bundle.to_json(),
-            CANONICAL_PREMISE_VERSION, now, session_id, system_id,
-        ),
+        (revision_id, session_id, system_id),
     )
 
     record_event(

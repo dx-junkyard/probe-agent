@@ -62,8 +62,14 @@ System
    求める。拒否は監査行として残す ── 拒否された昇格は後から状態から再導出でき
    ないからである。
 7. **Overview は正準 head だけを「現在の Understanding」として表示する。**
-   昇格前の System では `understanding_source='latest_session'` と明示し、
-   正準であるかのように見せない (#366 の「一つの表示語が二つの事実を運ばない」)。
+   昇格前の System では canonical の枠を空にし
+   (`understanding_source='not_promoted'`)、進行中の内容は **別セクション**
+   (`candidate_state` / `candidate_brief`) に置く。注記付きで canonical の枠へ
+   入れる形は採らない ── 注記があっても、確定した主張の位置に未確定の内容が
+   座り、ページの中心がセッション作成順に依存し続ける。`not_promoted`
+   (この System の事実) と `unavailable` (この要求の事実) も別の答えで、
+   findings も前者では `not_compared`、後者では `unavailable`
+   (#366 の「一つの表示語が二つの事実を運ばない」)。
 8. **既存データは推測で移行しない。** 初期 canonical revision は **人間の確認が
    実在する場合にのみ**生成する。誰も確認していない System に head を作るのは、
    この Issue が削除しようとしている「最新行が勝つ」規則そのもの。baseline を
@@ -103,7 +109,7 @@ System ごとに最大 1 行。`head_version` が compare-and-swap トークン�
 | `status` | `candidate` / `canonical` / `superseded`。既定は `candidate`。 |
 | `parent_revision_id` | 何を基準に更新したか。セッション内の直前リビジョン、無ければ開始時の premise。昇格時は当時の head。 |
 | `content_digest` | Understanding 内容の同一性。`understanding_brief.claim_payload` を再利用 (定義を二重化しない)。 |
-| `premise_digest` / `premise_json` | **昇格時にだけ**書かれる、その版が表す前提。以後不変。 |
+| `premise_digest` / `premise_json` | **昇格時にだけ**書かれる、その版が表す前提 (親 premise の確認済み Intent を継承)。以後不変。 |
 | `confirmed_by` / `confirmed_at` | 昇格した人と時刻。 |
 
 `premise_digest` を昇格時にのみ確定するのは、後から Intent を 1 つ確認しただけで
@@ -137,10 +143,15 @@ append-only。`head_initialized` / `promoted` / `promotion_conflict` /
 | 2 | `premise_tracking_version` が未知 | `invalid` | `premise_version_unsupported` |
 | 3 | bundle は revision を指すが FK 列が NULL / 行が消えた | `missing` | `base_revision_missing` |
 | 4 | head も base も無い | `current` | `no_canonical_head` |
-| 5 | 片方だけ存在する | `stale` | `head_moved` |
-| 6 | `base != head` | `stale` | `head_moved` |
-| 7 | `base == head` かつ digest 不一致 | `stale` | `premise_content_changed` |
-| 8 | それ以外 | `current` | `premise_matches_head` |
+| 5 | `base != head` かつ `result_revision_id == head` | `stale` | `promoted_by_this_session` |
+| 6 | 片方だけ存在する | `stale` | `head_moved` |
+| 7 | `base != head` | `stale` | `head_moved` |
+| 8 | `base == head` かつ digest 不一致 | `stale` | `premise_content_changed` |
+| 9 | それ以外 | `current` | `premise_matches_head` |
+
+行 5 が行 6 より前にあるのは契約である。正準 head が 1 つも無い System で
+始まったセッションは base を持たないので、そのセッションが System の最初の
+head を昇格すると行 6 に落ちて「誰かが先へ進んだ」と報告されてしまう。
 
 `continuable` は `state == 'current'`、**または** `disposition == 'branched'`。
 branch は「この会話は古い前提の検討である」と開発者が記録した事実なので続行でき
@@ -150,22 +161,35 @@ branch は「この会話は古い前提の検討である」と開発者が記�
 
 ## 4. ゲートの位置
 
-premise を **消費する** 2 経路にだけ 409 を置く:
+premise を **消費する** 経路にだけ 409 を置く:
 
 - `POST /interview/sessions/{id}/dialogue-turn`
 - `POST /interview/sessions/{id}/update-understanding`
+- 自動 refresh (#288) も同じ境界で止まる。こちらは 409 ではなく、通常の終端
+  ノートとして「前提が現在の正準ではないため自動更新をスキップした。回答は
+  保存されている」を記録する ── 何も壊れていないからである。
 
 開発者の入力を**記録する**経路 (Q&A 回答など) には置かない。前提の問題で人間の
 回答を失うのは、#336 が 「わからない」 の入口で先に回答を確定させたのと同じ理由で
 誤りである。
+
+### 4.1 保存直前の再検証
+
+事前ゲートだけでは足りない。推論呼び出しの間は DB 接続を手放している
+(CLAUDE.md: 外部呼び出しを跨いで `get_conn()` を保持しない) ので、その間に
+昇格が起きうる。`premise_token` を推論の**前**に取り、書き込みトランザクションの
+**先頭**で `revalidate_premise` する。不一致なら推論結果は 1 行も保存せず、
+実行自体は `intelligence_runs` に失敗として残す ── 有限コードは
+`head_moved_during_run` / `session_premise_changed_during_run` の 2 つで、
+開発者の次の操作が違うので畳まない。
 
 ---
 
 ## 5. 昇格 (compare-and-swap)
 
 1 トランザクションで: revision の status / lineage / premise、直前 head の
-`superseded` 化、head ポインタと `head_version`、昇格したセッションの新しい
-baseline、監査行。
+`superseded` 化、head ポインタと `head_version`、昇格元セッションの
+`result_understanding_revision_id`、監査行。
 
 3 つの独立したガード (それぞれ次の操作が違うので別コード):
 
@@ -175,9 +199,23 @@ baseline、監査行。
 - `revision_not_found` / `revision_not_candidate` / `revision_empty` — 候補として
   成立していない。
 
-昇格したセッションの baseline はその版へ進む (自分が作った内容が前提になった)。
-**他の open session は古い baseline のまま `stale` になる** ── それがこの機構の
-目的である。
+**昇格したセッションの premise は動かさない。** 動かすとその会話は「確定前の
+前提で行われた履歴」なのに「確定後の前提から始まった」と主張することになり、
+次の turn は新しい前提と古い会話を混ぜて実行される。§0.4 の不変条件はここでも
+そのまま効く。
+
+昇格したセッションは `stale` になり、専用の理由コード
+`promoted_by_this_session` を返す ── 「他人が先へ進んだ」とは別の事実で、次の
+操作も違う (続けるなら rebase で、昇格した版を本当に前提とする新しい
+セッションへ引き継ぐ)。**他の open session も古い baseline のまま `stale` に
+なる** ── それがこの機構の目的である。
+
+昇格時の premise bundle は、**現在の正準 premise の確認済み Intent を基底に
+して**構築する。そこへ昇格元セッション自身の決定を重ねる: `confirmed` は
+置き換え、`not_applicable` は削除、それ以外の状態 (`undecided` /
+`needs_review` / `proposed`) は 1 つの会話の途中経過なので継承した内容を
+そのまま残す。これが無いと、premise から Vision を読んだだけで再確認しなかった
+世代が昇格した瞬間に、開発者が確定した Vision が静かに消える。
 
 ---
 
@@ -201,6 +239,7 @@ baseline、監査行。
 | method | path | 役割 |
 | --- | --- | --- |
 | GET | `/understanding-head` | System の正準 Understanding。`revision_id: null` は「まだ誰も昇格していない」。 |
+| GET | `/overview` | `brief` は正準のみ。未昇格なら `null` + `understanding_source='not_promoted'` + `candidate_*`。 |
 | GET | `/interview/sessions/{id}/premise` | 前提判定 + 有限の選択肢。読み取りは何も書かない。 |
 | POST | `/interview/sessions/{id}/premise/rebase` | 現在の head 上に**新しいセッション**を作る。元の会話と前提は不変。 |
 | POST | `/interview/sessions/{id}/premise/branch` | 古い前提の検討として明示的に維持する。 |

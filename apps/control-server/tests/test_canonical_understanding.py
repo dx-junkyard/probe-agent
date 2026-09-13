@@ -681,6 +681,14 @@ def test_a_candidate_from_an_older_head_cannot_overwrite_a_newer_one(
     assert metrics["session_premise_counts"]["stale"] >= 1
 
 
+def _rebase(client, headers, session_id):
+    r = client.post(
+        f"/interview/sessions/{session_id}/premise/rebase", json={}, headers=headers
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["new_session_id"]
+
+
 def test_a_stale_head_expectation_is_refused_even_from_a_current_session(
     admin_client, tmp_path
 ):
@@ -701,17 +709,20 @@ def test_a_stale_head_expectation_is_refused_even_from_a_current_session(
     )
     _promote(client, headers, s0, r1, expected_head=None, expected_version=None)
 
+    # Continuing after a promotion is a rebase: the promoting session keeps the
+    # premise its whole conversation happened on.
+    s1 = _rebase(client, headers, s0)
     r2 = _store_candidate(
-        s0, system_id, snapshot_id,
+        s1, system_id, snapshot_id,
         _understanding(system_purpose=[_item("P2")], core_capabilities=[_item("C2")]),
     )
     stale_expectation = _promote(
-        client, headers, s0, r2, expected_head=None, expected_version=0
+        client, headers, s1, r2, expected_head=None, expected_version=0
     )
     assert stale_expectation.status_code == 409
     assert stale_expectation.json()["detail"]["code"] == "head_revision_mismatch"
 
-    ok = _promote(client, headers, s0, r2, expected_head=r1, expected_version=1)
+    ok = _promote(client, headers, s1, r2, expected_head=r1, expected_version=1)
     assert ok.status_code == 200, ok.text
 
 
@@ -755,14 +766,15 @@ def test_an_unconfirmed_candidate_does_not_change_the_overview(admin_client, tmp
     )
 
 
-def test_overview_labels_an_unpromoted_system_rather_than_claiming_it_is_canonical(
+def test_an_unpromoted_system_has_no_canonical_understanding_on_the_overview(
     admin_client, tmp_path
 ):
-    """A System nobody has promoted has no canonical Understanding.
+    """A System nobody has promoted has no canonical Understanding -- at all.
 
-    The fallback still shows the newest session so the screen is not blank,
-    but it says WHICH rule produced it -- `latest_session` and
-    `canonical_head` are two different claims.
+    The in-progress work is still shown, but in its OWN section. Putting it in
+    the canonical slot with a caveat still makes the page's central claim
+    depend on session creation order, which is the defect this Epic exists to
+    remove (#464 acceptance: candidate は別セクション).
     """
     client = admin_client
     token, system_id, snapshot_id = _setup(client, tmp_path, "System Unpromoted")
@@ -771,14 +783,68 @@ def test_overview_labels_an_unpromoted_system_rather_than_claiming_it_is_canonic
     s0 = _create_session(client, headers, snapshot_id)
     _store_candidate(
         s0, system_id, snapshot_id,
-        _understanding(system_purpose=[_item("P1")], core_capabilities=[_item("C1")]),
+        _understanding(
+            vision=[_item("未確定の Vision")],
+            system_purpose=[_item("P1")],
+            core_capabilities=[_item("C1")],
+        ),
     )
     overview = client.get("/overview", headers=headers).json()
-    assert overview["understanding_source"] == "latest_session"
+    assert overview["brief"] is None
+    assert overview["understanding_source"] == "not_promoted"
     assert overview["canonical_revision_id"] is None
+    # The work in progress is reported separately, and named as such.
+    assert overview["candidate_state"] == "unpromoted"
+    assert overview["candidate_session_id"] == s0
+    assert overview["candidate_brief"]["vision"]["name"] == "未確定の Vision"
+    # No canonical claim means no basis for comparison -- and that is a fact
+    # about the System, never a failed read.
+    assert overview["findings_state"] == "not_compared"
+    assert overview["findings_baseline_state"] == "no_baseline"
+    # 「次にやること」 still follows the work in progress.
+    assert overview["next_action"] is not None
 
     head = client.get("/understanding-head", headers=headers).json()
     assert head["revision_id"] is None
+
+
+def test_a_newer_candidate_is_reported_beside_the_canonical_head(
+    admin_client, tmp_path
+):
+    """Unconfirmed work never edits the canonical claim, but is still visible."""
+    client = admin_client
+    token, system_id, snapshot_id = _setup(client, tmp_path, "System Beside")
+    headers = _headers(token, system_id)
+
+    s0 = _create_session(client, headers, snapshot_id)
+    r1 = _store_candidate(
+        s0, system_id, snapshot_id,
+        _understanding(
+            vision=[_item("確定した Vision")],
+            system_purpose=[_item("P1")],
+            core_capabilities=[_item("C1")],
+        ),
+    )
+    _promote(client, headers, s0, r1, expected_head=None, expected_version=None)
+
+    settled = client.get("/overview", headers=headers).json()
+    assert settled["understanding_source"] == "canonical_head"
+    assert settled["candidate_state"] == "same_as_head"
+
+    s1 = _rebase(client, headers, s0)
+    _store_candidate(
+        s1, system_id, snapshot_id,
+        _understanding(
+            vision=[_item("まだ確認していない Vision")],
+            system_purpose=[_item("P2")],
+            core_capabilities=[_item("C2")],
+        ),
+    )
+    body = client.get("/overview", headers=headers).json()
+    assert body["brief"]["vision"]["name"] == "確定した Vision"
+    assert body["canonical_revision_id"] == r1
+    assert body["candidate_state"] == "newer_than_head"
+    assert body["candidate_brief"]["vision"]["name"] == "まだ確認していない Vision"
 
 
 # --- Scenario 6 --------------------------------------------------------------
@@ -852,6 +918,321 @@ def test_a_deleted_base_revision_is_missing_not_stale(admin_client, tmp_path):
     premise = _premise(client, headers, s1)
     assert premise["state"] == "missing"
     assert premise["reason_code"] == "base_revision_missing"
+
+
+# --- Review round 1: premise immutability, revalidation, Intent lineage ------
+
+
+def test_promotion_never_rewrites_the_promoting_session_premise(
+    admin_client, tmp_path
+):
+    """The conversation keeps the ground it actually happened on.
+
+    Advancing the promoting session's baseline to the revision it just
+    produced kept the session continuable, but it rewrote the premise every
+    existing message had been reasoned against -- the session would then claim
+    it had started from content that did not exist when it started. 「前提が
+    同じときだけ続ける」 cannot survive silently changing the premise.
+    """
+    client = admin_client
+    token, system_id, snapshot_id = _setup(client, tmp_path, "System Immutable")
+    headers = _headers(token, system_id)
+
+    s0 = _create_session(client, headers, snapshot_id)
+    before = _premise(client, headers, s0)
+    r1 = _store_candidate(
+        s0, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("P1")], core_capabilities=[_item("C1")]),
+    )
+    assert _promote(
+        client, headers, s0, r1, expected_head=None, expected_version=None
+    ).status_code == 200
+
+    after = _premise(client, headers, s0)
+    assert after["base_revision_id"] == before["base_revision_id"]
+    assert after["base_premise_digest"] == before["base_premise_digest"]
+    assert after["result_revision_id"] == r1
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT base_premise_json FROM interview_session WHERE id = ?", (s0,)
+        ).fetchone()
+    assert json.loads(row["base_premise_json"])["revision_id"] is None
+
+    # The session is stale, and says WHY: it settled the head itself. That is a
+    # different fact from somebody else having moved on, and the way forward is
+    # a rebase rather than three equal choices.
+    assert after["state"] == "stale"
+    assert after["reason_code"] == "promoted_by_this_session"
+    assert after["available_actions"][0] == "rebase"
+    assert after["continuable"] is False
+
+    turn = client.post(
+        f"/interview/sessions/{s0}/dialogue-turn",
+        json={"user_message": "続けて"},
+        headers=headers,
+    )
+    assert turn.status_code == 409
+
+    s1 = _rebase(client, headers, s0)
+    assert _premise(client, headers, s1)["base_revision_id"] == r1
+
+
+def test_confirmed_intent_survives_a_generation_that_never_restated_it(
+    admin_client, tmp_path
+):
+    """A confirmed Intent statement belongs to the System, not to one session.
+
+    Reading it from the premise (rather than re-confirming it) leaves the new
+    session with no row of its own, so building the next bundle from that
+    session alone silently dropped the Vision the developer had settled two
+    generations earlier.
+    """
+    client = admin_client
+    token, system_id, snapshot_id = _setup(client, tmp_path, "System Intent Lineage")
+    headers = _headers(token, system_id)
+
+    s0 = _create_session(client, headers, snapshot_id)
+    _confirm_intent(s0, system_id, "goal", "レビュー時間を半分にする")
+    r1 = _store_candidate(
+        s0, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("P1")], core_capabilities=[_item("C1")]),
+    )
+    assert _promote(
+        client, headers, s0, r1, expected_head=None, expected_version=None
+    ).status_code == 200
+
+    # Generation 2 never restates the goal.
+    s1 = _rebase(client, headers, s0)
+    r2 = _store_candidate(
+        s1, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("P2")], core_capabilities=[_item("C2")]),
+    )
+    assert _promote(
+        client, headers, s1, r2, expected_head=r1, expected_version=1
+    ).status_code == 200
+
+    # Generation 3 still sees it.
+    s2 = _rebase(client, headers, s1)
+    brief = client.get(
+        "/interview/understanding-brief", params={"session_id": s2}, headers=headers
+    ).json()
+    assert brief["vision"]["name"] == "レビュー時間を半分にする"
+
+    overview = client.get("/overview", headers=headers).json()
+    assert overview["brief"]["vision"]["name"] == "レビュー時間を半分にする"
+
+
+def test_an_explicit_not_applicable_is_the_only_way_to_drop_inherited_intent(
+    admin_client, tmp_path
+):
+    """Reopening a question is not the same as retracting a decision.
+
+    `undecided` is one conversation's in-progress state; only the explicit
+    `not_applicable` decision removes a System-level confirmed statement.
+    """
+    from app.canonical_understanding import merge_intent_items
+
+    inherited = [
+        {
+            "field": "goal",
+            "value_text": "A",
+            "status": "confirmed",
+            "origin": "user",
+            "is_mock": False,
+        }
+    ]
+    assert merge_intent_items(inherited, [{"field": "goal", "status": "undecided"}]) == inherited
+    assert merge_intent_items(inherited, [{"field": "goal", "status": "proposed"}]) == inherited
+    assert merge_intent_items(inherited, [{"field": "goal", "status": "not_applicable"}]) == []
+    replaced = merge_intent_items(
+        inherited,
+        [{"field": "goal", "value_text": "B", "status": "confirmed", "origin": "user"}],
+    )
+    assert [i["value_text"] for i in replaced] == ["B"]
+
+
+def _insert_understanding_graph(system_id, snapshot_id):
+    from app.documentation_claim_scanner import (
+        ChunkScanResult,
+        ClaimEvidence,
+        DocumentationClaim,
+    )
+    from app.understanding_graph import build_understanding_graph, save_graph_snapshot
+    from app.db import get_conn
+
+    result = ChunkScanResult(
+        chunk_id="chunk-1",
+        chunk_content_hash="hash-1",
+        prompt_version="claim-scanner-v1",
+        schema_version="claim-scanner-v1",
+        claims=[
+            DocumentationClaim(
+                claim_type="system_purpose",
+                summary="System helps inspect probe agent repositories",
+                evidence=ClaimEvidence(path="README.md", start_line=1, end_line=5),
+                confidence=0.9,
+            )
+        ],
+    )
+    graph = build_understanding_graph([result])
+    with get_conn() as conn:
+        return save_graph_snapshot(conn, system_id, graph, snapshot_id=snapshot_id)
+
+
+def _review_response(purpose_name="P-from-llm"):
+    return json.dumps({
+        "system_purpose": [{
+            "name": purpose_name,
+            "summary": "s",
+            "confidence": {"level": "likely", "reason": "r"},
+            "evidence": [
+                {"path": "README.md", "start_line": 1, "end_line": 5, "summary": "s"}
+            ],
+            "why_core": "",
+            "related_docs": ["README.md"],
+            "related_apis": [],
+            "children": [],
+        }],
+        "core_capabilities": [],
+        "capability_elements": [],
+        "supporting_elements": [],
+        "api_boundaries": [],
+        "probe_flow_candidates": [],
+        "gap_analysis": [],
+        "open_questions": [],
+        "suggested_next_action": "resolve_open_questions",
+    })
+
+
+def test_a_head_that_moves_during_the_reasoning_call_discards_the_result(
+    admin_client, tmp_path, monkeypatch
+):
+    """Issue #464 structural debt 9: revalidate immediately before storing.
+
+    The connection is released for the whole reasoning call (CLAUDE.md forbids
+    holding it across an external call), so a promotion can land mid-call. The
+    pre-flight gate cannot see that. Without a second check the rebuilt
+    understanding is written against a premise nobody reasoned against, and
+    nothing afterwards can tell.
+    """
+    client = admin_client
+    token, system_id, snapshot_id = _setup(client, tmp_path, "System Revalidate")
+    headers = _headers(token, system_id)
+    _insert_understanding_graph(system_id, snapshot_id)
+
+    s_head = _create_session(client, headers, snapshot_id)
+    r1 = _store_candidate(
+        s_head, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("P1")], core_capabilities=[_item("C1")]),
+    )
+    _promote(client, headers, s_head, r1, expected_head=None, expected_version=None)
+
+    target = _create_session(client, headers, snapshot_id)
+    assert _premise(client, headers, target)["state"] == "current"
+
+    import app.routes.interview as interview_route
+
+    other = _rebase(client, headers, s_head)
+
+    class PromotingClient:
+        """Stands in for the reasoning model, and moves the head while it runs."""
+
+        def generate_text(self, messages, *, temperature=None, max_tokens=None):
+            r2 = _store_candidate(
+                other, system_id, snapshot_id,
+                _understanding(
+                    system_purpose=[_item("P2")], core_capabilities=[_item("C2")]
+                ),
+            )
+            promoted = _promote(
+                client, headers, other, r2, expected_head=r1, expected_version=1
+            )
+            assert promoted.status_code == 200, promoted.text
+            return _review_response()
+
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "o3-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setattr(
+        interview_route, "create_llm_client", lambda config: PromotingClient()
+    )
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        before = conn.execute(
+            "SELECT COUNT(*) AS n FROM understanding_revision WHERE session_id = ?",
+            (target,),
+        ).fetchone()["n"]
+
+    response = client.post(
+        f"/interview/sessions/{target}/update-understanding", headers=headers
+    )
+    assert response.status_code == 200, response.text
+
+    with get_conn() as conn:
+        after = conn.execute(
+            "SELECT COUNT(*) AS n FROM understanding_revision WHERE session_id = ?",
+            (target,),
+        ).fetchone()["n"]
+        session_row = conn.execute(
+            "SELECT current_understanding, last_error FROM interview_session WHERE id = ?",
+            (target,),
+        ).fetchone()
+        run = conn.execute(
+            """SELECT status, error_details FROM intelligence_runs
+               WHERE system_id = ? AND run_type = 'understanding_review'
+               ORDER BY id DESC LIMIT 1""",
+            (system_id,),
+        ).fetchone()
+
+    # Nothing the stale run produced was stored, and the attempt is auditable.
+    assert after == before
+    assert "P-from-llm" not in (session_row["current_understanding"] or "")
+    assert run["status"] == "failed"
+    assert "正準 Understanding が更新された" in (run["error_details"] or "")
+    assert session_row["last_error"]
+
+
+def test_session_creation_is_one_transaction(admin_client, tmp_path, monkeypatch):
+    """A session must never exist without a recorded premise.
+
+    `get_conn()` is autocommit and never rolls back on its own, so the three
+    writes only become one act inside an explicit transaction.
+    """
+    client = admin_client
+    token, system_id, snapshot_id = _setup(client, tmp_path, "System Atomic")
+    headers = _headers(token, system_id)
+
+    import app.routes.interview as interview_route
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("premise capture failed")
+
+    monkeypatch.setattr(
+        interview_route.canonical_understanding, "capture_session_premise", boom
+    )
+    with pytest.raises(RuntimeError):
+        client.post(
+            "/interview/sessions", json={"snapshot_id": snapshot_id}, headers=headers
+        )
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        sessions = conn.execute(
+            "SELECT COUNT(*) AS n FROM interview_session WHERE system_id = ?",
+            (system_id,),
+        ).fetchone()["n"]
+        runs = conn.execute(
+            "SELECT COUNT(*) AS n FROM interview_process_run WHERE system_id = ?",
+            (system_id,),
+        ).fetchone()["n"]
+    assert sessions == 0
+    assert runs == 0
 
 
 # --- Cross-cutting -----------------------------------------------------------
@@ -960,16 +1341,20 @@ def test_promotion_marks_the_previous_head_superseded_and_keeps_lineage(
         _understanding(system_purpose=[_item("P1")], core_capabilities=[_item("C1")]),
     )
     _promote(client, headers, s0, r1, expected_head=None, expected_version=None)
+    s1 = _rebase(client, headers, s0)
     r2 = _store_candidate(
-        s0, system_id, snapshot_id,
+        s1, system_id, snapshot_id,
         _understanding(system_purpose=[_item("P2")], core_capabilities=[_item("C2")]),
     )
-    _promote(client, headers, s0, r2, expected_head=r1, expected_version=1)
+    _promote(client, headers, s1, r2, expected_head=r1, expected_version=1)
 
-    revisions = client.get(
+    first = client.get(
         f"/interview/sessions/{s0}/understanding-revisions", headers=headers
     ).json()["items"]
-    by_id = {r["id"]: r for r in revisions}
+    second = client.get(
+        f"/interview/sessions/{s1}/understanding-revisions", headers=headers
+    ).json()["items"]
+    by_id = {r["id"]: r for r in first + second}
     assert by_id[r1]["status"] == "superseded"
     assert by_id[r2]["status"] == "canonical"
     assert by_id[r2]["parent_revision_id"] == r1

@@ -200,6 +200,13 @@ def get_overview(system_id: int = Depends(get_system_id)) -> OverviewOut:
         understanding_source=result.understanding_source,
         canonical_revision_id=result.canonical_revision_id,
         canonical_head_version=result.canonical_head_version,
+        candidate_state=result.candidate_state,
+        candidate_session_id=result.candidate_session_id,
+        candidate_brief=(
+            UnderstandingBriefOut(system_id=system_id, **asdict(result.candidate_brief))
+            if result.candidate_brief is not None
+            else None
+        ),
         findings=findings,
         findings_initial_count=result.findings_initial_count,
         findings_state=result.findings_state,

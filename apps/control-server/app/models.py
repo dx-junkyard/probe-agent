@@ -2574,6 +2574,7 @@ InterviewPremiseReasonCode = Literal[
     "premise_matches_head",
     "no_canonical_head",
     "head_moved",
+    "promoted_by_this_session",
     "premise_content_changed",
     "base_revision_missing",
     "premise_not_captured",
@@ -2605,11 +2606,18 @@ UnderstandingCanonicalEventKind = Literal[
     "session_branched",
 ]
 
-# Where a screen's displayed "current Understanding" actually came from.
-# `latest_session` is the pre-#464 fallback and is labelled as such: a System
-# with no promoted head has no canonical Understanding, and saying so is the
-# point.
-UnderstandingSource = Literal["canonical_head", "latest_session", "unavailable"]
+# Where a screen's displayed "current Understanding" came from. Three answers,
+# never two: `not_promoted` is a fact about the System (nobody has confirmed
+# one yet) and `unavailable` is a fact about this request (it could not be
+# read). The in-progress work is reported separately as a candidate -- it is
+# never shown in the canonical slot, however it is labelled.
+UnderstandingSource = Literal["canonical_head", "not_promoted", "unavailable"]
+
+# Whether the in-progress Understanding differs from the canonical head.
+# Decided server-side so the Dashboard never compares revisions itself.
+OverviewCandidateState = Literal[
+    "none", "unpromoted", "newer_than_head", "same_as_head"
+]
 
 
 class InterviewSessionOut(BaseModel):
@@ -8871,6 +8879,12 @@ class OverviewOut(BaseModel):
     understanding_source: UnderstandingSource = "unavailable"
     canonical_revision_id: Optional[int] = None
     canonical_head_version: Optional[int] = None
+    #: Issue #464: the in-progress Understanding, in its own section. It never
+    #: substitutes for `brief` -- 「まだ誰も確定していない」 and 「これがこの
+    #: System の理解である」 are two different claims.
+    candidate_state: OverviewCandidateState = "none"
+    candidate_session_id: Optional[int] = None
+    candidate_brief: Optional[UnderstandingBriefOut] = None
     findings: List[OverviewFindingOut] = []
     #: How many findings the initial view shows (cap 3, never a pad).
     findings_initial_count: int = 0

@@ -141,6 +141,9 @@ function overview(overrides: Partial<OverviewOut> = {}): OverviewOut {
     // Issue #464: どの規則で決まった Understanding かは省略できない
     // (`latest_session` を正準として見せないため)。
     understanding_source: "canonical_head",
+    candidate_state: "same_as_head",
+    candidate_session_id: null,
+    candidate_brief: null,
     canonical_revision_id: null,
     canonical_head_version: null,
     understanding_revision_id: null,

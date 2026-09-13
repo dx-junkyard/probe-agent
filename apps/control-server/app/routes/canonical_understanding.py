@@ -99,6 +99,11 @@ def _available_actions(verdict: canonical.PremiseVerdict) -> List[str]:
     if verdict.disposition == "rebased":
         # The successor session is where the conversation moved to.
         return ["open_successor_session"]
+    if verdict.reason_code == "promoted_by_this_session":
+        # This conversation settled the head it no longer matches, so the
+        # normal continuation is to carry it onto what it just produced --
+        # `rebase` first, not as one of three equal choices.
+        return ["rebase", "start_new_session", "branch"]
     if verdict.state == "invalid":
         # A legacy session never recorded what it stood on, so re-pinning it
         # explicitly is the honest repair -- alongside the normal choices.
