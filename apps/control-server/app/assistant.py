@@ -681,6 +681,17 @@ class ContextPack:
     focused_state_id: Optional[str] = None
     screen_data: Optional[Dict[str, Any]] = None
     screen_data_sources: List[Dict[str, str]] = field(default_factory=list)
+    # Issue #456 follow-up: the operation-result of THIS turn's screen
+    # canonical-context read (`DiscussionOperationResult`, `app/models.py`),
+    # separate from `screen_data` itself on purpose -- an `unavailable` read
+    # must never be indistinguishable, to the model, from a genuinely empty
+    # `screen_data` (§9.2: "取得結果だけで機能不存在を確定しない"). `None`
+    # means "the caller did not compute one" (a pre-#456 call site, or a
+    # request with no `screen_id` context at all) and adds nothing to the
+    # prompt -- distinct from `"available"`, which is the normal successful
+    # case and also adds nothing (there is nothing to warn the model about).
+    screen_data_state: Optional[str] = None
+    screen_data_reason: str = ""
     route_params: Dict[str, str] = field(default_factory=dict)
     conversation: List[Dict[str, str]] = field(default_factory=list)
     # Issue #445 (Epic #443 Phase 2): an unsaved UI form draft, kept in a
@@ -738,6 +749,27 @@ class ContextPack:
             payload["route_params"] = self.route_params
             payload["screen_data"] = self.screen_data
             payload["screen_data_sources"] = self.screen_data_sources
+        # Issue #456 follow-up: a SEPARATE top-level key, never nested inside
+        # `screen_data` -- an `unavailable` read must read to the model as
+        # "this section could not be read", not as an empty section of facts
+        # (which would let it conclude "no such fact" per §9.2). Emitted
+        # ONLY for `unavailable` (a REGISTERED provider was attempted and
+        # failed THIS turn) -- deliberately NOT for `unsupported` (this
+        # screen never had a canonical-context concept at all, which is
+        # exactly the pre-#456 "no screen_data key" shape every non-
+        # discussion screen's prompt has always had) or `available` (nothing
+        # to warn the model about). A pre-#456 request's payload shape for
+        # every screen that never fails to read is therefore byte-for-byte
+        # unchanged.
+        if self.screen_data_state == "unavailable":
+            payload["screen_context_state"] = {
+                "state": self.screen_data_state,
+                "reason": self.screen_data_reason,
+                "note": (
+                    "この画面の正規データ (screen_data) はこの応答時点で取得できませんでした。"
+                    "screen_data が空/欠落であることを『そのような事実が無い』とは解釈しないでください。"
+                ),
+            }
         if self.ui_draft is not None:
             # TOP LEVEL, never nested inside `screen_data` (§2.4): the model
             # must be able to tell "the System's canonical facts" from "an
@@ -757,6 +789,8 @@ def build_context_pack(
     focused_state_id: Optional[str] = None,
     screen_data: Optional[Dict[str, Any]] = None,
     screen_data_sources: Optional[List[Dict[str, str]]] = None,
+    screen_data_state: Optional[str] = None,
+    screen_data_reason: str = "",
     route_params: Optional[Dict[str, str]] = None,
     conversation: Optional[List[Dict[str, str]]] = None,
     ui_draft: Optional[Dict[str, Any]] = None,
@@ -822,6 +856,8 @@ def build_context_pack(
         focused_state_id=focused_state_id,
         screen_data=screen_data,
         screen_data_sources=list(screen_data_sources or []),
+        screen_data_state=screen_data_state,
+        screen_data_reason=screen_data_reason,
         route_params=dict(route_params or {}),
         conversation=list(conversation or []),
         ui_draft=ui_draft,
@@ -1291,6 +1327,8 @@ def answer_question(
     focused_state_id: Optional[str] = None,
     screen_data: Optional[Dict[str, Any]] = None,
     screen_data_sources: Optional[List[Dict[str, str]]] = None,
+    screen_data_state: Optional[str] = None,
+    screen_data_reason: str = "",
     route_params: Optional[Dict[str, str]] = None,
     conversation: Optional[List[Dict[str, str]]] = None,
     voice_mode: bool = False,
@@ -1317,7 +1355,8 @@ def answer_question(
     """
     pack = build_context_pack(
         ctx, question, report, visible_check_ids, state_items, focused_state_id,
-        screen_data, screen_data_sources, route_params, conversation,
+        screen_data, screen_data_sources, screen_data_state, screen_data_reason,
+        route_params, conversation,
         ui_draft=ui_draft, ui_draft_sources=ui_draft_sources,
     )
     if client is None:

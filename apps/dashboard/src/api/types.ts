@@ -3798,6 +3798,8 @@ export interface UiDraftFieldIn {
 }
 
 export interface UiDraftContextIn {
+  validation_state?: "idle" | "validating" | "invalid";
+  section_errors?: { section: string; code: string; message: string }[];
   target_kind: DiscussionTargetKind;
   target_ref: string;
   form_id: string;
@@ -3843,6 +3845,9 @@ export interface AssistantAskRequest {
 // app/assistant_discussion.py's module constants exactly -- keep them exact.
 
 export type DiscussionScope = "screen" | "entity" | "element";
+// Issue #453 (Epic #443 Phase 4): Vision-to-Feature. Each resolves against
+// an existing owning module's stable identity -- see
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §4.1.
 export type DiscussionTargetKind =
   | "screen"
   | "interview_session"
@@ -3852,7 +3857,15 @@ export type DiscussionTargetKind =
   | "ux_journey_step"
   | "ux_requirement"
   | "solution_design"
-  | "blueprint_lane_cell";
+  | "blueprint_lane_cell"
+  | "purpose_element"
+  | "purpose_relation"
+  | "stakeholder"
+  | "stakeholder_need"
+  | "product_objective"
+  | "product_milestone"
+  | "product_gap"
+  | "product_feature";
 export type DiscussionTargetState = "current" | "stale" | "unresolvable" | "not_tracked";
 
 // docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3 (Issue #444, Epic #443 Phase 1). Derived
@@ -3865,6 +3878,19 @@ export type DiscussionCapability =
   | "propose_relations"
   | "prefill_form"
   | "promote_joint_understanding";
+
+// Issue #456. What a discussion-adapter READ operation (context gathering,
+// prefill readiness, ...) reports about itself -- a field of its own, never
+// folded into the facts it accompanies and never merged with
+// DiscussionTargetState (freshness). `unsupported`: no adapter/handler
+// registered. `unavailable`: a registered handler exists but this attempt
+// failed. `not_applicable`: this kind of target can never carry this
+// operation, independent of registration state.
+export type DiscussionOperationResult =
+  | "available"
+  | "unsupported"
+  | "unavailable"
+  | "not_applicable";
 
 export interface AssistantDiscussionTargetIn {
   scope: DiscussionScope;
@@ -3897,6 +3923,11 @@ export interface AssistantDiscussionTurn {
   ui_draft_state?: UiDraftState | null;
   ui_draft_form_id?: string | null;
   ui_draft_digest?: string;
+  // Issue #459 (§9.2): `null`/absent means "not a claims turn" -- every turn
+  // before this Issue, and every ordinary /assistant/ask turn since. Never
+  // `[]`, which is structurally impossible for an actual claims turn (a
+  // claims call always returns at least one claim or fails outright).
+  claims?: DiscussionContextClaim[] | null;
 }
 
 export interface AssistantDiscussionThread {
@@ -3917,14 +3948,214 @@ export interface AssistantDiscussionThread {
   schema_version: string;
 }
 
+// Issue #459 (docs/01-specifications/ux/decision-discussion-workflow.md §3, DD-UX-01): the finite, PRIORITY-ORDERED
+// `kind` vocabulary of the single overall next_action projection for a Gap
+// discussion thread. The order below IS the priority order -- this app never
+// reimplements it; it only renders whatever the server returns (DD-UX-01:
+// "clientは同じ判定表を本番コードへ複製しない").
+export type GapDiscussionNextActionKind =
+  | "target_error"
+  | "evidence_stale"
+  | "processing"
+  | "save_unknown"
+  | "unsaved_edit"
+  | "review_proposal"
+  | "investigation_result"
+  | "review_hypothesis"
+  | "match";
+
+export interface AssistantDiscussionNextAction {
+  kind: GapDiscussionNextActionKind;
+  reason: string;
+  target_ref: string | null;
+  // Which DB-backed fact groups ("proposal" / "investigation") could not be
+  // read for THIS evaluation -- a failure here never blocks an earlier or
+  // later row that IS determinable.
+  degraded_sections: string[];
+}
+
 export interface AssistantDiscussionThreadDetailOut {
   thread: AssistantDiscussionThread;
   target_state: DiscussionTargetState;
+  // Issue #456: the target's adapter-derived capability set, read fresh from
+  // the current server registry -- a separate field from `target_state`
+  // (freshness) on purpose (#366's rule). Optional on the wire type only so
+  // pre-#456 test fixtures built as object literals of this interface stay
+  // valid; the server always sends it (`Field(default_factory=list)`).
+  capabilities?: DiscussionCapability[];
   turns: AssistantDiscussionTurn[];
+  // Issue #459: the single overall next_action projection for this thread's
+  // whole Gap-discussion flow. Optional on the wire type only so pre-#459
+  // test fixtures stay valid; the server always sends it.
+  next_action?: AssistantDiscussionNextAction;
 }
 
 export interface AssistantDiscussionThreadsListOut {
   threads: AssistantDiscussionThread[];
+}
+
+// Discussion context bundle (Issue #458, Epic #443 §9, DD-CTX-01..05).
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §9.1 is the canonical wire shape; every field
+// here traces to `app/discussion_context_bundle.py`'s dataclasses. The
+// client never re-derives coverage/completeness/freshness -- it renders
+// exactly what the server decided.
+
+export type DiscussionContextCompleteness = "complete" | "partial" | "unknown";
+
+export type DiscussionContextStopReason =
+  | "complete"
+  | "item_budget"
+  | "byte_budget"
+  | "depth_budget"
+  | "provider_error"
+  | "unsupported"
+  | "not_applicable";
+
+export type DiscussionContextResolution = "resolved" | "unresolved" | "not_tracked";
+
+export type DiscussionContextDeepLinkState = "selected" | "screen_only" | "unavailable";
+
+export type DiscussionContextNextActionKind = "expand_context" | "none";
+
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §9.3: the durable audit consumer kinds --
+// mirrors `app/discussion_context_bundle.CONTEXT_AUDIT_CONSUMER_KINDS` exactly.
+export type DiscussionContextAuditConsumerKind = "turn" | "proposal" | "ju_session";
+
+export interface DiscussionContextRoot {
+  target_kind: string;
+  target_ref: string;
+  revision_id: number | null;
+  digest: string;
+}
+
+export interface DiscussionContextSnapshot {
+  id: number | null;
+  commit_sha: string | null;
+}
+
+export interface DiscussionContextEntry {
+  target_kind: string;
+  target_ref: string;
+  title: string;
+  revision_id: number | null;
+  digest: string;
+  resolution: DiscussionContextResolution;
+  facts: Record<string, unknown>;
+  // True when `facts` was replaced by an empty stub because including it
+  // would have exceeded the bundle-wide byte budget -- identity is never
+  // dropped, only the body.
+  truncated: boolean;
+}
+
+export interface DiscussionContextCoverage {
+  returned_count: number;
+  // `null` on any incomplete/failed sweep -- never a guessed lower bound
+  // (§9.1: "取得失敗時のtotal_count=nullは0件を意味しない").
+  total_count: number | null;
+  completeness: DiscussionContextCompleteness;
+  stop_reason: DiscussionContextStopReason;
+  // Opaque token for `POST .../context-expansions`, or `null` when there is
+  // nothing more to fetch for this section.
+  continuation: string | null;
+}
+
+export interface DiscussionContextSection {
+  section_id: string;
+  operation_state: DiscussionOperationResult;
+  facts: DiscussionContextEntry[];
+  coverage: DiscussionContextCoverage;
+}
+
+export interface DiscussionContextSource {
+  source_id: string;
+  target_kind: string;
+  target_ref: string;
+  revision_id: number | null;
+  digest: string;
+  snapshot_id: number | null;
+  freshness: DiscussionTargetState;
+  deep_link: string | null;
+  deep_link_state: DiscussionContextDeepLinkState;
+}
+
+export interface DiscussionContextDependency {
+  target_kind: string;
+  target_ref: string;
+  digest: string;
+}
+
+export interface DiscussionContextNextAction {
+  kind: DiscussionContextNextActionKind;
+  target: string;
+  enabled: boolean;
+  reason: string;
+}
+
+export interface DiscussionContextBundle {
+  schema_version: string;
+  bundle_digest: string;
+  root: DiscussionContextRoot;
+  snapshot: DiscussionContextSnapshot;
+  sections: DiscussionContextSection[];
+  sources: DiscussionContextSource[];
+  dependencies: DiscussionContextDependency[];
+  next_action: DiscussionContextNextAction;
+}
+
+export interface DiscussionContextExpansionRequest {
+  bundle_digest: string;
+  continuation: string;
+}
+
+export interface DiscussionContextExpansionOut {
+  bundle: DiscussionContextBundle;
+  expanded_section_ids: string[];
+}
+
+// §9.2 semantic claims (Issue #459). `app/discussion_claims.py` is the sole
+// producer -- mirrors `DiscussionClaim` / `ClaimsGenerationResult` exactly.
+
+export type DiscussionContextClaimKind =
+  | "fact"
+  | "inference"
+  | "hypothesis"
+  | "unknown"
+  | "conflict";
+
+export type DiscussionContextClaimBasis = "deterministic" | "reasoning_llm";
+
+export type DiscussionContextClaimErrorKind =
+  | "unavailable"
+  | "call_error"
+  | "invalid_response"
+  | "invalid_citation";
+
+export interface DiscussionContextClaim {
+  kind: DiscussionContextClaimKind;
+  statement: string;
+  cited_source_ids: string[];
+  basis: DiscussionContextClaimBasis;
+}
+
+export interface DiscussionContextClaimsRequest {
+  question?: string;
+}
+
+export interface DiscussionContextClaimsResultOut {
+  provider: string;
+  model: string;
+  is_mock: boolean;
+  prompt_version: string;
+  schema_version: string;
+  decision_method: "deterministic" | "reasoning_llm";
+  claims: DiscussionContextClaim[];
+  scope_note: string;
+  as_of_snapshot_commit: string | null;
+  retried: boolean;
+  error: string | null;
+  error_kind: DiscussionContextClaimErrorKind | null;
+  thread_id: number;
+  turn_number: number | null;
 }
 
 // Assistant discussion proposals (Issue #439, Epic #436). Finite unions
@@ -3950,6 +4181,14 @@ export interface AssistantDiscussionProposalItem {
   current_value: string;
   proposed_value: string;
   rationale: string;
+  // Issue #454 (Epic #443 §5.1): a ChildSpec address. `child_kind === ""`
+  // means "not a child item" (a plain top-level field/relation) -- the
+  // three fields above stay meaningful either way. `child_order === null`
+  // means "this item does not move the child's order".
+  child_kind: string;
+  child_key: string;
+  child_intent: "" | "add" | "update" | "remove";
+  child_order: number | null;
   status: DiscussionProposalItemStatus;
   eligibility: DiscussionProposalItemEligibility;
   applied_ref: string | null;
@@ -3964,6 +4203,29 @@ export interface AssistantDiscussionProposalItem {
   // `proposed` no matter how many times this item was prefilled.
   prefill_count: number;
   last_prefilled_at: number | null;
+}
+
+// Hypothesis (Issue #455, Epic #443 §6.1): an INDEPENDENT proposal item
+// type, never a field_change. competing_explanations/refutation_conditions/
+// next_investigation missing is refused server-side at generation AND
+// promotion time -- the UI never needs to (and must not) fill these in on
+// the server's behalf.
+export type AssistantDiscussionHypothesisStatus = "proposed" | "promoted" | "rejected";
+
+export interface AssistantDiscussionProposalHypothesis {
+  id: number;
+  proposal_id: number;
+  statement: string;
+  competing_explanations: string[];
+  refutation_conditions: string[];
+  next_investigation: string;
+  evidence_refs: string[];
+  uncertainty: string;
+  status: AssistantDiscussionHypothesisStatus;
+  first_turn_number: number | null;
+  last_turn_number: number | null;
+  created_at: number;
+  schema_version: string;
 }
 
 export interface AssistantDiscussionProposal {
@@ -3989,6 +4251,60 @@ export interface AssistantDiscussionProposal {
   created_by: string | null;
   created_at: number;
   items: AssistantDiscussionProposalItem[];
+  // Issue #455: independent from `items` -- a hypothesis is never applied
+  // through the field/relation/child apply path; it is promoted through
+  // its own bridge endpoint below.
+  hypotheses: AssistantDiscussionProposalHypothesis[];
+}
+
+// Hypothesis -> Joint Understanding bridge (Issue #455, Epic #443 §6.2).
+// `request_id` is a caller-minted idempotency key: retrying with the SAME
+// id returns the SAME `joint_understanding_session_id` (`reused: true`);
+// reusing it for a different hypothesis is refused 409.
+
+export interface AssistantDiscussionHypothesisPromoteRequest {
+  request_id: string;
+}
+
+export interface AssistantDiscussionHypothesisPromotion {
+  id: number;
+  hypothesis_id: number;
+  thread_id: number;
+  first_turn_number: number | null;
+  last_turn_number: number | null;
+  captured_target_kind: string;
+  captured_target_ref: string;
+  captured_target_digest: string;
+  joint_understanding_session_id: number;
+  request_id: string;
+  decision_method: "manual";
+  created_by: string | null;
+  created_at: number;
+}
+
+export interface AssistantDiscussionHypothesisPromoteOut {
+  hypothesis: AssistantDiscussionProposalHypothesis;
+  promotion: AssistantDiscussionHypothesisPromotion;
+  joint_understanding_session_id: number;
+  reused: boolean;
+}
+
+// Discussion <-> Joint Understanding reflux (Issue #455, Epic #443 §6.3).
+// `session` is the EXACT `JointUnderstandingOut` shape #329 already defines
+// -- `premise_state`/`outcome_is_provisional` verbatim, never re-derived on
+// the client. `current_findings` is populated ONLY when
+// `session.premise_state === "current"`.
+
+export interface AssistantDiscussionJointUnderstandingLink {
+  hypothesis: AssistantDiscussionProposalHypothesis;
+  promotion: AssistantDiscussionHypothesisPromotion;
+  session: JointUnderstandingOut;
+  current_findings: JointUnderstandingFindingOut[];
+  reconfirmation_required: boolean;
+}
+
+export interface AssistantDiscussionJointUnderstandingListOut {
+  links: AssistantDiscussionJointUnderstandingLink[];
 }
 
 export interface AssistantDiscussionProposalsListOut {
@@ -4079,6 +4395,17 @@ export interface AssistantAskOut {
   // implies `recheck_required` when both are read together.
   ui_draft_state?: UiDraftState;
   ui_draft_changed?: boolean;
+  // Issue #456 follow-up: the operation-result of THIS turn's screen
+  // canonical-context read, separate from any facts and from `target_state`
+  // (freshness). `unsupported` (this screen_id has no discussion-context
+  // concept at all) and `unavailable` (a registered read failed just now)
+  // are different axes from `classifyDiscussionError` in `lib/discussion-
+  // adapters.ts` -- that one classifies a REQUEST failure (thrown), this one
+  // is a status INSIDE a successful (200) response. Optional so a pre-#456
+  // test fixture/mock built as a literal of this interface stays valid; the
+  // server always sends it.
+  screen_context_state?: DiscussionOperationResult;
+  screen_context_reason?: string | null;
 }
 
 // UI 機能解説モード (Issue #440, Epic #436): `app/ui_help_registry.py` の
@@ -4726,10 +5053,31 @@ export interface CellAskSyncOut {
 // 「わからない」を終端回答ではなく共同で状況理解を作る工程の開始点として扱う。
 // 三つの来歴(investigation / translation / developer)は 1 つの回答へ混ぜない。
 
-export type JointUnderstandingOriginKind = "qa" | "intent" | "review_item" | "inquiry" | "purpose_need";
+export type JointUnderstandingOriginKind =
+  | "qa"
+  | "intent"
+  | "review_item"
+  | "inquiry"
+  | "purpose_need"
+  | "discussion";
 // "purpose_need" (Issue #389 / #444 §1.9): a Purpose Need response of
 // unknown/investigate opens a session the same way an unanswered Q&A does.
-export type JointUnderstandingTrigger = "unknown_answer" | "explicit_request" | "purpose_need";
+// "discussion" (Issue #461 / #443 §6.2): a session owned by an assistant
+// discussion thread rather than an interview session. It is the SIXTH origin
+// on purpose -- #337's premise contract requires a per-origin content hash, so
+// disguising a Journey conversation as one of the existing five would make it
+// claim a premise it does not have, and premise evaluation would stop meaning
+// anything. Its `origin_id` is the promoted hypothesis id (#455 registers the
+// provider that resolves it); until then the server answers 503
+// `joint_understanding_origin_unsupported` rather than pretending support.
+// "discussion_promotion" (Issue #455, Epic #443 §6.2): written ONLY by the
+// hypothesis -> Joint Understanding bridge -- never settable through the
+// generic create request body (Issue #336's rule).
+export type JointUnderstandingTrigger =
+  | "unknown_answer"
+  | "explicit_request"
+  | "purpose_need"
+  | "discussion_promotion";
 export type JointUnderstandingStatus = "open" | "held" | "closed";
 export type JointUnderstandingOutcome =
   | "understood"
@@ -6728,6 +7076,27 @@ export interface UxRequirementRevisionCreateRequest {
   out_of_scope_note?: string;
   change_note?: string;
   acceptance_criteria?: UxAcceptanceCriterionInput[];
+  /** Issue #452 (docs/01-specifications/capabilities/ai-discussion-adapter.md §3.6/§3.7): optional
+   * idempotency key. Omitted (or undefined) is the pre-#452 shape -- an
+   * ordinary save with no idempotent-retry contract. */
+  save_request_id?: string;
+}
+
+// --- Issue #452 §3.6/§3.7: idempotent save-request receipts ----------------
+
+export type DiscussionSaveReceiptStatus = "succeeded" | "failed";
+
+export interface DiscussionSaveReceiptOut {
+  save_request_id: string;
+  target_kind: string;
+  target_ref: string;
+  endpoint_kind: string;
+  status: DiscussionSaveReceiptStatus;
+  result_ref: string;
+  revision_id: number | null;
+  error_code: string;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface UxRequirementStepLinkCreateRequest {

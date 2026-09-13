@@ -29,8 +29,13 @@ import {
   OPEN_ASSISTANT_EVENT,
   type OpenAssistantDetail,
 } from "@/lib/assistant-control";
-import { DISCUSSION_ADAPTERS, resolveDiscussionCandidate } from "@/lib/discussion-adapters";
+import {
+  classifyDiscussionError, DISCUSSION_ADAPTERS, resolveDiscussionCandidate,
+} from "@/lib/discussion-adapters";
 import { useUiDraftRegistry } from "@/lib/ui-draft";
+import { DiscussionProposalReview } from "@/components/discussion-proposal-review";
+import { DiscussionContextPanel } from "@/components/discussion-context-panel";
+import { DiscussionInvestigationPanel } from "@/components/discussion-investigation-panel";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -141,6 +146,8 @@ function captureUiDraft(
   return {
     ...base,
     readable: true,
+    validation_state: snapshot.validationState ?? "idle",
+    section_errors: snapshot.sectionErrors ?? [],
     fields: snapshot.fields.map((f) => ({
       field_name: f.fieldName, value: f.value, dirty: f.dirty, validation_error: f.validationError,
     })),
@@ -162,6 +169,11 @@ interface ChatMessage {
   role: "user" | "assistant" | "error";
   text: string;
   result?: AssistantAskOut;
+  // Issue #456: set on an `error` message only when the failure is NOT a
+  // recognised structurally-unsupported/not_applicable discussion code --
+  // i.e. it may be transient, so offering a retry (of the same question
+  // text) is honest. See `classifyDiscussionError`.
+  retryQuestion?: string;
 }
 
 function CitationChip({ citation }: { citation: AssistantCitation }) {
@@ -192,7 +204,15 @@ function CitationChip({ citation }: { citation: AssistantCitation }) {
   );
 }
 
-function AnswerMessage({ result }: { result: AssistantAskOut }) {
+function AnswerMessage({
+  result, onRetryScreenContext,
+}: {
+  result: AssistantAskOut;
+  // Issue #456 follow-up: re-ask the SAME question, for when `screen_
+  // context_state === "unavailable"`. `undefined` when the caller has no
+  // question text to retry with (e.g. a turn restored from history).
+  onRetryScreenContext?: () => void;
+}) {
   const navigate = useNavigate();
   // Issue #445: derived from the citation list (persisted with every turn),
   // not from `ui_draft_state` alone -- a turn reconstructed from history
@@ -214,6 +234,40 @@ function AnswerMessage({ result }: { result: AssistantAskOut }) {
         <p className="text-[11px] text-muted-foreground" data-testid="assistant-used-ui-draft">
           この回答は未保存の下書きも参照しました(保存はされていません)。
         </p>
+      )}
+      {/* Issue #456 follow-up: `screen_context_state` is a status INSIDE a
+       * successful (200) response, a different axis from `classifyDiscussion
+       * Error` (which classifies a THROWN request failure) -- so this reads
+       * `result.screen_context_state` directly rather than routing through
+       * that function. `unsupported` gets no "move to an existing screen"
+       * link: unlike a discussion-adapter 422 (where the target legitimately
+       * lives on a DIFFERENT screen), a screen's OWN canonical-context
+       * capability has no other screen to redirect to -- the developer is
+       * already on the only screen this answer concerns, so a reason is all
+       * there is to show. `unavailable` gets a retry (re-asks the SAME
+       * question) because the read may succeed next time; `available` (the
+       * normal case) renders nothing. */}
+      {result.screen_context_state === "unsupported" && (
+        <p className="text-[11px] text-muted-foreground" data-testid="assistant-screen-context-unsupported">
+          この画面は正規データの参照に対応していません。会話の内容のみをもとに回答しています。
+        </p>
+      )}
+      {result.screen_context_state === "unavailable" && (
+        <div className="space-y-1">
+          <p className="text-xs text-amber-700" data-testid="assistant-screen-context-unavailable">
+            この画面の正規データを取得できませんでした。この回答は不完全な可能性があります。
+          </p>
+          {onRetryScreenContext && (
+            <button
+              type="button"
+              className="text-xs text-primary hover:underline cursor-pointer"
+              data-testid="assistant-screen-context-retry"
+              onClick={onRetryScreenContext}
+            >
+              再試行
+            </button>
+          )}
+        </div>
       )}
       <div className="flex flex-wrap items-center gap-1.5">
         {result.used_fallback ? (
@@ -630,7 +684,17 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         listenAfterPlayback: result.voice_follow_up_expected ?? false,
       };
     } catch (err) {
-      appendMessages([{ role: "error", text: String(err) }]);
+      // Issue #456 (docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3/§9's UI display
+      // contract): a structurally unsupported/not_applicable discussion
+      // failure gets its own Japanese reason and no retry (retrying would
+      // not help); anything else is shown as a possibly-transient failure
+      // with a retry that resends the SAME question text.
+      const classified = classifyDiscussionError(err);
+      appendMessages([{
+        role: "error",
+        text: classified.message,
+        retryQuestion: classified.retryable ? trimmed : undefined,
+      }]);
       return null;
     }
   };
@@ -843,7 +907,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           <p className="text-xs">{voiceFallbackNotice}</p>
         </div>
       )}
-      <div ref={listRef} className="flex-1 overflow-y-auto p-4 space-y-3" data-testid="assistant-message-list">
+      <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto p-4 space-y-3" data-testid="assistant-message-list">
         {/* §1.3: history stays readable, but it is not a current fact. The
             server has already withheld it from the model's context; say so
             rather than letting the transcript imply it was used. */}
@@ -923,11 +987,32 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
               <p className="text-sm whitespace-pre-wrap">{m.text}</p>
             </div>
           ) : m.role === "assistant" && m.result ? (
-            <AnswerMessage key={i} result={m.result} />
+            <AnswerMessage
+              key={i}
+              result={m.result}
+              onRetryScreenContext={
+                m.result.screen_context_state === "unavailable"
+                && messages[i - 1]?.role === "user"
+                  ? () => submit(messages[i - 1].text)
+                  : undefined
+              }
+            />
           ) : (
-            <p key={i} className="text-xs text-destructive" data-testid="assistant-error">
-              {m.text}
-            </p>
+            <div key={i} className="space-y-1">
+              <p className="text-xs text-destructive" data-testid="assistant-error">
+                {m.text}
+              </p>
+              {m.retryQuestion && (
+                <button
+                  type="button"
+                  className="text-xs text-primary hover:underline cursor-pointer"
+                  data-testid="assistant-error-retry"
+                  onClick={() => submit(m.retryQuestion!)}
+                >
+                  再試行
+                </button>
+              )}
+            </div>
           ),
         )}
         {ask.isPending && (
@@ -935,10 +1020,30 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             <Loader2 className="h-3.5 w-3.5 animate-spin" /> Thinking…
           </div>
         )}
-      </div>
 
+      {/* Issue #452 (docs/01-specifications/capabilities/ai-discussion-adapter.md §3): the Proposal review
+          region. Only for a specific entity/element target with a real
+          persisted thread -- a whole-screen conversation has no single
+          target to propose changes against, and the legacy (non-persisted)
+          conversation predates Proposals entirely. */}
+      {/* Issue #459 (Epic #457, docs/01-specifications/ux/decision-discussion-workflow.md): the overall
+          next_action banner + context bundle + 「目的・UX・機能を照合」
+          claims. `key={activeThread.id}` remounts this panel on a target
+          switch, discarding its in-flight question/result rather than
+          carrying them over to a different Gap/entity (DD-UX-07). */}
+      {!useLegacyConversation && activeThread && threadDetail && effectiveScope === "focus" && (
+        <DiscussionContextPanel key={activeThread.id} thread={threadDetail} />
+      )}
+      {!useLegacyConversation && activeThread && effectiveScope === "focus" && (
+        <>
+          <DiscussionInvestigationPanel key={activeThread.id} threadId={activeThread.id} />
+          <DiscussionProposalReview key={`proposal-${activeThread.id}`} thread={activeThread} />
+        </>
+      )}
+
+      </div>
       <form
-        className="flex items-center gap-2 border-t p-3"
+        className="flex shrink-0 items-center gap-2 border-t p-3"
         onSubmit={(e) => {
           e.preventDefault();
           void submit(question);

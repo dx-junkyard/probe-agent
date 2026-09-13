@@ -418,8 +418,22 @@ def test_ui_draft_unsupported_for_a_kind_with_no_forms(admin_client):
             ],
             {},
         ),
+        (
+            # Issue #451 / §2.3: "全体" is the UTF-8 byte total of every
+            # draft-derived string, `validation_error` included -- not just
+            # `value`. Each field's own `value` is empty and its
+            # `validation_error` stays within the per-field 2000-char bound,
+            # yet 17 of them (17 * 2005 bytes = 34,085) still cross the 32KB
+            # ceiling. A budget check that only counted `value` would let
+            # this request through.
+            [
+                {"field_name": "title", "value": "", "dirty": True, "validation_error": "e" * 2000}
+                for _ in range(17)
+            ],
+            {},
+        ),
     ],
-    ids=["too-many-fields", "value-too-long", "total-too-large"],
+    ids=["too-many-fields", "value-too-long", "total-too-large", "validation-error-counts-toward-total"],
 )
 def test_ui_draft_payload_too_large(admin_client, fields, extra):
     token = _login(admin_client)
@@ -671,3 +685,17 @@ def test_draft_derived_answers_are_ephemeral_and_not_inherited(admin_client, mon
     assert draft_value not in inherited
     assert question not in inherited
     assert "回答本文は履歴に残していません" not in inherited
+
+
+def test_validation_lifecycle_and_section_diagnostics_are_separate_and_redacted():
+    from app.models import UiDraftContextIn
+    from app.ui_draft_context import _build_redacted_payload
+    draft = UiDraftContextIn(target_kind='ux_requirement', target_ref='req-1', form_id='ux_requirement.revision',
+        validation_state='validating', section_errors=[{'section': 'acceptance_criteria', 'code': 'invalid', 'message': '条件を再確認'}])
+    payload = _build_redacted_payload(draft)
+    assert payload['validation_state'] == 'validating'
+    assert payload['section_errors'] == [{'section': 'acceptance_criteria', 'code': 'invalid', 'message': '条件を再確認'}]
+    assert payload['fields'] == {}
+    with pytest.raises(ValueError, match='ui_draft_payload_too_large'):
+        UiDraftContextIn(target_kind='ux_requirement', target_ref='req-1', form_id='ux_requirement.revision',
+            section_errors=[{'section': 'criteria', 'message': 'あ' * 2000} for _ in range(6)])

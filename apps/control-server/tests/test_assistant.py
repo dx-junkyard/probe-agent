@@ -489,6 +489,35 @@ def test_overview_discussion_receives_canonical_data_and_prior_turns(
     ]
 
 
+def test_a_failing_screen_context_provider_does_not_break_the_whole_ask(
+    admin_client, monkeypatch
+):
+    """Issue #456 (docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3): a canonical
+    projection raising inside a discussion-enabled screen's context provider
+    used to propagate all the way out of `POST /assistant/ask` as a 500,
+    destroying the whole assistant turn over one screen's context read. It
+    must now degrade to no screen_data for this turn instead."""
+    from app import assistant_discussion_context
+
+    def _boom(system_id):
+        raise RuntimeError("overview projection failed")
+
+    monkeypatch.setattr(assistant_discussion_context, "_overview_context", _boom)
+
+    token = _login(admin_client)
+    system = _create_system(admin_client, token)
+    r = admin_client.post(
+        "/assistant/ask",
+        json={"screen_id": "overview", "question": "現在の状況は?"},
+        headers=_headers(token, system["id"]),
+    )
+    assert r.status_code == 200, r.text
+    # No real LLM configured in this fixture, so the deterministic fallback
+    # answers -- the assertion that matters is the status code above (the
+    # request completed at all instead of 500ing).
+    assert r.json()["used_fallback"] is True
+
+
 def test_voice_element_help_is_validated_and_added_to_llm_context(
     admin_client, monkeypatch
 ):

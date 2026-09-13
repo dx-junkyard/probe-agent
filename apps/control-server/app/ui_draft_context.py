@@ -211,6 +211,11 @@ def _build_redacted_payload(ui_draft: UiDraftContextIn) -> Dict[str, Any]:
             for f in ui_draft.fields
         },
         "readable": ui_draft.readable,
+        "validation_state": ui_draft.validation_state,
+        "section_errors": [
+            {"section": _redact_meta(f.section), "code": _redact_meta(f.code), "message": _redact_meta(f.message)}
+            for f in ui_draft.section_errors
+        ],
         "selected_item_ref": _redact_meta(ui_draft.selected_item_ref),
         "active_tab": _redact_meta(ui_draft.active_tab),
         "comparison_target": _redact_meta(ui_draft.comparison_target),

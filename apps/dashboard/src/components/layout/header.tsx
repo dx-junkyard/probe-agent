@@ -1,3 +1,4 @@
+import { useUiDraftRegistry } from "@/lib/ui-draft";
 import { useAuth } from "@/api/auth";
 import { Select } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
@@ -82,6 +83,7 @@ export function Header({
   navDrawerId = MOBILE_NAV_DRAWER_ID,
 }: HeaderProps = {}) {
   const { user, systems, systemId, selectSystem, logout, refreshSystems } = useAuth();
+  const drafts = useUiDraftRegistry();
   const [showCreate, setShowCreate] = useState(false);
   const createSystem = useCreateSystem();
 
@@ -127,7 +129,7 @@ export function Header({
         {systems.length > 0 ? (
           <Select
             value={String(systemId ?? "")}
-            onChange={(e) => selectSystem(Number(e.target.value))}
+            onChange={(e) => { if (drafts?.confirmDiscard?.() !== false) selectSystem(Number(e.target.value)); }}
             className="w-40 md:w-60"
           >
             {systems.map((s) => (
@@ -176,7 +178,7 @@ export function Header({
             )}
           </span>
         )}
-        <Button variant="ghost" size="icon" onClick={logout} title="Logout">
+        <Button variant="ghost" size="icon" onClick={() => { if (drafts?.confirmDiscard?.() !== false) logout(); }} title="Logout">
           <LogOut className="h-4 w-4" />
         </Button>
       </div>

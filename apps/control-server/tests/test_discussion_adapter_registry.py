@@ -93,9 +93,11 @@ def test_every_target_kind_has_exactly_one_adapter():
     )
 
 
-def test_target_kinds_are_exactly_the_nine_epic_436_shipped():
-    # Pinned so Phase 1 cannot silently grow or shrink the registered set --
-    # #447 adds new kinds in a LATER phase, additively.
+def test_target_kinds_are_exactly_the_nine_epic_436_shipped_plus_453s_eight():
+    # Pinned so the registered set cannot silently grow or shrink. Phase 1's
+    # original 9 plus Issue #453 (Epic #443 Phase 4)'s 8 Vision-to-Feature
+    # kinds -- #454/#455/#458/#459 add capability, not target_kind, so this
+    # set is now the ceiling until one of those genuinely needs a new kind.
     assert set(discussion_adapters.DISCUSSION_TARGET_KINDS) == {
         "screen",
         "interview_session",
@@ -106,6 +108,14 @@ def test_target_kinds_are_exactly_the_nine_epic_436_shipped():
         "ux_requirement",
         "solution_design",
         "blueprint_lane_cell",
+        "purpose_element",
+        "purpose_relation",
+        "stakeholder",
+        "stakeholder_need",
+        "product_objective",
+        "product_milestone",
+        "product_gap",
+        "product_feature",
     }
 
 
@@ -115,12 +125,21 @@ def test_target_kinds_are_exactly_the_nine_epic_436_shipped():
 def test_scope_target_kinds_equals_pre_refactor_value():
     # Hard-coded from the pre-#444 `assistant_discussion.py` (the literal
     # dict this test replaces) -- NOT read back from either module under
-    # test, so a derivation bug cannot rewrite its own expectation.
+    # test, so a derivation bug cannot rewrite its own expectation. Extended
+    # by Issue #453 (Epic #443 Phase 4) with the 8 new kinds' own `scope`
+    # (§4.1's table: purpose_element/purpose_relation are "element";
+    # stakeholder/stakeholder_need/product_objective/product_milestone/
+    # product_gap/product_feature are "entity").
     expected = {
         "screen": ("screen",),
-        "entity": ("interview_session", "ux_journey", "ux_requirement", "solution_design"),
+        "entity": (
+            "interview_session", "ux_journey", "ux_requirement", "solution_design",
+            "stakeholder", "stakeholder_need",
+            "product_objective", "product_milestone", "product_gap", "product_feature",
+        ),
         "element": (
             "understanding_claim", "overview_finding", "ux_journey_step", "blueprint_lane_cell",
+            "purpose_element", "purpose_relation",
         ),
     }
     actual = {
@@ -178,6 +197,34 @@ def test_proposal_target_schema_equals_pre_refactor_value():
         "overview_finding": {"fields": (), "relations": ()},
         "interview_session": {"fields": (), "relations": ()},
         "screen": {"fields": (), "relations": ()},
+        # Issue #453: `purpose_element`/`purpose_relation`/`stakeholder`/
+        # `stakeholder_need` register neither `fields` nor `relations`
+        # (out of THEIR issue's scope) -- so each is present in the schema
+        # (every `target_kind` is) with both empty, exactly like
+        # `overview_finding`.
+        "purpose_element": {"fields": (), "relations": ()},
+        "purpose_relation": {"fields": (), "relations": ()},
+        "stakeholder": {"fields": (), "relations": ()},
+        "stakeholder_need": {"fields": (), "relations": ()},
+        # Issue #454 (Epic #443 §5.2): content is proposable; every human
+        # decision-ledger axis (`objective_state`/`achievement`/`lifecycle`/
+        # `priority_band`) is STRUCTURALLY absent, never merely filtered.
+        "product_objective": {
+            "fields": ("title", "intent", "contribution", "scope_note", "summary"),
+            "relations": ("upstream_ref",),
+        },
+        "product_milestone": {
+            "fields": ("title", "target_state", "verification_method", "verification_note", "summary"),
+            "relations": ("milestone_dependency",),
+        },
+        "product_gap": {
+            "fields": ("title", "current_state", "target_state", "interpretation", "suggested_priority_note"),
+            "relations": ("source_ref", "evidence_ref", "artifact_link"),
+        },
+        "product_feature": {
+            "fields": ("title", "statement", "rationale", "scope_note", "summary"),
+            "relations": ("requirement_link", "capability_link", "target_link"),
+        },
     }
     actual = assistant_discussion_proposal.PROPOSAL_TARGET_SCHEMA
     assert set(actual.keys()) == set(expected.keys())
@@ -192,8 +239,10 @@ def test_proposal_target_schema_equals_pre_refactor_value():
 def test_capabilities_derived_for_screen_adapter_is_discussion_only():
     adapter = discussion_adapters.DISCUSSION_ADAPTERS["screen"]
     # `screen` has no context provider, no fields, no relations, no ui_draft
-    # forms, no JU bridge -- Phase 1 gives it zero capabilities.
-    assert discussion_adapters.capabilities_for(adapter) == ()
+    # forms -- Phase 1 gives it zero capabilities beyond the Issue #455 JU
+    # bridge, which every kind now has regardless of its other capabilities
+    # (promoting a hypothesis never depends on the target's canonical facts).
+    assert discussion_adapters.capabilities_for(adapter) == ("promote_joint_understanding",)
 
 
 def test_capabilities_derived_for_ux_journey_has_read_and_propose_both():
@@ -202,13 +251,50 @@ def test_capabilities_derived_for_ux_journey_has_read_and_propose_both():
     assert "read_canonical" in caps
     assert "propose_fields" in caps
     assert "propose_relations" in caps
-    # Phase 2 (#445): `ux_journey` now has a `ui_draft_forms` entry, so both
-    # `read_ui_draft` (form registered) and `prefill_form` (form registered
-    # AND it can propose_fields/propose_relations) are derived true.
-    # `promote_joint_understanding` is still #449's -- untouched here.
+    # Phase 2 (#445): `ux_journey` now has a `ui_draft_forms` entry, so
+    # `read_ui_draft` (form registered) is derived true. `prefill_form` is
+    # NOT (Issue #456): a declared form only says a destination EXISTS, not
+    # that anything can deliver to it -- that additionally requires a
+    # registered `prefill_handler_id`, which stays `None` for every adapter
+    # until #452 wires the first real handler. `promote_joint_understanding`
+    # is Issue #455's bridge, which every kind carries.
     assert "read_ui_draft" in caps
-    assert "prefill_form" in caps
-    assert "promote_joint_understanding" not in caps
+    assert "prefill_form" not in caps
+    assert "promote_joint_understanding" in caps
+
+
+def test_prefill_form_becomes_true_only_once_a_handler_is_registered():
+    """Issue #456 §1.3: `prefill_form` must not be derivable from `ui_draft_
+    forms`/`fields` alone. This proves the WIRING actually flips it true once
+    a handler is registered (`fixture 接続時のみ対応済みになる`) -- using a
+    `dataclasses.replace`d copy so the REAL, unmodified registry (asserted
+    unaffected below) stays the honest "no handler wired yet" state that is
+    #456's own correct completion condition."""
+    from dataclasses import replace
+
+    journey = discussion_adapters.DISCUSSION_ADAPTERS["ux_journey"]
+    assert "prefill_form" not in discussion_adapters.capabilities_for(journey)
+
+    fixture_connected = replace(journey, prefill_handler_id="ux_journey.revision@v1")
+    assert "prefill_form" in discussion_adapters.capabilities_for(fixture_connected)
+
+    # The real registry entry is untouched by building the fixture copy.
+    assert discussion_adapters.DISCUSSION_ADAPTERS["ux_journey"].prefill_handler_id is None
+    assert "prefill_form" not in discussion_adapters.capabilities_for(
+        discussion_adapters.DISCUSSION_ADAPTERS["ux_journey"]
+    )
+
+
+def test_prefill_form_still_requires_ui_draft_forms_and_propose_capability():
+    """A `prefill_handler_id` alone (a handler with nowhere to deliver, or a
+    kind that cannot propose anything) must not be sufficient -- all THREE
+    preconditions are required together."""
+    from dataclasses import replace
+
+    overview_finding = discussion_adapters.DISCUSSION_ADAPTERS["overview_finding"]
+    assert overview_finding.ui_draft_forms == ()
+    handler_but_no_form = replace(overview_finding, prefill_handler_id="overview_finding.x@v1")
+    assert "prefill_form" not in discussion_adapters.capabilities_for(handler_but_no_form)
 
 
 def test_capabilities_derived_for_understanding_claim_has_no_ui_draft_yet():
@@ -231,10 +317,19 @@ def test_capabilities_derived_for_blueprint_lane_cell_relations_only():
 
 
 def test_capabilities_derived_for_interview_session_and_overview_finding_discussion_only():
-    for kind in ("interview_session", "overview_finding"):
-        adapter = discussion_adapters.DISCUSSION_ADAPTERS[kind]
-        caps = discussion_adapters.capabilities_for(adapter)
-        assert caps == (), f"{kind} should have zero capabilities in Phase 1, got {caps}"
+    # Phase 1 gave both kinds zero OTHER capabilities. Issue #455's JU bridge
+    # is the one capability MOST kinds carry regardless -- but `overview_
+    # finding` is the one exception (see its own `joint_understanding_
+    # bridge=False` comment: its premise cannot be verified from an
+    # already-open connection, so declaring the capability true would be
+    # exactly #456's "declares supported, cannot back it" defect one layer
+    # further out).
+    interview_session = discussion_adapters.DISCUSSION_ADAPTERS["interview_session"]
+    assert discussion_adapters.capabilities_for(interview_session) == (
+        "promote_joint_understanding",
+    )
+    overview_finding = discussion_adapters.DISCUSSION_ADAPTERS["overview_finding"]
+    assert discussion_adapters.capabilities_for(overview_finding) == ()
 
 
 def test_every_adapter_capabilities_are_a_subset_of_the_finite_vocabulary():
@@ -249,13 +344,26 @@ _KINDS_WITH_UI_DRAFT_FORMS = frozenset(
 
 
 def test_phase_2_children_and_ju_bridge_stay_empty_ui_draft_forms_is_the_new_field():
-    # #448 (children) and #449 (joint_understanding_bridge) are still ahead;
-    # only #445's `ui_draft_forms` is populated in this phase, and only for
-    # the 4 kinds whose Dashboard forms exist today (docs/ai-discussion-
-    # adapter.md §1.4's "declared now, populated later" shapes).
+    # Issue #455 turns on `joint_understanding_bridge` for every kind whose
+    # premise it can actually verify from an already-open connection
+    # (`app/discussion_hypothesis._target_digest_with_conn`'s covered set) --
+    # `overview_finding` is the one deliberate exception (see its own
+    # `joint_understanding_bridge=False` comment). #454 (Epic #443 §5.1)
+    # populates `children` for exactly ONE kind (`ux_requirement`'s
+    # `acceptance_criterion`) -- every other kind's `children` stays `()`.
+    # `ui_draft_forms` stays populated only for the 4 kinds whose Dashboard
+    # forms exist today (docs/ai-discussion-adapter.md §1.4's "declared now,
+    # populated later" shapes) -- #454 deliberately does not extend prefill
+    # to Acceptance Criteria.
     for kind, adapter in discussion_adapters.DISCUSSION_ADAPTERS.items():
-        assert adapter.children == ()
-        assert adapter.joint_understanding_bridge is False
+        if kind == "ux_requirement":
+            assert [c.child_kind for c in adapter.children] == ["acceptance_criterion"]
+        else:
+            assert adapter.children == (), f"{kind} should have no ChildSpec yet"
+        if kind == "overview_finding":
+            assert adapter.joint_understanding_bridge is False
+        else:
+            assert adapter.joint_understanding_bridge is True, kind
         if kind in _KINDS_WITH_UI_DRAFT_FORMS:
             assert adapter.ui_draft_forms != (), f"{kind} should have a ui_draft_forms entry"
         else:

@@ -3794,8 +3794,24 @@ class InterviewInquiryTransitionRequest(BaseModel):
 # `trigger='purpose_need'`, mirroring the 'unknown_answer' rule immediately
 # below: `trigger` records WHICH PATH opened the session, never a request
 # body's claim.
-JointUnderstandingOriginKind = Literal["qa", "intent", "review_item", "inquiry", "purpose_need"]
-JointUnderstandingTrigger = Literal["unknown_answer", "explicit_request", "purpose_need"]
+JointUnderstandingOriginKind = Literal[
+    "qa", "intent", "review_item", "inquiry", "purpose_need", "discussion",
+]
+# "discussion_promotion" (Issue #455, Epic #443 §6.2): written ONLY by
+# `POST /assistant/discussion-proposals/{id}/hypotheses/{hid}/promote`, the
+# same "trigger records WHICH PATH ran" discipline `unknown_answer` and
+# `purpose_need` already follow -- a request body can never claim it (the
+# public create endpoint under `/interview/sessions/...` still forces
+# `explicit_request`, Issue #336).
+JointUnderstandingTrigger = Literal[
+    "unknown_answer", "explicit_request", "purpose_need", "discussion_promotion",
+]
+# Issue #461: a session's owner is either an Interview (every session Epic
+# #328 through #339 ever created) or a Discussion (Issue #455, no owning
+# Interview at all). Exactly one of `session_id` / `discussion_thread_id`
+# resolves, fixed by this value -- see `app/joint_understanding.
+# validate_owner_scope`.
+JointUnderstandingOwnerScope = Literal["interview", "discussion"]
 JointUnderstandingStatus = Literal["open", "held", "closed"]
 # hypothesis_adopted is explicitly PROVISIONAL (never a fact); decided is the
 # only final human value judgement. See SESSION_OUTCOMES.
@@ -3832,6 +3848,9 @@ JointUnderstandingPremiseReason = Literal[
     "pinned_snapshot_removed", "origin_removed",
     "origin_superseded", "pinned_commit_changed", "origin_content_changed",
     "capability_scope_changed", "linked_intent_changed",
+    # Issue #461: the dependency reference manifest axis.
+    "dependency_manifest_unresolved", "dependency_target_removed",
+    "dependency_content_changed",
 ]
 # Issue #337: WHICH code path produced a finding, as distinct from whose voice
 # it speaks in (origin_role). 'legacy' is read-only -- what a row written
@@ -3974,10 +3993,22 @@ class JointUnderstandingActionCreate(BaseModel):
     note: Optional[str] = Field(default=None, max_length=2_000)
 
 
+class JointUnderstandingPremiseDependencyRefOut(BaseModel):
+    """One entry of the Issue #461 dependency reference manifest."""
+
+    target_kind: str
+    target_ref: str
+    digest: str
+
+
 class JointUnderstandingOut(BaseModel):
     id: int
-    session_id: int
+    # Issue #461: NULL for `owner_scope='discussion'`, which has no owning
+    # Interview at all -- `discussion_thread_id` resolves instead.
+    session_id: Optional[int] = None
     system_id: int
+    owner_scope: JointUnderstandingOwnerScope = "interview"
+    discussion_thread_id: Optional[int] = None
     origin_kind: JointUnderstandingOriginKind
     origin_id: int
     trigger: JointUnderstandingTrigger
@@ -4017,6 +4048,14 @@ class JointUnderstandingOut(BaseModel):
     premise_revision_id: Optional[int] = None
     premise_tracking_version: Optional[str] = None
     premise_captured_at: Optional[float] = None
+    # Issue #461: additional [{target_kind, target_ref, digest}] references
+    # the investigation relied on beyond the origin itself. Empty for every
+    # session that predates this field and for every one that never
+    # populates it.
+    premise_dependency_manifest: List[JointUnderstandingPremiseDependencyRefOut] = Field(
+        default_factory=list,
+    )
+    premise_dependency_manifest_digest: Optional[str] = None
     schema_version: str
     created_at: float
     updated_at: float
@@ -4347,7 +4386,9 @@ class JointUnderstandingLineageEventOut(BaseModel):
     # A finding id for an unknown/hypothesis; a Joint Understanding session id
     # for a question/decision/classification.
     subject_id: int
-    session_id: int
+    # Issue #461: NULL for a discussion-scope session, which has no owning
+    # Interview session id to report.
+    session_id: Optional[int] = None
     joint_understanding_id: int
     at: float
     # The successor that closed this subject's lineage, where there is one. This
@@ -4359,7 +4400,7 @@ class JointUnderstandingLineageEventOut(BaseModel):
 
 class JointUnderstandingSessionBurdenOut(BaseModel):
     joint_understanding_id: int
-    session_id: int
+    session_id: Optional[int] = None
     rounds: int = 0
     developer_actions: int = 0
     developer_findings: int = 0
@@ -6099,6 +6140,22 @@ DiscussionTargetKind = Literal[
     "ux_requirement",
     "solution_design",
     "blueprint_lane_cell",
+    # Issue #453 (Epic #443 Phase 4, #447's target-expansion follow-up):
+    # Vision-to-Feature. Every one of these resolves against an EXISTING
+    # owning module's stable identity (never a new id scheme) --
+    # `docs/01-specifications/capabilities/ai-discussion-adapter.md` §4.1's table:
+    # `purpose_element` / `purpose_relation` -> `app/purpose_chain.py`,
+    # `stakeholder` / `stakeholder_need` -> `app/stakeholder_network.py`,
+    # `product_objective` / `product_milestone` / `product_gap` ->
+    # `app/product_objective.py`, `product_feature` -> `app/product_feature.py`.
+    "purpose_element",
+    "purpose_relation",
+    "stakeholder",
+    "stakeholder_need",
+    "product_objective",
+    "product_milestone",
+    "product_gap",
+    "product_feature",
 ]
 
 # --- UiDraftContext (Issue #445, Epic #443 Phase 2) ---------------------------
@@ -6137,6 +6194,13 @@ class UiDraftFieldIn(BaseModel):
     validation_error: str = Field(default="", max_length=2000)
 
 
+class UiDraftSectionErrorIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    section: str = Field(default="", max_length=200)
+    code: str = Field(default="", max_length=200)
+    message: str = Field(default="", max_length=2000)
+
+
 class UiDraftContextIn(BaseModel):
     """§2.2. A client-only, unsaved form snapshot for one turn. Never stored
     -- `app/ui_draft_context.py` strips this down to (state, form_id, digest)
@@ -6163,13 +6227,15 @@ class UiDraftContextIn(BaseModel):
     #: `no_unsaved_changes` looks. A client that omits this behaves exactly
     #: as before it existed.
     readable: bool = True
+    validation_state: Literal["idle", "validating", "invalid"] = "idle"
+    section_errors: List[UiDraftSectionErrorIn] = Field(default_factory=list, max_length=40)
 
     @model_validator(mode="after")
     def validate_ui_draft_bounds(self):
         # An unreadable draft carries no content by definition -- accepting
         # fields alongside `readable: false` would mean the client both could
         # and could not read the same form.
-        if not self.readable and self.fields:
+        if not self.readable and (self.fields or self.section_errors):
             raise ValueError(
                 "ui_draft_unreadable_with_fields: readable=false must carry no fields"
             )
@@ -6198,6 +6264,7 @@ class UiDraftContextIn(BaseModel):
                 self.active_tab, self.comparison_target, self.local_revision_token,
             )
         )
+        total_bytes += sum(len(v.encode("utf-8")) for e in self.section_errors for v in (e.section, e.code, e.message))
         if total_bytes > 32 * 1024:
             raise ValueError(
                 "ui_draft_payload_too_large: total draft payload exceeds 32KB"
@@ -6401,6 +6468,22 @@ DiscussionCapability = Literal[
     "promote_joint_understanding",
 ]
 
+# Issue #456 (Epic #443 Phase 1 follow-up). The finite operation-result
+# contract a discussion-adapter READ operation (canonical context gathering,
+# prefill readiness, ...) reports ALONGSIDE its facts -- never folded into
+# them, and never merged with `DiscussionTargetState` (freshness) or with
+# `unknown` / `stale` / `conflict` / `validation_error`, which stay separate
+# facts of their own. First-match assignment (`app/discussion_adapters.py`):
+# `unsupported` (no adapter/handler is registered for this operation at all --
+# a structural gap in the current catalog), `unavailable` (a registered
+# handler exists but THIS attempt failed -- exception, transient read
+# failure), `not_applicable` (this kind of target can never carry this
+# operation, independent of whether a handler could someday be registered).
+# A deleted/inaccessible target stays on the EXISTING resolver/404 contract
+# (`DiscussionTargetState.unresolvable`, or a 404) rather than being
+# reclassified into this vocabulary.
+DiscussionOperationResult = Literal["available", "unsupported", "unavailable", "not_applicable"]
+
 
 class AssistantDiscussionTargetIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -6437,6 +6520,18 @@ class AssistantDiscussionTurnOut(BaseModel):
     ui_draft_state: Optional[UiDraftState] = None
     ui_draft_form_id: Optional[str] = None
     ui_draft_digest: str = ""
+    # Issue #459 (§9.2): `None` means "not a claims turn" (every turn before
+    # this Issue, and every ordinary `/assistant/ask` turn since) -- never
+    # defaulted to `[]`, which would be indistinguishable from "attached and
+    # empty" (structurally impossible: a claims call always returns at least
+    # one claim or fails outright, per `discussion_claims`). Kept as plain
+    # dicts (matching `DiscussionContextClaimOut`'s own shape, defined later
+    # in this module) rather than a forward-referenced model type -- this
+    # module has no `from __future__ import annotations`, and the two never
+    # drift because `routes/assistant.py` always constructs each item as
+    # `DiscussionContextClaimOut(...).model_dump()` before this turn is read
+    # back.
+    claims: Optional[List[Dict[str, Any]]] = None
 
 
 class AssistantDiscussionThreadOut(BaseModel):
@@ -6457,10 +6552,50 @@ class AssistantDiscussionThreadOut(BaseModel):
     schema_version: str = "assistant-discussion-thread-v1"
 
 
+#: Issue #459 (docs/01-specifications/ux/decision-discussion-workflow.md §3, DD-UX-01): the finite,
+#: PRIORITY-ORDERED `kind` vocabulary of the single overall next_action
+#: projection for a Gap discussion thread. Mirrors
+#: `app/discussion_next_action.NEXT_ACTION_KINDS` exactly -- the order below
+#: IS the priority order, never re-decided by the client (DD-UX-01: "client
+#: は同じ判定表を本番コードへ複製しない").
+GapDiscussionNextActionKind = Literal[
+    "target_error", "evidence_stale", "processing", "save_unknown",
+    "unsaved_edit", "review_proposal", "investigation_result",
+    "review_hypothesis", "match",
+]
+
+
+class AssistantDiscussionNextActionOut(BaseModel):
+    """`app/discussion_next_action.NextActionResult`'s wire shape."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: GapDiscussionNextActionKind
+    reason: str = ""
+    target_ref: Optional[str] = None
+    #: Which DB-backed fact groups (`"proposal"` / `"investigation"`) could
+    #: not be read for THIS evaluation -- a failure here never blocks an
+    #: earlier or later row that IS determinable (DD-INT: "任意sectionの失敗
+    #: だけで無関係な操作まで止めない").
+    degraded_sections: List[str] = Field(default_factory=list)
+
+
 class AssistantDiscussionThreadDetailOut(BaseModel):
     thread: AssistantDiscussionThreadOut
     target_state: DiscussionTargetState
+    # Issue #456: the target's adapter-derived capability set (§1.3), read
+    # fresh from the CURRENT registry every time -- never stored on the
+    # thread row, so a narrowed registry is reflected immediately rather than
+    # describing whatever was true when the thread was created. Separate
+    # field from `target_state` (freshness) on purpose (#366's rule): a
+    # thread can be `current` and still lack `prefill_form`, or be `stale`
+    # and still support it.
+    capabilities: List[DiscussionCapability] = Field(default_factory=list)
     turns: List[AssistantDiscussionTurnOut] = Field(default_factory=list)
+    #: Issue #459: the single overall next_action projection for this
+    #: thread's whole Gap-discussion flow, read fresh on every request
+    #: (never stored) -- see `AssistantDiscussionNextActionOut`.
+    next_action: AssistantDiscussionNextActionOut
 
 
 class AssistantDiscussionThreadsListOut(BaseModel):
@@ -6490,6 +6625,15 @@ class AssistantDiscussionProposalItemOut(BaseModel):
     current_value: str = ""
     proposed_value: str = ""
     rationale: str = ""
+    # Issue #454 (Epic #443 §5.1): a ChildSpec address. `child_kind=""`
+    # means "not a child item" (a plain top-level field/relation) -- the
+    # same three pre-#454 fields above stay meaningful either way. `child_
+    # order=None` means "this item does not move the child's order" (either
+    # it is not a reorder, or its `child_kind` is empty).
+    child_kind: str = ""
+    child_key: str = ""
+    child_intent: str = ""
+    child_order: Optional[int] = None
     status: DiscussionProposalItemStatus
     eligibility: DiscussionProposalItemEligibility
     applied_ref: Optional[str] = None
@@ -6504,6 +6648,34 @@ class AssistantDiscussionProposalItemOut(BaseModel):
     # stays `proposed` no matter how many times this item was prefilled.
     prefill_count: int = 0
     last_prefilled_at: Optional[float] = None
+
+
+# --- Discussion proposal hypotheses / JU bridge (Issue #455, Epic #443 §6) --
+# docs/01-specifications/capabilities/ai-discussion-adapter.md §6.1/§6.2. A
+# hypothesis is an INDEPENDENT type, never a field_change: `statement` /
+# `competing_explanations` / `refutation_conditions` / `next_investigation` /
+# `evidence_refs` / `uncertainty`. Missing `competing_explanations` /
+# `refutation_conditions` / `next_investigation` is refused at BOTH
+# generation time (`assistant_discussion_proposal.generate_proposal`) and
+# promotion time (`app/discussion_hypothesis.py`) -- a hypothesis without a
+# refutation condition is a claim, not a hypothesis.
+AssistantDiscussionHypothesisStatus = Literal["proposed", "promoted", "rejected"]
+
+
+class AssistantDiscussionProposalHypothesisOut(BaseModel):
+    id: int
+    proposal_id: int
+    statement: str
+    competing_explanations: List[str] = Field(default_factory=list)
+    refutation_conditions: List[str] = Field(default_factory=list)
+    next_investigation: str = ""
+    evidence_refs: List[str] = Field(default_factory=list)
+    uncertainty: str = ""
+    status: AssistantDiscussionHypothesisStatus
+    first_turn_number: Optional[int] = None
+    last_turn_number: Optional[int] = None
+    created_at: float
+    schema_version: str = "discussion-hypothesis-v1"
 
 
 class AssistantDiscussionProposalOut(BaseModel):
@@ -6529,6 +6701,9 @@ class AssistantDiscussionProposalOut(BaseModel):
     created_by: Optional[str] = None
     created_at: float
     items: List[AssistantDiscussionProposalItemOut] = Field(default_factory=list)
+    # Issue #455: independent from `items` -- a hypothesis is never a
+    # field/relation/child change (§6.1).
+    hypotheses: List[AssistantDiscussionProposalHypothesisOut] = Field(default_factory=list)
 
 
 class AssistantDiscussionProposalsListOut(BaseModel):
@@ -6576,6 +6751,71 @@ class AssistantDiscussionProposalPrefillRequest(BaseModel):
 class AssistantDiscussionProposalPrefillOut(BaseModel):
     proposal: AssistantDiscussionProposalOut
     prefilled_item_ids: List[int] = Field(default_factory=list)
+
+
+# --- Hypothesis -> Joint Understanding bridge (Issue #455, Epic #443 §6.2) --
+# docs/01-specifications/capabilities/ai-discussion-adapter.md §6.2/§6.3.
+# `request_id` is the idempotency key Issue #455's Decisions require ("同一
+# 昇格requestは同じJU IDを返す"): a retry with the SAME `request_id` returns
+# the SAME `joint_understanding_session_id` (`reused=true`); the SAME id
+# reused for a DIFFERENT hypothesis is refused 409 (never silently applied to
+# the new one).
+
+
+class AssistantDiscussionHypothesisPromoteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(..., min_length=1, max_length=200)
+
+
+class AssistantDiscussionHypothesisPromotionOut(BaseModel):
+    id: int
+    hypothesis_id: int
+    thread_id: int
+    first_turn_number: Optional[int] = None
+    last_turn_number: Optional[int] = None
+    captured_target_kind: str
+    captured_target_ref: str
+    captured_target_digest: str = ""
+    joint_understanding_session_id: int
+    request_id: str
+    decision_method: Literal["manual"] = "manual"
+    created_by: Optional[str] = None
+    created_at: float
+
+
+class AssistantDiscussionHypothesisPromoteOut(BaseModel):
+    hypothesis: AssistantDiscussionProposalHypothesisOut
+    promotion: AssistantDiscussionHypothesisPromotionOut
+    joint_understanding_session_id: int
+    # True when this call returned an EXISTING promotion (same `request_id`,
+    # same content) rather than creating a new Joint Understanding session --
+    # the idempotent-retry case Issue #455's Decisions require.
+    reused: bool = False
+
+
+# --- Discussion <-> Joint Understanding reflux (Issue #455, Epic #443 §6.3) -
+# `GET /assistant/discussion-threads/{id}/joint-understanding`. Never a new
+# understanding model: `session` is the EXACT `JointUnderstandingOut` #329
+# already defines (premise_state / outcome_is_provisional verbatim, #337's
+# verdict is never re-derived here). `current_findings` is populated ONLY
+# when `session.premise_state == "current"` -- a stale/missing/invalid
+# premise surfaces zero findings plus its own reason, never a guess.
+
+
+class AssistantDiscussionJointUnderstandingLinkOut(BaseModel):
+    hypothesis: AssistantDiscussionProposalHypothesisOut
+    promotion: AssistantDiscussionHypothesisPromotionOut
+    session: JointUnderstandingOut
+    current_findings: List[JointUnderstandingFindingOut] = Field(default_factory=list)
+    # True whenever `session.premise_state != "current"` -- the Dashboard's
+    # single signal to offer a re-confirmation action instead of the
+    # findings list (Issue #455 Decisions: "根拠更新時に再確認する").
+    reconfirmation_required: bool = False
+
+
+class AssistantDiscussionJointUnderstandingListOut(BaseModel):
+    links: List[AssistantDiscussionJointUnderstandingLinkOut] = Field(default_factory=list)
 
 
 # GitHub App publish workflow (Issue #216, sub-task 1): connection
@@ -6777,6 +7017,24 @@ class AssistantAskOut(BaseModel):
     # draft (§2.6).
     ui_draft_state: UiDraftState = "not_provided"
     ui_draft_changed: bool = False
+    # Issue #456 follow-up: the finite operation-result of THIS turn's screen
+    # canonical-context read (`assistant_discussion_context.build_screen_
+    # discussion_context`), reported as its OWN field -- never folded into
+    # `screen_data`/facts (the LLM prompt keeps the same separation, see
+    # `app/assistant.py`'s `ContextPack.screen_data_state`) and never merged
+    # with `target_state` (freshness, a DIFFERENT axis). `unsupported`: this
+    # screen_id has no discussion-context concept at all (`build_screen_
+    # discussion_context` returned `None`) -- distinct from the PRE-#456 wire
+    # shape, where that case was indistinguishable from "canonical read
+    # failed" because neither reached the client. `unavailable`: the screen
+    # is discussion-enabled but THIS turn's read failed; `screen_data` reads
+    # as empty for this turn (never fabricated facts) and this field is what
+    # tells the caller that emptiness means "could not read", not "read, and
+    # there is nothing". `available`: the read succeeded (an EMPTY result is
+    # still `available`, not `unavailable` -- a genuinely empty canonical
+    # projection is real data, not a failed read).
+    screen_context_state: DiscussionOperationResult = "unsupported"
+    screen_context_reason: Optional[str] = None
 
 
 # --- Replay engine (Issue #242 Phase B / #244) -------------------------------
@@ -9983,6 +10241,35 @@ class UxRequirementRevisionCreateRequest(BaseModel):
     out_of_scope_note: str = ""
     change_note: str = ""
     acceptance_criteria: List[UxAcceptanceCriterionInput] = Field(default_factory=list)
+    # Issue #452 (docs/01-specifications/capabilities/ai-discussion-adapter.md §3.6/§3.7): optional
+    # idempotency key for the AI Discussion Adapter's prefill-to-save flow.
+    # `None` (the default) is the pre-#452 shape -- an ordinary developer save
+    # with no idempotent-retry contract. An opaque, client-generated token;
+    # never interpreted, only bound to a request digest.
+    save_request_id: Optional[str] = Field(default=None, max_length=200)
+
+
+#: Issue #452 §3.6: the finite outcome of one idempotent save request.
+DiscussionSaveReceiptStatus = Literal["succeeded", "failed"]
+
+
+class DiscussionSaveReceiptOut(BaseModel):
+    """§3.7's result-query API response: `GET /ux-design/save-requests/{id}`.
+    Read-only projection of one `discussion_save_receipt` row -- never a
+    domain row itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    save_request_id: str
+    target_kind: str
+    target_ref: str
+    endpoint_kind: str
+    status: DiscussionSaveReceiptStatus
+    result_ref: str = ""
+    revision_id: Optional[int] = None
+    error_code: str = ""
+    created_at: float
+    updated_at: float
 
 
 class UxRequirementStepLinkCreateRequest(BaseModel):
@@ -15129,3 +15416,257 @@ class OverviewObjectiveOut(BaseModel):
     next_step_requirement_key: Optional[str] = None
     degraded_sections: List[str] = []
     degraded_detail: Dict[str, str] = {}
+
+
+# --- Discussion context bundle (Issue #458, Epic #443 §9, DD-CTX-01..05) -----
+# `docs/01-specifications/capabilities/ai-discussion-adapter.md` §9.1 is the canonical wire shape;
+# `app/discussion_context_bundle.py` is the only producer of these values --
+# this section is a pure Pydantic mirror of its dataclasses (never a second,
+# hand-maintained shape), converted via `discussion_context_bundle.
+# bundle_to_dict`.
+
+#: DD-CTX-02's finite coverage vocabulary. `unknown` means the walk was cut
+#: off before even the candidate COUNT could be established (never a guessed
+#: lower bound reported as `partial`).
+DiscussionContextCompleteness = Literal["complete", "partial", "unknown"]
+
+#: Why a section's coverage stopped short of `complete`. `complete` here
+#: doubles as "nothing stopped it" (paired with `completeness="complete"`),
+#: matching `discussion_context_bundle.BundleCoverage`'s own values exactly.
+DiscussionContextStopReason = Literal[
+    "complete", "item_budget", "byte_budget", "depth_budget",
+    "provider_error", "unsupported", "not_applicable",
+]
+
+#: One bundle entry's own resolution -- mirrors `discussion_adapters.
+#: ResolvedTarget.resolution` (never a fourth value invented here).
+DiscussionContextResolution = Literal["resolved", "unresolved", "not_tracked"]
+
+DiscussionContextDeepLinkState = Literal["selected", "screen_only", "unavailable"]
+
+DiscussionContextNextActionKind = Literal["expand_context", "none"]
+
+#: §9.3's durable audit consumer kinds -- mirrors `discussion_context_bundle.
+#: CONTEXT_AUDIT_CONSUMER_KINDS` exactly.
+DiscussionContextAuditConsumerKind = Literal["turn", "proposal", "ju_session"]
+
+#: §9.2/DD-CTX-04: the finite semantic-claim-kind vocabulary a bundle-grounded
+#: answer's claims carry, mirroring `discussion_context_bundle.
+#: DISCUSSION_CONTEXT_CLAIM_KINDS` exactly. This module never produces a
+#: value of this type itself -- #459's own main discussion operation does,
+#: citing against `DiscussionContextBundleOut.sources[].source_id` via
+#: `discussion_context_bundle.validate_citation_source_ids`.
+DiscussionContextClaimKind = Literal["fact", "inference", "hypothesis", "unknown", "conflict"]
+
+
+class DiscussionContextRootOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_kind: str
+    target_ref: str
+    revision_id: Optional[int] = None
+    digest: str = ""
+
+
+class DiscussionContextSnapshotOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Optional[int] = None
+    commit_sha: Optional[str] = None
+
+
+class DiscussionContextEntryOut(BaseModel):
+    """One entity read into a bundle -- the root's own `self` entry, the
+    Overview's `objective` stub, or one `related` neighbour."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_kind: str
+    target_ref: str
+    title: str
+    revision_id: Optional[int] = None
+    digest: str = ""
+    resolution: DiscussionContextResolution
+    facts: Dict[str, Any] = Field(default_factory=dict)
+    #: True when `facts` was replaced by an empty stub because including it
+    #: would have exceeded the bundle-wide byte budget -- identity
+    #: (target_kind/target_ref/digest/resolution) is never dropped, only the
+    #: body. §9.1: "取得失敗時のtotal_count=nullは0件を意味しない" applies at
+    #: the section level; this is the entry-level analogue -- `truncated`
+    #: never means "this entity has no facts", only "not included here".
+    truncated: bool = False
+
+
+class DiscussionContextCoverageOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    returned_count: int
+    #: `None` on any incomplete/failed sweep -- never a guessed lower bound
+    #: (§9.1: "取得失敗時のtotal_count=nullは0件を意味しない").
+    total_count: Optional[int] = None
+    completeness: DiscussionContextCompleteness
+    stop_reason: DiscussionContextStopReason
+    #: Opaque token for `POST .../context-expansions`. `None` when there is
+    #: nothing more to fetch for this section, or when this section's own
+    #: state (`unsupported`/`unavailable`/`not_applicable`) has no partial
+    #: progress to resume.
+    continuation: Optional[str] = None
+
+
+class DiscussionContextSectionOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    #: `"self"` | `"objective"` (Overview root only) | `"related"`.
+    section_id: str
+    #: DD-CTX-01/§9.1: the FETCH's own success/failure -- separate from any
+    #: individual entry's `resolution` (freshness), per #366's rule.
+    operation_state: DiscussionOperationResult
+    facts: List[DiscussionContextEntryOut] = Field(default_factory=list)
+    coverage: DiscussionContextCoverageOut
+
+
+class DiscussionContextSourceOut(BaseModel):
+    """One citable entity across the whole bundle -- the flat catalog
+    `sources[]` a semantic claim's citation (§9.2) resolves against, kept
+    separate from the section tree so a citation never has to name a
+    section/depth path to be checked against the allow-list."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str
+    target_kind: str
+    target_ref: str
+    revision_id: Optional[int] = None
+    digest: str = ""
+    snapshot_id: Optional[int] = None
+    #: A subset of `DiscussionTargetState` (`current`/`not_tracked`/
+    #: `unresolvable`) -- a bundle source is always read fresh, so `stale`
+    #: (a comparison against a PRIOR capture) does not arise here; the wider
+    #: type is kept so a future caller comparing against its own capture is
+    #: never boxed out.
+    freshness: DiscussionTargetState
+    deep_link: Optional[str] = None
+    deep_link_state: DiscussionContextDeepLinkState
+
+
+class DiscussionContextDependencyOut(BaseModel):
+    """One `dependencies[]` entry -- the DD-CTX-05 manifest of what this
+    bundle's answer actually relied on, pinned by digest. Field-for-field
+    identical to `joint_premise.PremiseDependencyRef` (Issue #461's shared
+    shape) -- never redefined independently."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_kind: str
+    target_ref: str
+    digest: str
+
+
+class DiscussionContextNextActionOut(BaseModel):
+    """§8: the ONLY action this Issue's bundle carries is "fetch more
+    context" -- never a domain action. #459 owns the discussion's own main
+    operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: DiscussionContextNextActionKind
+    target: str = ""
+    enabled: bool = False
+    reason: str = ""
+
+
+class DiscussionContextBundleOut(BaseModel):
+    """§9.1's full wire shape. Every field here traces to one bundle
+    dataclass in `app/discussion_context_bundle.py` -- see that module's own
+    docstring for the section/budget/cursor contract this mirrors."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str
+    bundle_digest: str
+    root: DiscussionContextRootOut
+    snapshot: DiscussionContextSnapshotOut
+    sections: List[DiscussionContextSectionOut] = Field(default_factory=list)
+    sources: List[DiscussionContextSourceOut] = Field(default_factory=list)
+    dependencies: List[DiscussionContextDependencyOut] = Field(default_factory=list)
+    next_action: DiscussionContextNextActionOut
+
+
+class DiscussionContextExpansionRequest(BaseModel):
+    """`POST /assistant/discussion-threads/{id}/context-expansions` body.
+    Both fields are required -- an unspecified `bundle_digest`/`continuation`
+    is not "expand the current bundle", it is a different, unsupported
+    request shape (§9.1: "既存askは未指定なら従来動作" describes `/assistant/
+    ask` staying unaffected by this Issue, not this endpoint growing
+    optional fields)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bundle_digest: str = Field(..., min_length=1, max_length=200)
+    continuation: str = Field(..., min_length=1, max_length=200)
+
+
+class DiscussionContextExpansionOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    bundle: DiscussionContextBundleOut
+    expanded_section_ids: List[str] = Field(default_factory=list)
+
+
+# --- §9.2 semantic claims (Issue #459) -----------------------------------------
+# `app/discussion_claims.py` is the sole producer. Mirrors
+# `discussion_claims.DiscussionClaim` / `ClaimsGenerationResult` field-for-field.
+
+#: Whether one claim came straight off a bundle's own structural field
+#: (`"deterministic"`) or the reasoning model's structured output
+#: (`"reasoning_llm"`). Mirrors `discussion_claims.CLAIM_BASIS_VALUES`.
+DiscussionContextClaimBasis = Literal["deterministic", "reasoning_llm"]
+
+#: Mirrors `discussion_claims`'s finite failure reasons for the §9.2 call.
+DiscussionContextClaimErrorKind = Literal[
+    "unavailable", "call_error", "invalid_response", "invalid_citation",
+]
+
+
+class DiscussionContextClaimsRequest(BaseModel):
+    """`POST /assistant/discussion-threads/{id}/context-claims` body. The
+    question is optional -- the primary action is a fixed
+    「目的・UX・機能を照合」 operation (docs/01-specifications/ux/decision-discussion-workflow.md §3), not a
+    free-form question every time."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(default="目的・UX・機能を照合", max_length=2000)
+
+
+class DiscussionContextClaimOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: DiscussionContextClaimKind
+    statement: str
+    cited_source_ids: List[str] = Field(default_factory=list)
+    basis: DiscussionContextClaimBasis
+
+
+class DiscussionContextClaimsResultOut(BaseModel):
+    """`discussion_claims.ClaimsGenerationResult`'s wire shape, plus the
+    turn this call's result was persisted onto (Principle 7 audit trail --
+    `None` only when persistence itself could not happen, e.g. the thread's
+    target became unresolvable between the read and the write)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    model: str
+    is_mock: bool
+    prompt_version: str
+    schema_version: str
+    decision_method: DecisionMethod
+    claims: List[DiscussionContextClaimOut] = Field(default_factory=list)
+    scope_note: str = ""
+    as_of_snapshot_commit: Optional[str] = None
+    retried: bool = False
+    error: Optional[str] = None
+    error_kind: Optional[DiscussionContextClaimErrorKind] = None
+    thread_id: int
+    turn_number: Optional[int] = None

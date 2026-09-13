@@ -43,6 +43,19 @@ ASSISTANT_DISCUSSION_SCHEMA_DEFS = {
     "DiscussionProposalItemStatus": "discussion_proposal_item_status",
     "DiscussionProposalItemEligibility": "discussion_proposal_item_eligibility",
     "UiDraftState": "ui_draft_state",
+    "DiscussionOperationResult": "discussion_operation_result",
+    # Issue #458 (Epic #443 §9, DD-CTX-01..05).
+    "DiscussionContextCompleteness": "discussion_context_completeness",
+    "DiscussionContextStopReason": "discussion_context_stop_reason",
+    "DiscussionContextResolution": "discussion_context_resolution",
+    "DiscussionContextDeepLinkState": "discussion_context_deep_link_state",
+    "DiscussionContextNextActionKind": "discussion_context_next_action_kind",
+    "DiscussionContextAuditConsumerKind": "discussion_context_audit_consumer_kind",
+    # Issue #459 (Epic #457).
+    "DiscussionContextClaimKind": "discussion_context_claim_kind",
+    "DiscussionContextClaimBasis": "discussion_context_claim_basis",
+    "DiscussionContextClaimErrorKind": "discussion_context_claim_error_kind",
+    "GapDiscussionNextActionKind": "gap_discussion_next_action_kind",
 }
 
 
@@ -416,3 +429,69 @@ def test_runtime_capability_vocabulary_matches_server_literal():
 
     server_types = _server_finite_types(SERVER_MODELS_PATH)
     assert set(discussion_adapters.DISCUSSION_CAPABILITIES) == server_types["DiscussionCapability"]
+
+
+# --- §1.3: prefill_form capability requires a MATCHING registered handler ----
+# Issue #456. `capabilities_for`'s `prefill_form` rule reads the SERVER's own
+# `prefill_handler_id` only (never anything the client claims) -- but "both
+# sides' registry contracts carry a matching id" is a claim about TWO files,
+# which only a parity check across them can hold. `None` on both sides today
+# is exactly the honest state: no real handler is wired yet (#452's job).
+
+
+def _dashboard_adapter_prefill_handler_ids() -> Dict[str, str]:
+    """Each Dashboard adapter's declared `prefillHandlerId`, parsed from the
+    source. `null` entries are OMITTED (not stored as the string `"null"`) so
+    the returned dict's keys are exactly the kinds the Dashboard claims a
+    handler for -- comparing key SETS, not a dict with a stringly-typed
+    `"null"` sentinel, is what makes a future typo (e.g. a stray adapter
+    setting a string where it meant `null`) show up as a real mismatch."""
+    source = DASHBOARD_ADAPTERS_PATH.read_text(encoding="utf-8")
+    out: Dict[str, str] = {}
+    for block in re.finditer(
+        r"targetKind:\s*\"(?P<kind>[\w]+)\"(?P<body>.*?)\n\};",
+        source,
+        flags=re.DOTALL,
+    ):
+        match = re.search(r'prefillHandlerId:\s*(?:"(?P<id>[^"]+)"|null)', block.group("body"))
+        assert match is not None, f"no prefillHandlerId for {block.group('kind')!r}"
+        if match.group("id") is not None:
+            out[block.group("kind")] = match.group("id")
+    return out
+
+
+def test_prefill_handler_id_parity_between_server_and_dashboard():
+    from app import discussion_adapters
+
+    dashboard_handler_ids = _dashboard_adapter_prefill_handler_ids()
+    server_handler_ids = {
+        kind: adapter.prefill_handler_id
+        for kind, adapter in discussion_adapters.DISCUSSION_ADAPTERS.items()
+        if adapter.prefill_handler_id is not None
+    }
+    assert dashboard_handler_ids == server_handler_ids
+    # Issue #452 populates the FIRST real entry (`ux_requirement`, the
+    # representative target its Decisions name). Pinned to the exact id
+    # (not just non-empty) so a future PR that adds ONE side's declaration
+    # without the other, or that changes one side's id without the other,
+    # fails this test rather than silently shipping a half-wired or
+    # mismatched capability.
+    assert server_handler_ids == {"ux_requirement": "ux_requirement.revision@v1"}
+
+
+def test_only_ux_requirement_derives_prefill_form_so_far():
+    """#456's own completion condition, extended by #452's first real
+    registration: `prefill_form` is true for EXACTLY the one kind with a
+    registered handler, and still false for every other kind that has every
+    OTHER precondition (`ui_draft_forms` and `propose_fields`) satisfied
+    already -- e.g. `ux_journey`, whose handler is `#454`'s job, not this
+    Issue's."""
+    from app import discussion_adapters
+
+    for kind, adapter in discussion_adapters.DISCUSSION_ADAPTERS.items():
+        if kind == "ux_requirement":
+            assert adapter.prefill_handler_id == "ux_requirement.revision@v1"
+            assert "prefill_form" in discussion_adapters.capabilities_for(adapter)
+        else:
+            assert adapter.prefill_handler_id is None
+            assert "prefill_form" not in discussion_adapters.capabilities_for(adapter)

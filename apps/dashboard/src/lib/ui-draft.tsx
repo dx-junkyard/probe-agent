@@ -29,7 +29,8 @@
 // module only provides the read; freezing the snapshot for a turn is the
 // caller's job (see `captureUiDraft` usage in `assistant-panel.tsx`).
 
-import { createContext, useContext, useEffect, useMemo, useRef, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import type { ApiError } from "@/api/client";
 
 export interface UiDraftFieldSnapshot {
   fieldName: string;
@@ -44,6 +45,11 @@ export interface UiDraftFieldSnapshot {
  * `app/ui_draft_context.py`, right before the LLM call; duplicating it here
  * would be a second, driftable copy of that rule). */
 export interface UiDraftSnapshot {
+  hasUnsavedChanges?: boolean;
+  saveResultUnknown?: boolean;
+  saveReferenceId?: string | null;
+  validationState?: "idle" | "validating" | "invalid";
+  sectionErrors?: { section: string; code: string; message: string }[];
   fields: UiDraftFieldSnapshot[];
   /** "" = no selection (§2.2). */
   selectedItemRef: string;
@@ -69,6 +75,8 @@ export type UiDraftReadResult =
   | { outcome: "readable"; snapshot: UiDraftSnapshot };
 
 interface UiDraftApi {
+  confirmDiscard?: () => boolean;
+  hasUnsavedWork?: () => boolean;
   /** Returns an unregister function; call it on unmount / when
    * formId+targetRef changes. */
   register: (formId: string, targetRef: string, getDraft: UiDraftGetter) => () => void;
@@ -78,6 +86,26 @@ interface UiDraftApi {
 }
 
 const UiDraftContext = createContext<UiDraftApi | null>(null);
+const DRAFT_CHANGED_EVENT = "probe-agent:draft-changed";
+const notifyDraftChanged = () => window.dispatchEvent(new Event(DRAFT_CHANGED_EVENT));
+const subscribeDraft = (listener: () => void) => {
+  window.addEventListener(DRAFT_CHANGED_EVENT, listener);
+  return () => window.removeEventListener(DRAFT_CHANGED_EVENT, listener);
+};
+
+/** Only observable local facts are sent to the server's next-action owner. */
+export function useUiDraftActivity(formId: string, targetRef: string) {
+  const registry = useUiDraftRegistry();
+  const read = () => {
+    const result = registry?.read(formId, targetRef);
+    if (result?.outcome !== "readable") return "false|false|";
+    const s = result.snapshot;
+    return `${s.hasUnsavedChanges ?? s.fields.some((f) => f.dirty)}|${s.saveResultUnknown ?? false}|${s.saveReferenceId ?? ""}`;
+  };
+  const value = useSyncExternalStore(subscribeDraft, read, () => "false|false|");
+  const [dirty, unknown, reference] = value.split("|");
+  return { has_unsaved_ui_draft: dirty === "true", save_result_unknown: unknown === "true", save_reference_id: reference || undefined };
+}
 
 function registryKey(formId: string, targetRef: string): string {
   return `${formId}|${targetRef}`;
@@ -87,6 +115,18 @@ export function UiDraftProvider({ children }: { children: ReactNode }) {
   const registry = useRef(new Map<string, UiDraftGetter>());
   const api = useMemo<UiDraftApi>(
     () => ({
+      hasUnsavedWork() {
+        for (const get of registry.current.values()) {
+          try {
+            const draft = get();
+            if (draft && (draft.hasUnsavedChanges ?? draft.fields.some((f) => f.dirty))) return true;
+          } catch { return true; }
+        }
+        return false;
+      },
+      confirmDiscard() {
+        return !this.hasUnsavedWork?.() || window.confirm("保存していない入力があります。破棄して選択を変更しますか?");
+      },
       register(formId, targetRef, getDraft) {
         if (!targetRef) {
           // A form editing a not-yet-identified row (e.g. a new Journey
@@ -116,12 +156,14 @@ export function UiDraftProvider({ children }: { children: ReactNode }) {
           return { ...snapshot, localRevisionToken: token };
         };
         registry.current.set(key, readDraft);
+        notifyDraftChanged();
         return () => {
           // Only clear the slot if it still belongs to THIS registration --
           // a fast remount (e.g. React StrictMode) can register the
           // replacement before the old cleanup runs.
           if (registry.current.get(key) === readDraft) {
             registry.current.delete(key);
+            notifyDraftChanged();
           }
         };
       },
@@ -145,6 +187,21 @@ export function UiDraftProvider({ children }: { children: ReactNode }) {
     }),
     [],
   );
+  useEffect(() => {
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (api.hasUnsavedWork?.()) { event.preventDefault(); event.returnValue = ""; }
+    };
+    const click = (event: MouseEvent) => {
+      const anchor = event.target instanceof Element ? event.target.closest("a[href]") : null;
+      if (!(anchor instanceof HTMLAnchorElement) || anchor.target === "_blank" || event.metaKey || event.ctrlKey) return;
+      const next = new URL(anchor.href);
+      if (next.origin === location.origin && next.pathname === location.pathname && next.search === location.search) return;
+      if (api.confirmDiscard?.() === false) { event.preventDefault(); event.stopPropagation(); }
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    document.addEventListener("click", click, true);
+    return () => { window.removeEventListener("beforeunload", beforeUnload); document.removeEventListener("click", click, true); };
+  }, [api]);
   return <UiDraftContext.Provider value={api}>{children}</UiDraftContext.Provider>;
 }
 
@@ -176,9 +233,156 @@ export function useUiDraftSource(
   // render, and the read itself only happens later, at turn start.
   useEffect(() => {
     getterRef.current = getDraft;
+    notifyDraftChanged();
   });
   useEffect(() => {
     if (!api) return;
     return api.register(formId, targetRef, () => getterRef.current());
   }, [api, formId, targetRef]);
+}
+
+// --- useFormValidation (Issue #451) ------------------------------------------
+//
+// docs/01-specifications/capabilities/ai-discussion-adapter.md §2.8 is the canonical contract. Journey /
+// Requirement / Solution Design forms were sending `validationError: ""` for
+// every field, unconditionally -- a real save failure reached only a toast,
+// never the draft context an AI conversation reads. This hook is the ONE
+// place that turns a rejected save's `ApiError` (`fieldPath`/`section`, both
+// structural per §2.8.1 -- never guessed from `.detail`'s message text) into
+// per-field diagnostics a form can both DISPLAY inline and feed into its own
+// `useUiDraftSource` `fields[].validationError`.
+//
+// Two axes this hook keeps separate on purpose (§2.8.3):
+//   - `status`: idle / validating / invalid -- the lifecycle of the LATEST
+//     save attempt. This is client-only bookkeeping; it never rides on the
+//     wire inside `UiDraftContextIn` (that describes CURRENT input, not "how
+//     did the last save go").
+//   - `readable`/`dirty` (already `UiDraftContextIn`'s own §2.2 contract) --
+//     unaffected by anything in this file.
+
+/** The lifecycle of the most recent save attempt this hook instance has been
+ * told about. `idle` = no attempt yet (or the last one succeeded); this is
+ * NOT the same axis as a field's own dirty/readable state. */
+export type FormValidationLifecycle = "idle" | "validating" | "invalid";
+
+/** One field's (or the whole form's) diagnostic. `section` is carried even on
+ * a field-level entry so a caller can group inline messages the same way a
+ * whole-form message is grouped (§2.8.2). */
+export interface FieldValidationDiagnostic {
+  message: string;
+  code: string;
+  section: string;
+}
+
+export interface FormValidationSnapshot {
+  status: FormValidationLifecycle;
+  /** Keyed by field name -- ONLY for `field_path` values that are members of
+   * the `knownFields` list passed to `resolveError` at the time it was
+   * reported. Untouched fields keep their prior diagnostic across a new
+   * `begin()`/`resolveError()` cycle (§2.8.4) -- only `clearField` or
+   * `resolveSuccess` remove an entry. */
+  fieldErrors: Record<string, FieldValidationDiagnostic>;
+  /** A diagnostic that does not name one of this form's OWN known fields --
+   * either `field_path === ""` (the server said "no specific field") or a
+   * `field_path` this particular form does not render an input for (§2.8.2:
+   * "未知 field_path はフォーム全体のエラー"). `null` = no such diagnostic
+   * outstanding. Replaced wholesale by each new `resolveError`/
+   * `resolveSuccess` (there is only ever one outstanding save attempt's
+   * whole-form message, unlike per-field diagnostics which persist
+   * independently). */
+  formError: FieldValidationDiagnostic | null;
+}
+
+export interface UseFormValidationResult extends FormValidationSnapshot {
+  /** Call immediately before issuing the save request. Returns a token --
+   * pass the SAME token to `resolveError`/`resolveSuccess` so a response for
+   * an OLDER attempt (this same target, resubmitted) can never land after a
+   * newer one already resolved (§2.8.5). */
+  begin(): number;
+  /** Apply a rejected save's `ApiError`. Ignored (no state change at all) if
+   * `token` is not this hook instance's MOST RECENT `begin()` token --
+   * §2.8.5's stale-response guard. `knownFields` is this specific form's own
+   * set of addressable inputs (not necessarily `UiDraftFormSpec.fields`; see
+   * §2.8.2) -- an `error.fieldPath` outside it becomes `formError` instead of
+   * a per-field entry, exactly like `error.fieldPath === ""`. */
+  resolveError(token: number, error: ApiError, knownFields: readonly string[]): void;
+  /** A successful save: clears every diagnostic and returns to `idle`. Same
+   * stale-token guard as `resolveError`. */
+  resolveSuccess(token: number): void;
+  /** The developer edited this field -- drop ITS diagnostic only (§2.8.4).
+   * Every other field's diagnostic, and any outstanding `formError`, is left
+   * untouched: this call says nothing about whether they are still valid. */
+  clearField(fieldName: string): void;
+  /** Full reset (e.g. an explicit "discard/cancel" action). Component
+   * remount already isolates one target's validation state from another's
+   * (§2.8.5) -- this is for within-instance resets only. */
+  reset(): void;
+}
+
+const IDLE_SNAPSHOT: FormValidationSnapshot = { status: "idle", fieldErrors: {}, formError: null };
+
+/**
+ * One save operation's client-side validation lifecycle (§2.8). A component
+ * with more than one independent save action (e.g. a create form AND a
+ * revision form on the same detail page) calls this once PER action -- each
+ * call is its own token sequence and its own diagnostic set.
+ */
+export function useFormValidation(): UseFormValidationResult {
+  const [snapshot, setSnapshot] = useState<FormValidationSnapshot>(IDLE_SNAPSHOT);
+  const tokenRef = useRef(0);
+
+  const begin = useCallback((): number => {
+    const token = tokenRef.current + 1;
+    tokenRef.current = token;
+    setSnapshot((prev) => ({ ...prev, status: "validating" }));
+    return token;
+  }, []);
+
+  const resolveError = useCallback(
+    (token: number, error: ApiError, knownFields: readonly string[]): void => {
+      if (token !== tokenRef.current) return; // stale response -- §2.8.5
+      const fieldPath = error.fieldPath;
+      const diagnostic: FieldValidationDiagnostic = {
+        message: error.detail || "",
+        code: error.code ?? "",
+        section: error.section,
+      };
+      setSnapshot((prev) => {
+        if (fieldPath && knownFields.includes(fieldPath)) {
+          return {
+            status: "invalid",
+            fieldErrors: { ...prev.fieldErrors, [fieldPath]: diagnostic },
+            formError: prev.formError,
+          };
+        }
+        // §2.8.2: field_path === "" OR unknown to THIS form -> whole-form.
+        return { status: "invalid", fieldErrors: prev.fieldErrors, formError: diagnostic };
+      });
+    },
+    [],
+  );
+
+  const resolveSuccess = useCallback((token: number): void => {
+    if (token !== tokenRef.current) return; // stale response -- §2.8.5
+    setSnapshot(IDLE_SNAPSHOT);
+  }, []);
+
+  const clearField = useCallback((fieldName: string): void => {
+    // Editing invalidates the submitted draft, even if this field did not
+    // already have a diagnostic when the request began.
+    tokenRef.current += 1;
+    setSnapshot((prev) => {
+      const nextFieldErrors = { ...prev.fieldErrors };
+      delete nextFieldErrors[fieldName];
+      const stillInvalid = prev.formError !== null || Object.keys(nextFieldErrors).length > 0;
+      return { status: stillInvalid ? "invalid" : "idle", fieldErrors: nextFieldErrors, formError: prev.formError };
+    });
+  }, []);
+
+  const reset = useCallback((): void => {
+    tokenRef.current += 1; // also invalidates any response already in flight
+    setSnapshot(IDLE_SNAPSHOT);
+  }, []);
+
+  return { ...snapshot, begin, resolveError, resolveSuccess, clearField, reset };
 }

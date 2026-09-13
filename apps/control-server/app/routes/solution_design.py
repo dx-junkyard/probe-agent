@@ -108,22 +108,41 @@ def _principal_actor(principal: Principal) -> str:
     return f"user:{principal.user_id}"
 
 
+#: §2.8 (Issue #451): the same structural field_path/section mapping
+#: `routes/ux_design.py` documents -- "" means "no specific field", and a
+#: `field_path` that does not name one of the current form's
+#: `UiDraftFormSpec.fields` renders as a whole-form diagnostic on the client
+#: rather than being guessed from the message text (Principle 6).
+_FIELD_PATH_BY_CODE = {
+    "solution_design_key_required": ("design_key", ""),
+    "solution_design_option_key_required": ("option_key", "options"),
+    "solution_design_target_ref_required": ("target_ref", "target_links"),
+    "flow_target_requires_snapshot": ("captured_snapshot_id", "target_links"),
+    "solution_design_invalid_target_kind": ("target_kind", "target_links"),
+    "out_of_scope_requirement_not_implementable": ("", "target_links"),
+}
+
+
 def _raise_domain_error(exc: ValueError) -> None:
     for exc_type, (code, status_code, fixed_message) in _PROBE_POINT_ERROR_MAP.items():
         if isinstance(exc, exc_type):
             message = fixed_message if fixed_message is not None else str(exc)
+            field_path, section = _FIELD_PATH_BY_CODE.get(code, ("", ""))
             raise HTTPException(
-                status_code=status_code, detail={"code": code, "message": message}
+                status_code=status_code,
+                detail={"code": code, "message": message, "field_path": field_path, "section": section},
             ) from exc
     text = str(exc)
     code, _, rest = text.partition(": ")
     if code in _STATUS_BY_CODE:
+        field_path, section = _FIELD_PATH_BY_CODE.get(code, ("", ""))
         raise HTTPException(
             status_code=_STATUS_BY_CODE[code],
-            detail={"code": code, "message": rest or text},
+            detail={"code": code, "message": rest or text, "field_path": field_path, "section": section},
         ) from exc
     raise HTTPException(
-        status_code=422, detail={"code": "solution_design_error", "message": text}
+        status_code=422,
+        detail={"code": "solution_design_error", "message": text, "field_path": "", "section": ""},
     ) from exc
 
 
