@@ -12,7 +12,13 @@ import {
   useAnswerInterviewQa,
   useApproveInterviewProposal,
   useConfirmInterviewUnderstanding,
+  useAdoptCurrentPremise,
+  useBranchInterviewPremise,
   useCreateInterviewSession,
+  useInterviewPremise,
+  usePromoteUnderstanding,
+  useRebaseInterviewPremise,
+  useUnderstandingHead,
   useEditInterviewProposal,
   useInterviewApprovedSet,
   useInterviewCapabilityGraph,
@@ -80,6 +86,10 @@ import {
   focusFirstCockpitTarget,
 } from "@/components/system-understanding/cockpit/navigation";
 import { CockpitStatusSummary } from "@/components/system-understanding/cockpit/status-summary";
+import {
+  CanonicalPromotePanel,
+  PremiseNotice,
+} from "@/components/system-understanding/premise-notice";
 import { UnderstandingMap } from "@/components/system-understanding/cockpit/understanding-map";
 import { CockpitDetailPanel } from "@/components/system-understanding/cockpit/detail-panel";
 import { CockpitUnresolvedItems } from "@/components/system-understanding/cockpit/unresolved-items";
@@ -1548,6 +1558,14 @@ export default function InterviewPage() {
   const { data: understandingBrief } = useUnderstandingBrief(selectedSessionId);
   const recordDiffReview = useRecordDiffReview(selectedSessionId);
   const acknowledgeBack = useAcknowledgeBackRequest(selectedSessionId);
+  // Issue #464: この会話が何を前提に始まったか、そしてそれが今も System の
+  // 正準 Understanding かどうか。判定はサーバーが毎回導出する。
+  const { data: premise } = useInterviewPremise(selectedSessionId);
+  const { data: understandingHead } = useUnderstandingHead();
+  const rebasePremise = useRebaseInterviewPremise(selectedSessionId);
+  const branchPremise = useBranchInterviewPremise(selectedSessionId);
+  const adoptPremise = useAdoptCurrentPremise(selectedSessionId);
+  const promoteUnderstanding = usePromoteUnderstanding(selectedSessionId);
   const closeSession = useCloseInterviewSession(selectedSessionId);
   const reopenSession = useReopenInterviewSession(selectedSessionId);
   // Issue #295 §4.8 / PR #296 review fix (Finding 4): one shared
@@ -1842,7 +1860,7 @@ export default function InterviewPage() {
     }
     if (uiState === "ready_for_proposals") {
       // 提案生成を依頼しても情報不足で提案できなかった場合、モデルは絞り込みの
-      // 確認質問を open_questions に返す(プロンプト interview-v6)。固定文の
+      // 確認質問を open_questions に返す(プロンプト interview-v7)。固定文の
       // 代わりにその質問を提示し、回答のたびに提案生成を再試行する。
       const open = sortQuestions(session.open_questions ?? []);
       if (open.length > 0) return focusedFromOpenQuestion(open[0]);
@@ -2576,6 +2594,63 @@ export default function InterviewPage() {
                 acknowledgeBack
                   .mutateAsync({ requestId, actor })
                   .then(() => toast.success("確認が必要な状態へ移動しました"))
+                  .catch(e => toast.error(String(e)))
+              }
+            />
+          )}
+
+          {/* Issue #464 — 前提 (premise) は例外より上。前提が動いていれば、
+              その下のどの作業面も「どの理解についての作業か」が定まらない。
+              判定・提示してよい選択肢はすべてサーバーが返した値で、ここで
+              再導出しない。 */}
+          {premise && (
+            <PremiseNotice
+              premise={premise}
+              pending={
+                rebasePremise.isPending ||
+                branchPremise.isPending ||
+                adoptPremise.isPending
+              }
+              onRebase={() =>
+                void rebasePremise
+                  .mutateAsync({})
+                  .then(created => {
+                    setSessionClearedByUser(false);
+                    setSearchParams({ session: String(created.new_session_id) });
+                    toast.success("現在の正準 Understanding を前提に新しいセッションを開始しました");
+                  })
+                  .catch(e => toast.error(String(e)))
+              }
+              onBranch={() =>
+                void branchPremise
+                  .mutateAsync({})
+                  .then(() => toast.success("古い前提の検討として維持します"))
+                  .catch(e => toast.error(String(e)))
+              }
+              onAdoptCurrent={() =>
+                void adoptPremise
+                  .mutateAsync({})
+                  .then(() => toast.success("現在の正準 Understanding を前提にしました"))
+                  .catch(e => toast.error(String(e)))
+              }
+              onStartNewSession={() => void startSession()}
+              onOpenSession={id => {
+                setSessionClearedByUser(false);
+                setSearchParams({ session: String(id) });
+              }}
+            />
+          )}
+
+          {premise && (
+            <CanonicalPromotePanel
+              premise={premise}
+              headRevisionId={understandingHead?.revision_id ?? null}
+              headVersion={understandingHead?.head_version ?? null}
+              pending={promoteUnderstanding.isPending}
+              onPromote={input =>
+                void promoteUnderstanding
+                  .mutateAsync(input)
+                  .then(() => toast.success("この理解を System の正準にしました"))
                   .catch(e => toast.error(String(e)))
               }
             />

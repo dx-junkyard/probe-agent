@@ -94,6 +94,14 @@ Overview の「次にすること」は 1 件だけで、操作名に加えて**
 | `unresolvable`（会話の対象） | 対象そのものが今は解決できない | 内容が変わった |
 | `not_tracked`（会話の対象） | その種類には digest 源が無い（画面全体） | 変化を検出できていない |
 | `deterministic`（機能解説） | 製品管理下レジストリの完全一致結果 | LLM が生成した説明 |
+| `canonical_head`（Understanding の出所） | 人が正準として昇格した内容 | 最新の会話が作った内容 |
+| `latest_session`（Understanding の出所） | まだ誰も昇格していない、最新セッションの途中経過 | この System の確定した理解 |
+| `current`（Interview の前提） | 開始時に固定した前提が今も正準 head と一致する | 会話の内容が正しい |
+| `stale`（Interview の前提） | 開始後に正準 Understanding が動いた | 会話が間違っていた |
+| `missing`（Interview の前提） | 前提にしていたリビジョンが消えた | 前提が動いた（`stale`） |
+| `invalid`（Interview の前提） | 前提を記録する前に作られた（legacy-unbased） | 前提が正しい（`current`） |
+| `branched`（Interview の前提） | 古い前提の検討として人が明示的に維持した | 前提が最新に戻った |
+| `candidate`（Understanding リビジョン） | まだ誰も正準として確定していない | Overview に出る内容 |
 
 ## 4. 空状態・失敗状態
 

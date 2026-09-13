@@ -50,11 +50,13 @@ probe-agent:
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, get_args
 
 from . import (
+    canonical_understanding,
     product_objective_projection,
     purpose_chain,
     purpose_needs,
@@ -1461,6 +1463,14 @@ class OverviewResult:
     snapshot_freshness: str = "unavailable"
     understanding_revision_id: Optional[int] = None
     understanding_confirmed_at: Optional[float] = None
+    #: Issue #464. Which rule produced the Understanding on this page:
+    #: `canonical_head` (a human promoted it), `latest_session` (nothing has
+    #: been promoted, so this is the newest conversation's in-progress state
+    #: and the screen says so), or `unavailable`. These are three different
+    #: answers and must never share copy.
+    understanding_source: str = "unavailable"
+    canonical_revision_id: Optional[int] = None
+    canonical_head_version: Optional[int] = None
     findings: List[Finding] = field(default_factory=list)
     finding_statuses: List[str] = field(default_factory=list)
     findings_initial_count: int = 0
@@ -1619,15 +1629,61 @@ def resolve_pending_instrumentation_publish(
 def _latest_interview_session_id(conn, system_id: int) -> Optional[int]:
     """The System's newest Interview session.
 
-    The same rule the Interview screen auto-selects with (`ORDER BY id DESC`),
-    so the Brief on the Overview and the Brief on the Interview screen are
-    always about the same session -- and the Overview's deep links land on it.
+    Issue #464 removed this from the canonical decision: creation order is not
+    promotion order, so "newest session" can never answer 「この System は今
+    なにを理解していることになっているか」. It survives ONLY as the fallback
+    for a System that has never promoted an Understanding, and the result is
+    labelled `understanding_source='latest_session'` so the screen says which
+    rule it used rather than presenting a candidate as settled.
     """
     row = conn.execute(
         "SELECT id FROM interview_session WHERE system_id = ? ORDER BY id DESC LIMIT 1",
         (system_id,),
     ).fetchone()
     return row["id"] if row else None
+
+
+@dataclass
+class CanonicalUnderstandingRef:
+    """Which Understanding the Overview is about, and by which rule."""
+
+    source: str  # canonical_head | latest_session | unavailable
+    session_id: Optional[int] = None
+    revision_id: Optional[int] = None
+    head_version: Optional[int] = None
+    understanding: Optional[Dict[str, Any]] = None
+
+
+def resolve_canonical_understanding(conn, system_id: int) -> CanonicalUnderstandingRef:
+    """First match: the promoted head, else the newest session, else nothing.
+
+    The head's SOURCE SESSION is what the deep links point at, so the
+    Overview's 「詳しく見る」 lands on the conversation that actually produced
+    the canonical content -- not on whichever session was created last.
+    """
+    head = canonical_understanding.load_head(conn, system_id)
+    if head is not None:
+        revision = canonical_understanding.load_revision(conn, system_id, head.revision_id)
+        if revision is not None:
+            raw = revision["current_understanding"]
+            understanding = None
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    understanding = parsed if isinstance(parsed, dict) else None
+                except (TypeError, ValueError):
+                    understanding = None
+            return CanonicalUnderstandingRef(
+                source="canonical_head",
+                session_id=revision["session_id"],
+                revision_id=revision["id"],
+                head_version=head.head_version,
+                understanding=understanding,
+            )
+    session_id = _latest_interview_session_id(conn, system_id)
+    if session_id is None:
+        return CanonicalUnderstandingRef(source="unavailable")
+    return CanonicalUnderstandingRef(source="latest_session", session_id=session_id)
 
 
 def load_snapshot_commit(
@@ -1845,12 +1901,19 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
         }
 
         session_id = None
+        canonical_ref = CanonicalUnderstandingRef(source="unavailable")
         try:
-            session_id = _latest_interview_session_id(conn, system_id)
+            canonical_ref = resolve_canonical_understanding(conn, system_id)
+            session_id = canonical_ref.session_id
         except Exception as exc:  # pragma: no cover - defensive
             availability["session"] = False
             _degrade(result, "brief", exc, detail_key="brief.session")
         result.interview_session_id = session_id
+        result.understanding_source = (
+            canonical_ref.source if availability["session"] else "unavailable"
+        )
+        result.canonical_revision_id = canonical_ref.revision_id
+        result.canonical_head_version = canonical_ref.head_version
 
         latest_ready = None
         latest_snapshot_status = None
@@ -1870,8 +1933,20 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
         brief = None
         if availability["session"]:
             try:
+                # Issue #464: when a canonical head exists, the Brief is
+                # built from THAT content, not from the session's live
+                # `current_understanding`. Otherwise an unconfirmed rebuild in
+                # the head's own session would change what the Overview
+                # reports as settled -- the acceptance condition
+                # 「Interview の未確認結果が Overview の canonical
+                # Understanding を直接変更しない」.
                 brief = understanding_brief.build_understanding_brief(
-                    conn, system_id, session_id, now=now
+                    conn,
+                    system_id,
+                    session_id,
+                    now=now,
+                    understanding_override=canonical_ref.understanding,
+                    revision_id_override=canonical_ref.revision_id,
                 )
                 result.brief = brief
                 result.snapshot_id = brief.snapshot_id

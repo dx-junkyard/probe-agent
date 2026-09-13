@@ -138,6 +138,11 @@ function overview(overrides: Partial<OverviewOut> = {}): OverviewOut {
     snapshot_commit_sha: null,
     latest_ready_snapshot_id: null,
     snapshot_freshness: "unavailable",
+    // Issue #464: どの規則で決まった Understanding かは省略できない
+    // (`latest_session` を正準として見せないため)。
+    understanding_source: "canonical_head",
+    canonical_revision_id: null,
+    canonical_head_version: null,
     understanding_revision_id: null,
     understanding_confirmed_at: null,
     findings: [],

@@ -49,6 +49,15 @@ INTERVIEW_CONTRACT_PREFIXES = (
 # ``typeof INTERVIEW_INTENT_FIELDS[number]`` recursively.
 FINITE_TYPE_NAMES = (
     "ValueNetworkNoticeCode",
+    # Issue #464: the canonical-head / premise vocabularies. A bare `str` on
+    # either side puts no enum in the schema and lets the union drift.
+    "InterviewPremiseState",
+    "InterviewPremiseReasonCode",
+    "InterviewPremiseDisposition",
+    "UnderstandingRevisionStatus",
+    "UnderstandingPromotionRejection",
+    "UnderstandingCanonicalEventKind",
+    "UnderstandingSource",
     "AlignmentConfidence",
     "AlignmentDecisionAction",
     "AlignmentItemStatus",

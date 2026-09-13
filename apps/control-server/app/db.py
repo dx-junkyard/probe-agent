@@ -1918,6 +1918,78 @@ CREATE INDEX IF NOT EXISTS idx_understanding_revision_session
 CREATE INDEX IF NOT EXISTS idx_understanding_revision_system
     ON understanding_revision (system_id, session_id);
 
+-- The System's single canonical Understanding pointer (Issue #464).
+--
+-- Before this table, "the current understanding of this System" had no
+-- storage at all: the Overview inferred it from the newest interview_session
+-- row and the Interview screen read each session's own in-progress
+-- current_understanding column, so the same project could legitimately
+-- report a Vision on one screen and none on the other. Creation order is not
+-- promotion order, and neither screen was wrong about its own rule -- the
+-- rule itself was the defect.
+--
+-- One row per System, at most. `head_version` is the compare-and-swap token:
+-- a promotion states the version it believed was current, and a stale
+-- expectation is rejected rather than merged (no last-write-wins, #464
+-- non-goal 3). The head moves ONLY through
+-- `canonical_understanding.promote_revision`, which is reachable only from
+-- an explicit human confirmation (`decision_method: manual`).
+CREATE TABLE IF NOT EXISTS system_understanding_head (
+    system_id    INTEGER PRIMARY KEY,
+    revision_id  INTEGER NOT NULL,
+    head_version INTEGER NOT NULL DEFAULT 1,
+    updated_at   REAL NOT NULL,
+    updated_by   TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    -- RESTRICT, not SET NULL: the retention sweep must never be able to
+    -- delete the revision the System points at (see
+    -- canonical_understanding.PROTECTED_REVISION_SQL). A dangling head is a
+    -- System that cannot say what it understands.
+    FOREIGN KEY (revision_id) REFERENCES understanding_revision (id)
+);
+
+-- Append-only audit of everything that moves the canonical head or records
+-- an explicit premise disposition (Issue #464).
+--
+-- A premise MISMATCH is deliberately NOT in this table: it is derived at read
+-- time from the pinned digests, and recording it would mean writing a row
+-- every time somebody merely looked at a screen. What IS recorded here is
+-- what somebody DID -- promoted, was refused a promotion, rebased, branched
+-- -- because a refused promotion cannot be re-derived from state afterwards.
+CREATE TABLE IF NOT EXISTS understanding_canonical_event (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id                INTEGER NOT NULL,
+    event_kind               TEXT NOT NULL,
+    session_id               INTEGER,
+    revision_id              INTEGER,
+    previous_revision_id     INTEGER,
+    -- The OTHER session an event relates to: the successor a rebase created.
+    -- Deliberately not stuffed into revision_id -- a session id in a column
+    -- named for revisions is the kind of quiet type confusion that makes an
+    -- audit trail unreadable a year later.
+    related_session_id       INTEGER,
+    head_version             INTEGER,
+    expected_head_revision_id INTEGER,
+    expected_head_version    INTEGER,
+    rejection_code           TEXT,
+    premise_state            TEXT,
+    decision_method          TEXT NOT NULL DEFAULT 'manual',
+    actor                    TEXT NOT NULL DEFAULT '',
+    actor_user_id            INTEGER,
+    note                     TEXT NOT NULL DEFAULT '',
+    created_at               REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES interview_session (id) ON DELETE SET NULL,
+    FOREIGN KEY (related_session_id) REFERENCES interview_session (id) ON DELETE SET NULL,
+    FOREIGN KEY (actor_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_canonical_event_system
+    ON understanding_canonical_event (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_understanding_canonical_event_kind
+    ON understanding_canonical_event (system_id, event_kind, created_at);
+
 -- Canonical, manually-confirmed capability composition (Issue #312).
 --
 -- The reasoning-model ``current_understanding`` JSON remains the proposal
@@ -9413,6 +9485,181 @@ def _report_artifact_migration(
     )
 
 
+def _migrate_canonical_understanding(conn: sqlite3.Connection) -> None:
+    """Issue #464: canonical-head lineage columns, then a fail-safe backfill.
+
+    Two halves, in this order:
+
+    1. **Additive columns.** `understanding_revision` gains its lineage
+       (`parent_revision_id`), identity (`content_digest`), promoted premise
+       (`premise_digest` / `premise_json`), and role (`status`).
+       `interview_session` gains the premise it was started on. Every existing
+       row keeps NULL, which is the honest answer: nothing recorded what these
+       conversations stood on.
+
+    2. **Initial canonical head, from a HUMAN confirmation only.** Migration
+       step 1 of the Issue says to aggregate each System's already-settled
+       information into an initial canonical revision -- and "already settled"
+       has exactly one meaning here: a developer pressed 確認. So the initial
+       head is the newest revision carrying an Issue #312 capability
+       confirmation, else the newest revision of a session with
+       `understanding_confirmed_at`. A System where nobody ever confirmed
+       anything gets NO head: inventing one would be the "newest row wins"
+       rule this Issue exists to delete.
+
+    Existing sessions are deliberately NOT given a baseline by guesswork
+    (migration step 3: `legacy-unbased`, never implicitly continuable). The one
+    exception is the session that PRODUCED the initial head -- its premise is
+    that revision by construction, not by inference, so it stays continuable
+    and the developer is not locked out of the very conversation that
+    established the System's understanding.
+    """
+    revision_cols = _columns(conn, "understanding_revision")
+    if revision_cols:
+        _add_column_if_missing(
+            conn, "understanding_revision", revision_cols, "parent_revision_id",
+            "INTEGER REFERENCES understanding_revision(id) ON DELETE SET NULL",
+        )
+        for column in ("content_digest", "premise_digest", "premise_json", "confirmed_by"):
+            _add_column_if_missing(
+                conn, "understanding_revision", revision_cols, column, "TEXT",
+            )
+        _add_column_if_missing(
+            conn, "understanding_revision", revision_cols, "status",
+            "TEXT NOT NULL DEFAULT 'candidate'",
+        )
+        _add_column_if_missing(
+            conn, "understanding_revision", revision_cols, "confirmed_at", "REAL",
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_understanding_revision_status
+               ON understanding_revision (system_id, status, id DESC)"""
+        )
+
+    session_cols = _columns(conn, "interview_session")
+    if session_cols:
+        _add_column_if_missing(
+            conn, "interview_session", session_cols,
+            "base_understanding_revision_id",
+            "INTEGER REFERENCES understanding_revision(id) ON DELETE SET NULL",
+        )
+        _add_column_if_missing(
+            conn, "interview_session", session_cols,
+            "result_understanding_revision_id",
+            "INTEGER REFERENCES understanding_revision(id) ON DELETE SET NULL",
+        )
+        for column in (
+            "base_premise_digest",
+            "base_premise_json",
+            "premise_tracking_version",
+            "premise_origin_kind",
+        ):
+            _add_column_if_missing(
+                conn, "interview_session", session_cols, column, "TEXT",
+            )
+        _add_column_if_missing(
+            conn, "interview_session", session_cols, "premise_disposition",
+            "TEXT NOT NULL DEFAULT 'active'",
+        )
+        _add_column_if_missing(
+            conn, "interview_session", session_cols, "premise_captured_at", "REAL",
+        )
+        _add_column_if_missing(
+            conn, "interview_session", session_cols, "premise_origin_session_id",
+            "INTEGER REFERENCES interview_session(id) ON DELETE SET NULL",
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_interview_session_premise
+               ON interview_session (system_id, base_understanding_revision_id)"""
+        )
+
+    if not revision_cols or not session_cols:
+        return
+    if not _columns(conn, "system_understanding_head"):
+        return
+
+    # --- initial canonical head, per System -----------------------------------
+    from .canonical_understanding import (
+        CANONICAL_PREMISE_VERSION,
+        build_premise_bundle,
+    )
+
+    now = time.time()
+    systems = [
+        row["system_id"]
+        for row in conn.execute(
+            """SELECT DISTINCT system_id FROM understanding_revision
+               WHERE system_id NOT IN (SELECT system_id FROM system_understanding_head)"""
+        ).fetchall()
+    ]
+    for system_id in systems:
+        revision = conn.execute(
+            """SELECT r.* FROM understanding_revision r
+               JOIN understanding_capability_confirmation c
+                 ON c.source_revision_id = r.id AND c.system_id = r.system_id
+               WHERE r.system_id = ? AND r.current_understanding IS NOT NULL
+               ORDER BY c.id DESC LIMIT 1""",
+            (system_id,),
+        ).fetchone()
+        if revision is None:
+            revision = conn.execute(
+                """SELECT r.* FROM understanding_revision r
+                   JOIN interview_session s
+                     ON s.id = r.session_id AND s.system_id = r.system_id
+                   WHERE r.system_id = ?
+                     AND s.understanding_confirmed_at IS NOT NULL
+                     AND r.current_understanding IS NOT NULL
+                     AND r.created_at <= s.understanding_confirmed_at
+                   ORDER BY r.id DESC LIMIT 1""",
+                (system_id,),
+            ).fetchone()
+        if revision is None:
+            # No human ever confirmed anything for this System. Leaving it
+            # headless is the correct, honest state -- the Overview then says
+            # so instead of promoting whatever was written last.
+            continue
+
+        bundle = build_premise_bundle(conn, system_id, revision)
+        conn.execute(
+            """UPDATE understanding_revision
+               SET status = 'canonical', content_digest = ?, premise_digest = ?,
+                   premise_json = ?, confirmed_at = COALESCE(confirmed_at, ?)
+               WHERE id = ? AND system_id = ?""",
+            (
+                bundle.content_digest, bundle.digest, bundle.to_json(), now,
+                revision["id"], system_id,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO system_understanding_head
+                (system_id, revision_id, head_version, updated_at, updated_by)
+            VALUES (?, ?, 1, ?, 'migration')""",
+            (system_id, revision["id"], now),
+        )
+        conn.execute(
+            """UPDATE interview_session
+               SET base_understanding_revision_id = ?, base_premise_digest = ?,
+                   base_premise_json = ?, premise_tracking_version = ?,
+                   premise_captured_at = ?
+               WHERE id = ? AND system_id = ?""",
+            (
+                revision["id"], bundle.digest, bundle.to_json(),
+                CANONICAL_PREMISE_VERSION, now,
+                revision["session_id"], system_id,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO understanding_canonical_event
+                (system_id, event_kind, session_id, revision_id, head_version,
+                 premise_state, decision_method, actor, note, created_at)
+            VALUES (?, 'head_initialized', ?, ?, 1, 'current', 'manual',
+                    'migration',
+                    'initial canonical head restored from an existing human confirmation',
+                    ?)""",
+            (system_id, revision["session_id"], revision["id"], now),
+        )
+
+
 def _migrate_ux_journey_upstream_ref_kinds(conn: sqlite3.Connection) -> None:
     """Widen `ux_journey_upstream_ref.ref_kind` to accept Product Objective /
     Milestone / Gap references (Issue #427/#431,
@@ -10254,6 +10501,9 @@ def init_db() -> None:
                     conn, "assistant_discussion_turn", turn_cols, column, definition
                 )
         _migrate_alignment_manual_recheck_targets(conn)
+        # Issue #464: runs last among the column migrations because its
+        # backfill reads the columns every earlier migration installed.
+        _migrate_canonical_understanding(conn)
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

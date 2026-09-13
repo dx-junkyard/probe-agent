@@ -7699,3 +7699,128 @@ Solution Design へはどちらの Requirement からも
 モジュールには Stakeholder の `display_name` と Journey の `beneficiary`
 文字列を比較するコードは一行も無い — テストはその不在を確認するだけで、
 振る舞いを実装しているわけではない。
+
+---
+
+## Issue #464 — System 正準 Understanding と Interview premise の分離
+
+canonical contract は `docs/01-specifications/product/canonical-understanding.md`。ここには
+「なぜその判断にしたか」だけを残す。
+
+### 症状と原因
+
+「Overview は Vision を把握しているのに Interview は未把握」。表示の不具合では
+なく、**存在しなかった所有境界**である。Vision / Purpose / 確定 Capability /
+確認済み意図はどれも System の事実なのに、それを生み出した Interview セッション
+の中にしか保存されていなかった。そのうえで Overview は `interview_session` の
+最新行から、Interview は自分の `current_understanding` 列から「現在の
+Understanding」を各自で解釈していた。**作成順は確定順でも昇格順でもない**ので、
+この 2 つが一致し続けることは原理的にありえない。どちらの規則も単体では
+間違っていない。規則が 2 つあることが欠陥だった。
+
+### 新しい軸を `interview_session.status` に載せなかった理由
+
+Issue 本文は session の `status` に `stale` / `rebased` / `branched` を足す形で
+書かれているが、その列は #349 の中断/再開軸として既に使われている。中断された
+セッションと前提が動いたセッションは別の事実で、開発者の次の操作も違う
+(#366 の「一つの表示語が二つの事実を運ばない」)。そこで軸を 2 つに分けた:
+
+- **premise 判定** (`current` / `stale` / `missing` / `invalid`) は**保存せず
+  導出する**。#337 / #338 / #349 と同じ規律 — 保存された lifecycle 値は記述対象
+  の行から drift しうるが、導出値は drift しえない。
+- **disposition** (`active` / `rebased` / `branched`) だけを保存する。これは
+  観測ではなく開発者自身の判断だから。`active` は「まだ決定が無い」であって
+  決定ではない。
+
+判定値を 4 つにしたのも #337 と同じ理由で、`missing` (前提が消えた) と
+`invalid` (そもそも記録していない) は `stale` に丸めると失敗方向が開く側になる。
+とくに **`invalid` を `current` として扱わない**こと ── 前提を記録していない
+セッションは「正しい前提の上にある」ことの証明ではない。
+
+### premise を不変にコピーする理由
+
+読み取り時に現在の head から作り直す実装にすると、それはもはや前提ではない。
+セッションは開始時に bundle (正準 claim + **確認済み** Intent) を丸ごとコピー
+する。未確定の Intent 提案を含めないのは #464 非目標 1 そのもので、それは
+セッションの仮説であって System の事実ではない。
+
+**premise を固定することと、そこから始めることは 1 つの行為**なので、
+`current_understanding` の seed は `capture_session_premise` の中にある。ルート
+側に置いていた実装では、rebase が今日の head を固定しながら空の Understanding を
+表示し、この Issue が直そうとしている不一致を別経路で再現していた。既存の内容は
+決して上書きしない ── 既に何か構築した会話に前提を採用させるときに、その作業を
+消してはならない。
+
+### `premise_digest` は昇格時にだけ確定する
+
+リビジョン作成時ではない。後から Intent を 1 つ確認しただけで正準 premise が
+静かに動くと、誰も昇格していないのに全 open session が `stale` になる。その変更は
+次に昇格される版に入る。逆に digest から `revision_id` を**除いてある**のは、
+同じ内容の再昇格を「変化」と読ませないため (#323 が snapshot 軸で使った規則と
+同じ)。
+
+### ゲートの位置
+
+premise を**消費する** 2 経路 (dialogue-turn / update-understanding) にだけ 409
+を置き、開発者の入力を**記録する**経路には置かない。前提の問題で人間の回答を
+失うのは、#336 が 「わからない」 の入口で回答を先に確定させたのと同じ理由で
+誤りである。
+
+`branched` が続行できるのは、開発者が「これは古い前提の検討だ」と記録した事実が
+あるから。判定は `stale` のままで、その候補は昇格できない (昇格は `current`
+必須) ── 受入条件 9 「古い premise の candidate が新しい head を上書きできない」
+はこの 1 本の規則で成立する。
+
+### 昇格の 3 ガードを 1 コードに畳まない
+
+`premise_not_current` / `head_revision_mismatch` / `head_version_mismatch` は
+どれも 409 だが、開発者の次の操作が違う。前者は「この会話ごと作り直すか rebase
+するか」、後者 2 つは「画面を読み直して確認し直す」。拒否は
+`understanding_canonical_event` に残す ── 拒否された昇格は後から状態から再導出
+できない (#412 の「記録は昇格ではない」と対になる規律で、こちらは「拒否も事実
+である」)。
+
+### retention guard を「親として参照されている行」にしなかった
+
+最初の実装は `parent_revision_id` で参照される行をすべて保護していたが、
+セッション内では最新以外のすべてのリビジョンが次の行の親なので、これは履歴全体を
+保護し retention を事実上無効化する (`test_revision_rotation_respects_limit` が
+即座に検出した)。守るべきは**正準 lineage とセッションの premise が指す行**
+だけで、昇格のたびに直前 head が `superseded` になるので、promoted chain は
+`status` だけで完全に覆われる。
+
+### 移行で head を作らない System を残す
+
+初期 canonical head は **人間の確認が実在する場合にのみ**生成する
+(#312 の capability confirmation、次いで `understanding_confirmed_at`)。誰も
+確認していない System に head を作るのは、この Issue が削除しようとしている
+「最新行が勝つ」規則そのものである。baseline を一意に復元できないセッションは
+`legacy-unbased` (= `invalid`) のままにし、修復は
+`POST .../premise/adopt-current` という開発者の明示操作だけに限る。読み取り時に
+暗黙適用しない。
+
+Overview 側は head が無いとき `understanding_source='latest_session'` と明示して
+最新セッションの途中経過を出す。**空にしない代わりに、正準であるかのようには
+見せない** ── 3 つ目の値 `unavailable` と合わせて、3 つの別の答えである。
+
+### Overview は head の内容から Brief を組む
+
+`build_understanding_brief` に `understanding_override` を足し、Overview は正準
+リビジョンの内容を渡す。セッションの live な `current_understanding` を読ませた
+ままだと、head を生んだセッションで未確認の rebuild が走るだけで Overview の
+「確定済み」表示が変わってしまい、受入条件「Interview の未確認結果が Overview の
+canonical Understanding を直接変更しない」を満たせない。
+
+`_latest_intent_items` に premise の確認済み Intent を **fallback として** 足す
+(セッション自身の行が常に優先)。確認済みの goal は System の事実であって、それを
+記録したセッションの所有物ではない ── これが無いと、新規 Interview は開発者が
+とっくに確定した Vision について「未設定」と報告する。行は**コピーしない**ので、
+著述者はそれを記録したセッションのまま残る。
+
+### prompt に premise を独立セクションで載せる
+
+`understanding-review-v8` / `interview-v7`。graph は code から導出した仮説、
+premise は人が既に確定した内容で、混ぜると rebuild がどちらか言えなくなる
+(#336 が investigation fact と developer answer を分けたのと同じ理由)。premise に
+別の prompt 予算を与えているのは、**切り詰められた premise が確定済みの Vision が
+静かに消える経路**だからである。

@@ -906,7 +906,7 @@ def test_question_evidence_from_understanding_allowed():
     assert result.next_questions[0].evidence_refs[0].path == "docs/design.md"
 
 
-# --- Requested proposal turns must propose or narrow (prompt interview-v6) ----
+# --- Requested proposal turns must propose or narrow (prompt interview-v7) ----
 
 
 def test_proposal_request_directive_included_in_prompt():

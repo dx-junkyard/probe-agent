@@ -37,7 +37,7 @@ from ..capability_graph import (
     latest_system_confirmed_graph,
 )
 from ..db import get_conn
-from .. import interview_workflow
+from .. import canonical_understanding, interview_workflow
 from ..interview_workflow import tracked_process
 from ..interview_context import build_interview_context
 from ..interview_agent import (
@@ -378,6 +378,9 @@ def _session_out(conn, row) -> InterviewSessionOut:
     confirmed_revision_id = (
         graph_confirmation["source_revision_id"] if graph_confirmation else None
     )
+    # Issue #464: derived on every read so a session can never display a
+    # premise verdict that disagrees with the System's actual head.
+    premise_verdict = canonical_understanding.evaluate_session_premise(conn, row)
     return InterviewSessionOut(
         id=row["id"],
         system_id=row["system_id"],
@@ -424,6 +427,11 @@ def _session_out(conn, row) -> InterviewSessionOut:
             if ("answerable_areas" in row.keys() and row["answerable_areas"])
             else []
         ),
+        premise_state=premise_verdict.state,
+        premise_disposition=premise_verdict.disposition,
+        premise_continuable=premise_verdict.continuable,
+        base_understanding_revision_id=premise_verdict.base_revision_id,
+        result_understanding_revision_id=premise_verdict.result_revision_id,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -653,6 +661,63 @@ def _proposal_out(conn, row) -> InterviewProposalOut:
     )
 
 
+def _premise_prompt_facts(session) -> Optional[dict]:
+    """The session's pinned canonical premise, shaped for a prompt.
+
+    Returns ``None`` for a session that pinned nothing (a legacy row, or a
+    System with no canonical head yet) -- an empty premise section is the
+    honest rendering of 「まだ正準 Understanding がない」, and inventing one
+    would be worse than leaving it out.
+    """
+    bundle = canonical_understanding.session_premise_bundle(session)
+    if bundle is None or (not bundle.understanding and not bundle.intent_items):
+        return None
+    facts: dict = {
+        "canonical_revision_id": bundle.revision_id,
+        "premise_version": bundle.premise_version,
+    }
+    for section in canonical_understanding.PREMISE_SECTIONS:
+        items = (bundle.understanding or {}).get(section) or []
+        if items:
+            facts[section] = items
+    if bundle.intent_items:
+        facts["intent_items"] = bundle.intent_items
+    return facts
+
+
+def _require_continuable_premise(conn, session, system_id: int) -> None:
+    """Refuse to consume a premise the System has moved past (Issue #464).
+
+    「canonical head が変わった既存 Interview は stale と判定され、暗黙に会話を
+    継続できない」. Enforced at the two entry points that actually SPEND the
+    premise -- the reasoning dialogue turn and the understanding rebuild --
+    and deliberately NOT on the paths that merely record what the developer
+    said. Losing a developer's answer to a premise problem would be the same
+    mistake Issue #336 fixed at the 「わからない」 entry point: commit the human
+    input first, then decide what the system may do with it.
+
+    A session the developer explicitly `branched` stays continuable: they have
+    recorded that it is an exploration of the old premise. Its candidate can
+    still never be promoted -- promotion requires `current`.
+    """
+    verdict = canonical_understanding.evaluate_session_premise(conn, session)
+    if verdict.continuable:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "interview_premise_stale",
+            "premise_state": verdict.state,
+            "reason_code": verdict.reason_code,
+            "message": verdict.message,
+            "base_revision_id": verdict.base_revision_id,
+            "head_revision_id": verdict.head_revision_id,
+            "head_version": verdict.head_version,
+            "next_action": "choose_new_rebase_or_branch",
+        },
+    )
+
+
 def _get_session_or_404(conn, session_id: int, system_id: int):
     row = conn.execute(
         "SELECT * FROM interview_session WHERE id = ? AND system_id = ?",
@@ -733,6 +798,23 @@ def create_interview_session(
         # `E3-a` immediately rather than after the stale sweep.
         initial_run_id = interview_workflow.start_process_run(
             conn, session_id, system_id, "understanding_build"
+        )
+
+        # Issue #464, required behaviour for a new Interview (steps 1-3): pin
+        # the System's canonical head and the immutable premise bundle built
+        # from it, in the SAME transaction that created the session, so a
+        # session can never exist without a recorded decision about what it
+        # stands on.
+        #
+        # Seeding `current_understanding` from that bundle is what makes the
+        # Overview and a brand-new Interview agree on the first paint. Before
+        # this, a new session started with NULL and the Overview was reading
+        # some other session's row, which is exactly how the same project
+        # could report a Vision on one screen and none on the other. The
+        # seeded content is the canonical revision's own -- not a guess, and
+        # not a copy of another session's in-progress state.
+        canonical_understanding.capture_session_premise(
+            conn, session_id=session_id, system_id=system_id, now=now
         )
         row = _get_session_or_404(conn, session_id, system_id)
         session_out = _session_out(conn, row)
@@ -1329,6 +1411,7 @@ def interview_dialogue_turn(
     """
     with get_conn() as conn:
         session = _get_session_or_404(conn, session_id, system_id)
+        _require_continuable_premise(conn, session, system_id)
         stage = session["stage"] or "understanding_initialized"
     if stage != "proposal_generation":
         return _interview_dialogue_turn_core(session_id, payload, system_id)
@@ -1410,6 +1493,13 @@ def _interview_dialogue_turn_core(
             json.loads(session["current_understanding"])
             if session["current_understanding"] else None
         )
+
+        # Issue #464 required behaviour 3: the conversation's system context
+        # ALWAYS carries the premise bundle built from the revision this
+        # session was started on. Read from the session's own immutable
+        # capture, never re-resolved from the current head -- a premise that
+        # silently refreshed mid-conversation would be no premise at all.
+        canonical_premise = _premise_prompt_facts(session)
         session_gaps = (
             json.loads(session["gap_analysis"]) if session["gap_analysis"] else None
         )
@@ -1580,6 +1670,7 @@ def _interview_dialogue_turn_core(
                 unconfirmed_qa=unconfirmed_qa_for_turn,
                 evidence_snippets=evidence_snippets,
                 proposals_requested=proposals_requested,
+                canonical_premise=canonical_premise,
             )
 
     # Phase 3 (DB lock re-acquired): persist the turn, its audit runs and
@@ -3361,6 +3452,17 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
         )
         verified_evidence = feed_prompt_facts(feed_entries)
 
+        # Issue #464: the rebuild reasons FROM the System's canonical premise,
+        # not from a blank slate. Read from the session's immutable capture so
+        # a rebuild half-way through a conversation uses the same ground the
+        # conversation started on.
+        canonical_premise = _premise_prompt_facts(
+            conn.execute(
+                "SELECT * FROM interview_session WHERE id = ? AND system_id = ?",
+                (session_id, system_id),
+            ).fetchone()
+        )
+
     # Phase 2 (DB lock released): the reasoning call. The LLM client
     # opens its own connection to consume System quota, so it must not
     # run while this thread holds one (see app/db.py).
@@ -3373,6 +3475,7 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
         unconfirmed_qa=unconfirmed_qa_pairs or None,
         alignment_feedback=alignment_feedback,
         verified_evidence=verified_evidence or None,
+        canonical_premise=canonical_premise,
     )
 
     # Phase 3 (DB lock re-acquired): persist the review outcome.
@@ -3493,12 +3596,40 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
         # Issue #136: append (never overwrite) an understanding revision,
         # linked to the understanding_review run that produced it, so the
         # Dashboard can show a deterministic diff against the previous one.
+        #
+        # Issue #464: every revision is born a `candidate`. It changes nothing
+        # the Overview shows until a human promotes it (acceptance condition
+        # 「Interview の未確認結果が Overview の canonical Understanding を直接
+        # 変更しない」). `parent_revision_id` records what this rebuild was
+        # derived FROM -- the session's previous revision if it has one, else
+        # the canonical premise it was started on -- so 「何を基準に更新したか」
+        # survives snapshot rebases and promotions.
+        previous_revision = conn.execute(
+            """SELECT id FROM understanding_revision
+               WHERE session_id = ? AND system_id = ? ORDER BY id DESC LIMIT 1""",
+            (session_id, system_id),
+        ).fetchone()
+        parent_revision_id = (
+            previous_revision["id"]
+            if previous_revision is not None
+            else session["base_understanding_revision_id"]
+            if "base_understanding_revision_id" in session.keys()
+            else None
+        )
         revision_cur = conn.execute(
             """INSERT INTO understanding_revision
                 (session_id, system_id, snapshot_id, intelligence_run_id,
-                 current_understanding, gap_analysis, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, system_id, snapshot_id, run_id, understanding_json, gap_json, now),
+                 current_understanding, gap_analysis, created_at,
+                 parent_revision_id, content_digest, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'candidate')""",
+            (
+                session_id, system_id, snapshot_id, run_id,
+                understanding_json, gap_json, now,
+                parent_revision_id,
+                canonical_understanding.compute_content_digest(
+                    review.current_understanding
+                ),
+            ),
         )
         revision_id = revision_cur.lastrowid
 
@@ -3522,14 +3653,22 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
             limit = revision_limit()
         except ValueError:
             limit = DEFAULT_REVISION_LIMIT
+        # Issue #464: retention must never delete a revision the System's
+        # canonical lineage or a session's pinned premise points at. A pruned
+        # head is a System that cannot say what it understands, and a pruned
+        # baseline turns a healthy session into `missing` for no reason.
         conn.execute(
-            """DELETE FROM understanding_revision
+            f"""DELETE FROM understanding_revision
                WHERE session_id = ? AND system_id = ? AND id NOT IN (
                    SELECT id FROM understanding_revision
                    WHERE session_id = ? AND system_id = ?
                    ORDER BY id DESC LIMIT ?
-               )""",
-            (session_id, system_id, session_id, system_id, limit),
+               )
+               AND NOT ({canonical_understanding.PROTECTED_REVISION_SQL})""",
+            (
+                session_id, system_id, session_id, system_id, limit,
+                system_id, system_id, system_id,
+            ),
         )
 
         if review.current_understanding:
@@ -3602,6 +3741,8 @@ def update_interview_understanding(
         # `_understanding_update_blocked` for the full condition) so the
         # session's `understanding_update_available` flag and this 409 can
         # never disagree.
+        _require_continuable_premise(conn, session, system_id)
+
         if _understanding_update_blocked(conn, session, system_id):
             raise HTTPException(
                 status_code=409,
@@ -3702,6 +3843,21 @@ def _revision_out(row) -> UnderstandingRevisionOut:
         ),
         gap_analysis=json.loads(row["gap_analysis"]) if row["gap_analysis"] else None,
         created_at=row["created_at"],
+        # Issue #464: a revision's role in the System's canonical lineage.
+        # `candidate` is the default for every revision an Interview produces;
+        # only an explicit human promotion moves it out.
+        status=row["status"] if "status" in row.keys() and row["status"] else "candidate",
+        parent_revision_id=(
+            row["parent_revision_id"] if "parent_revision_id" in row.keys() else None
+        ),
+        content_digest=(
+            row["content_digest"] if "content_digest" in row.keys() else None
+        ),
+        premise_digest=(
+            row["premise_digest"] if "premise_digest" in row.keys() else None
+        ),
+        confirmed_by=row["confirmed_by"] if "confirmed_by" in row.keys() else None,
+        confirmed_at=row["confirmed_at"] if "confirmed_at" in row.keys() else None,
     )
 
 

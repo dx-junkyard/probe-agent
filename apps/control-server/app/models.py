@@ -2562,6 +2562,56 @@ class InterviewSessionCreate(BaseModel):
     focus: str = Field(default="", max_length=500)
 
 
+# --- Canonical Understanding head and Interview premise (Issue #464) ---------
+#
+# The four values are the same, for the same reason, as Issue #337's Joint
+# Understanding premise: a premise that was never captured must read `invalid`
+# rather than be promoted to a satisfied one, and a premise whose ground
+# DISAPPEARED is a different next action from one that merely MOVED.
+InterviewPremiseState = Literal["current", "stale", "missing", "invalid"]
+
+InterviewPremiseReasonCode = Literal[
+    "premise_matches_head",
+    "no_canonical_head",
+    "head_moved",
+    "premise_content_changed",
+    "base_revision_missing",
+    "premise_not_captured",
+    "premise_version_unsupported",
+]
+
+# The developer's explicit decision about a session whose premise moved.
+# `active` is the ABSENCE of such a decision, never a decision.
+InterviewPremiseDisposition = Literal["active", "rebased", "branched"]
+
+# A revision's role in the System's canonical lineage. Only a human promotion
+# moves a revision out of `candidate`.
+UnderstandingRevisionStatus = Literal["candidate", "canonical", "superseded"]
+
+UnderstandingPromotionRejection = Literal[
+    "premise_not_current",
+    "head_revision_mismatch",
+    "head_version_mismatch",
+    "revision_not_found",
+    "revision_not_candidate",
+    "revision_empty",
+]
+
+UnderstandingCanonicalEventKind = Literal[
+    "head_initialized",
+    "promoted",
+    "promotion_conflict",
+    "session_rebased",
+    "session_branched",
+]
+
+# Where a screen's displayed "current Understanding" actually came from.
+# `latest_session` is the pre-#464 fallback and is labelled as such: a System
+# with no promoted head has no canonical Understanding, and saying so is the
+# point.
+UnderstandingSource = Literal["canonical_head", "latest_session", "unavailable"]
+
+
 class InterviewSessionOut(BaseModel):
     id: int
     system_id: int
@@ -2600,6 +2650,17 @@ class InterviewSessionOut(BaseModel):
     # (no role inference). Empty means no filtering -- the pre-#291 default
     # of showing every question, never "every area selected".
     answerable_areas: List[KnowledgeArea] = Field(default_factory=list)
+    # Issue #464: the premise axis. Deliberately SEPARATE from `status`, which
+    # is Issue #349's suspend/resume axis -- a suspended session and a session
+    # whose premise moved are two different facts with two different next
+    # actions. `premise_state` is derived on every read from the pinned
+    # digests (never stored, so it cannot drift); `premise_disposition` is the
+    # developer's own explicit decision and IS stored.
+    premise_state: InterviewPremiseState = "invalid"
+    premise_disposition: InterviewPremiseDisposition = "active"
+    premise_continuable: bool = False
+    base_understanding_revision_id: Optional[int] = None
+    result_understanding_revision_id: Optional[int] = None
     created_at: float
     updated_at: float
 
@@ -5151,6 +5212,133 @@ class UnderstandingRevisionOut(BaseModel):
     current_understanding: Optional[Dict[str, Any]] = None
     gap_analysis: Optional[List[Dict[str, Any]]] = None
     created_at: float
+    status: UnderstandingRevisionStatus = "candidate"
+    parent_revision_id: Optional[int] = None
+    content_digest: Optional[str] = None
+    premise_digest: Optional[str] = None
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[float] = None
+
+
+class UnderstandingHeadOut(BaseModel):
+    """The System's canonical Understanding pointer.
+
+    ``revision_id is None`` means no human has promoted an Understanding for
+    this System yet -- never "use the newest thing you can find".
+    """
+
+    system_id: int
+    revision_id: Optional[int] = None
+    head_version: Optional[int] = None
+    updated_at: Optional[float] = None
+    updated_by: Optional[str] = None
+    source_session_id: Optional[int] = None
+    content_digest: Optional[str] = None
+    premise_digest: Optional[str] = None
+    current_understanding: Optional[Dict[str, Any]] = None
+
+
+class InterviewPremiseOut(BaseModel):
+    """Whether one Interview may still be continued on its own premise."""
+
+    session_id: int
+    system_id: int
+    state: InterviewPremiseState
+    reason_code: InterviewPremiseReasonCode
+    message: str
+    label: str
+    continuable: bool
+    disposition: InterviewPremiseDisposition
+    disposition_label: str
+    base_revision_id: Optional[int] = None
+    base_premise_digest: Optional[str] = None
+    head_revision_id: Optional[int] = None
+    head_premise_digest: Optional[str] = None
+    head_version: Optional[int] = None
+    origin_kind: Optional[str] = None
+    origin_session_id: Optional[int] = None
+    #: The session a rebase moved this conversation to. Read from the
+    #: successor's own backlink, never stored twice.
+    successor_session_id: Optional[int] = None
+    result_revision_id: Optional[int] = None
+    promotable_revision_id: Optional[int] = None
+    available_actions: List[str] = Field(default_factory=list)
+
+
+class InterviewPremiseDecisionRequest(BaseModel):
+    note: str = ""
+
+
+class InterviewPremiseRebaseOut(BaseModel):
+    session_id: int
+    system_id: int
+    new_session_id: int
+    premise: InterviewPremiseOut
+
+
+class UnderstandingPromotionRequest(BaseModel):
+    """A human 「この理解を正準にする」.
+
+    ``expected_head_revision_id`` / ``expected_head_version`` are the
+    compare-and-swap expectation the developer's confirmation was made
+    against. A promotion whose expectation no longer holds is REJECTED, never
+    merged: that is the whole difference between this and last-write-wins.
+    """
+
+    revision_id: Optional[int] = None
+    expected_head_revision_id: Optional[int] = None
+    expected_head_version: Optional[int] = None
+    note: str = ""
+
+
+class UnderstandingPromotionOut(BaseModel):
+    system_id: int
+    session_id: int
+    revision_id: int
+    previous_revision_id: Optional[int] = None
+    head_version: int
+    content_digest: str
+    premise_digest: str
+    promoted_at: float
+    promoted_by: str
+
+
+class UnderstandingCanonicalMetricsOut(BaseModel):
+    """Observability for premise mismatch, stale sessions, and head conflicts."""
+
+    system_id: int
+    head_revision_id: Optional[int] = None
+    head_version: Optional[int] = None
+    head_updated_at: Optional[float] = None
+    session_premise_counts: Dict[str, int] = Field(default_factory=dict)
+    disposition_counts: Dict[str, int] = Field(default_factory=dict)
+    event_counts: Dict[str, int] = Field(default_factory=dict)
+    promotion_conflict_codes: Dict[str, int] = Field(default_factory=dict)
+    candidate_revision_count: int = 0
+
+
+class UnderstandingCanonicalEventOut(BaseModel):
+    id: int
+    system_id: int
+    event_kind: UnderstandingCanonicalEventKind
+    session_id: Optional[int] = None
+    revision_id: Optional[int] = None
+    previous_revision_id: Optional[int] = None
+    related_session_id: Optional[int] = None
+    head_version: Optional[int] = None
+    expected_head_revision_id: Optional[int] = None
+    expected_head_version: Optional[int] = None
+    rejection_code: Optional[str] = None
+    premise_state: Optional[str] = None
+    decision_method: str = "manual"
+    actor: str = ""
+    note: str = ""
+    created_at: float
+
+
+class UnderstandingCanonicalEventListOut(BaseModel):
+    system_id: int
+    items: List[UnderstandingCanonicalEventOut] = Field(default_factory=list)
 
 
 class UnderstandingRevisionListOut(BaseModel):
@@ -8417,6 +8605,14 @@ class OverviewOut(BaseModel):
     #: 「どの断面のどの版の理解か」 is answerable without opening a disclosure.
     understanding_revision_id: Optional[int] = None
     understanding_confirmed_at: Optional[float] = None
+    #: Issue #464: which rule produced the Understanding on this page.
+    #: `canonical_head` means a human promoted it; `latest_session` means
+    #: nothing has been promoted for this System yet and what is shown is the
+    #: newest conversation's in-progress state. The screen must say which --
+    #: they are not the same claim.
+    understanding_source: UnderstandingSource = "unavailable"
+    canonical_revision_id: Optional[int] = None
+    canonical_head_version: Optional[int] = None
     findings: List[OverviewFindingOut] = []
     #: How many findings the initial view shows (cap 3, never a pad).
     findings_initial_count: int = 0

@@ -2069,6 +2069,74 @@ creating incomplete persistence or execution paths for later phases.
     5 つの別操作で、どれかが他を自動的に起こしてはならない。本 Epic が追加する
     prefill、hypothesis の昇格・却下もすべて `decision_method: manual`。
 
+30. Issue #464 — System 正準 Understanding と Interview premise の分離。
+    「Overview は Vision を把握しているのに Interview は未把握」は表示の不具合
+    ではなく、**存在しなかった所有境界**だった。Vision / Purpose / 確定
+    Capability / 確認済み意図はどれも System の事実なのに、それを生み出した
+    Interview セッションの中にしか保存されておらず、各画面が「現在の
+    Understanding」を各自で解釈していた(Overview は最新セッション行、Interview
+    は自分の `current_understanding` 列)。**作成順は確定順でも昇格順でもない**
+    ので、この 2 つが一致し続けることは原理的にありえない。
+    `docs/01-specifications/product/canonical-understanding.md` が canonical contract で、§0 を
+    読んでからこの領域に触ること。後から変えるときに守ること:
+    - **正準 head は人の昇格でしか動かない。** `system_understanding_head` は
+      `canonical_understanding.promote_revision` からのみ更新され、その関数は
+      明示的な人間の確認 (`decision_method: manual`) からしか到達できない。
+      「最後に更新されたもの」を正準とみなす last-write-wins を導入しない。
+    - **premise 判定は導出であり保存しない。** `current` / `stale` / `missing` /
+      `invalid` は読み取りのたびに固定 digest から再計算する(#337/#338/#349 と
+      同じ規律)。保存するのは開発者自身の明示的な決定 (`rebased` / `branched`)
+      だけで、それは観測ではなく判断だから。`active` は決定の不在であって決定
+      ではない。
+    - **`invalid` を `current` へ丸めない。** 前提を記録していないセッションは
+      「正しい前提の上にある」ことの証明ではない。`missing`(前提が消えた)と
+      `stale`(前提が動いた)も、開発者の次の操作が違うので畳まない。
+    - **premise は不変。** セッション開始時に bundle を丸ごとコピーし、会話中に
+      暗黙更新しない。読み取り時に現在の head から作り直したら、それはもはや
+      前提ではない。**前提を固定することとそこから始めることは 1 つの行為**なので
+      `current_understanding` の seed は `capture_session_premise` の中にあり、
+      既存の内容は決して上書きしない。
+    - **premise は正準 claim と「確認済み」Intent だけを運ぶ。** 未確定の Intent
+      提案・セッションごとの仮説・質問順・未確認 evidence を System 共通状態に
+      しない(#464 非目標 1)。
+    - **`premise_digest` は昇格時にだけ確定する。** 後から Intent を 1 つ確認した
+      だけで正準 premise が静かに動くと、誰も昇格していないのに全 open session が
+      `stale` になる。digest から `revision_id` は除く — 同じ内容の再昇格は同じ
+      前提である(#323 が snapshot 軸で使った規則)。
+    - **`interview_session.status` に premise 軸を載せない。** それは #349 の
+      中断/再開軸で、中断されたセッションと前提が動いたセッションは別の事実。
+    - **ゲートは premise を消費する 2 経路にだけ置く**(`dialogue-turn` /
+      `update-understanding`)。開発者の入力を記録する経路には置かない — 前提の
+      問題で人間の回答を失うのは #336 が直した誤りと同じ。`branched` は続行でき
+      るが判定は `stale` のままで、その候補は昇格できない(昇格は `current`
+      必須)。これが「古い premise の candidate が新しい head を上書きできない」
+      の全体である。
+    - **昇格は拒否するのであってマージしない。** `premise_not_current` /
+      `head_revision_mismatch` / `head_version_mismatch` は次の操作が違うので
+      1 コードに畳まない。拒否は `understanding_canonical_event` に残す — 拒否
+      された昇格は後から状態から再導出できない。
+    - **retention guard は「親として参照されている行」ではない。** セッション内
+      では最新以外の全リビジョンが次の行の親なので、それでは retention が無効化
+      される。守るのは正準 lineage(`status`)とセッションの premise が指す行だけ。
+    - **移行は推測しない。** 初期 canonical head は人間の確認が実在する場合のみ
+      生成し、無ければ head を作らない。baseline を一意に復元できないセッション
+      は `legacy-unbased`(= `invalid`)のままで、修復は
+      `POST .../premise/adopt-current` という明示操作だけ。
+    - **Overview は正準 head だけを「現在の Understanding」として表示する。**
+      head が無い System は `understanding_source='latest_session'` と明示し、
+      正準のようには見せない(`unavailable` と合わせて 3 つの別の答え)。Brief は
+      `understanding_override` で head の内容から組む — セッションの live な
+      `current_understanding` を読ませると、未確認の rebuild が Overview の
+      「確定済み」表示を変えてしまう。確認済み Intent は premise から **fallback
+      として** 読み(セッション自身の行が常に優先)、行はコピーしない。
+    - **prompt には premise を独立した最初のセクションで載せる**
+      (`understanding-review-v8` / `interview-v7`)。graph は code 由来の仮説、
+      premise は人が確定した内容で、混ぜると rebuild がどちらか言えなくなる。
+      premise 専用の予算を持つのは、切り詰められた premise が確定済み Vision の
+      消える経路だから。
+    既存の human gate は一切緩めない。本 Epic が追加する昇格・rebase・branch・
+    premise 採用もすべて `decision_method: manual`。
+
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and

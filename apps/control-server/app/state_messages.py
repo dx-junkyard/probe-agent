@@ -1173,6 +1173,15 @@ def success_summary(*, done: int, total: int, symbol_count: int, entrypoint_coun
 REFRESH_JOB_MESSAGES: Dict[str, str] = {
     "skipped_no_new_answers": "新しい回答がないため、理解の更新をスキップしました。",
     "superseded": "より新しい更新結果が既に存在するため、この結果は破棄されました。",
+    # Issue #464: the session's premise is no longer the System's canonical
+    # Understanding. The developer's answers are already committed; what is
+    # skipped is the automatic rebuild, because refreshing against a premise
+    # the System has moved past is exactly the implicit continuation #464
+    # forbids. The developer chooses new / rebase / branch on the screen.
+    "skipped_premise_not_current": (
+        "このセッションの前提が現在の正準 Understanding ではないため、"
+        "理解の自動更新をスキップしました。回答は保存されています。"
+    ),
 }
 
 

@@ -40,6 +40,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from .. import canonical_understanding
 from ..auth import get_system_id
 from ..change_sets import (
     UNDERSTANDING_SECTIONS,
@@ -491,16 +492,23 @@ def _apply_claim_edits(
                 entry["summary"] = item_row["after_value"]
                 break
 
+    # Issue #464: a correction is a new `candidate` whose parent is the
+    # revision it was edited from. It never moves the System's canonical head
+    # -- a developer fixing a sentence has not thereby re-confirmed the whole
+    # Understanding.
     revision_cur = conn.execute(
         """INSERT INTO understanding_revision
             (session_id, system_id, snapshot_id, intelligence_run_id,
-             current_understanding, gap_analysis, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+             current_understanding, gap_analysis, created_at,
+             parent_revision_id, content_digest, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'candidate')""",
         (
             session_id, system_id, latest_revision["snapshot_id"],
             change_set_row["intelligence_run_id"],
             json.dumps(current_understanding, ensure_ascii=False),
             latest_revision["gap_analysis"], now,
+            latest_revision["id"],
+            canonical_understanding.compute_content_digest(current_understanding),
         ),
     )
     return revision_cur.lastrowid

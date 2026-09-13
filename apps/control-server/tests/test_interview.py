@@ -765,7 +765,7 @@ def test_update_understanding_records_llm_config_failure(admin_client, monkeypat
     assert run is not None
     assert run["status"] == "failed"
     assert "ANTHROPIC_API_KEY" in run["error_details"]
-    assert run["prompt_version"] == "understanding-review-v7"
+    assert run["prompt_version"] == "understanding-review-v8"
     assert detail["messages"][-1]["intelligence_run_id"] == run["id"]
 
 
@@ -909,7 +909,7 @@ def test_update_understanding_records_run_and_reviewer_qa_rows(admin_client, mon
         ).fetchone()
     assert run is not None
     assert run["status"] == "completed"
-    assert run["prompt_version"] == "understanding-review-v7"
+    assert run["prompt_version"] == "understanding-review-v8"
     assert run["decision_method"] == "reasoning_llm"
 
     qa_listing = admin_client.get(
@@ -2099,7 +2099,7 @@ def test_requested_turn_with_zero_proposals_reports_narrowing(
         "対象は要約フローで正しいですか?"
     ]
     # The route told the reasoning model that proposals were requested
-    # (prompt interview-v6 contract: propose or keep narrowing).
+    # (prompt interview-v7 contract: propose or keep narrowing).
     assert captured["proposals_requested"] is True
     # The narrowing question is persisted so the dashboard can re-surface it
     # in ready_for_proposals and consume it on the next turn.

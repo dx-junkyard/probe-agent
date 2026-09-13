@@ -3500,6 +3500,100 @@ export function useUnderstandingBrief(sessionId: number | null) {
   });
 }
 
+// --- Issue #464: 正準 Understanding head と Interview premise ---------------
+//
+// premise の判定はサーバーが永続 digest から毎回導出する。ここで再導出しない
+// (再導出した瞬間、画面とサーバーが同じ事実について別の答えを出せるように
+// なる ── #349 と同じ理由)。
+
+/** System の正準 Understanding。`revision_id === null` は「まだ誰も昇格して
+ * いない」であって「最新のものを使え」ではない。 */
+export function useUnderstandingHead() {
+  return useQuery({
+    queryKey: sysKey("understandingHead"),
+    queryFn: () =>
+      api.get<import("@/api/types").UnderstandingHeadOut>("/understanding-head"),
+    enabled: !!getSystemId(),
+  });
+}
+
+/** このセッションを今の前提のまま続けてよいか。 */
+export function useInterviewPremise(sessionId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("interviewPremise"), sessionId],
+    queryFn: () =>
+      api.get<import("@/api/types").InterviewPremiseOut>(
+        `/interview/sessions/${sessionId}/premise`,
+      ),
+    enabled: !!getSystemId() && !!sessionId,
+  });
+}
+
+function _invalidatePremise(
+  qc: ReturnType<typeof useQueryClient>,
+  sessionId: number | null,
+) {
+  qc.invalidateQueries({ queryKey: [...sysKey("interviewPremise"), sessionId] });
+  qc.invalidateQueries({ queryKey: sysKey("understandingHead") });
+  qc.invalidateQueries({ queryKey: sysKey("overview") });
+  _invalidateWorkflow(qc, sessionId);
+}
+
+/** 現在の head 上で新しいセッションとして続ける(元の会話は不変)。 */
+export function useRebaseInterviewPremise(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { note?: string }) =>
+      api.post<import("@/api/types").InterviewPremiseRebaseOut>(
+        `/interview/sessions/${sessionId}/premise/rebase`,
+        { note: body.note ?? "" },
+      ),
+    onSuccess: (created) => {
+      _invalidatePremise(qc, sessionId);
+      _invalidatePremise(qc, created.new_session_id);
+    },
+  });
+}
+
+/** 古い前提の検討として明示的に維持する(stale のまま続行可能になる)。 */
+export function useBranchInterviewPremise(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { note?: string }) =>
+      api.post<import("@/api/types").InterviewPremiseOut>(
+        `/interview/sessions/${sessionId}/premise/branch`,
+        { note: body.note ?? "" },
+      ),
+    onSuccess: () => _invalidatePremise(qc, sessionId),
+  });
+}
+
+/** 前提が記録されていない旧セッションを、明示的に今の正準前提へ結び直す。 */
+export function useAdoptCurrentPremise(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { note?: string }) =>
+      api.post<import("@/api/types").InterviewPremiseOut>(
+        `/interview/sessions/${sessionId}/premise/adopt-current`,
+        { note: body.note ?? "" },
+      ),
+    onSuccess: () => _invalidatePremise(qc, sessionId),
+  });
+}
+
+/** 候補リビジョンを正準 head へ昇格する(人の確認 + compare-and-swap)。 */
+export function usePromoteUnderstanding(sessionId: number | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: import("@/api/types").UnderstandingPromotionRequest) =>
+      api.post<import("@/api/types").UnderstandingPromotionOut>(
+        `/interview/sessions/${sessionId}/promote-understanding`,
+        body,
+      ),
+    onSuccess: () => _invalidatePremise(qc, sessionId),
+  });
+}
+
 /** `W6` の主操作: 差分を確認したという明示記録 (永続事実 A)。 */
 export function useRecordDiffReview(sessionId: number | null) {
   const qc = useQueryClient();

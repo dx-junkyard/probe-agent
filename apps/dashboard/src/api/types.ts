@@ -810,6 +810,14 @@ export interface InterviewSessionOut {
   // Issue #291: which knowledge areas the developer can answer RIGHT NOW
   // (no role inference). Empty means no filtering, never "every area".
   answerable_areas: KnowledgeArea[];
+  // Issue #464: the premise axis, separate from `status` (which is #349's
+  // suspend/resume axis). `premise_state` is derived by the server on every
+  // read; never re-derive it here.
+  premise_state: InterviewPremiseState;
+  premise_disposition: InterviewPremiseDisposition;
+  premise_continuable: boolean;
+  base_understanding_revision_id: number | null;
+  result_understanding_revision_id: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -1930,6 +1938,47 @@ export interface InterviewMaterializeOut {
 
 // --- Understanding Revisions (Issue #136) ------------------------------------
 
+// Issue #464: the System's canonical Understanding head and the premise an
+// Interview was started on. The four premise states are the same four, for
+// the same reasons, as the Joint Understanding premise (#337): a premise that
+// was never captured reads `invalid`, and a premise whose ground disappeared
+// is not the same answer as one that merely moved.
+export type InterviewPremiseState = 'current' | 'stale' | 'missing' | 'invalid';
+
+export type InterviewPremiseReasonCode =
+  | 'premise_matches_head'
+  | 'no_canonical_head'
+  | 'head_moved'
+  | 'premise_content_changed'
+  | 'base_revision_missing'
+  | 'premise_not_captured'
+  | 'premise_version_unsupported';
+
+// The developer's explicit decision about a session whose premise moved.
+// `active` is the ABSENCE of such a decision, never a decision.
+export type InterviewPremiseDisposition = 'active' | 'rebased' | 'branched';
+
+export type UnderstandingRevisionStatus = 'candidate' | 'canonical' | 'superseded';
+
+export type UnderstandingPromotionRejection =
+  | 'premise_not_current'
+  | 'head_revision_mismatch'
+  | 'head_version_mismatch'
+  | 'revision_not_found'
+  | 'revision_not_candidate'
+  | 'revision_empty';
+
+export type UnderstandingCanonicalEventKind =
+  | 'head_initialized'
+  | 'promoted'
+  | 'promotion_conflict'
+  | 'session_rebased'
+  | 'session_branched';
+
+// Where a screen's displayed "current Understanding" came from. `latest_session`
+// is the pre-#464 fallback and must be labelled as such.
+export type UnderstandingSource = 'canonical_head' | 'latest_session' | 'unavailable';
+
 export interface UnderstandingRevisionOut {
   id: number;
   session_id: number;
@@ -1939,6 +1988,114 @@ export interface UnderstandingRevisionOut {
   current_understanding: CurrentUnderstanding | null;
   gap_analysis: Record<string, unknown>[] | null;
   created_at: number;
+  status: UnderstandingRevisionStatus;
+  parent_revision_id: number | null;
+  content_digest: string | null;
+  premise_digest: string | null;
+  confirmed_by: string | null;
+  confirmed_at: number | null;
+}
+
+export interface UnderstandingHeadOut {
+  system_id: number;
+  revision_id: number | null;
+  head_version: number | null;
+  updated_at: number | null;
+  updated_by: string | null;
+  source_session_id: number | null;
+  content_digest: string | null;
+  premise_digest: string | null;
+  current_understanding: CurrentUnderstanding | null;
+}
+
+export interface InterviewPremiseOut {
+  session_id: number;
+  system_id: number;
+  state: InterviewPremiseState;
+  reason_code: InterviewPremiseReasonCode;
+  message: string;
+  label: string;
+  continuable: boolean;
+  disposition: InterviewPremiseDisposition;
+  disposition_label: string;
+  base_revision_id: number | null;
+  base_premise_digest: string | null;
+  head_revision_id: number | null;
+  head_premise_digest: string | null;
+  head_version: number | null;
+  origin_kind: string | null;
+  origin_session_id: number | null;
+  // rebase でこの会話が移った先のセッション。後継側の backlink から読む。
+  successor_session_id: number | null;
+  result_revision_id: number | null;
+  promotable_revision_id: number | null;
+  available_actions: string[];
+}
+
+export interface InterviewPremiseDecisionRequest {
+  note: string;
+}
+
+export interface InterviewPremiseRebaseOut {
+  session_id: number;
+  system_id: number;
+  new_session_id: number;
+  premise: InterviewPremiseOut;
+}
+
+export interface UnderstandingPromotionRequest {
+  revision_id?: number | null;
+  expected_head_revision_id?: number | null;
+  expected_head_version?: number | null;
+  note?: string;
+}
+
+export interface UnderstandingPromotionOut {
+  system_id: number;
+  session_id: number;
+  revision_id: number;
+  previous_revision_id: number | null;
+  head_version: number;
+  content_digest: string;
+  premise_digest: string;
+  promoted_at: number;
+  promoted_by: string;
+}
+
+export interface UnderstandingCanonicalMetricsOut {
+  system_id: number;
+  head_revision_id: number | null;
+  head_version: number | null;
+  head_updated_at: number | null;
+  session_premise_counts: Record<string, number>;
+  disposition_counts: Record<string, number>;
+  event_counts: Record<string, number>;
+  promotion_conflict_codes: Record<string, number>;
+  candidate_revision_count: number;
+}
+
+export interface UnderstandingCanonicalEventOut {
+  id: number;
+  system_id: number;
+  event_kind: UnderstandingCanonicalEventKind;
+  session_id: number | null;
+  revision_id: number | null;
+  previous_revision_id: number | null;
+  related_session_id: number | null;
+  head_version: number | null;
+  expected_head_revision_id: number | null;
+  expected_head_version: number | null;
+  rejection_code: string | null;
+  premise_state: string | null;
+  decision_method: string;
+  actor: string;
+  note: string;
+  created_at: number;
+}
+
+export interface UnderstandingCanonicalEventListOut {
+  system_id: number;
+  items: UnderstandingCanonicalEventOut[];
 }
 
 export interface UnderstandingRevisionListOut {
@@ -5376,6 +5533,11 @@ export interface OverviewOut {
   snapshot_freshness: OverviewSnapshotFreshness;
   understanding_revision_id: number | null;
   understanding_confirmed_at: number | null;
+  // Issue #464: which rule produced the Understanding on this page. Never
+  // present `latest_session` content as settled -- nothing has been promoted.
+  understanding_source: UnderstandingSource;
+  canonical_revision_id: number | null;
+  canonical_head_version: number | null;
   findings: OverviewFindingOut[];
   findings_initial_count: number;
   findings_state: OverviewFindingsState;
