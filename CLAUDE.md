@@ -2113,7 +2113,10 @@ creating incomplete persistence or execution paths for later phases.
     - **`premise_digest` は昇格時にだけ確定する。** 後から Intent を 1 つ確認した
       だけで正準 premise が静かに動くと、誰も昇格していないのに全 open session が
       `stale` になる。digest から `revision_id` は除く — 同じ内容の再昇格は同じ
-      前提である(#323 が snapshot 軸で使った規則)。
+      前提である(#323 が snapshot 軸で使った規則)。Intent の
+      `source_intent_item_id`(Purpose Chain の引用アンカー)も同じ理由で digest に
+      入れない。アンカーが無い旧 bundle では `source_ids` を空にする — 引用できる
+      行が無いことを捏造した id で埋めない。
     - **`interview_session.status` に premise 軸を載せない。** それは #349 の
       中断/再開軸で、中断されたセッションと前提が動いたセッションは別の事実。
     - **ゲートは premise を消費する経路にだけ置く**(`dialogue-turn` /
@@ -2123,8 +2126,11 @@ creating incomplete persistence or execution paths for later phases.
       `premise_token` を推論の前に取り、書き込みトランザクションの先頭で
       `revalidate_premise` する。不一致なら推論結果は 1 行も保存せず、実行自体は
       失敗として `intelligence_runs` に残す(dialogue では開発者自身のメッセージ
-      だけは保存する)。**セッション作成も 1 トランザクション** — `get_conn()` は
-      autocommit で ROLLBACK もしないので、`BEGIN IMMEDIATE` で囲まないと前提の
+      だけは保存する)。**再検証と書き込みは同一トランザクション**で、
+      `db.write_transaction` の `BEGIN IMMEDIATE` で開く — 既定の遅延 `BEGIN` は
+      最初の書き込みまで write lock を取らないので同じ窓が残り、プロセス内の
+      接続 lock は別 worker を止めない。**セッション作成も 1 トランザクション** —
+      `get_conn()` は autocommit で ROLLBACK もしないので、囲まないと前提の
       無いセッションが残る。`branched` は続行でき
       るが判定は `stale` のままで、その候補は昇格できない(昇格は `current`
       必須)。これが「古い premise の candidate が新しい head を上書きできない」
@@ -2153,8 +2159,15 @@ creating incomplete persistence or execution paths for later phases.
       が丸ごと消える。Brief は
       `understanding_override` で head の内容から組む — セッションの live な
       `current_understanding` を読ませると、未確認の rebuild が Overview の
-      「確定済み」表示を変えてしまう。確認済み Intent は premise から **fallback
-      として** 読み(セッション自身の行が常に優先)、行はコピーしない。
+      「確定済み」表示を変えてしまう。**Intent も同じく凍結する**
+      (`intent_override`): 訂正は stale セッションでも正当な操作なので、昇格元の
+      現在行を読むと head を動かさずに Overview の Vision が変わる。Purpose Chain も
+      同じ override を受け取る(以前は `_latest_intent_item` で同じ行を直読みして
+      いた)。セッション自身の Brief では、確認済み Intent を premise から
+      **fallback として** 読み(セッション自身の行が常に優先)、行はコピーしない。
+      **candidate の状態と内容は 1 つの revision から決める** — `newer_than_head` は
+      特定 revision の主張なので session / brief はその revision の所有セッション、
+      `same_as_head` は候補が無いので両方 `None`。
     - **prompt には premise を独立した最初のセクションで載せる**
       (`understanding-review-v8` / `interview-v7`)。graph は code 由来の仮説、
       premise は人が確定した内容で、混ぜると rebuild がどちらか言えなくなる。

@@ -115,6 +115,12 @@ System ごとに最大 1 行。`head_version` が compare-and-swap トークン�
 `premise_digest` を昇格時にのみ確定するのは、後から Intent を 1 つ確認しただけで
 正準 premise が静かに動かないようにするため。その変更は次に昇格される版に入る。
 
+digest の対象は Intent の**意味を持つ列だけ** (`field` / `value_text` /
+`status` / `origin` / `is_mock`)。`source_intent_item_id` は Purpose Chain が
+`intent_item:<id>` として引用するためのアンカーで、digest には入れない ──
+同じ文言を別の行 id で再確認したものは同じ前提である (claim 軸の
+`content_digest` と同じ規則)。
+
 ### 2.3 `interview_session` の追加列
 
 `base_understanding_revision_id` / `base_premise_digest` / `base_premise_json` /
@@ -182,6 +188,40 @@ premise を **消費する** 経路にだけ 409 を置く:
 実行自体は `intelligence_runs` に失敗として残す ── 有限コードは
 `head_moved_during_run` / `session_premise_changed_during_run` の 2 つで、
 開発者の次の操作が違うので畳まない。
+
+**再検証と書き込みは 1 トランザクションでなければならない。**
+`db.write_transaction` が `BEGIN IMMEDIATE` で開く(既定の遅延 `BEGIN` は
+最初の書き込みまで write lock を取らない)。検査と書き込みが分かれていると、
+その隙間に別 worker が昇格でき、旧 premise の結果がそのまま保存される ──
+プロセス内の接続 lock はこのプロセスしか直列化しないので、ここでは防御に
+ならない。
+
+---
+
+## 4.2 正準 projection は凍結された内容だけを読む
+
+`GET /overview` の canonical Brief と Purpose Chain は、昇格された revision の
+`premise_json` に凍結された **claim と Intent の両方**を読む
+(`understanding_override` / `revision_id_override` / `intent_override`)。
+
+Intent の訂正は stale なセッションでも正当な操作なので、昇格元セッションの
+現在行を読むと **head を一切動かさずに Overview の Vision と望ましい変化が
+変わる**。それは受入条件「Interview の未確認結果が Overview の canonical
+Understanding を直接変更しない」の反例そのものである。訂正はそのセッションの
+Interview 画面には出るが、正準になるのは次の昇格を通ったときだけ。
+
+`rebase` は行をコピーしないので、昇格されなかった訂正は後続セッションへ
+自動的には引き継がれない。引き継ぐには昇格するセッションでもう一度確定する
+(merge 規則の overlay 側)。
+
+### 4.3 candidate の状態と内容は 1 つの revision から決める
+
+`newer_than_head` は特定の revision についての主張なので、`candidate_session_id`
+と `candidate_brief` はその revision を持つセッションから取る。状態を
+「System 内のどれかの candidate revision」から、内容を「最新セッション」から
+別々に決めると、古いセッションが候補を持ったまま新しいセッションを作った時点で
+両者が別の会話を指す。`same_as_head` は候補が無いという意味なので、
+`candidate_session_id` も `candidate_brief` も `None` を返す。
 
 ---
 

@@ -1000,6 +1000,7 @@ def build_understanding_brief(
     now: Optional[float] = None,
     understanding_override: Optional[Dict[str, Any]] = None,
     revision_id_override: Optional[int] = None,
+    intent_override: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> BriefResult:
     """Assemble the Brief and Readiness for one session (or for none).
 
@@ -1011,9 +1012,15 @@ def build_understanding_brief(
     Understanding, supplied by the Overview. The Brief is then about what the
     System has settled rather than about what one conversation is currently
     building -- which is the acceptance condition 「Interview の未確認結果が
-    Overview の canonical Understanding を直接変更しない」. The session is
-    still needed for the confirmation baseline, the Intent items and the
-    runtime evidence; only the claim content comes from the override.
+    Overview の canonical Understanding を直接変更しない」.
+
+    `intent_override` is the Intent frozen into that same canonical revision,
+    and it REPLACES the session lookup rather than merging with it. The
+    promoting session's Intent rows keep changing after the promotion (a
+    correction is a normal action even on a stale session), so reading them
+    here would let a confirmed Vision change on the Overview without the head
+    moving. The session is still needed for the confirmation baseline and the
+    runtime evidence.
     """
     now = time.time() if now is None else now
 
@@ -1038,18 +1045,23 @@ def build_understanding_brief(
            WHERE session_id = ? AND system_id = ? ORDER BY id DESC LIMIT 1""",
         (session["id"], system_id),
     ).fetchone()
-    intent_items = _latest_intent_items(conn, session["id"], system_id)
-    # Issue #464: the developer's CONFIRMED intent belongs to the System, not
-    # to whichever conversation happened to record it. A session that has not
-    # (yet) restated it reads it from its pinned premise, so a brand-new
-    # Interview shows the same Vision the Overview shows instead of reporting
-    # 「Vision 未設定」 about a System that settled it long ago. Only fields
-    # the session has no row of its own for are filled: a correction made in
-    # THIS session always wins over the premise's copy.
-    for field_name, premise_item in canonical_understanding.premise_intent_items(
-        session
-    ).items():
-        intent_items.setdefault(field_name, premise_item)
+    if intent_override is not None:
+        # A canonical projection reads the Intent frozen into the revision and
+        # nothing else -- see the docstring.
+        intent_items = dict(intent_override)
+    else:
+        intent_items = _latest_intent_items(conn, session["id"], system_id)
+        # Issue #464: the developer's CONFIRMED intent belongs to the System,
+        # not to whichever conversation happened to record it. A session that
+        # has not (yet) restated it reads it from its pinned premise, so a
+        # brand-new Interview shows the same Vision the Overview shows instead
+        # of reporting 「Vision 未設定」 about a System that settled it long
+        # ago. Only fields the session has no row of its own for are filled: a
+        # correction made in THIS session always wins over the premise's copy.
+        for field_name, premise_item in canonical_understanding.premise_intent_items(
+            session
+        ).items():
+            intent_items.setdefault(field_name, premise_item)
     snapshot_id = session["snapshot_id"]
 
     def build_claims(section: str, kind: str) -> List[BriefClaim]:

@@ -380,6 +380,8 @@ def normalize_intent_items(rows: Any) -> List[Dict[str, Any]]:
                 "status": "confirmed",
                 "origin": str(data.get("origin") or ""),
                 "is_mock": bool(data.get("is_mock")),
+                # Citation anchor only -- never part of the digest.
+                "source_intent_item_id": data.get("id"),
             }
         )
     items.sort(key=lambda entry: (entry["field"], entry["value_text"]))
@@ -416,12 +418,22 @@ def merge_intent_items(
                 "status": "confirmed",
                 "origin": str(data.get("origin") or ""),
                 "is_mock": bool(data.get("is_mock")),
+                "source_intent_item_id": data.get("id"),
             }
         elif status == INTENT_RETRACTION_STATUS:
             merged.pop(field, None)
     items = list(merged.values())
     items.sort(key=lambda entry: (entry["field"], entry["value_text"]))
     return items
+
+
+#: The meaning-bearing keys of a premise Intent item. `source_intent_item_id`
+#: is deliberately OUTSIDE this set: it is a citation anchor, and the same
+#: statement re-confirmed under a new row id is the same premise (the rule
+#: `content_digest` follows on the claim axis). Keeping the projection exactly
+#: equal to the pre-existing key set also means every already-promoted
+#: revision keeps the digest it was stored with.
+_INTENT_DIGEST_FIELDS = ("field", "value_text", "status", "origin", "is_mock")
 
 
 def compute_premise_digest(bundle: PremiseBundle) -> str:
@@ -436,7 +448,10 @@ def compute_premise_digest(bundle: PremiseBundle) -> str:
         {
             "premise_version": bundle.premise_version,
             "content_digest": bundle.content_digest,
-            "intent_items": bundle.intent_items,
+            "intent_items": [
+                {key: item.get(key) for key in _INTENT_DIGEST_FIELDS}
+                for item in bundle.intent_items
+            ],
         }
     )
 
@@ -506,7 +521,7 @@ def current_intent_rows(conn, session_id: int, system_id: int):
     because it is how a developer retracts an inherited statement.
     """
     return conn.execute(
-        """SELECT field, value_text, status, origin, is_mock
+        """SELECT id, field, value_text, status, origin, is_mock
            FROM interview_intent_item
            WHERE session_id = ? AND system_id = ? AND superseded_by_id IS NULL
            ORDER BY id""",
@@ -686,6 +701,40 @@ def session_premise_bundle(session_row) -> Optional[PremiseBundle]:
     )
 
 
+def _intent_index(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Frozen Intent statements keyed by field, shaped like an `interview_intent_item` row.
+
+    `id` is the citation anchor the Purpose Chain cites
+    (`intent_item:<id>`); it is `None` for a bundle captured before the anchor
+    existed, and every consumer must treat that as "no citable row" rather
+    than dereferencing it.
+    """
+    index: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        field = str(item.get("field") or "")
+        if not field:
+            continue
+        entry = dict(item)
+        entry["id"] = item.get("source_intent_item_id")
+        index[field] = entry
+    return index
+
+
+def revision_intent_items(revision_row) -> Dict[str, Dict[str, Any]]:
+    """The Intent frozen INTO a promoted revision, keyed by field.
+
+    This is what a canonical projection must read. The promoting session's own
+    `interview_intent_item` rows keep changing afterwards -- a correction is a
+    normal, permitted action even on a stale session -- so reading them would
+    let the Overview's settled Vision change without the head moving, which is
+    precisely what this Epic exists to prevent.
+    """
+    bundle = load_bundle(revision_row)
+    if bundle is None:
+        return {}
+    return _intent_index(bundle.intent_items)
+
+
 def premise_intent_items(session_row) -> Dict[str, Dict[str, Any]]:
     """Confirmed Intent statements carried by the session's premise, by field.
 
@@ -698,11 +747,7 @@ def premise_intent_items(session_row) -> Dict[str, Dict[str, Any]]:
     bundle = session_premise_bundle(session_row)
     if bundle is None:
         return {}
-    return {
-        str(item.get("field")): dict(item)
-        for item in bundle.intent_items
-        if item.get("field")
-    }
+    return _intent_index(bundle.intent_items)
 
 
 def successor_session_id(conn, session_row) -> Optional[int]:

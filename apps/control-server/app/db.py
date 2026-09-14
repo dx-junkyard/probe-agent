@@ -82,6 +82,31 @@ def get_conn() -> Iterator[sqlite3.Connection]:
             conn.close()
 
 
+@contextmanager
+def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """One explicit write transaction over an already-open connection.
+
+    `get_conn()` is autocommit and never rolls back on its own, so a sequence
+    of statements is only ONE act if something wraps it. `BEGIN IMMEDIATE`
+    (not the default deferred `BEGIN`) takes the write lock at the start, so a
+    read taken inside the block -- a precondition check, a compare-and-swap
+    expectation -- still holds when the writes land. The process-wide
+    connection lock does not provide this: it serialises this process only,
+    and a second worker or a second process is exactly the case a
+    revalidation gate exists for.
+
+    Exists as a context manager so a long block with several early `return`s
+    commits on every path without being re-indented into a `try`.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
 _SOLUTION_DESIGN_OPTION_DDL = """
 CREATE TABLE IF NOT EXISTS solution_design_option (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,

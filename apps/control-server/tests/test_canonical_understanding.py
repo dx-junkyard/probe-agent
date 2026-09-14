@@ -1235,6 +1235,259 @@ def test_session_creation_is_one_transaction(admin_client, tmp_path, monkeypatch
     assert runs == 0
 
 
+# --- Review round 2 ----------------------------------------------------------
+
+
+def test_editing_intent_after_promotion_does_not_move_the_canonical_overview(
+    admin_client, tmp_path
+):
+    """The canonical projection reads the Intent FROZEN into the revision.
+
+    Correcting an Intent item is legitimate at any time, including on a stale
+    session -- but it is not a change to what the System has settled until a
+    new promotion. Reading the promoting session's live rows let the
+    Overview's Vision and 望ましい変化 change with no head movement at all.
+    """
+    client = admin_client
+    token, system_id, snapshot_id = _setup(client, tmp_path, "System Frozen Intent")
+    headers = _headers(token, system_id)
+
+    s0 = _create_session(client, headers, snapshot_id)
+    _confirm_intent(s0, system_id, "goal", "確定した Vision")
+    _confirm_intent(s0, system_id, "pain", "確定した課題")
+    r1 = _store_candidate(
+        s0, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("P1")], core_capabilities=[_item("C1")]),
+    )
+    assert _promote(
+        client, headers, s0, r1, expected_head=None, expected_version=None
+    ).status_code == 200
+
+    before = client.get("/overview", headers=headers).json()
+    assert before["brief"]["vision"]["name"] == "確定した Vision"
+
+    # The promoting session corrects both Intent items afterwards.
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        for field, text in (("goal", "書き換えた Vision"), ("pain", "書き換えた課題")):
+            old_id = conn.execute(
+                """SELECT id FROM interview_intent_item
+                   WHERE session_id = ? AND field = ? AND superseded_by_id IS NULL""",
+                (s0, field),
+            ).fetchone()["id"]
+            new_id = conn.execute(
+                """INSERT INTO interview_intent_item
+                       (session_id, system_id, field, value_text, status, origin,
+                        decision_method, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'confirmed', 'user', 'manual', ?, ?)""",
+                (s0, system_id, field, text, now, now),
+            ).lastrowid
+            conn.execute(
+                "UPDATE interview_intent_item SET superseded_by_id = ? WHERE id = ?",
+                (new_id, old_id),
+            )
+
+    after = client.get("/overview", headers=headers).json()
+    assert after["canonical_revision_id"] == r1
+    assert after["brief"]["vision"]["name"] == "確定した Vision"
+    # The Purpose Chain is the same canonical projection and must not move
+    # either -- it read the very same live rows before this fix.
+    frame = {e["kind"]: e for e in after["purpose_chain"]["elements"]}
+    assert frame["beneficiary_problem"]["statement"] == "確定した課題"
+    assert frame["desired_change"]["statement"] == "確定した Vision"
+
+    # The Interview screen, which IS about that session, shows the correction.
+    session_brief = client.get(
+        "/interview/understanding-brief", params={"session_id": s0}, headers=headers
+    ).json()
+    assert session_brief["vision"]["name"] == "書き換えた Vision"
+
+    # A later promotion from a session that restated NOTHING still carries the
+    # canonical Intent forward unchanged. The correction above lives in s0's
+    # rows and was never promoted, and a rebase copies no rows -- it pins the
+    # premise the head holds. Losing it here would be the Intent-lineage bug;
+    # adopting it would let an unpromoted edit become canonical by proxy.
+    s1 = _rebase(client, headers, s0)
+    r2 = _store_candidate(
+        s1, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("P2")], core_capabilities=[_item("C2")]),
+    )
+    assert _promote(
+        client, headers, s1, r2, expected_head=r1, expected_version=1
+    ).status_code == 200
+    carried = client.get("/overview", headers=headers).json()
+    assert carried["brief"]["vision"]["name"] == "確定した Vision"
+
+    # Confirming it in the PROMOTING session is what moves it -- the overlay
+    # half of the merge rule.
+    _confirm_intent(s1, system_id, "goal", "書き換えた Vision")
+    s2 = _rebase(client, headers, s1)
+    r3 = _store_candidate(
+        s2, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("P3")], core_capabilities=[_item("C3")]),
+    )
+    _confirm_intent(s2, system_id, "goal", "書き換えた Vision")
+    assert _promote(
+        client, headers, s2, r3, expected_head=r2, expected_version=2
+    ).status_code == 200
+    promoted = client.get("/overview", headers=headers).json()
+    assert promoted["brief"]["vision"]["name"] == "書き換えた Vision"
+
+
+def test_a_promotion_landing_after_revalidation_cannot_be_overwritten(
+    admin_client, tmp_path, monkeypatch
+):
+    """The revalidation and the writes are ONE transaction.
+
+    The previous test moves the head DURING the reasoning call. This one moves
+    it in the window the earlier fix left open: after `revalidate_premise`
+    returned `None` and before the revision was inserted. A second connection
+    -- which is what a second worker is -- must not be able to slip a
+    promotion in there.
+    """
+    client = admin_client
+    token, system_id, snapshot_id = _setup(client, tmp_path, "System Window")
+    headers = _headers(token, system_id)
+    _insert_understanding_graph(system_id, snapshot_id)
+
+    s_head = _create_session(client, headers, snapshot_id)
+    r1 = _store_candidate(
+        s_head, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("P1")], core_capabilities=[_item("C1")]),
+    )
+    _promote(client, headers, s_head, r1, expected_head=None, expected_version=None)
+    target = _create_session(client, headers, snapshot_id)
+
+    import sqlite3
+
+    from app import canonical_understanding as canonical_module
+    import app.routes.interview as interview_route
+
+    class StubClient:
+        def generate_text(self, messages, *, temperature=None, max_tokens=None):
+            return _review_response()
+
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("LLM_MODEL", "o3-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setattr(interview_route, "create_llm_client", lambda config: StubClient())
+
+    original = canonical_module.revalidate_premise
+    attempted: list = []
+
+    def _promote_from_another_connection(conn, token_value):
+        """Revalidate, then try to move the head from a SEPARATE connection.
+
+        A raw `sqlite3.connect` on purpose: `get_conn()` is process-locked and
+        would deadlock, which is exactly why the process lock is not the
+        protection this window needs.
+        """
+        verdict = original(conn, token_value)
+        if attempted:
+            return verdict
+        attempted.append(True)
+        import os
+
+        side = sqlite3.connect(os.environ["PROBE_DB_PATH"], timeout=0.2)
+        try:
+            side.execute("BEGIN IMMEDIATE")
+            side.execute(
+                "UPDATE system_understanding_head SET head_version = head_version + 1"
+                " WHERE system_id = ?",
+                (system_id,),
+            )
+            side.execute("COMMIT")
+        except sqlite3.OperationalError as exc:
+            # The rebuild already holds the write lock -- which is the point.
+            attempted.append(str(exc))
+        finally:
+            side.close()
+        return verdict
+
+    monkeypatch.setattr(
+        canonical_module, "revalidate_premise", _promote_from_another_connection
+    )
+
+    response = client.post(
+        f"/interview/sessions/{target}/update-understanding", headers=headers
+    )
+    assert response.status_code == 200, response.text
+
+    # The concurrent write was refused by the transaction, so the rebuild's
+    # own result is consistent with the premise it checked.
+    assert any(isinstance(entry, str) and "lock" in entry for entry in attempted), attempted
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        head = conn.execute(
+            "SELECT head_version FROM system_understanding_head WHERE system_id = ?",
+            (system_id,),
+        ).fetchone()
+    assert head["head_version"] == 1
+
+
+def test_the_candidate_state_and_its_content_come_from_one_revision(
+    admin_client, tmp_path
+):
+    """`newer_than_head` names a revision, so the Brief must be ITS session's.
+
+    Deciding the state from any candidate revision in the System while taking
+    the content from the newest session let the two describe different
+    conversations.
+    """
+    client = admin_client
+    token, system_id, snapshot_id = _setup(client, tmp_path, "System Candidate Owner")
+    headers = _headers(token, system_id)
+
+    s0 = _create_session(client, headers, snapshot_id)
+    r1 = _store_candidate(
+        s0, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("P1")], core_capabilities=[_item("C1")]),
+    )
+    _promote(client, headers, s0, r1, expected_head=None, expected_version=None)
+
+    # The candidate lives in an OLDER session than the newest one.
+    owner = _rebase(client, headers, s0)
+    _store_candidate(
+        owner, system_id, snapshot_id,
+        _understanding(
+            vision=[_item("候補セッションの Vision")],
+            system_purpose=[_item("P2")],
+            core_capabilities=[_item("C2")],
+        ),
+    )
+    newest = _create_session(client, headers, snapshot_id)
+    assert newest > owner
+
+    body = client.get("/overview", headers=headers).json()
+    assert body["candidate_state"] == "newer_than_head"
+    assert body["candidate_session_id"] == owner
+    assert body["candidate_brief"]["session_id"] == owner
+    assert body["candidate_brief"]["vision"]["name"] == "候補セッションの Vision"
+
+
+def test_no_candidate_means_no_candidate_session_and_no_candidate_brief(
+    admin_client, tmp_path
+):
+    client = admin_client
+    token, system_id, snapshot_id = _setup(client, tmp_path, "System No Candidate")
+    headers = _headers(token, system_id)
+    s0 = _create_session(client, headers, snapshot_id)
+    r1 = _store_candidate(
+        s0, system_id, snapshot_id,
+        _understanding(system_purpose=[_item("P1")], core_capabilities=[_item("C1")]),
+    )
+    _promote(client, headers, s0, r1, expected_head=None, expected_version=None)
+
+    body = client.get("/overview", headers=headers).json()
+    assert body["candidate_state"] == "same_as_head"
+    assert body["candidate_session_id"] is None
+    assert body["candidate_brief"] is None
+
+
 # --- Cross-cutting -----------------------------------------------------------
 
 

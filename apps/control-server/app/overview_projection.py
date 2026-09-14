@@ -1659,13 +1659,21 @@ def _latest_interview_session_id(conn, system_id: int) -> Optional[int]:
 
 @dataclass
 class CanonicalUnderstandingRef:
-    """Which Understanding the Overview is about, and by which rule."""
+    """Which Understanding the Overview is about, and by which rule.
 
-    source: str  # canonical_head | latest_session | unavailable
+    `intent_items` is the Intent frozen INTO the promoted revision. It travels
+    with the claims because both halves of a canonical projection have to come
+    from the same immutable place: the promoting session keeps editing its own
+    Intent rows afterwards, and reading those would let a confirmed Vision
+    change on the Overview without the head ever moving.
+    """
+
+    source: str  # canonical_head | not_promoted | unavailable
     session_id: Optional[int] = None
     revision_id: Optional[int] = None
     head_version: Optional[int] = None
     understanding: Optional[Dict[str, Any]] = None
+    intent_items: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 def resolve_canonical_understanding(conn, system_id: int) -> CanonicalUnderstandingRef:
@@ -1704,6 +1712,7 @@ def resolve_canonical_understanding(conn, system_id: int) -> CanonicalUnderstand
         revision_id=revision["id"],
         head_version=head.head_version,
         understanding=understanding,
+        intent_items=canonical_understanding.revision_intent_items(revision),
     )
 
 
@@ -1719,27 +1728,48 @@ class CandidateUnderstandingRef:
 
     state: str  # none | unpromoted | newer_than_head | same_as_head
     session_id: Optional[int] = None
+    #: The specific candidate revision `newer_than_head` is about. `None` for
+    #: every other state, because no other state names a revision.
+    revision_id: Optional[int] = None
 
 
 def resolve_candidate_understanding(
     conn, system_id: int, canonical_ref: CanonicalUnderstandingRef
 ) -> CandidateUnderstandingRef:
-    session_id = _latest_interview_session_id(conn, system_id)
-    if session_id is None:
-        return CandidateUnderstandingRef(state="none")
+    """The in-progress Understanding: its state AND the session that owns it.
+
+    Both come from the SAME resolution. Deciding `newer_than_head` from any
+    candidate revision in the System while taking the content from the newest
+    SESSION let the two disagree: an older session holding the unpromoted
+    candidate, plus a newer session created afterwards, produced
+    `newer_than_head` beside a Brief showing the newer session's unrelated
+    content. The reported candidate is one specific revision, so its session
+    is the one whose content may be shown.
+    """
     if canonical_ref.source != "canonical_head" or canonical_ref.revision_id is None:
+        # Nothing promoted: the candidate is simply "the conversation in
+        # progress", and there may be no revision at all yet.
+        session_id = _latest_interview_session_id(conn, system_id)
+        if session_id is None:
+            return CandidateUnderstandingRef(state="none")
         return CandidateUnderstandingRef(state="unpromoted", session_id=session_id)
     newer = conn.execute(
-        """SELECT 1 FROM understanding_revision
+        """SELECT id, session_id FROM understanding_revision
            WHERE system_id = ? AND id > ?
              AND COALESCE(status, 'candidate') = 'candidate'
              AND current_understanding IS NOT NULL
-           LIMIT 1""",
+           ORDER BY id DESC LIMIT 1""",
         (system_id, canonical_ref.revision_id),
     ).fetchone()
+    if newer is None:
+        # No candidate exists, so there is no candidate session and no
+        # candidate content -- naming one anyway would be the same
+        # state/content mismatch from the other direction.
+        return CandidateUnderstandingRef(state="same_as_head")
     return CandidateUnderstandingRef(
-        state="newer_than_head" if newer else "same_as_head",
-        session_id=session_id,
+        state="newer_than_head",
+        session_id=newer["session_id"],
+        revision_id=newer["id"],
     )
 
 
@@ -2013,6 +2043,7 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                     now=now,
                     understanding_override=canonical_ref.understanding,
                     revision_id_override=canonical_ref.revision_id,
+                    intent_override=canonical_ref.intent_items or {},
                 )
                 result.brief = brief
             except Exception as exc:  # pragma: no cover - defensive
@@ -2034,9 +2065,11 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 candidate_brief = understanding_brief.build_understanding_brief(
                     conn, system_id, candidate_ref.session_id, now=now
                 )
-                # Exposed only when there is something in progress to show; a
-                # placeholder under 「進行中の候補」 would be noise.
-                if candidate_ref.state != "none":
+                # Exposed only for the two states that actually name a
+                # candidate. `same_as_head` means there is nothing in
+                # progress, so a Brief under 「進行中の候補」 would be either
+                # noise or -- worse -- someone else's content.
+                if candidate_ref.state in ("unpromoted", "newer_than_head"):
                     result.candidate_brief = candidate_brief
             except Exception as exc:  # pragma: no cover - defensive
                 brief_readable = False
@@ -2135,8 +2168,24 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
         # separate reads a request apart.
         if availability["session"]:
             try:
+                # Issue #464: when a head exists the Purpose Frame is a
+                # CANONICAL projection too -- same frozen claims, same frozen
+                # Intent. Without the overrides it re-read the promoting
+                # session's live Intent rows, so correcting a goal there moved
+                # the Overview's 望ましい変化 with no promotion at all.
                 result.purpose_chain = purpose_chain.derive_purpose_chain(
-                    conn, system_id, session_id, now=now
+                    conn,
+                    system_id,
+                    session_id if canonical_ref.source == "canonical_head"
+                    else candidate_ref.session_id,
+                    now=now,
+                    understanding_override=canonical_ref.understanding,
+                    revision_id_override=canonical_ref.revision_id,
+                    intent_override=(
+                        canonical_ref.intent_items or {}
+                        if canonical_ref.source == "canonical_head"
+                        else None
+                    ),
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 _degrade(result, "purpose_chain", exc)

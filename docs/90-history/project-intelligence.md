@@ -7895,3 +7895,48 @@ premise 捕捉が落ちると、前提を持たないセッションと走らな
 は「まだ作っていない」という**成功した読み取り**なので常に呼び、公開するのは
 `candidate_state != 'none'` のときだけにする。「まだ作っていない」と「読めなかった」の
 区別は #380 が作ったもので、ここでも同じ形で再発した。
+
+### Issue #464 検証ラウンド2
+
+前ラウンドの 5 点を直した後のレビューで、さらに 3 点。いずれも「境界を作った
+つもりの場所に、まだ可変なものが流れ込んでいた」型である。
+
+**正準 Brief と Purpose Chain が昇格後も可変 Intent を読んでいた。**
+`understanding_override` で claim は凍結したが、Intent は昇格元セッションの
+現在行から読んだままだった。Intent の訂正は stale セッションでも正当な操作
+なので、`goal=A` を確認して昇格 → 同じセッションで `goal=B` に訂正、で
+**head を動かさずに Overview の Vision が変わる**。Purpose Chain も
+`_latest_intent_item` で同じ行を直接読んでいた。両方に `intent_override` を
+足し、revision の `premise_json` に凍結された Intent だけを読ませた。
+
+このために premise bundle の Intent へ `source_intent_item_id` を足す必要が
+あった (Purpose Chain は `intent_item:<id>` を引用する)。**digest には入れない**
+── 同じ文言を別の行 id で再確認したものは同じ前提だからで、`content_digest` が
+claim 軸で守っているのと同じ規則である。digest 対象を既存のキー集合ちょうどに
+射影したので、すでに昇格済みの revision の digest は変わらない。アンカーを
+持たない旧 bundle では引用 id が `None` になるので、`source_ids` は空にする ──
+引用できる行が無いことを、捏造した id で埋めない。
+
+**rebase は訂正を引き継がない**という帰結もテストで固定した。昇格されなかった
+訂正は、昇格するセッションでもう一度確定したときだけ正準になる。行をコピーして
+引き継ぐと、昇格していない編集が代理で正準になってしまう。
+
+**rebuild の再検証と保存が同一トランザクションでなかった。** 接続を開いた直後に
+`revalidate_premise` を呼び、その後の書き込みは autocommit だった。検査と
+書き込みの隙間に別 worker が昇格できるので、ゲートは何も保証していない
+(プロセス内の接続 lock はこのプロセスしか直列化しない)。`db.write_transaction`
+を足して `BEGIN IMMEDIATE` で囲んだ ── **既定の遅延 `BEGIN` では不十分**で、
+最初の書き込みまで write lock を取らないため同じ窓が残る。dialogue turn 側の
+`BEGIN` も `BEGIN IMMEDIATE` へ上げた。context manager にしたのは、早期
+`return` が複数ある 240 行のブロックを `try` へ再インデントせずに全経路で
+commit するため。回帰テストは**再検証の直後に別接続から昇格を試み**、それが
+write lock で拒否されることを確認する (LLM 呼び出し中に動かす前ラウンドの
+テストはこの窓を通らない)。
+
+**candidate の状態と内容が別セッションを指し得た。** `newer_than_head` は
+System 内のどれかの candidate revision から、`candidate_brief` は最新
+セッションから、別々に決めていた。古いセッションが未昇格 candidate を持った
+まま新しいセッションを作ると、状態と内容が別の会話を指す。候補 revision を
+先に一意に選び、その revision の所有セッションから両方を出すようにした。
+`same_as_head` は候補が無いという意味なので、session id も brief も `None` を
+返す ── ここで最新セッションを名乗らせるのが、同じ不一致の裏返しである。

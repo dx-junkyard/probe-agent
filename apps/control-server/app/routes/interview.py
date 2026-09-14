@@ -36,7 +36,7 @@ from ..capability_graph import (
     confirm_capability_graph,
     latest_system_confirmed_graph,
 )
-from ..db import get_conn
+from ..db import get_conn, write_transaction
 from .. import canonical_understanding, interview_workflow
 from ..interview_workflow import tracked_process
 from ..interview_context import build_interview_context
@@ -1692,7 +1692,11 @@ def _interview_dialogue_turn_core(
     # Phase 3 (DB lock re-acquired): persist the turn, its audit runs and
     # any proposals in a single transaction.
     with get_conn() as conn:
-        conn.execute("BEGIN")
+        # `BEGIN IMMEDIATE`, not the default deferred `BEGIN`: the premise
+        # revalidation below is a READ whose answer must still hold when the
+        # writes land, and a deferred transaction takes no write lock until
+        # the first write (Issue #464).
+        conn.execute("BEGIN IMMEDIATE")
         try:
             # Issue #464: the premise this turn was reasoned against must still
             # be the one the session stands on. If it moved while the model was
@@ -3517,7 +3521,14 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
     )
 
     # Phase 3 (DB lock re-acquired): persist the review outcome.
-    with get_conn() as conn:
+    #
+    # ONE write transaction, opened with `BEGIN IMMEDIATE` BEFORE the premise
+    # is re-checked. The check and the writes have to be atomic or the gate
+    # does nothing: another worker could promote between the revalidation and
+    # the revision INSERT, and the stale candidate would be stored anyway. The
+    # process-wide connection lock does not cover that -- it serialises this
+    # process, not the second one.
+    with get_conn() as conn, write_transaction(conn):
         # Issue #464: a rebuilt Understanding is a claim about a specific
         # premise. If the canonical head moved while the model was working,
         # storing this candidate would attach it to a premise nobody reasoned

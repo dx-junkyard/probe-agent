@@ -424,8 +424,14 @@ def _beneficiary_problem_element(pain_item: Optional[Dict[str, Any]]) -> Purpose
         provenance=provenance,
         provenance_label=PROVENANCE_LABELS[provenance],
         source_kind="intent_item",
-        source_ids=[f"intent_item:{pain_item['id']}"],
-        intent_revision_id=pain_item["id"],
+        # A premise bundle captured before the citation anchor existed has no
+        # citable row id. That is "no citable row", never a fabricated one.
+        source_ids=(
+            [f"intent_item:{pain_item.get('id')}"]
+            if pain_item.get("id") is not None
+            else []
+        ),
+        intent_revision_id=pain_item.get("id"),
         is_mock=bool(pain_item.get("is_mock")),
     )
 
@@ -445,7 +451,13 @@ def _claim_source(
     `developer_authored=True` for them.
     """
     if claim.kind == "vision" and claim.provenance == "developer_intent" and goal_item is not None:
-        return "intent_item", [f"intent_item:{goal_item['id']}"], goal_item["id"], None
+        goal_id = goal_item.get("id")
+        return (
+            "intent_item",
+            [f"intent_item:{goal_id}"] if goal_id is not None else [],
+            goal_id,
+            None,
+        )
     section = _SECTION_BY_CLAIM_KIND.get(claim.kind, claim.kind)
     return (
         "understanding_claim",
@@ -857,6 +869,9 @@ def derive_purpose_chain(
     session_id: Optional[int] = None,
     *,
     now: Optional[float] = None,
+    understanding_override: Optional[Dict[str, Any]] = None,
+    revision_id_override: Optional[int] = None,
+    intent_override: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> PurposeChainResult:
     """Assemble the whole Purpose Chain for one session (or the System's
     newest, or none).
@@ -872,6 +887,13 @@ def derive_purpose_chain(
     Brief read as `frame` and so degrade together), and `relations` (which
     depends on `frame`/`capabilities` already having elements to connect, but
     can independently fail even when they succeeded).
+
+    The three `*_override` arguments (Issue #464) make this a CANONICAL
+    projection: the claims, the revision id and the Intent all come from a
+    promoted revision instead of from the session's live rows. The Overview
+    passes them so its Purpose Frame cannot change when the promoting session
+    later corrects an Intent item -- that correction is legitimate, but it is
+    not a change to what the System has settled until a new promotion.
     """
     now = time.time() if now is None else now
     degraded_sections: List[str] = []
@@ -932,7 +954,10 @@ def derive_purpose_chain(
     if not brief_unavailable:
         try:
             brief = understanding_brief.build_understanding_brief(
-                conn, system_id, effective_session_id, now=now
+                conn, system_id, effective_session_id, now=now,
+                understanding_override=understanding_override,
+                revision_id_override=revision_id_override,
+                intent_override=intent_override,
             )
         except Exception as exc:  # pragma: no cover - defensive
             brief_unavailable = True
@@ -945,7 +970,13 @@ def derive_purpose_chain(
     goal_item: Optional[Dict[str, Any]] = None
     pain_item: Optional[Dict[str, Any]] = None
     intent_unavailable = session_resolution_failed
-    if resolved_session_id is not None:
+    if intent_override is not None:
+        # Canonical projection: the Intent frozen into the promoted revision,
+        # never the session's current rows.
+        intent_unavailable = False
+        goal_item = intent_override.get("goal")
+        pain_item = intent_override.get("pain")
+    elif resolved_session_id is not None:
         try:
             goal_item = _latest_intent_item(conn, resolved_session_id, system_id, "goal")
             pain_item = _latest_intent_item(conn, resolved_session_id, system_id, "pain")
