@@ -1,6 +1,6 @@
 """Journey Service Blueprint projection (Issue #423, Epic #418).
 
-`docs/stakeholder-value-network.md` §8 is the canonical contract. This
+`docs/01-specifications/product/stakeholder-value-network.md` §8 is the canonical contract. This
 module is a **read-only, deterministic domain service -- no LLM call
 anywhere** (Principle 6 / §0 invariant 9). Everything it returns is either a
 direct read of a persisted row, a first-match classification over a small
@@ -39,7 +39,7 @@ by an explicit write to that table -- never inferred from the mere absence
 of a link, which always reads `unknown`. This only applies to the four
 delivery lanes (frontstage/backstage/support/external); the other five lanes
 report only `present`/`unknown` (never invented). See
-`docs/project-intelligence.md`'s Issue #423 notes for the full rationale.
+`docs/90-history/project-intelligence.md`'s Issue #423 notes for the full rationale.
 
 probe-agent:
   role: Deterministic Journey Service Blueprint projection + delivery/stakeholder/exchange link domain service

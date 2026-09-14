@@ -9,7 +9,7 @@
 # and reverse-proxying to the Dashboard, which in turn proxies `/api/*` to
 # the Control Server (see apps/dashboard/nginx.conf).
 #
-# Usage: see docs/deployment-https.md
+# Usage: see docs/04-operations/deployment-https.md
 #   docker compose -f docker-compose.prod.yml up -d --build
 
 services:
@@ -32,7 +32,7 @@ services:
       # boot without an active admin, refuses CONTROL_API_KEYS (legacy
       # shared keys are forbidden -- removed below on purpose), and rejects
       # sample/weak CONTROL_ADMIN_PASSWORD values. See
-      # docs/deployment-https.md "公開前チェック".
+      # docs/04-operations/deployment-https.md "公開前チェック".
       CONTROL_ENV: "production"
       # Fail startup instead of silently running without authentication.
       # Forced on for CONTROL_ENV=production anyway; kept explicit here.
@@ -57,6 +57,12 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-120}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_TTS_MODEL: ${OPENAI_TTS_MODEL:-gpt-4o-mini-tts}
+      OPENAI_TTS_VOICE: ${OPENAI_TTS_VOICE:-marin}
+      OPENAI_TTS_INSTRUCTIONS: ${OPENAI_TTS_INSTRUCTIONS:-}
+      OPENAI_TTS_TIMEOUT: ${OPENAI_TTS_TIMEOUT:-30}
+      OPENAI_TTS_BASE_URL: ${OPENAI_TTS_BASE_URL:-https://api.openai.com/v1}
       INTELLIGENCE_LLM_PROVIDER: ${INTELLIGENCE_LLM_PROVIDER:-}
       INTELLIGENCE_LLM_MODEL: ${INTELLIGENCE_LLM_MODEL:-}
       INTELLIGENCE_LLM_TIMEOUT: ${INTELLIGENCE_LLM_TIMEOUT:-120}
@@ -71,7 +77,7 @@ services:
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       # Fixed in-container path of the Compose secret mounted below -- never
       # a host path. Compose mounts secrets read-only by default. See
-      # docs/github-app-deployment.md for placing the PEM on the host and
+      # docs/04-operations/github-app-deployment.md for placing the PEM on the host and
       # for key rotation; the PEM must NOT live under
       # PROBE_REPOSITORY_HOST_ROOT or on the probe-data volume, so
       # repository mounts and DB/volume backups never contain it.
@@ -188,7 +194,7 @@ volumes:
 # `github_app_configured()` treats an empty key file as "not configured"
 # (Issue #224) rather than failing later inside JWT signing. Point
 # GITHUB_APP_PRIVATE_KEY_HOST_PATH at the real PEM (see
-# docs/github-app-deployment.md) only once the publish workflow should be
+# docs/04-operations/github-app-deployment.md) only once the publish workflow should be
 # enabled. The PEM file itself must never be placed under
 # PROBE_REPOSITORY_HOST_ROOT or on the probe-data volume, so that repository
 # mounts and DB/volume backups never contain it.

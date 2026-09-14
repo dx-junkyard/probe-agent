@@ -4,7 +4,7 @@ Builds candidate execution flows starting from an entrypoint (FastAPI HTTP
 route or a public function) using only committed-snapshot symbols and a minimal
 Python AST call-edge extraction.
 
-Design constraints (see CLAUDE.md / docs/project-intelligence.md):
+Design constraints (see CLAUDE.md / docs/90-history/project-intelligence.md):
 
 - Only committed-snapshot symbols and source are used. No working-tree reads.
 - Edges that cannot be resolved deterministically are kept as ``unresolved``

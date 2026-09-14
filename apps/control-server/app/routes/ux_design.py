@@ -1,7 +1,7 @@
 """UX Design Lineage: Journey / Requirement / Artifact API (Issue #407,
 Epic #405).
 
-`docs/ux-design-lineage.md` §2.10 is the endpoint contract this module
+`docs/01-specifications/ux/ux-design-lineage.md` §2.10 is the endpoint contract this module
 implements against `app/ux_design.py`'s deterministic domain service. What
 this boundary deliberately does NOT do:
 
@@ -36,10 +36,11 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .. import ux_design
+from .. import discussion_save_receipts, trace_redaction, ux_design
 from ..auth import Principal, get_system_id, require_user
 from ..db import get_conn
 from ..models import (
+    DiscussionSaveReceiptOut,
     UxArtifactReferenceCreateRequest,
     UxArtifactReferenceOut,
     UxDesignDecisionCreateRequest,
@@ -110,11 +111,76 @@ _MESSAGES: Dict[str, str] = {
     "ux_design_subject_not_found": "設計対象が見つかりません。",
     "ux_design_decision_stale_digest": "指定された digest が現在の内容と一致しません。",
     "ux_design_not_decidable": "この状態からはその決定を記録できません。",
+    # Issue #452 §3.6: reusing `save_request_id` with different content.
+    "discussion_save_request_conflict": "同じ保存要求 ID が別の内容で既に使われています。編集後は新しい保存要求として送信してください。",
+    "discussion_save_request_not_found": "指定された保存要求は見つかりませんでした。",
 }
 
+# --- §2.8 (Issue #451): domain validation diagnostics for the real Journey /
+# Requirement / Solution Design forms ---------------------------------------
+#
+# `docs/01-specifications/capabilities/ai-discussion-adapter.md` §2.8 is the canonical contract. Every 422/404/409
+# this module raises now carries `field_path` / `section` alongside the
+# existing `code` / `message`, so the Dashboard's form-level diagnostics
+# (`lib/ui-draft.tsx`'s `useFormValidation`) can attach an error to the
+# EXACT field the domain layer identified -- never by guessing a field from
+# the Japanese message text (Principle 6). `field_path`/`section` are a
+# STRUCTURAL mapping from each finite code (this table), not derived from
+# `str(exc)` content: `str(exc)` only supplies the offending VALUE (e.g.
+# which `step_key` collided), embedded into the message for the human to
+# read, and is redacted first (Principle 9) because it is developer-typed
+# content that could coincidentally look like a credential.
+#
+# A code with no entry here means "no specific field" (`("", "")`) -- the
+# client's own field allowlist (`UiDraftFormSpec.fields`) decides whether a
+# non-empty `field_path` actually names one of ITS fields; when it does not
+# (e.g. `journey_key` on a form that only drafts `title`/`beneficiary`/...),
+# the client renders the SAME whole-form diagnostic as a `("", "")` code
+# would, per §2.8's "未知 field_path はフォーム全体のエラー" rule -- this
+# table never needs to know which forms exist to stay correct.
+_FIELD_PATH_BY_CODE: Dict[str, tuple] = {
+    "journey_step_key_duplicated": ("step_key", "steps"),
+    "journey_step_not_found": ("step_key", "steps"),
+    "ux_requirement_criterion_key_duplicated": ("criterion_key", "acceptance_criteria"),
+    "out_of_scope_requirement_not_verifiable": ("", "acceptance_criteria"),
+    "artifact_uri_invalid": ("uri", ""),
+    "artifact_hash_required": ("content_hash", ""),
+    "artifact_hash_invalid": ("content_hash", ""),
+    "journey_baseline_not_as_is": ("baseline_journey_id", ""),
+    "journey_baseline_foreign_system": ("baseline_journey_id", ""),
+}
 
-def _reject(code: str, status_code: int) -> HTTPException:
-    return HTTPException(status_code=status_code, detail={"code": code, "message": _MESSAGES[code]})
+#: `KeyRequired(field_name)` already carries the exact missing field's name
+#: as its own `str(exc)` (see the raise sites in `app/ux_design.py`) -- this
+#: is the one exception type whose field_path IS its argument rather than a
+#: fixed per-code constant, so it is looked up here instead of in
+#: `_FIELD_PATH_BY_CODE`. The section is "" for identity fields that are not
+#: part of any nested collection (`journey_key` / `requirement_key`).
+_KEY_REQUIRED_SECTION = {"step_key": "steps", "criterion_key": "acceptance_criteria"}
+
+
+def _redact_offender(value: str) -> str:
+    """Principle 9 over a user-typed identifier (a `step_key` /
+    `criterion_key` value) before it is embedded into an HTTP error message.
+    Structurally the same redaction `ui_draft_context._redact_meta` applies
+    to `validation_error` text -- reused, not reimplemented."""
+    redacted, _entries = trace_redaction.redact_text(value, field_name="ux_design_error_value")
+    return redacted if redacted is not None else value
+
+
+def _reject(
+    code: str, status_code: int, *, message: Optional[str] = None, field_path: str = "", section: str = ""
+) -> HTTPException:
+    fp, sec = _FIELD_PATH_BY_CODE.get(code, (field_path, section))
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message if message is not None else _MESSAGES[code],
+            "field_path": fp,
+            "section": sec,
+        },
+    )
 
 
 def _raise_for_ux_error(exc: Exception) -> None:
@@ -122,7 +188,10 @@ def _raise_for_ux_error(exc: Exception) -> None:
     response. Subclasses of `NotFound` are checked before the generic
     `NotFound` fallback. Re-raises anything unrecognized."""
     if isinstance(exc, KeyRequired):
-        raise _reject("ux_design_key_required", 422)
+        field = str(exc)
+        raise _reject(
+            "ux_design_key_required", 422, field_path=field, section=_KEY_REQUIRED_SECTION.get(field, "")
+        )
     if isinstance(exc, KeyConflict):
         raise _reject("ux_design_key_conflict", 409)
     if isinstance(exc, BaselineNotAsIs):
@@ -130,11 +199,20 @@ def _raise_for_ux_error(exc: Exception) -> None:
     if isinstance(exc, BaselineForeignSystem):
         raise _reject("journey_baseline_foreign_system", 404)
     if isinstance(exc, StepKeyDuplicated):
-        raise _reject("journey_step_key_duplicated", 422)
+        raise _reject(
+            "journey_step_key_duplicated", 422,
+            message=f"同じ revision 内に同じ step_key({_redact_offender(str(exc))}) が指定されています。",
+        )
     if isinstance(exc, StepNotFound):
-        raise _reject("journey_step_not_found", 404)
+        raise _reject(
+            "journey_step_not_found", 404,
+            message=f"指定された step_key({_redact_offender(str(exc))}) が現在の revision に見つかりません。",
+        )
     if isinstance(exc, CriterionKeyDuplicated):
-        raise _reject("ux_requirement_criterion_key_duplicated", 422)
+        raise _reject(
+            "ux_requirement_criterion_key_duplicated", 422,
+            message=f"同じ revision 内に同じ criterion_key({_redact_offender(str(exc))}) が指定されています。",
+        )
     if isinstance(exc, OutOfScopeNotVerifiable):
         raise _reject("out_of_scope_requirement_not_verifiable", 422)
     if isinstance(exc, ArtifactUriInvalid):
@@ -150,9 +228,15 @@ def _raise_for_ux_error(exc: Exception) -> None:
     if isinstance(exc, NotDecidable):
         raise _reject("ux_design_not_decidable", 422)
     if isinstance(exc, NotFound):
-        raise HTTPException(status_code=404, detail=str(exc) or "Not found")
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "ux_design_not_found", "message": str(exc) or "Not found", "field_path": "", "section": ""},
+        )
     if isinstance(exc, UxDesignValidationError):
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "ux_design_validation_error", "message": str(exc), "field_path": "", "section": ""},
+        )
     raise
 
 
@@ -347,6 +431,28 @@ def get_requirement_endpoint(
     return UxRequirementDetailOut(**detail)
 
 
+#: §3.6's endpoint identity for the receipt table -- distinct from
+#: `target_kind` ("ux_requirement") because one target_kind could grow more
+#: than one save operation later (`#454`'s child extensions).
+_REQUIREMENT_REVISION_ENDPOINT_KIND = "ux_requirement.revision"
+
+
+def _requirement_revision_request_digest(payload: "UxRequirementRevisionCreateRequest") -> str:
+    """§3.6's `request_digest`: every domain-meaningful field the write
+    actually persists, and NOTHING else -- `save_request_id` itself is
+    identity, not content, and is excluded."""
+    return discussion_save_receipts.compute_request_digest(
+        {
+            "statement": payload.statement,
+            "rationale": payload.rationale,
+            "constraint_text": payload.constraint_text,
+            "out_of_scope_note": payload.out_of_scope_note,
+            "change_note": payload.change_note,
+            "acceptance_criteria": [c.model_dump() for c in payload.acceptance_criteria],
+        }
+    )
+
+
 @router.post(
     "/requirements/{requirement_key}/revisions", response_model=UxRequirementDetailOut, status_code=201
 )
@@ -356,7 +462,37 @@ def add_requirement_revision_endpoint(
     system_id: int = Depends(get_system_id),
     principal: Principal = Depends(require_user),
 ) -> UxRequirementDetailOut:
+    """§3.6/§3.7 (Issue #452): an optional `save_request_id` makes this
+    endpoint idempotent -- see `app/discussion_save_receipts.py`'s module
+    docstring for the exact calling convention this follows. Without one,
+    behaviour is byte-for-byte the pre-#452 shape."""
+    actor = _principal_actor(principal)
+    save_request_id = (payload.save_request_id or "").strip() or None
+    request_digest = _requirement_revision_request_digest(payload) if save_request_id else ""
+
     with get_conn() as conn:
+        if save_request_id:
+            try:
+                existing = discussion_save_receipts.check_reusable(
+                    conn, system_id=system_id, save_request_id=save_request_id,
+                    request_digest=request_digest,
+                )
+            except discussion_save_receipts.SaveRequestConflict:
+                raise _reject("discussion_save_request_conflict", 409)
+            if existing is not None and existing["status"] == "succeeded":
+                # §3.6: "同一ID・同一内容は同じ結果" -- a lost-response retry
+                # (or a deliberate retry click that made no edit) converges on
+                # the SAME revision, never a second one.
+                try:
+                    detail = ux_design.get_requirement_detail(conn, system_id, requirement_key)
+                except Exception as exc:
+                    _raise_for_ux_error(exc)
+                    raise
+                return UxRequirementDetailOut(**detail)
+            # `existing is None` (never attempted) or `existing["status"] ==
+            # "failed"` (nothing was persisted for this id yet) both fall
+            # through to a real attempt below.
+
         try:
             detail = ux_design.add_requirement_revision(
                 conn,
@@ -371,12 +507,71 @@ def add_requirement_revision_endpoint(
                 authored_by_kind="developer",
                 decision_method="manual",
                 intelligence_run_id=None,
-                created_by=_principal_actor(principal),
+                created_by=actor,
             )
         except Exception as exc:
-            _raise_for_ux_error(exc)
-            raise
+            if not save_request_id:
+                _raise_for_ux_error(exc)
+                raise
+            # Translate first so the receipt's `error_code` is the SAME
+            # finite code the client actually receives -- never a second,
+            # independently-guessed code. `_raise_for_ux_error` either raises
+            # an `HTTPException` (recognized) or re-raises `exc` itself
+            # (unrecognized, via its own trailing bare `raise`) -- catching
+            # plain `Exception` here (not just `HTTPException`) is required
+            # so BOTH cases still reach `record_outcome` below instead of the
+            # unrecognized case escaping this block unrecorded.
+            error_code = type(exc).__name__
+            to_raise: BaseException = exc
+            try:
+                _raise_for_ux_error(exc)
+            except Exception as translated:
+                to_raise = translated
+                if isinstance(translated, HTTPException) and isinstance(translated.detail, dict):
+                    error_code = translated.detail.get("code", error_code)
+            discussion_save_receipts.record_outcome(
+                conn, system_id=system_id, save_request_id=save_request_id, actor=actor,
+                target_kind="ux_requirement", target_ref=requirement_key,
+                endpoint_kind=_REQUIREMENT_REVISION_ENDPOINT_KIND, request_digest=request_digest,
+                status="failed", error_code=error_code,
+            )
+            raise to_raise
+        if save_request_id:
+            revision_id = detail.get("current_revision_id")
+            discussion_save_receipts.record_outcome(
+                conn, system_id=system_id, save_request_id=save_request_id, actor=actor,
+                target_kind="ux_requirement", target_ref=requirement_key,
+                endpoint_kind=_REQUIREMENT_REVISION_ENDPOINT_KIND, request_digest=request_digest,
+                status="succeeded", result_ref=f"requirement_revision:{revision_id}",
+                revision_id=revision_id,
+            )
     return UxRequirementDetailOut(**detail)
+
+
+@router.get("/save-requests/{save_request_id}", response_model=DiscussionSaveReceiptOut)
+def get_save_request_endpoint(
+    save_request_id: str, system_id: int = Depends(get_system_id),
+) -> DiscussionSaveReceiptOut:
+    """§3.7's result-query API: "応答不明時は同じ ID で照会 / 再試行する" --
+    this is the照会 half. Scoped by System like every other read here (a
+    save request made under a different System is reported the same as one
+    that never existed, never disclosed)."""
+    with get_conn() as conn:
+        receipt = discussion_save_receipts.find_receipt(conn, system_id, save_request_id)
+    if receipt is None:
+        raise _reject("discussion_save_request_not_found", 404)
+    return DiscussionSaveReceiptOut(
+        save_request_id=receipt["save_request_id"],
+        target_kind=receipt["target_kind"],
+        target_ref=receipt["target_ref"],
+        endpoint_kind=receipt["endpoint_kind"],
+        status=receipt["status"],
+        result_ref=receipt["result_ref"],
+        revision_id=receipt["revision_id"],
+        error_code=receipt["error_code"],
+        created_at=receipt["created_at"],
+        updated_at=receipt["updated_at"],
+    )
 
 
 @router.get("/requirements/{requirement_key}/revisions", response_model=UxRequirementRevisionListOut)

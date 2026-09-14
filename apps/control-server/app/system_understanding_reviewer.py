@@ -54,7 +54,7 @@ from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 # Vision に対してこのシステムが担う役割」) and must never be produced by
 # folding the two together; the Understanding Brief shows them separately and
 # labels their provenance separately.
-PROMPT_VERSION = "understanding-review-v7"
+PROMPT_VERSION = "understanding-review-v8"
 SCHEMA_VERSION = "understanding-review-v2"
 DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
 DEFAULT_REVIEW_MAX_NODES_PER_TYPE = 5
@@ -63,6 +63,11 @@ DEFAULT_REVIEW_MAX_EVIDENCE_PER_NODE = 2
 # Same budget interview_agent.py uses for Q&A JSON-trim (GAP_AND_QUESTION_MAX_CHARS).
 QA_PROMPT_MAX_CHARS = 4_000
 ALIGNMENT_FEEDBACK_PROMPT_MAX_CHARS = 6_000
+# Issue #464: the canonical premise budget. Generous relative to the other
+# sections because it is the one part of the prompt the model must not be
+# allowed to lose -- a truncated premise is how a settled Vision silently
+# disappears from a rebuild.
+PREMISE_PROMPT_MAX_CHARS = 8_000
 #: Issue #352: the Understanding Brief shows exactly one Vision statement, so
 #: extra items a model returns are dropped rather than silently concatenated.
 _MAX_VISION_ITEMS = 1
@@ -328,9 +333,30 @@ def _build_review_prompt(
     unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
     alignment_feedback: Optional[List[Dict[str, Any]]] = None,
     verified_evidence: Optional[List[Dict[str, Any]]] = None,
+    canonical_premise: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build the review prompt from graph + code facts."""
     parts: List[str] = []
+
+    # Issue #464: the System's canonical premise. It is first because it is
+    # the ground everything else is read against: a brand-new Interview used
+    # to start with nothing here, so the model re-derived (or failed to
+    # re-derive) a Vision the System had already settled, and the Interview
+    # then disagreed with the Overview about the same project. This section is
+    # never the session's own in-progress state -- it is the revision a human
+    # promoted, plus the Intent statements a human confirmed.
+    if canonical_premise:
+        parts.append(
+            "## Canonical System Understanding (premise)\n"
+            "This is what THIS SYSTEM has already been established to be, "
+            "confirmed by a human and pinned when this interview started. "
+            "Treat it as the starting point: carry it forward, refine it, or "
+            "contradict it explicitly with evidence -- never silently drop a "
+            "claim, and never re-derive a Vision that is already stated here. "
+            "`intent_items` are the developer's own confirmed statements and "
+            "outrank any reading of the repository."
+        )
+        parts.append(_trim_json(canonical_premise, PREMISE_PROMPT_MAX_CHARS))
 
     # Human Alignment decisions have higher authority than generated graph
     # hypotheses, so put them first.  The final prompt budget truncates from
@@ -487,6 +513,7 @@ def generate_understanding_review(
     unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
     alignment_feedback: Optional[List[Dict[str, Any]]] = None,
     verified_evidence: Optional[List[Dict[str, Any]]] = None,
+    canonical_premise: Optional[Dict[str, Any]] = None,
 ) -> ReviewResult:
     """Generate a system understanding review from graph + code facts.
 
@@ -508,6 +535,13 @@ def generate_understanding_review(
     generated Understanding; keeping their old rows actionable is not by
     itself sufficient.
 
+    ``canonical_premise`` (Issue #464) is the System's canonical
+    Understanding plus the developer's confirmed Intent statements, pinned
+    when the session started. It is the ground the rebuild refines, which is
+    why it is a separate, first section rather than being merged into the
+    graph: the graph is a hypothesis derived from code, the premise is what a
+    human already settled about this System.
+
     Fail-closed: mock clients and non-reasoning models return an error.
     No proposals are generated.
     """
@@ -525,6 +559,7 @@ def generate_understanding_review(
         answered_qa=answered_qa, unconfirmed_qa=unconfirmed_qa,
         alignment_feedback=alignment_feedback,
         verified_evidence=verified_evidence,
+        canonical_premise=canonical_premise,
     )
     try:
         max_output_tokens = _review_max_output_tokens()

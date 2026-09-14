@@ -3,7 +3,7 @@
 // `HelpModeProvider` の `active` が true のときだけイベントリスナーを張り、
 // false に戻ると `useEffect` の cleanup で全て外す -- 「解除後は通常操作へ
 // 完全に戻る」を、リスナーを条件付きで張ることそのもので保証する
-// (`docs/assistant-discussion.md` §3)。
+// (`docs/01-specifications/capabilities/assistant-discussion.md` §3)。
 //
 // - hover (`pointerover` / `mouseover`) は ~150ms デバウンスする。
 // - `focusin` はキーボード操作向けに即座に選択する。

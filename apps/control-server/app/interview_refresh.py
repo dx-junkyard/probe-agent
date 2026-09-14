@@ -8,7 +8,7 @@ reuse the latest persisted revision and rebuild Alignment/Review Queue.
 Saved answers are never coupled to refresh success, execution is idempotent,
 and stale/superseded results never overwrite newer state.
 
-Design (see the Issue #288 section of ``docs/project-intelligence.md`` for
+Design (see the Issue #288 section of ``docs/90-history/project-intelligence.md`` for
 the full write-up):
 
 - One ``interview_refresh_job`` row per refresh attempt.
@@ -308,6 +308,30 @@ def _run_one_locked(job_id: int) -> None:
 
         trigger_kind = job["trigger_kind"]
         rebuild_understanding = trigger_kind in _UNDERSTANDING_REBUILD_TRIGGERS
+
+        # Issue #464: an automatic rebuild is still a consumption of the
+        # session's premise, so it stops at the same boundary the manual
+        # endpoints do. The developer's answers were committed before this job
+        # was ever enqueued -- what is skipped is only the rebuild, recorded as
+        # a normal terminal note rather than a failure, because nothing went
+        # wrong: the System simply moved on and the developer has to choose
+        # new / rebase / branch. A `branched` session is continuable and so is
+        # refreshed as usual.
+        from . import canonical_understanding
+
+        premise = canonical_understanding.evaluate_session_premise(conn, session)
+        if not premise.continuable:
+            conn.execute(
+                """UPDATE interview_refresh_job
+                   SET status = 'updated', finished_at = ?, error = ?
+                   WHERE id = ?""",
+                (
+                    time.time(),
+                    refresh_job_message("skipped_premise_not_current"),
+                    job_id,
+                ),
+            )
+            return
 
         # The Q&A trigger shares the manual endpoint's "nothing new" gate.
         # Other trigger kinds must never return here: Alignment decisions

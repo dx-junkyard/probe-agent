@@ -10,6 +10,7 @@ from .routes import (
     assistant,
     auth,
     candidate_studio,
+    canonical_understanding,
     cell_fabric,
     cell_improvement,
     cell_orchestrators,
@@ -164,6 +165,7 @@ def create_app() -> FastAPI:
     app.include_router(interview_refresh.router, dependencies=_auth)
     app.include_router(interview_workflow.router, dependencies=_auth)
     app.include_router(interview_brief.router, dependencies=_auth)
+    app.include_router(canonical_understanding.router, dependencies=_auth)
     app.include_router(purpose_chain.router, dependencies=_auth)
     app.include_router(interview_change_sets.router, dependencies=_auth)
     app.include_router(question_router.router, dependencies=_auth)

@@ -1,7 +1,7 @@
 """Evolution Node API: contract, maturity lifecycle and lineage
 (Issue #396, Phase 1 of the evolution control plane Epic #394).
 
-The canonical contract is `docs/evolutionary-pipeline.md`; the domain layer
+The canonical contract is `docs/01-specifications/capabilities/evolutionary-pipeline.md`; the domain layer
 is `app/evolution_node.py`. This module is a thin boundary over it and
 deliberately owns no decision of its own:
 

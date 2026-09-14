@@ -50,11 +50,13 @@ probe-agent:
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, get_args
 
 from . import (
+    canonical_understanding,
     product_objective_projection,
     purpose_chain,
     purpose_needs,
@@ -233,6 +235,14 @@ class _BriefUnavailable(Exception):
     """Raised internally when findings cannot be built because the Brief could
     not be read. Distinct from a genuine extraction failure so the two report
     different sentences."""
+
+
+class _NothingPromoted(Exception):
+    """Raised internally when the System has no canonical Understanding yet.
+
+    A fact about the System, not a failure of this request -- so it produces
+    `not_compared`, never `unavailable` (Issue #464).
+    """
 
 
 class _FindingsUnavailable(Exception):
@@ -1461,6 +1471,20 @@ class OverviewResult:
     snapshot_freshness: str = "unavailable"
     understanding_revision_id: Optional[int] = None
     understanding_confirmed_at: Optional[float] = None
+    #: Issue #464. Which rule produced the Understanding on this page:
+    #: `canonical_head` (a human promoted it), `latest_session` (nothing has
+    #: been promoted, so this is the newest conversation's in-progress state
+    #: and the screen says so), or `unavailable`. These are three different
+    #: answers and must never share copy.
+    understanding_source: str = "unavailable"
+    canonical_revision_id: Optional[int] = None
+    canonical_head_version: Optional[int] = None
+    #: Issue #464: the in-progress Understanding, reported in its OWN section.
+    #: `candidate_state` is finite and decided here so the Dashboard never has
+    #: to work out whether the candidate differs from the canonical head.
+    candidate_state: str = "none"
+    candidate_session_id: Optional[int] = None
+    candidate_brief: Optional[Any] = None
     findings: List[Finding] = field(default_factory=list)
     finding_statuses: List[str] = field(default_factory=list)
     findings_initial_count: int = 0
@@ -1619,15 +1643,155 @@ def resolve_pending_instrumentation_publish(
 def _latest_interview_session_id(conn, system_id: int) -> Optional[int]:
     """The System's newest Interview session.
 
-    The same rule the Interview screen auto-selects with (`ORDER BY id DESC`),
-    so the Brief on the Overview and the Brief on the Interview screen are
-    always about the same session -- and the Overview's deep links land on it.
+    Issue #464 removed this from the canonical decision: creation order is not
+    promotion order, so "newest session" can never answer 「この System は今
+    なにを理解していることになっているか」. It survives ONLY as the fallback
+    for a System that has never promoted an Understanding, and the result is
+    labelled `understanding_source='latest_session'` so the screen says which
+    rule it used rather than presenting a candidate as settled.
     """
     row = conn.execute(
         "SELECT id FROM interview_session WHERE system_id = ? ORDER BY id DESC LIMIT 1",
         (system_id,),
     ).fetchone()
     return row["id"] if row else None
+
+
+@dataclass
+class CanonicalUnderstandingRef:
+    """Which Understanding the Overview is about, and by which rule.
+
+    `intent_items` is the Intent frozen INTO the promoted revision. It travels
+    with the claims because both halves of a canonical projection have to come
+    from the same immutable place: the promoting session keeps editing its own
+    Intent rows afterwards, and reading those would let a confirmed Vision
+    change on the Overview without the head ever moving.
+    """
+
+    source: str  # canonical_head | not_promoted | unavailable
+    session_id: Optional[int] = None
+    revision_id: Optional[int] = None
+    head_version: Optional[int] = None
+    understanding: Optional[Dict[str, Any]] = None
+    intent_items: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def resolve_canonical_understanding(conn, system_id: int) -> CanonicalUnderstandingRef:
+    """The System's canonical Understanding -- the promoted head, or nothing.
+
+    There is deliberately NO fallback to the newest session. A session's
+    in-progress content is a candidate: labelling it 「現在の Understanding」,
+    even with a caveat, still puts it where the settled claim belongs and
+    still makes the page's centrepiece depend on session creation order. When
+    nothing has been promoted the answer is `not_promoted`, and the
+    in-progress work is reported separately (`CandidateUnderstandingRef`).
+
+    The head's SOURCE SESSION is what the deep links point at, so the
+    Overview's 「詳しく見る」 lands on the conversation that actually produced
+    the canonical content.
+    """
+    head = canonical_understanding.load_head(conn, system_id)
+    if head is None:
+        return CanonicalUnderstandingRef(source="not_promoted")
+    revision = canonical_understanding.load_revision(conn, system_id, head.revision_id)
+    if revision is None:
+        # The head points at a revision that cannot be read. That is a failure
+        # to read, not an absence of a decision.
+        return CanonicalUnderstandingRef(source="unavailable")
+    raw = revision["current_understanding"]
+    understanding = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            understanding = parsed if isinstance(parsed, dict) else None
+        except (TypeError, ValueError):
+            understanding = None
+    return CanonicalUnderstandingRef(
+        source="canonical_head",
+        session_id=revision["session_id"],
+        revision_id=revision["id"],
+        head_version=head.head_version,
+        understanding=understanding,
+        intent_items=canonical_understanding.revision_intent_items(revision),
+    )
+
+
+@dataclass
+class CandidateUnderstandingRef:
+    """The in-progress Understanding nobody has confirmed as canonical.
+
+    A separate section, never a substitute for the canonical claim (#464
+    acceptance: 「Interview 固有の進捗、未確認 claim、candidate は別セクション
+    として表示する」). `state` is finite and server-decided so the Dashboard
+    never has to work out whether the candidate differs from the head.
+    """
+
+    state: str  # none | unpromoted | newer_than_head | same_as_head
+    session_id: Optional[int] = None
+    #: The specific candidate revision `newer_than_head` is about. `None` for
+    #: every other state, because no other state names a revision.
+    revision_id: Optional[int] = None
+
+
+def resolve_candidate_understanding(
+    conn, system_id: int, canonical_ref: CanonicalUnderstandingRef
+) -> CandidateUnderstandingRef:
+    """The in-progress Understanding: its state AND the session that owns it.
+
+    Both come from the SAME resolution. Deciding `newer_than_head` from any
+    candidate revision in the System while taking the content from the newest
+    SESSION let the two disagree: an older session holding the unpromoted
+    candidate, plus a newer session created afterwards, produced
+    `newer_than_head` beside a Brief showing the newer session's unrelated
+    content. The reported candidate is one specific revision, so its session
+    is the one whose content may be shown.
+    """
+    if canonical_ref.source != "canonical_head" or canonical_ref.revision_id is None:
+        # Nothing promoted: prefer the newest actual candidate revision over
+        # session creation order.  An older session may already own a built
+        # candidate when somebody opens a newer, still-empty conversation;
+        # returning that empty session would make `candidate_state` and
+        # `candidate_brief` describe different work just as surely as it did
+        # in the canonical-head case below.
+        candidate = conn.execute(
+            """SELECT id, session_id FROM understanding_revision
+               WHERE system_id = ?
+                 AND COALESCE(status, 'candidate') = 'candidate'
+                 AND current_understanding IS NOT NULL
+               ORDER BY id DESC LIMIT 1""",
+            (system_id,),
+        ).fetchone()
+        if candidate is not None:
+            return CandidateUnderstandingRef(
+                state="unpromoted",
+                session_id=candidate["session_id"],
+                revision_id=candidate["id"],
+            )
+
+        # A conversation can be in progress before its first revision exists.
+        # Only that no-revision case falls back to the newest session.
+        session_id = _latest_interview_session_id(conn, system_id)
+        if session_id is None:
+            return CandidateUnderstandingRef(state="none")
+        return CandidateUnderstandingRef(state="unpromoted", session_id=session_id)
+    newer = conn.execute(
+        """SELECT id, session_id FROM understanding_revision
+           WHERE system_id = ? AND id > ?
+             AND COALESCE(status, 'candidate') = 'candidate'
+             AND current_understanding IS NOT NULL
+           ORDER BY id DESC LIMIT 1""",
+        (system_id, canonical_ref.revision_id),
+    ).fetchone()
+    if newer is None:
+        # No candidate exists, so there is no candidate session and no
+        # candidate content -- naming one anyway would be the same
+        # state/content mismatch from the other direction.
+        return CandidateUnderstandingRef(state="same_as_head")
+    return CandidateUnderstandingRef(
+        state="newer_than_head",
+        session_id=newer["session_id"],
+        revision_id=newer["id"],
+    )
 
 
 def load_snapshot_commit(
@@ -1845,12 +2009,27 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
         }
 
         session_id = None
+        canonical_ref = CanonicalUnderstandingRef(source="unavailable")
+        candidate_ref = CandidateUnderstandingRef(state="none")
         try:
-            session_id = _latest_interview_session_id(conn, system_id)
+            canonical_ref = resolve_canonical_understanding(conn, system_id)
+            candidate_ref = resolve_candidate_understanding(
+                conn, system_id, canonical_ref
+            )
+            session_id = canonical_ref.session_id
         except Exception as exc:  # pragma: no cover - defensive
             availability["session"] = False
             _degrade(result, "brief", exc, detail_key="brief.session")
-        result.interview_session_id = session_id
+        result.understanding_source = (
+            canonical_ref.source if availability["session"] else "unavailable"
+        )
+        result.canonical_revision_id = canonical_ref.revision_id
+        result.canonical_head_version = canonical_ref.head_version
+        result.candidate_state = candidate_ref.state
+        result.candidate_session_id = candidate_ref.session_id
+        # Deep links land on the conversation that owns the canonical content
+        # when there is one, and otherwise on the one the developer will open.
+        result.interview_session_id = session_id or candidate_ref.session_id
 
         latest_ready = None
         latest_snapshot_status = None
@@ -1868,15 +2047,59 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
             latest_ready_at = latest_ready["completed_at"] or latest_ready["created_at"]
 
         brief = None
-        if availability["session"]:
+        candidate_brief = None
+        brief_readable = availability["session"]
+        if availability["session"] and canonical_ref.source == "canonical_head":
             try:
+                # Issue #464: the canonical Brief is built from the PROMOTED
+                # content, never from a session's live `current_understanding`.
+                # Otherwise an unconfirmed rebuild in the head's own session
+                # would change what the Overview reports as settled -- the
+                # acceptance condition 「Interview の未確認結果が Overview の
+                # canonical Understanding を直接変更しない」.
                 brief = understanding_brief.build_understanding_brief(
-                    conn, system_id, session_id, now=now
+                    conn,
+                    system_id,
+                    session_id,
+                    now=now,
+                    understanding_override=canonical_ref.understanding,
+                    revision_id_override=canonical_ref.revision_id,
+                    intent_override=canonical_ref.intent_items or {},
                 )
                 result.brief = brief
-                result.snapshot_id = brief.snapshot_id
             except Exception as exc:  # pragma: no cover - defensive
+                brief_readable = False
                 _degrade(result, "brief", exc)
+        if availability["session"]:
+            try:
+                # The in-progress work, read from the session itself. It is a
+                # SEPARATE value from the canonical Brief and never replaces
+                # it: 「まだ誰も確定していない」 and 「これがこの System の
+                # 理解である」 are two different claims.
+                #
+                # Computed even with no session at all, because
+                # `build_understanding_brief(None)` is the honest "nothing has
+                # been built yet" answer -- a READ that succeeded. The rule
+                # table needs that distinction: 「まだ作っていない」 must still
+                # produce 「システムを理解する」, while 「読めなかった」 must
+                # produce no action at all (#380).
+                candidate_brief = understanding_brief.build_understanding_brief(
+                    conn, system_id, candidate_ref.session_id, now=now
+                )
+                # Exposed only for the two states that actually name a
+                # candidate. `same_as_head` means there is nothing in
+                # progress, so a Brief under 「進行中の候補」 would be either
+                # noise or -- worse -- someone else's content.
+                if candidate_ref.state in ("unpromoted", "newer_than_head"):
+                    result.candidate_brief = candidate_brief
+            except Exception as exc:  # pragma: no cover - defensive
+                brief_readable = False
+                _degrade(result, "brief", exc)
+        # The analysis 断面 qualifies whatever the page shows, canonical or
+        # not, so it is read from whichever Brief exists.
+        context_brief = brief or candidate_brief
+        if context_brief is not None:
+            result.snapshot_id = context_brief.snapshot_id
 
         if result.snapshot_id is not None:
             try:
@@ -1901,8 +2124,10 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
             result.snapshot_freshness = "current"
         else:
             result.snapshot_freshness = "stale"
-        result.understanding_revision_id = getattr(brief, "revision_id", None)
-        result.understanding_confirmed_at = getattr(brief, "confirmed_at", None)
+        result.understanding_revision_id = getattr(context_brief, "revision_id", None)
+        result.understanding_confirmed_at = getattr(
+            context_brief, "confirmed_at", None
+        )
 
         # The interview workflow's canonical engine is reused, but only its
         # PURE half. `evaluate_session_workflow` persists the workflow
@@ -1964,8 +2189,24 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
         # separate reads a request apart.
         if availability["session"]:
             try:
+                # Issue #464: when a head exists the Purpose Frame is a
+                # CANONICAL projection too -- same frozen claims, same frozen
+                # Intent. Without the overrides it re-read the promoting
+                # session's live Intent rows, so correcting a goal there moved
+                # the Overview's 望ましい変化 with no promotion at all.
                 result.purpose_chain = purpose_chain.derive_purpose_chain(
-                    conn, system_id, session_id, now=now
+                    conn,
+                    system_id,
+                    session_id if canonical_ref.source == "canonical_head"
+                    else candidate_ref.session_id,
+                    now=now,
+                    understanding_override=canonical_ref.understanding,
+                    revision_id_override=canonical_ref.revision_id,
+                    intent_override=(
+                        canonical_ref.intent_items or {}
+                        if canonical_ref.source == "canonical_head"
+                        else None
+                    ),
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 _degrade(result, "purpose_chain", exc)
@@ -1999,8 +2240,15 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
         # writes nothing (`build_objective_overview` calls no persisting
         # function), matching #380's rule for every other Overview section.
         try:
+            # Issue #464: the Objective section asks 「次に何を決めるべきか」,
+            # which is about the work in progress -- so it reads the same
+            # `context_brief` the next-action table does. Handing it `None`
+            # because nothing has been PROMOTED yet would report an unreadable
+            # Vision on a System whose Vision was read perfectly well, and the
+            # section would answer `unavailable` instead of 「Vision を確定
+            # する」.
             result.objective = product_objective_projection.build_objective_overview(
-                conn, system_id, brief, now=now
+                conn, system_id, context_brief if brief_readable else None, now=now
             )
         except Exception as exc:  # pragma: no cover - defensive
             _degrade(result, "objective", exc)
@@ -2045,13 +2293,10 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 decided_experiment_exists = loaded
 
         try:
-            if brief is None:
-                # Without the Brief there is no baseline, so no finding could
-                # be honestly labelled `new` or `ongoing` -- and every
-                # Brief-derived finding is missing anyway. Reporting
-                # `unavailable` is the whole answer; the Runtime section still
-                # renders on its own.
-                raise _BriefUnavailable()
+            # Order matters: a genuine read failure outranks "nothing has been
+            # promoted yet". Both produce an empty finding list, but only one
+            # of them is a statement about this System -- and reporting a
+            # broken read as 「まだ確定していない」 would hide the breakage.
             if not all(
                 (
                     availability["session"],
@@ -2065,6 +2310,20 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
                 )
             ):
                 raise _FindingsUnavailable()
+            if brief is None and canonical_ref.source == "not_promoted":
+                # Issue #464: nothing has been promoted, so there is no
+                # canonical claim to compare anything against. That is a real
+                # answer about this System -- NOT a failure to read one, which
+                # is what `unavailable` means. Collapsing the two would tell a
+                # developer who has simply not finished yet that the page broke.
+                raise _NothingPromoted()
+            if brief is None:
+                # Without the Brief there is no baseline, so no finding could
+                # be honestly labelled `new` or `ongoing` -- and every
+                # Brief-derived finding is missing anyway. Reporting
+                # `unavailable` is the whole answer; the Runtime section still
+                # renders on its own.
+                raise _BriefUnavailable()
             result.findings, result.finding_statuses, result.findings_state = _findings(
                 brief=brief,
                 gathered=gathered,
@@ -2080,6 +2339,10 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
             result.findings_initial_count = min(
                 len(result.findings), INITIAL_FINDING_LIMIT
             )
+        except _NothingPromoted:
+            result.findings = []
+            result.finding_statuses = []
+            result.findings_state = "not_compared"
         except _BriefUnavailable:
             result.findings = []
             result.finding_statuses = []
@@ -2107,7 +2370,17 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
         # developer; 「読めなかった」 is a claim about this request. Collapsing
         # them told a System whose Brief happened to fail that its developer
         # had never confirmed anything.
-        if brief is None:
+        if (
+            brief is None
+            and canonical_ref.source == "not_promoted"
+            and result.findings_state != "unavailable"
+        ):
+            result.findings_baseline_state = "no_baseline"
+            result.findings_baseline_at = None
+            result.findings_baseline_label = (
+                "正準 Understanding がまだ確定していないため、比較の基準がありません"
+            )
+        elif brief is None:
             result.findings_baseline_state = "unavailable"
             result.findings_baseline_at = None
             result.findings_baseline_label = (
@@ -2132,8 +2405,14 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
             repository_configured=repository_configured,
             latest_snapshot_status=latest_snapshot_status,
             ready_snapshot_exists=result.latest_ready_snapshot_id is not None,
+            # Issue #464: 「次にやること」 is about the work in progress, so
+            # with nothing promoted it follows the CANDIDATE. The canonical
+            # display stays empty either way -- what to do next and what is
+            # settled are two different questions.
             readiness_state=(
-                brief.readiness_state if brief is not None else "not_built"
+                context_brief.readiness_state
+                if context_brief is not None
+                else "not_built"
             ),
             workflow_state=workflow_state,
             interview_session_id=session_id,
@@ -2157,7 +2436,7 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
             pending_instrumentation_publish=pending_instrumentation_publish,
             completed_variant_run_exists=variant_count > 0,
             decided_experiment_exists=decided_experiment_exists,
-            brief_available=brief is not None,
+            brief_available=context_brief is not None and brief_readable,
             runtime_available=result.runtime is not None,
             workflow_available=gathered is not None,
             repository_available=availability["repository"],

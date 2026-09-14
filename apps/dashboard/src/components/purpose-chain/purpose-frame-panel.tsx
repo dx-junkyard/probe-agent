@@ -1,7 +1,7 @@
 // Issue #390 §3.2: Interview Level 1 — the full Purpose Chain panel.
 //
 // The 3 frame elements and their relations, in vertical semantic order (a
-// graph is never forced — `docs/purpose-chain.md` §3.2 and the accessibility
+// graph is never forced — `docs/01-specifications/product/purpose-chain.md` §3.2 and the accessibility
 // contract §3.4 both require heading order = causal order and relations not
 // conveyed by arrows/lines alone). Each element shows statement / confirmation
 // / provenance / relation status / source revision / evidence / staleness;

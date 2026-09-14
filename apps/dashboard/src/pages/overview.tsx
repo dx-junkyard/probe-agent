@@ -10,7 +10,11 @@ import { SystemBriefCard } from "@/components/overview/system-brief";
 import { targetHref } from "@/components/overview/display";
 import { PurposeFrameCard } from "@/components/purpose-chain/purpose-frame-card";
 import { formatTimestamp } from "@/lib/utils";
-import type { OverviewOut, OverviewSnapshotFreshness } from "@/api/types";
+import type {
+  OverviewOut,
+  OverviewSnapshotFreshness,
+  UnderstandingSource,
+} from "@/api/types";
 
 // Issue #380: the Overview is the System Intelligence Brief / decision
 // cockpit, not a metrics screen.
@@ -215,6 +219,15 @@ const SNAPSHOT_FRESHNESS_LABEL: Record<OverviewSnapshotFreshness, string> = {
   unavailable: "断面を特定できません",
 };
 
+// Issue #464: 表示されている Understanding が「誰かが正準として確定したもの」
+// なのか「まだ誰も確定していない最新の会話の途中経過」なのかを言い分ける固定
+// 文言。`latest_session` を正準のように見せないことがこの表示の目的。
+const UNDERSTANDING_SOURCE_LABEL: Record<UnderstandingSource, string> = {
+  canonical_head: "正準",
+  not_promoted: "未確定(正準はまだありません)",
+  unavailable: "特定できません",
+};
+
 /**
  * The first-view System context.
  *
@@ -275,10 +288,20 @@ function PageHeading({
           </div>
           <div className="flex gap-1">
             <dt>理解リビジョン</dt>
-            <dd className="text-foreground">
+            <dd
+              className="text-foreground"
+              data-understanding-source={overview.understanding_source}
+            >
               {overview.understanding_revision_id != null
                 ? `#${overview.understanding_revision_id}`
                 : "未構築"}
+              {/* Issue #464: どの規則でこの内容になったかは、内容と同じくらい
+                  重要な事実。正準として昇格されたものと、まだ誰も確定して
+                  いない最新セッションの途中経過は別の主張であり、同じ文言で
+                  見せてはならない (#366)。 */}
+              <span className="ml-1">
+                （{UNDERSTANDING_SOURCE_LABEL[overview.understanding_source]}）
+              </span>
             </dd>
           </div>
           <div className="flex gap-1">

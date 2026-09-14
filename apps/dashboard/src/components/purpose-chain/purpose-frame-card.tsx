@@ -1,6 +1,6 @@
 // Issue #390 §3.1: Overview Level 0 — the Purpose Frame.
 //
-// Leads the main column, above System Brief (`docs/purpose-chain.md` §3.1):
+// Leads the main column, above System Brief (`docs/01-specifications/product/purpose-chain.md` §3.1):
 // the Epic's question 「何のためのシステムか」 must be answerable before
 // anything else on the page. Three elements in causal order, then AT MOST
 // ONE contextual question — never a list, never a completion percentage,

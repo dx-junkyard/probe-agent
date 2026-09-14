@@ -1,6 +1,6 @@
 """Functional Lineage View API (Issue #424, Epic #418).
 
-`docs/stakeholder-value-network.md` §9/§10 is the endpoint contract. This is
+`docs/01-specifications/product/stakeholder-value-network.md` §9/§10 is the endpoint contract. This is
 a single read-only endpoint over `app.functional_lineage.
 build_functional_lineage`'s deterministic projection -- it writes nothing
 (GET never mutates state, invariant 9 / #382's rule), calls no LLM, and

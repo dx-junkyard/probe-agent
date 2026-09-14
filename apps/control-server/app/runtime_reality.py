@@ -51,7 +51,7 @@ DEFAULT_MAX_CHARS = 8_000
 MAX_RUNTIME_QUESTIONS = 5
 
 # Issue #290: how long a runtime fact stays 'fresh' before the provenance
-# envelope marks it 'stale'. Documented in docs/project-intelligence.md's
+# envelope marks it 'stale'. Documented in docs/90-history/project-intelligence.md's
 # Issue #290 section. Default 7 days (matches the existing runtime-reality
 # aggregation window default, but is a separate, independently overridable
 # setting -- the aggregation window controls WHAT is aggregated, this

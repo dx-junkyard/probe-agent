@@ -1,6 +1,6 @@
 """Stakeholder Value Network API (Issue #422, Epic #418).
 
-`docs/stakeholder-value-network.md` §7.1/§10 is the endpoint contract. This
+`docs/01-specifications/product/stakeholder-value-network.md` §7.1/§10 is the endpoint contract. This
 is a single read-only endpoint over `app.stakeholder_value_network.
 build_value_network`'s deterministic projection -- it writes nothing (GET
 never mutates state, invariant 9 / #382's rule), calls no LLM, and accepts

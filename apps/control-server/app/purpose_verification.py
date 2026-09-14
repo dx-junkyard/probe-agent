@@ -1,7 +1,7 @@
 """Purpose Verification: Experience Hypothesis / Outcome Criterion / Reuse
 Hypothesis (Issue #391, the 4th and final sub-issue of Epic #387).
 
-`docs/purpose-chain.md` §4 is the design contract this module implements.
+`docs/01-specifications/product/purpose-chain.md` §4 is the design contract this module implements.
 The Purpose Chain (#388) and Purpose Needs (#389) modules describe and
 diagnose the causal chain from 対象者と現在の課題 down to Capabilities; this
 module is the layer §0's diagram marks "必要時のみ": three OPTIONAL concepts

@@ -1,7 +1,7 @@
 """Tests for Issue #431 -- Product Feature: identity, revisions, links
 (Epic #427).
 
-`docs/product-objective-lineage.md` §7.2 / §8 / §10 / §12 is the contract
+`docs/01-specifications/product/product-objective-lineage.md` §7.2 / §8 / §10 / §12 is the contract
 this file is organized around. Coverage (per the task brief):
 
 1. `feature_key` required / conflict.

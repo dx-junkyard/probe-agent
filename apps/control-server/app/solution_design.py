@@ -1,7 +1,7 @@
 """Solution Design: Requirement -> Solution Design -> Flow / Node / Cell
 (Epic #405 / UX Design Lineage, Issue #408).
 
-The canonical contract is `docs/ux-design-lineage.md` §3 (read it in full
+The canonical contract is `docs/01-specifications/ux/ux-design-lineage.md` §3 (read it in full
 before touching this file). This module is deterministic end to end -- it
 calls no reasoning model anywhere (Principle 6). What it owns:
 

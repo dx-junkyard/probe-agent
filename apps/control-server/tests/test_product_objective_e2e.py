@@ -1,7 +1,7 @@
 """E2E verification for Epic #427 (Product Objective / Milestone / Gap),
 Issue #433.
 
-`docs/product-objective-lineage.md` SS11/SS12 (plus SS0/SS6) is the canonical
+`docs/01-specifications/product/product-objective-lineage.md` SS11/SS12 (plus SS0/SS6) is the canonical
 contract this file verifies against the ALREADY IMPLEMENTED #428-#432 code
 (`app/product_objective.py`, `app/product_gap_sources.py`,
 `app/product_feature.py`, `app/product_objective_projection.py`,

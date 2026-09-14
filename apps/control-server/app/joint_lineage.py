@@ -127,7 +127,9 @@ class LineageEvent:
     subject_kind: str
     subject_id: int
     system_id: int
-    session_id: int
+    # Issue #461: `None` for a discussion-scope session, which has no owning
+    # Interview session id to report.
+    session_id: Optional[int]
     joint_understanding_id: int
     at: float
     supersedes_subject_id: Optional[int] = None
@@ -140,7 +142,7 @@ class SessionBurden:
 
     joint_understanding_id: int
     system_id: int
-    session_id: int
+    session_id: Optional[int]
     rounds: int = 0
     developer_actions: int = 0
     developer_findings: int = 0

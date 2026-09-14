@@ -1,7 +1,7 @@
 """Stakeholder Value Network API: Stakeholder / Need / Environment
 Observation / Value Exchange (Issue #420, Epic #418).
 
-`docs/stakeholder-value-network.md` §10 is the endpoint contract this module
+`docs/01-specifications/product/stakeholder-value-network.md` §10 is the endpoint contract this module
 implements against `app/stakeholder_network.py`'s deterministic domain
 service. What this boundary deliberately does NOT do:
 

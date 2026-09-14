@@ -149,7 +149,7 @@ answer・correct を保存すると、`app/interview_refresh.py` が
 Understanding / Alignment / Review Queue の自動更新ジョブ
 (`interview_refresh_job`)を enqueue する。手動の
 `POST /interview/sessions/{id}/update-understanding` は障害復旧・診断用
-として残る。詳細は `docs/project-intelligence.md` の
+として残る。詳細は `docs/90-history/project-intelligence.md` の
 「回答バッチ後の自動更新(Issue #288)」を参照。
 
 ### Control Server の実行モデル

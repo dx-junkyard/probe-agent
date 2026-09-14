@@ -68,7 +68,7 @@ function entryFixture(helpId: string, overrides: Partial<UiHelpEntry> = {}): UiH
     title: `title:${helpId}`,
     summary: `summary:${helpId}`,
     usage: `usage:${helpId}`,
-    doc_refs: [{ doc_path: "docs/system-understanding-navigation.md", title: `doc:${helpId}`, anchor: "" }],
+    doc_refs: [{ doc_path: "docs/01-specifications/ux/system-understanding-navigation.md", title: `doc:${helpId}`, anchor: "" }],
     related_actions: [],
     related_help_ids: [],
     registry_version: "ui-help-v1",
@@ -192,7 +192,7 @@ describe("Selecting and explaining a target (Issue #440 AC1/AC2/AC4)", () => {
     // AC2: the documentation source is visible, including its path.
     const docRefs = screen.getByTestId("help-mode-doc-refs");
     expect(docRefs.textContent).toContain("doc:overview.brief.vision");
-    expect(docRefs.textContent).toContain("docs/system-understanding-navigation.md");
+    expect(docRefs.textContent).toContain("docs/01-specifications/ux/system-understanding-navigation.md");
 
     // The element's own normal action (its onClick) must NOT have fired.
     expect(onNestedClick).not.toHaveBeenCalled();

@@ -1,6 +1,6 @@
 """Product Objective / Milestone API (Issue #429, Epic #427).
 
-`docs/product-objective-lineage.md` §10 is the endpoint contract this module
+`docs/01-specifications/product/product-objective-lineage.md` §10 is the endpoint contract this module
 implements against `app/product_objective.py`'s deterministic domain
 service. Follows `routes/ux_design.py` exactly:
 

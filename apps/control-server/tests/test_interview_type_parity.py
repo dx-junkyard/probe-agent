@@ -49,6 +49,15 @@ INTERVIEW_CONTRACT_PREFIXES = (
 # ``typeof INTERVIEW_INTENT_FIELDS[number]`` recursively.
 FINITE_TYPE_NAMES = (
     "ValueNetworkNoticeCode",
+    # Issue #464: the canonical-head / premise vocabularies. A bare `str` on
+    # either side puts no enum in the schema and lets the union drift.
+    "InterviewPremiseState",
+    "InterviewPremiseReasonCode",
+    "InterviewPremiseDisposition",
+    "UnderstandingRevisionStatus",
+    "UnderstandingPromotionRejection",
+    "UnderstandingCanonicalEventKind",
+    "UnderstandingSource",
     "AlignmentConfidence",
     "AlignmentDecisionAction",
     "AlignmentItemStatus",
@@ -224,7 +233,7 @@ FINITE_TYPE_NAMES = (
     # Epic #427 (Issues #429-#432): Product Objective / Milestone / Gap's
     # finite vocabularies. Same drift risk as every family above -- and
     # unusually high stakes here, because §0 invariant 7 of
-    # docs/product-objective-lineage.md structurally forbids a numeric
+    # docs/01-specifications/product/product-objective-lineage.md structurally forbids a numeric
     # priority/severity/completeness/confidence field anywhere in this
     # Epic's responses. The only way `priority_band` or `lifecycle` stays a
     # human-placed finite choice instead of quietly regrowing a score is if

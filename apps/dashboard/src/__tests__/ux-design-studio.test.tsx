@@ -1,13 +1,13 @@
 /// <reference types="vitest/globals" />
 // Issue #409 (Epic #405): UX Design Studio tests.
 //
-// `docs/ux-design-lineage.md` §0 invariant 9 is the thing every test here
+// `docs/01-specifications/ux/ux-design-lineage.md` §0 invariant 9 is the thing every test here
 // ultimately protects: the client re-derives no state. Everything below
 // exercises what the Studio does with values the server already decided --
 // never a computation the Studio performs itself (that discipline lives in
 // `model.ts` and is unit-tested directly at the bottom of this file).
 
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
@@ -34,11 +34,20 @@ class ApiError extends Error {
   status: number;
   detail: string;
   code?: string;
-  constructor(status: number, detail: string, code?: string) {
+  // Issue #451 (`docs/01-specifications/capabilities/ai-discussion-adapter.md` §2.8.1): mirrors the real
+  // `src/api/client.ts` `ApiError`'s two added fields so tests can exercise
+  // the field_path/section-driven inline diagnostics. `""` (never
+  // `undefined`) is the "no specific field" default, matching the real
+  // class.
+  fieldPath: string;
+  section: string;
+  constructor(status: number, detail: string, code?: string, fieldPath = "", section = "") {
     super(detail);
     this.status = status;
     this.detail = detail;
     this.code = code;
+    this.fieldPath = fieldPath;
+    this.section = section;
   }
 }
 
@@ -1145,4 +1154,286 @@ describe("Requirement -> Feature の対応づけ", () => {
     // form whose options are a lower bound.
     expect(screen.queryByTestId("ux-requirement-feature-link-form")).toBeNull();
   });
+});
+
+// --- Issue #451 (`docs/01-specifications/capabilities/ai-discussion-adapter.md` §2.8): real forms wired to
+// domain validation diagnostics -----------------------------------------------
+//
+// Every case below drives the REAL Journey/Requirement/Solution Design forms
+// through a rejected save and checks the three things §2.8 requires: a
+// known field_path attaches inline to the exact field (input value kept,
+// clears on edit); a field_path this form does not render becomes a
+// section-scoped whole-form diagnostic instead of vanishing or attaching to
+// the wrong input; and a fresh target's form carries none of a previous
+// target's diagnostic.
+
+describe("実フォームの validation error 接続 (#451)", () => {
+  test("known field への診断は該当 field の直下に表示され、入力は保持され、編集で解除される", async () => {
+    mockGet({
+      "/ux-design/journeys": journeyListOut([journeyOut({ journey_key: "checkout-to-be" })]),
+      "/ux-design/journeys/checkout-to-be": journeyDetailOut(),
+    });
+    mockApi.post.mockRejectedValueOnce(
+      new ApiError(422, "タイトルが不正です。", "some_code", "title", ""),
+    );
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("ux-journey-item-checkout-to-be"));
+    fireEvent.click(await screen.findByRole("button", { name: "版を追加する" }));
+
+    const titleInput = screen.getByPlaceholderText("タイトル") as HTMLInputElement;
+    fireEvent.change(titleInput, { target: { value: "新しいタイトル" } });
+    fireEvent.click(screen.getByRole("button", { name: "版を保存する" }));
+
+    expect(await screen.findByText("タイトルが不正です。")).toBeInTheDocument();
+    // 入力はエラー後もリセットされない。
+    expect(titleInput.value).toBe("新しいタイトル");
+    // known field の診断はフォーム全体のバナーではなく field 直下に出る。
+    expect(screen.queryByTestId("ux-journey-revision-form-error")).toBeNull();
+
+    // 編集するとその field の診断だけが解除される。
+    fireEvent.change(titleInput, { target: { value: "さらに編集" } });
+    expect(screen.queryByText("タイトルが不正です。")).toBeNull();
+  });
+
+  test("このフォームが持たない field_path はフォーム全体(該当 section)のエラーとして表示される", async () => {
+    mockGet({
+      "/ux-design/journeys": journeyListOut([journeyOut({ journey_key: "checkout-to-be" })]),
+      "/ux-design/journeys/checkout-to-be": journeyDetailOut(),
+    });
+    // journey_step_key_duplicated names `step_key` -- a real code the server
+    // returns for this exact endpoint, but the top-level Journey fields do
+    // not include a `step_key` input (§2.8.2).
+    mockApi.post.mockRejectedValueOnce(
+      new ApiError(
+        422, "同じ revision 内に同じ step_key(dup) が指定されています。",
+        "journey_step_key_duplicated", "step_key", "steps",
+      ),
+    );
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("ux-journey-item-checkout-to-be"));
+    fireEvent.click(await screen.findByRole("button", { name: "版を追加する" }));
+    fireEvent.click(screen.getByRole("button", { name: "版を保存する" }));
+
+    const stepsError = await screen.findByTestId("ux-journey-steps-form-error");
+    expect(within(stepsError).getByText(/step_key\(dup\)/)).toBeInTheDocument();
+    // Not attached to the top-level fields' own banner slot.
+    expect(screen.queryByTestId("ux-journey-revision-form-error")).toBeNull();
+  });
+
+  test("対象を切り替えると古い診断を引き継がない", async () => {
+    const first = journeyOut({ id: 1, journey_key: "journey-a" });
+    const second = journeyOut({ id: 2, journey_key: "journey-b" });
+    mockGet({
+      "/ux-design/journeys": journeyListOut([first, second]),
+      "/ux-design/journeys/journey-a": journeyDetailOut({ id: 1, journey_key: "journey-a" }),
+      "/ux-design/journeys/journey-b": journeyDetailOut({ id: 2, journey_key: "journey-b" }),
+    });
+    mockApi.post.mockRejectedValueOnce(new ApiError(422, "タイトルが不正です。", "some_code", "title", ""));
+    await renderPage();
+
+    fireEvent.click(await screen.findByTestId("ux-journey-item-journey-a"));
+    fireEvent.click(await screen.findByRole("button", { name: "版を追加する" }));
+    fireEvent.click(screen.getByRole("button", { name: "版を保存する" }));
+    expect(await screen.findByText("タイトルが不正です。")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("ux-journey-item-journey-b"));
+    await screen.findByTestId("ux-journey-detail");
+    fireEvent.click(screen.getByRole("button", { name: "版を追加する" }));
+    // journey-b's revision form is a fresh instance (remounted by
+    // `key={selectedKey}`) -- it must not display journey-a's diagnostic.
+    expect(screen.queryByText("タイトルが不正です。")).toBeNull();
+    expect(screen.queryByTestId("ux-journey-revision-form-error")).toBeNull();
+  });
+
+  test("Requirement の受入条件エラーは受入条件セクションに、field エラーはその field 直下に出る", async () => {
+    const requirement = requirementOut({ id: 10, requirement_key: "single-page-checkout" });
+    mockGet({
+      "/ux-design/requirements": requirementListOut([requirement]),
+      "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+      "/product-features": productFeatureListOut([]),
+    });
+    mockApi.post.mockRejectedValueOnce(
+      new ApiError(422, "対象外の Requirement には受入条件を設定できません。", "out_of_scope_requirement_not_verifiable", "", "acceptance_criteria"),
+    );
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+    fireEvent.click(await screen.findByTestId("ux-requirement-item-single-page-checkout"));
+    fireEvent.click(await screen.findByRole("button", { name: "版を追加する" }));
+
+    const statementInput = screen.getByPlaceholderText("要件の文") as HTMLTextAreaElement;
+    fireEvent.change(statementInput, { target: { value: "受入条件を追加してみる" } });
+    fireEvent.click(screen.getByRole("button", { name: "版を保存する" }));
+
+    const criteriaError = await screen.findByTestId("ux-requirement-criteria-form-error");
+    expect(within(criteriaError).getByText("対象外の Requirement には受入条件を設定できません。")).toBeInTheDocument();
+    // No specific field named -> never attached to `statement`, and the
+    // input keeps what the developer typed.
+    expect(screen.queryByTestId("ux-requirement-revision-form-error")).toBeNull();
+    expect(statementInput.value).toBe("受入条件を追加してみる");
+  });
+
+  test("Requirement 作成の key エラーは journey_key 入力の直下に出て、値は保持される", async () => {
+    mockGet({
+      "/ux-design/requirements": requirementListOut([]),
+      "/product-features": productFeatureListOut([]),
+    });
+    mockApi.post.mockRejectedValueOnce(
+      new ApiError(409, "同じ key が既にこの System に存在します。", "ux_design_key_conflict", "", ""),
+    );
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+
+    const keyInput = await screen.findByPlaceholderText("requirement_key(例: checkout-single-page)");
+    fireEvent.change(keyInput, { target: { value: "dup-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Requirement を作成する" }));
+
+    expect(await screen.findByTestId("ux-requirement-create-form-error")).toHaveTextContent(
+      "同じ key が既にこの System に存在します。",
+    );
+    expect((keyInput as HTMLInputElement).value).toBe("dup-key");
+  });
+
+  test("Solution Design の Option 追加は option_key エラーをその field 直下に出す", async () => {
+    const design = solutionDesignOut({ id: 20, design_key: "design-a" });
+    mockGet({
+      "/solution-designs": solutionDesignListOut([design]),
+      "/solution-designs/design-a": solutionDesignDetailOut({ id: 20, design_key: "design-a" }),
+    });
+    // Trigger the diagnostic while satisfying the client's own non-empty
+    // guard on `option_key` (so the button is enabled and a save actually
+    // happens) -- the server rejection is otherwise the exact same shape
+    // `solution_design_option_key_required` carries.
+    mockApi.post.mockRejectedValueOnce(
+      new ApiError(422, "option_key の形式が不正です。", "solution_design_option_key_required", "option_key", "options"),
+    );
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-solutions"));
+    fireEvent.click(await screen.findByTestId("ux-solution-design-item-design-a"));
+    fireEvent.click(await screen.findByRole("button", { name: "Option を追加する" }));
+
+    const form = screen.getByTestId("ux-solution-design-add-option-form");
+    fireEvent.change(within(form).getByPlaceholderText("option_key"), { target: { value: "bad key" } });
+    const titleInput = within(form).getByPlaceholderText("タイトル");
+    fireEvent.change(titleInput, { target: { value: "候補タイトル" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Option を追加する" }));
+
+    expect(await within(form).findByText("option_key の形式が不正です。")).toBeInTheDocument();
+    expect(within(form).queryByTestId("ux-solution-design-add-option-form-error")).toBeNull();
+    expect((titleInput as HTMLInputElement).value).toBe("候補タイトル");
+  });
+
+  test("Solution Design の実装対象リンクは flow_target_requires_snapshot を captured_snapshot_id 直下に出す", async () => {
+    // The default fixture already carries one option ("opt-a"), which is
+    // what makes `optionKeys.length > 0` render the 実装対象への紐づけ
+    // section at all.
+    mockGet({
+      "/solution-designs": solutionDesignListOut([solutionDesignOut({ id: 20, design_key: "design-a" })]),
+      "/solution-designs/design-a": solutionDesignDetailOut({ id: 20, design_key: "design-a" }),
+    });
+    mockApi.post.mockRejectedValueOnce(
+      new ApiError(
+        422, "static_flow の link には captured_snapshot_id が必須です。",
+        "flow_target_requires_snapshot", "captured_snapshot_id", "target_links",
+      ),
+    );
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-solutions"));
+    fireEvent.click(await screen.findByTestId("ux-solution-design-item-design-a"));
+    fireEvent.click(await screen.findByRole("button", { name: "実装対象に紐づける" }));
+
+    const form = screen.getByTestId("ux-solution-design-add-target-link-form");
+    // `captured_snapshot_id`'s input only renders for target_kind ==
+    // "static_flow" -- select it before submitting so the field (and its
+    // inline diagnostic slot) exists to attach to.
+    const selects = within(form).getAllByRole("combobox");
+    fireEvent.change(selects[1], { target: { value: "static_flow" } });
+    fireEvent.change(within(form).getByPlaceholderText("target_ref"), { target: { value: "ep-1" } });
+    fireEvent.click(within(form).getByRole("button", { name: "紐づける" }));
+
+    expect(await within(form).findByText("static_flow の link には captured_snapshot_id が必須です。")).toBeInTheDocument();
+    expect(within(form).queryByTestId("ux-solution-design-add-target-link-form-error")).toBeNull();
+  });
+
+  test("再試行: 失敗後に修正して再送信すると成功し、診断が消える", async () => {
+    mockGet({
+      "/ux-design/journeys": journeyListOut([journeyOut({ journey_key: "checkout-to-be" })]),
+      "/ux-design/journeys/checkout-to-be": journeyDetailOut(),
+    });
+    mockApi.post
+      .mockRejectedValueOnce(new ApiError(422, "タイトルが不正です。", "some_code", "title", ""))
+      .mockResolvedValueOnce(journeyDetailOut());
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("ux-journey-item-checkout-to-be"));
+    fireEvent.click(await screen.findByRole("button", { name: "版を追加する" }));
+
+    const titleInput = screen.getByPlaceholderText("タイトル") as HTMLInputElement;
+    fireEvent.click(screen.getByRole("button", { name: "版を保存する" }));
+    expect(await screen.findByText("タイトルが不正です。")).toBeInTheDocument();
+
+    // 修正して再送信する。同じ試行の中で domain は一切変わっていない
+    // (POST は 1 回しか成功していない -- 2 回目の呼び出しでようやく成功する)。
+    fireEvent.change(titleInput, { target: { value: "修正後のタイトル" } });
+    expect(screen.queryByText("タイトルが不正です。")).toBeNull(); // 編集で解除される
+    fireEvent.click(await screen.findByRole("button", { name: "版を保存する" }));
+
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("タイトルが不正です。")).toBeNull();
+  });
+});
+
+
+describe("PR #462 prefill acceptance audit", () => {
+  test("open request mounts the real form, consumes keyed criteria once, and saves only on click", async () => {
+    const inbox = await import("@/lib/form-draft-inbox");
+    mockGet({
+      "/ux-design/requirements": requirementListOut([requirementOut()]),
+      "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+    });
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+    fireEvent.click(await screen.findByTestId("ux-requirement-item-single-page-checkout"));
+    await screen.findByTestId("ux-requirement-detail");
+    expect(screen.queryByTestId("ux-requirement-revision-form")).toBeNull();
+    act(() => inbox.requestFormDraftOpen("ux_requirement.revision", "single-page-checkout"));
+    await screen.findByTestId("ux-requirement-revision-form");
+    const patch: import("@/lib/form-draft-inbox").FormDraftPatch = {
+      patchToken: "audit-criteria-once", targetKind: "ux_requirement", targetRef: "single-page-checkout",
+      formId: "ux_requirement.revision", selectedItemRef: "", fields: [], relations: [],
+      childOps: [{ childKind: "acceptance_criterion", childKey: "reserved-42", intent: "add", order: 2,
+        fields: [{ fieldName: "statement", value: "候補を一度だけ追加" }] }],
+    };
+    await act(async () => { expect(await inbox.dispatchFormDraftPatchAndWaitForAck(patch)).toBe("acked"); });
+    await act(async () => { expect(await inbox.dispatchFormDraftPatchAndWaitForAck(patch)).toBe("acked"); });
+    expect(screen.getAllByDisplayValue("候補を一度だけ追加")).toHaveLength(1);
+    expect(screen.getByPlaceholderText("要件の文")).toHaveValue("1 画面で完了できる");
+    expect(mockApi.post).not.toHaveBeenCalled();
+    mockApi.post.mockResolvedValueOnce({});
+    fireEvent.click(screen.getByTestId("ux-requirement-revision-submit"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/ux-design/requirements/single-page-checkout/revisions",
+      expect.objectContaining({ acceptance_criteria: [expect.objectContaining({ criterion_key: "reserved-42", statement: "候補を一度だけ追加" })], save_request_id: expect.any(String) }),
+    ));
+  });
+});
+
+
+test("a late successful save preserves edits made while the request was pending", async () => {
+  const inbox = await import("@/lib/form-draft-inbox");
+  mockGet({
+    "/ux-design/requirements": requirementListOut([requirementOut()]),
+    "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+  });
+  await renderPage();
+  fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+  fireEvent.click(await screen.findByTestId("ux-requirement-item-single-page-checkout"));
+  await screen.findByTestId("ux-requirement-detail");
+  act(() => inbox.requestFormDraftOpen("ux_requirement.revision", "single-page-checkout"));
+  await screen.findByTestId("ux-requirement-revision-form");
+  let finish!: (value: object) => void;
+  mockApi.post.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  fireEvent.click(screen.getByTestId("ux-requirement-revision-submit"));
+  await waitFor(() => expect(finish).toBeDefined());
+  fireEvent.change(screen.getByPlaceholderText("要件の文"), { target: { value: "保存中の追加入力" } });
+  await act(async () => { finish({}); });
+  expect(screen.getByPlaceholderText("要件の文")).toHaveValue("保存中の追加入力");
 });

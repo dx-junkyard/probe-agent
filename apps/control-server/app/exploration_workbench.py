@@ -1,7 +1,7 @@
 """Exploration Workbench: comparing implementation MODALITIES against one
 Node contract (Issue #398, Phase 3 of the evolution control plane Epic #394).
 
-The canonical contract is `docs/evolutionary-pipeline.md`. Phase 3's question
+The canonical contract is `docs/01-specifications/capabilities/evolutionary-pipeline.md`. Phase 3's question
 is not "which LLM candidate is best" -- it is "for the SAME Node contract and
 the SAME evaluation refs, how do an LLM implementation, a rule implementation
 and a deterministic-code implementation compare". That question is only
@@ -1339,7 +1339,7 @@ def complete_run(
     winner would be exactly the automatic adoption this Epic forbids.
 
     Note what is deliberately NOT required: two or more distinct modalities.
-    `docs/evolutionary-pipeline.md` §8.3 makes cross-modality comparison the
+    `docs/01-specifications/capabilities/evolutionary-pipeline.md` §8.3 makes cross-modality comparison the
     PHASE's completion gate -- the capability must exist -- not a property
     every individual run must have. Comparing two variants of one modality
     (two prompts, two rule sets) is a legitimate exploration, and refusing it

@@ -1045,9 +1045,12 @@ def test_overview_on_a_bare_system(admin_client):
     assert body["next_action"]["reason"]
     assert body["next_action"]["completion_condition"]
     assert body["next_action"]["value"]
-    # No understanding, so no Vision and no comparison baseline.
-    assert body["brief"]["vision"] is None
-    assert body["brief"]["readiness_state"] == "not_built"
+    # Issue #464: nothing has been promoted, so the canonical slot is empty
+    # and says so -- it is never filled with a session's in-progress state.
+    assert body["brief"] is None
+    assert body["understanding_source"] == "not_promoted"
+    assert body["candidate_state"] == "none"
+    assert body["candidate_brief"] is None
     assert body["findings_state"] == "not_compared"
     assert body["findings_baseline_at"] is None
     assert body["findings_baseline_label"]
@@ -1207,10 +1210,12 @@ def test_a_failed_runtime_section_does_not_offer_a_connection_cta(
     body = admin_client.get("/overview", headers=_headers(token, system_id)).json()
     assert "runtime" in body["degraded_sections"]
     assert body["runtime"] is None
-    # The Brief still renders, and the understanding rows can still answer --
-    # this System genuinely has no understanding yet, and that fact was read
-    # successfully. Fail-closed removes guesses, not everything.
-    assert body["brief"] is not None
+    # The understanding rows can still answer -- this System genuinely has no
+    # understanding yet, and that fact was read successfully. Fail-closed
+    # removes guesses, not everything. The canonical slot stays empty because
+    # nothing has been promoted, which is a different fact from a failed read.
+    assert body["brief"] is None
+    assert body["understanding_source"] == "not_promoted"
     assert body["next_action"]["key"] == "build_understanding"
 
 
@@ -1413,8 +1418,11 @@ def test_one_failing_fact_loader_never_takes_down_the_page(
     assert "next_action" in body["degraded_sections"]
     assert any(key.startswith("next_action") for key in body["degraded_detail"])
 
-    # The independent sections still render -- that is the whole point.
-    assert body["brief"] is not None
+    # The independent sections still render -- that is the whole point. The
+    # canonical Understanding slot is empty because nothing has been promoted
+    # (#464), and it SAYS so rather than going blank or borrowing a session's
+    # in-progress state.
+    assert body["understanding_source"] == "not_promoted"
     assert body["runtime"] is not None
     assert body["loop_stages"]
 
@@ -1472,10 +1480,62 @@ def test_pre_section_read_failure_is_local_and_returns_200(
         "_runtime_checks",
     )
     if loader == "_runtime_checks":
-        assert body["brief"] is not None
+        assert body["understanding_source"] == "not_promoted"
         assert body["runtime"] is None
     else:
         assert body["degraded_sections"]
+
+
+def _promote_head(client, token, system_id, snapshot_id):
+    """Create a session, give it content, and promote it -- #464's human gate."""
+    import json as _json
+    import time as _time
+
+    from app.db import get_conn
+
+    headers = _headers(token, system_id)
+    session = client.post(
+        "/interview/sessions",
+        json={"snapshot_id": snapshot_id, "title": "promote"},
+        headers=headers,
+    )
+    assert session.status_code in (200, 201), session.text
+    session_id = session.json()["id"]
+    understanding = {
+        "vision": [],
+        "system_purpose": [{
+            "name": "P", "summary": "s",
+            "confidence": {"level": "likely", "reason": ""},
+            "evidence": [], "why_core": "",
+            "related_docs": [], "related_apis": [], "children": [],
+        }],
+        "core_capabilities": [{
+            "name": "C", "summary": "s",
+            "confidence": {"level": "likely", "reason": ""},
+            "evidence": [], "why_core": "",
+            "related_docs": [], "related_apis": [], "children": [],
+        }],
+        "capability_elements": [], "supporting_elements": [],
+        "api_boundaries": [], "probe_flow_candidates": [],
+    }
+    with get_conn() as conn:
+        revision_id = conn.execute(
+            """INSERT INTO understanding_revision
+                   (session_id, system_id, snapshot_id, current_understanding,
+                    gap_analysis, created_at, status)
+               VALUES (?, ?, ?, ?, '[]', ?, 'candidate')""",
+            (
+                session_id, system_id, snapshot_id,
+                _json.dumps(understanding, ensure_ascii=False), _time.time(),
+            ),
+        ).lastrowid
+    promoted = client.post(
+        f"/interview/sessions/{session_id}/promote-understanding",
+        json={"revision_id": revision_id},
+        headers=headers,
+    )
+    assert promoted.status_code == 200, promoted.text
+    return session_id, revision_id
 
 
 @pytest.mark.parametrize("loader", ["load_snapshot_commit", "load_revision_created_at"])
@@ -1489,12 +1549,10 @@ def test_context_read_failure_does_not_blank_overview(
         "/repository", json={"repo_path": repo}, headers=_headers(token, system_id)
     )
     snapshot_id = _insert_snapshot(system_id, repo, sha)
-    session = admin_client.post(
-        "/interview/sessions",
-        json={"snapshot_id": snapshot_id, "title": "guard"},
-        headers=_headers(token, system_id),
-    )
-    assert session.status_code in (200, 201), session.text
+    # Promote a head first: the snapshot/revision context this test guards is
+    # read for the CANONICAL Understanding, which only exists after a human
+    # promotion (#464).
+    _promote_head(admin_client, token, system_id, snapshot_id)
 
     from app import overview_projection
 
@@ -1520,6 +1578,7 @@ def test_context_read_failure_does_not_blank_overview(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["brief"] is not None
+    assert body["understanding_source"] == "canonical_head"
     assert body["runtime"] is not None
     assert body["loop_stages"]
     assert body["degraded_sections"]
@@ -1586,19 +1645,31 @@ def test_a_failing_loader_does_not_affect_another_system(admin_client, tmp_path)
 def test_findings_baseline_distinguishes_unavailable_from_unconfirmed(
     admin_client, tmp_path, monkeypatch
 ):
-    """#382: 取得不能と未確認を混同しない。"""
+    """#382: 取得不能と未確認を混同しない。#464 が 3 つ目を足した。
+
+    「読めなかった」「正準がまだ無い」「正準はあるが確認していない」は 3 つの
+    別の答えで、それぞれ次の操作が違う。
+    """
     token = _login(admin_client)
     system_id = _create_system(admin_client, token, "Baseline")
     repo, sha = _init_repo(tmp_path, "repo-baseline")
     admin_client.put(
         "/repository", json={"repo_path": repo}, headers=_headers(token, system_id)
     )
-    _insert_snapshot(system_id, repo, sha)
+    snapshot_id = _insert_snapshot(system_id, repo, sha)
 
-    # Brief reads fine, nothing confirmed -> the developer HAS not confirmed.
+    # Nothing promoted -> there is no canonical claim to compare against, and
+    # the label says THAT rather than blaming the developer for not confirming.
     body = admin_client.get("/overview", headers=_headers(token, system_id)).json()
     assert body["findings_baseline_state"] == "no_baseline"
     assert body["findings_state"] == "not_compared"
+    assert "正準 Understanding がまだ確定していない" in body["findings_baseline_label"]
+
+    # A promoted head with no 確認 -> now it IS about the developer.
+    _promote_head(admin_client, token, system_id, snapshot_id)
+    body = admin_client.get("/overview", headers=_headers(token, system_id)).json()
+    assert body["understanding_source"] == "canonical_head"
+    assert body["findings_baseline_state"] == "no_baseline"
     assert "まだ理解を確認していない" in body["findings_baseline_label"]
 
     # Brief cannot be read -> we do not know whether they confirmed.

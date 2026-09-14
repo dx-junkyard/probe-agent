@@ -1,19 +1,19 @@
 // 音声対話 (Issue #441, Epic #436) Phase 1: provider-neutral な voice adapter。
 //
 // §0 / §4 の境界:
-// - 音声バイナリはブラウザの外へ一切出さない。STT/TTS はどちらもブラウザ内
-//   Web Speech API を直接叩くだけで、サーバへ音声を送る経路そのものが存在
-//   しない -- 「音声は永続保存されない」は、ここにネットワーク送信コードを
-//   一切書かないことで構造的に保証する (ポリシーではなく構造)。
+// - STT はブラウザの Web Speech API のままなので、録音音声を Control Server
+//   へ送信・保存しない。TTS は短いテキストだけを Control Server に送り、API
+//   key をブラウザへ露出せず OpenAI Speech API で生成した音声を再生する。
 // - 有限語彙 (Principle 6): `VoicePrerequisite` と `VoiceErrorReason` は
 //   どちらも小さく明示的な集合。`permission_denied` (マイクを拒否された) と
 //   `stt_failed` (認識処理自体が失敗した) は別の答えで、対応も異なるため
 //   決して 1 つに丸めない。
 // - このファイルは React 非依存。`assistant-voice.tsx` から状態機械として
 //   利用され、fake object を差し込むだけで単体テストできる。
-// - Phase 2 (WebSocket ストリーミング / VAD / barge-in / reconnect /
-//   コスト上限) はここでは実装しない。turn-based (発話 → 認識確定 → 応答)
-//   のみを扱う。
+// - WebSocket / VAD は使わない。再生中の「話を挟む」は音声取得・再生を即時
+//   cancel して次の turn の STT を始める、明示的な turn-based barge-in。
+
+import { api } from "@/api/client";
 
 /** ブラウザが音声対話を実行できる状態にあるか。 */
 export type VoicePrerequisite = "ready" | "insecure_context" | "unsupported";
@@ -99,7 +99,6 @@ type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
 interface VoiceGlobalWindow {
   SpeechRecognition?: SpeechRecognitionCtor;
   webkitSpeechRecognition?: SpeechRecognitionCtor;
-  speechSynthesis?: SpeechSynthesis;
   isSecureContext?: boolean;
 }
 
@@ -113,11 +112,6 @@ function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
   return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 }
 
-function hasSpeechSynthesis(): boolean {
-  const w = voiceWindow();
-  return !!w && typeof w.speechSynthesis !== "undefined";
-}
-
 /**
  * 現在のブラウザ/コンテキストが音声対話を実行できる状態かを判定する。
  * fail-closed: 何か 1 つでも欠けていれば `ready` にはしない。
@@ -127,11 +121,10 @@ export function voicePrerequisite(): VoicePrerequisite {
   if (!w) return "unsupported";
   if (w.isSecureContext === false) return "insecure_context";
   const hasStt = !!getSpeechRecognitionCtor();
-  const hasTts = hasSpeechSynthesis();
-  // Turn-based voice needs both halves of the pipeline.  Advertising voice
-  // mode when only recognition or only synthesis exists merely postpones an
-  // inevitable failure until after the user has started a turn.
-  if (!hasStt || !hasTts) return "unsupported";
+  // TTS is provided by the server-side OpenAI Speech API, so the browser only
+  // needs its recognition half. Configuration/upstream failures are reported
+  // by the TTS adapter after the answer is generated.
+  if (!hasStt) return "unsupported";
   return "ready";
 }
 
@@ -188,40 +181,76 @@ function createSpeechToTextAdapter(): SpeechToTextAdapter {
 }
 
 function createTextToSpeechAdapter(): TextToSpeechAdapter {
+  let controller: AbortController | null = null;
+  let audio: HTMLAudioElement | null = null;
+  let objectUrl: string | null = null;
+  let rejectPlayback: ((reason: unknown) => void) | null = null;
+
+  const release = () => {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    objectUrl = null;
+    audio = null;
+    controller = null;
+    rejectPlayback = null;
+  };
+
+  const cancel = () => {
+    controller?.abort();
+    if (audio) {
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+    }
+    rejectPlayback?.(new DOMException("Speech playback cancelled", "AbortError"));
+    release();
+  };
+
   return {
-    speak(text) {
-      return new Promise<void>((resolve, reject) => {
-        const w = voiceWindow();
-        if (!w?.speechSynthesis) {
-          reject(new VoiceAdapterError("tts_failed"));
-          return;
-        }
-        try {
-          const utterance = new SpeechSynthesisUtterance(text);
-          utterance.lang = "ja-JP";
-          utterance.onend = () => resolve();
-          utterance.onerror = () => reject(new VoiceAdapterError("tts_failed"));
-          w.speechSynthesis.cancel();
-          w.speechSynthesis.speak(utterance);
-        } catch {
-          reject(new VoiceAdapterError("tts_failed"));
-        }
-      });
-    },
-    cancel() {
+    async speak(text) {
+      cancel();
+      const ownController = new AbortController();
+      controller = ownController;
       try {
-        voiceWindow()?.speechSynthesis?.cancel();
-      } catch {
-        // 再生中でなければ何もしない。
+        const blob = await api.postBlob(
+          "/assistant/speech",
+          { text },
+          ownController.signal,
+        );
+        if (ownController.signal.aborted) return;
+        objectUrl = URL.createObjectURL(blob);
+        const player = new Audio(objectUrl);
+        audio = player;
+        await new Promise<void>((resolve, reject) => {
+          rejectPlayback = reject;
+          player.onended = () => {
+            release();
+            resolve();
+          };
+          player.onerror = () => {
+            release();
+            reject(new VoiceAdapterError("tts_failed"));
+          };
+          player.play().catch((error) => {
+            release();
+            reject(error);
+          });
+        });
+      } catch (error) {
+        if (ownController.signal.aborted) return;
+        release();
+        throw error instanceof VoiceAdapterError
+          ? error
+          : new VoiceAdapterError("tts_failed");
       }
     },
+    cancel,
   };
 }
 
 /**
  * ブラウザ実装の adapter ペアを作る。前提を満たさない環境では `null` を返し
- * (呼び出し側は音声トグルを無効化する)、Web Speech API を直接インスタンス化
- * しないので、この関数を呼ぶこと自体はどの環境でも安全 (副作用なし)。
+ * (呼び出し側は音声トグルを無効化する)。TTS adapter は生成時には通信せず、
+ * `speak` の時だけ認証済みの Control Server endpoint を呼ぶ。
  */
 export function createBrowserVoiceAdapters(): {
   stt: SpeechToTextAdapter;

@@ -213,7 +213,7 @@ export function JointUnderstandingPanel({
   juId,
   onClosed,
 }: {
-  sessionId: number;
+  sessionId: number | null;
   juId: number;
   onClosed?: () => void;
 }) {
@@ -227,6 +227,8 @@ export function JointUnderstandingPanel({
   const resume = useResumeJointUnderstanding(sessionId);
 
   const [showReasons, setShowReasons] = useState(false);
+  const [researchFocus, setResearchFocus] = useState("");
+  const [operationMessage, setOperationMessage] = useState("");
   const [showEvidence, setShowEvidence] = useState(false);
   const [showAudit, setShowAudit] = useState(false);
   const [menu, setMenu] = useState<{ action_kind: JointUnderstandingActionKind; label: string; what_changes: string }[]>([]);
@@ -269,8 +271,9 @@ export function JointUnderstandingPanel({
     try {
       await recordAction.mutateAsync({ juId, actionKind });
       if (actionKind === "request_investigation") {
-        const result = await investigate.mutateAsync({ juId });
-        toast.success(STOP_REASON_LABELS[result.stop_reason]);
+        const result = await investigate.mutateAsync({ juId, researchFocus: researchFocus || undefined });
+        setOperationMessage(STOP_REASON_LABELS[result.stop_reason]);
+        toast.info(STOP_REASON_LABELS[result.stop_reason]);
       } else if (actionKind === "explain_reasoning" || actionKind === "compare_options") {
         const result = await translate.mutateAsync({ juId });
         setMenu(result.action_menu);
@@ -279,7 +282,9 @@ export function JointUnderstandingPanel({
       }
     } catch (error) {
       // 選んだ行動の監査は先に残す。実行に失敗しても対話は open のまま続けられる。
-      toast.error(error instanceof Error ? error.message : "操作に失敗しました");
+      const message = error instanceof Error ? error.message : "操作に失敗しました";
+      setOperationMessage(message);
+      toast.error(message);
     }
   };
 
@@ -596,12 +601,18 @@ export function JointUnderstandingPanel({
               この対話を中断する
             </Button>
           </div>
+          <label className="block text-xs space-y-1">
+            調査対象を絞る（任意）
+            <input className="w-full rounded border p-2" value={researchFocus}
+              placeholder="関連する用語やファイル名" onChange={(event) => setResearchFocus(event.target.value)} />
+          </label>
+          {operationMessage && <p role="status" className="text-xs">{operationMessage}</p>}
           {investigate.isPending && (
             <p className="text-xs text-muted-foreground" data-testid="ju-investigating">
               関連するコードとテストを確認しています…
             </p>
           )}
-          {investigationFindings.length > 0 && (
+          {sessionId !== null && investigationFindings.length > 0 && (
             <Button
               size="sm"
               variant="ghost"

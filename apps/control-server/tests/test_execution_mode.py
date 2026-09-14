@@ -1,7 +1,7 @@
 """Tests for Epic #412 Issue #413: the execution-mode contract and the
 fail-closed capability gate.
 
-Canonical contract: `docs/execution-modes.md` §9.1. What must hold:
+Canonical contract: `docs/01-specifications/capabilities/execution-modes.md` §9.1. What must hold:
 
 1. Each of the ten resolution rows of §3.3 is reached on its own, and the
    resolver is a pure function of `ModeFacts`.
