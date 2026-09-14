@@ -1469,6 +1469,47 @@ def test_the_candidate_state_and_its_content_come_from_one_revision(
     assert body["candidate_brief"]["vision"]["name"] == "候補セッションの Vision"
 
 
+def test_an_unpromoted_candidate_outranks_a_newer_empty_session(
+    admin_client, tmp_path
+):
+    """Session creation order never replaces an actual candidate revision.
+
+    This is the zero-head counterpart of the test above.  The first fix only
+    selected a revision after a canonical head existed, so opening a newer
+    empty session while the System was still unpromoted hid the older
+    session's real candidate behind an `unpromoted` state describing the
+    empty session.
+    """
+    client = admin_client
+    token, system_id, snapshot_id = _setup(
+        client, tmp_path, "System Unpromoted Candidate Owner"
+    )
+    headers = _headers(token, system_id)
+
+    owner = _create_session(client, headers, snapshot_id)
+    revision_id = _store_candidate(
+        owner,
+        system_id,
+        snapshot_id,
+        _understanding(
+            vision=[_item("未昇格候補の Vision")],
+            system_purpose=[_item("P1")],
+            core_capabilities=[_item("C1")],
+        ),
+    )
+    newest = _create_session(client, headers, snapshot_id)
+    assert newest > owner
+
+    body = client.get("/overview", headers=headers).json()
+    assert body["understanding_source"] == "not_promoted"
+    assert body["canonical_revision_id"] is None
+    assert body["candidate_state"] == "unpromoted"
+    assert body["candidate_session_id"] == owner
+    assert body["candidate_brief"]["session_id"] == owner
+    assert body["candidate_brief"]["revision_id"] == revision_id
+    assert body["candidate_brief"]["vision"]["name"] == "未昇格候補の Vision"
+
+
 def test_no_candidate_means_no_candidate_session_and_no_candidate_brief(
     admin_client, tmp_path
 ):

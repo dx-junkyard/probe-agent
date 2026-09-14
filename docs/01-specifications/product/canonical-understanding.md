@@ -216,8 +216,11 @@ Interview 画面には出るが、正準になるのは次の昇格を通った�
 
 ### 4.3 candidate の状態と内容は 1 つの revision から決める
 
-`newer_than_head` は特定の revision についての主張なので、`candidate_session_id`
-と `candidate_brief` はその revision を持つセッションから取る。状態を
+`newer_than_head` と revision が存在する `unpromoted` は特定の revision についての
+主張なので、`candidate_session_id` と `candidate_brief` はその revision を持つ
+セッションから取る。head がまだ無い場合も、実在する candidate revision を
+セッション作成順より優先する。revision が 1 件も無い場合に限り、開始済みの会話を
+表すため最新セッションへフォールバックする。状態を
 「System 内のどれかの candidate revision」から、内容を「最新セッション」から
 別々に決めると、古いセッションが候補を持ったまま新しいセッションを作った時点で
 両者が別の会話を指す。`same_as_head` は候補が無いという意味なので、

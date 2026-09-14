@@ -1747,8 +1747,29 @@ def resolve_candidate_understanding(
     is the one whose content may be shown.
     """
     if canonical_ref.source != "canonical_head" or canonical_ref.revision_id is None:
-        # Nothing promoted: the candidate is simply "the conversation in
-        # progress", and there may be no revision at all yet.
+        # Nothing promoted: prefer the newest actual candidate revision over
+        # session creation order.  An older session may already own a built
+        # candidate when somebody opens a newer, still-empty conversation;
+        # returning that empty session would make `candidate_state` and
+        # `candidate_brief` describe different work just as surely as it did
+        # in the canonical-head case below.
+        candidate = conn.execute(
+            """SELECT id, session_id FROM understanding_revision
+               WHERE system_id = ?
+                 AND COALESCE(status, 'candidate') = 'candidate'
+                 AND current_understanding IS NOT NULL
+               ORDER BY id DESC LIMIT 1""",
+            (system_id,),
+        ).fetchone()
+        if candidate is not None:
+            return CandidateUnderstandingRef(
+                state="unpromoted",
+                session_id=candidate["session_id"],
+                revision_id=candidate["id"],
+            )
+
+        # A conversation can be in progress before its first revision exists.
+        # Only that no-revision case falls back to the newest session.
         session_id = _latest_interview_session_id(conn, system_id)
         if session_id is None:
             return CandidateUnderstandingRef(state="none")
