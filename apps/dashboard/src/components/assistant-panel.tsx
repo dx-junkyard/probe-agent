@@ -36,6 +36,7 @@ import { useUiDraftRegistry } from "@/lib/ui-draft";
 import { DiscussionProposalReview } from "@/components/discussion-proposal-review";
 import { DiscussionContextPanel } from "@/components/discussion-context-panel";
 import { DiscussionInvestigationPanel } from "@/components/discussion-investigation-panel";
+import { InterviewDiscussionReview } from "@/components/interview-discussion";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -351,9 +352,13 @@ interface AssistantPanelProps {
 export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNoticeClick }: AssistantPanelProps = {}) {
   const location = useLocation();
   const navigate = useNavigate();
-  const screenId = screenIdFromPath(location.pathname);
+  const liveScreenId = screenIdFromPath(location.pathname);
+  const [pinnedInterview, setPinnedInterview] = useState<string | null>(null);
+  const screenId = pinnedInterview ? "interview" : liveScreenId;
+  const discussionSearch = pinnedInterview ? `?session=${encodeURIComponent(pinnedInterview)}` : location.search;
   const [open, setOpen] = useState(false);
   const [question, setQuestion] = useState("");
+  const interviewTurnRequests = useRef(new Map<string, string>());
   // Threads are kept per screen so switching pages keeps each conversation.
   // This stays the ENTIRE mechanism for non-discussion screens, and is the
   // fallback for discussion screens whose thread endpoints fail (#438).
@@ -387,8 +392,8 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   // --- Issue #438: target-scoped discussion threads ------------------------
   const discussionEnabled = isDiscussionScreen(screenId);
   const candidate = useMemo(
-    () => (discussionEnabled ? resolveDiscussionCandidate(screenId, location.search) : null),
-    [discussionEnabled, screenId, location.search],
+    () => (discussionEnabled ? resolveDiscussionCandidate(screenId, discussionSearch) : null),
+    [discussionEnabled, screenId, discussionSearch],
   );
   // Which of the two separable threads (whole screen vs. the selected
   // entity/element) is active. Explicit user choice wins; otherwise default
@@ -540,11 +545,26 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     const handleOpen = (event: Event) => {
       const detail = (event as CustomEvent<OpenAssistantDetail>).detail;
       setOpen(true);
+      if (detail?.interviewSessionId) {
+        setPinnedInterview(String(detail.interviewSessionId));
+        setManualScope("focus");
+      }
       if (detail?.question) setQuestion(detail.question);
     };
     window.addEventListener(OPEN_ASSISTANT_EVENT, handleOpen);
     return () => window.removeEventListener(OPEN_ASSISTANT_EVENT, handleOpen);
   }, []);
+
+  const [restoredDiscussionLocation, setRestoredDiscussionLocation] = useState<string | null>(null);
+  if (restoredDiscussionLocation !== location.key) {
+    const params = new URLSearchParams(location.search);
+    setRestoredDiscussionLocation(location.key);
+    if (liveScreenId === "interview" && params.has("discussion") && params.get("session")) {
+      setPinnedInterview(params.get("session"));
+      setManualScope("focus");
+      setOpen(true);
+    }
+  }
 
   const failingChecks = useMemo(
     () => (ctx?.screen_checks ?? []).filter((c) => c.severity !== "ok"),
@@ -567,7 +587,8 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     if (useLegacyConversation) {
       setThreads((prev) => ({ ...prev, [screenId]: [...(prev[screenId] ?? []), ...msgs] }));
     } else {
-      setMirror((prev) => ({ ...prev, messages: [...prev.messages, ...msgs] }));
+      setMirror((prev) => prev.targetKey === activeTargetKey
+        ? ({ ...prev, messages: [...prev.messages, ...msgs] }) : prev);
     }
     requestAnimationFrame(() => {
       const list = listRef.current;
@@ -629,7 +650,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             )
             .slice(-12)
             .map((message) => ({ role: message.role, content: message.text.slice(0, 4000) }));
-      const baseRouteParams = voiceTurn?.routeParams ?? Object.fromEntries(new URLSearchParams(location.search));
+      const baseRouteParams = voiceTurn?.routeParams ?? Object.fromEntries(new URLSearchParams(discussionSearch));
       // The hovered/selected help-mode element (#440), when there is one, is
       // carried as an ordinary route param -- §4 deliberately does not add a
       // new `DiscussionTargetKind` for element-scoped voice questions (the
@@ -645,6 +666,12 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
       // form edited after this point cannot silently change what this turn
       // asks about.
       const uiDraft = voiceTurn ? voiceTurn.uiDraft : captureUiDraft(uiDraftRegistry, turnThread);
+      const turnRequestKey = `${turnThread?.id}:${trimmed}`;
+      let clientTurnId: string | undefined;
+      if (turnThread?.target_kind === "interview_session") {
+        clientTurnId = interviewTurnRequests.current.get(turnRequestKey) ?? crypto.randomUUID();
+        interviewTurnRequests.current.set(turnRequestKey, clientTurnId);
+      }
       const result = await ask.mutateAsync({
         screen_id: turnScreenId,
         question: trimmed,
@@ -656,6 +683,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           voice_spoken_history: voiceContext?.spokenHistory ?? [],
         } : {}),
         ...(turnThread ? { thread_id: turnThread.id } : {}),
+        ...(clientTurnId ? { client_turn_id: clientTurnId } : {}),
         ...(uiDraft ? { ui_draft: uiDraft } : {}),
         visible_check_ids: failingChecks.map((c) => c.check_id),
         ...(focusedStateItem ? {
@@ -663,6 +691,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           focused_state_id: focusedStateItem.state_id,
         } : {}),
       });
+      interviewTurnRequests.current.delete(turnRequestKey);
       const currentDraft = captureUiDraft(uiDraftRegistry, turnThread);
       if (uiDraft?.local_revision_token !== currentDraft?.local_revision_token ||
           uiDraft?.readable !== currentDraft?.readable) {
@@ -707,7 +736,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
       screenId,
       useLegacy: useLegacyConversation,
       thread,
-      routeParams: Object.fromEntries(new URLSearchParams(location.search)),
+      routeParams: Object.fromEntries(new URLSearchParams(discussionSearch)),
       helpId: helpMode.target,
       uiDraft: captureUiDraft(uiDraftRegistry, thread),
     };
@@ -744,7 +773,10 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         <Button
           ref={openButtonRef}
           size="icon"
-          onClick={() => setOpen(true)}
+          onClick={() => {
+            if (liveScreenId === "interview") setPinnedInterview(new URLSearchParams(location.search).get("session"));
+            setOpen(true);
+          }}
           title="Ask the assistant about this screen"
           data-testid="assistant-button"
           className="h-11 w-11 rounded-full shadow-lg"
@@ -823,6 +855,18 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         >
           {VOICE_PREREQUISITE_MESSAGE[voicePrereq]}
         </p>
+      )}
+
+      {pinnedInterview && (
+        <div className="border-b px-4 py-2 text-xs" data-testid="interview-discussion-origin">
+          起点: Interview #{pinnedInterview}
+          {(liveScreenId !== "interview" || new URLSearchParams(location.search).get("session") !== pinnedInterview) && (
+            <Button size="sm" variant="outline" onClick={() => {
+              setPinnedInterview(liveScreenId === "interview" ? new URLSearchParams(location.search).get("session") : null);
+              setQuestion(""); setManualScope(null);
+            }}>表示中の画面の会話へ切り替える</Button>
+          )}
+        </div>
       )}
 
       {/* Issue #438: the two threads a discussion screen can hold are
@@ -1036,8 +1080,12 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
       )}
       {!useLegacyConversation && activeThread && effectiveScope === "focus" && (
         <>
+          {activeThread.target_kind === "interview_session" && (
+            <InterviewDiscussionReview key={`interview-${activeThread.id}`} threadId={activeThread.id}
+              sessionId={Number(activeThread.target_ref)} throughTurn={Math.max(0, ...view.messages.map(m => m.result?.turn_number ?? 0), ...(threadDetail?.turns.map(t => t.turn_number) ?? []))} />
+          )}
           <DiscussionInvestigationPanel key={activeThread.id} threadId={activeThread.id} />
-          <DiscussionProposalReview key={`proposal-${activeThread.id}`} thread={activeThread} />
+          {activeThread.target_kind !== "interview_session" && <DiscussionProposalReview key={`proposal-${activeThread.id}`} thread={activeThread} />}
         </>
       )}
 

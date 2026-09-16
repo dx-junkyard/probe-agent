@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
+import { InterviewContributions } from "@/components/interview-discussion";
 import {
   AlertCircle, CheckCircle, Download, FileCode, GitPullRequest,
   HelpCircle, LifeBuoy, Loader2, MessageSquareText, Pencil, RefreshCw, Send,
@@ -2574,6 +2575,7 @@ export default function InterviewPage() {
           {/* R1 — 現在地。全状態で 1 箇所のみ。「次にやること」が指す操作は
               その状態の主操作そのもの (原則 P2)。進捗ステップも同じカードへ
               まとめる (§3.2 #9/#11/#50/#63 の統合)。 */}
+          <InterviewContributions key={selectedSessionId} sessionId={selectedSessionId} />
           {workflow && (
             <div data-help-id="interview.workflow_state">
               <WorkflowLocationCard

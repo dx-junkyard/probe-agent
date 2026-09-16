@@ -3829,6 +3829,7 @@ export interface UiDraftContextIn {
 }
 
 export interface AssistantAskRequest {
+  client_turn_id?: string;
   screen_id: string;
   question: string;
   route_params?: Record<string, string>;

@@ -62,6 +62,7 @@ Vision / Stakeholder Value
 | [System Understanding Navigation](01-specifications/ux/system-understanding-navigation.md) | 画面間導線、用語、次の操作、Overview projection |
 | [UI Glossary](01-specifications/ux/ui-glossary.md) | 利用者向けラベル、状態語、操作ラベル |
 | [共同検討UX](01-specifications/ux/decision-discussion-workflow.md) | Gapを起点にVision・UX・機能を照合し、仮説調査から設計へ還流する目標導線 |
+| [関心起点のInterview対話](01-specifications/ux/interest-led-interview-discussion.md) | 自由な質問から各Interviewへの補足・訂正を整理する目標UX（設計確定・未実装） |
 
 ### Core capabilities
 
@@ -71,6 +72,7 @@ Vision / Stakeholder Value
 | [Execution Modes](01-specifications/capabilities/execution-modes.md) | 実行モード、解決規則、fail-closed gate、監査 |
 | [Assistant Discussion](01-specifications/capabilities/assistant-discussion.md) | 画面コンテキスト会話と変更候補化 |
 | [AI Discussion Adapter](01-specifications/capabilities/ai-discussion-adapter.md) | UI adapter、未保存 draft、proposal review の拡張契約 |
+| [Interview Discussion Contributions](01-specifications/capabilities/interview-discussion-contributions.md) | 会話起点と反映先、補足の来歴、API、競合・冪等反映の目標契約（設計確定・未実装） |
 
 ### Platform / safety
 

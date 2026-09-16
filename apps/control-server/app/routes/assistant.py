@@ -987,11 +987,11 @@ def get_discussion_joint_understanding(
     return AssistantDiscussionJointUnderstandingListOut(links=links)
 
 
-@router.post("/assistant/ask", response_model=AssistantAskOut)
-def assistant_ask(
+def _assistant_ask_impl(
     payload: AssistantAskRequest,
     system_id: int = Depends(get_system_id),
     principal: Principal = Depends(get_principal),
+    existing_user_turn: Optional[int] = None,
 ) -> AssistantAskOut:
     ctx = get_screen_context(payload.screen_id)
     if ctx is None:
@@ -1062,7 +1062,7 @@ def assistant_ask(
             with get_conn() as conn:
                 recent = assistant_discussion.recent_turns(conn, thread_row["id"])
             conversation_messages = [
-                {"role": t["role"], "content": t["content"]} for t in recent
+                {"role": t["role"], "content": t["content"]} for t in recent if t['id'] != existing_user_turn
             ]
         else:
             conversation_messages = []
@@ -1163,9 +1163,14 @@ def assistant_ask(
         )
         citations_payload = [asdict(c) for c in result.citations]
         with get_conn() as conn:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                assistant_discussion.append_turn(
+                if existing_user_turn is not None:
+                    completed = conn.execute('SELECT reply_turn_id FROM interview_discussion_turn_request WHERE user_turn_id=?', (existing_user_turn,)).fetchone()
+                    if completed and completed['reply_turn_id'] is not None:
+                        raise HTTPException(status_code=409, detail={'code':'turn_already_completed'})
+                if existing_user_turn is None:
+                    assistant_discussion.append_turn(
                     conn,
                     system_id=system_id,
                     thread_id=thread_row["id"],
@@ -1208,6 +1213,9 @@ def assistant_ask(
                 assistant_discussion.touch_thread_captured_target(
                     conn, thread_row["id"], resolved
                 )
+                if existing_user_turn is not None:
+                    conn.execute('UPDATE interview_discussion_turn_request SET reply_turn_id=? WHERE user_turn_id=?',
+                                 (assistant_turn['id'], existing_user_turn))
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -1261,3 +1269,57 @@ def assistant_ask(
         screen_context_state=screen_context_state,
         screen_context_reason=screen_context_reason or None,
     )
+
+
+@router.post('/assistant/ask', response_model=AssistantAskOut)
+def assistant_ask(payload: AssistantAskRequest, system_id: int = Depends(get_system_id),
+                  principal: Principal = Depends(get_principal)) -> AssistantAskOut:
+    if not payload.client_turn_id:
+        return _assistant_ask_impl(payload, system_id, principal)
+    from .. import interview_discussion as d, interview_discussion_jobs as jobs
+    from ..db import write_transaction
+    if payload.thread_id is None or payload.ui_draft is not None:
+        d.fail('invalid_interview_turn', 422)
+    payload = payload.model_copy(update={'question': d.clean(payload.question)})
+    request_digest = d.digest([payload.question, payload.input_mode])
+    with get_conn() as conn, write_transaction(conn):
+        tr = d.thread(conn, system_id, payload.thread_id)
+        row = conn.execute('SELECT * FROM interview_discussion_turn_request WHERE thread_id=? AND client_turn_id=?',
+                           (payload.thread_id, payload.client_turn_id)).fetchone()
+        if row and row['payload_digest'] != request_digest:
+            d.fail('idempotency_payload_mismatch')
+        if row and row['result_json']:
+            return AssistantAskOut.model_validate_json(row['result_json'])
+        if row and row['reply_turn_id']:
+            reply = conn.execute('SELECT * FROM assistant_discussion_turn WHERE id=?', (row['reply_turn_id'],)).fetchone()
+            return AssistantAskOut(screen_id='interview',answer=reply['content'],citations=d.json.loads(reply['citations_json'] or '[]'),
+                used_fallback=bool(reply['used_fallback']),decision_method=reply['decision_method'],provider=reply['provider'],
+                model=reply['model'],prompt_version=reply['prompt_version'],schema_version=reply['schema_version'],
+                generated_at=reply['created_at'],thread_id=payload.thread_id,turn_number=reply['turn_number'])
+        running = conn.execute('SELECT id FROM interview_discussion_turn_request WHERE thread_id=? AND result_json IS NULL AND lease_until>?',
+                               (payload.thread_id, time.time())).fetchone()
+        if running:
+            d.fail('turn_in_progress')
+        if row:
+            uid, rid = row['user_turn_id'], row['id']
+            conn.execute('UPDATE interview_discussion_turn_request SET lease_until=? WHERE id=?', (time.time()+900, rid))
+        else:
+            user = assistant_discussion.append_turn(conn, system_id=system_id, thread_id=payload.thread_id,
+                role='user', content=payload.question, decision_method='manual', input_mode=payload.input_mode,
+                created_by=_principal_actor(principal))
+            uid = user['id']
+            rid = conn.execute('INSERT INTO interview_discussion_turn_request(system_id,thread_id,client_turn_id,payload_digest,user_turn_id,lease_until) VALUES(?,?,?,?,?,?)',
+                (system_id,payload.thread_id,payload.client_turn_id,request_digest,uid,time.time()+900)).lastrowid
+    try:
+        result = _assistant_ask_impl(payload, system_id, principal, existing_user_turn=uid)
+        with get_conn() as conn, write_transaction(conn):
+            reply = conn.execute('SELECT id FROM assistant_discussion_turn WHERE thread_id=? AND turn_number=?',
+                                  (payload.thread_id, result.turn_number)).fetchone()
+            conn.execute('UPDATE interview_discussion_turn_request SET result_json=?,reply_turn_id=?,lease_until=0 WHERE id=?',
+                         (result.model_dump_json(), reply['id'], rid))
+            jobs.schedule(conn, system_id, _principal_actor(principal), tr['id'], result.turn_number)
+        return result
+    except BaseException:
+        with get_conn() as conn:
+            conn.execute('UPDATE interview_discussion_turn_request SET lease_until=0 WHERE id=?', (rid,))
+        raise

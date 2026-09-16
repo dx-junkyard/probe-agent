@@ -10296,6 +10296,8 @@ def init_db() -> None:
         # below do.
         _migrate_joint_understanding_session_owner_scope(conn)
         conn.executescript(SCHEMA)
+        from .interview_discussion_schema import SCHEMA as interview_discussion_schema
+        conn.executescript(interview_discussion_schema)
         _migrate_canonical_execution_authorization(conn)
         _migrate_flow_execution_ref_uniqueness(conn)
         _migrate_solution_design_option_unique(conn)

@@ -1473,6 +1473,8 @@ PROTECTED_REVISION_SQL = """
         SELECT revision_id FROM system_understanding_head WHERE system_id = ?
     )
     OR COALESCE(status, 'candidate') IN ('canonical', 'superseded')
+    OR id IN (SELECT revision_id FROM interview_discussion_revision_source)
+    OR id IN (SELECT result_revision_id FROM interview_discussion_application WHERE result_revision_id IS NOT NULL)
     OR id IN (
         SELECT base_understanding_revision_id FROM interview_session
         WHERE system_id = ? AND base_understanding_revision_id IS NOT NULL

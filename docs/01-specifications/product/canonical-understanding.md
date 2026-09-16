@@ -2,6 +2,11 @@
 
 canonical design contract. 実装はこの文書に従う。
 
+追加設計 [Interview Discussion Contributions](../capabilities/interview-discussion-contributions.md)
+（2026-09-16、設計確定・未実装）は、自由対話からの補足記録と既存項目への反映を定義する。
+補足保存・candidate更新は本書の正準昇格とは別操作であり、head更新・premise固定・CASの
+所有者は引き続き本書である。
+
 Overview は Vision を把握しているのに、同じ System の Interview は未把握として
 扱う ── この Epic はその報告から始まっている。原因は表示の不具合ではなく、
 **存在しなかった所有境界**である。

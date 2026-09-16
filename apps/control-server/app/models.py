@@ -6295,6 +6295,7 @@ class AssistantAskRequest(BaseModel):
     # `conversation` list -- the two are mutually exclusive so there is never
     # a second source of truth for "what was said before" (§1.5).
     thread_id: Optional[int] = Field(default=None, gt=0)
+    client_turn_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     # Issue #441: how the developer entered THIS question. It is recorded on
     # the user turn only -- the assistant did not speak into a microphone, so
     # claiming its reply was "voice input" would be a second meaning for one

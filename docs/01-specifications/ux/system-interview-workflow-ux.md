@@ -25,6 +25,10 @@ Scope: `apps/dashboard/src/pages/interview.tsx` と
 
 関連文書:
 
+- [関心起点の対話とインタビューへの補足](interest-led-interview-discussion.md) —
+  2026-09-16設計確定・未実装の追加UX。自由対話・整理候補のレビューを所有し、
+  本書のW状態・人間ゲートを置換しない。
+
 - `docs/01-specifications/ux/system-understanding-navigation.md` — 用語定義と画面間導線
 - `docs/02-challenges-and-decisions/ux-gap-analysis-system-understanding.md` — System Understanding 側の
   同種ギャップ調査（状態モデルの二系統問題）

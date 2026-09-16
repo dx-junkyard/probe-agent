@@ -334,9 +334,14 @@ def _build_review_prompt(
     alignment_feedback: Optional[List[Dict[str, Any]]] = None,
     verified_evidence: Optional[List[Dict[str, Any]]] = None,
     canonical_premise: Optional[Dict[str, Any]] = None,
+    discussion_contributions: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build the review prompt from graph + code facts."""
     parts: List[str] = []
+    if discussion_contributions:
+        parts.append("## Human-reviewed discussion contributions (reports, NOT canonical facts)\n"
+                     "Preserve open questions and hypotheses as unresolved. Cite contribution IDs.\n"
+                     + _trim_json(discussion_contributions, 16000))
 
     # Issue #464: the System's canonical premise. It is first because it is
     # the ground everything else is read against: a brand-new Interview used
@@ -514,6 +519,7 @@ def generate_understanding_review(
     alignment_feedback: Optional[List[Dict[str, Any]]] = None,
     verified_evidence: Optional[List[Dict[str, Any]]] = None,
     canonical_premise: Optional[Dict[str, Any]] = None,
+    discussion_contributions: Optional[Dict[str, Any]] = None,
 ) -> ReviewResult:
     """Generate a system understanding review from graph + code facts.
 
@@ -560,6 +566,7 @@ def generate_understanding_review(
         alignment_feedback=alignment_feedback,
         verified_evidence=verified_evidence,
         canonical_premise=canonical_premise,
+        discussion_contributions=discussion_contributions,
     )
     try:
         max_output_tokens = _review_max_output_tokens()

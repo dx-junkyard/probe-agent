@@ -3508,6 +3508,9 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
     # Phase 2 (DB lock released): the reasoning call. The LLM client
     # opens its own connection to consume System quota, so it must not
     # run while this thread holds one (see app/db.py).
+    from ..interview_discussion import context_contributions
+    with get_conn() as conn:
+        discussion_contributions = context_contributions(conn, system_id, session['id'])
     review = generate_understanding_review(
         client, config,
         graph=graph,
@@ -3518,6 +3521,7 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
         alignment_feedback=alignment_feedback,
         verified_evidence=verified_evidence or None,
         canonical_premise=canonical_premise,
+        discussion_contributions=discussion_contributions,
     )
 
     # Phase 3 (DB lock re-acquired): persist the review outcome.
@@ -3698,6 +3702,9 @@ def _rebuild_understanding_core(session, system_id: int) -> UnderstandingRebuild
             ),
         )
         revision_id = revision_cur.lastrowid
+        for contribution in discussion_contributions['items']:
+            conn.execute('INSERT OR IGNORE INTO interview_discussion_revision_source VALUES(?,?)',
+                         (revision_id, contribution['id']))
 
         # Issue #336: record that this rebuild USED these verified facts. This
         # is deliberately not a confirmation -- the developer accepting the

@@ -92,7 +92,10 @@ def _interview_context(
             conn, system_id, session["id"] if session is not None else None
         )
         selected = None
+        supplements = None
         if session is not None:
+            from .interview_discussion import context_contributions
+            supplements = context_contributions(conn, system_id, session['id'])
             selected = {
                 "id": session["id"],
                 "snapshot_id": session["snapshot_id"],
@@ -127,6 +130,7 @@ def _interview_context(
             "selected_session": selected,
             "understanding_brief": asdict(brief),
             "available_sessions": [dict(row) for row in sessions],
+            "reviewed_discussion_contributions": supplements,
         },
         sources=sources,
     )
