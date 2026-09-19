@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -9483,6 +9484,14 @@ def _migrate_cell_improvement_event_types(conn: sqlite3.Connection) -> None:
         return
 
     conn.execute("PRAGMA foreign_keys=OFF")
+    # `legacy_alter_table` for the rename alone: SQLite's default RENAME
+    # rewrites every OTHER table's stored FK clause to follow this table
+    # under its new name, leaving those children referencing the `_old_`
+    # table dropped below -- a dangling reference that raises `no such
+    # table` on the child's next INSERT rather than here (Issue #453).
+    # Nothing references this table today; the pragma is what keeps that
+    # from mattering when something does.
+    conn.execute("PRAGMA legacy_alter_table=ON")
     try:
         conn.execute("BEGIN")
         conn.execute(
@@ -9530,6 +9539,7 @@ def _migrate_cell_improvement_event_types(conn: sqlite3.Connection) -> None:
         conn.execute("ROLLBACK")
         raise
     finally:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
         conn.execute("PRAGMA foreign_keys=ON")
 
 
@@ -9581,7 +9591,13 @@ def _migrate_solution_design_option_unique(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         PRAGMA foreign_keys = OFF;
+        -- `legacy_alter_table` for the rename ALONE: without it SQLite
+        -- rewrites every child table's stored FK clause to follow this table
+        -- to its new name, leaving them pointing at the `_legacy` table the
+        -- last statement here drops. See `_repair_dangling_foreign_key_targets`.
+        PRAGMA legacy_alter_table = ON;
         ALTER TABLE solution_design_option RENAME TO solution_design_option_legacy;
+        PRAGMA legacy_alter_table = OFF;
         -- A rename carries the table's indexes with it, so their NAMES are still
         -- taken and the DDL's `CREATE INDEX IF NOT EXISTS` below would silently
         -- do nothing -- leaving the rebuilt table with no constraint at all,
@@ -9773,7 +9789,13 @@ def _migrate_product_gap_artifact_link_kinds(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         PRAGMA foreign_keys = OFF;
+        -- `legacy_alter_table` for the rename ALONE: without it SQLite
+        -- rewrites every child table's stored FK clause to follow this table
+        -- to its new name, leaving them pointing at the `_legacy` table the
+        -- last statement here drops. See `_repair_dangling_foreign_key_targets`.
+        PRAGMA legacy_alter_table = ON;
         ALTER TABLE product_gap_artifact_link RENAME TO product_gap_artifact_link_legacy;
+        PRAGMA legacy_alter_table = OFF;
         -- A rename carries the indexes with it, so their names stay taken and
         -- the DDL's `CREATE INDEX IF NOT EXISTS` below would silently do
         -- nothing, leaving the rebuilt table unindexed. Free the names first
@@ -10051,7 +10073,13 @@ def _migrate_ux_journey_upstream_ref_kinds(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         PRAGMA foreign_keys = OFF;
+        -- `legacy_alter_table` for the rename ALONE: without it SQLite
+        -- rewrites every child table's stored FK clause to follow this table
+        -- to its new name, leaving them pointing at the `_legacy` table the
+        -- last statement here drops. See `_repair_dangling_foreign_key_targets`.
+        PRAGMA legacy_alter_table = ON;
         ALTER TABLE ux_journey_upstream_ref RENAME TO ux_journey_upstream_ref_legacy;
+        PRAGMA legacy_alter_table = OFF;
         -- A rename carries the table's indexes with it, so their NAMES stay
         -- taken and the DDL's `CREATE INDEX IF NOT EXISTS` below would
         -- silently do nothing -- leaving the rebuilt table with no index at
@@ -10121,7 +10149,13 @@ def _migrate_assistant_discussion_thread_target_kinds(conn: sqlite3.Connection) 
     conn.executescript(
         """
         PRAGMA foreign_keys = OFF;
+        -- `legacy_alter_table` for the rename ALONE: without it SQLite
+        -- rewrites every child table's stored FK clause to follow this table
+        -- to its new name, leaving them pointing at the `_legacy` table the
+        -- last statement here drops. See `_repair_dangling_foreign_key_targets`.
+        PRAGMA legacy_alter_table = ON;
         ALTER TABLE assistant_discussion_thread RENAME TO assistant_discussion_thread_legacy;
+        PRAGMA legacy_alter_table = OFF;
         -- A rename carries the table's indexes with it, so their NAMES stay
         -- taken and the DDL's `CREATE INDEX IF NOT EXISTS` below would
         -- silently do nothing -- leaving the rebuilt table with no index at
@@ -10281,6 +10315,163 @@ def _migrate_joint_understanding_session_owner_scope(conn: sqlite3.Connection) -
         PRAGMA foreign_keys = ON;
         """
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #453 regression repair: dangling foreign-key targets left behind by a
+# table rebuild that renamed without `PRAGMA legacy_alter_table = ON`.
+# ---------------------------------------------------------------------------
+#
+# SQLite's default `ALTER TABLE x RENAME TO x_legacy` rewrites the stored FK
+# clause of every OTHER table that references `x`, so those children follow
+# the table to its new name. A rebuild migration (rename -> recreate -> copy
+# -> drop) therefore leaves every child referencing `x_legacy` and then drops
+# it. Nothing fails at migration time; the connection has
+# `PRAGMA foreign_keys=ON`, so the damage surfaces later as
+# `sqlite3.OperationalError: no such table: main.x_legacy` on the child's next
+# INSERT -- which is exactly how `POST /assistant/ask` started returning 500
+# after `_migrate_assistant_discussion_thread_target_kinds` ran.
+#
+# The migrations above are fixed, but a database that already ran the broken
+# one stays broken: the migration is idempotent and now no-ops, and
+# `CREATE TABLE IF NOT EXISTS` cannot repair a table that already exists. This
+# repairs those databases in place.
+#
+# It never guesses. The mapping from a dangling target back to the real table
+# is the finite, explicitly enumerated set of wrapper forms this file's
+# rebuilds have ever used (Principle 6), and the base table must actually
+# exist; anything else is left exactly as it is.
+
+def _legacy_wrapper_base(name: str) -> list:
+    """Candidate real table names for a dangling FK target, most specific first.
+
+    The inverse of the three wrapper forms this file's rebuilds have ever
+    produced -- `<base>_legacy`, `_old_<base>`, `_<base>_old` -- written out
+    rather than matched with a general suffix regex, so a name none of them
+    could have produced yields no candidate at all.
+    """
+    candidates = []
+    if name.endswith("_legacy"):
+        candidates.append(name[: -len("_legacy")])
+    if name.startswith("_old_"):
+        candidates.append(name[len("_old_"):])
+    if name.startswith("_") and name.endswith("_old"):
+        candidates.append(name[1: -len("_old")])
+    return [c for c in candidates if c]
+
+
+def _rewrite_references(sql: str, dangling: str, base: str) -> str:
+    """Point one table's `REFERENCES <dangling>` clauses back at `<base>`.
+
+    Only the identifier directly after a `REFERENCES` keyword is touched, in
+    every quoting form SQLite accepts, so a column or table whose name merely
+    contains the dangling name is never rewritten.
+    """
+    escaped = re.escape(dangling)
+    pattern = re.compile(
+        r'(REFERENCES\s+)(?:"%s"|\'%s\'|`%s`|\[%s\]|%s(?![\w$]))'
+        % ((escaped,) * 5),
+        re.IGNORECASE,
+    )
+    return pattern.sub(lambda m: m.group(1) + '"%s"' % base, sql)
+
+
+def _repair_dangling_foreign_key_targets(conn: sqlite3.Connection) -> None:
+    """Heal child tables left pointing at a dropped `_legacy`/`_old` table.
+
+    Detection reads `PRAGMA foreign_key_list` rather than pattern-matching
+    stored SQL: the pragma reports the resolved target of every FK, so a
+    target that is not an existing table is a structural fact, not a guess.
+
+    Each damaged table is rebuilt with only its `REFERENCES` clause corrected
+    -- every row, every id, every index and every trigger preserved -- using
+    the same rename-under-`legacy_alter_table` discipline whose absence caused
+    the damage. A table whose dangling target cannot be mapped back to an
+    existing base table is left untouched: an unrepairable reference is a
+    fact worth keeping visible, not a licence to invent a target.
+    """
+    tables = {
+        row["name"]: row["sql"]
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'table' AND sql IS NOT NULL"
+        )
+        if not row["name"].startswith("sqlite_")
+    }
+    repairs = {}
+    for table in tables:
+        for fk in conn.execute('PRAGMA foreign_key_list("%s")' % table.replace('"', '""')):
+            target = fk["table"]
+            if target in tables:
+                continue
+            base = next(
+                (c for c in _legacy_wrapper_base(target) if c in tables), None
+            )
+            if base is None:
+                continue
+            repairs.setdefault(table, {})[target] = base
+    if not repairs:
+        return
+
+    # PRAGMA foreign_keys is a no-op inside a transaction, so it is set here
+    # and restored after the last rebuild commits.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        for table, mapping in repairs.items():
+            _rebuild_table_with_repaired_references(conn, table, tables[table], mapping)
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _rebuild_table_with_repaired_references(
+    conn: sqlite3.Connection,
+    table: str,
+    create_sql: str,
+    mapping: dict,
+) -> None:
+    fixed_sql = create_sql
+    for dangling, base in mapping.items():
+        fixed_sql = _rewrite_references(fixed_sql, dangling, base)
+    if fixed_sql == create_sql:
+        # The pragma reported a dangling target the CREATE statement does not
+        # spell the way this function can rewrite. Rebuilding would copy the
+        # damage forward, so leave the table exactly as it is.
+        return
+
+    quoted = '"%s"' % table.replace('"', '""')
+    scratch = '"%s"' % (table + "__fk_repair").replace('"', '""')
+    # Captured BEFORE the rename: `DROP TABLE` below takes the table's indexes
+    # and triggers with it, and they are recreated verbatim afterwards. Rows
+    # with a NULL `sql` are the implicit indexes SQLite creates for UNIQUE /
+    # PRIMARY KEY constraints -- those come back with the table definition.
+    aux = [
+        row["sql"]
+        for row in conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE tbl_name = ? AND type IN ('index', 'trigger') "
+            "AND sql IS NOT NULL",
+            (table,),
+        )
+    ]
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Ours alone, and only present if an earlier repair died between
+            # the rename and the drop.
+            conn.execute("DROP TABLE IF EXISTS %s" % scratch)
+            conn.execute("ALTER TABLE %s RENAME TO %s" % (quoted, scratch))
+            conn.execute(fixed_sql)
+            conn.execute("INSERT INTO %s SELECT * FROM %s" % (quoted, scratch))
+            conn.execute("DROP TABLE %s" % scratch)
+            for statement in aux:
+                conn.execute(statement)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
 
 
 def init_db() -> None:
@@ -11086,6 +11277,11 @@ def init_db() -> None:
         # Issue #464: runs last among the column migrations because its
         # backfill reads the columns every earlier migration installed.
         _migrate_canonical_understanding(conn)
+        # Runs after EVERY migration above: it repairs whatever state the
+        # schema is actually in, including damage a rebuild migration in this
+        # same startup would have caused, so it cannot be ordered against the
+        # one migration that happens to have produced it.
+        _repair_dangling_foreign_key_targets(conn)
         _ensure_legacy_system(conn)
     _validate_startup_environment()
     _validate_publish_startup_config()

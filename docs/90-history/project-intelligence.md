@@ -7940,3 +7940,76 @@ System 内のどれかの candidate revision から、`candidate_brief` は最�
 先に一意に選び、その revision の所有セッションから両方を出すようにした。
 `same_as_head` は候補が無いという意味なので、session id も brief も `None` を
 返す ── ここで最新セッションを名乗らせるのが、同じ不一致の裏返しである。
+
+## テーブル再構築で child の FK が `_legacy` を指したまま残った不具合
+
+### 症状
+
+`POST /assistant/ask` が 500 を返し、`assistant_discussion.append_turn` の
+`INSERT INTO assistant_discussion_turn` で
+`sqlite3.OperationalError: no such table: main.assistant_discussion_thread_legacy`
+になる。`assistant_discussion_thread_legacy` は Issue #453 の
+`_migrate_assistant_discussion_thread_target_kinds` が作って同じ関数の最後で
+drop する一時テーブルなので、drop 済みのはずの名前が実行時に現れていた。
+
+### 原因
+
+SQLite の既定の `ALTER TABLE x RENAME TO x_legacy` は、**`x` を参照している
+他のテーブル**の保存済み FK 句を `x_legacy` へ書き換える (リネーム後も同じ
+テーブルを指し続けるため、という既定の親切)。再構築 migration
+(rename → recreate → copy → drop) はその直後に `x_legacy` を drop するので、
+child は**存在しないテーブルを指したまま**残る。
+
+**この時点では何も失敗しない。** 接続は `PRAGMA foreign_keys=ON` なので、
+壊れたことが分かるのは child への次の INSERT のときで、しかも失敗するのは
+migration でも親テーブルでもなく child である。`assistant_discussion_thread`
+を参照していた 9 テーブル (`assistant_discussion_turn` /
+`assistant_discussion_proposal` / `assistant_discussion_hypothesis_promotion` /
+`discussion_context_cursor` / `joint_understanding_session` と
+`interview_discussion_schema` の 4 テーブル) が一斉にこの状態になっていた。
+
+`_migrate_joint_understanding_session_owner_scope` (#461) は同じ罠を
+`PRAGMA legacy_alter_table = ON` で回避しており、その理由も docstring に
+書かれている。#453 の migration はその規律を継いでいなかった。
+
+### 修正 (2 つ要る)
+
+**(1) 再発防止。** rename だけを `PRAGMA legacy_alter_table = ON` で囲む。
+この pragma が ON の間は書き換えが行われないので、child は素の名前 `x` を
+指したままになり、その名前は migration が直後に作り直すテーブルに解決する
+── child 側の修正は 1 行も要らない。`_migrate_solution_design_option_unique` /
+`_migrate_product_gap_artifact_link_kinds` /
+`_migrate_ux_journey_upstream_ref_kinds` /
+`_migrate_cell_improvement_event_types` にも同じ形があったので揃えた。**今その
+テーブルを参照しているものが無くても付ける** ── 次に FK が 1 本足された瞬間に
+同じ欠陥が黙って復活する側だからである。
+
+**(2) 既に壊れた DB の修復。** migration 自体を直しても、壊れた版を一度でも
+走らせた DB は直らない。migration は構造検出で冪等なのでもう no-op になり、
+`CREATE TABLE IF NOT EXISTS` は既存テーブルを直せない。
+`_repair_dangling_foreign_key_targets` を `init_db()` の最後に置いた
+(**すべての migration の後** ── この起動で新たに壊れた場合も同じ pass で
+拾うため、特定の migration との順序では書けない)。
+
+- 検出は保存済み SQL への正規表現ではなく `PRAGMA foreign_key_list` で行う。
+  pragma は FK の解決先を報告するので、「解決先が実在テーブルでない」は
+  推測ではなく構造的事実である。
+- **推測しない。** dangling な名前から実テーブルへの写像は、この file の
+  再構築が実際に使ってきた wrapper 形 (`<base>_legacy` / `_old_<base>` /
+  `_<base>_old`) の有限列挙 (Principle 6) に限り、しかも base が実在する場合
+  だけ。解決できない dangling 参照は**そのまま残す** ── 解決できない参照は
+  見えていることに価値のある事実であって、別の行を指させてよい理由ではない。
+- 修復は `REFERENCES` 句だけを直した再構築で、行・id・index・trigger を
+  すべて保存する。その rename 自身も当然 `legacy_alter_table = ON` で行う。
+
+運用上は**コンテナを再起動するだけ**で治る (`init_db()` が起動時に走る)。
+
+### テスト
+
+`tests/test_dangling_foreign_key_repair.py` は、まず**報告された 500 を実際に
+再現**してから修復を検証する (仮想の不具合に対する修復にしないため)。
+cascade が復活すること (dangling 参照は cascade を黙って無効化していた)、
+index が保存されること、冪等であること、解決できない参照を発明しないこと、
+`REFERENCES` の直後の識別子だけを書き換えること (名前に dangling 名を含む
+だけの列やテーブルは触らない)、そして修正後の #453 migration が child を
+壊さずに語彙を広げることを確認する。
