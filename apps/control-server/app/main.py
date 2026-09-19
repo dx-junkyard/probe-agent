@@ -10,6 +10,7 @@ from .routes import (
     assistant,
     auth,
     candidate_studio,
+    canonical_understanding,
     cell_fabric,
     cell_improvement,
     cell_orchestrators,
@@ -33,6 +34,7 @@ from .routes import (
     interview_alignment,
     interview_brief,
     interview_change_sets,
+    interview_discussion,
     interview_handoff,
     interview_inquiry,
     interview_intent,
@@ -85,9 +87,12 @@ async def lifespan(_app: FastAPI):
     # (started below) covers everything that goes stale afterwards.
     publish_recovery.repair_interrupted_jobs(reason="startup_recovery")
     publish_recovery.start_worker()
+    from .interview_discussion_jobs import start_worker
+    discussion_worker_stop = start_worker()
     try:
         yield
     finally:
+        discussion_worker_stop.set()
         publish_recovery.stop_worker()
 
 
@@ -164,8 +169,10 @@ def create_app() -> FastAPI:
     app.include_router(interview_refresh.router, dependencies=_auth)
     app.include_router(interview_workflow.router, dependencies=_auth)
     app.include_router(interview_brief.router, dependencies=_auth)
+    app.include_router(canonical_understanding.router, dependencies=_auth)
     app.include_router(purpose_chain.router, dependencies=_auth)
     app.include_router(interview_change_sets.router, dependencies=_auth)
+    app.include_router(interview_discussion.router, dependencies=_auth)
     app.include_router(question_router.router, dependencies=_auth)
     app.include_router(joint_understanding.router, dependencies=_auth)
     app.include_router(github_connections.router, dependencies=_auth)

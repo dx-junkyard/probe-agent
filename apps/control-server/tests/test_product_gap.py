@@ -1,6 +1,6 @@
 """Tests for Issue #429/#430 -- Product Gap (Epic #427).
 
-`docs/product-objective-lineage.md` §12 is the acceptance list this file is
+`docs/01-specifications/product/product-objective-lineage.md` §12 is the acceptance list this file is
 organized (together with `test_product_objective.py`) around. This file
 covers Gap-specific behaviour:
 

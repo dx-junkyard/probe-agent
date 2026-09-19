@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
+import { InterviewContributions } from "@/components/interview-discussion";
 import {
   AlertCircle, CheckCircle, Download, FileCode, GitPullRequest,
   HelpCircle, LifeBuoy, Loader2, MessageSquareText, Pencil, RefreshCw, Send,
@@ -12,7 +13,13 @@ import {
   useAnswerInterviewQa,
   useApproveInterviewProposal,
   useConfirmInterviewUnderstanding,
+  useAdoptCurrentPremise,
+  useBranchInterviewPremise,
   useCreateInterviewSession,
+  useInterviewPremise,
+  usePromoteUnderstanding,
+  useRebaseInterviewPremise,
+  useUnderstandingHead,
   useEditInterviewProposal,
   useInterviewApprovedSet,
   useInterviewCapabilityGraph,
@@ -80,6 +87,10 @@ import {
   focusFirstCockpitTarget,
 } from "@/components/system-understanding/cockpit/navigation";
 import { CockpitStatusSummary } from "@/components/system-understanding/cockpit/status-summary";
+import {
+  CanonicalPromotePanel,
+  PremiseNotice,
+} from "@/components/system-understanding/premise-notice";
 import { UnderstandingMap } from "@/components/system-understanding/cockpit/understanding-map";
 import { CockpitDetailPanel } from "@/components/system-understanding/cockpit/detail-panel";
 import { CockpitUnresolvedItems } from "@/components/system-understanding/cockpit/unresolved-items";
@@ -1537,7 +1548,7 @@ export default function InterviewPage() {
   const updateUnderstanding = useUpdateInterviewUnderstanding();
   const confirmUnderstanding = useConfirmInterviewUnderstanding(selectedSessionId);
   // Issue #349: the canonical developer-facing state. The server evaluates
-  // docs/system-interview-workflow-ux.md §2.2 (13-row first-match rule table
+  // docs/01-specifications/ux/system-interview-workflow-ux.md §2.2 (13-row first-match rule table
   // + backward hold) over persisted facts only, and returns the state, its
   // single primary action, and the currently-active exceptions. This page
   // must not re-derive a workflow state from client-only values (a chosen
@@ -1548,6 +1559,17 @@ export default function InterviewPage() {
   const { data: understandingBrief } = useUnderstandingBrief(selectedSessionId);
   const recordDiffReview = useRecordDiffReview(selectedSessionId);
   const acknowledgeBack = useAcknowledgeBackRequest(selectedSessionId);
+  // Issue #464: この会話が何を前提に始まったか、そしてそれが今も System の
+  // 正準 Understanding かどうか。判定はサーバーが毎回導出する。
+  const { data: premise } = useInterviewPremise(selectedSessionId);
+  const {
+    data: understandingHead,
+    isLoading: understandingHeadLoading,
+  } = useUnderstandingHead();
+  const rebasePremise = useRebaseInterviewPremise(selectedSessionId);
+  const branchPremise = useBranchInterviewPremise(selectedSessionId);
+  const adoptPremise = useAdoptCurrentPremise(selectedSessionId);
+  const promoteUnderstanding = usePromoteUnderstanding(selectedSessionId);
   const closeSession = useCloseInterviewSession(selectedSessionId);
   const reopenSession = useReopenInterviewSession(selectedSessionId);
   // Issue #295 §4.8 / PR #296 review fix (Finding 4): one shared
@@ -1762,10 +1784,15 @@ export default function InterviewPage() {
   // is gone (spec §2.4-2, §3.2).
 
   // Issue #349 (再レビュー #1): 自動選択は「初回ロードで URL に session が
-  // 無いとき」の 1 回だけ。以前は未選択を見つけるたびに最新セッションへ戻して
+  // 無いとき」の 1 回だけ。以前は未選択を見つけるたびにセッションへ戻して
   // いたため、開発者が 「セッション未選択」 を選んでも即座に選択が復活し、
   // `W0-B` (= 新しいインタビューを開始する状態) に到達できなかった。既存
   // セッションがあるシステムでは新規開始が事実上不可能になる。
+  //
+  // 最初に開くのは単なる最新行ではなく、System の正準 head を所有する
+  // セッション。新しい candidate があるだけで「現在の Vision」が消えたように
+  // 見えるのを防ぐ。head が無い／所有セッションが一覧に無い場合だけ従来どおり
+  // newest-first の一覧先頭へフォールバックする。
   const autoSelectedRef = useRef(false);
   useEffect(() => {
     if (autoSelectedRef.current) return;
@@ -1773,7 +1800,7 @@ export default function InterviewPage() {
       autoSelectedRef.current = true;
       return;
     }
-    if (sessionsLoading) return;
+    if (sessionsLoading || understandingHeadLoading) return;
     if (sessionClearedByUser) {
       autoSelectedRef.current = true;
       return;
@@ -1781,14 +1808,43 @@ export default function InterviewPage() {
     if (sortedSessions.length > 0) {
       autoSelectedRef.current = true;
       const next = new URLSearchParams(searchParams);
-      next.set("session", String(sortedSessions[0].id));
+      const canonicalSession = sortedSessions.find(
+        candidate => candidate.id === understandingHead?.source_session_id,
+      );
+      next.set("session", String(canonicalSession?.id ?? sortedSessions[0].id));
       setSearchParams(next, { replace: true });
     }
   }, [
     selectedSessionId,
     sessionsLoading,
+    understandingHeadLoading,
     sessionClearedByUser,
     sortedSessions,
+    understandingHead?.source_session_id,
+    searchParams,
+    setSearchParams,
+  ]);
+
+  // Diagnostics describe the current System, not a historical conversation.
+  // A saved URL can still contain an old `session` together with `fix` /
+  // `diagnostic`; in that case land on the canonical source session while
+  // preserving the requested callout. A manual selector change removes those
+  // focus params below, so this never prevents deliberate history browsing.
+  useEffect(() => {
+    const canonicalSessionId = understandingHead?.source_session_id;
+    const hasDiagnosticFocus = searchParams.has("fix") || searchParams.has("diagnostic");
+    if (
+      !hasDiagnosticFocus
+      || canonicalSessionId == null
+      || selectedSessionId == null
+      || selectedSessionId === canonicalSessionId
+    ) return;
+    const next = new URLSearchParams(searchParams);
+    next.set("session", String(canonicalSessionId));
+    setSearchParams(next, { replace: true });
+  }, [
+    selectedSessionId,
+    understandingHead?.source_session_id,
     searchParams,
     setSearchParams,
   ]);
@@ -1842,7 +1898,7 @@ export default function InterviewPage() {
     }
     if (uiState === "ready_for_proposals") {
       // 提案生成を依頼しても情報不足で提案できなかった場合、モデルは絞り込みの
-      // 確認質問を open_questions に返す(プロンプト interview-v6)。固定文の
+      // 確認質問を open_questions に返す(プロンプト interview-v7)。固定文の
       // 代わりにその質問を提示し、回答のたびに提案生成を再試行する。
       const open = sortQuestions(session.open_questions ?? []);
       if (open.length > 0) return focusedFromOpenQuestion(open[0]);
@@ -2413,6 +2469,11 @@ export default function InterviewPage() {
             value={selectedSessionId ? String(selectedSessionId) : ""}
             onChange={e => {
               const next = new URLSearchParams(searchParams);
+              // Choosing a session is an explicit navigation decision. Clear
+              // a diagnostic deep-link focus so the canonical-target redirect
+              // above does not undo the developer's history selection.
+              next.delete("fix");
+              next.delete("diagnostic");
               if (e.target.value) {
                 next.set("session", e.target.value);
                 setSessionClearedByUser(false);
@@ -2429,7 +2490,9 @@ export default function InterviewPage() {
             <option value="">セッション未選択</option>
             {sortedSessions.map(s => (
               <option key={s.id} value={s.id}>
-                #{s.id} · snapshot {s.snapshot_id} · {s.status}
+                #{s.id}
+                {s.id === understandingHead?.source_session_id ? " · 正準" : ""}
+                {` · snapshot ${s.snapshot_id} · ${s.status}`}
               </option>
             ))}
           </Select>
@@ -2439,6 +2502,37 @@ export default function InterviewPage() {
               どちらが正準か分からない重複になる (原則 P7)。 */}
         </div>
       </div>
+
+      {session
+        && understandingHead?.source_session_id != null
+        && selectedSessionId !== understandingHead.source_session_id && (
+        <Card className="border-amber-300 bg-amber-50" data-testid="historical-session-notice">
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4 text-sm">
+            <div className="space-y-1">
+              <p className="font-medium">正準とは異なるセッションを表示しています。</p>
+              <p className="text-muted-foreground">
+                セッション #{selectedSessionId} は履歴・候補の内容です。System の現在の
+                Vision と Understanding は正準セッション #{understandingHead.source_session_id}
+                で確認できます。
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                const next = new URLSearchParams(searchParams);
+                next.set("session", String(understandingHead.source_session_id));
+                next.delete("fix");
+                next.delete("diagnostic");
+                setSessionClearedByUser(false);
+                setSearchParams(next);
+              }}
+            >
+              正準セッションを開く
+            </Button>
+          </CardContent>
+        </Card>
+      )}
 
       <div {...purposeFixHighlight}>
         <DiagnosticFixCallout anchor="interview-purpose" />
@@ -2556,6 +2650,7 @@ export default function InterviewPage() {
           {/* R1 — 現在地。全状態で 1 箇所のみ。「次にやること」が指す操作は
               その状態の主操作そのもの (原則 P2)。進捗ステップも同じカードへ
               まとめる (§3.2 #9/#11/#50/#63 の統合)。 */}
+          <InterviewContributions key={selectedSessionId} sessionId={selectedSessionId} />
           {workflow && (
             <div data-help-id="interview.workflow_state">
               <WorkflowLocationCard
@@ -2576,6 +2671,63 @@ export default function InterviewPage() {
                 acknowledgeBack
                   .mutateAsync({ requestId, actor })
                   .then(() => toast.success("確認が必要な状態へ移動しました"))
+                  .catch(e => toast.error(String(e)))
+              }
+            />
+          )}
+
+          {/* Issue #464 — 前提 (premise) は例外より上。前提が動いていれば、
+              その下のどの作業面も「どの理解についての作業か」が定まらない。
+              判定・提示してよい選択肢はすべてサーバーが返した値で、ここで
+              再導出しない。 */}
+          {premise && (
+            <PremiseNotice
+              premise={premise}
+              pending={
+                rebasePremise.isPending ||
+                branchPremise.isPending ||
+                adoptPremise.isPending
+              }
+              onRebase={() =>
+                void rebasePremise
+                  .mutateAsync({})
+                  .then(created => {
+                    setSessionClearedByUser(false);
+                    setSearchParams({ session: String(created.new_session_id) });
+                    toast.success("現在の正準 Understanding を前提に新しいセッションを開始しました");
+                  })
+                  .catch(e => toast.error(String(e)))
+              }
+              onBranch={() =>
+                void branchPremise
+                  .mutateAsync({})
+                  .then(() => toast.success("古い前提の検討として維持します"))
+                  .catch(e => toast.error(String(e)))
+              }
+              onAdoptCurrent={() =>
+                void adoptPremise
+                  .mutateAsync({})
+                  .then(() => toast.success("現在の正準 Understanding を前提にしました"))
+                  .catch(e => toast.error(String(e)))
+              }
+              onStartNewSession={() => void startSession()}
+              onOpenSession={id => {
+                setSessionClearedByUser(false);
+                setSearchParams({ session: String(id) });
+              }}
+            />
+          )}
+
+          {premise && (
+            <CanonicalPromotePanel
+              premise={premise}
+              headRevisionId={understandingHead?.revision_id ?? null}
+              headVersion={understandingHead?.head_version ?? null}
+              pending={promoteUnderstanding.isPending}
+              onPromote={input =>
+                void promoteUnderstanding
+                  .mutateAsync(input)
+                  .then(() => toast.success("この理解を System の正準にしました"))
                   .catch(e => toast.error(String(e)))
               }
             />

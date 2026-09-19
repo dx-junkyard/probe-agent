@@ -24,6 +24,12 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-120}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_TTS_MODEL: ${OPENAI_TTS_MODEL:-gpt-4o-mini-tts}
+      OPENAI_TTS_VOICE: ${OPENAI_TTS_VOICE:-marin}
+      OPENAI_TTS_INSTRUCTIONS: ${OPENAI_TTS_INSTRUCTIONS:-}
+      OPENAI_TTS_TIMEOUT: ${OPENAI_TTS_TIMEOUT:-30}
+      OPENAI_TTS_BASE_URL: ${OPENAI_TTS_BASE_URL:-https://api.openai.com/v1}
       INTELLIGENCE_LLM_PROVIDER: ${INTELLIGENCE_LLM_PROVIDER:-}
       INTELLIGENCE_LLM_MODEL: ${INTELLIGENCE_LLM_MODEL:-}
       INTELLIGENCE_LLM_TIMEOUT: ${INTELLIGENCE_LLM_TIMEOUT:-120}
@@ -38,7 +44,7 @@ services:
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       # Local dev: a plain host path is fine (no Compose secret needed).
       # docker-compose.prod.yml fixes this to a Compose secret path instead
-      # (Issue #224) -- see the comment there and docs/github-app-deployment.md.
+      # (Issue #224) -- see the comment there and docs/04-operations/github-app-deployment.md.
       GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
       GITHUB_PUBLISH_ENABLED: ${GITHUB_PUBLISH_ENABLED:-false}
       GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-}

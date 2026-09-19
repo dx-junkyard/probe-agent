@@ -1,7 +1,7 @@
 // Issue #424 (Epic #418): the Functional Lineage View + Gap/Impact Overlay.
 //
 // Dashboard-only rendering of `GET /functional-lineage`
-// (`docs/stakeholder-value-network.md` §9). This screen re-derives NOTHING:
+// (`docs/01-specifications/product/stakeholder-value-network.md` §9). This screen re-derives NOTHING:
 // `kind` / gap `code` / `severity` all arrive already decided by the
 // server, and `components/functional-lineage/model.ts` (pure, no React, no
 // API client) is the only place that filters, labels, or walks the

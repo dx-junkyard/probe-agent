@@ -1,6 +1,6 @@
 """State-driven System Interview workflow API (Issue #349).
 
-The HTTP surface of `docs/system-interview-workflow-ux.md`. Five endpoints:
+The HTTP surface of `docs/01-specifications/ux/system-interview-workflow-ux.md`. Five endpoints:
 
 * ``GET  /interview/workflow-state`` -- the canonical two-stage evaluation
   (§2.2). The ONLY place the Dashboard learns which of `W0-A` / `W0-B` /

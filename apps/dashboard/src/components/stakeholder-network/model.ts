@@ -7,7 +7,7 @@
 // component re-derives a state, a filter, or a classification on its own.
 // `design_status` / `recheck_state` / `validity_state` / `evidence_state` /
 // every notice all arrive DECIDED by `GET /stakeholder-value-network`
-// (`docs/stakeholder-value-network.md` §0 invariant 9). What is left here is
+// (`docs/01-specifications/product/stakeholder-value-network.md` §0 invariant 9). What is left here is
 // genuinely presentational:
 //
 //   1. Fixed Japanese labels for every finite code (§2), one map per union

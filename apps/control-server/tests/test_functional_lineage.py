@@ -1,7 +1,7 @@
 """Tests for Issue #424 -- Functional Lineage View + Gap/Impact Overlay
 (Epic #418).
 
-`docs/stakeholder-value-network.md` §9/§15 is the contract this file
+`docs/01-specifications/product/stakeholder-value-network.md` §9/§15 is the contract this file
 verifies:
 
 1. every §9.2 gap code is reachable, with its FIXED severity (§15 item

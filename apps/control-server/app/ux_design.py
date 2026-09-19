@@ -1,7 +1,7 @@
 """UX Design Lineage: Journey / Step / Requirement / Acceptance Criterion /
 Artifact Reference (Issue #407, Epic #405).
 
-`docs/ux-design-lineage.md` is the canonical contract; §0 and §2 are this
+`docs/01-specifications/ux/ux-design-lineage.md` is the canonical contract; §0 and §2 are this
 module's specification. This is a deterministic domain service -- **no LLM
 call anywhere in this module** (Principle 6). Everything a caller can ask
 this module for is either a direct read of a persisted row, a first-match
@@ -966,7 +966,7 @@ def add_journey_revision(
     always passes `authored_by_kind="developer"`,
     `decision_method="manual"` (#407 calls no LLM anywhere; a future AI-
     assisted authoring flow is out of this issue's scope, see
-    `docs/ux-design-lineage.md` and CLAUDE.md's roadmap note on the
+    `docs/01-specifications/ux/ux-design-lineage.md` and CLAUDE.md's roadmap note on the
     conversational metadata/probe flow).
     """
     now = time.time() if now is None else now

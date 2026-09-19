@@ -1,7 +1,7 @@
 """Tests for Issue #420 -- Stakeholder Value Network: Stakeholder / Need /
 Environment Observation / Value Exchange persistence (Epic #418).
 
-`docs/stakeholder-value-network.md` §15 is the Epic-level testing bar this
+`docs/01-specifications/product/stakeholder-value-network.md` §15 is the Epic-level testing bar this
 file is organized around, scoped to what #420 actually owns (persistence +
 API for the four canonical entities; `stakeholder_ref`/evidence/decision
 tables exist but full reference RESOLUTION against upstream/downstream

@@ -38,7 +38,7 @@ def _hash_text(text: str) -> str:
 # system.  The block is author-written (source-authored) and is copied
 # verbatim into the index; probe-agent never infers meaning from free text and
 # never writes this metadata back to the target repository.  See
-# docs/project-intelligence.md for the documented vocabulary.
+# docs/90-history/project-intelligence.md for the documented vocabulary.
 # ---------------------------------------------------------------------------
 
 #: Marker line that opens the metadata block inside a docstring.

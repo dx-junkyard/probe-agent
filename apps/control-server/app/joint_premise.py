@@ -50,7 +50,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from .alignment import compute_intent_item_digest
 from .inquiry_premise import (
@@ -105,6 +105,15 @@ PREMISE_REASON_CODES = (
     "origin_content_changed",
     "capability_scope_changed",
     "linked_intent_changed",
+    # Issue #461: the dependency reference manifest -- additional facts (kind
+    # #458 will populate) the investigation relied on beyond the origin
+    # itself. 'unresolved' is distinct from a real content mismatch: no
+    # resolver is registered yet (or the caller did not attempt resolution),
+    # so this reports "cannot confirm unchanged" rather than "confirmed
+    # unchanged" -- decision 6's 欠損はcurrentにしない.
+    "dependency_manifest_unresolved",
+    "dependency_target_removed",
+    "dependency_content_changed",
 )
 
 
@@ -134,6 +143,12 @@ class PremiseBundle:
     capability_digest: Optional[str]
     intent_digest: Optional[str]
     review_subject_id: Optional[str]
+    # Issue #461: additional [{target_kind, target_ref, digest}] references
+    # the investigation relied on, beyond the origin itself. Empty for every
+    # session captured before this field existed and for every one that
+    # never populates it -- `is_complete` does NOT depend on this, so a
+    # session with no dependencies is still a complete, comparable bundle.
+    dependency_manifest: Tuple["PremiseDependencyRef", ...] = ()
 
     @property
     def is_complete(self) -> bool:
@@ -182,6 +197,14 @@ class PremiseFacts:
     content_hash: Optional[str]
     capability_digest: Optional[str]
     intent_digest: Optional[str]
+    # Issue #461: the CURRENT digest of each captured dependency manifest
+    # entry, keyed by `PremiseDependencyRef.key()`. `None` (the whole
+    # mapping) means "no resolver attempted this at all" -- distinct from an
+    # entry present in the mapping with value `None`, which means "resolved,
+    # and the target no longer exists". Both are non-'current' outcomes, but
+    # they are different reasons or (Issue #458) callers could not tell them
+    # apart from a caller who never tried.
+    dependency_digests: Optional[Dict[str, Optional[str]]] = None
 
 
 @dataclass(frozen=True)
@@ -244,6 +267,23 @@ def evaluate_joint_premise(
         return PremiseVerdict("stale", "capability_scope_changed")
     if facts.content_hash != bundle.content_hash:
         return PremiseVerdict("stale", "origin_content_changed")
+    # Issue #461: the dependency reference manifest is an ADDITIONAL premise
+    # axis -- root/origin unchanged does not by itself mean current if a
+    # dependency reference did. A no-op for every bundle whose manifest is
+    # empty (every session before Issue #461, and every one that never
+    # populates it), so this changes nothing for them.
+    if bundle.dependency_manifest:
+        if facts.dependency_digests is None:
+            return PremiseVerdict("stale", "dependency_manifest_unresolved")
+        for ref in bundle.dependency_manifest:
+            key = ref.key()
+            if key not in facts.dependency_digests:
+                return PremiseVerdict("stale", "dependency_manifest_unresolved")
+            current = facts.dependency_digests[key]
+            if current is None:
+                return PremiseVerdict("missing", "dependency_target_removed")
+            if current != ref.digest:
+                return PremiseVerdict("stale", "dependency_content_changed")
     return PremiseVerdict("current", None)
 
 
@@ -592,6 +632,329 @@ caller to interpret differently from Issue #308's.
 """
 
 
+# --- Dependency reference manifest (Issue #461) --------------------------------
+#
+# The premise bundle above answers "did the ORIGIN move". This answers "did
+# something ELSE the investigation relied on move" -- a manifest of
+# additional ``[{target_kind, target_ref, digest}]`` references, captured at
+# session creation and compared at every gate the same way the origin content
+# hash already is. `normalize_premise_manifest` / `compute_premise_manifest_
+# digest` are the SHARED helpers Issue #461 decision 5 requires: Issue #458's
+# context bundle builds and validates the same shape, so both features apply
+# exactly one normalization rule rather than two that can silently diverge.
+
+
+@dataclass(frozen=True)
+class PremiseDependencyRef:
+    """One entry of a dependency reference manifest.
+
+    ``digest`` is the value CAPTURED at the time the reference was recorded
+    -- never re-computed here. Comparing it against a freshly resolved
+    current digest (via ``resolve_dependency_digests``) is what lets
+    ``evaluate_joint_premise`` detect "the root did not move, but this
+    dependency did".
+    """
+
+    target_kind: str
+    target_ref: str
+    digest: str
+
+    def key(self) -> str:
+        """Stable lookup key, matching the sort order manifests are stored in."""
+        return f"{self.target_kind}:{self.target_ref}"
+
+    def as_dict(self) -> Dict[str, str]:
+        return {
+            "target_kind": self.target_kind,
+            "target_ref": self.target_ref,
+            "digest": self.digest,
+        }
+
+
+def normalize_premise_manifest(
+    entries: Sequence[Mapping[str, str]],
+) -> Tuple[PremiseDependencyRef, ...]:
+    """Validate, stably sort, and reject duplicates in a dependency manifest.
+
+    Every entry must carry non-empty ``target_kind`` / ``target_ref`` /
+    ``digest``; a ``(target_kind, target_ref)`` pair that repeats is a
+    ``JointPremiseError`` rather than a silent dedupe -- keeping the last
+    occurrence and dropping the earlier one would let a caller lose a
+    reference without ever being told. The result is sorted by
+    ``(target_kind, target_ref)`` so the stored order -- and therefore
+    ``compute_premise_manifest_digest`` -- is independent of the order the
+    caller happened to discover the references in.
+    """
+    refs: list = []
+    seen: set = set()
+    for entry in entries:
+        try:
+            target_kind = str(entry["target_kind"])
+            target_ref = str(entry["target_ref"])
+            digest = str(entry["digest"])
+        except (KeyError, TypeError) as exc:
+            raise JointPremiseError(
+                "each dependency manifest entry requires target_kind, "
+                "target_ref, and digest"
+            ) from exc
+        if not target_kind or not target_ref or not digest:
+            raise JointPremiseError(
+                "dependency manifest entries must have non-empty "
+                "target_kind/target_ref/digest"
+            )
+        key = (target_kind, target_ref)
+        if key in seen:
+            raise JointPremiseError(
+                f"duplicate dependency manifest entry for "
+                f"{target_kind}:{target_ref}"
+            )
+        seen.add(key)
+        refs.append(PremiseDependencyRef(
+            target_kind=target_kind, target_ref=target_ref, digest=digest,
+        ))
+    refs.sort(key=lambda r: (r.target_kind, r.target_ref))
+    return tuple(refs)
+
+
+def compute_premise_manifest_digest(manifest: Sequence[PremiseDependencyRef]) -> str:
+    """SHA-256 of the UTF-8 canonical JSON of a normalized manifest.
+
+    Deliberately excludes anything ephemeral -- fetch timestamp, pagination
+    cursor, unsaved UI draft state (Issue #461 decision 5): only the facts
+    that define WHAT WAS READ belong in a digest that decides staleness.
+    Callers must pass an already-``normalize_premise_manifest``-d sequence;
+    this function does not re-sort or re-validate, so two callers computing
+    over the same normalized manifest always agree.
+    """
+    return _canonical_digest({"dependencies": [ref.as_dict() for ref in manifest]})
+
+
+EMPTY_DEPENDENCY_MANIFEST_DIGEST = compute_premise_manifest_digest(())
+"""The digest of an explicitly empty dependency manifest.
+
+Every session captured before Issue #461, and every one that never
+populates a manifest, stores this value -- a real, stable digest for "no
+extra dependencies" rather than ``NULL``, mirroring
+``EMPTY_CAPABILITY_SCOPE_DIGEST`` above.
+"""
+
+
+def load_dependency_manifest(ju_row) -> Tuple[PremiseDependencyRef, ...]:
+    """Parse a session row's stored, already-normalized manifest JSON.
+
+    Tolerates a missing/blank/malformed column (a pre-#461 row, or a legacy
+    row bypassing this module entirely) by reporting an empty manifest --
+    the same "no dependencies tracked" state a session that never populated
+    one reports, never a crash.
+    """
+    raw = _column(ju_row, "premise_dependency_manifest_json")
+    if not raw:
+        return ()
+    try:
+        entries = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    try:
+        return tuple(
+            PremiseDependencyRef(
+                target_kind=str(e["target_kind"]),
+                target_ref=str(e["target_ref"]),
+                digest=str(e["digest"]),
+            )
+            for e in entries
+        )
+    except (KeyError, TypeError):
+        return ()
+
+
+# A live resolver for the CURRENT digest of one dependency reference.
+# Signature: ``(conn, *, target_kind, target_ref, system_id) -> Optional[str]``,
+# returning ``None`` when the target no longer resolves at all (removed).
+# Unregistered until Issue #458 provides context exploration; every lookup
+# before that reports "not attempted" (see ``resolve_dependency_digests``),
+# which ``evaluate_joint_premise`` treats as NOT current rather than as a
+# match (decision 6: 欠損はcurrentにしない). Tests may register a fake
+# resolver directly to exercise the staleness path end-to-end; always restore
+# the previous value (typically ``None``) afterwards.
+DependencyDigestResolver = Callable[..., Optional[str]]
+_dependency_digest_resolver: Optional[DependencyDigestResolver] = None
+
+
+def register_dependency_digest_resolver(
+    resolver: Optional[DependencyDigestResolver],
+) -> None:
+    """Install (or, with ``None``, remove) the live dependency-digest resolver."""
+    global _dependency_digest_resolver
+    _dependency_digest_resolver = resolver
+
+
+def dependency_digest_resolver_registered() -> bool:
+    return _dependency_digest_resolver is not None
+
+
+def resolve_dependency_digests(
+    conn, manifest: Sequence[PremiseDependencyRef], *, system_id: int,
+) -> Optional[Dict[str, Optional[str]]]:
+    """The current digest of each manifest entry, or ``None`` if unattempted.
+
+    An empty manifest resolves to ``{}`` regardless of whether a resolver is
+    registered -- there is nothing to check, so "not attempted" would be a
+    misleading answer for a session that never captured any dependencies.
+    """
+    if not manifest:
+        return {}
+    if _dependency_digest_resolver is None:
+        return None
+    return {
+        ref.key(): _dependency_digest_resolver(
+            conn, target_kind=ref.target_kind, target_ref=ref.target_ref,
+            system_id=system_id,
+        )
+        for ref in manifest
+    }
+
+
+# --- Discussion origin provider (Issue #461) -----------------------------------
+#
+# `origin_kind='discussion'`'s `origin_id` is a Discussion hypothesis --
+# Issue #455's table, which does not exist yet. Defining the TYPE and the
+# provider registration point here (rather than waiting for #455) is
+# deliberate: it is what lets `_origin_facts` fail closed with an explicit
+# "unsupported" error the moment anything tries to capture or evaluate a
+# 'discussion'-origin premise before a provider is registered, instead of
+# either crashing on a missing table or -- far worse -- silently reporting
+# the origin absent (which `evaluate_joint_premise` would read as a
+# comparable, if unfortunate, `missing` verdict rather than "this feature is
+# not wired up yet").
+
+
+@dataclass(frozen=True)
+class DiscussionOriginFacts:
+    """The subset of a Discussion hypothesis's facts the premise needs.
+
+    Mirrors the shape ``_origin_facts`` already returns for every other
+    origin kind, so `#455`'s provider has one small, obvious contract to
+    satisfy rather than having to understand this module's internals.
+    """
+
+    current_origin_id: int
+    superseded: bool = False
+    revision_id: Optional[int] = None
+    content_hash: Optional[str] = None
+    capability_digest: Optional[str] = None
+    intent_digest: Optional[str] = None
+
+
+# Signature: ``(conn, *, origin_id, system_id) -> Optional[DiscussionOriginFacts]``,
+# returning ``None`` when the hypothesis no longer exists (Issue #461
+# decision 8: the origin's own removal reports the existing 'missing' /
+# 'origin_removed' verdict, the same as every other origin kind).
+DiscussionOriginProvider = Callable[..., Optional[DiscussionOriginFacts]]
+_discussion_origin_provider: Optional[DiscussionOriginProvider] = None
+
+
+def register_discussion_origin_provider(
+    provider: Optional[DiscussionOriginProvider],
+) -> None:
+    """Install (or, with ``None``, remove) the ``origin_kind='discussion'`` provider.
+
+    Issue #455 calls this once its hypothesis table and lifecycle exist.
+    Tests may register a fake provider to exercise the discussion-origin path
+    end to end without depending on #455; always restore the previous value
+    (typically ``None``) afterwards.
+    """
+    global _discussion_origin_provider
+    _discussion_origin_provider = provider
+
+
+def discussion_origin_provider_registered() -> bool:
+    return _discussion_origin_provider is not None
+
+
+# --- Owner resolution (Issue #461) ----------------------------------------------
+#
+# Generalizes the pre-#461 direct `interview_session` lookup so every
+# consumer of `resolve_premise_facts` works for a session whose OWNER is a
+# Discussion thread instead, without each one re-deriving "how do I check
+# this session's owner still exists" (decision 7).
+
+
+@dataclass(frozen=True)
+class OwnerFacts:
+    """Whether a session's owner still resolves, and its live commit axis.
+
+    ``commit_tracked`` is ``False`` for `owner_scope='discussion'`: a
+    Discussion thread carries no rolling "current snapshot" pointer the way
+    an interview session does (nothing about it moves when the System's
+    understanding is rebuilt), so there is no independent "did the ground
+    move" signal on the COMMIT axis for a discussion-scope session -- the
+    dependency manifest above is that axis's real staleness detector for
+    them. When ``False``, ``current_commit_sha`` is unused and the caller
+    must compare against the bundle's OWN captured commit instead (making
+    the existing `pinned_commit_changed` check a structural no-op, the same
+    way the `qa`/`intent`/`purpose_need` origins already make the
+    capability-scope axis a no-op by reporting the same empty digest on both
+    sides).
+    """
+
+    exists: bool
+    commit_tracked: bool
+    current_commit_sha: Optional[str] = None
+
+
+def resolve_owner_facts(conn, ju_row) -> OwnerFacts:
+    """The live state of a session's owner (interview session or Discussion thread)."""
+    owner_scope = _column(ju_row, "owner_scope") or "interview"
+    system_id = ju_row["system_id"]
+    if owner_scope == "discussion":
+        thread_id = _column(ju_row, "discussion_thread_id")
+        if thread_id is None:
+            return OwnerFacts(exists=False, commit_tracked=False)
+        thread = conn.execute(
+            "SELECT id FROM assistant_discussion_thread WHERE id = ? AND system_id = ?",
+            (thread_id, system_id),
+        ).fetchone()
+        return OwnerFacts(exists=thread is not None, commit_tracked=False)
+    session = conn.execute(
+        "SELECT snapshot_id FROM interview_session WHERE id = ? AND system_id = ?",
+        (ju_row["session_id"], system_id),
+    ).fetchone()
+    if session is None:
+        return OwnerFacts(exists=False, commit_tracked=True)
+    current_commit = None
+    if session["snapshot_id"] is not None:
+        snap = conn.execute(
+            "SELECT commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
+            (session["snapshot_id"], system_id),
+        ).fetchone()
+        if snap is not None:
+            current_commit = snap["commit_sha"]
+    return OwnerFacts(exists=True, commit_tracked=True, current_commit_sha=current_commit)
+
+
+def require_discussion_thread_in_system(
+    conn, *, discussion_thread_id: int, system_id: int,
+) -> None:
+    """Existence + System-match check for a `discussion_thread_id`.
+
+    Raises ``JointPremiseError`` whether the thread does not exist at all OR
+    belongs to a different System -- the two report identically so a caller
+    can never learn that a thread with this id exists in ANOTHER System
+    (Issue #461 decision 8, generalized from the session row itself to the
+    resource it is about to attach to). Callers translate this to a 404,
+    exactly as `routes/joint_understanding.py`'s existing `_get_*_or_404`
+    helpers do for their own not-found cases.
+    """
+    row = conn.execute(
+        "SELECT id FROM assistant_discussion_thread WHERE id = ? AND system_id = ?",
+        (discussion_thread_id, system_id),
+    ).fetchone()
+    if row is None:
+        raise JointPremiseError(
+            f"discussion_thread_id={discussion_thread_id} does not resolve in this System"
+        )
+
+
 # --- Persistence-facing capture and evaluation --------------------------------
 #
 # The only functions in this module that touch the database. They are the
@@ -806,6 +1169,34 @@ def _origin_facts(
             "capability_digest": EMPTY_CAPABILITY_SCOPE_DIGEST,
             "intent_digest": None,
         }
+    if origin_kind == "discussion":
+        # Issue #461 decision 4: the hypothesis table is Issue #455's, so
+        # this is the ONE origin kind resolved through a pluggable provider
+        # rather than a direct table read. Failing closed on an unregistered
+        # provider (rather than treating the origin as simply absent) is
+        # what keeps "no provider yet" from being silently reported as the
+        # unremarkable 'missing'/'origin_removed' verdict every other
+        # deleted origin produces.
+        if _discussion_origin_provider is None:
+            raise JointPremiseError(
+                "origin_kind='discussion' has no registered provider "
+                "(unsupported); Issue #455 registers one once the Discussion "
+                "hypothesis table exists"
+            )
+        resolved = _discussion_origin_provider(
+            conn, origin_id=origin_id, system_id=system_id,
+        )
+        if resolved is None:
+            return absent
+        return {
+            "exists": True,
+            "superseded": resolved.superseded,
+            "current_origin_id": resolved.current_origin_id,
+            "revision_id": resolved.revision_id,
+            "content_hash": resolved.content_hash,
+            "capability_digest": resolved.capability_digest or EMPTY_CAPABILITY_SCOPE_DIGEST,
+            "intent_digest": resolved.intent_digest,
+        }
     raise JointPremiseError(f"Unknown origin_kind: {origin_kind!r}")
 
 
@@ -819,22 +1210,52 @@ def _latest_revision_id(conn, *, session_id: int, system_id: int) -> Optional[in
 
 
 def capture_premise_bundle(
-    conn, *, origin_kind: str, origin_id: int, session_row, system_id: int, now: float
+    conn,
+    *,
+    origin_kind: str,
+    origin_id: int,
+    session_row=None,
+    system_id: int,
+    now: float,
+    dependencies: Sequence[Mapping[str, str]] = (),
 ) -> Dict[str, object]:
     """The immutable premise facts to store on a newly created session.
 
     Mirrors ``routes/interview_inquiry._capture_premise`` (Issue #308) in shape
     and column names, and extends it in the two ways a code investigation
     needs: the pinned COMMIT (what the investigation will actually read) and
-    coverage of all four Joint Understanding origins rather than review items
+    coverage of all Joint Understanding origins rather than review items
     alone.
+
+    ``session_row`` is the owning ``interview_session`` row for every origin
+    kind except ``discussion`` (Issue #461): a discussion-origin session has
+    no owning Interview at all, so this omits it (``None``) and instead pins
+    whatever the System's latest READY snapshot is right now -- the same
+    "no snapshot_id given, resolve the newest ready one" default every other
+    Replay/Candidate Studio entry point uses.
+
+    ``dependencies`` is the Issue #461 dependency reference manifest,
+    normalized and dedupe-checked by ``normalize_premise_manifest`` (a bad
+    shape or a duplicate raises ``JointPremiseError`` here, at capture time,
+    rather than being stored and discovered later). Empty by default, which
+    reproduces byte-for-byte the pre-#461 premise for every existing caller.
 
     Nothing here is inferred. When a fact cannot be resolved the column stays
     NULL, which makes the bundle incomplete and the session explicitly
     ``invalid`` -- refused for the asserting outcomes -- rather than compared
     against a reconstructed premise.
     """
-    snapshot_id = session_row["snapshot_id"]
+    if session_row is not None:
+        snapshot_id = session_row["snapshot_id"]
+        owning_session_id = session_row["id"]
+    else:
+        latest = conn.execute(
+            "SELECT id FROM repository_snapshots "
+            "WHERE system_id = ? AND status = 'ready' ORDER BY id DESC LIMIT 1",
+            (system_id,),
+        ).fetchone()
+        snapshot_id = latest["id"] if latest is not None else None
+        owning_session_id = None
     commit_sha = None
     if snapshot_id is not None:
         snapshot = conn.execute(
@@ -845,7 +1266,7 @@ def capture_premise_bundle(
             commit_sha = snapshot["commit_sha"]
     origin = _origin_facts(
         conn, origin_kind=origin_kind, origin_id=origin_id, system_id=system_id,
-        session_id=session_row["id"],
+        session_id=owning_session_id,
     )
     review_subject_id = None
     if origin_kind == "review_item":
@@ -860,18 +1281,24 @@ def capture_premise_bundle(
             "new", "unchanged", "changed",
         ):
             review_subject_id = _column(item, "review_subject_id")
+    manifest = normalize_premise_manifest(dependencies)
     return {
         "premise_snapshot_id": snapshot_id,
         "premise_commit_sha": commit_sha,
         # The origin's own revision where it has one (a review item pins the
-        # Understanding revision it was built from), else the session's latest.
-        # Captured for audit and for the hypothesis re-confirmation lineage --
-        # never an input to the staleness verdict (Issue #323).
+        # Understanding revision it was built from), else the OWNING
+        # interview session's latest -- never derivable at all for a
+        # discussion-origin session, which has none. Captured for audit and
+        # for the hypothesis re-confirmation lineage -- never an input to the
+        # staleness verdict (Issue #323).
         "premise_revision_id": (
             origin["revision_id"]
             if origin["revision_id"] is not None
-            else _latest_revision_id(
-                conn, session_id=session_row["id"], system_id=system_id,
+            else (
+                _latest_revision_id(
+                    conn, session_id=owning_session_id, system_id=system_id,
+                )
+                if owning_session_id is not None else None
             )
         ),
         "premise_content_hash": origin["content_hash"],
@@ -880,6 +1307,10 @@ def capture_premise_bundle(
         "premise_review_subject_id": review_subject_id,
         "premise_tracking_version": JOINT_PREMISE_VERSION,
         "premise_captured_at": now,
+        "premise_dependency_manifest_json": json.dumps(
+            [ref.as_dict() for ref in manifest], ensure_ascii=False,
+        ),
+        "premise_dependency_manifest_digest": compute_premise_manifest_digest(manifest),
     }
 
 
@@ -894,22 +1325,21 @@ def load_premise_bundle(ju_row) -> PremiseBundle:
         capability_digest=_column(ju_row, "premise_capability_digest"),
         intent_digest=_column(ju_row, "premise_intent_digest"),
         review_subject_id=_column(ju_row, "premise_review_subject_id"),
+        dependency_manifest=load_dependency_manifest(ju_row),
     )
 
 
 def resolve_premise_facts(conn, ju_row) -> Optional[PremiseFacts]:
     """The current state of everything the session's bundle captured.
 
-    ``None`` when the owning interview session no longer resolves at all --
-    which ``evaluate_joint_premise`` reads as ``missing``. The pre-#337 code
+    ``None`` when the session's OWNER (interview session, or -- Issue #461 --
+    Discussion thread) no longer resolves at all -- which
+    ``evaluate_joint_premise`` reads as ``missing``. The pre-#337 code
     returned ``fresh`` for exactly this case.
     """
     system_id = ju_row["system_id"]
-    session = conn.execute(
-        "SELECT snapshot_id FROM interview_session WHERE id = ? AND system_id = ?",
-        (ju_row["session_id"], system_id),
-    ).fetchone()
-    if session is None:
+    owner = resolve_owner_facts(conn, ju_row)
+    if not owner.exists:
         return None
     pinned_id = _column(ju_row, "premise_snapshot_id")
     snapshot_exists = False
@@ -918,14 +1348,10 @@ def resolve_premise_facts(conn, ju_row) -> Optional[PremiseFacts]:
             "SELECT 1 FROM repository_snapshots WHERE id = ? AND system_id = ?",
             (pinned_id, system_id),
         ).fetchone() is not None
-    current_commit = None
-    if session["snapshot_id"] is not None:
-        current = conn.execute(
-            "SELECT commit_sha FROM repository_snapshots WHERE id = ? AND system_id = ?",
-            (session["snapshot_id"], system_id),
-        ).fetchone()
-        if current is not None:
-            current_commit = current["commit_sha"]
+    current_commit = (
+        owner.current_commit_sha if owner.commit_tracked
+        else _column(ju_row, "premise_commit_sha")
+    )
     origin = _origin_facts(
         conn,
         origin_kind=ju_row["origin_kind"],
@@ -933,6 +1359,8 @@ def resolve_premise_facts(conn, ju_row) -> Optional[PremiseFacts]:
         system_id=system_id,
         session_id=ju_row["session_id"],
     )
+    manifest = load_dependency_manifest(ju_row)
+    dependency_digests = resolve_dependency_digests(conn, manifest, system_id=system_id)
     return PremiseFacts(
         snapshot_exists=snapshot_exists,
         commit_sha=current_commit,
@@ -943,6 +1371,7 @@ def resolve_premise_facts(conn, ju_row) -> Optional[PremiseFacts]:
         content_hash=origin["content_hash"],
         capability_digest=origin["capability_digest"],
         intent_digest=origin["intent_digest"],
+        dependency_digests=dependency_digests,
     )
 
 
@@ -964,17 +1393,23 @@ __all__ = [
     "ASSERTABLE_PREMISE_STATES",
     "BASIS_REJECTION_CODES",
     "BasisFinding",
+    "DependencyDigestResolver",
+    "DiscussionOriginFacts",
+    "DiscussionOriginProvider",
     "EMPTY_CAPABILITY_SCOPE_DIGEST",
+    "EMPTY_DEPENDENCY_MANIFEST_DIGEST",
     "INTERNAL_PRODUCER_KINDS",
     "JOINT_PREMISE_VERSION",
     "JointPremiseError",
     "LEGACY_PREMISE_STATES",
     "OUTCOMES_REQUIRING_BASIS",
+    "OwnerFacts",
     "PREMISE_REASON_CODES",
     "PREMISE_STATES",
     "PRODUCER_KINDS",
     "PRODUCER_ROLES",
     "PremiseBundle",
+    "PremiseDependencyRef",
     "PremiseFacts",
     "PremiseVerdict",
     "ProducerContext",
@@ -983,12 +1418,22 @@ __all__ = [
     "compute_intent_content_hash",
     "compute_intent_item_digest",
     "compute_inquiry_content_hash",
+    "compute_premise_manifest_digest",
     "compute_purpose_need_content_hash",
     "compute_qa_content_hash",
+    "dependency_digest_resolver_registered",
     "developer_producer",
+    "discussion_origin_provider_registered",
     "evaluate_joint_premise",
     "evaluate_session_premise",
+    "load_dependency_manifest",
     "load_premise_bundle",
+    "normalize_premise_manifest",
+    "register_dependency_digest_resolver",
+    "register_discussion_origin_provider",
+    "require_discussion_thread_in_system",
+    "resolve_dependency_digests",
+    "resolve_owner_facts",
     "resolve_premise_facts",
     "system_producer",
     "validate_basis",

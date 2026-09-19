@@ -1,6 +1,6 @@
 """Product Feature: identity, revisions, and links (Issue #431, Epic #427).
 
-`docs/product-objective-lineage.md` §7.2 / §8 is the canonical contract this
+`docs/01-specifications/product/product-objective-lineage.md` §7.2 / §8 is the canonical contract this
 module implements. This is a deterministic domain service -- **no LLM call
 anywhere in this module** (Principle 6). It is modelled closely on
 `app/ux_design.py` (same typed-exception hierarchy, the same

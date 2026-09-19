@@ -125,7 +125,7 @@ export function isMissingFactState(state: FlowFactState): boolean {
 
 /** Mode names stay in their canonical form (they are the API's vocabulary and
  * appear in the audit rows and the docs); the Japanese gloss is what the
- * developer reads — docs/ui-glossary.md's 初出のみ併記 rule. */
+ * developer reads — docs/01-specifications/ux/ui-glossary.md's 初出のみ併記 rule. */
 export const EXECUTION_MODE_LABEL: Record<ExecutionMode, string> = {
   fixed: "固定実装のみ",
   observe: "固定実装 + 観測",

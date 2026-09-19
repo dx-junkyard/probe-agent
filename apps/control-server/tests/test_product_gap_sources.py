@@ -1,6 +1,6 @@
 """Tests for Issue #430 -- the Gap source federation layer (Epic #427).
 
-`docs/product-objective-lineage.md` §5.4/§5.10 is the canonical contract this
+`docs/01-specifications/product/product-objective-lineage.md` §5.4/§5.10 is the canonical contract this
 file is organized around. `app/product_gap_sources.py` is a pure READ layer:
 it calls the 14 existing gap/divergence producers by reference and never
 persists anything, so every fixture here builds rows directly with

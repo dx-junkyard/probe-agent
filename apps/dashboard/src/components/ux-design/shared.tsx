@@ -3,7 +3,7 @@
 // only -- no field here is computed from anything but props the caller
 // already read from a server response.
 
-import { useState, type ReactNode } from "react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -98,6 +98,85 @@ export function SectionHeading({
   children: ReactNode;
 }) {
   return <Tag className="text-sm font-semibold">{children}</Tag>;
+}
+
+/**
+ * Issue #451 (`docs/01-specifications/capabilities/ai-discussion-adapter.md` §2.8): a small ref registry so a
+ * form-level error summary can focus the exact `<Input>`/`<Textarea>` a
+ * server diagnostic named, without every field needing its own local
+ * `useRef`. Kept in a ref (not state) -- registering must never re-render.
+ */
+type FocusableFormElement = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+
+export interface FieldRefRegistry {
+  register: (name: string) => (el: FocusableFormElement | null) => void;
+  focus: (name: string) => void;
+}
+
+export function useFieldRefs(): FieldRefRegistry {
+  const refs = useRef<Record<string, FocusableFormElement | null>>({});
+  const register = useCallback(
+    (name: string) => (el: FocusableFormElement | null) => {
+      refs.current[name] = el;
+    },
+    [],
+  );
+  const focus = useCallback((name: string) => {
+    refs.current[name]?.focus();
+  }, []);
+  return { register, focus };
+}
+
+/** One field's inline diagnostic, rendered directly under the input it names
+ * (§2.8.2) -- the developer never has to correlate a summary line with the
+ * right field. */
+export function FieldErrorText({ message }: { message?: string }) {
+  if (!message) return null;
+  return (
+    <p className="mt-1 text-xs text-destructive" role="alert">
+      {message}
+    </p>
+  );
+}
+
+/**
+ * Whole-form / section-scoped diagnostic (§2.8.2/§2.8.7): shown when the
+ * server named no specific field (`field_path === ""`), or named a
+ * `field_path` this particular form does not render an input for -- §2.8.2's
+ * "未知 field_path はフォーム全体のエラー" rule. Never guesses a field from
+ * `message`'s text.
+ */
+export function FormErrorBanner({
+  error,
+  onFocusFirstField,
+  testId,
+}: {
+  error: { message: string; code: string } | null;
+  onFocusFirstField?: () => void;
+  testId?: string;
+}) {
+  if (!error) return null;
+  return (
+    <div
+      className="rounded border border-destructive p-2 text-xs text-destructive"
+      role="alert"
+      data-testid={testId ?? "ux-design-form-error"}
+    >
+      <span className="font-mono">{error.code}</span>
+      <span className="ml-2">{error.message}</span>
+      {onFocusFirstField && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="ml-2 h-6 px-2 py-0"
+          onClick={onFocusFirstField}
+        >
+          該当欄へ
+        </Button>
+      )}
+    </div>
+  );
 }
 
 /** A degraded-section note: names WHICH section could not be read, never

@@ -88,6 +88,62 @@ export function SystemBriefCard({
 }) {
   const brief = overview.brief;
 
+  // Issue #464: 「まだ誰も正準として確定していない」 と 「取得できなかった」 は
+  // 別の答えで、次の操作も違う。前者は進行中の候補を別枠で見せて確定へ誘導し、
+  // 後者は何も主張しない。正準の枠へ候補を入れて注記を添える形は採らない —
+  // 注記があっても、確定した主張の位置に未確定の内容が座ることになる。
+  if (!brief && overview.understanding_source === "not_promoted") {
+    const candidate = overview.candidate_brief;
+    return (
+      <Card data-testid="overview-brief-not-promoted">
+        <CardHeader>
+          <CardTitle as="h2" className="text-lg">System Brief</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3 text-base">
+          <p>この System の正準 Understanding はまだ確定していません。</p>
+          {candidate ? (
+            <div
+              className="rounded-md border p-3"
+              data-testid="overview-candidate-brief"
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="outline">進行中・未確定</Badge>
+                {candidate.readiness_label && (
+                  <span className="text-sm text-muted-foreground">
+                    {candidate.readiness_label}
+                  </span>
+                )}
+              </div>
+              {candidate.vision && (
+                <p className="mt-2" data-testid="overview-candidate-vision">
+                  {candidate.vision.name}
+                </p>
+              )}
+              {candidate.system_purpose.slice(0, 1).map(claim => (
+                <p key={claim.name} className="mt-1 text-muted-foreground">
+                  {claim.name}
+                </p>
+              ))}
+              <p className="mt-2 text-sm text-muted-foreground">
+                これは進行中の内容で、まだ誰も正準として確定していません。
+              </p>
+            </div>
+          ) : (
+            <p className="text-muted-foreground">
+              まだシステム理解を作成していません。
+            </p>
+          )}
+          <p className="text-muted-foreground">
+            <Link to={interviewHref} className="text-primary underline">
+              システム理解
+            </Link>
+            の画面で内容を確認し、正準として確定してください。
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
   if (overview.degraded_sections.includes("brief") || !brief) {
     // Degraded, not empty. Saying 「理解がありません」 here would assert a fact
     // about the system from a failure to read one (#384).

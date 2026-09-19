@@ -755,7 +755,7 @@ class TestDeriveStageStatuses:
     """Issue #202: ``_derive_stage_statuses`` derives a deterministic
     not_started / in_progress / blocked / complete status (+ counts) for each
     of the 4 Hub stages, using the finite rules documented in
-    docs/system-understanding-navigation.md.
+    docs/01-specifications/ux/system-understanding-navigation.md.
     """
 
     def _complete_pipeline(self):

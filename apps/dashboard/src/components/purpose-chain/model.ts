@@ -6,7 +6,7 @@
 // re-derives ordering or a label on its own. Everything a component needs
 // that is a JUDGEMENT -- an element's state, a relation's status, resolution
 // level, recheck reason, provenance -- comes from `GET /purpose-chain`
-// verbatim (`docs/purpose-chain.md` §0 invariant 2). What is left here is
+// verbatim (`docs/01-specifications/product/purpose-chain.md` §0 invariant 2). What is left here is
 // genuinely presentational:
 //
 //   1. The fixed CAUSAL order of the 3 frame slots (§3.1/§3.2 both require
@@ -40,7 +40,7 @@ import type {
  * indexing `PurposeFrameOut` with this type is then statically safe. */
 export type FrameSlotKind = Exclude<PurposeElementKind, "core_capability">;
 
-/** The causal order of the 3 Purpose Frame slots (`docs/purpose-chain.md` §0
+/** The causal order of the 3 Purpose Frame slots (`docs/01-specifications/product/purpose-chain.md` §0
  * diagram). Both Overview Level 0 and Interview Level 1 read this array
  * rather than hand-ordering `Object.values(chain.frame)`, so the two screens
  * can never drift into showing a different sequence. */
@@ -51,7 +51,7 @@ export const FRAME_ELEMENT_ORDER: readonly FrameSlotKind[] = [
 ];
 
 /** Heading text for each frame slot, matching the causal-order phrasing
- * `docs/purpose-chain.md` §3.1 specifies verbatim (「誰のどんな現状を変える
+ * `docs/01-specifications/product/purpose-chain.md` §3.1 specifies verbatim (「誰のどんな現状を変える
  * か」 etc.) so the Overview's copy and this contract cannot drift apart. */
 export const ELEMENT_KIND_HEADING: Record<PurposeElementKind, string> = {
   beneficiary_problem: "対象者と現在の課題",

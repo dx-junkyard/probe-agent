@@ -1,6 +1,6 @@
 """Journey Service Blueprint API (Issue #423, Epic #418).
 
-`docs/stakeholder-value-network.md` §8/§10 is the endpoint contract this
+`docs/01-specifications/product/stakeholder-value-network.md` §8/§10 is the endpoint contract this
 module implements against `app/journey_blueprint.py`'s deterministic domain
 service. What this boundary deliberately does NOT do:
 

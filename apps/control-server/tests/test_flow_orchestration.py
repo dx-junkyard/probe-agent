@@ -1,6 +1,6 @@
 """Tests for Epic #412 Issue #415: Flow experiment orchestration.
 
-Canonical contract: `docs/execution-modes.md` §7, test requirements §9.3.
+Canonical contract: `docs/01-specifications/capabilities/execution-modes.md` §7, test requirements §9.3.
 What must hold:
 
 1. Every §7.1 completeness and structural refusal is reachable on its own and

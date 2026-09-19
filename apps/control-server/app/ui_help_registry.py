@@ -4,7 +4,7 @@ Overview / Interview / UX Design Studio / Journey Blueprint の主要な画面�
 について、「これは何か / どう使うか / どのドキュメントに書いてあるか」を
 静的にコード管理する。LLM は一切呼ばない — 説明文はここに著述された固定
 テキストであり、`decision_method` は常に `"deterministic"` である
-(`docs/assistant-discussion.md` §0 / §3、CLAUDE.md Core Design Principle 6/7)。
+(`docs/01-specifications/capabilities/assistant-discussion.md` §0 / §3、CLAUDE.md Core Design Principle 6/7)。
 
 このモジュールが持つのは「解説」という新しい成果物と、既存 Dashboard 画面の
 要素への参照 (`screen_id` + `help_id`) だけである。新しい理解モデルは作らず、
@@ -73,14 +73,14 @@ class UiHelpEntry:
 
 # --- doc shorthands ----------------------------------------------------------
 
-_NAV = "docs/system-understanding-navigation.md"
-_WORKFLOW = "docs/system-interview-workflow-ux.md"
-_PURPOSE = "docs/purpose-chain.md"
-_UX_LINEAGE = "docs/ux-design-lineage.md"
-_STAKEHOLDER = "docs/stakeholder-value-network.md"
-_OBJECTIVE = "docs/product-objective-lineage.md"
-_GLOSSARY = "docs/ui-glossary.md"
-_INTEL = "docs/project-intelligence.md"
+_NAV = "docs/01-specifications/ux/system-understanding-navigation.md"
+_WORKFLOW = "docs/01-specifications/ux/system-interview-workflow-ux.md"
+_PURPOSE = "docs/01-specifications/product/purpose-chain.md"
+_UX_LINEAGE = "docs/01-specifications/ux/ux-design-lineage.md"
+_STAKEHOLDER = "docs/01-specifications/product/stakeholder-value-network.md"
+_OBJECTIVE = "docs/01-specifications/product/product-objective-lineage.md"
+_GLOSSARY = "docs/01-specifications/ux/ui-glossary.md"
+_INTEL = "docs/90-history/project-intelligence.md"
 
 
 # --- Overview -----------------------------------------------------------------

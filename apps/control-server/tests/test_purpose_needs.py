@@ -1,6 +1,6 @@
 """Tests for Issue #389 -- Purpose Needs adaptive next-question.
 
-`docs/purpose-chain.md` §2.8 is the acceptance list this file is organized
+`docs/01-specifications/product/purpose-chain.md` §2.8 is the acceptance list this file is organized
 around:
 
 * rule table 全行 reachable (every need code, every priority row);
@@ -801,4 +801,7 @@ def test_overview_degrades_only_purpose_question_on_failure(admin_client, tmp_pa
     # The Purpose Chain itself (a completely separate section) still renders.
     assert body["purpose_chain"] is not None
     assert "purpose_chain" not in body["degraded_sections"]
-    assert body["brief"] is not None
+    # Nothing has been promoted here, so the canonical Understanding slot
+    # reports that fact (#464) rather than going blank.
+    assert body["understanding_source"] == "not_promoted"
+    assert "brief" not in body["degraded_sections"]

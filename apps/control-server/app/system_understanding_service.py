@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 GAP_HISTORY_EMPTY_SENTINEL = "__no_open_gaps__"
 
 
-# Pipeline step names (from docs/system-understanding-navigation.md)
+# Pipeline step names (from docs/01-specifications/ux/system-understanding-navigation.md)
 PIPELINE_STEPS = [
     "repository_configured",
     "snapshot_ready",
@@ -899,7 +899,7 @@ def _derive_stage_statuses(
     Each stage's rules are evaluated top-to-bottom, first match wins
     (Principle 6: explicit finite branches over an enumerated set, no
     reasoning model). See the "Stage status" table in
-    docs/system-understanding-navigation.md for the rule source.
+    docs/01-specifications/ux/system-understanding-navigation.md for the rule source.
     """
     stages: List[StageStatus] = []
 

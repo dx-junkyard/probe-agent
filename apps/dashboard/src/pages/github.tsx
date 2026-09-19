@@ -138,11 +138,11 @@ function InstallationsPanel({ systemId }: { systemId: number | null }) {
         設定済みのGitHub Organizationのみ登録できます。Connectionを作成する前に、有効なInstallationをこのSystemに割り当ててください。
         セットアップ手順の詳細は
         <a
-          href="https://github.com/dx-junkyard/probe-agent/blob/main/docs/github-app-deployment.md"
+          href="https://github.com/dx-junkyard/probe-agent/blob/main/docs/04-operations/github-app-deployment.md"
           target="_blank" rel="noreferrer"
           className="mx-1 inline-flex items-center gap-1 text-primary hover:underline"
         >
-          docs/github-app-deployment.md <ExternalLink className="h-3 w-3" />
+          docs/04-operations/github-app-deployment.md <ExternalLink className="h-3 w-3" />
         </a>
         を参照してください。
       </CardDescription>
@@ -218,7 +218,7 @@ function AppStatusCard({ status, isLoading }: {
             （既存のprivate keyファイルを指す）を設定し、再起動してください。任意:
             <code className="ml-1">GITHUB_API_BASE_URL</code> / <code>GITHUB_WEB_BASE_URL</code>
             （GitHub Enterprise向け）。これらが設定されるまでConnectionとpublish jobは利用できません。
-            手順の詳細は<code className="mx-1">docs/github-app-deployment.md</code>を参照してください。
+            手順の詳細は<code className="mx-1">docs/04-operations/github-app-deployment.md</code>を参照してください。
           </div>
         )}
       </CardContent>

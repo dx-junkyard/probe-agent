@@ -16,7 +16,7 @@ describe("voicePrerequisite", () => {
     });
   });
 
-  test("requires both speech recognition and speech synthesis", () => {
+  test("requires speech recognition but not browser speech synthesis", () => {
     Object.defineProperty(window, "SpeechRecognition", {
       configurable: true,
       value: class FakeRecognition {},
@@ -25,7 +25,7 @@ describe("voicePrerequisite", () => {
       configurable: true,
       value: undefined,
     });
-    expect(voicePrerequisite()).toBe("unsupported");
+    expect(voicePrerequisite()).toBe("ready");
 
     Object.defineProperty(window, "SpeechRecognition", {
       configurable: true,

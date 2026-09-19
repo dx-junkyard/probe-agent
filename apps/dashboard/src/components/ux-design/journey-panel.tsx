@@ -32,8 +32,12 @@ import {
 } from "./model";
 import {
   ArtifactReferencesCard, DegradedNote, DesignDecisionControls, EmptyNote,
-  LoadErrorCard, LoadingBlock, SectionHeading, StateBadge,
+  FieldErrorText, FormErrorBanner, LoadErrorCard, LoadingBlock, SectionHeading,
+  StateBadge, useFieldRefs,
 } from "./shared";
+import { useFormValidation, useUiDraftSource } from "@/lib/ui-draft";
+import { peekPendingFormDraftPatch, useFormDraftReceiver } from "@/lib/form-draft-inbox";
+import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
 
 const PERSPECTIVES: UxJourneyPerspective[] = ["as_is", "to_be"];
 const BASELINE_MODES: UxJourneyBaselineMode[] = ["linked", "greenfield", "undecided"];
@@ -54,8 +58,16 @@ function JourneyCreateForm() {
   const [key, setKey] = useState("");
   const [perspective, setPerspective] = useState<UxJourneyPerspective>("to_be");
   const [baselineMode, setBaselineMode] = useState<UxJourneyBaselineMode>("undecided");
+  // Issue #451 (§2.8): this create form has no ui_draft form (creation has no
+  // existing content for an AI to be discussing yet) but still surfaces the
+  // server's structural field_path/section diagnostic inline, keeps the
+  // typed key on failure, and never guesses a field from the message text.
+  const validation = useFormValidation();
+  const fieldRefs = useFieldRefs();
+  const KNOWN_FIELDS = ["journey_key"] as const;
 
   function submit() {
+    const token = validation.begin();
     create.mutate(
       {
         journey_key: key.trim(),
@@ -64,21 +76,40 @@ function JourneyCreateForm() {
       },
       {
         onSuccess: () => {
+          validation.resolveSuccess(token);
           setKey("");
           toast.success("Journey を作成しました");
         },
-        onError: (error) => toast.error((error as ApiError).detail || "作成できませんでした"),
+        onError: (error) => {
+          const apiError = error as ApiError;
+          validation.resolveError(token, apiError, KNOWN_FIELDS);
+          toast.error(apiError.detail || "作成できませんでした");
+        },
       },
     );
   }
 
   return (
     <div className="space-y-2" data-testid="ux-journey-create-form">
+      <FormErrorBanner
+        error={validation.formError}
+        onFocusFirstField={
+          Object.keys(validation.fieldErrors).length > 0
+            ? () => fieldRefs.focus(Object.keys(validation.fieldErrors)[0])
+            : undefined
+        }
+        testId="ux-journey-create-form-error"
+      />
       <Input
+        ref={fieldRefs.register("journey_key")}
         placeholder="journey_key(例: checkout-to-be)"
         value={key}
-        onChange={(e) => setKey(e.target.value)}
+        onChange={(e) => {
+          setKey(e.target.value);
+          validation.clearField("journey_key");
+        }}
       />
+      <FieldErrorText message={validation.fieldErrors.journey_key?.message} />
       <div className="flex gap-2">
         <Select value={perspective} onChange={(e) => setPerspective(e.target.value as UxJourneyPerspective)}>
           {PERSPECTIVES.map((p) => (
@@ -174,6 +205,45 @@ function emptyStepInput(order: number): UxJourneyStepInput {
   };
 }
 
+/** Issue #445: a headless registration for one step row's `ux_journey_step`
+ * UI draft. A separate component (not a hook call inside the `.map()` below)
+ * because the number of steps can change between renders of the SAME
+ * `JourneyRevisionForm` instance, and React forbids a hook whose call COUNT
+ * varies within one component instance. */
+function StepDraftSource({
+  journeyKey,
+  step,
+  seed,
+}: {
+  journeyKey: string;
+  step: UxJourneyStepInput;
+  seed?: UxJourneyStepInput;
+}) {
+  const fields = [
+    { fieldName: "user_intent", value: step.user_intent ?? "", dirty: (step.user_intent ?? "") !== (seed?.user_intent ?? ""), validationError: "" },
+    { fieldName: "system_response", value: step.system_response ?? "", dirty: (step.system_response ?? "") !== (seed?.system_response ?? ""), validationError: "" },
+    { fieldName: "success_criteria", value: step.success_criteria ?? "", dirty: (step.success_criteria ?? "") !== (seed?.success_criteria ?? ""), validationError: "" },
+    { fieldName: "failure_mode", value: step.failure_mode ?? "", dirty: (step.failure_mode ?? "") !== (seed?.failure_mode ?? ""), validationError: "" },
+    { fieldName: "recovery_path", value: step.recovery_path ?? "", dirty: (step.recovery_path ?? "") !== (seed?.recovery_path ?? ""), validationError: "" },
+    { fieldName: "evidence_expectation", value: step.evidence_expectation ?? "", dirty: (step.evidence_expectation ?? "") !== (seed?.evidence_expectation ?? ""), validationError: "" },
+  ];
+  useUiDraftSource(
+    "ux_journey_step.revision",
+    // "" (blank step_key -- a newly added, not-yet-keyed row) is refused by
+    // the registry as a no-op registration (`src/lib/ui-draft.ts`): there is
+    // no discussion thread an unkeyed step could ever be about.
+    step.step_key ? `${journeyKey}#${step.step_key}` : "",
+    () => ({
+      fields,
+      selectedItemRef: "",
+      activeTab: "",
+      comparisonTarget: "",
+      localRevisionToken: JSON.stringify(fields.map((f) => [f.fieldName, f.value])),
+    }),
+  );
+  return null;
+}
+
 /** Adding a revision replaces the WHOLE step sequence (§2.3: Step は Journey
  * revision の内容であり、独自の revision 鎖を持たない). The form therefore
  * seeds from the current revision's steps when one exists, so revising reads
@@ -187,6 +257,21 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
     failure_mode: s.failure_mode, recovery_path: s.recovery_path,
     evidence_expectation: s.evidence_expectation, evidence_source_kind: s.evidence_source_kind,
   }));
+  // Issue #445: frozen at mount so a later refetch (e.g. after this same
+  // form's own successful submit) does not retroactively change what counts
+  // as "unedited" mid-session. A lazy `useState` initialiser rather than a
+  // ref: freezing a value at mount IS what that expresses, it is readable
+  // during render (a ref is not -- `react-hooks/refs`), and the initialiser
+  // runs once instead of rebuilding the Map on every render.
+  const [seed] = useState(() => ({
+    title: detail.data?.current_revision?.title ?? "",
+    beneficiary: detail.data?.current_revision?.beneficiary ?? "",
+    usageContext: detail.data?.current_revision?.usage_context ?? "",
+    entryTrigger: detail.data?.current_revision?.entry_trigger ?? "",
+    valueArrival: detail.data?.current_revision?.value_arrival ?? "",
+    summary: detail.data?.current_revision?.summary ?? "",
+    stepsByKey: new Map(seedSteps.map((s) => [s.step_key, s])),
+  }));
   const [title, setTitle] = useState(detail.data?.current_revision?.title ?? "");
   const [beneficiary, setBeneficiary] = useState(detail.data?.current_revision?.beneficiary ?? "");
   const [usageContext, setUsageContext] = useState(detail.data?.current_revision?.usage_context ?? "");
@@ -196,11 +281,53 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
   const [changeNote, setChangeNote] = useState("");
   const [steps, setSteps] = useState<UxJourneyStepInput[]>(seedSteps.length > 0 ? seedSteps : [emptyStepInput(1)]);
 
+  // Issue #451 (§2.8): the real save-validation connection this form was
+  // missing -- a rejected `POST .../revisions` now reaches BOTH the inline
+  // display below and (via `journeyFields[].validationError`) the ui_draft
+  // context an AI conversation reads.
+  const validation = useFormValidation();
+  const fieldRefs = useFieldRefs();
+  const JOURNEY_KNOWN_FIELDS = [
+    "title", "beneficiary", "usage_context", "entry_trigger", "value_arrival", "summary",
+  ] as const;
+
+  // Issue #445 (§2.2/§2.3): the `ux_journey` draft -- title/beneficiary/...
+  // only, the SAME allowlist `app/discussion_adapters.py` registers.
+  const journeyFields = [
+    { fieldName: "title", value: title, dirty: title !== seed.title, validationError: validation.fieldErrors.title?.message ?? "" },
+    { fieldName: "beneficiary", value: beneficiary, dirty: beneficiary !== seed.beneficiary, validationError: validation.fieldErrors.beneficiary?.message ?? "" },
+    { fieldName: "usage_context", value: usageContext, dirty: usageContext !== seed.usageContext, validationError: validation.fieldErrors.usage_context?.message ?? "" },
+    { fieldName: "entry_trigger", value: entryTrigger, dirty: entryTrigger !== seed.entryTrigger, validationError: validation.fieldErrors.entry_trigger?.message ?? "" },
+    { fieldName: "value_arrival", value: valueArrival, dirty: valueArrival !== seed.valueArrival, validationError: validation.fieldErrors.value_arrival?.message ?? "" },
+    { fieldName: "summary", value: summary, dirty: summary !== seed.summary, validationError: validation.fieldErrors.summary?.message ?? "" },
+  ];
+  useUiDraftSource("ux_journey.revision", journeyKey, () => ({
+    validationState: validation.status,
+    sectionErrors: validation.formError ? [validation.formError] : [],
+    fields: journeyFields,
+    selectedItemRef: "",
+    activeTab: "",
+    comparisonTarget: "",
+    localRevisionToken: JSON.stringify(journeyFields.map((f) => [f.fieldName, f.value])),
+  }));
+
+  // Issue #446 (§3.2/§3.3): only the top-level Journey fields -- Step-level
+  // prefill is a #448 (nested/list) concern, out of scope for this phase.
+  const draftReceiver = useFormDraftReceiver("ux_journey.revision", journeyKey, {
+    title: { value: title, dirty: title !== seed.title, setValue: setTitle },
+    beneficiary: { value: beneficiary, dirty: beneficiary !== seed.beneficiary, setValue: setBeneficiary },
+    usage_context: { value: usageContext, dirty: usageContext !== seed.usageContext, setValue: setUsageContext },
+    entry_trigger: { value: entryTrigger, dirty: entryTrigger !== seed.entryTrigger, setValue: setEntryTrigger },
+    value_arrival: { value: valueArrival, dirty: valueArrival !== seed.valueArrival, setValue: setValueArrival },
+    summary: { value: summary, dirty: summary !== seed.summary, setValue: setSummary },
+  });
+
   function updateStep(i: number, patch: Partial<UxJourneyStepInput>) {
     setSteps((prev) => prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s)));
   }
 
   function submit() {
+    const token = validation.begin();
     addRevision.mutate(
       {
         title, beneficiary, usage_context: usageContext, entry_trigger: entryTrigger,
@@ -208,30 +335,101 @@ function JourneyRevisionForm({ journeyKey, onDone }: { journeyKey: string; onDon
       },
       {
         onSuccess: () => {
+          validation.resolveSuccess(token);
           toast.success("Journey の版を追加しました");
           onDone();
         },
-        onError: (error) => toast.error((error as ApiError).detail || "追加できませんでした"),
+        onError: (error) => {
+          const apiError = error as ApiError;
+          validation.resolveError(token, apiError, JOURNEY_KNOWN_FIELDS);
+          toast.error(apiError.detail || "追加できませんでした");
+        },
       },
     );
   }
 
+  // `formError.section === "steps"` (e.g. a duplicated/missing step_key) is
+  // rendered near the Step 列 heading instead of here -- §2.8.2's rule that
+  // `section` routes a whole-form diagnostic to the part of the screen it is
+  // actually about.
+  const topLevelFormError =
+    validation.formError && validation.formError.section !== "steps" ? validation.formError : null;
+  const stepsFormError = validation.formError?.section === "steps" ? validation.formError : null;
+  const firstInvalidJourneyField = JOURNEY_KNOWN_FIELDS.find((f) => validation.fieldErrors[f]);
+
   return (
     <div className="space-y-3 rounded border p-3" data-testid="ux-journey-revision-form">
+      <FormDraftConflictBanner conflicts={draftReceiver.conflicts} onResolve={draftReceiver.resolveField} />
+      <FormErrorBanner
+        error={topLevelFormError}
+        onFocusFirstField={firstInvalidJourneyField ? () => fieldRefs.focus(firstInvalidJourneyField) : undefined}
+        testId="ux-journey-revision-form-error"
+      />
       <div className="grid gap-2 sm:grid-cols-2">
-        <Input placeholder="タイトル" value={title} onChange={(e) => setTitle(e.target.value)} />
-        <Input placeholder="対象者" value={beneficiary} onChange={(e) => setBeneficiary(e.target.value)} />
-        <Input placeholder="文脈" value={usageContext} onChange={(e) => setUsageContext(e.target.value)} />
-        <Input placeholder="トリガー" value={entryTrigger} onChange={(e) => setEntryTrigger(e.target.value)} />
-        <Input placeholder="価値到達" value={valueArrival} onChange={(e) => setValueArrival(e.target.value)} />
+        <div>
+          <Input
+            ref={fieldRefs.register("title")}
+            placeholder="タイトル"
+            value={title}
+            onChange={(e) => { setTitle(e.target.value); validation.clearField("title"); }}
+          />
+          <FieldErrorText message={validation.fieldErrors.title?.message} />
+        </div>
+        <div>
+          <Input
+            ref={fieldRefs.register("beneficiary")}
+            placeholder="対象者"
+            value={beneficiary}
+            onChange={(e) => { setBeneficiary(e.target.value); validation.clearField("beneficiary"); }}
+          />
+          <FieldErrorText message={validation.fieldErrors.beneficiary?.message} />
+        </div>
+        <div>
+          <Input
+            ref={fieldRefs.register("usage_context")}
+            placeholder="文脈"
+            value={usageContext}
+            onChange={(e) => { setUsageContext(e.target.value); validation.clearField("usage_context"); }}
+          />
+          <FieldErrorText message={validation.fieldErrors.usage_context?.message} />
+        </div>
+        <div>
+          <Input
+            ref={fieldRefs.register("entry_trigger")}
+            placeholder="トリガー"
+            value={entryTrigger}
+            onChange={(e) => { setEntryTrigger(e.target.value); validation.clearField("entry_trigger"); }}
+          />
+          <FieldErrorText message={validation.fieldErrors.entry_trigger?.message} />
+        </div>
+        <div>
+          <Input
+            ref={fieldRefs.register("value_arrival")}
+            placeholder="価値到達"
+            value={valueArrival}
+            onChange={(e) => { setValueArrival(e.target.value); validation.clearField("value_arrival"); }}
+          />
+          <FieldErrorText message={validation.fieldErrors.value_arrival?.message} />
+        </div>
         <Input placeholder="変更メモ(任意)" value={changeNote} onChange={(e) => setChangeNote(e.target.value)} />
       </div>
-      <Textarea placeholder="概要" value={summary} onChange={(e) => setSummary(e.target.value)} rows={2} />
+      <div>
+        <Textarea
+          ref={fieldRefs.register("summary")}
+          placeholder="概要"
+          value={summary}
+          onChange={(e) => { setSummary(e.target.value); validation.clearField("summary"); }}
+          rows={2}
+        />
+        <FieldErrorText message={validation.fieldErrors.summary?.message} />
+      </div>
 
       <div className="space-y-2">
         <SectionHeading as="h4">Step 列</SectionHeading>
+        <FormErrorBanner error={stepsFormError} testId="ux-journey-steps-form-error" />
         {steps.map((s, i) => (
           <div key={i} className="space-y-1 rounded border p-2 text-xs" data-testid={`ux-journey-step-row-${i}`}>
+            <StepDraftSource journeyKey={journeyKey} step={s} seed={seed.stepsByKey.get(s.step_key)} />
             <div className="flex gap-2">
               <Input
                 placeholder="step_key"
@@ -507,7 +705,11 @@ function JourneyDetail({
   onOpenRequirement: (key: string) => void;
 }) {
   const detail = useUxJourneyDetail(journeyKey);
-  const [revisionOpen, setRevisionOpen] = useState(false);
+  // Issue #446: auto-open the revision form when a prefill patch for THIS
+  // Journey is already waiting (see `RequirementDetail`'s identical rule).
+  const [revisionOpen, setRevisionOpen] = useState(() =>
+    peekPendingFormDraftPatch("ux_journey.revision", journeyKey),
+  );
   const [stepKey, setStepKey] = useState<string | null>(null);
 
   if (detail.isLoading) return <LoadingBlock testId="ux-journey-detail-loading" />;

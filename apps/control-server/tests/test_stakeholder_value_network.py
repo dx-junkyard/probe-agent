@@ -1,6 +1,6 @@
 """Tests for Issue #422 -- Stakeholder Value Network projection (Epic #418).
 
-`docs/stakeholder-value-network.md` §7.1/§7.2/§15 is the contract this file
+`docs/01-specifications/product/stakeholder-value-network.md` §7.1/§7.2/§15 is the contract this file
 verifies:
 
 1. total/stable ordering for nodes and edges (§7.1).

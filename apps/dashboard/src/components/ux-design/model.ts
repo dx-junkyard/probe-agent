@@ -8,7 +8,7 @@
 // `design_status`, `recheck_state`, `revision_state`, every ref/link state,
 // the diffs, and the change-origin classification all arrive decided by
 // `GET /ux-design/...` and `GET /solution-designs/...`
-// (`docs/ux-design-lineage.md` §0 invariant 9). What is left here is
+// (`docs/01-specifications/ux/ux-design-lineage.md` §0 invariant 9). What is left here is
 // genuinely presentational:
 //
 //   1. Fixed DISPLAY ORDER for lists whose server response is not already

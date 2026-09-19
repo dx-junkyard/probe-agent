@@ -1,0 +1,128 @@
+# UI 用語集とラベル規則 (Issue #374)
+
+同じ改善ループの中に `candidate version` / `variant` / `Replay Set` /
+`Replay run` / `shadow` / `Experiment` が短時間で登場し、どれが何を指すのかが
+画面から読み取れなかった。ここを用語の基準にする。
+
+## 1. 利用者向けの言い換え
+
+内部データモデル名は主導線に出さない。出す場合は、この対応で言い換える。
+
+| 内部の名前 | 利用者向けの言い方 | 何を指すか |
+| --- | --- | --- |
+| Candidate Session | 改善セッション | 1つの component に対する改善作業のまとまり |
+| Candidate Version | 候補 v1, v2 … | 生成された差分1つ。immutable |
+| Variant | 比較する実装 | 1回の比較で並べる baseline / 候補 |
+| Replay Set | 評価に使う Trace の集合 | 比較の母数になる、記録済み入力の集合 |
+| Replay Run | 比較の実行 | 隔離環境での1回の実行 |
+| Shadow | 本番並行実行 | 本番トラフィックで候補も動かして記録する（戻り値は変えない） |
+| Experiment | 実験 | 複数 variant を隔離ワークスペースで実行し、採否を記録する単位 |
+| Snapshot | Snapshot | 固定した commit のコード一式（固有概念なのでそのまま） |
+| Product Objective | Objective | Vision へ寄与する中間目標。安定 key を持つ (#427) |
+| Milestone | Milestone | その Objective が達成へ向かったと観測・判断できる状態 |
+| Gap | Gap | 明示された現状と、その Milestone の目標状態との差 |
+| Product Feature | Feature | Requirement を満たす機能単位。Capability・Flow・Component とは別 |
+
+「Replay」「Trace」「Snapshot」「Experiment」「System」「Capability」は
+固有の製品概念なのでそのまま使う（CLAUDE.md の Dashboard UI言語規約）。
+
+## 2. 操作ラベルの規則
+
+操作名は「何が起きるか」ではなく「**何が作られるか**」が分かる形にする。
+監査で最も強く出た指摘がこれで、「送信」「promote」「Experimentへ送る」は
+どれも結果を説明していなかった。
+
+| 悪い例 | 良い例 | 作られるもの |
+| --- | --- | --- |
+| 送信 | 候補を生成 | 候補 version（差分） |
+| promote | Experiment 作成へ進む | Experiment の下書き（作成はまだ） |
+| 実行 | baseline と比較する | Replay の実行結果 |
+| 適用 | 差分をダウンロード | ローカルの .patch ファイル |
+
+改善ループの各段階が「その操作が作るもの」を画面上で述べる責任を持つ
+(`components/improvement-loop/model.ts` の `produces`)。
+
+Overview の「次にすること」は 1 件だけで、操作名に加えて**選定理由・完了条件・
+完了後に得られる価値**を必ず併記する(Issue #383)。押せない操作を disabled で
+並べない -- 操作が無い状態は「処理中です」「判定できませんでした」という
+文章で表す。
+
+## 3. 状態語の規則
+
+**1つの語に2つの事実を持たせない。** Issue #366 の不具合はすべてこの形だった。
+
+| 語 | 意味すること | 意味しないこと |
+| --- | --- | --- |
+| `ready`（Snapshot） | 解析処理が完了した | HEAD と一致している |
+| `current`（Snapshot） | HEAD と一致している | 解析が完了している |
+| `receiving`（接続） | 一度でも受信した（累積） | いま受信している |
+| `receiving_now`（鮮度） | いま受信している | 過去に受信した |
+| `active`（token） | いま認証に使える | 失効していないだけ |
+| `partial`（Replay） | 一部マスクされた入力で復元できる | 復元できない |
+| `not_captured` | capture 設定自体がない | capture に失敗した |
+| `new`（Overview finding） | 前回の理解確認より後に発生した | 重要度が高い |
+| `ongoing`（Overview finding） | 前回の確認時点から続いている | 解消済み |
+| `not_compared`（Overview finding） | 比較の基準がまだ無い | 新しい発見が無い |
+| `no_findings`（Overview） | 比較した結果、重要な新規発見が無い | 比較していない |
+| `unavailable`（Overview） | 取得に失敗した | 該当が無い |
+| `waiting`（Overview 主操作） | システムが処理中で、押す操作が無い | 操作が禁止されている |
+| `unavailable`（Overview 主操作） | 判定に必要な事実を読めなかった | まだその段階に達していない |
+| `observed_component_count` | window 内に trace を出した component 数 | 観測済み Capability 数 |
+| `not_computed`（coverage） | 算出していない | カバレッジが 0 |
+| `developer_intent` | 開発者が表明した意図・目標 | 開発者が下した採否判断 |
+| `developer_decision` | 採否・確認などの判断記録 | 開発者が表明した意図 |
+| `mixed`（provenance） | 集約した出所が複数に割れた | 出所が不明 |
+| `publish_instrumentation` | 計測 patch を公開する | 採用した改善変更を公開する |
+| `no_baseline`（Overview） | 開発者がまだ理解を確認していない | 基準を読めなかった |
+| `unavailable`（baseline） | 基準を読めなかった | 開発者が確認していない |
+| `confirmed`（Milestone） | 到達状態の**定義**を人が確定した | 達成した |
+| `met`（Milestone） | 人が**達成した**と判定した | 定義が確定している |
+| `unassessed`（Milestone） | まだ誰も達成を評価していない | 評価して判定できなかった |
+| `indeterminate`（Milestone） | 人が評価して、判定できなかった | まだ誰も見ていない |
+| `assessability=unavailable` | 検証方法が決まっていないので評価できない | 達成していない |
+| `contradicted`（Gap source） | 検出元が「もう成り立たない」と言っている | 検出元にもう存在しない |
+| `disappeared`（Gap source） | 検出元にもう存在しない | 検出元が否定している |
+| `unavailable`（Gap source） | 検出元の読み取りに失敗した | 検出元にもう存在しない |
+| `changed`（Gap source） | 検出元の内容が動いた | Gap が解消した |
+| `resolved`（Gap） | 人が差を埋めたと判断した | 検出元が消えた |
+| `obsolete`（Gap） | 人が「問いとして成り立たない」と判断した | 差を埋めた |
+| `rejected`（Gap） | 人が「これは Gap ではない」と判断した | 差を埋めた |
+| `priority_band` | 人が置いた有限バンド | 件数や severity から計算した重要度 |
+| `objective_state=null`（Overview） | Objective がまだ 1 つも無い | 読み取りに失敗した |
+| `current`（会話の対象） | 会話開始時に捕捉した内容と今も一致する | 対象が確認済みである |
+| `stale`（会話の対象） | 内容が動いたので過去の turn を前提に使わない | 過去の turn を消す |
+| `unresolvable`（会話の対象） | 対象そのものが今は解決できない | 内容が変わった |
+| `not_tracked`（会話の対象） | その種類には digest 源が無い（画面全体） | 変化を検出できていない |
+| `deterministic`（機能解説） | 製品管理下レジストリの完全一致結果 | LLM が生成した説明 |
+| `canonical_head`（Understanding の出所） | 人が正準として昇格した内容 | 最新の会話が作った内容 |
+| `not_promoted`（Understanding の出所） | まだ誰も正準として確定していない | 取得できなかった（`unavailable`） |
+| `candidate_state`（Overview） | 進行中の内容が正準とどう違うか | 正準そのもの |
+| `promoted_by_this_session`（前提の理由） | この会話が確定させたので前提が古くなった | 他の誰かが先へ進めた（`head_moved`） |
+| `current`（Interview の前提） | 開始時に固定した前提が今も正準 head と一致する | 会話の内容が正しい |
+| `stale`（Interview の前提） | 開始後に正準 Understanding が動いた | 会話が間違っていた |
+| `missing`（Interview の前提） | 前提にしていたリビジョンが消えた | 前提が動いた（`stale`） |
+| `invalid`（Interview の前提） | 前提を記録する前に作られた（legacy-unbased） | 前提が正しい（`current`） |
+| `branched`（Interview の前提） | 古い前提の検討として人が明示的に維持した | 前提が最新に戻った |
+| `candidate`（Understanding リビジョン） | まだ誰も正準として確定していない | Overview に出る内容 |
+
+## 4. 空状態・失敗状態
+
+空状態は3つを必ず書く。
+
+1. 何が無いのか（事実）
+2. なぜ無いのか（前提不足があれば）
+3. 次にする1操作（CTA）
+
+「まだありません」だけで終わらせない。
+
+**「無い」と「分からない」を同じ文言にしない。** Overview の「今わかったこと」
+はこの区別を 3 つの空状態として持つ(Issue #382): 比較した結果として発見が無い /
+比較の基準がまだ無い / 取得に失敗した。Runtime health も同じで、「取得できま
+せんでした」を「受信が止まっています」と書いてはならない -- 前者は観測できて
+いないという事実で、後者はシステムについての主張である。
+
+## 5. アクセシビリティ
+
+- icon-only ボタンには `aria-label` を付ける（copy / revoke / close / collapse）。
+- 状態を色だけで表さない。必ずテキストラベルを併記する。
+- 折りたたみは `<details>` / `aria-expanded` を使い、DOM から要素を消さない。

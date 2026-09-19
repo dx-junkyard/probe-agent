@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 // Issue #422 (Epic #418): Stakeholder Value Network screen tests.
 //
-// `docs/stakeholder-value-network.md` §0 invariant 9 is what every test here
+// `docs/01-specifications/product/stakeholder-value-network.md` §0 invariant 9 is what every test here
 // protects: the client re-derives nothing. Everything below exercises what
 // the screen does with values `GET /stakeholder-value-network` already
 // decided -- filtering/labelling/URL-state logic is unit-tested directly on

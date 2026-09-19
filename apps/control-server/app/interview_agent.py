@@ -48,7 +48,7 @@ from .probe_planner import check_denylist
 # with a do-not-re-ask rule (Issue #129).
 # v4: pass-1 evidence-selection prompt precedes this one when evidence
 # snippets are supplied (Issue #130); the response schema is unchanged.
-PROMPT_VERSION = "interview-v6"
+PROMPT_VERSION = "interview-v7"
 # v2: next_questions items are structured {question_text, hypothesis,
 # evidence_refs, answer_options} objects (Issue #128); plain strings are
 # still accepted and normalized.
@@ -314,9 +314,25 @@ def _build_user_prompt(
     understanding_max_chars: int = DEFAULT_UNDERSTANDING_MAX_CHARS,
     evidence_snippets: Optional[List[EvidenceSnippet]] = None,
     proposals_requested: bool = False,
+    canonical_premise: Optional[Dict[str, Any]] = None,
 ) -> str:
     recent_history = history[-MAX_RECENT_MESSAGES:]
     parts: List[str] = []
+    # Issue #464: the System's canonical premise, pinned when this session
+    # started. It comes before the session's own working hypothesis because
+    # the two are different kinds of fact: this one a human already settled
+    # for the whole System, the one below is what this conversation has
+    # provisionally built. Without it a fresh interview asked the developer to
+    # restate a Vision the Overview was already showing them.
+    if canonical_premise:
+        parts.append(
+            "## Canonical System Understanding (premise, human-confirmed)\n"
+            "Already established for this system and fixed for this "
+            "conversation. Never ask the developer to restate any of it; "
+            "build on it, and raise an explicit question only when new "
+            "evidence contradicts it."
+        )
+        parts.append(_trim_json(canonical_premise, understanding_max_chars))
     if current_understanding:
         parts.append(
             "## Current understanding (your working hypothesis about this system; "
@@ -512,6 +528,7 @@ def generate_interview_turn(
     unconfirmed_qa: Optional[List[Dict[str, Any]]] = None,
     evidence_snippets: Optional[List[EvidenceSnippet]] = None,
     proposals_requested: bool = False,
+    canonical_premise: Optional[Dict[str, Any]] = None,
 ) -> InterviewTurnResult:
     """Generate one structured assistant turn for the interview dialogue.
 
@@ -576,6 +593,7 @@ def generate_interview_turn(
         understanding_max_chars=understanding_max_chars,
         evidence_snippets=evidence_snippets,
         proposals_requested=proposals_requested,
+        canonical_premise=canonical_premise,
     )
 
     try:

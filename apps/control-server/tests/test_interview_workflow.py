@@ -2,7 +2,7 @@
 
 Covers `app/interview_workflow.py` (the canonical two-stage evaluation and
 the process-run lifecycle) and `app/routes/interview_workflow.py` (the API
-that persists facts A-D), against `docs/system-interview-workflow-ux.md`.
+that persists facts A-D), against `docs/01-specifications/ux/system-interview-workflow-ux.md`.
 
 Part 1 -- the pure engine:
   * every one of the 13 first-match rule rows, in isolation;

@@ -1,6 +1,6 @@
 """Gap source federation (Issue #430, Epic #427).
 
-`docs/product-objective-lineage.md` §5.4/§5.10 is the canonical contract.
+`docs/01-specifications/product/product-objective-lineage.md` §5.4/§5.10 is the canonical contract.
 This module is the SINGLE read-time resolution layer a `product_gap_source_ref`
 dispatches through. It calls the 14 EXISTING gap/divergence producers listed in
 §5.4's table and reads their EXISTING canonical rows -- it never re-implements

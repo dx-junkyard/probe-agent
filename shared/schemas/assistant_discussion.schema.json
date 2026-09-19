@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/assistant_discussion.json",
+  "title": "AssistantDiscussionAdapter",
+  "description": "The finite vocabularies Epic #443 pins for the AI Discussion UI Adapter (Issue #444, Phase 1). `docs/01-specifications/capabilities/ai-discussion-adapter.md` §1 is the canonical contract; `docs/01-specifications/capabilities/assistant-discussion.md` §1/§2 are the canonical contract for the underlying thread/proposal persistence these vocabularies describe (unchanged by this Epic). This schema does not describe a new persisted row shape -- Phase 1 adds no database table -- it exists so `tests/test_discussion_contract_parity.py` has one machine-checkable source alongside the server `Literal`s (`app/models.py`) and the Dashboard unions (`src/api/types.ts`) for every enum this Epic's registry introduces or touches. Each `$defs` entry below is referenced elsewhere as `#/$defs/<name>` rather than restated.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "scope": { "$ref": "#/$defs/discussion_scope" },
+    "target_kind": { "$ref": "#/$defs/discussion_target_kind" },
+    "target_state": { "$ref": "#/$defs/discussion_target_state" },
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/discussion_capability" }
+    },
+    "operation_state": { "$ref": "#/$defs/discussion_operation_result" },
+    "proposal_item_kind": { "$ref": "#/$defs/discussion_proposal_item_kind" },
+    "proposal_item_status": { "$ref": "#/$defs/discussion_proposal_item_status" },
+    "proposal_item_eligibility": { "$ref": "#/$defs/discussion_proposal_item_eligibility" },
+    "ui_draft_state": { "$ref": "#/$defs/ui_draft_state" },
+    "ui_draft_validation_state": { "$ref": "#/$defs/ui_draft_validation_state" },
+    "context_completeness": { "$ref": "#/$defs/discussion_context_completeness" },
+    "context_stop_reason": { "$ref": "#/$defs/discussion_context_stop_reason" },
+    "context_resolution": { "$ref": "#/$defs/discussion_context_resolution" },
+    "context_deep_link_state": { "$ref": "#/$defs/discussion_context_deep_link_state" },
+    "context_next_action_kind": { "$ref": "#/$defs/discussion_context_next_action_kind" },
+    "context_audit_consumer_kind": { "$ref": "#/$defs/discussion_context_audit_consumer_kind" },
+    "context_claim_basis": { "$ref": "#/$defs/discussion_context_claim_basis" },
+    "context_claim_error_kind": { "$ref": "#/$defs/discussion_context_claim_error_kind" },
+    "gap_discussion_next_action_kind": { "$ref": "#/$defs/gap_discussion_next_action_kind" }
+  },
+  "$defs": {
+    "ui_draft_validation_state": {
+      "description": "Client form validation lifecycle, independent of dirty/readable state.",
+      "enum": ["idle", "validating", "invalid"]
+    },
+    "discussion_scope": {
+      "description": "docs/01-specifications/capabilities/assistant-discussion.md §1.1. Fixed per target_kind (never chosen by the caller) via the scope -> target_kind first-match table `app/discussion_adapters.py`'s registry derives `SCOPE_TARGET_KINDS` from.",
+      "enum": ["screen", "entity", "element"]
+    },
+    "discussion_target_kind": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §1.1/§1.2/§4.1. One `DiscussionAdapter` per value, registered in `app/discussion_adapters.DISCUSSION_ADAPTERS` -- an unregistered value is refused fail-closed (422 discussion_target_kind_unregistered) rather than silently degrading. Phase 1 (#444) covered the 9 kinds Epic #436 (#438) already shipped; Issue #453 (Phase 4, #447's follow-up) adds the Vision-to-Feature 8 kinds below, additively -- each resolves against an EXISTING owning module's stable identity (purpose_element/purpose_relation -> app/purpose_chain.py, stakeholder/stakeholder_need -> app/stakeholder_network.py, product_objective/product_milestone/product_gap -> app/product_objective.py, product_feature -> app/product_feature.py), never a new id scheme.",
+      "enum": [
+        "screen",
+        "interview_session",
+        "understanding_claim",
+        "overview_finding",
+        "ux_journey",
+        "ux_journey_step",
+        "ux_requirement",
+        "solution_design",
+        "blueprint_lane_cell",
+        "purpose_element",
+        "purpose_relation",
+        "stakeholder",
+        "stakeholder_need",
+        "product_objective",
+        "product_milestone",
+        "product_gap",
+        "product_feature"
+      ]
+    },
+    "discussion_target_state": {
+      "description": "docs/01-specifications/capabilities/assistant-discussion.md §1.3. Derived at read time from the captured digest vs. the target's current canonical digest -- never a stored column, so an edited target cannot keep reporting a stale answer as current.",
+      "enum": ["current", "stale", "unresolvable", "not_tracked"]
+    },
+    "discussion_capability": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3. Derived from what a DiscussionAdapter actually declares (`fields`/`relations`/`children`/`ui_draft_forms`/`joint_understanding_bridge`) -- never a stored column or a second constant, so a capability can never drift from the adapter that is supposed to back it. Phase 1 derived only `read_canonical`/`propose_fields`/`propose_relations` true (every `ui_draft_forms`/`children` was empty and `joint_understanding_bridge` false); Phases 2/3/5 (#445/#452/#454) populate `ui_draft_forms` and one adapter's `children`, and `promote_joint_understanding` remains unreachable until #449 -- this enum itself does not widen for any of that.",
+      "enum": [
+        "read_canonical",
+        "read_ui_draft",
+        "propose_fields",
+        "propose_relations",
+        "prefill_form",
+        "promote_joint_understanding"
+      ]
+    },
+    "discussion_proposal_item_kind": {
+      "description": "docs/01-specifications/capabilities/assistant-discussion.md §2.3. Unchanged by Epic #443 Phase 1 -- included here so the parity test can check it alongside the adapter vocabularies above in one place.",
+      "enum": ["field", "relation"]
+    },
+    "discussion_proposal_item_status": {
+      "description": "docs/01-specifications/capabilities/assistant-discussion.md §2.3. The item's OWN persisted lifecycle -- separate from `discussion_proposal_item_eligibility`, which is derived at read time and never stored (§2.2).",
+      "enum": ["proposed", "applied", "rejected"]
+    },
+    "discussion_proposal_item_eligibility": {
+      "description": "docs/01-specifications/capabilities/assistant-discussion.md §2.2's first-match order: forbidden -> stale -> conflict -> appliable. Derived at read time from the target's CURRENT canonical digest and the item's own status/address, never stored.",
+      "enum": ["forbidden", "stale", "conflict", "appliable"]
+    },
+    "ui_draft_state": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §2.6 (Issue #445, Epic #443 Phase 2). `not_provided` (client sent none) and `unreadable` (a form IS open for this target but the client could not read it, self-reported via `UiDraftContextIn.readable`) are deliberately distinct answers: an assistant that reports the former when the latter is true is describing a screen the developer is not looking at. Recorded on the USER turn only (`assistant_discussion_turn.ui_draft_state`); `NULL` on a pre-#445 row is a FOURTH, distinct meaning ('this server could not have recorded it') that this enum does not cover.",
+      "enum": ["not_provided", "applied", "no_unsaved_changes", "unsupported", "unreadable"]
+    },
+    "discussion_operation_result": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §1.3/§1.7/§9 (Issue #456). What a discussion-adapter READ operation (canonical context gathering, prefill readiness, ...) reports about ITSELF, kept in a field separate from the facts/capabilities it accompanies and separate from `discussion_target_state` (freshness). First-match: `unsupported` (no adapter/handler registered for this operation -- a structural gap in the current catalog), `unavailable` (a registered handler exists but this specific attempt failed), `not_applicable` (this kind of target can never carry this operation, independent of registration state). A deleted/inaccessible target stays on the existing resolver/404 contract rather than being reclassified into this vocabulary.",
+      "enum": ["available", "unsupported", "unavailable", "not_applicable"]
+    },
+    "discussion_context_completeness": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.1/§9.2 (Issue #458, DD-CTX-02). `unknown` means the walk was cut off before even the candidate COUNT could be established -- never a guessed lower bound reported as `partial`.",
+      "enum": ["complete", "partial", "unknown"]
+    },
+    "discussion_context_stop_reason": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.1 (Issue #458). Why one section's coverage stopped short of `complete`; `complete` doubles as \"nothing stopped it\".",
+      "enum": ["complete", "item_budget", "byte_budget", "depth_budget", "provider_error", "unsupported", "not_applicable"]
+    },
+    "discussion_context_resolution": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.1 (Issue #458). One bundle entry's own resolution -- mirrors `discussion_adapters.ResolvedTarget.resolution` exactly.",
+      "enum": ["resolved", "unresolved", "not_tracked"]
+    },
+    "discussion_context_deep_link_state": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.1 (Issue #458). Whether a bundle source's `deep_link` both exists and selects the exact entity (`selected`), only opens the owning screen (`screen_only`), or does not exist (`unavailable`).",
+      "enum": ["selected", "screen_only", "unavailable"]
+    },
+    "discussion_context_next_action_kind": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §8/§9.1 (Issue #458). The ONLY action a context bundle itself carries is \"fetch more context\" -- never a domain action; #459 owns the discussion's own main operation.",
+      "enum": ["expand_context", "none"]
+    },
+    "discussion_context_audit_consumer_kind": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.3 (Issue #458). The durable audit table's finite `consumer_kind` -- which kind of durable row a bundle's dependency manifest backed. Mirrors `app/discussion_context_bundle.CONTEXT_AUDIT_CONSUMER_KINDS` exactly.",
+      "enum": ["turn", "proposal", "ju_session"]
+    },
+    "discussion_context_claim_kind": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.2/DD-CTX-04 (Issue #459). The finite semantic-claim-kind vocabulary a bundle-grounded 照合 answer's claims carry. Mirrors `app/discussion_context_bundle.DISCUSSION_CONTEXT_CLAIM_KINDS` / `app/models.DiscussionContextClaimKind` exactly.",
+      "enum": ["fact", "inference", "hypothesis", "unknown", "conflict"]
+    },
+    "discussion_context_claim_basis": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.2 (Issue #459). Whether one claim came straight off a bundle's own structural field (`deterministic`) or the reasoning model's structured output (`reasoning_llm`). Mirrors `app/discussion_claims.CLAIM_BASIS_VALUES` exactly.",
+      "enum": ["deterministic", "reasoning_llm"]
+    },
+    "discussion_context_claim_error_kind": {
+      "description": "docs/01-specifications/capabilities/ai-discussion-adapter.md §9.2 (Issue #459). Why a §9.2 claims call failed or was refused, first-match: no usable reasoning-model client, a real call error, invalid structured output, or an LLM response that still cited an id outside the bundle's allow-list after one retry.",
+      "enum": ["unavailable", "call_error", "invalid_response", "invalid_citation"]
+    },
+    "gap_discussion_next_action_kind": {
+      "description": "docs/01-specifications/ux/decision-discussion-workflow.md §3, DD-UX-01 (Issue #459). The finite, PRIORITY-ORDERED `kind` vocabulary of the single overall next_action projection for a Gap discussion thread -- the enum order below IS the priority order. Mirrors `app/discussion_next_action.NEXT_ACTION_KINDS` exactly.",
+      "enum": [
+        "target_error",
+        "evidence_stale",
+        "processing",
+        "save_unknown",
+        "unsaved_edit",
+        "review_proposal",
+        "investigation_result",
+        "review_hypothesis",
+        "match"
+      ]
+    }
+  }
+}

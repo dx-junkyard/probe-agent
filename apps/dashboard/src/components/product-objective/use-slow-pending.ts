@@ -1,5 +1,5 @@
 // Issue #432 (Epic #427) P2 review fix §3.3: a lane must never show an
-// indefinite bare skeleton (`docs/product-objective-lineage.md` §9.5).
+// indefinite bare skeleton (`docs/01-specifications/product/product-objective-lineage.md` §9.5).
 //
 // `useSlowPending` starts returning `false` (a plain loading skeleton is
 // enough) and flips to `true` once `pending` has been true for longer than
