@@ -19,7 +19,9 @@ Vision / Stakeholder Value
 1. [Vision・UX・コア機能要件](00-product/vision-and-core-requirements.md)
 2. [System Understanding の理想状態](00-product/system-understanding-ideal-state.md)
 3. 関心領域に対応する [システム仕様](#01-specifications--システム仕様)
-4. 実装・運用時は [運用ガイド](#04-operations--運用ガイド)
+4. 改善着手時は [製品状態から選ぶ改善サイクル](04-operations/improvement-cycle/README.md) と
+   [課題ナレッジ](02-challenges-and-decisions/issue-knowledge/README.md)
+5. 実装・運用時は [運用ガイド](#04-operations--運用ガイド)
 
 ## 情報の正本と読み方
 
@@ -83,6 +85,12 @@ Vision / Stakeholder Value
 
 ## 02-challenges-and-decisions — 課題と検討結果
 
+[課題ナレッジ](02-challenges-and-decisions/issue-knowledge/README.md) は、原因の4軸・発見観点・
+解決観点から過去の記録を引くための知識層。[生成索引](02-challenges-and-decisions/issue-knowledge/index.md)
+から個別課題と根拠へ進む。現行仕様の正本や製品の現在状態とは区別する。
+改善候補の比較は `improvement-plans/` に置く
+（[導入時の例](02-challenges-and-decisions/improvement-plans/2026-09-19-knowledge-bootstrap.md)）。
+
 | 文書 | 記録時点・用途 |
 | --- | --- |
 | [System Understanding UX Gap Analysis](02-challenges-and-decisions/ux-gap-analysis-system-understanding.md) | 状態矛盾・導線・用語・テスト不足の調査と改善提案 |
@@ -97,12 +105,14 @@ canonical contract を確認する。
 | --- | --- |
 | [Purpose Chain Dogfooding](03-validation/dogfooding-purpose-chain.md) | Purpose Chain の理解度検証プロトコルと結果 |
 | [System Understanding Scenario](03-validation/dogfooding-system-understanding-scenario.md) | end-to-end 導線の再現可能な検証シナリオ |
+| [改善サイクル導入の検証](03-validation/improvement-cycle/2026-09-19-knowledge-bootstrap.md) | ナレッジ・索引・手順の導入結果。以後の改善結果も同ディレクトリへ置く |
 | [共同検討UXの検証・引継ぎ](03-validation/decision-discussion-handoff.md) | 操作Mock、Issue分担、実装時の検証シナリオと未検証範囲 |
 
 ## 04-operations — 運用ガイド
 
 | 文書 | 用途 |
 | --- | --- |
+| [製品状態から選ぶ改善サイクル](04-operations/improvement-cycle/README.md) | 根拠付き状態・利用見通し・候補比較・Recipe選択・結果の還流 |
 | [AI Agent Improvement Guide](04-operations/ai-agent-improvement-guide.md) | AI エージェントが改善ループを運用する手順 |
 | [Production HTTPS Deployment](04-operations/deployment-https.md) | Caddy を含む本番公開、バックアップ、復旧 |
 | [GitHub App Deployment](04-operations/github-app-deployment.md) | GitHub App の登録、秘密鍵配置、ローテーション |

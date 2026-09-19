@@ -68,3 +68,17 @@ canonical contract に照らして再検証する。
 既存セクションを変更する必要がある場合は、まず該当する `01-specifications/` の正本を更新し、
 ログには変更理由、対象 Issue、正本へのリンクだけを残す。正本がまだない領域では、必要な契約を
 独立文書へ抽出してから実装を進める。
+
+## 7. 改善知識を残す
+
+- 改善を始めるときは [改善サイクル](04-operations/improvement-cycle/README.md) に従い、
+  `02-challenges-and-decisions/improvement-plans/` に根拠付き状態・利用見通し・候補比較を記録する。
+- 原因・発見観点・解決観点は [課題ナレッジ](02-challenges-and-decisions/issue-knowledge/README.md) に残す。
+  元の監査・仕様を複製せず sources で接続し、過去の指摘を現在の未解決事項へ読み替えない。
+- 結果は `03-validation/improvement-cycle/` に、再利用する手順は `04-operations/improvement-cycle/recipes/` に置く。
+  Recipeの候補と実績のある手順を区別し、見逃し・非適用条件も更新する。
+- 分類・語彙・辞書・索引は製品仕様ではなく文書運用の契約。同ディレクトリのtaxonomyが所有し、
+  製品のGap、canonical contract、人間の採否判断を上書きしない。
+- 課題を更新したら `python3 docs/tools/issue_knowledge.py` と同コマンドの `--check` を実行する。
+  生成器は許可値・構造・参照実在・索引同期を検査する。根拠の真偽、承認の実在、履歴の完全性、
+  コードでの解消、分類の意味はレビューで確認する。CIへの組込みは現在行っていない。

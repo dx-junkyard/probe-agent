@@ -1,5 +1,10 @@
 # AIエージェント向け probe-agent 改善サイクルガイド
 
+改善対象と検証手順を選ぶときは、先に [製品状態から選ぶ改善サイクル](improvement-cycle/README.md) を使う。
+本書は観測・評価・shadow比較の具体的な実施手順を所有する。結果は
+[結果様式](improvement-cycle/RESULT_TEMPLATE.md) と
+[課題ナレッジ](../02-challenges-and-decisions/issue-knowledge/README.md) へ接続し、次の候補選択に返す。
+
 ## 1. このシステムの目的
 
 `probe-agent` は、開発対象システムの関数単位の実行データを収集し、現在の実装と
