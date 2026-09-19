@@ -2431,6 +2431,128 @@ describe("Interview page", () => {
     expect(callout.textContent).toContain("Interview で System Purpose");
   });
 
+  test("opens the canonical source session instead of a newer non-canonical session", async () => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    const canonical = interviewSession({ id: 7 });
+    const newerCandidate = interviewSession({ id: 8, title: "newer candidate" });
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions") {
+        return Promise.resolve([newerCandidate, canonical]);
+      }
+      if (path === "/understanding-head") {
+        return Promise.resolve({
+          system_id: 1,
+          revision_id: 3,
+          head_version: 1,
+          updated_at: 1,
+          updated_by: "admin",
+          source_session_id: 7,
+          content_digest: "content",
+          premise_digest: "premise",
+          current_understanding: canonical.current_understanding,
+        });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const selector = await screen.findByLabelText("インタビューセッション");
+    await waitFor(() => expect(selector).toHaveValue("7"));
+    expect(screen.getByRole("option", { name: /#7 · 正準/ })).toBeInTheDocument();
+  });
+
+  test("marks an explicitly opened non-canonical session as history and offers the canonical session", async () => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    const historical = interviewSession({ id: 7 });
+    const canonical = interviewSession({ id: 8, title: "canonical" });
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions") return Promise.resolve([canonical, historical]);
+      if (path === "/understanding-head") {
+        return Promise.resolve({
+          system_id: 1,
+          revision_id: 4,
+          head_version: 2,
+          updated_at: 2,
+          updated_by: "admin",
+          source_session_id: 8,
+          content_digest: "content",
+          premise_digest: "premise",
+          current_understanding: canonical.current_understanding,
+        });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const notice = await screen.findByTestId("historical-session-notice");
+    expect(notice).toHaveTextContent("セッション #7 は履歴・候補の内容です");
+    expect(notice).toHaveTextContent("正準セッション #8");
+    expect(screen.getByRole("button", { name: "正準セッションを開く" })).toBeInTheDocument();
+  });
+
+  test("a diagnostic deep link replaces a stale session with the canonical source session", async () => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    const stale = interviewSession({ id: 7 });
+    const canonical = interviewSession({ id: 8, title: "canonical" });
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/interview/sessions") return Promise.resolve([canonical, stale]);
+      if (path === "/understanding-head") {
+        return Promise.resolve({
+          system_id: 1,
+          revision_id: 4,
+          head_version: 2,
+          updated_at: 2,
+          updated_by: "admin",
+          source_session_id: 8,
+          content_digest: "content",
+          premise_digest: "premise",
+          current_understanding: canonical.current_understanding,
+        });
+      }
+      return baseGet?.(path) ?? Promise.resolve(null);
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } },
+    });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/interview?session=7&fix=interview-purpose"]}>
+          <InterviewPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const selector = await screen.findByLabelText("インタビューセッション");
+    await waitFor(() => expect(selector).toHaveValue("8"));
+  });
+
   test("renders mock reasoning provenance and wires proposal decisions", async () => {
     mockInterviewApi();
     mockApi.post.mockResolvedValue({ id: 1, decision: "approved", decision_method: "manual" });

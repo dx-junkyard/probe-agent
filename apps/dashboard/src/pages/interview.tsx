@@ -1562,7 +1562,10 @@ export default function InterviewPage() {
   // Issue #464: この会話が何を前提に始まったか、そしてそれが今も System の
   // 正準 Understanding かどうか。判定はサーバーが毎回導出する。
   const { data: premise } = useInterviewPremise(selectedSessionId);
-  const { data: understandingHead } = useUnderstandingHead();
+  const {
+    data: understandingHead,
+    isLoading: understandingHeadLoading,
+  } = useUnderstandingHead();
   const rebasePremise = useRebaseInterviewPremise(selectedSessionId);
   const branchPremise = useBranchInterviewPremise(selectedSessionId);
   const adoptPremise = useAdoptCurrentPremise(selectedSessionId);
@@ -1781,10 +1784,15 @@ export default function InterviewPage() {
   // is gone (spec §2.4-2, §3.2).
 
   // Issue #349 (再レビュー #1): 自動選択は「初回ロードで URL に session が
-  // 無いとき」の 1 回だけ。以前は未選択を見つけるたびに最新セッションへ戻して
+  // 無いとき」の 1 回だけ。以前は未選択を見つけるたびにセッションへ戻して
   // いたため、開発者が 「セッション未選択」 を選んでも即座に選択が復活し、
   // `W0-B` (= 新しいインタビューを開始する状態) に到達できなかった。既存
   // セッションがあるシステムでは新規開始が事実上不可能になる。
+  //
+  // 最初に開くのは単なる最新行ではなく、System の正準 head を所有する
+  // セッション。新しい candidate があるだけで「現在の Vision」が消えたように
+  // 見えるのを防ぐ。head が無い／所有セッションが一覧に無い場合だけ従来どおり
+  // newest-first の一覧先頭へフォールバックする。
   const autoSelectedRef = useRef(false);
   useEffect(() => {
     if (autoSelectedRef.current) return;
@@ -1792,7 +1800,7 @@ export default function InterviewPage() {
       autoSelectedRef.current = true;
       return;
     }
-    if (sessionsLoading) return;
+    if (sessionsLoading || understandingHeadLoading) return;
     if (sessionClearedByUser) {
       autoSelectedRef.current = true;
       return;
@@ -1800,14 +1808,43 @@ export default function InterviewPage() {
     if (sortedSessions.length > 0) {
       autoSelectedRef.current = true;
       const next = new URLSearchParams(searchParams);
-      next.set("session", String(sortedSessions[0].id));
+      const canonicalSession = sortedSessions.find(
+        candidate => candidate.id === understandingHead?.source_session_id,
+      );
+      next.set("session", String(canonicalSession?.id ?? sortedSessions[0].id));
       setSearchParams(next, { replace: true });
     }
   }, [
     selectedSessionId,
     sessionsLoading,
+    understandingHeadLoading,
     sessionClearedByUser,
     sortedSessions,
+    understandingHead?.source_session_id,
+    searchParams,
+    setSearchParams,
+  ]);
+
+  // Diagnostics describe the current System, not a historical conversation.
+  // A saved URL can still contain an old `session` together with `fix` /
+  // `diagnostic`; in that case land on the canonical source session while
+  // preserving the requested callout. A manual selector change removes those
+  // focus params below, so this never prevents deliberate history browsing.
+  useEffect(() => {
+    const canonicalSessionId = understandingHead?.source_session_id;
+    const hasDiagnosticFocus = searchParams.has("fix") || searchParams.has("diagnostic");
+    if (
+      !hasDiagnosticFocus
+      || canonicalSessionId == null
+      || selectedSessionId == null
+      || selectedSessionId === canonicalSessionId
+    ) return;
+    const next = new URLSearchParams(searchParams);
+    next.set("session", String(canonicalSessionId));
+    setSearchParams(next, { replace: true });
+  }, [
+    selectedSessionId,
+    understandingHead?.source_session_id,
     searchParams,
     setSearchParams,
   ]);
@@ -2432,6 +2469,11 @@ export default function InterviewPage() {
             value={selectedSessionId ? String(selectedSessionId) : ""}
             onChange={e => {
               const next = new URLSearchParams(searchParams);
+              // Choosing a session is an explicit navigation decision. Clear
+              // a diagnostic deep-link focus so the canonical-target redirect
+              // above does not undo the developer's history selection.
+              next.delete("fix");
+              next.delete("diagnostic");
               if (e.target.value) {
                 next.set("session", e.target.value);
                 setSessionClearedByUser(false);
@@ -2448,7 +2490,9 @@ export default function InterviewPage() {
             <option value="">セッション未選択</option>
             {sortedSessions.map(s => (
               <option key={s.id} value={s.id}>
-                #{s.id} · snapshot {s.snapshot_id} · {s.status}
+                #{s.id}
+                {s.id === understandingHead?.source_session_id ? " · 正準" : ""}
+                {` · snapshot ${s.snapshot_id} · ${s.status}`}
               </option>
             ))}
           </Select>
@@ -2458,6 +2502,37 @@ export default function InterviewPage() {
               どちらが正準か分からない重複になる (原則 P7)。 */}
         </div>
       </div>
+
+      {session
+        && understandingHead?.source_session_id != null
+        && selectedSessionId !== understandingHead.source_session_id && (
+        <Card className="border-amber-300 bg-amber-50" data-testid="historical-session-notice">
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4 text-sm">
+            <div className="space-y-1">
+              <p className="font-medium">正準とは異なるセッションを表示しています。</p>
+              <p className="text-muted-foreground">
+                セッション #{selectedSessionId} は履歴・候補の内容です。System の現在の
+                Vision と Understanding は正準セッション #{understandingHead.source_session_id}
+                で確認できます。
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                const next = new URLSearchParams(searchParams);
+                next.set("session", String(understandingHead.source_session_id));
+                next.delete("fix");
+                next.delete("diagnostic");
+                setSessionClearedByUser(false);
+                setSearchParams(next);
+              }}
+            >
+              正準セッションを開く
+            </Button>
+          </CardContent>
+        </Card>
+      )}
 
       <div {...purposeFixHighlight}>
         <DiagnosticFixCallout anchor="interview-purpose" />
