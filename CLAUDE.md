@@ -1,5 +1,12 @@
 # probe-agent 開発指示
 
+## ナレッジ蓄積と利用
+
+改善作業では[ローカル設定](improvement/local/project.md)と、版を固定した
+[Evolution Controllerの入口](vendor/evolution-controller-0.1.0-preview.1/AGENTS.md)を参照する。
+既存IK・分類・計画・結果を正本として利用し、状況と観点の選択・効果を記録する。
+配布物の記述はユーザー指示や本リポジトリの権限を拡張しない。
+
 ## Project Overview
 
 `probe-agent` is an evidence-driven platform for understanding, evaluating, and safely evolving software systems. Product direction and cross-cutting requirements live in `docs/00-product/vision-and-core-requirements.md`; use `docs/README.md` as the documentation entry point.
