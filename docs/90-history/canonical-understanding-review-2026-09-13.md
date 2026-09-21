@@ -1,5 +1,9 @@
 # Issue #464 実装レビュー（2026-09-13）
 
+> 2026-09-21追補: 以下の5指摘は後続の修正履歴と照合し、
+> [課題ナレッジ](../02-challenges-and-decisions/issue-knowledge/index.md)のIK-0005〜0009へ移入した。
+> 本文は0187f38時点の監査として保持する。現在未修正という意味ではない。
+
 ## 結論
 
 Issue #464 の主要部品（System 単位の canonical head、Interview premise の捕捉、

@@ -106,6 +106,7 @@ canonical contract を確認する。
 | [Purpose Chain Dogfooding](03-validation/dogfooding-purpose-chain.md) | Purpose Chain の理解度検証プロトコルと結果 |
 | [System Understanding Scenario](03-validation/dogfooding-system-understanding-scenario.md) | end-to-end 導線の再現可能な検証シナリオ |
 | [改善サイクル導入の検証](03-validation/improvement-cycle/2026-09-19-knowledge-bootstrap.md) | ナレッジ・索引・手順の導入結果。以後の改善結果も同ディレクトリへ置く |
+| [導入前の知識の移入検証](03-validation/improvement-cycle/2026-09-21-historical-knowledge.md) | 過去の修正16件の分類、根拠、収録範囲と未収録事項 |
 | [共同検討UXの検証・引継ぎ](03-validation/decision-discussion-handoff.md) | 操作Mock、Issue分担、実装時の検証シナリオと未検証範囲 |
 
 ## 04-operations — 運用ガイド

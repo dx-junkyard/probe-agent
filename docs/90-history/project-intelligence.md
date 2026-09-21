@@ -1,5 +1,9 @@
 # Feature Intelligence / Experiment Workspace — 設計・実装履歴
 
+> 2026-09-21追補: #464検証ラウンドの8件とEpic #394検証ラウンドの8件を
+> [課題ナレッジ索引](../02-challenges-and-decisions/issue-knowledge/index.md)のIK-0005〜0020へ抽出。
+> [移入範囲・検証結果](../03-validation/improvement-cycle/2026-09-21-historical-knowledge.md)を参照。過去の記録の再分類であり、現行稼働の再検証ではない。
+
 > **文書の役割:** historical journal / legacy composite log
 > **状態:** historical（各セクションの記録時点における設計・実装情報）
 > **現行仕様の入口:** [`../README.md`](../README.md) と
