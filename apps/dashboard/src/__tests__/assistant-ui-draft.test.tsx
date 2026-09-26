@@ -364,7 +364,9 @@ describe("Issue #445 §2.5 -- the draft is captured at turn start, not re-read w
 
     fireEvent.click(screen.getByTestId("assistant-voice-toggle"));
     await screen.findByTestId("assistant-voice");
-    fireEvent.click(screen.getByTestId("voice-talk"));
+    await waitFor(() =>
+      expect(screen.getByTestId("voice-state")).toHaveAttribute("data-state", "listening"),
+    );
 
     // The developer keeps typing in the form WHILE the utterance is still
     // being recognized -- this must not change what the in-flight turn asks.

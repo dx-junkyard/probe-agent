@@ -246,13 +246,16 @@ assistant_discussion_proposal_item(
 Control Server の `POST /assistant/speech` を介して OpenAI Speech API を使う。
 API key はブラウザへ渡さない。利用者の録音音声と生成音声は永続保存しない。
 
+- Header のマイクボタンで音声面へ入ると同時に STT を開始する。初回だけ別の
+  「話しかける」操作を要求しない。以後は回答の再生完了後に毎回 STT を再開し、
+  利用者が `stop` または `exit` を選ぶまで turn-based の対話を継続する。
 - `src/lib/voice-adapter.ts`: `SpeechToTextAdapter` / `TextToSpeechAdapter` /
   `createBrowserVoiceAdapters()` / `voicePrerequisite()` →
   `"ready" | "insecure_context" | "unsupported"`。
 - `POST /assistant/ask` は voice turn に完全な `answer` と、最大 3 文・180 文字の
   `spoken_answer` を返す。長い場合は概要・中核の後に「続けて詳しく説明するか」
-  を尋ね、`voice_follow_up_expected: true` を返す。クライアントは再生終了後に
-  自動で STT を再開し、詳細はボタン操作なしの次の利用者 turn を待つ。
+  を尋ね、`voice_follow_up_expected: true` を返す。この値は次の turn を説明の
+  続きとして扱うかを決める。STT 自体は値にかかわらず再生終了後に再開する。
 - mounted voice surface は実際に再生完了した文だけを最大 8 件の
   `voice_spoken_history` としてメモリ内に保持し、次の voice turn へ渡す。
   サーバは LLM prompt と最終 spoken projection の両方で既出文を除外する。

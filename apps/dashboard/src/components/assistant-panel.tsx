@@ -939,6 +939,8 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           onExit={() => setVoiceActive(false)}
           scopeLabel={voiceScopeLabel}
           conversationKey={activeTargetKey ?? `legacy:${screenId}`}
+          autoStart
+          continuousConversation
         />
       ) : (
         <>

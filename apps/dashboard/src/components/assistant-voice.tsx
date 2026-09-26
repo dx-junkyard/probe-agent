@@ -86,6 +86,10 @@ export interface AssistantVoiceProps<Target> {
   conversationKey?: string;
   /** テスト用に差し込むための adapter。省略時はブラウザ実装を使う。 */
   adapters?: { stt: SpeechToTextAdapter; tts: TextToSpeechAdapter } | null;
+  /** 音声面を開いた直後に、追加操作なしで最初の発話を聞き始める。 */
+  autoStart?: boolean;
+  /** 各 turn の完了後も、明示的に停止されるまで次の発話を待ち続ける。 */
+  continuousConversation?: boolean;
 }
 
 export function AssistantVoice<Target>({
@@ -96,6 +100,8 @@ export function AssistantVoice<Target>({
   scopeLabel,
   conversationKey = "default",
   adapters,
+  autoStart = false,
+  continuousConversation = false,
 }: AssistantVoiceProps<Target>) {
   const resolvedAdapters = useMemo(
     () => (adapters !== undefined ? adapters : createBrowserVoiceAdapters()),
@@ -109,6 +115,12 @@ export function AssistantVoice<Target>({
   // STT and /assistant/ask cannot always be cancelled at the platform level,
   // so late completions must also be ignored at the state-machine boundary.
   const generationRef = useRef(0);
+  const autoStartedRef = useRef(false);
+  const startTurnRef = useRef<(
+    continuation?: boolean,
+    continuingTarget?: Target,
+    continuingConversationKey?: string,
+  ) => void>(() => undefined);
   const spokenHistoryRef = useRef<Map<string, string[]>>(new Map());
   const reducedMotion = usePrefersReducedMotion();
 
@@ -132,6 +144,18 @@ export function AssistantVoice<Target>({
 
   function returnToIdle() {
     setState("idle");
+  }
+
+  function completeTurn(
+    continuation: boolean,
+    target: Target,
+    turnConversationKey: string,
+  ) {
+    if (continuousConversation || continuation) {
+      startTurn(continuation, target, turnConversationKey);
+    } else {
+      returnToIdle();
+    }
   }
 
   function startTurn(
@@ -162,7 +186,7 @@ export function AssistantVoice<Target>({
           .then((answer) => {
             if (generation !== generationRef.current) return undefined;
             if (!answer || mutedRef.current) {
-              returnToIdle();
+              completeTurn(false, target, turnConversationKey);
               return undefined;
             }
             const reply = typeof answer === "string" ? { text: answer } : answer;
@@ -174,11 +198,7 @@ export function AssistantVoice<Target>({
                   ...(spokenHistoryRef.current.get(turnConversationKey) ?? []),
                   reply.text,
                 ].slice(-8));
-                if (reply.listenAfterPlayback) {
-                  startTurn(true, target, turnConversationKey);
-                } else {
-                  returnToIdle();
-                }
+                completeTurn(Boolean(reply.listenAfterPlayback), target, turnConversationKey);
               },
               () => {
                 if (generation === generationRef.current) fail("tts_failed");
@@ -189,7 +209,9 @@ export function AssistantVoice<Target>({
             // /assistant/ask 自体の失敗は既存の会話履歴 (エラーメッセージ)
             // 側で扱われる普通のエラーであり、adapter の障害ではない --
             // 音声モードを終了させず、次の発話へ戻るだけにする。
-            if (generation === generationRef.current) returnToIdle();
+            if (generation === generationRef.current) {
+              completeTurn(false, target, turnConversationKey);
+            }
           });
       },
       onError: (reason) => {
@@ -202,6 +224,14 @@ export function AssistantVoice<Target>({
       },
     });
   }
+
+  startTurnRef.current = startTurn;
+
+  useEffect(() => {
+    if (!autoStart || autoStartedRef.current) return;
+    autoStartedRef.current = true;
+    startTurnRef.current();
+  }, [autoStart, resolvedAdapters]);
 
   function stop() {
     generationRef.current += 1;
@@ -270,7 +300,7 @@ export function AssistantVoice<Target>({
         {(state === "idle" || state === "speaking") && (
           <Button onClick={() => startTurn(false)} data-testid="voice-talk">
             <Mic className="mr-1.5 h-4 w-4" />
-            {state === "speaking" ? "話を挟む" : "話しかける"}
+            {state === "speaking" ? "話を挟む" : "再開"}
           </Button>
         )}
         <p className="max-w-sm text-center text-[11px] text-muted-foreground">
