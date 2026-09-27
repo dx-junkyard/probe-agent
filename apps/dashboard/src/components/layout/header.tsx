@@ -71,7 +71,7 @@ function MenuItemButton({ onClick, icon, children, testId }: {
 }
 
 /**
- * Issue #466 (UX-14): 狭い画面 (lg 未満) では、補助操作 (解説モード・テーマ・
+ * Issue #466 (UX-14): ヘッダーが狭いとき (幅 48rem 未満) は、補助操作 (解説モード・テーマ・
  * ユーザー名・ログアウト・System 追加) をこのメニューへ移す。ヘッダーに
  * 残すのは System 選択・重要通知・ナビゲーションのメニューボタンだけで、
  * 390px 幅で System 名と右側のアイコンが重なるのを防ぐ。
@@ -102,7 +102,7 @@ function HeaderOverflowMenu({ children }: { children: (close: () => void) => Rea
   }, [open]);
 
   return (
-    <div ref={rootRef} className="relative lg:hidden">
+    <div ref={rootRef} className="relative @3xl:hidden">
       <Button
         ref={buttonRef}
         variant="ghost"
@@ -210,7 +210,13 @@ export function Header({
   };
 
   return (
-    <header className="flex items-center justify-between gap-2 border-b bg-card px-3 md:px-6 h-14">
+    <header
+      // Issue #466 (UX-14): 表示の段階は画面幅ではなくヘッダー自身の幅で
+      // 決める (container query)。1280px でもアシスタントを並べて開くと
+      // ヘッダーは約 640px になり、画面幅のブレークポイントのままだと
+      // フェーズ表示が System 選択に重なる。
+      className="@container flex items-center justify-between gap-2 border-b bg-card px-3 md:px-6 h-14"
+    >
       <div className="flex min-w-0 flex-1 items-center gap-2 md:gap-3">
         {/* Issue #362: below md the sidebar is an overlay Drawer, opened
             from here. At md and above the static rail is always present, so
@@ -282,7 +288,7 @@ export function Header({
           <Button
             variant="ghost"
             size="icon"
-            className="hidden shrink-0 lg:inline-flex"
+            className="hidden shrink-0 @3xl:inline-flex"
             onClick={() => setShowCreate(true)}
             title="New system"
             aria-label="System を作成"
@@ -300,7 +306,7 @@ export function Header({
         <UserPhaseIndicator />
         <ConnectivityBadge />
         <DiagnosticsBadge />
-        <div className="hidden items-center gap-2 lg:flex">
+        <div className="hidden items-center gap-2 @3xl:flex">
           <HelpModeToggle />
           <ThemeToggle />
           {user && (

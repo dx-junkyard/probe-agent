@@ -329,8 +329,8 @@ describe("UX-13: ナビゲーションの段階化・検索・現在地", () => 
 
 // ── UX-14: 狭い画面のヘッダー ──────────────────────────────────────
 
-describe("UX-14: 狭い画面では補助操作をメニューへ移す", () => {
-  test("System 選択は残り幅に収まり、補助操作は lg 未満でメニューにまとまる", async () => {
+describe("UX-14: 狭いヘッダーでは補助操作をメニューへ移す", () => {
+  test("System 選択は残り幅に収まり、補助操作は狭いヘッダーでメニューにまとまる", async () => {
     mockSystems = [{ id: 1, name: "とても長いシステム名".repeat(4), environment: "production" }];
     mockUser = { id: 7, username: "very-long-user-name-for-layout-check", role: "admin" };
     mockApi.get.mockImplementation(() => Promise.resolve(null));
@@ -343,12 +343,14 @@ describe("UX-14: 狭い画面では補助操作をメニューへ移す", () => 
     expect(select.parentElement!.className).toMatch(/min-w-0/);
     expect(select.parentElement!.className).toMatch(/flex-1/);
 
-    // デスクトップの補助操作群は lg 未満で隠れ、メニューボタンは lg 以上で隠れる。
+    // 段階はヘッダー自身の幅 (container query) で決める: 補助操作群は
+    // 48rem 未満で隠れ、メニューボタンは 48rem 以上で隠れる。
+    expect(screen.getByRole("banner").className).toMatch(/@container/);
     const logout = screen.getByRole("button", { name: "ログアウト" });
     expect(logout.parentElement!.className).toMatch(/hidden/);
-    expect(logout.parentElement!.className).toMatch(/lg:flex/);
+    expect(logout.parentElement!.className).toMatch(/@3xl:flex/);
     const toggle = screen.getByTestId("header-overflow-toggle");
-    expect(toggle.parentElement!.className).toMatch(/lg:hidden/);
+    expect(toggle.parentElement!.className).toMatch(/@3xl:hidden/);
 
     fireEvent.click(toggle);
     const menu = screen.getByTestId("header-overflow-menu");
