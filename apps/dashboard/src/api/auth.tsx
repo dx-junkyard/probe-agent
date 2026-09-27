@@ -18,7 +18,7 @@ import type { MeResponse, UserOut, SystemOut } from "./types";
 //     401 を返しても、状態は 1 つの boolean なので再認証は 1 回だけ出る。
 
 /** 起動時の読み取りのタイムアウト。これを超えたら説明と再試行を出す。 */
-export const AUTH_BOOTSTRAP_TIMEOUT_MS = 15_000;
+const AUTH_BOOTSTRAP_TIMEOUT_MS = 15_000;
 
 export type SystemsStatus = "loading" | "ready" | "error";
 

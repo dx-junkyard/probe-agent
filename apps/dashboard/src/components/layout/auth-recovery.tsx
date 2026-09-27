@@ -16,7 +16,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 //   - 認証失効 (ReauthDialog): 画面をそのまま残して再ログインし、入力を保全する。
 
 /** 起動時の読み込み表示。長引いたら「待っている」ことを文章で伝える。 */
-export const AUTH_SLOW_NOTICE_MS = 5_000;
+const AUTH_SLOW_NOTICE_MS = 5_000;
 
 export function AuthLoadingScreen() {
   const [slow, setSlow] = useState(false);
