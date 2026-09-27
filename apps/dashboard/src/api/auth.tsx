@@ -140,6 +140,45 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const login = useCallback(async (username: string, password: string) => {
     const previousUserId = userRef.current?.id ?? null;
     await api.post<{ expires_at: number }>("/auth/login", { username, password });
+    // Issue #466 review R1: 利用中の再認証 (画面を残したまま) では、ログインの
+    // POST が通っても直後の `/auth/me` が失敗しうる (500・通信断・タイムアウト)。
+    // そこで起動時と同じ `fetchMe` を使うと user が null になり、AppLayout が
+    // 接続エラー画面へ置き換わってフォームがアンマウントされる — 再認証が
+    // 守るはずの入力が消える。再認証中は user を消さず、失効状態も解除せず、
+    // ダイアログ内でやり直せるよう失敗として返す。同じ利用者だと確認できた
+    // ときだけ再開する。
+    if (previousUserId != null) {
+      let me: MeResponse;
+      try {
+        me = await api.get<MeResponse>("/auth/me", { timeoutMs: AUTH_BOOTSTRAP_TIMEOUT_MS });
+      } catch (err) {
+        const failure = describeRequestFailure(err);
+        throw new Error(
+          `ログインは受け付けられましたが、ログイン状態を確認できませんでした。${failure.summary.replace("取得できませんでした", "")}`
+          + "画面の入力はそのまま残っています。もう一度「再ログインして続ける」を押してください。",
+          { cause: err },
+        );
+      }
+      if (!me.user) {
+        throw new Error("ログイン状態を確認できませんでした。画面の入力はそのまま残っています。もう一度お試しください。");
+      }
+      const sameUser = me.user.id === previousUserId;
+      setUser(me.user);
+      userRef.current = me.user;
+      setAuthError(null);
+      setSessionExpired(false);
+      setExplicitLogout(false);
+      if (sameUser) {
+        // 同じ利用者: 失敗していた取得をやり直すだけでよい。
+        qc.invalidateQueries();
+      } else {
+        // 別の利用者: 前の利用者の cache を持ち越さない。UiDraftProvider は
+        // user.id を key にしているので、前の利用者の入力もここで破棄される。
+        qc.clear();
+        await refreshSystems();
+      }
+      return;
+    }
     const next = await fetchMe();
     setSessionExpired(false);
     setExplicitLogout(false);

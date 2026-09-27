@@ -2197,8 +2197,12 @@ creating incomplete persistence or execution paths for later phases.
       (`NetworkError`) と拒否 (`ApiError`) を区別し、書き込みにタイムアウトを
       付けない (結果不明を未保存と断定しない)。
     - 認証は「確認できない」「System 一覧を取れない」「利用中に失効した」を
-      別状態にし、失効はページを残したまま再認証する。復帰先はアプリ内パス
-      だけ。
+      別状態にし、失効はページを残したまま再認証する。再認証の途中で
+      `/auth/me` が失敗しても `user` を消さない (消すとフォームがアンマウント
+      される)。復帰先はアプリ内パスだけ。
+    - アプリは data router (`createBrowserRouter`) で動き、未保存入力の破棄
+      確認は `useBlocker` で戻る/進む・`navigate(...)` を含む全遷移に掛かる。
+      `BrowserRouter` に戻さない。
     - 実装と開発者の実ブラウザー検証は完了。スクリーンリーダー実機・実 IME・
       代表利用者の評価は #463 で追跡し、本 Issue の完了を利用者評価の完了と
       しない。UX-13 は #401 の方針どおり新しいナビ体系・canonical 状態を

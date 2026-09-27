@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   useExperiments, useRunExperiment, useExperimentDecision,
@@ -215,6 +215,17 @@ export default function ExperimentsPage() {
     || !!staleReason.trim()
     || (variants ?? []).some(v => v.label.trim() || v.patch_text.trim() || v.risk_note.trim());
   useUnsavedChangesGuard(`experiment-create:system-${systemId ?? "none"}`, hasDraft);
+  // Issue #466 review R3: 送信した下書きと、応答を待つ間に編集された現在の
+  // 下書きを区別する。成功時に無条件で初期化すると、送信後の追記 (POST に
+  // 含まれず保存もされていない) まで消える。応答時点の下書きは ref で読む
+  // (handler の closure は送信時点の値しか持たない)。
+  const draftSignature = JSON.stringify([
+    systemId, formFeatureId, formObjective, newSnapshotId, staleReason, formVariants,
+  ]);
+  const draftSignatureRef = useRef(draftSignature);
+  useEffect(() => {
+    draftSignatureRef.current = draftSignature;
+  }, [draftSignature]);
   const dialogOpen = showCreate || draftOpen || replayPrefillOpen || fromTraceOpen;
   const targetSystemName = systems.find(s => s.id === systemId)?.name ?? null;
 
@@ -238,6 +249,7 @@ export default function ExperimentsPage() {
       return;
     }
     const submittedSystemId = systemId;
+    const submittedSignature = draftSignature;
     try {
       await createExperiment.mutateAsync({
         feature_id: formFeatureId,
@@ -262,7 +274,14 @@ export default function ExperimentsPage() {
       );
       setShowCreate(false);
       setDraftDismissed(true);
-      resetForm();
+      if (draftSignatureRef.current === submittedSignature) {
+        resetForm();
+      } else {
+        // 送信後に編集された内容は保存されていない。下書きとして残し、
+        // その旨を伝える (作成済みの Experiment は一覧にある)。
+        if (variants == null) setVariants(formVariants);
+        toast.info("送信後に編集した内容は保存されていないため、下書きとして残しています。");
+      }
     } catch (err) {
       // 失敗時は下書きを残す (再送や修正のため)。
       toast.error(String(err));

@@ -291,6 +291,22 @@ function overlaps(a, b) {
   expectTrue("discard confirmation before leaving", !!dialogSeen);
   expectTrue("still on Repository after dismiss", page.url().includes("/repository"));
 
+  console.log("R2: ブラウザー履歴の戻るも破棄確認を通る");
+  let backDialogs = 0;
+  page.on("dialog", async (d) => { backDialogs += 1; await d.dismiss(); });
+  // A cancelled back never completes a navigation, so page.goBack() would
+  // wait for one; drive the browser history directly instead.
+  await page.evaluate(() => history.back());
+  await page.waitForTimeout(800);
+  expect("one confirmation on history back", backDialogs, 1);
+  expectTrue("URL stays on Repository after cancel", page.url().includes("/repository"));
+  expect("input kept after cancelled back", await page.getByLabel(/Include Patterns/).inputValue(), "*.py\nsrc/**\n*.ts");
+  page.removeAllListeners("dialog");
+  page.once("dialog", (d) => d.accept());
+  await page.evaluate(() => history.back());
+  await page.waitForURL((url) => !url.pathname.startsWith("/repository"));
+  expectTrue("accepted back leaves the page", true);
+
   console.log("UX-03 / UX-04: Experiment の下書きと行別エラー");
   await page.goto(`${APP}/experiments`);
   await page.getByTestId("experiment-create-button").click();
@@ -363,7 +379,16 @@ function overlaps(a, b) {
   await page.keyboard.press("Escape");
   expect("Escape does not dismiss the re-auth choice", await page.getByRole("dialog").count(), 1);
   await page.unroute("**/api/**");
+
+  console.log("R1: 再ログイン POST 成功後に /auth/me が失敗しても入力を保つ");
+  await page.route("**/api/auth/me", (route) => route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ detail: "injected" }) }));
   await reauth.getByLabel("パスワード").fill(PASS);
+  await reauth.getByTestId("reauth-submit").click();
+  await reauth.getByText(/ログイン状態を確認できませんでした/).waitFor();
+  expect("no connection-error screen", await page.getByTestId("auth-bootstrap-error").count(), 0);
+  expect("draft kept while /auth/me fails", await page.getByLabel("Description").inputValue(), "keep-this-draft");
+  await page.unroute("**/api/auth/me");
+
   await reauth.getByTestId("reauth-submit").click();
   await reauth.waitFor({ state: "detached" });
   expect("draft survives re-authentication", await page.getByLabel("Description").inputValue(), "keep-this-draft");

@@ -1038,9 +1038,21 @@ mutation も権限も追加しない。
 - **未保存入力の保護は 1 つの破棄確認に集約する。** 画面ローカルな入力は
   `useUnsavedChangesGuard(guardId, dirty)` (`lib/ui-draft.tsx`) で
   `UiDraftProvider` のレジストリへ dirty だけを申告する。System 切替・
-  ログアウト・アプリ内リンク・ページ離脱の確認はそこが 1 回だけ出す。
-  field の値は登録しない。編集中フォームを持つタブは
-  `<TabsContent keepMounted>` でアンマウントしない。
+  ログアウト・ページ離脱の確認はそこが 1 回だけ出す。field の値は登録しない。
+  編集中フォームを持つタブは `<TabsContent keepMounted>` でアンマウントしない。
+- **アプリ内遷移は種類を問わずブロッカーを通る** (review R2)。`main.tsx` は
+  data router (`createBrowserRouter`) で、`UiDraftProvider` の
+  `RouterDiscardBlocker` が `useBlocker` で PUSH / REPLACE / POP をすべて止める
+  (アンカーのクリックと `beforeunload` だけでは、戻る/進むと `navigate(...)` が
+  素通りする)。画面側で `confirmDiscard()` の了承を得てから遷移するときは、
+  その了承が直後 1 回の遷移にだけ効くので確認は二重にならない — **独自の
+  `window.confirm` で了承を取ってから遷移しない** (二度聞かれる)。
+  **`BrowserRouter` に戻さない** — `useBlocker` は data router の中でしか動かない。
+- **dirty は保存時と同じ正規化で比べる** (review R4)。保存で空白・空行を
+  落とすなら、dirty 判定も同じ関数を通した値で比べる。生の文字列で比べると
+  保存後も「未保存」が消えず、離脱のたびに確認が出る。
+- **送信中の編集を成功時に上書きしない** (review R3)。送信した下書きの
+  signature を持ち、応答時点の下書き (ref で読む) と一致するときだけ初期化する。
 - **取得失敗を 0 件・読み込み中・未作成にしない。** `isError && !data` は
   `components/query-state.tsx` の `QueryErrorState` (原因の種類 + 再試行) を
   出す。0 件の文言や作成 CTA を失敗時に出さない。失敗から対象の不存在
@@ -1060,7 +1072,11 @@ mutation も権限も追加しない。
   判定は `lib/systems-state.ts` の `systemsKnownEmpty`)、利用中の 401 は
   client が `UNAUTHORIZED_EVENT` を投げ、`sessionExpired` になって AppLayout の
   再認証ダイアログがページを残したまま出る。`/auth/*` 自身の 401 は失効では
-  ないので通知しない。
+  ないので通知しない。**再認証中 (既存ユーザーあり) の `login()` は `user` を
+  消さない** (review R1): POST 成功後の `/auth/me` が失敗しても失効状態を
+  解除せず、ダイアログ内に理由を出して失敗として返す。`user` を null にすると
+  AppLayout が接続エラー画面へ置き換わり、守るはずのフォームがアンマウント
+  される。別の利用者と確定したときだけ cache と入力を破棄する。
 - **ログイン後の復帰先は `?next=`** (`lib/return-to.ts`)。アプリ内パスのみ
   (`safeReturnPath`)。自分でログアウトした場合は付けない (`explicitLogout`)。
 - **選択は URL が唯一の正本** (Workspace の `?open=` の形)。state の初期値と

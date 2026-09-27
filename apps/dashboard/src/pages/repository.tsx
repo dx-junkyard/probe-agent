@@ -753,10 +753,16 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
   // UX-03: 保存済み設定との差分を未保存入力として、アプリ共通の破棄確認
   // (System 切替・ログアウト・画面離脱) に参加させる。
   const { systemId } = useAuth();
+  // Issue #466 review R4: 保存時と同じ正規化 (`textToPatterns`: 前後空白・
+  // 空行の除去) をかけた値どうしで比べる。生の文字列で比べると、末尾改行や
+  // 空行を含む入力は保存に成功しても「未保存」のまま残り、離脱のたびに
+  // 破棄確認が出続ける。
+  const samePatterns = (text: string, saved: string[] | undefined) =>
+    JSON.stringify(textToPatterns(text)) === JSON.stringify(saved ?? []);
   const dirty =
     repoPath !== (config?.repo_path ?? "")
-    || includePatterns !== patternsToText(config?.include_patterns)
-    || excludePatterns !== patternsToText(config?.exclude_patterns);
+    || !samePatterns(includePatterns, config?.include_patterns)
+    || !samePatterns(excludePatterns, config?.exclude_patterns);
   useUnsavedChangesGuard(`repository-config:system-${systemId ?? "none"}`, dirty);
   const repoPathHighlight = useDiagnosticHighlight<HTMLDivElement>("repo-config");
   const patternsHighlight = useDiagnosticHighlight<HTMLDivElement>("repo-patterns");

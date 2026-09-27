@@ -2,7 +2,7 @@
 // Issue #466 batch 2 — UX-03 (未保存入力の保持), UX-04 (入力途中の候補を黙って
 // 落とさない), UX-05 (取得失敗を 0 件・読み込み中にしない)。
 
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
@@ -366,5 +366,85 @@ describe("UX-05 / UX-12: Journey Service Blueprint", () => {
     expect(screen.queryByTestId("blueprint-diff-loading")).not.toBeInTheDocument();
     fireEvent.click(within(screen.getByTestId("blueprint-diff-error")).getByRole("button", { name: "再試行" }));
     expect(onRetry).toHaveBeenCalled();
+  });
+});
+
+// ── レビュー指摘 R3 / R4 ────────────────────────────────────────────
+
+describe("R3: 作成の応答待ち中に追記した内容を成功時に消さない", () => {
+  async function fillComplete(dialog: HTMLElement) {
+    fillBasics(dialog);
+    for (const [i, label, patch] of [[1, "a", "diff a"], [2, "b", "diff b"]] as const) {
+      fireEvent.change(within(dialog).getByLabelText(`候補 ${i} のラベル`), { target: { value: label } });
+      fireEvent.change(within(dialog).getByLabelText(`候補 ${i} のpatch`), { target: { value: patch } });
+    }
+    const submit = within(dialog).getByRole("button", { name: "Experimentを作成" });
+    await waitFor(() => expect(submit).not.toBeDisabled());
+    return submit;
+  }
+
+  test("送信後に編集した内容は下書きとして残り、送信した内容と区別して伝える", async () => {
+    mockExperimentsApi();
+    let resolvePost: (v: unknown) => void = () => {};
+    mockApi.post.mockImplementation(() => new Promise((resolve) => { resolvePost = resolve; }));
+    const { dialog } = await openCreateDialog();
+    const submit = await fillComplete(dialog);
+    fireEvent.click(submit);
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(within(dialog).getByLabelText("候補 1 のpatch"), { target: { value: "diff a plus unsaved update" } });
+    await act(async () => { resolvePost({ id: 9 }); });
+
+    const { toast } = await import("sonner");
+    await waitFor(() => expect(toast.info).toHaveBeenCalledWith(expect.stringContaining("下書きとして残しています")));
+    expect(await screen.findByTestId("experiment-draft-notice")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("experiment-create-button"));
+    const reopened = await screen.findByRole("dialog", { name: "Experimentを作成" });
+    expect(within(reopened).getByLabelText("候補 1 のpatch")).toHaveValue("diff a plus unsaved update");
+  });
+
+  test("応答待ち中に編集していなければ、成功時に下書きを初期化する", async () => {
+    mockExperimentsApi();
+    mockApi.post.mockResolvedValue({ id: 9 });
+    const { dialog } = await openCreateDialog();
+    const submit = await fillComplete(dialog);
+    fireEvent.click(submit);
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(screen.queryByTestId("experiment-draft-notice")).not.toBeInTheDocument();
+    expect(screen.getByTestId("experiment-create-button")).toHaveTextContent("Experimentを作成");
+  });
+});
+
+describe("R4: Repository 設定の保存後に『未保存』が残らない", () => {
+  test("末尾改行・空行・前後空白は保存時と同じ正規化で比較し、意味のある編集だけを未保存とする", async () => {
+    let saved = { include_patterns: ["*.py"], exclude_patterns: [] as string[] };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository") return Promise.resolve({ id: 1, system_id: 1, repo_path: "/repos/alpha", ...saved });
+      if (path === "/repository-candidates") return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
+      if (path === "/repository/snapshots") return Promise.resolve([]);
+      if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
+      return Promise.resolve(null);
+    });
+    mockApi.put.mockImplementation((_path: string, body: typeof saved) => {
+      saved = { include_patterns: body.include_patterns, exclude_patterns: body.exclude_patterns };
+      return Promise.resolve({ id: 1, system_id: 1, repo_path: "/repos/alpha", ...saved });
+    });
+    const { default: RepositoryPage } = await import("@/pages/repository");
+    renderAt(<RepositoryPage />, "/repository");
+
+    const include = await screen.findByLabelText(/Include Patterns/);
+    fireEvent.change(include, { target: { value: "*.py\n\n  *.ts  \n" } });
+    fireEvent.change(screen.getByLabelText(/Exclude Patterns/), { target: { value: " \n" } });
+    expect(screen.getByTestId("repo-config-unsaved")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save Configuration" }));
+    await waitFor(() => expect(mockApi.put).toHaveBeenCalledWith("/repository", expect.objectContaining({
+      include_patterns: ["*.py", "*.ts"], exclude_patterns: [],
+    })));
+    await waitFor(() => expect(screen.queryByTestId("repo-config-unsaved")).not.toBeInTheDocument());
+
+    // 意味のある追加編集では再び未保存になる。
+    fireEvent.change(screen.getByLabelText(/Include Patterns/), { target: { value: "*.py\n*.ts\n*.md" } });
+    expect(screen.getByTestId("repo-config-unsaved")).toBeInTheDocument();
   });
 });
