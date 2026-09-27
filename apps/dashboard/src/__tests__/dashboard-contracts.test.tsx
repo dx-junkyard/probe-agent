@@ -1544,6 +1544,10 @@ describe("Decision Workspace page", () => {
     vi.clearAllMocks();
     mockSystemId = 1;
     vi.spyOn(window, "confirm").mockReturnValue(true);
+    // Issue #466 (UX-10): the selected Workspace now lives in the URL
+    // (`?open=`), and `createWrapper` uses BrowserRouter, i.e. the shared
+    // jsdom location. Start every case from an unselected URL.
+    window.history.replaceState({}, "", "/");
   });
 
   test("lists workspaces and selects one to load its conversation", async () => {
@@ -5320,7 +5324,7 @@ describe("Sidebar phase-linked navigation (Issue #257)", () => {
     expect(within(screen.getByTestId("sidebar-group-other")).getByText("Generate")).toBeTruthy();
   });
 
-  test("preparation phase: Understand is current, Setup is reached, later groups are future and dimmed", async () => {
+  test("preparation phase: Understand is current, Setup is reached, later groups are future (labelled, not dimmed)", async () => {
     await renderSidebar(stateWithPhase("preparation"));
 
     const setup = screen.getByTestId("sidebar-group-setup");
@@ -5339,12 +5343,14 @@ describe("Sidebar phase-linked navigation (Issue #257)", () => {
     expect(observeEvaluate.getAttribute("data-phase-state")).toBe("future");
     expect(publish.getAttribute("data-phase-state")).toBe("future");
 
-    // Dimmed (future) groups carry a reduced-opacity class; reached/current do not.
-    expect(instrument.className).toMatch(/opacity-50/);
-    expect(observeEvaluate.className).toMatch(/opacity-50/);
-    expect(publish.className).toMatch(/opacity-50/);
-    expect(setup.className).not.toMatch(/opacity-50/);
-    expect(understand.className).not.toMatch(/opacity-50/);
+    // Issue #466 (UX-13) supersedes the #257 dimming: a future group's links
+    // are usable, so they must not look disabled. The phase position is
+    // stated as text on the heading (「これから」) instead of opacity.
+    for (const group of [setup, understand, instrument, observeEvaluate, publish]) {
+      expect(group.className).not.toMatch(/opacity-50/);
+    }
+    expect(within(instrument).getByText("これから")).toBeTruthy();
+    expect(within(setup).queryByText("これから")).toBeNull();
 
     // The current group's heading shows the sidebar's own 現在地表示 marker.
     expect(within(understand).getByText("現在")).toBeTruthy();

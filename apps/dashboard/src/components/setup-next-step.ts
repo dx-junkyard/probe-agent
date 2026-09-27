@@ -21,6 +21,23 @@ export const SETUP_STEPS = [
 
 export type SetupStepId = (typeof SETUP_STEPS)[number];
 
+/**
+ * Issue #466 (UX-11): 「次の操作」を文章だけで終わらせず、その操作を行う
+ * 場所へ 1 つの CTA でつなぐ。`route` は別画面へ遷移し、`anchor` は同じ
+ * ページ内の該当セクションを開いてフォーカスする。CTA は遷移するだけで、
+ * 何かを実行しない。
+ */
+export type SetupStepCta =
+  | { kind: "route"; label: string; to: string }
+  | { kind: "anchor"; label: string; anchorId: string };
+
+/** ページ内 CTA の到達先 id (setup-guide.tsx の各セクションに付ける)。 */
+export const SETUP_ANCHORS = {
+  runtimePatterns: "setup-runtime-patterns",
+  connectivityChecks: "setup-connectivity-checks",
+  troubleshooting: "setup-troubleshooting",
+} as const;
+
 export interface SetupStep {
   id: SetupStepId;
   /** Where the developer stands. */
@@ -29,6 +46,8 @@ export interface SetupStep {
   action: string;
   /** How they will know it worked. */
   completion: string;
+  /** The one place where `action` is performed. */
+  cta: SetupStepCta;
 }
 
 const STEPS: Record<SetupStepId, SetupStep> = {
@@ -37,30 +56,35 @@ const STEPS: Record<SetupStepId, SetupStep> = {
     state: "SDK 用の API token がまだありません",
     action: "Connect SDK で API token を発行する",
     completion: "有効な API token が一覧に表示される",
+    cta: { kind: "route", label: "Connect SDK で token を発行する", to: "/connect-sdk" },
   },
   configure_sdk: {
     id: "configure_sdk",
     state: "token はありますが、まだ何も受信していません",
     action: "監視対象に SDK を導入し、PROBE_SERVER_URL と token を設定する",
     completion: "手動 smoke trace が HTTP 201 を返す",
+    cta: { kind: "anchor", label: "実行形態別の設定例を開く", anchorId: SETUP_ANCHORS.runtimePatterns },
   },
   verify_transport: {
     id: "verify_transport",
     state: "疎通確認 trace のみ受信しています（受信経路は正常）",
     action: "@probe を付けたアプリを実際に動かす",
     completion: "実 workload の trace が届き、Components に表示される",
+    cta: { kind: "anchor", label: "実 workload の確認手順を開く", anchorId: SETUP_ANCHORS.connectivityChecks },
   },
   run_workload: {
     id: "run_workload",
     state: "実 workload の trace を受信しています",
     action: "Components で trace を確認する",
     completion: "改善したい component の入出力が読める",
+    cta: { kind: "route", label: "Components で Trace を確認する", to: "/components" },
   },
   restore_reception: {
     id: "restore_reception",
     state: "過去には受信していましたが、現在は届いていません",
     action: "health・認証・network・workload の順に確認する",
     completion: "直近の期間別件数が 0 でなくなる",
+    cta: { kind: "anchor", label: "トラブルシューティングを開く", anchorId: SETUP_ANCHORS.troubleshooting },
   },
 };
 

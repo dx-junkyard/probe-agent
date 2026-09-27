@@ -66,10 +66,13 @@ export function ConnectivityBadge() {
       data-state={data.state}
       data-freshness={data.freshness}
       title={spec.title}
-      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${TONE_CLASSES[spec.tone]}`}
+      aria-label={spec.label}
+      className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-1 text-xs font-medium transition-colors lg:px-2.5 ${TONE_CLASSES[spec.tone]}`}
     >
       <RadioTower className="h-3.5 w-3.5" />
-      {spec.label}
+      {/* Issue #466 (UX-14): 狭い画面では文言を畳み、アイコン + アクセシブル名
+          (と title) だけで通知を残す。重要通知は隠さない。 */}
+      <span className="hidden lg:inline">{spec.label}</span>
     </Link>
   );
 }

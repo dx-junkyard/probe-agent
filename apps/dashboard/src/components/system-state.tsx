@@ -123,8 +123,19 @@ export function UserPhaseIndicator() {
     ?? USER_PHASE_LABELS[data.user_phase]
     ?? data.user_phase;
   return (
+    <>
+    {/* Issue #466 (UX-14): md〜xl では現在のフェーズ名だけを小さく示す。 */}
+    <span
+      className="hidden shrink-0 items-center rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary md:flex xl:hidden"
+      data-testid="user-phase-indicator-compact"
+      title={`現在のフェーズ: ${currentPhaseLabel}`}
+    >
+      {currentPhaseLabel}
+    </span>
     <div
-      className="hidden items-center gap-1 md:flex"
+      // Issue #466 (UX-14): 6 フェーズを並べると約 480px になり、サイドバーの
+      // レール (w-56) と並ぶ md〜lg 幅ではヘッダーの他の操作と重なる。
+      className="hidden items-center gap-1 xl:flex"
       data-testid="user-phase-indicator"
       data-current-phase={data.user_phase}
       title={`現在のフェーズ: ${currentPhaseLabel}`}
@@ -154,6 +165,7 @@ export function UserPhaseIndicator() {
         );
       })}
     </div>
+    </>
   );
 }
 

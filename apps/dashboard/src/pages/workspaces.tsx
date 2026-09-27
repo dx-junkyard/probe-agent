@@ -30,12 +30,29 @@ const ITEM_TYPE_ROUTE: Record<string, string> = {
 
 const ITEM_TYPES: WorkspaceContextItemType[] = ["feature", "component", "trace", "experiment", "probe_plan"];
 
+// Issue #466 (UX-10): 選択中の Workspace は URL (`?open=`) が唯一の正本。
+// 以前は `?open=` を state の初期値として一度読むだけで、選択・作成しても
+// URL が変わらなかったため、再読込・戻る/進む・URL 共有で対象が維持されな
+// かった。選択は履歴に積む (戻るで前の Workspace へ戻れる)。
+function parseWorkspaceId(raw: string | null): number | null | "invalid" {
+  if (raw === null || raw === "") return null;
+  const id = Number(raw);
+  return Number.isInteger(id) && id > 0 ? id : "invalid";
+}
+
 export default function WorkspacesPage() {
-  const [params] = useSearchParams();
-  const queryOpen = params.get("open");
+  const [params, setParams] = useSearchParams();
+  const parsedOpen = parseWorkspaceId(params.get("open"));
   const { data: workspaces, isLoading: workspacesLoading } = useWorkspaces();
-  const [selectedId, setSelectedId] = useState<number | null>(queryOpen ? Number(queryOpen) : null);
+  const selectedId = typeof parsedOpen === "number" ? parsedOpen : null;
   const [showCreate, setShowCreate] = useState(false);
+
+  const setSelectedId = (id: number | null) => {
+    const next = new URLSearchParams(params);
+    if (id === null) next.delete("open");
+    else next.set("open", String(id));
+    setParams(next);
+  };
 
   return (
     <div className="space-y-6">
@@ -54,7 +71,16 @@ export default function WorkspacesPage() {
           selectedId={selectedId}
           onSelect={setSelectedId}
         />
-        <ConversationPane workspaceId={selectedId} />
+        {parsedOpen === "invalid" ? (
+          <Card role="alert" data-testid="workspace-invalid-id">
+            <CardContent className="space-y-3 py-8 text-center text-sm">
+              <p>URL の Workspace 指定(open={params.get("open")})が正しくありません。</p>
+              <Button size="sm" variant="outline" onClick={() => setSelectedId(null)}>Workspace 一覧に戻る</Button>
+            </CardContent>
+          </Card>
+        ) : (
+          <ConversationPane workspaceId={selectedId} onBackToList={() => setSelectedId(null)} />
+        )}
         <ContextProposalsPane workspaceId={selectedId} />
       </div>
 
@@ -124,6 +150,8 @@ function WorkspaceListPane({ workspaces, isLoading, selectedId, onSelect }: {
           workspaces.map(w => (
             <button
               key={w.id}
+              type="button"
+              aria-current={selectedId === w.id ? "true" : undefined}
               onClick={() => onSelect(w.id)}
               className={cn(
                 "w-full rounded-lg border p-3 text-left text-sm transition-colors cursor-pointer",
@@ -144,7 +172,7 @@ function WorkspaceListPane({ workspaces, isLoading, selectedId, onSelect }: {
   );
 }
 
-function ConversationPane({ workspaceId }: { workspaceId: number | null }) {
+function ConversationPane({ workspaceId, onBackToList }: { workspaceId: number | null; onBackToList: () => void }) {
   const { data: workspace, isLoading, error } = useWorkspace(workspaceId);
   const sendTurn = useCreateWorkspaceAgentTurn(workspaceId ?? -1);
   const [message, setMessage] = useState("");
@@ -166,9 +194,14 @@ function ConversationPane({ workspaceId }: { workspaceId: number | null }) {
 
   if (error || !workspace) {
     return (
-      <Card>
-        <CardContent className="py-8 text-center text-sm text-destructive">
-          Could not load this workspace. It may belong to a different system.
+      <Card role="alert" data-testid="workspace-load-error">
+        <CardContent className="space-y-3 py-8 text-center text-sm">
+          <p className="text-destructive">
+            Workspace #{workspaceId} を開けませんでした。存在しないか、別の System の Workspace の可能性があります。
+          </p>
+          <Button size="sm" variant="outline" onClick={onBackToList} data-testid="workspace-back-to-list">
+            Workspace 一覧に戻る
+          </Button>
         </CardContent>
       </Card>
     );
