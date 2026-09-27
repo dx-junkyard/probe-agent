@@ -46,6 +46,36 @@ entity -- that difference is exactly what a carried-over form would hide.
 NODE_PATH=/tmp/pw/node_modules node browser-tests/objective-map.cjs /tmp/out
 ```
 
+## Dashboard 横断 UX 監査 (`ux-audit-466.cjs`, Issue #466)
+
+Issue #466 の 20 件のうち、jsdom では確かめられない保証を実ブラウザーで
+確認する (91 項目)。サーバーは実物を使い、失敗 (500・通信断・401) だけを
+route interception で注入する。
+
+| Scenario | Why it needs a real browser |
+| --- | --- |
+| 対象付き URL → ログイン → 同じ URL (UX-09) | 実際の redirect と query/hash の保持。外部 URL の `next` を無視すること |
+| 同名 token の識別と失効確認 (UX-01) | 実サーバーの 2 System × 同名 token |
+| コピー拒否 / 許可 (UX-08) | クリップボード権限と `getSelection()` の実挙動 |
+| 共通 Dialog のフォーカス (UX-02) | 初期フォーカス・Tab 循環・Escape・復帰・スクロールロック |
+| ヘッダーの重なり (UX-14) | 320/390/768/1024/1280px と 1280px + アシスタントで、表示中の操作要素どうしの矩形の重なりを測る。横 overflow だけでは衝突を見逃す |
+| Workspace の URL (UX-10) | 再読込・戻る・進む |
+| 下書きの保持 (UX-03/04) | 背景クリック、タブ往復、離脱時の `confirm` |
+| 取得失敗の表示 (UX-05/06/12) | 500・通信断・401 を注入し、0 件や未ログインとして描かないこと。401 の再認証後も入力が残ること |
+| Setup Guide / ナビ (UX-11/13/19) | 画面移動をまたぐ保存、検索からの遷移、減光なし |
+| アシスタント (UX-16/17/20) | 1280px で本文と並ぶ・390px でモーダルへ戻る、Shift+Enter、CDP の IME 合成中 Enter |
+
+スクリーンリーダーの読み上げ・実際の日本語 IME・代表利用者の評価は
+ここでは確認しない (Issue #463)。
+
+```bash
+NODE_PATH=/tmp/pw/node_modules node browser-tests/ux-audit-466.cjs /tmp/out
+```
+
+`E2E_USER` / `E2E_PASS` が管理者資格情報 (既定は下の手順の `root` / `s3cret`)。
+固定の名前で System・token・Workspace を作るので、毎回新しい scratch DB で
+実行する。
+
 ## Running
 
 Playwright is deliberately not a repository dependency (the same treatment

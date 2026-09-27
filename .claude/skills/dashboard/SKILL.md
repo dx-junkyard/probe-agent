@@ -1015,3 +1015,77 @@ mutation も権限も追加しない。
 - UI copy は Issue #266 の日本語規約に従う。`System` / `Trace` / `Flow` /
   `Node` / `Capability` / `Snapshot`、実行モード名(`fixed` / `observe` /
   `propose` / `shadow`)、capability 名、有限コード名は canonical のまま。
+
+## 横断 UX の共通部品 (issue #466)
+
+`docs/02-challenges-and-decisions/ux-audit-2026-09-26.md` の「修正結果」が
+経緯と証拠。画面を足す・直すときは、ここにある部品を使い、同じ規則の
+2 つ目の実装を作らないこと。
+
+- **共通 Dialog (`components/ui/dialog.tsx`) は `useModalSurface` に載って
+  いる。** dialog ロール、`DialogTitle` / `DialogDescription` の id を context
+  で登録した `aria-labelledby` / `aria-describedby`、初期フォーカス、Tab 循環、
+  Escape、フォーカス復帰を持つ。閉じるボタンは DOM の末尾で初期フォーカス
+  対象外 (`data-modal-initial-skip`)。破壊的操作の確認は取り消しボタンに
+  `data-autofocus` を付ける。入れ子は `lib/modal-surface.ts` のスタックで
+  最上位だけが Escape / Tab を処理し、背景のスクロールロックは
+  `lockBodyScroll()` の参照カウント。**Dialog の中に独自の keydown/Escape
+  処理を書かない。** 長い入力を持つダイアログで閉じても下書きを保持できない
+  なら `closeOnOverlayClick={false}`。
+- **閉じることと破棄することは別の操作。** 入力を持つダイアログは閉じても
+  下書きを保持し、破棄は明示ボタンだけが行う (Experiment 作成の形)。下書きは
+  作成先 System に属し、System が変わったら持ち越さない。
+- **未保存入力の保護は 1 つの破棄確認に集約する。** 画面ローカルな入力は
+  `useUnsavedChangesGuard(guardId, dirty)` (`lib/ui-draft.tsx`) で
+  `UiDraftProvider` のレジストリへ dirty だけを申告する。System 切替・
+  ログアウト・アプリ内リンク・ページ離脱の確認はそこが 1 回だけ出す。
+  field の値は登録しない。編集中フォームを持つタブは
+  `<TabsContent keepMounted>` でアンマウントしない。
+- **取得失敗を 0 件・読み込み中・未作成にしない。** `isError && !data` は
+  `components/query-state.tsx` の `QueryErrorState` (原因の種類 + 再試行) を
+  出す。0 件の文言や作成 CTA を失敗時に出さない。失敗から対象の不存在
+  (「plan #5 が見つからない」) を判定しない。原因の種類は
+  `lib/request-state.ts` の `describeRequestFailure` が有限集合
+  (offline/network/timeout/unauthorized/forbidden/not_found/server/unknown)
+  で決める。**`@/api/client` のクラスを `instanceof` で判定しない** — 多くの
+  テストが client をモックしており、モックに無い export へ触れると落ちる。
+- **client は「応答なし」と「拒否」を区別する。** fetch 自体の失敗は
+  `NetworkError` (書き込みでは `resultUnknown: true`、「処理結果は不明」)、
+  サーバーの拒否は `ApiError`。**書き込み要求にタイムアウトを付けない** —
+  応答待ちを打ち切っても処理は止まらず、結果が不明になるだけ。
+  `api.get(path, { timeoutMs })` は読み取りだけ。
+- **認証の状態は 3 つに分ける** (`api/auth.tsx`)。確認できない
+  (`authError`: 到達不能・タイムアウト・5xx) はログイン画面へ送らず再試行、
+  `/systems` の失敗は `systemsStatus: "error"` (成功した 0 件だけが「未作成」、
+  判定は `lib/systems-state.ts` の `systemsKnownEmpty`)、利用中の 401 は
+  client が `UNAUTHORIZED_EVENT` を投げ、`sessionExpired` になって AppLayout の
+  再認証ダイアログがページを残したまま出る。`/auth/*` 自身の 401 は失効では
+  ないので通知しない。
+- **ログイン後の復帰先は `?next=`** (`lib/return-to.ts`)。アプリ内パスのみ
+  (`safeReturnPath`)。自分でログアウトした場合は付けない (`explicitLogout`)。
+- **選択は URL が唯一の正本** (Workspace の `?open=` の形)。state の初期値と
+  して一度読むだけにしない。選択は履歴に積み、無効値からは一覧へ戻れる。
+  BrowserRouter を使うテストは jsdom の location を共有するので、
+  `beforeEach` で `window.history.replaceState({}, "", "/")` する。
+- **未知のパスは `pages/not-found.tsx`** (AppLayout 内の `*` ルート)。
+- **ヘッダーの段階は container query** (`<header className="@container">`
+  と子の `@3xl:` / `@4xl:` / `@5xl:`)。画面幅のブレークポイントにすると、
+  アシスタントを並べて開いたときにヘッダーだけが狭くなって重なる。狭い
+  ときは System 選択・重要通知・メニューボタンだけを残し、補助操作は
+  `HeaderOverflowMenu` へ。ヘッダーに要素を足したら
+  `browser-tests/ux-audit-466.cjs` の重なり検査を実行する。
+- **サイドバー**: 主要入口と既定で閉じた「詳細ビュー」(`detail: true`)、
+  画面検索 (`keywords` は表示しない日本語の目的語)、現在地は「表示中」の
+  文字バッジ。**利用可能なリンクを半透明にしない** — 将来フェーズは見出しの
+  「これから」で示す (#257 の減光を置き換えた)。
+- **アシスタントパネル**: 幅 1280px 以上は本文と並ぶ非モーダル
+  (`data-layout="side"`、`role="complementary"`)、未満はモーダル。会話一覧を
+  ライブ領域にしない (履歴読込で全件読み上げになる) — 新しい出来事だけを
+  `assistant-live-status` (status) / `assistant-live-alert` (alert) へ書く。
+  永続スレッドの初回解決中は送信を待たせ、解決に失敗した対象は一時会話の
+  まま固定して「保存されない会話」と明示する。入力は textarea で、Enter 送信・
+  Shift+Enter 改行・IME 変換中 (`isComposing` / keyCode 229) は送信しない。
+- **ラベルは `FormField`** (`components/ui/form-field.tsx`) で入力に関連付ける。
+  `<Label>` を隣に置くだけにしない。
+- **クリップボードは `lib/clipboard.ts` の `copyText` の結果で通知する。**
+  完了前に成功 toast を出さない。
