@@ -30,6 +30,7 @@ import type { RepositoryCandidateOut, RepositoryConfigOut, RepositoryStatus } fr
 import { SystemStateBanner } from "@/components/system-state";
 import { useRepositoryConfiguredGate } from "@/components/repository-gate";
 import { Link } from "react-router-dom";
+import { useUnsavedChangesGuard } from "@/lib/ui-draft";
 
 function patternsToText(patterns: string[] | undefined): string {
   return (patterns ?? []).join("\n");
@@ -135,7 +136,8 @@ export default function RepositoryPage() {
           <TabsTrigger value="api-scan">API Scan</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="config">
+        {/* UX-03: 設定フォームの編集内容はタブ往復で失わない。 */}
+        <TabsContent value="config" keepMounted>
           <DiagnosticFixCallout anchor="repo-config" className="mb-3" />
           <DiagnosticFixCallout anchor="repo-patterns" className="mb-3" />
           <Card>
@@ -748,6 +750,14 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
   const [repoPath, setRepoPath] = useState(config?.repo_path ?? "");
   const [includePatterns, setIncludePatterns] = useState(patternsToText(config?.include_patterns));
   const [excludePatterns, setExcludePatterns] = useState(patternsToText(config?.exclude_patterns));
+  // UX-03: 保存済み設定との差分を未保存入力として、アプリ共通の破棄確認
+  // (System 切替・ログアウト・画面離脱) に参加させる。
+  const { systemId } = useAuth();
+  const dirty =
+    repoPath !== (config?.repo_path ?? "")
+    || includePatterns !== patternsToText(config?.include_patterns)
+    || excludePatterns !== patternsToText(config?.exclude_patterns);
+  useUnsavedChangesGuard(`repository-config:system-${systemId ?? "none"}`, dirty);
   const repoPathHighlight = useDiagnosticHighlight<HTMLDivElement>("repo-config");
   const patternsHighlight = useDiagnosticHighlight<HTMLDivElement>("repo-patterns");
 
@@ -764,8 +774,8 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
   return (
     <>
       <div {...repoPathHighlight} className={`space-y-2 ${repoPathHighlight.className}`}>
-        <Label>Repository</Label>
-        <Select value={repoPath} onChange={e => setRepoPath(e.target.value)}>
+        <Label htmlFor="repo-config-path">Repository</Label>
+        <Select id="repo-config-path" value={repoPath} onChange={e => setRepoPath(e.target.value)}>
           <option value="">Select repository...</option>
           {config?.repo_path && !candidates.some(candidate => candidate.path === config.repo_path) && (
             <option value={config.repo_path} disabled>
@@ -786,17 +796,24 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
       </div>
       <div {...patternsHighlight} className={`space-y-4 ${patternsHighlight.className}`}>
         <div className="space-y-2">
-          <Label>Include Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
-          <Textarea value={includePatterns} onChange={e => setIncludePatterns(e.target.value)} placeholder={"*.py\n*.js"} rows={3} />
+          <Label htmlFor="repo-config-include">Include Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
+          <Textarea id="repo-config-include" value={includePatterns} onChange={e => setIncludePatterns(e.target.value)} placeholder={"*.py\n*.js"} rows={3} />
         </div>
         <div className="space-y-2">
-          <Label>Exclude Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
-          <Textarea value={excludePatterns} onChange={e => setExcludePatterns(e.target.value)} placeholder={"test_*\n__pycache__"} rows={3} />
+          <Label htmlFor="repo-config-exclude">Exclude Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
+          <Textarea id="repo-config-exclude" value={excludePatterns} onChange={e => setExcludePatterns(e.target.value)} placeholder={"test_*\n__pycache__"} rows={3} />
         </div>
       </div>
-      <Button onClick={handleSave} disabled={isPending || !repoPath || !candidates.some(candidate => candidate.path === repoPath)}>
-        {isPending ? "Saving..." : "Save Configuration"}
-      </Button>
+      <div className="flex items-center gap-3">
+        <Button onClick={handleSave} disabled={isPending || !repoPath || !candidates.some(candidate => candidate.path === repoPath)}>
+          {isPending ? "Saving..." : "Save Configuration"}
+        </Button>
+        {dirty && (
+          <span className="text-xs text-amber-700 dark:text-amber-400" role="status" data-testid="repo-config-unsaved">
+            未保存の変更があります
+          </span>
+        )}
+      </div>
     </>
   );
 }

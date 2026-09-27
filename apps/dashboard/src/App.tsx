@@ -31,6 +31,7 @@ import FlowAgentsPage from "./pages/flow-agents";
 import JourneyBlueprintPage from "./pages/journey-blueprint";
 import FunctionalLineagePage from "./pages/functional-lineage";
 import ObjectiveMapPage from "./pages/objective-map";
+import NotFoundPage from "./pages/not-found";
 
 export default function App() {
   return (
@@ -67,6 +68,8 @@ export default function App() {
         <Route path="objective-map" element={<ObjectiveMapPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="admin" element={<AdminPage />} />
+        {/* Issue #466 (UX-18): 未知のパスを空白画面にしない。 */}
+        <Route path="*" element={<NotFoundPage />} />
       </Route>
     </Routes>
   );

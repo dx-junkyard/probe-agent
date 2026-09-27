@@ -26,7 +26,7 @@ CardHeader.displayName = "CardHeader";
  * be reached by heading navigation at all.
  */
 type CardTitleProps = HTMLAttributes<HTMLHeadingElement> & {
-  as?: "div" | "h2" | "h3" | "h4";
+  as?: "div" | "h1" | "h2" | "h3" | "h4";
 };
 
 const CardTitle = forwardRef<HTMLHeadingElement, CardTitleProps>(

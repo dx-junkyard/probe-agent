@@ -6,12 +6,38 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { BlueprintDiffOut } from "@/api/types";
 import { BLUEPRINT_DIFF_STATE_LABEL, diffChangeGroups } from "./model";
+import { QueryErrorState } from "@/components/query-state";
 
-export function BlueprintDiffPanel({ diff }: { diff: BlueprintDiffOut | null | undefined }) {
+// Issue #466 (UX-05): 「データが無い」をすべて読み込み中と表示しない。
+// 取得中・取得失敗・(取得前に) 何も要求していない、の 3 つを分ける。
+export function BlueprintDiffPanel({
+  diff,
+  isLoading = false,
+  error = null,
+  onRetry,
+  retrying = false,
+}: {
+  diff: BlueprintDiffOut | null | undefined;
+  isLoading?: boolean;
+  error?: unknown;
+  onRetry?: () => void;
+  retrying?: boolean;
+}) {
+  if (!diff && error) {
+    return (
+      <QueryErrorState
+        target="as-is / to-be 差分"
+        error={error}
+        onRetry={onRetry}
+        retrying={retrying}
+        data-testid="blueprint-diff-error"
+      />
+    );
+  }
   if (!diff) {
     return (
-      <p className="text-sm text-muted-foreground" data-testid="blueprint-diff-loading">
-        読み込み中です。
+      <p className="text-sm text-muted-foreground" role="status" data-testid="blueprint-diff-loading">
+        {isLoading ? "差分を読み込んでいます…" : "差分はまだ取得していません。"}
       </p>
     );
   }

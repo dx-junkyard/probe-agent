@@ -241,6 +241,33 @@ export function useUiDraftSource(
   }, [api, formId, targetRef]);
 }
 
+/**
+ * Issue #466 (UX-03): 画面ローカルな未保存入力を、アプリ共通の破棄確認
+ * (System 切替・ログアウト・アプリ内リンク・ページ離脱) に参加させる。
+ *
+ * 破棄確認を画面ごとに別実装すると、同じ操作で確認が 2 回出たり、片方だけ
+ * 確認が出なかったりする。ここでは `UiDraftProvider` のレジストリへ「内容を
+ * 持たない dirty 申告」だけを登録する。field の値は登録しない — この登録は
+ * 破棄確認のためだけのもので、アシスタントが読む下書き (adapter の form spec
+ * に一致する formId) ではない。
+ *
+ * `guardId` は画面内で一意にし、所属 (System 等) を含める。
+ */
+export function useUnsavedChangesGuard(guardId: string, dirty: boolean): void {
+  useUiDraftSource(`unsaved-changes:${guardId}`, guardId, () =>
+    dirty
+      ? {
+        hasUnsavedChanges: true,
+        fields: [],
+        selectedItemRef: "",
+        activeTab: "",
+        comparisonTarget: "",
+        localRevisionToken: "dirty",
+      }
+      : null,
+  );
+}
+
 // --- useFormValidation (Issue #451) ------------------------------------------
 //
 // docs/01-specifications/capabilities/ai-discussion-adapter.md §2.8 is the canonical contract. Journey /

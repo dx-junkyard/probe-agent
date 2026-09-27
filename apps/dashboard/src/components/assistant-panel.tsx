@@ -512,8 +512,22 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   // itself. That is the safe migration path, and it is also what every
   // non-discussion screen keeps permanently.
   const activeThread = view.threadId !== null ? threadDetail?.thread ?? null : null;
-  const useLegacyConversation = !discussionEnabled || activeThread === null;
-  const messages = useLegacyConversation ? (threads[screenId] ?? []) : view.messages;
+  // Issue #466 (UX-07): 永続スレッドの初回解決中に送った発言は、解決後に
+  // 表示元が永続履歴へ切り替わった瞬間に消えていた (一時会話からの移行が
+  // 無い)。そこで 2 つの規則を置く:
+  //   1. 解決中は送信を待たせる (`threadResolving`)。状態を文章で示す。
+  //   2. 解決に失敗して一時会話で話し始めた対象は、その後スレッドが解決
+  //      しても一時会話のまま保つ (`legacyPinned`)。表示元を黙って切り替え
+  //      ない。保存されない会話であることは画面に明示する。
+  // 一時会話の保存先は対象ごとに分ける (画面ごとだと、同じ画面の別対象の
+  // 会話が混ざる)。
+  const threadResolving = discussionEnabled && !!activeTarget && threadQuery.isLoading && !threadDetail;
+  const threadFailed = discussionEnabled && !!activeTarget && threadQuery.isError && !threadDetail;
+  const legacyKey = discussionEnabled && activeTargetKey ? `target:${activeTargetKey}` : screenId;
+  const [legacyPinned, setLegacyPinned] = useState<Record<string, true>>({});
+  const useLegacyConversation = !discussionEnabled || activeThread === null || !!legacyPinned[legacyKey];
+  const messages = useLegacyConversation ? (threads[legacyKey] ?? []) : view.messages;
+  const unsavedConversation = discussionEnabled && useLegacyConversation && (threadFailed || !!legacyPinned[legacyKey]);
   // `null` while the thread is unavailable: 「まだ分からない」 is not
   // 「current」 (#366), so no banner and no recheck claim in that case.
   const targetState: DiscussionTargetState | null = useLegacyConversation
@@ -585,7 +599,10 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   // thread resolves mid-conversation.
   const appendMessages = (msgs: ChatMessage[]) => {
     if (useLegacyConversation) {
-      setThreads((prev) => ({ ...prev, [screenId]: [...(prev[screenId] ?? []), ...msgs] }));
+      setThreads((prev) => ({ ...prev, [legacyKey]: [...(prev[legacyKey] ?? []), ...msgs] }));
+      if (discussionEnabled && activeTargetKey && !legacyPinned[legacyKey]) {
+        setLegacyPinned((prev) => ({ ...prev, [legacyKey]: true }));
+      }
     } else {
       setMirror((prev) => prev.targetKey === activeTargetKey
         ? ({ ...prev, messages: [...prev.messages, ...msgs] }) : prev);
@@ -616,7 +633,9 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     voiceContext?: AssistantVoiceTurnContext,
   ): Promise<string | AssistantVoiceReply | null> => {
     const trimmed = q.trim();
-    if (!trimmed || ask.isPending) return null;
+    // UX-07: 永続スレッドの初回解決中は送らない (送った発言が解決後に消える)。
+    // 入力欄の内容は消さずに残す。
+    if (!trimmed || ask.isPending || (!voiceTurn && threadResolving)) return null;
     setQuestion("");
     // The target this turn is about is captured HERE (or, for voice, was
     // already captured at listening-start and handed in) and used for the
@@ -1066,6 +1085,20 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             <Loader2 className="h-3.5 w-3.5 animate-spin" /> Thinking…
           </div>
         )}
+        {threadResolving && (
+          <p className="flex items-center gap-2 text-xs text-muted-foreground" data-testid="assistant-thread-resolving">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            会話履歴を読み込んでいます。読み込みが終わると送信できます(入力した内容は残ります)。
+          </p>
+        )}
+        {unsavedConversation && (
+          <p
+            className="rounded-md border border-amber-300 bg-amber-50 p-2 text-xs dark:border-amber-800 dark:bg-amber-950"
+            data-testid="assistant-thread-unsaved"
+          >
+            会話履歴を取得できなかったため、この会話は保存されません。画面を再読み込みすると消えます。
+          </p>
+        )}
 
       {/* Issue #452 (docs/01-specifications/capabilities/ai-discussion-adapter.md §3): the Proposal review
           region. Only for a specific entity/element target with a real
@@ -1108,7 +1141,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         <Button
           type="submit"
           size="icon"
-          disabled={ask.isPending || !question.trim()}
+          disabled={ask.isPending || !question.trim() || threadResolving}
           title="Send"
           data-testid="assistant-send"
         >

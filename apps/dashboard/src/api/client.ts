@@ -1,3 +1,5 @@
+import { UNAUTHORIZED_EVENT } from "@/lib/auth-events";
+
 const BASE = "/api";
 
 let currentSystemId: number | null = (() => {
@@ -87,16 +89,73 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method,
-    headers: headers(method),
-    credentials: "include",
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+/**
+ * Issue #466 (UX-05/06): サーバーに到達できなかった (応答が無い) ことを表す。
+ *
+ * `ApiError` は「サーバーが応答し、拒否した」事実で、こちらは「応答そのものが
+ * 無かった」事実。後者を 0 件・未作成・未ログインとして扱ってはならないし、
+ * 書き込みでは「保存されなかった」とも断定できない (リクエストは届いて処理
+ * された後に応答だけ失われたかもしれない) — `resultUnknown` がそれを示す。
+ */
+export class NetworkError extends Error {
+  kind: "offline" | "network" | "timeout";
+  /** 書き込み要求で応答を失った: サーバー側で処理済みの可能性がある。 */
+  resultUnknown: boolean;
+  constructor(kind: NetworkError["kind"], method: string) {
+    const unsafe = !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
+    const base = kind === "timeout"
+      ? "サーバーの応答が時間内にありませんでした。"
+      : kind === "offline"
+        ? "ネットワークに接続されていません。"
+        : "サーバーに接続できませんでした。";
+    super(unsafe ? `${base}処理結果は不明です。再送する前に一覧で結果を確認してください。` : base);
+    this.name = "NetworkError";
+    this.kind = kind;
+    this.resultUnknown = unsafe;
+  }
+}
+
+// 利用中のセッション失効 (401) を AuthProvider へ伝える。ページ遷移はせず、
+// その場で再認証させる (未保存入力を保全するため)。認証系エンドポイント
+// 自身の 401 (ログイン失敗・未ログイン判定) は失効ではないので通知しない。
+
+function notifyUnauthorized(path: string) {
+  if (path.startsWith("/auth/")) return;
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT, { detail: { path } }));
+}
+
+export interface RequestOptions {
+  /** 読み取り要求のタイムアウト (ms)。書き込みには付けない — 応答待ちを
+   * 打ち切っても処理は止まらず、結果が不明になるだけなので。 */
+  timeoutMs?: number;
+}
+
+async function request<T>(method: string, path: string, body?: unknown, options: RequestOptions = {}): Promise<T> {
+  const controller = options.timeoutMs ? new AbortController() : null;
+  let timedOut = false;
+  const timer = controller
+    ? setTimeout(() => { timedOut = true; controller.abort(); }, options.timeoutMs)
+    : null;
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      method,
+      headers: headers(method),
+      credentials: "include",
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+  } catch {
+    const offline = typeof navigator !== "undefined" && navigator.onLine === false;
+    throw new NetworkError(timedOut ? "timeout" : offline ? "offline" : "network", method);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   if (res.status === 204) return undefined as T;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (res.status === 401) notifyUnauthorized(path);
     throw new ApiError(res.status, data.detail ?? res.statusText);
   }
   return data as T;
@@ -117,13 +176,14 @@ async function requestBlob(
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
+    if (res.status === 401) notifyUnauthorized(path);
     throw new ApiError(res.status, data.detail ?? res.statusText);
   }
   return res.blob();
 }
 
 export const api = {
-  get: <T>(path: string) => request<T>("GET", path),
+  get: <T>(path: string, options?: RequestOptions) => request<T>("GET", path, undefined, options),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
   put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
   patch: <T>(path: string, body?: unknown) => request<T>("PATCH", path, body),

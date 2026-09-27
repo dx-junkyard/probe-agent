@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useAuth } from "@/api/auth";
+import { systemsKnownEmpty } from "@/lib/systems-state";
 import { useUpdateSystem } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -9,7 +10,8 @@ import { FormField } from "@/components/ui/form-field";
 import { toast } from "sonner";
 
 export default function SettingsPage() {
-  const { systems, systemId, refreshSystems } = useAuth();
+  const auth = useAuth();
+  const { systems, systemId, refreshSystems } = auth;
   const system = systems.find(s => s.id === systemId);
   const updateSystem = useUpdateSystem();
 
@@ -22,7 +24,12 @@ export default function SettingsPage() {
     <div className="space-y-6 max-w-2xl">
       <h1 className="text-2xl font-bold tracking-tight">Settings</h1>
 
-      {systems.length === 0 ? (
+      {systems.length === 0 && !systemsKnownEmpty(auth) ? (
+        // Issue #466 (UX-06): 取得失敗の空配列を「System 未作成」と言わない。
+        <p className="text-sm text-muted-foreground" data-testid="settings-systems-unknown">
+          System 一覧を取得できていません。上の「System 一覧を再取得」を試してください。
+        </p>
+      ) : systems.length === 0 ? (
         // Issue #265: this used to be a heading-only blank screen when no
         // System exists yet -- there was nothing to configure and nothing
         // saying why. Same guidance pattern as connect-sdk.tsx's

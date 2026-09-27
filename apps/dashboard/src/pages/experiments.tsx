@@ -23,6 +23,10 @@ import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
 import { SnapshotPreflightPanel } from "@/components/snapshot-preflight";
 import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
+import { FormField } from "@/components/ui/form-field";
+import { useAuth } from "@/api/auth";
+import { useUnsavedChangesGuard } from "@/lib/ui-draft";
+import { checkVariants, describeMissing, VARIANT_FIELD_LABEL } from "@/lib/experiment-variants";
 
 const STATUS_VARIANT: Record<string, "default" | "success" | "destructive" | "secondary" | "warning"> = {
   draft: "secondary",
@@ -46,6 +50,7 @@ interface VariantInput {
 }
 
 export default function ExperimentsPage() {
+  const { systemId, systems } = useAuth();
   const [searchParams] = useSearchParams();
   const draftIdParam = searchParams.get("draft");
   const workspaceIdParam = searchParams.get("workspace");
@@ -126,6 +131,11 @@ export default function ExperimentsPage() {
   const [newObjective, setNewObjective] = useState<string | null>(null);
   const [newSnapshotId, setNewSnapshotId] = useState<string>("");
   const [variants, setVariants] = useState<VariantInput[] | null>(null);
+  // UX-04: 行別エラーは送信を試みた後に出す (入力中の行を最初から赤くしない)。
+  const [submitAttempted, setSubmitAttempted] = useState(false);
+  // UX-03: 下書きは作成先 System に属する。別 System へ切り替えたら持ち越さない
+  // (ヘッダーの System 切替は破棄確認を出した上で切り替える)。
+  const [draftSystemId, setDraftSystemId] = useState(systemId);
 
   // Issue #369: the shared preflight decides both axes for the selected
   // snapshot (or the recommended one when nothing is selected yet). The page
@@ -183,15 +193,51 @@ export default function ExperimentsPage() {
     setNewObjective(null);
     setNewSnapshotId("");
     setVariants(null);
+    setStaleReason("");
+    setSubmitAttempted(false);
+  };
+
+  if (draftSystemId !== systemId) {
+    // props 変化に応じた state 調整 (render 中)。effect にすると一度だけ
+    // 別 System の下書きを描いてしまう。
+    setDraftSystemId(systemId);
+    resetForm();
+    setShowCreate(false);
+  }
+
+  const variantCheck = checkVariants(formVariants);
+  // 下書きの有無は「利用者が入力した内容があるか」で決める。URL の prefill を
+  // そのまま開いただけなら、同じ URL から再現できるので未保存入力ではない。
+  const hasDraft =
+    !!(newFeatureId ?? "").trim()
+    || !!(newObjective ?? "").trim()
+    || !!newSnapshotId
+    || !!staleReason.trim()
+    || (variants ?? []).some(v => v.label.trim() || v.patch_text.trim() || v.risk_note.trim());
+  useUnsavedChangesGuard(`experiment-create:system-${systemId ?? "none"}`, hasDraft);
+  const dialogOpen = showCreate || draftOpen || replayPrefillOpen || fromTraceOpen;
+  const targetSystemName = systems.find(s => s.id === systemId)?.name ?? null;
+
+  const discardDraft = () => {
+    if (hasDraft && !window.confirm("入力中の Experiment 下書きを破棄しますか?(元に戻せません)")) return;
+    resetForm();
+    setShowCreate(false);
+    setDraftDismissed(true);
   };
 
   const handleCreate = async () => {
     if (!formFeatureId || !formObjective.trim() || !newSnapshotId) return;
-    const validVariants = formVariants.filter(v => v.label.trim() && v.patch_text.trim());
+    setSubmitAttempted(true);
+    if (variantCheck.partial.length > 0) {
+      toast.error(`${variantCheck.partial.map(describeMissing).join("。")}。入力するか、候補を削除してください。`);
+      return;
+    }
+    const validVariants = variantCheck.complete.map(r => formVariants[r.index]);
     if (validVariants.length < 2) {
       toast.error("ラベルとpatchを入力した比較候補が2件以上必要です");
       return;
     }
+    const submittedSystemId = systemId;
     try {
       await createExperiment.mutateAsync({
         feature_id: formFeatureId,
@@ -209,11 +255,18 @@ export default function ExperimentsPage() {
           ? { stale_snapshot_reason: staleReason.trim() }
           : {}),
       });
-      toast.success("Experimentを作成しました");
+      toast.success(
+        targetSystemName && submittedSystemId != null
+          ? `Experimentを作成しました(${targetSystemName})`
+          : "Experimentを作成しました",
+      );
       setShowCreate(false);
       setDraftDismissed(true);
       resetForm();
-    } catch (err) { toast.error(String(err)); }
+    } catch (err) {
+      // 失敗時は下書きを残す (再送や修正のため)。
+      toast.error(String(err));
+    }
   };
 
   const updateVariant = (idx: number, field: keyof VariantInput, value: string) => {
@@ -227,6 +280,10 @@ export default function ExperimentsPage() {
   const removeVariant = (idx: number) => {
     if (formVariants.length <= 2) return;
     setVariants(formVariants.filter((_, i) => i !== idx));
+  };
+
+  const clearVariant = (idx: number) => {
+    setVariants(formVariants.map((v, i) => i === idx ? { label: "", patch_text: "", risk_note: "" } : v));
   };
 
   return (
@@ -251,20 +308,40 @@ export default function ExperimentsPage() {
       )}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Experiments</h1>
-        <Button size="sm" onClick={() => {
+        <Button size="sm" data-testid="experiment-create-button" onClick={() => {
           setDraftDismissed(true);
-          setNewFeatureId("");
-          setNewObjective("");
-          setVariants([
-            { label: "", patch_text: "", risk_note: "" },
-            { label: "", patch_text: "", risk_note: "" },
-          ]);
+          // UX-03: 保持している下書きがあれば、それを開き直す (空で上書きしない)。
+          if (!hasDraft) {
+            setNewFeatureId("");
+            setNewObjective("");
+            setVariants([
+              { label: "", patch_text: "", risk_note: "" },
+              { label: "", patch_text: "", risk_note: "" },
+            ]);
+          }
           setShowCreate(true);
         }}>
           <Plus className="h-4 w-4 mr-1" />
-          Experimentを作成
+          {hasDraft ? "下書きを再開" : "Experimentを作成"}
         </Button>
       </div>
+
+      {hasDraft && !dialogOpen && (
+        <div
+          role="status"
+          data-testid="experiment-draft-notice"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm dark:border-amber-800 dark:bg-amber-950/20"
+        >
+          <span>
+            作成途中の Experiment 下書きを保持しています
+            {targetSystemName ? `(作成先: ${targetSystemName})` : ""}。保存はまだされていません。
+          </span>
+          <span className="flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => setShowCreate(true)}>下書きを再開</Button>
+            <Button size="sm" variant="ghost" onClick={discardDraft}>下書きを破棄</Button>
+          </span>
+        </div>
+      )}
 
       {isLoading ? (
         <div className="space-y-4">{[1,2].map(i => <Skeleton key={i} className="h-40 w-full" />)}</div>
@@ -277,7 +354,7 @@ export default function ExperimentsPage() {
       ) : !experiments?.length ? (
         <Card><CardContent className="space-y-3 py-8 text-center text-sm text-muted-foreground">
           <p>Experimentはまだありません。評価する候補を用意して作成してください。</p>
-          <Button size="sm" onClick={() => setShowCreate(true)}>最初のExperimentを作成</Button>
+          <Button size="sm" onClick={() => setShowCreate(true)}>{hasDraft ? "下書きを再開" : "最初のExperimentを作成"}</Button>
         </CardContent></Card>
       ) : (
         <div className="space-y-4">
@@ -301,16 +378,24 @@ export default function ExperimentsPage() {
         </div>
       )}
 
-      <Dialog open={showCreate || draftOpen || replayPrefillOpen || fromTraceOpen} onOpenChange={(open) => {
+      {/* UX-03: 閉じる (背景クリック・Escape・×) と破棄を分ける。閉じても
+          下書きは保持し、破棄は「下書きを破棄」ボタンだけが行う。 */}
+      <Dialog open={dialogOpen} onOpenChange={(open) => {
         setShowCreate(open);
         if (!open) {
           setDraftDismissed(true);
-          resetForm();
+          // `variants` が null のまま閉じると、URL の prefill が次回も同じ
+          // 内容で開く。入力があれば現在の内容を明示的な下書きとして固定する。
+          if (hasDraft && variants == null) setVariants(formVariants);
         }
       }}>
         <DialogHeader>
           <DialogTitle>Experimentを作成</DialogTitle>
         </DialogHeader>
+        <p className="mb-2 text-xs text-muted-foreground" data-testid="experiment-create-target-system">
+          作成先の System: {targetSystemName ? `${targetSystemName}(#${systemId})` : "未選択"}
+          {" "}— 閉じても入力内容は下書きとして保持されます。
+        </p>
         <div className="space-y-4 max-h-[60vh] overflow-y-auto">
           {replayPayload && (
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
@@ -349,29 +434,29 @@ export default function ExperimentsPage() {
               )}
             </div>
           )}
-          <div className="space-y-2">
-            <Label>Feature（評価対象）</Label>
-            {features.length > 0 ? (
-              <Select value={formFeatureId} onChange={e => setNewFeatureId(e.target.value)}>
+          <FormField label="Feature（評価対象）">
+            {(field) => features.length > 0 ? (
+              <Select {...field} value={formFeatureId} onChange={e => setNewFeatureId(e.target.value)}>
                 <option value="">Featureを選択...</option>
                 {features.map(f => <option key={f.feature_id} value={f.feature_id}>{f.feature_id} — {f.name}</option>)}
               </Select>
             ) : (
-              <Input value={formFeatureId} onChange={e => setNewFeatureId(e.target.value)} placeholder="feature-id" />
+              <Input {...field} value={formFeatureId} onChange={e => setNewFeatureId(e.target.value)} placeholder="feature-id" />
             )}
-          </div>
-          <div className="space-y-2">
-            <Label>評価目的</Label>
-            <Textarea value={formObjective} onChange={e => setNewObjective(e.target.value)} placeholder="この比較で確認したいこと" rows={2} />
-          </div>
+          </FormField>
+          <FormField label="評価目的">
+            {(field) => (
+              <Textarea {...field} value={formObjective} onChange={e => setNewObjective(e.target.value)} placeholder="この比較で確認したいこと" rows={2} />
+            )}
+          </FormField>
           {/* Issue #369: the selector no longer presents every "ready"
               snapshot as an equal option. Exactly one is the recommendation;
               the rest are disclosed as reproduction-only choices, and the
               shared preflight below states both axes for whichever is
               selected. */}
           <div className="space-y-2">
-            <Label>Snapshot</Label>
-            <Select value={newSnapshotId} onChange={e => setNewSnapshotId(e.target.value)}>
+            <Label htmlFor="experiment-create-snapshot">Snapshot</Label>
+            <Select id="experiment-create-snapshot" value={newSnapshotId} onChange={e => setNewSnapshotId(e.target.value)}>
               <option value="">Snapshotを選択...</option>
               {recommendedSnapshot && (
                 <option value={recommendedSnapshot.id}>
@@ -402,39 +487,74 @@ export default function ExperimentsPage() {
                 <Plus className="h-3 w-3 mr-1" /> 候補を追加
               </Button>
             </div>
-            {formVariants.map((v, i) => (
-              <div key={i} className="rounded-lg border p-3 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium text-muted-foreground">候補 {i + 1}</span>
-                  {formVariants.length > 2 && (
-                    <Button variant="ghost" size="icon" className="h-6 w-6" aria-label={`候補 ${i + 1} を削除`} onClick={() => removeVariant(i)}>
-                      <Trash2 className="h-3 w-3" />
-                    </Button>
+            {formVariants.map((v, i) => {
+              const row = variantCheck.rows[i];
+              const showRowError = submitAttempted && row?.state === "partial";
+              const errorId = `experiment-variant-${i}-error`;
+              const invalid = (f: "label" | "patch_text") =>
+                showRowError && row.missing.includes(f) ? { "aria-invalid": true as const, "aria-describedby": errorId } : {};
+              return (
+                <div
+                  key={i}
+                  className={`rounded-lg border p-3 space-y-2 ${showRowError ? "border-destructive" : ""}`}
+                  data-testid={`experiment-variant-row-${i}`}
+                  data-row-state={row?.state}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-muted-foreground">
+                      候補 {i + 1}
+                      {row?.state === "partial" && <span className="ml-2 text-amber-700 dark:text-amber-400">入力途中</span>}
+                    </span>
+                    {formVariants.length > 2 ? (
+                      <Button variant="ghost" size="icon" className="h-6 w-6" aria-label={`候補 ${i + 1} を削除`} onClick={() => removeVariant(i)}>
+                        <Trash2 className="h-3 w-3" />
+                      </Button>
+                    ) : row?.state === "partial" ? (
+                      <Button variant="ghost" size="sm" className="h-6 text-xs" onClick={() => clearVariant(i)}>
+                        入力をクリア
+                      </Button>
+                    ) : null}
+                  </div>
+                  <Input
+                    aria-label={`候補 ${i + 1} の${VARIANT_FIELD_LABEL.label}`}
+                    placeholder="ラベル（例: optimized-v1）"
+                    value={v.label}
+                    onChange={e => updateVariant(i, "label", e.target.value)}
+                    {...invalid("label")}
+                  />
+                  <Textarea
+                    aria-label={`候補 ${i + 1} の${VARIANT_FIELD_LABEL.patch_text}`}
+                    placeholder="Patch内容（unified diff形式）"
+                    value={v.patch_text}
+                    onChange={e => updateVariant(i, "patch_text", e.target.value)}
+                    rows={4}
+                    className="font-mono text-xs"
+                    {...invalid("patch_text")}
+                  />
+                  <Input
+                    aria-label={`候補 ${i + 1} のリスクメモ`}
+                    placeholder="リスクメモ（任意）"
+                    value={v.risk_note}
+                    onChange={e => updateVariant(i, "risk_note", e.target.value)}
+                  />
+                  {showRowError && (
+                    <p id={errorId} role="alert" className="text-xs text-destructive" data-testid={`experiment-variant-error-${i}`}>
+                      {describeMissing(row)}。入力するか、{formVariants.length > 2 ? "この候補を削除" : "入力をクリア"}してください。
+                    </p>
                   )}
                 </div>
-                <Input
-                  placeholder="ラベル（例: optimized-v1）"
-                  value={v.label}
-                  onChange={e => updateVariant(i, "label", e.target.value)}
-                />
-                <Textarea
-                  placeholder="Patch内容（unified diff形式）"
-                  value={v.patch_text}
-                  onChange={e => updateVariant(i, "patch_text", e.target.value)}
-                  rows={4}
-                  className="font-mono text-xs"
-                />
-                <Input
-                  placeholder="リスクメモ（任意）"
-                  value={v.risk_note}
-                  onChange={e => updateVariant(i, "risk_note", e.target.value)}
-                />
-              </div>
-            ))}
+              );
+            })}
           </div>
+          {variantCheck.partial.length > 0 && !submitAttempted && (
+            <p className="text-xs text-amber-700 dark:text-amber-400" data-testid="experiment-variant-partial-hint">
+              入力途中の候補があります({variantCheck.partial.map(r => `候補 ${r.index + 1}`).join("、")})。
+              作成するには入力を完了するか、削除してください。
+            </p>
+          )}
           <Button
             onClick={handleCreate}
-            disabled={createExperiment.isPending || !formFeatureId || !formObjective.trim() || !newSnapshotId || formVariants.filter(v => v.label.trim() && v.patch_text.trim()).length < 2 || staleAckMissing || preflight?.verdict === "blocked"}
+            disabled={createExperiment.isPending || !formFeatureId || !formObjective.trim() || !newSnapshotId || variantCheck.complete.length < 2 || staleAckMissing || preflight?.verdict === "blocked"}
             title={
               staleAckMissing
                 ? "HEADより古いSnapshotを使う理由を入力してください"
@@ -446,6 +566,11 @@ export default function ExperimentsPage() {
           >
             {createExperiment.isPending ? "作成中..." : "Experimentを作成"}
           </Button>
+          {hasDraft && (
+            <Button variant="ghost" size="sm" className="w-full" onClick={discardDraft} data-testid="experiment-discard-draft">
+              下書きを破棄
+            </Button>
+          )}
         </div>
       </Dialog>
     </div>

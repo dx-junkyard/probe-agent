@@ -4,7 +4,8 @@ import { useAuth } from "@/api/auth";
 import { useSystemState } from "@/api/hooks";
 import { Sidebar, MOBILE_NAV_DRAWER_ID } from "./sidebar";
 import { Header } from "./header";
-import { Skeleton } from "@/components/ui/skeleton";
+import { AuthBootstrapError, AuthLoadingScreen, ReauthDialog, SystemsLoadErrorBanner } from "./auth-recovery";
+import { loginPathFor } from "@/lib/return-to";
 import { AssistantPanel } from "@/components/assistant-panel";
 import { ReturnToBanner } from "@/components/discussion-return-banner";
 import { systemStateTarget } from "@/components/system-state";
@@ -13,7 +14,7 @@ import { HelpModeLayer } from "@/components/help-mode-layer";
 import { UiDraftProvider } from "@/lib/ui-draft";
 
 export function AppLayout() {
-  const { user, loading, systemId } = useAuth();
+  const { user, loading, systemId, authError, retryBootstrap, explicitLogout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const { data: systemState } = useSystemState();
@@ -38,19 +39,20 @@ export function AppLayout() {
     [pathname],
   );
 
-  if (loading) {
-    return (
-      <div className="flex h-screen items-center justify-center">
-        <div className="space-y-4 w-64">
-          <Skeleton className="h-8 w-full" />
-          <Skeleton className="h-4 w-3/4" />
-          <Skeleton className="h-4 w-1/2" />
-        </div>
-      </div>
-    );
+  if (loading) return <AuthLoadingScreen />;
+
+  // Issue #466 (UX-06): 認証状態を確認できなかった (到達不能・タイムアウト・
+  // 5xx) のは「未ログイン」ではない。ログイン画面へ送らず、再試行させる。
+  if (!user && authError) {
+    return <AuthBootstrapError message={authError} onRetry={() => retryBootstrap?.()} />;
   }
 
-  if (!user) return <Navigate to="/login" replace />;
+  // Issue #466 (UX-09): 共有リンクの目的地 (pathname / query / hash) を
+  // `next` に持たせ、ログイン後に同じ画面へ戻す。自分でログアウトした場合は
+  // 戻さない (次にログインする人の目的地ではないため)。
+  if (!user) {
+    return <Navigate to={explicitLogout ? "/login" : loginPathFor(location)} replace />;
+  }
 
   return (
     // Issue #445: mounted here (not per-page, unlike `UnsavedWorkProvider`)
@@ -76,6 +78,7 @@ export function AppLayout() {
             navToggleRef={navToggleRef}
             navDrawerId={MOBILE_NAV_DRAWER_ID}
           />
+          <SystemsLoadErrorBanner />
           <ReturnToBanner />
           {/* `pb-24` は `AssistantPanel` の浮いているボタン (閉じているとき
               右下に固定) のための予約領域。本文の末尾が常にボタンより上で
@@ -94,6 +97,7 @@ export function AppLayout() {
           }}
         />
         <HelpModeLayer />
+        <ReauthDialog />
       </div>
     </HelpModeProvider>
     </UiDraftProvider>

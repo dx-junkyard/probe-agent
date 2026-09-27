@@ -122,16 +122,24 @@ function TabsTrigger({ value, children, className, disabled, ...rest }: {
   );
 }
 
-function TabsContent({ value, children, className, ...rest }: {
+function TabsContent({ value, children, className, keepMounted = false, ...rest }: {
   value: string;
   children: ReactNode;
   className?: string;
+  /**
+   * Issue #466 (UX-03): 非表示の間もマウントしたままにする。編集中のフォームを
+   * 持つタブでは、タブを往復しただけでアンマウントされて入力が消えるのを防ぐ。
+   * 非表示中は `hidden` 属性で支援技術からも隠す。
+   */
+  keepMounted?: boolean;
   "data-testid"?: string;
 }) {
   const ctx = useContext(TabsContext);
-  if (ctx.value !== value) return null;
+  const active = ctx.value === value;
+  if (!active && !keepMounted) return null;
   return (
     <div
+      hidden={!active}
       role="tabpanel"
       id={`${ctx.baseId}-panel-${value}`}
       aria-labelledby={`${ctx.baseId}-tab-${value}`}

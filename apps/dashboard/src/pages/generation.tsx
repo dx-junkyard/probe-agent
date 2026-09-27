@@ -11,6 +11,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { Sparkles, Bot, ArrowRight } from "lucide-react";
+import { QueryErrorState } from "@/components/query-state";
 
 const VERDICT_VARIANT: Record<string, "default" | "success" | "destructive" | "secondary" | "warning"> = {
   better: "success", worse: "destructive", same: "secondary", unsafe: "warning", error: "destructive",
@@ -20,12 +21,16 @@ const VERDICT_ICON: Record<string, string> = {
 };
 
 export default function GenerationPage() {
-  const { data: components } = useComponents();
+  const componentsQuery = useComponents();
+  const components = componentsQuery.data;
   const [selectedComponent, setSelectedComponent] = useState("");
   const [selectedTrace, setSelectedTrace] = useState("");
   const [objective, setObjective] = useState("");
-  const { data: traces } = useTraces(selectedComponent || null);
-  const { data: runs, isLoading } = useGenerationRuns(selectedComponent || undefined);
+  const tracesQuery = useTraces(selectedComponent || null);
+  const traces = tracesQuery.data;
+  // Issue #466 (UX-05): 取得失敗を「No generation runs yet」と同じ表示にしない。
+  const runsQuery = useGenerationRuns(selectedComponent || undefined);
+  const { data: runs, isLoading } = runsQuery;
   const createRun = useCreateGenerationRun();
   const [expandedRun, setExpandedRun] = useState<number | null>(null);
 
@@ -74,15 +79,24 @@ export default function GenerationPage() {
         <CardContent className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label>Component</Label>
-              <Select value={selectedComponent} onChange={e => { setSelectedComponent(e.target.value); setSelectedTrace(""); }}>
+              <Label htmlFor="generation-component">Component</Label>
+              <Select id="generation-component" value={selectedComponent} onChange={e => { setSelectedComponent(e.target.value); setSelectedTrace(""); }}>
                 <option value="">Select component...</option>
                 {components?.map(c => <option key={c.component_id} value={c.component_id}>{c.component_id}</option>)}
               </Select>
+              {componentsQuery.isError && (
+                <QueryErrorState
+                  target="Component 一覧"
+                  error={componentsQuery.error}
+                  onRetry={() => { void componentsQuery.refetch(); }}
+                  retrying={componentsQuery.isFetching}
+                  data-testid="generation-components-error"
+                />
+              )}
             </div>
             <div className="space-y-2">
-              <Label>Trace</Label>
-              <Select value={selectedTrace} onChange={e => setSelectedTrace(e.target.value)} disabled={!selectedComponent}>
+              <Label htmlFor="generation-trace">Trace</Label>
+              <Select id="generation-trace" value={selectedTrace} onChange={e => setSelectedTrace(e.target.value)} disabled={!selectedComponent}>
                 <option value="">Select trace...</option>
                 {traces?.map(t => (
                   <option key={t.trace_id} value={t.trace_id}>
@@ -90,11 +104,20 @@ export default function GenerationPage() {
                   </option>
                 ))}
               </Select>
+              {tracesQuery.isError && (
+                <QueryErrorState
+                  target="Trace 一覧"
+                  error={tracesQuery.error}
+                  onRetry={() => { void tracesQuery.refetch(); }}
+                  retrying={tracesQuery.isFetching}
+                  data-testid="generation-traces-error"
+                />
+              )}
             </div>
           </div>
           <div className="space-y-2">
-            <Label>Objective</Label>
-            <Textarea value={objective} onChange={e => setObjective(e.target.value)} placeholder="Improve accuracy of..." rows={3} />
+            <Label htmlFor="generation-objective">Objective</Label>
+            <Textarea id="generation-objective" value={objective} onChange={e => setObjective(e.target.value)} placeholder="Improve accuracy of..." rows={3} />
           </div>
           <Button
             onClick={handleGenerate}
@@ -113,6 +136,14 @@ export default function GenerationPage() {
         <CardContent>
           {isLoading ? (
             <div className="space-y-3">{[1,2,3].map(i => <Skeleton key={i} className="h-16 w-full" />)}</div>
+          ) : runsQuery.isError && !runs ? (
+            <QueryErrorState
+              target="Generation run 一覧"
+              error={runsQuery.error}
+              onRetry={() => { void runsQuery.refetch(); }}
+              retrying={runsQuery.isFetching}
+              data-testid="generation-runs-error"
+            />
           ) : !runs?.length ? (
             <p className="text-sm text-muted-foreground text-center py-8">No generation runs yet</p>
           ) : (

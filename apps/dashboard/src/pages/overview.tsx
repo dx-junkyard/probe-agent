@@ -1,5 +1,6 @@
 import { useOverview } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
+import { systemsKnownEmpty } from "@/lib/systems-state";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { FindingsCard } from "@/components/overview/findings";
@@ -37,7 +38,8 @@ import type {
 // re-derives a readiness verdict from counts (#380 UX原則 6).
 
 export default function OverviewPage() {
-  const { systems, systemId } = useAuth();
+  const auth = useAuth();
+  const { systems, systemId } = auth;
   const { data: overview, isLoading, isError, refetch } = useOverview();
   const system = systems.find((s) => s.id === systemId);
 
@@ -60,6 +62,18 @@ export default function OverviewPage() {
   // Zero Systems is not a state the System-scoped endpoint can be asked about,
   // so it is answered here. It uses the same finite action vocabulary
   // (`create_system`) rather than growing a second one.
+  // Issue #466 (UX-06): 取得に失敗した・まだ取得中の空配列は「0 件」では
+  // ない。その場合は AppLayout の取得失敗バナーが再試行を出す。
+  if (systems.length === 0 && !systemsKnownEmpty(auth)) {
+    return (
+      <div className="space-y-4">
+        <PageHeading system={undefined} />
+        <p className="text-sm text-muted-foreground" data-testid="overview-systems-unknown">
+          System 一覧を取得できていないため、表示できる内容がありません。上の「System 一覧を再取得」を試してください。
+        </p>
+      </div>
+    );
+  }
   if (systems.length === 0) {
     return (
       <div className="space-y-4">

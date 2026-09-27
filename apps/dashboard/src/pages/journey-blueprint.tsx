@@ -9,7 +9,9 @@
 // here one layer over from the Value Network screen).
 
 import { useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { buttonVariants } from "@/components/ui/button";
+import { QueryErrorState } from "@/components/query-state";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
@@ -86,6 +88,19 @@ export default function JourneyBlueprintPage() {
 
   // §9.4's cross-view navigation: the selected Journey carries over as
   // Functional Lineage's own `ref_kind`/`ref` param pair.
+  // Issue #466 (UX-05/12): Journey 一覧の取得状態を分ける。取得中・取得失敗・
+  // 成功した 0 件のどれでも選択肢は「未選択」だけになるが、次の操作は
+  // 「待つ」「再試行」「作成する」でまったく違う。選べない状態で
+  // 「選択してください」を主案内にしない。
+  const journeyList = journeys.data?.journeys ?? [];
+  const journeysState: "loading" | "error" | "empty" | "ready" = journeys.isLoading
+    ? "loading"
+    : journeys.isError && !journeys.data
+      ? "error"
+      : journeyList.length === 0
+        ? "empty"
+        : "ready";
+
   const functionalLineageHref = journeyKey
     ? `/functional-lineage?ref_kind=ux_journey&ref=${encodeURIComponent(journeyKey)}`
     : "/functional-lineage";
@@ -115,9 +130,11 @@ export default function JourneyBlueprintPage() {
         <CardContent className="flex flex-wrap items-center gap-3">
           <Select
             data-testid="blueprint-journey-select"
+            aria-label="Journey"
             value={journeyKey ?? ""}
             onChange={(e) => onSelectJourney(e.target.value)}
             className="w-64"
+            disabled={journeysState !== "ready"}
           >
             <option value="">(未選択)</option>
             {(journeys.data?.journeys ?? []).map((j) => (
@@ -148,9 +165,35 @@ export default function JourneyBlueprintPage() {
         </CardContent>
       </Card>
 
-      {journeyKey === null ? (
+      {journeysState === "loading" ? (
+        <p className="text-sm text-muted-foreground" role="status" data-testid="blueprint-journeys-loading">
+          Journey 一覧を読み込んでいます…
+        </p>
+      ) : journeysState === "error" ? (
+        <QueryErrorState
+          target="Journey 一覧"
+          error={journeys.error}
+          onRetry={() => { void journeys.refetch(); }}
+          retrying={journeys.isFetching}
+          data-testid="blueprint-journeys-error"
+        />
+      ) : journeysState === "empty" ? (
+        <div className="rounded-md border p-4 text-sm space-y-2" data-testid="blueprint-no-journeys">
+          <p className="font-medium">この System にはまだ Journey がありません。</p>
+          <p className="text-muted-foreground">
+            Service Blueprint は Journey の Step ごとに表示します。まず UX Design Studio で Journey を作成してください。
+          </p>
+          <Link
+            to="/ux-design-studio?tab=journeys"
+            className={buttonVariants({ size: "sm" })}
+            data-testid="blueprint-create-journey"
+          >
+            UX Design Studio で Journey を作成する
+          </Link>
+        </div>
+      ) : journeyKey === null ? (
         <p className="text-sm text-muted-foreground" data-testid="blueprint-no-journey">
-          Journey を選択してください。
+          上の一覧から表示する Journey を選択してください。
         </p>
       ) : (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(280px,1fr)]">
@@ -161,9 +204,13 @@ export default function JourneyBlueprintPage() {
                   読み込み中です。
                 </p>
               ) : blueprint.isError ? (
-                <p className="text-sm text-destructive" data-testid="blueprint-error">
-                  取得できませんでした。
-                </p>
+                <QueryErrorState
+                  target="Service Blueprint"
+                  error={blueprint.error}
+                  onRetry={() => { void blueprint.refetch(); }}
+                  retrying={blueprint.isFetching}
+                  data-testid="blueprint-error"
+                />
               ) : blueprint.data ? (
                 <>
                   <p className="text-xs text-muted-foreground" data-testid="blueprint-baseline-state">
@@ -182,7 +229,13 @@ export default function JourneyBlueprintPage() {
                 </>
               ) : null
             ) : (
-              <BlueprintDiffPanel diff={diff.data} />
+              <BlueprintDiffPanel
+                diff={diff.data}
+                isLoading={diff.isLoading}
+                error={diff.isError && !diff.data ? diff.error : null}
+                onRetry={() => { void diff.refetch(); }}
+                retrying={diff.isFetching}
+              />
             )}
           </div>
 
