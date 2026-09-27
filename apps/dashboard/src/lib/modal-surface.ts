@@ -12,6 +12,13 @@
 //   - 閉じたら、開く前にフォーカスしていた要素へ戻す
 //
 // 表示・レイアウト・背景クリックは呼び出し側が持つ (面ごとに違うため)。
+//
+// Issue #466 (UX-02) で共通 Dialog もこの hook に載せた。Dialog は入れ子に
+// なる (詳細ダイアログの中から承認確認を開く) ので、面は 1 本のスタックで
+// 管理し、Escape と Tab の循環は「いちばん上の面」だけが処理する。スタックが
+// 無いと 1 回の Escape で重なった全ての面が閉じ、内側の面の Tab 循環を外側の
+// 面が奪う。背景のスクロールロックも同じ理由で参照カウントにする — 内側を
+// 閉じた時点で外側がまだ開いているのにロックが外れてはならない。
 
 import { useEffect, useRef, type RefObject } from "react";
 
@@ -23,6 +30,47 @@ export const FOCUSABLE_SELECTOR = [
   "textarea:not([disabled])",
   '[tabindex]:not([tabindex="-1"])',
 ].join(",");
+
+// 開いている面の識別子。末尾がいちばん上。
+const surfaceStack: symbol[] = [];
+
+/** テスト用: 開いている面の数。 */
+export function openModalSurfaceCount(): number {
+  return surfaceStack.length;
+}
+
+let scrollLockCount = 0;
+let scrollLockPrevious = "";
+
+/**
+ * 背景 (body) のスクロールを止める。戻り値の関数で解除する。参照カウント
+ * なので、複数の面が重なっていても最後の 1 つが閉じるまでロックは外れない。
+ */
+export function lockBodyScroll(): () => void {
+  if (scrollLockCount === 0) {
+    scrollLockPrevious = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+  }
+  scrollLockCount += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    scrollLockCount -= 1;
+    if (scrollLockCount === 0) document.body.style.overflow = scrollLockPrevious;
+  };
+}
+
+function initialFocusTarget(panel: HTMLElement): HTMLElement {
+  // 呼び出し側が明示した初期フォーカス (破壊的操作の確認では「キャンセル」に
+  // 置く) を最優先し、次に「最初の操作要素のうち初期フォーカス対象から外した
+  // もの (閉じるボタン) 以外」。閉じるボタンに最初に着地すると、読み上げは
+  // 「閉じる」から始まり、Enter 1 回で入力を捨てる。
+  const explicit = panel.querySelector<HTMLElement>("[data-autofocus]");
+  if (explicit) return explicit;
+  const items = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
+  return items.find((el) => !el.hasAttribute("data-modal-initial-skip")) ?? items[0] ?? panel;
+}
 
 export function useModalSurface({
   open,
@@ -59,9 +107,16 @@ export function useModalSurface({
       returnFocusRef?.current
       ?? (previouslyFocused instanceof HTMLElement ? previouslyFocused : null);
 
-    (focusables()[0] ?? panel).focus();
+    const token = Symbol("modal-surface");
+    surfaceStack.push(token);
+
+    initialFocusTarget(panel).focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // いちばん上の面だけが反応する (入れ子の Dialog)。
+      if (surfaceStack[surfaceStack.length - 1] !== token) return;
+      // IME 変換中の Escape は変換の取り消しであって、面を閉じる操作ではない。
+      if (event.isComposing) return;
       if (event.key === "Escape") {
         event.preventDefault();
         onCloseRef.current();
@@ -91,7 +146,14 @@ export function useModalSurface({
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
-      if (returnFocusTarget && returnFocusTarget.isConnected) returnFocusTarget.focus();
+      const index = surfaceStack.lastIndexOf(token);
+      if (index >= 0) surfaceStack.splice(index, 1);
+      if (returnFocusTarget && returnFocusTarget.isConnected) {
+        returnFocusTarget.focus();
+      } else if (returnFocusTarget?.id) {
+        // 起点が再描画で作り直された場合 (同じ id の新しい要素) はそちらへ戻す。
+        document.getElementById(returnFocusTarget.id)?.focus();
+      }
     };
   }, [open, panelRef, returnFocusRef]);
 }

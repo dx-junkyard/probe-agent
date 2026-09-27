@@ -5,7 +5,7 @@ import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/com
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { Label } from "@/components/ui/label";
+import { FormField } from "@/components/ui/form-field";
 import { toast } from "sonner";
 
 export default function SettingsPage() {
@@ -62,7 +62,13 @@ function SettingsForm({ system, onSave, isPending }: {
   const [env, setEnv] = useState(system.environment ?? "");
   const [desc, setDesc] = useState(system.description ?? "");
 
+  // 保存前に空の System 名を止める。エラーは入力欄に関連付けて読み上げる。
+  const [attempted, setAttempted] = useState(false);
+  const nameError = attempted && !name.trim() ? "System 名を入力してください。" : undefined;
+
   const handleSave = async () => {
+    setAttempted(true);
+    if (!name.trim()) return;
     try {
       await onSave({ name, environment: env, description: desc });
     } catch (err) { toast.error(String(err)); }
@@ -75,18 +81,25 @@ function SettingsForm({ system, onSave, isPending }: {
         <CardDescription>Update the current system's settings</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="space-y-2">
-          <Label>System Name</Label>
-          <Input value={name} onChange={e => setName(e.target.value)} />
-        </div>
-        <div className="space-y-2">
-          <Label>Environment</Label>
-          <Input value={env} onChange={e => setEnv(e.target.value)} placeholder="production" />
-        </div>
-        <div className="space-y-2">
-          <Label>Description</Label>
-          <Textarea value={desc} onChange={e => setDesc(e.target.value)} rows={3} />
-        </div>
+        <FormField
+          label="System Name"
+          required
+          hint="ヘッダーの System 選択や token の対象 System 表示に使われる名前です。"
+          error={nameError}
+        >
+          {(field) => <Input {...field} value={name} onChange={e => setName(e.target.value)} />}
+        </FormField>
+        <FormField
+          label="Environment"
+          hint="例: production / staging / development。"
+        >
+          {(field) => (
+            <Input {...field} value={env} onChange={e => setEnv(e.target.value)} placeholder="production" />
+          )}
+        </FormField>
+        <FormField label="Description" hint="この System の用途や担当範囲を記録します(任意)。">
+          {(field) => <Textarea {...field} value={desc} onChange={e => setDesc(e.target.value)} rows={3} />}
+        </FormField>
         <Button onClick={handleSave} disabled={isPending}>
           {isPending ? "Saving..." : "Save Settings"}
         </Button>
