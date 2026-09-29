@@ -47,7 +47,11 @@ def _size(payload: Any) -> int:
 
 
 def measure(pack: Any, report: Any) -> int:
-    return _size(pack.to_llm_payload(report))
+    # The `context_budget` notice is the budget's own output: counting it would
+    # make every recorded omission push the payload back over the limit.
+    payload = pack.to_llm_payload(report)
+    payload.pop("context_budget", None)
+    return _size(payload)
 
 
 def _omit(pack: Any, section: str, dropped: int) -> None:
@@ -139,11 +143,13 @@ def _trim_screen_lists(pack: Any, report: Any, limit: int) -> None:
         # The list that costs the most gives up its tail first.
         key = max(candidates, key=lambda k: _size(data[k]))
         data[key].pop()
+        # The coverage row is part of the payload (and grows when it turns
+        # `truncated`), so it is updated BEFORE the next size check.
+        _upsert_truncated(pack, key, returned=len(data[key]), original=originals[key])
     for key in keys:
         dropped = originals[key] - len(data[key])
         if dropped:
             _omit(pack, f"screen_data.{key}", dropped)
-            _upsert_truncated(pack, key, returned=len(data[key]), original=originals[key])
 
 
 def apply_context_budget(

@@ -108,6 +108,7 @@ Generate & Evaluate は `app.llm` の抽象化層だけを通して LLM を呼�
 | `INTELLIGENCE_LLM_PROVIDER` | Feature Intelligence 用 provider (未設定なら `LLM_PROVIDER` を使用) |
 | `INTELLIGENCE_LLM_MODEL` | Feature Intelligence 用 reasoning model (未設定なら `LLM_MODEL` を使用) |
 | `INTELLIGENCE_LLM_TIMEOUT` | Feature Intelligence の HTTP timeout 秒（既定値: `120`） |
+| `ASSISTANT_CONTEXT_BUDGET_CHARS` | AIアシスタント1回の質問でLLMに渡す context payload の上限文字数（既定値: `60000`。不正値・0以下は既定値）。超過時は `assistant-answer-quality.md` §3.3 の順で削る |
 | `INTELLIGENCE_MAX_OUTPUT_TOKENS` | Repository Draft生成の最大出力token数（既定値: `128000`） |
 | `INTERVIEW_LANGUAGE` | System Interview の出力言語 `ja` / `en`（既定値: `ja`）。JSON キーと enum 値は常に英語。不正値は fail-closed |
 | `INTERVIEW_CONTEXT_MAX_CHARS` | インタビュー context pack の文字数バジェット（既定値: `60000`） |
