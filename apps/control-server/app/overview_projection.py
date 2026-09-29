@@ -53,7 +53,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple, get_args
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, get_args
 
 from . import (
     canonical_understanding,
@@ -1969,7 +1969,12 @@ def _runtime_health(
     )
 
 
-def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewResult:
+def build_overview(
+    system_id: int,
+    *,
+    now: Optional[float] = None,
+    system_state_provider: Optional[Callable[[], Any]] = None,
+) -> OverviewResult:
     """Compose the whole Overview projection for one System.
 
     Section by section, each guarded independently: a section that cannot be
@@ -1987,7 +1992,14 @@ def build_overview(system_id: int, *, now: Optional[float] = None) -> OverviewRe
 
     assessment = None
     try:
-        assessment = system_state.build_system_state(system_id)
+        # Issue #469: a zero-arg PROVIDER (not a value) so a failing shared
+        # computation still raises inside this guard and degrades the `loop`
+        # section exactly as the inline call did.
+        assessment = (
+            system_state_provider()
+            if system_state_provider is not None
+            else system_state.build_system_state(system_id)
+        )
         result.user_phase = assessment.user_phase
         result.loop_stages = build_loop_stages(assessment.user_phase, assessment.phases)
     except Exception as exc:  # pragma: no cover - defensive

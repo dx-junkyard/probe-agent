@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
 from .db import get_conn
@@ -49,10 +50,22 @@ def _positive_int(value: Optional[str]) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+# Issue #469: the ask request's scope, visible only for the duration of one
+# provider call (keeps every provider's (system_id[, params]) signature).
+_ACTIVE_SCOPE: ContextVar[Any] = ContextVar("assistant_ask_scope", default=None)
+
+
 def _overview_context(system_id: int) -> ScreenDiscussionContext:
     from .overview_projection import build_overview
 
-    overview = build_overview(system_id)
+    scope = _ACTIVE_SCOPE.get()
+    if scope is not None and scope.system_id != system_id:
+        scope = None  # never share another System's state
+
+    overview = build_overview(
+        system_id,
+        system_state_provider=scope.system_state if scope is not None else None,
+    )
     facts = {
         "snapshot_id": overview.snapshot_id,
         "snapshot_commit_sha": overview.snapshot_commit_sha,
@@ -345,7 +358,11 @@ _SCREEN_CONTEXT_PROVIDERS: Dict[str, Any] = {
 
 
 def build_screen_discussion_context(
-    screen_id: str, system_id: int, route_params: Optional[Dict[str, str]] = None
+    screen_id: str,
+    system_id: int,
+    route_params: Optional[Dict[str, str]] = None,
+    *,
+    scope: Any = None,
 ) -> Optional[ScreenDiscussionContext]:
     """Return canonical facts only for discussion-enabled screens.
 
@@ -368,7 +385,11 @@ def build_screen_discussion_context(
     if provider is None:
         return None
     try:
-        return provider(system_id, params)
+        token = _ACTIVE_SCOPE.set(scope)
+        try:
+            return provider(system_id, params)
+        finally:
+            _ACTIVE_SCOPE.reset(token)
     except Exception:
         # Exercised directly by `tests/test_discussion_operation_result.py`'s
         # `TestScreenDiscussionContextDegrades` and by `tests/test_assistant.

@@ -46,6 +46,7 @@ from ..assistant import (
     REAL_PROVIDERS,
 )
 from ..assistant_discussion_context import build_screen_discussion_context
+from ..assistant_request_scope import AskRequestScope
 from ..auth import Principal, get_principal, get_system_id
 from ..db import get_conn
 from ..llm import LLMClient, LLMConfig, create_llm_client
@@ -1032,8 +1033,9 @@ def _assistant_ask_impl(
                 draft_digest=resolved_draft.digest,
             )
 
-    report = run_system_diagnostics(system_id)
-    assessment = build_system_state(system_id)
+    request_scope = AskRequestScope(system_id)  # Issue #469: 1 compute per ask
+    report = request_scope.diagnostics()
+    assessment = request_scope.system_state()
     state_by_id = {item.state_id: item for item in assessment.items}
     visible_state_ids = list(dict.fromkeys(payload.visible_state_ids))
     state_items = [state_by_id[state_id] for state_id in visible_state_ids if state_id in state_by_id]
@@ -1068,7 +1070,7 @@ def _assistant_ask_impl(
             conversation_messages = []
 
     discussion = build_screen_discussion_context(
-        payload.screen_id, system_id, effective_route_params
+        payload.screen_id, system_id, effective_route_params, scope=request_scope
     )
     screen_data: Optional[Dict[str, Any]] = dict(discussion.facts) if discussion else None
     screen_data_sources = list(discussion.sources) if discussion else []
