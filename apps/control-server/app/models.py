@@ -7044,6 +7044,117 @@ class AssistantAskOut(BaseModel):
     # projection is real data, not a failed read).
     screen_context_state: DiscussionOperationResult = "unsupported"
     screen_context_reason: Optional[str] = None
+    # Issue #468: the per-ask measurement record's id
+    # (`assistant_ask_metric.request_id`). Additive; an idempotent replay
+    # returns the ORIGINAL ask's id (or None when rebuilt from the turn row),
+    # never a new one -- a replay is not a new ask.
+    request_id: Optional[str] = None
+
+
+# --- Assistant ask metrics (Issue #468, Epic #467) ---------------------------
+# docs/01-specifications/capabilities/assistant-answer-quality.md §1.
+AskStage = Literal[
+    "request_validation", "diagnostics", "system_state", "screen_context",
+    "context_bundle", "context_pack", "llm", "response_validation", "persist",
+]
+AskOutcome = Literal["answered", "deterministic_answer", "failed", "rejected", "error"]
+AssistantFailureClass = Literal[
+    "provider_not_configured", "provider_test_only", "timeout", "network",
+    "auth", "rate_limited", "provider_error", "malformed_output",
+    "truncated_output", "context_unavailable", "budget_exceeded",
+]
+
+
+class AskStageTimingOut(BaseModel):
+    ms: float
+    count: int
+
+
+class AskMetricOut(BaseModel):
+    request_id: str
+    screen_id: str
+    thread_id: Optional[int] = None
+    assistant_turn_id: Optional[int] = None
+    input_mode: str
+    started_at: float
+    finished_at: float
+    outcome: AskOutcome
+    failure_class: Optional[AssistantFailureClass] = None
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    stage_timings: Dict[str, AskStageTimingOut] = Field(default_factory=dict)
+    counters: Dict[str, int] = Field(default_factory=dict)
+    input_sizes: Dict[str, int] = Field(default_factory=dict)
+    usage: Dict[str, Any] = Field(default_factory=dict)
+    manifest: Dict[str, Any] = Field(default_factory=dict)
+    client_timing: Optional[Dict[str, Any]] = None
+    created_at: float
+
+
+class AskMetricListOut(BaseModel):
+    metrics: List[AskMetricOut]
+
+
+class AskClientTimingIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    first_visible_ms: Optional[float] = Field(default=None, ge=0)
+    complete_ms: Optional[float] = Field(default=None, ge=0)
+    aborted: bool = False
+
+
+class AskClientTimingOut(BaseModel):
+    request_id: str
+    first_visible_ms: Optional[float] = None
+    complete_ms: Optional[float] = None
+    aborted: bool = False
+
+
+class AskPercentileOut(BaseModel):
+    """`value` is an observed sample (nearest-rank); null + `unmeasured` when
+    there is no sample (never 0)."""
+
+    p50: Optional[float] = None
+    p95: Optional[float] = None
+    sample_count: int = 0
+    not_run_count: int = 0
+    state: Literal["measured", "unmeasured"] = "unmeasured"
+
+
+class AskRateOut(BaseModel):
+    numerator: int
+    denominator: int
+    value: Optional[float] = None
+    state: Literal["measured", "unmeasured"] = "unmeasured"
+
+
+class AskTokenSumOut(BaseModel):
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    sample_count: int = 0
+    state: Literal["measured", "unmeasured"] = "unmeasured"
+
+
+class AskEstimatedTokenSumOut(BaseModel):
+    estimated_input_tokens: Optional[int] = None
+    estimate_method: str = "chars_div_4"
+    sample_count: int = 0
+    state: Literal["measured", "unmeasured"] = "unmeasured"
+
+
+class AskMetricSummaryOut(BaseModel):
+    window_hours: int
+    total_requests: int
+    stages: Dict[str, AskPercentileOut]
+    client_first_visible_ms: AskPercentileOut
+    client_complete_ms: AskPercentileOut
+    outcome_counts: Dict[str, int]
+    failure_class_counts: Dict[str, int]
+    failure_rate: AskRateOut
+    llm_calls_total: int
+    provider_reported_tokens: AskTokenSumOut
+    estimated_tokens: AskEstimatedTokenSumOut
 
 
 # --- Replay engine (Issue #242 Phase B / #244) -------------------------------

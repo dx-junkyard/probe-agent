@@ -30,12 +30,15 @@ probe-agent:
 from __future__ import annotations
 
 import json
+import math
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .assistant_metrics import failure_class_for
 from .llm import LLMClient, LLMConfig, LLMError, PROVIDER_KEY_ENV
 from .settings_metadata import SETTINGS_BY_KEY, SettingMetadata
 from .system_diagnostics import DiagnosticCheck, SystemDiagnosticsReport
@@ -1029,9 +1032,11 @@ def _llm_answer(
     voice_mode: bool = False,
     voice_continuation: bool = False,
     voice_spoken_history: Optional[List[str]] = None,
+    trace: Optional[Any] = None,
 ) -> AssistantAnswer:
+    context_payload = pack.to_llm_payload(report)
     payload = {
-        "context": pack.to_llm_payload(report),
+        "context": context_payload,
         "question": question,
     }
     if voice_mode:
@@ -1048,40 +1053,48 @@ def _llm_answer(
         ]
     messages.extend(pack.conversation)
     messages.append({"role": "user", "content": question})
-    raw = client.generate_text(
-        messages,
-        temperature=0.2,
-        max_tokens=2048,
-    )
+    if trace is not None:
+        _record_input_sizes(trace, context_payload, system_prompt, pack.conversation, question)
     try:
-        data = json.loads(_strip_json_fences(raw))
-    except json.JSONDecodeError as exc:
-        raise LLMError(f"Assistant response was not valid JSON: {raw[:300]}") from exc
-    try:
-        parsed = _RawAssistantResponse.model_validate(data)
-    except ValidationError as exc:
-        raise LLMError(f"Assistant response failed schema validation: {exc}") from exc
+        with (trace.stage("llm") if trace is not None else nullcontext()):
+            if trace is not None:
+                trace.counters["llm_calls"] += 1
+            raw = client.generate_text(
+                messages,
+                temperature=0.2,
+                max_tokens=2048,
+            )
+    except LLMError as exc:
+        if trace is not None:
+            _record_llm_result(trace, client)
+            trace.failure_class = failure_class_for(error_kind=exc.kind)
+        raise
+    if trace is not None:
+        _record_llm_result(trace, client)
+    with (trace.stage("response_validation") if trace is not None else nullcontext()):
+        parsed = _parse_assistant_response(raw, trace)
+        allowed = pack.allowed_citation_ids()
+        citations = []
+        for c in parsed.citations:
+            if c.id in allowed.get(c.type, set()):
+                title, detail = _citation_title(pack, c.type, c.id)
+                citations.append(Citation(type=c.type, id=c.id, title=title, detail=detail))
 
-    allowed = pack.allowed_citation_ids()
-    citations = []
-    for c in parsed.citations:
-        if c.id in allowed.get(c.type, set()):
-            title, detail = _citation_title(pack, c.type, c.id)
-            citations.append(Citation(type=c.type, id=c.id, title=title, detail=detail))
+        setting_keys = {s.key for s in pack.settings}
+        actions = []
+        for a in parsed.suggested_actions:
+            # navigate/operate targets are routes the UI navigates to; anything
+            # outside the finite route set is dropped (structural validation).
+            if a.kind in ("navigate", "operate") and a.target not in KNOWN_ROUTES:
+                continue
+            if a.kind == "configure" and a.target not in setting_keys:
+                continue
+            actions.append(
+                SuggestedAction(label=a.label, kind=a.kind, target=a.target, detail=a.detail)
+            )
 
-    setting_keys = {s.key for s in pack.settings}
-    actions = []
-    for a in parsed.suggested_actions:
-        # navigate/operate targets are routes the UI navigates to; anything
-        # outside the finite route set is dropped (structural validation).
-        if a.kind in ("navigate", "operate") and a.target not in KNOWN_ROUTES:
-            continue
-        if a.kind == "configure" and a.target not in setting_keys:
-            continue
-        actions.append(
-            SuggestedAction(label=a.label, kind=a.kind, target=a.target, detail=a.detail)
-        )
-
+    if trace is not None:
+        trace.output_chars = len(parsed.answer)
     return AssistantAnswer(
         answer=parsed.answer,
         suggested_actions=actions,
@@ -1091,6 +1104,55 @@ def _llm_answer(
         provider=config.provider,
         model=config.model,
     )
+
+
+def _record_input_sizes(
+    trace: Any, context: Dict[str, Any], system_prompt: str,
+    conversation: List[Dict[str, str]], question: str,
+) -> None:
+    sizes = {
+        key: len(json.dumps(value, ensure_ascii=False)) for key, value in context.items()
+    }
+    sizes["system_prompt"] = len(system_prompt)
+    sizes["conversation"] = sum(len(m.get("content", "")) for m in conversation)
+    sizes["question"] = len(question)
+    sizes["total"] = sum(sizes.values())
+    trace.input_sizes = sizes
+    trace.estimated_input_tokens = math.ceil(sizes["total"] / 4)
+
+
+def _record_llm_result(trace: Any, client: Any) -> None:
+    usage = getattr(client, "last_usage", None)
+    trace.finish_reason = getattr(client, "last_finish_reason", None)
+    if isinstance(usage, dict):
+        trace.usage = {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "source": "provider_reported",
+        }
+
+
+def _parse_assistant_response(raw: str, trace: Optional[Any]) -> "_RawAssistantResponse":
+    def malformed() -> None:
+        if trace is not None:
+            trace.failure_class = failure_class_for(
+                malformed_output=True, finish_reason=trace.finish_reason
+            )
+
+    try:
+        data = json.loads(_strip_json_fences(raw))
+    except json.JSONDecodeError as exc:
+        malformed()
+        raise LLMError(
+            f"Assistant response was not valid JSON: {raw[:300]}", kind="malformed_response"
+        ) from exc
+    try:
+        return _RawAssistantResponse.model_validate(data)
+    except ValidationError as exc:
+        malformed()
+        raise LLMError(
+            f"Assistant response failed schema validation: {exc}", kind="malformed_response"
+        ) from exc
 
 
 # --- Deterministic fallback --------------------------------------------------
@@ -1336,6 +1398,7 @@ def answer_question(
     voice_spoken_history: Optional[List[str]] = None,
     ui_draft: Optional[Dict[str, Any]] = None,
     ui_draft_sources: Optional[List[Dict[str, str]]] = None,
+    trace: Optional[Any] = None,
 ) -> AssistantAnswer:
     """Answer a screen question; LLM when available, marked fallback otherwise.
 
@@ -1353,13 +1416,20 @@ def answer_question(
       consumers: [利用者向け assistant 質問応答フロー]
       state_effects: [external-api]
     """
-    pack = build_context_pack(
-        ctx, question, report, visible_check_ids, state_items, focused_state_id,
-        screen_data, screen_data_sources, screen_data_state, screen_data_reason,
-        route_params, conversation,
-        ui_draft=ui_draft, ui_draft_sources=ui_draft_sources,
-    )
+    with (trace.stage("context_pack") if trace is not None else nullcontext()):
+        pack = build_context_pack(
+            ctx, question, report, visible_check_ids, state_items, focused_state_id,
+            screen_data, screen_data_sources, screen_data_state, screen_data_reason,
+            route_params, conversation,
+            ui_draft=ui_draft, ui_draft_sources=ui_draft_sources,
+        )
+    if trace is not None:
+        trace.record_pack(pack)
     if client is None:
+        if trace is not None:
+            trace.failure_class = failure_class_for(
+                client_available=False, provider=config.provider
+            )
         if config.provider == "mock":
             reason = (
                 "LLM provider 'mock' is test-only data and is never used for "
@@ -1384,10 +1454,13 @@ def answer_question(
             voice_mode=voice_mode,
             voice_continuation=voice_continuation,
             voice_spoken_history=voice_spoken_history,
+            trace=trace,
         )
         state_actions = _state_actions(pack.state_items)
         if state_actions:
             answer.suggested_actions = (state_actions + answer.suggested_actions)[:8]
         return answer
     except LLMError as exc:
+        if trace is not None and trace.failure_class is None:
+            trace.failure_class = failure_class_for(error_kind=exc.kind)
         return _fallback_answer(pack, report, config, f"LLM call failed: {exc}")

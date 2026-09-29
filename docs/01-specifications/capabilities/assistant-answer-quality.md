@@ -339,5 +339,5 @@ AnswerStatus = "answered" | "deterministic_answer" | "failed"
   禁止する断定を持つ。
 - 採点表と実行手順: [docs/03-validation/assistant-answer-quality.md](../../03-validation/assistant-answer-quality.md)。
 - 実行: `apps/control-server/scripts/assistant_eval.py`。既定は偽 LLM による
-  **構造検証**モードで、実 LLM は `--real --max-calls N` を明示したときだけ
+  **構造検証**モードで、実 LLM は `--mode real --max-calls N` を明示したときだけ
   呼ぶ。両者の結果を混同しない。

@@ -19,11 +19,12 @@ probe-agent:
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import asdict
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from .. import (
@@ -46,11 +47,18 @@ from ..assistant import (
     REAL_PROVIDERS,
 )
 from ..assistant_discussion_context import build_screen_discussion_context
+from .. import assistant_metrics
+from ..assistant_metrics import AskTrace
 from ..assistant_request_scope import AskRequestScope
 from ..auth import Principal, get_principal, get_system_id
 from ..db import get_conn
 from ..llm import LLMClient, LLMConfig, create_llm_client
 from ..models import (
+    AskClientTimingIn,
+    AskClientTimingOut,
+    AskMetricListOut,
+    AskMetricOut,
+    AskMetricSummaryOut,
     AssistantActionOut,
     AssistantAskOut,
     AssistantAskRequest,
@@ -994,6 +1002,58 @@ def _assistant_ask_impl(
     principal: Principal = Depends(get_principal),
     existing_user_turn: Optional[int] = None,
 ) -> AssistantAskOut:
+    """One measured ask (Issue #468): exactly one `assistant_ask_metric` row
+    per call, written AFTER the turn transaction (never inside it, never while
+    a `get_conn()` is held).  A metrics failure never changes the outcome."""
+    trace = AskTrace()
+    try:
+        out = _assistant_ask_core(payload, system_id, principal, existing_user_turn, trace)
+    except HTTPException as exc:
+        trace.outcome = "error" if exc.status_code >= 500 else "rejected"
+        _persist_ask_metric(trace, payload, system_id)
+        raise
+    except Exception:
+        trace.outcome = "error"
+        _persist_ask_metric(trace, payload, system_id)
+        raise
+    _persist_ask_metric(trace, payload, system_id)
+    return out.model_copy(update={"request_id": trace.request_id})
+
+
+def _persist_ask_metric(trace: AskTrace, payload: AssistantAskRequest, system_id: int) -> None:
+    meta = trace.meta
+    assistant_metrics.persist(
+        trace,
+        system_id=system_id,
+        screen_id=payload.screen_id,
+        thread_id=meta.get("thread_id"),
+        assistant_turn_id=meta.get("assistant_turn_id"),
+        input_mode=payload.input_mode,
+        provider=meta.get("provider", ""),
+        model=meta.get("model", ""),
+        prompt_version=meta.get("prompt_version", ""),
+        schema_version=meta.get("schema_version", ""),
+    )
+
+
+def _assistant_ask_core(
+    payload: AssistantAskRequest,
+    system_id: int,
+    principal: Principal,
+    existing_user_turn: Optional[int],
+    trace: AskTrace,
+) -> AssistantAskOut:
+    with trace.stage("request_validation"):
+        (ctx, thread_row, thread_target_state, resolved_draft,
+         ui_draft_changed) = _validate_ask_request(payload, system_id)
+    trace.manifest["ui_draft_state"] = resolved_draft.state
+    return _assistant_ask_body(
+        payload, system_id, principal, existing_user_turn, trace,
+        ctx, thread_row, thread_target_state, resolved_draft, ui_draft_changed,
+    )
+
+
+def _validate_ask_request(payload: AssistantAskRequest, system_id: int):
     ctx = get_screen_context(payload.screen_id)
     if ctx is None:
         raise HTTPException(
@@ -1032,10 +1092,25 @@ def _assistant_ask_impl(
                 form_id=resolved_draft.form_id,
                 draft_digest=resolved_draft.digest,
             )
+    return ctx, thread_row, thread_target_state, resolved_draft, ui_draft_changed
 
-    request_scope = AskRequestScope(system_id)  # Issue #469: 1 compute per ask
+
+def _assistant_ask_body(
+    payload: AssistantAskRequest,
+    system_id: int,
+    principal: Principal,
+    existing_user_turn: Optional[int],
+    trace: AskTrace,
+    ctx: Any,
+    thread_row: Optional[Dict[str, Any]],
+    thread_target_state: Optional[str],
+    resolved_draft: Any,
+    ui_draft_changed: bool,
+) -> AssistantAskOut:
+    request_scope = AskRequestScope(system_id, timer=trace.stage)  # Issue #469: 1 compute per ask
     report = request_scope.diagnostics()
     assessment = request_scope.system_state()
+    trace.merge_scope_counters(request_scope)
     state_by_id = {item.state_id: item for item in assessment.items}
     visible_state_ids = list(dict.fromkeys(payload.visible_state_ids))
     state_items = [state_by_id[state_id] for state_id in visible_state_ids if state_id in state_by_id]
@@ -1044,6 +1119,7 @@ def _assistant_ask_impl(
         state_items.insert(0, state_by_id[focused_state_id])
     config = LLMConfig.intelligence_from_env()
     client = _usable_llm_client(config)
+    trace.meta.update(provider=config.provider, model=config.model)
 
     effective_route_params: Dict[str, str] = dict(payload.route_params)
     conversation_messages = [message.model_dump() for message in payload.conversation]
@@ -1069,9 +1145,11 @@ def _assistant_ask_impl(
         else:
             conversation_messages = []
 
-    discussion = build_screen_discussion_context(
-        payload.screen_id, system_id, effective_route_params, scope=request_scope
-    )
+    with trace.stage("screen_context"):
+        discussion = build_screen_discussion_context(
+            payload.screen_id, system_id, effective_route_params, scope=request_scope
+        )
+    trace.merge_scope_counters(request_scope)
     screen_data: Optional[Dict[str, Any]] = dict(discussion.facts) if discussion else None
     screen_data_sources = list(discussion.sources) if discussion else []
     # Issue #456 follow-up: `discussion is None` means this screen_id has no
@@ -1131,6 +1209,14 @@ def _assistant_ask_impl(
             }
         )
 
+    if thread_row is not None:
+        # Identity/freshness of the thread's target as read at the top of the
+        # request -- what the manifest's discussion_target source reports.
+        trace.set_thread_target(
+            revision_id=thread_row.get("captured_target_revision_id"),
+            digest=thread_row.get("captured_target_digest") or "",
+            target_state=thread_target_state,
+        )
     result = answer_question(
         ctx,
         payload.question,
@@ -1151,6 +1237,12 @@ def _assistant_ask_impl(
         voice_spoken_history=payload.voice_spoken_history,
         ui_draft=resolved_draft.payload,
         ui_draft_sources=resolved_draft.sources,
+        trace=trace,
+    )
+    trace.outcome = "deterministic_answer" if result.used_fallback else "answered"
+    trace.meta.update(
+        provider=result.provider, model=result.model,
+        prompt_version=result.prompt_version, schema_version=result.schema_version,
     )
 
     thread_id_out: Optional[int] = None
@@ -1164,66 +1256,68 @@ def _assistant_ask_impl(
             system_id, thread_row["target_kind"], thread_row["target_ref"]
         )
         citations_payload = [asdict(c) for c in result.citations]
-        with get_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                if existing_user_turn is not None:
-                    completed = conn.execute('SELECT reply_turn_id FROM interview_discussion_turn_request WHERE user_turn_id=?', (existing_user_turn,)).fetchone()
-                    if completed and completed['reply_turn_id'] is not None:
-                        raise HTTPException(status_code=409, detail={'code':'turn_already_completed'})
-                if existing_user_turn is None:
-                    assistant_discussion.append_turn(
-                    conn,
-                    system_id=system_id,
-                    thread_id=thread_row["id"],
-                    role="user",
-                    content=payload.question,
-                    decision_method="manual",
-                    # Issue #441: the entry mode belongs to the human's turn.
-                    # The assistant turn keeps the default `text`: it did not
-                    # speak into a microphone, and reading its answer aloud is
-                    # a client playback choice, not a fact about the turn.
-                    input_mode=payload.input_mode,
-                    created_by=_principal_actor(principal),
-                    # Issue #445 §2.7: recorded on the USER turn only, and
-                    # never the draft's field VALUES -- see
-                    # `ui_draft_context.ResolvedUiDraft`.
-                    ui_draft_state=resolved_draft.state,
-                    ui_draft_form_id=resolved_draft.form_id or None,
-                    ui_draft_digest=resolved_draft.digest or None,
-                )
-                assistant_turn = assistant_discussion.append_turn(
-                    conn,
-                    system_id=system_id,
-                    thread_id=thread_row["id"],
-                    role="assistant",
-                    # Draft-derived answers may quote unsaved values. Return
-                    # the live answer, but persist only a neutral history marker.
-                    content=(
-                        "未保存の下書きを参照した回答です。下書きの内容を保存しないため、回答本文は履歴に残していません。"
-                        if resolved_draft.payload is not None else result.answer
-                    ),
-                    citations=citations_payload,
-                    target_revision_id=resolved.revision_id,
-                    target_digest=resolved.digest,
-                    used_fallback=result.used_fallback,
-                    decision_method=result.decision_method,
-                    provider=result.provider,
-                    model=result.model,
-                    prompt_version=result.prompt_version,
-                )
-                assistant_discussion.touch_thread_captured_target(
-                    conn, thread_row["id"], resolved
-                )
-                if existing_user_turn is not None:
-                    conn.execute('UPDATE interview_discussion_turn_request SET reply_turn_id=? WHERE user_turn_id=?',
-                                 (assistant_turn['id'], existing_user_turn))
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
+        with trace.stage("persist"):
+            with get_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if existing_user_turn is not None:
+                        completed = conn.execute('SELECT reply_turn_id FROM interview_discussion_turn_request WHERE user_turn_id=?', (existing_user_turn,)).fetchone()
+                        if completed and completed['reply_turn_id'] is not None:
+                            raise HTTPException(status_code=409, detail={'code':'turn_already_completed'})
+                    if existing_user_turn is None:
+                        assistant_discussion.append_turn(
+                        conn,
+                        system_id=system_id,
+                        thread_id=thread_row["id"],
+                        role="user",
+                        content=payload.question,
+                        decision_method="manual",
+                        # Issue #441: the entry mode belongs to the human's turn.
+                        # The assistant turn keeps the default `text`: it did not
+                        # speak into a microphone, and reading its answer aloud is
+                        # a client playback choice, not a fact about the turn.
+                        input_mode=payload.input_mode,
+                        created_by=_principal_actor(principal),
+                        # Issue #445 §2.7: recorded on the USER turn only, and
+                        # never the draft's field VALUES -- see
+                        # `ui_draft_context.ResolvedUiDraft`.
+                        ui_draft_state=resolved_draft.state,
+                        ui_draft_form_id=resolved_draft.form_id or None,
+                        ui_draft_digest=resolved_draft.digest or None,
+                    )
+                    assistant_turn = assistant_discussion.append_turn(
+                        conn,
+                        system_id=system_id,
+                        thread_id=thread_row["id"],
+                        role="assistant",
+                        # Draft-derived answers may quote unsaved values. Return
+                        # the live answer, but persist only a neutral history marker.
+                        content=(
+                            "未保存の下書きを参照した回答です。下書きの内容を保存しないため、回答本文は履歴に残していません。"
+                            if resolved_draft.payload is not None else result.answer
+                        ),
+                        citations=citations_payload,
+                        target_revision_id=resolved.revision_id,
+                        target_digest=resolved.digest,
+                        used_fallback=result.used_fallback,
+                        decision_method=result.decision_method,
+                        provider=result.provider,
+                        model=result.model,
+                        prompt_version=result.prompt_version,
+                    )
+                    assistant_discussion.touch_thread_captured_target(
+                        conn, thread_row["id"], resolved
+                    )
+                    if existing_user_turn is not None:
+                        conn.execute('UPDATE interview_discussion_turn_request SET reply_turn_id=? WHERE user_turn_id=?',
+                                     (assistant_turn['id'], existing_user_turn))
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
         thread_id_out = thread_row["id"]
         turn_number_out = assistant_turn["turn_number"]
+        trace.meta.update(thread_id=thread_id_out, assistant_turn_id=assistant_turn["id"])
         # §2.6: a changed draft also forces a recheck -- the previous answer,
         # if any, was not about the draft as it reads now.
         recheck_required = (
@@ -1325,3 +1419,82 @@ def assistant_ask(payload: AssistantAskRequest, system_id: int = Depends(get_sys
         with get_conn() as conn:
             conn.execute('UPDATE interview_discussion_turn_request SET lease_until=0 WHERE id=?', (rid,))
         raise
+
+
+# --- Ask metrics (Issue #468, Epic #467; assistant-answer-quality.md §1.5) ---
+
+
+def _metric_row(system_id: int, request_id: str) -> Dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM assistant_ask_metric WHERE system_id = ? AND request_id = ?",
+            (system_id, request_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown ask metric")
+    return assistant_metrics.row_to_out(row)
+
+
+@router.get("/assistant/ask-metrics", response_model=AskMetricListOut)
+def list_ask_metrics(
+    limit: int = Query(50, ge=1, le=200),
+    system_id: int = Depends(get_system_id),
+) -> AskMetricListOut:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM assistant_ask_metric WHERE system_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (system_id, limit),
+        ).fetchall()
+    return AskMetricListOut(metrics=[AskMetricOut(**assistant_metrics.row_to_out(r)) for r in rows])
+
+
+@router.get("/assistant/ask-metrics-summary", response_model=AskMetricSummaryOut)
+def ask_metrics_summary(
+    window_hours: int = Query(24, ge=1, le=720),
+    system_id: int = Depends(get_system_id),
+) -> AskMetricSummaryOut:
+    since = time.time() - window_hours * 3600.0
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM assistant_ask_metric WHERE system_id = ? AND created_at >= ?",
+            (system_id, since),
+        ).fetchall()
+    return AskMetricSummaryOut(
+        **assistant_metrics.summarize([assistant_metrics.row_to_out(r) for r in rows], window_hours)
+    )
+
+
+@router.get("/assistant/ask-metrics/{request_id}", response_model=AskMetricOut)
+def get_ask_metric(request_id: str, system_id: int = Depends(get_system_id)) -> AskMetricOut:
+    return AskMetricOut(**_metric_row(system_id, request_id))
+
+
+@router.post(
+    "/assistant/ask-metrics/{request_id}/client-timing", response_model=AskClientTimingOut
+)
+def record_ask_client_timing(
+    request_id: str,
+    payload: AskClientTimingIn,
+    system_id: int = Depends(get_system_id),
+) -> AskClientTimingOut:
+    from ..db import write_transaction
+
+    with get_conn() as conn, write_transaction(conn):
+        row = conn.execute(
+            "SELECT client_timing_json FROM assistant_ask_metric "
+            "WHERE system_id = ? AND request_id = ?",
+            (system_id, request_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Unknown ask metric")
+        if row["client_timing_json"]:
+            raise HTTPException(
+                status_code=409, detail={"code": "client_timing_already_recorded"}
+            )
+        conn.execute(
+            "UPDATE assistant_ask_metric SET client_timing_json = ? "
+            "WHERE system_id = ? AND request_id = ?",
+            (json.dumps(payload.model_dump()), system_id, request_id),
+        )
+    return AskClientTimingOut(request_id=request_id, **payload.model_dump())

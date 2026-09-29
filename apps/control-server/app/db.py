@@ -347,6 +347,44 @@ CREATE INDEX IF NOT EXISTS idx_assistant_discussion_turn_thread
 """
 
 
+# assistant_ask_metric (Issue #468, Epic #467, docs/01-specifications/capabilities/
+# assistant-answer-quality.md §1.4): ONE row per `POST /assistant/ask`. It holds
+# only timings, counts, sizes, finite codes and source ids/digests -- never the
+# question, the answer, an unsaved draft's values, a prompt or a provider
+# response. A metrics write failure never breaks the answer.
+_ASSISTANT_ASK_METRIC_DDL = """
+CREATE TABLE IF NOT EXISTS assistant_ask_metric (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    request_id          TEXT NOT NULL UNIQUE,
+    screen_id           TEXT NOT NULL DEFAULT '',
+    thread_id           INTEGER,
+    assistant_turn_id   INTEGER,
+    input_mode          TEXT NOT NULL DEFAULT 'text',
+    started_at          REAL NOT NULL,
+    finished_at         REAL NOT NULL,
+    outcome             TEXT NOT NULL CHECK (outcome IN
+                             ('answered', 'deterministic_answer', 'failed', 'rejected', 'error')),
+    failure_class       TEXT,
+    provider            TEXT NOT NULL DEFAULT '',
+    model               TEXT NOT NULL DEFAULT '',
+    prompt_version      TEXT NOT NULL DEFAULT '',
+    schema_version      TEXT NOT NULL DEFAULT '',
+    stage_timings_json  TEXT NOT NULL DEFAULT '{}',
+    counters_json       TEXT NOT NULL DEFAULT '{}',
+    input_sizes_json    TEXT NOT NULL DEFAULT '{}',
+    usage_json          TEXT NOT NULL DEFAULT '{}',
+    manifest_json       TEXT NOT NULL DEFAULT '{}',
+    client_timing_json  TEXT,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_ask_metric_system
+    ON assistant_ask_metric (system_id, created_at DESC);
+"""
+
+
 # assistant_discussion_proposal / assistant_discussion_proposal_item (Issue
 # #439, Epic #436, docs/01-specifications/capabilities/assistant-discussion.md §2): a reviewable, structured
 # change-set summarized from a discussion thread's (#438) turns through the
@@ -9105,7 +9143,7 @@ CREATE INDEX IF NOT EXISTS idx_product_feature_decision_feature
 
 """ + _PRODUCT_GAP_ARTIFACT_LINK_DDL + _ASSISTANT_DISCUSSION_DDL + _ASSISTANT_DISCUSSION_PROPOSAL_DDL \
     + _ASSISTANT_DISCUSSION_HYPOTHESIS_DDL \
-    + _DISCUSSION_SAVE_RECEIPT_DDL + _DISCUSSION_CONTEXT_DDL
+    + _DISCUSSION_SAVE_RECEIPT_DDL + _DISCUSSION_CONTEXT_DDL + _ASSISTANT_ASK_METRIC_DDL
 
 
 _SCOPED_TABLES = [
