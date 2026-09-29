@@ -475,7 +475,7 @@ def _dedupe_new(candidates: Sequence[Tuple[str, str]], visited: Set[Tuple[str, s
     return out
 
 
-def _make_entry(system_id: int, kind: str, ref: str, tracker: _BudgetTracker):
+def _make_entry(system_id: int, kind: str, ref: str, tracker: _BudgetTracker, memo: Optional[dict] = None):
     """Resolve + gather one entity, applying the byte budget. Returns
     `(BundleEntry, resolved, context_result)` or `None` when the kind is no
     longer registered (defensive) or the entry could not even be counted
@@ -483,6 +483,8 @@ def _make_entry(system_id: int, kind: str, ref: str, tracker: _BudgetTracker):
     resolved = _resolve(system_id, kind, ref)
     if resolved is None:
         return None
+    if memo is not None:
+        memo[(kind, ref)] = resolved
     context_result = _gather(system_id, kind, ref)
     facts = context_result.facts if context_result.operation_state == "available" else {}
     size = _json_size(facts)
@@ -591,6 +593,7 @@ def _build_related_section(
     budget: ContextBudget,
     *,
     extra_seeds: Sequence[Tuple[str, str]] = (),
+    resolved_memo: Optional[dict] = None,
 ) -> Tuple[BundleSection, List[Tuple[str, str, str]], Tuple[Tuple[str, str], ...]]:
     """DD-CTX-02's bounded, depth<=2, identity-cycle-cut BFS. Returns
     `(section, included, returned_keys)`:
@@ -655,7 +658,7 @@ def _build_related_section(
             hit_budget = True
             triggering_reason = tracker.limiting_reason() if not tracker.has_item_room() else "item_budget"
             break
-        made = _make_entry(system_id, kind, ref, tracker)
+        made = _make_entry(system_id, kind, ref, tracker, resolved_memo)
         if made is None:
             d1_fully_processed = False
             hit_budget = True
@@ -682,7 +685,7 @@ def _build_related_section(
                 hit_budget = True
                 triggering_reason = tracker.limiting_reason() if not tracker.has_item_room() else "item_budget"
                 break
-            made = _make_entry(system_id, kind, ref, tracker)
+            made = _make_entry(system_id, kind, ref, tracker, resolved_memo)
             if made is None:
                 hit_budget = True
                 triggering_reason = tracker.limiting_reason()
@@ -716,6 +719,7 @@ def _build_related_section(
 def build_context_bundle(
     system_id: int, root_target_kind: str, root_target_ref: str, *,
     thread_id: int, budget: ContextBudget = DEFAULT_BUDGET, mint_cursor: bool = True,
+    root_resolved: Optional["discussion_adapters.ResolvedTarget"] = None,
 ) -> DiscussionContextBundle:
     """DD-CTX-01/02's full bundle for one root, scoped to `thread_id` (the
     discussion thread this bundle's continuations, if any, will be resumed
@@ -728,14 +732,21 @@ def build_context_bundle(
     adapter = discussion_adapters.get_adapter(root_target_kind)
     if adapter is None:
         raise ContextBundleError("discussion_target_kind_unregistered", root_target_kind)
-    root_resolved = adapter.resolver(system_id, root_target_ref)
+    # Issue #470: `root_resolved` is the SAME request's own resolution of this
+    # root (the ask resolved the thread target during validation); absent, it
+    # is resolved here exactly as before.
+    if root_resolved is None:
+        root_resolved = adapter.resolver(system_id, root_target_ref)
     if root_resolved.resolution == "unresolved":
         raise ContextBundleError("discussion_context_root_not_found", root_target_ref)
 
     from . import state_facts
 
+    # One connection for the snapshot read and the root's context gather
+    # (both read-only, neither calls out while it is held).
     with get_conn() as conn:
         snapshot_row = state_facts.get_latest_ready_snapshot(conn, system_id)
+        root_context = discussion_adapters.gather_context(conn, system_id, root_target_kind, root_target_ref)
     snapshot = BundleSnapshotRef(
         id=snapshot_row["id"] if snapshot_row is not None else None,
         commit_sha=snapshot_row["commit_sha"] if snapshot_row is not None else None,
@@ -757,7 +768,6 @@ def build_context_bundle(
 
     _register_source(root_target_kind, root_target_ref, root_resolved)
 
-    root_context = _gather(system_id, root_target_kind, root_target_ref)
     self_section, _self_entry = _self_section(root_target_kind, root_target_ref, root_resolved, root_context, tracker)
     sections: List[BundleSection] = [self_section]
 
@@ -767,13 +777,19 @@ def build_context_bundle(
         sections.append(objective_section)
         extra_seeds = seeds
 
+    # Same build, same entities: the related walk already resolved each
+    # included entry; reuse that read for the sources catalog.
+    resolved_memo: dict = {}
     related_section, related_included, related_returned_keys = _build_related_section(
         system_id, root_target_kind, root_context, tracker, visited, budget, extra_seeds=extra_seeds,
+        resolved_memo=resolved_memo,
     )
     sections.append(related_section)
 
     for kind, ref, digest in related_included:
-        resolved = _resolve(system_id, kind, ref)
+        resolved = resolved_memo.get((kind, ref))
+        if resolved is None:
+            resolved = _resolve(system_id, kind, ref)
         if resolved is not None:
             _register_source(kind, ref, resolved)
         dependency_triples.append((kind, ref, digest))

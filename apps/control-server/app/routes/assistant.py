@@ -1055,12 +1055,12 @@ def _assistant_ask_core(
     with trace.stage("request_validation"):
         with bind_scope(request_scope):
             (ctx, thread_row, thread_target_state, resolved_draft,
-             ui_draft_changed) = _validate_ask_request(payload, system_id)
+             ui_draft_changed, thread_resolved) = _validate_ask_request(payload, system_id)
     trace.manifest["ui_draft_state"] = resolved_draft.state
     return _assistant_ask_body(
         payload, system_id, principal, existing_user_turn, trace,
         ctx, thread_row, thread_target_state, resolved_draft, ui_draft_changed,
-        request_scope,
+        request_scope, thread_resolved,
     )
 
 
@@ -1073,8 +1073,11 @@ def _validate_ask_request(payload: AssistantAskRequest, system_id: int):
 
     thread_row: Optional[Dict[str, Any]] = None
     thread_target_state: Optional[str] = None
+    thread_resolved: Any = None
     if payload.thread_id is not None:
-        thread_data = assistant_discussion.get_thread(system_id, payload.thread_id)
+        pair = assistant_discussion.get_thread_with_resolution(system_id, payload.thread_id)
+        thread_data = pair[0] if pair is not None else None
+        thread_resolved = pair[1] if pair is not None else None
         if thread_data is None:
             raise HTTPException(
                 status_code=404, detail=f"Unknown discussion thread id: {payload.thread_id}"
@@ -1103,7 +1106,7 @@ def _validate_ask_request(payload: AssistantAskRequest, system_id: int):
                 form_id=resolved_draft.form_id,
                 draft_digest=resolved_draft.digest,
             )
-    return ctx, thread_row, thread_target_state, resolved_draft, ui_draft_changed
+    return ctx, thread_row, thread_target_state, resolved_draft, ui_draft_changed, thread_resolved
 
 
 def _assistant_ask_body(
@@ -1118,6 +1121,7 @@ def _assistant_ask_body(
     resolved_draft: Any,
     ui_draft_changed: bool,
     request_scope: AskRequestScope,
+    thread_resolved: Any = None,
 ) -> AssistantAskOut:
     report = request_scope.diagnostics()
     assessment = request_scope.system_state()
@@ -1243,6 +1247,7 @@ def _assistant_ask_body(
     with bind_scope(request_scope):
         related = gather_related_context(
             system_id, thread_row, thread_target_state, trace=trace,
+            root_resolved=thread_resolved,
         )
     trace.merge_scope_counters(request_scope)
     coverage_rows = [

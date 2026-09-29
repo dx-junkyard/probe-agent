@@ -423,3 +423,41 @@ def test_moderate_budget_trims_screen_lists_and_marks_coverage(env, monkeypatch)
     assert any(o["section"] == "screen_data.journeys" for o in ctx["context_budget"]["omitted_sections"])
     assert ctx["context_budget"]["over_budget"] is False
     assert ctx["screen_data"]["active_tab"]  # non-list facts untouched
+
+
+def test_bundle_stage_connections_and_precomputed_root_equivalence(env, monkeypatch):
+    """Perf (#470): the ask reuses its validation's root resolution, and the
+    bundle reads snapshot + root context on ONE connection.  Result identical
+    with and without the pre-computed root."""
+    from app import assistant_discussion, db, discussion_context_bundle as dcb
+
+    client, _, system_id, headers = env
+    fkey, _rkey = _seed_feature_with_requirement(client, headers)
+    thread_id = _feature_thread(client, headers, fkey)
+    pair = assistant_discussion.get_thread_with_resolution(system_id, thread_id)
+    thread, resolved = pair[0]["thread"], pair[1]
+    assert pair[0]["target_state"] == "current"
+
+    real = db._connect
+    calls = {"n": 0}
+
+    def counting():
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(db, "_connect", counting)
+    kwargs = dict(thread_id=thread_id, budget=dcb.DEFAULT_BUDGET, mint_cursor=False)
+
+    plain = dcb.build_context_bundle(system_id, thread["target_kind"], thread["target_ref"], **kwargs)
+    plain_conns = calls["n"]
+    calls["n"] = 0
+    pre = dcb.build_context_bundle(
+        system_id, thread["target_kind"], thread["target_ref"], root_resolved=resolved, **kwargs
+    )
+    pre_conns = calls["n"]
+    assert dcb.bundle_to_dict(plain) == dcb.bundle_to_dict(pre)
+    assert pre_conns < plain_conns
+    # snapshot + root gather share one connection; each related entry costs
+    # its resolver + its gather (the sources catalog reuses the resolution).
+    assert pre_conns <= 1 + 2 * (len(pre.sources) - 1)
+    assert plain_conns == pre_conns + 1

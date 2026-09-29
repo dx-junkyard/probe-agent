@@ -156,6 +156,7 @@ def gather_related_context(
     thread_target_state: Optional[str],
     *,
     trace: Optional[Any] = None,
+    root_resolved: Optional[Any] = None,
 ) -> RelatedContext:
     """First match:
 
@@ -182,6 +183,7 @@ def gather_related_context(
             bundle = discussion_context_bundle.build_context_bundle(
                 system_id, kind, ref, thread_id=int(thread_row["id"]),
                 budget=ASK_BUNDLE_BUDGET, mint_cursor=False,
+                root_resolved=root_resolved,
             )
         return project_bundle(bundle)
     except ContextBundleError as exc:

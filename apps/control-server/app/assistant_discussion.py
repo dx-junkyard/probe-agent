@@ -339,6 +339,14 @@ def resolve_or_create_thread(
 def get_thread(system_id: int, thread_id: int) -> Optional[Dict[str, Any]]:
     """§1.5 `GET /assistant/discussion-threads/{id}`. A foreign/unknown
     thread returns `None` (the route turns that into 404)."""
+    pair = get_thread_with_resolution(system_id, thread_id)
+    return None if pair is None else pair[0]
+
+
+def get_thread_with_resolution(system_id: int, thread_id: int):
+    """`get_thread`'s data plus the `ResolvedTarget` its `target_state` was
+    evaluated from (Issue #470: the ask reuses this same read for its bundle
+    instead of resolving the target a second time)."""
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM assistant_discussion_thread WHERE id = ? AND system_id = ?",
@@ -351,7 +359,7 @@ def get_thread(system_id: int, thread_id: int) -> Optional[Dict[str, Any]]:
 
     resolved = resolve_target(system_id, thread["target_kind"], thread["target_ref"])
     target_state = evaluate_target_state(thread["captured_target_digest"], resolved)
-    return {"thread": thread, "target_state": target_state, "turns": turns}
+    return {"thread": thread, "target_state": target_state, "turns": turns}, resolved
 
 
 def list_threads(
