@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -34,6 +35,19 @@ PROVIDER_KEY_ENV: Dict[str, str] = {
 # value (deterministic test/local-smoke output), not an error state.
 KNOWN_PROVIDERS = frozenset(PROVIDER_KEY_ENV) | {"mock"}
 
+# Default model per provider (unknown providers fall back to the OpenAI one).
+DEFAULT_MODELS: Dict[str, str] = {
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-3-5-haiku-latest",
+    "gemini": "gemini-1.5-flash",
+    "mock": "mock",
+}
+_FALLBACK_MODEL = "gpt-4o-mini"
+
+# Assistant output/time knobs (Issue #467 / #468).
+ASSISTANT_DEFAULT_MAX_OUTPUT_TOKENS = 2048
+ASSISTANT_MAX_OUTPUT_TOKENS_CEILING = 8192
+
 
 @dataclass(frozen=True)
 class LLMConfig:
@@ -52,12 +66,7 @@ class LLMConfig:
             or os.getenv("ANTHROPIC_API_KEY")
             or os.getenv("GEMINI_API_KEY")
         )
-        default_model = {
-            "openai": "gpt-4o-mini",
-            "anthropic": "claude-3-5-haiku-latest",
-            "gemini": "gemini-1.5-flash",
-            "mock": "mock",
-        }.get(provider, "gpt-4o-mini")
+        default_model = DEFAULT_MODELS.get(provider, _FALLBACK_MODEL)
         try:
             timeout = float(os.getenv("LLM_TIMEOUT", "120"))
         except ValueError:
@@ -86,12 +95,9 @@ class LLMConfig:
         ).strip().lower()
         model = (os.getenv("INTELLIGENCE_LLM_MODEL") or "").strip()
         if not model:
-            model = os.getenv("LLM_MODEL") or {
-                "openai": "gpt-4o-mini",
-                "anthropic": "claude-3-5-haiku-latest",
-                "gemini": "gemini-1.5-flash",
-                "mock": "mock",
-            }.get(provider, "gpt-4o-mini")
+            model = os.getenv("LLM_MODEL") or DEFAULT_MODELS.get(
+                provider, _FALLBACK_MODEL
+            )
         specific_env = PROVIDER_KEY_ENV.get(provider)
         api_key = (
             (os.getenv("LLM_API_KEY") or "").strip()
@@ -112,8 +118,103 @@ class LLMConfig:
             timeout=timeout,
         )
 
+    @classmethod
+    def assistant_from_env(cls) -> "LLMConfig":
+        """Config for the Dashboard AI Assistant (Issue #467).
+
+        Starts from ``intelligence_from_env`` and overrides each field only
+        when its ``ASSISTANT_LLM_*`` variable is set and non-blank, so with no
+        assistant variables the result equals ``intelligence_from_env()``.
+
+        When ``ASSISTANT_LLM_PROVIDER`` changes the provider:
+        - the model defaults to that provider's default model (NOT the
+          intelligence model, which belongs to another provider) unless
+          ``ASSISTANT_LLM_MODEL`` is set;
+        - the API key is ``ASSISTANT_LLM_API_KEY``, else that provider's
+          specific key env. The generic ``LLM_API_KEY`` is NOT used: it was
+          configured for the analysis provider, and sending it to another
+          provider's host would leak a credential (fail closed with None);
+        - the base URL is ``ASSISTANT_LLM_BASE_URL`` or the provider default,
+          never the analysis provider's custom endpoint.
+        """
+        base = cls.intelligence_from_env()
+
+        def _env(name: str) -> str:
+            return (os.getenv(name) or "").strip()
+
+        provider = base.provider
+        provider_changed = False
+        raw_provider = _env("ASSISTANT_LLM_PROVIDER").lower()
+        if raw_provider:
+            provider_changed = raw_provider != base.provider
+            provider = raw_provider
+
+        model = base.model
+        raw_model = _env("ASSISTANT_LLM_MODEL")
+        if raw_model:
+            model = raw_model
+        elif provider_changed:
+            model = DEFAULT_MODELS.get(provider, _FALLBACK_MODEL)
+
+        api_key = base.api_key
+        raw_key = _env("ASSISTANT_LLM_API_KEY")
+        if raw_key:
+            api_key = raw_key
+        elif provider_changed:
+            specific_env = PROVIDER_KEY_ENV.get(provider)
+            api_key = (_env(specific_env) if specific_env else "") or None
+
+        base_url = _env("ASSISTANT_LLM_BASE_URL") or (
+            None if provider_changed else base.base_url
+        )
+
+        timeout = base.timeout
+        raw_timeout = _env("ASSISTANT_LLM_TIMEOUT")
+        if raw_timeout:
+            try:
+                timeout = float(raw_timeout)
+            except ValueError:
+                pass
+        return cls(
+            provider=provider,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            timeout=timeout,
+        )
+
+
+def assistant_max_output_tokens() -> int:
+    """``ASSISTANT_LLM_MAX_OUTPUT_TOKENS`` (default 2048, clamped to 8192)."""
+    raw = (os.getenv("ASSISTANT_LLM_MAX_OUTPUT_TOKENS") or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return ASSISTANT_DEFAULT_MAX_OUTPUT_TOKENS
+    if value <= 0:
+        return ASSISTANT_DEFAULT_MAX_OUTPUT_TOKENS
+    return min(value, ASSISTANT_MAX_OUTPUT_TOKENS_CEILING)
+
+
+def assistant_request_budget_seconds() -> Optional[float]:
+    """``ASSISTANT_REQUEST_BUDGET_SECONDS``; None when unset/invalid/<=0."""
+    raw = (os.getenv("ASSISTANT_REQUEST_BUDGET_SECONDS") or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if value != value or value <= 0 or value == float("inf"):
+        return None
+    return value
+
 
 class LLMClient(ABC):
+    # Set by each real client after every ``generate_text`` (reset to None at
+    # the start of the call). ``last_usage`` is provider-reported token counts
+    # or None; ``last_finish_reason`` is one of FINISH_REASONS or None.
+    last_usage: Optional[Dict[str, Optional[int]]] = None
+    last_finish_reason: Optional[str] = None
+
     @abstractmethod
     def generate_text(
         self,
@@ -134,8 +235,85 @@ class LLMClient(ABC):
         """
 
 
+# Finite failure kinds (Issue #467 / #472).
+LLM_ERROR_KINDS = (
+    "timeout",
+    "network",
+    "auth",
+    "rate_limited",
+    "provider_error",
+    "malformed_response",
+    "config",
+)
+
+# Finite normalized finish reasons; ``None`` means unknown / not reported.
+FINISH_REASONS = ("stop", "length", "other")
+
+
 class LLMError(RuntimeError):
-    pass
+    """A failed LLM call.
+
+    ``str(exc)`` is the full audit message (may embed a provider response body
+    -- other features persist it, Principle 7). Callers that show or record the
+    failure to end users must use ``kind`` / ``http_status`` / ``safe_message``
+    instead, which never contain a provider response body.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        kind: str = "provider_error",
+        http_status: Optional[int] = None,
+        safe_message: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.kind = kind if kind in LLM_ERROR_KINDS else "provider_error"
+        self.http_status = http_status
+        self.safe_message = safe_message or _default_safe_message(
+            self.kind, http_status
+        )
+
+
+def _default_safe_message(kind: str, http_status: Optional[int]) -> str:
+    if http_status is not None:
+        return f"LLM request failed: HTTP {http_status}"
+    return {
+        "timeout": "LLM request timed out",
+        "network": "LLM request failed: network error",
+        "auth": "LLM request failed: authentication error",
+        "rate_limited": "LLM request failed: rate limited",
+        "malformed_response": "LLM response was malformed",
+        "config": "LLM is not configured",
+    }.get(kind, "LLM request failed")
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(exc.reason, (TimeoutError, socket.timeout))
+    return False
+
+
+def _usage(input_tokens: Any, output_tokens: Any) -> Optional[Dict[str, Optional[int]]]:
+    def _num(v: Any) -> Optional[int]:
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    i, o = _num(input_tokens), _num(output_tokens)
+    if i is None and o is None:
+        return None
+    return {"input_tokens": i, "output_tokens": o}
+
+
+def _finish(raw: Any, length_value: str, stop_values: tuple) -> Optional[str]:
+    if not isinstance(raw, str) or not raw:
+        return None
+    if raw == length_value:
+        return "length"
+    if raw in stop_values:
+        return "stop"
+    return "other"
 
 
 def _effective_timeout(config: LLMConfig, override: Optional[float]) -> float:
@@ -207,19 +385,36 @@ def _request_json(
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise LLMError(f"LLM request failed: HTTP {exc.code}: {detail}") from exc
+        if exc.code in (401, 403):
+            kind = "auth"
+        elif exc.code == 429:
+            kind = "rate_limited"
+        else:
+            kind = "provider_error"
+        raise LLMError(
+            f"LLM request failed: HTTP {exc.code}: {detail}",
+            kind=kind,
+            http_status=exc.code,
+        ) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise LLMError(f"LLM request failed: {exc}") from exc
+        raise LLMError(
+            f"LLM request failed: {exc}",
+            kind="timeout" if _is_timeout(exc) else "network",
+        ) from exc
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise LLMError(f"LLM response was not JSON: {raw[:500]}") from exc
+        raise LLMError(
+            f"LLM response was not JSON: {raw[:500]}", kind="malformed_response"
+        ) from exc
 
 
 class OpenAIChatClient(LLMClient):
     def __init__(self, config: LLMConfig):
         if not config.api_key:
-            raise LLMError("LLM_API_KEY or OPENAI_API_KEY is required for OpenAI")
+            raise LLMError(
+                "LLM_API_KEY or OPENAI_API_KEY is required for OpenAI", kind="config"
+            )
         self.config = config
 
     def generate_text(
@@ -230,6 +425,8 @@ class OpenAIChatClient(LLMClient):
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> str:
+        self.last_usage = None
+        self.last_finish_reason = None
         payload: Dict[str, Any] = {
             "model": self.config.model,
             "messages": _adapt_openai_messages(messages, self.config.model),
@@ -250,15 +447,32 @@ class OpenAIChatClient(LLMClient):
             timeout=_effective_timeout(self.config, timeout),
         )
         try:
-            return response["choices"][0]["message"]["content"] or ""
+            choice = response["choices"][0]
+            text = choice["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as exc:
-            raise LLMError(f"Unexpected OpenAI response: {response}") from exc
+            raise LLMError(
+                f"Unexpected OpenAI response: {response}", kind="malformed_response"
+            ) from exc
+        usage = response.get("usage")
+        if isinstance(usage, dict):
+            self.last_usage = _usage(
+                usage.get("prompt_tokens"), usage.get("completion_tokens")
+            )
+        self.last_finish_reason = _finish(
+            choice.get("finish_reason") if isinstance(choice, dict) else None,
+            "length",
+            ("stop",),
+        )
+        return text
 
 
 class AnthropicClient(LLMClient):
     def __init__(self, config: LLMConfig):
         if not config.api_key:
-            raise LLMError("LLM_API_KEY or ANTHROPIC_API_KEY is required for Anthropic")
+            raise LLMError(
+                "LLM_API_KEY or ANTHROPIC_API_KEY is required for Anthropic",
+                kind="config",
+            )
         self.config = config
 
     def generate_text(
@@ -269,6 +483,8 @@ class AnthropicClient(LLMClient):
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> str:
+        self.last_usage = None
+        self.last_finish_reason = None
         system_parts = [m["content"] for m in messages if m.get("role") == "system"]
         non_system = [m for m in messages if m.get("role") != "system"]
         payload: Dict[str, Any] = {
@@ -292,15 +508,31 @@ class AnthropicClient(LLMClient):
         )
         try:
             parts = response.get("content") or []
-            return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
-        except AttributeError as exc:
-            raise LLMError(f"Unexpected Anthropic response: {response}") from exc
+            text = "".join(
+                p.get("text", "") for p in parts if p.get("type") == "text"
+            )
+        except (AttributeError, TypeError) as exc:
+            raise LLMError(
+                f"Unexpected Anthropic response: {response}",
+                kind="malformed_response",
+            ) from exc
+        usage = response.get("usage")
+        if isinstance(usage, dict):
+            self.last_usage = _usage(
+                usage.get("input_tokens"), usage.get("output_tokens")
+            )
+        self.last_finish_reason = _finish(
+            response.get("stop_reason"), "max_tokens", ("end_turn", "stop_sequence")
+        )
+        return text
 
 
 class GeminiClient(LLMClient):
     def __init__(self, config: LLMConfig):
         if not config.api_key:
-            raise LLMError("LLM_API_KEY or GEMINI_API_KEY is required for Gemini")
+            raise LLMError(
+                "LLM_API_KEY or GEMINI_API_KEY is required for Gemini", kind="config"
+            )
         self.config = config
 
     def generate_text(
@@ -311,6 +543,8 @@ class GeminiClient(LLMClient):
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> str:
+        self.last_usage = None
+        self.last_finish_reason = None
         system_instructions = [
             {"parts": [{"text": m["content"]}]}
             for m in messages
@@ -345,20 +579,37 @@ class GeminiClient(LLMClient):
             headers={},
             timeout=_effective_timeout(self.config, timeout),
         )
+        usage = response.get("usageMetadata") if isinstance(response, dict) else None
+        if isinstance(usage, dict):
+            self.last_usage = _usage(
+                usage.get("promptTokenCount"), usage.get("candidatesTokenCount")
+            )
         try:
             # When finishReason is MAX_TOKENS, content can be missing or empty.
             candidate = response.get("candidates", [{}])[0]
+            self.last_finish_reason = _finish(
+                candidate.get("finishReason"), "MAX_TOKENS", ("STOP",)
+            )
             content = candidate.get("content", {})
             if not content:
                 return ""
             parts = content.get("parts", [])
             return "".join(part.get("text", "") for part in parts)
-        except (IndexError, TypeError) as exc:
-            raise LLMError(f"Unexpected Gemini response format: {response}") from exc
+        except (IndexError, TypeError, AttributeError) as exc:
+            raise LLMError(
+                f"Unexpected Gemini response format: {response}",
+                kind="malformed_response",
+            ) from exc
 
 
 class MockLLMClient(LLMClient):
-    """Deterministic provider used by tests and local UI smoke checks."""
+    """Deterministic provider used by tests and local UI smoke checks.
+
+    ``last_usage`` stays None (no provider reported anything) and
+    ``last_finish_reason`` is ``"stop"`` (the mock always completes).
+    """
+
+    last_finish_reason: Optional[str] = "stop"
 
     def generate_text(
         self,
@@ -539,6 +790,14 @@ class _QuotaLLMClient(LLMClient):
 
     def __init__(self, delegate: LLMClient):
         self._delegate = delegate
+
+    @property
+    def last_usage(self) -> Optional[Dict[str, Optional[int]]]:  # type: ignore[override]
+        return getattr(self._delegate, "last_usage", None)
+
+    @property
+    def last_finish_reason(self) -> Optional[str]:  # type: ignore[override]
+        return getattr(self._delegate, "last_finish_reason", None)
 
     def generate_text(
         self,
