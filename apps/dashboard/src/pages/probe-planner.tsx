@@ -24,6 +24,7 @@ import { ContextHeader } from "@/components/layout/context-header";
 import { PrerequisiteGuide } from "@/components/prerequisite-guide";
 import { useSystemState } from "@/api/hooks";
 import { useRepositoryReadySnapshotGate } from "@/components/repository-gate";
+import { QueryErrorState } from "@/components/query-state";
 
 export default function ProbePlannerPage() {
   const [searchParams] = useSearchParams();
@@ -37,7 +38,10 @@ export default function ProbePlannerPage() {
   const capabilityContext = searchParams.get("capability");
   const { data: workspaceDraft } = useWorkspaceProposalDraft(draftId);
   const { data: featureDrafts } = useLatestDrafts();
-  const { data: plansData, isLoading } = useProbePlans();
+  const plansQuery = useProbePlans();
+  const { data: plansData, isLoading } = plansQuery;
+  // Issue #466 (UX-05): 初回取得の失敗を空一覧と同じ扱いにしない。
+  const plansFailed = plansQuery.isError && !plansData;
   const generatePlan = useGenerateProbePlan();
   const updatePointStatus = useUpdateProbePointStatus();
   const { data: patches } = useProbePatches();
@@ -94,14 +98,15 @@ export default function ProbePlannerPage() {
   const setExpandedPlan = setUserExpandedPlan;
 
   useEffect(() => {
-    if (planParamNotified.current || planId === null || isLoading) return;
+    // 取得失敗から「plan が存在しない」を判定しない。
+    if (planParamNotified.current || planId === null || isLoading || plansFailed) return;
     planParamNotified.current = true;
     if (planMatch) {
       cardRefs.current[planId]?.scrollIntoView?.({ behavior: "smooth", block: "start" });
     } else {
       toast.error(`Probe plan #${planId} was not found.`);
     }
-  }, [planId, isLoading, planMatch]);
+  }, [planId, isLoading, planMatch, plansFailed]);
 
   const features = featureDrafts?.feature_drafts ?? [];
   const formFeatureId = featureId
@@ -184,6 +189,14 @@ export default function ProbePlannerPage() {
 
       {isLoading ? (
         <div className="space-y-4">{[1,2].map(i => <Skeleton key={i} className="h-40 w-full" />)}</div>
+      ) : plansFailed ? (
+        <QueryErrorState
+          target="Probe plan 一覧"
+          error={plansQuery.error}
+          onRetry={() => { void plansQuery.refetch(); }}
+          retrying={plansQuery.isFetching}
+          data-testid="probe-plans-error"
+        />
       ) : !plans.length ? (
         <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">No probe plans yet. Generate a plan to start.</CardContent></Card>
       ) : (

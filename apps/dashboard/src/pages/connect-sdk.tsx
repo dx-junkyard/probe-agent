@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMyTokens, useIssueToken, useRevokeMyToken } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
@@ -21,6 +21,26 @@ import {
 import type { TokenOut } from "@/api/types";
 import { Copy, Key, Trash2, ArrowRight } from "lucide-react";
 import { getClientServerUrl } from "@/lib/env";
+import { copyText, selectElementText } from "@/lib/clipboard";
+
+// Issue #466 (UX-01): `/tokens/me` は利用者の全 token を System を問わず返す。
+// 「発行先の System」を表示している同じカードに一覧を並べると、一覧も同じ
+// System の token だと読めてしまい、別 System の同名 token を失効させうる。
+// 一覧は既定で選択中の System に絞り、「全 System」は明示的な切り替えにする。
+// System に紐づかない token は System の token ではないので、どちらの表示でも
+// 専用の区分に分ける。
+type TokenScope = "current" | "all";
+
+type SystemLookup = (systemId: number | null) => string;
+
+function useSystemLabel(): SystemLookup {
+  const { systems } = useAuth();
+  return (systemId) => {
+    if (systemId == null) return "System 未関連";
+    const name = systems.find((s) => s.id === systemId)?.name;
+    return name ? `${name}(#${systemId})` : `System #${systemId}`;
+  };
+}
 
 export default function ConnectSdkPage() {
   const { systemId, systems } = useAuth();
@@ -31,6 +51,11 @@ export default function ConnectSdkPage() {
   const [expDays, setExpDays] = useState(90);
   const [issued, setIssued] = useState<TokenOut | null>(null);
   const [confirmRevoke, setConfirmRevoke] = useState<TokenOut | null>(null);
+  const [scope, setScope] = useState<TokenScope>("current");
+  // UX-08: コピーの結果。成功は「コピーした」事実、失敗は手動コピーの導線。
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const issuedTokenRef = useRef<HTMLElement>(null);
+  const systemLabel = useSystemLabel();
 
   const systemName = systems.find(s => s.id === systemId)?.name ?? null;
 
@@ -43,6 +68,7 @@ export default function ConnectSdkPage() {
         expires_in_days: expDays,
       });
       setIssued(t.token ? t : null);
+      setCopyState("idle");
       setNewTokenName("");
       toast.success("Token を発行しました");
     } catch (err) { toast.error(String(err)); }
@@ -62,8 +88,32 @@ export default function ConnectSdkPage() {
   // different credential (issued by /auth/login, not usable as PROBE_API_KEY)
   // and live in their own clearly-labelled section.
   const allTokens = tokens ?? [];
-  const apiTokens = sortTokensByUsability(allTokens.filter(isApiToken));
+  const allApiTokens = allTokens.filter(isApiToken);
+  // 選択 System が無いときは「現在の System」に絞る対象が存在しないので、
+  // 全 System 表示に倒す (空一覧を「token がない」と読ませない)。
+  const effectiveScope: TokenScope = systemId == null ? "all" : scope;
+  const systemBoundApiTokens = allApiTokens.filter(t => t.system_id != null);
+  const apiTokens = sortTokensByUsability(
+    effectiveScope === "current"
+      ? systemBoundApiTokens.filter(t => t.system_id === systemId)
+      : systemBoundApiTokens,
+  );
+  const unboundApiTokens = sortTokensByUsability(allApiTokens.filter(t => t.system_id == null));
+  const otherSystemCount = systemBoundApiTokens.filter(t => t.system_id !== systemId).length;
   const sessionTokens = allTokens.filter(t => !isApiToken(t));
+
+  const handleCopyIssued = async () => {
+    if (!issued?.token) return;
+    if (await copyText(issued.token)) {
+      setCopyState("copied");
+      toast.success("コピーしました");
+    } else {
+      // token は表示したまま保持する。失敗時に消すと二度と取り出せない。
+      setCopyState("failed");
+      selectElementText(issuedTokenRef.current);
+      toast.error("コピーできませんでした。表示中の token を手動でコピーしてください。");
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -166,20 +216,44 @@ def summarize(text: str) -> str:
                 Token を発行しました。この値が表示されるのはこの一度だけです。今すぐコピーしてください。
               </p>
               <div className="flex items-center gap-2">
-                <code className="flex-1 rounded bg-background px-3 py-2 text-xs font-mono break-all border">
+                <code
+                  ref={issuedTokenRef}
+                  className="flex-1 rounded bg-background px-3 py-2 text-xs font-mono break-all border select-all"
+                  data-testid="issued-token-value"
+                >
                   {issued.token}
                 </code>
                 <Button
                   size="icon" variant="outline"
                   aria-label="発行した token をコピー"
-                  onClick={() => {
-                    navigator.clipboard.writeText(issued.token as string);
-                    toast.success("コピーしました");
-                  }}
+                  data-testid="issued-token-copy"
+                  onClick={handleCopyIssued}
                 >
                   <Copy className="h-4 w-4" />
                 </Button>
               </div>
+              <p
+                role="status"
+                aria-live="polite"
+                data-testid="issued-token-copy-status"
+                className={copyState === "failed" ? "text-xs text-destructive" : "text-xs text-emerald-900/80 dark:text-emerald-100/80"}
+              >
+                {copyState === "copied" && "クリップボードにコピーしました。"}
+                {copyState === "failed" && (
+                  <>
+                    クリップボードにコピーできませんでした(ブラウザーが許可していない可能性があります)。
+                    token は選択状態にしてあります。Ctrl+C(Mac は ⌘+C)でコピーしてから画面を離れてください。
+                    <button
+                      type="button"
+                      className="ml-1 underline cursor-pointer"
+                      data-testid="issued-token-select"
+                      onClick={() => selectElementText(issuedTokenRef.current)}
+                    >
+                      もう一度選択する
+                    </button>
+                  </>
+                )}
+              </p>
               <ul className="text-xs text-emerald-900/80 dark:text-emerald-100/80 space-y-0.5">
                 <li data-testid="issued-token-expiry">
                   有効期限: {formatExpiresIn(issued)}
@@ -196,18 +270,66 @@ def summarize(text: str) -> str:
             </div>
           )}
 
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-4">
+            <h3 className="text-sm font-medium" data-testid="sdk-token-list-heading">
+              {effectiveScope === "current" && systemId != null
+                ? `${systemLabel(systemId)} の API token`
+                : "全 System の API token"}
+            </h3>
+            {systemId != null && (
+              <div role="group" aria-label="表示する token の範囲" className="inline-flex rounded-md border p-0.5">
+                <Button
+                  size="sm"
+                  variant={effectiveScope === "current" ? "default" : "ghost"}
+                  aria-pressed={effectiveScope === "current"}
+                  data-testid="sdk-token-scope-current"
+                  onClick={() => setScope("current")}
+                >
+                  選択中の System
+                </Button>
+                <Button
+                  size="sm"
+                  variant={effectiveScope === "all" ? "default" : "ghost"}
+                  aria-pressed={effectiveScope === "all"}
+                  data-testid="sdk-token-scope-all"
+                  onClick={() => setScope("all")}
+                >
+                  全 System{otherSystemCount > 0 ? `(他 ${otherSystemCount} 件)` : ""}
+                </Button>
+              </div>
+            )}
+          </div>
+
           {isLoading ? (
             <div className="space-y-2">{[1,2].map(i => <Skeleton key={i} className="h-12 w-full" />)}</div>
           ) : !apiTokens.length ? (
             <p className="text-sm text-muted-foreground text-center py-4" data-testid="sdk-token-empty">
-              SDK 用の API token はまだありません。
+              {effectiveScope === "current"
+                ? "この System の SDK 用 API token はまだありません。"
+                : "SDK 用の API token はまだありません。"}
             </p>
           ) : (
             <TokenTable
               tokens={apiTokens}
               testIdPrefix="sdk-token"
               onRevoke={setConfirmRevoke}
+              systemLabel={systemLabel}
             />
+          )}
+
+          {!isLoading && unboundApiTokens.length > 0 && (
+            <div className="space-y-2" data-testid="sdk-token-unbound">
+              <h3 className="text-sm font-medium">System 未関連の API token</h3>
+              <p className="text-xs text-muted-foreground">
+                どの System にも紐づいていない token です。選択中の System の token ではありません。
+              </p>
+              <TokenTable
+                tokens={unboundApiTokens}
+                testIdPrefix="sdk-token-unbound"
+                onRevoke={setConfirmRevoke}
+                systemLabel={systemLabel}
+              />
+            </div>
           )}
         </CardContent>
       </Card>
@@ -235,6 +357,7 @@ def summarize(text: str) -> str:
                   tokens={sortTokensByUsability(sessionTokens)}
                   testIdPrefix="session-token"
                   onRevoke={setConfirmRevoke}
+                  systemLabel={systemLabel}
                 />
               </div>
             </details>
@@ -248,12 +371,25 @@ def summarize(text: str) -> str:
         </DialogHeader>
         {confirmRevoke && (
           <div className="space-y-4" data-testid="revoke-confirm-dialog">
+            <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-md border bg-muted/40 p-3 text-sm">
+              <dt className="text-muted-foreground">Token</dt>
+              <dd data-testid="revoke-confirm-name">
+                {confirmRevoke.name ?? `#${confirmRevoke.id}`}(#{confirmRevoke.id})
+              </dd>
+              <dt className="text-muted-foreground">対象 System</dt>
+              <dd data-testid="revoke-confirm-system">{systemLabel(confirmRevoke.system_id)}</dd>
+              <dt className="text-muted-foreground">作成</dt>
+              <dd>{formatTimestamp(confirmRevoke.created_at)}</dd>
+            </dl>
             <p className="text-sm">
-              「{confirmRevoke.name ?? `#${confirmRevoke.id}`}」を失効させます。
+              {confirmRevoke.system_id != null
+                ? `${systemLabel(confirmRevoke.system_id)} に紐づく「${confirmRevoke.name ?? `#${confirmRevoke.id}`}」を失効させます。`
+                : `System に紐づかない「${confirmRevoke.name ?? `#${confirmRevoke.id}`}」を失効させます。`}
               この token を使っている SDK は直ちに認証できなくなり、失効は取り消せません。
             </p>
             <div className="flex justify-end gap-2">
-              <Button variant="outline" onClick={() => setConfirmRevoke(null)}>
+              {/* 破壊的操作の確認: 初期フォーカスは取り消し側に置く。 */}
+              <Button variant="outline" data-autofocus="" onClick={() => setConfirmRevoke(null)}>
                 キャンセル
               </Button>
               <Button
@@ -284,10 +420,12 @@ function TokenTable({
   tokens,
   testIdPrefix,
   onRevoke,
+  systemLabel,
 }: {
   tokens: TokenOut[];
   testIdPrefix: string;
   onRevoke: (token: TokenOut) => void;
+  systemLabel: SystemLookup;
 }) {
   return (
     <div className="overflow-x-auto">
@@ -295,6 +433,7 @@ function TokenTable({
         <thead>
           <tr className="border-b text-left">
             <th className="pb-2 font-medium text-muted-foreground">名前</th>
+            <th className="pb-2 font-medium text-muted-foreground">System</th>
             <th className="pb-2 font-medium text-muted-foreground">種別</th>
             <th className="pb-2 font-medium text-muted-foreground">作成</th>
             <th className="pb-2 font-medium text-muted-foreground">有効期限</th>
@@ -306,6 +445,9 @@ function TokenTable({
           {tokens.map(t => (
             <tr key={t.id} className="border-b last:border-0" data-testid={`${testIdPrefix}-row-${t.id}`}>
               <td className="py-2">{t.name ?? `#${t.id}`}</td>
+              <td className="py-2 text-xs" data-testid={`${testIdPrefix}-system-${t.id}`}>
+                {systemLabel(t.system_id)}
+              </td>
               <td className="py-2"><Badge variant="outline">{t.kind}</Badge></td>
               <td className="py-2 text-xs text-muted-foreground">{formatTimestamp(t.created_at)}</td>
               <td className="py-2 text-xs text-muted-foreground">
@@ -321,7 +463,7 @@ function TokenTable({
                 {isTokenUsable(t.status) && (
                   <Button
                     variant="ghost" size="icon" className="h-7 w-7"
-                    aria-label={`token「${t.name ?? `#${t.id}`}」を失効させる`}
+                    aria-label={`${systemLabel(t.system_id)} の token「${t.name ?? `#${t.id}`}」を失効させる`}
                     onClick={() => onRevoke(t)}
                   >
                     <Trash2 className="h-4 w-4 text-destructive" />
@@ -344,7 +486,10 @@ function CodeBlock({ children, lang }: { children: string; lang: string }) {
       </pre>
       <Button
         variant="ghost" size="icon" className="absolute top-2 right-2 h-7 w-7"
-        onClick={() => { navigator.clipboard.writeText(children); toast.success("コピーしました"); }}
+        onClick={async () => {
+          if (await copyText(children)) toast.success("コピーしました");
+          else toast.error("コピーできませんでした。コードを選択して手動でコピーしてください。");
+        }}
         aria-label={`${lang} のコードをコピー`}
         title={`${lang} のコードをコピー`}
       >

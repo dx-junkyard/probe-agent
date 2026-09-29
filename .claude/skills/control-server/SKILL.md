@@ -1239,6 +1239,39 @@ the first design layer in the repo that PERSISTS its own content.
   migration block, not in `SCHEMA`: that script also runs against older
   databases, where `CREATE TABLE IF NOT EXISTS` is a no-op and the indexed
   column does not exist yet.
+- **A table REBUILD (rename -> recreate -> copy -> drop) must do the rename
+  under `PRAGMA legacy_alter_table = ON`.** SQLite's default
+  `ALTER TABLE x RENAME TO x_legacy` rewrites the stored FK clause of every
+  OTHER table that references `x` so it keeps pointing at `x` under its new
+  name — so a plain rename leaves every child table referencing
+  `x_legacy`, and the `DROP TABLE x_legacy` at the end of the rebuild makes
+  that reference dangle. Nothing fails at migration time: the damage only
+  surfaces later, as `sqlite3.OperationalError: no such table:
+  main.x_legacy` on the next INSERT into a CHILD table (the connection has
+  `PRAGMA foreign_keys=ON`). That is how Issue #453's
+  `_migrate_assistant_discussion_thread_target_kinds` broke
+  `POST /assistant/ask` — six tables
+  (`assistant_discussion_turn`, `assistant_discussion_proposal`,
+  `joint_understanding_session`, and the four
+  `interview_discussion_schema` tables) were left pointing at a table that
+  no longer existed. With the pragma ON the child tables keep the bare name
+  `x`, which resolves to the table the rebuild is about to (re)create, and
+  no child needs fixing up at all. The pragma is only for the rename: turn
+  it OFF immediately after, and keep `PRAGMA foreign_keys = OFF` around the
+  whole rebuild.
+  This applies even when nothing references the table today — the next FK
+  added to it would reintroduce the defect silently.
+- `db.py`'s `_repair_dangling_foreign_key_targets` runs at the end of
+  `init_db()` and heals databases already damaged this way: it finds every
+  FK target that is not an existing table (via `PRAGMA foreign_key_list`,
+  not a regex over SQL), maps it back to its base table only through the
+  finite, explicitly enumerated wrapper forms this file has ever used
+  (`<base>_legacy` / `_old_<base>` / `_<base>_old`), and rebuilds the
+  referencing table with the reference corrected — preserving every row, id,
+  index and trigger. It never guesses: a dangling target whose base table
+  does not exist is left alone. Do not treat it as a licence to skip the
+  pragma above; it is a repair for databases that already shipped, not a
+  substitute for the correct rename.
 
 ## Required Tests
 

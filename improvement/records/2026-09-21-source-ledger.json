@@ -1,0 +1,525 @@
+{
+  "ledger_id": "probe-agent:SL-20260921-01",
+  "acquired_at": "2026-09-21",
+  "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+  "analysis_method": "probe-agent-ec/0.1",
+  "release_id": "evolution-controller-0.1.0-preview.1",
+  "release_source_snapshot_sha256": "6378cd3a28113c234e088f7ccc9506bb28ce840482f147ae107e70534c3d2bc8",
+  "release_source_identity": "allowlisted working-tree content; not identified by git HEAD",
+  "components": {
+    "situation": "0.1",
+    "roles": "0.1",
+    "perspectives": "0.1",
+    "workflow": "0.1"
+  },
+  "scope": "既存20事例の保持・配置と依存先の取得時hash。全文履歴の採録や原因の再確定ではない。",
+  "entries": [
+    {
+      "id": "probe-agent:IK-0001",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0001-generation-contract-vocabulary.md",
+      "sha256": "b32127e20ee2507777210c349d81100e0cc28dc8f3544daa488030309c6c7172",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-12",
+      "observed_revision": "c9859ac556497d8a62cb677f8926268ec010ba3c を起点とする2026-09-12監査修正後（最終SHAは出典未記載）",
+      "dependency_paths": [
+        "apps/control-server/app/assistant_discussion_proposal.py",
+        "apps/control-server/tests/test_assistant_discussion_proposals.py",
+        "docs/01-specifications/ux/decision-discussion-audit-2026-09-12.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0002",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0002-unmounted-form-delivery.md",
+      "sha256": "ff93405f306cc759948f7c828c16447540e2f2d9ff4d5672734a5f86c5549186",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-12",
+      "observed_revision": "2026-09-12監査修正後（最終SHAは出典未記載）",
+      "dependency_paths": [
+        "apps/control-server/tests/test_discussion_prefill.py",
+        "apps/dashboard/src/pages/ux-design-studio.tsx",
+        "docs/01-specifications/ux/decision-discussion-audit-2026-09-12.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0003",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0003-root-only-freshness.md",
+      "sha256": "4f53fccaae71a2912311a3b5a3d84dc0d4eced7002e90796621f8280cc375430",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-12",
+      "observed_revision": "2026-09-12監査修正後（最終SHAは出典未記載）",
+      "dependency_paths": [
+        "apps/control-server/app/assistant_discussion_proposal.py",
+        "apps/control-server/tests/test_assistant_discussion_proposals.py",
+        "docs/01-specifications/ux/decision-discussion-audit-2026-09-12.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0004",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0004-unobserved-user-outcomes.md",
+      "sha256": "a4bcfbcef038b56b16c493fed9f76f645f727f9c2a3e75c4a2b765e30d65e0e0",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-12",
+      "observed_revision": "2026-09-12監査時点",
+      "dependency_paths": [
+        "docs/01-specifications/ux/decision-discussion-audit-2026-09-12.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0005",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0005-immutable-premise-overwritten.md",
+      "sha256": "2c358e100d6b799515e68319eb22e7fb145e2cd99fc54734357061f43b28eab3",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-13",
+      "observed_revision": "575a6c4（#464 第1回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/canonical_understanding.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/canonical-understanding-review-2026-09-13.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0006",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0006-missing-post-inference-check.md",
+      "sha256": "02a919d6db113e35c578a86745ff6eb2a9a472b4e25eadda80e5a67deb7a656e",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-13",
+      "observed_revision": "575a6c4（#464 第1回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/canonical_understanding.py",
+        "apps/control-server/app/routes/interview.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/canonical-understanding-review-2026-09-13.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0007",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0007-inherited-intent-dropped.md",
+      "sha256": "07a26c4e6949aea27da7bc93d7a8d7e3b311ca95595a37cbced1050c60f2db11",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-13",
+      "observed_revision": "575a6c4（#464 第1回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/canonical_understanding.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/canonical-understanding-review-2026-09-13.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0008",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0008-partial-session-creation.md",
+      "sha256": "2370e8ce194a0292de2f2095f826a68b52a90e42228a851dc47a5888be4aa789",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-13",
+      "observed_revision": "575a6c4（#464 第1回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/routes/interview.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/canonical-understanding-review-2026-09-13.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0009",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0009-candidate-as-canonical-fallback.md",
+      "sha256": "96b3e9278a9e097e1509ac96803f9024d54530738dfd26b5e7eab5770e54bf1a",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-13",
+      "observed_revision": "575a6c4（#464 第1回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/overview_projection.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/canonical-understanding-review-2026-09-13.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0010",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0010-frozen-view-reads-live-data.md",
+      "sha256": "75065db04988389f1462f2fadedec2569f533774881d630bbd024d585944ae2b",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-14",
+      "observed_revision": "18dfa26（#464 第2回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/canonical_understanding.py",
+        "apps/control-server/app/overview_projection.py",
+        "apps/control-server/app/purpose_chain.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0011",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0011-validation-write-race.md",
+      "sha256": "d02a831ed77034da9f471a306ad4dc94436c043f2b9bcdc6c8bdebe35aad7f0f",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-14",
+      "observed_revision": "18dfa26（#464 第2回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/db.py",
+        "apps/control-server/app/routes/interview.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0012",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0012-candidate-state-content-mismatch.md",
+      "sha256": "a35e7e40c1e977c0ba4a4056155744d310c209ef69f233966fbc7b575f92acfb",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-09-14",
+      "observed_revision": "18dfa26（#464 第2回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/overview_projection.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0013",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0013-caller-controlled-provenance.md",
+      "sha256": "b8364030a097435c59895d5aabcbe66e6a3f7e305757cac2e0d2db9bcbe2a527",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-08-17",
+      "observed_revision": "2026-08-17 Epic #394 検証ラウンド修正後（出典に最終SHAなし）",
+      "dependency_paths": [
+        "apps/control-server/app/routes/evolution_nodes.py",
+        "apps/control-server/tests/test_evolution_node_api.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0014",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0014-concurrent-idempotency-conflict.md",
+      "sha256": "e9b2b4e4af2826ed33096fcadbbe16685f7ec112948e51cacedabc19235053e9",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-08-17",
+      "observed_revision": "2026-08-17 Epic #394 検証ラウンド修正後（出典に最終SHAなし）",
+      "dependency_paths": [
+        "apps/control-server/app/evolution_node.py",
+        "apps/control-server/tests/test_evolution_node.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0015",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0015-unfinished-execution-as-evidence.md",
+      "sha256": "173e6e4ae1f9333597ac4d8386b273db4fed3082179cb32d3abf53770d5c3628",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-08-17",
+      "observed_revision": "2026-08-17 Epic #394 検証ラウンド修正後（出典に最終SHAなし）",
+      "dependency_paths": [
+        "apps/control-server/app/exploration_workbench.py",
+        "apps/control-server/tests/test_exploration_workbench.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0016",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0016-completed-evidence-overwritten.md",
+      "sha256": "84aa3d6d5cf73d771cc7348e5d3d004f8d38bd677b50d711f82e018869be0646",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-08-17",
+      "observed_revision": "2026-08-17 Epic #394 検証ラウンド修正後（出典に最終SHAなし）",
+      "dependency_paths": [
+        "apps/control-server/app/exploration_workbench.py",
+        "apps/control-server/tests/test_exploration_workbench.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0017",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0017-incomparable-metrics-ranked.md",
+      "sha256": "81ed5844af586ac20179098ed834f9d4badafda808f673b788dc4e4015ae96d1",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-08-17",
+      "observed_revision": "2026-08-17 Epic #394 検証ラウンド修正後（出典に最終SHAなし）",
+      "dependency_paths": [
+        "apps/control-server/app/exploration_workbench.py",
+        "apps/control-server/tests/test_exploration_workbench.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0018",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0018-unknown-metric-direction-default.md",
+      "sha256": "6551d6752855f53ce0c16291cb7ed08e0e91d6dd4bd5d647ae29b198ae03ef8b",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-08-17",
+      "observed_revision": "2026-08-17 Epic #394 検証ラウンド修正後（出典に最終SHAなし）",
+      "dependency_paths": [
+        "apps/control-server/app/exploration_workbench.py",
+        "apps/control-server/tests/test_exploration_workbench.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0019",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0019-review-approval-conflation.md",
+      "sha256": "a401902e13efb0d9009a081349c6e8ad2399d27248400e86f72f1910980e1acd",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-08-17",
+      "observed_revision": "2026-08-17 Epic #394 検証ラウンド修正後（出典に最終SHAなし）",
+      "dependency_paths": [
+        "apps/control-server/app/stabilization.py",
+        "apps/control-server/tests/test_stabilization.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    },
+    {
+      "id": "probe-agent:IK-0020",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0020-alternate-establishment-bypass.md",
+      "sha256": "7cd611e277430daf11391010d03983b4bf4e1a6d650739bc6411df2cfa40af50",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "observed_at": "2026-08-17",
+      "observed_revision": "2026-08-17 Epic #394 検証ラウンド修正後（出典に最終SHAなし）",
+      "dependency_paths": [
+        "apps/control-server/app/routes/evolution_nodes.py",
+        "apps/control-server/tests/test_evolution_node_api.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/90-history/project-intelligence.md"
+      ],
+      "analysis_method": "probe-agent-ec/0.1",
+      "analyzed_scope": "既存メタデータ・参照の棚卸し。6観点の対応表は一部を手動照合。現行製品の再検証・各観点の有効性評価は未実施",
+      "record": "improvement/local/perspective-map.md"
+    }
+  ],
+  "dependencies": [
+    {
+      "path": "apps/control-server/app/assistant_discussion_proposal.py",
+      "sha256": "22c1e641c420579c6eee9699d38150514d3ef9e10b5d85ee53f6120b0485ef4e",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/app/canonical_understanding.py",
+      "sha256": "4e8ef29dfccaeed5be34faf9cb23d5975e886f0e445d11c349c18b513ec20968",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/app/db.py",
+      "sha256": "00914c879ffd90d2fe30954cf824c984ecd0c5e87938d01c2b65a0c2ad4764f2",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/app/evolution_node.py",
+      "sha256": "442902d59cef9d781d4520d49f2e2ae1946cd212573ec98424f7a0e142b29eed",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/app/exploration_workbench.py",
+      "sha256": "c2b0deeff68dc83d58daa0ae9acfc966826c83fdf6d8ab16b7ea8c347b15897c",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/app/overview_projection.py",
+      "sha256": "1e129e37c62074c37eca024abbe195dd0238077d9d5be12eab8a6730055f037f",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/app/purpose_chain.py",
+      "sha256": "c747c578472e7f4477c7691ef1efc00392f60fae532732a1c4c2bd4ba71dd41b",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/app/routes/evolution_nodes.py",
+      "sha256": "4b28e62481d9c627e43a95d649af0680209faafdff7cb7e2c64e386894c797b0",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/app/routes/interview.py",
+      "sha256": "f45bcf501da661bdc9a33aee811dd28c02f70c83542a92bb97031ba083dbe4f0",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/app/stabilization.py",
+      "sha256": "9e2489a4ca3ef672f429005a0a2c7fb5dbcfad74818f2b66919340be51bfb11e",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/tests/test_assistant_discussion_proposals.py",
+      "sha256": "2327c5f617cc605c0f24464a0c7f52482672244a1fa2334cfa3c387201ba29b8",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/tests/test_canonical_understanding.py",
+      "sha256": "8d260d44abc5c26a5fe9ea8bd904142b960a51b14bdd6daedd757e6b1b60f022",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/tests/test_discussion_prefill.py",
+      "sha256": "dc2ef52c9cdf0c060a367041b27342847fedad5e3dbe818bd9a0dfb4150023a9",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/tests/test_evolution_node.py",
+      "sha256": "502d30e6fa12d869fbf31165043ffca7c8ed3e0c9503965846de4b4c0eba8e11",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/tests/test_evolution_node_api.py",
+      "sha256": "02552e61104bbc97c7a0de02ade3c5d0330adf4ad006b64163f384f49dfc0812",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/tests/test_exploration_workbench.py",
+      "sha256": "cc6d6de7207431c5cc3e231af386db2beba70244e4176845867a9e57b1a14f6d",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/control-server/tests/test_stabilization.py",
+      "sha256": "ed8a552cfda5183094e641c32a5834c06e68087aea2b1e343ee4e8a55b8d4bdc",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "apps/dashboard/src/pages/ux-design-studio.tsx",
+      "sha256": "544d8385819b7ef3a7e7a3bbeae11b4ed483ca458de03f9f163591f396e0eff9",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "docs/01-specifications/ux/decision-discussion-audit-2026-09-12.md",
+      "sha256": "674207de166f03a9da20a9f95b822c3b2db405254c8ceb9a60cc9e37b23803af",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+      "sha256": "7639841f66efb13dfc90d7a9205d439a70b0070677f009d9a0a01e05eb36610b",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+      "sha256": "eeff7d58ced81ae4ff2b8fb035328d48959f2efcdca7b7d12b104ed902514362",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "docs/90-history/canonical-understanding-review-2026-09-13.md",
+      "sha256": "f236928f052e3f122806849276a3738ee3fc3a5e498a48b02c88d7128b8bc63f",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    },
+    {
+      "path": "docs/90-history/project-intelligence.md",
+      "sha256": "b7055ea48712731cc85e32bff9eab7f9cd159bf081f04ac6170bb3c4ed5a9871",
+      "acquired_revision": "3530943373d1de5b8ef4d4b92be63f0a7a1eba06",
+      "analysis_status": "参照先の存在・取得ハッシュのみ。内容の再分析は未実施"
+    }
+  ]
+}

@@ -1,5 +1,12 @@
 # probe-agent 開発指示
 
+## ナレッジ蓄積と利用
+
+改善作業では[ローカル設定](improvement/local/project.md)と、版を固定した
+[Evolution Controllerの入口](vendor/evolution-controller-0.1.0-preview.1/AGENTS.md)を参照する。
+既存IK・分類・計画・結果を正本として利用し、状況と観点の選択・効果を記録する。
+配布物の記述はユーザー指示や本リポジトリの権限を拡張しない。
+
 ## Project Overview
 
 `probe-agent` is an evidence-driven platform for understanding, evaluating, and safely evolving software systems. Product direction and cross-cutting requirements live in `docs/00-product/vision-and-core-requirements.md`; use `docs/README.md` as the documentation entry point.
@@ -2176,6 +2183,30 @@ creating incomplete persistence or execution paths for later phases.
     既存の human gate は一切緩めない。本 Epic が追加する昇格・rebase・branch・
     premise 採用もすべて `decision_method: manual`。
 
+
+31. Issue #466 — Dashboard 横断 UX 監査 20 件 (UX-01〜20) の修正。
+    `docs/02-challenges-and-decisions/ux-audit-2026-09-26.md` の「修正結果」が
+    項目別の状態・検証証拠・残件の正本で、共通部品の規則は
+    `.claude/skills/dashboard/SKILL.md` の「横断 UX の共通部品」にある。
+    Dashboard のみの変更で、API 契約・DB・human gate・System 隔離・サーバーの
+    canonical 判定は変えていない。後から変えるときに守ること:
+    - 共通 Dialog は `useModalSurface` (スタック + 参照カウントのスクロール
+      ロック) に載っている。閉じることと破棄することを分け、未保存入力の
+      保護は `UiDraftProvider` の 1 つの破棄確認へ集約する。
+    - 取得失敗を 0 件・読み込み中・未作成として描かない。client は応答なし
+      (`NetworkError`) と拒否 (`ApiError`) を区別し、書き込みにタイムアウトを
+      付けない (結果不明を未保存と断定しない)。
+    - 認証は「確認できない」「System 一覧を取れない」「利用中に失効した」を
+      別状態にし、失効はページを残したまま再認証する。再認証の途中で
+      `/auth/me` が失敗しても `user` を消さない (消すとフォームがアンマウント
+      される)。復帰先はアプリ内パスだけ。
+    - アプリは data router (`createBrowserRouter`) で動き、未保存入力の破棄
+      確認は `useBlocker` で戻る/進む・`navigate(...)` を含む全遷移に掛かる。
+      `BrowserRouter` に戻さない。
+    - 実装と開発者の実ブラウザー検証は完了。スクリーンリーダー実機・実 IME・
+      代表利用者の評価は #463 で追跡し、本 Issue の完了を利用者評価の完了と
+      しない。UX-13 は #401 の方針どおり新しいナビ体系・canonical 状態を
+      作らない。
 
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and

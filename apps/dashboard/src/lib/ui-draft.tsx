@@ -31,6 +31,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { ApiError } from "@/api/client";
+import { UNSAFE_DataRouterContext, useBlocker } from "react-router-dom";
 
 export interface UiDraftFieldSnapshot {
   fieldName: string;
@@ -111,8 +112,63 @@ function registryKey(formId: string, targetRef: string): string {
   return `${formId}|${targetRef}`;
 }
 
+// Issue #466 review R2: 破棄の了承を「次の 1 回の遷移」にだけ有効にする。
+// 画面側が confirmDiscard() で了承を得てから navigate / setSearchParams を
+// 呼ぶ経路 (UX Design Studio の選択変更など) で、ルーターのブロッカーが同じ
+// 確認をもう一度出さないため。了承の直後に同期的に起きる遷移だけを通し、
+// 遷移が起きなければ次の tick で失効する (後の無関係な遷移を素通りさせない)。
+function createDiscardBypass() {
+  let armed = false;
+  return {
+    arm() {
+      armed = true;
+      setTimeout(() => { armed = false; }, 0);
+    },
+    consume(): boolean {
+      if (!armed) return false;
+      armed = false;
+      return true;
+    },
+  };
+}
+
+const DISCARD_PROMPT = "保存していない入力があります。破棄して移動しますか?";
+
+/**
+ * Issue #466 review R2: アプリ内の遷移を種類 (PUSH / REPLACE / POP) を問わず
+ * 未保存入力の破棄確認に通す。アンカーのクリックだけを見ていると、ブラウザーの
+ * 戻る/進む (SPA 内では beforeunload が起きない) と `navigate(...)` による
+ * 遷移が素通りして、ページのローカル state が失われる。
+ *
+ * `useBlocker` は data router (createBrowserRouter) の中でしか使えないので、
+ * そのときだけこのコンポーネントを描く。キャンセルでは URL も入力もそのまま、
+ * 了承したときだけ遷移する。
+ */
+function RouterDiscardBlocker({ api, bypass }: {
+  api: UiDraftApi;
+  bypass: ReturnType<typeof createDiscardBypass>;
+}) {
+  const blocker = useBlocker(({ currentLocation, nextLocation }) => {
+    // ハッシュだけの変化は同じ画面内の移動なので止めない。
+    if (currentLocation.pathname === nextLocation.pathname && currentLocation.search === nextLocation.search) {
+      return false;
+    }
+    if (!api.hasUnsavedWork?.()) return false;
+    if (bypass.consume()) return false;
+    return true;
+  });
+  useEffect(() => {
+    if (blocker.state !== "blocked") return;
+    if (window.confirm(DISCARD_PROMPT)) blocker.proceed();
+    else blocker.reset();
+  }, [blocker]);
+  return null;
+}
+
 export function UiDraftProvider({ children }: { children: ReactNode }) {
   const registry = useRef(new Map<string, UiDraftGetter>());
+  const bypass = useMemo(() => createDiscardBypass(), []);
+  const inDataRouter = useContext(UNSAFE_DataRouterContext) != null;
   const api = useMemo<UiDraftApi>(
     () => ({
       hasUnsavedWork() {
@@ -125,7 +181,11 @@ export function UiDraftProvider({ children }: { children: ReactNode }) {
         return false;
       },
       confirmDiscard() {
-        return !this.hasUnsavedWork?.() || window.confirm("保存していない入力があります。破棄して選択を変更しますか?");
+        if (!this.hasUnsavedWork?.()) return true;
+        const ok = window.confirm("保存していない入力があります。破棄して選択を変更しますか?");
+        // 了承した直後の遷移でルーターのブロッカーが二度目の確認を出さない。
+        if (ok) bypass.arm();
+        return ok;
       },
       register(formId, targetRef, getDraft) {
         if (!targetRef) {
@@ -185,12 +245,18 @@ export function UiDraftProvider({ children }: { children: ReactNode }) {
         return snapshot === null ? { outcome: "absent" } : { outcome: "readable", snapshot };
       },
     }),
-    [],
+    [bypass],
   );
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (api.hasUnsavedWork?.()) { event.preventDefault(); event.returnValue = ""; }
     };
+    // data router の中ではアプリ内遷移をすべて RouterDiscardBlocker が扱う。
+    // アンカーのクリックでも確認すると 1 回の遷移で確認が 2 回出る。
+    if (inDataRouter) {
+      window.addEventListener("beforeunload", beforeUnload);
+      return () => window.removeEventListener("beforeunload", beforeUnload);
+    }
     const click = (event: MouseEvent) => {
       const anchor = event.target instanceof Element ? event.target.closest("a[href]") : null;
       if (!(anchor instanceof HTMLAnchorElement) || anchor.target === "_blank" || event.metaKey || event.ctrlKey) return;
@@ -201,8 +267,13 @@ export function UiDraftProvider({ children }: { children: ReactNode }) {
     window.addEventListener("beforeunload", beforeUnload);
     document.addEventListener("click", click, true);
     return () => { window.removeEventListener("beforeunload", beforeUnload); document.removeEventListener("click", click, true); };
-  }, [api]);
-  return <UiDraftContext.Provider value={api}>{children}</UiDraftContext.Provider>;
+  }, [api, inDataRouter]);
+  return (
+    <UiDraftContext.Provider value={api}>
+      {inDataRouter && <RouterDiscardBlocker api={api} bypass={bypass} />}
+      {children}
+    </UiDraftContext.Provider>
+  );
 }
 
 export function useUiDraftRegistry(): UiDraftApi | null {
@@ -239,6 +310,33 @@ export function useUiDraftSource(
     if (!api) return;
     return api.register(formId, targetRef, () => getterRef.current());
   }, [api, formId, targetRef]);
+}
+
+/**
+ * Issue #466 (UX-03): 画面ローカルな未保存入力を、アプリ共通の破棄確認
+ * (System 切替・ログアウト・アプリ内リンク・ページ離脱) に参加させる。
+ *
+ * 破棄確認を画面ごとに別実装すると、同じ操作で確認が 2 回出たり、片方だけ
+ * 確認が出なかったりする。ここでは `UiDraftProvider` のレジストリへ「内容を
+ * 持たない dirty 申告」だけを登録する。field の値は登録しない — この登録は
+ * 破棄確認のためだけのもので、アシスタントが読む下書き (adapter の form spec
+ * に一致する formId) ではない。
+ *
+ * `guardId` は画面内で一意にし、所属 (System 等) を含める。
+ */
+export function useUnsavedChangesGuard(guardId: string, dirty: boolean): void {
+  useUiDraftSource(`unsaved-changes:${guardId}`, guardId, () =>
+    dirty
+      ? {
+        hasUnsavedChanges: true,
+        fields: [],
+        selectedItemRef: "",
+        activeTab: "",
+        comparisonTarget: "",
+        localRevisionToken: "dirty",
+      }
+      : null,
+  );
 }
 
 // --- useFormValidation (Issue #451) ------------------------------------------

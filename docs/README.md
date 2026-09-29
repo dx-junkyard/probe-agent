@@ -14,6 +14,9 @@ Vision / Stakeholder Value
 最初に「なぜ・誰のために・どの状態を目指すか」を読み、その後に「どんな体験と
 能力で実現するか」、必要な場合だけ詳細な契約・検証記録・履歴へ進む。
 
+[Evolution Controller接続設定](../improvement/local/project.md): 既存事例を状況に応じて利用するための手動運用。
+[導入検証](03-validation/improvement-cycle/2026-09-21-evolution-controller.md)を参照。
+
 ## 最初に読む文書
 
 1. [Vision・UX・コア機能要件](00-product/vision-and-core-requirements.md)
@@ -106,6 +109,7 @@ canonical contract を確認する。
 | [Purpose Chain Dogfooding](03-validation/dogfooding-purpose-chain.md) | Purpose Chain の理解度検証プロトコルと結果 |
 | [System Understanding Scenario](03-validation/dogfooding-system-understanding-scenario.md) | end-to-end 導線の再現可能な検証シナリオ |
 | [改善サイクル導入の検証](03-validation/improvement-cycle/2026-09-19-knowledge-bootstrap.md) | ナレッジ・索引・手順の導入結果。以後の改善結果も同ディレクトリへ置く |
+| [導入前の知識の移入検証](03-validation/improvement-cycle/2026-09-21-historical-knowledge.md) | 過去の修正16件の分類、根拠、収録範囲と未収録事項 |
 | [共同検討UXの検証・引継ぎ](03-validation/decision-discussion-handoff.md) | 操作Mock、Issue分担、実装時の検証シナリオと未検証範囲 |
 
 ## 04-operations — 運用ガイド

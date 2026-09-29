@@ -1,4 +1,6 @@
 import { useMemo, useState } from "react";
+import { EMPTY_SETUP_PROGRESS, loadSetupProgress, saveSetupProgress, setupProgressKey, type SetupProgress } from "@/lib/setup-progress";
+import { buttonVariants } from "@/components/ui/button";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   Activity, AlertTriangle, CheckCircle2, FileDiff, LifeBuoy, RadioTower,
@@ -13,7 +15,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CodeBlock } from "@/components/code-block";
 import { getClientServerUrl } from "@/lib/env";
 import { formatTimestamp } from "@/lib/utils";
-import { resolveSetupStep } from "@/components/setup-next-step";
+import { resolveSetupStep, SETUP_ANCHORS, type SetupStepCta } from "@/components/setup-next-step";
 import {
   FRESHNESS_LABELS,
   FreshnessBadge,
@@ -23,6 +25,10 @@ import {
 
 // 実行形態は明示的な有限集合。開発者は自分に近いパターンを選ぶ。
 type RuntimePattern = "host" | "compose" | "image" | "external";
+
+function isRuntimePattern(value: string | null): value is RuntimePattern {
+  return value === "host" || value === "compose" || value === "image" || value === "external";
+}
 
 const PATTERN_LABELS: Record<RuntimePattern, string> = {
   host: "ホストで直接実行",
@@ -168,8 +174,42 @@ function NextStepCard() {
         <p className="text-xs text-muted-foreground" data-testid="setup-next-step-completion">
           完了条件: {step.completion}
         </p>
+        <NextStepCta cta={step.cta} />
       </CardContent>
     </Card>
+  );
+}
+
+/** ページ内のセクションを開き (折りたたみなら展開し)、見出しへフォーカスする。 */
+function openSetupSection(anchorId: string) {
+  const target = document.getElementById(anchorId);
+  if (!target) return;
+  let node: HTMLElement | null = target;
+  while (node) {
+    if (node instanceof HTMLDetailsElement) node.open = true;
+    node = node.parentElement;
+  }
+  target.scrollIntoView?.({ behavior: "smooth", block: "start" });
+  const focusTarget = target instanceof HTMLDetailsElement
+    ? target.querySelector<HTMLElement>("summary") ?? target
+    : target;
+  focusTarget.focus({ preventScroll: true });
+}
+
+// Issue #466 (UX-11): 次の操作を行う場所へつなぐ 1 つの CTA。遷移するだけで、
+// 何かを実行しない。
+function NextStepCta({ cta }: { cta: SetupStepCta }) {
+  if (cta.kind === "route") {
+    return (
+      <Link to={cta.to} className={buttonVariants({ size: "sm" })} data-testid="setup-next-step-cta">
+        {cta.label}
+      </Link>
+    );
+  }
+  return (
+    <Button size="sm" onClick={() => openSetupSection(cta.anchorId)} data-testid="setup-next-step-cta">
+      {cta.label}
+    </Button>
   );
 }
 
@@ -267,16 +307,38 @@ function ConnectivityStatusCard() {
   );
 }
 
-function RuntimeChecklist({ pattern }: { pattern: RuntimePattern }) {
-  const [checked, setChecked] = useState<Record<string, boolean>>({});
+function RuntimeChecklist({ pattern, checked, onToggle }: {
+  pattern: RuntimePattern;
+  checked: Record<string, boolean>;
+  onToggle: (key: string, value: boolean) => void;
+}) {
   const items = PATTERN_CHECKLISTS[pattern];
   const complete = items.filter(item => checked[`${pattern}:${item}`]).length;
+  // UX-19: 手動の記録と、サーバーが確認した接続状態を別々に示す。
+  const { data: connectivity, isError: connectivityError } = useConnectivityStatus(15_000);
   return (
     <div className="mt-4 rounded-md border p-3" data-testid={`runtime-checklist-${pattern}`}>
       <div className="mb-2 flex items-center justify-between gap-2">
         <p className="text-sm font-medium">{PATTERN_LABELS[pattern]}の完了チェック</p>
-        <Badge variant={complete === items.length ? "success" : "secondary"}>{complete} / {items.length}</Badge>
+        <Badge variant="outline" data-testid="runtime-checklist-manual-count">
+          手動確認 {complete} / {items.length}
+        </Badge>
       </div>
+      <p className="mb-2 text-xs text-muted-foreground">
+        このチェックはあなた自身の作業記録です(このブラウザーに System ごとに保存されます)。
+        接続できているかどうかは、サーバーが確認した次の接続ステータスで判断してください。
+      </p>
+      <p className="mb-2 flex items-center gap-2 text-xs" data-testid="runtime-checklist-server-status">
+        <span className="text-muted-foreground">サーバーが確認した接続状態:</span>
+        {connectivity ? (
+          <>
+            <span className="font-medium">{FRESHNESS_LABELS[connectivity.freshness]}</span>
+            <FreshnessBadge freshness={connectivity.freshness} />
+          </>
+        ) : (
+          <span>{connectivityError ? "取得できませんでした" : "確認中…"}</span>
+        )}
+      </p>
       <ul className="space-y-2">
         {items.map(item => {
           const key = `${pattern}:${item}`;
@@ -286,7 +348,7 @@ function RuntimeChecklist({ pattern }: { pattern: RuntimePattern }) {
                 <input
                   type="checkbox"
                   checked={!!checked[key]}
-                  onChange={event => setChecked(current => ({ ...current, [key]: event.target.checked }))}
+                  onChange={event => onToggle(key, event.target.checked)}
                   className="mt-0.5"
                 />
                 <span>{item}</span>
@@ -339,8 +401,29 @@ export default function SetupGuidePage() {
   const [searchParams] = useSearchParams();
   const sessionParam = Number(searchParams.get("session"));
   const sessionId = Number.isFinite(sessionParam) && sessionParam > 0 ? sessionParam : null;
-  const { systemId } = useAuth();
-  const [pattern, setPattern] = useState<RuntimePattern>("compose");
+  const { systemId, user } = useAuth();
+  // UX-19: 実行形態と手動チェックは利用者 × System ごとに保存し、再訪で復元する。
+  // System を切り替えたら、その System の進捗を読み直す (render 中の state 調整)。
+  const progressKey = setupProgressKey(user?.id, systemId);
+  const [progressState, setProgressState] = useState<{ key: string | null; progress: SetupProgress }>(
+    () => ({ key: progressKey, progress: loadSetupProgress(progressKey) }),
+  );
+  if (progressState.key !== progressKey) {
+    setProgressState({ key: progressKey, progress: loadSetupProgress(progressKey) });
+  }
+  const progress = progressState.key === progressKey ? progressState.progress : EMPTY_SETUP_PROGRESS;
+  const pattern: RuntimePattern = isRuntimePattern(progress.pattern) ? progress.pattern : "compose";
+  const updateProgress = (next: SetupProgress) => {
+    setProgressState({ key: progressKey, progress: next });
+    saveSetupProgress(progressKey, next);
+  };
+  const setPattern = (next: RuntimePattern) => updateProgress({ ...progress, pattern: next });
+  const toggleChecked = (key: string, value: boolean) => {
+    const checked = { ...progress.checked };
+    if (value) checked[key] = true;
+    else delete checked[key];
+    updateProgress({ ...progress, checked });
+  };
 
   const serverUrl = getClientServerUrl();
 
@@ -462,7 +545,7 @@ git commit`}</CodeBlock>
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id={SETUP_ANCHORS.runtimePatterns} tabIndex={-1} className="scroll-mt-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
         <CardHeader>
           <CardTitle className="text-sm flex items-center gap-2">
             <RadioTower className="h-4 w-4" /> 実行形態を選ぶ
@@ -549,7 +632,7 @@ curl -sS "$PROBE_SERVER_URL/health"   # => {"ok":true}`}</CodeBlock>
               </p>
             </TabsContent>
           </Tabs>
-          <RuntimeChecklist pattern={pattern} />
+          <RuntimeChecklist pattern={pattern} checked={progress.checked} onToggle={toggleChecked} />
         </CardContent>
       </Card>
 
@@ -587,7 +670,7 @@ curl -sS "$PROBE_SERVER_URL/health"   # => {"ok":true}`}</CodeBlock>
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id={SETUP_ANCHORS.connectivityChecks} tabIndex={-1} className="scroll-mt-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
         <CardHeader>
           <CardTitle className="text-sm flex items-center gap-2">
             <Activity className="h-4 w-4" /> 疎通確認
@@ -623,7 +706,7 @@ curl -sS "$PROBE_SERVER_URL/health"
         </CardContent>
       </Card>
 
-      <details data-testid="setup-troubleshooting-disclosure">
+      <details id={SETUP_ANCHORS.troubleshooting} data-testid="setup-troubleshooting-disclosure">
         <summary className="cursor-pointer rounded-md border px-3 py-2 text-sm font-medium">
           届かないときのトラブルシューティング
         </summary>

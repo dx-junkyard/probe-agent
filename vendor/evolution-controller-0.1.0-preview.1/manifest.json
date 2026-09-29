@@ -1,0 +1,34 @@
+{
+  "release_id": "evolution-controller-0.1.0-preview.1",
+  "version": "0.1.0-preview.1",
+  "status": "preview",
+  "created_date": "2026-09-20",
+  "source_snapshot_sha256": "6378cd3a28113c234e088f7ccc9506bb28ce840482f147ae107e70534c3d2bc8",
+  "source_identity": "allowlisted working-tree content; not identified by git HEAD",
+  "components": {
+    "situation": "0.1",
+    "roles": "0.1",
+    "perspectives": "0.1",
+    "workflow": "0.1"
+  },
+  "compatibility": "new side-by-side installations; no automatic migration",
+  "evidence_status": "candidate; operational effectiveness not established",
+  "files": {
+    "AGENTS.md": "9919e49be0938e27b5ed0961b9c4675bfc2a4ca00dca0cc0f8c8ee5ba1d0b295",
+    "CHANGELOG.md": "30d69cb893789ebbbe43418b29bc3654b8dd3e8dd9d5cff5b50d12870f912f71",
+    "COMPATIBILITY.md": "5f40828312db51f9b8af7363df4b87a80fab5f5efe3fa7561f16c694e8524dc1",
+    "NOTICE.md": "17e4dfc6310d7e13132111624c64ff91ff2aec59eb54a5065bace178ef4c9897",
+    "PROVENANCE.md": "31e3751ec96b289b0af00fd0bd6eee9765dba3d6d76ed75032b52939959d4d32",
+    "README.md": "daf071a1419593f4ed329fb06c9e95cb692329727f9f4dc63adcc23ba0497f0b",
+    "examples/pipeline.md": "80d412ebe32c6618ed62c74ddc37e8cbd5b66f9dbb0c17cd86f02e24dd1fb63b",
+    "knowledge/perspectives.md": "08e3925e0a18a6a6ca7238878d77d54821c31152e37431c81fbdce9388ad11a6",
+    "self-improvement.md": "c148dec03408dfa472ddf8a86940a63915c24a5bef4bf8ceab73b95944bbc9df",
+    "situation-model.md": "0d1006489ea22811b8b8bc7201a00044e4c6ae53912908b90df78b41409ec06b",
+    "templates/cycle.md": "823d01287fd0ab2f5be08f0028743024bcef635dc48d7efa414e740295f961c4",
+    "templates/guidance-feedback.md": "e626e8b0bfd3f36e51c6bdded35b9f57d90941e7ff46573da5692590937a3a00",
+    "templates/pattern.md": "32a31cbe251cc28db8119f8ef0d8a3c9476ecef1a249d209543f99bd8027b183",
+    "templates/project.md": "50f3033f1605858012fa1bb6593a2d7b19f050d97d9fd2b69332c892135829d8",
+    "templates/situation.md": "885d94c082ca498a36aeb6fce767dbe60af699e1f180060f38045222ce70559b",
+    "workflow.md": "6d91acdcf1595ed51910ff9e5e27461c7eec5dd12db9a134d528fb6d5dc5331f"
+  }
+}

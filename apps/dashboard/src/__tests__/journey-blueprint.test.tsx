@@ -123,10 +123,13 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("Journey Service Blueprint の表示", () => {
-  test("Journey 未選択のときは案内文のみ表示する", async () => {
+  test("Journey が 0 件のときは選択ではなく作成へ誘導する (Issue #466 UX-12)", async () => {
     mockGet({ "/ux-design/journeys": journeyListOut([]) });
     await renderPage();
-    expect(await screen.findByTestId("blueprint-no-journey")).toBeInTheDocument();
+    expect(await screen.findByTestId("blueprint-no-journeys")).toBeInTheDocument();
+    // 選べない状態で「選択してください」を主案内にしない。
+    expect(screen.queryByTestId("blueprint-no-journey")).not.toBeInTheDocument();
+    expect(screen.getByTestId("blueprint-create-journey")).toHaveAttribute("href", "/ux-design-studio?tab=journeys");
   });
 
   test("Journey を選ぶと 9 レーン全てが表示される", async () => {

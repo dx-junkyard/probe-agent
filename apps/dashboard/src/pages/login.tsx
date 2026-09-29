@@ -1,5 +1,7 @@
 import { useState } from "react";
-import { useNavigate, Navigate } from "react-router-dom";
+import { useNavigate, Navigate, useSearchParams } from "react-router-dom";
+import { RETURN_TO_PARAM, safeReturnPath } from "@/lib/return-to";
+import { AuthBootstrapError, AuthLoadingScreen } from "@/components/layout/auth-recovery";
 import { useAuth } from "@/api/auth";
 import { useBootstrapStatus } from "@/api/hooks";
 import { Button } from "@/components/ui/button";
@@ -8,8 +10,11 @@ import { Label } from "@/components/ui/label";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 
 export default function LoginPage() {
-  const { user, login, loading } = useAuth();
+  const { user, login, loading, authError, retryBootstrap } = useAuth();
   const navigate = useNavigate();
+  // Issue #466 (UX-09): ログイン後は共有リンクの目的地へ戻す (アプリ内のみ)。
+  const [searchParams] = useSearchParams();
+  const returnTo = safeReturnPath(searchParams.get(RETURN_TO_PARAM)) ?? "/";
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   // Issue #265: "phase 0" -- before any admin user exists there is no
@@ -20,8 +25,13 @@ export default function LoginPage() {
   // /auth/bootstrap-status`).
   const { data: bootstrap, isLoading: bootstrapLoading } = useBootstrapStatus();
 
-  if (loading) return null;
-  if (user) return <Navigate to="/" replace />;
+  if (loading) return <AuthLoadingScreen />;
+  // Issue #466 (UX-06): サーバーに到達できないときにログインフォームを出すと、
+  // 正しい資格情報でも失敗して「パスワード違い」と誤解させる。
+  if (!user && authError) {
+    return <AuthBootstrapError message={authError} onRetry={() => retryBootstrap?.()} />;
+  }
+  if (user) return <Navigate to={returnTo} replace />;
 
   const showBootstrapGuide = !bootstrapLoading && bootstrap?.admin_exists === false;
 
@@ -32,7 +42,7 @@ export default function LoginPage() {
     const fd = new FormData(e.currentTarget);
     try {
       await login(fd.get("username") as string, fd.get("password") as string);
-      navigate("/", { replace: true });
+      navigate(returnTo, { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
@@ -89,6 +99,11 @@ export default function LoginPage() {
             </div>
           ) : (
             <form onSubmit={handleSubmit} className="space-y-4">
+              {returnTo !== "/" && (
+                <p className="rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground" data-testid="login-return-to">
+                  ログイン後、開こうとしていた画面(<code className="break-all">{returnTo}</code>)へ戻ります。
+                </p>
+              )}
               {error && (
                 <div className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
                   {error}

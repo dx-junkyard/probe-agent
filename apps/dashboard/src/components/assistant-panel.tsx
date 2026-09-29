@@ -6,7 +6,6 @@ import {
 } from "@/api/hooks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { DiagnosticSeverityIcon } from "@/components/diagnostics-badge";
 import {
   AssistantVoice,
@@ -22,7 +21,9 @@ import type {
   SystemStateItem,
 } from "@/api/types";
 import { systemStateTarget } from "@/components/system-state";
-import { useModalSurface } from "@/lib/modal-surface";
+import { openModalSurfaceCount, useModalSurface } from "@/lib/modal-surface";
+import { ASSISTANT_SIDE_BY_SIDE_QUERY, useMediaQuery } from "@/lib/use-media-query";
+import { Textarea } from "@/components/ui/textarea";
 import { useHelpMode } from "@/lib/help-mode";
 import { voicePrerequisite, VOICE_ERROR_MESSAGES, type VoiceErrorReason } from "@/lib/voice-adapter";
 import {
@@ -365,7 +366,26 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   const [threads, setThreads] = useState<Record<string, ChatMessage[]>>({});
   const listRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
-  useModalSurface({ open, onClose: () => setOpen(false), panelRef });
+  // Issue #466 (UX-17): 広い画面では本文と並ぶ非モーダルなパネルにする。
+  // 回答を読みながらフォームを編集するために開閉を繰り返さなくてよいように。
+  // 狭い画面では従来どおり本文を覆うモーダル (背景・Escape・フォーカス
+  // トラップ)。幅が変わって切り替わっても、会話・対象・入力中の質問は
+  // このコンポーネントの state なので失われない。
+  const sideBySide = useMediaQuery(ASSISTANT_SIDE_BY_SIDE_QUERY);
+  useModalSurface({ open: open && !sideBySide, onClose: () => setOpen(false), panelRef });
+  const questionRef = useRef<HTMLTextAreaElement>(null);
+  // 並べて表示するときも、開いた直後は質問欄へフォーカスを移す (キーボード
+  // 利用者がパネルを探し直さなくてよいように)。トラップはしない。
+  const sideOpenedRef = useRef(false);
+  useEffect(() => {
+    if (open && sideBySide && !sideOpenedRef.current) questionRef.current?.focus();
+    sideOpenedRef.current = open && sideBySide;
+  }, [open, sideBySide]);
+  // Issue #466 (UX-16): 読み上げ向けの通知。会話一覧そのものをライブ領域に
+  // すると、履歴を読み込んだ瞬間に全件が読み上げられる。新しく起きたこと
+  // (処理中・回答到着・失敗) だけをここで伝える。
+  const [liveStatus, setLiveStatus] = useState("");
+  const [liveAlert, setLiveAlert] = useState("");
 
   // --- Issue #441: turn-based voice mode ------------------------------------
   // `voicePrerequisite()` reads only static browser/context capabilities
@@ -512,8 +532,22 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
   // itself. That is the safe migration path, and it is also what every
   // non-discussion screen keeps permanently.
   const activeThread = view.threadId !== null ? threadDetail?.thread ?? null : null;
-  const useLegacyConversation = !discussionEnabled || activeThread === null;
-  const messages = useLegacyConversation ? (threads[screenId] ?? []) : view.messages;
+  // Issue #466 (UX-07): 永続スレッドの初回解決中に送った発言は、解決後に
+  // 表示元が永続履歴へ切り替わった瞬間に消えていた (一時会話からの移行が
+  // 無い)。そこで 2 つの規則を置く:
+  //   1. 解決中は送信を待たせる (`threadResolving`)。状態を文章で示す。
+  //   2. 解決に失敗して一時会話で話し始めた対象は、その後スレッドが解決
+  //      しても一時会話のまま保つ (`legacyPinned`)。表示元を黙って切り替え
+  //      ない。保存されない会話であることは画面に明示する。
+  // 一時会話の保存先は対象ごとに分ける (画面ごとだと、同じ画面の別対象の
+  // 会話が混ざる)。
+  const threadResolving = discussionEnabled && !!activeTarget && threadQuery.isLoading && !threadDetail;
+  const threadFailed = discussionEnabled && !!activeTarget && threadQuery.isError && !threadDetail;
+  const legacyKey = discussionEnabled && activeTargetKey ? `target:${activeTargetKey}` : screenId;
+  const [legacyPinned, setLegacyPinned] = useState<Record<string, true>>({});
+  const useLegacyConversation = !discussionEnabled || activeThread === null || !!legacyPinned[legacyKey];
+  const messages = useLegacyConversation ? (threads[legacyKey] ?? []) : view.messages;
+  const unsavedConversation = discussionEnabled && useLegacyConversation && (threadFailed || !!legacyPinned[legacyKey]);
   // `null` while the thread is unavailable: 「まだ分からない」 is not
   // 「current」 (#366), so no banner and no recheck claim in that case.
   const targetState: DiscussionTargetState | null = useLegacyConversation
@@ -579,13 +613,27 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     ? `What should I do about: ${focusedStateItem.summary}`
     : null;
 
+  // UX-20: 入力内容に合わせて高さを伸ばす (上限は CSS の max-h)。
+  const resizeQuestion = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  };
+  // 外部から入力が差し込まれた場合 (提案文の下書き等) も高さを合わせる。
+  useEffect(() => {
+    resizeQuestion(questionRef.current);
+  }, [question, open]);
+
   // One append, two stores: the persisted thread's local mirror when a
   // thread is driving this conversation, the legacy per-screen map
   // otherwise. Writing to both would show the same turn twice the moment a
   // thread resolves mid-conversation.
   const appendMessages = (msgs: ChatMessage[]) => {
     if (useLegacyConversation) {
-      setThreads((prev) => ({ ...prev, [screenId]: [...(prev[screenId] ?? []), ...msgs] }));
+      setThreads((prev) => ({ ...prev, [legacyKey]: [...(prev[legacyKey] ?? []), ...msgs] }));
+      if (discussionEnabled && activeTargetKey && !legacyPinned[legacyKey]) {
+        setLegacyPinned((prev) => ({ ...prev, [legacyKey]: true }));
+      }
     } else {
       setMirror((prev) => prev.targetKey === activeTargetKey
         ? ({ ...prev, messages: [...prev.messages, ...msgs] }) : prev);
@@ -616,7 +664,9 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     voiceContext?: AssistantVoiceTurnContext,
   ): Promise<string | AssistantVoiceReply | null> => {
     const trimmed = q.trim();
-    if (!trimmed || ask.isPending) return null;
+    // UX-07: 永続スレッドの初回解決中は送らない (送った発言が解決後に消える)。
+    // 入力欄の内容は消さずに残す。
+    if (!trimmed || ask.isPending || (!voiceTurn && threadResolving)) return null;
     setQuestion("");
     // The target this turn is about is captured HERE (or, for voice, was
     // already captured at listening-start and handed in) and used for the
@@ -634,6 +684,8 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     // utterance, not a gap in the request itself (`turnThread` above is what
     // decides what actually gets asked and persisted server-side).
     appendMessages([{ role: "user", text: trimmed }]);
+    setLiveAlert("");
+    setLiveStatus("回答を作成しています。");
     try {
       // Keep a bounded multi-turn discussion context. The current question is
       // sent separately, so only turns that existed before this submit belong
@@ -699,6 +751,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         result.recheck_required = true;
       }
       appendMessages([{ role: "assistant", text: result.answer, result }]);
+      setLiveStatus(`回答が届きました。${result.answer.slice(0, 240)}${result.answer.length > 240 ? "…(続きは会話欄)" : ""}`);
       // The answer re-pins the thread to the content it was actually
       // produced against, so a resolved recheck stops being advertised.
       if (turnThread && result.target_state) {
@@ -719,6 +772,8 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
       // not help); anything else is shown as a possibly-transient failure
       // with a retry that resends the SAME question text.
       const classified = classifyDiscussionError(err);
+      setLiveStatus("");
+      setLiveAlert(`回答を取得できませんでした。${classified.message}`);
       appendMessages([{
         role: "error",
         text: classified.message,
@@ -789,25 +844,46 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
 
   return (
     <>
-      {/* 開いているパネルは本文の上に重なるモーダルな面。とくに 390px 幅では
-          画面全体を覆うので、閉じる手段が右上のボタン 1 つだけだと逃げ場が
-          無くなる。背景クリック・Escape・フォーカストラップは、サイドバー
-          Drawer (#362) と同じ `useModalSurface` の規則で揃える。 */}
-      <div
-        className="fixed inset-0 z-40 bg-black/40"
-        onClick={() => setOpen(false)}
-        aria-hidden="true"
-        data-testid="assistant-backdrop"
-      />
+      {/* 開いているパネルは、狭い画面では本文の上に重なるモーダルな面。
+          とくに 390px 幅では画面全体を覆うので、閉じる手段が右上のボタン
+          1 つだけだと逃げ場が無くなる。背景クリック・Escape・フォーカス
+          トラップは、サイドバー Drawer (#362) と同じ `useModalSurface` の
+          規則で揃える。広い画面 (UX-17) では本文と並ぶ列になり、背景も
+          トラップも持たない。 */}
+      {!sideBySide && (
+        <div
+          className="fixed inset-0 z-40 bg-black/40"
+          onClick={() => setOpen(false)}
+          aria-hidden="true"
+          data-testid="assistant-backdrop"
+        />
+      )}
       <div
         ref={panelRef}
         tabIndex={-1}
-        role="dialog"
-        aria-modal="true"
+        role={sideBySide ? "complementary" : "dialog"}
+        aria-modal={sideBySide ? undefined : "true"}
         aria-label="画面アシスタント"
-        className="fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col border-l bg-background shadow-xl focus-visible:outline-none"
+        data-layout={sideBySide ? "side" : "overlay"}
+        onKeyDown={sideBySide ? (event) => {
+          // 並べて表示しているときの Escape は、フォーカスがパネル内にあり、
+          // その上に開いた面 (Dialog) が無いときだけ閉じる。
+          if (event.key === "Escape" && !event.nativeEvent.isComposing && openModalSurfaceCount() === 0) {
+            event.preventDefault();
+            setOpen(false);
+          }
+        } : undefined}
+        className={sideBySide
+          ? "relative flex h-full w-[26rem] shrink-0 flex-col border-l bg-background focus-visible:outline-none"
+          : "fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col border-l bg-background shadow-xl focus-visible:outline-none"}
         data-testid="assistant-panel"
       >
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true" data-testid="assistant-live-status">
+        {liveStatus}
+      </div>
+      <div className="sr-only" role="alert" aria-atomic="true" data-testid="assistant-live-alert">
+        {liveAlert}
+      </div>
       <div className="flex items-start justify-between gap-2 border-b p-4">
         <div className="flex items-start gap-2 min-w-0">
           <Bot className="h-5 w-5 mt-0.5 shrink-0" />
@@ -842,6 +918,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             size="icon"
             onClick={() => setOpen(false)}
             title="Close assistant"
+            aria-label="アシスタントを閉じる"
             data-testid="assistant-close"
           >
             <X className="h-4 w-4" />
@@ -939,6 +1016,8 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           onExit={() => setVoiceActive(false)}
           scopeLabel={voiceScopeLabel}
           conversationKey={activeTargetKey ?? `legacy:${screenId}`}
+          autoStart
+          continuousConversation
         />
       ) : (
         <>
@@ -1064,6 +1143,20 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             <Loader2 className="h-3.5 w-3.5 animate-spin" /> Thinking…
           </div>
         )}
+        {threadResolving && (
+          <p className="flex items-center gap-2 text-xs text-muted-foreground" data-testid="assistant-thread-resolving">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            会話履歴を読み込んでいます。読み込みが終わると送信できます(入力した内容は残ります)。
+          </p>
+        )}
+        {unsavedConversation && (
+          <p
+            className="rounded-md border border-amber-300 bg-amber-50 p-2 text-xs dark:border-amber-800 dark:bg-amber-950"
+            data-testid="assistant-thread-unsaved"
+          >
+            会話履歴を取得できなかったため、この会話は保存されません。画面を再読み込みすると消えます。
+          </p>
+        )}
 
       {/* Issue #452 (docs/01-specifications/capabilities/ai-discussion-adapter.md §3): the Proposal review
           region. Only for a specific entity/element target with a real
@@ -1090,28 +1183,55 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
       )}
 
       </div>
+      {/* Issue #466 (UX-20): 箇条書き・コード・複数条件を見渡せる、自動で
+          伸びる複数行入力。Enter で送信、Shift+Enter で改行。日本語 IME の
+          変換確定の Enter では送信しない。 */}
       <form
-        className="flex shrink-0 items-center gap-2 border-t p-3"
+        className="shrink-0 space-y-1 border-t p-3"
         onSubmit={(e) => {
           e.preventDefault();
           void submit(question);
         }}
       >
-        <Input
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          placeholder="この画面のデータ構造や目的について質問…"
-          data-testid="assistant-question-input"
-        />
-        <Button
-          type="submit"
-          size="icon"
-          disabled={ask.isPending || !question.trim()}
-          title="Send"
-          data-testid="assistant-send"
-        >
-          <Send className="h-4 w-4" />
-        </Button>
+        <label htmlFor="assistant-question" className="text-xs font-medium">
+          質問
+        </label>
+        <div className="flex items-end gap-2">
+          <Textarea
+            id="assistant-question"
+            ref={questionRef}
+            value={question}
+            rows={1}
+            onChange={(e) => {
+              setQuestion(e.target.value);
+              resizeQuestion(e.currentTarget);
+            }}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter" || e.shiftKey) return;
+              // IME 変換中 (isComposing / keyCode 229) の Enter は確定操作。
+              if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+              e.preventDefault();
+              void submit(question);
+            }}
+            aria-describedby="assistant-question-help"
+            placeholder="この画面のデータ構造や目的について質問…"
+            className="max-h-48 min-h-9 resize-none overflow-y-auto"
+            data-testid="assistant-question-input"
+          />
+          <Button
+            type="submit"
+            size="icon"
+            disabled={ask.isPending || !question.trim() || threadResolving}
+            title="Send"
+            aria-label="送信"
+            data-testid="assistant-send"
+          >
+            <Send className="h-4 w-4" />
+          </Button>
+        </div>
+        <p id="assistant-question-help" className="text-[11px] text-muted-foreground">
+          Enter で送信、Shift+Enter で改行
+        </p>
       </form>
         </>
       )}

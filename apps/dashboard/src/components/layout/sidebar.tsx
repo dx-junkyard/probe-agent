@@ -36,6 +36,15 @@ type NavItem = {
   // its 7 pages look similar at a glance, e.g. Simulation Workbench vs AI
   // Candidate Studio).
   subtitle?: string;
+  /**
+   * Issue #466 (UX-13): 詳細ビュー。グループ内の主要入口の下に、既定で閉じた
+   * 「詳細ビュー」として段階的に表示する (リンクは DOM に残り、展開・検索で
+   * 到達できる)。Map / Lineage / Blueprint のように使い分けを学ぶ必要がある
+   * 画面が、初見の利用者の視界を占めないようにするため。
+   */
+  detail?: boolean;
+  /** Issue #466 (UX-13): 画面検索で一致させる日本語の目的語 (表示はしない)。 */
+  keywords?: string[];
 };
 
 // Issue #257: a group carries `phases` only when it has phase meaning.
@@ -61,30 +70,30 @@ const NAV_GROUPS: NavGroup[] = [
     heading: "Understand",
     phases: ["preparation"],
     items: [
-      { to: "/system-understanding", icon: Brain, label: "System Understanding" },
-      { to: "/capability-map", icon: Network, label: "Capability Map" },
-      { to: "/feature-map", icon: Map, label: "Feature Map" },
-      { to: "/flow-explorer", icon: Workflow, label: "Flow Explorer" },
-      { to: "/interview", icon: MessageSquareText, label: "Interview" },
+      { to: "/system-understanding", icon: Brain, label: "System Understanding", keywords: ["現状", "理解"] },
+      { to: "/capability-map", icon: Network, label: "Capability Map", detail: true },
+      { to: "/feature-map", icon: Map, label: "Feature Map", detail: true },
+      { to: "/flow-explorer", icon: Workflow, label: "Flow Explorer", detail: true },
+      { to: "/interview", icon: MessageSquareText, label: "Interview", keywords: ["インタビュー", "理解"] },
       {
-        to: "/ux-design-studio", icon: PenTool, label: "UX Design Studio",
+        to: "/ux-design-studio", icon: PenTool, label: "UX Design Studio", keywords: ["要件", "設計", "体験"],
         subtitle: "Journey/Requirement/Solution Designの追跡",
       },
       {
         to: "/stakeholder-value-network", icon: Users, label: "Stakeholder Value Network",
-        subtitle: "当事者とValue Exchangeの追跡",
+        subtitle: "当事者とValue Exchangeの追跡", detail: true,
       },
       {
         to: "/journey-blueprint", icon: Rows3, label: "Journey Service Blueprint",
-        subtitle: "Step × 9レーンのサービスブループリント",
+        subtitle: "Step × 9レーンのサービスブループリント", detail: true,
       },
       {
         to: "/functional-lineage", icon: GitFork, label: "Functional Lineage",
-        subtitle: "Purpose → Capability → 実装 → Outcome の追跡とGap",
+        subtitle: "Purpose → Capability → 実装 → Outcome の追跡とGap", detail: true,
       },
       {
         to: "/objective-map", icon: Target, label: "Objective Map",
-        subtitle: "Vision へ向かうObjective/Milestone とGap Workbench",
+        subtitle: "Vision へ向かうObjective/Milestone とGap Workbench", detail: true,
       },
     ],
   },
@@ -111,24 +120,24 @@ const NAV_GROUPS: NavGroup[] = [
       // Issue #257 label improvement: "Components" alone didn't say this is
       // also the trace/observation view.
       {
-        to: "/components", icon: Boxes, label: "Components / Traces",
+        to: "/components", icon: Boxes, label: "Components / Traces", keywords: ["トレース", "観測"],
         subtitle: "Trace記録とpolicy切替",
       },
       {
         to: "/trace-lineage", icon: GitFork, label: "Trace Lineage",
-        subtitle: "Traceのつながりを俯瞰",
+        subtitle: "Traceのつながりを俯瞰", detail: true,
       },
       {
         to: "/trace-analyzers", icon: Filter, label: "Trace Analyzers",
-        subtitle: "パターン抽出とshadow diff検出",
+        subtitle: "パターン抽出とshadow diff検出", detail: true,
       },
       {
-        to: "/experiments", icon: FlaskConical, label: "Experiments",
+        to: "/experiments", icon: FlaskConical, label: "Experiments", keywords: ["比較", "評価", "実験"],
         subtitle: "候補のバッチ実行と評価",
       },
       {
         to: "/simulation-workbench", icon: Beaker, label: "Simulation Workbench",
-        subtitle: "手動でdiffを編集して検証",
+        subtitle: "手動でdiffを編集して検証", detail: true,
       },
       {
         to: "/candidate-studio", icon: Bot, label: "AI Candidate Studio",
@@ -136,15 +145,15 @@ const NAV_GROUPS: NavGroup[] = [
       },
       {
         to: "/workspaces", icon: MessageSquare, label: "Decision Workspace",
-        subtitle: "意思決定の記録と提案レビュー",
+        subtitle: "意思決定の記録と提案レビュー", detail: true,
       },
       {
         to: "/cell-fabric", icon: Layers, label: "Cell Fabric",
-        subtitle: "Probe Cell群の統合ダイジェストとAsk対応",
+        subtitle: "Probe Cell群の統合ダイジェストとAsk対応", detail: true,
       },
       {
         to: "/evolution-nodes", icon: Layers, label: "Evolution Node",
-        subtitle: "処理単位の契約・実装方式・成熟度",
+        subtitle: "処理単位の契約・実装方式・成熟度", detail: true,
       },
       // Epic #412 (#414/#415): the Flow-level view of those same Nodes plus
       // the execution-mode control and the experiment proposals awaiting a
@@ -152,7 +161,7 @@ const NAV_GROUPS: NavGroup[] = [
       // Node page is the per-Node inspector, this one is the Flow aggregate.
       {
         to: "/flow-agents", icon: Bot, label: "Flow・エージェント群",
-        subtitle: "Flow単位の5軸・実行モード・実験提案",
+        subtitle: "Flow単位の5軸・実行モード・実験提案", detail: true,
       },
     ],
   },
@@ -227,6 +236,108 @@ function SidebarBrand({ collapsed }: { collapsed: boolean }) {
   );
 }
 
+// Issue #466 (UX-13): 初見の利用者が「現状を理解する」「要件を設計する」
+// 「候補を比較評価する」の開始地点を、機能名を知らなくても選べるように、
+// 目的の言葉で 3 つの入口を置く。行き先は既存の画面で、新しいナビ体系や
+// canonical な状態は作らない (#401 の方針)。
+const PURPOSE_ENTRIES: { to: string; icon: typeof LayoutDashboard; label: string; hint: string }[] = [
+  { to: "/system-understanding", icon: Brain, label: "現状を理解する", hint: "System Understanding を開く" },
+  { to: "/ux-design-studio", icon: PenTool, label: "要件を設計する", hint: "UX Design Studio を開く" },
+  { to: "/experiments", icon: FlaskConical, label: "候補を比較評価する", hint: "Experiments を開く" },
+];
+
+function isItemActive(to: string, pathname: string): boolean {
+  return to === "/" ? pathname === "/" : pathname.startsWith(to);
+}
+
+/** 画面検索の照合 (表示ラベルと補足文への部分一致。大文字小文字・全角半角を無視)。 */
+function normalizeForSearch(value: string): string {
+  return value.normalize("NFKC").toLowerCase();
+}
+
+function matchNavItem(item: Pick<NavItem, "label" | "subtitle" | "to" | "keywords">, query: string): boolean {
+  const q = normalizeForSearch(query.trim());
+  if (!q) return true;
+  return [item.label, item.subtitle ?? "", item.to, ...(item.keywords ?? [])]
+    .some((field) => normalizeForSearch(field).includes(q));
+}
+
+interface NavViewState {
+  query: string;
+  setQuery: (query: string) => void;
+  /** グループごとの「詳細ビュー」の開閉 (利用者の操作)。未操作なら undefined。 */
+  detailsOpen: Record<string, boolean>;
+  setDetailsOpen: (heading: string, open: boolean) => void;
+}
+
+function NavItemLink({
+  item,
+  collapsed,
+  active,
+  onNavigate,
+}: {
+  item: NavItem;
+  collapsed: boolean;
+  active: boolean;
+  onNavigate?: () => void;
+}) {
+  return (
+    <NavLink
+      to={item.to}
+      // Issue #362: inside the mobile Drawer, following a link
+      // must close the overlay. The AppLayout also closes on a
+      // react-router location change, so a link to the current
+      // route (which produces no location change) still closes.
+      onClick={onNavigate}
+      className={cn(
+        "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+        // Issue #466 (UX-13): 利用可能なリンクの文字は薄くしない。現在地は
+        // 背景だけでなく「表示中」の文字でも示す (色だけに頼らない)。
+        active
+          ? "bg-secondary text-foreground"
+          : "text-foreground/90 hover:bg-secondary/50 hover:text-foreground",
+        collapsed && "justify-center px-2",
+      )}
+      title={item.title ?? (collapsed ? item.label : undefined)}
+    >
+      <item.icon className="h-4 w-4 shrink-0" />
+      {!collapsed && (
+        <span className="flex flex-col min-w-0">
+          <span className="flex flex-wrap items-center gap-1.5">
+            <span>{item.label}</span>
+            {active && (
+              <span
+                className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-medium text-primary-foreground"
+                data-testid="sidebar-current-badge"
+              >
+                表示中
+              </span>
+            )}
+            {item.legacy && (
+              <span
+                className="rounded bg-muted px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+                data-testid="sidebar-legacy-badge"
+              >
+                Legacy
+              </span>
+            )}
+          </span>
+          {/* Issue #267 item 11: usage-distinction subtext. Issue #466
+              (UX-13): 狭いサイドバーで省略しない (折り返して全文を読める)。 */}
+          {item.subtitle && (
+            <span
+              className="whitespace-normal break-words text-[11px] font-normal normal-case tracking-normal text-muted-foreground"
+              data-testid={`sidebar-item-subtitle-${item.to.replace(/\//g, "")}`}
+            >
+              {item.subtitle}
+            </span>
+          )}
+        </span>
+      )}
+    </NavLink>
+  );
+}
+
 // The nav list itself. Rendered by the static desktop rail and by the mobile
 // Drawer alike (Issue #362) so the two presentations can never drift apart --
 // there is exactly one source of nav markup.
@@ -235,96 +346,168 @@ function SidebarNavList({
   collapsed,
   userPhase,
   onNavigate,
+  view,
 }: {
   groups: NavGroup[];
   collapsed: boolean;
   userPhase: UserPhase | undefined;
   onNavigate?: () => void;
+  view: NavViewState;
 }) {
   const location = useLocation();
+  const searching = !collapsed && view.query.trim().length > 0;
+  const matches = searching
+    ? groups.flatMap((group) =>
+      group.items
+        .filter((item) => matchNavItem(item, view.query))
+        .map((item) => ({ item, heading: group.heading })),
+    )
+    : [];
   return (
-    <nav className="flex-1 overflow-y-auto py-2 px-2 space-y-3" data-testid="sidebar-nav">
-      {groups.map((group, gi) => {
-        const slug = group.heading ? group.heading.toLowerCase().replace(/\s+/g, "-") : undefined;
-        const phaseState = phaseGroupState(group.phases, userPhase);
-        return (
-          <div
-            key={group.heading ?? `group-${gi}`}
-            className={cn("space-y-0.5", phaseState === "future" && "opacity-50")}
-            data-testid={slug ? `sidebar-group-${slug}` : undefined}
-            // Issue #257: only phase-linked groups (Setup/Understand/
-            // Instrument/Observe & Evaluate/Publish) carry this attribute;
-            // Overview and Other have no phase and stay undefined.
-            data-phase-state={group.phases ? phaseState : undefined}
-          >
-            {group.heading && !collapsed && (
-              <p
-                className={cn(
-                  "flex items-center gap-1.5 px-3 pb-1 text-xs font-semibold uppercase tracking-wide",
-                  phaseState === "current" ? "text-primary" : "text-muted-foreground/70",
-                )}
-              >
-                {group.heading}
-                {phaseState === "current" && (
-                  <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-primary">
-                    現在
-                  </span>
-                )}
-              </p>
-            )}
-            {group.items.map((item) => {
-              const isActive = item.to === "/"
-                ? location.pathname === "/"
-                : location.pathname.startsWith(item.to);
-              return (
+    <nav className="flex-1 overflow-y-auto py-2 px-2 space-y-3" data-testid="sidebar-nav" aria-label="メインナビゲーション">
+      {!collapsed && (
+        <div className="px-1">
+          <label className="sr-only" htmlFor={`nav-search-${onNavigate ? "drawer" : "rail"}`}>画面を検索</label>
+          <input
+            id={`nav-search-${onNavigate ? "drawer" : "rail"}`}
+            type="search"
+            value={view.query}
+            onChange={(e) => view.setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && view.query) {
+                // 検索語を消すだけで、Drawer は閉じない。
+                e.stopPropagation();
+                e.nativeEvent.stopImmediatePropagation();
+                view.setQuery("");
+              }
+            }}
+            placeholder="画面を検索(例: Trace, 要件)"
+            className="h-8 w-full rounded-md border border-input bg-transparent px-2 text-xs placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            data-testid="sidebar-search"
+          />
+        </div>
+      )}
+      {searching ? (
+        <div className="space-y-0.5" data-testid="sidebar-search-results" role="region" aria-label="画面の検索結果">
+          <p className="px-3 pb-1 text-xs text-muted-foreground" aria-live="polite">
+            {matches.length > 0 ? `${matches.length} 件の画面` : "該当する画面がありません"}
+          </p>
+          {matches.map(({ item, heading }) => (
+            <div key={item.to}>
+              <NavItemLink
+                item={heading ? { ...item, subtitle: item.subtitle ? `${heading} · ${item.subtitle}` : heading } : item}
+                collapsed={false}
+                active={isItemActive(item.to, location.pathname)}
+                onNavigate={onNavigate}
+              />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <>
+          {!collapsed && (
+            <div className="space-y-0.5" data-testid="sidebar-purpose-entries">
+              <p className="px-3 pb-1 text-xs font-semibold text-muted-foreground">目的から始める</p>
+              {PURPOSE_ENTRIES.map((entry) => (
                 <NavLink
-                  key={item.to}
-                  to={item.to}
-                  // Issue #362: inside the mobile Drawer, following a link
-                  // must close the overlay. The AppLayout also closes on a
-                  // react-router location change, so a link to the current
-                  // route (which produces no location change) still closes.
+                  key={entry.to}
+                  to={entry.to}
                   onClick={onNavigate}
-                  className={cn(
-                    "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
-                    isActive
-                      ? "bg-secondary text-foreground"
-                      : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground",
-                    collapsed && "justify-center px-2",
-                  )}
-                  title={item.title ?? (collapsed ? item.label : undefined)}
+                  className="flex items-center gap-3 rounded-lg px-3 py-1.5 text-sm text-foreground/90 hover:bg-secondary/50 hover:text-foreground"
+                  data-testid={`sidebar-purpose-${entry.to.replace(/\//g, "")}`}
+                  // 目的の入口は同じ画面への近道なので、現在地の表示は下の
+                  // 機能一覧の側だけで行う (同じ画面に「表示中」が 2 つ出ない)。
+                  aria-current={undefined}
                 >
-                  <item.icon className="h-4 w-4 shrink-0" />
-                  {!collapsed && (
-                    <span className="flex flex-col min-w-0">
-                      <span className="flex items-center gap-1.5">
-                        <span>{item.label}</span>
-                        {item.legacy && (
-                          <span
-                            className="rounded bg-muted px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
-                            data-testid="sidebar-legacy-badge"
-                          >
-                            Legacy
-                          </span>
-                        )}
-                      </span>
-                      {/* Issue #267 item 11: usage-distinction subtext. */}
-                      {item.subtitle && (
-                        <span
-                          className="truncate text-[11px] font-normal normal-case tracking-normal text-muted-foreground/80"
-                          data-testid={`sidebar-item-subtitle-${item.to.replace(/\//g, "")}`}
-                        >
-                          {item.subtitle}
-                        </span>
-                      )}
-                    </span>
-                  )}
+                  <entry.icon className="h-4 w-4 shrink-0" />
+                  <span className="flex flex-col">
+                    <span className="font-medium">{entry.label}</span>
+                    <span className="text-[11px] text-muted-foreground">{entry.hint}</span>
+                  </span>
                 </NavLink>
-              );
-            })}
-          </div>
-        );
-      })}
+              ))}
+            </div>
+          )}
+          {groups.map((group, gi) => {
+            const slug = group.heading ? group.heading.toLowerCase().replace(/\s+/g, "-") : undefined;
+            const phaseState = phaseGroupState(group.phases, userPhase);
+            const primary = collapsed ? group.items : group.items.filter((item) => !item.detail);
+            const details = collapsed ? [] : group.items.filter((item) => item.detail);
+            const activeInDetails = details.some((item) => isItemActive(item.to, location.pathname));
+            const detailsKey = group.heading ?? `group-${gi}`;
+            const detailsOpen = view.detailsOpen[detailsKey] ?? activeInDetails;
+            return (
+              <div
+                key={group.heading ?? `group-${gi}`}
+                // Issue #466 (UX-13): 将来フェーズのグループも半透明にしない。
+                // リンクは操作できるので、無効に見せてはいけない。フェーズの
+                // 位置は見出しの文字 (「現在」「これから」) で伝える。
+                className="space-y-0.5"
+                data-testid={slug ? `sidebar-group-${slug}` : undefined}
+                // Issue #257: only phase-linked groups (Setup/Understand/
+                // Instrument/Observe & Evaluate/Publish) carry this attribute;
+                // Overview and Other have no phase and stay undefined.
+                data-phase-state={group.phases ? phaseState : undefined}
+              >
+                {group.heading && !collapsed && (
+                  <p
+                    className={cn(
+                      "flex items-center gap-1.5 px-3 pb-1 text-xs font-semibold uppercase tracking-wide",
+                      phaseState === "current" ? "text-primary" : "text-muted-foreground",
+                    )}
+                  >
+                    {group.heading}
+                    {phaseState === "current" && (
+                      <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-primary">
+                        現在
+                      </span>
+                    )}
+                    {phaseState === "future" && (
+                      <span className="rounded-full border px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-muted-foreground">
+                        これから
+                      </span>
+                    )}
+                  </p>
+                )}
+                {primary.map((item) => (
+                  <NavItemLink
+                    key={item.to}
+                    item={item}
+                    collapsed={collapsed}
+                    active={isItemActive(item.to, location.pathname)}
+                    onNavigate={onNavigate}
+                  />
+                ))}
+                {details.length > 0 && (
+                  <details
+                    open={detailsOpen}
+                    onToggle={(e) => {
+                      const open = (e.currentTarget as HTMLDetailsElement).open;
+                      if (open !== detailsOpen) view.setDetailsOpen(detailsKey, open);
+                    }}
+                    data-testid={slug ? `sidebar-details-${slug}` : undefined}
+                  >
+                    <summary className="cursor-pointer rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-secondary/50 hover:text-foreground">
+                      詳細ビュー({details.length})
+                    </summary>
+                    <div className="space-y-0.5 pl-2">
+                      {details.map((item) => (
+                        <NavItemLink
+                          key={item.to}
+                          item={item}
+                          collapsed={false}
+                          active={isItemActive(item.to, location.pathname)}
+                          onNavigate={onNavigate}
+                        />
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </div>
+            );
+          })}
+        </>
+      )}
     </nav>
   );
 }
@@ -358,6 +541,16 @@ export function Sidebar({
   const { data: systemState } = useSystemState();
   const userPhase = systemState?.user_phase;
   const drawerRef = useRef<HTMLDivElement>(null);
+  // UX-13: 検索語と詳細ビューの開閉は、デスクトップのレールと Drawer で共有する
+  // (Drawer は開くたびにマウントされるので、ここで持たないと毎回リセットされる)。
+  const [query, setQuery] = useState("");
+  const [detailsOpen, setDetailsOpenState] = useState<Record<string, boolean>>({});
+  const view: NavViewState = {
+    query,
+    setQuery,
+    detailsOpen,
+    setDetailsOpen: (heading, open) => setDetailsOpenState((prev) => ({ ...prev, [heading]: open })),
+  };
 
   // Issue #362: 開いている間の Drawer はモーダルな面 -- Escape で閉じ、
   // Tab / Shift+Tab は中で循環し、開いたら中へ、閉じたらメニューボタンへ
@@ -394,7 +587,7 @@ export function Sidebar({
           <SidebarBrand collapsed={collapsed} />
         </div>
 
-        <SidebarNavList groups={groups} collapsed={collapsed} userPhase={userPhase} />
+        <SidebarNavList groups={groups} collapsed={collapsed} userPhase={userPhase} view={view} />
 
         <button
           onClick={() => setCollapsed(!collapsed)}
@@ -444,6 +637,7 @@ export function Sidebar({
               collapsed={false}
               userPhase={userPhase}
               onNavigate={onNavClose}
+              view={view}
             />
           </div>
         </>

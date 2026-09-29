@@ -589,6 +589,10 @@ function mockGetForScreens(...screenIds: string[]) {
 async function enterVoiceMode() {
   fireEvent.click(screen.getByTestId("assistant-voice-toggle"));
   await screen.findByTestId("assistant-voice");
+  await waitFor(() =>
+    expect(screen.getByTestId("voice-state")).toHaveAttribute("data-state", "listening"),
+  );
+  expect(screen.queryByTestId("voice-talk")).toBeNull();
 }
 
 describe("Issue #441 AC1 -- a voice question can be asked in screen scope and element scope", () => {
@@ -604,7 +608,6 @@ describe("Issue #441 AC1 -- a voice question can be asked in screen scope and el
     await enterVoiceMode();
     expect(screen.getByTestId("voice-scope").textContent).toContain("画面全体");
 
-    fireEvent.click(screen.getByTestId("voice-talk"));
     fake.fireResult("この画面は何をするところですか");
 
     await waitFor(() => {
@@ -640,7 +643,6 @@ describe("Issue #441 AC1 -- a voice question can be asked in screen scope and el
 
     await renderPanel("/widgets");
     await enterVoiceMode();
-    fireEvent.click(screen.getByTestId("voice-talk"));
     fake.fireResult("概要を教えて");
 
     await waitFor(() => expect(fake.start).toHaveBeenCalledTimes(2));
@@ -670,7 +672,6 @@ describe("Issue #441 AC1 -- a voice question can be asked in screen scope and el
     await enterVoiceMode();
     expect(screen.getByTestId("voice-scope").textContent).toContain("overview.brief");
 
-    fireEvent.click(screen.getByTestId("voice-talk"));
     fake.fireResult("この要素は何のためにありますか");
 
     await waitFor(() => {
@@ -694,7 +695,6 @@ describe("Issue #441 AC2 -- switching target mid-utterance does not drift the in
     await enterVoiceMode();
 
     // Turn starts in SCREEN scope (no help target selected yet).
-    fireEvent.click(screen.getByTestId("voice-talk"));
     // The developer's cursor now lands on an element WHILE the utterance is
     // still in flight (listening -> not yet a result).
     fireEvent.click(screen.getByTestId("test-set-help-target"));
@@ -720,8 +720,6 @@ describe("Issue #441 AC2 -- switching target mid-utterance does not drift the in
 
     await renderPanel("/widgets");
     await enterVoiceMode();
-    fireEvent.click(screen.getByTestId("voice-talk"));
-
     fireEvent.click(screen.getByTestId("test-navigate-away"));
 
     fake.fireResult("移動する前に聞いた質問です");
@@ -778,7 +776,6 @@ describe("Issue #441 AC2 -- switching target mid-utterance does not drift the in
     await screen.findByText("req-a の話");
     await enterVoiceMode();
 
-    fireEvent.click(screen.getByTestId("voice-talk"));
     // The developer switches the visible discussion scope WHILE the
     // utterance is in flight.
     fireEvent.click(screen.getByTestId("assistant-scope-screen"));
@@ -806,7 +803,6 @@ describe("Issue #441 AC3 -- a microphone denial or an STT/TTS failure returns sa
     await enterVoiceMode();
     expect(screen.getByTestId("assistant-voice-toggle")).toHaveAttribute("aria-pressed", "true");
 
-    fireEvent.click(screen.getByTestId("voice-talk"));
     fake.fireError("permission_denied");
 
     await waitFor(() => expect(screen.queryByTestId("assistant-voice")).toBeNull());
@@ -832,7 +828,6 @@ describe("Issue #441 AC3 -- a microphone denial or an STT/TTS failure returns sa
 
     await renderPanel("/widgets");
     await enterVoiceMode();
-    fireEvent.click(screen.getByTestId("voice-talk"));
     fake.fireResult("読み上げに失敗するはずの質問");
 
     const notice = await screen.findByTestId("voice-fallback-notice");
@@ -862,7 +857,6 @@ describe("Issue #441 AC4 -- a voice conversation never changes domain data direc
 
     await renderPanel("/widgets");
     await enterVoiceMode();
-    fireEvent.click(screen.getByTestId("voice-talk"));
     fake.fireResult("データを変更しますか");
 
     await waitFor(() => {
@@ -883,8 +877,9 @@ describe("Issue #441 AC4 -- a voice conversation never changes domain data direc
       expect(body).not.toBeInstanceOf(Blob);
       expect(body).not.toBeInstanceOf(ArrayBuffer);
     }
-    expect(fake.start).toHaveBeenCalledTimes(1);
+    expect(fake.start).toHaveBeenCalledTimes(2);
     expect(fake.speak).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("voice-state")).toHaveAttribute("data-state", "listening");
   });
 
   test("history is retained (not cleared) after exiting voice mode", async () => {
@@ -900,7 +895,6 @@ describe("Issue #441 AC4 -- a voice conversation never changes domain data direc
     // The message list is not rendered while voice mode is active.
     expect(screen.queryByTestId("assistant-message-list")).toBeNull();
 
-    fireEvent.click(screen.getByTestId("voice-talk"));
     fake.fireResult("音声での質問");
     await waitFor(() => expect(fake.speak).toHaveBeenCalled());
 

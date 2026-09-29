@@ -18,6 +18,14 @@
   → 状態・原因・Recipeの条件・選択理由を更新 → 次の判断
 ```
 
+## 2026-09-21の拡張: 状況から観点を選ぶ
+
+[Evolution Controllerのローカル設定](../../../improvement/local/project.md)を導入した。
+状況の役割・接続・操作から候補観点を選び、適合候補・要観測・非適合を記録する。
+既存の原因4軸・状態8性質・IP/IR・IKを保持し、[対応表](../../../improvement/local/perspective-map.md)で接続する。
+以後の計画・結果には配布版と形式版、状況・提示記録のID、知識が変えた判断と未確認を残す。
+旧記録は遡及変更しない。自動推薦・収集・常駐実行は導入されない。
+
 ## 1. 最初に作る着手の地図
 
 [計画テンプレート](PLAN_TEMPLATE.md)を `docs/02-challenges-and-decisions/improvement-plans/` へコピーする。
