@@ -4376,7 +4376,9 @@ export interface AssistantCitation {
     | "screen_data"
     // Issue #445 (Epic #443 Phase 2): the answer relied on an unsaved UI
     // draft, never a persisted fact.
-    | "ui_draft";
+    | "ui_draft"
+    // Issue #470: a canonical entity related to the conversation's target.
+    | "related_context";
   id: string;
   title: string;
   detail: string;

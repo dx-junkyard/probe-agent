@@ -542,9 +542,14 @@ def _objective_section(system_id: int, tracker: _BudgetTracker) -> Tuple[BundleS
     walk so an Overview root can reach the SAME Objective/Gap up- and
     downstream a direct `product_objective` / `product_gap` root would."""
     from . import overview_projection
+    from .assistant_request_scope import active_system_state_provider
 
     try:
-        overview = overview_projection.build_overview(system_id)
+        # Issue #470: inside an ask, reuse the request scope's System state
+        # (None outside an ask -> unchanged standalone behaviour).
+        overview = overview_projection.build_overview(
+            system_id, system_state_provider=active_system_state_provider(system_id),
+        )
     except Exception:
         return (
             BundleSection("objective", "unavailable", (), BundleCoverage(0, None, "unknown", "provider_error", None)),
@@ -710,7 +715,7 @@ def _build_related_section(
 
 def build_context_bundle(
     system_id: int, root_target_kind: str, root_target_ref: str, *,
-    thread_id: int, budget: ContextBudget = DEFAULT_BUDGET,
+    thread_id: int, budget: ContextBudget = DEFAULT_BUDGET, mint_cursor: bool = True,
 ) -> DiscussionContextBundle:
     """DD-CTX-01/02's full bundle for one root, scoped to `thread_id` (the
     discussion thread this bundle's continuations, if any, will be resumed
@@ -786,7 +791,14 @@ def build_context_bundle(
     # function again from scratch, not continuing a cursor. `self`/
     # `objective` truncation (a single oversized entry replaced by a stub)
     # has no "next batch" either -- there is nothing paginated to continue.
-    if related_section.operation_state == "available" and related_section.coverage.completeness != "complete":
+    # Issue #470: `mint_cursor=False` is for a read that will never come back
+    # for "追加取得" (an assistant ask reads the bundle for one answer): a
+    # cursor row written on every ask would be litter that expires unused.
+    if (
+        mint_cursor
+        and related_section.operation_state == "available"
+        and related_section.coverage.completeness != "complete"
+    ):
         with get_conn() as conn:
             token = create_context_cursor(
                 conn, system_id=system_id, thread_id=thread_id, root=root_ref_out, snapshot=snapshot,
@@ -1016,6 +1028,44 @@ def resolve_context_expansion(
 
 
 # --- Wire conversion -----------------------------------------------------------
+
+
+def entry_depths(bundle: DiscussionContextBundle) -> Dict[Tuple[str, str], int]:
+    """Hop distance from the root of every entry in ``bundle`` (Issue #470).
+
+    The wire shape deliberately carries no depth (``extra="forbid"``), so it is
+    recovered with the SAME relation extractors the builder used: an entry the
+    root's own facts (or the Overview objective seeds) name is depth 1, every
+    other related entry is depth 2, the root is 0.  When the root's facts were
+    replaced by a byte-budget stub the depth-1 set is unknowable and every
+    related entry is reported as depth 1 -- never a guessed depth 2.
+    """
+    depths: Dict[Tuple[str, str], int] = {(bundle.root.target_kind, bundle.root.target_ref): 0}
+    section_by_id = {s.section_id: s for s in bundle.sections}
+    d1: Set[Tuple[str, str]] = set()
+    self_section = section_by_id.get("self")
+    extractor = _RELATION_EXTRACTORS.get(bundle.root.target_kind)
+    if self_section is not None and self_section.facts and extractor is not None:
+        root_entry = self_section.facts[0]
+        if not root_entry.truncated:
+            d1.update(extractor(root_entry.facts))
+    objective = section_by_id.get("objective")
+    if objective is not None and objective.facts:
+        facts = objective.facts[0].facts
+        active = facts.get("active_objective")
+        if isinstance(active, dict) and active.get("objective_key"):
+            d1.add(("product_objective", active["objective_key"]))
+        gap = facts.get("primary_gap")
+        if isinstance(gap, dict) and gap.get("gap_key"):
+            d1.add(("product_gap", gap["gap_key"]))
+    related = section_by_id.get("related")
+    if related is not None:
+        for entry in related.facts:
+            key = (entry.target_kind, entry.target_ref)
+            if key in depths:
+                continue
+            depths[key] = 2 if (d1 and key not in d1) else 1
+    return depths
 
 
 def bundle_to_dict(bundle: DiscussionContextBundle) -> Dict[str, Any]:

@@ -161,7 +161,25 @@ class AskTrace:
                 add("screen_data", sid)
         for src in getattr(pack, "ui_draft_sources", []) or []:
             add("ui_draft", src.get("id", ""))
+        for entry in getattr(pack, "related_context", []) or []:
+            add(
+                "related_context", entry.get("source_id", ""),
+                revision=entry.get("revision_id"), digest=entry.get("digest") or None,
+                freshness=entry.get("freshness", "unknown"),
+            )
         self.manifest["sources"] = sources
+        # Issue #470: what the model was and was not given (codes/counts only).
+        self.manifest["coverage"] = [dict(c) for c in getattr(pack, "coverage", []) or []]
+        self.manifest["omitted_sections"] = [
+            dict(o) for o in getattr(pack, "omitted_sections", []) or []
+        ]
+        budget = getattr(pack, "budget_info", None)
+        if budget is not None:
+            self.manifest["budget"] = {
+                "limit_chars": budget.get("limit_chars"),
+                "used_chars": budget.get("used_chars"),
+                "over_budget": bool(budget.get("over_budget")),
+            }
         self.manifest["history_turns"] = len(getattr(pack, "conversation", []) or [])
 
 

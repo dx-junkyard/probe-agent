@@ -6449,7 +6449,7 @@ class AssistantCitationOut(BaseModel):
     # model's `ui_draft` citations get silently dropped by one of them.
     type: Literal[
         "setting", "diagnostic_check", "pipeline_step", "state_item",
-        "screen_data", "ui_draft",
+        "screen_data", "ui_draft", "related_context",
     ]
     id: str
     title: str = ""

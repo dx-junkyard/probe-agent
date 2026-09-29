@@ -283,10 +283,15 @@ def _resolve_understanding_claim(system_id: int, target_ref: str) -> ResolvedTar
 
 
 def _resolve_overview_finding(system_id: int, target_ref: str) -> ResolvedTarget:
+    from .assistant_request_scope import active_system_state_provider
     from .overview_projection import build_overview
 
     try:
-        overview = build_overview(system_id)
+        # Issue #470: inside an ask, reuse the request scope's System state
+        # (None outside an ask -> unchanged standalone behaviour).
+        overview = build_overview(
+            system_id, system_state_provider=active_system_state_provider(system_id),
+        )
     except Exception:  # pragma: no cover - defensive
         return ResolvedTarget("", None, "", "unresolved")
     finding = next((f for f in overview.findings if f.dedupe_key == target_ref), None)

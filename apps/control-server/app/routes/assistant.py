@@ -49,7 +49,8 @@ from ..assistant import (
 from ..assistant_discussion_context import build_screen_discussion_context
 from .. import assistant_metrics
 from ..assistant_metrics import AskTrace
-from ..assistant_request_scope import AskRequestScope
+from ..assistant_request_scope import AskRequestScope, bind_scope
+from ..assistant_related_context import gather_related_context
 from ..auth import Principal, get_principal, get_system_id
 from ..db import get_conn
 from ..llm import LLMClient, LLMConfig, create_llm_client
@@ -1043,13 +1044,19 @@ def _assistant_ask_core(
     existing_user_turn: Optional[int],
     trace: AskTrace,
 ) -> AssistantAskOut:
+    # Issue #469/#470: ONE scope per ask.  It is bound during validation too,
+    # because resolving a thread's target (`overview_finding`) also builds the
+    # Overview, and that must reuse -- not recompute -- the System state.
+    request_scope = AskRequestScope(system_id, timer=trace.stage)
     with trace.stage("request_validation"):
-        (ctx, thread_row, thread_target_state, resolved_draft,
-         ui_draft_changed) = _validate_ask_request(payload, system_id)
+        with bind_scope(request_scope):
+            (ctx, thread_row, thread_target_state, resolved_draft,
+             ui_draft_changed) = _validate_ask_request(payload, system_id)
     trace.manifest["ui_draft_state"] = resolved_draft.state
     return _assistant_ask_body(
         payload, system_id, principal, existing_user_turn, trace,
         ctx, thread_row, thread_target_state, resolved_draft, ui_draft_changed,
+        request_scope,
     )
 
 
@@ -1106,8 +1113,8 @@ def _assistant_ask_body(
     thread_target_state: Optional[str],
     resolved_draft: Any,
     ui_draft_changed: bool,
+    request_scope: AskRequestScope,
 ) -> AssistantAskOut:
-    request_scope = AskRequestScope(system_id, timer=trace.stage)  # Issue #469: 1 compute per ask
     report = request_scope.diagnostics()
     assessment = request_scope.system_state()
     trace.merge_scope_counters(request_scope)
@@ -1217,6 +1224,19 @@ def _assistant_ask_body(
             digest=thread_row.get("captured_target_digest") or "",
             target_state=thread_target_state,
         )
+    # Issue #470 §3.1: the thread target's neighbours, only when the thread
+    # still matches its target and its kind is registered.  Bound to the
+    # request scope so the Overview objective section reuses the System state;
+    # no `get_conn()` is held here (the bundle builder opens its own).
+    with bind_scope(request_scope):
+        related = gather_related_context(
+            system_id, thread_row, thread_target_state, trace=trace,
+        )
+    trace.merge_scope_counters(request_scope)
+    coverage_rows = [
+        *(discussion.coverage if discussion else []),
+        *(c.to_dict() for c in related.coverage),
+    ]
     result = answer_question(
         ctx,
         payload.question,
@@ -1238,6 +1258,9 @@ def _assistant_ask_body(
         ui_draft=resolved_draft.payload,
         ui_draft_sources=resolved_draft.sources,
         trace=trace,
+        coverage=coverage_rows,
+        related_context=related.entries,
+        omitted_sections=related.omitted_sections,
     )
     trace.outcome = "deterministic_answer" if result.used_fallback else "answered"
     trace.meta.update(

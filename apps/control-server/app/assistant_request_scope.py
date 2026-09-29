@@ -12,10 +12,37 @@ their own connections.
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
-from typing import Any, Callable, ContextManager, Optional
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from typing import Any, Callable, ContextManager, Iterator, Optional
 
 Timer = Callable[[str], ContextManager[Any]]
+
+# The ask request's scope, visible only while a caller binds it (Issue #469:
+# screen providers; Issue #470: the discussion-bundle and adapter resolvers,
+# which also call ``build_overview``).  ContextVar, not module state: nothing
+# is shared across requests, threads, or Systems.
+ACTIVE_SCOPE: ContextVar[Any] = ContextVar("assistant_ask_scope", default=None)
+
+
+@contextmanager
+def bind_scope(scope: Any) -> Iterator[None]:
+    token = ACTIVE_SCOPE.set(scope)
+    try:
+        yield
+    finally:
+        ACTIVE_SCOPE.reset(token)
+
+
+def active_system_state_provider(system_id: int) -> Optional[Callable[[], Any]]:
+    """The bound scope's ``system_state`` provider for ``system_id``, or None.
+
+    A scope of another System is never used (no cross-System sharing).
+    """
+    scope = ACTIVE_SCOPE.get()
+    if scope is None or getattr(scope, "system_id", None) != system_id:
+        return None
+    return scope.system_state
 
 
 class AskRequestScope:
