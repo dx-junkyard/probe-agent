@@ -662,6 +662,26 @@ def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             "llm_calls_per_ask": mean([r["llm_calls"] for r in rs]),
         }
 
+    # Issues #471/#472: answer_status / grounding_state distributions per
+    # llm_script.  `None` keys mean the field was absent (base commit).
+    by_script: Dict[str, Dict[str, Any]] = {}
+    for script in sorted({r["llm_script"] for r in ran}):
+        rs = [r for r in ran if r["llm_script"] == script]
+        status_counts: Dict[str, int] = defaultdict(int)
+        grounding_counts: Dict[str, int] = defaultdict(int)
+        failure_counts: Dict[str, int] = defaultdict(int)
+        for r in rs:
+            status_counts[str(r.get("answer_status"))] += 1
+            grounding_counts[str(r.get("grounding_state"))] += 1
+            if r.get("failure_class"):
+                failure_counts[r["failure_class"]] += 1
+        by_script[script] = {
+            "runs": len(rs),
+            "answer_status": dict(status_counts),
+            "grounding_state": dict(grounding_counts),
+            "failure_class": dict(failure_counts),
+        }
+
     n = len(ran)
     http_fail = sum(1 for r in ran if r["http_status"] >= 400)
     status_present = [r for r in ran if r.get("answer_status") is not None]
@@ -688,6 +708,7 @@ def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             "answer_status_failed_count": status_failed if status_present else None,
             "answer_status_state": "measured" if status_present else "unmeasured (field absent)",
         },
+        "by_llm_script": by_script,
         "calls_per_ask": {
             "overall": {
                 "diagnostics": mean([r["diagnostics_calls"] for r in ran]),

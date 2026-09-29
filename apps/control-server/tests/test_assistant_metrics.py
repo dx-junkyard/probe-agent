@@ -75,7 +75,7 @@ class _Client:
         if self._text is not None:
             return self._text
         return json.dumps({
-            "answer": f"{ANSWER_MARKER} 回答です。",
+            "conclusion": f"{ANSWER_MARKER} 回答です。",
             "suggested_actions": [],
             "citations": [],
         })
@@ -176,7 +176,7 @@ def _make_journey_thread(client, headers):
 def test_no_row_contains_question_answer_draft_or_secret(env, monkeypatch):
     client, _, system_id, headers = env
     _enable(monkeypatch, _Client(text=json.dumps({
-        "answer": f"{ANSWER_MARKER} {SECRET}", "suggested_actions": [],
+        "conclusion": f"{ANSWER_MARKER} {SECRET}", "suggested_actions": [],
         "citations": [{"type": "ui_draft", "id": "ui_draft:ux_journey.revision"}],
     })))
     thread_id = _make_journey_thread(client, headers)
@@ -224,7 +224,7 @@ def test_llm_failure_records_failure_class(env, monkeypatch, fake, expected):
     body = _ask(client, headers)
     assert body["used_fallback"] is True
     row = _rows(system_id)[0]
-    assert row["outcome"] == "deterministic_answer"
+    assert row["outcome"] == "failed"
     assert row["failure_class"] == expected
     assert json.loads(row["counters_json"])["llm_calls"] == 1
 
@@ -233,7 +233,7 @@ def test_no_client_records_provider_class(env):
     client, _, system_id, headers = env  # LLM_PROVIDER=mock
     _ask(client, headers)
     row = _rows(system_id)[0]
-    assert row["outcome"] == "deterministic_answer"
+    assert row["outcome"] == "failed"
     assert row["failure_class"] == "provider_test_only"
     assert json.loads(row["counters_json"])["llm_calls"] == 0
 

@@ -39,16 +39,24 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .assistant_context_budget import apply_context_budget
+from .assistant_failure import compose_failed_answer, failure_dict, failure_message
 from .assistant_metrics import failure_class_for
-from .llm import LLMClient, LLMConfig, LLMError, PROVIDER_KEY_ENV
+from .llm import (
+    LLMClient,
+    LLMConfig,
+    LLMError,
+    LLMQuotaExceeded,
+    LLMResourceLimitError,
+    PROVIDER_KEY_ENV,
+)
 from .settings_metadata import SETTINGS_BY_KEY, SettingMetadata
 from .system_diagnostics import DiagnosticCheck, SystemDiagnosticsReport
 from .system_state import StateItem
 
 from probe_agent import probe
 
-PROMPT_VERSION = "v1"
-SCHEMA_VERSION = "v1"
+PROMPT_VERSION = "v2"
+SCHEMA_VERSION = "v2"
 
 MAX_QUESTION_CHARS = 4000
 
@@ -681,6 +689,9 @@ class ContextPack:
     pipeline_steps: List[str]
     mentioned_setting_keys: List[str]
     mentioned_check_ids: List[str]
+    # Issue #472: pipeline steps the QUESTION named (exact match), separate
+    # from `pipeline_steps`, which also carries the screen's related steps.
+    mentioned_pipeline_steps: List[str] = field(default_factory=list)
     state_items: List[StateItem] = field(default_factory=list)
     focused_state_id: Optional[str] = None
     screen_data: Optional[Dict[str, Any]] = None
@@ -884,6 +895,7 @@ def build_context_pack(
         pipeline_steps=steps,
         mentioned_setting_keys=[s.key for s in mentioned_settings],
         mentioned_check_ids=mentioned_check_ids,
+        mentioned_pipeline_steps=list(mentioned_steps),
         state_items=list(state_items or []),
         focused_state_id=focused_state_id,
         screen_data=screen_data,
@@ -931,6 +943,40 @@ class AssistantAnswer:
     prompt_version: str = PROMPT_VERSION
     schema_version: str = SCHEMA_VERSION
     fallback_reason: Optional[str] = None
+    # Issues #471/#472: the structured, validated answer (§4) and the
+    # answer-status / failure response (§5).  `points` are plain dicts
+    # {kind, text, sources, grounding}; `failure` is `failure_dict(...)`.
+    conclusion: Optional[str] = None
+    points: List[Dict[str, Any]] = field(default_factory=list)
+    missing_information: List[Dict[str, str]] = field(default_factory=list)
+    grounding_state: Optional[str] = None
+    grounding_counts: Optional[Dict[str, int]] = None
+    answer_status: str = "answered"
+    failure: Optional[Dict[str, Any]] = None
+    failure_class: Optional[str] = None
+
+    def structure(self) -> Dict[str, Any]:
+        """The persisted `answer_structure_json` payload (§4.4)."""
+        return {
+            "conclusion": self.conclusion,
+            "points": [dict(p) for p in self.points],
+            "missing_information": [dict(m) for m in self.missing_information],
+            "grounding_state": self.grounding_state,
+            "answer_status": self.answer_status,
+            "failure_class": self.failure_class,
+        }
+
+
+class _AnswerFailure(Exception):
+    """An LLM attempt that produced no usable answer, already classified.
+
+    Deliberately carries only the finite class: never `str(exc)`, a provider
+    body, or the raw model output (Principle 9).
+    """
+
+    def __init__(self, failure_class: str):
+        super().__init__(failure_class)
+        self.failure_class = failure_class
 
 
 def _citation_title(pack: ContextPack, ctype: str, cid: str) -> tuple:
@@ -987,10 +1033,42 @@ class _RawCitation(BaseModel):
     id: str = Field(..., min_length=1, max_length=200)
 
 
-class _RawAssistantResponse(BaseModel):
+_CITATION_TYPE_PATTERN = (
+    "^(setting|diagnostic_check|pipeline_step|state_item|screen_data|ui_draft|related_context)$"
+)
+
+
+class _RawSource(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    answer: str = Field(..., min_length=1, max_length=20_000)
+    type: str = Field(..., pattern=_CITATION_TYPE_PATTERN)
+    id: str = Field(..., min_length=1, max_length=200)
+
+
+class _RawPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = Field(..., pattern="^(fact|interpretation|unknown)$")
+    text: str = Field(..., min_length=1, max_length=2_000)
+    sources: List[_RawSource] = Field(default_factory=list, max_length=10)
+
+
+class _RawMissing(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    what: str = Field(..., min_length=1, max_length=500)
+    how_to_get: str = Field(..., min_length=1, max_length=500)
+
+
+class _RawAssistantResponse(BaseModel):
+    """`prompt_version: v2` output (contract §4.1).  A v1-shaped output (only
+    `answer`) fails here on purpose: it is never silently accepted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    conclusion: str = Field(..., min_length=1, max_length=4_000)
+    points: List[_RawPoint] = Field(default_factory=list, max_length=20)
+    missing_information: List[_RawMissing] = Field(default_factory=list, max_length=10)
     suggested_actions: List[_RawAction] = Field(default_factory=list, max_length=10)
     citations: List[_RawCitation] = Field(default_factory=list, max_length=20)
 
@@ -1037,9 +1115,34 @@ only see part of it); "empty" means the list was read and has zero items;
 "context_budget" is present, its omitted_sections names what was NOT provided
 to you (and why); say so rather than guessing at the missing part.
 
+Answer quality rules (output contract v2):
+- Put the direct answer to the question FIRST, in "conclusion" (1-3 sentences).
+  Do not open with a description of the screen unless that is the question.
+- Put supporting claims in "points". Each point has a kind:
+  "fact" = something stated by the provided context; it MUST list the
+  "sources" (type + id) it rests on, taken from the context. A fact without a
+  source from the context will be shown to the user as unverified.
+  "interpretation" = your reading, judgement or suggestion; cite what it is
+  based on when there is something to cite.
+  "unknown" = something you cannot determine from the context.
+- If the context does not support a claim, do NOT state it as a fact: make it
+  an "unknown" point or phrase it as an "interpretation".
+- Anything you would need but were not given goes in "missing_information",
+  each with what is missing and how_to_get (how the developer can obtain it).
+  Missing information is not a failure: still answer what you can.
+- For plain operation-help questions no fact points are needed: "points" may
+  be an empty list.
+
 Respond with ONLY a JSON object (no markdown fence) of this shape:
 {
-  "answer": "explanation grounded in the provided context",
+  "conclusion": "the direct answer to the question",
+  "points": [
+    {"kind": "fact|interpretation|unknown",
+     "text": "one claim",
+     "sources": [{"type": "setting|diagnostic_check|pipeline_step|state_item|screen_data|ui_draft|related_context",
+                  "id": "key or id from the context (related_context: its source_id)"}]}
+  ],
+  "missing_information": [{"what": "what is missing", "how_to_get": "how to obtain it"}],
   "suggested_actions": [
     {"label": "short action (for operate: the operation name, e.g. 'Run Build / Refresh')",
      "kind": "navigate|configure|operate",
@@ -1047,7 +1150,7 @@ Respond with ONLY a JSON object (no markdown fence) of this shape:
      "detail": "optional how-to detail"}
   ],
   "citations": [
-    {"type": "setting|diagnostic_check|pipeline_step|state_item|screen_data|ui_draft|related_context", "id": "key or id from the context (related_context: its source_id)"}
+    {"type": "setting|diagnostic_check|pipeline_step|state_item|screen_data|ui_draft|related_context", "id": "key or id from the context"}
   ]
 }
 Cite every setting, diagnostics check, and pipeline step you rely on.
@@ -1120,18 +1223,21 @@ def _llm_answer(
     except LLMError as exc:
         if trace is not None:
             _record_llm_result(trace, client)
-            trace.failure_class = failure_class_for(error_kind=exc.kind)
-        raise
+        raise _AnswerFailure(failure_class_for(error_kind=exc.kind) or "provider_error") from None
+    except LLMResourceLimitError as exc:
+        # Not an `LLMError`: quota / missing System context.  The System's
+        # daily allowance is a budget; a missing context is a server-side
+        # provider-call precondition, so it is reported as a provider error.
+        if trace is not None:
+            _record_llm_result(trace, client)
+        raise _AnswerFailure(
+            "budget_exceeded" if isinstance(exc, LLMQuotaExceeded) else "provider_error"
+        ) from None
     if trace is not None:
         _record_llm_result(trace, client)
     with (trace.stage("response_validation") if trace is not None else nullcontext()):
-        parsed = _parse_assistant_response(raw, trace)
-        allowed = pack.allowed_citation_ids()
-        citations = []
-        for c in parsed.citations:
-            if c.id in allowed.get(c.type, set()):
-                title, detail = _citation_title(pack, c.type, c.id)
-                citations.append(Citation(type=c.type, id=c.id, title=title, detail=detail))
+        parsed = _parse_assistant_response(raw, getattr(client, "last_finish_reason", None))
+        grounded = ground_response(pack, parsed)
 
         setting_keys = {s.key for s in pack.settings}
         actions = []
@@ -1147,16 +1253,163 @@ def _llm_answer(
             )
 
     if trace is not None:
-        trace.output_chars = len(parsed.answer)
+        trace.output_chars = len(grounded["answer"])
     return AssistantAnswer(
-        answer=parsed.answer,
+        answer=grounded["answer"],
         suggested_actions=actions,
-        citations=citations,
+        citations=grounded["citations"],
         used_fallback=False,
         decision_method="reasoning_llm",
         provider=config.provider,
         model=config.model,
+        conclusion=parsed.conclusion,
+        points=grounded["points"],
+        missing_information=grounded["missing_information"],
+        grounding_state=grounded["grounding_state"],
+        grounding_counts=grounded["grounding_counts"],
+        answer_status="answered",
     )
+
+
+# --- Grounding (Issue #471, contract §4.2/§4.3) ---------------------------------
+
+_SECTION_FACT = "確認済みの事実:"
+_SECTION_INTERPRETATION = "解釈・提案:"
+_SECTION_STALE = "古い根拠に基づく内容 (再確認が必要):"
+_SECTION_UNSUPPORTED = "根拠を確認できなかった主張 (事実として扱わないでください):"
+_SECTION_MISSING = "不足している情報:"
+
+
+def _source_is_stale(pack: ContextPack, ctype: str, cid: str) -> bool:
+    """`stale` only for a source the pack itself marks stale: a
+    `related_context` entry with freshness stale, or the thread's own
+    discussion target when its target_state is stale.  Everything else is
+    current/unknown (the manifest records finer detail)."""
+    if ctype == "related_context":
+        return any(
+            e.get("source_id") == cid and e.get("freshness") == "stale"
+            for e in pack.related_context
+        )
+    if ctype == "screen_data" and cid.startswith("discussion_target:"):
+        target = (pack.screen_data or {}).get("discussion_target") or {}
+        return target.get("target_state") == "stale"
+    return False
+
+
+def ground_response(pack: ContextPack, parsed: "_RawAssistantResponse") -> Dict[str, Any]:
+    """Deterministically validate a v2 response against the pack.
+
+    Structural only: an existing-but-irrelevant id is `supported` here and only
+    human evaluation can tell (contract §4.2).  An unsupported fact is never
+    shown as a fact and its (invalid) ids are never written back to citations.
+    """
+    allowed = pack.allowed_citation_ids()
+    rejected = 0
+    points: List[Dict[str, Any]] = []
+    citation_keys: List[tuple] = []
+
+    def _valid(ctype: str, cid: str) -> bool:
+        return cid in allowed.get(ctype, set())
+
+    def _remember(ctype: str, cid: str) -> None:
+        if (ctype, cid) not in citation_keys:
+            citation_keys.append((ctype, cid))
+
+    for raw_point in parsed.points:
+        valid: List[tuple] = []
+        for src in raw_point.sources:
+            key = (src.type, src.id)
+            if not _valid(src.type, src.id):
+                rejected += 1
+                continue
+            if key not in valid:
+                valid.append(key)
+        if raw_point.kind == "fact":
+            if not valid:
+                grounding = "unsupported"
+            elif any(not _source_is_stale(pack, t, i) for t, i in valid):
+                grounding = "supported"
+            else:
+                grounding = "stale"
+        elif raw_point.kind == "interpretation":
+            grounding = "supported" if valid else "not_required"
+        else:
+            grounding = "not_required"
+        for t, i in valid:
+            _remember(t, i)
+        points.append({
+            "kind": raw_point.kind,
+            "text": raw_point.text,
+            "sources": [{"type": t, "id": i} for t, i in valid],
+            "grounding": grounding,
+        })
+
+    for c in parsed.citations:
+        if _valid(c.type, c.id):
+            _remember(c.type, c.id)
+        else:
+            rejected += 1
+
+    counts = {"supported": 0, "stale": 0, "unsupported": 0, "not_required": 0}
+    for point in points:
+        counts[point["grounding"]] += 1
+    counts["rejected_citations"] = rejected
+
+    facts = [p for p in points if p["kind"] == "fact"]
+    if not facts:
+        state = "not_required"
+    elif all(p["grounding"] == "supported" for p in facts):
+        state = "grounded"
+    elif any(p["grounding"] == "supported" for p in facts):
+        state = "partially_grounded"
+    else:
+        state = "ungrounded"
+
+    citations = []
+    for ctype, cid in citation_keys:
+        title, detail = _citation_title(pack, ctype, cid)
+        citations.append(Citation(type=ctype, id=cid, title=title, detail=detail))
+
+    missing = [{"what": m.what, "how_to_get": m.how_to_get} for m in parsed.missing_information]
+    return {
+        "points": points,
+        "missing_information": missing,
+        "grounding_state": state,
+        "grounding_counts": counts,
+        "citations": citations,
+        "answer": compose_answer(parsed.conclusion, points, missing),
+    }
+
+
+def compose_answer(
+    conclusion: str, points: List[Dict[str, Any]], missing: List[Dict[str, str]]
+) -> str:
+    """§4.3: the backward-compatible `answer`, composed by the server."""
+    def bullets(items: List[str]) -> List[str]:
+        return [f"- {t}" for t in items]
+
+    facts = [p["text"] for p in points if p["kind"] == "fact" and p["grounding"] == "supported"]
+    interpretations = [p["text"] for p in points if p["kind"] == "interpretation"]
+    stale = [p["text"] for p in points if p["kind"] == "fact" and p["grounding"] == "stale"]
+    unsupported = [p["text"] for p in points if p["kind"] == "fact" and p["grounding"] == "unsupported"]
+    # An `unknown` point is the model saying it cannot determine something,
+    # which is missing information without a how-to.
+    missing_lines = bullets([p["text"] for p in points if p["kind"] == "unknown"])
+    missing_lines += [
+        f"- {m['what']} — {m['how_to_get']}" if m.get("how_to_get") else f"- {m['what']}"
+        for m in missing
+    ]
+    blocks = [conclusion.strip()]
+    for heading, lines in (
+        (_SECTION_FACT, bullets(facts)),
+        (_SECTION_INTERPRETATION, bullets(interpretations)),
+        (_SECTION_STALE, bullets(stale)),
+        (_SECTION_UNSUPPORTED, bullets(unsupported)),
+        (_SECTION_MISSING, missing_lines),
+    ):
+        if lines:
+            blocks.append("\n".join([heading, *lines]))
+    return "\n\n".join(blocks)
 
 
 def _record_input_sizes(
@@ -1185,27 +1438,21 @@ def _record_llm_result(trace: Any, client: Any) -> None:
         }
 
 
-def _parse_assistant_response(raw: str, trace: Optional[Any]) -> "_RawAssistantResponse":
-    def malformed() -> None:
-        if trace is not None:
-            trace.failure_class = failure_class_for(
-                malformed_output=True, finish_reason=trace.finish_reason
-            )
-
+def _parse_assistant_response(
+    raw: str, finish_reason: Optional[str] = None
+) -> "_RawAssistantResponse":
+    """Parse and schema-validate a v2 response; any failure is a classified
+    `_AnswerFailure` (`truncated_output` when the model hit its length limit,
+    else `malformed_output`).  The raw text never leaves this function."""
+    malformed = failure_class_for(malformed_output=True, finish_reason=finish_reason)
     try:
         data = json.loads(_strip_json_fences(raw))
-    except json.JSONDecodeError as exc:
-        malformed()
-        raise LLMError(
-            f"Assistant response was not valid JSON: {raw[:300]}", kind="malformed_response"
-        ) from exc
+    except (json.JSONDecodeError, TypeError):
+        raise _AnswerFailure(malformed or "malformed_output") from None
     try:
         return _RawAssistantResponse.model_validate(data)
-    except ValidationError as exc:
-        malformed()
-        raise LLMError(
-            f"Assistant response failed schema validation: {exc}", kind="malformed_response"
-        ) from exc
+    except ValidationError:
+        raise _AnswerFailure(malformed or "malformed_output") from None
 
 
 # --- Deterministic fallback --------------------------------------------------
@@ -1317,16 +1564,19 @@ def _state_actions(items: List[StateItem]) -> List[SuggestedAction]:
     return actions
 
 
-def _fallback_answer(
+def _deterministic_answer(
     pack: ContextPack,
     report: SystemDiagnosticsReport,
     config: LLMConfig,
-    reason: str,
-) -> AssistantAnswer:
-    """Compose an answer verbatim from static metadata and diagnostics.
+    failure_class: str,
+) -> Optional[AssistantAnswer]:
+    """Compose an answer verbatim from static metadata and diagnostics, ONLY
+    for what the question matched exactly (Issue #472, contract §5.2).
 
-    Only finite-set matches (setting keys, check ids/titles, pipeline steps)
-    select content; free text is never interpreted heuristically.
+    Only finite-set matches (setting keys, check ids/titles, pipeline steps,
+    the focused state item) select content; free text is never interpreted
+    heuristically.  Returns None when nothing matched: the caller then answers
+    `failed` -- a screen overview or settings list is never an answer here.
     """
     mentioned_settings = [
         SETTINGS_BY_KEY[k] for k in pack.mentioned_setting_keys if k in SETTINGS_BY_KEY
@@ -1375,56 +1625,72 @@ def _fallback_answer(
         )
         action_checks.append(check)
 
-    if not sections:
-        failing = [c for c in pack.checks if c.severity != "ok"]
-        overview_lines = [
-            f"{pack.screen.title}: {pack.screen.purpose}",
-        ]
-        if pack.screen.visible_sections:
-            overview_lines.append(
-                f"Main sections: {', '.join(pack.screen.visible_sections)}"
-            )
-        if failing:
-            overview_lines.append("Current problems on this screen:")
-            for check in failing:
-                overview_lines.append(
-                    f"- '{check.title}' is {check.severity}: {check.detail}"
-                )
-                citations.append(
-                    Citation(
-                        type="diagnostic_check",
-                        id=check.check_id,
-                        title=check.title,
-                        detail=f"{check.severity}: {check.detail}",
-                    )
-                )
-            action_checks.extend(failing)
-        else:
-            overview_lines.append(
-                "All diagnostics checks related to this screen are passing."
-            )
-        overview_lines.append(
-            "The reasoning model is not available, so this rule-based fallback "
-            "can only explain known settings and diagnostics checks. Mention a "
-            "setting key (e.g. "
-            + ", ".join(pack.screen.related_settings[:3] or ["LLM_PROVIDER"])
-            + ") or a check name for details."
+    for step in pack.mentioned_pipeline_steps:
+        if any(step in c.related_pipeline_steps for c in mentioned_checks):
+            continue
+        sections.append(f"Pipeline step: {PIPELINE_STEP_LABELS.get(step, step)}")
+        citations.append(
+            Citation(type="pipeline_step", id=step, title=PIPELINE_STEP_LABELS.get(step, step))
         )
-        sections.append("\n".join(overview_lines))
+
+    if not sections:
+        return None
 
     return AssistantAnswer(
         answer="\n\n".join(sections),
         suggested_actions=(
             _state_actions(pack.state_items)
-            + _fallback_actions(action_checks or pack.checks, mentioned_settings or pack.settings)
+            + _fallback_actions(action_checks, mentioned_settings)
         )[:8],
         citations=citations,
         used_fallback=True,
         decision_method="deterministic",
         provider=config.provider,
         model=config.model,
-        fallback_reason=reason,
+        fallback_reason=failure_message(failure_class),
+        grounding_state="not_required",
+        grounding_counts={
+            "supported": 0, "stale": 0, "unsupported": 0, "not_required": 0,
+            "rejected_citations": 0,
+        },
+        answer_status="deterministic_answer",
+        failure=failure_dict(failure_class),
+        failure_class=failure_class,
     )
+
+
+def _failed_answer(config: LLMConfig, failure_class: str) -> AssistantAnswer:
+    """`answer_status: failed` (§5.2): the reason and the next operations only."""
+    return AssistantAnswer(
+        answer=compose_failed_answer(failure_class),
+        suggested_actions=[],
+        citations=[],
+        used_fallback=True,
+        decision_method="deterministic",
+        provider=config.provider,
+        model=config.model,
+        fallback_reason=failure_message(failure_class),
+        answer_status="failed",
+        failure=failure_dict(failure_class),
+        failure_class=failure_class,
+    )
+
+
+def _degraded_answer(
+    pack: ContextPack,
+    report: SystemDiagnosticsReport,
+    config: LLMConfig,
+    failure_class: str,
+    trace: Optional[Any],
+) -> AssistantAnswer:
+    if trace is not None:
+        trace.failure_class = failure_class
+    answer = _deterministic_answer(pack, report, config, failure_class)
+    if answer is None:
+        answer = _failed_answer(config, failure_class)
+    if trace is not None:
+        trace.output_chars = len(answer.answer)
+    return answer
 
 
 # --- Entry point -------------------------------------------------------------
@@ -1489,24 +1755,8 @@ def answer_question(
     if trace is not None:
         trace.record_pack(pack)
     if client is None:
-        if trace is not None:
-            trace.failure_class = failure_class_for(
-                client_available=False, provider=config.provider
-            )
-        if config.provider == "mock":
-            reason = (
-                "LLM provider 'mock' is test-only data and is never used for "
-                "assistant answers."
-            )
-        elif config.provider in REAL_PROVIDERS and not config.api_key:
-            key_env = PROVIDER_KEY_ENV.get(config.provider, "")
-            reason = (
-                f"No API key for provider '{config.provider}' "
-                f"(set LLM_API_KEY{f' or {key_env}' if key_env else ''})."
-            )
-        else:
-            reason = f"No usable LLM configuration (provider '{config.provider}')."
-        return _fallback_answer(pack, report, config, reason)
+        failure_class = failure_class_for(client_available=False, provider=config.provider)
+        return _degraded_answer(pack, report, config, failure_class or "provider_not_configured", trace)
     try:
         answer = _llm_answer(
             client,
@@ -1519,11 +1769,9 @@ def answer_question(
             voice_spoken_history=voice_spoken_history,
             trace=trace,
         )
-        state_actions = _state_actions(pack.state_items)
-        if state_actions:
-            answer.suggested_actions = (state_actions + answer.suggested_actions)[:8]
-        return answer
-    except LLMError as exc:
-        if trace is not None and trace.failure_class is None:
-            trace.failure_class = failure_class_for(error_kind=exc.kind)
-        return _fallback_answer(pack, report, config, f"LLM call failed: {exc}")
+    except _AnswerFailure as failure:
+        return _degraded_answer(pack, report, config, failure.failure_class, trace)
+    state_actions = _state_actions(pack.state_items)
+    if state_actions:
+        answer.suggested_actions = (state_actions + answer.suggested_actions)[:8]
+    return answer

@@ -11307,6 +11307,14 @@ def init_db() -> None:
                 # empty is itself impossible here since a claims call always
                 # returns at least one claim or fails outright).
                 ("claims_json", "TEXT"),
+                # Issue #471 (Epic #467, docs/01-specifications/capabilities/
+                # assistant-answer-quality.md §4.4): the validated structure of
+                # an ASSISTANT `/assistant/ask` turn -- conclusion, points with
+                # grounding, missing information, grounding_state, answer_status,
+                # failure_class. NULL on every pre-#471 row and on a turn that
+                # referenced an unsaved draft (its structure is deliberately not
+                # stored, like its body); both simply render `content` as before.
+                ("answer_structure_json", "TEXT"),
             ):
                 _add_column_if_missing(
                     conn, "assistant_discussion_turn", turn_cols, column, definition

@@ -272,10 +272,11 @@ def test_ask_generic_question_returns_screen_overview_without_guessing(admin_cli
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["used_fallback"] is True
-    # No open-ended guessing: the fallback states its limitation and shows
-    # the screen purpose instead.
-    assert "Components" in body["answer"]
-    assert "fallback" in body["answer"]
+    # Issue #472: no open-ended guessing AND no screen overview standing in
+    # for an answer -- an unmatched question is `failed` (reason + next steps).
+    assert body["answer_status"] == "failed"
+    assert body["failure"]["failure_class"] == "provider_test_only"
+    assert "Main sections" not in body["answer"]
 
 
 def test_ask_with_focused_canonical_state_returns_its_citation_and_target(admin_client):
@@ -337,7 +338,7 @@ class _GroundedClient:
         assert messages[-1]["content"] == payload["question"]
         return json.dumps(
             {
-                "answer": "Documentation claim scanning needs a reasoning model.",
+                "conclusion": "Documentation claim scanning needs a reasoning model.",
                 "suggested_actions": [
                     {
                         "label": "Open System Understanding",
@@ -395,7 +396,7 @@ class _DiscussionCaptureClient:
     def __init__(self):
         self.messages = None
         self.response = json.dumps({
-            "answer": "Vision と System Purpose の接続を確認します。",
+            "conclusion": "Vision と System Purpose の接続を確認します。",
             "suggested_actions": [],
             "citations": [{"type": "screen_data", "id": "overview"}],
         })
@@ -574,7 +575,7 @@ def test_voice_answer_uses_bounded_spoken_projection(admin_client, monkeypatch):
     system = _create_system(admin_client, token)
     client = _DiscussionCaptureClient()
     client.response = json.dumps({
-        "answer": (
+        "conclusion": (
             "最初に全体像を説明します。中核となる結論です。"
             "ここから先は詳しい背景です。さらに長い実装詳細が続きます。"
         ),
@@ -601,7 +602,7 @@ def test_voice_continuation_does_not_repeat_spoken_content(admin_client, monkeyp
     system = _create_system(admin_client, token)
     client = _DiscussionCaptureClient()
     client.response = json.dumps({
-        "answer": "要点は設定が必要なことです。",
+        "conclusion": "要点は設定が必要なことです。",
         "suggested_actions": [],
         "citations": [],
     }, ensure_ascii=False)
@@ -670,8 +671,12 @@ def test_ask_llm_failure_switches_to_marked_fallback(admin_client, monkeypatch):
     body = r.json()
     assert body["used_fallback"] is True
     assert body["decision_method"] == "deterministic"
-    assert "LLM call failed" in body["fallback_reason"]
-    assert "invalid api key" in body["fallback_reason"]
+    # Issue #472: the reason is the fixed Japanese sentence for the class,
+    # never `str(exc)` (which embeds the provider body).
+    assert body["answer_status"] == "deterministic_answer"
+    assert body["failure"]["failure_class"] == "provider_error"
+    assert body["fallback_reason"] == body["failure"]["message"]
+    assert "invalid api key" not in json.dumps(body)
     assert "INTELLIGENCE_LLM_MODEL" in body["answer"]
 
 
@@ -692,14 +697,15 @@ def test_ask_llm_malformed_output_switches_to_marked_fallback(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["used_fallback"] is True
-    assert "not valid JSON" in body["fallback_reason"]
+    assert body["failure"]["failure_class"] == "malformed_output"
+    assert body["fallback_reason"] == body["failure"]["message"]
 
 
 def test_ask_provider_key_mismatch_falls_back_without_llm_call(
     admin_client, monkeypatch
 ):
     """A key belonging to a different provider is not usable: no external
-    call is attempted and the fallback reason names the missing key."""
+    call is attempted and the failure class says the provider is not configured."""
     token = _login(admin_client)
     system = _create_system(admin_client, token)
     monkeypatch.setenv("LLM_PROVIDER", "openai")
@@ -725,8 +731,10 @@ def test_ask_provider_key_mismatch_falls_back_without_llm_call(
     body = r.json()
     assert body["used_fallback"] is True
     assert body["decision_method"] == "deterministic"
-    assert "anthropic" in body["fallback_reason"]
-    assert "ANTHROPIC_API_KEY" in body["fallback_reason"]
+    assert body["failure"]["failure_class"] == "provider_not_configured"
+    assert body["answer_status"] == "deterministic_answer"
+    assert body["fallback_reason"] == body["failure"]["message"]
+    assert "LLM_API_KEY" in {r["target"] for r in body["failure"]["recovery"]}
 
 
 def test_ask_requires_auth(admin_client):

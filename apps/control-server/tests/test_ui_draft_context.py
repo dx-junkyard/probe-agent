@@ -133,7 +133,7 @@ class _CapturingClient:
     def generate_text(self, messages, *, temperature=None, max_tokens=None):
         self.calls.append(messages)
         return json.dumps({
-            "answer": f"answer-{len(self.calls)}",
+            "conclusion": f"answer-{len(self.calls)}",
             "suggested_actions": [],
             "citations": [{"type": "ui_draft", "id": "ui_draft:ux_journey.revision"}],
         })
@@ -651,7 +651,7 @@ def test_draft_derived_answers_are_ephemeral_and_not_inherited(admin_client, mon
     class EchoClient(_CapturingClient):
         def generate_text(self, messages, **kwargs):
             self.calls.append(messages)
-            return json.dumps({"answer": f"{draft_value} / {secret}", "suggested_actions": [], "citations": []})
+            return json.dumps({"conclusion": f"{draft_value} / {secret}", "suggested_actions": [], "citations": []})
 
     fake = EchoClient()
     _enable_real_llm(monkeypatch, fake)

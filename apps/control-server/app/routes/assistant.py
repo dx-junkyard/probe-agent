@@ -48,6 +48,7 @@ from ..assistant import (
 )
 from ..assistant_discussion_context import build_screen_discussion_context
 from .. import assistant_metrics
+from ..assistant_failure import FAILURE_TABLE, failure_dict, failure_message
 from ..assistant_metrics import AskTrace
 from ..assistant_request_scope import AskRequestScope, bind_scope
 from ..assistant_related_context import gather_related_context
@@ -286,6 +287,9 @@ def _turn_out(row: Dict[str, Any]) -> AssistantDiscussionTurnOut:
         ui_draft_state=row.get("ui_draft_state"),
         ui_draft_form_id=row.get("ui_draft_form_id"),
         ui_draft_digest=row.get("ui_draft_digest") or "",
+        # Issue #471: forgetting this here would silently drop the stored
+        # structure on reload even though the DB row carries it.
+        answer_structure=row.get("answer_structure"),
         # Issue #459 (§9.2): `None` unless this turn is a claims turn --
         # forgetting this field here (unlike `assistant_discussion._turn_out`,
         # which already parses `claims_json`) would silently drop every
@@ -1262,7 +1266,9 @@ def _assistant_ask_body(
         related_context=related.entries,
         omitted_sections=related.omitted_sections,
     )
-    trace.outcome = "deterministic_answer" if result.used_fallback else "answered"
+    trace.outcome = result.answer_status
+    if result.failure_class is not None:
+        trace.failure_class = result.failure_class
     trace.meta.update(
         provider=result.provider, model=result.model,
         prompt_version=result.prompt_version, schema_version=result.schema_version,
@@ -1320,6 +1326,12 @@ def _assistant_ask_body(
                             if resolved_draft.payload is not None else result.answer
                         ),
                         citations=citations_payload,
+                        # Issue #471 §4.4: NULL when a draft was used -- the
+                        # structure would repeat the body the neutral marker
+                        # above exists to keep out of history.
+                        answer_structure=(
+                            None if resolved_draft.payload is not None else result.structure()
+                        ),
                         target_revision_id=resolved.revision_id,
                         target_digest=resolved.digest,
                         used_fallback=result.used_fallback,
@@ -1387,7 +1399,49 @@ def _assistant_ask_body(
         ui_draft_changed=ui_draft_changed,
         screen_context_state=screen_context_state,
         screen_context_reason=screen_context_reason or None,
+        **_answer_fields(result),
     )
+
+
+def _load_structure(raw: Any) -> Optional[Dict[str, Any]]:
+    try:
+        loaded = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _answer_fields(result: Any) -> Dict[str, Any]:
+    """The additive #471/#472 fields of `AssistantAskOut` from an answer."""
+    return {
+        "conclusion": result.conclusion,
+        "points": result.points,
+        "missing_information": result.missing_information,
+        "grounding_state": result.grounding_state,
+        "grounding_counts": result.grounding_counts,
+        "answer_status": result.answer_status,
+        "failure": result.failure,
+    }
+
+
+def _answer_fields_from_structure(structure: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Rebuild the same fields from a stored `answer_structure_json` (replay
+    path).  A NULL structure yields the pre-#471 defaults."""
+    if not structure:
+        return {}
+    status = structure.get("answer_status") or "answered"
+    failure_class = structure.get("failure_class")
+    fields: Dict[str, Any] = {
+        "conclusion": structure.get("conclusion"),
+        "points": structure.get("points") or [],
+        "missing_information": structure.get("missing_information") or [],
+        "grounding_state": structure.get("grounding_state"),
+        "answer_status": status,
+    }
+    if failure_class in FAILURE_TABLE:
+        fields["failure"] = failure_dict(failure_class)
+        fields["fallback_reason"] = failure_message(failure_class)
+    return fields
 
 
 @router.post('/assistant/ask', response_model=AssistantAskOut)
@@ -1414,7 +1468,8 @@ def assistant_ask(payload: AssistantAskRequest, system_id: int = Depends(get_sys
             return AssistantAskOut(screen_id='interview',answer=reply['content'],citations=d.json.loads(reply['citations_json'] or '[]'),
                 used_fallback=bool(reply['used_fallback']),decision_method=reply['decision_method'],provider=reply['provider'],
                 model=reply['model'],prompt_version=reply['prompt_version'],schema_version=reply['schema_version'],
-                generated_at=reply['created_at'],thread_id=payload.thread_id,turn_number=reply['turn_number'])
+                generated_at=reply['created_at'],thread_id=payload.thread_id,turn_number=reply['turn_number'],
+                **_answer_fields_from_structure(_load_structure(reply['answer_structure_json'])))
         running = conn.execute('SELECT id FROM interview_discussion_turn_request WHERE thread_id=? AND result_json IS NULL AND lease_until>?',
                                (payload.thread_id, time.time())).fetchone()
         if running:

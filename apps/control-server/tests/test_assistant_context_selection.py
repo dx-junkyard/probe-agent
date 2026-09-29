@@ -75,7 +75,7 @@ class _Fake:
 
     def generate_text(self, messages, *, temperature=None, max_tokens=None):
         self.calls.append(messages)
-        return json.dumps({"answer": "回答です", "suggested_actions": [], "citations": self.citations})
+        return json.dumps({"conclusion": "回答です", "suggested_actions": [], "citations": self.citations})
 
     def context(self):
         user = next(m for m in self.calls[-1] if m["content"].startswith("Screen context"))

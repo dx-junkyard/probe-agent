@@ -6503,6 +6503,71 @@ class AssistantDiscussionTargetIn(BaseModel):
     target_ref: str = Field(..., min_length=1, max_length=500)
 
 
+# --- Grounded answer structure & failure response (Issues #471/#472, Epic #467)
+# docs/01-specifications/capabilities/assistant-answer-quality.md §4/§5.
+# Every finite set is a `Literal` so the schema carries the enum and a
+# Dashboard union cannot drift unnoticed.
+AssistantFailureClass = Literal[
+    "provider_not_configured", "provider_test_only", "timeout", "network",
+    "auth", "rate_limited", "provider_error", "malformed_output",
+    "truncated_output", "context_unavailable", "budget_exceeded",
+]
+PointKind = Literal["fact", "interpretation", "unknown"]
+PointGrounding = Literal["supported", "stale", "unsupported", "not_required"]
+GroundingState = Literal["grounded", "partially_grounded", "ungrounded", "not_required"]
+AnswerStatus = Literal["answered", "deterministic_answer", "failed"]
+RecoveryKind = Literal["retry", "configure", "rephrase", "open_settings"]
+
+
+class AnswerSourceOut(BaseModel):
+    type: str
+    id: str
+
+
+class AnswerPointOut(BaseModel):
+    kind: PointKind
+    text: str
+    sources: List[AnswerSourceOut] = Field(default_factory=list)
+    grounding: PointGrounding
+
+
+class MissingInformationOut(BaseModel):
+    what: str
+    how_to_get: str = ""
+
+
+class GroundingCountsOut(BaseModel):
+    supported: int = 0
+    stale: int = 0
+    unsupported: int = 0
+    not_required: int = 0
+    rejected_citations: int = 0
+
+
+class AssistantRecoveryOut(BaseModel):
+    kind: RecoveryKind
+    label: str
+    target: Optional[str] = None
+
+
+class AssistantFailureOut(BaseModel):
+    failure_class: AssistantFailureClass
+    message: str
+    retryable: bool
+    recovery: List[AssistantRecoveryOut] = Field(default_factory=list)
+
+
+class AnswerStructureOut(BaseModel):
+    """What `assistant_discussion_turn.answer_structure_json` holds (§4.4)."""
+
+    conclusion: Optional[str] = None
+    points: List[AnswerPointOut] = Field(default_factory=list)
+    missing_information: List[MissingInformationOut] = Field(default_factory=list)
+    grounding_state: Optional[GroundingState] = None
+    answer_status: AnswerStatus = "answered"
+    failure_class: Optional[AssistantFailureClass] = None
+
+
 class AssistantDiscussionTurnOut(BaseModel):
     id: int
     thread_id: int
@@ -6529,6 +6594,9 @@ class AssistantDiscussionTurnOut(BaseModel):
     ui_draft_state: Optional[UiDraftState] = None
     ui_draft_form_id: Optional[str] = None
     ui_draft_digest: str = ""
+    # Issue #471 (§4.4): `None` on a pre-#471 row and on a turn that used an
+    # unsaved draft (its structure is deliberately not stored).
+    answer_structure: Optional[AnswerStructureOut] = None
     # Issue #459 (§9.2): `None` means "not a claims turn" (every turn before
     # this Issue, and every ordinary `/assistant/ask` turn since) -- never
     # defaulted to `[]`, which would be indistinguishable from "attached and
@@ -7049,6 +7117,15 @@ class AssistantAskOut(BaseModel):
     # returns the ORIGINAL ask's id (or None when rebuilt from the turn row),
     # never a new one -- a replay is not a new ask.
     request_id: Optional[str] = None
+    # Issues #471/#472: structured, grounded answer + failure response.
+    # All additive; `answer` stays the deterministic composition of them.
+    conclusion: Optional[str] = None
+    points: List[AnswerPointOut] = Field(default_factory=list)
+    missing_information: List[MissingInformationOut] = Field(default_factory=list)
+    grounding_state: Optional[GroundingState] = None
+    grounding_counts: Optional[GroundingCountsOut] = None
+    answer_status: AnswerStatus = "answered"
+    failure: Optional[AssistantFailureOut] = None
 
 
 # --- Assistant ask metrics (Issue #468, Epic #467) ---------------------------
@@ -7058,11 +7135,6 @@ AskStage = Literal[
     "context_bundle", "context_pack", "llm", "response_validation", "persist",
 ]
 AskOutcome = Literal["answered", "deterministic_answer", "failed", "rejected", "error"]
-AssistantFailureClass = Literal[
-    "provider_not_configured", "provider_test_only", "timeout", "network",
-    "auth", "rate_limited", "provider_error", "malformed_output",
-    "truncated_output", "context_unavailable", "budget_exceeded",
-]
 
 
 class AskStageTimingOut(BaseModel):

@@ -433,7 +433,7 @@ class TestScreenContextStateReachesTheWire:
             def generate_text(self, messages, *, temperature=None, max_tokens=None):
                 self.messages = messages
                 return _json.dumps({
-                    "answer": "x", "suggested_actions": [], "citations": [],
+                    "conclusion": "x", "suggested_actions": [], "citations": [],
                 })
 
         client = _CaptureClient()

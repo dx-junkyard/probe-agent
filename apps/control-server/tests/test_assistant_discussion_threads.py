@@ -156,7 +156,7 @@ class _CapturingClient:
 
     def generate_text(self, messages, *, temperature=None, max_tokens=None):
         self.calls.append(messages)
-        return json.dumps({"answer": f"answer-{len(self.calls)}", "suggested_actions": [], "citations": []})
+        return json.dumps({"conclusion": f"answer-{len(self.calls)}", "suggested_actions": [], "citations": []})
 
 
 def _enable_real_llm(monkeypatch, fake_client):
