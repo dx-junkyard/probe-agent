@@ -48,6 +48,8 @@ from .llm import (
     LLMQuotaExceeded,
     LLMResourceLimitError,
     PROVIDER_KEY_ENV,
+    assistant_max_output_tokens,
+    assistant_request_budget_seconds,
 )
 from .settings_metadata import SETTINGS_BY_KEY, SettingMetadata
 from .system_diagnostics import DiagnosticCheck, SystemDiagnosticsReport
@@ -1178,6 +1180,10 @@ def _strip_json_fences(text: str) -> str:
     return stripped.strip()
 
 
+# Below this remaining request budget a provider call cannot usefully finish.
+_MIN_LLM_CALL_SECONDS = 1.0
+
+
 def _llm_answer(
     client: LLMClient,
     config: LLMConfig,
@@ -1211,15 +1217,30 @@ def _llm_answer(
     messages.append({"role": "user", "content": question})
     if trace is not None:
         _record_input_sizes(trace, context_payload, system_prompt, pack.conversation, question)
+    # Issue #473: the request budget bounds the whole ask; it is a separate
+    # concept from the provider socket timeout (`LLMConfig.timeout`), and the
+    # llm layer clamps the call to min(socket timeout, remaining).  Defaults
+    # (no env) are unchanged: 2048 tokens, no budget, no timeout override.
+    max_tokens = assistant_max_output_tokens()
+    budget = assistant_request_budget_seconds()
+    call_timeout: Optional[float] = None
+    if budget is not None and trace is not None:
+        remaining = budget - trace.elapsed_seconds()
+        trace.request_config["request_budget_seconds"] = round(budget, 3)
+        trace.request_config["budget_remaining_seconds"] = round(max(remaining, 0.0), 3)
+        if remaining < _MIN_LLM_CALL_SECONDS:
+            raise _AnswerFailure("budget_exceeded")
+        call_timeout = remaining
+    if trace is not None:
+        trace.request_config["max_output_tokens"] = max_tokens
     try:
         with (trace.stage("llm") if trace is not None else nullcontext()):
             if trace is not None:
                 trace.counters["llm_calls"] += 1
-            raw = client.generate_text(
-                messages,
-                temperature=0.2,
-                max_tokens=2048,
-            )
+            generate_kwargs: Dict[str, Any] = {"temperature": 0.2, "max_tokens": max_tokens}
+            if call_timeout is not None:
+                generate_kwargs["timeout"] = call_timeout
+            raw = client.generate_text(messages, **generate_kwargs)
     except LLMError as exc:
         if trace is not None:
             _record_llm_result(trace, client)

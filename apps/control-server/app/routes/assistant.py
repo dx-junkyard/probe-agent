@@ -1128,9 +1128,17 @@ def _assistant_ask_body(
     focused_state_id = payload.focused_state_id if payload.focused_state_id in state_by_id else None
     if focused_state_id and focused_state_id not in {item.state_id for item in state_items}:
         state_items.insert(0, state_by_id[focused_state_id])
-    config = LLMConfig.intelligence_from_env()
+    # Issue #473: the normal ask alone may use an assistant-specific config
+    # (ASSISTANT_LLM_*).  Unset => identical to intelligence_from_env().  The
+    # other analysis features below/above keep the intelligence config.
+    config = LLMConfig.assistant_from_env()
     client = _usable_llm_client(config)
     trace.meta.update(provider=config.provider, model=config.model)
+    trace.request_config["llm_config_source"] = (
+        "intelligence_default"
+        if config == LLMConfig.intelligence_from_env()
+        else "assistant_override"
+    )
 
     effective_route_params: Dict[str, str] = dict(payload.route_params)
     conversation_messages = [message.model_dump() for message in payload.conversation]

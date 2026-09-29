@@ -191,6 +191,10 @@ class ScriptedClient:
         self.last_context_ids: List[Tuple[str, str]] = []
         self.last_input_chars = 0
         self.last_list_sizes: Dict[str, int] = {}
+        # Attributes real clients set after each call (Issue #473); the base
+        # commit ignores them, so the harness stays base-compatible.
+        self.last_usage: Optional[Dict[str, Optional[int]]] = None
+        self.last_finish_reason: Optional[str] = None
 
     def generate_text(self, messages, *, temperature=None, max_tokens=None, **_kw):
         self.calls += 1
@@ -219,7 +223,10 @@ class ScriptedClient:
             raise _make_llm_error("scripted 429", kind="rate_limited", http_status=429)
         if script == "malformed_json":
             return "これはJSONではありません。申し訳ありません。"
+        self.last_finish_reason = "stop"
         if script == "truncated":
+            self.last_finish_reason = "length"
+            self.last_usage = {"input_tokens": 1200, "output_tokens": 2048}
             return '{"answer": "途中で切れた回答です。まず設定を確認し'
         system_text = next((m["content"] for m in messages if m.get("role") == "system"), "")
         v2 = '"conclusion"' in system_text
@@ -231,6 +238,7 @@ class ScriptedClient:
         else:  # grounded_v1
             cited = [{"type": t, "id": i} for t, i in ids[:1]]
         text = "提供された文脈に基づく構造検証用の固定回答です。"
+        self.last_usage = {"input_tokens": 1200, "output_tokens": 180}
         if v2:
             return json.dumps({
                 "conclusion": text,

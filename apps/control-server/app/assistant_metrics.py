@@ -98,9 +98,16 @@ class AskTrace:
         self.thread_target: Optional[Dict[str, Any]] = None
         self.outcome: Optional[str] = None
         self.failure_class: Optional[str] = None
+        # Issue #473: which LLM config / limits this ask ran with.  Finite
+        # codes and numbers only (never a key, URL, or model text).
+        self.request_config: Dict[str, Any] = {}
         # Row identity fields the route learns along the way (ids / model
         # labels only -- never text).
         self.meta: Dict[str, Any] = {}
+
+    def elapsed_seconds(self) -> float:
+        """Seconds since this ask began (monotonic)."""
+        return time.perf_counter() - self._t0
 
     @contextmanager
     def stage(self, name: str) -> Iterator[None]:
@@ -220,6 +227,7 @@ def persist(
         usage["estimate_method"] = trace.estimate_method
         usage["output_chars"] = trace.output_chars
         usage["finish_reason"] = trace.finish_reason
+        usage.update(trace.request_config)
         with get_conn() as conn:
             conn.execute(
                 "DELETE FROM assistant_ask_metric WHERE system_id = ? AND created_at < ?",
