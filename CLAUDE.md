@@ -2208,6 +2208,41 @@ creating incomplete persistence or execution paths for later phases.
       しない。UX-13 は #401 の方針どおり新しいナビ体系・canonical 状態を
       作らない。
 
+32. Issue #467 (subs #468-#473) — AI アシスタントの回答品質と応答時間。
+    通常 ask (`POST /assistant/ask`) の計測・情報選択・根拠付き回答・失敗時
+    応答・待ち時間。`docs/01-specifications/capabilities/assistant-answer-quality.md`
+    が canonical contract で、§0 を読んでからこの領域に触ること。固定課題・
+    採点表・採否基準・baseline は `docs/03-validation/assistant-answer-quality.md`、
+    計画と結果は IP/IR-20260929-01。後から変えるときに守ること:
+    - **構造検証の合格は回答品質の合格ではない** (IK-0004)。source ID が許可
+      集合に入っていることは主張の裏付けではない。偽 LLM の harness
+      (`scripts/assistant_eval.py`) の結果を実 LLM の品質・時間として報告しない。
+      **実 LLM 評価と代表利用者評価 (#463) は未実施**。
+    - **計測記録 (`assistant_ask_metric`) は本文を持たない**: 質問・回答・
+      未保存 draft の値・秘密値・provider 応答を 1 文字も保存しない。
+      rejected / error も記録し、欠測を 0 にしない (`unmeasured`)。
+      `/assistant/ask-metrics-summary` は `{request_id}` 経路と衝突させない。
+    - **診断・System state は 1 リクエスト内でだけ共有する**
+      (`AskRequestScope`)。System をまたぐキャッシュ・TTL を入れない。LLM 後の
+      対象再解決は省略しない。
+    - **情報選択は構造的事実だけで決める** (thread 対象 / adapter registry /
+      完全一致の設定キー)。自由文からの意図分類器を入れない。切り詰めた一覧は
+      coverage (`truncated` ≠ `empty` ≠ `unavailable`) を持ち、予算で削った
+      source は引用できない。claims 本文は再利用しない。
+    - **根拠の無い事実を事実として表示しない。** 無効引用を消して本文だけ残す
+      ことを禁じるため、`answer` は server が points から決定的に組み立てる。
+      `unsupported` は「根拠を確認できなかった主張」、`stale` は再確認セクション。
+    - **失敗を正常回答にしない。** `answer_status` は `answered` /
+      `deterministic_answer` (有限集合に完全一致した質問だけ) / `failed`。
+      画面概要や設定一覧を回答の代わりに返さない。`fallback_reason` と応答・
+      履歴・計測に `str(exc)` / provider 本文を出さない。失敗 turn は LLM 履歴
+      から除く。サーバーは自動再試行しない。
+    - **待ち時間の設定点は既定値を変えない** (`ASSISTANT_LLM_*` 未設定なら
+      intelligence 設定と同一、出力上限 2048、リクエスト予算は無効)。切り替えた
+      provider に `LLM_API_KEY` / `LLM_BASE_URL` を渡さない。出力量・専用モデル・
+      streaming・形式修復の採否は同じ課題・同じモデルで実測してから決める。
+    既存の human gate は一切緩めない。会話は正規データを変更しない。
+
 The Repository, Feature Map, Probe Planner, and Experiments tabs are no
 longer whole-page mocks: they call real Control Server endpoints, and
 `is_mock` badges mark mock LLM output per response (provenance labeling,

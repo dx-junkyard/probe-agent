@@ -77,6 +77,7 @@ Vision / Stakeholder Value
 | [Execution Modes](01-specifications/capabilities/execution-modes.md) | 実行モード、解決規則、fail-closed gate、監査 |
 | [Assistant Discussion](01-specifications/capabilities/assistant-discussion.md) | 画面コンテキスト会話と変更候補化 |
 | [AI Discussion Adapter](01-specifications/capabilities/ai-discussion-adapter.md) | UI adapter、未保存 draft、proposal review の拡張契約 |
+| [Assistant Answer Quality](01-specifications/capabilities/assistant-answer-quality.md) | 通常askの計測・情報選択・根拠付き回答・失敗時応答・待ち時間 (Epic #467) |
 | [Interview Discussion Contributions](01-specifications/capabilities/interview-discussion-contributions.md) | 会話起点と反映先、補足の来歴、API、競合・冪等反映の目標契約（設計確定・未実装） |
 
 ### Platform / safety
