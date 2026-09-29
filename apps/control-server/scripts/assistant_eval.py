@@ -601,7 +601,15 @@ def run_question(
                 [f"{e['type']}:{e['id']}" for e in expected if (e["type"], e["id"]) not in available]
                 if available is not None else None
             )
+            # Server-side per-stage timings (Epic #467 metric; absent on the
+            # base commit). Read after the measured ask, outside its wall time.
+            stage_ms: Optional[Dict[str, float]] = None
+            if data.get("request_id"):
+                mr = client.get(f"/assistant/ask-metrics/{data['request_id']}", headers=env.headers)
+                if mr.status_code == 200:
+                    stage_ms = {k: v.get("ms") for k, v in (mr.json().get("stage_timings") or {}).items()}
             record.update({
+                "stage_ms": stage_ms,
                 "http_status": resp.status_code,
                 "cold": cold,
                 "wall_ms": round(wall_ms, 2),
