@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
   useAssistantAsk, useAssistantDiscussionThread, useAssistantDiscussionThreads,
-  useAssistantScreenContext,
+  useAssistantScreenContext, postAskClientTiming,
 } from "@/api/hooks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,10 +13,10 @@ import {
   type AssistantVoiceTurnContext,
 } from "@/components/assistant-voice";
 import {
-  ArrowRight, Bot, ExternalLink, Loader2, Mic, Send, Settings2, Wrench, X,
+  Bot, ExternalLink, Loader2, Mic, Send, Settings2, Wrench, X,
 } from "lucide-react";
 import type {
-  AssistantAskRequest, AssistantAskOut, AssistantCitation, AssistantDiscussionTargetIn,
+  AssistantAskRequest, AssistantAskOut, AssistantDiscussionTargetIn,
   AssistantDiscussionThread, AssistantDiscussionThreadDetailOut, DiscussionTargetState,
   SystemStateItem,
 } from "@/api/types";
@@ -33,6 +33,9 @@ import {
 import {
   classifyDiscussionError, DISCUSSION_ADAPTERS, resolveDiscussionCandidate,
 } from "@/lib/discussion-adapters";
+import {
+  CitationChip, DeterministicNotice, FailureCard, ScopeDisclosure, StructuredAnswer,
+} from "@/components/assistant-answer";
 import { useUiDraftRegistry } from "@/lib/ui-draft";
 import { DiscussionProposalReview } from "@/components/discussion-proposal-review";
 import { DiscussionContextPanel } from "@/components/discussion-context-panel";
@@ -176,40 +179,29 @@ interface ChatMessage {
   // i.e. it may be transient, so offering a retry (of the same question
   // text) is honest. See `classifyDiscussionError`.
   retryQuestion?: string;
+  // Issue #468: browser-measured timings of THIS live ask, posted once when the
+  // answer first renders. Absent on a turn restored from history.
+  timing?: { startedAt: number; completeMs: number };
+  // Issue #471/#472: a turn restored from history -- a failed one shows its
+  // record but offers no recovery buttons.
+  fromHistory?: boolean;
 }
 
-function CitationChip({ citation }: { citation: AssistantCitation }) {
-  if (citation.type === "setting") {
-    return (
-      <code
-        className="text-[11px] bg-muted px-1.5 py-0.5 rounded font-mono"
-        title={citation.title}
-        data-testid="assistant-citation"
-      >
-        {citation.id}
-      </code>
-    );
-  }
-  return (
-    <span
-      className="inline-flex items-center gap-1 text-[11px] bg-muted px-1.5 py-0.5 rounded"
-      title={citation.detail || citation.id}
-      data-testid="assistant-citation"
-    >
-      {citation.type === "diagnostic_check" ? (
-        <Wrench className="h-3 w-3" />
-      ) : (
-        <ArrowRight className="h-3 w-3" />
-      )}
-      {citation.title || citation.id}
-    </span>
-  );
-}
+// request_ids whose client timing was already posted (a remount must not
+// post again; the server would answer 409 anyway).
+const postedClientTiming = new Set<string>();
 
 function AnswerMessage({
-  result, onRetryScreenContext,
+  result, onRetryScreenContext, onRetry, onRephrase, retryPending, timing, fromHistory,
 }: {
   result: AssistantAskOut;
+  // Issue #472: re-ask the SAME question on the SAME target (the one send
+  // path), and put the question back in the input to reword it.
+  onRetry?: () => void;
+  onRephrase?: () => void;
+  retryPending?: boolean;
+  timing?: { startedAt: number; completeMs: number };
+  fromHistory?: boolean;
   // Issue #456 follow-up: re-ask the SAME question, for when `screen_
   // context_state === "unavailable"`. `undefined` when the caller has no
   // question text to retry with (e.g. a turn restored from history).
@@ -222,9 +214,50 @@ function AnswerMessage({
   // on the user turn), but its citations are exactly what was cited when it
   // was first answered, so this reads the same way live or after a reload.
   const usedUiDraft = result.citations.some((c) => c.type === "ui_draft");
+  // An older server omits `answer_status`: that reads as "answered".
+  const status = result.answer_status ?? "answered";
+  const failed = status === "failed";
+  const deterministic = status === "deterministic_answer";
+  const structured = !failed && !!result.conclusion;
+  const requestId = result.request_id;
+  // Issue #468: the answer is on screen once this effect runs.
+  useEffect(() => {
+    if (!timing || !requestId || postedClientTiming.has(requestId)) return;
+    postedClientTiming.add(requestId);
+    postAskClientTiming(requestId, {
+      first_visible_ms: Math.max(0, performance.now() - timing.startedAt),
+      complete_ms: timing.completeMs,
+    });
+  }, [timing, requestId]);
   return (
     <div className="rounded-lg border bg-card p-3 space-y-2" data-testid="assistant-answer">
-      <p className="text-sm whitespace-pre-wrap">{result.answer}</p>
+      {failed ? (
+        <FailureCard
+          message={result.answer}
+          failure={result.failure}
+          onRetry={onRetry}
+          onRephrase={onRephrase}
+          readOnly={fromHistory}
+          pending={retryPending}
+        />
+      ) : (
+        <>
+          {deterministic && (
+            <DeterministicNotice
+              failure={result.failure}
+              onRetry={onRetry}
+              onRephrase={onRephrase}
+              readOnly={fromHistory}
+              pending={retryPending}
+            />
+          )}
+          {structured ? (
+            <StructuredAnswer result={result} />
+          ) : (
+            <p className="text-sm whitespace-pre-wrap">{result.answer}</p>
+          )}
+        </>
+      )}
       {(result.ui_draft_changed || result.recheck_required) && (
         <p role="status" className="text-sm text-amber-700" data-testid="assistant-recheck">
           {result.ui_draft_changed
@@ -272,14 +305,14 @@ function AnswerMessage({
         </div>
       )}
       <div className="flex flex-wrap items-center gap-1.5">
-        {result.used_fallback ? (
+        {failed ? null : result.used_fallback || deterministic ? (
           <Badge
             variant="secondary"
             className="text-[10px]"
             title={result.fallback_reason ?? undefined}
             data-testid="assistant-fallback-badge"
           >
-            rule-based fallback (no LLM)
+            LLM を使わない定型回答
           </Badge>
         ) : (
           <Badge variant="outline" className="text-[10px]" title={`${result.provider}/${result.model}`}>
@@ -287,9 +320,9 @@ function AnswerMessage({
           </Badge>
         )}
       </div>
-      {result.citations.length > 0 && (
+      {!failed && !structured && result.citations.length > 0 && (
         <div className="space-y-1">
-          <p className="text-[11px] font-medium text-muted-foreground">Based on</p>
+          <p className="text-[11px] font-medium text-muted-foreground">根拠</p>
           <div className="flex flex-wrap gap-1">
             {result.citations.map((c, i) => (
               <CitationChip key={`${c.type}-${c.id}-${i}`} citation={c} />
@@ -299,7 +332,7 @@ function AnswerMessage({
       )}
       {result.suggested_actions.length > 0 && (
         <div className="space-y-1">
-          <p className="text-[11px] font-medium text-muted-foreground">Next actions</p>
+          <p className="text-[11px] font-medium text-muted-foreground">次の操作</p>
           <div className="flex flex-col gap-1">
             {result.suggested_actions.map((a, i) => (
               <div key={`${a.kind}-${a.target}-${i}`} className="flex items-start gap-1.5">
@@ -340,6 +373,7 @@ function AnswerMessage({
           </div>
         </div>
       )}
+      {requestId && !fromHistory && <ScopeDisclosure requestId={requestId} />}
     </div>
   );
 }
@@ -471,9 +505,29 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     return detail.turns.map((turn) => ({
       role: turn.role,
       text: turn.content,
+      ...(turn.role === "assistant" ? { fromHistory: true } : {}),
       ...(turn.role === "assistant"
         ? {
             result: {
+              // Issue #471 (§4.4): a NULL structure renders the stored
+              // content exactly as before.
+              ...(turn.answer_structure
+                ? {
+                    conclusion: turn.answer_structure.conclusion ?? null,
+                    points: turn.answer_structure.points ?? [],
+                    missing_information: turn.answer_structure.missing_information ?? [],
+                    grounding_state: turn.answer_structure.grounding_state ?? null,
+                    answer_status: turn.answer_structure.answer_status ?? "answered",
+                    failure: turn.answer_structure.failure_class
+                      ? {
+                          failure_class: turn.answer_structure.failure_class,
+                          message: turn.content,
+                          retryable: false,
+                          recovery: [],
+                        }
+                      : null,
+                  }
+                : {}),
               screen_id: detail.thread.screen_id,
               answer: turn.content,
               suggested_actions: [],
@@ -570,6 +624,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
 
   const { data: ctx } = useAssistantScreenContext(screenId, open);
   const ask = useAssistantAsk();
+  const askInFlight = useRef(false);
   const uiDraftRegistry = useUiDraftRegistry();
 
   // System Brief and other in-page review affordances can open this existing
@@ -666,7 +721,10 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     const trimmed = q.trim();
     // UX-07: 永続スレッドの初回解決中は送らない (送った発言が解決後に消える)。
     // 入力欄の内容は消さずに残す。
-    if (!trimmed || ask.isPending || (!voiceTurn && threadResolving)) return null;
+    if (!trimmed || ask.isPending || askInFlight.current || (!voiceTurn && threadResolving)) return null;
+    // A ref, not `ask.isPending`: two clicks in one tick both see the state
+    // from before the first render (#466 double-submit rule).
+    askInFlight.current = true;
     setQuestion("");
     // The target this turn is about is captured HERE (or, for voice, was
     // already captured at listening-start and handed in) and used for the
@@ -724,6 +782,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         clientTurnId = interviewTurnRequests.current.get(turnRequestKey) ?? crypto.randomUUID();
         interviewTurnRequests.current.set(turnRequestKey, clientTurnId);
       }
+      const askStartedAt = performance.now();
       const result = await ask.mutateAsync({
         screen_id: turnScreenId,
         question: trimmed,
@@ -743,6 +802,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           focused_state_id: focusedStateItem.state_id,
         } : {}),
       });
+      const completeMs = performance.now() - askStartedAt;
       interviewTurnRequests.current.delete(turnRequestKey);
       const currentDraft = captureUiDraft(uiDraftRegistry, turnThread);
       if (uiDraft?.local_revision_token !== currentDraft?.local_revision_token ||
@@ -750,8 +810,16 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         result.ui_draft_changed = true;
         result.recheck_required = true;
       }
-      appendMessages([{ role: "assistant", text: result.answer, result }]);
-      setLiveStatus(`回答が届きました。${result.answer.slice(0, 240)}${result.answer.length > 240 ? "…(続きは会話欄)" : ""}`);
+      appendMessages([{
+        role: "assistant", text: result.answer, result,
+        timing: { startedAt: askStartedAt, completeMs },
+      }]);
+      if (result.answer_status === "failed") {
+        setLiveStatus("");
+        setLiveAlert(`回答を作成できませんでした。${result.failure?.message ?? result.answer}`);
+      } else {
+        setLiveStatus(`回答が届きました。${result.answer.slice(0, 240)}${result.answer.length > 240 ? "…(続きは会話欄)" : ""}`);
+      }
       // The answer re-pins the thread to the content it was actually
       // produced against, so a resolved recheck stops being advertised.
       if (turnThread && result.target_state) {
@@ -780,6 +848,8 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         retryQuestion: classified.retryable ? trimmed : undefined,
       }]);
       return null;
+    } finally {
+      askInFlight.current = false;
     }
   };
 
@@ -1113,6 +1183,22 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             <AnswerMessage
               key={i}
               result={m.result}
+              timing={m.timing}
+              fromHistory={m.fromHistory}
+              retryPending={ask.isPending}
+              onRetry={
+                !m.fromHistory && messages[i - 1]?.role === "user"
+                  ? () => submit(messages[i - 1].text)
+                  : undefined
+              }
+              onRephrase={
+                !m.fromHistory && messages[i - 1]?.role === "user"
+                  ? () => {
+                      setQuestion(messages[i - 1].text);
+                      questionRef.current?.focus();
+                    }
+                  : undefined
+              }
               onRetryScreenContext={
                 m.result.screen_context_state === "unavailable"
                 && messages[i - 1]?.role === "user"

@@ -78,7 +78,7 @@ import type {
   IssueDraftUpdateRequest,
   SystemDiagnosticsOut,
   CapabilityContextOut,
-  AssistantScreenContext, AssistantAskRequest, AssistantAskOut,
+  AssistantScreenContext, AssistantAskRequest, AssistantAskOut, AskMetric, AskClientTimingIn,
   AssistantSettingsMetadataOut,
   AssistantDiscussionTargetIn, AssistantDiscussionThreadDetailOut, AssistantDiscussionThreadsListOut,
   DiscussionContextBundle, DiscussionContextExpansionRequest, DiscussionContextExpansionOut,
@@ -2443,6 +2443,31 @@ export function useAssistantAsk() {
     mutationFn: (data: AssistantAskRequest) =>
       api.post<AssistantAskOut>("/assistant/ask", data),
   });
+}
+
+// Issue #468/#470: the per-ask measurement record, fetched lazily and ONLY when
+// the developer opens the 参照範囲 disclosure (`enabled` is that gate).
+export function useAskMetric(requestId: string | null | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: [...sysKey("assistant-ask-metric"), requestId],
+    queryFn: () => api.get<AskMetric>(`/assistant/ask-metrics/${encodeURIComponent(requestId ?? "")}`),
+    enabled: enabled && !!requestId,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+}
+
+// Issue #468: fire-and-forget. Never throws, never blocks, and a 409 (already
+// recorded) or any other failure is deliberately ignored -- a measurement must
+// not surface as an error to the developer.
+export function postAskClientTiming(requestId: string, timing: AskClientTimingIn): void {
+  try {
+    void Promise.resolve(
+      api.post(`/assistant/ask-metrics/${encodeURIComponent(requestId)}/client-timing`, timing),
+    ).catch(() => {});
+  } catch {
+    /* ignore */
+  }
 }
 
 // Assistant discussion threads (Issue #438, Epic #436): target-scoped

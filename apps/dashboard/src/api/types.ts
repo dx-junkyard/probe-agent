@@ -3941,6 +3941,8 @@ export interface AssistantDiscussionTurn {
   // `[]`, which is structurally impossible for an actual claims turn (a
   // claims call always returns at least one claim or fails outright).
   claims?: DiscussionContextClaim[] | null;
+  // Issue #471 (§4.4): `null`/absent on a pre-#471 row.
+  answer_structure?: AnswerStructure | null;
 }
 
 export interface AssistantDiscussionThread {
@@ -4384,6 +4386,155 @@ export interface AssistantCitation {
   detail: string;
 }
 
+// Issues #471/#472 (Epic #467): grounded answer structure and failure
+// response. Finite unions mirror app/models.py's Literal aliases exactly.
+export type PointKind = "fact" | "interpretation" | "unknown";
+export type PointGrounding = "supported" | "stale" | "unsupported" | "not_required";
+export type GroundingState = "grounded" | "partially_grounded" | "ungrounded" | "not_required";
+export type AnswerStatus = "answered" | "deterministic_answer" | "failed";
+export type RecoveryKind = "retry" | "configure" | "rephrase" | "open_settings";
+export type AssistantFailureClass =
+  | "provider_not_configured"
+  | "provider_test_only"
+  | "timeout"
+  | "network"
+  | "auth"
+  | "rate_limited"
+  | "provider_error"
+  | "malformed_output"
+  | "truncated_output"
+  | "context_unavailable"
+  | "budget_exceeded";
+export type AskStage =
+  | "request_validation"
+  | "diagnostics"
+  | "system_state"
+  | "screen_context"
+  | "context_bundle"
+  | "context_pack"
+  | "llm"
+  | "response_validation"
+  | "persist";
+export type AskOutcome = "answered" | "deterministic_answer" | "failed" | "rejected" | "error";
+
+export interface AnswerSource {
+  type: string;
+  id: string;
+}
+
+export interface AnswerPoint {
+  kind: PointKind;
+  text: string;
+  sources: AnswerSource[];
+  grounding: PointGrounding;
+}
+
+export interface MissingInformation {
+  what: string;
+  how_to_get: string;
+}
+
+export interface GroundingCounts {
+  supported: number;
+  stale: number;
+  unsupported: number;
+  not_required: number;
+  rejected_citations: number;
+}
+
+export interface AssistantRecovery {
+  kind: RecoveryKind;
+  label: string;
+  target?: string | null;
+}
+
+export interface AssistantFailure {
+  failure_class: AssistantFailureClass;
+  message: string;
+  retryable: boolean;
+  recovery: AssistantRecovery[];
+}
+
+// What a persisted assistant turn stores (`answer_structure_json`). `null` on
+// a pre-#471 row and on a turn that used an unsaved draft.
+export interface AnswerStructure {
+  conclusion?: string | null;
+  points: AnswerPoint[];
+  missing_information: MissingInformation[];
+  grounding_state?: GroundingState | null;
+  answer_status: AnswerStatus;
+  failure_class?: AssistantFailureClass | null;
+}
+
+export interface AskStageTiming {
+  ms: number;
+  count: number;
+}
+
+export interface AskCoverageEntry {
+  section: string;
+  state: string;
+  returned: number;
+  total?: number | null;
+  limit?: number | null;
+  more_available_via?: string | null;
+  reason?: string | null;
+}
+
+export interface AskManifestSource {
+  type: string;
+  id: string;
+  revision?: string | null;
+  digest?: string | null;
+  freshness?: string;
+}
+
+export interface AskOmittedSection {
+  section: string;
+  reason: string;
+  dropped_items?: number | null;
+}
+
+// `manifest` is stored as an open dict; every key is optional because an old
+// or partial row must render as "unknown", not as a fabricated empty value.
+export interface AskContextManifest {
+  sources?: AskManifestSource[];
+  coverage?: AskCoverageEntry[];
+  omitted_sections?: AskOmittedSection[];
+  history_turns?: number;
+  ui_draft_state?: string;
+  budget?: { limit_chars: number; used_chars: number; over_budget: boolean };
+}
+
+export interface AskMetric {
+  request_id: string;
+  screen_id: string;
+  thread_id?: number | null;
+  assistant_turn_id?: number | null;
+  input_mode: string;
+  started_at: number;
+  finished_at: number;
+  outcome: AskOutcome;
+  failure_class?: AssistantFailureClass | null;
+  provider: string;
+  model: string;
+  prompt_version: string;
+  schema_version: string;
+  stage_timings: Record<string, AskStageTiming>;
+  counters: Record<string, number>;
+  input_sizes: Record<string, number>;
+  usage: Record<string, unknown>;
+  manifest: AskContextManifest;
+  client_timing?: Record<string, unknown> | null;
+  created_at: number;
+}
+
+export interface AskClientTimingIn {
+  first_visible_ms?: number | null;
+  complete_ms?: number | null;
+  aborted?: boolean;
+}
+
 export interface AssistantAskOut {
   screen_id: string;
   answer: string;
@@ -4421,6 +4572,16 @@ export interface AssistantAskOut {
   // server always sends it.
   screen_context_state?: DiscussionOperationResult;
   screen_context_reason?: string | null;
+  // Issues #468/#471/#472: all optional -- an older server omits them, and
+  // `answer_status` absent reads as "answered".
+  request_id?: string | null;
+  conclusion?: string | null;
+  points?: AnswerPoint[];
+  missing_information?: MissingInformation[];
+  grounding_state?: GroundingState | null;
+  grounding_counts?: GroundingCounts | null;
+  answer_status?: AnswerStatus;
+  failure?: AssistantFailure | null;
 }
 
 // UI 機能解説モード (Issue #440, Epic #436): `app/ui_help_registry.py` の
