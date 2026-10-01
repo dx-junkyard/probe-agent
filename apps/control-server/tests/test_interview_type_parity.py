@@ -48,6 +48,15 @@ INTERVIEW_CONTRACT_PREFIXES = (
 # ``AlignmentUserDecisionAction = AlignmentDecisionAction | ...`` and
 # ``typeof INTERVIEW_INTENT_FIELDS[number]`` recursively.
 FINITE_TYPE_NAMES = (
+    # Issues #468/#471/#472: the assistant answer-quality vocabularies.
+    "PointKind",
+    "PointGrounding",
+    "GroundingState",
+    "AnswerStatus",
+    "RecoveryKind",
+    "AssistantFailureClass",
+    "AskStage",
+    "AskOutcome",
     "ValueNetworkNoticeCode",
     # Issue #464: the canonical-head / premise vocabularies. A bare `str` on
     # either side puts no enum in the schema and lets the union drift.

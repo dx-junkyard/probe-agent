@@ -77,6 +77,9 @@ def schedule(conn,system_id,actor,thread_id,through):
         # Exclude unsaved draft questions AND their following answers.
         if row['ui_draft_form_id']:
             continue
+        # Issue #472: a FAILED assistant turn holds a failure notice, not an answer.
+        if row['role']=='assistant' and '"answer_status": "failed"' in (row['answer_structure_json'] or ''):
+            continue
         if row['role']=='assistant' and conn.execute('SELECT 1 FROM assistant_discussion_turn WHERE thread_id=? AND turn_number=? AND ui_draft_form_id IS NOT NULL',(thread_id,row['turn_number']-1)).fetchone():
             continue
         turns.append({'id':row['id'],'role':row['role'],'content':d.clean(row['content'])})

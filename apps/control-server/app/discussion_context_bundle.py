@@ -475,7 +475,7 @@ def _dedupe_new(candidates: Sequence[Tuple[str, str]], visited: Set[Tuple[str, s
     return out
 
 
-def _make_entry(system_id: int, kind: str, ref: str, tracker: _BudgetTracker):
+def _make_entry(system_id: int, kind: str, ref: str, tracker: _BudgetTracker, memo: Optional[dict] = None):
     """Resolve + gather one entity, applying the byte budget. Returns
     `(BundleEntry, resolved, context_result)` or `None` when the kind is no
     longer registered (defensive) or the entry could not even be counted
@@ -483,6 +483,8 @@ def _make_entry(system_id: int, kind: str, ref: str, tracker: _BudgetTracker):
     resolved = _resolve(system_id, kind, ref)
     if resolved is None:
         return None
+    if memo is not None:
+        memo[(kind, ref)] = resolved
     context_result = _gather(system_id, kind, ref)
     facts = context_result.facts if context_result.operation_state == "available" else {}
     size = _json_size(facts)
@@ -542,9 +544,14 @@ def _objective_section(system_id: int, tracker: _BudgetTracker) -> Tuple[BundleS
     walk so an Overview root can reach the SAME Objective/Gap up- and
     downstream a direct `product_objective` / `product_gap` root would."""
     from . import overview_projection
+    from .assistant_request_scope import active_system_state_provider
 
     try:
-        overview = overview_projection.build_overview(system_id)
+        # Issue #470: inside an ask, reuse the request scope's System state
+        # (None outside an ask -> unchanged standalone behaviour).
+        overview = overview_projection.build_overview(
+            system_id, system_state_provider=active_system_state_provider(system_id),
+        )
     except Exception:
         return (
             BundleSection("objective", "unavailable", (), BundleCoverage(0, None, "unknown", "provider_error", None)),
@@ -586,6 +593,7 @@ def _build_related_section(
     budget: ContextBudget,
     *,
     extra_seeds: Sequence[Tuple[str, str]] = (),
+    resolved_memo: Optional[dict] = None,
 ) -> Tuple[BundleSection, List[Tuple[str, str, str]], Tuple[Tuple[str, str], ...]]:
     """DD-CTX-02's bounded, depth<=2, identity-cycle-cut BFS. Returns
     `(section, included, returned_keys)`:
@@ -650,7 +658,7 @@ def _build_related_section(
             hit_budget = True
             triggering_reason = tracker.limiting_reason() if not tracker.has_item_room() else "item_budget"
             break
-        made = _make_entry(system_id, kind, ref, tracker)
+        made = _make_entry(system_id, kind, ref, tracker, resolved_memo)
         if made is None:
             d1_fully_processed = False
             hit_budget = True
@@ -677,7 +685,7 @@ def _build_related_section(
                 hit_budget = True
                 triggering_reason = tracker.limiting_reason() if not tracker.has_item_room() else "item_budget"
                 break
-            made = _make_entry(system_id, kind, ref, tracker)
+            made = _make_entry(system_id, kind, ref, tracker, resolved_memo)
             if made is None:
                 hit_budget = True
                 triggering_reason = tracker.limiting_reason()
@@ -710,7 +718,8 @@ def _build_related_section(
 
 def build_context_bundle(
     system_id: int, root_target_kind: str, root_target_ref: str, *,
-    thread_id: int, budget: ContextBudget = DEFAULT_BUDGET,
+    thread_id: int, budget: ContextBudget = DEFAULT_BUDGET, mint_cursor: bool = True,
+    root_resolved: Optional["discussion_adapters.ResolvedTarget"] = None,
 ) -> DiscussionContextBundle:
     """DD-CTX-01/02's full bundle for one root, scoped to `thread_id` (the
     discussion thread this bundle's continuations, if any, will be resumed
@@ -723,14 +732,21 @@ def build_context_bundle(
     adapter = discussion_adapters.get_adapter(root_target_kind)
     if adapter is None:
         raise ContextBundleError("discussion_target_kind_unregistered", root_target_kind)
-    root_resolved = adapter.resolver(system_id, root_target_ref)
+    # Issue #470: `root_resolved` is the SAME request's own resolution of this
+    # root (the ask resolved the thread target during validation); absent, it
+    # is resolved here exactly as before.
+    if root_resolved is None:
+        root_resolved = adapter.resolver(system_id, root_target_ref)
     if root_resolved.resolution == "unresolved":
         raise ContextBundleError("discussion_context_root_not_found", root_target_ref)
 
     from . import state_facts
 
+    # One connection for the snapshot read and the root's context gather
+    # (both read-only, neither calls out while it is held).
     with get_conn() as conn:
         snapshot_row = state_facts.get_latest_ready_snapshot(conn, system_id)
+        root_context = discussion_adapters.gather_context(conn, system_id, root_target_kind, root_target_ref)
     snapshot = BundleSnapshotRef(
         id=snapshot_row["id"] if snapshot_row is not None else None,
         commit_sha=snapshot_row["commit_sha"] if snapshot_row is not None else None,
@@ -752,7 +768,6 @@ def build_context_bundle(
 
     _register_source(root_target_kind, root_target_ref, root_resolved)
 
-    root_context = _gather(system_id, root_target_kind, root_target_ref)
     self_section, _self_entry = _self_section(root_target_kind, root_target_ref, root_resolved, root_context, tracker)
     sections: List[BundleSection] = [self_section]
 
@@ -762,13 +777,19 @@ def build_context_bundle(
         sections.append(objective_section)
         extra_seeds = seeds
 
+    # Same build, same entities: the related walk already resolved each
+    # included entry; reuse that read for the sources catalog.
+    resolved_memo: dict = {}
     related_section, related_included, related_returned_keys = _build_related_section(
         system_id, root_target_kind, root_context, tracker, visited, budget, extra_seeds=extra_seeds,
+        resolved_memo=resolved_memo,
     )
     sections.append(related_section)
 
     for kind, ref, digest in related_included:
-        resolved = _resolve(system_id, kind, ref)
+        resolved = resolved_memo.get((kind, ref))
+        if resolved is None:
+            resolved = _resolve(system_id, kind, ref)
         if resolved is not None:
             _register_source(kind, ref, resolved)
         dependency_triples.append((kind, ref, digest))
@@ -786,7 +807,14 @@ def build_context_bundle(
     # function again from scratch, not continuing a cursor. `self`/
     # `objective` truncation (a single oversized entry replaced by a stub)
     # has no "next batch" either -- there is nothing paginated to continue.
-    if related_section.operation_state == "available" and related_section.coverage.completeness != "complete":
+    # Issue #470: `mint_cursor=False` is for a read that will never come back
+    # for "追加取得" (an assistant ask reads the bundle for one answer): a
+    # cursor row written on every ask would be litter that expires unused.
+    if (
+        mint_cursor
+        and related_section.operation_state == "available"
+        and related_section.coverage.completeness != "complete"
+    ):
         with get_conn() as conn:
             token = create_context_cursor(
                 conn, system_id=system_id, thread_id=thread_id, root=root_ref_out, snapshot=snapshot,
@@ -1016,6 +1044,44 @@ def resolve_context_expansion(
 
 
 # --- Wire conversion -----------------------------------------------------------
+
+
+def entry_depths(bundle: DiscussionContextBundle) -> Dict[Tuple[str, str], int]:
+    """Hop distance from the root of every entry in ``bundle`` (Issue #470).
+
+    The wire shape deliberately carries no depth (``extra="forbid"``), so it is
+    recovered with the SAME relation extractors the builder used: an entry the
+    root's own facts (or the Overview objective seeds) name is depth 1, every
+    other related entry is depth 2, the root is 0.  When the root's facts were
+    replaced by a byte-budget stub the depth-1 set is unknowable and every
+    related entry is reported as depth 1 -- never a guessed depth 2.
+    """
+    depths: Dict[Tuple[str, str], int] = {(bundle.root.target_kind, bundle.root.target_ref): 0}
+    section_by_id = {s.section_id: s for s in bundle.sections}
+    d1: Set[Tuple[str, str]] = set()
+    self_section = section_by_id.get("self")
+    extractor = _RELATION_EXTRACTORS.get(bundle.root.target_kind)
+    if self_section is not None and self_section.facts and extractor is not None:
+        root_entry = self_section.facts[0]
+        if not root_entry.truncated:
+            d1.update(extractor(root_entry.facts))
+    objective = section_by_id.get("objective")
+    if objective is not None and objective.facts:
+        facts = objective.facts[0].facts
+        active = facts.get("active_objective")
+        if isinstance(active, dict) and active.get("objective_key"):
+            d1.add(("product_objective", active["objective_key"]))
+        gap = facts.get("primary_gap")
+        if isinstance(gap, dict) and gap.get("gap_key"):
+            d1.add(("product_gap", gap["gap_key"]))
+    related = section_by_id.get("related")
+    if related is not None:
+        for entry in related.facts:
+            key = (entry.target_kind, entry.target_ref)
+            if key in depths:
+                continue
+            depths[key] = 2 if (d1 and key not in d1) else 1
+    return depths
 
 
 def bundle_to_dict(bundle: DiscussionContextBundle) -> Dict[str, Any]:

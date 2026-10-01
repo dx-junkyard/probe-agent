@@ -1744,7 +1744,9 @@ def _diagnostic_state_item(check: Any) -> StateItem:
     )
 
 
-def build_system_state(system_id: int) -> SystemStateAssessment:
+def build_system_state(
+    system_id: int, *, diagnostics_report: Optional[Any] = None
+) -> SystemStateAssessment:
     """Build the deterministic state assessment for one system.
 
     Read-only, LLM-free (Principle 6). Every item is derived from persisted
@@ -1955,8 +1957,11 @@ def build_system_state(system_id: int) -> SystemStateAssessment:
     covered_check_ids = {
         check_id for item in items for check_id in item.related_checks
     }
-    from .system_diagnostics import run_system_diagnostics
-    diagnostics_report = run_system_diagnostics(system_id)
+    if diagnostics_report is None:
+        # Standalone callers run their own; an ask request injects the one it
+        # already computed (Issue #469).
+        from .system_diagnostics import run_system_diagnostics
+        diagnostics_report = run_system_diagnostics(system_id)
     for check in diagnostics_report.checks:
         if check.severity == "ok":
             continue

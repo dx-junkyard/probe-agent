@@ -196,6 +196,16 @@ def _turn_out(row: Any) -> Dict[str, Any]:
     except (TypeError, ValueError):
         data["citations"] = []
     data["used_fallback"] = bool(data.get("used_fallback"))
+    # Issue #471: `None` = no stored structure (pre-#471 row, draft turn, user turn).
+    raw_structure = data.pop("answer_structure_json", None)
+    structure = None
+    if raw_structure:
+        try:
+            loaded = json.loads(raw_structure)
+            structure = loaded if isinstance(loaded, dict) else None
+        except (TypeError, ValueError):
+            structure = None
+    data["answer_structure"] = structure
     # Issue #459: `None` (no `claims_json` column value) means "not a §9.2
     # claims turn", kept distinct from an (impossible in practice, but never
     # trusted) empty list -- see `append_turn`'s own docstring on `claims`.
@@ -229,6 +239,10 @@ def recent_turns(conn, thread_id: int, limit: int = MAX_CONTEXT_TURNS) -> List[D
         # Keep both rows available through the separate history-read path.
         "SELECT t.* FROM assistant_discussion_turn t WHERE t.thread_id = ? "
         "AND t.ui_draft_form_id IS NULL "
+        # Issue #472 §5.4: a FAILED assistant turn is kept in the thread (order)
+        # but is never fed back to the model as if it were an answer.
+        "AND NOT (t.role = 'assistant' AND CASE WHEN json_valid(t.answer_structure_json) "
+        "THEN json_extract(t.answer_structure_json, '$.answer_status') END = 'failed') "
         "AND NOT (t.role = 'assistant' AND EXISTS ("
         "SELECT 1 FROM assistant_discussion_turn previous "
         "WHERE previous.thread_id = t.thread_id AND previous.role = 'user' "
@@ -325,6 +339,14 @@ def resolve_or_create_thread(
 def get_thread(system_id: int, thread_id: int) -> Optional[Dict[str, Any]]:
     """§1.5 `GET /assistant/discussion-threads/{id}`. A foreign/unknown
     thread returns `None` (the route turns that into 404)."""
+    pair = get_thread_with_resolution(system_id, thread_id)
+    return None if pair is None else pair[0]
+
+
+def get_thread_with_resolution(system_id: int, thread_id: int):
+    """`get_thread`'s data plus the `ResolvedTarget` its `target_state` was
+    evaluated from (Issue #470: the ask reuses this same read for its bundle
+    instead of resolving the target a second time)."""
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM assistant_discussion_thread WHERE id = ? AND system_id = ?",
@@ -337,7 +359,7 @@ def get_thread(system_id: int, thread_id: int) -> Optional[Dict[str, Any]]:
 
     resolved = resolve_target(system_id, thread["target_kind"], thread["target_ref"])
     target_state = evaluate_target_state(thread["captured_target_digest"], resolved)
-    return {"thread": thread, "target_state": target_state, "turns": turns}
+    return {"thread": thread, "target_state": target_state, "turns": turns}, resolved
 
 
 def list_threads(
@@ -406,6 +428,10 @@ def append_turn(
     # means "not a claims turn" -- a normal `/assistant/ask` answer never
     # sets this, so it stays indistinguishable from a pre-#459 row.
     claims: Optional[Sequence[Dict[str, Any]]] = None,
+    # Issue #471 (§4.4): the validated answer structure of an assistant
+    # `/assistant/ask` turn. `None` for every other turn, and for a turn that
+    # used an unsaved draft.
+    answer_structure: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Insert one turn on an ALREADY-OPEN connection -- callers that append a
     user turn and its assistant answer wrap both calls (and any thread
@@ -433,8 +459,8 @@ def append_turn(
             target_revision_id, target_digest, used_fallback, decision_method,
             input_mode, provider, model, prompt_version, created_by, created_at,
             schema_version, ui_draft_state, ui_draft_form_id, ui_draft_digest,
-            claims_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            claims_json, answer_structure_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             system_id, thread_id, turn_number, role, content,
             json.dumps(list(citations or []), ensure_ascii=False),
@@ -443,6 +469,7 @@ def append_turn(
             created_by, now, TURN_SCHEMA_VERSION,
             ui_draft_state, ui_draft_form_id, ui_draft_digest,
             json.dumps(list(claims), ensure_ascii=False) if claims is not None else None,
+            json.dumps(answer_structure, ensure_ascii=False) if answer_structure is not None else None,
         ),
     )
     turn_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]

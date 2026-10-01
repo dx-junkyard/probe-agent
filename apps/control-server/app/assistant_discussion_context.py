@@ -8,9 +8,11 @@ corresponding Dashboard screen and returns a bounded JSON context pack.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .assistant_coverage import bounded_list
+from .assistant_request_scope import ACTIVE_SCOPE, active_system_state_provider, bind_scope
 from .db import get_conn
 
 
@@ -31,6 +33,12 @@ class ScreenDiscussionContext:
     # request -- see its own docstring).
     operation_state: str = "available"  # DiscussionOperationResult
     reason: str = ""
+    # Issue #470: how much of each cut list was returned
+    # (`assistant_coverage.CoverageEntry.to_dict()` rows). Its OWN field, never
+    # folded into `facts`: a fact about the System and a fact about how much
+    # of it was shown are different things. Additive; a provider that cuts no
+    # list leaves it empty.
+    coverage: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _selected_or_none(loader) -> tuple[Optional[Dict[str, Any]], bool]:
@@ -49,10 +57,23 @@ def _positive_int(value: Optional[str]) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+# Issue #469: the ask request's scope, visible only for the duration of one
+# provider call (keeps every provider's (system_id[, params]) signature).
+# Issue #470: the variable itself lives in `assistant_request_scope` so the
+# discussion-bundle / adapter resolvers can share the same scope.
+_ACTIVE_SCOPE = ACTIVE_SCOPE
+
+
 def _overview_context(system_id: int) -> ScreenDiscussionContext:
     from .overview_projection import build_overview
 
-    overview = build_overview(system_id)
+    overview = build_overview(
+        system_id,
+        system_state_provider=active_system_state_provider(system_id),
+    )
+    findings, findings_cov = bounded_list(
+        "findings", overview.findings, 20, total=len(overview.findings),
+    )
     facts = {
         "snapshot_id": overview.snapshot_id,
         "snapshot_commit_sha": overview.snapshot_commit_sha,
@@ -60,13 +81,14 @@ def _overview_context(system_id: int) -> ScreenDiscussionContext:
         "understanding_revision_id": overview.understanding_revision_id,
         "understanding_confirmed_at": overview.understanding_confirmed_at,
         "system_brief": asdict(overview.brief) if overview.brief is not None else None,
-        "findings": [asdict(item) for item in overview.findings[:20]],
+        "findings": [asdict(item) for item in findings],
         "next_action": asdict(overview.next_action) if overview.next_action is not None else None,
         "degraded_sections": list(overview.degraded_sections),
     }
     return ScreenDiscussionContext(
         facts=facts,
         sources=[{"id": "overview", "title": "Canonical Overview projection"}],
+        coverage=[findings_cov.to_dict()],
     )
 
 
@@ -77,11 +99,20 @@ def _interview_context(
 
     requested_session_id = _positive_int(route_params.get("session"))
     with get_conn() as conn:
-        sessions = conn.execute(
+        # Issue #470: fetch one row past the limit so a cut is visible, and
+        # count in the SAME connection (cheap) so `total` is exact.
+        session_rows = conn.execute(
             """SELECT id, snapshot_id, title, focus, status, stage, updated_at
-               FROM interview_session WHERE system_id = ? ORDER BY id DESC LIMIT 20""",
+               FROM interview_session WHERE system_id = ? ORDER BY id DESC LIMIT 21""",
             (system_id,),
         ).fetchall()
+        session_total = conn.execute(
+            "SELECT COUNT(*) FROM interview_session WHERE system_id = ?", (system_id,),
+        ).fetchone()[0]
+        sessions, sessions_cov = bounded_list(
+            "available_sessions", session_rows, 20, total=int(session_total),
+            more_available_via="GET /interview/sessions",
+        )
         session = None
         if requested_session_id is not None:
             session = conn.execute(
@@ -133,6 +164,7 @@ def _interview_context(
             "reviewed_discussion_contributions": supplements,
         },
         sources=sources,
+        coverage=[sessions_cov.to_dict()],
     )
 
 
@@ -159,6 +191,19 @@ def _ux_design_context(
                 conn, system_id=system_id, design_key=design_key
             )
         ) if design_key else (None, False)
+    journey_items, journeys_cov = bounded_list(
+        "journeys", journeys["journeys"], MAX_LIST_ITEMS, total=len(journeys["journeys"]),
+        more_available_via="GET /ux-design/journeys",
+    )
+    requirement_items, requirements_cov = bounded_list(
+        "requirements", requirements["requirements"], MAX_LIST_ITEMS,
+        total=len(requirements["requirements"]),
+        more_available_via="GET /ux-design/requirements",
+    )
+    design_items, designs_cov = bounded_list(
+        "solution_designs", designs["designs"], MAX_LIST_ITEMS, total=len(designs["designs"]),
+        more_available_via="GET /solution-designs",
+    )
     sources = [
         {"id": "ux_journeys", "title": "Canonical UX Journeys"},
         {"id": "ux_requirements", "title": "Canonical UX Requirements"},
@@ -174,9 +219,9 @@ def _ux_design_context(
     return ScreenDiscussionContext(
         facts={
             "active_tab": route_params.get("tab", "journeys"),
-            "journeys": journeys["journeys"][:MAX_LIST_ITEMS],
-            "requirements": requirements["requirements"][:MAX_LIST_ITEMS],
-            "solution_designs": designs["designs"][:MAX_LIST_ITEMS],
+            "journeys": journey_items,
+            "requirements": requirement_items,
+            "solution_designs": design_items,
             "selected_journey": selected_journey,
             "selected_requirement": selected_requirement,
             "selected_solution_design": selected_design,
@@ -192,6 +237,7 @@ def _ux_design_context(
             )),
         },
         sources=sources,
+        coverage=[c.to_dict() for c in (journeys_cov, requirements_cov, designs_cov)],
     )
 
 
@@ -212,6 +258,10 @@ def _journey_blueprint_context(
             diff, diff_missing = _selected_or_none(
                 lambda: journey_blueprint.diff_as_is_to_be(conn, system_id, journey_key)
             )
+    available, available_cov = bounded_list(
+        "available_journeys", journeys["journeys"], MAX_LIST_ITEMS,
+        total=len(journeys["journeys"]), more_available_via="GET /ux-design/journeys",
+    )
     sources = [{"id": "ux_journeys", "title": "Canonical UX Journeys"}]
     if journey_key:
         sources.append({
@@ -227,13 +277,14 @@ def _journey_blueprint_context(
         facts={
             "view": route_params.get("view", "blueprint"),
             "selected_journey_key": journey_key,
-            "available_journeys": journeys["journeys"][:MAX_LIST_ITEMS],
+            "available_journeys": available,
             "blueprint": blueprint,
             "diff": diff,
             "selection_not_found": journey_missing,
             "diff_unavailable": diff_missing,
         },
         sources=sources,
+        coverage=[available_cov.to_dict()],
     )
 
 
@@ -263,6 +314,11 @@ def _objective_map_context(
         selected_gap, gap_missing = _selected_or_none(
             lambda: product_objective.get_gap_detail(conn, system_id, gap_key)
         ) if gap_key else (None, False)
+    objective_nodes = obj_map.get("nodes", [])
+    objectives, objectives_cov = bounded_list(
+        "objectives", objective_nodes, MAX_LIST_ITEMS, total=len(objective_nodes),
+        more_available_via="GET /product-objectives",
+    )
     sources = [{"id": "product_objective_map", "title": "Canonical Objective Map"}]
     for kind, key in (
         ("product_objective", objective_key),
@@ -274,7 +330,7 @@ def _objective_map_context(
     return ScreenDiscussionContext(
         facts={
             "view": view,
-            "objectives": obj_map.get("nodes", [])[:MAX_LIST_ITEMS],
+            "objectives": objectives,
             "selected_objective": selected_objective,
             "selected_milestone": selected_milestone,
             "selected_gap": selected_gap,
@@ -286,6 +342,7 @@ def _objective_map_context(
             "degraded_sections": list(obj_map.get("degraded_sections", [])),
         },
         sources=sources,
+        coverage=[objectives_cov.to_dict()],
     )
 
 
@@ -309,21 +366,28 @@ def _stakeholder_value_network_context(
         selected_edge, edge_missing = _selected_or_none(
             lambda: sn.get_exchange_detail(conn, system_id, edge_key)
         ) if edge_key else (None, False)
+    covered: Dict[str, Any] = {}
+    coverage_rows: List[Dict[str, Any]] = []
+    for name in ("nodes", "edges", "notices"):
+        full = network.get(name, [])
+        covered[name], cov = bounded_list(name, full, MAX_LIST_ITEMS, total=len(full))
+        coverage_rows.append(cov.to_dict())
     sources = [{"id": "stakeholder_value_network", "title": "Canonical Stakeholder Value Network"}]
     for kind, key in (("stakeholder", node_key), ("value_exchange", edge_key)):
         if key:
             sources.append({"id": f"{kind}:{key}", "title": f"Selected {kind}"})
     return ScreenDiscussionContext(
         facts={
-            "nodes": network.get("nodes", [])[:MAX_LIST_ITEMS],
-            "edges": network.get("edges", [])[:MAX_LIST_ITEMS],
-            "notices": network.get("notices", [])[:MAX_LIST_ITEMS],
+            "nodes": covered["nodes"],
+            "edges": covered["edges"],
+            "notices": covered["notices"],
             "selected_stakeholder": selected_node,
             "selected_exchange": selected_edge,
             "selection_not_found": {"stakeholder": node_missing, "value_exchange": edge_missing},
             "degraded_sections": list(network.get("degraded_sections", [])),
         },
         sources=sources,
+        coverage=coverage_rows,
     )
 
 
@@ -345,7 +409,11 @@ _SCREEN_CONTEXT_PROVIDERS: Dict[str, Any] = {
 
 
 def build_screen_discussion_context(
-    screen_id: str, system_id: int, route_params: Optional[Dict[str, str]] = None
+    screen_id: str,
+    system_id: int,
+    route_params: Optional[Dict[str, str]] = None,
+    *,
+    scope: Any = None,
 ) -> Optional[ScreenDiscussionContext]:
     """Return canonical facts only for discussion-enabled screens.
 
@@ -368,7 +436,8 @@ def build_screen_discussion_context(
     if provider is None:
         return None
     try:
-        return provider(system_id, params)
+        with bind_scope(scope):
+            return provider(system_id, params)
     except Exception:
         # Exercised directly by `tests/test_discussion_operation_result.py`'s
         # `TestScreenDiscussionContextDegrades` and by `tests/test_assistant.

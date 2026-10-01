@@ -108,6 +108,11 @@ Generate & Evaluate は `app.llm` の抽象化層だけを通して LLM を呼�
 | `INTELLIGENCE_LLM_PROVIDER` | Feature Intelligence 用 provider (未設定なら `LLM_PROVIDER` を使用) |
 | `INTELLIGENCE_LLM_MODEL` | Feature Intelligence 用 reasoning model (未設定なら `LLM_MODEL` を使用) |
 | `INTELLIGENCE_LLM_TIMEOUT` | Feature Intelligence の HTTP timeout 秒（既定値: `120`） |
+| `ASSISTANT_CONTEXT_BUDGET_CHARS` | AIアシスタント1回の質問でLLMに渡す context payload の上限文字数（既定値: `60000`。不正値・0以下は既定値）。超過時は `assistant-answer-quality.md` §3.3 の順で削る |
+| `ASSISTANT_LLM_PROVIDER` / `ASSISTANT_LLM_MODEL` / `ASSISTANT_LLM_API_KEY` / `ASSISTANT_LLM_BASE_URL` / `ASSISTANT_LLM_TIMEOUT` | AIアシスタントの通常質問だけに使う LLM 設定（Issue #473。未設定の項目は `INTELLIGENCE_*` / `LLM_*` と同じ値。provider を分析用と変えた場合、モデルはその provider の既定、API key は `ASSISTANT_LLM_API_KEY` か provider 固有 key のみで、`LLM_API_KEY` / `LLM_BASE_URL` は流用しない）。計測比較用で、既定は変更なし。他の分析処理には影響しない |
+| `ASSISTANT_LLM_MAX_OUTPUT_TOKENS` | AIアシスタント回答の最大出力token数（既定値: `2048`、上限 `8192`。不正値・0以下は既定値） |
+| `ASSISTANT_REQUEST_BUDGET_SECONDS` | AIアシスタント1回の質問全体の予算秒（未設定・不正値・0以下は無効）。LLM呼び出しの timeout は `min(socket timeout, 残り予算)`、残りが1秒未満なら呼ばず `budget_exceeded` |
+| `ASSISTANT_METRIC_RETENTION_DAYS` | `assistant_ask_metric` の保持日数（既定値: `30`） |
 | `INTELLIGENCE_MAX_OUTPUT_TOKENS` | Repository Draft生成の最大出力token数（既定値: `128000`） |
 | `INTERVIEW_LANGUAGE` | System Interview の出力言語 `ja` / `en`（既定値: `ja`）。JSON キーと enum 値は常に英語。不正値は fail-closed |
 | `INTERVIEW_CONTEXT_MAX_CHARS` | インタビュー context pack の文字数バジェット（既定値: `60000`） |

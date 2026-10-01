@@ -6449,7 +6449,7 @@ class AssistantCitationOut(BaseModel):
     # model's `ui_draft` citations get silently dropped by one of them.
     type: Literal[
         "setting", "diagnostic_check", "pipeline_step", "state_item",
-        "screen_data", "ui_draft",
+        "screen_data", "ui_draft", "related_context",
     ]
     id: str
     title: str = ""
@@ -6503,6 +6503,71 @@ class AssistantDiscussionTargetIn(BaseModel):
     target_ref: str = Field(..., min_length=1, max_length=500)
 
 
+# --- Grounded answer structure & failure response (Issues #471/#472, Epic #467)
+# docs/01-specifications/capabilities/assistant-answer-quality.md §4/§5.
+# Every finite set is a `Literal` so the schema carries the enum and a
+# Dashboard union cannot drift unnoticed.
+AssistantFailureClass = Literal[
+    "provider_not_configured", "provider_test_only", "timeout", "network",
+    "auth", "rate_limited", "provider_error", "malformed_output",
+    "truncated_output", "context_unavailable", "budget_exceeded",
+]
+PointKind = Literal["fact", "interpretation", "unknown"]
+PointGrounding = Literal["supported", "stale", "unsupported", "not_required"]
+GroundingState = Literal["grounded", "partially_grounded", "ungrounded", "not_required"]
+AnswerStatus = Literal["answered", "deterministic_answer", "failed"]
+RecoveryKind = Literal["retry", "configure", "rephrase", "open_settings"]
+
+
+class AnswerSourceOut(BaseModel):
+    type: str
+    id: str
+
+
+class AnswerPointOut(BaseModel):
+    kind: PointKind
+    text: str
+    sources: List[AnswerSourceOut] = Field(default_factory=list)
+    grounding: PointGrounding
+
+
+class MissingInformationOut(BaseModel):
+    what: str
+    how_to_get: str = ""
+
+
+class GroundingCountsOut(BaseModel):
+    supported: int = 0
+    stale: int = 0
+    unsupported: int = 0
+    not_required: int = 0
+    rejected_citations: int = 0
+
+
+class AssistantRecoveryOut(BaseModel):
+    kind: RecoveryKind
+    label: str
+    target: Optional[str] = None
+
+
+class AssistantFailureOut(BaseModel):
+    failure_class: AssistantFailureClass
+    message: str
+    retryable: bool
+    recovery: List[AssistantRecoveryOut] = Field(default_factory=list)
+
+
+class AnswerStructureOut(BaseModel):
+    """What `assistant_discussion_turn.answer_structure_json` holds (§4.4)."""
+
+    conclusion: Optional[str] = None
+    points: List[AnswerPointOut] = Field(default_factory=list)
+    missing_information: List[MissingInformationOut] = Field(default_factory=list)
+    grounding_state: Optional[GroundingState] = None
+    answer_status: AnswerStatus = "answered"
+    failure_class: Optional[AssistantFailureClass] = None
+
+
 class AssistantDiscussionTurnOut(BaseModel):
     id: int
     thread_id: int
@@ -6529,6 +6594,9 @@ class AssistantDiscussionTurnOut(BaseModel):
     ui_draft_state: Optional[UiDraftState] = None
     ui_draft_form_id: Optional[str] = None
     ui_draft_digest: str = ""
+    # Issue #471 (§4.4): `None` on a pre-#471 row and on a turn that used an
+    # unsaved draft (its structure is deliberately not stored).
+    answer_structure: Optional[AnswerStructureOut] = None
     # Issue #459 (§9.2): `None` means "not a claims turn" (every turn before
     # this Issue, and every ordinary `/assistant/ask` turn since) -- never
     # defaulted to `[]`, which would be indistinguishable from "attached and
@@ -7044,6 +7112,121 @@ class AssistantAskOut(BaseModel):
     # projection is real data, not a failed read).
     screen_context_state: DiscussionOperationResult = "unsupported"
     screen_context_reason: Optional[str] = None
+    # Issue #468: the per-ask measurement record's id
+    # (`assistant_ask_metric.request_id`). Additive; an idempotent replay
+    # returns the ORIGINAL ask's id (or None when rebuilt from the turn row),
+    # never a new one -- a replay is not a new ask.
+    request_id: Optional[str] = None
+    # Issues #471/#472: structured, grounded answer + failure response.
+    # All additive; `answer` stays the deterministic composition of them.
+    conclusion: Optional[str] = None
+    points: List[AnswerPointOut] = Field(default_factory=list)
+    missing_information: List[MissingInformationOut] = Field(default_factory=list)
+    grounding_state: Optional[GroundingState] = None
+    grounding_counts: Optional[GroundingCountsOut] = None
+    answer_status: AnswerStatus = "answered"
+    failure: Optional[AssistantFailureOut] = None
+
+
+# --- Assistant ask metrics (Issue #468, Epic #467) ---------------------------
+# docs/01-specifications/capabilities/assistant-answer-quality.md §1.
+AskStage = Literal[
+    "request_validation", "diagnostics", "system_state", "screen_context",
+    "context_bundle", "context_pack", "llm", "response_validation", "persist",
+]
+AskOutcome = Literal["answered", "deterministic_answer", "failed", "rejected", "error"]
+
+
+class AskStageTimingOut(BaseModel):
+    ms: float
+    count: int
+
+
+class AskMetricOut(BaseModel):
+    request_id: str
+    screen_id: str
+    thread_id: Optional[int] = None
+    assistant_turn_id: Optional[int] = None
+    input_mode: str
+    started_at: float
+    finished_at: float
+    outcome: AskOutcome
+    failure_class: Optional[AssistantFailureClass] = None
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    stage_timings: Dict[str, AskStageTimingOut] = Field(default_factory=dict)
+    counters: Dict[str, int] = Field(default_factory=dict)
+    input_sizes: Dict[str, int] = Field(default_factory=dict)
+    usage: Dict[str, Any] = Field(default_factory=dict)
+    manifest: Dict[str, Any] = Field(default_factory=dict)
+    client_timing: Optional[Dict[str, Any]] = None
+    created_at: float
+
+
+class AskMetricListOut(BaseModel):
+    metrics: List[AskMetricOut]
+
+
+class AskClientTimingIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    first_visible_ms: Optional[float] = Field(default=None, ge=0)
+    complete_ms: Optional[float] = Field(default=None, ge=0)
+    aborted: bool = False
+
+
+class AskClientTimingOut(BaseModel):
+    request_id: str
+    first_visible_ms: Optional[float] = None
+    complete_ms: Optional[float] = None
+    aborted: bool = False
+
+
+class AskPercentileOut(BaseModel):
+    """`value` is an observed sample (nearest-rank); null + `unmeasured` when
+    there is no sample (never 0)."""
+
+    p50: Optional[float] = None
+    p95: Optional[float] = None
+    sample_count: int = 0
+    not_run_count: int = 0
+    state: Literal["measured", "unmeasured"] = "unmeasured"
+
+
+class AskRateOut(BaseModel):
+    numerator: int
+    denominator: int
+    value: Optional[float] = None
+    state: Literal["measured", "unmeasured"] = "unmeasured"
+
+
+class AskTokenSumOut(BaseModel):
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    sample_count: int = 0
+    state: Literal["measured", "unmeasured"] = "unmeasured"
+
+
+class AskEstimatedTokenSumOut(BaseModel):
+    estimated_input_tokens: Optional[int] = None
+    estimate_method: str = "chars_div_4"
+    sample_count: int = 0
+    state: Literal["measured", "unmeasured"] = "unmeasured"
+
+
+class AskMetricSummaryOut(BaseModel):
+    window_hours: int
+    total_requests: int
+    stages: Dict[str, AskPercentileOut]
+    client_first_visible_ms: AskPercentileOut
+    client_complete_ms: AskPercentileOut
+    outcome_counts: Dict[str, int]
+    failure_class_counts: Dict[str, int]
+    failure_rate: AskRateOut
+    llm_calls_total: int
+    provider_reported_tokens: AskTokenSumOut
+    estimated_tokens: AskEstimatedTokenSumOut
 
 
 # --- Replay engine (Issue #242 Phase B / #244) -------------------------------
