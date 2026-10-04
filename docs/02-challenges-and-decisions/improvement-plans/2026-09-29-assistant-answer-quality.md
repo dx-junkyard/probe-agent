@@ -14,7 +14,7 @@
 
 正本契約: [assistant-answer-quality.md](../../01-specifications/capabilities/assistant-answer-quality.md)。
 
-## 観点の選択（手動照合、`probe-agent-ec/0.1`）
+## 観点の選択（手動照合、`probe-agent-ec/0.2`）
 
 | 観点・事例 | 照合 | 利用 |
 | --- | --- | --- |
@@ -43,3 +43,9 @@
 - 秘密値・未保存draft・実会話本文を計測へ保存しない。
 
 結果: [IR-20260929-01](../../03-validation/improvement-cycle/2026-09-29-assistant-answer-quality.md)。
+
+## 2026-10-04訂正: 接続方式の表記
+
+見出しの旧表記`probe-agent-ec/0.1`を`probe-agent-ec/0.2`へ訂正した。
+根拠は同案件の[G-20260929-01](../../../improvement/records/2026-09-29-assistant-answer-quality-guidance.md)の使用版と一般化候補の参照記録。
+当時の全手順の遵守を遡及認定するものではなく、異なる版表記を整合させたもの。訂正担当はコーディングエージェント。

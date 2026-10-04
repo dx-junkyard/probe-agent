@@ -1,0 +1,272 @@
+{
+  "ledger_id": "probe-agent:SL-20260927-02",
+  "acquired_at": "2026-09-27",
+  "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+  "content_identity": "取得時working tree。取得版と過去の観測版を分離し、内容はファイルごとのSHA-256で固定。",
+  "analysis_method": "local-patterns/0.1",
+  "connection_method": "probe-agent-ec/0.2",
+  "release_id": "evolution-controller-0.1.0-preview.1",
+  "scope": "EC-LP-0001/0002の根拠6件と依存資料。既存台帳は保持。既知例との整合確認であり独立適用効果ではない。",
+  "entries": [
+    {
+      "id": "probe-agent:IK-0003",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0003-root-only-freshness.md",
+      "sha256": "4f53fccaae71a2912311a3b5a3d84dc0d4eced7002e90796621f8280cc375430",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "observed_at": "2026-09-12",
+      "observed_revision": "2026-09-12監査修正後（最終SHAは出典未記載）",
+      "dependency_paths": [
+        "apps/control-server/app/assistant_discussion_proposal.py",
+        "apps/control-server/tests/test_assistant_discussion_proposals.py",
+        "docs/01-specifications/ux/decision-discussion-audit-2026-09-12.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/04-operations/improvement-cycle/recipes/boundary-and-version.md",
+        "vendor/evolution-controller-0.1.0-preview.1/knowledge/perspectives.md",
+        "vendor/evolution-controller-0.1.0-preview.1/templates/pattern.md"
+      ],
+      "analysis_method": "local-patterns/0.1",
+      "analyzed_scope": "既存の原因・解決・検証条件を共通原理と条件差分に整理。元の監査・修正記録と照合。現行製品テストと新候補の効果測定は未実施。",
+      "record": "improvement/local/patterns/EC-LP-0001-premise-validity-v1.md"
+    },
+    {
+      "id": "probe-agent:IK-0005",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0005-immutable-premise-overwritten.md",
+      "sha256": "2c358e100d6b799515e68319eb22e7fb145e2cd99fc54734357061f43b28eab3",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "observed_at": "2026-09-13",
+      "observed_revision": "575a6c4（#464 第1回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/canonical_understanding.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/04-operations/improvement-cycle/recipes/boundary-and-version.md",
+        "docs/90-history/canonical-understanding-review-2026-09-13.md",
+        "docs/90-history/project-intelligence.md",
+        "vendor/evolution-controller-0.1.0-preview.1/knowledge/perspectives.md",
+        "vendor/evolution-controller-0.1.0-preview.1/templates/pattern.md"
+      ],
+      "analysis_method": "local-patterns/0.1",
+      "analyzed_scope": "既存の原因・解決・検証条件を共通原理と条件差分に整理。元の監査・修正記録と照合。現行製品テストと新候補の効果測定は未実施。",
+      "record": "improvement/local/patterns/EC-LP-0002-fixed-information-v1.md"
+    },
+    {
+      "id": "probe-agent:IK-0006",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0006-missing-post-inference-check.md",
+      "sha256": "02a919d6db113e35c578a86745ff6eb2a9a472b4e25eadda80e5a67deb7a656e",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "observed_at": "2026-09-13",
+      "observed_revision": "575a6c4（#464 第1回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/canonical_understanding.py",
+        "apps/control-server/app/routes/interview.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/04-operations/improvement-cycle/recipes/boundary-and-version.md",
+        "docs/90-history/canonical-understanding-review-2026-09-13.md",
+        "docs/90-history/project-intelligence.md",
+        "vendor/evolution-controller-0.1.0-preview.1/knowledge/perspectives.md",
+        "vendor/evolution-controller-0.1.0-preview.1/templates/pattern.md"
+      ],
+      "analysis_method": "local-patterns/0.1",
+      "analyzed_scope": "既存の原因・解決・検証条件を共通原理と条件差分に整理。元の監査・修正記録と照合。現行製品テストと新候補の効果測定は未実施。",
+      "record": "improvement/local/patterns/EC-LP-0001-premise-validity-v1.md"
+    },
+    {
+      "id": "probe-agent:IK-0010",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0010-frozen-view-reads-live-data.md",
+      "sha256": "75065db04988389f1462f2fadedec2569f533774881d630bbd024d585944ae2b",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "observed_at": "2026-09-14",
+      "observed_revision": "18dfa26（#464 第2回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/canonical_understanding.py",
+        "apps/control-server/app/overview_projection.py",
+        "apps/control-server/app/purpose_chain.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/04-operations/improvement-cycle/recipes/boundary-and-version.md",
+        "docs/90-history/project-intelligence.md",
+        "vendor/evolution-controller-0.1.0-preview.1/knowledge/perspectives.md",
+        "vendor/evolution-controller-0.1.0-preview.1/templates/pattern.md"
+      ],
+      "analysis_method": "local-patterns/0.1",
+      "analyzed_scope": "既存の原因・解決・検証条件を共通原理と条件差分に整理。元の監査・修正記録と照合。現行製品テストと新候補の効果測定は未実施。",
+      "record": "improvement/local/patterns/EC-LP-0002-fixed-information-v1.md"
+    },
+    {
+      "id": "probe-agent:IK-0011",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0011-validation-write-race.md",
+      "sha256": "d02a831ed77034da9f471a306ad4dc94436c043f2b9bcdc6c8bdebe35aad7f0f",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "observed_at": "2026-09-14",
+      "observed_revision": "18dfa26（#464 第2回修正後）",
+      "dependency_paths": [
+        "apps/control-server/app/db.py",
+        "apps/control-server/app/routes/interview.py",
+        "apps/control-server/tests/test_canonical_understanding.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/04-operations/improvement-cycle/recipes/boundary-and-version.md",
+        "docs/90-history/project-intelligence.md",
+        "vendor/evolution-controller-0.1.0-preview.1/knowledge/perspectives.md",
+        "vendor/evolution-controller-0.1.0-preview.1/templates/pattern.md"
+      ],
+      "analysis_method": "local-patterns/0.1",
+      "analyzed_scope": "既存の原因・解決・検証条件を共通原理と条件差分に整理。元の監査・修正記録と照合。現行製品テストと新候補の効果測定は未実施。",
+      "record": "improvement/local/patterns/EC-LP-0001-premise-validity-v1.md"
+    },
+    {
+      "id": "probe-agent:IK-0016",
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/entries/IK-0016-completed-evidence-overwritten.md",
+      "sha256": "84aa3d6d5cf73d771cc7348e5d3d004f8d38bd677b50d711f82e018869be0646",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "observed_at": "2026-08-17",
+      "observed_revision": "2026-08-17 Epic #394 検証ラウンド修正後（出典に最終SHAなし）",
+      "dependency_paths": [
+        "apps/control-server/app/exploration_workbench.py",
+        "apps/control-server/tests/test_exploration_workbench.py",
+        "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+        "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+        "docs/04-operations/improvement-cycle/recipes/boundary-and-version.md",
+        "docs/90-history/project-intelligence.md",
+        "vendor/evolution-controller-0.1.0-preview.1/knowledge/perspectives.md",
+        "vendor/evolution-controller-0.1.0-preview.1/templates/pattern.md"
+      ],
+      "analysis_method": "local-patterns/0.1",
+      "analyzed_scope": "既存の原因・解決・検証条件を共通原理と条件差分に整理。元の監査・修正記録と照合。現行製品テストと新候補の効果測定は未実施。",
+      "record": "improvement/local/patterns/EC-LP-0002-fixed-information-v1.md"
+    }
+  ],
+  "dependencies": [
+    {
+      "path": "apps/control-server/app/assistant_discussion_proposal.py",
+      "sha256": "22c1e641c420579c6eee9699d38150514d3ef9e10b5d85ee53f6120b0485ef4e",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "apps/control-server/app/canonical_understanding.py",
+      "sha256": "4e8ef29dfccaeed5be34faf9cb23d5975e886f0e445d11c349c18b513ec20968",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "apps/control-server/app/db.py",
+      "sha256": "f571bd248a247549d1016b94ee675b46d7ea2a105ec771d55e3f6d27fe112b08",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "apps/control-server/app/exploration_workbench.py",
+      "sha256": "c2b0deeff68dc83d58daa0ae9acfc966826c83fdf6d8ab16b7ea8c347b15897c",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "apps/control-server/app/overview_projection.py",
+      "sha256": "1e129e37c62074c37eca024abbe195dd0238077d9d5be12eab8a6730055f037f",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "apps/control-server/app/purpose_chain.py",
+      "sha256": "c747c578472e7f4477c7691ef1efc00392f60fae532732a1c4c2bd4ba71dd41b",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "apps/control-server/app/routes/interview.py",
+      "sha256": "f45bcf501da661bdc9a33aee811dd28c02f70c83542a92bb97031ba083dbe4f0",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "apps/control-server/tests/test_assistant_discussion_proposals.py",
+      "sha256": "2327c5f617cc605c0f24464a0c7f52482672244a1fa2334cfa3c387201ba29b8",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "apps/control-server/tests/test_canonical_understanding.py",
+      "sha256": "8d260d44abc5c26a5fe9ea8bd904142b960a51b14bdd6daedd757e6b1b60f022",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "apps/control-server/tests/test_exploration_workbench.py",
+      "sha256": "cc6d6de7207431c5cc3e231af386db2beba70244e4176845867a9e57b1a14f6d",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "docs/01-specifications/ux/decision-discussion-audit-2026-09-12.md",
+      "sha256": "674207de166f03a9da20a9f95b822c3b2db405254c8ceb9a60cc9e37b23803af",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/dictionary.md",
+      "sha256": "7639841f66efb13dfc90d7a9205d439a70b0070677f009d9a0a01e05eb36610b",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "docs/02-challenges-and-decisions/issue-knowledge/taxonomy.md",
+      "sha256": "3ce21d716298c9f14fd8203ca8d2ff048013d13eefae6ddcd675f79ca80013dd",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "working_tree_change",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "docs/04-operations/improvement-cycle/recipes/boundary-and-version.md",
+      "sha256": "c1fdfe2e83e44a1a974bccc639248278f62ed5b95b6e901671b816851b385106",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "docs/90-history/canonical-understanding-review-2026-09-13.md",
+      "sha256": "f236928f052e3f122806849276a3738ee3fc3a5e498a48b02c88d7128b8bc63f",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "docs/90-history/project-intelligence.md",
+      "sha256": "d2b67a86f0975a28a7b85558ea1daff40879df93d537d94ead1f630a13f609b1",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "vendor/evolution-controller-0.1.0-preview.1/knowledge/perspectives.md",
+      "sha256": "08e3925e0a18a6a6ca7238878d77d54821c31152e37431c81fbdce9388ad11a6",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    },
+    {
+      "path": "vendor/evolution-controller-0.1.0-preview.1/templates/pattern.md",
+      "sha256": "32a31cbe251cc28db8119f8ef0d8a3c9476ecef1a249d209543f99bd8027b183",
+      "acquired_revision": "d821a5442127ff063276e209e83a73516b6fde56",
+      "content_state": "matches_revision",
+      "analyzed_scope": "参照先・取得時内容を識別。製品コード・テストパスは追跡先であり、全内容の再監査・製品テスト再実行を意味しない。"
+    }
+  ]
+}

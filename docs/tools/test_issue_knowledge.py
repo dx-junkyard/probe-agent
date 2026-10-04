@@ -49,6 +49,16 @@ class KnowledgeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '分類確定者'):
             self.validate()
 
+    def test_agent_can_confirm_classification_with_recorded_evidence(self):
+        self.e['classification'].update(review='confirmed',
+                                        reviewed_by='coding-agent',
+                                        reviewed_at='2026-10-04')
+        self.e['history'].append({
+            'date': '2026-10-04', 'field': 'classification.review',
+            'from': 'candidate', 'to': 'confirmed',
+            'reason': '対象版の出典と隣接型を照合。解決策の新規適用効果とは別。'})
+        self.validate()
+
     def test_resolved_requires_verification(self):
         self.e['resolution']['verification'] = []
         with self.assertRaisesRegex(ValueError, '検証証拠'):

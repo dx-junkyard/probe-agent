@@ -22,7 +22,7 @@ Vision / Stakeholder Value
 1. [Vision・UX・コア機能要件](00-product/vision-and-core-requirements.md)
 2. [System Understanding の理想状態](00-product/system-understanding-ideal-state.md)
 3. 関心領域に対応する [システム仕様](#01-specifications--システム仕様)
-4. 改善着手時は [製品状態から選ぶ改善サイクル](04-operations/improvement-cycle/README.md) と
+4. 自律改善が難しい、または行き詰まった場合は [製品状態から選ぶ改善サイクル](04-operations/improvement-cycle/README.md) と
    [課題ナレッジ](02-challenges-and-decisions/issue-knowledge/README.md)
 5. 実装・運用時は [運用ガイド](#04-operations--運用ガイド)
 
@@ -97,6 +97,7 @@ Vision / Stakeholder Value
 
 | 文書 | 記録時点・用途 |
 | --- | --- |
+| [課題・ソリューションの抽象化層の検討](02-challenges-and-decisions/improvement-plans/2026-09-27-knowledge-abstraction.md) | 2026-09-27、既存20件の検討と2候補の手動試行の導入判断 |
 | [System Understanding UX Gap Analysis](02-challenges-and-decisions/ux-gap-analysis-system-understanding.md) | 状態矛盾・導線・用語・テスト不足の調査と改善提案 |
 | [End-to-end UX Audit](02-challenges-and-decisions/end-to-end-ux-audit-2026-08-11.md) | 2026-08-11 時点の優先度付き UX 監査 |
 
@@ -111,6 +112,7 @@ canonical contract を確認する。
 | [System Understanding Scenario](03-validation/dogfooding-system-understanding-scenario.md) | end-to-end 導線の再現可能な検証シナリオ |
 | [改善サイクル導入の検証](03-validation/improvement-cycle/2026-09-19-knowledge-bootstrap.md) | ナレッジ・索引・手順の導入結果。以後の改善結果も同ディレクトリへ置く |
 | [導入前の知識の移入検証](03-validation/improvement-cycle/2026-09-21-historical-knowledge.md) | 過去の修正16件の分類、根拠、収録範囲と未収録事項 |
+| [一般化層の導入検証](03-validation/improvement-cycle/2026-09-27-knowledge-abstraction.md) | 2候補の正例・非適用例、運用接続と既存知識の保持 |
 | [共同検討UXの検証・引継ぎ](03-validation/decision-discussion-handoff.md) | 操作Mock、Issue分担、実装時の検証シナリオと未検証範囲 |
 
 ## 04-operations — 運用ガイド
@@ -118,6 +120,7 @@ canonical contract を確認する。
 | 文書 | 用途 |
 | --- | --- |
 | [製品状態から選ぶ改善サイクル](04-operations/improvement-cycle/README.md) | 根拠付き状態・利用見通し・候補比較・Recipe選択・結果の還流 |
+| [課題と解決原理の一般化候補](../improvement/local/patterns/README.md) | 状況から共通原理・派生形・補完対策を選ぶ手動試行の入口 |
 | [AI Agent Improvement Guide](04-operations/ai-agent-improvement-guide.md) | AI エージェントが改善ループを運用する手順 |
 | [Production HTTPS Deployment](04-operations/deployment-https.md) | Caddy を含む本番公開、バックアップ、復旧 |
 | [GitHub App Deployment](04-operations/github-app-deployment.md) | GitHub App の登録、秘密鍵配置、ローテーション |

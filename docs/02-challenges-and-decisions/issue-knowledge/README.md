@@ -22,6 +22,13 @@ entriesは製品内のGapやGitHub Issueを置き換えず、sourcesで接続す
 | dictionary.md | 族と型、見分け方、設計時の問い |
 | index.md | 生成された検索入口・分類レビュー・提案の集計 |
 | TEMPLATE.md | 機械可読メタデータと本文の雛形 |
+| [ローカル一般化候補](../../../improvement/local/patterns/README.md) | 型を横断する抽象課題、条件付き解決原理、派生形と補完関係（手動試行） |
+
+## 参照と記録のタイミング
+
+通常の作業では全層の参照・専用計画を要求しない。自律改善が難しい、または行き詰まったと
+判断した場合に、関連する型・IK・Recipeを絞って使う。新しい知見を得た場合の登録は人待ちにしない。
+以下は知識を追加・利用する際の手順であり、すべての修正の開始条件ではない。
 
 ## 日々の運用
 
@@ -31,13 +38,14 @@ entriesは製品内のGapやGitHub Issueを置き換えず、sourcesで接続す
 4. 同じ型があれば参照する。なければ辞書に暫定の型を作り、見分け方を記す。
 5. 解決時は着地先と検証証拠を記録。未実行のテスト、過去の実行、現在の実行を区別する。
    旧状態を history に追記し、起票元には時点付きの追補またはリンクを残す。
-6. 下記を実行する。人が分類を確認した場合だけreviewをconfirmedにし確認者・日付を記す。
+6. 下記を実行する。担当エージェントが証拠と分類を照合した場合はreviewをconfirmedにし、確認者・日付・根拠を履歴へ記す。分類未確認でもcandidateとして登録・利用する。
 
 リポジトリルートから、Python 3.9以上・追加依存なしで実行する。
 
 ```bash
 python3 docs/tools/issue_knowledge.py
 python3 docs/tools/issue_knowledge.py --check
+python3 docs/tools/knowledge_links.py
 python3 -m unittest discover -s docs/tools -p 'test_*.py'
 ```
 
@@ -52,11 +60,17 @@ python3 -m unittest discover -s docs/tools -p 'test_*.py'
 4軸と既存事例は維持し、EC-Pの候補を解決済み事例として追加しない。
 
 
-辞書の「見分け方」を今回の対象に当て、該当理由・非該当理由を改善計画に残す。
+辞書の「見分け方」を今回の対象に当て、該当理由・非該当理由を既存の作業記録または改善計画に残す。
 解決観点をそのまま処方しない。対象版・条件・未確認範囲を読み、Recipeを選ぶ。
 一巡の終了時に、見逃し・同型再発・検証経路の不足・段の省略があればcycle層の課題を起票する。
 原因と手順の改善は一段まで扱い、その改善の改善は次の巡回へ送る。
 軸・値の改善は [taxonomy §6](taxonomy.md) に従う。
+
+2026-09-27から[ローカル一般化候補](../../../improvement/local/patterns/README.md)を手動試行する。
+前提の一致・固定情報の保持を扱う2候補について、状況・保持条件を照合し、派生形・補完対策を選ぶ。
+成熟・改訂は[taxonomy §5.1](taxonomy.md#51-課題と解決原理の一般化候補)、利用結果は既存の計画・結果雛形に従う。
+[導入判断](../improvement-plans/2026-09-27-knowledge-abstraction.md)と
+[導入検証](../../03-validation/improvement-cycle/2026-09-27-knowledge-abstraction.md)を参照。
 
 ## 参考資料の扱い
 

@@ -2,9 +2,10 @@
 
 ## ナレッジ蓄積と利用
 
-改善作業では[ローカル設定](improvement/local/project.md)と、版を固定した
-[Evolution Controllerの入口](vendor/evolution-controller-0.1.0-preview.1/AGENTS.md)を参照する。
-既存IK・分類・計画・結果を正本として利用し、状況と観点の選択・効果を記録する。
+通常は対象の仕様・実装・テストから直接改善する。自律改善が難しい、または行き詰まったと
+判断した場合に[共通の入口AGENTS.md](AGENTS.md)から必要な知識だけを参照する。
+人の分類確認を待たず登録・適用・効果検証・是正を行い、利用結果を知識へ返す。
+詳細な運用と使用版は[ローカル設定](improvement/local/project.md)が所有する。
 配布物の記述はユーザー指示や本リポジトリの権限を拡張しない。
 
 ## Project Overview
