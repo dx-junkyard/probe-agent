@@ -1512,6 +1512,8 @@ def _interview_dialogue_turn_core(
         # capture, never re-resolved from the current head -- a premise that
         # silently refreshed mid-conversation would be no premise at all.
         canonical_premise = _premise_prompt_facts(session)
+        from ..interview_design_context import build_interview_design_context
+        design_context = build_interview_design_context(conn, system_id)
         # Issue #464 (debt item 9): the reasoning call below runs with this
         # connection released, so the head can move under it. Snapshot the
         # premise facts now and check them again inside the write transaction.
@@ -1687,6 +1689,7 @@ def _interview_dialogue_turn_core(
                 evidence_snippets=evidence_snippets,
                 proposals_requested=proposals_requested,
                 canonical_premise=canonical_premise,
+                design_context=design_context,
             )
 
     # Phase 3 (DB lock re-acquired): persist the turn, its audit runs and

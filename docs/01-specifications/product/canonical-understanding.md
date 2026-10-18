@@ -3,7 +3,7 @@
 canonical design contract. 実装はこの文書に従う。
 
 追加設計 [Interview Discussion Contributions](../capabilities/interview-discussion-contributions.md)
-（2026-09-16、設計確定・未実装）は、自由対話からの補足記録と既存項目への反映を定義する。
+（基礎実装済み、全受入条件の達成は未確認）は、自由対話からの補足記録と既存項目への反映を定義する。
 補足保存・candidate更新は本書の正準昇格とは別操作であり、head更新・premise固定・CASの
 所有者は引き続き本書である。
 
@@ -301,7 +301,7 @@ Interview 画面には出るが、正準になるのは次の昇格を通った�
 ## 8. 会話コンテキスト
 
 `system_understanding_reviewer` (`understanding-review-v8`) と `interview_agent`
-(`interview-v7`) はどちらも、セッションが固定した premise bundle を **独立した
+(`interview-v8`) はどちらも、セッションが固定した premise bundle を **独立した
 最初のセクション**として受け取る。graph は code から導出した仮説、premise は人が
 既に確定した内容であり、混ぜると rebuild がどちらか言えなくなる。premise 用の
 prompt 予算を別に持つのは、**切り詰められた premise は確定済みの Vision が静かに

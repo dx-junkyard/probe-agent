@@ -2446,6 +2446,15 @@ Do not rely only on manual testing when behavior can be covered by unit tests.
 
 ---
 
+## Vision・UX・Feature のヒアリング
+
+Interview の対話と画面アシスタントは、固定された canonical premise と、
+System 内の現行 Objective / Milestone / Gap / Journey / Requirement / Product Feature
+を区別して読む。設計情報は既存 domain reader から上限付きで参照し、保存済みの
+関連・著者・確認状態・再確認状態を維持する。取得失敗・省略は欠如と解釈しない。
+質問は利用者の関心から入り、目的→体験→必要な機能の接続のうち未確認の一点を
+尋ねる。関連がない箇所を推測で接続せず、回答だけで設計や正準 head を更新しない。
+
 ## Implementation Constraints
 
 - Prefer small, focused changes.

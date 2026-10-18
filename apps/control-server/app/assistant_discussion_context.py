@@ -96,6 +96,7 @@ def _interview_context(
     system_id: int, route_params: Dict[str, str]
 ) -> ScreenDiscussionContext:
     from .understanding_brief import build_understanding_brief
+    from .interview_design_context import build_interview_design_context
 
     requested_session_id = _positive_int(route_params.get("session"))
     with get_conn() as conn:
@@ -122,6 +123,7 @@ def _interview_context(
         brief = build_understanding_brief(
             conn, system_id, session["id"] if session is not None else None
         )
+        design_context = build_interview_design_context(conn, system_id)
         selected = None
         supplements = None
         if session is not None:
@@ -149,7 +151,10 @@ def _interview_context(
                 "user_intent": session["user_intent"],
                 "understanding_confirmed_at": session["understanding_confirmed_at"],
             }
-    sources = [{"id": "interview_sessions", "title": "Interview session list"}]
+    sources = [
+        {"id": "interview_sessions", "title": "Interview session list"},
+        {"id": "interview_design_context", "title": "Current System design and explicit links"},
+    ]
     if selected is not None:
         sources.extend([
             {"id": f"interview_session:{selected['id']}", "title": "Selected Interview session"},
@@ -162,6 +167,7 @@ def _interview_context(
             "understanding_brief": asdict(brief),
             "available_sessions": [dict(row) for row in sessions],
             "reviewed_discussion_contributions": supplements,
+            "current_design_context": design_context,
         },
         sources=sources,
         coverage=[sessions_cov.to_dict()],

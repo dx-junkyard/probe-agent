@@ -1,7 +1,7 @@
 # 画面コンテキスト対応 AI アシスタント (Epic #436) — canonical contract
 
 関心起点のInterview対話の追加設計は [UX契約](../ux/interest-led-interview-discussion.md) と
-[補足・反映契約](interview-discussion-contributions.md) を参照（2026-09-16、設計確定・未実装）。
+[補足・反映契約](interview-discussion-contributions.md) を参照（基礎実装済み、全受入条件の達成は未確認）。
 既存thread identityと単一target Proposalは維持し、複数Interviewへの関連付けは補足ごとに持つ。
 本書の既存apply経路と、新設計の補足保存・domain反映を同一視しない。
 

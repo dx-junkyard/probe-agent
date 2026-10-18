@@ -1015,3 +1015,23 @@ def test_unrequested_turn_with_neither_is_still_valid():
     assert result.error is None
     assert result.proposals == []
     assert result.next_questions == []
+
+
+def test_design_context_reaches_dialogue_separately_from_pinned_vision():
+    client = _CapturingClient()
+    result = generate_interview_turn(
+        client, _make_config(), context_pack=_context_pack(), history=[],
+        user_message="この体験にどの機能が必要ですか",
+        canonical_premise={"vision": "利用者の負担を減らす"},
+        design_context={"scope": "current_system_design_not_pinned_premise",
+                        "sections": {"features": {"items": [{"feature_key": "checkout"}],
+                                                   "omitted": 2}}},
+    )
+    assert result.error is None
+    prompt = client.messages[-1]['content']
+    assert 'Canonical System Understanding' in prompt
+    assert 'Current design context' in prompt
+    assert '利用者の負担を減らす' in prompt
+    assert 'checkout' in prompt
+    assert '"omitted": 2' in prompt
+    assert 'ONE missing connection' in client.messages[0]['content']

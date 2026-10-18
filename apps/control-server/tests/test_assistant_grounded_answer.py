@@ -107,7 +107,7 @@ def test_supported_fact_is_grounded_and_conclusion_comes_first(env, monkeypatch)
     client, _, _, headers = env
     _enable(monkeypatch, _Fake(_v2("モデル名は設定で決まります。", [_fact("この設定は必須です", VALID)])))
     body = _ask(client, headers)
-    assert body["prompt_version"] == "v2" and body["schema_version"] == "v2"
+    assert body["prompt_version"] == "v3" and body["schema_version"] == "v2"
     assert body["answer_status"] == "answered" and body["failure"] is None
     assert body["conclusion"] == "モデル名は設定で決まります。"
     assert body["answer"].startswith("モデル名は設定で決まります。")
