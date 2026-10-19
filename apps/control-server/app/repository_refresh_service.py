@@ -301,7 +301,11 @@ def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: in
     feature-code links are preserved) but may lack #54 source metadata and #55
     source-hash provenance.  This re-parses the pinned snapshot files and
     additively backfills, matching existing symbols by ``(path,
-    qualified_name)``:
+    qualified_name, start_line, end_line)``.  Several definitions can share a
+    qualified name (a property getter and setter, a redefined function) while
+    the index stores only one of them, so the line range is part of the key:
+    only the definition the stored row describes is backfilled, and the other
+    definitions never write their hashes or metadata onto it.
 
     - symbol source/body hashes on ``code_symbols`` (idempotent UPDATE),
     - missing ``symbol_source_metadata`` rows (with explanation hash),
@@ -324,10 +328,14 @@ def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: in
     file_hash_map = _load_file_hash_map(conn, snapshot_id)
 
     sym_rows = conn.execute(
-        "SELECT id, path, qualified_name FROM code_symbols WHERE snapshot_id = ?",
+        "SELECT id, path, qualified_name, start_line, end_line "
+        "FROM code_symbols WHERE snapshot_id = ?",
         (snapshot_id,),
     ).fetchall()
-    id_by_key = {(r["path"], r["qualified_name"]): r["id"] for r in sym_rows}
+    id_by_key = {
+        (r["path"], r["qualified_name"], r["start_line"], r["end_line"]): r["id"]
+        for r in sym_rows
+    }
     # symbol_id -> (metadata_id, explanation_hash)
     existing_meta = {
         r["symbol_id"]: (r["id"], r["explanation_hash"])
@@ -355,8 +363,12 @@ def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: in
     conn.execute("BEGIN")
     try:
         for sym in result.symbols:
-            symbol_id = id_by_key.get((sym.path, sym.qualified_name))
+            symbol_id = id_by_key.pop(
+                (sym.path, sym.qualified_name, sym.start_line, sym.end_line), None
+            )
             if symbol_id is None:
+                # Not the stored definition (or already backfilled from an
+                # identical one): never write onto another definition's row.
                 continue
             # Idempotently set the deterministic source hashes.
             conn.execute(
