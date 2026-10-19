@@ -1173,3 +1173,99 @@ class TestCrossSnapshotChunkReuse:
                 assert claim.evidence.path == chunk.path
                 assert claim.evidence.start_line == chunk.start_line
                 assert claim.evidence.end_line == chunk.end_line
+
+
+# --- source metadata persisted by the build's symbol_index step ----------
+
+_METADATA_SOURCE = '''def summarize(text):
+    """Summarize text.
+
+    probe-agent:
+      role: summarizes incoming text
+      capability: text summarization
+      element_type: capability
+      operation_kind: analysis
+      consumers: [api.summarize]
+      state_effects: [none]
+    """
+    return text[:10]
+'''
+
+
+def _setup_metadata_repo(client, token, tmp_path):
+    sys = _create_system(client, token, "Metadata System")
+    hdrs = _headers(token, sys["id"])
+    repo = tmp_path / "meta-repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "summarize.py").write_text(_METADATA_SOURCE)
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    for args in (["config", "user.email", "t@t.com"], ["config", "user.name", "T"],
+                 ["add", "."], ["commit", "-m", "init"]):
+        subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True)
+    client.put(
+        "/repository",
+        json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+        headers=hdrs,
+    )
+    snap = client.post("/repository/snapshots", json={}, headers=hdrs)
+    assert snap.status_code == 201, snap.text
+    return sys["id"], snap.json()["id"], hdrs
+
+
+def _metadata_rows(snapshot_id):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT qualified_name, capability FROM symbol_source_metadata WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+
+
+def test_build_symbol_index_step_persists_source_metadata(admin_client, tmp_path):
+    """The build pipeline's symbol_index step used to store code_symbols only,
+    so `probe-agent:` docstring metadata never reached symbol_source_metadata
+    and the capability hierarchy stayed empty after a System Understanding
+    build, although the manual POST /repository/symbols/index stored it."""
+    from app.system_understanding_jobs import StepContext, _run_symbol_index
+
+    token = _login(admin_client)
+    system_id, snapshot_id, hdrs = _setup_metadata_repo(admin_client, token, tmp_path)
+
+    _run_symbol_index(StepContext(
+        build_id=0, step_id=0, step="symbol_index", system_id=system_id, snapshot_id=snapshot_id,
+    ))
+
+    rows = _metadata_rows(snapshot_id)
+    assert [(r["qualified_name"], r["capability"]) for r in rows] == [("summarize", "text summarization")]
+    symbols = admin_client.get("/repository/symbols", headers=hdrs).json()["symbols"]
+    summarize = next(s for s in symbols if s["qualified_name"] == "summarize")
+    assert summarize["source_metadata"]["capability"] == "text summarization"
+
+
+def test_index_written_by_old_build_step_is_backfilled_on_read(admin_client, tmp_path):
+    """Indexes the old build step wrote carry the current-looking schema
+    version but no metadata; reading the index must backfill them once."""
+    from app.db import get_conn
+    from app.system_understanding_jobs import StepContext, _run_symbol_index
+
+    token = _login(admin_client)
+    system_id, snapshot_id, hdrs = _setup_metadata_repo(admin_client, token, tmp_path)
+    _run_symbol_index(StepContext(
+        build_id=0, step_id=0, step="symbol_index", system_id=system_id, snapshot_id=snapshot_id,
+    ))
+    # Reproduce what the old build step left behind.
+    with get_conn() as conn:
+        conn.execute("DELETE FROM explanation_source_anchors WHERE snapshot_id = ?", (snapshot_id,))
+        conn.execute("DELETE FROM symbol_source_metadata WHERE snapshot_id = ?", (snapshot_id,))
+        conn.execute(
+            "UPDATE intelligence_runs SET schema_version = 'provenance-v1', model = 'n/a' "
+            "WHERE snapshot_id = ? AND run_type = 'symbol_index'",
+            (snapshot_id,),
+        )
+    assert _metadata_rows(snapshot_id) == []
+
+    r = admin_client.post("/repository/symbols/index", headers=hdrs)
+    assert r.status_code in (200, 201), r.text
+
+    assert [r["qualified_name"] for r in _metadata_rows(snapshot_id)] == ["summarize"]

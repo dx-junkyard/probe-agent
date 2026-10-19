@@ -986,6 +986,8 @@ export interface InterviewDialogueTurnOut {
   // Issue #142: count of question evidence_refs dropped as unverifiable
   // (graceful fallback, not an error).
   evidence_refs_dropped: number;
+  // Evidence targets pass 1 asked for beyond INTERVIEW_EVIDENCE_MAX_FILES (not read).
+  evidence_targets_omitted: number;
 }
 
 // --- Evidence read audit (Issue #137) -----------------------------------------

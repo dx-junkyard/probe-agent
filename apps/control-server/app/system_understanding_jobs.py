@@ -958,6 +958,7 @@ _EXISTING_CHECKS = {
 
 def _run_symbol_index(ctx: StepContext) -> Dict[str, Any]:
     from .code_indexer import index_snapshot_files
+    from .repository_refresh_service import _load_file_hash_map, persist_symbol_index
 
     with get_conn() as conn:
         file_rows = conn.execute(
@@ -971,34 +972,18 @@ def _run_symbol_index(ctx: StepContext) -> Dict[str, Any]:
     result = index_snapshot_files(files)
     ctx.heartbeat()
 
+    # Same persistence as POST /repository/symbols/index: symbols together
+    # with their `probe-agent:` source metadata, anchors and index warnings.
     with get_conn() as conn:
-        now = time.time()
-        run_id = conn.execute(
-            """INSERT INTO intelligence_runs
-                (system_id, snapshot_id, run_type, provider, model,
-                 prompt_version, schema_version, decision_method,
-                 status, is_mock, started_at, completed_at)
-            VALUES (?, ?, 'symbol_index', 'deterministic', 'n/a',
-                    'n/a', 'provenance-v1', 'deterministic',
-                    'completed', 0, ?, ?)""",
-            (ctx.system_id, ctx.snapshot_id, started_at, now),
-        ).lastrowid
-        for sym in result.symbols:
-            conn.execute(
-                """INSERT OR IGNORE INTO code_symbols
-                    (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line,
-                     docstring, decorators, imports, is_test, route_path, route_method,
-                     component_id, symbol_source_hash, symbol_body_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    ctx.snapshot_id, ctx.system_id, sym.path, sym.qualified_name,
-                    sym.kind, sym.start_line, sym.end_line,
-                    sym.docstring, json.dumps(sym.decorators), json.dumps(sym.imports),
-                    1 if sym.is_test else 0, sym.route_path, sym.route_method,
-                    sym.component_id,
-                    sym.symbol_source_hash, sym.symbol_body_hash,
-                ),
-            )
+        run_id = persist_symbol_index(
+            conn,
+            system_id=ctx.system_id,
+            snapshot_id=ctx.snapshot_id,
+            result=result,
+            file_hash_map=_load_file_hash_map(conn, ctx.snapshot_id),
+            started_at=started_at,
+            completed_at=time.time(),
+        )
     return {"intelligence_run_id": run_id, "symbol_count": len(result.symbols)}
 
 

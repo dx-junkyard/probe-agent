@@ -222,7 +222,10 @@ def create_snapshot_service(system_id: int) -> SnapshotOut:
 # snapshots indexed by an older version can be deterministically upgraded
 # without re-creating code_symbols (which would cascade-delete feature links).
 # metadata-v1: #54 source metadata. provenance-v1: #55 source-hash provenance.
-SYMBOL_INDEX_SCHEMA_VERSION = "provenance-v1"
+# provenance-v2: the build's symbol_index step now persists source metadata
+# too; v1 runs it wrote have symbols without metadata and are backfilled on
+# the next read by `_upgrade_index_if_stale`.
+SYMBOL_INDEX_SCHEMA_VERSION = "provenance-v2"
 
 
 def _metadata_out(row) -> SourceMetadataOut:
@@ -502,6 +505,126 @@ def _symbol_out(
     )
 
 
+def persist_symbol_index(
+    conn,
+    *,
+    system_id: int,
+    snapshot_id: int,
+    result,
+    file_hash_map: dict,
+    started_at: float,
+    completed_at: float,
+) -> int:
+    """Persist one deterministic symbol index and return its run id.
+
+    The single owner of what a symbol index stores: the run record, the
+    symbols, their ``probe-agent:`` source metadata with explanation anchors,
+    and the index warnings. Both the manual index endpoint and the System
+    Understanding build's ``symbol_index`` step call it, so the build path can
+    no longer store symbols without their metadata. The caller owns the
+    transaction.
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO intelligence_runs
+            (system_id, snapshot_id, run_type, provider, model,
+             prompt_version, schema_version, decision_method,
+             status, is_mock, started_at, completed_at)
+        VALUES (?, ?, 'symbol_index', 'deterministic', 'ast',
+                'n/a', ?, 'deterministic',
+                'completed', 0, ?, ?)
+        """,
+        (system_id, snapshot_id, SYMBOL_INDEX_SCHEMA_VERSION, started_at, completed_at),
+    )
+    run_id = cur.lastrowid
+
+    for sym in result.symbols:
+        sym_cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO code_symbols
+                (snapshot_id, system_id, path, qualified_name, kind,
+                 start_line, end_line, decorators, imports, docstring,
+                 is_test, is_pydantic_model, route_path, route_method,
+                 component_id, symbol_source_hash, symbol_body_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                system_id,
+                sym.path,
+                sym.qualified_name,
+                sym.kind,
+                sym.start_line,
+                sym.end_line,
+                json.dumps(sym.decorators),
+                json.dumps(sym.imports),
+                sym.docstring,
+                1 if sym.is_test else 0,
+                1 if sym.is_pydantic_model else 0,
+                sym.route_path,
+                sym.route_method,
+                sym.component_id,
+                sym.symbol_source_hash,
+                sym.symbol_body_hash,
+            ),
+        )
+        # INSERT OR IGNORE skips duplicate (snapshot_id, qualified_name,
+        # path) rows instead of raising a UNIQUE constraint error. When a
+        # row is ignored, lastrowid is stale, so skip the dependent
+        # source-metadata/anchor inserts to avoid mis-attributing them.
+        if sym_cur.rowcount == 0:
+            continue
+        symbol_id = sym_cur.lastrowid
+        meta = sym.source_metadata
+        if meta is not None:
+            meta_cur = conn.execute(
+                """
+                INSERT INTO symbol_source_metadata
+                    (snapshot_id, system_id, symbol_id, path,
+                     qualified_name, start_line, end_line, role,
+                     capability, element_type, system_purpose,
+                     operation_kind, consumers, state_effects,
+                     probe_value, raw_block, origin, explanation_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    system_id,
+                    symbol_id,
+                    sym.path,
+                    sym.qualified_name,
+                    meta.start_line,
+                    meta.end_line,
+                    meta.role,
+                    meta.capability,
+                    meta.element_type,
+                    meta.system_purpose,
+                    meta.operation_kind,
+                    json.dumps(meta.consumers),
+                    json.dumps(meta.state_effects),
+                    meta.probe_value,
+                    meta.raw_block,
+                    meta.origin,
+                    meta.explanation_hash,
+                ),
+            )
+            _insert_explanation_anchor(
+                conn, snapshot_id, system_id, meta_cur.lastrowid,
+                symbol_id, sym, meta, file_hash_map.get(sym.path),
+            )
+
+    for warn in result.warnings:
+        conn.execute(
+            """
+            INSERT INTO symbol_index_warnings
+                (snapshot_id, system_id, path, message)
+            VALUES (?, ?, ?, ?)
+            """,
+            (snapshot_id, system_id, warn.path, warn.message),
+        )
+    return run_id
+
+
 def index_symbols_service(
     system_id: int,
     snapshot_id: Optional[int] = None,
@@ -587,104 +710,10 @@ def index_symbols_service(
     with get_conn() as conn:
         conn.execute("BEGIN")
         try:
-            cur = conn.execute(
-                """
-                INSERT INTO intelligence_runs
-                    (system_id, snapshot_id, run_type, provider, model,
-                     prompt_version, schema_version, decision_method,
-                     status, is_mock, started_at, completed_at)
-                VALUES (?, ?, 'symbol_index', 'deterministic', 'ast',
-                        'n/a', ?, 'deterministic',
-                        'completed', 0, ?, ?)
-                """,
-                (system_id, snapshot_id, SYMBOL_INDEX_SCHEMA_VERSION, started_at, completed_at),
+            run_id = persist_symbol_index(
+                conn, system_id=system_id, snapshot_id=snapshot_id, result=result,
+                file_hash_map=file_hash_map, started_at=started_at, completed_at=completed_at,
             )
-            run_id = cur.lastrowid
-
-            for sym in result.symbols:
-                sym_cur = conn.execute(
-                    """
-                    INSERT OR IGNORE INTO code_symbols
-                        (snapshot_id, system_id, path, qualified_name, kind,
-                         start_line, end_line, decorators, imports, docstring,
-                         is_test, is_pydantic_model, route_path, route_method,
-                         component_id, symbol_source_hash, symbol_body_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        snapshot_id,
-                        system_id,
-                        sym.path,
-                        sym.qualified_name,
-                        sym.kind,
-                        sym.start_line,
-                        sym.end_line,
-                        json.dumps(sym.decorators),
-                        json.dumps(sym.imports),
-                        sym.docstring,
-                        1 if sym.is_test else 0,
-                        1 if sym.is_pydantic_model else 0,
-                        sym.route_path,
-                        sym.route_method,
-                        sym.component_id,
-                        sym.symbol_source_hash,
-                        sym.symbol_body_hash,
-                    ),
-                )
-                # INSERT OR IGNORE skips duplicate (snapshot_id, qualified_name,
-                # path) rows instead of raising a UNIQUE constraint error. When a
-                # row is ignored, lastrowid is stale, so skip the dependent
-                # source-metadata/anchor inserts to avoid mis-attributing them.
-                if sym_cur.rowcount == 0:
-                    continue
-                symbol_id = sym_cur.lastrowid
-                meta = sym.source_metadata
-                if meta is not None:
-                    meta_cur = conn.execute(
-                        """
-                        INSERT INTO symbol_source_metadata
-                            (snapshot_id, system_id, symbol_id, path,
-                             qualified_name, start_line, end_line, role,
-                             capability, element_type, system_purpose,
-                             operation_kind, consumers, state_effects,
-                             probe_value, raw_block, origin, explanation_hash)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            snapshot_id,
-                            system_id,
-                            symbol_id,
-                            sym.path,
-                            sym.qualified_name,
-                            meta.start_line,
-                            meta.end_line,
-                            meta.role,
-                            meta.capability,
-                            meta.element_type,
-                            meta.system_purpose,
-                            meta.operation_kind,
-                            json.dumps(meta.consumers),
-                            json.dumps(meta.state_effects),
-                            meta.probe_value,
-                            meta.raw_block,
-                            meta.origin,
-                            meta.explanation_hash,
-                        ),
-                    )
-                    _insert_explanation_anchor(
-                        conn, snapshot_id, system_id, meta_cur.lastrowid,
-                        symbol_id, sym, meta, file_hash_map.get(sym.path),
-                    )
-
-            for warn in result.warnings:
-                conn.execute(
-                    """
-                    INSERT INTO symbol_index_warnings
-                        (snapshot_id, system_id, path, message)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (snapshot_id, system_id, warn.path, warn.message),
-                )
 
             conn.execute("COMMIT")
 

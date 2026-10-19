@@ -245,6 +245,41 @@ def run_refresh_job(job_id: int) -> None:
 
 
 def _run_one_locked(job_id: int) -> None:
+    """Run one job inside its System's quota context and never leave it open.
+
+    The job runs on a background thread (``_dispatch``), outside the request
+    that set the quota context, so it sets the context itself exactly as the
+    System Understanding build job does (``system_understanding_jobs``):
+    every LLM call is gated on it. An unexpected exception closes the job as
+    'failed' instead of leaving it 'updating', which ``interview_workflow``
+    would otherwise report as a running understanding_update (``W1``)
+    forever, and lets ``run_refresh_job`` drain the next queued job.
+    """
+    from .resource_limits import reset_current_system_id, set_current_system_id
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT system_id FROM interview_refresh_job WHERE id = ?", (job_id,)
+        ).fetchone()
+    if row is None:
+        return
+    quota_context = set_current_system_id(row["system_id"])
+    try:
+        _run_one_in_context(job_id)
+    except Exception as exc:
+        logger.exception("interview refresh job %s crashed", job_id)
+        with get_conn() as conn:
+            conn.execute(
+                """UPDATE interview_refresh_job
+                   SET status = 'failed', error = ?, finished_at = ?
+                   WHERE id = ? AND status IN ('pending', 'updating')""",
+                (f"{type(exc).__name__}: {exc}", time.time(), job_id),
+            )
+    finally:
+        reset_current_system_id(quota_context)
+
+
+def _run_one_in_context(job_id: int) -> None:
     with get_conn() as conn:
         job = conn.execute(
             "SELECT * FROM interview_refresh_job WHERE id = ?", (job_id,)

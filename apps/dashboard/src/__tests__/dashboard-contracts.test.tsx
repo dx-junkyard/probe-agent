@@ -3008,6 +3008,7 @@ describe("Interview page", () => {
       evidence_used: [],
       evidence_reads: [],
       evidence_refs_dropped: 0,
+      evidence_targets_omitted: 0,
     });
 
     const qc = new QueryClient({
@@ -3153,6 +3154,7 @@ describe("Interview page", () => {
           evidence_used: [],
           evidence_reads: [],
           evidence_refs_dropped: 0,
+          evidence_targets_omitted: 0,
         });
       }
       return Promise.resolve(undefined);

@@ -3093,6 +3093,10 @@ class InterviewDialogueTurnOut(BaseModel):
     # fallback — the question is still asked — so this is surfaced for operator
     # visibility, not an error.
     evidence_refs_dropped: int = 0
+    # Evidence targets pass 1 asked for beyond INTERVIEW_EVIDENCE_MAX_FILES.
+    # They were not read; the turn continued with the first N (cost-budget
+    # truncation), so the omission is reported rather than hidden.
+    evidence_targets_omitted: int = 0
 
 
 # --- Evidence read audit (Issue #137) -----------------------------------------

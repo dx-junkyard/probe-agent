@@ -414,7 +414,7 @@ class TestReadPathUpgrade:
         assert flow["file_content_hash"] is not None
         assert flow["source_metadata"] is not None
         assert flow["source_metadata"]["explanation_hash"] is not None
-        assert out["intelligence_run"]["schema_version"] == "provenance-v1"
+        assert out["intelligence_run"]["schema_version"] == "provenance-v2"
 
     def test_get_anchors_upgrades_stale_index(self, admin_client, tmp_path):
         token = _login(admin_client)

@@ -122,6 +122,7 @@ canonical contract を確認する。
 | [製品状態から選ぶ改善サイクル](04-operations/improvement-cycle/README.md) | 根拠付き状態・利用見通し・候補比較・Recipe選択・結果の還流 |
 | [課題と解決原理の一般化候補](../improvement/local/patterns/README.md) | 状況から共通原理・派生形・補完対策を選ぶ手動試行の入口 |
 | [AI Agent Improvement Guide](04-operations/ai-agent-improvement-guide.md) | AI エージェントが改善ループを運用する手順 |
+| [UX評価用ダミーデータの生成指示文](04-operations/ux-dummy-data-generation-prompt.md) | 小規模プロジェクト・ペルソナから段階的に、助言と観測の最適化を評価する素材を生成 |
 | [Production HTTPS Deployment](04-operations/deployment-https.md) | Caddy を含む本番公開、バックアップ、復旧 |
 | [GitHub App Deployment](04-operations/github-app-deployment.md) | GitHub App の登録、秘密鍵配置、ローテーション |
 

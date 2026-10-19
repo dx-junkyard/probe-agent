@@ -27,6 +27,7 @@ from .interview_evidence import (
     EvidenceConfigError,
     EvidenceSnippet,
     EvidenceTarget,
+    max_files,
     validate_evidence_targets,
 )
 from .interview_language import get_interview_language, language_directive
@@ -57,7 +58,7 @@ SCHEMA_VERSION = "interview-v2"
 
 # Issue #130: pass-1 (evidence selection) prompt/schema versions, audited as
 # a separate intelligence_runs row from the pass-2 dialogue turn above.
-EVIDENCE_PROMPT_VERSION = "interview-evidence-v1"
+EVIDENCE_PROMPT_VERSION = "interview-evidence-v2"  # v2: states the effective INTERVIEW_EVIDENCE_MAX_FILES limit
 EVIDENCE_SCHEMA_VERSION = "interview-evidence-v1"
 MAX_EVIDENCE_TARGETS = 10
 
@@ -757,7 +758,7 @@ commentary), matching exactly this shape:
 }
 
 Rules:
-- "targets" may contain at most %d entries. Prefer fewer, focused reads.
+- "targets" may contain at most %(limit)d entries. Prefer fewer, focused reads.
 - Every "path" must be a path that appears in the supplied context pack or \
 current understanding. Never invent a path.
 - "start_line"/"end_line" must be a sane, bounded range (a function body, \
@@ -767,11 +768,18 @@ hypothesis (or the symbol name and line range alone) is already enough to \
 ask a precise question — most turns do not need this step.
 - This step never asks the developer anything and never proposes metadata; \
 it only selects what to read.
-""" % MAX_EVIDENCE_TARGETS
+"""
 
 
-def _evidence_system_prompt(language: str) -> str:
-    return _EVIDENCE_SYSTEM_PROMPT + language_directive(language) + "\n"
+def effective_evidence_target_limit() -> int:
+    """The number of targets pass 1 may read: the schema bound capped by
+    INTERVIEW_EVIDENCE_MAX_FILES. The prompt states this same number, so the
+    model is never told it may request more than will be read."""
+    return min(MAX_EVIDENCE_TARGETS, max_files())
+
+
+def _evidence_system_prompt(language: str, limit: int) -> str:
+    return _EVIDENCE_SYSTEM_PROMPT % {"limit": limit} + language_directive(language) + "\n"
 
 
 class _RawEvidenceTarget(BaseModel):
@@ -801,6 +809,10 @@ class EvidenceSelectionResult:
     schema_version: str = EVIDENCE_SCHEMA_VERSION
     need_evidence: bool = False
     targets: List[EvidenceTarget] = field(default_factory=list)
+    # Targets the model asked for beyond the file limit, in its own order.
+    # They are not read; the turn continues with ``targets`` (cost-budget
+    # truncation, like the per-file and total-character caps).
+    targets_omitted: List[EvidenceTarget] = field(default_factory=list)
     error: Optional[str] = None
 
 
@@ -834,7 +846,10 @@ def select_evidence_targets(
 
     try:
         language = get_interview_language()
+        target_limit = effective_evidence_target_limit()
     except ValueError as exc:
+        # EvidenceConfigError is a ValueError: an invalid INTERVIEW_EVIDENCE_*
+        # setting fails the turn closed as a recorded failure.
         return EvidenceSelectionResult(
             provider=config.provider, model=config.model, is_mock=False, error=str(exc),
         )
@@ -857,7 +872,7 @@ def select_evidence_targets(
     try:
         raw = client.generate_text(
             [
-                {"role": "system", "content": _evidence_system_prompt(language)},
+                {"role": "system", "content": _evidence_system_prompt(language, target_limit)},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.0,
@@ -886,10 +901,13 @@ def select_evidence_targets(
         for t in validated.targets
     ]
 
+    omitted = targets[target_limit:]
+    targets = targets[:target_limit]
+
     if validated.need_evidence and targets:
         allowed_spans = _allowed_evidence_spans(context_pack, current_understanding)
         try:
-            error = validate_evidence_targets(targets, allowed_spans)
+            error = validate_evidence_targets(targets, allowed_spans, limit=target_limit)
         except EvidenceConfigError as exc:
             # Invalid INTERVIEW_EVIDENCE_* configuration fails the turn closed
             # as a recorded run failure, not an unaudited HTTP 500.
@@ -908,4 +926,5 @@ def select_evidence_targets(
         is_mock=False,
         need_evidence=validated.need_evidence and bool(targets),
         targets=targets,
+        targets_omitted=omitted if validated.need_evidence else [],
     )

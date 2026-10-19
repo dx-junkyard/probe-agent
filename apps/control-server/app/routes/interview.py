@@ -2104,6 +2104,9 @@ def _interview_dialogue_turn_core(
             ],
             evidence_reads=evidence_reads_out,
             evidence_refs_dropped=turn.evidence_refs_dropped,
+            evidence_targets_omitted=(
+                len(evidence_audit.targets_omitted) if evidence_audit is not None else 0
+            ),
         )
 
 
