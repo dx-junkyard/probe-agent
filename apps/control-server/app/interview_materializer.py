@@ -128,6 +128,10 @@ def materialize_approved_set(
             for item in file_items:
                 in_file_symbol = _strip_module_prefix(item.qualified_name, path)
                 doc_edits.append((in_file_symbol, item.metadata))
+                if in_file_symbol == "":
+                    # A module carries docstring metadata only; there is no
+                    # function to decorate with @probe.
+                    continue
                 probe_points.append(ApprovedPoint(
                     component_id=item.component_id,
                     path=path,

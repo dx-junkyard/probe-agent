@@ -540,3 +540,37 @@ def tricky():
     assert meta.role == "Handle input: parse & validate [items]"
     assert meta.system_purpose == "Parse config #values with special: chars"
     assert meta.probe_value == "Check {throughput} & latency"
+
+
+def test_probe_goes_below_registering_decorators():
+    # Above `@router.post`, FastAPI registered the undecorated handler and the
+    # @probe wrapper was never called (System 7 interview 15, summarize_thread).
+    from app.patch_generator import ApprovedPoint, instrument_file
+
+    source = (
+        "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\n"
+        "@router.post(\"/threads/{tid}/summary\", status_code=201)\n"
+        "def summarize_thread(tid: int):\n    return tid\n"
+    )
+    out, skipped = instrument_file(source, [ApprovedPoint(
+        component_id="summarize_thread", path="routes.py", symbol="summarize_thread",
+        recommended_mode="trace", line_start=0, line_end=0)])
+    assert skipped == []
+    lines = out.splitlines()
+    i = lines.index("def summarize_thread(tid: int):")
+    assert lines[i - 1] == '@probe(component_id="summarize_thread")'
+    assert lines[i - 2].startswith("@router.post(")
+
+
+def test_module_item_gets_docstring_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROBE_REPOSITORY_ROOTS", str(tmp_path))
+    repo, sha = _init_repo(tmp_path, {"apps/api/app/proposals.py": '"""Proposals."""\nimport json\n\n\ndef decide():\n    return 1\n'})
+    result = materialize_approved_set(
+        repo_path=repo, commit_sha=sha, worktree_base=str(tmp_path / "wt"),
+        items=[MaterializationItem(path="apps/api/app/proposals.py", qualified_name="apps.api.app.proposals",
+                                   metadata=MetadataValues(role="共通基盤", element_type="boundary"),
+                                   component_id="proposals", recommended_mode="trace", line_start=0, line_end=0)],
+    )
+    assert result.error is None, result.error
+    assert result.items_applied == 1
+    assert "role: 共通基盤" in result.diff and "@probe" not in result.diff

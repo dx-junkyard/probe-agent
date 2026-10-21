@@ -170,7 +170,11 @@ def instrument_file(
             skipped.append(f"{point.symbol}: already has @probe decorator")
             continue
 
-        insert_line_idx = dec_line - 1
+        # Innermost: directly above `def`, below any existing decorators.
+        # Above them, a registering decorator such as FastAPI's
+        # `@router.post(...)` registers the undecorated function first, so
+        # the @probe wrapper it returns is never called and nothing is traced.
+        insert_line_idx = func_node.lineno - 1
         indent = ""
         if insert_line_idx < len(lines):
             existing_line = lines[insert_line_idx]
