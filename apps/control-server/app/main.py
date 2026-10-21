@@ -49,6 +49,7 @@ from .routes import (
     node_operations,
     overview,
     probe_patterns,
+    instrumentation_coverage,
     product_features,
     product_gaps,
     product_lineage,
@@ -152,6 +153,7 @@ def create_app() -> FastAPI:
     app.include_router(candidate_studio.router, dependencies=_auth)
     app.include_router(project_intelligence.router, dependencies=_auth)
     app.include_router(probe_patterns.router, dependencies=_auth)
+    app.include_router(instrumentation_coverage.router, dependencies=_auth)
     app.include_router(connectivity.router, dependencies=_auth)
     app.include_router(snapshot_preflight.router, dependencies=_auth)
     app.include_router(replay_readiness.router, dependencies=_auth)

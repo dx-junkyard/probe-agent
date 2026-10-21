@@ -659,7 +659,19 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     () => (ctx?.screen_checks ?? []).filter((c) => c.severity !== "ok"),
     [ctx],
   );
-  const noticeText = focusedStateItem?.summary ?? snapshotNotice ?? null;
+  const rawNoticeText = focusedStateItem?.summary ?? snapshotNotice ?? null;
+  // The floating notice sits over page content (bottom-right) and used to
+  // have no way to dismiss it, so it kept hiding table rows and banners.
+  // Dismissing hides that exact text for this tab; a different notice shows again.
+  const [dismissedNotice, setDismissedNotice] = useState<string | null>(() => {
+    try { return sessionStorage.getItem("assistant-dismissed-notice"); } catch { return null; }
+  });
+  const noticeText = rawNoticeText && rawNoticeText !== dismissedNotice ? rawNoticeText : null;
+  const dismissNotice = () => {
+    if (!rawNoticeText) return;
+    setDismissedNotice(rawNoticeText);
+    try { sessionStorage.setItem("assistant-dismissed-notice", rawNoticeText); } catch { /* storage may be unavailable */ }
+  };
   const handleNoticeClick = onSnapshotNoticeClick ?? (() => {
     const target = focusedStateItem ? systemStateTarget(focusedStateItem) : null;
     if (target) navigate(target);
@@ -893,6 +905,18 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
           >
             {noticeText}
             <span className="absolute -right-1 bottom-4 h-2 w-2 rotate-45 border-r border-t border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950" />
+          </button>
+        )}
+        {noticeText && (
+          <button
+            type="button"
+            onClick={dismissNotice}
+            className="self-start -ml-3 -mt-2 rounded-full border border-amber-300 bg-white p-0.5 text-amber-900 shadow hover:bg-amber-100 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100"
+            aria-label="この通知を閉じる"
+            title="この通知を閉じる"
+            data-testid="assistant-snapshot-notice-dismiss"
+          >
+            <X className="h-3 w-3" />
           </button>
         )}
         <Button

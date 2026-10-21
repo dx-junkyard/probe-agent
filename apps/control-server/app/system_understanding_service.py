@@ -558,6 +558,12 @@ def _load_gaps_from_reconciler(conn, system_id: int, snapshot_id: int) -> List[D
         return _detect_extra_gaps(conn, system_id, snapshot_id)
 
     result = reconcile(conn, system_id, snapshot_id, graph)
+    # The first capability node, found once: the per-gap scan below used to
+    # walk the whole graph for every gap (15k gaps x 5k nodes on a large
+    # System) to arrive at this same node each time.
+    first_capability = next(
+        (n.name for n in graph.nodes.values() if n.node_type == "capability"), None
+    )
     gaps = []
     for g in result.gaps:
         gap_dict: Dict[str, Any] = {
@@ -577,12 +583,8 @@ def _load_gaps_from_reconciler(conn, system_id: int, snapshot_id: int) -> List[D
             # a gap carries no evidence/capability.
             "source_id": (f"node:{g.node_id}" if g.node_id else None),
         }
-        if g.node_id and g.node_id in graph.nodes:
-            node = graph.nodes[g.node_id]
-            for parent_id, parent_node in graph.nodes.items():
-                if parent_node.node_type == "capability":
-                    gap_dict["capability_key"] = parent_node.name
-                    break
+        if g.node_id and g.node_id in graph.nodes and first_capability is not None:
+            gap_dict["capability_key"] = first_capability
         if g.doc_evidence:
             gap_dict["doc_refs"] = [
                 {"path": de.path, "start_line": de.start_line, "end_line": de.end_line}

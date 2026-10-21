@@ -270,8 +270,32 @@ def _collect_file(
                 "include_router", "register_blueprint",
             ):
                 include_calls.append((file_path, node))
+        if isinstance(node, ast.For):
+            include_calls.extend((file_path, c) for c in _expand_include_loop(node))
 
     return router_defs, route_decls, include_calls
+
+
+def _expand_include_loop(loop: ast.For) -> List[ast.Call]:
+    """``for r in (a.router, b.router): app.include_router(r, prefix="/api")``
+    mounts each listed router; return one include call per element so their
+    routes get the prefix (without this they were listed unprefixed)."""
+    if not isinstance(loop.target, ast.Name) or not isinstance(loop.iter, (ast.Tuple, ast.List)):
+        return []
+    expanded: List[ast.Call] = []
+    for stmt in loop.body:
+        for node in ast.walk(stmt):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("include_router", "register_blueprint")
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == loop.target.id
+            ):
+                for elt in loop.iter.elts:
+                    expanded.append(ast.Call(func=node.func, args=[elt, *node.args[1:]], keywords=node.keywords))
+    return expanded
 
 
 def _ctor_name(func: ast.expr) -> str:

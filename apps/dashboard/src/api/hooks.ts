@@ -3,6 +3,7 @@ import { useQuery, useQueries, useMutation, useQueryClient } from "@tanstack/rea
 import { api, getSystemId } from "./client";
 import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
+  InstrumentationCoverageOut, RecentTraceOut,
   LineageOut, TraceAnalyzer, AnalysisRun, AnalyzerContext,
   RepositoryStatus,
   RepositoryResyncJob,
@@ -5075,5 +5076,27 @@ export function useRecordProductMilestoneAssessment(milestoneKey: string | null)
     mutationFn: (body: ProductMilestoneAssessmentCreateRequest) =>
       api.post<ProductMilestoneAssessmentOut>(`/product-milestones/${encodeURIComponent(milestoneKey ?? "")}/assessments`, body),
     onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+// ── Instrumentation coverage and live feed ──────────────────────────
+
+export function useInstrumentationCoverage(refetchInterval?: number | false) {
+  return useQuery({
+    queryKey: sysKey("instrumentationCoverage"),
+    queryFn: () => api.get<InstrumentationCoverageOut>("/instrumentation-coverage"),
+    enabled: !!getSystemId(),
+    retry: false,
+    refetchInterval,
+  });
+}
+
+export function useRecentTraces(refetchInterval?: number | false) {
+  return useQuery({
+    queryKey: sysKey("recentTraces"),
+    queryFn: () => api.get<{ items: RecentTraceOut[] }>("/instrumentation-coverage/recent-traces?limit=30"),
+    enabled: !!getSystemId(),
+    retry: false,
+    refetchInterval,
   });
 }

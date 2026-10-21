@@ -1283,3 +1283,53 @@ class TestEntrypointFiltering:
         assert any(
             "No backend entrypoints detected" in d for d in data["diagnostics"]
         )
+
+
+class TestImportAwareResolution:
+    """Bare-name matching produced wrong edges (a literal "\\n".join() linked
+    to an HTTP route named join, conn.close() linked to an unrelated class's
+    close()) and left llm.complete_json() unresolved (System 7)."""
+
+    FILES = {
+        "app/llm.py": "def complete_json(system, user):\n    return {}\n",
+        "app/routes/communities.py": (
+            "from fastapi import APIRouter\nrouter = APIRouter()\n\n"
+            "@router.post('/communities/{cid}/join')\ndef join(cid):\n    return cid\n"
+        ),
+        "app/agents/shaping.py": "class _HtmlTables:\n    def close(self):\n        pass\n",
+        "app/db.py": "import sqlite3\n\ndef get_conn():\n    conn = sqlite3.connect('x')\n    conn.close()\n    return conn\n",
+        "app/agents/summary.py": (
+            "from fastapi import APIRouter\nfrom .. import llm\nfrom ..db import get_conn\n"
+            "router = APIRouter()\n\n"
+            "@router.post('/threads/summary')\ndef summarize(posts):\n"
+            "    text = '\\n\\n'.join(posts)\n"
+            "    get_conn()\n"
+            "    return llm.complete_json('s', text)\n"
+        ),
+    }
+
+    def _edges(self):
+        from app.flow_graph import build_flow_graph
+
+        symbols, files = [], []
+        for path, src in self.FILES.items():
+            symbols += _records_from_source(path, src)
+            files.append((path, src))
+        for i, s in enumerate(symbols, start=1):
+            s.symbol_id = i
+        graph = build_flow_graph(symbols=symbols, files=files, snapshot_id=1, commit_sha="x",
+                                 entrypoint_type="http_route", entrypoint_id="POST:/threads/summary")
+        assert graph is not None
+        return {(e.source_node_id.split("::")[-1], (e.target_node_id or "").split("::")[-1], e.resolution)
+                for e in graph.edges}
+
+    def test_module_attribute_call_resolves_through_the_import(self):
+        assert ("summarize", "complete_json", "resolved") in self._edges()
+
+    def test_imported_function_resolves(self):
+        assert ("summarize", "get_conn", "resolved") in self._edges()
+
+    def test_literal_method_and_unknown_object_method_are_not_project_calls(self):
+        targets = {t for _, t, _ in self._edges()}
+        assert "join" not in targets
+        assert "_HtmlTables.close" not in targets

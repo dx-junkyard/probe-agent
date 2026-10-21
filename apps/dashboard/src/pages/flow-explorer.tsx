@@ -16,7 +16,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Workflow, Crosshair, AlertTriangle, ArrowRight, Activity, RefreshCw } from "lucide-react";
+import { Workflow, Crosshair, AlertTriangle, ArrowRight, Activity, RefreshCw, CircleDashed, Radio } from "lucide-react";
 import type {
   FlowEntrypointOut, FlowGraphOut, FlowNodeOut, FlowEdgeOut,
   FlowProbeSelection, ProbePreviewOut, FlowOverlayOut, FlowOverlayRequest,
@@ -551,16 +551,9 @@ export default function FlowExplorerPage() {
                             {node.is_external ? "external boundary (not instrumentable)" : `${node.path}:${node.line_start}–${node.line_end}`}
                             {node.component_id && <span> · {node.component_id}</span>}
                           </div>
-                          {!node.is_external && (node.trace_count > 0 || node.evaluation_pass + node.evaluation_fail > 0) && (
-                            <div className="flex items-center gap-2 mt-1 text-[11px]">
-                              {node.observed && (
-                                <span className="inline-flex items-center gap-0.5 text-emerald-600">
-                                  <Activity className="h-3 w-3" /> {node.trace_count} trace(s)
-                                </span>
-                              )}
-                              {node.error_count > 0 && (
-                                <span className="text-red-600">{node.error_count} error(s)</span>
-                              )}
+                          {!node.is_external && (
+                            <div className="flex flex-wrap items-center gap-2 mt-1 text-[11px]">
+                              <ObservationBadge node={node} />
                               {node.evaluation_pass + node.evaluation_fail > 0 && (
                                 <span className="text-muted-foreground">
                                   eval {node.evaluation_pass}✓/{node.evaluation_fail}✗
@@ -908,4 +901,22 @@ function FlowOverlayPanel({ entrypoint, graph }: {
       </CardContent>
     </Card>
   );
+}
+
+
+/** Observation state of a graph node, always shown (never colour alone):
+ * not instrumented / instrumented but not observed yet / observed / errors. */
+function ObservationBadge({ node }: { node: { component_id?: string | null; trace_count: number; error_count: number } }) {
+  // Received traces decide first: a node can be observed through a component
+  // the graph did not name.
+  if (node.error_count > 0) {
+    return <span className="inline-flex items-center gap-0.5 text-red-600"><AlertTriangle className="h-3 w-3" aria-hidden />エラー {node.error_count} / {node.trace_count} trace</span>;
+  }
+  if (node.trace_count > 0) {
+    return <span className="inline-flex items-center gap-0.5 text-emerald-600"><Activity className="h-3 w-3" aria-hidden />観測済み {node.trace_count} trace</span>;
+  }
+  if (!node.component_id) {
+    return <span className="inline-flex items-center gap-0.5 text-muted-foreground"><CircleDashed className="h-3 w-3" aria-hidden />計測なし</span>;
+  }
+  return <span className="inline-flex items-center gap-0.5 text-amber-700 dark:text-amber-400"><Radio className="h-3 w-3" aria-hidden />計測あり・未観測</span>;
 }

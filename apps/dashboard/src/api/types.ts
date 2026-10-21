@@ -9443,3 +9443,46 @@ export interface OverviewObjectiveOut {
   degraded_sections: string[];
   degraded_detail: Record<string, string>;
 }
+
+// ── Instrumentation coverage (code-side points × received traces) ──
+export type InstrumentationStatus = "receiving" | "errors" | "not_received" | "metadata_only";
+
+export interface InstrumentationPointOut {
+  path: string;
+  symbol: string;
+  line_start: number;
+  line_end: number;
+  component_id: string | null;
+  instrumentation: "probe" | "wrapper" | "metadata_only";
+  route: string | null;
+  role: string | null;
+  features: string[];
+  status: InstrumentationStatus;
+  trace_count: number;
+  recent_errors: number;
+  last_seen: number | null;
+  avg_duration_ms: number | null;
+}
+
+export interface InstrumentationCoverageOut {
+  system_id: number;
+  snapshot_id: number;
+  sdk_connected: boolean;
+  last_trace_at: number | null;
+  counts: Record<InstrumentationStatus, number>;
+  points: InstrumentationPointOut[];
+  unmatched_components: { component_id: string; trace_count: number; last_seen: number | null }[];
+}
+
+export interface RecentTraceOut {
+  trace_id: string;
+  component_id: string;
+  mode: string | null;
+  ok: boolean;
+  error: string | null;
+  duration_ms: number | null;
+  timestamp: number;
+  input_preview: string | null;
+  output_preview: string | null;
+  code: { path: string; symbol: string; line_start: number; route: string | null } | null;
+}

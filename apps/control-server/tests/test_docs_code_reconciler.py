@@ -316,3 +316,38 @@ class TestReconcilePreservesEvidence:
         for mapping in result.mappings:
             assert len(mapping.doc_evidence) > 0
             assert len(mapping.code_evidence) > 0
+
+
+def test_reconcile_builds_the_symbol_index_once(monkeypatch):
+    """The index used to be rebuilt for every graph node: ~12k symbols x ~5k
+    nodes made /system-state take 25 s and stall every request behind the DB
+    lock. One reconciliation must build it once, whatever the node count."""
+    import app.docs_code_reconciler as rec
+
+    conn, snap_id = _make_db()
+    for i in range(50):
+        _add_symbol(conn, snap_id, "src/mod.py", f"mod.func_{i}")
+    graph = _build_graph([_claim(summary=f"claim {i}", symbols=[f"func_{i}"]) for i in range(30)])
+    built = []
+    real = rec._SymbolIndex
+
+    class Counting(real):
+        def __init__(self, symbols):
+            built.append(len(symbols))
+            super().__init__(symbols)
+
+    monkeypatch.setattr(rec, "_SymbolIndex", Counting)
+    result = rec.reconcile(conn, 1, snap_id, graph)
+    assert built == [50]
+    assert result.matched_count >= 1
+
+
+def test_symbol_index_keeps_first_suffix_match_semantics():
+    from app.docs_code_reconciler import _match_symbols_to_code
+
+    syms = [
+        {"id": 1, "qualified_name": "pkg.a.run", "path": "p", "start_line": 1, "end_line": 2},
+        {"id": 2, "qualified_name": "other.run", "path": "p", "start_line": 1, "end_line": 2},
+        {"id": 3, "qualified_name": "Tool", "path": "p", "start_line": 1, "end_line": 2},
+    ]
+    assert [m.symbol_id for m in _match_symbols_to_code(["run", "x.tool", "pkg.a.run", "nothing"], syms)] == [1, 3, 1]
