@@ -869,6 +869,9 @@ export interface InterviewProposalOut {
   proposal_confidence: number | null;
   decision_method: InterviewDecisionMethod;
   approval_state: InterviewApprovalState;
+  /** The human edit's values (set when approval_state is "edited"). */
+  edited_metadata?: InterviewProposalMetadataBlock | null;
+  edited_probe_plan?: InterviewProposalProbePlan | null;
   is_mock: boolean;
   intelligence_run: IntelligenceRunOut | null;
   created_at: number;

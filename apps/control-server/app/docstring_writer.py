@@ -175,6 +175,18 @@ def _strip_module_prefix(qualified_name: str, path: str) -> str:
     module itself (no in-file symbol), signaling that the caller should
     target the module-level docstring.
     """
+    # The full dotted module path derived from the file path (e.g.
+    # ``apps.api.app.proposals`` for ``apps/api/app/proposals.py``). Symbol
+    # indexes name module-level symbols this way; matching only the file stem
+    # left the whole name as the "in-file symbol", which is never in the AST,
+    # so a module-docstring proposal failed to materialize.
+    dotted = os.path.splitext(path.replace(os.sep, "/"))[0].strip("/").replace("/", ".")
+    if dotted.endswith(".__init__"):
+        dotted = dotted[: -len(".__init__")]
+    if dotted and qualified_name == dotted:
+        return ""
+    if dotted and qualified_name.startswith(dotted + "."):
+        return qualified_name[len(dotted) + 1:]
     stem = os.path.splitext(os.path.basename(path))[0]
     parts = qualified_name.split(".")
     if parts and parts[0] == stem:

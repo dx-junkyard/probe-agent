@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 from .auth import get_principal
 from .db import init_db
+from . import interview_refresh as interview_refresh_jobs
 from . import publish_recovery, repository_resync_jobs
 from .routes import (
     assistant,
@@ -82,6 +83,7 @@ _auth = [Depends(get_principal)]
 async def lifespan(_app: FastAPI):
     init_db()
     repository_resync_jobs.recover_interrupted_repository_resync_jobs()
+    interview_refresh_jobs.recover_interrupted_refresh_jobs()
     # Fail over publish jobs interrupted by a previous crash/restart before
     # the periodic worker's first tick (Issue #226); the periodic worker
     # (started below) covers everything that goes stale afterwards.

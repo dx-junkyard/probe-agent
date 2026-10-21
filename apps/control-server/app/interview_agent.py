@@ -30,6 +30,7 @@ from .interview_evidence import (
     max_files,
     validate_evidence_targets,
 )
+from .answered_qa_budget import answered_qa_max_chars, answered_qa_prompt_json
 from .interview_language import get_interview_language, language_directive
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
 from .models import (
@@ -376,7 +377,7 @@ def _build_user_prompt(
             "questions; treat the answers as established facts and NEVER ask "
             "about these topics again, even reworded)"
         )
-        parts.append(_trim_json(answered_qa, GAP_AND_QUESTION_MAX_CHARS))
+        parts.append(answered_qa_prompt_json(answered_qa, answered_qa_max_chars()))
     if unconfirmed_qa:
         parts.append(
             "## Unconfirmed Q&A (the developer explicitly could NOT confirm these "

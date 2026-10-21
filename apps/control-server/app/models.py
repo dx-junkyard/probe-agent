@@ -2783,6 +2783,12 @@ class InterviewProposalOut(BaseModel):
     evidence_summary: Optional[str] = None
     proposal_confidence: Optional[float] = None
     approval_state: InterviewProposalApprovalState
+    # The values a human edit replaced `metadata` / `probe_plan` with. They
+    # live on the decision record; without them here a list of proposals
+    # showed an 'edited' item with its original (pre-edit) values, which read
+    # as if the edit had been lost even though materialization uses them.
+    edited_metadata: Optional[InterviewProposalMetadataBlock] = None
+    edited_probe_plan: Optional[InterviewProposalProbePlan] = None
     is_mock: bool = False
     intelligence_run: Optional[IntelligenceRunOut] = None
     created_at: float

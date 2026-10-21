@@ -313,6 +313,27 @@ def test_strip_module_prefix():
     assert _strip_module_prefix("summarize", "src/summarize.py") == ""
 
 
+def test_strip_module_prefix_accepts_the_dotted_module_path():
+    # Symbol indexes name module-level symbols by their dotted module path.
+    # This used to stay unchanged, was never found in the AST, and failed the
+    # whole materialization (System 7 interview 15: apps.api.app.proposals).
+    assert _strip_module_prefix("apps.api.app.proposals", "apps/api/app/proposals.py") == ""
+    assert _strip_module_prefix("apps.api.app.proposals.decide", "apps/api/app/proposals.py") == "decide"
+    assert _strip_module_prefix("app.routes", "app/routes/__init__.py") == ""
+
+
+def test_module_docstring_metadata_from_a_dotted_module_name(tmp_path):
+    from app.docstring_writer import apply_docstring_edits
+
+    source = '"""AI 提案の共通パターン."""\nimport json\n\n\ndef decide():\n    return 1\n'
+    symbol = _strip_module_prefix("apps.api.app.proposals", "apps/api/app/proposals.py")
+    out, skipped = apply_docstring_edits(source, [(symbol, MetadataValues(role="AI 提案の共通基盤", element_type="boundary"))])
+    assert skipped == []
+    assert out.startswith('"""AI 提案の共通パターン.')
+    assert "probe-agent:" in out.split("import json")[0]
+    assert "role: AI 提案の共通基盤" in out
+
+
 # --- Test 8: No approved items returns error ---------------------------------
 
 

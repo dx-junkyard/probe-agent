@@ -41,6 +41,7 @@ from .llm import (
     MockLLMClient,
     is_reasoning_model,
 )
+from .answered_qa_budget import answered_qa_max_chars, answered_qa_prompt_json, is_reasked
 from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 
 # v2: configurable output language for questions/summaries (Issue #127).
@@ -54,7 +55,10 @@ from .understanding_graph import UnderstandingGraph, GraphNode, EvidenceRef
 # Vision に対してこのシステムが担う役割」) and must never be produced by
 # folding the two together; the Understanding Brief shows them separately and
 # labels their provenance separately.
-PROMPT_VERSION = "understanding-review-v8"
+# v9: Confirmed Q&A moves before the graph, is budgeted newest-first by whole
+# item, and the model is told never to re-ask an answered topic; re-asked
+# questions are also dropped deterministically after parsing.
+PROMPT_VERSION = "understanding-review-v9"
 SCHEMA_VERSION = "understanding-review-v2"
 DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 32_768
 DEFAULT_REVIEW_MAX_NODES_PER_TYPE = 5
@@ -234,6 +238,9 @@ Rules:
 - Phrase each open question as a focused confirmation the developer can
   answer briefly; avoid broad "explain the system" questions when the
   graph already contains a hypothesis to confirm.
+- Never ask again about a topic covered by Confirmed Q&A, even reworded or
+  narrowed. Apply the answer to the understanding instead. Ask a follow-up
+  only about a specific point the answer explicitly leaves open.
 """
 
 
@@ -380,6 +387,28 @@ def _build_review_prompt(
             _trim_json(alignment_feedback, ALIGNMENT_FEEDBACK_PROMPT_MAX_CHARS)
         )
 
+    # The developer's answers outrank graph hypotheses and the final budget
+    # truncates from the tail, so they go before the graph -- after the graph
+    # a large repository dropped every answer and the same questions came
+    # back reworded. Budgeted newest-first by whole item (answered_qa_budget).
+    if answered_qa:
+        parts.append(
+            "## Confirmed Q&A (latest revisions of already-answered interview "
+            "questions, including answers given only through the Q&A panel; "
+            "treat the answers as established facts and NEVER ask about these "
+            "topics again, even reworded)"
+        )
+        parts.append(answered_qa_prompt_json(answered_qa, answered_qa_max_chars()))
+
+    if unconfirmed_qa:
+        parts.append(
+            "## Unconfirmed Q&A (the developer explicitly could NOT confirm "
+            "these topics — 「わかりません」/不明. Treat each as an OPEN "
+            "hypothesis, never as an established fact, and keep it as an open "
+            "question or gap rather than treating it as resolved.)"
+        )
+        parts.append(_trim_json(unconfirmed_qa, QA_PROMPT_MAX_CHARS))
+
     selected_nodes = _selected_review_nodes(graph)
     parts.append(
         "## Understanding Graph Nodes\n"
@@ -443,22 +472,6 @@ def _build_review_prompt(
         )
         parts.append(_trim_json(verified_evidence, QA_PROMPT_MAX_CHARS))
 
-    if answered_qa:
-        parts.append(
-            "\n## Confirmed Q&A (latest revisions of already-answered interview "
-            "questions, including answers given only through the Q&A panel; "
-            "treat the answers as established facts)"
-        )
-        parts.append(_trim_json(answered_qa, QA_PROMPT_MAX_CHARS))
-
-    if unconfirmed_qa:
-        parts.append(
-            "\n## Unconfirmed Q&A (the developer explicitly could NOT confirm "
-            "these topics — 「わかりません」/不明. Treat each as an OPEN "
-            "hypothesis, never as an established fact, and keep it as an open "
-            "question or gap rather than treating it as resolved.)"
-        )
-        parts.append(_trim_json(unconfirmed_qa, QA_PROMPT_MAX_CHARS))
 
     if history:
         parts.append("\n## Interview History\n")
@@ -678,7 +691,11 @@ def generate_understanding_review(
     }
 
     gap_analysis = [item.model_dump() for item in validated.gap_analysis]
-    open_questions = [item.model_dump() for item in validated.open_questions]
+    answered_questions = [q.get("question", "") for q in (answered_qa or [])]
+    open_questions = [
+        item.model_dump() for item in validated.open_questions
+        if not is_reasked(item.question, answered_questions)
+    ]
 
     return ReviewResult(
         provider=config.provider,

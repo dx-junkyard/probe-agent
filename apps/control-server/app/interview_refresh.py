@@ -190,6 +190,29 @@ def request_refresh(session_id: int, system_id: int, trigger_kind: str) -> Optio
     return job_id
 
 
+def recover_interrupted_refresh_jobs() -> int:
+    """Close refresh jobs a restart (or a crashed dispatch thread) left open.
+
+    Jobs run on an in-process thread. When that thread is gone, a 'pending'
+    or 'updating' job is never picked up again, and the session keeps
+    reporting a running understanding update (``W1``): the Interview screen
+    stays on 「更新中」 with nothing able to clear it, because retry only
+    accepts failed jobs. Same policy as repository resync recovery: mark
+    them failed with the reason, so the developer can retry them.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """UPDATE interview_refresh_job
+               SET status = 'failed',
+                   error = 'Control Server restarted before this understanding refresh ran',
+                   finished_at = ?
+               WHERE status IN ('pending', 'updating')""",
+            (now,),
+        )
+        return cur.rowcount
+
+
 def _dispatch(job_id: int) -> None:
     if _eager_mode():
         run_refresh_job(job_id)

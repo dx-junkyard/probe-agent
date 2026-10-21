@@ -608,3 +608,32 @@ def test_approved_set_empty_when_no_proposals(admin_client):
     assert r.status_code == 200
     assert r.json()["items"] == []
     assert r.json()["total_proposals"] == 0
+
+
+def test_edited_proposal_lists_the_edited_values(admin_client):
+    """The proposals list used to return an 'edited' proposal with only its
+    original AI values, so an edit looked lost although materialization used
+    it. The list now carries the human edit next to the original."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    sid, created = _create_session_with_proposals(admin_client, headers, snapshot_id)
+    p = created[0]
+    original_role = p["metadata"]["role"]
+    r = admin_client.post(
+        f"/interview/sessions/{sid}/proposals/{p['id']}/edit",
+        json={"actor": "dev", "metadata": {"role": "Edited role", "capability": "edited",
+                                             "element_type": "core", "operation_kind": "read",
+                                             "state_effects": ["database-read"]},
+              "probe_plan": {"feature_id": "f", "objective": "Edited objective", "reason": "r",
+                             "recommended_mode": "trace", "side_effect_risk": "low", "replayability": "safe"}},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    listed = {x["id"]: x for x in admin_client.get(f"/interview/sessions/{sid}/proposals", headers=headers).json()}
+    item = listed[p["id"]]
+    assert item["approval_state"] == "edited"
+    assert item["metadata"]["role"] == original_role
+    assert item["edited_metadata"]["role"] == "Edited role"
+    assert item["edited_probe_plan"]["objective"] == "Edited objective"
+    others = [x for i, x in listed.items() if i != p["id"]]
+    assert all(x["edited_metadata"] is None for x in others)

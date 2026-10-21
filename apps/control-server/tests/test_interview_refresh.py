@@ -941,3 +941,21 @@ def test_refresh_job_crash_is_recorded_and_does_not_leave_w1(admin_client, tmp_p
     ).json()
     # No phantom running understanding_update is left behind for the finished jobs.
     assert "understanding_update" not in state["facts"]["running_process_kinds"]
+
+
+def test_startup_recovery_closes_jobs_left_open(admin_client, tmp_path):
+    """A pending/updating refresh job whose thread is gone used to stay open
+    forever (System 7 interview 15, job #4): the screen showed 「更新中」 and
+    retry refused it because it was not failed. Startup recovery closes it as
+    failed so it can be retried."""
+    from app.interview_refresh import recover_interrupted_refresh_jobs, retry_refresh_job
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    session_id = _create_session(admin_client, _headers(token, system_id), snapshot_id)
+    job_id = _insert_pending_job(session_id, system_id)
+
+    assert recover_interrupted_refresh_jobs() >= 1
+    job = _job_row(job_id)
+    assert job["status"] == "failed" and "restarted" in job["error"]
+    assert recover_interrupted_refresh_jobs() == 0  # idempotent
+    retry_refresh_job(job_id, session_id, system_id)  # now retryable; must not raise
