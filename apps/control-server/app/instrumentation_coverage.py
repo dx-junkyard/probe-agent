@@ -25,7 +25,7 @@ import sqlite3
 from typing import Any, Dict, List, Optional
 
 FEATURE_ID = re.compile(r"\bF-\d{2,3}\b")
-# A trace error in this many most recent traces of a component marks it "errors".
+# Errors among this many most recent traces are reported as recent_errors.
 RECENT_WINDOW = 50
 
 
@@ -51,6 +51,11 @@ def _runtime_stats(conn: sqlite3.Connection, system_id: int) -> Dict[str, Dict[s
             "recent_errors": 0,
         }
     for cid in stats:
+        last = conn.execute(
+            "SELECT error FROM traces WHERE system_id = ? AND component_id = ? ORDER BY timestamp DESC LIMIT 1",
+            (system_id, cid),
+        ).fetchone()
+        stats[cid]["last_failed"] = bool(last and last["error"])
         stats[cid]["recent_errors"] = conn.execute(
             """SELECT COUNT(*) FROM (SELECT error FROM traces WHERE system_id = ? AND component_id = ?
                                      ORDER BY timestamp DESC LIMIT ?) WHERE error IS NOT NULL AND error != ''""",
@@ -59,12 +64,29 @@ def _runtime_stats(conn: sqlite3.Connection, system_id: int) -> Dict[str, Dict[s
     return stats
 
 
+def _entry_flows(conn: sqlite3.Connection, system_id: int, limit: int = 3) -> Dict[str, List[str]]:
+    flows: Dict[str, List[str]] = {}
+    for r in conn.execute(
+        """SELECT component_id, flow_id, MAX(timestamp) AS last FROM trace_spans
+           WHERE system_id = ? AND flow_id IS NOT NULL GROUP BY component_id, flow_id
+           ORDER BY component_id, last DESC""",
+        (system_id,),
+    ):
+        lst = flows.setdefault(r["component_id"], [])
+        if len(lst) < limit:
+            lst.append(r["flow_id"])
+    return flows
+
+
 def _status(component_id: Optional[str], stat: Optional[Dict[str, Any]]) -> str:
     if not component_id:
         return "metadata_only"
     if not stat:
         return "not_received"
-    return "errors" if stat["recent_errors"] else "receiving"
+    # The latest call decides: a component that failed once and has since
+    # recovered is "receiving" (its recent error count is still reported),
+    # instead of staying "errors" until 50 newer traces push the failure out.
+    return "errors" if stat["last_failed"] else "receiving"
 
 
 def build_coverage(conn: sqlite3.Connection, system_id: int, snapshot_id: int) -> Dict[str, Any]:
@@ -76,6 +98,7 @@ def build_coverage(conn: sqlite3.Connection, system_id: int, snapshot_id: int) -
         )
     }
     stats = _runtime_stats(conn, system_id)
+    entry_flows = _entry_flows(conn, system_id)
     # Composed routes (router prefixes applied) from entrypoint discovery; the
     # symbol index only knows the decorator's own path ("/threads/..." for
     # "/api/threads/...").
@@ -127,8 +150,11 @@ def build_coverage(conn: sqlite3.Connection, system_id: int, snapshot_id: int) -
             "status": _status(cid, stat),
             "trace_count": stat["trace_count"] if stat else 0,
             "recent_errors": stat["recent_errors"] if stat else 0,
+            "last_failed": stat["last_failed"] if stat else False,
             "last_seen": stat["last_seen"] if stat else None,
             "avg_duration_ms": stat["avg_duration_ms"] if stat else None,
+            # Requests (method + route) the component was reached from, newest first.
+            "entry_flows": entry_flows.get(cid, []) if cid else [],
         })
     unmatched = [
         {"component_id": cid, **st}
@@ -171,21 +197,13 @@ def recent_traces(conn: sqlite3.Connection, system_id: int, snapshot_id: Optiona
         where += " AND timestamp > ?"
         args.append(since)
     rows = conn.execute(
-        f"""SELECT trace_id, component_id, mode, error, duration_ms, timestamp, input_json, output_text
-            FROM traces WHERE {where} ORDER BY timestamp DESC LIMIT ?""",
+        f"""SELECT t.trace_id, t.component_id, t.mode, t.error, t.duration_ms, t.timestamp, t.input_json, t.output_text,
+                   sp.correlation_id, sp.flow_id
+            FROM traces t LEFT JOIN trace_spans sp ON sp.system_id = t.system_id AND sp.trace_id = t.trace_id
+            WHERE t.{where.replace(' AND timestamp', ' AND t.timestamp')} ORDER BY t.timestamp DESC LIMIT ?""",
         (*args, max(1, min(limit, 200))),
     ).fetchall()
-    locations: Dict[str, Dict[str, Any]] = {}
-    if snapshot_id is not None:
-        for s in conn.execute(
-            """SELECT component_id, path, qualified_name, start_line, route_method, route_path
-               FROM code_symbols WHERE system_id = ? AND snapshot_id = ? AND component_id IS NOT NULL""",
-            (system_id, snapshot_id),
-        ):
-            locations.setdefault(s["component_id"], {
-                "path": s["path"], "symbol": s["qualified_name"], "line_start": s["start_line"],
-                "route": f"{s['route_method']} {s['route_path']}" if s["route_method"] and s["route_path"] else None,
-            })
+    locations = _code_locations(conn, system_id, snapshot_id)
     return [
         {
             "trace_id": r["trace_id"],
@@ -198,6 +216,70 @@ def recent_traces(conn: sqlite3.Connection, system_id: int, snapshot_id: Optiona
             "input_preview": _preview(r["input_json"]),
             "output_preview": _preview(r["output_text"]),
             "code": locations.get(r["component_id"]),
+            "correlation_id": r["correlation_id"],
+            "request": r["flow_id"],
         }
         for r in rows
     ]
+
+
+def _code_locations(conn: sqlite3.Connection, system_id: int, snapshot_id: Optional[int]) -> Dict[str, Dict[str, Any]]:
+    locations: Dict[str, Dict[str, Any]] = {}
+    if snapshot_id is None:
+        return locations
+    for s in conn.execute(
+        """SELECT component_id, path, qualified_name, start_line, route_method, route_path FROM code_symbols
+           WHERE system_id = ? AND snapshot_id = ? AND component_id IS NOT NULL""",
+        (system_id, snapshot_id),
+    ):
+        locations.setdefault(s["component_id"], {
+            "path": s["path"], "symbol": s["qualified_name"], "line_start": s["start_line"],
+            "route": f"{s['route_method']} {s['route_path']}" if s["route_method"] and s["route_path"] else None,
+        })
+    return locations
+
+
+def request_waterfall(conn: sqlite3.Connection, system_id: int, snapshot_id: Optional[int],
+                      correlation_id: str) -> Optional[Dict[str, Any]]:
+    """Every traced call of one request, positioned by start time and duration.
+
+    The SDK stamps a trace when the call ends, so start = timestamp - duration.
+    Calls nest by span parent; depth is the nesting level for indentation.
+    """
+    rows = conn.execute(
+        """SELECT t.trace_id, t.component_id, t.error, t.duration_ms, t.timestamp,
+                  sp.span_id, sp.parent_span_id, sp.flow_id
+           FROM trace_spans sp JOIN traces t ON t.system_id = sp.system_id AND t.trace_id = sp.trace_id
+           WHERE sp.system_id = ? AND sp.correlation_id = ? ORDER BY t.timestamp""",
+        (system_id, correlation_id),
+    ).fetchall()
+    if not rows:
+        return None
+    locations = _code_locations(conn, system_id, snapshot_id)
+    calls = []
+    for r in rows:
+        dur = r["duration_ms"] or 0.0
+        calls.append({
+            "trace_id": r["trace_id"], "component_id": r["component_id"], "ok": not r["error"],
+            "error": _preview(r["error"]), "duration_ms": dur, "start": r["timestamp"] - dur / 1000.0,
+            "end": r["timestamp"], "span_id": r["span_id"], "parent_span_id": r["parent_span_id"],
+            "code": locations.get(r["component_id"]),
+        })
+    by_span = {c["span_id"]: c for c in calls if c["span_id"]}
+
+    def depth(c: Dict[str, Any], seen: int = 0) -> int:
+        p = by_span.get(c["parent_span_id"]) if c["parent_span_id"] else None
+        return 0 if p is None or seen > 20 else 1 + depth(p, seen + 1)
+
+    calls.sort(key=lambda c: c["start"])
+    begin = calls[0]["start"]
+    for c in calls:
+        c["depth"] = depth(c)
+        c["offset_ms"] = (c["start"] - begin) * 1000.0
+    return {
+        "correlation_id": correlation_id,
+        "request": rows[0]["flow_id"],
+        "start": begin,
+        "total_ms": (max(c["end"] for c in calls) - begin) * 1000.0,
+        "calls": calls,
+    }

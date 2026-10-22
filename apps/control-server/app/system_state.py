@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import state_facts, state_messages
 from .db import get_conn
@@ -1171,11 +1171,36 @@ def _docs_code_reconcile_state_item(conn, system_id: int, snapshot_id: int) -> O
     )
 
 
-def _open_gap_triage_item(conn, system_id: int, snapshot_id: int) -> Optional[StateItem]:
-    """Open-only gap work remains actionable; judged gaps are distinguished.
+# Inputs of the docs-code reconciliation and of gap triage. Their row
+# fingerprint decides whether the cached gap counts are still valid.
+_GAP_INPUT_TABLES = (
+    "understanding_graph_snapshots", "code_symbols", "code_entrypoints", "symbol_source_metadata",
+    "capability_hierarchy_nodes", "explanation_refresh_proposals", "gap_triage_decisions",
+)
+_GAP_COUNT_CACHE: Dict[Tuple[str, int, int], Tuple[Tuple, int, int]] = {}
 
-    This uses the same identity/effective-state functions as the worklist and
-    build history, so StateItem counts cannot drift from those surfaces.
+
+def _gap_inputs_fingerprint(conn, system_id: int) -> Tuple:
+    """Cheap fingerprint of every row the gap counts derive from: per table,
+    the row count, the max id and (when present) the latest update time."""
+    parts = []
+    for table in _GAP_INPUT_TABLES:
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if not cols:
+            parts.append((table, None))
+            continue
+        extra = ", MAX(updated_at)" if "updated_at" in cols else ""
+        parts.append((table, tuple(conn.execute(
+            f"SELECT COUNT(*), MAX(id){extra} FROM {table} WHERE system_id = ?", (system_id,)).fetchone())))
+    return tuple(parts)
+
+
+def _open_gap_counts(conn, system_id: int, snapshot_id: int) -> Tuple[int, int]:
+    """(open, total) gap counts, recomputed only when an input changed.
+
+    Recomputing reconciles every symbol and fingerprints every gap (15k gaps
+    on a large System: ~1-2 s on every page load, holding the DB lock) only
+    to produce two numbers.
     """
     from .system_understanding_service import (
         _attach_gap_triage,
@@ -1183,12 +1208,29 @@ def _open_gap_triage_item(conn, system_id: int, snapshot_id: int) -> Optional[St
         _open_gaps,
     )
 
+    from .db import db_path
+
+    key = (db_path(), system_id, snapshot_id)
+    fp = _gap_inputs_fingerprint(conn, system_id)
+    cached = _GAP_COUNT_CACHE.get(key)
+    if cached is not None and cached[0] == fp:
+        return cached[1], cached[2]
     gaps = _load_gaps_from_reconciler(conn, system_id, snapshot_id)
     _attach_gap_triage(conn, system_id, snapshot_id, gaps)
-    open_count = len(_open_gaps(gaps))
+    counts = (len(_open_gaps(gaps)), len(gaps))
+    _GAP_COUNT_CACHE[key] = (fp, *counts)
+    return counts
+
+
+def _open_gap_triage_item(conn, system_id: int, snapshot_id: int) -> Optional[StateItem]:
+    """Open-only gap work remains actionable; judged gaps are distinguished.
+
+    This uses the same identity/effective-state functions as the worklist and
+    build history, so StateItem counts cannot drift from those surfaces.
+    """
+    open_count, total_count = _open_gap_counts(conn, system_id, snapshot_id)
     if open_count == 0:
         return None
-    total_count = len(gaps)
     triaged_count = total_count - open_count
     msg = state_messages.state_message("understanding.gaps.open")
     return StateItem(

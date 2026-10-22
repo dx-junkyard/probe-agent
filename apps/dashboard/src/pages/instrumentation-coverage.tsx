@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatTimestamp } from "@/lib/utils";
+import { RequestWaterfall } from "@/components/request-waterfall";
 
 const LIVE_INTERVAL_MS = 3000;
 
@@ -16,7 +17,7 @@ const STATUS_META: Record<InstrumentationStatus, {
   label: string; hint: string; variant: "success" | "destructive" | "warning" | "outline"; Icon: typeof CheckCircle;
 }> = {
   receiving: { label: "受信中", hint: "trace が届いています。", variant: "success", Icon: CheckCircle },
-  errors: { label: "エラーあり", hint: "直近の trace にエラーがあります。", variant: "destructive", Icon: AlertTriangle },
+  errors: { label: "エラーあり", hint: "最新の trace がエラーでした。", variant: "destructive", Icon: AlertTriangle },
   not_received: {
     label: "未受信", hint: "計測は入っていますが、まだ一度も trace が届いていません。この処理を通る操作をアプリで行ってください。",
     variant: "warning", Icon: CircleDashed,
@@ -164,11 +165,18 @@ export default function InstrumentationCoveragePage() {
                       ) : "—"}
                       <div className="text-muted-foreground">{KIND_LABEL[p.instrumentation]}</div>
                     </td>
-                    <td className="p-2 font-mono text-xs">{p.route ?? "—"}</td>
+                    <td className="p-2 font-mono text-xs">
+                      {p.route ?? (p.entry_flows?.length ? (
+                        <>
+                          <span className="font-sans text-muted-foreground">呼び出し元:</span>
+                          {p.entry_flows.map((f) => <div key={f}>{f}</div>)}
+                        </>
+                      ) : "—")}
+                    </td>
                     <td className="p-2 text-xs">{p.features.length ? p.features.join(", ") : "—"}</td>
                     <td className="p-2 text-right text-xs">
                       {p.trace_count}
-                      {p.recent_errors > 0 && <div className="text-destructive">エラー {p.recent_errors}</div>}
+                      {p.recent_errors > 0 && <div className="text-destructive">直近のエラー {p.recent_errors}</div>}
                       {p.avg_duration_ms != null && <div className="text-muted-foreground">平均 {p.avg_duration_ms.toFixed(1)} ms</div>}
                     </td>
                     <td className="p-2 text-xs">{ago(p.last_seen)}</td>
@@ -203,6 +211,7 @@ export default function InstrumentationCoveragePage() {
 }
 
 function LiveFeed({ items }: { items: RecentTraceOut[] }) {
+  const [openRequest, setOpenRequest] = useState<string | null>(null);
   return (
     <Card aria-live="polite">
       <CardHeader>
@@ -223,6 +232,19 @@ function LiveFeed({ items }: { items: RecentTraceOut[] }) {
               {t.code?.route && <span className="font-mono">{t.code.route}</span>}
               <span className="ml-auto text-muted-foreground">{t.duration_ms != null ? `${t.duration_ms.toFixed(1)} ms · ` : ""}{ago(t.timestamp)}</span>
             </div>
+            {t.request && (
+              <div className="mt-1 flex items-center gap-2">
+                <span className="text-muted-foreground">リクエスト:</span>
+                <span className="font-mono">{t.request}</span>
+                {t.correlation_id && (
+                  <button type="button" className="underline" aria-expanded={openRequest === t.correlation_id}
+                    onClick={() => setOpenRequest(openRequest === t.correlation_id ? null : t.correlation_id!)}>
+                    {openRequest === t.correlation_id ? "呼び出しを閉じる" : "このリクエストの呼び出し"}
+                  </button>
+                )}
+              </div>
+            )}
+            {t.correlation_id && openRequest === t.correlation_id && <div className="mt-1"><RequestWaterfall correlationId={t.correlation_id} /></div>}
             {t.error && <div className="mt-1 text-destructive">{t.error}</div>}
             {t.input_preview && <div className="mt-1 truncate font-mono text-muted-foreground">入力: {t.input_preview}</div>}
             {t.output_preview && <div className="truncate font-mono text-muted-foreground">出力: {t.output_preview}</div>}

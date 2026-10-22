@@ -126,6 +126,13 @@ class TestApiRouteComposition:
         assert {"GET:/api/news", "POST:/api/communities/{cid}/join", "GET:/api/health"} <= ids
         assert "GET:/news" not in ids
 
+        files["app/main.py"] = files["app/main.py"].replace(
+            "for r in (news.router, communities.router):", "ROUTERS = (news.router, communities.router)\nfor r in ROUTERS:"
+        ).replace('prefix="/api"', "prefix=API_PREFIX").replace("app = FastAPI()", "app = FastAPI()\nAPI_PREFIX = '/api'")
+        records, fl = _records(files)
+        ids = {e.entrypoint_id for e in discover_entrypoints(records, fl).entrypoints}
+        assert {"GET:/api/news", "POST:/api/communities/{cid}/join"} <= ids
+
     def test_flask_blueprint_url_prefix(self):
         from app.entrypoint_discovery import discover_entrypoints
 

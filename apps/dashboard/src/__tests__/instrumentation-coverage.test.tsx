@@ -97,3 +97,22 @@ describe("システムマップ", () => {
     expect(screen.getByText("コードと対応 1 件")).toBeInTheDocument();
   });
 });
+
+describe("リクエストのウォーターフォール", () => {
+  test("lays out a request's calls with offsets, nesting and text status", async () => {
+    mockApi.get.mockImplementation((path: string) => path === "/instrumentation-coverage/requests/req-1"
+      ? Promise.resolve({ correlation_id: "req-1", request: "POST /api/threads/{tid}/summary", start: 100, total_ms: 6000, calls: [
+          { trace_id: "p", component_id: "thread-summary-agent", ok: true, error: null, duration_ms: 6000, start: 104, end: 110,
+            offset_ms: 0, depth: 0, span_id: "s1", parent_span_id: null, code: { path: "app/agents/thread_summary.py", symbol: "summarize", line_start: 63, route: null } },
+          { trace_id: "c", component_id: "llm", ok: false, error: "Timeout", duration_ms: 3000, start: 106, end: 109,
+            offset_ms: 2000, depth: 1, span_id: "s2", parent_span_id: "s1", code: null },
+        ] })
+      : Promise.resolve(null));
+    const { RequestWaterfall } = await import("@/components/request-waterfall");
+    wrap(<RequestWaterfall correlationId="req-1" />);
+    await screen.findByText("POST /api/threads/{tid}/summary");
+    expect(screen.getByText(/計 6000 ms · 呼び出し 2 件/)).toBeInTheDocument();
+    expect(screen.getByText("エラー: Timeout")).toBeInTheDocument();
+    expect(screen.getByText("+2000 ms · 3000 ms")).toBeInTheDocument();
+  });
+});

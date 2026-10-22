@@ -9460,8 +9460,11 @@ export interface InstrumentationPointOut {
   status: InstrumentationStatus;
   trace_count: number;
   recent_errors: number;
+  last_failed?: boolean;
   last_seen: number | null;
   avg_duration_ms: number | null;
+  /** Requests (method + route) the component was reached from, newest first. */
+  entry_flows?: string[];
 }
 
 export interface InstrumentationCoverageOut {
@@ -9485,4 +9488,19 @@ export interface RecentTraceOut {
   input_preview: string | null;
   output_preview: string | null;
   code: { path: string; symbol: string; line_start: number; route: string | null } | null;
+  correlation_id?: string | null;
+  /** The request (method + route) this call ran in, when the app binds a request context. */
+  request?: string | null;
+}
+
+export interface RequestWaterfallOut {
+  correlation_id: string;
+  request: string | null;
+  start: number;
+  total_ms: number;
+  calls: {
+    trace_id: string; component_id: string; ok: boolean; error: string | null; duration_ms: number;
+    start: number; end: number; offset_ms: number; depth: number; span_id: string | null; parent_span_id: string | null;
+    code: { path: string; symbol: string; line_start: number; route: string | null } | null;
+  }[];
 }

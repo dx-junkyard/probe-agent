@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useState } from "react";
+import { RequestWaterfall } from "@/components/request-waterfall";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   useComponents, useTracePage, useTraceSummary, useUpdatePolicy,
@@ -377,6 +378,7 @@ export default function ComponentsPage() {
                                         {/* Issue #367: the payload stays closed
                                             until asked for, behind its shape
                                             and redaction state. */}
+                                        <div className="mb-3"><RequestWaterfall traceId={t.trace_id} /></div>
                                         <TracePayloadPanel
                                           input={t.input}
                                           output={t.output}
