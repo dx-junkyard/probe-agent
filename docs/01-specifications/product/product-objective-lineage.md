@@ -963,6 +963,11 @@ code**(`functional_lineage.PRODUCT_OBJECTIVE_LAYER_GAP_CODES` の 11 個)は
   Gap の close へ押すことになる。
 * `unresolved_reference` / `unavailable_reference` / `stale_link` は section
   1-5 も出すので**対象外**。
+* 同じ理由で、resolver が分割する構造（`product_gap_sources.SOURCE_REF_FORMATS`、
+  例: `journey_baseline_diff` は `<journey_key>|<step_key>`）を持たない参照も
+  作成時に 422 `product_gap_source_ref_unresolvable` で拒否し、期待する形式を
+  メッセージで返す。形式が違う参照は永久に解決せず、`disappeared` として
+  `close_candidate` の入力にもなるため（2026-10-24 追加）。
 
 ### 5.6 lifecycle は人間の決定からだけ導出する
 

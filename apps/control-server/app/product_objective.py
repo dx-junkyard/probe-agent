@@ -124,6 +124,7 @@ __all__ = [
     "RefKindInvalid",
     "SourceKindInvalid",
     "SourceRefUnresolvable",
+    "SourceRefMalformed",
     "LinkKindInvalid",
     "content_digest",
     "objective_revision_digest",
@@ -434,6 +435,16 @@ class SourceRefUnresolvable(ProductObjectiveValidationError):
     fact, and the developer would learn that only by reading a permanently
     degraded row later.
     """
+
+
+class SourceRefMalformed(SourceRefUnresolvable):
+    """The ref lacks the structure its kind requires. Same 422 code as its
+    parent; the message names the expected format."""
+
+    def __init__(self, source_kind: str, expected: str, got: str) -> None:
+        super().__init__(f"source_ref for {source_kind} must have the form {expected}; got {got!r}")
+        self.source_kind = source_kind
+        self.expected = expected
 
 
 class LinkKindInvalid(ProductObjectiveValidationError):
@@ -2214,7 +2225,9 @@ def _is_unique_violation(exc: sqlite3.IntegrityError, table: str) -> bool:
 
 
 def _check_source_ref_resolvable(source_kind: str, source_ref: str) -> None:
-    """§5.4.2: refuse a `functional_lineage_gap` ref whose gap code only the
+    """Refuse a ref that can never resolve: one without the structure its
+    kind's resolver splits (`product_gap_sources.SOURCE_REF_FORMATS`), and
+    (§5.4.2) a `functional_lineage_gap` ref whose gap code only the
     Functional Lineage view's Product Objective sections emit.
 
     A Gap's own source resolution must run that projection with those
@@ -2229,6 +2242,11 @@ def _check_source_ref_resolvable(source_kind: str, source_ref: str) -> None:
     code set itself lives in `functional_lineage` beside the sections that
     emit it.
     """
+    from .product_gap_sources import malformed_source_ref_hint
+
+    expected = malformed_source_ref_hint(source_kind, source_ref)
+    if expected is not None:
+        raise SourceRefMalformed(source_kind, expected, source_ref)
     if source_kind != "functional_lineage_gap":
         return
     parts = source_ref.split("|", 2)

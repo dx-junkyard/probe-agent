@@ -620,3 +620,26 @@ def test_truncated_output_is_reported_as_a_budget_problem():
     assert result.error and "output token limit" in result.error
     other = scan_chunk(_BudgetClient("not json", finish="stop"), _cfg(), _chunk("README.md"))
     assert other.error.startswith("Failed to parse scan response")
+
+
+# --- malformed Gap source refs (found registering the outdoor-play Gaps) ----------
+
+
+def test_malformed_structured_gap_source_ref_is_refused(admin_client):
+    headers, _ = _setup(admin_client, "VF gap source format")
+    _gap_setup(admin_client, headers)
+    r = admin_client.post("/product-gaps/g1/source-refs",
+                          json={"source_kind": "journey_baseline_diff", "source_ref": "SC-outdoor-play"}, headers=headers)
+    assert r.status_code == 422, r.text
+    assert "product_gap_source_ref_unresolvable" in r.text and "<journey_key>|<step_key>" in r.text
+    r = admin_client.post("/product-gaps/g1/source-refs",
+                          json={"source_kind": "requirement_diff", "source_ref": "UXR-1|"}, headers=headers)
+    assert r.status_code == 422, r.text
+    # Well-formed refs are still accepted and read back (here: the journey does not exist -> disappeared).
+    r = admin_client.post("/product-gaps/g1/source-refs",
+                          json={"source_kind": "journey_baseline_diff", "source_ref": "J-none|S1"}, headers=headers)
+    assert r.status_code == 201, r.text
+    # Kinds without a fixed structure are unaffected.
+    r = admin_client.post("/product-gaps/g1/source-refs",
+                          json={"source_kind": "manual", "source_ref": "anything"}, headers=headers)
+    assert r.status_code == 201, r.text

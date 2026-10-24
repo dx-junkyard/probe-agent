@@ -153,6 +153,11 @@ def _raise_for_error(exc: Exception) -> None:
     if isinstance(exc, DependencyDuplicate):
         raise _reject("product_milestone_dependency_duplicate", 409)
     if isinstance(exc, SourceRefUnresolvable):
+        if isinstance(exc, product_objective.SourceRefMalformed):
+            raise HTTPException(status_code=422, detail={
+                "code": "product_gap_source_ref_unresolvable",
+                "message": f"検出元の参照の形式が違います。{exc.source_kind} は {exc.expected} の形で指定してください。",
+            })
         raise _reject("product_gap_source_ref_unresolvable", 422)
     if isinstance(exc, SourceDuplicate):
         raise _reject("product_gap_source_duplicate", 409)

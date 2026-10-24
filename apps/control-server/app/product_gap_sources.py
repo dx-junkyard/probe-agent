@@ -143,6 +143,35 @@ def _disappeared(*, title: str = "", detail: str = "", extra: Optional[Dict[str,
     )
 
 
+#: The structure every reference of these kinds must have, as the resolver
+#: below splits it. A reference that does not have it can never resolve, so
+#: it is refused at creation (`malformed_source_ref_hint`) instead of being
+#: stored and read back as `disappeared` forever (§5.5.1's reasoning).
+#: `capability_drift` is absent: it accepts more than one shape.
+SOURCE_REF_FORMATS: Dict[str, str] = {
+    "understanding_review_gap": "<gap_type>|<node_name>",
+    "understanding_claim_change": "<section>|<name>",
+    "functional_lineage_gap": "<code>|<subject_kind>|<subject_ref>",
+    "value_network_notice": "<code>|<subject_kind>|<subject_key>",
+    "journey_baseline_diff": "<journey_key>|<step_key>",
+    "requirement_diff": "<requirement_key>|<criterion_key>",
+    "node_anomaly": "<node_key>|<dedupe_key>",
+}
+
+
+def malformed_source_ref_hint(source_kind: str, source_ref: str) -> Optional[str]:
+    """The expected format when `source_ref` cannot be split the way the
+    kind's resolver splits it (every part non-empty), else None."""
+    fmt = SOURCE_REF_FORMATS.get(source_kind)
+    if fmt is None:
+        return None
+    n = fmt.count("|") + 1
+    parts = source_ref.split("|", n - 1)
+    if len(parts) != n or any(not p.strip() for p in parts):
+        return fmt
+    return None
+
+
 def _split2(source_ref: str) -> Optional[Tuple[str, str]]:
     if "|" not in source_ref:
         return None
