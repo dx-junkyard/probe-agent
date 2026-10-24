@@ -1417,10 +1417,31 @@ class TestClaimScanStepReuseRespectsVersions:
         assert job2["status"] == "completed", job2
         assert calls == []
 
-        # The source prompt changes: only the source chunks are scanned again.
+        from app.db import get_conn
+
+        def _graph_ids():
+            with get_conn() as conn:
+                return [r[0] for r in conn.execute(
+                    "SELECT id FROM understanding_graph_snapshots WHERE snapshot_id = ? ORDER BY id",
+                    (job1["snapshot_id"],),
+                ).fetchall()]
+
+        graphs_before = _graph_ids()
+
+        # The source prompt changes: only the source chunks are scanned again,
+        # and the graph is rebuilt from the new results (not reused).
         monkeypatch.setattr(scanner_module, "SOURCE_PROMPT_VERSION", "claim-scanner-source-test-bump")
         calls.clear()
         job3 = _wait_job(admin_client, hdrs, admin_client.post(
             "/repository/system-understanding/build", headers=hdrs).json()["id"])
         assert job3["status"] == "completed", job3
         assert calls and set(calls) == {"docs/plan.md"}
+        assert len(_graph_ids()) == len(graphs_before) + 1
+
+        # And a further rebuild with nothing changed reuses that new graph.
+        calls.clear()
+        job4 = _wait_job(admin_client, hdrs, admin_client.post(
+            "/repository/system-understanding/build", headers=hdrs).json()["id"])
+        assert job4["status"] == "completed", job4
+        assert calls == []
+        assert len(_graph_ids()) == len(graphs_before) + 1

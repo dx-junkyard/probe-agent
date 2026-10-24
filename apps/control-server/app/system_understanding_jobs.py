@@ -939,11 +939,22 @@ def _scan_versions_outdated(conn, system_id: int, snapshot_id: int) -> bool:
 def _existing_graph(system_id: int, snapshot_id: int) -> Optional[Dict[str, Any]]:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, claim_count FROM understanding_graph_snapshots "
+            "SELECT id, claim_count, created_at FROM understanding_graph_snapshots "
             "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
             (system_id, snapshot_id),
         ).fetchone()
         if row is None or _scan_versions_outdated(conn, system_id, snapshot_id):
+            return None
+        # A claim scan that finished after this graph was built (for example
+        # one that just re-read chunks under a new prompt version) means the
+        # graph no longer reflects the scan results: rebuild it.
+        newer_scan = conn.execute(
+            "SELECT 1 FROM system_understanding_llm_tasks "
+            "WHERE system_id = ? AND snapshot_id = ? AND task_type = 'claim_scan_chunk' "
+            "AND status = 'completed' AND completed_at > ? LIMIT 1",
+            (system_id, snapshot_id, row["created_at"]),
+        ).fetchone()
+        if newer_scan is not None:
             return None
     return {"understanding_graph_snapshot_id": row["id"], "claim_count": row["claim_count"]}
 
