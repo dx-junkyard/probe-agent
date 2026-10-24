@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { AlertTriangle, CheckCircle, CircleDashed, FileCode, Pause, Play, Plug, Radio, Tag } from "lucide-react";
 import { useInstrumentationCoverage, useRecentTraces } from "@/api/hooks";
@@ -51,20 +51,27 @@ function StatusBadge({ status }: { status: InstrumentationStatus }) {
 
 /** Rows whose trace count grew since the previous refresh, for the live highlight. */
 function useFreshRows(points: InstrumentationPointOut[] | undefined): Set<string> {
-  const prev = useRef<Map<string, number>>(new Map());
-  const [fresh, setFresh] = useState<Set<string>>(new Set());
-  useEffect(() => {
-    if (!points) return;
-    const next = new Set<string>();
+  // Derived during render from the previous points (no effect), so a refresh
+  // never renders once with a stale highlight before correcting itself.
+  const [tracked, setTracked] = useState<{
+    points: InstrumentationPointOut[] | undefined;
+    counts: Map<string, number>;
+    fresh: Set<string>;
+  }>({ points: undefined, counts: new Map(), fresh: new Set() });
+  if (points && points !== tracked.points) {
+    const counts = new Map<string, number>();
+    const fresh = new Set<string>();
     for (const p of points) {
       const key = `${p.path}:${p.symbol}`;
-      const before = prev.current.get(key);
-      if (before !== undefined && p.trace_count > before) next.add(key);
-      prev.current.set(key, p.trace_count);
+      const before = tracked.counts.get(key);
+      if (before !== undefined && p.trace_count > before) fresh.add(key);
+      counts.set(key, p.trace_count);
     }
-    setFresh(next);
-  }, [points]);
-  return fresh;
+    // Keep counts of rows absent from this refresh, as the ref-based version did.
+    for (const [key, n] of tracked.counts) if (!counts.has(key)) counts.set(key, n);
+    setTracked({ points, counts, fresh });
+  }
+  return tracked.fresh;
 }
 
 export default function InstrumentationCoveragePage() {
