@@ -31,6 +31,7 @@ probe-agent:
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -38,7 +39,30 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .documentation_chunker import MarkdownChunk
-from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
+from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient, is_reasoning_model
+
+#: Output budget per chunk. For a reasoning model the budget also covers its
+#: hidden reasoning, so 4096 left long chunks with an empty answer whenever
+#: the model reasoned at length (seen on a 118-line table chunk with
+#: gpt-6-luna: 4075 of 4096 tokens used on a successful try, empty on others).
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_REASONING_MAX_OUTPUT_TOKENS = 16384
+
+
+def scan_max_output_tokens(config: LLMConfig) -> int:
+    """`INTELLIGENCE_CLAIM_SCAN_MAX_OUTPUT_TOKENS` if set, else a larger
+    default for reasoning models."""
+    raw = os.getenv("INTELLIGENCE_CLAIM_SCAN_MAX_OUTPUT_TOKENS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    if is_reasoning_model(config.provider or "", config.model or ""):
+        return DEFAULT_REASONING_MAX_OUTPUT_TOKENS
+    return DEFAULT_MAX_OUTPUT_TOKENS
 
 PROMPT_VERSION = "claim-scanner-v1"
 SCHEMA_VERSION = "claim-scanner-v1"
@@ -366,6 +390,7 @@ def scan_chunk(
         f"## Chunk content\n\n{chunk.content}"
     )
 
+    max_output_tokens = scan_max_output_tokens(config)
     try:
         raw = client.generate_text(
             [
@@ -373,7 +398,7 @@ def scan_chunk(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
-            max_tokens=4096,
+            max_tokens=max_output_tokens,
         )
     except LLMError as exc:
         return ChunkScanResult(
@@ -388,12 +413,20 @@ def scan_chunk(
         parsed = json.loads(_strip_fences(raw))
         validated = _RawScanResponse.model_validate(parsed)
     except (json.JSONDecodeError, ValidationError) as exc:
+        finish = getattr(client, "last_finish_reason", None)
+        if finish in ("length", "max_tokens"):
+            message = (
+                f"Model output hit the output token limit ({max_output_tokens}) before the answer was complete; "
+                "raise INTELLIGENCE_CLAIM_SCAN_MAX_OUTPUT_TOKENS or split the section"
+            )
+        else:
+            message = f"Failed to parse scan response: {exc}"
         return ChunkScanResult(
             chunk_id=chunk.chunk_id,
             chunk_content_hash=chunk.content_hash,
             prompt_version=prompt_version,
             schema_version=schema_version,
-            error=f"Failed to parse scan response: {exc}",
+            error=message,
         )
 
     claims: List[DocumentationClaim] = []

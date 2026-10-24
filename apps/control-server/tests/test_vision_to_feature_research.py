@@ -585,3 +585,38 @@ def test_is_reasoning_model_by_family_and_version(provider, model, expected):
     from app.llm import is_reasoning_model
 
     assert is_reasoning_model(provider, model) is expected
+
+
+# --- claim scan output budget (found when a long table chunk came back empty) ----
+
+
+class _BudgetClient:
+    def __init__(self, response: str, finish=None):
+        self.response = response
+        self.last_finish_reason = finish
+        self.kwargs = None
+
+    def generate_text(self, messages, **kwargs):
+        self.kwargs = kwargs
+        return self.response
+
+
+def test_reasoning_models_get_a_larger_scan_budget(monkeypatch):
+    monkeypatch.delenv("INTELLIGENCE_CLAIM_SCAN_MAX_OUTPUT_TOKENS", raising=False)
+    client = _BudgetClient('{"claims": []}')
+    scan_chunk(client, LLMConfig(provider="openai", model="gpt-6-luna", api_key="k", base_url=None, timeout=10),
+               _chunk("README.md"))
+    assert client.kwargs["max_tokens"] == 16384
+    scan_chunk(client, LLMConfig(provider="openai", model="gpt-4o", api_key="k", base_url=None, timeout=10),
+               _chunk("README.md"))
+    assert client.kwargs["max_tokens"] == 4096
+    monkeypatch.setenv("INTELLIGENCE_CLAIM_SCAN_MAX_OUTPUT_TOKENS", "9000")
+    scan_chunk(client, _cfg(), _chunk("README.md"))
+    assert client.kwargs["max_tokens"] == 9000
+
+
+def test_truncated_output_is_reported_as_a_budget_problem():
+    result = scan_chunk(_BudgetClient("", finish="length"), _cfg(), _chunk("README.md"))
+    assert result.error and "output token limit" in result.error
+    other = scan_chunk(_BudgetClient("not json", finish="stop"), _cfg(), _chunk("README.md"))
+    assert other.error.startswith("Failed to parse scan response")
