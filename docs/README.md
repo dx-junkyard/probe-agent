@@ -56,6 +56,7 @@ Vision / Stakeholder Value
 | [Purpose Chain](01-specifications/product/purpose-chain.md) | Problem、Change、Intervention、Capability の関係 |
 | [Stakeholder Value Network](01-specifications/product/stakeholder-value-network.md) | Stakeholder、Need、Value Exchange と各 projection |
 | [Product Objective Lineage](01-specifications/product/product-objective-lineage.md) | Objective、Milestone、Gap、Feature と上下流 lineage |
+| [Vision → UX → Feature の調査手法](01-specifications/product/vision-to-feature-research.md) | 外部資料の収集、3 種類の現状調査、原因仮説から Feature を選ぶ手順（draft。ドメイン設定で各プロジェクトに当てはめる） |
 | [System 正準 Understanding と Interview premise](01-specifications/product/canonical-understanding.md) | System の正準 head、Interview の前提固定、候補の昇格 |
 
 ### UX / interaction
