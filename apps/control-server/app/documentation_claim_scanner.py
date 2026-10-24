@@ -44,8 +44,8 @@ PROMPT_VERSION = "claim-scanner-v1"
 SCHEMA_VERSION = "claim-scanner-v1"
 #: Source chunks use their own prompt and schema; system chunks keep v1 so
 #: existing scan results stay reusable.
-SOURCE_PROMPT_VERSION = "claim-scanner-source-v1"
-SOURCE_SCHEMA_VERSION = "claim-scanner-source-v1"
+SOURCE_PROMPT_VERSION = "claim-scanner-source-v2"
+SOURCE_SCHEMA_VERSION = "claim-scanner-source-v2"
 
 SYSTEM_CLAIM_TYPES = {
     "system_purpose",
@@ -68,6 +68,10 @@ SOURCE_CLAIM_TYPES = {
     "problem_statement",
     "target_group",
     "constraint",
+    # A view the source attributes to someone other than its publisher
+    # (committee members, survey free comments, ...). Kept apart so it is
+    # never read as the publisher's own goal (VF-D1).
+    "opinion",
 }
 
 CLAIM_TYPES = SYSTEM_CLAIM_TYPES | SOURCE_CLAIM_TYPES
@@ -204,7 +208,7 @@ no commentary), matching exactly this shape:
 {
   "claims": [
     {
-      "claim_type": "<one of: aspiration, policy_goal, indicator, initiative, problem_statement, target_group, constraint>",
+      "claim_type": "<one of: aspiration, policy_goal, indicator, initiative, problem_statement, target_group, constraint, opinion>",
       "summary": "What the source states, close to its own wording, in the source's language",
       "evidence_start_line": <absolute line number in the source file>,
       "evidence_end_line": <absolute line number in the source file>,
@@ -222,6 +226,11 @@ claim_type meanings:
 - problem_statement: a problem or current condition as the source recognises it
 - target_group: a group of people the source names as affected or targeted
 - constraint: a principle, condition or prohibition the source sets
+- opinion: a view the source attributes to someone other than its publisher
+  (for example committee members' comments, survey free-text answers,
+  "との意見"). Use opinion instead of any other type for such statements,
+  even when they propose a goal or a measure: they are not the publisher's
+  own position.
 
 Rules:
 - Extract only what is written in this chunk. Never add numbers, years or

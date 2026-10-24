@@ -233,7 +233,7 @@ class TestSourceClaimTypes:
     def test_vocabularies_are_disjoint(self):
         assert not (SOURCE_CLAIM_TYPES & SYSTEM_CLAIM_TYPES)
         assert {"aspiration", "policy_goal", "indicator", "initiative", "problem_statement",
-                "target_group", "constraint"} == SOURCE_CLAIM_TYPES
+                "target_group", "constraint", "opinion"} == SOURCE_CLAIM_TYPES
 
     def test_source_chunk_accepts_source_types_and_keeps_source_id(self):
         client = _Recorder({"claims": [
@@ -256,6 +256,16 @@ class TestSourceClaimTypes:
         assert valid[1].indicator is None
         rejected = [c for c in result.claims if not c.is_valid]
         assert len(rejected) == 1 and "not allowed in an external source" in rejected[0].invalid_reason
+
+    def test_opinion_is_a_source_type_and_named_in_the_prompt(self):
+        client = _Recorder({"claims": [
+            {"claim_type": "opinion", "summary": "委員: アウトリーチ型の支援も示すべきでは", "evidence_start_line": 12,
+             "evidence_end_line": 12, "confidence": 0.8},
+        ]})
+        result = scan_chunk(client, _cfg(), _chunk(), source=SOURCE)
+        assert [(c.claim_type, c.is_valid) for c in result.claims] == [("opinion", True)]
+        assert "opinion:" in client.messages[0]["content"]
+        assert "not the publisher's" in client.messages[0]["content"]
 
     def test_system_chunk_rejects_source_types(self):
         client = _Recorder({"claims": [
