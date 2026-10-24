@@ -545,3 +545,31 @@ class TestGapResolutionChoice:
         headers, _ = _setup(admin_client, "VF gap stale")
         _gap_setup(admin_client, headers)
         _choose(admin_client, headers, 409, approach="operation", rationale="x", captured_digest="stale")
+
+
+# --- reasoning-model detection (found while running the Shibuya first cycle) ----
+
+
+@pytest.mark.parametrize("provider,model,expected", [
+    ("openai", "gpt-6-luna", True),
+    ("openai", "gpt-5.4-mini", True),
+    ("openai", "gpt-10", True),
+    ("openai", "o3-mini", True),
+    ("openai", "gpt-4o", False),
+    ("openai", "gpt-4.1", False),
+    ("anthropic", "claude-opus-5-5", True),
+    ("anthropic", "claude-fable-5-1", True),
+    ("anthropic", "claude-sonnet-4-5", True),
+    ("anthropic", "claude-4-opus", True),
+    ("anthropic", "claude-3-7-sonnet", True),
+    ("anthropic", "claude-3-5-sonnet", False),
+    ("anthropic", "claude-haiku-3", False),
+    ("gemini", "gemini-2.5-pro", True),
+    ("gemini", "gemini-3-flash", True),
+    ("gemini", "gemini-2.0-flash", False),
+    ("mock", "anything", False),
+])
+def test_is_reasoning_model_by_family_and_version(provider, model, expected):
+    from app.llm import is_reasoning_model
+
+    assert is_reasoning_model(provider, model) is expected
