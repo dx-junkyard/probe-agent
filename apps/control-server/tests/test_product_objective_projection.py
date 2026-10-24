@@ -672,7 +672,7 @@ class TestDeepLinks:
             po.add_gap_revision(conn, system_id=sid, gap_key="g1", title="g1", created_by="dev")
             po.add_gap_source_ref(
                 conn, system_id=sid, gap_key="g1", source_kind="node_anomaly",
-                source_ref="anomaly-x", created_by="dev",
+                source_ref="anomaly-node|anomaly-x", created_by="dev",
             )
             conn.commit()
 

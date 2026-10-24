@@ -1173,3 +1173,275 @@ class TestCrossSnapshotChunkReuse:
                 assert claim.evidence.path == chunk.path
                 assert claim.evidence.start_line == chunk.start_line
                 assert claim.evidence.end_line == chunk.end_line
+
+
+# --- source metadata persisted by the build's symbol_index step ----------
+
+_METADATA_SOURCE = '''def summarize(text):
+    """Summarize text.
+
+    probe-agent:
+      role: summarizes incoming text
+      capability: text summarization
+      element_type: capability
+      operation_kind: analysis
+      consumers: [api.summarize]
+      state_effects: [none]
+    """
+    return text[:10]
+'''
+
+
+def _setup_metadata_repo(client, token, tmp_path):
+    sys = _create_system(client, token, "Metadata System")
+    hdrs = _headers(token, sys["id"])
+    repo = tmp_path / "meta-repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "summarize.py").write_text(_METADATA_SOURCE)
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    for args in (["config", "user.email", "t@t.com"], ["config", "user.name", "T"],
+                 ["add", "."], ["commit", "-m", "init"]):
+        subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True)
+    client.put(
+        "/repository",
+        json={"repo_path": str(repo), "include_patterns": ["**"], "exclude_patterns": []},
+        headers=hdrs,
+    )
+    snap = client.post("/repository/snapshots", json={}, headers=hdrs)
+    assert snap.status_code == 201, snap.text
+    return sys["id"], snap.json()["id"], hdrs
+
+
+def _metadata_rows(snapshot_id):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT qualified_name, capability FROM symbol_source_metadata WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+
+
+def test_build_symbol_index_step_persists_source_metadata(admin_client, tmp_path):
+    """The build pipeline's symbol_index step used to store code_symbols only,
+    so `probe-agent:` docstring metadata never reached symbol_source_metadata
+    and the capability hierarchy stayed empty after a System Understanding
+    build, although the manual POST /repository/symbols/index stored it."""
+    from app.system_understanding_jobs import StepContext, _run_symbol_index
+
+    token = _login(admin_client)
+    system_id, snapshot_id, hdrs = _setup_metadata_repo(admin_client, token, tmp_path)
+
+    _run_symbol_index(StepContext(
+        build_id=0, step_id=0, step="symbol_index", system_id=system_id, snapshot_id=snapshot_id,
+    ))
+
+    rows = _metadata_rows(snapshot_id)
+    assert [(r["qualified_name"], r["capability"]) for r in rows] == [("summarize", "text summarization")]
+    symbols = admin_client.get("/repository/symbols", headers=hdrs).json()["symbols"]
+    summarize = next(s for s in symbols if s["qualified_name"] == "summarize")
+    assert summarize["source_metadata"]["capability"] == "text summarization"
+
+
+def test_index_written_by_old_build_step_is_backfilled_on_read(admin_client, tmp_path):
+    """Indexes the old build step wrote carry the current-looking schema
+    version but no metadata; reading the index must backfill them once."""
+    from app.db import get_conn
+    from app.system_understanding_jobs import StepContext, _run_symbol_index
+
+    token = _login(admin_client)
+    system_id, snapshot_id, hdrs = _setup_metadata_repo(admin_client, token, tmp_path)
+    _run_symbol_index(StepContext(
+        build_id=0, step_id=0, step="symbol_index", system_id=system_id, snapshot_id=snapshot_id,
+    ))
+    # Reproduce what the old build step left behind.
+    with get_conn() as conn:
+        conn.execute("DELETE FROM explanation_source_anchors WHERE snapshot_id = ?", (snapshot_id,))
+        conn.execute("DELETE FROM symbol_source_metadata WHERE snapshot_id = ?", (snapshot_id,))
+        conn.execute(
+            "UPDATE intelligence_runs SET schema_version = 'provenance-v1', model = 'n/a' "
+            "WHERE snapshot_id = ? AND run_type = 'symbol_index'",
+            (snapshot_id,),
+        )
+    assert _metadata_rows(snapshot_id) == []
+
+    r = admin_client.post("/repository/symbols/index", headers=hdrs)
+    assert r.status_code in (200, 201), r.text
+
+    assert [r["qualified_name"] for r in _metadata_rows(snapshot_id)] == ["summarize"]
+
+
+SOURCE_FILE_V1 = (
+    "---\n"
+    "probe_source:\n"
+    "  source_id: SRC-a\n"
+    "  layer: SL-2\n"
+    "  title: Plan\n"
+    "  publisher: Sponsor\n"
+    "  url: https://example.org/plan\n"
+    "  retrieved: 2026-10-24\n"
+    "  status: current\n"
+    "---\n"
+    "# Plan\n\nIntro.\n\n"
+    "## Goals\n\nEvery child has a place to play.\n"
+)
+
+
+class TestSourceChunksInClaimScan:
+    """vision-to-feature-research.md VF-G4: chunks of a registered external
+    source are scanned with the source prompt version and the source
+    attributes; reused results take the CURRENT source_id."""
+
+    def test_source_chunks_get_source_and_reuse_refreshes_source_id(self, admin_client, tmp_path, monkeypatch):
+        token = _login(admin_client)
+        _, hdrs = _setup_repo(admin_client, token, tmp_path, "job-source-scan", readme_text="# Readme\n\nText.\n")
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(exist_ok=True)
+        (repo / "docs" / "plan.md").write_text(SOURCE_FILE_V1)
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add source"], cwd=str(repo), check=True, capture_output=True)
+
+        def _new_snapshot():
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo), check=True,
+                                 capture_output=True, text=True).stdout.strip()
+            r = admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs)
+            assert r.status_code == 201, r.text
+
+        _new_snapshot()
+
+        import app.system_understanding_service as sus
+        import app.documentation_claim_scanner as scanner_module
+
+        monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
+        calls: list = []
+
+        def _scan(client, config, chunk, cache=None, source=None):
+            calls.append((chunk.path, chunk.heading_path[-1] if chunk.heading_path else "", source))
+            is_source = bool(source)
+            pv, sv = scanner_module.versions_for(is_source)
+            claim_type = "policy_goal" if is_source else "capability_element"
+            return scanner_module.ChunkScanResult(
+                chunk_id=chunk.chunk_id, chunk_content_hash=chunk.content_hash,
+                prompt_version=pv, schema_version=sv,
+                claims=[scanner_module.DocumentationClaim(
+                    claim_type=claim_type, summary=f"claim:{chunk.chunk_id}",
+                    evidence=scanner_module.ClaimEvidence(
+                        path=chunk.path, start_line=chunk.start_line, end_line=chunk.end_line,
+                        source_id=source["source_id"] if source else None,
+                    ),
+                    confidence=0.9,
+                )],
+            )
+
+        monkeypatch.setattr(scanner_module, "scan_chunk", _scan)
+
+        r1 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job1 = _wait_job(admin_client, hdrs, r1.json()["id"])
+        assert job1["status"] == "completed", job1
+        source_calls = [c for c in calls if c[0] == "docs/plan.md"]
+        assert source_calls and all(c[2] and c[2]["source_id"] == "SRC-a" for c in source_calls)
+        assert all(c[2] is None for c in calls if c[0] != "docs/plan.md")
+
+        from app.db import get_conn
+
+        with get_conn() as conn:
+            versions = {
+                (r["chunk_path"], r["prompt_version"])
+                for r in conn.execute(
+                    "SELECT chunk_path, prompt_version FROM system_understanding_llm_tasks WHERE build_id = ?",
+                    (job1["id"],),
+                ).fetchall()
+            }
+        assert ("docs/plan.md", scanner_module.SOURCE_PROMPT_VERSION) in versions
+        assert all(pv == scanner_module.PROMPT_VERSION for path, pv in versions if path != "docs/plan.md")
+
+        # Same body, new source_id in the front matter: the Goals chunk is
+        # byte-identical and reused, but must carry the new source_id.
+        (repo / "docs" / "plan.md").write_text(SOURCE_FILE_V1.replace("SRC-a", "SRC-b"))
+        subprocess.run(["git", "commit", "-am", "rename source"], cwd=str(repo), check=True, capture_output=True)
+        _new_snapshot()
+        calls.clear()
+        r2 = admin_client.post("/repository/system-understanding/build", headers=hdrs)
+        job2 = _wait_job(admin_client, hdrs, r2.json()["id"])
+        assert job2["status"] == "completed", job2
+        assert ("docs/plan.md", "Goals") not in [(c[0], c[1]) for c in calls]  # reused, not rescanned
+
+        r = admin_client.get("/source-register/claims", headers=hdrs)
+        assert r.status_code == 200, r.text
+        claims = r.json()["claims"]
+        assert claims and {c["source_id"] for c in claims} == {"SRC-b"}
+        assert all(c["source"]["attributes"]["publisher"] == "Sponsor" for c in claims)
+
+
+class TestClaimScanStepReuseRespectsVersions:
+    """A rebuild of the SAME snapshot must not reuse the graph when the claim
+    scanner's version for some chunks changed (found while re-scanning the
+    Shibuya sources after adding the `opinion` type)."""
+
+    def test_version_bump_rescans_only_affected_chunks(self, admin_client, tmp_path, monkeypatch):
+        token = _login(admin_client)
+        _, hdrs = _setup_repo(admin_client, token, tmp_path, "job-version-bump", readme_text="# Readme\n\nText.\n")
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(exist_ok=True)
+        (repo / "docs" / "plan.md").write_text(SOURCE_FILE_V1)
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add source"], cwd=str(repo), check=True, capture_output=True)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo), check=True,
+                             capture_output=True, text=True).stdout.strip()
+        assert admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs).status_code == 201
+
+        import app.system_understanding_service as sus
+        import app.documentation_claim_scanner as scanner_module
+
+        monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
+        calls: list = []
+
+        def _scan(client, config, chunk, cache=None, source=None):
+            calls.append(chunk.path)
+            pv, sv = scanner_module.versions_for(bool(source))
+            return scanner_module.ChunkScanResult(
+                chunk_id=chunk.chunk_id, chunk_content_hash=chunk.content_hash,
+                prompt_version=pv, schema_version=sv, claims=[],
+            )
+
+        monkeypatch.setattr(scanner_module, "scan_chunk", _scan)
+        job1 = _wait_job(admin_client, hdrs, admin_client.post(
+            "/repository/system-understanding/build", headers=hdrs).json()["id"])
+        assert job1["status"] == "completed", job1
+        assert "docs/plan.md" in calls
+
+        # Unchanged versions: the whole step is reused, nothing is scanned.
+        calls.clear()
+        job2 = _wait_job(admin_client, hdrs, admin_client.post(
+            "/repository/system-understanding/build", headers=hdrs).json()["id"])
+        assert job2["status"] == "completed", job2
+        assert calls == []
+
+        from app.db import get_conn
+
+        def _graph_ids():
+            with get_conn() as conn:
+                return [r[0] for r in conn.execute(
+                    "SELECT id FROM understanding_graph_snapshots WHERE snapshot_id = ? ORDER BY id",
+                    (job1["snapshot_id"],),
+                ).fetchall()]
+
+        graphs_before = _graph_ids()
+
+        # The source prompt changes: only the source chunks are scanned again,
+        # and the graph is rebuilt from the new results (not reused).
+        monkeypatch.setattr(scanner_module, "SOURCE_PROMPT_VERSION", "claim-scanner-source-test-bump")
+        calls.clear()
+        job3 = _wait_job(admin_client, hdrs, admin_client.post(
+            "/repository/system-understanding/build", headers=hdrs).json()["id"])
+        assert job3["status"] == "completed", job3
+        assert calls and set(calls) == {"docs/plan.md"}
+        assert len(_graph_ids()) == len(graphs_before) + 1
+
+        # And a further rebuild with nothing changed reuses that new graph.
+        calls.clear()
+        job4 = _wait_job(admin_client, hdrs, admin_client.post(
+            "/repository/system-understanding/build", headers=hdrs).json()["id"])
+        assert job4["status"] == "completed", job4
+        assert calls == []
+        assert len(_graph_ids()) == len(graphs_before) + 1

@@ -3,6 +3,7 @@ import { useQuery, useQueries, useMutation, useQueryClient } from "@tanstack/rea
 import { api, getSystemId } from "./client";
 import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
+  InstrumentationCoverageOut, RecentTraceOut, RequestWaterfallOut,
   LineageOut, TraceAnalyzer, AnalysisRun, AnalyzerContext,
   RepositoryStatus,
   RepositoryResyncJob,
@@ -5075,5 +5076,40 @@ export function useRecordProductMilestoneAssessment(milestoneKey: string | null)
     mutationFn: (body: ProductMilestoneAssessmentCreateRequest) =>
       api.post<ProductMilestoneAssessmentOut>(`/product-milestones/${encodeURIComponent(milestoneKey ?? "")}/assessments`, body),
     onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+// ── Instrumentation coverage and live feed ──────────────────────────
+
+export function useInstrumentationCoverage(refetchInterval?: number | false) {
+  return useQuery({
+    queryKey: sysKey("instrumentationCoverage"),
+    queryFn: () => api.get<InstrumentationCoverageOut>("/instrumentation-coverage"),
+    enabled: !!getSystemId(),
+    retry: false,
+    refetchInterval,
+  });
+}
+
+export function useRecentTraces(refetchInterval?: number | false) {
+  return useQuery({
+    queryKey: sysKey("recentTraces"),
+    queryFn: () => api.get<{ items: RecentTraceOut[] }>("/instrumentation-coverage/recent-traces?limit=30"),
+    enabled: !!getSystemId(),
+    retry: false,
+    refetchInterval,
+  });
+}
+
+/** The traced calls of one request, by correlation id or by one of its trace ids. */
+export function useRequestWaterfall(ref: { correlationId?: string | null; traceId?: string | null }) {
+  const path = ref.correlationId
+    ? `/instrumentation-coverage/requests/${encodeURIComponent(ref.correlationId)}`
+    : ref.traceId ? `/instrumentation-coverage/traces/${encodeURIComponent(ref.traceId)}/request` : null;
+  return useQuery({
+    queryKey: sysKey("requestWaterfall", path),
+    queryFn: () => api.get<RequestWaterfallOut>(path as string),
+    enabled: !!path && !!getSystemId(),
+    retry: false,
   });
 }

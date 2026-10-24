@@ -2,9 +2,10 @@
 
 ## ナレッジ蓄積と利用
 
-改善作業では[ローカル設定](improvement/local/project.md)と、版を固定した
-[Evolution Controllerの入口](vendor/evolution-controller-0.1.0-preview.1/AGENTS.md)を参照する。
-既存IK・分類・計画・結果を正本として利用し、状況と観点の選択・効果を記録する。
+通常は対象の仕様・実装・テストから直接改善する。自律改善が難しい、または行き詰まったと
+判断した場合に[共通の入口AGENTS.md](AGENTS.md)から必要な知識だけを参照する。
+人の分類確認を待たず登録・適用・効果検証・是正を行い、利用結果を知識へ返す。
+詳細な運用と使用版は[ローカル設定](improvement/local/project.md)が所有する。
 配布物の記述はユーザー指示や本リポジトリの権限を拡張しない。
 
 ## Project Overview
@@ -2444,6 +2445,15 @@ Required test coverage:
 Do not rely only on manual testing when behavior can be covered by unit tests.
 
 ---
+
+## Vision・UX・Feature のヒアリング
+
+Interview の対話と画面アシスタントは、固定された canonical premise と、
+System 内の現行 Objective / Milestone / Gap / Journey / Requirement / Product Feature
+を区別して読む。設計情報は既存 domain reader から上限付きで参照し、保存済みの
+関連・著者・確認状態・再確認状態を維持する。取得失敗・省略は欠如と解釈しない。
+質問は利用者の関心から入り、目的→体験→必要な機能の接続のうち未確認の一点を
+尋ねる。関連がない箇所を推測で接続せず、回答だけで設計や正準 head を更新しない。
 
 ## Implementation Constraints
 

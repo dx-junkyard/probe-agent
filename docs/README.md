@@ -22,7 +22,7 @@ Vision / Stakeholder Value
 1. [Vision・UX・コア機能要件](00-product/vision-and-core-requirements.md)
 2. [System Understanding の理想状態](00-product/system-understanding-ideal-state.md)
 3. 関心領域に対応する [システム仕様](#01-specifications--システム仕様)
-4. 改善着手時は [製品状態から選ぶ改善サイクル](04-operations/improvement-cycle/README.md) と
+4. 自律改善が難しい、または行き詰まった場合は [製品状態から選ぶ改善サイクル](04-operations/improvement-cycle/README.md) と
    [課題ナレッジ](02-challenges-and-decisions/issue-knowledge/README.md)
 5. 実装・運用時は [運用ガイド](#04-operations--運用ガイド)
 
@@ -56,6 +56,7 @@ Vision / Stakeholder Value
 | [Purpose Chain](01-specifications/product/purpose-chain.md) | Problem、Change、Intervention、Capability の関係 |
 | [Stakeholder Value Network](01-specifications/product/stakeholder-value-network.md) | Stakeholder、Need、Value Exchange と各 projection |
 | [Product Objective Lineage](01-specifications/product/product-objective-lineage.md) | Objective、Milestone、Gap、Feature と上下流 lineage |
+| [Vision → UX → Feature の調査手法](01-specifications/product/vision-to-feature-research.md) | 外部資料の収集、3 種類の現状調査、原因仮説から Feature を選ぶ手順（draft。ドメイン設定で各プロジェクトに当てはめる） |
 | [System 正準 Understanding と Interview premise](01-specifications/product/canonical-understanding.md) | System の正準 head、Interview の前提固定、候補の昇格 |
 
 ### UX / interaction
@@ -67,7 +68,7 @@ Vision / Stakeholder Value
 | [System Understanding Navigation](01-specifications/ux/system-understanding-navigation.md) | 画面間導線、用語、次の操作、Overview projection |
 | [UI Glossary](01-specifications/ux/ui-glossary.md) | 利用者向けラベル、状態語、操作ラベル |
 | [共同検討UX](01-specifications/ux/decision-discussion-workflow.md) | Gapを起点にVision・UX・機能を照合し、仮説調査から設計へ還流する目標導線 |
-| [関心起点のInterview対話](01-specifications/ux/interest-led-interview-discussion.md) | 自由な質問から各Interviewへの補足・訂正を整理する目標UX（設計確定・未実装） |
+| [関心起点のInterview対話](01-specifications/ux/interest-led-interview-discussion.md) | 自由な質問から各Interviewへの補足・訂正を整理するUX（基礎実装済み、利用者評価は未実施） |
 
 ### Core capabilities
 
@@ -78,7 +79,7 @@ Vision / Stakeholder Value
 | [Assistant Discussion](01-specifications/capabilities/assistant-discussion.md) | 画面コンテキスト会話と変更候補化 |
 | [AI Discussion Adapter](01-specifications/capabilities/ai-discussion-adapter.md) | UI adapter、未保存 draft、proposal review の拡張契約 |
 | [Assistant Answer Quality](01-specifications/capabilities/assistant-answer-quality.md) | 通常askの計測・情報選択・根拠付き回答・失敗時応答・待ち時間 (Epic #467) |
-| [Interview Discussion Contributions](01-specifications/capabilities/interview-discussion-contributions.md) | 会話起点と反映先、補足の来歴、API、競合・冪等反映の目標契約（設計確定・未実装） |
+| [Interview Discussion Contributions](01-specifications/capabilities/interview-discussion-contributions.md) | 会話起点と反映先、補足の来歴、API、競合・冪等反映の契約（基礎実装済み、全受入条件の達成は未確認） |
 
 ### Platform / safety
 
@@ -97,6 +98,7 @@ Vision / Stakeholder Value
 
 | 文書 | 記録時点・用途 |
 | --- | --- |
+| [課題・ソリューションの抽象化層の検討](02-challenges-and-decisions/improvement-plans/2026-09-27-knowledge-abstraction.md) | 2026-09-27、既存20件の検討と2候補の手動試行の導入判断 |
 | [System Understanding UX Gap Analysis](02-challenges-and-decisions/ux-gap-analysis-system-understanding.md) | 状態矛盾・導線・用語・テスト不足の調査と改善提案 |
 | [End-to-end UX Audit](02-challenges-and-decisions/end-to-end-ux-audit-2026-08-11.md) | 2026-08-11 時点の優先度付き UX 監査 |
 
@@ -111,6 +113,7 @@ canonical contract を確認する。
 | [System Understanding Scenario](03-validation/dogfooding-system-understanding-scenario.md) | end-to-end 導線の再現可能な検証シナリオ |
 | [改善サイクル導入の検証](03-validation/improvement-cycle/2026-09-19-knowledge-bootstrap.md) | ナレッジ・索引・手順の導入結果。以後の改善結果も同ディレクトリへ置く |
 | [導入前の知識の移入検証](03-validation/improvement-cycle/2026-09-21-historical-knowledge.md) | 過去の修正16件の分類、根拠、収録範囲と未収録事項 |
+| [一般化層の導入検証](03-validation/improvement-cycle/2026-09-27-knowledge-abstraction.md) | 2候補の正例・非適用例、運用接続と既存知識の保持 |
 | [共同検討UXの検証・引継ぎ](03-validation/decision-discussion-handoff.md) | 操作Mock、Issue分担、実装時の検証シナリオと未検証範囲 |
 
 ## 04-operations — 運用ガイド
@@ -118,7 +121,9 @@ canonical contract を確認する。
 | 文書 | 用途 |
 | --- | --- |
 | [製品状態から選ぶ改善サイクル](04-operations/improvement-cycle/README.md) | 根拠付き状態・利用見通し・候補比較・Recipe選択・結果の還流 |
+| [課題と解決原理の一般化候補](../improvement/local/patterns/README.md) | 状況から共通原理・派生形・補完対策を選ぶ手動試行の入口 |
 | [AI Agent Improvement Guide](04-operations/ai-agent-improvement-guide.md) | AI エージェントが改善ループを運用する手順 |
+| [UX評価用ダミーデータの生成指示文](04-operations/ux-dummy-data-generation-prompt.md) | 小規模プロジェクト・ペルソナから段階的に、助言と観測の最適化を評価する素材を生成 |
 | [Production HTTPS Deployment](04-operations/deployment-https.md) | Caddy を含む本番公開、バックアップ、復旧 |
 | [GitHub App Deployment](04-operations/github-app-deployment.md) | GitHub App の登録、秘密鍵配置、ローテーション |
 

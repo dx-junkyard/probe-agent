@@ -3153,7 +3153,10 @@ export default function InterviewPage() {
                               )}
                             </div>
                           )}
-                          <MetadataGrid metadata={proposal.metadata} probe={proposal.probe_plan} />
+                          {proposal.edited_metadata && (
+                            <div className="text-xs text-muted-foreground">人が編集した値を表示しています（AI の元の提案ではありません）。</div>
+                          )}
+                          <MetadataGrid metadata={proposal.edited_metadata ?? proposal.metadata} probe={proposal.edited_probe_plan ?? proposal.probe_plan} />
                           <div className="flex items-center gap-2 justify-end">
                             <Button
                               size="sm"

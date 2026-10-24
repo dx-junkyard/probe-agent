@@ -180,7 +180,7 @@ AskOutcome = "answered" | "deterministic_answer" | "failed" | "rejected" | "erro
 
 ## §4 根拠付き回答 (#471)
 
-### 4.1 出力契約 (`prompt_version: v2`, `schema_version: v2`)
+### 4.1 出力契約 (`prompt_version: v3`, `schema_version: v2`)
 
 ```
 {

@@ -254,6 +254,19 @@ def _collect_file(
 
     route_decls: List[_RouteDecl] = []
     include_calls: List[Tuple[str, ast.Call]] = []
+    # Module-level string constants (`API_PREFIX = "/api"`) used as a prefix.
+    str_consts = {
+        t.id: n.value
+        for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str)
+        for t in n.targets if isinstance(t, ast.Name)
+    }
+    # Module-level `NAME = (a.router, b.router)` so `for r in NAME:` expands too.
+    sequences = {
+        t.id: n.value
+        for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, (ast.Tuple, ast.List))
+        for t in n.targets if isinstance(t, ast.Name)
+    }
 
     def _handler_symbol(func: ast.AST) -> Optional[SymbolRecord]:
         return sym_by_line.get(getattr(func, "lineno", -1))
@@ -269,9 +282,50 @@ def _collect_file(
             if isinstance(attr, ast.Attribute) and attr.attr in (
                 "include_router", "register_blueprint",
             ):
-                include_calls.append((file_path, node))
+                include_calls.append((file_path, _inline_str_consts(node, str_consts)))
+        if isinstance(node, ast.For):
+            include_calls.extend(
+                (file_path, _inline_str_consts(c, str_consts)) for c in _expand_include_loop(node, sequences))
 
     return router_defs, route_decls, include_calls
+
+
+def _inline_str_consts(call: ast.Call, consts: dict) -> ast.Call:
+    """Replace keyword values that name a module-level string constant with it."""
+    if not consts:
+        return call
+    keywords = [
+        ast.keyword(arg=kw.arg, value=consts[kw.value.id])
+        if isinstance(kw.value, ast.Name) and kw.value.id in consts else kw
+        for kw in call.keywords
+    ]
+    return ast.Call(func=call.func, args=call.args, keywords=keywords)
+
+
+def _expand_include_loop(loop: ast.For, sequences: Optional[dict] = None) -> List[ast.Call]:
+    """``for r in (a.router, b.router): app.include_router(r, prefix="/api")``
+    mounts each listed router; return one include call per element so their
+    routes get the prefix (without this they were listed unprefixed). The
+    iterable may also be a module-level tuple/list name (``for r in ROUTERS``)."""
+    iterable = loop.iter
+    if isinstance(iterable, ast.Name) and sequences and iterable.id in sequences:
+        iterable = sequences[iterable.id]
+    if not isinstance(loop.target, ast.Name) or not isinstance(iterable, (ast.Tuple, ast.List)):
+        return []
+    expanded: List[ast.Call] = []
+    for stmt in loop.body:
+        for node in ast.walk(stmt):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("include_router", "register_blueprint")
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == loop.target.id
+            ):
+                for elt in iterable.elts:
+                    expanded.append(ast.Call(func=node.func, args=[elt, *node.args[1:]], keywords=node.keywords))
+    return expanded
 
 
 def _ctor_name(func: ast.expr) -> str:

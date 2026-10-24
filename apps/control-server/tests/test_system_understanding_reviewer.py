@@ -462,6 +462,48 @@ class TestQaInjection:
         assert "Panel Q2" in user_prompt
         assert "不明" in user_prompt
 
+    def test_answered_qa_survives_a_graph_larger_than_the_prompt_budget(self, monkeypatch):
+        # The whole prompt is cut from the tail. Answers used to sit after the
+        # graph, so a large repository dropped every answer and the same
+        # questions came back reworded in the next rebuild.
+        monkeypatch.setenv("INTELLIGENCE_REVIEW_MAX_PROMPT_CHARS", "3000")
+        monkeypatch.setenv("INTELLIGENCE_REVIEW_MAX_NODES_PER_TYPE", "50")
+        graph = _build_graph([_claim(summary=f"capability {i} " + "x" * 150, claim_type="core_capability")
+                              for i in range(40)])
+        answered_qa = [{"question": "『3つの入口』とは何ですか", "answer": "記事・対話・スレッド"}]
+        prompt = _build_review_prompt(graph, _empty_reconciliation(), answered_qa=answered_qa)
+        assert "Prompt truncated" in prompt
+        assert "記事・対話・スレッド" in prompt
+        assert prompt.index("Confirmed Q&A") < prompt.index("Understanding Graph Nodes")
+
+    def test_answered_qa_budget_keeps_the_newest_whole_answers(self, monkeypatch):
+        monkeypatch.setenv("INTERVIEW_ANSWERED_QA_MAX_CHARS", "400")
+        answered_qa = [{"question": f"Q{i}", "answer": f"answer-{i} " + "y" * 60} for i in range(10)]
+        prompt = _build_review_prompt(_build_graph([_claim()]), _empty_reconciliation(), answered_qa=answered_qa)
+        assert "answer-9" in prompt and "answer-0" not in prompt
+        assert "older answered question(s) omitted" in prompt
+        assert "…[truncated to budget]" not in prompt.split("Understanding Graph Nodes")[0]
+
+    def test_reworded_answered_questions_are_not_asked_again(self):
+        response = {**VALID_REVIEW_RESPONSE, "open_questions": [
+            {"question": "『3つの入口』とは具体的にどの入力経路ですか。", "category": "probe_flow", "priority": "high"},
+            {"question": "`GET /api/ingest-runs` はMVPで唯一の明示APIですか。それとも候補保存・公開にも別APIがありますか。",
+             "category": "api", "priority": "medium"},
+            {"question": "7つの注力分野は、課題カード保存時の必須分類ですか、それとも主に閲覧・絞り込み用ですか。",
+             "category": "capability", "priority": "medium"},
+        ]}
+        client = CapturingReasoningClient([response])
+        answered_qa = [
+            {"question": "受入条件にある『3つの入口』は具体的に何を指しますか。", "answer": "記事・対話・スレッド"},
+            {"question": "`GET /api/ingest-runs` 以外に、この理解で押さえるべき主要API境界はありますか。", "answer": "..."},
+        ]
+        result = generate_understanding_review(
+            client, _reasoning_config(), graph=_build_graph([_claim()]),
+            reconciliation=_empty_reconciliation(), answered_qa=answered_qa,
+        )
+        assert [q["question"] for q in result.open_questions] == [
+            "7つの注力分野は、課題カード保存時の必須分類ですか、それとも主に閲覧・絞り込み用ですか。"]
+
     def test_generate_understanding_review_forwards_alignment_feedback_to_prompt(self):
         graph = _build_graph([_claim()])
         recon = _empty_reconciliation()
@@ -490,7 +532,7 @@ class TestQaInjection:
         # Bumped for the Alignment-feedback injection (v5) and again for the
         # Vision section (v6). The audit record must never claim an output was
         # produced by a prompt that no longer exists.
-        assert PROMPT_VERSION == "understanding-review-v8"
+        assert PROMPT_VERSION == "understanding-review-v9"
 
 
 class TestEnumValidation:
@@ -640,7 +682,7 @@ class TestOutputLanguage:
         system_msg = client.calls[0]["messages"][0]["content"]
         assert "in Japanese" in system_msg
         assert "enum values" in system_msg
-        assert result.prompt_version == "understanding-review-v8"
+        assert result.prompt_version == "understanding-review-v9"
         assert "review_capabilities" in system_msg
 
     def test_english_directive(self, monkeypatch):
@@ -763,5 +805,5 @@ class TestVisionSection:
     def test_prompt_and_schema_versions_record_the_vision_change(self):
         from app.system_understanding_reviewer import PROMPT_VERSION, SCHEMA_VERSION
 
-        assert PROMPT_VERSION == "understanding-review-v8"
+        assert PROMPT_VERSION == "understanding-review-v9"
         assert SCHEMA_VERSION == "understanding-review-v2"

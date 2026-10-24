@@ -39,7 +39,7 @@ from ..capability_graph import (
 from ..db import get_conn, write_transaction
 from .. import canonical_understanding, interview_workflow
 from ..interview_workflow import tracked_process
-from ..interview_context import build_interview_context
+from ..interview_context import build_interview_context, focus_paths_in_text
 from ..interview_agent import (
     EVIDENCE_PROMPT_VERSION,
     EVIDENCE_SCHEMA_VERSION,
@@ -620,6 +620,14 @@ def _proposal_out(conn, row) -> InterviewProposalOut:
         "SELECT * FROM intelligence_runs WHERE id = ?",
         (row["intelligence_run_id"],),
     ).fetchone()
+    edited = None
+    if row["approval_state"] == "edited":
+        decision_row = conn.execute(
+            """SELECT * FROM interview_proposal_decision
+               WHERE proposal_id = ? AND decision = 'edited' ORDER BY id DESC LIMIT 1""",
+            (row["id"],),
+        ).fetchone()
+        edited = _decision_out(decision_row) if decision_row else None
     return InterviewProposalOut(
         id=row["id"],
         session_id=row["session_id"],
@@ -654,6 +662,8 @@ def _proposal_out(conn, row) -> InterviewProposalOut:
         proposal_confidence=row["proposal_confidence"] if "proposal_confidence" in row.keys() else None,
         decision_method=row["decision_method"],
         approval_state=row["approval_state"],
+        edited_metadata=edited.edited_metadata if edited else None,
+        edited_probe_plan=edited.edited_probe_plan if edited else None,
         is_mock=bool(row["is_mock"]),
         intelligence_run=_intelligence_run_out(run_row) if run_row else None,
         created_at=row["created_at"],
@@ -1129,6 +1139,18 @@ def rebase_interview_snapshot(
         )
 
         row = _get_session_or_404(conn, session_id, system_id)
+        # The understanding update reads the target snapshot's graph. Say so
+        # here, where the developer just moved the session, instead of only
+        # in the next update's failure.
+        from ..system_understanding_service import _load_graph_for_snapshot
+        graph_note = (
+            ""
+            if _load_graph_for_snapshot(conn, system_id, target_snapshot_id) is not None
+            else (
+                f" Snapshot #{target_snapshot_id} has no System Understanding yet: "
+                "run the System Understanding build before updating this session's understanding."
+            )
+        )
         return InterviewSnapshotRebaseOut(
             session_id=session_id,
             system_id=system_id,
@@ -1140,7 +1162,7 @@ def rebase_interview_snapshot(
             proposals_changed_source=changed_source,
             message=(
                 f"Updated session to snapshot #{target_snapshot_id}; "
-                f"{needs_review} proposal(s) require re-review."
+                f"{needs_review} proposal(s) require re-review." + graph_note
             ),
             session=_session_out(conn, row),
         )
@@ -1490,6 +1512,7 @@ def _interview_dialogue_turn_core(
         context_pack = build_interview_context(
             conn, system_id, snapshot_id, budget_chars=payload.budget,
             stage=session_stage,
+            focus_paths=focus_paths_in_text(conn, system_id, snapshot_id, payload.user_message),
         )
 
         message_rows = conn.execute(
@@ -1512,6 +1535,8 @@ def _interview_dialogue_turn_core(
         # capture, never re-resolved from the current head -- a premise that
         # silently refreshed mid-conversation would be no premise at all.
         canonical_premise = _premise_prompt_facts(session)
+        from ..interview_design_context import build_interview_design_context
+        design_context = build_interview_design_context(conn, system_id)
         # Issue #464 (debt item 9): the reasoning call below runs with this
         # connection released, so the head can move under it. Snapshot the
         # premise facts now and check them again inside the write transaction.
@@ -1687,6 +1712,7 @@ def _interview_dialogue_turn_core(
                 evidence_snippets=evidence_snippets,
                 proposals_requested=proposals_requested,
                 canonical_premise=canonical_premise,
+                design_context=design_context,
             )
 
     # Phase 3 (DB lock re-acquired): persist the turn, its audit runs and
@@ -2101,6 +2127,9 @@ def _interview_dialogue_turn_core(
             ],
             evidence_reads=evidence_reads_out,
             evidence_refs_dropped=turn.evidence_refs_dropped,
+            evidence_targets_omitted=(
+                len(evidence_audit.targets_omitted) if evidence_audit is not None else 0
+            ),
         )
 
 

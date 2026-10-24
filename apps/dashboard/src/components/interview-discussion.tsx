@@ -160,6 +160,10 @@ export function InterviewContributions({ sessionId }: { sessionId: number }) {
   return <section className="rounded border p-3 space-y-3" aria-label="会話からの補足">
     <div className="flex flex-wrap justify-between gap-2"><h2 className="font-medium">会話からの補足</h2><Button variant="outline" size="sm" onClick={() => openScreenAssistant(undefined,sessionId)}>この内容について話す</Button></div>
     <p className="text-xs text-muted-foreground">自由に質問して理解を深め、わかったことを補足できます。保存した補足はユーザーの申告として次回の理解更新で参照します。</p>
+    <Button variant="outline" size="sm" onClick={() => openScreenAssistant(
+      "Vision（誰にどんな変化を届けるか）から、UX（利用場面・体験）、Feature（必要な機能）まで、保存済みの内容と関連を整理してください。つながりが未確認の箇所を一つずつ質問しながら、一緒に具体化したいです。",
+      sessionId,
+    )}>Vision・UX・機能のつながりを相談する</Button>
     {query.isError && <Button onClick={() => query.refetch()}>補足を再取得</Button>}
     {query.data?.items.map(item => <article key={item.id} className="rounded border p-2 space-y-2"><p className="text-xs">{labels[item.kind]} · {item.application ? "反映済み" : "補足として保存済み"}</p><p className="text-sm whitespace-pre-wrap">{item.text}</p><a className="text-xs underline" href={item.origin_url}>起点の会話を開く</a><details><summary className="text-xs">根拠の発言</summary>{item.sources.map((s,i)=><blockquote key={i} className="text-xs whitespace-pre-wrap">{s.quote}</blockquote>)}</details>{!item.application && item.target.target.target_kind !== "session" && ["supplement","correction"].includes(item.kind) && <Button size="sm" variant="outline" disabled={busy || item.target.freshness !== "current"} onClick={() => inspect(item)}>既存の内容へ反映</Button>}{item.target.freshness !== "current" && <p className="text-xs">参照先が変わっています。起点の会話で訂正版の候補を作ってください。</p>}</article>)}
     {cursor > 0 && <Button size="sm" onClick={() => setCursor(0)}>最初へ</Button>}{query.data?.next_cursor && <Button size="sm" onClick={() => setCursor(query.data!.next_cursor!)}>次の補足</Button>}

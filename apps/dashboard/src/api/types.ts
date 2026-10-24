@@ -869,6 +869,9 @@ export interface InterviewProposalOut {
   proposal_confidence: number | null;
   decision_method: InterviewDecisionMethod;
   approval_state: InterviewApprovalState;
+  /** The human edit's values (set when approval_state is "edited"). */
+  edited_metadata?: InterviewProposalMetadataBlock | null;
+  edited_probe_plan?: InterviewProposalProbePlan | null;
   is_mock: boolean;
   intelligence_run: IntelligenceRunOut | null;
   created_at: number;
@@ -986,6 +989,8 @@ export interface InterviewDialogueTurnOut {
   // Issue #142: count of question evidence_refs dropped as unverifiable
   // (graceful fallback, not an error).
   evidence_refs_dropped: number;
+  // Evidence targets pass 1 asked for beyond INTERVIEW_EVIDENCE_MAX_FILES (not read).
+  evidence_targets_omitted: number;
 }
 
 // --- Evidence read audit (Issue #137) -----------------------------------------
@@ -9437,4 +9442,65 @@ export interface OverviewObjectiveOut {
   next_step_requirement_key: string | null;
   degraded_sections: string[];
   degraded_detail: Record<string, string>;
+}
+
+// ── Instrumentation coverage (code-side points × received traces) ──
+export type InstrumentationStatus = "receiving" | "errors" | "not_received" | "metadata_only";
+
+export interface InstrumentationPointOut {
+  path: string;
+  symbol: string;
+  line_start: number;
+  line_end: number;
+  component_id: string | null;
+  instrumentation: "probe" | "wrapper" | "metadata_only";
+  route: string | null;
+  role: string | null;
+  features: string[];
+  status: InstrumentationStatus;
+  trace_count: number;
+  recent_errors: number;
+  last_failed?: boolean;
+  last_seen: number | null;
+  avg_duration_ms: number | null;
+  /** Requests (method + route) the component was reached from, newest first. */
+  entry_flows?: string[];
+}
+
+export interface InstrumentationCoverageOut {
+  system_id: number;
+  snapshot_id: number;
+  sdk_connected: boolean;
+  last_trace_at: number | null;
+  counts: Record<InstrumentationStatus, number>;
+  points: InstrumentationPointOut[];
+  unmatched_components: { component_id: string; trace_count: number; last_seen: number | null }[];
+}
+
+export interface RecentTraceOut {
+  trace_id: string;
+  component_id: string;
+  mode: string | null;
+  ok: boolean;
+  error: string | null;
+  duration_ms: number | null;
+  timestamp: number;
+  input_preview: string | null;
+  output_preview: string | null;
+  code: { path: string; symbol: string; line_start: number; route: string | null } | null;
+  correlation_id?: string | null;
+  /** The request (method + route) this call ran in, when the app binds a request context. */
+  request?: string | null;
+}
+
+export interface RequestWaterfallOut {
+  correlation_id: string;
+  request: string | null;
+  start: number;
+  total_ms: number;
+  calls: {
+    trace_id: string; component_id: string; ok: boolean; error: string | null; duration_ms: number;
+    start: number; end: number; offset_ms: number; depth: number; span_id: string | null; parent_span_id: string | null;
+    code: { path: string; symbol: string; line_start: number; route: string | null } | null;
+  }[];
 }

@@ -2,7 +2,7 @@
 
 [入口](README.md) · [索引・成立状態](index.md) · [分類規則](taxonomy.md)
 
-族→型の2段。下記は分類確認前の暫定型。成立状態は索引が人の分類確定と独立原因数から導出する。
+族→型の2段。下記は分類確認前の暫定型。成立状態は索引が証拠に基づく分類確認と独立原因数から導出する。
 典型座標は検索の手掛かりで、個別エントリへ強制しない。型を変える前に相手との見分け方を確認する。
 
 ### contract-transfer
@@ -247,6 +247,48 @@
 | 発見観点 | invariant_audit / adversarial_review |
 | 解決観点 | single_point_fix / fail_closed |
 | 見分け方・設計時の問い | 未知dimensionを渡したとき、勝手にhigher-is-betterにならず拒否されるか。語彙伝達の問題ではなく局所分岐の既定値が原因。 |
+
+### context-scope
+
+実際の作用範囲と判断材料の範囲の不一致。
+
+#### viewport-used-for-container-layout
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 画面幅だけでレイアウトを選び、パネル併設時の領域縮小を見落とす |
+| 典型座標 | connection.condition |
+| 発見観点 | reproduction / boundary_walk |
+| 解決観点 | explicit_contract / carry_through |
+| 見分け方・設計時の問い | viewportを変えず隣接パネルを開いたとき、実領域に合わせて配置できるか。単なる狭幅の閾値不良と区別する。 |
+
+### repeated-work
+
+処理段をまたいで同じ仕事の固定費を重ねる原因。
+
+#### repeated-resolution-connection-overhead
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 同一リクエストで解決済みの対象を後段で再解決し、接続開設の固定費を増やす |
+| 典型座標 | structure.responsibility + connection.information |
+| 発見観点 | data_inspection / reproduction |
+| 解決観点 | carry_through / responsibility_move |
+| 見分け方・設計時の問い | 遅延はクエリ自体か、接続開設と対象再解決か。共有範囲をリクエスト内に限定し、待機後の必要な再検証を保持できるか。 |
+
+### knowledge-feedback
+
+知識の登録・利用・検証から次の判断への還流を扱う。
+
+#### classification-gates-capture
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 分類の確定を知識登録の開始条件と取り違え、観測済み知見を索引外に滞留させる |
+| 典型座標 | governance.ordering + governance.assignment |
+| 発見観点 | invariant_audit / inventory |
+| 解決観点 | explicit_contract / responsibility_move |
+| 見分け方・設計時の問い | 分類未確定でも根拠付きcandidateとして検索・試行できるか。単なる証拠不足による未登録とは区別する。 |
 
 型の追加時は上記の項目を揃え、同じ変更で少なくとも1つのエントリから参照する。
 単純な局所処理の不良も対象。該当例が得られる前に想像で辞書の型を増やさない。

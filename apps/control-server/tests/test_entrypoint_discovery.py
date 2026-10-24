@@ -100,6 +100,39 @@ class TestApiRouteComposition:
         # Composition diagnostic is surfaced.
         assert any("composed" in d.lower() for d in disc.diagnostics)
 
+    def test_fastapi_routers_mounted_in_a_loop_get_the_prefix(self):
+        # `for r in (a.router, b.router): app.include_router(r, prefix="/api")`
+        # left every route unprefixed (System 7 listed /communities for /api/communities).
+        from app.entrypoint_discovery import discover_entrypoints
+
+        files = {
+            "app/routes/news.py": "from fastapi import APIRouter\nrouter = APIRouter()\n\n@router.get('/news')\ndef list_news():\n    return []\n",
+            "app/routes/communities.py": "from fastapi import APIRouter\nrouter = APIRouter()\n\n@router.post('/communities/{cid}/join')\ndef join(cid):\n    return cid\n",
+            "app/main.py": textwrap.dedent("""\
+                from fastapi import FastAPI
+                from .routes import communities, news
+
+                app = FastAPI()
+                for r in (news.router, communities.router):
+                    app.include_router(r, prefix="/api")
+
+                @app.get("/api/health")
+                def health():
+                    return {}
+            """),
+        }
+        records, fl = _records(files)
+        ids = {e.entrypoint_id for e in discover_entrypoints(records, fl).entrypoints}
+        assert {"GET:/api/news", "POST:/api/communities/{cid}/join", "GET:/api/health"} <= ids
+        assert "GET:/news" not in ids
+
+        files["app/main.py"] = files["app/main.py"].replace(
+            "for r in (news.router, communities.router):", "ROUTERS = (news.router, communities.router)\nfor r in ROUTERS:"
+        ).replace('prefix="/api"', "prefix=API_PREFIX").replace("app = FastAPI()", "app = FastAPI()\nAPI_PREFIX = '/api'")
+        records, fl = _records(files)
+        ids = {e.entrypoint_id for e in discover_entrypoints(records, fl).entrypoints}
+        assert {"GET:/api/news", "POST:/api/communities/{cid}/join"} <= ids
+
     def test_flask_blueprint_url_prefix(self):
         from app.entrypoint_discovery import discover_entrypoints
 

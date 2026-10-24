@@ -42,6 +42,8 @@ from ..models import (
     ProductGapEvidenceRefCreateRequest,
     ProductGapListOut,
     ProductGapOut,
+    ProductGapResolutionChoiceCreateRequest,
+    ProductGapResolutionChoiceOut,
     ProductGapRevisionCreateRequest,
     ProductGapSourceOut,
     ProductGapSourceRefCreateRequest,
@@ -98,6 +100,11 @@ def _raise_for_error(exc: Exception) -> None:
     if isinstance(exc, KeyConflict):
         raise _reject(f"product_{exc.kind}_key_conflict", 409)
     if isinstance(exc, SourceRefUnresolvable):
+        if isinstance(exc, product_objective.SourceRefMalformed):
+            raise HTTPException(status_code=422, detail={
+                "code": "product_gap_source_ref_unresolvable",
+                "message": f"検出元の参照の形式が違います。{exc.source_kind} は {exc.expected} の形で指定してください。",
+            })
         raise _reject("product_gap_source_ref_unresolvable", 422)
     if isinstance(exc, SourceDuplicate):
         raise _reject("product_gap_source_duplicate", 409)
@@ -287,3 +294,30 @@ def record_gap_decision_endpoint(
             _raise_for_error(exc)
             raise
     return ProductGapDecisionOut(**row)
+
+
+@router.post("/{gap_key}/resolution-choices", response_model=ProductGapResolutionChoiceOut, status_code=201)
+def record_gap_resolution_choice_endpoint(
+    gap_key: str,
+    payload: ProductGapResolutionChoiceCreateRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> ProductGapResolutionChoiceOut:
+    """How a human chose to close the Gap (vision-to-feature-research.md
+    §5.3). Never moves `lifecycle` or `priority_band`."""
+    with get_conn() as conn:
+        try:
+            row = product_objective.record_gap_resolution_choice(
+                conn,
+                system_id=system_id,
+                gap_key=gap_key,
+                approach=payload.approach,
+                feature_key=payload.feature_key,
+                rationale=payload.rationale,
+                captured_digest=payload.captured_digest,
+                decided_by=_principal_actor(principal),
+            )
+        except Exception as exc:
+            _raise_for_error(exc)
+            raise
+    return ProductGapResolutionChoiceOut(**row)

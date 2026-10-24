@@ -8,6 +8,8 @@ import CapabilityMapPage from "./pages/capability-map";
 import InterviewPage from "./pages/interview";
 import ProbePlannerPage from "./pages/probe-planner";
 import ProbePatternsPage from "./pages/probe-patterns";
+import InstrumentationCoveragePage from "./pages/instrumentation-coverage";
+import SystemMapPage from "./pages/system-map";
 import FlowExplorerPage from "./pages/flow-explorer";
 import TraceLineagePage from "./pages/trace-lineage";
 import TraceAnalyzersPage from "./pages/trace-analyzers";
@@ -49,6 +51,8 @@ export default function App() {
         <Route path="trace-analyzers" element={<TraceAnalyzersPage />} />
         <Route path="probe-planner" element={<ProbePlannerPage />} />
         <Route path="probe-patterns" element={<ProbePatternsPage />} />
+        <Route path="instrumentation-coverage" element={<InstrumentationCoveragePage />} />
+        <Route path="system-map" element={<SystemMapPage />} />
         <Route path="experiments" element={<ExperimentsPage />} />
         <Route path="connect-sdk" element={<ConnectSdkPage />} />
         <Route path="setup-guide" element={<SetupGuidePage />} />

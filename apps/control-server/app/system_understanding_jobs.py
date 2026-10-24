@@ -905,15 +905,57 @@ def _existing_documentation_index(system_id: int, snapshot_id: int) -> Optional[
     return None
 
 
+def _scan_versions_outdated(conn, system_id: int, snapshot_id: int) -> bool:
+    """True when the latest claim scan of this snapshot used a prompt/schema
+    version other than the one each chunk would get now (for example after
+    the source-claim prompt changed). Reusing that graph would silently keep
+    claims extracted under the old rules; returning True makes the step run,
+    and its own per-chunk reuse still skips every chunk whose version is
+    unchanged. A snapshot with no recorded scan tasks keeps the old behaviour.
+    """
+    from . import documentation_claim_scanner as scanner
+    from .source_register import load_register
+
+    latest = conn.execute(
+        "SELECT MAX(build_id) FROM system_understanding_llm_tasks "
+        "WHERE system_id = ? AND snapshot_id = ? AND task_type = 'claim_scan_chunk' AND status = 'completed'",
+        (system_id, snapshot_id),
+    ).fetchone()[0]
+    if latest is None:
+        return False
+    rows = conn.execute(
+        "SELECT DISTINCT chunk_path, prompt_version, schema_version FROM system_understanding_llm_tasks "
+        "WHERE build_id = ? AND task_type = 'claim_scan_chunk'",
+        (latest,),
+    ).fetchall()
+    source_paths = set(load_register(conn, snapshot_id).path_to_source)
+    for row in rows:
+        expected = scanner.versions_for(row["chunk_path"] in source_paths)
+        if (row["prompt_version"], row["schema_version"]) != expected:
+            return True
+    return False
+
+
 def _existing_graph(system_id: int, snapshot_id: int) -> Optional[Dict[str, Any]]:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, claim_count FROM understanding_graph_snapshots "
+            "SELECT id, claim_count, created_at FROM understanding_graph_snapshots "
             "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
             (system_id, snapshot_id),
         ).fetchone()
-    if row is None:
-        return None
+        if row is None or _scan_versions_outdated(conn, system_id, snapshot_id):
+            return None
+        # A claim scan that finished after this graph was built (for example
+        # one that just re-read chunks under a new prompt version) means the
+        # graph no longer reflects the scan results: rebuild it.
+        newer_scan = conn.execute(
+            "SELECT 1 FROM system_understanding_llm_tasks "
+            "WHERE system_id = ? AND snapshot_id = ? AND task_type = 'claim_scan_chunk' "
+            "AND status = 'completed' AND completed_at > ? LIMIT 1",
+            (system_id, snapshot_id, row["created_at"]),
+        ).fetchone()
+        if newer_scan is not None:
+            return None
     return {"understanding_graph_snapshot_id": row["id"], "claim_count": row["claim_count"]}
 
 
@@ -958,6 +1000,7 @@ _EXISTING_CHECKS = {
 
 def _run_symbol_index(ctx: StepContext) -> Dict[str, Any]:
     from .code_indexer import index_snapshot_files
+    from .repository_refresh_service import _load_file_hash_map, persist_symbol_index
 
     with get_conn() as conn:
         file_rows = conn.execute(
@@ -971,34 +1014,18 @@ def _run_symbol_index(ctx: StepContext) -> Dict[str, Any]:
     result = index_snapshot_files(files)
     ctx.heartbeat()
 
+    # Same persistence as POST /repository/symbols/index: symbols together
+    # with their `probe-agent:` source metadata, anchors and index warnings.
     with get_conn() as conn:
-        now = time.time()
-        run_id = conn.execute(
-            """INSERT INTO intelligence_runs
-                (system_id, snapshot_id, run_type, provider, model,
-                 prompt_version, schema_version, decision_method,
-                 status, is_mock, started_at, completed_at)
-            VALUES (?, ?, 'symbol_index', 'deterministic', 'n/a',
-                    'n/a', 'provenance-v1', 'deterministic',
-                    'completed', 0, ?, ?)""",
-            (ctx.system_id, ctx.snapshot_id, started_at, now),
-        ).lastrowid
-        for sym in result.symbols:
-            conn.execute(
-                """INSERT OR IGNORE INTO code_symbols
-                    (snapshot_id, system_id, path, qualified_name, kind, start_line, end_line,
-                     docstring, decorators, imports, is_test, route_path, route_method,
-                     component_id, symbol_source_hash, symbol_body_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    ctx.snapshot_id, ctx.system_id, sym.path, sym.qualified_name,
-                    sym.kind, sym.start_line, sym.end_line,
-                    sym.docstring, json.dumps(sym.decorators), json.dumps(sym.imports),
-                    1 if sym.is_test else 0, sym.route_path, sym.route_method,
-                    sym.component_id,
-                    sym.symbol_source_hash, sym.symbol_body_hash,
-                ),
-            )
+        run_id = persist_symbol_index(
+            conn,
+            system_id=ctx.system_id,
+            snapshot_id=ctx.snapshot_id,
+            result=result,
+            file_hash_map=_load_file_hash_map(conn, ctx.snapshot_id),
+            started_at=started_at,
+            completed_at=time.time(),
+        )
     return {"intelligence_run_id": run_id, "symbol_count": len(result.symbols)}
 
 
@@ -1111,15 +1138,26 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
     from .documentation_indexer import build_documentation_index
     from .llm import LLMConfig, create_llm_client
 
+    from .source_register import load_register
+
     with get_conn() as conn:
         doc_index = build_documentation_index(conn, ctx.system_id, ctx.snapshot_id)
+        register = load_register(conn, ctx.snapshot_id)
     chunks = doc_index.chunks
     now = time.time()
     max_attempts = _llm_max_attempts()
 
+    # External sources (vision-to-feature-research.md §3.3): a chunk of a
+    # registered source is scanned with the source prompt and versions.
+    sources_by_path: Dict[str, Dict[str, str]] = {}
+    for path, source_id in register.path_to_source.items():
+        entry = register.entries[source_id]
+        sources_by_path[path] = {"source_id": source_id, **entry.attributes}
+
     chunk_by_id = {c.chunk_id: c for c in chunks}
     with get_conn() as conn:
         for chunk in chunks:
+            chunk_prompt_version, chunk_schema_version = scanner.versions_for(chunk.path in sources_by_path)
             conn.execute(
                 """INSERT OR IGNORE INTO system_understanding_llm_tasks
                     (build_id, step_id, system_id, snapshot_id, task_type, chunk_id,
@@ -1129,7 +1167,7 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
                 (
                     ctx.build_id, ctx.step_id, ctx.system_id, ctx.snapshot_id,
                     chunk.chunk_id, chunk.content_hash, chunk.path, chunk.start_line,
-                    scanner.PROMPT_VERSION, scanner.SCHEMA_VERSION,
+                    chunk_prompt_version, chunk_schema_version,
                     max_attempts, now,
                 ),
             )
@@ -1151,7 +1189,7 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
         # documentation index), so they cannot be pulled into the graph via
         # this reuse path.
         reusable = conn.execute(
-            "SELECT id, chunk_id FROM system_understanding_llm_tasks "
+            "SELECT id, chunk_id, prompt_version, schema_version FROM system_understanding_llm_tasks "
             "WHERE build_id = ? AND status = 'pending' ORDER BY id",
             (ctx.build_id,),
         ).fetchall()
@@ -1168,7 +1206,7 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
                      AND build_id != ?
                    ORDER BY id DESC LIMIT 1""",
                 (ctx.system_id, chunk.content_hash, chunk.path,
-                 scanner.PROMPT_VERSION, scanner.SCHEMA_VERSION, ctx.build_id),
+                 row["prompt_version"], row["schema_version"], ctx.build_id),
             ).fetchone()
             if prev is None:
                 continue
@@ -1186,6 +1224,11 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
             except ValueError:
                 continue
             result.chunk_id = chunk.chunk_id
+            # The source_id comes from the CURRENT register: a reused chunk
+            # keeps its text, but its file's front matter may have changed.
+            current_source_id = (sources_by_path.get(chunk.path) or {}).get("source_id")
+            for claim in result.claims:
+                claim.evidence.source_id = current_source_id
             if delta:
                 for claim in result.claims:
                     claim.evidence.start_line += delta
@@ -1234,7 +1277,11 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
                         (attempts, time.time(), task["id"]),
                     )
                 ctx.heartbeat()
-                result = scanner.scan_chunk(client, config, chunk)
+                chunk_source = sources_by_path.get(chunk.path)
+                if chunk_source:
+                    result = scanner.scan_chunk(client, config, chunk, source=chunk_source)
+                else:
+                    result = scanner.scan_chunk(client, config, chunk)
                 if result.error is None:
                     with get_conn() as conn:
                         conn.execute(

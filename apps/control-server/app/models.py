@@ -2783,6 +2783,12 @@ class InterviewProposalOut(BaseModel):
     evidence_summary: Optional[str] = None
     proposal_confidence: Optional[float] = None
     approval_state: InterviewProposalApprovalState
+    # The values a human edit replaced `metadata` / `probe_plan` with. They
+    # live on the decision record; without them here a list of proposals
+    # showed an 'edited' item with its original (pre-edit) values, which read
+    # as if the edit had been lost even though materialization uses them.
+    edited_metadata: Optional[InterviewProposalMetadataBlock] = None
+    edited_probe_plan: Optional[InterviewProposalProbePlan] = None
     is_mock: bool = False
     intelligence_run: Optional[IntelligenceRunOut] = None
     created_at: float
@@ -3093,6 +3099,10 @@ class InterviewDialogueTurnOut(BaseModel):
     # fallback — the question is still asked — so this is surfaced for operator
     # visibility, not an error.
     evidence_refs_dropped: int = 0
+    # Evidence targets pass 1 asked for beyond INTERVIEW_EVIDENCE_MAX_FILES.
+    # They were not read; the turn continued with the first N (cost-budget
+    # truncation), so the omission is reported rather than hidden.
+    evidence_targets_omitted: int = 0
 
 
 # --- Evidence read audit (Issue #137) -----------------------------------------
@@ -13463,6 +13473,15 @@ class StakeholderEvidenceRefOut(BaseModel):
     created_by: Optional[str] = None
     created_at: float
     superseded_by_id: Optional[int] = None
+    #: Read-time join with the external source register
+    #: (vision-to-feature-research.md §3.3) for an `evidence_ref` of the form
+    #: `source:<source_id>[#locator]`: `not_a_source` | `resolved` |
+    #: `unresolved` (no such source in the latest snapshot) | `unavailable`
+    #: (the register could not be read). Never stored on the row.
+    source_resolution: Literal["not_a_source", "resolved", "unresolved", "unavailable"] = "not_a_source"
+    source_id: Optional[str] = None
+    source_locator: str = ""
+    source: Optional[Dict[str, Any]] = None
 
 
 class StakeholderEvidenceRefListOut(BaseModel):
@@ -14444,6 +14463,14 @@ ProductGapDecisionKind = Literal[
 #: never this ledger, whose `decision_method` is CHECK-fixed to `manual`.
 ProductGapPriorityBand = Literal["unset", "watch", "next", "now"]
 
+#: How a human chose to close a Gap (vision-to-feature-research.md §5.3,
+#: VF-G7). A third axis beside `lifecycle` and `priority_band`, folded from
+#: its own manual-only ledger `product_gap_resolution_choice`. It never
+#: moves `lifecycle`: choosing `feature_new` is not resolving the Gap.
+ProductGapResolutionApproach = Literal[
+    "feature_new", "feature_extend", "operation", "sponsor_decision", "out_of_scope",
+]
+
 #: The finite kinds of evidence a `product_gap_evidence_ref` can point at
 #: (§5.9's CHECK). No body column exists anywhere on this model --
 #: structurally, not by convention (mirrors `UxArtifactKind`'s discipline).
@@ -15073,6 +15100,11 @@ class ProductGapOut(BaseModel):
     effective_target_availability: ProductGapEffectiveTargetAvailability = "unknown"
     lifecycle: ProductGapLifecycle = "open"
     priority_band: ProductGapPriorityBand = "unset"
+    #: Latest non-superseded resolution choice; `undecided` when none.
+    resolution_approach: Literal[
+        "undecided", "feature_new", "feature_extend", "operation", "sponsor_decision", "out_of_scope",
+    ] = "undecided"
+    resolution_feature_key: Optional[str] = None
     recheck_state: ProductRecheckState = "current"
     read_flags: List[ProductGapReadFlag] = []
     created_by: Optional[str] = None
@@ -15103,8 +15135,42 @@ class ProductGapDetailOut(ProductGapOut):
     evidence_refs: List[ProductGapEvidenceOut] = []
     artifact_links: List[ProductGapArtifactOut] = []
     decisions: List[ProductGapDecisionOut] = []
+    resolution_choices: List["ProductGapResolutionChoiceOut"] = []
     degraded_sections: List[str] = []
     degraded_detail: Dict[str, str] = {}
+
+
+class ProductGapResolutionChoiceOut(BaseModel):
+    """One row of the human-only resolution-choice ledger (VF-G7)."""
+
+    id: int
+    gap_id: int
+    gap_key: str
+    approach: ProductGapResolutionApproach
+    feature_key: Optional[str] = None
+    rationale: str
+    captured_digest: str = ""
+    captured_revision_id: Optional[int] = None
+    decision_method: Literal["manual"] = "manual"
+    decided_by: Optional[str] = None
+    superseded_by_id: Optional[int] = None
+    created_at: float
+
+
+ProductGapDetailOut.model_rebuild()
+
+
+class ProductGapResolutionChoiceCreateRequest(BaseModel):
+    """`feature_key` is required for `feature_extend`, optional for
+    `feature_new` (the Feature may not exist yet) and refused for the
+    non-feature approaches. `rationale` is required."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approach: ProductGapResolutionApproach
+    feature_key: Optional[str] = None
+    rationale: str
+    captured_digest: str = ""
 
 
 class ProductGapListOut(BaseModel):

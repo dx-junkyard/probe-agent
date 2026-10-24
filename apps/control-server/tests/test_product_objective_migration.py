@@ -183,9 +183,11 @@ class TestInitDbIsRerunnable:
                 r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             )
         assert first == second
-        # All 23 of this Epic's tables exist after the first run.
+        # All 23 of this Epic's tables, plus `product_gap_resolution_choice`
+        # (vision-to-feature-research.md VF-G7), exist after the first run.
         product_tables = [name for name in first if name.startswith("product_")]
-        assert len(product_tables) == 23, product_tables
+        assert len(product_tables) == 24, product_tables
+        assert "product_gap_resolution_choice" in product_tables
 
     def test_init_db_on_a_populated_database_changes_no_rows(self, admin_client, tmp_path):
         from app.db import get_conn, init_db

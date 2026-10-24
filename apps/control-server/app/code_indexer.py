@@ -221,11 +221,37 @@ def _extract_route_info(decorators: List[ast.expr]) -> Tuple[Optional[str], Opti
     return None, None
 
 
-def _extract_component_id(decorators: List[ast.expr]) -> Optional[str]:
+@dataclass(frozen=True)
+class InstrumentationDecorator:
+    """A decorator the target repository uses to instrument a function.
+
+    `@probe(component_id=...)` is built in. A repository that wraps the SDK
+    (e.g. ``observe.observed("chat-agent")`` so it runs without the SDK)
+    declares its wrapper in ``probe-agent.yml``::
+
+        instrumentation:
+          decorators:
+            - name: observed        # last dotted segment of the decorator
+              component_arg: 0      # positional index of the component id
+    """
+
+    name: str
+    component_arg: Optional[int] = None
+
+
+BUILTIN_INSTRUMENTATION = (InstrumentationDecorator(name="probe"),)
+
+
+def _extract_component_id(
+    decorators: List[ast.expr],
+    instrumentation: Tuple[InstrumentationDecorator, ...] = BUILTIN_INSTRUMENTATION,
+) -> Optional[str]:
+    by_name = {d.name: d for d in instrumentation}
     for dec in decorators:
         if not isinstance(dec, ast.Call):
             continue
-        if _decorator_name(dec.func).split(".")[-1] != "probe":
+        spec = by_name.get(_decorator_name(dec.func).split(".")[-1])
+        if spec is None:
             continue
         for kw in dec.keywords:
             if (
@@ -234,7 +260,31 @@ def _extract_component_id(decorators: List[ast.expr]) -> Optional[str]:
                 and isinstance(kw.value.value, str)
             ):
                 return kw.value.value
+        if spec.component_arg is not None and len(dec.args) > spec.component_arg:
+            arg = dec.args[spec.component_arg]
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                return arg.value
     return None
+
+
+def instrumentation_from_config(raw_text: str) -> Tuple[InstrumentationDecorator, ...]:
+    """Read `instrumentation.decorators` from probe-agent.yml (fail-safe:
+    an unreadable section only means no extra decorators)."""
+    try:
+        raw = yaml.safe_load(raw_text)
+    except yaml.YAMLError:
+        return BUILTIN_INSTRUMENTATION
+    section = raw.get("instrumentation") if isinstance(raw, dict) else None
+    decorators = section.get("decorators") if isinstance(section, dict) else None
+    extra = []
+    for item in decorators if isinstance(decorators, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"].strip():
+            arg = item.get("component_arg")
+            extra.append(InstrumentationDecorator(
+                name=item["name"].strip().split(".")[-1],
+                component_arg=arg if isinstance(arg, int) and arg >= 0 else None,
+            ))
+    return BUILTIN_INSTRUMENTATION + tuple(extra)
 
 
 def _is_pydantic_model(node: ast.ClassDef) -> bool:
@@ -477,7 +527,11 @@ def index_python_file(
     return result.symbols, result.imports, result.warnings[0] if result.warnings else None
 
 
-def index_python_file_full(path: str, source: str) -> FileIndexResult:
+def index_python_file_full(
+    path: str,
+    source: str,
+    instrumentation: Tuple[InstrumentationDecorator, ...] = BUILTIN_INSTRUMENTATION,
+) -> FileIndexResult:
     try:
         tree = ast.parse(source, filename=path)
     except SyntaxError as exc:
@@ -558,7 +612,7 @@ def index_python_file_full(path: str, source: str) -> FileIndexResult:
                 qname = f"{prefix}.{child.name}" if prefix else child.name
                 decorator_strs = [_decorator_str(d) for d in child.decorator_list]
                 route_path, route_method = _extract_route_info(child.decorator_list)
-                component_id = _extract_component_id(child.decorator_list)
+                component_id = _extract_component_id(child.decorator_list, instrumentation)
                 is_test = _is_test_function(child.name, path)
                 kind = "async_function" if isinstance(child, ast.AsyncFunctionDef) else "function"
                 func_symbol = CodeSymbol(
@@ -608,6 +662,10 @@ def index_snapshot_files(
     all_symbols: List[CodeSymbol] = []
     all_imports: List[ImportInfo] = []
     warnings: List[IndexWarning] = []
+    instrumentation = BUILTIN_INSTRUMENTATION
+    for path, content in files:
+        if path == "probe-agent.yml":
+            instrumentation = instrumentation_from_config(content.decode("utf-8", errors="replace"))
 
     for path, content in files:
         if not path.endswith(".py"):
@@ -618,7 +676,7 @@ def index_snapshot_files(
             warnings.append(IndexWarning(path=path, message="Cannot decode file as UTF-8"))
             continue
 
-        result = index_python_file_full(path, source)
+        result = index_python_file_full(path, source, instrumentation)
         all_symbols.extend(result.symbols)
         all_imports.extend(result.imports)
         warnings.extend(result.warnings)

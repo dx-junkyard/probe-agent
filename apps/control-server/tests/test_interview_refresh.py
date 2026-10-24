@@ -844,3 +844,118 @@ def test_refresh_skips_rebuild_when_nothing_new(admin_client, tmp_path, monkeypa
             "SELECT COUNT(*) FROM understanding_revision WHERE session_id = ?", (session_id,)
         ).fetchone()[0]
     assert revision_count_after == revision_count_before
+
+
+# --- 10. background refresh runs inside the System quota context ---------
+
+
+class _QuotaCheckingReviewClient(_FakeReviewClient):
+    """Enforces the same guard as the production LLM wrapper
+    (app.llm._consume_current_system_quota): a call made without a System
+    quota context raises LLMSystemContextMissing."""
+
+    def generate_text(self, messages, *, temperature=None, max_tokens=None):
+        from app.llm import _consume_current_system_quota
+
+        _consume_current_system_quota()
+        return super().generate_text(messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def _insert_pending_job(session_id, system_id):
+    from app.db import get_conn
+
+    now = time.time()
+    with get_conn() as conn:
+        return conn.execute(
+            """INSERT INTO interview_refresh_job
+                (session_id, system_id, trigger_kind, base_revision_id,
+                 base_answer_marker, status, created_at)
+            VALUES (?, ?, 'qa_answer', NULL, ?, 'pending', ?)""",
+            (session_id, system_id, now, now),
+        ).lastrowid
+
+
+def _job_row(job_id):
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        return dict(conn.execute("SELECT * FROM interview_refresh_job WHERE id = ?", (job_id,)).fetchone())
+
+
+def test_background_refresh_sets_system_quota_context(admin_client, tmp_path, monkeypatch):
+    """The refresh job runs on its own thread in production, outside any
+    request's quota context. It must set that context itself, as the
+    System Understanding build job does, or every LLM call fails with
+    "A System quota context is required before every LLM execution"."""
+    import app.routes.interview as interview_route
+    from app.interview_refresh import run_refresh_job
+    from app.resource_limits import current_system_id
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    session_id = _create_session(admin_client, _headers(token, system_id), snapshot_id)
+    _stub_understanding_review(monkeypatch)
+    monkeypatch.setattr(interview_route, "create_llm_client", lambda config: _QuotaCheckingReviewClient())
+    _stub_alignment_build(monkeypatch, items=[])
+    job_id = _insert_pending_job(session_id, system_id)
+
+    # Run on a fresh thread, exactly like _dispatch does outside eager mode.
+    thread = threading.Thread(target=run_refresh_job, args=(job_id,))
+    thread.start()
+    thread.join(timeout=30)
+
+    job = _job_row(job_id)
+    assert job["status"] == "updated", job["error"]
+    assert job["result_revision_id"] is not None
+    assert current_system_id() is None  # the context does not leak to the caller
+
+
+def test_refresh_job_crash_is_recorded_and_does_not_leave_w1(admin_client, tmp_path, monkeypatch):
+    """An unexpected exception during the rebuild must close the job as
+    'failed' (with the error) instead of leaving it 'updating' forever,
+    which made workflow-state report a running understanding_update (W1)
+    that never ends, and must still drain the next queued job."""
+    import app.routes.interview as interview_route
+    from app.interview_refresh import run_refresh_job
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    def boom(session, system_id):
+        raise RuntimeError("unexpected rebuild crash")
+
+    monkeypatch.setattr(interview_route, "_rebuild_understanding_core", boom)
+    first = _insert_pending_job(session_id, system_id)
+    second = _insert_pending_job(session_id, system_id)
+
+    run_refresh_job(first)
+
+    for job_id in (first, second):
+        job = _job_row(job_id)
+        assert job["status"] == "failed"
+        assert "unexpected rebuild crash" in job["error"]
+        assert job["finished_at"] is not None
+
+    state = admin_client.get(
+        f"/interview/workflow-state?session_id={session_id}", headers=headers
+    ).json()
+    # No phantom running understanding_update is left behind for the finished jobs.
+    assert "understanding_update" not in state["facts"]["running_process_kinds"]
+
+
+def test_startup_recovery_closes_jobs_left_open(admin_client, tmp_path):
+    """A pending/updating refresh job whose thread is gone used to stay open
+    forever (System 7 interview 15, job #4): the screen showed 「更新中」 and
+    retry refused it because it was not failed. Startup recovery closes it as
+    failed so it can be retried."""
+    from app.interview_refresh import recover_interrupted_refresh_jobs, retry_refresh_job
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path)
+    session_id = _create_session(admin_client, _headers(token, system_id), snapshot_id)
+    job_id = _insert_pending_job(session_id, system_id)
+
+    assert recover_interrupted_refresh_jobs() >= 1
+    job = _job_row(job_id)
+    assert job["status"] == "failed" and "restarted" in job["error"]
+    assert recover_interrupted_refresh_jobs() == 0  # idempotent
+    retry_refresh_job(job_id, session_id, system_id)  # now retryable; must not raise

@@ -3,7 +3,7 @@ import {
   LayoutDashboard, GitBranch, Map, Crosshair, FlaskConical,
   Plug, Sparkles, Boxes, Settings, Users, ChevronLeft, ChevronRight, MessageSquare,
   Workflow, Network, MessageSquareText, Brain, GitFork, Filter,
-  LifeBuoy, BookMarked, GitMerge, Beaker, Bot, Layers, PenTool, Rows3, Target,
+  LifeBuoy, BookMarked, GitMerge, Beaker, Bot, Layers, PenTool, Rows3, Target, Radio,
 } from "lucide-react";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -108,6 +108,10 @@ const NAV_GROUPS: NavGroup[] = [
       // touched here (owned by other in-flight sub-issues).
       { to: "/probe-patterns", icon: BookMarked, label: "Probe Patterns" },
       { to: "/connect-sdk", icon: Plug, label: "Connect SDK" },
+      {
+        to: "/instrumentation-coverage", icon: Radio, label: "計測カバレッジ", keywords: ["coverage", "動作確認", "ライブ"],
+        subtitle: "計測点ごとの受信状況とライブ表示",
+      },
     ],
   },
   {
@@ -238,11 +242,15 @@ function SidebarBrand({ collapsed }: { collapsed: boolean }) {
 
 // Issue #466 (UX-13): 初見の利用者が「現状を理解する」「要件を設計する」
 // 「候補を比較評価する」の開始地点を、機能名を知らなくても選べるように、
-// 目的の言葉で 3 つの入口を置く。行き先は既存の画面で、新しいナビ体系や
+// 目的の言葉で入口を置く（「全体を見渡す」「動作を確かめる」を追加して 5 つ）。行き先は既存の画面で、新しいナビ体系や
 // canonical な状態は作らない (#401 の方針)。
 const PURPOSE_ENTRIES: { to: string; icon: typeof LayoutDashboard; label: string; hint: string }[] = [
+  // 全体像: Feature → コード → 入口 → 計測の受信状況を 1 枚で見る。
+  { to: "/system-map", icon: Map, label: "全体を見渡す", hint: "システムマップを開く" },
   { to: "/system-understanding", icon: Brain, label: "現状を理解する", hint: "System Understanding を開く" },
   { to: "/ux-design-studio", icon: PenTool, label: "要件を設計する", hint: "UX Design Studio を開く" },
+  // probe を入れた所が動いているかを、計測点ごとの受信状況とライブ表示で確かめる。
+  { to: "/instrumentation-coverage", icon: Radio, label: "動作を確かめる", hint: "計測カバレッジを開く" },
   { to: "/experiments", icon: FlaskConical, label: "候補を比較評価する", hint: "Experiments を開く" },
 ];
 

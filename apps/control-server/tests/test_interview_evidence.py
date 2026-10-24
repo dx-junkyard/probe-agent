@@ -300,6 +300,66 @@ def test_select_evidence_targets_llm_error_fails_closed():
     assert "timeout" in result.error
 
 
+class _RecordingLLMClient(FakeLLMClient):
+    def __init__(self, response: Any = None):
+        super().__init__(response=response)
+        self.messages: List[Any] = []
+
+    def generate_text(self, messages, *, temperature=None, max_tokens=None) -> str:
+        self.messages.append(messages)
+        return super().generate_text(messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def _many_targets(n):
+    return [
+        {"path": "src/summarize.py", "start_line": i, "end_line": i + 1, "reason": f"read {i}"}
+        for i in range(1, n + 1)
+    ]
+
+
+def test_select_evidence_targets_prompt_states_effective_file_limit(monkeypatch):
+    """The prompt must state the limit validation will enforce. It used to say
+    MAX_EVIDENCE_TARGETS (10) while INTERVIEW_EVIDENCE_MAX_FILES defaults to
+    5, so a model that obeyed the prompt with 6-10 targets failed the turn."""
+    monkeypatch.setenv("INTERVIEW_EVIDENCE_MAX_FILES", "3")
+    client = _RecordingLLMClient(response={"need_evidence": False, "targets": []})
+    select_evidence_targets(
+        client, _make_config(), context_pack=_context_pack(), history=[], user_message="Ask.",
+    )
+    system_prompt = client.messages[0][0]["content"]
+    assert "at most 3 entries" in system_prompt
+
+
+def test_select_evidence_targets_truncates_targets_over_file_limit(monkeypatch):
+    """More targets than INTERVIEW_EVIDENCE_MAX_FILES is a cost-budget overrun,
+    not an unsafe selection: keep the model's first N (its priority order)
+    and report what was omitted instead of failing the whole turn."""
+    monkeypatch.setenv("INTERVIEW_EVIDENCE_MAX_FILES", "5")
+    client = FakeLLMClient(response={"need_evidence": True, "targets": _many_targets(9)})
+    result = select_evidence_targets(
+        client, _make_config(), context_pack=_context_pack(), history=[],
+        user_message="Ask about the summarizer.",
+    )
+    assert result.error is None
+    assert result.need_evidence is True
+    assert [t.start_line for t in result.targets] == [1, 2, 3, 4, 5]
+    assert [t.start_line for t in result.targets_omitted] == [6, 7, 8, 9]
+
+
+def test_select_evidence_targets_truncation_still_validates_kept_targets(monkeypatch):
+    """Truncation never relaxes the safety checks on the targets that are kept."""
+    monkeypatch.setenv("INTERVIEW_EVIDENCE_MAX_FILES", "1")
+    client = FakeLLMClient(response={"need_evidence": True, "targets": [
+        {"path": "src/unknown.py", "start_line": 1, "end_line": 2, "reason": "x"},
+        {"path": "src/summarize.py", "start_line": 1, "end_line": 2, "reason": "y"},
+    ]})
+    result = select_evidence_targets(
+        client, _make_config(), context_pack=_context_pack(), history=[], user_message="Ask.",
+    )
+    assert result.error is not None
+    assert "unknown path" in result.error
+
+
 def test_select_evidence_targets_invalid_config_fails_closed(monkeypatch):
     """An invalid INTERVIEW_EVIDENCE_* value must become a recorded turn
     failure (fail-closed), never an unhandled exception."""

@@ -426,3 +426,30 @@ def test_stage_aware_truncation_prioritizes_entrypoints(admin_client):
 
     # The stage-dependent choice is recorded for auditability.
     assert any("api_boundary_mapping" in note for note in api_pack.omission_notes)
+
+
+def test_files_named_in_the_turn_survive_the_budget(admin_client):
+    """A file late in path order was dropped by the budget even when the
+    developer named it, and the turn then failed evidence validation for it
+    (System 7 interview 15: apps/api/app/routes/issues.py)."""
+    token, system_id, snapshot_id = _setup(admin_client)
+    _insert_symbols(system_id, snapshot_id, count=60, prefix="apps/api/app/agents/a.py")
+    _insert_symbols(system_id, snapshot_id, count=3, prefix="apps/api/app/routes/issues.py")
+
+    from app.db import get_conn
+    from app.interview_context import build_interview_context, focus_paths_in_text
+
+    with get_conn() as conn:
+        plain = build_interview_context(conn, system_id, snapshot_id, budget_chars=6000)
+        focus = focus_paths_in_text(conn, system_id, snapshot_id,
+                                    "対象は apps/api/app/routes/issues.py の candidate_context")
+        focused = build_interview_context(conn, system_id, snapshot_id, budget_chars=6000, focus_paths=focus)
+        tiny = build_interview_context(conn, system_id, snapshot_id, budget_chars=200, focus_paths=focus)
+
+    assert focus == {"apps/api/app/routes/issues.py"}
+    assert plain.truncated and "apps/api/app/routes/issues.py" not in {s.path for s in plain.symbols}
+    assert focused.truncated
+    assert [s.path for s in focused.symbols[:3]] == ["apps/api/app/routes/issues.py"] * 3
+    assert focused.budget_used_chars <= 6000
+    # The budget still wins when even the named files do not fit.
+    assert tiny.budget_used_chars <= 200 or not tiny.symbols

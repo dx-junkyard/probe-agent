@@ -85,6 +85,7 @@ from .models import (
     ProductGapEvidenceKind,
     ProductGapLifecycle,
     ProductGapPriorityBand,
+    ProductGapResolutionApproach,
     ProductGapReadFlag,
     ProductGapSourceKind,
     ProductGapSourceState,
@@ -123,6 +124,7 @@ __all__ = [
     "RefKindInvalid",
     "SourceKindInvalid",
     "SourceRefUnresolvable",
+    "SourceRefMalformed",
     "LinkKindInvalid",
     "content_digest",
     "objective_revision_digest",
@@ -183,6 +185,11 @@ GAP_SOURCE_STATES: Tuple[str, ...] = get_args(ProductGapSourceState)
 GAP_LIFECYCLES: Tuple[str, ...] = get_args(ProductGapLifecycle)
 GAP_DECISION_KINDS: Tuple[str, ...] = get_args(ProductGapDecisionKind)
 GAP_PRIORITY_BANDS: Tuple[str, ...] = get_args(ProductGapPriorityBand)
+GAP_RESOLUTION_APPROACHES: Tuple[str, ...] = get_args(ProductGapResolutionApproach)
+#: A resolution choice makes no sense once a human said the Gap is not a Gap
+#: (`rejected`) or no longer a question (`obsolete`).
+_GAP_RESOLUTION_CHOICE_ILLEGAL_FROM: Tuple[str, ...] = ("rejected", "obsolete")
+_GAP_RESOLUTION_FEATURE_APPROACHES: Tuple[str, ...] = ("feature_new", "feature_extend")
 GAP_EVIDENCE_KINDS: Tuple[str, ...] = get_args(ProductGapEvidenceKind)
 GAP_ARTIFACT_LINK_KINDS: Tuple[str, ...] = get_args(ProductGapArtifactLinkKind)
 GAP_READ_FLAGS: Tuple[str, ...] = get_args(ProductGapReadFlag)
@@ -428,6 +435,16 @@ class SourceRefUnresolvable(ProductObjectiveValidationError):
     fact, and the developer would learn that only by reading a permanently
     degraded row later.
     """
+
+
+class SourceRefMalformed(SourceRefUnresolvable):
+    """The ref lacks the structure its kind requires. Same 422 code as its
+    parent; the message names the expected format."""
+
+    def __init__(self, source_kind: str, expected: str, got: str) -> None:
+        super().__init__(f"source_ref for {source_kind} must have the form {expected}; got {got!r}")
+        self.source_kind = source_kind
+        self.expected = expected
 
 
 class LinkKindInvalid(ProductObjectiveValidationError):
@@ -2208,7 +2225,9 @@ def _is_unique_violation(exc: sqlite3.IntegrityError, table: str) -> bool:
 
 
 def _check_source_ref_resolvable(source_kind: str, source_ref: str) -> None:
-    """§5.4.2: refuse a `functional_lineage_gap` ref whose gap code only the
+    """Refuse a ref that can never resolve: one without the structure its
+    kind's resolver splits (`product_gap_sources.SOURCE_REF_FORMATS`), and
+    (§5.4.2) a `functional_lineage_gap` ref whose gap code only the
     Functional Lineage view's Product Objective sections emit.
 
     A Gap's own source resolution must run that projection with those
@@ -2223,6 +2242,11 @@ def _check_source_ref_resolvable(source_kind: str, source_ref: str) -> None:
     code set itself lives in `functional_lineage` beside the sections that
     emit it.
     """
+    from .product_gap_sources import malformed_source_ref_hint
+
+    expected = malformed_source_ref_hint(source_kind, source_ref)
+    if expected is not None:
+        raise SourceRefMalformed(source_kind, expected, source_ref)
     if source_kind != "functional_lineage_gap":
         return
     parts = source_ref.split("|", 2)
@@ -2542,6 +2566,89 @@ def record_gap_decision(
     return dict(row)
 
 
+def derive_gap_resolution_choice(conn: sqlite3.Connection, system_id: int, gap_key: str) -> Optional[Dict[str, Any]]:
+    """VF-G7: the latest non-superseded resolution choice, or None."""
+    row = conn.execute(
+        """SELECT * FROM product_gap_resolution_choice
+           WHERE system_id = ? AND gap_key = ? AND superseded_by_id IS NULL
+           ORDER BY id DESC LIMIT 1""",
+        (system_id, gap_key),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def record_gap_resolution_choice(
+    conn: sqlite3.Connection,
+    *,
+    system_id: int,
+    gap_key: str,
+    approach: str,
+    feature_key: Optional[str],
+    rationale: str,
+    captured_digest: str = "",
+    decided_by: Optional[str],
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Record how a human chose to close a Gap (vision-to-feature-research.md
+    §5.3). Append-only; supersedes the previous choice. Never moves
+    `lifecycle` or `priority_band`."""
+    now = time.time() if now is None else now
+    _check_membership(approach, GAP_RESOLUTION_APPROACHES, "approach")
+    rationale = (rationale or "").strip()
+    if not rationale:
+        raise ProductObjectiveValidationError("rationale is required for a resolution choice")
+    feature_key = (feature_key or "").strip() or None
+    if approach == "feature_extend" and feature_key is None:
+        raise ProductObjectiveValidationError("feature_extend requires feature_key (the Feature being extended)")
+    if approach not in _GAP_RESOLUTION_FEATURE_APPROACHES and feature_key is not None:
+        raise ProductObjectiveValidationError(f"{approach} does not take a feature_key")
+
+    gap = _get_gap_row(conn, system_id, gap_key)
+    if gap is None:
+        raise NotFound(f"Gap {gap_key!r} not found")
+    if feature_key is not None:
+        feature = conn.execute(
+            "SELECT id FROM product_feature WHERE system_id = ? AND feature_key = ?", (system_id, feature_key)
+        ).fetchone()
+        if feature is None:
+            raise NotFound(f"Feature {feature_key!r} not found")
+
+    current_digest = _gap_current_digest(conn, gap)
+    if captured_digest and captured_digest != current_digest:
+        raise DecisionStaleDigest("gap", gap_key)
+    lifecycle, _ = derive_gap_lifecycle(conn, system_id, gap_key)
+    if lifecycle in _GAP_RESOLUTION_CHOICE_ILLEGAL_FROM:
+        raise NotDecidable("gap", gap_key)
+
+    conn.execute("BEGIN")
+    try:
+        prior = conn.execute(
+            """SELECT id FROM product_gap_resolution_choice
+               WHERE system_id = ? AND gap_key = ? AND superseded_by_id IS NULL
+               ORDER BY id DESC LIMIT 1""",
+            (system_id, gap_key),
+        ).fetchone()
+        cur = conn.execute(
+            """INSERT INTO product_gap_resolution_choice
+                   (system_id, gap_id, gap_key, approach, feature_key, rationale, captured_digest,
+                    captured_revision_id, decided_by, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (system_id, gap["id"], gap_key, approach, feature_key, rationale, captured_digest,
+             gap["current_revision_id"], decided_by, now),
+        )
+        new_id = cur.lastrowid
+        if prior is not None:
+            conn.execute(
+                "UPDATE product_gap_resolution_choice SET superseded_by_id = ? WHERE id = ?", (new_id, prior["id"])
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    row = conn.execute("SELECT * FROM product_gap_resolution_choice WHERE id = ?", (new_id,)).fetchone()
+    return dict(row)
+
+
 def _gap_revision_out_dict(row: Dict[str, Any]) -> Dict[str, Any]:
     d = dict(row)
     d["revision_state"] = "superseded" if d["superseded_by_id"] is not None else "current"
@@ -2589,6 +2696,7 @@ def _gap_out_dict(conn: sqlite3.Connection, system_id: int, gap: Dict[str, Any])
 
     lifecycle, lifecycle_row = derive_gap_lifecycle(conn, system_id, gap["gap_key"])
     priority_band = derive_gap_priority_band(conn, system_id, gap["gap_key"])
+    resolution = derive_gap_resolution_choice(conn, system_id, gap["gap_key"])
     # The EFFECTIVE digest, not the revision's own column: an
     # `inherited_from_milestone` Gap is judged against a target that lives
     # on the Milestone (§5.3), so its recheck has to see that target move.
@@ -2646,6 +2754,8 @@ def _gap_out_dict(conn: sqlite3.Connection, system_id: int, gap: Dict[str, Any])
         "effective_target_availability": effective_target_availability,
         "lifecycle": lifecycle,
         "priority_band": priority_band,
+        "resolution_approach": resolution["approach"] if resolution else "undecided",
+        "resolution_feature_key": resolution["feature_key"] if resolution else None,
         "recheck_state": recheck_state,
         "read_flags": read_flags,
         "created_by": gap["created_by"],
@@ -2765,6 +2875,16 @@ def get_gap_detail(conn: sqlite3.Connection, system_id: int, gap_key: str) -> Di
     except Exception as exc:  # pragma: no cover - defensive
         _degrade(degraded_sections, degraded_detail, "decisions", exc)
 
+    resolution_choices: List[Dict[str, Any]] = []
+    try:
+        rows = conn.execute(
+            "SELECT * FROM product_gap_resolution_choice WHERE system_id = ? AND gap_key = ? ORDER BY id DESC",
+            (system_id, gap_key),
+        ).fetchall()
+        resolution_choices = [dict(r) for r in rows]
+    except Exception as exc:  # pragma: no cover - defensive
+        _degrade(degraded_sections, degraded_detail, "resolution_choices", exc)
+
     summary.update(
         {
             "current_revision": revision_out,
@@ -2773,6 +2893,7 @@ def get_gap_detail(conn: sqlite3.Connection, system_id: int, gap_key: str) -> Di
             "evidence_refs": evidence_refs,
             "artifact_links": artifact_links,
             "decisions": decisions,
+            "resolution_choices": resolution_choices,
             "degraded_sections": degraded_sections,
             "degraded_detail": degraded_detail,
         }

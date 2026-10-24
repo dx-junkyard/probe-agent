@@ -1970,6 +1970,12 @@ def create_evidence_ref(
 ) -> Dict[str, Any]:
     now = time.time() if now is None else now
     _check_membership(evidence_kind, EVIDENCE_KINDS, "evidence_kind")
+    if evidence_ref.startswith("source:") and evidence_kind not in ("document", "external_analytics"):
+        # A registered external source is a document or a third-party
+        # figure; it is never a human interview note or a runtime reading.
+        raise StakeholderValidationError(
+            "evidence_ref 'source:...' requires evidence_kind document or external_analytics"
+        )
     if subject_kind not in ("stakeholder_need", "environment_observation", "value_exchange"):
         raise StakeholderValidationError(
             f"subject_kind must be one of stakeholder_need, environment_observation, "
@@ -2015,9 +2021,35 @@ def list_evidence_refs(conn: sqlite3.Connection, system_id: int, subject_kind: s
         evidence_refs = [dict(r) for r in rows]
     except Exception as exc:  # pragma: no cover - defensive
         _degrade(degraded_sections, degraded_detail, "evidence_refs", exc)
+    _join_source_register(conn, system_id, evidence_refs)
     return {
         "evidence_refs": evidence_refs, "degraded_sections": degraded_sections, "degraded_detail": degraded_detail,
     }
+
+
+def _join_source_register(conn: sqlite3.Connection, system_id: int, evidence_refs: List[Dict[str, Any]]) -> None:
+    """Attach source attributes to `source:` evidence refs at read time
+    (vision-to-feature-research.md §3.3, VF-G3). The register is read from
+    the latest ready snapshot; a failed read marks those refs `unavailable`,
+    never `unresolved`."""
+    from .source_register import SourceRegister, latest_snapshot_id, load_register, resolve_source_ref
+
+    if not any((r.get("evidence_ref") or "").startswith("source:") for r in evidence_refs):
+        return
+    try:
+        sid = latest_snapshot_id(conn, system_id)
+        register = (
+            load_register(conn, sid) if sid is not None
+            else SourceRegister(snapshot_id=None, state="none")
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        register = SourceRegister(snapshot_id=None, state="unavailable", detail=str(exc))
+    for ref in evidence_refs:
+        resolved = resolve_source_ref(register, ref.get("evidence_ref") or "")
+        ref["source_resolution"] = resolved["resolution"]
+        ref["source_id"] = resolved["source_id"]
+        ref["source_locator"] = resolved["locator"]
+        ref["source"] = resolved["source"]
 
 
 # --- Issue #421: GET /stakeholder-network/exchanges/{key}/lineage ---------------

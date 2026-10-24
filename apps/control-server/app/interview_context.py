@@ -120,10 +120,15 @@ def build_interview_context(
     snapshot_id: int,
     budget_chars: Optional[int] = None,
     stage: Optional[str] = None,
+    focus_paths: Optional[Set[str]] = None,
 ) -> InterviewContextPack:
     """Build a deterministic interview context pack.
 
     Selection order:
+    0. Items in ``focus_paths`` (files the developer named in this turn) come
+       first in each list, so the budget never drops the very files the
+       request is about. Without this a large repository lost files late in
+       path order, and the turn then failed evidence validation for them.
     1. Unclassified symbols first (they most need authoring), then classified.
     2. Within each group, order by (path, start_line) for reproducibility.
     3. Entrypoints follow the same unclassified-first, then (path, line) order.
@@ -156,7 +161,7 @@ def build_interview_context(
         else:
             unclassified_symbols.append(sym)
 
-    ordered_symbols = unclassified_symbols + classified_symbols
+    ordered_symbols = _focus_first(unclassified_symbols + classified_symbols, focus_paths, "path")
     if len(ordered_symbols) > MAX_SYMBOLS:
         omission_notes.append(
             f"symbols: {len(ordered_symbols) - MAX_SYMBOLS} symbol(s) omitted "
@@ -207,7 +212,7 @@ def build_interview_context(
         else:
             unclassified_eps.append(ep)
 
-    ordered_eps = unclassified_eps + classified_eps
+    ordered_eps = _focus_first(unclassified_eps + classified_eps, focus_paths, "handler_path")
     if len(ordered_eps) > MAX_ENTRYPOINTS:
         omission_notes.append(
             f"entrypoints: {len(ordered_eps) - MAX_ENTRYPOINTS} entrypoint(s) omitted "
@@ -255,14 +260,30 @@ def build_interview_context(
         omission_notes=omission_notes,
     )
 
-    pack = _apply_budget(pack, budget, stage=stage)
+    pack = _apply_budget(pack, budget, stage=stage, keep_paths=focus_paths)
     return pack
+
+
+def _focus_first(rows: List[sqlite3.Row], focus_paths: Optional[Set[str]], key: str) -> List[sqlite3.Row]:
+    if not focus_paths:
+        return rows
+    return [r for r in rows if r[key] in focus_paths] + [r for r in rows if r[key] not in focus_paths]
+
+
+def focus_paths_in_text(conn: sqlite3.Connection, system_id: int, snapshot_id: int, text: str) -> Set[str]:
+    """Snapshot file paths the text names verbatim (deterministic substring match)."""
+    rows = conn.execute(
+        "SELECT DISTINCT path FROM code_symbols WHERE system_id = ? AND snapshot_id = ?",
+        (system_id, snapshot_id),
+    ).fetchall()
+    return {r["path"] for r in rows if r["path"] and r["path"] in text}
 
 
 def _apply_budget(
     pack: InterviewContextPack,
     budget: int,
     stage: Optional[str] = None,
+    keep_paths: Optional[Set[str]] = None,
 ) -> InterviewContextPack:
     """Deterministically truncate tail items until the serialized pack fits.
 
@@ -277,17 +298,30 @@ def _apply_budget(
     truncated = False
     entrypoints_first = stage not in ENTRYPOINT_PRIORITY_STAGES
 
+    keep = keep_paths or set()
+
+    def _droppable(items, key) -> bool:
+        # Focused items sit at the head; once only they remain, stop
+        # dropping this list (the developer named these files).
+        return bool(items) and getattr(items[-1], key) not in keep
+
     while len(pack.model_dump_json()) > budget:
-        primary = pack.entrypoints if entrypoints_first else pack.symbols
-        secondary = pack.symbols if entrypoints_first else pack.entrypoints
+        primary, p_key = (pack.entrypoints, "handler_path") if entrypoints_first else (pack.symbols, "path")
+        secondary, s_key = (pack.symbols, "path") if entrypoints_first else (pack.entrypoints, "handler_path")
         # Classified items sit at each list's tail, so tail pops remove the
         # lowest-priority items first.
-        if primary:
+        if _droppable(primary, p_key):
             primary.pop()
             truncated = True
             continue
-        if secondary:
+        if _droppable(secondary, s_key):
             secondary.pop()
+            truncated = True
+            continue
+        # Only focused items are left and they still do not fit: the budget
+        # wins, in the same tail order as before.
+        if primary or secondary:
+            (primary or secondary).pop()
             truncated = True
             continue
         break

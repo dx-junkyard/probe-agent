@@ -1,10 +1,11 @@
 import { Fragment, useEffect, useState } from "react";
+import { RequestWaterfall } from "@/components/request-waterfall";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   useComponents, useTracePage, useTraceSummary, useUpdatePolicy,
   useComponentProfile, useUpdateComponentProfile,
   useShadowResults, useUpdateEvaluation,
-  useCriteria,
+  useCriteria, useInstrumentationCoverage,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -154,8 +155,12 @@ export default function ComponentsPage() {
           </div>
         ) : !components?.length ? (
           <div className="space-y-2 px-2 py-4 text-xs text-muted-foreground">
-            <p>componentがありません。</p>
-            <Button size="sm" variant="outline" onClick={() => navigate("/setup-guide")}>Setup Guideを開く</Button>
+            <p>まだ trace を受信した component がありません。</p>
+            <p>コードに入れた計測点と、届いているかどうかは「計測カバレッジ」で確かめられます。</p>
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" variant="outline" onClick={() => navigate("/instrumentation-coverage")}>計測カバレッジを開く</Button>
+              <Button size="sm" variant="ghost" onClick={() => navigate("/setup-guide")}>Setup Guide</Button>
+            </div>
           </div>
         ) : (
           components.map(c => (
@@ -359,6 +364,7 @@ export default function ComponentsPage() {
                                         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                                           <span className="text-xs text-muted-foreground">
                                             Trace ID（全体）: <span className="font-mono text-foreground">{t.trace_id}</span>
+                                            <TraceCodeLocation componentId={selected} />
                                           </span>
                                           <div className="flex items-center gap-1 flex-wrap">
                                             <ReplayRowActions componentId={selected} traceId={t.trace_id} />
@@ -372,6 +378,7 @@ export default function ComponentsPage() {
                                         {/* Issue #367: the payload stays closed
                                             until asked for, behind its shape
                                             and redaction state. */}
+                                        <div className="mb-3"><RequestWaterfall traceId={t.trace_id} /></div>
                                         <TracePayloadPanel
                                           input={t.input}
                                           output={t.output}
@@ -507,5 +514,19 @@ export default function ComponentsPage() {
       </div>
     </div>
     </div>
+  );
+}
+
+
+/** Where in the code this component's traces come from (instrumentation coverage). */
+function TraceCodeLocation({ componentId }: { componentId: string | null }) {
+  const { data } = useInstrumentationCoverage();
+  const point = data?.points.find((p) => p.component_id === componentId);
+  if (!point) return null;
+  return (
+    <span className="ml-3 font-mono">
+      記録したコード: <span className="text-foreground">{point.path}:{point.line_start}</span> {point.symbol}
+      {point.route && <> · 入口: <span className="text-foreground">{point.route}</span></>}
+    </span>
   );
 }

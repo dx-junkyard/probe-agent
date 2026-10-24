@@ -2,7 +2,7 @@
 
 Interviewの自由対話から複数の関連先へ補足する追加契約は
 [Interview Discussion Contributions](interview-discussion-contributions.md) が所有する
-（2026-09-16、設計確定・未実装）。本書の単一target adapter・Proposalの境界を維持し、
+（基礎実装済み、全受入条件の達成は未確認）。本書の単一target adapter・Proposalの境界を維持し、
 sessionを明示した参照、補足の来歴、domain反映のサービス境界を追加する。
 
 ## 実装状況（2026-09-12、PR #462 監査）

@@ -490,7 +490,7 @@ class TestGapSourceRefs:
         with get_conn() as conn:
             for kind in product_objective.GAP_SOURCE_KINDS:
                 out = product_objective.add_gap_source_ref(
-                    conn, system_id=system_id, gap_key="g1", source_kind=kind, source_ref=f"ref-{kind}",
+                    conn, system_id=system_id, gap_key="g1", source_kind=kind, source_ref=f"ref|{kind}|x" if kind in ("functional_lineage_gap", "value_network_notice") else f"ref|{kind}",
                     created_by="root",
                 )
                 assert out["source_kind"] == kind

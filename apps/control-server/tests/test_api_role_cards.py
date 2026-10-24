@@ -240,3 +240,28 @@ class TestApiRoleCards:
         ).json()
         labels = {c["label"] for c in body_b["cards"]}
         assert "GET /flow" not in labels
+
+
+def test_source_metadata_classifies_when_the_hierarchy_left_it_unclassified(admin_client, tmp_path):
+    """The hierarchy (from an older snapshot) left the handler unclassified and
+    the card kept saying "no source-authored explanation yet" although the
+    handler now has a probe-agent: block (System 7 summarize_thread)."""
+    token = _login(admin_client)
+    system = _create_system(admin_client, token, "CardLateMetadata")
+    repo = _make_repo(tmp_path)
+    h = _setup(admin_client, token, system["id"], repo)
+    flow = (repo / "src" / "flow.py").read_text().replace(
+        "def get_unrelated():\n    return 1\n",
+        'def get_unrelated():\n    """Unrelated.\n\n    probe-agent:\n      role: Returns one\n'
+        '      capability: late-capability\n      element_type: boundary\n    """\n    return 1\n')
+    (repo / "src" / "flow.py").write_text(flow)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "metadata")
+    admin_client.post("/repository/snapshots", headers=h)
+    admin_client.post("/repository/symbols/index", headers=h)
+
+    card = _card(admin_client.get("/repository/api-role-cards", headers=h).json(), "GET /unrelated")
+    assert card["classification"] == "classified"
+    assert card["capability_key"] == "late-capability"
+    assert card["role"] == "Returns one"
+    assert "source_authored" in card["provenance_kinds"]

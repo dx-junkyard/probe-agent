@@ -157,45 +157,105 @@ def _load_drift_info(
     return [dict(r) for r in rows]
 
 
+def _entrypoints_by_path(entrypoints: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    by_path: Dict[str, List[Dict[str, Any]]] = {}
+    for ep in entrypoints:
+        ep_path = (ep.get("route_path") or "").rstrip("/")
+        if ep_path:
+            by_path.setdefault(ep_path, []).append(ep)
+    return by_path
+
+
 def _match_api_to_entrypoints(
     mentioned_apis: List[str],
-    entrypoints: List[Dict[str, Any]],
+    entrypoints: "List[Dict[str, Any]] | Dict[str, List[Dict[str, Any]]]",
 ) -> List[CodeEvidence]:
-    """Match documented API paths to discovered entrypoints."""
+    """Match documented API paths to discovered entrypoints.
+
+    Accepts the entrypoint list or a prebuilt path index (`_entrypoints_by_path`)
+    so a reconciliation over thousands of graph nodes does not rescan every
+    entrypoint per node. Order of matches is the entrypoint order, as before.
+    """
+    by_path = entrypoints if isinstance(entrypoints, dict) else _entrypoints_by_path(entrypoints)
     matches: List[CodeEvidence] = []
     for api in mentioned_apis:
         method, path = _normalize_api(api)
-        for ep in entrypoints:
+        if not path:
+            continue
+        for ep in by_path.get(path.rstrip("/"), []):
             ep_method = (ep.get("route_method") or "").upper()
-            ep_path = (ep.get("route_path") or "").rstrip("/")
-            if ep_path and path:
-                if ep_path == path or ep_path.rstrip("/") == path.rstrip("/"):
-                    if not method or method == ep_method:
-                        matches.append(CodeEvidence(
-                            source="entrypoint",
-                            path=ep["handler_path"],
-                            qualified_name=ep["handler_qualified_name"],
-                            start_line=ep["line_start"],
-                            end_line=ep["line_end"],
-                            route_method=ep_method,
-                            route_path=ep_path,
-                            entrypoint_id=ep["id"],
-                        ))
+            if method and method != ep_method:
+                continue
+            matches.append(CodeEvidence(
+                source="entrypoint",
+                path=ep["handler_path"],
+                qualified_name=ep["handler_qualified_name"],
+                start_line=ep["line_start"],
+                end_line=ep["line_end"],
+                route_method=ep_method,
+                route_path=(ep.get("route_path") or "").rstrip("/"),
+                entrypoint_id=ep["id"],
+            ))
     return matches
+
+
+class _SymbolIndex:
+    """Normalized symbol lookups built once per reconciliation.
+
+    `_match_symbols_to_code` used to rebuild its index for every graph node.
+    With ~12k symbols and ~5k nodes that was 65M normalizations, and
+    `/system-state` (which reconciles on every page load) took 25 s while
+    holding the process-wide DB lock, stalling every other request.
+
+    `match` keeps the previous semantics exactly: an exact normalized match,
+    else the FIRST symbol in index order whose name is a dotted suffix of the
+    reference or has the reference as a dotted suffix.
+    """
+
+    def __init__(self, code_symbols: List[Dict[str, Any]]):
+        self.exact: Dict[str, Dict[str, Any]] = {}
+        for s in code_symbols:
+            self.exact[_normalize_symbol(s["qualified_name"])] = s
+        # Position of each surviving key in dict order (later duplicates
+        # overwrite the value but keep the first key position).
+        self.order: Dict[str, int] = {q: i for i, q in enumerate(self.exact)}
+        # Every proper dotted suffix of a symbol name -> first symbol name having it.
+        self.by_suffix: Dict[str, str] = {}
+        for qname in self.exact:
+            parts = qname.split(".")
+            for i in range(1, len(parts)):
+                self.by_suffix.setdefault(".".join(parts[i:]), qname)
+
+    def match(self, ref: str) -> Optional[Dict[str, Any]]:
+        norm = _normalize_symbol(ref)
+        if norm in self.exact:
+            return self.exact[norm]
+        candidates = []
+        # qname.endswith("." + norm)
+        q = self.by_suffix.get(norm)
+        if q is not None:
+            candidates.append(q)
+        # norm.endswith("." + qname)
+        parts = norm.split(".")
+        for i in range(1, len(parts)):
+            suffix = ".".join(parts[i:])
+            if suffix in self.exact:
+                candidates.append(suffix)
+        if not candidates:
+            return None
+        return self.exact[min(candidates, key=self.order.__getitem__)]
 
 
 def _match_symbols_to_code(
     mentioned_symbols: List[str],
-    code_symbols: List[Dict[str, Any]],
+    code_symbols: "List[Dict[str, Any]] | _SymbolIndex",
 ) -> List[CodeEvidence]:
     """Match documented symbol references to code symbols."""
+    index = code_symbols if isinstance(code_symbols, _SymbolIndex) else _SymbolIndex(code_symbols)
     matches: List[CodeEvidence] = []
-    sym_index = {_normalize_symbol(s["qualified_name"]): s for s in code_symbols}
-
     for sym_ref in mentioned_symbols:
-        norm = _normalize_symbol(sym_ref)
-        if norm in sym_index:
-            s = sym_index[norm]
+        s = index.match(sym_ref)
+        if s is not None:
             matches.append(CodeEvidence(
                 source="code_symbol",
                 path=s["path"],
@@ -204,18 +264,6 @@ def _match_symbols_to_code(
                 end_line=s["end_line"],
                 symbol_id=s["id"],
             ))
-        else:
-            for qname, s in sym_index.items():
-                if qname.endswith("." + norm) or norm.endswith("." + qname):
-                    matches.append(CodeEvidence(
-                        source="code_symbol",
-                        path=s["path"],
-                        qualified_name=s["qualified_name"],
-                        start_line=s["start_line"],
-                        end_line=s["end_line"],
-                        symbol_id=s["id"],
-                    ))
-                    break
     return matches
 
 
@@ -237,13 +285,27 @@ def reconcile(
     matched_node_ids: Set[str] = set()
     matched_symbol_ids: Set[int] = set()
     matched_entrypoint_ids: Set[int] = set()
+    symbol_index = _SymbolIndex(code_symbols)
+    entrypoint_by_id = {e["id"]: e for e in entrypoints}
+    entrypoints_by_path = _entrypoints_by_path(entrypoints)
+    metadata_symbol_ids = {m["symbol_id"] for m in source_metadata}
+    classified_symbol_ids = {
+        cn.get("symbol_id") for cn in capability_nodes if cn.get("classification") == "classified"
+    }
+
+    from .understanding_graph import SOURCE_NODE_TYPES
 
     for nid, node in graph.nodes.items():
         if node.node_type == "conflict":
             continue
+        # External-source claims describe the world, not this code base:
+        # an indicator in a public plan with no matching symbol is not a
+        # docs-only gap (vision-to-feature-research.md VF-D1).
+        if node.node_type in SOURCE_NODE_TYPES:
+            continue
 
-        api_matches = _match_api_to_entrypoints(node.mentioned_apis, entrypoints)
-        sym_matches = _match_symbols_to_code(node.mentioned_symbols, code_symbols)
+        api_matches = _match_api_to_entrypoints(node.mentioned_apis, entrypoints_by_path)
+        sym_matches = _match_symbols_to_code(node.mentioned_symbols, symbol_index)
         all_code_evidence = api_matches + sym_matches
 
         if all_code_evidence:
@@ -253,10 +315,7 @@ def reconcile(
                     matched_symbol_ids.add(ce.symbol_id)
                 if ce.entrypoint_id:
                     matched_entrypoint_ids.add(ce.entrypoint_id)
-                    ep_rec = next(
-                        (e for e in entrypoints if e["id"] == ce.entrypoint_id),
-                        None,
-                    )
+                    ep_rec = entrypoint_by_id.get(ce.entrypoint_id)
                     if ep_rec and ep_rec.get("handler_symbol_id"):
                         matched_symbol_ids.add(ep_rec["handler_symbol_id"])
 
@@ -307,13 +366,8 @@ def reconcile(
         if ep["id"] not in matched_entrypoint_ids:
             ep_type = ep.get("entrypoint_type", "")
             handler_sym_id = ep.get("handler_symbol_id")
-            has_metadata = handler_sym_id and any(
-                m["symbol_id"] == handler_sym_id for m in source_metadata
-            )
-            has_classification = handler_sym_id and any(
-                cn.get("symbol_id") == handler_sym_id and cn.get("classification") == "classified"
-                for cn in capability_nodes
-            )
+            has_metadata = handler_sym_id and handler_sym_id in metadata_symbol_ids
+            has_classification = handler_sym_id and handler_sym_id in classified_symbol_ids
 
             if not has_metadata and not has_classification:
                 gaps.append(ReconciliationMapping(

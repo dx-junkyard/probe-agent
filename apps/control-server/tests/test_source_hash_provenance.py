@@ -414,7 +414,7 @@ class TestReadPathUpgrade:
         assert flow["file_content_hash"] is not None
         assert flow["source_metadata"] is not None
         assert flow["source_metadata"]["explanation_hash"] is not None
-        assert out["intelligence_run"]["schema_version"] == "provenance-v1"
+        assert out["intelligence_run"]["schema_version"] == "provenance-v2"
 
     def test_get_anchors_upgrades_stale_index(self, admin_client, tmp_path):
         token = _login(admin_client)
@@ -432,3 +432,60 @@ class TestReadPathUpgrade:
         assert anchor["qualified_name"] == "build_flow_graph"
         assert anchor["symbol_source_hash"] is not None
         assert anchor["explanation_hash"] is not None
+
+
+PROPERTY_PY = '''class Temp:
+    @property
+    def value(self):
+        return self._v
+
+    @value.setter
+    def value(self, v):
+        """Set value.
+
+        probe-agent:
+          role: stores the value
+          capability: temperature control
+        """
+        self._v = v
+'''
+
+
+class TestReadPathUpgradeDuplicateNames:
+    def test_backfill_targets_only_the_stored_definition(self, admin_client, tmp_path):
+        """A property getter and setter share one qualified name, and the index
+        stores only the first definition (the getter). Upgrading must not write
+        the setter's hashes or metadata onto the getter's row, or the stored
+        line range, hashes and explanation would describe different code."""
+        from app.code_indexer import index_snapshot_files
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "DupNames")
+        h = _headers(token, system["id"])
+        repo = tmp_path / "dup-repo"
+        _git_init(repo)
+        (repo / "src").mkdir()
+        (repo / "src" / "temp.py").write_text(PROPERTY_PY)
+        _git_commit(repo, "init")
+        body = _configure_and_index(admin_client, token, system["id"], repo)
+
+        stored = _by_name(body, "Temp.value")
+        definitions = [
+            s for s in index_snapshot_files([("src/temp.py", PROPERTY_PY.encode())]).symbols
+            if s.qualified_name == "Temp.value"
+        ]
+        getter = next(s for s in definitions if s.start_line == stored["start_line"])
+        setter = next(s for s in definitions if s.start_line != stored["start_line"])
+        assert stored["source_metadata"] is None  # fresh index: getter has none
+
+        _degrade_to_pre_55_index(body["snapshot_id"])
+        out = admin_client.get("/repository/symbols", headers=h).json()
+
+        upgraded = _by_name(out, "Temp.value")
+        assert upgraded["start_line"] == getter.start_line
+        assert upgraded["symbol_source_hash"] == getter.symbol_source_hash
+        assert upgraded["symbol_source_hash"] != setter.symbol_source_hash
+        assert upgraded["symbol_body_hash"] == getter.symbol_body_hash
+        assert upgraded["source_metadata"] is None
+        anchors = admin_client.get("/repository/explanation-anchors", headers=h).json()
+        assert anchors["anchor_count"] == 0

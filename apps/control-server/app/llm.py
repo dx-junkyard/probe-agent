@@ -344,15 +344,33 @@ class LLMSystemContextMissing(LLMResourceLimitError):
 
 
 def is_reasoning_model(provider: str, model: str) -> bool:
+    """Whether ``model`` is a reasoning-capable model of ``provider``.
+
+    Decided by family and MAJOR VERSION, not by a list of known names, so a
+    newer release of a family that already qualifies (``gpt-6-*``,
+    ``claude-opus-5-*``, ``gemini-4-*``) is recognised without a code change.
+    Older and non-reasoning families stay rejected.
+    """
     normalized_provider = provider.strip().lower()
     normalized_model = model.strip().lower()
-    patterns = {
-        "openai": r"^(o1|o3|o4|gpt-5)",
-        "anthropic": r"^(claude-(3-7|4)|claude-(opus|sonnet)-4)",
-        "gemini": r"^gemini-(2\.5|3)",
-    }
-    pattern = patterns.get(normalized_provider)
-    return bool(pattern and re.match(pattern, normalized_model))
+    if normalized_provider == "openai":
+        if re.match(r"^o\d", normalized_model):
+            return True
+        m = re.match(r"^gpt-(\d+)", normalized_model)
+        return bool(m and int(m.group(1)) >= 5)
+    if normalized_provider == "anthropic":
+        if re.match(r"^claude-3-7", normalized_model):
+            return True
+        # claude-4..., claude-<family>-<major>... (opus / sonnet / haiku / fable ...)
+        m = re.match(r"^claude-(?:[a-z]+-)?(\d+)", normalized_model)
+        return bool(m and int(m.group(1)) >= 4 and not normalized_model.startswith("claude-3"))
+    if normalized_provider == "gemini":
+        m = re.match(r"^gemini-(\d+)(?:\.(\d+))?", normalized_model)
+        if not m:
+            return False
+        major, minor = int(m.group(1)), int(m.group(2) or 0)
+        return (major, minor) >= (2, 5)
+    return False
 
 
 def _adapt_openai_messages(messages: List[Message], model: str) -> List[Message]:

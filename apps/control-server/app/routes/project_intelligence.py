@@ -3035,7 +3035,11 @@ def get_api_role_cards(
             capability_key = node["capability_key"]
             if node["provenance_kind"] == "reasoning_llm":
                 provenance_kinds = ["reasoning_llm", "structural"]
-        elif meta is not None and meta["capability"]:
+        if classification != "classified" and meta is not None and meta["capability"]:
+            # A source-authored explanation classifies the entrypoint even when
+            # a (possibly older-snapshot) hierarchy node left it unclassified;
+            # otherwise the card said "no explanation yet" for a handler that
+            # has a probe-agent: block.
             classification = "classified"
             capability_key = meta["capability"]
         if meta is not None and meta["capability"]:

@@ -277,12 +277,14 @@ describe("UX-13: ナビゲーションの段階化・検索・現在地", () => 
     return renderAt(<Sidebar />, route);
   }
 
-  test("目的別の 3 入口から開始地点を選べる", async () => {
+  test("目的別の入口から開始地点を選べる", async () => {
     await renderSidebar();
     const entries = screen.getByTestId("sidebar-purpose-entries");
     expect(within(entries).getByRole("link", { name: /現状を理解する/ })).toHaveAttribute("href", "/system-understanding");
     expect(within(entries).getByRole("link", { name: /要件を設計する/ })).toHaveAttribute("href", "/ux-design-studio");
     expect(within(entries).getByRole("link", { name: /候補を比較評価する/ })).toHaveAttribute("href", "/experiments");
+    expect(within(entries).getByRole("link", { name: /全体を見渡す/ })).toHaveAttribute("href", "/system-map");
+    expect(within(entries).getByRole("link", { name: /動作を確かめる/ })).toHaveAttribute("href", "/instrumentation-coverage");
   });
 
   test("詳細ビューは既定で閉じ、現在地が詳細ビューにあるときは開いて『表示中』を示す", async () => {

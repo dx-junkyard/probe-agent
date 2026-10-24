@@ -36,3 +36,36 @@
 - backup/restore・System削除における新テーブルの統合検証と、workerクラッシュ・複数worker競合の障害注入。
 
 基礎フローの実装と上記回帰確認を保存するcommitであり、公開・デプロイや実データ更新は行わない。
+
+## 2026-10-17: Vision・UX・Feature の接続ヒアリング
+
+通常の Interview 対話にはコードの context pack と Understanding は渡っていたが、
+保存済みの UX / Product Feature 設計は渡っていなかった。質問指示も目的から API / probe
+へ進む形だったため、体験と必要な機能の接続を既存の記録から聞く材料が不足していた。
+
+- `interview_design_context.py` に System 隔離・件数/文字数上限付きの read-only 参照を追加。
+  Objective / Milestone / Gap / Journey / Requirement / Feature の既存 domain reader を使い、
+  保存済み関連と再確認状態を保持。現在の設計と固定された premise を区別する。
+- Interview 対話と画面アシスタントが同じ参照を利用。質問は関心起点で未確認の接続を一つずつ
+  聞く指示へ変更。監査用 prompt version は `interview-v8` / assistant `v3`、出力schemaは変更なし。
+- 「会話からの補足」に相談文の入力補助を追加。起点sessionを保持し、送信・保存は行わない。
+- docs目次・Workflow・canonical Understanding・Assistant Discussion・Adapterに残っていた
+  補足機能の「未実装」表記を、基礎実装済み・全受入条件の達成未確認へ整合。
+
+検証:
+
+- Control Server: `test_interview_agent.py` / `test_interview_design_context.py` /
+  `test_interview.py` / `test_assistant.py` の116件通過。
+- prompt version更新後: `test_assistant_grounded_answer.py` と
+  `test_interview_agent.py` の57件通過（前項との重複38件、計135件）。
+- Dashboard: `interview-design-entry.test.tsx` / `assistant-discussion-thread.test.tsx` /
+  `interview-cockpit.test.tsx` の73件通過。production build通過。
+- 新規テストはSystem隔離、読取りによる変更なし、Requirement更新後のlink stale、
+  画面側への同じcontext供給、省略と取得失敗の区別、LLMへの設計入力、相談入口の起点保持を確認。
+
+未確認・制限:
+
+- 実LLM・実利用者による質問の自然さ、重複質問の減少、実ブラウザ・音声の完走は未確認。
+- 設計参照は各層の新しいidentity最大5件、JSON文字数6000以内。全件探索・関心による選別はしない。
+- 回答による設計自動作成・自動リンク確定は追加していない。既存のレビュー・保存境界を使う。
+- buildには既存の`env.js`とbundle sizeの警告がある。

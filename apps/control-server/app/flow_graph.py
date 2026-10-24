@@ -188,6 +188,10 @@ class _CallSite:
     line: int
     base: Optional[str] = None  # immediate attribute base, e.g. "requests"
     dotted: str = ""  # "requests.get", "task.delay", "open"
+    # Call shape: "name" (f()), "self" (self.m()), "attr" (x.m() on a bare
+    # name) or "expr_attr" (m() on a literal / call result / subscript, e.g.
+    # "\n".join(...)). Only "name"/"attr" can refer to project symbols by name.
+    shape: str = "name"
 
 
 def _node_id(path: str, qualified_name: str) -> str:
@@ -218,6 +222,73 @@ def _callee_name(func: ast.expr) -> Tuple[Optional[str], bool, Optional[str], st
             return func.attr, base_name == "self", base_name, f"{base_name}.{func.attr}"
         return func.attr, False, None, func.attr
     return None, False, None, ""
+
+
+def _call_shape(func: ast.expr) -> str:
+    if isinstance(func, ast.Name):
+        return "name"
+    if isinstance(func, ast.Attribute):
+        if isinstance(func.value, ast.Name):
+            return "self" if func.value.id == "self" else "attr"
+        if isinstance(func.value, ast.Attribute):
+            return "attr"  # an object reached through attributes (self.repo.save())
+    return "expr_attr"
+
+
+@dataclass
+class _FileImports:
+    """What the names in one file refer to, from its import statements.
+
+    ``modules``: alias -> candidate module paths (repo-relative, no suffix),
+    e.g. ``llm`` -> ["apps/api/app/llm"] for ``from .. import llm``.
+    ``symbols``: alias -> (candidate module paths, imported name), e.g.
+    ``card_out`` -> (["apps/api/app/routes/issues"], "card_out").
+    ``referenced``: every bare name the file mentions (to tell whether a class
+    is in play when a method is called on an unknown local object).
+    """
+
+    modules: Dict[str, List[str]] = field(default_factory=dict)
+    symbols: Dict[str, Tuple[List[str], str]] = field(default_factory=dict)
+    referenced: set = field(default_factory=set)
+
+
+def _package_dir(path: str, level: int) -> str:
+    parts = path.replace("\\", "/").split("/")[:-1]
+    if level > 1:
+        parts = parts[: max(0, len(parts) - (level - 1))]
+    return "/".join(parts)
+
+
+def extract_imports(path: str, source: str) -> _FileImports:
+    out = _FileImports()
+    try:
+        tree = ast.parse(source, filename=path)
+    except SyntaxError:
+        return out
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            out.referenced.add(node.id)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                mod = a.name.replace(".", "/")
+                if a.asname:
+                    out.modules[a.asname] = [mod]
+                else:
+                    out.modules[a.name.split(".")[0]] = [a.name.split(".")[0]]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = _package_dir(path, node.level)
+                pkg = f"{base}/{node.module.replace('.', '/')}" if node.module else base
+            else:
+                pkg = (node.module or "").replace(".", "/")
+            for a in node.names:
+                if a.name == "*":
+                    continue
+                alias = a.asname or a.name
+                # `from pkg import name`: name is a submodule or a symbol of pkg.
+                out.modules[alias] = [f"{pkg}/{a.name}".strip("/")]
+                out.symbols[alias] = ([pkg.strip("/")], a.name)
+    return out
 
 
 def extract_call_sites(path: str, source: str) -> List[_CallSite]:
@@ -260,6 +331,7 @@ def extract_call_sites(path: str, source: str) -> List[_CallSite]:
                         line=getattr(child, "lineno", 0),
                         base=base,
                         dotted=dotted,
+                        shape=_call_shape(child.func),
                     ))
             record_calls(child, enclosing_func)
 
@@ -515,9 +587,13 @@ def _make_external_node(boundary_kind: str, label: str, dotted: str) -> FlowNode
 
 
 class _SymbolIndex:
-    def __init__(self, symbols: List[SymbolRecord]):
+    def __init__(self, symbols: List[SymbolRecord],
+                 imports: Optional[Dict[str, "_FileImports"]] = None):
+        self.imports: Dict[str, _FileImports] = imports or {}
         self.by_key: Dict[Tuple[str, str], SymbolRecord] = {}
         self.by_simple_name: Dict[str, List[SymbolRecord]] = {}
+        # Module path (no suffix; package __init__ maps to the package) -> file path.
+        self.module_files: Dict[str, str] = {}
         for sym in symbols:
             if sym.kind not in _FUNCTION_KINDS:
                 continue
@@ -526,14 +602,78 @@ class _SymbolIndex:
             self.by_key[(sym.path, sym.qualified_name)] = sym
             simple = sym.qualified_name.rsplit(".", 1)[-1]
             self.by_simple_name.setdefault(simple, []).append(sym)
+        for sym in symbols:
+            mod = sym.path[:-3] if sym.path.endswith(".py") else sym.path
+            if mod.endswith("/__init__"):
+                mod = mod[: -len("/__init__")]
+            self.module_files.setdefault(mod, sym.path)
         # Deterministic ordering of candidates.
         for cands in self.by_simple_name.values():
             cands.sort(key=lambda s: (s.path, s.start_line, s.qualified_name))
 
+    def _module_file(self, candidates: List[str]) -> Optional[str]:
+        """Repo file for an imported module path; absolute imports match by
+        path suffix (``app/llm`` -> ``apps/api/app/llm.py``) when unique."""
+        for mod in candidates:
+            if mod in self.module_files:
+                return self.module_files[mod]
+            hits = [f for m, f in self.module_files.items() if m.endswith("/" + mod)]
+            if len(hits) == 1:
+                return hits[0]
+        return None
+
     def resolve(
         self, caller: SymbolRecord, site: _CallSite,
     ) -> Tuple[Optional[SymbolRecord], str]:
-        """Resolve a call site to a target symbol and a resolution level."""
+        """Resolve a call site to a target symbol and a resolution level.
+
+        Imports decide first: ``llm.complete_json()`` after ``from .. import
+        llm`` is the function in that module, and ``card_out()`` after ``from
+        .issues import card_out`` is that function. A method called on a
+        literal or expression (``"\\n".join()``) or on an unknown local object
+        is never matched by bare name to an unrelated project function --
+        that produced edges such as ``summarize -> join`` (an HTTP route).
+        """
+        imp = self.imports.get(caller.path)
+        if imp is not None and not site.is_self:
+            if site.shape == "attr" and site.base in imp.modules:
+                mfile = self._module_file(imp.modules[site.base])
+                if mfile is not None:
+                    target = self.by_key.get((mfile, site.callee_name))
+                    return (target, _RESOLVED) if target is not None else (None, "external")
+            if site.shape == "attr" and site.base in imp.symbols:
+                mods, name = imp.symbols[site.base]
+                mfile = self._module_file(mods)
+                if mfile is not None:
+                    target = self.by_key.get((mfile, f"{name}.{site.callee_name}"))
+                    if target is not None:
+                        return target, _RESOLVED
+            if site.shape == "name" and site.callee_name in imp.symbols:
+                mods, name = imp.symbols[site.callee_name]
+                mfile = self._module_file(mods)
+                if mfile is not None:
+                    target = self.by_key.get((mfile, name))
+                    if target is not None:
+                        return target, _RESOLVED
+        if site.shape == "expr_attr":
+            return None, "external"
+        if site.shape == "attr":
+            # obj.method(): a class method defined in this file, or a method
+            # whose class this file actually mentions; otherwise unknown.
+            local = self.by_key.get((caller.path, f"{site.base}.{site.callee_name}"))
+            if local is not None:
+                return local, _RESOLVED
+            if imp is not None:
+                methods = [
+                    c for c in self.by_simple_name.get(site.callee_name, [])
+                    if "." in c.qualified_name
+                    and c.qualified_name.rsplit(".", 2)[-2] in imp.referenced
+                ]
+                if len(methods) == 1:
+                    return methods[0], _INFERRED
+                if len(methods) > 1:
+                    return None, _UNRESOLVED
+                return None, "external"
         if site.is_self:
             # self.method() -> sibling method in the same class.
             class_prefix = caller.qualified_name.rsplit(".", 1)[0]
@@ -947,7 +1087,10 @@ def build_flow_graph(
         return None
     entry_sym, entry_ep = found
 
-    index = _SymbolIndex(symbols)
+    index = _SymbolIndex(
+        symbols,
+        imports={path: extract_imports(path, src) for path, src in files if path.endswith(".py")},
+    )
 
     # Extract call sites per file, then group by caller qualified name.
     sources = {path: src for path, src in files}
@@ -1254,6 +1397,9 @@ def _flow_title(nodes: Dict[str, FlowNode], path: List[str]) -> str:
         (nodes[n].qualified_name if n in nodes else n).rsplit(".", 1)[-1]
         for n in path
     ]
-    if len(names) <= 4:
+    # Paths that differ only in the middle used to render identically
+    # ("a → b → … → provider" twice). Show up to six names, and keep the
+    # node before the leaf when eliding, so sibling paths stay distinguishable.
+    if len(names) <= 6:
         return " → ".join(names)
-    return " → ".join([names[0], names[1], "…", names[-1]])
+    return " → ".join([names[0], names[1], "…", names[-2], names[-1]])
