@@ -905,6 +905,37 @@ def _existing_documentation_index(system_id: int, snapshot_id: int) -> Optional[
     return None
 
 
+def _scan_versions_outdated(conn, system_id: int, snapshot_id: int) -> bool:
+    """True when the latest claim scan of this snapshot used a prompt/schema
+    version other than the one each chunk would get now (for example after
+    the source-claim prompt changed). Reusing that graph would silently keep
+    claims extracted under the old rules; returning True makes the step run,
+    and its own per-chunk reuse still skips every chunk whose version is
+    unchanged. A snapshot with no recorded scan tasks keeps the old behaviour.
+    """
+    from . import documentation_claim_scanner as scanner
+    from .source_register import load_register
+
+    latest = conn.execute(
+        "SELECT MAX(build_id) FROM system_understanding_llm_tasks "
+        "WHERE system_id = ? AND snapshot_id = ? AND task_type = 'claim_scan_chunk' AND status = 'completed'",
+        (system_id, snapshot_id),
+    ).fetchone()[0]
+    if latest is None:
+        return False
+    rows = conn.execute(
+        "SELECT DISTINCT chunk_path, prompt_version, schema_version FROM system_understanding_llm_tasks "
+        "WHERE build_id = ? AND task_type = 'claim_scan_chunk'",
+        (latest,),
+    ).fetchall()
+    source_paths = set(load_register(conn, snapshot_id).path_to_source)
+    for row in rows:
+        expected = scanner.versions_for(row["chunk_path"] in source_paths)
+        if (row["prompt_version"], row["schema_version"]) != expected:
+            return True
+    return False
+
+
 def _existing_graph(system_id: int, snapshot_id: int) -> Optional[Dict[str, Any]]:
     with get_conn() as conn:
         row = conn.execute(
@@ -912,8 +943,8 @@ def _existing_graph(system_id: int, snapshot_id: int) -> Optional[Dict[str, Any]
             "WHERE system_id = ? AND snapshot_id = ? ORDER BY id DESC LIMIT 1",
             (system_id, snapshot_id),
         ).fetchone()
-    if row is None:
-        return None
+        if row is None or _scan_versions_outdated(conn, system_id, snapshot_id):
+            return None
     return {"understanding_graph_snapshot_id": row["id"], "claim_count": row["claim_count"]}
 
 

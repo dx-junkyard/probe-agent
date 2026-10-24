@@ -1371,3 +1371,56 @@ class TestSourceChunksInClaimScan:
         claims = r.json()["claims"]
         assert claims and {c["source_id"] for c in claims} == {"SRC-b"}
         assert all(c["source"]["attributes"]["publisher"] == "Sponsor" for c in claims)
+
+
+class TestClaimScanStepReuseRespectsVersions:
+    """A rebuild of the SAME snapshot must not reuse the graph when the claim
+    scanner's version for some chunks changed (found while re-scanning the
+    Shibuya sources after adding the `opinion` type)."""
+
+    def test_version_bump_rescans_only_affected_chunks(self, admin_client, tmp_path, monkeypatch):
+        token = _login(admin_client)
+        _, hdrs = _setup_repo(admin_client, token, tmp_path, "job-version-bump", readme_text="# Readme\n\nText.\n")
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(exist_ok=True)
+        (repo / "docs" / "plan.md").write_text(SOURCE_FILE_V1)
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add source"], cwd=str(repo), check=True, capture_output=True)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo), check=True,
+                             capture_output=True, text=True).stdout.strip()
+        assert admin_client.post("/repository/snapshots", json={"commit_sha": sha}, headers=hdrs).status_code == 201
+
+        import app.system_understanding_service as sus
+        import app.documentation_claim_scanner as scanner_module
+
+        monkeypatch.setattr(sus, "_is_reasoning_model_available", lambda: True)
+        calls: list = []
+
+        def _scan(client, config, chunk, cache=None, source=None):
+            calls.append(chunk.path)
+            pv, sv = scanner_module.versions_for(bool(source))
+            return scanner_module.ChunkScanResult(
+                chunk_id=chunk.chunk_id, chunk_content_hash=chunk.content_hash,
+                prompt_version=pv, schema_version=sv, claims=[],
+            )
+
+        monkeypatch.setattr(scanner_module, "scan_chunk", _scan)
+        job1 = _wait_job(admin_client, hdrs, admin_client.post(
+            "/repository/system-understanding/build", headers=hdrs).json()["id"])
+        assert job1["status"] == "completed", job1
+        assert "docs/plan.md" in calls
+
+        # Unchanged versions: the whole step is reused, nothing is scanned.
+        calls.clear()
+        job2 = _wait_job(admin_client, hdrs, admin_client.post(
+            "/repository/system-understanding/build", headers=hdrs).json()["id"])
+        assert job2["status"] == "completed", job2
+        assert calls == []
+
+        # The source prompt changes: only the source chunks are scanned again.
+        monkeypatch.setattr(scanner_module, "SOURCE_PROMPT_VERSION", "claim-scanner-source-test-bump")
+        calls.clear()
+        job3 = _wait_job(admin_client, hdrs, admin_client.post(
+            "/repository/system-understanding/build", headers=hdrs).json()["id"])
+        assert job3["status"] == "completed", job3
+        assert calls and set(calls) == {"docs/plan.md"}
