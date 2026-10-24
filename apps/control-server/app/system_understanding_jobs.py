@@ -1096,15 +1096,26 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
     from .documentation_indexer import build_documentation_index
     from .llm import LLMConfig, create_llm_client
 
+    from .source_register import load_register
+
     with get_conn() as conn:
         doc_index = build_documentation_index(conn, ctx.system_id, ctx.snapshot_id)
+        register = load_register(conn, ctx.snapshot_id)
     chunks = doc_index.chunks
     now = time.time()
     max_attempts = _llm_max_attempts()
 
+    # External sources (vision-to-feature-research.md §3.3): a chunk of a
+    # registered source is scanned with the source prompt and versions.
+    sources_by_path: Dict[str, Dict[str, str]] = {}
+    for path, source_id in register.path_to_source.items():
+        entry = register.entries[source_id]
+        sources_by_path[path] = {"source_id": source_id, **entry.attributes}
+
     chunk_by_id = {c.chunk_id: c for c in chunks}
     with get_conn() as conn:
         for chunk in chunks:
+            chunk_prompt_version, chunk_schema_version = scanner.versions_for(chunk.path in sources_by_path)
             conn.execute(
                 """INSERT OR IGNORE INTO system_understanding_llm_tasks
                     (build_id, step_id, system_id, snapshot_id, task_type, chunk_id,
@@ -1114,7 +1125,7 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
                 (
                     ctx.build_id, ctx.step_id, ctx.system_id, ctx.snapshot_id,
                     chunk.chunk_id, chunk.content_hash, chunk.path, chunk.start_line,
-                    scanner.PROMPT_VERSION, scanner.SCHEMA_VERSION,
+                    chunk_prompt_version, chunk_schema_version,
                     max_attempts, now,
                 ),
             )
@@ -1136,7 +1147,7 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
         # documentation index), so they cannot be pulled into the graph via
         # this reuse path.
         reusable = conn.execute(
-            "SELECT id, chunk_id FROM system_understanding_llm_tasks "
+            "SELECT id, chunk_id, prompt_version, schema_version FROM system_understanding_llm_tasks "
             "WHERE build_id = ? AND status = 'pending' ORDER BY id",
             (ctx.build_id,),
         ).fetchall()
@@ -1153,7 +1164,7 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
                      AND build_id != ?
                    ORDER BY id DESC LIMIT 1""",
                 (ctx.system_id, chunk.content_hash, chunk.path,
-                 scanner.PROMPT_VERSION, scanner.SCHEMA_VERSION, ctx.build_id),
+                 row["prompt_version"], row["schema_version"], ctx.build_id),
             ).fetchone()
             if prev is None:
                 continue
@@ -1171,6 +1182,11 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
             except ValueError:
                 continue
             result.chunk_id = chunk.chunk_id
+            # The source_id comes from the CURRENT register: a reused chunk
+            # keeps its text, but its file's front matter may have changed.
+            current_source_id = (sources_by_path.get(chunk.path) or {}).get("source_id")
+            for claim in result.claims:
+                claim.evidence.source_id = current_source_id
             if delta:
                 for claim in result.claims:
                     claim.evidence.start_line += delta
@@ -1219,7 +1235,11 @@ def _run_claim_scan(ctx: StepContext) -> Dict[str, Any]:
                         (attempts, time.time(), task["id"]),
                     )
                 ctx.heartbeat()
-                result = scanner.scan_chunk(client, config, chunk)
+                chunk_source = sources_by_path.get(chunk.path)
+                if chunk_source:
+                    result = scanner.scan_chunk(client, config, chunk, source=chunk_source)
+                else:
+                    result = scanner.scan_chunk(client, config, chunk)
                 if result.error is None:
                     with get_conn() as conn:
                         conn.execute(

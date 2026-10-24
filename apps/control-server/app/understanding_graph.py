@@ -28,7 +28,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .documentation_claim_scanner import ChunkScanResult, DocumentationClaim, ClaimEvidence
+from .documentation_claim_scanner import (
+    SOURCE_CLAIM_TYPES,
+    ChunkScanResult,
+    ClaimEvidence,
+    DocumentationClaim,
+)
 
 NODE_TYPES = {
     "system_purpose",
@@ -39,7 +44,14 @@ NODE_TYPES = {
     "probe_flow",
     "open_question",
     "conflict",
-}
+} | SOURCE_CLAIM_TYPES
+
+#: Node types that record what an external source says
+#: (vision-to-feature-research.md §3.2). They are kept per source: never
+#: merged across sources, never marked weak for having one quote (a source
+#: repeating itself is not independent corroboration), never fed into the
+#: system's own conflict detection or hierarchy.
+SOURCE_NODE_TYPES = frozenset(SOURCE_CLAIM_TYPES)
 
 
 @dataclass
@@ -66,6 +78,8 @@ class GraphNode:
     parent_id: Optional[str] = None
     conflict_with: Optional[str] = None
     is_weak: bool = False
+    source_id: Optional[str] = None
+    indicator: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -190,11 +204,18 @@ def build_understanding_graph(
             else:
                 continue
 
-        merge_key = None
-        for (existing_type, existing_name), existing_id in name_map.items():
-            if existing_type == node_type and _is_similar_name(existing_name, name):
-                merge_key = (existing_type, existing_name)
-                break
+        source_id = claim.evidence.source_id if node_type in SOURCE_NODE_TYPES else None
+        if node_type in SOURCE_NODE_TYPES:
+            # Exact match within one source only (no fuzzy merge): two
+            # indicators of two plans are two facts.
+            name = f"{source_id or ''}::{name}"
+            merge_key = (node_type, name) if (node_type, name) in name_map else None
+        else:
+            merge_key = None
+            for (existing_type, existing_name), existing_id in name_map.items():
+                if existing_type == node_type and _is_similar_name(existing_name, name):
+                    merge_key = (existing_type, existing_name)
+                    break
 
         if merge_key and merge_key in name_map:
             existing_node_id = name_map[merge_key]
@@ -230,6 +251,8 @@ def build_understanding_graph(
                 confidence=claim.confidence,
                 mentioned_apis=list(claim.mentioned_apis),
                 mentioned_symbols=list(claim.mentioned_symbols),
+                source_id=source_id,
+                indicator=claim.indicator.model_dump() if claim.indicator is not None else None,
             )
             name_map[(node_type, name)] = nid
 
@@ -254,6 +277,11 @@ def build_understanding_graph(
     for nid, node in nodes.items():
         if node.node_type == "conflict":
             continue
+        if node.node_type in SOURCE_NODE_TYPES:
+            if node.confidence < 0.5:
+                node.is_weak = True
+                weak_nodes.append(nid)
+            continue
         if node.confidence < 0.5 or len(node.evidence) < 2:
             node.is_weak = True
             weak_nodes.append(nid)
@@ -272,6 +300,9 @@ def build_understanding_graph(
             claims_data = [
                 (c.claim_type, c.summary, c.evidence.path, c.evidence.start_line,
                  c.evidence.end_line, c.confidence)
+                if c.evidence.source_id is None
+                else (c.claim_type, c.summary, c.evidence.path, c.evidence.start_line,
+                      c.evidence.end_line, c.confidence, c.evidence.source_id)
                 for c in sorted(
                     result.claims,
                     key=lambda c: (c.claim_type, c.summary, c.evidence.path, c.evidence.start_line),
@@ -383,6 +414,8 @@ def graph_to_dict(graph: UnderstandingGraph) -> Dict[str, Any]:
             "parent_id": n.parent_id,
             "conflict_with": n.conflict_with,
             "is_weak": n.is_weak,
+            "source_id": n.source_id,
+            "indicator": n.indicator,
         }
     return {
         "nodes": node_dicts,

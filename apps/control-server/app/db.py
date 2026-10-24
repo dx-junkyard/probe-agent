@@ -8861,6 +8861,38 @@ CREATE INDEX IF NOT EXISTS idx_product_gap_decision_system
 CREATE INDEX IF NOT EXISTS idx_product_gap_decision_gap
     ON product_gap_decision (gap_id, id DESC);
 
+-- product_gap_resolution_choice (vision-to-feature-research.md §5.3, VF-G7):
+-- how a human chose to close a Gap. Its own append-only ledger, NOT a new
+-- `product_gap_decision.decision` value: it is a third axis that never moves
+-- `lifecycle` or `priority_band`, and a separate table needs no rebuild of
+-- the CHECK-constrained decision table on existing databases.
+CREATE TABLE IF NOT EXISTS product_gap_resolution_choice (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    gap_id               INTEGER NOT NULL,
+    gap_key              TEXT NOT NULL,
+    approach             TEXT NOT NULL CHECK (approach IN
+                             ('feature_new', 'feature_extend', 'operation',
+                              'sponsor_decision', 'out_of_scope')),
+    feature_key          TEXT,
+    rationale            TEXT NOT NULL CHECK (length(trim(rationale)) > 0),
+    captured_digest      TEXT NOT NULL DEFAULT '',
+    captured_revision_id INTEGER,
+    decision_method      TEXT NOT NULL DEFAULT 'manual'
+                             CHECK (decision_method = 'manual'),
+    decided_by           TEXT,
+    superseded_by_id     INTEGER,
+    created_at           REAL NOT NULL,
+    schema_version       TEXT NOT NULL DEFAULT 'product-gap-resolution-choice-v1',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (gap_id) REFERENCES product_gap (id) ON DELETE CASCADE,
+    FOREIGN KEY (superseded_by_id)
+        REFERENCES product_gap_resolution_choice (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_gap_resolution_choice_gap
+    ON product_gap_resolution_choice (system_id, gap_key, id DESC);
+
 -- ---------------------------------------------------------------------------
 -- product_feature (Issue #431, contract §7.2). §7.2 specifies Feature's
 -- RESPONSIBILITIES (identity + revision + five link kinds) but not its DDL;

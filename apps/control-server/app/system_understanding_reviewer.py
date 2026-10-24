@@ -319,7 +319,14 @@ def _selected_review_nodes(graph: UnderstandingGraph) -> List[GraphNode]:
     ]
     by_type: Dict[str, List[GraphNode]] = {node_type: [] for node_type in type_order}
     extra_types: Dict[str, List[GraphNode]] = {}
+    from .understanding_graph import SOURCE_NODE_TYPES
+
     for node in graph.nodes.values():
+        # External-source claims are the Sponsor's words, not facts about
+        # this system (vision-to-feature-research.md VF-D1): they never
+        # enter the system understanding review.
+        if node.node_type in SOURCE_NODE_TYPES:
+            continue
         target = by_type if node.node_type in by_type else extra_types
         target.setdefault(node.node_type, []).append(node)
 

@@ -50,6 +50,7 @@ from .routes import (
     overview,
     probe_patterns,
     instrumentation_coverage,
+    source_register,
     product_features,
     product_gaps,
     product_lineage,
@@ -154,6 +155,7 @@ def create_app() -> FastAPI:
     app.include_router(project_intelligence.router, dependencies=_auth)
     app.include_router(probe_patterns.router, dependencies=_auth)
     app.include_router(instrumentation_coverage.router, dependencies=_auth)
+    app.include_router(source_register.router, dependencies=_auth)
     app.include_router(connectivity.router, dependencies=_auth)
     app.include_router(snapshot_preflight.router, dependencies=_auth)
     app.include_router(replay_readiness.router, dependencies=_auth)

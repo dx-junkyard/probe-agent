@@ -296,9 +296,14 @@ class TestScanChunk:
         assert "parse" in result.error.lower()
 
     def test_all_claim_types_accepted(self):
+        # System documentation accepts every system claim type. External
+        # source types are accepted only in registered source chunks
+        # (test_vision_to_feature_research.py).
+        from app.documentation_claim_scanner import SYSTEM_CLAIM_TYPES
+
         chunk = _make_chunk(start_line=1, end_line=100)
         claims = []
-        for ct in sorted(CLAIM_TYPES):
+        for ct in sorted(SYSTEM_CLAIM_TYPES):
             claims.append({
                 "claim_type": ct,
                 "summary": f"Claim of type {ct}",
@@ -312,7 +317,7 @@ class TestScanChunk:
         client = FakeLLMClient(response)
         result = scan_chunk(client, _mock_config(), chunk)
         assert all(c.is_valid for c in result.claims)
-        assert len(result.claims) == len(CLAIM_TYPES)
+        assert len(result.claims) == len(SYSTEM_CLAIM_TYPES)
 
 
 class TestScanAllChunks:

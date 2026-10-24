@@ -293,8 +293,15 @@ def reconcile(
         cn.get("symbol_id") for cn in capability_nodes if cn.get("classification") == "classified"
     }
 
+    from .understanding_graph import SOURCE_NODE_TYPES
+
     for nid, node in graph.nodes.items():
         if node.node_type == "conflict":
+            continue
+        # External-source claims describe the world, not this code base:
+        # an indicator in a public plan with no matching symbol is not a
+        # docs-only gap (vision-to-feature-research.md VF-D1).
+        if node.node_type in SOURCE_NODE_TYPES:
             continue
 
         api_matches = _match_api_to_entrypoints(node.mentioned_apis, entrypoints_by_path)

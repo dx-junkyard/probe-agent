@@ -1,7 +1,7 @@
 # Vision → UX → Feature の調査手法（外部資料の収集・現状調査・仮説構築）
 
 **文書の役割:** canonical-contract（手法の契約。対象システムに依存しない）
-**状態:** draft（目標契約。実装完了を意味しない。§9 の不足は未対応）
+**状態:** draft（目標契約。§9 のうち VF-G3 / G4 / G7 / G8 は実装済み、その他は未対応）
 **対象:** 公開資料などの外部資料から Vision を集め、あるべき UX を導き、現状調査と仮説構築を経て Feature を提案する手順
 **確認時点:** 2026-10-24
 **上位方針:** [System Understanding の理想状態](../../00-product/system-understanding-ideal-state.md)、[Purpose Chain](purpose-chain.md)
@@ -71,7 +71,16 @@ Sponsor は、例えば自治体、企業の経営層、事業部、資金提供
 ### 3.2 主張の型
 
 資料から取り出す主張は次の型のいずれかにし、資料の位置（ページ・行）を必須にする。
-ドメイン設定は型を **追加** できるが、削除・意味の変更はしない。
+ドメイン固有の分類（例: Sponsor 独自の分野区分）は新しい型にせず、`policy_goal` 等の主張と
+Sponsor Stakeholder の Need の対応で表す（型の語彙は全プロジェクトで共通に保つ）。
+
+実装（`documentation_claim_scanner.py`）: 台帳に登録された資料（§3.3）のチャンクは専用の
+抽出プロンプト（`claim-scanner-source-v1`）で読み、下表の型 **だけ** を受け付ける。それ以外の
+文書のチャンクは下表の型を受け付けない（VF-D1 を語彙で強制する）。各主張は `source_id` を持ち、
+資料の属性は保存せず台帳から読み取り時に結合する。`indicator` は `name` / `unit` / `baseline` /
+`baseline_year` / `target` / `target_year` を資料の文言のまま持つ（書かれていない値は空）。
+資料の主張は理解グラフで資料ごとに別ノードとして保ち（資料をまたいで統合しない）、
+対象システムの System Understanding レビューと文書・コード照合には入れない。
 
 | 型 | 内容 | 主な行き先 |
 | --- | --- | --- |
@@ -93,16 +102,43 @@ probe-agent はコミット済みファイルだけを読み、外部ネット�
 | 項目 | 意味 |
 | --- | --- |
 | `source_id` | 主張・relation から参照する安定 ID。URL や行 id から導出しない |
+| `part` | 1 資料を複数ファイルに分けたときの番号（任意） |
 | `layer` | SL-1〜SL-5 |
 | `title` / `publisher` / `url` | 原典へ戻るため |
-| `issued` / `period` / `edition` | 策定日・計画期間・版（`final` / `draft`） |
+| `issued` / `period_start` / `period_end` / `edition` | 策定日・計画期間・版（`final` / `draft`） |
 | `retrieved` / `content_digest` | 取得日と本文のハッシュ。同一性と変更検知 |
 | `coverage` | 取り込んだ範囲（全文 / 章）。未読部分を明示する（VF-D5） |
-| `status` | `current` / `superseded` / `draft` / `unavailable`（取得できなかった。理由を必ず書く） |
+| `status` | `current` / `superseded`（`superseded_by` 必須） / `draft` / `unavailable`（取得できなかった。`unavailable_reason` 必須） |
 | `license_note` | 転載条件。本文を置けない資料は要約と位置参照だけを置く |
 
 本文はページ境界を保った Markdown にする（例: `<!-- page: 12 -->`）。表形式の指標は CSV にしてよい
 （同じ `source_id` を持たせる）。**取得できなかった資料も台帳に行を持つ**。
+
+実装（`source_register.py`）: 台帳は別ファイルではなく、各資料の Markdown 先頭の front matter に
+`probe_source` の mapping として書く。期間は `period_start` / `period_end`（年度末などは正確な日付で
+書く。年だけなら暦年末と読む）。資料が 1 ファイルの上限を超えるときは `part` で分割し、資料単位の
+属性は全 part で一致させる。`content_digest` は front matter を除いた本文の `sha256:<hex>`。
+probe-agent は snapshot 内の全 Markdown から台帳を決定的に組み立て、次の検査を返す
+（`error` は台帳として信頼できない、`notice` は利用前に見るべき事実）:
+
+| 検査 | 重さ | 条件 |
+| --- | --- | --- |
+| `front_matter_invalid` | error | `probe_source` が読めない、mapping でない |
+| `field_missing` / `field_invalid` | error | 必須項目の欠落、層・状態・版・日付・part の形式違反 |
+| `duplicate_source_part` | error | 同じ `source_id` と `part` が複数ファイルにある |
+| `part_attributes_mismatch` | error | part 間で資料単位の属性が食い違う |
+| `unavailable_without_reason` | error | `unavailable` に理由がない |
+| `superseded_without_successor` / `successor_unresolved` | error | 後継の指定がない、後継が台帳にない |
+| `digest_mismatch` | error | 宣言したハッシュと本文が一致しない |
+| `body_missing` | error | `unavailable` 以外で本文が空 |
+| `digest_not_declared` / `coverage_unstated` | notice | ハッシュ・取り込み範囲が書かれていない |
+| `edition_draft` | notice | 素案など確定前の資料 |
+| `period_ended` | notice | `current` のまま計画期間が終わっている（次版の確認が要る） |
+
+API: `GET /source-register`（台帳・検査・資料ごとの主張件数）、`GET /source-register/claims`
+（資料の主張と、結合した資料の属性）。Stakeholder の根拠は `evidence_ref` に
+`source:<source_id>[#位置]` と書くと、一覧の読み取り時に資料の属性と期間の状態が結合される
+（`source_resolution`: `resolved` / `unresolved` / `unavailable` / `not_a_source`）。
 
 ### 3.4 Sponsor の目標と製品 Vision の接続
 
@@ -177,6 +213,14 @@ Gap を直接 Feature へ変換しない。**なぜ差があるのか** を仮�
 `feature_new` / `feature_extend` を選ぶときは、Requirement → Feature の link と、その Feature が
 どの原因仮説に効くかを持たせる。仮説が棄却されたら、その Feature 候補は要再確認になる。
 
+実装（VF-G7）: 選択は Gap の第 3 の軸として、人だけが書く追記専用の台帳
+`product_gap_resolution_choice` に記録する（`POST /product-gaps/{gap_key}/resolution-choices`）。
+`lifecycle` と `priority_band` は動かさない（`feature_new` を選んでも Gap は解消しない）。
+`deferred` は既存の lifecycle 決定 `defer` で表すので選択肢に含めない。理由は必須、
+`feature_extend` は対象 Feature が必須、機能以外の選択は Feature を持たない。
+`rejected` / `obsolete` の Gap には記録できない。Gap の一覧・詳細は現在の選択
+（`resolution_approach`、未選択は `undecided`）と履歴を返す。
+
 ## 6. 手順（VF-S0〜S9）と probe-agent の担い手
 
 | 手順 | 内容 | 担い手（既存） | 置き場所 | 人のゲート |
@@ -248,12 +292,12 @@ Interview の質問、Joint Understanding の調査目的、AI 対話の依頼�
 | --- | --- | --- | --- |
 | VF-G1 | 外部ネットワークに出ない（安全境界） | 資料の収集ができない | 変えない。S1 は外で行いコミットする |
 | VF-G2 | 文書の索引が Markdown のみ（`documentation_indexer`） | PDF などをそのまま読めない | 取り込み時にページ境界付き Markdown にする。索引側の対応は別途判断 |
-| VF-G3 | 根拠に発行者・策定日・計画期間・版を持つ欄がない | 新旧資料の優先や期限切れを機械的に扱えない | 当面は台帳を文書としてレビューに読ませる。根拠への資料属性の追加を Issue 化する |
-| VF-G4 | 主張抽出が §3.2 の型を区別しない | 指標を Milestone 候補へ渡しにくい | 抽出スキーマに主張の型を追加する Issue を起こす |
+| VF-G3 | 根拠に発行者・策定日・計画期間・版を持つ欄がない | 新旧資料の優先や期限切れを機械的に扱えない | **実装済み（2026-10-24）**: 主張の `source_id` と Stakeholder 根拠の `source:` 参照を台帳と読み取り時に結合（§3.3） |
+| VF-G4 | 主張抽出が §3.2 の型を区別しない | 指標を Milestone 候補へ渡しにくい | **実装済み（2026-10-24）**: 資料専用の型と抽出プロンプト、`indicator` の構造化（§3.2） |
 | VF-G5 | Stakeholder / Objective / Journey の作成は決定的処理で、AI 対話の変更候補は既存対象 1 件ずつ | 資料から多数の候補を一括で起こせない | 当面は候補を対象リポジトリの文書に書き、Interview に読ませる。一括候補の経路を Issue 化する |
 | VF-G6 | AI 対話の対象に Environment Observation / Value Exchange がない | 資料の新版を対話で登録できない | 当面は API で登録。対象追加を Issue 化する |
-| VF-G7 | 原因仮説の「埋め方の選択」（§5.3）を持つ欄がない | Gap の埋め方が Feature 以外のとき記録できない | Gap の決定語彙への追加を検討する |
-| VF-G8 | 外部資料台帳の項目（§3.3）を検査する仕組みがない | 台帳の欠落（取得失敗の理由なし等）が見逃される | 台帳の構造検査を snapshot 取り込み時の診断に加える案を検討する |
+| VF-G7 | 原因仮説の「埋め方の選択」（§5.3）を持つ欄がない | Gap の埋め方が Feature 以外のとき記録できない | **実装済み（2026-10-24）**: Gap の解消方法の台帳（§5.3） |
+| VF-G8 | 外部資料台帳の項目（§3.3）を検査する仕組みがない | 台帳の欠落（取得失敗の理由なし等）が見逃される | **実装済み（2026-10-24）**: snapshot から台帳を組み立てて検査する `GET /source-register`（§3.3）。Dashboard 画面は未実装 |
 
 ## 10. 非目標
 

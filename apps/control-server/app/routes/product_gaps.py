@@ -42,6 +42,8 @@ from ..models import (
     ProductGapEvidenceRefCreateRequest,
     ProductGapListOut,
     ProductGapOut,
+    ProductGapResolutionChoiceCreateRequest,
+    ProductGapResolutionChoiceOut,
     ProductGapRevisionCreateRequest,
     ProductGapSourceOut,
     ProductGapSourceRefCreateRequest,
@@ -287,3 +289,30 @@ def record_gap_decision_endpoint(
             _raise_for_error(exc)
             raise
     return ProductGapDecisionOut(**row)
+
+
+@router.post("/{gap_key}/resolution-choices", response_model=ProductGapResolutionChoiceOut, status_code=201)
+def record_gap_resolution_choice_endpoint(
+    gap_key: str,
+    payload: ProductGapResolutionChoiceCreateRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> ProductGapResolutionChoiceOut:
+    """How a human chose to close the Gap (vision-to-feature-research.md
+    §5.3). Never moves `lifecycle` or `priority_band`."""
+    with get_conn() as conn:
+        try:
+            row = product_objective.record_gap_resolution_choice(
+                conn,
+                system_id=system_id,
+                gap_key=gap_key,
+                approach=payload.approach,
+                feature_key=payload.feature_key,
+                rationale=payload.rationale,
+                captured_digest=payload.captured_digest,
+                decided_by=_principal_actor(principal),
+            )
+        except Exception as exc:
+            _raise_for_error(exc)
+            raise
+    return ProductGapResolutionChoiceOut(**row)
