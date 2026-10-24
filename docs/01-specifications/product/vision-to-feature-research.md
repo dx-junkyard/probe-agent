@@ -75,7 +75,7 @@ Sponsor は、例えば自治体、企業の経営層、事業部、資金提供
 Sponsor Stakeholder の Need の対応で表す（型の語彙は全プロジェクトで共通に保つ）。
 
 実装（`documentation_claim_scanner.py`）: 台帳に登録された資料（§3.3）のチャンクは専用の
-抽出プロンプト（`claim-scanner-source-v2`）で読み、下表の型 **だけ** を受け付ける。それ以外の
+抽出プロンプト（`claim-scanner-source-v3`）で読み、下表の型 **だけ** を受け付ける。それ以外の
 文書のチャンクは下表の型を受け付けない（VF-D1 を語彙で強制する）。各主張は `source_id` を持ち、
 資料の属性は保存せず台帳から読み取り時に結合する。`indicator` は `name` / `unit` / `baseline` /
 `baseline_year` / `target` / `target_year` を資料の文言のまま持つ（書かれていない値は空）。
@@ -91,7 +91,7 @@ Sponsor Stakeholder の Need の対応で表す（型の語彙は全プロジェ
 | `problem_statement` | Sponsor の課題認識 | 現状の証拠（Sponsor の認識として。受益者の声とは別。VF-D2） |
 | `target_group` | 対象者 | Stakeholder の候補 |
 | `constraint` | 制約・原則・禁止事項 | 非目標、横断 Requirement |
-| `opinion` | 資料の中で発行者以外（委員、アンケートの自由回答など）に帰属する意見 | 仮説や調査の手がかり。発行者の目標としては扱わない（VF-D1） |
+| `opinion` | 資料の中で発行者以外（委員、引用された自由回答など）に帰属する意見。発行者が数値で報告する集計結果（アンケートの割合など）は `indicator` | 仮説や調査の手がかり。発行者の目標としては扱わない（VF-D1） |
 
 ### 3.3 外部資料台帳（External Source Registry）
 

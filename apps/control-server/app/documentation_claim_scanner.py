@@ -44,8 +44,8 @@ PROMPT_VERSION = "claim-scanner-v1"
 SCHEMA_VERSION = "claim-scanner-v1"
 #: Source chunks use their own prompt and schema; system chunks keep v1 so
 #: existing scan results stay reusable.
-SOURCE_PROMPT_VERSION = "claim-scanner-source-v2"
-SOURCE_SCHEMA_VERSION = "claim-scanner-source-v2"
+SOURCE_PROMPT_VERSION = "claim-scanner-source-v3"
+SOURCE_SCHEMA_VERSION = "claim-scanner-source-v3"
 
 SYSTEM_CLAIM_TYPES = {
     "system_purpose",
@@ -227,10 +227,13 @@ claim_type meanings:
 - target_group: a group of people the source names as affected or targeted
 - constraint: a principle, condition or prohibition the source sets
 - opinion: a view the source attributes to someone other than its publisher
-  (for example committee members' comments, survey free-text answers,
+  (for example committee members' comments, quoted free-text answers,
   "との意見"). Use opinion instead of any other type for such statements,
   even when they propose a goal or a measure: they are not the publisher's
   own position.
+  Aggregated results the publisher reports as measured numbers (survey
+  shares, counts, rates) are indicator, not opinion, even when respondents
+  were asked what they want.
 
 Rules:
 - Extract only what is written in this chunk. Never add numbers, years or

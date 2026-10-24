@@ -266,6 +266,8 @@ class TestSourceClaimTypes:
         assert [(c.claim_type, c.is_valid) for c in result.claims] == [("opinion", True)]
         assert "opinion:" in client.messages[0]["content"]
         assert "not the publisher's" in client.messages[0]["content"]
+        # Reported survey figures are measurements, not opinions.
+        assert "Aggregated results the publisher reports as measured numbers" in client.messages[0]["content"]
 
     def test_system_chunk_rejects_source_types(self):
         client = _Recorder({"claims": [
