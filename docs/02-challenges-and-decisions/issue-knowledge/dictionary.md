@@ -326,7 +326,17 @@
 | 典型座標 | connection.contract + connection.information |
 | 発見観点 | reproduction / trace_walk |
 | 解決観点 | carry_through / explicit_contract |
-| 見分け方・設計時の問い | 生成器が座標（行番号等）を数えずに読み取れる形で入力を受け取るか。座標の逸脱1件で他の有効な結果まで捨てていないか。語彙の不一致（generation-contract-mismatch）ではなく、座標の算出に要る情報が渡らない点を問う。 |
+| 見分け方・設計時の問い | 生成器が座標（行番号等）を数えずに読み取れる形で入力を受け取るか。座標の逸脱1件で他の有効な結果まで捨てていないか。語彙の不一致（generation-contract-mismatch）ではなく、座標の算出に要る情報が渡らない点を問う。識別子（IK-0027）では派生形が3つ出た: (1)名前のslug化（列挙idでなく名前からidを自作）、(2)一覧表記の装飾の転写（`(kind)` を名前に写す）、(3)経路由来のモジュール接頭辞の付加（`pkg.mod.Name`、索引は `Name`）。提示形式の明示に加え、既知の変形を照合側で正規化してから落とすかを問う。 |
+
+#### hardcoded-output-budget-diverges
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 同じ生成器を呼ぶ経路の一部が出力上限を共有設定でなく小さい固定値で持ち、上限内で本文が残らず空応答になる |
+| 典型座標 | governance.budget + structure.aggregation |
+| 発見観点 | reproduction / inventory |
+| 解決観点 | canonical_source / order_and_budget |
+| 見分け方・設計時の問い | 同じモデルを呼ぶ全経路が上限を同じ設定から読むか。推論に出力枠を先に使うモデルで、上限が本文に足りるか。応答の形式不一致（unanchored-reference-strict-validation）ではなく、本文自体が空である点を問う。 |
 
 型の追加時は上記の項目を揃え、同じ変更で少なくとも1つのエントリから参照する。
 単純な局所処理の不良も対象。該当例が得られる前に想像で辞書の型を増やさない。

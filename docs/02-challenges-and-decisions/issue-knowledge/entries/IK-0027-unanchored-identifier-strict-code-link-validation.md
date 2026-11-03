@@ -62,7 +62,7 @@
       "explicit_contract",
       "carry_through"
     ],
-    "note": "プロンプトで feature_id を先頭に置き「列挙値をそのまま写す」契約を明示し、パーサは別名解決・(kind)除去後も解決できないlinkだけを落とす。コミット880a1eaで着地。不明として落としたlinkが成功応答にもログにも出ない点は残課題。",
+    "note": "プロンプトで feature_id を先頭に置き「列挙値をそのまま写す」契約を明示し、パーサは別名解決・(kind)除去後も解決できないlinkだけを落とす。コミット880a1eaで着地。不明として落としたlinkが成功応答にもログにも出ない点は残課題。 2026-11-03の3例目（モジュール接頭辞の付加）に対し、経路由来の接頭辞除去と最後の`.`以降での照合をコミット103f47eで追加。",
     "landed_in": [
       "apps/control-server/app/code_mapper.py"
     ],
@@ -95,6 +95,13 @@
         "carry_through"
       ],
       "reason": "写すべき識別子の契約をプロンプトで明示し、Feature名の別名表で識別子を照合側まで運んだ。"
+    },
+    {
+      "date": "2026-11-03",
+      "field": "resolution.note",
+      "from": "880a1eaのみ",
+      "to": "880a1ea + 103f47e",
+      "reason": "sim-sandbox E-0007で3例目（全linkのsymbol_qualified_nameにファイル経路由来のモジュール接頭辞）を観測。880a1eaの落とした一覧付きエラーで原因が即座に判明し、103f47eで接頭辞除去と末尾名照合を追加。テスト関連39件pass、実機再試行でlink 29件completed。statusはresolvedのまま。"
     }
   ]
 }
@@ -129,8 +136,13 @@ code-links生成を2回再現し、error_detailsが示す未知のfeature_id・s
 - テスト: `apps/control-server/tests/test_code_mapper_parse.py`（新規5件）、`tests/test_feature_code_mapping.py` と `tests/test_probe_plan.py` を含めて75 passed（イメージの使い捨てコンテナで実行）。
 - 実機: 再ビルド後の `code-links/generate` が completed、link 14件（5 Feature全部に対応、confidence 0.85〜1.0）。
 
+**追加の事例と解決（2026-11-03、sim-sandbox E-0007）。** 3例目: 135 symbolsの一覧に対し、`code-links/generate`（gpt-6-luna）が全linkの `symbol_qualified_name` をファイル経路由来のモジュール接頭辞つき（`sims.p01-tov.tov.eos.Polytrope`、索引は `Polytrope`）で書き、全linkが落ちてfailed。上記(3)の「全部落ちたときだけ失敗し、落ちた一覧をエラーに出す」により原因が即座に読めた。起票元: `sim-sandbox/docs/02-experiments/E-0007-p03-dcf-synthetic-probe-agent.md`（本リポジトリ外）。
+
+- 修正（コミット `103f47e`）: `_parse_mapping_response` で、経路（`tov/eos.py` → `tov.eos.`）から作った接頭辞を剥がし、それでも解決しなければ最後の `.` 以降で照合してから落とす。
+- 検証: `tests/test_code_mapper_parse.py` に2件追加し、関連39件pass。実機: 再試行でlink 29件completed。
+
 残課題（未対応）: 不明として落としたlinkの一覧が成功応答に出ず、ログにも残らない。
 
 ## 一般化
 
-生成器に識別子を返させるなら、写す元の値を名前・種別などの装飾と区別して提示し、「そのまま写す」契約を明示する必要がある。そのうえで1件の未知識別子で全体を捨てると、有効な結果まで失われる。IK-0026の座標（行番号）と同じく、生成器が自力で作れない参照値を厳密照合する箇所で再発しうる。
+生成器に識別子を返させるなら、写す元の値を名前・種別などの装飾と区別して提示し、「そのまま写す」契約を明示する必要がある。そのうえで1件の未知識別子で全体を捨てると、有効な結果まで失われる。IK-0026の座標（行番号）と同じく、生成器が自力で作れない参照値を厳密照合する箇所で再発しうる。識別子のずれは「名前のslug化」「一覧表記 `(kind)` の転写」「モジュール経路の付加」の3型が出た。提示の明示だけでは防ぎきれず、既知の変形を照合側で正規化してから落とすことが有効だった。
