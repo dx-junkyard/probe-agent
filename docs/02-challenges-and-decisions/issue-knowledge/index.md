@@ -8,7 +8,7 @@
 ## 概況
 
 - エントリ: 26 / 独立原因: 26
-- 状態: deferred 1、open 3、resolved 22
+- 状態: deferred 1、open 2、resolved 23
 - 分類レビュー: candidate 25、confirmed 1
 - 群: 局所 1、構造・接続・統制 25
 
@@ -41,7 +41,7 @@
 | [IK-0023](entries/IK-0023-classification-gates-capture.md) | 分類確定を知識登録の条件と取り違え、観測済み知見が索引外に滞留する | resolved / confirmed / confirmed | 構造・接続・統制 | processing=none / structure=none / connection=none / governance=ordering+assignment | 2026-10-04 |
 | [IK-0024](entries/IK-0024-sandbox-presence-as-capability.md) | 隔離実行ツールの存在を動作可能と見なし、Compose既定構成で名前空間を作れない失敗を診断が検知しない | open / hypothesis / candidate | 構造・接続・統制 | processing=none / structure=none / connection=condition / governance=completion | 2026-11-03 |
 | [IK-0025](entries/IK-0025-isolated-runtime-dependency-unprovisioned.md) | 隔離実行がネットワークを禁じる一方で依存の供給経路を定めず、第三者ライブラリに依存する対象を実行できない | open / hypothesis / candidate | 構造・接続・統制 | processing=none / structure=responsibility / connection=contract / governance=none | 2026-11-03 |
-| [IK-0026](entries/IK-0026-unnumbered-context-evidence-line-validation.md) | draft生成が行番号なしの本文から1-basedの行範囲を要求し、1件の範囲超過でdraft全体を破棄する | open / hypothesis / candidate | 構造・接続・統制 | processing=none / structure=none / connection=contract+information / governance=none | 2026-11-03 |
+| [IK-0026](entries/IK-0026-unnumbered-context-evidence-line-validation.md) | draft生成が行番号なしの本文から1-basedの行範囲を要求し、1件の範囲超過でdraft全体を破棄する | resolved / hypothesis / candidate | 構造・接続・統制 | processing=none / structure=none / connection=contract+information / governance=none | 2026-11-03 |
 
 ## 型・族と実際の座標
 
@@ -263,14 +263,14 @@
 ## 解決観点
 
 - `canonical_source`: [IK-0010](entries/IK-0010-frozen-view-reads-live-data.md)、[IK-0012](entries/IK-0012-candidate-state-content-mismatch.md)、[IK-0020](entries/IK-0020-alternate-establishment-bypass.md)
-- `carry_through`: [IK-0002](entries/IK-0002-unmounted-form-delivery.md)、[IK-0003](entries/IK-0003-root-only-freshness.md)、[IK-0007](entries/IK-0007-inherited-intent-dropped.md)、[IK-0010](entries/IK-0010-frozen-view-reads-live-data.md)、[IK-0012](entries/IK-0012-candidate-state-content-mismatch.md)、[IK-0017](entries/IK-0017-incomparable-metrics-ranked.md)、[IK-0021](entries/IK-0021-viewport-used-for-container-layout.md)、[IK-0022](entries/IK-0022-repeated-resolution-connection-overhead.md)
+- `carry_through`: [IK-0002](entries/IK-0002-unmounted-form-delivery.md)、[IK-0003](entries/IK-0003-root-only-freshness.md)、[IK-0007](entries/IK-0007-inherited-intent-dropped.md)、[IK-0010](entries/IK-0010-frozen-view-reads-live-data.md)、[IK-0012](entries/IK-0012-candidate-state-content-mismatch.md)、[IK-0017](entries/IK-0017-incomparable-metrics-ranked.md)、[IK-0021](entries/IK-0021-viewport-used-for-container-layout.md)、[IK-0022](entries/IK-0022-repeated-resolution-connection-overhead.md)、[IK-0026](entries/IK-0026-unnumbered-context-evidence-line-validation.md)
 - `deferred_decision`: [IK-0004](entries/IK-0004-unobserved-user-outcomes.md)
-- `explicit_contract`: [IK-0002](entries/IK-0002-unmounted-form-delivery.md)、[IK-0007](entries/IK-0007-inherited-intent-dropped.md)、[IK-0008](entries/IK-0008-partial-session-creation.md)、[IK-0009](entries/IK-0009-candidate-as-canonical-fallback.md)、[IK-0011](entries/IK-0011-validation-write-race.md)、[IK-0013](entries/IK-0013-caller-controlled-provenance.md)、[IK-0015](entries/IK-0015-unfinished-execution-as-evidence.md)、[IK-0017](entries/IK-0017-incomparable-metrics-ranked.md)、[IK-0019](entries/IK-0019-review-approval-conflation.md)、[IK-0021](entries/IK-0021-viewport-used-for-container-layout.md)、[IK-0023](entries/IK-0023-classification-gates-capture.md)
+- `explicit_contract`: [IK-0002](entries/IK-0002-unmounted-form-delivery.md)、[IK-0007](entries/IK-0007-inherited-intent-dropped.md)、[IK-0008](entries/IK-0008-partial-session-creation.md)、[IK-0009](entries/IK-0009-candidate-as-canonical-fallback.md)、[IK-0011](entries/IK-0011-validation-write-race.md)、[IK-0013](entries/IK-0013-caller-controlled-provenance.md)、[IK-0015](entries/IK-0015-unfinished-execution-as-evidence.md)、[IK-0017](entries/IK-0017-incomparable-metrics-ranked.md)、[IK-0019](entries/IK-0019-review-approval-conflation.md)、[IK-0021](entries/IK-0021-viewport-used-for-container-layout.md)、[IK-0023](entries/IK-0023-classification-gates-capture.md)、[IK-0026](entries/IK-0026-unnumbered-context-evidence-line-validation.md)
 - `fail_closed`: [IK-0006](entries/IK-0006-missing-post-inference-check.md)、[IK-0015](entries/IK-0015-unfinished-execution-as-evidence.md)、[IK-0016](entries/IK-0016-completed-evidence-overwritten.md)、[IK-0018](entries/IK-0018-unknown-metric-direction-default.md)、[IK-0020](entries/IK-0020-alternate-establishment-bypass.md)
 - `first_class_state`: [IK-0005](entries/IK-0005-immutable-premise-overwritten.md)、[IK-0009](entries/IK-0009-candidate-as-canonical-fallback.md)、[IK-0019](entries/IK-0019-review-approval-conflation.md)
 - `guardrail_fix`: [IK-0001](entries/IK-0001-generation-contract-vocabulary.md)、[IK-0014](entries/IK-0014-concurrent-idempotency-conflict.md)
 - `order_and_budget`: [IK-0006](entries/IK-0006-missing-post-inference-check.md)、[IK-0008](entries/IK-0008-partial-session-creation.md)、[IK-0011](entries/IK-0011-validation-write-race.md)、[IK-0014](entries/IK-0014-concurrent-idempotency-conflict.md)
-- `pending`: [IK-0024](entries/IK-0024-sandbox-presence-as-capability.md)、[IK-0025](entries/IK-0025-isolated-runtime-dependency-unprovisioned.md)、[IK-0026](entries/IK-0026-unnumbered-context-evidence-line-validation.md)
+- `pending`: [IK-0024](entries/IK-0024-sandbox-presence-as-capability.md)、[IK-0025](entries/IK-0025-isolated-runtime-dependency-unprovisioned.md)
 - `representation_change`: [IK-0003](entries/IK-0003-root-only-freshness.md)
 - `responsibility_move`: [IK-0013](entries/IK-0013-caller-controlled-provenance.md)、[IK-0022](entries/IK-0022-repeated-resolution-connection-overhead.md)、[IK-0023](entries/IK-0023-classification-gates-capture.md)
 - `single_point_fix`: [IK-0018](entries/IK-0018-unknown-metric-direction-default.md)
@@ -298,7 +298,7 @@
 - 分類候補: [IK-0001](entries/IK-0001-generation-contract-vocabulary.md)、[IK-0002](entries/IK-0002-unmounted-form-delivery.md)、[IK-0003](entries/IK-0003-root-only-freshness.md)、[IK-0004](entries/IK-0004-unobserved-user-outcomes.md)、[IK-0005](entries/IK-0005-immutable-premise-overwritten.md)、[IK-0006](entries/IK-0006-missing-post-inference-check.md)、[IK-0007](entries/IK-0007-inherited-intent-dropped.md)、[IK-0008](entries/IK-0008-partial-session-creation.md)、[IK-0009](entries/IK-0009-candidate-as-canonical-fallback.md)、[IK-0010](entries/IK-0010-frozen-view-reads-live-data.md)、[IK-0011](entries/IK-0011-validation-write-race.md)、[IK-0012](entries/IK-0012-candidate-state-content-mismatch.md)、[IK-0013](entries/IK-0013-caller-controlled-provenance.md)、[IK-0014](entries/IK-0014-concurrent-idempotency-conflict.md)、[IK-0015](entries/IK-0015-unfinished-execution-as-evidence.md)、[IK-0016](entries/IK-0016-completed-evidence-overwritten.md)、[IK-0017](entries/IK-0017-incomparable-metrics-ranked.md)、[IK-0018](entries/IK-0018-unknown-metric-direction-default.md)、[IK-0019](entries/IK-0019-review-approval-conflation.md)、[IK-0020](entries/IK-0020-alternate-establishment-bypass.md)、[IK-0021](entries/IK-0021-viewport-used-for-container-layout.md)、[IK-0022](entries/IK-0022-repeated-resolution-connection-overhead.md)、[IK-0024](entries/IK-0024-sandbox-presence-as-capability.md)、[IK-0025](entries/IK-0025-isolated-runtime-dependency-unprovisioned.md)、[IK-0026](entries/IK-0026-unnumbered-context-evidence-line-validation.md)
 - 原因仮説: [IK-0024](entries/IK-0024-sandbox-presence-as-capability.md)、[IK-0025](entries/IK-0025-isolated-runtime-dependency-unprovisioned.md)、[IK-0026](entries/IK-0026-unnumbered-context-evidence-line-validation.md)
 - unknownあり: なし
-- 未解決・保留: [IK-0004](entries/IK-0004-unobserved-user-outcomes.md)、[IK-0024](entries/IK-0024-sandbox-presence-as-capability.md)、[IK-0025](entries/IK-0025-isolated-runtime-dependency-unprovisioned.md)、[IK-0026](entries/IK-0026-unnumbered-context-evidence-line-validation.md)
+- 未解決・保留: [IK-0004](entries/IK-0004-unobserved-user-outcomes.md)、[IK-0024](entries/IK-0024-sandbox-presence-as-capability.md)、[IK-0025](entries/IK-0025-isolated-runtime-dependency-unprovisioned.md)
 - [IK-0001](entries/IK-0001-generation-contract-vocabulary.md) 確信度low/medium: structure, governance
 - [IK-0002](entries/IK-0002-unmounted-form-delivery.md) 確信度low/medium: structure, governance
 - [IK-0003](entries/IK-0003-root-only-freshness.md) 確信度low/medium: structure, governance

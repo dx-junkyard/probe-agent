@@ -2,11 +2,11 @@
 {
   "id": "IK-0026",
   "title": "draft生成が行番号なしの本文から1-basedの行範囲を要求し、1件の範囲超過でdraft全体を破棄する",
-  "status": "open",
+  "status": "resolved",
   "recorded_at": "2026-11-03",
   "observed_at": "2026-11-03",
-  "target_revision": "2026-11-03 時点のローカル checkout（Compose クイックスタート構成、PROBE_EXECUTION_BACKEND=inprocess）",
-  "resolved_at": null,
+  "target_revision": "ブランチ sim-sandbox/ik-0024-0026（uraから分岐、2026-11-03）。起票時は2026-11-03時点のローカルcheckout",
+  "resolved_at": "2026-11-03",
   "sources": [
     "docs/90-history/project-intelligence.md"
   ],
@@ -59,18 +59,44 @@
   },
   "resolution": {
     "perspective": [
-      "pending"
+      "carry_through",
+      "explicit_contract"
     ],
-    "note": "未実行の候補: (a)行番号付き提示 (b)draft全体を捨てない検証 (c)検証失敗をLLMへ返して1回修正 (d)失敗runを201以外で返す (e)不正範囲の値をerror_detailsへ残す (f)上限で落としたファイルをメタデータに出す。採否はprobe-agent側の判断。",
-    "landed_in": [],
-    "verification": []
+    "note": "(a)行番号付き提示と(b)の一部（end_line超過の丸め）を採用し、コミットf18116f・a788f94で着地。(c)(e)は未採用（拒否時エラーに実際の値と行数を含める点で(e)を部分的に充足）。(d)失敗runへの201応答、(f)200,000字超過で落としたファイルの非表示は残課題。",
+    "landed_in": [
+      "apps/control-server/app/draft_generator.py"
+    ],
+    "verification": [
+      "apps/control-server/tests/test_draft_generator_evidence.py",
+      "apps/control-server/tests/test_repository_intelligence.py"
+    ]
   },
   "related": [
     "IK-0024",
     "IK-0025"
   ],
   "view_of": [],
-  "history": []
+  "history": [
+    {
+      "date": "2026-11-03",
+      "field": "status",
+      "from": "open",
+      "to": "resolved",
+      "reason": "ブランチ sim-sandbox/ik-0024-0026 のコミット f18116f・a788f94 で着地。同日の現在の実行でテスト52 passed、実機drafts生成completed。"
+    },
+    {
+      "date": "2026-11-03",
+      "field": "resolution.perspective",
+      "from": [
+        "pending"
+      ],
+      "to": [
+        "carry_through",
+        "explicit_contract"
+      ],
+      "reason": "行番号を生成側へ運び、範囲の受入契約を明示（末尾超過の丸め・start_line超過のみ拒否）した。"
+    }
+  ]
 }
 ---
 
@@ -92,7 +118,21 @@ drafts生成を対象範囲を変えて再現し、error_detailsが指すpathの
 
 ## 解決の観点
 
-未実行（pending）。候補:
+**解決（2026-11-03、対象版: ブランチ `sim-sandbox/ik-0024-0026`、`ura` から分岐）。**
+
+着地先: `apps/control-server/app/draft_generator.py`。
+
+- コミット `f18116f`: end_line がファイル末尾を超える引用は末尾に丸めて受理し、start_line が末尾を越える引用だけ拒否する。bwrap の `--dev /dev` 追加も同コミット（IK-0024 関連）。
+- コミット `a788f94`: `_build_file_context` で各行に `NNNN| ` を前置し、プロンプトでその番号を使うよう指示。start<1 は 1 に、end<start は入れ替え。拒否時のエラーに実際の値と行数を含める。
+
+検証（すべて 2026-11-03 の現在の実行）:
+
+- テスト: `apps/control-server/tests/test_draft_generator_evidence.py`（新規 8 件）、`tests/test_repository_intelligence.py` の `test_invalid_evidence_range_fails_without_persisting_drafts` を start_line 超過の例に変更。イメージ `probe-agent/control-server:latest` の使い捨てコンテナで `pytest tests/test_repository_intelligence.py tests/test_draft_generator_evidence.py` → 52 passed。
+- 実機: control-server を再ビルド後、`POST /repository/drafts/generate`（provider openai、model gpt-6-luna、snapshot #2 = sim-sandbox の `sims/**` 16 files）が `status=completed`。System Profile 1 件・Feature 5 件（各 evidence 4〜7 件）。修正前は同条件で 4 回連続 failed（うち 1 回は丸めのみの修正後で `invalid evidence line range`）。
+
+残課題（未対応、新規 IK は起票しない）: (d) 失敗した intelligence_run に HTTP 201 を返す点、(f) 200,000 字超過で落としたファイルが応答に現れない点。
+
+起票時の候補（参考、2026-11-03 起票時点）:
 
 - (a) プロンプトで各行に行番号を付けて提示する（LLMが数えなくてよい）。
 - (b) 超過したevidenceは切り詰める・その項目だけ落とすなど、draft全体を捨てない検証にする。

@@ -8,8 +8,9 @@ results for testing.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .code_indexer import CodeSymbol
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
@@ -81,7 +82,8 @@ def _build_feature_context(features: List[FeatureContext]) -> str:
     for f in features:
         keywords = ", ".join(f.evidence_keywords) if f.evidence_keywords else "none"
         parts.append(
-            f"- Feature: {f.name} (id: {f.feature_id})\n"
+            f"- feature_id: {f.feature_id}\n"
+            f"  Name: {f.name}\n"
             f"  Summary: {f.summary}\n"
             f"  User value: {f.user_value}\n"
             f"  Success criteria: {', '.join(f.success_criteria) or 'none'}\n"
@@ -100,7 +102,8 @@ Given the following features and code symbols from a Python repository,
 identify which symbols implement or support each feature.
 
 For each link, provide:
-- feature_id: the feature being mapped
+- feature_id: copy the feature_id value exactly as listed under "## Features";
+  do not derive an id from the feature name
 - symbol_qualified_name: the exact qualified name from the symbol list
 - symbol_path: the file path of the symbol
 - relation_reason: why this symbol is related to the feature
@@ -132,10 +135,16 @@ Respond with ONLY valid JSON matching this schema:
 {symbol_context}"""
 
 
+def _slug(text: str) -> str:
+    """Kebab-case a feature name the way a model tends to when it invents an id."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
 def _parse_mapping_response(
     raw_json: str,
     valid_feature_ids: set,
     valid_symbols: set[Tuple[str, str]],
+    feature_aliases: Optional[Dict[str, str]] = None,
 ) -> List[FeatureCodeLinkResult]:
     data = json.loads(raw_json)
     if not isinstance(data, dict):
@@ -147,6 +156,8 @@ def _parse_mapping_response(
 
     results = []
     seen = set()
+    unknown_features: List[str] = []
+    unknown_symbols: List[str] = []
     for item in links_data:
         if not isinstance(item, dict):
             raise MappingValidationError("link items must be objects")
@@ -155,16 +166,29 @@ def _parse_mapping_response(
         if not feature_id:
             raise MappingValidationError("feature_id is required")
         if feature_id not in valid_feature_ids:
-            raise MappingValidationError(f"unknown feature_id: {feature_id}")
+            # Models slugify the feature *name* instead of copying the id
+            # ("use-polytropic-or-tabulated-eos" for select-equation-of-state).
+            # Resolve that through the name alias; a link whose feature cannot
+            # be resolved at all is dropped on its own instead of discarding
+            # every other link in the response.
+            resolved = (feature_aliases or {}).get(_slug(feature_id))
+            if resolved is None:
+                unknown_features.append(feature_id)
+                continue
+            feature_id = resolved
 
         sym_name = str(item.get("symbol_qualified_name", "")).strip()
         if not sym_name:
             raise MappingValidationError("symbol_qualified_name is required")
+        # The symbol list reads "name (kind) in path:..."; models copy the
+        # "(kind)" suffix into the name. Strip it before matching.
+        sym_name = re.sub(r"\s*\([a-z_ ]+\)$", "", sym_name)
         response_path = str(item.get("symbol_path", "")).strip()
         if (response_path, sym_name) not in valid_symbols:
-            raise MappingValidationError(
-                f"unknown symbol: {response_path}:{sym_name}"
-            )
+            # A symbol that is not in the index cannot be linked, but one bad
+            # link is no reason to drop the valid ones in the same response.
+            unknown_symbols.append(f"{response_path}:{sym_name}")
+            continue
 
         sym_path = response_path
 
@@ -193,6 +217,13 @@ def _parse_mapping_response(
             source="reasoning_llm",
         ))
 
+    if not results and (unknown_features or unknown_symbols):
+        problems = []
+        if unknown_features:
+            problems.append(f"unknown feature_id: {', '.join(sorted(set(unknown_features)))}")
+        if unknown_symbols:
+            problems.append(f"unknown symbol: {', '.join(sorted(set(unknown_symbols)))}")
+        raise MappingValidationError("; ".join(problems))
     return results
 
 
@@ -259,6 +290,7 @@ def generate_code_mapping(
         )
 
     valid_feature_ids = {f.feature_id for f in features}
+    feature_aliases = {_slug(f.name): f.feature_id for f in features}
     valid_symbols = {(s.path, s.qualified_name) for s in symbols}
 
     try:
@@ -269,7 +301,9 @@ def generate_code_mapping(
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             cleaned = "\n".join(lines)
-        links = _parse_mapping_response(cleaned, valid_feature_ids, valid_symbols)
+        links = _parse_mapping_response(
+            cleaned, valid_feature_ids, valid_symbols, feature_aliases
+        )
     except (json.JSONDecodeError, MappingValidationError, KeyError, TypeError) as exc:
         return MappingResult(
             provider=config.provider,
