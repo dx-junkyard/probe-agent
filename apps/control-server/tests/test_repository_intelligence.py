@@ -923,8 +923,11 @@ class TestDraftGeneration:
                             "success_criteria": [],
                             "evidence": [
                                 {
+                                    # start_line が末尾を越える = 裏付けが無い引用。
+                                    # end_line だけの超過は末尾に丸めて受理する（IK-0026、
+                                    # test_draft_generator_evidence.py）。
                                     "path": "README.md",
-                                    "start_line": 1,
+                                    "start_line": 9999,
                                     "end_line": 9999,
                                     "summary": "outside file bounds",
                                 }

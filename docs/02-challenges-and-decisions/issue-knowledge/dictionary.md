@@ -290,5 +290,43 @@
 | 解決観点 | explicit_contract / responsibility_move |
 | 見分け方・設計時の問い | 分類未確定でも根拠付きcandidateとして検索・試行できるか。単なる証拠不足による未登録とは区別する。 |
 
+### execution-environment
+
+隔離実行の環境が実際に使えるか、実行に要るものを揃えられるかを扱う。2026-11-03に外部検証の実施記録から追加。
+
+#### sandbox-presence-as-capability
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 隔離実行ツールの存在を可用性と見なし、実環境での起動可否を事前に検査しない |
+| 典型座標 | connection.condition + governance.completion |
+| 発見観点 | reproduction / inventory |
+| 解決観点 | fail_closed / explicit_contract |
+| 見分け方・設計時の問い | ツールが存在するが権限不足で動かない環境で、診断が失敗を示すか。ツール不在時のfail closed（既存）とは検出対象が異なる。 |
+
+#### isolated-runtime-dependency-unprovisioned
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 隔離実行で外部取得を禁じたまま、実行に要る依存の供給経路と担当を定めない |
+| 典型座標 | connection.contract + structure.responsibility |
+| 発見観点 | boundary_walk / external_constraint |
+| 解決観点 | explicit_contract / responsibility_move |
+| 見分け方・設計時の問い | network=falseのまま第三者ライブラリ依存の対象を、文書化された手順で再作成後も実行できるか。隔離自体が動かない問題（IK-0024）とは別に、隔離が動いても依存が無い点を問う。 |
+
+### generated-reference
+
+2026-11-03に外部検証（sim-sandbox E-0002）から暫定追加。
+
+#### unanchored-reference-strict-validation
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 生成器に参照座標の手がかりを渡さずに座標を要求し、1件の逸脱で生成結果全体を破棄する |
+| 典型座標 | connection.contract + connection.information |
+| 発見観点 | reproduction / trace_walk |
+| 解決観点 | carry_through / explicit_contract |
+| 見分け方・設計時の問い | 生成器が座標（行番号等）を数えずに読み取れる形で入力を受け取るか。座標の逸脱1件で他の有効な結果まで捨てていないか。語彙の不一致（generation-contract-mismatch）ではなく、座標の算出に要る情報が渡らない点を問う。 |
+
 型の追加時は上記の項目を揃え、同じ変更で少なくとも1つのエントリから参照する。
 単純な局所処理の不良も対象。該当例が得られる前に想像で辞書の型を増やさない。

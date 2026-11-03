@@ -160,10 +160,19 @@ def _parse_evidence(raw: Any, line_counts: Dict[str, int]) -> List[EvidenceItem]
             ) from exc
         if start_line < 1 or end_line < start_line:
             raise DraftValidationError(f"invalid evidence line range: {path}")
-        if end_line > line_counts[path]:
+        # The prompt shows file bodies without line numbers, so the model has to
+        # count lines itself and routinely overshoots by a few lines on long or
+        # wrapped text (IK-0026). An overshoot is a citation precision problem,
+        # not a fabricated path, so clamp it to the file end instead of
+        # discarding the whole draft. A range that starts past the end is still
+        # rejected: nothing in the file backs it.
+        line_count = line_counts[path]
+        if start_line > line_count:
             raise DraftValidationError(
                 f"evidence line range exceeds snapshot content: {path}"
             )
+        if end_line > line_count:
+            end_line = line_count
         summary = str(e.get("summary", "")).strip()
         if not summary:
             raise DraftValidationError(f"evidence summary is required: {path}")
