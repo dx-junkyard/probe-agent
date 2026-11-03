@@ -59,6 +59,13 @@ services:
     volumes:
       - probe-data:/data
       - ${PROBE_REPOSITORY_HOST_ROOT:?Set PROBE_REPOSITORY_HOST_ROOT}:/repositories:rw
+    # inprocess backend の隔離実行（bwrap --unshare-net）がコンテナ内で名前空間と pivot_root を使えるようにする
+    # （IK-0024）。--privileged は不要。worker backend の構成ではこの 2 項目は要らない。
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+    security_opt:
+      - seccomp=unconfined
     ports:
       - "8000:8000"
     healthcheck:
