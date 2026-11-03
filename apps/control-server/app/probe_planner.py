@@ -17,6 +17,7 @@ probe-agent:
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -320,7 +321,9 @@ def generate_probe_plan(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=4096,
+            # Same budget as draft generation (see code_mapper): a 4096 cap can
+            # leave a reasoning model with no room for the answer body.
+            max_tokens=int(os.getenv("INTELLIGENCE_MAX_OUTPUT_TOKENS", "128000")),
         )
     except LLMError as exc:
         return PlanResult(

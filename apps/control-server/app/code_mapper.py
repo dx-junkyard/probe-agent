@@ -8,6 +8,7 @@ results for testing.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -291,7 +292,10 @@ def generate_code_mapping(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=4096,
+            # Same budget as draft generation: reasoning models spend output
+            # tokens on reasoning first, and a 4096 cap returned an empty body
+            # for 135 symbols (sim-sandbox E-0007).
+            max_tokens=int(os.getenv("INTELLIGENCE_MAX_OUTPUT_TOKENS", "128000")),
         )
     except LLMError as exc:
         return MappingResult(
