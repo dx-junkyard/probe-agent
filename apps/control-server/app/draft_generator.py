@@ -87,9 +87,17 @@ def _build_file_context(
                 continue
             total += len(text)
             selected.append(f)
+            # Number every line so evidence ranges can be read off instead of
+            # counted: unnumbered bodies made models overshoot, zero-base or
+            # invert ranges and the whole draft was rejected (IK-0026). The
+            # numbering must match line_counts (splitlines, trailing newline
+            # not counted as a line).
+            numbered = "\n".join(
+                f"{n:4d}| {line}" for n, line in enumerate(text.splitlines(), 1)
+            )
             parts.append(
                 f"### File: {f.path} (type: {source_type})\n"
-                f"<repository_file>\n{text}\n</repository_file>"
+                f"<repository_file>\n{numbered}\n</repository_file>"
             )
 
     return "\n\n".join(parts), selected
@@ -109,6 +117,9 @@ Analyze the following repository snapshot and produce:
 
 Every claim in the System Profile and every Feature MUST include evidence
 with: path (file path), start_line (1-based), end_line (1-based), and summary.
+Each line of every file below is prefixed with its 1-based line number and
+"| ". Use those numbers for start_line and end_line; do not count lines
+yourself, and never cite a number larger than the last one shown for a file.
 
 Respond with ONLY valid JSON matching this schema:
 {{
@@ -158,18 +169,20 @@ def _parse_evidence(raw: Any, line_counts: Dict[str, int]) -> List[EvidenceItem]
             raise DraftValidationError(
                 f"evidence line range must be integers: {path}"
             ) from exc
-        if start_line < 1 or end_line < start_line:
-            raise DraftValidationError(f"invalid evidence line range: {path}")
-        # The prompt shows file bodies without line numbers, so the model has to
-        # count lines itself and routinely overshoots by a few lines on long or
-        # wrapped text (IK-0026). An overshoot is a citation precision problem,
-        # not a fabricated path, so clamp it to the file end instead of
-        # discarding the whole draft. A range that starts past the end is still
-        # rejected: nothing in the file backs it.
+        # Line numbers are a citation-precision problem, not a fabricated path
+        # (IK-0026): models still miscount or invert ranges even with numbered
+        # context. Normalise what can be normalised and only reject a range
+        # that nothing in the file can back. Keep the raw values in the error
+        # so a failed run says what the model actually wrote.
         line_count = line_counts[path]
-        if start_line > line_count:
+        if start_line < 1:
+            start_line = 1
+        if end_line < start_line:
+            start_line, end_line = end_line, start_line
+        if start_line < 1 or start_line > line_count:
             raise DraftValidationError(
-                f"evidence line range exceeds snapshot content: {path}"
+                "evidence line range exceeds snapshot content: "
+                f"{path} ({e.get('start_line')}-{e.get('end_line')}, {line_count} lines)"
             )
         if end_line > line_count:
             end_line = line_count
