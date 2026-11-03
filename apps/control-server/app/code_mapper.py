@@ -185,6 +185,19 @@ def _parse_mapping_response(
         sym_name = re.sub(r"\s*\([a-z_ ]+\)$", "", sym_name)
         response_path = str(item.get("symbol_path", "")).strip()
         if (response_path, sym_name) not in valid_symbols:
+            # Models also prefix the name with a module path derived from the
+            # file ("sims.p01-tov.tov.eos.Polytrope" for tov/eos.py:Polytrope).
+            # Try the name with that prefix removed, then the last dotted
+            # segment, before giving the link up.
+            module_prefix = re.sub(r"\.py$", "", response_path).replace("/", ".") + "."
+            for candidate in (
+                sym_name[len(module_prefix):] if sym_name.startswith(module_prefix) else None,
+                sym_name.rsplit(".", 1)[-1] if "." in sym_name else None,
+            ):
+                if candidate and (response_path, candidate) in valid_symbols:
+                    sym_name = candidate
+                    break
+        if (response_path, sym_name) not in valid_symbols:
             # A symbol that is not in the index cannot be linked, but one bad
             # link is no reason to drop the valid ones in the same response.
             unknown_symbols.append(f"{response_path}:{sym_name}")

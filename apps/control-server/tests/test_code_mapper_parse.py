@@ -41,6 +41,17 @@ def test_kind_suffix_on_symbol_name_is_stripped():
     assert out[0].symbol_qualified_name == "mass_radius_sequence"
 
 
+def test_module_qualified_symbol_name_is_resolved_against_path():
+    # モデルがファイル経路由来のモジュール接頭辞を付けて書く（sims.p01-tov.tov.eos.Polytrope）
+    out = _parse([_link("select-equation-of-state", "sims.p01-tov.tov.eos.Polytrope", "tov/eos.py")])
+    assert out[0].symbol_qualified_name == "Polytrope"
+
+
+def test_dotted_name_falls_back_to_last_segment():
+    out = _parse([_link("mass-radius-sequence", "some.module.mass_radius_sequence", "tov/sequence.py")])
+    assert out[0].symbol_qualified_name == "mass_radius_sequence"
+
+
 def test_unresolvable_link_is_dropped_but_others_kept():
     out = _parse([
         _link("totally-made-up", "Polytrope", "tov/eos.py"),
