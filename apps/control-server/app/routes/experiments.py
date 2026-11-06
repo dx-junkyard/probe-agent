@@ -717,6 +717,112 @@ def _analysis_messages(
     ]
 
 
+def _analysis_max_tokens() -> int:
+    value = int(os.getenv("INTELLIGENCE_MAX_OUTPUT_TOKENS", "128000"))
+    if value < 1:
+        raise ValueError("INTELLIGENCE_MAX_OUTPUT_TOKENS must be positive")
+    return value
+
+
+def _text_of(value: Any) -> Optional[str]:
+    """A string field the model may have returned as a list or object."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [_text_of(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("text", "summary", "description", "risk", "reason", "detail"):
+            if isinstance(value.get(key), str) and value[key].strip():
+                return value[key].strip()
+        return json.dumps(value, ensure_ascii=False)
+    return str(value).strip()
+
+
+def _normalize_analysis(
+    parsed: Dict[str, Any],
+    allowed_keys: List[str],
+    experiment: ExperimentOut,
+) -> Dict[str, Any]:
+    """Normalise -> resolve -> drop only the bad field (K-0001, IK-0031).
+
+    Only a missing narrative fails the analysis: it is the one field nothing
+    else can stand in for. A shape slip (risks as a string, a reason as a
+    list) is normalised, and a recommendation that does not resolve to an
+    experiment variant is dropped with a note while the narrative is kept.
+    Every adjustment is reported in ``notes``.
+    """
+    notes: List[str] = []
+
+    narrative = _text_of(parsed.get("narrative"))
+    if not narrative:
+        raise ValueError("narrative is required")
+    if not isinstance(parsed.get("narrative"), str):
+        notes.append(
+            f"narrative was a {type(parsed.get('narrative')).__name__}; joined into text"
+        )
+
+    raw_reason = parsed.get("recommendation_reason")
+    reason = _text_of(raw_reason) or ""
+    if raw_reason is not None and not isinstance(raw_reason, str):
+        notes.append(
+            f"recommendation_reason was a {type(raw_reason).__name__}; joined into text"
+        )
+
+    raw_risks = parsed.get("risks")
+    if raw_risks is None:
+        risks: List[str] = []
+    elif isinstance(raw_risks, list):
+        risks = [text for text in (_text_of(item) for item in raw_risks) if text]
+        if any(not isinstance(item, str) for item in raw_risks):
+            notes.append("risks contained non-string items; converted to text")
+    elif isinstance(raw_risks, str):
+        risks = [raw_risks.strip()] if raw_risks.strip() else []
+        notes.append("risks was a string; normalised to a one-item list")
+    else:
+        text = _text_of(raw_risks)
+        risks = [text] if text else []
+        notes.append(
+            f"risks was a {type(raw_risks).__name__}; normalised to a one-item list"
+        )
+
+    raw_key = parsed.get("recommendation_variant_key")
+    recommendation: Optional[str] = None
+    if raw_key is not None and not (isinstance(raw_key, str) and not raw_key.strip()):
+        candidate = str(raw_key).strip()
+        if candidate in allowed_keys:
+            recommendation = candidate
+        else:
+            # Resolve the two slips a model makes with a listed key: case or
+            # spacing, and naming the variant by its label instead of its key.
+            by_key = {key.lower(): key for key in allowed_keys}
+            by_label = {
+                variant.label.strip().lower(): variant.variant_key
+                for variant in experiment.variants
+                if variant.variant_key in allowed_keys
+            }
+            resolved = by_key.get(candidate.lower()) or by_label.get(candidate.lower())
+            if resolved is not None:
+                recommendation = resolved
+                notes.append(
+                    f"recommendation_variant_key {candidate!r} resolved to {resolved!r}"
+                )
+            else:
+                notes.append(
+                    f"recommendation_variant_key {candidate!r} is not an experiment "
+                    "variant; recommendation dropped, narrative kept"
+                )
+    return {
+        "narrative": narrative,
+        "recommendation_variant_key": recommendation,
+        "recommendation_reason": reason,
+        "risks": risks,
+        "notes": notes,
+    }
+
+
 def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
     config = LLMConfig.intelligence_from_env()
     if config.provider == "mock" or not is_reasoning_model(config.provider, config.model):
@@ -739,21 +845,17 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
             raise ValueError("No completed variant metrics are available for analysis")
         response = client.generate_text(
             _analysis_messages(experiment, allowed_keys),
-            max_tokens=1800,
+            # Same budget as drafts / code-links / probe plans (IK-0028): a
+            # reasoning model spends output tokens on reasoning first.
+            max_tokens=_analysis_max_tokens(),
         )
         parsed = _json_object(response)
-        narrative = parsed.get("narrative")
-        recommendation_reason = parsed.get("recommendation_reason")
-        if not isinstance(narrative, str) or not narrative.strip():
-            raise ValueError("narrative is required")
-        if not isinstance(recommendation_reason, str):
-            raise ValueError("recommendation_reason must be a string")
-        recommendation = parsed.get("recommendation_variant_key")
-        if recommendation is not None and recommendation not in allowed_keys:
-            raise ValueError("recommendation_variant_key is not an experiment variant")
-        risks = parsed.get("risks") or []
-        if not isinstance(risks, list):
-            raise ValueError("risks must be an array")
+        normalized = _normalize_analysis(parsed, allowed_keys, experiment)
+        narrative = normalized["narrative"]
+        recommendation = normalized["recommendation_variant_key"]
+        recommendation_reason = normalized["recommendation_reason"]
+        risks = normalized["risks"]
+        notes = normalized["notes"]
         with get_conn() as conn:
             run_id = _record_analysis_run(
                 conn,
@@ -774,11 +876,11 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
                     "prompt_version": PROMPT_VERSION,
                     "schema_version": SCHEMA_VERSION,
                     "decision_method": "reasoning_llm",
-                    "narrative": narrative.strip(),
+                    "narrative": narrative,
                     "recommendation_variant_key": recommendation,
-                    "recommendation_reason": recommendation_reason.strip(),
-                    "risks_json": json.dumps([str(item) for item in risks], ensure_ascii=False),
-                    "notes_json": "[]",
+                    "recommendation_reason": recommendation_reason,
+                    "risks_json": json.dumps(risks, ensure_ascii=False),
+                    "notes_json": json.dumps(notes, ensure_ascii=False),
                     "error": None,
                     "intelligence_run_id": run_id,
                     "created_at": time.time(),

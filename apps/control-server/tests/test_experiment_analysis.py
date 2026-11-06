@@ -192,3 +192,88 @@ def test_output_language_detection():
     assert _output_language("compare calculator outputs") == "English"
     assert _output_language("[E-0009 再現] DCF 比の比較") == "Japanese"
     assert _output_language("") == "English"
+
+
+# IK-0031: K-0001 applied to the interpretation output.
+
+
+def _reanalyze(admin_client, headers, experiment, monkeypatch, response):
+    client = use_analysis_client(monkeypatch, AnalysisClient(response))
+    r = admin_client.post(f"/experiments/{experiment['id']}/analyze", headers=headers)
+    assert r.status_code == 200, r.text
+    return client, r.json()["analysis"]
+
+
+def test_risks_as_a_string_is_normalised_not_failed(admin_client, ran_experiment, monkeypatch):
+    headers, experiment = ran_experiment
+    _, analysis = _reanalyze(
+        admin_client, headers, experiment, monkeypatch,
+        dict(GOOD, risks="baseline itself is above 1"),
+    )
+    assert analysis["status"] == "completed"
+    assert analysis["risks"] == ["baseline itself is above 1"]
+    assert any("risks was a string" in note for note in analysis["notes"])
+
+
+def test_unknown_recommendation_keeps_narrative_and_drops_only_the_key(
+    admin_client, ran_experiment, monkeypatch
+):
+    headers, experiment = ran_experiment
+    _, analysis = _reanalyze(
+        admin_client, headers, experiment, monkeypatch,
+        dict(GOOD, recommendation_variant_key="variant-9"),
+    )
+    assert analysis["status"] == "completed"
+    assert analysis["narrative"] == GOOD["narrative"]
+    assert analysis["recommendation_variant_key"] is None
+    assert any("'variant-9' is not an experiment variant" in n for n in analysis["notes"])
+
+
+def test_recommendation_given_as_label_resolves_to_key(admin_client, ran_experiment, monkeypatch):
+    headers, experiment = ran_experiment
+    _, analysis = _reanalyze(
+        admin_client, headers, experiment, monkeypatch,
+        dict(GOOD, recommendation_variant_key="return three"),
+    )
+    assert analysis["recommendation_variant_key"] == "variant-2"
+    assert any("resolved to 'variant-2'" in n for n in analysis["notes"])
+
+
+def test_object_risks_and_list_reason_are_converted(admin_client, ran_experiment, monkeypatch):
+    headers, experiment = ran_experiment
+    _, analysis = _reanalyze(
+        admin_client, headers, experiment, monkeypatch,
+        dict(
+            GOOD,
+            risks=[{"risk": "single trace"}, "small sample"],
+            recommendation_reason=["closest", "simplest"],
+        ),
+    )
+    assert analysis["risks"] == ["single trace", "small sample"]
+    assert analysis["recommendation_reason"] == "closest\nsimplest"
+
+
+def test_missing_narrative_still_fails_and_keeps_the_raw_response(
+    admin_client, ran_experiment, monkeypatch
+):
+    headers, experiment = ran_experiment
+    _, analysis = _reanalyze(
+        admin_client, headers, experiment, monkeypatch,
+        {"risks": ["x"], "recommendation_variant_key": None},
+    )
+    assert analysis["status"] == "analysis_failed"
+    assert analysis["error"] == "narrative is required"
+    stored = admin_client.get(
+        f"/intelligence-runs/{analysis['intelligence_run_id']}/payloads", headers=headers
+    ).json()
+    assert json.loads(stored["payloads"][1]["text"]) == {
+        "risks": ["x"],
+        "recommendation_variant_key": None,
+    }
+
+
+def test_analysis_uses_the_shared_output_budget(admin_client, ran_experiment, monkeypatch):
+    headers, experiment = ran_experiment
+    monkeypatch.setenv("INTELLIGENCE_MAX_OUTPUT_TOKENS", "64000")
+    client, _ = _reanalyze(admin_client, headers, experiment, monkeypatch, GOOD)
+    assert client.max_tokens == [64000]
