@@ -19,6 +19,16 @@
 | 解決観点 | vocabulary_table / guardrail_fix |
 | 見分け方・設計時の問い | 生成例が正規値か、表示ラベルか。生成時と適用時に同じ語彙を使うか。 |
 
+#### downstream-record-assembled-by-hand
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 後段（外部の台帳）が受け取る記録の形を前段が出さず、人が詳細のJSONから毎回組み立てて写す |
+| 典型座標 | connection.contract + connection.information |
+| 発見観点 | external_constraint / boundary_walk |
+| 解決観点 | explicit_contract / carry_through |
+| 見分け方・設計時の問い | 後段の入力の項目（必須・任意）を前段の出力だけで埋められるか。同じ実行から誰が何度組み立てても同じ記録になるか（LLMや時刻を挟まない）。記録が未完（判断待ち等）であることを記録自身が言うか。 |
+
 ### delivery-path
 
 対象への到達に関する原因をまとめる。
