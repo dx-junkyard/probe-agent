@@ -1093,12 +1093,26 @@ class FeatureDraftOut(BaseModel):
 
 
 class FeatureIdResolutionOut(BaseModel):
-    """IK-0032: how generated feature ids relate to the previous drafts run."""
+    """How each drafted feature got its registry key (IK-0038; IK-0032 shape kept).
+
+    ``reused`` / ``new``: keys matched / minted. ``resolved`` is always empty
+    since IK-0038 (no slug rewriting). ``handle_matched``: {handle,
+    feature_key}. ``minted``: {feature_key, display_name}. ``slug_matches``:
+    new features whose name slug equals an existing key (logged only).
+    ``dropped`` / ``normalized``: K-0001 adjustments. ``not_referenced``:
+    live keys this run did not mention.
+    """
 
     previous_run_id: Optional[int] = None
     reused: List[str] = Field(default_factory=list)
     resolved: List[Dict[str, str]] = Field(default_factory=list)
     new: List[str] = Field(default_factory=list)
+    handle_matched: List[Dict[str, str]] = Field(default_factory=list)
+    minted: List[Dict[str, str]] = Field(default_factory=list)
+    slug_matches: List[Dict[str, str]] = Field(default_factory=list)
+    dropped: List[Dict[str, Any]] = Field(default_factory=list)
+    normalized: List[Dict[str, Any]] = Field(default_factory=list)
+    not_referenced: List[str] = Field(default_factory=list)
 
 
 class DraftGenerationResult(BaseModel):

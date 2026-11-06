@@ -1460,6 +1460,26 @@ CREATE TABLE IF NOT EXISTS feature_drafts (
 CREATE INDEX IF NOT EXISTS idx_feature_drafts_system
     ON feature_drafts (system_id, id DESC);
 
+-- IK-0038: run-independent Feature registry. feature_key is the
+-- feature_id every drafts run, experiment, probe plan and code link uses; it
+-- is minted and kept by the system (never by the drafts LLM). retired_at
+-- NULL = live (shown to the model as a handle F1..Fn).
+CREATE TABLE IF NOT EXISTS feature_registry (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    feature_key   TEXT NOT NULL,
+    display_name  TEXT NOT NULL,
+    summary       TEXT NOT NULL DEFAULT '',
+    origin        TEXT NOT NULL DEFAULT 'minted'
+                  CHECK (origin IN ('minted', 'migrated')),
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    last_run_id   INTEGER,
+    retired_at    REAL,
+    UNIQUE (system_id, feature_key),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS draft_evidence (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id       INTEGER NOT NULL,
@@ -9656,6 +9676,30 @@ def _migrate_cell_improvement_event_types(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_feature_registry(conn: sqlite3.Connection) -> None:
+    """Seed the Feature registry from each System's latest drafts run (IK-0038).
+
+    Before the registry, feature ids lived only in feature_drafts rows and
+    were re-matched against the latest completed run (IK-0032). Each id of
+    that run becomes a live registry key unchanged, so experiments, probe
+    plans and code links that refer to it keep working. Systems that already
+    have registry rows are left alone (idempotent).
+    """
+    if not _columns(conn, "feature_registry"):
+        return
+    from .feature_registry import ensure_seeded
+
+    system_ids = [
+        row["system_id"]
+        for row in conn.execute(
+            """SELECT DISTINCT system_id FROM intelligence_runs
+               WHERE run_type = 'repository_drafts' AND status = 'completed'"""
+        ).fetchall()
+    ]
+    for system_id in system_ids:
+        ensure_seeded(conn, system_id)
+
+
 def _migrate_cell_ask_decision_note(conn: sqlite3.Connection) -> None:
     """Separate legacy Ask decision notes from the finite decision value.
 
@@ -11432,6 +11476,7 @@ def init_db() -> None:
         # Issue #464: runs last among the column migrations because its
         # backfill reads the columns every earlier migration installed.
         _migrate_canonical_understanding(conn)
+        _migrate_feature_registry(conn)
         # Runs after EVERY migration above: it repairs whatever state the
         # schema is actually in, including damage a rebuild migration in this
         # same startup would have caused, so it cannot be ordered against the

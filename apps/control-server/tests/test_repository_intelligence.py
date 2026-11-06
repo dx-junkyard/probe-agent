@@ -735,7 +735,7 @@ class TestDraftGeneration:
         assert run["provider"] == "mock"
         assert run["is_mock"] is True
         assert run["decision_method"] == "reasoning_llm"
-        assert run["prompt_version"] == "v2"
+        assert run["prompt_version"] == "v3"
 
         sp = body["system_profile_draft"]
         assert sp is not None
@@ -1025,8 +1025,8 @@ class TestIntelligenceRunAudit:
         run = r.json()["intelligence_run"]
         assert run["provider"] == "mock"
         assert run["model"] == "mock"
-        assert run["prompt_version"] == "v2"
-        assert run["schema_version"] == "v1"
+        assert run["prompt_version"] == "v3"
+        assert run["schema_version"] == "v2"
         assert run["decision_method"] == "reasoning_llm"
         assert run["started_at"] > 0
         assert run["completed_at"] >= run["started_at"]

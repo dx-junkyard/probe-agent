@@ -74,7 +74,8 @@
     ]
   },
   "related": [
-    "IK-0032"
+    "IK-0032",
+    "IK-0038"
   ],
   "view_of": [],
   "history": [
