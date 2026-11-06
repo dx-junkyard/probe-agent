@@ -135,6 +135,48 @@ STAGE_ORDER = [
 ]
 
 
+def _interview_symbol_candidates(
+    conn, system_id: int, snapshot_id: int, context_pack, current_understanding
+) -> dict:
+    """(path, qualified_name) -> symbol_id the dialogue model may propose (IK-0039).
+
+    The context pack's symbols and entrypoint handlers, plus every indexed
+    symbol of a file the current understanding cites as evidence (the system
+    prompt allows proposing those too). symbol_id always comes from the
+    snapshot's code_symbols, never from the model.
+    """
+    from ..interview_agent import pack_symbol_candidates
+
+    candidates = pack_symbol_candidates(context_pack)
+    paths = {path for path, _ in candidates}
+    for section in (current_understanding or {}).values():
+        if not isinstance(section, list):
+            continue
+        for item in section:
+            if not isinstance(item, dict):
+                continue
+            for ev in item.get("evidence") or []:
+                if isinstance(ev, dict) and ev.get("path"):
+                    paths.add(str(ev["path"]))
+    if not paths:
+        return candidates
+    placeholders = ",".join("?" for _ in paths)
+    rows = conn.execute(
+        f"""SELECT id, path, qualified_name FROM code_symbols
+            WHERE system_id = ? AND snapshot_id = ? AND path IN ({placeholders})""",
+        (system_id, snapshot_id, *sorted(paths)),
+    ).fetchall()
+    by_key = {(r["path"], r["qualified_name"]): r["id"] for r in rows}
+    for key in list(candidates):
+        if candidates[key] is None and key in by_key:
+            candidates[key] = by_key[key]
+    understanding_paths = paths - {path for path, _ in pack_symbol_candidates(context_pack)}
+    for key, symbol_id in by_key.items():
+        if key[0] in understanding_paths:
+            candidates.setdefault(key, symbol_id)
+    return candidates
+
+
 def _component_id_for(qualified_name: str) -> str:
     """Deterministic component_id for an interview-authored probe.
 
@@ -1621,6 +1663,15 @@ def _interview_dialogue_turn_core(
             (snapshot_id, system_id),
         ).fetchone()
 
+        # IK-0039: the candidate set the model is given, so the references it
+        # writes back (symbol, feature) can be checked and symbol_id re-derived.
+        symbol_candidates = _interview_symbol_candidates(
+            conn, system_id, snapshot_id, context_pack, session_understanding
+        )
+        from ..feature_registry import known_features as _known_features
+
+        known_features = _known_features(conn, system_id)
+
     # Phase 2 (DB lock released): evidence selection, the deterministic
     # evidence read from the pinned snapshot, and turn generation. The LLM
     # client opens its own connection to consume System quota, so running
@@ -1713,6 +1764,8 @@ def _interview_dialogue_turn_core(
                 proposals_requested=proposals_requested,
                 canonical_premise=canonical_premise,
                 design_context=design_context,
+                symbol_candidates=symbol_candidates,
+                known_features=known_features,
             )
 
     # Phase 3 (DB lock re-acquired): persist the turn, its audit runs and
@@ -1841,6 +1894,18 @@ def _interview_dialogue_turn_core(
                 ),
             )
             run_id = run_cur.lastrowid
+            if turn.proposal_diagnostics:
+                # IK-0039: what was dropped/corrected stays on the run record.
+                conn.execute(
+                    "UPDATE intelligence_runs SET diagnostics_json = ? WHERE id = ?",
+                    (
+                        json.dumps(
+                            {"proposal_diagnostics": turn.proposal_diagnostics},
+                            ensure_ascii=False,
+                        ),
+                        run_id,
+                    ),
+                )
 
             run_row = conn.execute(
                 "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,),
@@ -2127,6 +2192,7 @@ def _interview_dialogue_turn_core(
             ],
             evidence_reads=evidence_reads_out,
             evidence_refs_dropped=turn.evidence_refs_dropped,
+            proposal_diagnostics=turn.proposal_diagnostics,
             evidence_targets_omitted=(
                 len(evidence_audit.targets_omitted) if evidence_audit is not None else 0
             ),

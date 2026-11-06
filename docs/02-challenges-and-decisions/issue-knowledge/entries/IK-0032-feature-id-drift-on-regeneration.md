@@ -73,7 +73,8 @@
   },
   "related": [
     "IK-0026",
-    "IK-0027"
+    "IK-0027",
+    "IK-0038"
   ],
   "view_of": [],
   "history": [
@@ -83,6 +84,13 @@
       "from": "open",
       "to": "resolved",
       "reason": "起票と同時に記帳。sim-sandbox E-0010の3件目として着地、関連テストpass。実機での再生成による安定度の計測は未実施。"
+    },
+    {
+      "date": "2026-11-07",
+      "field": "resolution",
+      "from": "前回runのidを写させ、slugで前回へ解決する",
+      "to": "IK-0038の系の台帳とハンドルに置き換え（本エントリは履歴として残す）",
+      "reason": "利用者の規則（2026-11-07）: 識別子はLLMに作らせない。写させる方式は照合漏れでLLMのidが正本になるため。"
     }
   ]
 }
@@ -112,6 +120,8 @@
 検証: `tests/test_feature_id_stability.py`（初回は一覧なし・2回目に写せる形で提示・名前一致でのid解決・前回idの重複割当なし）pass。
 
 未確認・残り: 実機で5回再生成したときのidの一致率は未計測（E-0009と同じ条件での再計測が要る）。名前もidも変わったFeature（意味は同じ）は新規扱いになる。前回のFeatureが消えたことは応答に出していない。
+
+**追記（2026-11-07）:** この方式は [IK-0038](IK-0038-feature-registry-instead-of-llm-feature-id.md) で系の台帳（`feature_registry`）とハンドル（`same_as: "F3"` / `new: true`）に置き換えた。`resolve_feature_ids` と「Previously identified features」節は削除し、`tests/test_feature_id_stability.py` はIK-0038の検証に書き直した。
 
 ## 一般化
 

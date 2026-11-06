@@ -1577,15 +1577,24 @@ def _failed_run_response(body, run) -> Optional[JSONResponse]:
     return JSONResponse(status_code=failed_run_status(run.error_details), content=content)
 
 
-def _previous_feature_list(system_id: int):
-    """The latest completed drafts run's features, for id reuse (IK-0032).
+def _feature_registry_for_prompt(system_id: int):
+    """The System's live Feature registry, seeded on first use (IK-0038).
 
-    Any snapshot counts: ids are meant to survive a new snapshot too. Each
-    feature carries up to three evidence paths so the model can recognise it.
+    Returns (latest completed drafts run id, live entries with handles
+    F1..Fn, every key the System has used). The registry is independent of
+    runs and snapshots; an empty one is seeded from the latest completed
+    drafts run so existing feature ids stay valid.
     """
-    from ..draft_generator import PreviousFeature
+    from ..feature_registry import ensure_seeded, live_entries, taken_keys
 
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ensure_seeded(conn, system_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         run_row = conn.execute(
             """
             SELECT id FROM intelligence_runs
@@ -1595,37 +1604,9 @@ def _previous_feature_list(system_id: int):
             """,
             (system_id,),
         ).fetchone()
-        if run_row is None:
-            return None, []
-        rows = conn.execute(
-            """
-            SELECT id, feature_id, name FROM feature_drafts
-            WHERE system_id = ? AND intelligence_run_id = ?
-            ORDER BY id
-            """,
-            (system_id, run_row["id"]),
-        ).fetchall()
-        previous = []
-        for row in rows:
-            paths: List[str] = []
-            for ev in conn.execute(
-                """
-                SELECT path FROM draft_evidence
-                WHERE draft_type = 'feature' AND draft_id = ?
-                ORDER BY id
-                """,
-                (row["id"],),
-            ).fetchall():
-                if ev["path"] not in paths:
-                    paths.append(ev["path"])
-                if len(paths) == 3:
-                    break
-            previous.append(
-                PreviousFeature(
-                    feature_id=row["feature_id"], name=row["name"], evidence_paths=paths
-                )
-            )
-    return run_row["id"], previous
+        entries = live_entries(conn, system_id)
+        taken = taken_keys(conn, system_id)
+    return (run_row["id"] if run_row is not None else None), entries, taken
 
 
 @router.post(
@@ -1700,7 +1681,7 @@ def generate_drafts_endpoint(
             )
         )
 
-    previous_run_id, previous_features = _previous_feature_list(system_id)
+    previous_run_id, registry_entries, taken = _feature_registry_for_prompt(system_id)
 
     llm_config = _resolve_intelligence_config()
 
@@ -1717,7 +1698,7 @@ def generate_drafts_endpoint(
             raise LLMError("Snapshot contains no files")
         llm_client = wrap_for_recording(create_llm_client(llm_config))
         result = generate_drafts(
-            llm_client, llm_config, indexed_files, previous_features
+            llm_client, llm_config, indexed_files, registry_entries, taken
         )
     except LLMError as exc:
         result = GenerationResult(
@@ -1761,6 +1742,13 @@ def generate_drafts_endpoint(
             )
             run_id = cur.lastrowid
             store_payloads(conn, run_id, PROMPT_VERSION, recorded_calls(llm_client))
+            if result.error is None:
+                from ..feature_registry import record_run
+
+                record_run(
+                    conn, system_id, run_id,
+                    result.registry_matched, result.registry_minted,
+                )
 
             sp_draft_out = None
             if result.system_profile:
@@ -1877,6 +1865,12 @@ def generate_drafts_endpoint(
             reused=result.id_resolution.reused,
             resolved=result.id_resolution.resolved,
             new=result.id_resolution.new,
+            handle_matched=result.id_resolution.handle_matched,
+            minted=result.id_resolution.minted,
+            slug_matches=result.id_resolution.slug_matches,
+            dropped=result.id_resolution.dropped,
+            normalized=result.id_resolution.normalized,
+            not_referenced=result.id_resolution.not_referenced,
         )
     body = DraftGenerationResult(
         intelligence_run=_intelligence_run_out(run_row),
@@ -4258,6 +4252,19 @@ def generate_probe_plan_endpoint(
             relation_reason=lr["relation_reason"],
         ))
 
+    # IK-0037: component_id is assigned by the system per (path,
+    # qualified_name) -- the id already in code, else the last planned id,
+    # else a deterministic derivation -- never by the model.
+    from ..component_ids import assign_component_ids
+
+    with get_conn() as conn:
+        assignments = assign_component_ids(
+            conn,
+            system_id,
+            [(link.symbol_path, link.symbol_qualified_name) for link in accepted_links],
+        )
+    component_ids = {key: a.component_id for key, a in assignments.items()}
+
     llm_config = _resolve_intelligence_config()
 
     llm_client = None
@@ -4281,6 +4288,7 @@ def generate_probe_plan_endpoint(
             feature_risks=json.loads(fd_row["risks"]),
             accepted_links=accepted_links,
             objective_hint=objective,
+            component_ids=component_ids,
         )
     except LLMError as exc:
         from ..probe_planner import PlanResult

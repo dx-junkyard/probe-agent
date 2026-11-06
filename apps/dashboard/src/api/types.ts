@@ -989,6 +989,9 @@ export interface InterviewDialogueTurnOut {
   // Issue #142: count of question evidence_refs dropped as unverifiable
   // (graceful fallback, not an error).
   evidence_refs_dropped: number;
+  // IK-0039: proposals dropped / references corrected because the model named
+  // a symbol or feature outside the candidate set it was given.
+  proposal_diagnostics?: Array<Record<string, unknown>>;
   // Evidence targets pass 1 asked for beyond INTERVIEW_EVIDENCE_MAX_FILES (not read).
   evidence_targets_omitted: number;
 }
