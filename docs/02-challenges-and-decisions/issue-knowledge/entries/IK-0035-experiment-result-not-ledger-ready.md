@@ -79,7 +79,8 @@
   "related": [
     "IK-0029",
     "IK-0030",
-    "IK-0031"
+    "IK-0031",
+    "IK-0036"
   ],
   "view_of": [],
   "history": [
@@ -88,7 +89,7 @@
       "field": "status",
       "from": "open",
       "to": "resolved",
-      "reason": "起票と同時に記帳。sim-sandbox 第3周 §2.3 として b8828f5 で着地、関連テストpass。実機（再ビルド後）で GET /experiments/2/record・/4/record が200、/999/record が404、同じ記録を2回取って同一バイト列、GET /experiments/2・/4 が再ビルド前と一致。dashboardはホストにnodeが無くコンテナのビルド（tsc -b && vite build）とvitestで確認、dashboardコンテナは再ビルドしていない。"
+      "reason": "起票と同時に記帳。sim-sandbox 第3周 §2.3 として d5def68 で着地、関連テストpass。実機（再ビルド後）で GET /experiments/2/record・/4/record が200、/999/record が404、同じ記録を2回取って同一バイト列、GET /experiments/2・/4 が再ビルド前と一致。dashboardはホストにnodeが無くコンテナのビルド（tsc -b && vite build）とvitestで確認、dashboardコンテナは再ビルドしていない。"
     }
   ]
 }
@@ -108,12 +109,12 @@ episteme-graphの `EXTERNAL_REF_KEYS` / `EXTERNAL_REF_REQUIRED_KEYS` と、`GET 
 
 ## 解決の観点
 
-**解決（2026-11-07、`b8828f5`）。**
+**解決（2026-11-07、`d5def68`）。**
 
 - `GET /experiments/{id}/record`（読み取り専用、他のExperimentの口と同じ認証、存在しない・別Systemは404）。上位6項目は台帳の `external_ref` と同じキーで値はすべて文字列。`complete` と `detail`（experiment_id・feature_id・snapshot_id・baseline_commit・status・variantごとの status / test_pass_rate / criteria_pass_rate・analysis_version・human_decision・human_decision_variant_key）を足す。
 - 決定論: LLM・乱数・現在時刻を使わない。`executed_at` は `completed_at` のUTC ISO（秒）、`run_ref` は `experiment:{id}`。同じ行からは同じバイト列になる（テストと実機で確認）。
 - 条件の文: objective、snapshot #id（baseline_commit 先頭7字）、variantごとに label（key）と risk_note（baselineは「基準」と明記）。
-- 結果の文: 現在の解釈が完了していればそれ、失敗していれば履歴の最新の完了版（narrative と推奨の label（key）・理由、版があれば v番号）。人の判断（採用ならそのvariant）と判断メモ。推奨は助言であることを見出しで示す。
+- 結果の文（IK-0036 で人の判断だけに改め、解釈と推奨は `analysis_summary` に分けた。以下は d5def68 時点）: 現在の解釈が完了していればそれ、失敗していれば履歴の最新の完了版（narrative と推奨の label（key）・理由、版があれば v番号）。人の判断（採用ならそのvariant）と判断メモ。推奨は助言であることを見出しで示す。
 - 言語: IK-0030の `_output_language`（objectiveにCJKがあれば日本語）。見出し・判断の語・括弧を日英で切り替える。
 - `complete`: Experimentが completed、完了した解釈があり、人の判断が adopted / rejected / needs_more_data のときだけ true。
 - `url`: control serverはdashboardの公開先を知らないので、`PROBE_DASHBOARD_URL` があるときだけ `/experiments?experiment={id}` を組み立てる（composeの既定 `http://localhost:8501`）。無ければ空文字（台帳では任意）。
