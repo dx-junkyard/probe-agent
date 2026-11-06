@@ -646,7 +646,7 @@ class TestProbePlanGeneration:
             "/repository/probe-plans/generate?feature_id=user-management",
             headers=h,
         )
-        assert r.status_code == 201
+        assert r.status_code == 502
         data = r.json()
         run = data.get("intelligence_run", {})
         assert run.get("status") == "failed"

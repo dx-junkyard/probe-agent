@@ -44,7 +44,7 @@ export default function FeatureMapPage() {
           `Drafts generated: ${result.feature_drafts.length} feature(s)`,
         );
       })
-      .catch(e => toast.error(String(e)));
+      .catch(e => toast.error(e instanceof Error ? e.message : String(e)));
   };
 
   return (

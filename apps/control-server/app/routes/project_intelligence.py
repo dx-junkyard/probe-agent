@@ -19,6 +19,7 @@ import hashlib
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.responses import JSONResponse
 
 from ..auth import Principal, get_system_id, require_user
 from ..capability_hierarchy import (
@@ -1546,6 +1547,36 @@ def _feature_draft_out(conn, row) -> FeatureDraftOut:
     )
 
 
+VALIDATION_FAILURE_PREFIX = "Failed to parse LLM response"
+
+
+def failed_run_status(error_details: Optional[str]) -> int:
+    """HTTP status for a failed reasoning run (IK-0034).
+
+    422 when the model answered but its output failed validation (the
+    generators prefix those errors with ``Failed to parse LLM response``);
+    502 for everything else -- the provider call failed, or no usable
+    reasoning model was configured, so no valid answer was obtained upstream.
+    """
+    if (error_details or "").startswith(VALIDATION_FAILURE_PREFIX):
+        return 422
+    return 502
+
+
+def _failed_run_response(body, run) -> Optional[JSONResponse]:
+    """Return the run body with a non-2xx status when the run failed.
+
+    The body is the same as on success (the persisted intelligence_run with
+    status failed + error_details, and whatever was saved), plus ``detail``
+    carrying error_details so generic clients show the reason.
+    """
+    if run is None or run.status != "failed":
+        return None
+    content = body.model_dump(mode="json")
+    content["detail"] = run.error_details or "Reasoning run failed"
+    return JSONResponse(status_code=failed_run_status(run.error_details), content=content)
+
+
 def _previous_feature_list(system_id: int):
     """The latest completed drafts run's features, for id reuse (IK-0032).
 
@@ -1847,12 +1878,13 @@ def generate_drafts_endpoint(
             resolved=result.id_resolution.resolved,
             new=result.id_resolution.new,
         )
-    return DraftGenerationResult(
+    body = DraftGenerationResult(
         intelligence_run=_intelligence_run_out(run_row),
         system_profile_draft=sp_draft_out,
         feature_drafts=feature_drafts_out,
         feature_id_resolution=id_resolution,
     )
+    return _failed_run_response(body, body.intelligence_run) or body
 
 
 @router.get(
@@ -3991,7 +4023,7 @@ def generate_code_links_endpoint(
             conn.execute("ROLLBACK")
             raise
 
-    return FeatureCodeLinksOut(
+    body = FeatureCodeLinksOut(
         system_id=system_id,
         snapshot_id=snapshot_id,
         intelligence_run=_intelligence_run_out(run_row),
@@ -3999,6 +4031,7 @@ def generate_code_links_endpoint(
         is_mock=mapping_result.is_mock,
         **_mapping_diagnostics(run_row),
     )
+    return _failed_run_response(body, body.intelligence_run) or body
 
 
 @router.get("/repository/code-links", response_model=FeatureCodeLinksOut)
@@ -4337,7 +4370,7 @@ def generate_probe_plan_endpoint(
             conn.execute("ROLLBACK")
             raise
 
-    return result
+    return _failed_run_response(result, result.intelligence_run) or result
 
 
 @router.get("/repository/probe-plans", response_model=ProbePlansListOut)

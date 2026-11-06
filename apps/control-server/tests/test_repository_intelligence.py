@@ -892,7 +892,7 @@ class TestDraftGeneration:
         monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
         monkeypatch.setenv("LLM_API_KEY", "unused")
         r = admin_client.post("/repository/drafts/generate", headers=h)
-        assert r.status_code == 201
+        assert r.status_code == 502
         run = r.json()["intelligence_run"]
         assert run["status"] == "failed"
         assert "reasoning model" in run["error_details"]
@@ -973,7 +973,7 @@ class TestDraftGeneration:
             lambda _config: InvalidEvidenceClient(),
         )
         r = admin_client.post("/repository/drafts/generate", headers=h)
-        assert r.status_code == 201
+        assert r.status_code == 422
         body = r.json()
         assert body["intelligence_run"]["status"] == "failed"
         assert "line range exceeds" in body["intelligence_run"]["error_details"]

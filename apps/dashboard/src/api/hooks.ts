@@ -619,7 +619,10 @@ export function useGenerateDrafts() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.post<DraftGenerationResultOut>("/repository/drafts/generate"),
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("drafts") }),
+    // IK-0034: a failed run answers 422/502 with the persisted run in the body
+    // and its error_details as `detail` (shown by ApiError); refresh either way
+    // so the failed run is visible.
+    onSettled: () => qc.invalidateQueries({ queryKey: sysKey("drafts") }),
   });
 }
 
@@ -670,7 +673,7 @@ export function useGenerateCodeLinks() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.post("/repository/code-links/generate"),
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("codeLinks") }),
+    onSettled: () => qc.invalidateQueries({ queryKey: sysKey("codeLinks") }),
   });
 }
 
@@ -699,7 +702,7 @@ export function useGenerateProbePlan() {
       if (objective?.trim()) query.set("objective", objective.trim());
       return api.post(`/repository/probe-plans/generate?${query.toString()}`);
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
+    onSettled: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
   });
 }
 

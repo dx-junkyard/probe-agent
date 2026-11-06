@@ -596,7 +596,7 @@ class TestFeatureCodeMappingAPI:
         admin_client.post("/repository/symbols/index", headers=h)
 
         r = admin_client.post("/repository/code-links/generate", headers=h)
-        assert r.status_code == 201
+        assert r.status_code == 502
         body = r.json()
 
         run = body["intelligence_run"]
@@ -652,7 +652,7 @@ class TestFeatureCodeMappingAPI:
         monkeypatch.setenv("LLM_API_KEY", "unused")
 
         r = admin_client.post("/repository/code-links/generate", headers=h)
-        assert r.status_code == 201
+        assert r.status_code == 502
         body = r.json()
         assert body["intelligence_run"]["status"] == "failed"
         assert "reasoning model" in body["intelligence_run"]["error_details"]
@@ -687,7 +687,7 @@ class TestFeatureCodeMappingAPI:
         )
 
         r = admin_client.post("/repository/code-links/generate", headers=h)
-        assert r.status_code == 201
+        assert r.status_code == 422
         assert r.json()["intelligence_run"]["status"] == "failed"
         assert "unknown symbol" in r.json()["intelligence_run"]["error_details"]
         assert r.json()["links"] == []
