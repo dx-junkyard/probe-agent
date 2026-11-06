@@ -51,11 +51,16 @@ from .probe_planner import check_denylist
 # with a do-not-re-ask rule (Issue #129).
 # v4: pass-1 evidence-selection prompt precedes this one when evidence
 # snippets are supplied (Issue #130); the response schema is unchanged.
-PROMPT_VERSION = "interview-v8"
+# v9 (IK-0039): proposals no longer carry symbol_id (the system derives it
+# from path + qualified_name) and probe_plan.feature_id must be one of the
+# listed Known features (or empty); the context pack omits symbol_id.
+PROMPT_VERSION = "interview-v9"
 # v2: next_questions items are structured {question_text, hypothesis,
 # evidence_refs, answer_options} objects (Issue #128); plain strings are
 # still accepted and normalized.
-SCHEMA_VERSION = "interview-v2"
+# v3 (IK-0039): proposal.symbol_id removed from the requested shape (still
+# accepted and ignored).
+SCHEMA_VERSION = "interview-v3"
 
 # Issue #130: pass-1 (evidence selection) prompt/schema versions, audited as
 # a separate intelligence_runs row from the pass-2 dialogue turn above.
@@ -114,6 +119,8 @@ class _RawCombinedProposal(BaseModel):
 
     path: str
     qualified_name: str
+    # Not requested since IK-0039; accepted for old answers and ignored (the
+    # system re-derives symbol_id from path + qualified_name).
     symbol_id: Optional[int] = None
     metadata: _RawProposalMetadata
     probe_plan: _RawProposalProbePlan
@@ -177,6 +184,9 @@ class InterviewTurnResult:
     # fallback, not a failure — the question is still asked without that
     # citation, so a single bad line range never stops the interview.
     evidence_refs_dropped: int = 0
+    # IK-0039: proposals dropped or adjusted because a reference the model
+    # wrote (symbol, feature) was not in the candidate set it was given.
+    proposal_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
 
 
@@ -195,7 +205,6 @@ no commentary), matching exactly this shape:
     {
       "path": "src/module.py",
       "qualified_name": "module.function_name",
-      "symbol_id": 42,
       "metadata": {
         "role": "...",
         "capability": "...",
@@ -228,7 +237,10 @@ no commentary), matching exactly this shape:
 
 Rules:
 - Only reference symbols and paths that appear in the supplied context pack
-  or the supplied current understanding.
+  or the supplied current understanding. Identify a symbol by its exact
+  "path" and "qualified_name"; never write a symbol id (the system resolves it).
+- "probe_plan.feature_id" must be copied exactly from the "Known features"
+  list when one fits, or left "" -- never invent a feature id.
 - "proposals" should be empty unless the user asks you to generate proposals.
   When asked, produce one combined proposal per discussed symbol.
 - Each proposal's "metadata" must use only the enum values shown above for
@@ -334,6 +346,7 @@ def _build_user_prompt(
     proposals_requested: bool = False,
     canonical_premise: Optional[Dict[str, Any]] = None,
     design_context: Optional[Dict[str, Any]] = None,
+    known_features: Optional[List[Tuple[str, str]]] = None,
 ) -> str:
     recent_history = history[-MAX_RECENT_MESSAGES:]
     parts: List[str] = []
@@ -397,7 +410,15 @@ def _build_user_prompt(
     parts.append(
         "## Context Pack (snapshot-grounded symbols and entrypoints; code evidence source)"
     )
-    parts.append(context_pack.model_dump_json())
+    parts.append(_context_pack_json(context_pack))
+    if known_features:
+        parts.append(
+            "## Known features (copy a feature_id exactly for probe_plan.feature_id, "
+            "or leave it \"\")"
+        )
+        parts.append("\n".join(
+            f"- feature_id: {key} | name: {name}" for key, name in known_features
+        ))
     if recent_history:
         parts.append("## Recent conversation history")
         for msg in recent_history:
@@ -437,6 +458,81 @@ def _normalize_question(
         ],
         answer_options=list(q.answer_options),
     )
+
+
+def _context_pack_json(context_pack: InterviewContextPack) -> str:
+    """The context pack as shown to the model, without symbol ids (IK-0039).
+
+    Symbols are identified by path + qualified_name; the integer id is a
+    database key the model has no reason to copy back.
+    """
+    return context_pack.model_dump_json(exclude={"symbols": {"__all__": {"symbol_id"}}})
+
+
+SymbolKey = Tuple[str, str]
+
+
+def pack_symbol_candidates(
+    context_pack: InterviewContextPack,
+) -> Dict[SymbolKey, Optional[int]]:
+    """(path, qualified_name) -> symbol_id for the symbols the pack shows."""
+    candidates: Dict[SymbolKey, Optional[int]] = {}
+    for ep in context_pack.entrypoints:
+        candidates[(ep.handler_path, ep.handler_qualified_name)] = None
+    for sym in context_pack.symbols:
+        candidates[(sym.path, sym.qualified_name)] = sym.symbol_id
+    return candidates
+
+
+def validate_proposal_refs(
+    proposals: List[InterviewProposalResult],
+    candidates: Dict[SymbolKey, Optional[int]],
+    feature_keys: List[str],
+) -> Tuple[List[InterviewProposalResult], List[Dict[str, Any]]]:
+    """Check each proposal's references against what the model was given (K-0001).
+
+    - The symbol must be one of ``candidates`` (path + qualified_name; a path
+      with a leading "./" is normalised). Otherwise the proposal is dropped.
+    - ``symbol_id`` is always re-derived from the candidate; a different value
+      the model wrote is recorded as corrected.
+    - ``probe_plan.feature_id`` must be one of ``feature_keys`` (exact, or the
+      same ignoring case). Otherwise it is cleared and the proposal is kept.
+    Returns the kept proposals and one diagnostic per adjustment.
+    """
+    diagnostics: List[Dict[str, Any]] = []
+    kept: List[InterviewProposalResult] = []
+    lowered = {key.lower(): key for key in feature_keys}
+    for proposal in proposals:
+        path = proposal.path.strip()
+        if path.startswith("./"):
+            path = path[2:]
+        key = (path, proposal.qualified_name.strip())
+        if key not in candidates:
+            diagnostics.append({
+                "kind": "proposal_dropped", "reason": "symbol_not_in_candidates",
+                "path": proposal.path, "qualified_name": proposal.qualified_name,
+            })
+            continue
+        proposal.path, proposal.qualified_name = key
+        derived = candidates[key]
+        if proposal.symbol_id is not None and proposal.symbol_id != derived:
+            diagnostics.append({
+                "kind": "symbol_id_corrected", "path": key[0], "qualified_name": key[1],
+                "from": proposal.symbol_id, "to": derived,
+            })
+        proposal.symbol_id = derived
+        feature_id = (proposal.probe_plan.feature_id or "").strip()
+        if feature_id:
+            resolved = feature_id if feature_id in feature_keys else lowered.get(feature_id.lower())
+            if resolved is None:
+                diagnostics.append({
+                    "kind": "feature_id_cleared", "reason": "feature_not_in_candidates",
+                    "path": key[0], "qualified_name": key[1], "feature_id": feature_id,
+                })
+                resolved = ""
+            proposal.probe_plan.feature_id = resolved
+        kept.append(proposal)
+    return kept, diagnostics
 
 
 def _allowed_evidence_spans(
@@ -553,6 +649,8 @@ def generate_interview_turn(
     proposals_requested: bool = False,
     canonical_premise: Optional[Dict[str, Any]] = None,
     design_context: Optional[Dict[str, Any]] = None,
+    symbol_candidates: Optional[Dict[SymbolKey, Optional[int]]] = None,
+    known_features: Optional[List[Tuple[str, str]]] = None,
 ) -> InterviewTurnResult:
     """Generate one structured assistant turn for the interview dialogue.
 
@@ -619,6 +717,7 @@ def generate_interview_turn(
         proposals_requested=proposals_requested,
         canonical_premise=canonical_premise,
         design_context=design_context,
+        known_features=known_features,
     )
 
     try:
@@ -692,6 +791,16 @@ def generate_interview_turn(
         result = _apply_denylist(result)
         proposals.append(result)
 
+    # IK-0039: references the model wrote are checked against the candidate
+    # set it was given; the system owns symbol_id and feature ids.
+    candidates = (
+        symbol_candidates if symbol_candidates is not None
+        else pack_symbol_candidates(context_pack)
+    )
+    proposals, proposal_diagnostics = validate_proposal_refs(
+        proposals, candidates, [key for key, _ in (known_features or [])]
+    )
+
     # Normalize questions and structurally validate their evidence refs
     # against the snapshot-grounded spans (deterministic; fail closed).
     questions = [_normalize_question(q) for q in validated.next_questions]
@@ -730,6 +839,7 @@ def generate_interview_turn(
         proposals=proposals,
         next_questions=questions,
         evidence_refs_dropped=dropped,
+        proposal_diagnostics=proposal_diagnostics,
     )
 
 
@@ -861,7 +971,7 @@ def select_evidence_targets(
         parts.append("## Current understanding")
         parts.append(_trim_json(current_understanding, GAP_AND_QUESTION_MAX_CHARS))
     parts.append("## Context Pack (only allowed source of paths/symbols)")
-    parts.append(context_pack.model_dump_json())
+    parts.append(_context_pack_json(context_pack))
     if recent_history:
         parts.append("## Recent conversation history")
         for msg in recent_history:

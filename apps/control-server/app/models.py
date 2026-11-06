@@ -3201,6 +3201,10 @@ class InterviewDialogueTurnOut(BaseModel):
     # fallback — the question is still asked — so this is surfaced for operator
     # visibility, not an error.
     evidence_refs_dropped: int = 0
+    # IK-0039: proposals dropped (symbol not in the candidate set given to the
+    # model) and references corrected (symbol_id re-derived, unknown
+    # feature_id cleared). Also stored in the run's diagnostics_json.
+    proposal_diagnostics: List[Dict[str, Any]] = Field(default_factory=list)
     # Evidence targets pass 1 asked for beyond INTERVIEW_EVIDENCE_MAX_FILES.
     # They were not read; the turn continued with the first N (cost-budget
     # truncation), so the omission is reported rather than hidden.

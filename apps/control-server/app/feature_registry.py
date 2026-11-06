@@ -213,3 +213,29 @@ def record_run(
             (system_id, item["feature_key"], item["display_name"],
              item.get("summary", ""), now, now, run_id),
         )
+
+
+def known_features(conn: sqlite3.Connection, system_id: int) -> List[tuple]:
+    """(feature_key, display_name) a prompt may let the model refer to (read-only).
+
+    The live registry; when it has not been seeded yet, the latest completed
+    drafts run's feature ids (what seeding would register).
+    """
+    rows = conn.execute(
+        """SELECT feature_key, display_name FROM feature_registry
+           WHERE system_id = ? AND retired_at IS NULL ORDER BY id""",
+        (system_id,),
+    ).fetchall()
+    if rows:
+        return [(r["feature_key"], r["display_name"]) for r in rows]
+    run_id = _latest_completed_drafts_run(conn, system_id)
+    if run_id is None:
+        return []
+    seen: Dict[str, str] = {}
+    for r in conn.execute(
+        """SELECT feature_id, name FROM feature_drafts
+           WHERE system_id = ? AND intelligence_run_id = ? ORDER BY id""",
+        (system_id, run_id),
+    ).fetchall():
+        seen.setdefault(r["feature_id"], r["name"])
+    return list(seen.items())
