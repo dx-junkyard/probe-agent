@@ -70,6 +70,7 @@ const NAV_GROUPS: NavGroup[] = [
     heading: "Understand",
     phases: ["preparation"],
     items: [
+      { to: "/system-map", icon: Map, label: "システムマップ", keywords: ["system map", "system-map", "全体", "全体を見渡す"] },
       { to: "/system-understanding", icon: Brain, label: "System Understanding", keywords: ["現状", "理解"] },
       { to: "/capability-map", icon: Network, label: "Capability Map", detail: true },
       { to: "/feature-map", icon: Map, label: "Feature Map", detail: true },

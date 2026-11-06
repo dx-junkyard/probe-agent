@@ -16,6 +16,7 @@ import { toast } from "sonner";
 import { MOBILE_NAV_DRAWER_ID } from "./sidebar";
 import { HelpCircle } from "lucide-react";
 import { useHelpMode } from "@/lib/help-mode";
+import { useLocation, useNavigate } from "react-router-dom";
 
 function initTheme() {
   const saved = localStorage.getItem("theme");
@@ -181,6 +182,8 @@ export function Header({
   navDrawerId = MOBILE_NAV_DRAWER_ID,
 }: HeaderProps = {}) {
   const auth = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
   const { user, systems, systemId, selectSystem, logout, refreshSystems } = auth;
   const selectedSystem = systems.find((s) => s.id === systemId);
   const selectedSystemLabel = selectedSystem
@@ -190,6 +193,13 @@ export function Header({
   const drafts = useUiDraftRegistry();
   const [showCreate, setShowCreate] = useState(false);
   const createSystem = useCreateSystem();
+  const changeSystem = (id: number) => {
+    if (id === systemId || drafts?.confirmDiscard?.() === false) return;
+    // Entity selections belong to the previous System. Keep the screen,
+    // but start it without the old query/hash rather than requesting its IDs.
+    navigate(location.pathname, { replace: true });
+    selectSystem(id);
+  };
 
   const handleCreate = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -201,6 +211,14 @@ export function Header({
         description: (fd.get("description") as string) || undefined,
       });
       await refreshSystems();
+      // Confirm immediately before switching, including edits made while the
+      // request was running. Cancelling keeps the new System and current draft.
+      if (drafts?.confirmDiscard?.() === false) {
+        setShowCreate(false);
+        toast.success("System を作成しました。現在の System で作業を続けます。");
+        return;
+      }
+      navigate(location.pathname, { replace: true });
       selectSystem(sys.id);
       setShowCreate(false);
       toast.success("System created");
@@ -245,10 +263,15 @@ export function Header({
               aria-label="System"
               title={selectedSystemLabel}
               value={String(systemId ?? "")}
-              onChange={(e) => { if (drafts?.confirmDiscard?.() !== false) selectSystem(Number(e.target.value)); }}
+              onChange={(e) => changeSystem(Number(e.target.value))}
               className="w-full min-w-0 truncate"
               data-testid="header-system-select"
             >
+              {!selectedSystem && (
+                <option value={String(systemId ?? "")} disabled>
+                  {systemId === null ? "System を選択してください" : "選択していた System は利用できません"}
+                </option>
+              )}
               {systems.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.name}{s.environment ? ` / ${s.environment}` : ""}

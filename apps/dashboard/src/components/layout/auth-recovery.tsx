@@ -6,6 +6,7 @@ import { Dialog, DialogDescription, DialogHeader, DialogTitle } from "@/componen
 import { FormField } from "@/components/ui/form-field";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { systemSelectionUnavailable } from "@/lib/systems-state";
 
 // Issue #466 (UX-06): 認証・System 取得の失敗から再開するための表示。
 //
@@ -87,6 +88,19 @@ export function SystemsLoadErrorBanner() {
       >
         {retrying ? "再試行中…" : "System 一覧を再取得"}
       </Button>
+    </div>
+  );
+}
+
+export function SystemSelectionRecoveryBanner() {
+  const auth = useAuth();
+  if (!systemSelectionUnavailable(auth)) return null;
+  return (
+    <div role="alert" data-testid="system-selection-unavailable" className="border-b border-amber-500/40 bg-amber-500/5 px-4 py-2 text-sm">
+      選択していた System は利用できなくなりました。
+      {auth.systems.length > 0
+        ? " ヘッダーで利用可能な System を選び直してください。未保存の入力は、切り替えを確認するまで保持されます。"
+        : " 利用可能な System がありません。ヘッダーの「System を作成」から作成できます。"}
     </div>
   );
 }

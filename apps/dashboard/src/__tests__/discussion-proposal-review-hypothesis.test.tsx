@@ -12,6 +12,8 @@ import type { AssistantDiscussionProposal, AssistantDiscussionThread } from "@/a
 
 const promoteMutate = vi.fn();
 const promoteState = { isPending: false };
+const listState = { isError: false, error: new Error("offline"), isFetching: false, refetch: vi.fn() };
+const applyMutate = vi.fn();
 
 function baseHypothesis(overrides: Partial<AssistantDiscussionProposal["hypotheses"][number]> = {}) {
   return {
@@ -54,10 +56,10 @@ const THREAD: AssistantDiscussionThread = {
 let currentProposal: AssistantDiscussionProposal;
 
 vi.mock("@/api/hooks", () => ({
-  useDiscussionProposals: () => ({ data: { proposals: [currentProposal] }, isLoading: false }),
+  useDiscussionProposals: () => ({ data: listState.isError ? undefined : { proposals: [currentProposal] }, isLoading: false, ...listState }),
   useCreateDiscussionProposal: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useDiscussionProposal: () => ({ data: currentProposal, isLoading: false, isError: false }),
-  useApplyDiscussionProposalItems: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useApplyDiscussionProposalItems: () => ({ mutate: applyMutate, isPending: false, isError: false }),
   useRejectDiscussionProposalItems: () => ({ mutate: vi.fn(), isPending: false }),
   usePrefillDiscussionProposalItems: () => ({ mutateAsync: vi.fn(), isPending: false }),
   usePromoteDiscussionHypothesis: () => ({ mutate: promoteMutate, ...promoteState }),
@@ -80,7 +82,35 @@ describe("DiscussionProposalReview hypothesis section (Issue #455)", () => {
   beforeEach(() => {
     promoteMutate.mockReset();
     promoteState.isPending = false;
+    listState.isError = false;
+    listState.refetch.mockReset();
+    applyMutate.mockReset();
     currentProposal = baseProposal([baseHypothesis()]);
+  });
+
+  it("shows a list retrieval error with retry instead of an empty state or enabled generation", () => {
+    listState.isError = true;
+    renderReview();
+    expect(screen.getByTestId("discussion-proposals-error")).toHaveTextContent("変更候補一覧を取得できませんでした");
+    expect(screen.queryByTestId("discussion-proposal-empty")).not.toBeInTheDocument();
+    expect(screen.getByTestId("discussion-proposal-generate")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "再試行" }));
+    expect(listState.refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps direct saving in a collapsed disclosure and explains that prefill stays unsaved", () => {
+    currentProposal.items = [{ id: 5, item_kind: "field", field_name: "title", current_value: "以前", proposed_value: "変更後", rationale: "明確にする", eligibility: "appliable", status: "proposed", prefill_count: 0 }] as AssistantDiscussionProposal["items"];
+    renderReview();
+    expect(screen.getByText(/フォームへの反映は未保存の下書き/)).toBeInTheDocument();
+    const direct = screen.getByTestId("discussion-proposal-apply");
+    expect(direct.closest("details")).not.toHaveAttribute("open");
+    expect(direct).not.toBeVisible();
+    fireEvent.click(screen.getByText("詳細: フォームを使わず保存する"));
+    expect(direct).toBeVisible();
+    fireEvent.click(screen.getByTestId("discussion-proposal-item-select-5"));
+    expect(applyMutate).not.toHaveBeenCalled();
+    fireEvent.click(direct);
+    expect(applyMutate).toHaveBeenCalledWith({ item_ids: [5] }, expect.any(Object));
   });
 
   it("renders the hypothesis with its competing_explanations/refutation_conditions/next_investigation", () => {

@@ -13,3 +13,14 @@ export function systemsKnownEmpty(auth: {
 }): boolean {
   return auth.systems.length === 0 && (auth.systemsStatus === undefined || auth.systemsStatus === "ready");
 }
+
+/** A successful list can prove a saved selection is no longer available.
+ * Do not replace it automatically: a background refresh must preserve drafts. */
+export function systemSelectionUnavailable(auth: {
+  systemId: number | null;
+  systems: readonly { id: number }[];
+  systemsStatus?: "loading" | "ready" | "error";
+}): boolean {
+  return auth.systemsStatus === "ready" && auth.systemId !== null
+    && !auth.systems.some((system) => system.id === auth.systemId);
+}

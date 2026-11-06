@@ -4,7 +4,7 @@ import { useAuth } from "@/api/auth";
 import { useSystemState } from "@/api/hooks";
 import { Sidebar, MOBILE_NAV_DRAWER_ID } from "./sidebar";
 import { Header } from "./header";
-import { AuthBootstrapError, AuthLoadingScreen, ReauthDialog, SystemsLoadErrorBanner } from "./auth-recovery";
+import { AuthBootstrapError, AuthLoadingScreen, ReauthDialog, SystemsLoadErrorBanner, SystemSelectionRecoveryBanner } from "./auth-recovery";
 import { loginPathFor } from "@/lib/return-to";
 import { AssistantPanel } from "@/components/assistant-panel";
 import { ReturnToBanner } from "@/components/discussion-return-banner";
@@ -79,6 +79,7 @@ export function AppLayout() {
             navDrawerId={MOBILE_NAV_DRAWER_ID}
           />
           <SystemsLoadErrorBanner />
+          <SystemSelectionRecoveryBanner />
           <ReturnToBanner />
           {/* `pb-24` は `AssistantPanel` の浮いているボタン (閉じているとき
               右下に固定) のための予約領域。本文の末尾が常にボタンより上で

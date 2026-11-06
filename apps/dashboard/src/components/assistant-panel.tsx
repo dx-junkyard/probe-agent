@@ -41,6 +41,7 @@ import { DiscussionProposalReview } from "@/components/discussion-proposal-revie
 import { DiscussionContextPanel } from "@/components/discussion-context-panel";
 import { DiscussionInvestigationPanel } from "@/components/discussion-investigation-panel";
 import { InterviewDiscussionReview } from "@/components/interview-discussion";
+import { AssistantWaitStatus } from "@/components/assistant-wait-status";
 
 // Per-screen assistant (Issue #102): floating agent button + right-side panel.
 // Answers come from POST /assistant/ask and are grounded in screen context,
@@ -624,6 +625,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
 
   const { data: ctx } = useAssistantScreenContext(screenId, open);
   const ask = useAssistantAsk();
+  const [askStartedAt, setAskStartedAt] = useState(0);
   const askInFlight = useRef(false);
   const uiDraftRegistry = useUiDraftRegistry();
 
@@ -737,6 +739,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     // A ref, not `ask.isPending`: two clicks in one tick both see the state
     // from before the first render (#466 double-submit rule).
     askInFlight.current = true;
+    setAskStartedAt(Date.now());
     setQuestion("");
     // The target this turn is about is captured HERE (or, for voice, was
     // already captured at listening-start and handed in) and used for the
@@ -926,12 +929,14 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             if (liveScreenId === "interview") setPinnedInterview(new URLSearchParams(location.search).get("session"));
             setOpen(true);
           }}
-          title="Ask the assistant about this screen"
+          title={ask.isPending ? "回答を受信中です。開いて確認する" : "この画面について質問する"}
+          aria-label={ask.isPending ? "回答を受信中です。アシスタントを開く" : "この画面について質問する"}
           data-testid="assistant-button"
           className="h-11 w-11 rounded-full shadow-lg"
         >
           <Bot className="h-5 w-5" />
         </Button>
+        {ask.isPending && <span className="rounded border bg-background px-2 py-1 text-xs" role="status" data-testid="assistant-closed-pending">回答を受信中</span>}
       </div>
     );
   }
@@ -1248,11 +1253,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             </div>
           ),
         )}
-        {ask.isPending && (
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Thinking…
-          </div>
-        )}
+        {ask.isPending && <AssistantWaitStatus startedAt={askStartedAt} />}
         {threadResolving && (
           <p className="flex items-center gap-2 text-xs text-muted-foreground" data-testid="assistant-thread-resolving">
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -1285,6 +1286,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         <>
           {activeThread.target_kind === "interview_session" && (
             <InterviewDiscussionReview key={`interview-${activeThread.id}`} threadId={activeThread.id}
+              onOpenSaved={() => setOpen(false)}
               sessionId={Number(activeThread.target_ref)} throughTurn={Math.max(0, ...view.messages.map(m => m.result?.turn_number ?? 0), ...(threadDetail?.turns.map(t => t.turn_number) ?? []))} />
           )}
           <DiscussionInvestigationPanel key={activeThread.id} threadId={activeThread.id} />

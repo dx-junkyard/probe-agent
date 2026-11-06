@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, MemoryRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, MemoryRouter, Routes, Route, useLocation } from "react-router-dom";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
 import type { SystemStateItem } from "@/api/types";
@@ -4481,6 +4481,27 @@ describe("Interview page", () => {
     await waitFor(() => {
       expect(screen.queryByTestId("interview-load-error")).toBeNull();
     });
+  });
+
+  test.each([403, 404])("セッション詳細のHTTP %sから一覧へ戻ると古い選択を再取得しない", async (status) => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => path === "/interview/sessions/999"
+      ? Promise.reject(new ApiError(status, "Interview session not available"))
+      : baseGet?.(path) ?? Promise.resolve(null));
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    function Location() {
+      const location = useLocation();
+      return <span data-testid="interview-recovery-location">{location.pathname}{location.search}{location.hash}</span>;
+    }
+    render(<QueryClientProvider client={qc}><MemoryRouter initialEntries={["/interview?session=999&purpose_need=old#detail"]}>
+      <InterviewPage /><Location />
+    </MemoryRouter></QueryClientProvider>);
+    fireEvent.click(await screen.findByTestId("interview-load-error-return"));
+    await waitFor(() => expect(screen.queryByTestId("interview-load-error")).not.toBeInTheDocument());
+    expect(screen.getByTestId("interview-recovery-location")).toHaveTextContent(/^\/interview$/);
+    expect(screen.getByRole("option", { name: "セッション未選択" }).closest("select")).toHaveValue("");
   });
 
   test("セッション詳細の取得に失敗したらエラーと再試行を出す", async () => {

@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { ReplayReadinessPanel } from "@/components/replay-readiness";
 import { SnapshotPreflightPanel } from "@/components/snapshot-preflight";
 import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
@@ -37,6 +37,7 @@ import { CodeBlock } from "@/components/code-block";
 import { ApprovalPanel } from "@/components/replay-approval-panel";
 import { ResultMatrix } from "@/components/replay-result-matrix";
 import { cn, formatTimestamp } from "@/lib/utils";
+import { useUnsavedChangesGuard } from "@/lib/ui-draft";
 
 // AI Candidate Studio (Issue #252): a conversation + candidate-versioning UI
 // over the EXISTING isolated Replay stack (#243-#246). This page adds no new
@@ -98,13 +99,14 @@ export default function CandidateStudioPage() {
   if (!sessionId) {
     return (
       <StartView
+        key={searchParams.toString()}
         prefillComponentId={searchParams.get("component_id")}
         prefillTraceId={searchParams.get("trace_id")}
         prefillReplaySetId={searchParams.get("replay_set_id")}
       />
     );
   }
-  return <StudioView sessionId={sessionId} />;
+  return <StudioView key={sessionId} sessionId={sessionId} />;
 }
 
 // --- Start view: pick a component (+ optional trace), create the session ---
@@ -162,6 +164,17 @@ function StartView({
     !!snapshotPreflight?.requires_stale_acknowledgement && !staleReason.trim();
   const readinessJudgeable = !replaySetId || !!selectedReplaySet;
   const readinessBlocked = readiness?.verdict === "blocked" && readinessJudgeable;
+  const signature = JSON.stringify([componentId, traceId, replaySetId, objective.trim(), staleReason.trim()]);
+  const [createdSession, setCreatedSession] = useState<{ id: number; signature: string } | null>(null);
+  const edited = !!objective.trim() || !!staleReason.trim()
+    || componentId !== (prefillComponentId ?? "") || traceId !== (prefillTraceId ?? "")
+    || replaySetId !== (prefillReplaySetId ?? "");
+  useUnsavedChangesGuard("candidate-start", edited && signature !== createdSession?.signature);
+  // Let the shared draft registration observe the saved signature before
+  // navigating. Edits made while creation was pending stay on this page.
+  useEffect(() => {
+    if (createdSession?.signature === signature) navigate(`/candidate-studio?session_id=${createdSession.id}`);
+  }, [createdSession, signature, navigate]);
 
   const canStart =
     !!componentId && !createSession.isPending && !readinessBlocked
@@ -182,7 +195,7 @@ function StartView({
     }
     try {
       const session = await createSession.mutateAsync(payload);
-      navigate(`/candidate-studio?session_id=${session.id}`);
+      setCreatedSession({ id: session.id, signature });
     } catch (e) {
       toast.error(String(e));
     }
@@ -325,6 +338,12 @@ function StartView({
           >
             {createSession.isPending ? "開始中..." : "セッションを開始"}
           </Button>
+          {createdSession && createdSession.signature !== signature && (
+            <p role="status" className="text-sm">
+              セッションを作成しました。送信後に編集した入力はこの画面に残しています。{" "}
+              <Link className="underline" to={`/candidate-studio?session_id=${createdSession.id}`}>作成したセッションを開く</Link>
+            </p>
+          )}
         </CardContent>
       </Card>
     </div>
@@ -342,6 +361,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
   const promote = usePromoteCandidateVersion();
 
   const [draftText, setDraftText] = useState("");
+  const [savedDraftText, setSavedDraftText] = useState("");
   const [selectedVersionId, setSelectedVersionId] = useState<number | null>(null);
   const [trackedSessionId, setTrackedSessionId] = useState<number | null>(null);
 
@@ -355,6 +375,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
     setTrackedSessionId(sessionId);
     setSelectedVersionId(null);
     setDraftText(session.objective);
+    setSavedDraftText(session.objective);
     effectiveSelectedVersionId = null;
   } else if (
     versions.length > 0 &&
@@ -369,6 +390,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
   const componentId = session?.component_id ?? null;
   const { data: approvalState } = useReplayApproval(componentId);
   const canRun = !!approvalState?.active;
+  useUnsavedChangesGuard(`candidate-session:${sessionId}`, draftText.trim() !== savedDraftText.trim());
 
   if (isLoading) {
     return <Skeleton className="h-64 w-full" />;
@@ -396,13 +418,15 @@ function StudioView({ sessionId }: { sessionId: number }) {
       toast.error("先に指示を入力してください。");
       return;
     }
+    const submittedText = draftText;
     try {
       const version = await generate.mutateAsync({
         sessionId,
         instruction: draftText.trim(),
         parent_version_id: parentVersionId,
       });
-      setDraftText("");
+      setDraftText(current => current === submittedText ? "" : current);
+      setSavedDraftText("");
       setSelectedVersionId(version.id);
       toast.success(`候補 v${version.version_number} を生成しました`);
     } catch (e) {
@@ -412,9 +436,11 @@ function StudioView({ sessionId }: { sessionId: number }) {
 
   const handleSend = async () => {
     if (!draftText.trim()) return;
+    const submittedText = draftText;
     try {
       await sendMessage.mutateAsync({ sessionId, content: draftText.trim() });
-      setDraftText("");
+      setDraftText(current => current === submittedText ? "" : current);
+      setSavedDraftText("");
     } catch (e) {
       toast.error(String(e));
     }

@@ -161,6 +161,27 @@ describe("UX-07: 履歴の初回解決中に送った発言が消えない", () 
 // ── UX-16 ───────────────────────────────────────────────────────────
 
 describe("UX-16: 回答到着・処理中・失敗を読み上げに通知する", () => {
+  test("回答待ちで閉じても受信を続け、開き直して回答を確認できる", async () => {
+    let resolveAsk: (value: typeof askResponse) => void = () => {};
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/assistant/discussion-threads") return Promise.resolve(threadDetail());
+      if (path === "/assistant/ask") return new Promise(resolve => { resolveAsk = resolve; });
+      return Promise.resolve(null);
+    });
+    await renderPanel();
+    await waitFor(() => expect(screen.queryByTestId("assistant-thread-resolving")).not.toBeInTheDocument());
+    fireEvent.change(screen.getByTestId("assistant-question-input"), { target: { value: "質問" } });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+    await screen.findByTestId("assistant-wait-status");
+    fireEvent.click(screen.getByTestId("assistant-close"));
+    expect(screen.getByTestId("assistant-closed-pending")).toHaveTextContent("回答を受信中");
+    await act(async () => { resolveAsk(askResponse); });
+    expect(screen.queryByTestId("assistant-closed-pending")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("assistant-button"));
+    expect(await screen.findByText(askResponse.answer)).toBeInTheDocument();
+    expect(mockApi.post.mock.calls.filter(([path]) => path === "/assistant/ask")).toHaveLength(1);
+  });
+
   test("履歴の読み込みでは通知せず、新しい回答だけを通知する", async () => {
     let resolveAsk: (v: typeof askResponse) => void = () => {};
     mockApi.post.mockImplementation((path: string) => {

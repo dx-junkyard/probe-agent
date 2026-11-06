@@ -4,7 +4,7 @@
 
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import type { CandidateVersionOut } from "@/api/types";
+import type { CandidateVersionOut, ReplayVariantRunOut } from "@/api/types";
 import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 import {
   LOOP_STAGES,
@@ -71,6 +71,13 @@ describe("resolveStage", () => {
     expect(
       resolveStage({ ...base, version: version({ replay_status: "completed" }) }),
     ).toBe("decide");
+  });
+
+  it("Workbenchで選択したrunの結果と承認から次の段階を示す", () => {
+    const run = { id: 9, status: "completed" } as ReplayVariantRunOut;
+    expect(resolveStage({ componentId: "c", replayRun: run, approved: true })).toBe("decide");
+    expect(resolveStage({ componentId: "c", replayRun: { ...run, status: "failed" }, approved: true })).toBe("compare");
+    expect(resolveStage({ componentId: "c", replayRun: { ...run, status: "failed" }, approved: false })).toBe("verify");
   });
 });
 

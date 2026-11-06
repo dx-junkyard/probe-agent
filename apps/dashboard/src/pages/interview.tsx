@@ -56,6 +56,7 @@ import {
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { api } from "@/api/client";
+import { describeRequestFailure } from "@/lib/request-state";
 import { DiagnosticFixCallout, useDiagnosticHighlight } from "@/components/diagnostic-fix";
 import { UnderstandingOverview } from "@/components/system-understanding/understanding-overview";
 import { UnderstandingBriefPanel } from "@/components/system-understanding/understanding-brief";
@@ -1503,6 +1504,44 @@ function AlignmentSummaryHeader({
   );
 }
 
+export function InterviewLoadErrorCard({ error, sessionsFailed, selectedSessionId, onRetry, onReturnToSessions }: {
+  error: unknown;
+  sessionsFailed: boolean;
+  selectedSessionId: number | null;
+  onRetry: () => void;
+  onReturnToSessions: () => void;
+}) {
+  const failure = describeRequestFailure(error);
+  const unavailableSelection = !sessionsFailed && (failure.kind === "not_found" || failure.kind === "forbidden");
+  return (
+    <Card data-testid="interview-load-error" data-failure-kind={failure.kind}>
+      <CardHeader>
+        <CardTitle className="text-sm flex items-center gap-2">
+          <AlertCircle className="h-4 w-4 text-destructive" />
+          {sessionsFailed ? "インタビューセッション一覧を取得できませんでした" : `セッション #${selectedSessionId} を取得できませんでした`}
+        </CardTitle>
+        <CardDescription>
+          {unavailableSelection
+            ? "この System では指定されたセッションを開けません。この System のセッション一覧へ戻るか、ヘッダーで System を選び直してください。"
+            : failure.summary}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {failure.detail && <p className="rounded-md border p-2 text-xs font-mono break-words" data-testid="interview-load-error-detail">{failure.detail}</p>}
+        {unavailableSelection ? (
+          <Button size="sm" variant="outline" onClick={onReturnToSessions} data-testid="interview-load-error-return">
+            この System のセッション一覧へ戻る
+          </Button>
+        ) : (
+          <Button size="sm" variant="outline" onClick={onRetry} data-testid="interview-load-error-retry">
+            <RefreshCw className="h-4 w-4 mr-1" />再試行
+          </Button>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function InterviewPage() {
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -1727,7 +1766,7 @@ export default function InterviewPage() {
   useEffect(() => {
     if (!session) return;
     const target = location.hash.slice(1);
-    if (target !== "cockpit-aux-intent" && target !== "cockpit-aux-change-set") return;
+    if (target !== "cockpit-aux-intent" && target !== "cockpit-aux-change-set" && target !== "discussion-contributions") return;
     focusCockpitTarget(target);
   }, [location.hash, session]);
   // 復旧操作の常設をやめる (§5.3-1): 対応する例外が今発生しているときだけ。
@@ -2580,44 +2619,20 @@ export default function InterviewPage() {
         /* 取得失敗。これまではここで本文が空になり、何が起きたのかも次に何を
            すればよいのかも読めなかった。失敗した対象・サーバーからの理由・
            再試行を 1 枠にまとめる (例外表示 §4.4 と同じ形)。 */
-        <Card data-testid="interview-load-error">
-          <CardHeader>
-            <CardTitle className="text-sm flex items-center gap-2">
-              <AlertCircle className="h-4 w-4 text-destructive" />
-              {sessionsFailed
-                ? "インタビューセッション一覧を取得できませんでした"
-                : `セッション #${selectedSessionId} を取得できませんでした`}
-            </CardTitle>
-            <CardDescription>
-              Control Server からの応答が得られないため、この画面の内容を表示できません。
-              接続を確認してから再試行してください。
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <p
-              className="rounded-md border p-2 text-xs font-mono break-words"
-              data-testid="interview-load-error-detail"
-            >
-              {String(
-                (sessionsFailed ? sessionsError : sessionError)?.message
-                ?? (sessionsFailed ? sessionsError : sessionError)
-                ?? "unknown error",
-              )}
-            </p>
-            <Button
-              size="sm"
-              variant="outline"
-              data-testid="interview-load-error-retry"
-              onClick={() => {
-                if (sessionsFailed) void refetchSessions();
-                if (sessionFailed) void refetchSession();
-              }}
-            >
-              <RefreshCw className="h-4 w-4 mr-1" />
-              再試行
-            </Button>
-          </CardContent>
-        </Card>
+        <InterviewLoadErrorCard
+          error={sessionsFailed ? sessionsError : sessionError}
+          sessionsFailed={sessionsFailed}
+          selectedSessionId={selectedSessionId}
+          onRetry={() => {
+            if (sessionsFailed) void refetchSessions();
+            if (sessionFailed) void refetchSession();
+          }}
+          onReturnToSessions={() => {
+            setSessionClearedByUser(true);
+            autoSelectedRef.current = true;
+            setSearchParams({}, { replace: true });
+          }}
+        />
       ) : !selectedSessionId || !session ? (
         /* `W0-B` インタビューを始める。`W0-A` のときはこのカードを出さない
            (実行できない主操作を見せない、原則 P3)。 */
@@ -2650,7 +2665,9 @@ export default function InterviewPage() {
           {/* R1 — 現在地。全状態で 1 箇所のみ。「次にやること」が指す操作は
               その状態の主操作そのもの (原則 P2)。進捗ステップも同じカードへ
               まとめる (§3.2 #9/#11/#50/#63 の統合)。 */}
-          <InterviewContributions key={selectedSessionId} sessionId={selectedSessionId} />
+          <div id="discussion-contributions" data-testid="discussion-contributions" className="scroll-mt-4">
+            <InterviewContributions key={selectedSessionId} sessionId={selectedSessionId} />
+          </div>
           {workflow && (
             <div data-help-id="interview.workflow_state">
               <WorkflowLocationCard

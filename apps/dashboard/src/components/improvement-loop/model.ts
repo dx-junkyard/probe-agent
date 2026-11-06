@@ -1,4 +1,4 @@
-import type { CandidateVersionOut, ExperimentOut } from "@/api/types";
+import type { CandidateVersionOut, ExperimentOut, ReplayVariantRunOut } from "@/api/types";
 
 // Issue #371: one improvement loop, five user-facing stages.
 //
@@ -87,6 +87,8 @@ export interface LoopContext {
   approved?: boolean;
   /** An experiment in focus, when the developer is on that surface. */
   experiment?: ExperimentOut | null;
+  /** The persisted run selected in the Simulation Workbench. */
+  replayRun?: ReplayVariantRunOut | null;
 }
 
 /**
@@ -97,10 +99,12 @@ export interface LoopContext {
  * Studio covers create → verify → compare).
  */
 export function resolveStage(context: LoopContext): LoopStageId {
-  const { componentId, sessionId, version, approved, experiment } = context;
+  const { componentId, sessionId, version, approved, experiment, replayRun } = context;
 
   // A decision already recorded, or an experiment in focus, is the last stage.
   if (experiment || version?.promoted_at) return "decide";
+  if (replayRun?.status === "completed") return "decide";
+  if (replayRun) return approved ? "compare" : "verify";
   if (version?.replay_status === "completed") return "decide";
   if (version?.replay_status === "running") return "compare";
   // A generated version that has not been replayed: the next thing is the

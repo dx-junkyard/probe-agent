@@ -4,6 +4,9 @@ import { api, ApiError, getSystemId } from "@/api/client";
 import { sysKey } from "@/api/hooks";
 import { Button } from "@/components/ui/button";
 import { openScreenAssistant } from "@/lib/assistant-control";
+import type { InterviewSessionOut } from "@/api/types";
+import { QueryErrorState } from "@/components/query-state";
+import { Link } from "react-router-dom";
 
 type Kind = "supplement" | "correction" | "open_question" | "hypothesis";
 type Target = { session_id: number; target_kind: "session" | "qa" | "intent_item" | "claim"; row_id?: number; revision_id?: number; section?: string; name?: string };
@@ -13,6 +16,7 @@ type Job = { id?: number; state: string; error_code?: string; targets?: Resolved
 type Saved = { id: number; contribution_id: number; text: string; kind: Kind; origin_url: string; application: unknown; target: { target: Target; freshness: string }; sources: Candidate["sources"] };
 type Preview = { preview_token: string; items: { link_id: number; before: string; after: string; effect: string; title: string }[] };
 const labels: Record<Kind, string> = { supplement: "補足", correction: "訂正", open_question: "未解決の問い", hypothesis: "仮説" };
+const sessionStatusLabels: Record<InterviewSessionOut["status"], string> = { open: "進行中", proposals_ready: "提案レビュー", materialized: "差分生成済み", closed: "終了済み（保存には再開が必要）" };
 const id = () => crypto.randomUUID();
 const errorMessage = (e: unknown) => {
   const code = e instanceof ApiError ? e.code : undefined;
@@ -36,6 +40,7 @@ function CandidateEditor({ item, onChange }: { item: Candidate; onChange: () => 
   const [kind, setKind] = useState<Kind>(item.kind);
   const [selected, setSelected] = useState<Target[]>(item.targets.filter(t => t.selection === "selected").map(t => t.target));
   const [sid, setSid] = useState(String(item.targets[0]?.target.session_id ?? ""));
+  const [sessionSearch, setSessionSearch] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [jobId, setJobId] = useState<number>();
@@ -46,6 +51,7 @@ function CandidateEditor({ item, onChange }: { item: Candidate; onChange: () => 
     return requests.current.get(key)!;
   };
   const targets = useQuery({ queryKey: [...sysKey("interview-discussion-targets"), sid], queryFn: () => api.get<{ targets: Resolved[] }>(`/interview/sessions/${sid}/discussion-targets`), enabled: /^\d+$/.test(sid) && Number(sid) > 0, retry: false });
+  const sessions = useQuery({ queryKey: sysKey("interview-discussion-sessions"), queryFn: () => api.get<InterviewSessionOut[]>("/interview/sessions"), retry: false });
   const searchJob = useQuery({ queryKey: [...sysKey("interview-discussion-job"), jobId], queryFn: () => api.get<Job>(`/assistant/interview-extractions/${jobId}`), enabled: !!jobId, refetchInterval: q => ["queued", "running"].includes(q.state.data?.state ?? "") ? 1500 : false });
   const choices: Resolved[] = [...item.targets.map(t => ({ ref: t.target, title: t.title, session_title: t.session_title ?? `Interview #${t.target.session_id}`, reason: t.reason })), ...(targets.data?.targets ?? []), ...(searchJob.data?.targets ?? [])];
   const unique = [...new Map(choices.map(t => [JSON.stringify(t.ref), t])).values()];
@@ -74,9 +80,15 @@ function CandidateEditor({ item, onChange }: { item: Candidate; onChange: () => 
       <label className="block text-xs">分類<select className="ml-2 border rounded" value={kind} onChange={e => setKind(e.target.value as Kind)}>{Object.entries(labels).map(([k,v]) => <option key={k} value={k}>{v}</option>)}</select></label>
       <label className="block text-xs">整理文（既存内容へ反映する場合は更新後の全文）<textarea className="w-full rounded border p-2" rows={4} maxLength={4000} value={text} onChange={e => setText(e.target.value)} /></label>
       <details><summary className="text-xs">根拠の発言</summary>{item.sources.map((s,i) => <blockquote key={i} className="border-l pl-2 text-xs whitespace-pre-wrap">{s.role === "user" ? "ユーザー" : s.role === "manual" ? "レビューで追記" : "AI（推測を含む）"}{s.turn_id ? ` · 発言 #${s.turn_id}` : ""}: {s.quote}</blockquote>)}</details>
-      <label className="block text-xs">関連先のInterview番号<input className="ml-2 w-20 border" type="number" min="1" value={sid} onChange={e => setSid(e.target.value)} /></label>
-      {targets.isError && <p role="alert" className="text-xs">関連先を取得できません。番号を確認してください。</p>}
-      <fieldset className="max-h-44 overflow-auto space-y-1"><legend className="text-xs">保存する関連先を選択</legend>{unique.map(t => <label key={JSON.stringify(t.ref)} className="flex gap-2 text-xs"><input type="checkbox" checked={selected.some(s => JSON.stringify(s) === JSON.stringify(t.ref))} onChange={() => toggle(t.ref)} /><span>{t.session_title} · {t.title}{t.reason && <small className="block">{t.reason}</small>}</span></label>)}</fieldset>
+      <label className="block text-xs">関連先を名前・番号で検索<input className="ml-2 rounded border p-1" value={sessionSearch} onChange={e => setSessionSearch(e.target.value)} /></label>
+      {sessions.isError && <QueryErrorState target="関連先のインタビュー一覧" error={sessions.error} onRetry={() => void sessions.refetch()} retrying={sessions.isFetching} />}
+      <label className="block text-xs">関連先のインタビュー<select className="ml-2 max-w-full rounded border p-1" value={sid} onChange={e => setSid(e.target.value)} disabled={sessions.isLoading}>
+        <option value="">インタビューを選択</option>
+        {sid && !sessions.data?.some(s => String(s.id) === sid) && <option value={sid}>Interview #{sid}（一覧で未確認）</option>}
+        {(sessions.data ?? []).filter(s => String(s.id) === sid || `${s.title} ${s.id}`.toLowerCase().includes(sessionSearch.toLowerCase())).map(s => <option key={s.id} value={s.id}>{s.title || `Interview #${s.id}`} · {sessionStatusLabels[s.status]} · #{s.id}</option>)}
+      </select></label>
+      {targets.isError && <QueryErrorState target="選択したインタビューの関連先" error={targets.error} onRetry={() => void targets.refetch()} retrying={targets.isFetching} />}
+      <fieldset className="max-h-44 overflow-auto space-y-1"><legend className="text-xs">保存する関連先を選択</legend>{unique.map(t => <label key={JSON.stringify(t.ref)} className="flex gap-2 text-xs"><input type="checkbox" checked={selected.some(s => JSON.stringify(s) === JSON.stringify(t.ref))} onChange={() => toggle(t.ref)} /><span>{t.session_title} · {t.title}{item.targets.some(original => JSON.stringify(original.target) === JSON.stringify(t.ref) && original.freshness !== "current") && <small className="block text-amber-700">参照先が更新されています。最新の関連先を選び直してください。</small>}{t.reason && <small className="block">{t.reason}</small>}</span></label>)}</fieldset>
       <Button size="sm" variant="outline" disabled={busy} onClick={() => search()}>関連するインタビューを探す</Button>
       {searchJob.data && <p className="text-xs" role="status">{searchJob.data.state === "succeeded" ? "関連候補を取得しました。保存先は選択して確認してください。" : searchJob.data.state === "failed" ? "関連探索に失敗しました。再試行できます。" : "関連を探しています…"}</p>}
       {searchJob.data?.next_cursor && <Button size="sm" variant="outline" onClick={() => search(searchJob.data!.next_cursor!)}>関連をさらに探す</Button>}
@@ -86,7 +98,7 @@ function CandidateEditor({ item, onChange }: { item: Candidate; onChange: () => 
   </details>;
 }
 
-export function InterviewDiscussionReview({ threadId, sessionId, throughTurn }: { threadId: number; sessionId: number; throughTurn: number }) {
+export function InterviewDiscussionReview({ threadId, sessionId, throughTurn, onOpenSaved }: { threadId: number; sessionId: number; throughTurn: number; onOpenSaved?: () => void }) {
   const enabled = useInterviewDiscussionEnabled();
   const qc = useQueryClient();
   const [selected, setSelected] = useState<number[]>([]);
@@ -95,6 +107,7 @@ export function InterviewDiscussionReview({ threadId, sessionId, throughTurn }: 
   const [busy, setBusy] = useState(false);
   const [jobId, setJobId] = useState<number>();
   const [cursor, setCursor] = useState(0);
+  const [savedTargets, setSavedTargets] = useState<{ sessionId: number; title: string }[]>([]);
   const pending = useRef<{ signature: string; id: string } | null>(null);
   const queryKey = [...sysKey("interview-discussion-candidates"), threadId, cursor];
   const query = useQuery({ queryKey, queryFn: () => api.get<{ items: Candidate[]; next_cursor: number | null; latest_job?: Job }>(`/assistant/discussion-threads/${threadId}/interview-candidates?cursor=${cursor}`), enabled, refetchInterval: enabled ? 3000 : false });
@@ -108,6 +121,12 @@ export function InterviewDiscussionReview({ threadId, sessionId, throughTurn }: 
       const result = await api.post<Job>(path, { ...payload, request_id: requestId });
       if (result.id && "state" in result) setJobId(result.id);
       pending.current = null;
+      if (path.endsWith("/interview-contributions")) {
+        const destinations = candidates.filter(c => selected.includes(c.id))
+          .flatMap(c => c.targets.filter(t => t.selection === "selected"))
+          .map(t => [t.target.session_id, { sessionId: t.target.session_id, title: t.session_title ?? `Interview #${t.target.session_id}` }] as const);
+        setSavedTargets([...new Map(destinations).values()]);
+      }
       setNotice(success); setSelected([]);
       await qc.invalidateQueries({ queryKey: sysKey("interview-discussion-candidates") });
       await qc.invalidateQueries({ queryKey: sysKey("interview-discussion-saved") });
@@ -121,11 +140,15 @@ export function InterviewDiscussionReview({ threadId, sessionId, throughTurn }: 
     <div className="flex items-center justify-between"><p className="text-sm font-medium">整理候補 {candidates.filter(c => c.decision === "pending").length}件</p><Button size="sm" variant="outline" disabled={busy || throughTurn < 1} onClick={() => run(`/assistant/discussion-threads/${threadId}/interview-extractions`, { through_turn_number: throughTurn }, "整理を開始しました。会話は続けられます。")}>ここまでを整理</Button></div>
     {activeJob && <p role="status" className="text-xs">{activeJob.state === "failed" ? "AIによる整理に失敗しました。「ここまでを整理」で再試行、または手入力で補足できます。" : ["queued", "running"].includes(activeJob.state) ? "発言を整理しています…" : activeJob.remaining ? "まだ未整理の発言があります。もう一度「ここまでを整理」で続きを処理できます。" : candidates.length ? "整理が完了しました。" : "今回は内容の更新はありません。"}</p>}
     {query.isError && <Button size="sm" onClick={() => query.refetch()}>候補を再取得する</Button>}
-    {candidates.map(c => <div key={c.id} className="space-y-1"><CandidateEditor key={`${c.id}:${c.revision}`} item={c} onChange={() => { setSelected([]); void query.refetch(); }} />{["pending","held"].includes(c.decision) && <label className="text-xs flex gap-2"><input type="checkbox" checked={selected.includes(c.id)} disabled={!c.targets.some(t => t.selection === "selected") || c.targets.some(t => t.selection === "selected" && t.freshness !== "current")} onChange={() => setSelected(prev => prev.includes(c.id) ? prev.filter(i => i !== c.id) : [...prev,c.id])} />この補足を保存する</label>}</div>)}
+    {candidates.map(c => {
+      const blocked = !c.targets.some(t => t.selection === "selected") ? "保存先が未選択です。候補を開き、関連先を選んで「編集・関連先を確認」を押してください。" : c.targets.some(t => t.selection === "selected" && t.freshness !== "current") ? "参照先が更新されています。候補を開いて最新の関連先を選び直し、「編集・関連先を確認」を押してください。" : null;
+      return <div key={c.id} className="space-y-1"><CandidateEditor key={`${c.id}:${c.revision}`} item={c} onChange={() => { setSelected([]); void query.refetch(); }} />{["pending","held"].includes(c.decision) && <><label className="text-xs flex gap-2"><input type="checkbox" aria-describedby={blocked ? `candidate-blocked-${c.id}` : undefined} checked={selected.includes(c.id)} disabled={!!blocked} onChange={() => setSelected(prev => prev.includes(c.id) ? prev.filter(i => i !== c.id) : [...prev,c.id])} />この補足を保存する</label>{blocked && <p id={`candidate-blocked-${c.id}`} className="text-xs text-amber-700">{blocked}</p>}</>}</div>;
+    })}
     {cursor > 0 && <Button variant="outline" size="sm" onClick={() => { setCursor(0); setSelected([]); }}>最初の候補へ</Button>}{query.data?.next_cursor && <Button variant="outline" size="sm" onClick={() => { setCursor(query.data!.next_cursor!); setSelected([]); }}>次の候補</Button>}
     <Button size="sm" disabled={busy || !selected.length} onClick={() => run(`/assistant/discussion-threads/${threadId}/interview-contributions`, { items: candidates.filter(c => selected.includes(c.id)).map(c => ({ candidate_id:c.id,expected_revision:c.revision })) }, "選択した補足を保存しました。既存内容への反映と正準理解への昇格は別操作です。")}>選択した補足を保存</Button>
     <details><summary className="text-xs cursor-pointer">手入力で補足する</summary><textarea aria-label="手入力の補足" className="w-full border rounded p-2" value={manual} maxLength={4000} onChange={e => setManual(e.target.value)} /><Button size="sm" disabled={busy || !manual.trim()} onClick={() => run(`/interview/sessions/${sessionId}/discussion-contribution-drafts`, { kind:"supplement",text:manual }, "手入力の候補を作りました。関連先を確認して保存してください。")}>候補を作る</Button></details>
     <p className="text-xs" role="status">{notice}</p>
+    {savedTargets.length > 0 && <div className="rounded border p-2 text-xs space-y-1"><p>補足として保存済みです。既存内容への反映・正準理解への昇格はまだ行っていません。</p>{savedTargets.map(t => <Link className="block underline" key={t.sessionId} onClick={onOpenSaved} to={`/interview?session=${t.sessionId}#discussion-contributions`}>{t.title}の補足を確認し、既存内容への反映へ進む</Link>)}</div>}
   </section>;
 }
 
