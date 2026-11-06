@@ -979,6 +979,12 @@ class ExperimentAnalysisOut(BaseModel):
     risks: List[str] = Field(default_factory=list)
     error: Optional[str] = None
     created_at: Optional[float] = None
+    # IK-0030: the version row this analysis is (None for a legacy row that
+    # predates versioning) and the intelligence_run holding its payloads.
+    version_id: Optional[int] = None
+    intelligence_run_id: Optional[int] = None
+    # IK-0031: what validation normalised or dropped instead of failing.
+    notes: List[str] = Field(default_factory=list)
 
 
 class ExperimentDecisionUpdate(BaseModel):
@@ -1006,6 +1012,9 @@ class ExperimentOut(BaseModel):
     variants: List[ExperimentVariantResultOut] = Field(default_factory=list)
     comparison: dict[str, Any] = Field(default_factory=dict)
     analysis: ExperimentAnalysisOut
+    # IK-0030: every interpretation attempt, newest first (includes the
+    # current one once it has been recorded as a version).
+    analysis_history: List[ExperimentAnalysisOut] = Field(default_factory=list)
     created_at: float
     started_at: Optional[float] = None
     completed_at: Optional[float] = None

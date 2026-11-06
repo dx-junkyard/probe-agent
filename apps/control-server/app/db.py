@@ -2007,6 +2007,32 @@ CREATE TABLE IF NOT EXISTS experiment_analyses (
     FOREIGN KEY (experiment_id) REFERENCES experiments (id) ON DELETE CASCADE
 );
 
+-- IK-0030: every interpretation attempt of an Experiment, newest last.
+-- experiment_analyses stays the "current" row; re-analysis or a re-run no
+-- longer destroys the previous interpretation.
+CREATE TABLE IF NOT EXISTS experiment_analysis_versions (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id        INTEGER NOT NULL,
+    status               TEXT NOT NULL,
+    provider             TEXT,
+    model                TEXT,
+    prompt_version       TEXT,
+    schema_version       TEXT,
+    decision_method      TEXT,
+    narrative            TEXT,
+    recommendation_variant_key TEXT,
+    recommendation_reason TEXT,
+    risks_json           TEXT NOT NULL DEFAULT '[]',
+    notes_json           TEXT NOT NULL DEFAULT '[]',
+    error                TEXT,
+    intelligence_run_id  INTEGER,
+    created_at           REAL,
+    FOREIGN KEY (experiment_id) REFERENCES experiments (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiment_analysis_versions_experiment
+    ON experiment_analysis_versions (experiment_id, id DESC);
+
 CREATE TABLE IF NOT EXISTS workspaces (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id     INTEGER NOT NULL,
@@ -11376,6 +11402,22 @@ def init_db() -> None:
             "experiment_analyses",
             _columns(conn, "experiment_analyses"),
             "intelligence_run_id",
+            "INTEGER",
+        )
+        # IK-0030/IK-0031: normalisation notes of the current analysis and the
+        # version row it mirrors. Nullable; older analyses have neither.
+        _add_column_if_missing(
+            conn,
+            "experiment_analyses",
+            _columns(conn, "experiment_analyses"),
+            "notes_json",
+            "TEXT",
+        )
+        _add_column_if_missing(
+            conn,
+            "experiment_analyses",
+            _columns(conn, "experiment_analyses"),
+            "version_id",
             "INTEGER",
         )
         # Issue #464: runs last among the column migrations because its

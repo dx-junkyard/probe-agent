@@ -31,7 +31,7 @@ from .execution_modes import gate_execution_target, record_attested_execution_ob
 from .snapshot_preflight import require_snapshot_preflight
 
 router = APIRouter()
-PROMPT_VERSION = "experiment-interpretation-v1"
+PROMPT_VERSION = "experiment-interpretation-v2"
 SCHEMA_VERSION = "experiment-analysis-v1"
 
 
@@ -147,9 +147,11 @@ def _json_object(text: str) -> Dict[str, Any]:
     return value
 
 
-def _analysis_out(row) -> ExperimentAnalysisOut:
+def _analysis_out(row, *, version_id: Optional[int] = None) -> ExperimentAnalysisOut:
     if row is None:
         return ExperimentAnalysisOut(status="pending")
+    keys = row.keys()
+    notes_raw = row["notes_json"] if "notes_json" in keys else None
     return ExperimentAnalysisOut(
         status=row["status"],
         provider=row["provider"],
@@ -163,7 +165,27 @@ def _analysis_out(row) -> ExperimentAnalysisOut:
         risks=json.loads(row["risks_json"] or "[]"),
         error=row["error"],
         created_at=row["created_at"],
+        version_id=(
+            version_id
+            if version_id is not None
+            else (row["version_id"] if "version_id" in keys else None)
+        ),
+        intelligence_run_id=(
+            row["intelligence_run_id"] if "intelligence_run_id" in keys else None
+        ),
+        notes=json.loads(notes_raw or "[]"),
     )
+
+
+def _analysis_history(conn, experiment_id: int) -> List[ExperimentAnalysisOut]:
+    rows = conn.execute(
+        """
+        SELECT * FROM experiment_analysis_versions
+        WHERE experiment_id = ? ORDER BY id DESC
+        """,
+        (experiment_id,),
+    ).fetchall()
+    return [_analysis_out(row, version_id=row["id"]) for row in rows]
 
 
 def _experiment_out(conn, row) -> ExperimentOut:
@@ -245,6 +267,7 @@ def _experiment_out(conn, row) -> ExperimentOut:
         variants=variants,
         comparison=comparison_payload(comparison_rows),
         analysis=_analysis_out(analysis),
+        analysis_history=_analysis_history(conn, row["id"]),
         created_at=row["created_at"],
         started_at=row["started_at"],
         completed_at=row["completed_at"],
@@ -501,6 +524,94 @@ def _record_analysis_run(
     return run_id
 
 
+_ANALYSIS_FIELDS = (
+    "status",
+    "provider",
+    "model",
+    "prompt_version",
+    "schema_version",
+    "decision_method",
+    "narrative",
+    "recommendation_variant_key",
+    "recommendation_reason",
+    "risks_json",
+    "notes_json",
+    "error",
+    "intelligence_run_id",
+    "created_at",
+)
+
+
+def _archive_unversioned_analysis(conn, experiment_id: int) -> None:
+    """Keep a pre-versioning (or not yet versioned) current analysis.
+
+    Analyses written before IK-0030 live only in ``experiment_analyses``;
+    copy such a row into the version table once, before anything replaces
+    it, so a re-run or re-analysis never destroys it. Additive only.
+    """
+    current = conn.execute(
+        "SELECT * FROM experiment_analyses WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchone()
+    if current is None or current["status"] == "pending":
+        return
+    if current["version_id"] is not None:
+        return
+    keys = current.keys()
+    values = [
+        current[field] if field in keys else None for field in _ANALYSIS_FIELDS
+    ]
+    values[_ANALYSIS_FIELDS.index("risks_json")] = current["risks_json"] or "[]"
+    values[_ANALYSIS_FIELDS.index("notes_json")] = current["notes_json"] or "[]"
+    version_id = conn.execute(
+        f"""
+        INSERT INTO experiment_analysis_versions
+            (experiment_id, {", ".join(_ANALYSIS_FIELDS)})
+        VALUES (?, {", ".join("?" for _ in _ANALYSIS_FIELDS)})
+        """,
+        (experiment_id, *values),
+    ).lastrowid
+    conn.execute(
+        "UPDATE experiment_analyses SET version_id = ? WHERE experiment_id = ?",
+        (version_id, experiment_id),
+    )
+
+
+def _write_analysis(conn, experiment_id: int, fields: Dict[str, Any]) -> int:
+    """Append a version and point the current analysis at it."""
+    _archive_unversioned_analysis(conn, experiment_id)
+    values = [fields.get(field) for field in _ANALYSIS_FIELDS]
+    values[_ANALYSIS_FIELDS.index("risks_json")] = fields.get("risks_json") or "[]"
+    values[_ANALYSIS_FIELDS.index("notes_json")] = fields.get("notes_json") or "[]"
+    version_id = conn.execute(
+        f"""
+        INSERT INTO experiment_analysis_versions
+            (experiment_id, {", ".join(_ANALYSIS_FIELDS)})
+        VALUES (?, {", ".join("?" for _ in _ANALYSIS_FIELDS)})
+        """,
+        (experiment_id, *values),
+    ).lastrowid
+    exists = conn.execute(
+        "SELECT 1 FROM experiment_analyses WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchone()
+    if exists is None:
+        conn.execute(
+            "INSERT INTO experiment_analyses (experiment_id, status) VALUES (?, 'pending')",
+            (experiment_id,),
+        )
+    conn.execute(
+        f"""
+        UPDATE experiment_analyses
+        SET {", ".join(f"{field} = ?" for field in _ANALYSIS_FIELDS)},
+            version_id = ?
+        WHERE experiment_id = ?
+        """,
+        (*values, version_id, experiment_id),
+    )
+    return version_id
+
+
 def _store_analysis_failure(
     experiment: ExperimentOut,
     config: LLMConfig,
@@ -519,28 +630,91 @@ def _store_analysis_failure(
             started_at=started_at or time.time(),
             calls=list(calls),
         )
-        conn.execute(
-            """
-            UPDATE experiment_analyses
-            SET status = 'analysis_failed', provider = ?, model = ?,
-                prompt_version = ?, schema_version = ?,
-                decision_method = 'reasoning_llm', narrative = NULL,
-                recommendation_variant_key = NULL, recommendation_reason = NULL,
-                risks_json = '[]', error = ?, created_at = ?,
-                intelligence_run_id = ?
-            WHERE experiment_id = ?
-            """,
-            (
-                config.provider,
-                config.model,
-                PROMPT_VERSION,
-                SCHEMA_VERSION,
-                error,
-                time.time(),
-                run_id,
-                experiment.id,
-            ),
+        _write_analysis(
+            conn,
+            experiment.id,
+            {
+                "status": "analysis_failed",
+                "provider": config.provider,
+                "model": config.model,
+                "prompt_version": PROMPT_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "decision_method": "reasoning_llm",
+                "risks_json": "[]",
+                "notes_json": "[]",
+                "error": error,
+                "intelligence_run_id": run_id,
+                "created_at": time.time(),
+            },
         )
+
+
+_CJK = re.compile(r"[぀-ヿ㐀-鿿豈-﫿ｦ-ﾟ]")
+PATCH_EXCERPT_CHARS = 300
+
+
+def _output_language(objective: str) -> str:
+    """The language the interpretation must be written in (IK-0030).
+
+    The objective is the developer's own words; answer in that language. Only
+    Japanese vs. English is distinguished -- a CJK character in the objective
+    means Japanese.
+    """
+    return "Japanese" if _CJK.search(objective or "") else "English"
+
+
+def _variant_context(experiment: ExperimentOut) -> List[Dict[str, Any]]:
+    """What each variant *is*, so the model does not guess from its label.
+
+    A label such as "corr8" was read as "longer correlation" twice when the
+    risk note said the opposite (sim-sandbox E-0009, IK-0030).
+    """
+    context = []
+    for variant in experiment.variants:
+        patch = variant.patch_text or ""
+        excerpt = patch[:PATCH_EXCERPT_CHARS]
+        context.append(
+            {
+                "variant_key": variant.variant_key,
+                "label": variant.label,
+                "is_baseline": variant.is_baseline,
+                "source": variant.source,
+                "risk_note": variant.risk_note,
+                "patch_excerpt": excerpt,
+                "patch_truncated": len(patch) > len(excerpt),
+            }
+        )
+    return context
+
+
+def _analysis_messages(
+    experiment: ExperimentOut, allowed_keys: List[str]
+) -> List[Dict[str, str]]:
+    language = _output_language(experiment.objective)
+    system = (
+        "Interpret deterministic experiment metrics. Return JSON only with the keys "
+        "narrative (string), recommendation_variant_key (one of allowed_variant_keys, "
+        "or null), recommendation_reason (string) and risks (array of strings). "
+        "A recommendation is advisory and never a human adoption decision. "
+        "Each entry of `variants` says what that variant changes: read its "
+        "risk_note, source and patch_excerpt to learn what the variant does, and "
+        "do not infer the meaning of a variant from its label alone. "
+        f"Write narrative, recommendation_reason and every risk in {language}, "
+        "the language of `objective`; keep variant keys, labels and numbers as given."
+    )
+    user = {
+        "objective": experiment.objective,
+        "output_language": language,
+        "baseline_commit": experiment.baseline_commit,
+        "config_revision": experiment.config_revision,
+        "allowed_variant_keys": allowed_keys,
+        "variants": _variant_context(experiment),
+        "comparison": experiment.comparison,
+    }
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ]
 
 
 def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
@@ -564,29 +738,7 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
         if not allowed_keys:
             raise ValueError("No completed variant metrics are available for analysis")
         response = client.generate_text(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Interpret deterministic experiment metrics. Return JSON only with "
-                        "narrative, recommendation_variant_key, recommendation_reason, risks. "
-                        "A recommendation is advisory and never a human adoption decision."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "objective": experiment.objective,
-                            "baseline_commit": experiment.baseline_commit,
-                            "config_revision": experiment.config_revision,
-                            "allowed_variant_keys": allowed_keys,
-                            "comparison": experiment.comparison,
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
+            _analysis_messages(experiment, allowed_keys),
             max_tokens=1800,
         )
         parsed = _json_object(response)
@@ -612,30 +764,25 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
                 started_at=started_at,
                 calls=recorded_calls(client),
             )
-            conn.execute(
-                """
-                UPDATE experiment_analyses
-                SET status = 'completed', provider = ?, model = ?,
-                    prompt_version = ?, schema_version = ?,
-                    decision_method = 'reasoning_llm', narrative = ?,
-                    recommendation_variant_key = ?, recommendation_reason = ?,
-                    risks_json = ?, error = NULL, created_at = ?,
-                    intelligence_run_id = ?
-                WHERE experiment_id = ?
-                """,
-                (
-                    config.provider,
-                    config.model,
-                    PROMPT_VERSION,
-                    SCHEMA_VERSION,
-                    narrative.strip(),
-                    recommendation,
-                    recommendation_reason.strip(),
-                    json.dumps([str(item) for item in risks]),
-                    time.time(),
-                    run_id,
-                    experiment.id,
-                ),
+            _write_analysis(
+                conn,
+                experiment.id,
+                {
+                    "status": "completed",
+                    "provider": config.provider,
+                    "model": config.model,
+                    "prompt_version": PROMPT_VERSION,
+                    "schema_version": SCHEMA_VERSION,
+                    "decision_method": "reasoning_llm",
+                    "narrative": narrative.strip(),
+                    "recommendation_variant_key": recommendation,
+                    "recommendation_reason": recommendation_reason.strip(),
+                    "risks_json": json.dumps([str(item) for item in risks], ensure_ascii=False),
+                    "notes_json": "[]",
+                    "error": None,
+                    "intelligence_run_id": run_id,
+                    "created_at": time.time(),
+                },
             )
     except Exception as exc:
         _store_analysis_failure(
@@ -645,6 +792,29 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
             started_at=started_at,
             calls=recorded_calls(client),
         )
+
+
+@router.post("/experiments/{experiment_id}/analyze", response_model=ExperimentOut)
+def analyze_experiment(
+    experiment_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ExperimentOut:
+    """Re-run only the reasoning interpretation of a finished Experiment.
+
+    IK-0030: variants are not executed again and metrics are not touched; the
+    new interpretation is appended to ``analysis_history`` and becomes the
+    current ``analysis``.
+    """
+    with get_conn() as conn:
+        row = _get_experiment_or_404(conn, experiment_id, system_id)
+        if row["status"] not in ("completed", "failed"):
+            raise HTTPException(
+                status_code=409,
+                detail="Only a finished (completed or failed) Experiment can be analyzed",
+            )
+        current = _experiment_out(conn, row)
+    _run_reasoning_analysis(current)
+    return get_experiment(experiment_id, system_id)
 
 
 @router.post("/experiments/{experiment_id}/run", response_model=ExperimentOut)
@@ -759,12 +929,15 @@ def run_experiment(
             """,
             (experiment_id,),
         )
+        # IK-0030: a re-run keeps the previous interpretation in the history.
+        _archive_unversioned_analysis(conn, experiment_id)
         conn.execute(
             """
             UPDATE experiment_analyses
             SET status = 'pending', narrative = NULL,
                 recommendation_variant_key = NULL, recommendation_reason = NULL,
-                risks_json = '[]', error = NULL, created_at = NULL
+                risks_json = '[]', error = NULL, created_at = NULL,
+                notes_json = NULL, intelligence_run_id = NULL, version_id = NULL
             WHERE experiment_id = ?
             """,
             (experiment_id,),
