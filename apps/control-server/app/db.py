@@ -11413,6 +11413,15 @@ def init_db() -> None:
             "notes_json",
             "TEXT",
         )
+        # IK-0033: per-run diagnostics (code-links: dropped links and carried
+        # over reviews). Nullable; older runs have none.
+        _add_column_if_missing(
+            conn,
+            "intelligence_runs",
+            _columns(conn, "intelligence_runs"),
+            "diagnostics_json",
+            "TEXT",
+        )
         _add_column_if_missing(
             conn,
             "experiment_analyses",

@@ -1356,12 +1356,24 @@ class FeatureCodeLinkOut(BaseModel):
     updated_at: float
 
 
+class DroppedCodeLinkOut(BaseModel):
+    """IK-0033: a link the model proposed that could not be resolved."""
+
+    feature_id: str
+    raw_symbol: str
+    reason: str
+
+
 class FeatureCodeLinksOut(BaseModel):
     system_id: int
     snapshot_id: Optional[int] = None
     intelligence_run: Optional[IntelligenceRunOut] = None
     links: List[FeatureCodeLinkOut] = Field(default_factory=list)
     is_mock: bool = False
+    # IK-0033: unresolved links dropped one by one, and how many links took
+    # over an accepted/rejected review from an earlier mapping run.
+    dropped_links: List[DroppedCodeLinkOut] = Field(default_factory=list)
+    carried_over_reviews: int = 0
 
 
 class LinkReviewUpdate(BaseModel):

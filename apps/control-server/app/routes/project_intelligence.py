@@ -3715,6 +3715,16 @@ def _link_out(conn, row) -> FeatureCodeLinkOut:
     )
 
 
+def _mapping_diagnostics(run_row) -> dict:
+    """Dropped links and carried-over reviews of a mapping run (IK-0033)."""
+    raw = run_row["diagnostics_json"] if "diagnostics_json" in run_row.keys() else None
+    data = json.loads(raw) if raw else {}
+    return {
+        "dropped_links": data.get("dropped_links", []),
+        "carried_over_reviews": data.get("carried_over_reviews", 0),
+    }
+
+
 @router.post(
     "/repository/code-links/generate",
     response_model=FeatureCodeLinksOut,
@@ -3857,10 +3867,30 @@ def generate_code_links_endpoint(
     completed_at = time.time()
 
     status = "completed" if mapping_result.error is None else "failed"
+    dropped_links = list(getattr(mapping_result, "dropped", []) or [])
 
     symbol_key_to_id = {}
     for sr in sym_rows:
         symbol_key_to_id[(sr["path"], sr["qualified_name"])] = sr["id"]
+
+    # IK-0033: a human review of the same (feature_id, path, symbol) in an
+    # earlier mapping run carries over; the latest review wins.
+    with get_conn() as conn:
+        prior_reviews = {
+            (r["feature_id"], r["path"], r["qualified_name"]): r["review_status"]
+            for r in conn.execute(
+                """
+                SELECT fcl.feature_id, cs.path, cs.qualified_name, fcl.review_status
+                FROM feature_code_links fcl
+                JOIN code_symbols cs ON fcl.symbol_id = cs.id
+                WHERE fcl.system_id = ?
+                  AND fcl.review_status IN ('accepted', 'rejected')
+                ORDER BY fcl.updated_at, fcl.id
+                """,
+                (system_id,),
+            ).fetchall()
+        }
+    carried_over = 0
 
     with get_conn() as conn:
         conn.execute("BEGIN")
@@ -3898,6 +3928,12 @@ def generate_code_links_endpoint(
                 )
                 if symbol_id is None:
                     continue
+                review_status = prior_reviews.get(
+                    (link.feature_id, link.symbol_path, link.symbol_qualified_name),
+                    "proposed",
+                )
+                if review_status != "proposed":
+                    carried_over += 1
                 conn.execute(
                     """
                     INSERT INTO feature_code_links
@@ -3905,7 +3941,7 @@ def generate_code_links_endpoint(
                          feature_id, symbol_id, relation_reason,
                          confidence, source, review_status,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         system_id,
@@ -3916,10 +3952,24 @@ def generate_code_links_endpoint(
                         link.relation_reason,
                         link.confidence,
                         link.source,
+                        review_status,
                         now,
                         now,
                     ),
                 )
+            conn.execute(
+                "UPDATE intelligence_runs SET diagnostics_json = ? WHERE id = ?",
+                (
+                    json.dumps(
+                        {
+                            "dropped_links": dropped_links,
+                            "carried_over_reviews": carried_over,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    run_id,
+                ),
+            )
 
             run_row = conn.execute(
                 "SELECT * FROM intelligence_runs WHERE id = ?",
@@ -3947,6 +3997,7 @@ def generate_code_links_endpoint(
         intelligence_run=_intelligence_run_out(run_row),
         links=links_out,
         is_mock=mapping_result.is_mock,
+        **_mapping_diagnostics(run_row),
     )
 
 
@@ -3981,6 +4032,7 @@ def get_code_links(
             intelligence_run=_intelligence_run_out(run_row),
             links=[_link_out(conn, lr) for lr in link_rows],
             is_mock=bool(run_row["is_mock"]),
+            **_mapping_diagnostics(run_row),
         )
 
 

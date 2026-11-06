@@ -8,16 +8,19 @@ results for testing.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .code_indexer import CodeSymbol
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
 
 PROMPT_VERSION = "v1"
 SCHEMA_VERSION = "v1"
+
+logger = logging.getLogger(__name__)
 
 LinkSource = str  # "reasoning_llm" | "manual"
 ReviewStatus = str  # "proposed" | "accepted" | "rejected"
@@ -40,6 +43,9 @@ class MappingResult:
     is_mock: bool
     links: List[FeatureCodeLinkResult]
     error: Optional[str] = None
+    # IK-0033: links the model proposed that could not be resolved and were
+    # dropped one by one ({feature_id, raw_symbol, reason}).
+    dropped: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class MappingValidationError(ValueError):
@@ -141,11 +147,31 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
+def _record_drop(
+    dropped: Optional[List[Dict[str, Any]]],
+    feature_id: str,
+    raw_symbol: str,
+    reason: str,
+) -> None:
+    """Make a dropped link visible instead of silently skipping it (IK-0033)."""
+    logger.warning(
+        "code-link dropped: feature_id=%s symbol=%s reason=%s",
+        feature_id,
+        raw_symbol,
+        reason,
+    )
+    if dropped is not None:
+        dropped.append(
+            {"feature_id": feature_id, "raw_symbol": raw_symbol, "reason": reason}
+        )
+
+
 def _parse_mapping_response(
     raw_json: str,
     valid_feature_ids: set,
     valid_symbols: set[Tuple[str, str]],
     feature_aliases: Optional[Dict[str, str]] = None,
+    dropped: Optional[List[Dict[str, Any]]] = None,
 ) -> List[FeatureCodeLinkResult]:
     data = json.loads(raw_json)
     if not isinstance(data, dict):
@@ -175,9 +201,19 @@ def _parse_mapping_response(
             resolved = (feature_aliases or {}).get(_slug(feature_id))
             if resolved is None:
                 unknown_features.append(feature_id)
+                _record_drop(
+                    dropped,
+                    feature_id,
+                    f"{item.get('symbol_path', '')}:{item.get('symbol_qualified_name', '')}",
+                    "unknown feature_id",
+                )
                 continue
             feature_id = resolved
 
+        raw_symbol = (
+            f"{str(item.get('symbol_path', '')).strip()}:"
+            f"{str(item.get('symbol_qualified_name', '')).strip()}"
+        )
         sym_name = str(item.get("symbol_qualified_name", "")).strip()
         if not sym_name:
             raise MappingValidationError("symbol_qualified_name is required")
@@ -202,6 +238,7 @@ def _parse_mapping_response(
             # A symbol that is not in the index cannot be linked, but one bad
             # link is no reason to drop the valid ones in the same response.
             unknown_symbols.append(f"{response_path}:{sym_name}")
+            _record_drop(dropped, feature_id, raw_symbol, "symbol not in index")
             continue
 
         sym_path = response_path
@@ -310,6 +347,7 @@ def generate_code_mapping(
     feature_aliases = {_slug(f.name): f.feature_id for f in features}
     valid_symbols = {(s.path, s.qualified_name) for s in symbols}
 
+    dropped: List[Dict[str, Any]] = []
     try:
         cleaned = raw.strip()
         if cleaned.startswith("```"):
@@ -319,7 +357,7 @@ def generate_code_mapping(
                 lines = lines[:-1]
             cleaned = "\n".join(lines)
         links = _parse_mapping_response(
-            cleaned, valid_feature_ids, valid_symbols, feature_aliases
+            cleaned, valid_feature_ids, valid_symbols, feature_aliases, dropped
         )
     except (json.JSONDecodeError, MappingValidationError, KeyError, TypeError) as exc:
         return MappingResult(
@@ -328,6 +366,7 @@ def generate_code_mapping(
             is_mock=False,
             links=[],
             error=f"Failed to parse LLM response: {exc}",
+            dropped=dropped,
         )
 
     return MappingResult(
@@ -335,4 +374,5 @@ def generate_code_mapping(
         model=config.model,
         is_mock=False,
         links=links,
+        dropped=dropped,
     )
