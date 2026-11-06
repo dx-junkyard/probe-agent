@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .git_ops import IndexedFile
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
 
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"
 SCHEMA_VERSION = "v1"
 DEFAULT_MAX_OUTPUT_TOKENS = 128_000
 
@@ -52,6 +53,25 @@ class FeatureDraft:
 
 
 @dataclass
+class PreviousFeature:
+    """A feature of the previous completed drafts run (IK-0032)."""
+
+    feature_id: str
+    name: str
+    evidence_paths: List[str] = field(default_factory=list)
+
+
+@dataclass
+class FeatureIdResolution:
+    """How each generated feature_id relates to the previous run (IK-0032)."""
+
+    reused: List[str] = field(default_factory=list)
+    resolved: List[Dict[str, str]] = field(default_factory=list)
+    new: List[str] = field(default_factory=list)
+    previous_run_id: Optional[int] = None
+
+
+@dataclass
 class GenerationResult:
     provider: str
     model: str
@@ -59,6 +79,7 @@ class GenerationResult:
     system_profile: Optional[SystemProfileDraft]
     features: List[FeatureDraft]
     error: Optional[str] = None
+    id_resolution: Optional[FeatureIdResolution] = None
 
 
 class DraftValidationError(ValueError):
@@ -145,9 +166,24 @@ Respond with ONLY valid JSON matching this schema:
   ]
 }}
 
-Repository contents:
+{previous_features}Repository contents:
 
 {file_context}"""
+
+_PREVIOUS_FEATURES_TEMPLATE = """\
+## Previously identified features
+
+An earlier analysis of this repository produced the features below (feature_id,
+name, main evidence files). Feature ids are referenced by experiments, probe
+plans and code links, so keep them stable:
+- When a feature you identify delivers the same user value as one listed here,
+  copy its feature_id exactly as written (do not rename, re-slug or add words).
+- Mint a new kebab-case feature_id only for a feature that is genuinely new.
+- Do not split or merge listed features unless the repository contents require it.
+
+{lines}
+
+"""
 
 
 def _parse_evidence(raw: Any, line_counts: Dict[str, int]) -> List[EvidenceItem]:
@@ -325,11 +361,66 @@ def _mock_drafts(files: List[IndexedFile]) -> Tuple[SystemProfileDraft, List[Fea
     return sp, features
 
 
+def _id_slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+
+
+def _previous_features_block(previous: List[PreviousFeature]) -> str:
+    if not previous:
+        return ""
+    lines = []
+    for item in previous:
+        paths = ", ".join(item.evidence_paths) or "none"
+        lines.append(
+            f"- feature_id: {item.feature_id} | name: {item.name} | evidence: {paths}"
+        )
+    return _PREVIOUS_FEATURES_TEMPLATE.format(lines="\n".join(lines))
+
+
+def resolve_feature_ids(
+    features: List[FeatureDraft],
+    previous: List[PreviousFeature],
+) -> FeatureIdResolution:
+    """Normalise -> resolve generated ids against the previous run (K-0001).
+
+    An id copied exactly is reused. Otherwise the id or the name is slugged and
+    matched against the previous ids and names; a match takes the previous id.
+    Anything else is new. Each previous id is given to at most one feature, so
+    two generated features never collapse into one.
+    """
+    resolution = FeatureIdResolution()
+    previous_ids = {item.feature_id for item in previous}
+    aliases: Dict[str, str] = {}
+    for item in previous:
+        aliases.setdefault(_id_slug(item.feature_id), item.feature_id)
+        aliases.setdefault(_id_slug(item.name), item.feature_id)
+    taken = {f.feature_id for f in features if f.feature_id in previous_ids}
+    for feature in features:
+        if feature.feature_id in previous_ids:
+            resolution.reused.append(feature.feature_id)
+            continue
+        target = None
+        for key in (_id_slug(feature.feature_id), _id_slug(feature.name)):
+            candidate = aliases.get(key)
+            if candidate is not None and candidate not in taken:
+                target = candidate
+                break
+        if target is None:
+            resolution.new.append(feature.feature_id)
+            continue
+        resolution.resolved.append({"from": feature.feature_id, "to": target})
+        feature.feature_id = target
+        taken.add(target)
+    return resolution
+
+
 def generate_drafts(
     client: LLMClient,
     config: LLMConfig,
     files: List[IndexedFile],
+    previous_features: Optional[List[PreviousFeature]] = None,
 ) -> GenerationResult:
+    previous_features = previous_features or []
     is_mock = isinstance(client, MockLLMClient)
     if is_mock:
         sp, features = _mock_drafts(files)
@@ -351,7 +442,10 @@ def generate_drafts(
             features=[],
             error="Snapshot contains no readable text content",
         )
-    prompt = _DRAFT_PROMPT_TEMPLATE.format(file_context=file_context)
+    prompt = _DRAFT_PROMPT_TEMPLATE.format(
+        file_context=file_context,
+        previous_features=_previous_features_block(previous_features),
+    )
 
     try:
         max_output_tokens = int(
@@ -409,4 +503,5 @@ def generate_drafts(
         is_mock=False,
         system_profile=sp,
         features=features,
+        id_resolution=resolve_feature_ids(features, previous_features),
     )

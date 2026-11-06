@@ -1053,10 +1053,20 @@ class FeatureDraftOut(BaseModel):
     created_at: float
 
 
+class FeatureIdResolutionOut(BaseModel):
+    """IK-0032: how generated feature ids relate to the previous drafts run."""
+
+    previous_run_id: Optional[int] = None
+    reused: List[str] = Field(default_factory=list)
+    resolved: List[Dict[str, str]] = Field(default_factory=list)
+    new: List[str] = Field(default_factory=list)
+
+
 class DraftGenerationResult(BaseModel):
     intelligence_run: IntelligenceRunOut
     system_profile_draft: Optional[SystemProfileDraftOut] = None
     feature_drafts: List[FeatureDraftOut] = Field(default_factory=list)
+    feature_id_resolution: Optional[FeatureIdResolutionOut] = None
 
 
 class LatestDraftsOut(BaseModel):

@@ -127,6 +127,7 @@ from ..models import (
     FeatureDraftOut,
     FeatureEvidence,
     GitHubIssueStatusOut,
+    FeatureIdResolutionOut,
     IntelligenceRunOut,
     IntelligenceRunPayloadOut,
     IntelligenceRunPayloadsOut,
@@ -1545,6 +1546,57 @@ def _feature_draft_out(conn, row) -> FeatureDraftOut:
     )
 
 
+def _previous_feature_list(system_id: int):
+    """The latest completed drafts run's features, for id reuse (IK-0032).
+
+    Any snapshot counts: ids are meant to survive a new snapshot too. Each
+    feature carries up to three evidence paths so the model can recognise it.
+    """
+    from ..draft_generator import PreviousFeature
+
+    with get_conn() as conn:
+        run_row = conn.execute(
+            """
+            SELECT id FROM intelligence_runs
+            WHERE system_id = ? AND run_type = 'repository_drafts'
+              AND status = 'completed'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if run_row is None:
+            return None, []
+        rows = conn.execute(
+            """
+            SELECT id, feature_id, name FROM feature_drafts
+            WHERE system_id = ? AND intelligence_run_id = ?
+            ORDER BY id
+            """,
+            (system_id, run_row["id"]),
+        ).fetchall()
+        previous = []
+        for row in rows:
+            paths: List[str] = []
+            for ev in conn.execute(
+                """
+                SELECT path FROM draft_evidence
+                WHERE draft_type = 'feature' AND draft_id = ?
+                ORDER BY id
+                """,
+                (row["id"],),
+            ).fetchall():
+                if ev["path"] not in paths:
+                    paths.append(ev["path"])
+                if len(paths) == 3:
+                    break
+            previous.append(
+                PreviousFeature(
+                    feature_id=row["feature_id"], name=row["name"], evidence_paths=paths
+                )
+            )
+    return run_row["id"], previous
+
+
 @router.post(
     "/repository/drafts/generate",
     response_model=DraftGenerationResult,
@@ -1617,6 +1669,8 @@ def generate_drafts_endpoint(
             )
         )
 
+    previous_run_id, previous_features = _previous_feature_list(system_id)
+
     llm_config = _resolve_intelligence_config()
 
     llm_client = None
@@ -1631,7 +1685,9 @@ def generate_drafts_endpoint(
         if not indexed_files:
             raise LLMError("Snapshot contains no files")
         llm_client = wrap_for_recording(create_llm_client(llm_config))
-        result = generate_drafts(llm_client, llm_config, indexed_files)
+        result = generate_drafts(
+            llm_client, llm_config, indexed_files, previous_features
+        )
     except LLMError as exc:
         result = GenerationResult(
             provider=llm_config.provider,
@@ -1783,10 +1839,19 @@ def generate_drafts_endpoint(
             conn.execute("ROLLBACK")
             raise
 
+    id_resolution = None
+    if result.id_resolution is not None:
+        id_resolution = FeatureIdResolutionOut(
+            previous_run_id=previous_run_id,
+            reused=result.id_resolution.reused,
+            resolved=result.id_resolution.resolved,
+            new=result.id_resolution.new,
+        )
     return DraftGenerationResult(
         intelligence_run=_intelligence_run_out(run_row),
         system_profile_draft=sp_draft_out,
         feature_drafts=feature_drafts_out,
+        feature_id_resolution=id_resolution,
     )
 
 
