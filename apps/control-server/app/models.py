@@ -804,6 +804,24 @@ class IntelligenceRunOut(BaseModel):
     budget_elapsed_seconds: Optional[float] = None
 
 
+class IntelligenceRunPayloadOut(BaseModel):
+    """One stored LLM request or response of a reasoning run (IK-0029)."""
+
+    id: int
+    run_id: int
+    kind: Literal["request", "response"]
+    prompt_version: str
+    text: str
+    usage: Optional[Dict[str, Any]] = None
+    finish_reason: Optional[str] = None
+    created_at: float
+
+
+class IntelligenceRunPayloadsOut(BaseModel):
+    intelligence_run: IntelligenceRunOut
+    payloads: List[IntelligenceRunPayloadOut] = Field(default_factory=list)
+
+
 class FeatureEvidence(BaseModel):
     path: str
     start_line: int = 0

@@ -1400,6 +1400,23 @@ CREATE TABLE IF NOT EXISTS intelligence_runs (
 CREATE INDEX IF NOT EXISTS idx_intelligence_runs_system
     ON intelligence_runs (system_id, id DESC);
 
+-- IK-0029: the exact request/response of a reasoning run, kept even when the
+-- response fails validation. Additive: older runs simply have no rows.
+CREATE TABLE IF NOT EXISTS intelligence_run_payloads (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id          INTEGER NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('request', 'response')),
+    prompt_version  TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    usage_json      TEXT,
+    finish_reason   TEXT,
+    created_at      REAL NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_intelligence_run_payloads_run
+    ON intelligence_run_payloads (run_id, id);
+
 CREATE TABLE IF NOT EXISTS system_profile_drafts (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id            INTEGER NOT NULL,
@@ -11352,6 +11369,15 @@ def init_db() -> None:
                     conn, "assistant_discussion_turn", turn_cols, column, definition
                 )
         _migrate_alignment_manual_recheck_targets(conn)
+        # IK-0029: the analysis row points at the intelligence_run that holds
+        # its request/response payloads. Nullable; older analyses have none.
+        _add_column_if_missing(
+            conn,
+            "experiment_analyses",
+            _columns(conn, "experiment_analyses"),
+            "intelligence_run_id",
+            "INTEGER",
+        )
         # Issue #464: runs last among the column migrations because its
         # backfill reads the columns every earlier migration installed.
         _migrate_canonical_understanding(conn)

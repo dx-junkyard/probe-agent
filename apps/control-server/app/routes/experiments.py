@@ -16,6 +16,7 @@ from ..auth import get_system_id
 from ..db import get_conn
 from ..experiment_runner import comparison_payload, execute_variant, patch_hash
 from ..git_ops import GitError, read_file_at_commit
+from ..intelligence_payloads import recorded_calls, store_payloads, wrap_for_recording
 from ..llm import LLMConfig, create_llm_client, is_reasoning_model
 from ..models import (
     ExperimentAnalysisOut,
@@ -462,12 +463,62 @@ def get_experiment(
         return _experiment_out(conn, row)
 
 
+def _record_analysis_run(
+    conn,
+    experiment: ExperimentOut,
+    config: LLMConfig,
+    *,
+    status: str,
+    error: Optional[str],
+    started_at: float,
+    calls,
+) -> int:
+    """Record the analysis as an intelligence_run with its payloads (IK-0029)."""
+    run_id = conn.execute(
+        """
+        INSERT INTO intelligence_runs
+            (system_id, snapshot_id, run_type, provider, model,
+             prompt_version, schema_version, decision_method,
+             status, error_details, is_mock, started_at, completed_at)
+        VALUES (?, ?, 'experiment_analysis', ?, ?, ?, ?, 'reasoning_llm',
+                ?, ?, ?, ?, ?)
+        """,
+        (
+            experiment.system_id,
+            experiment.snapshot_id,
+            config.provider,
+            config.model,
+            PROMPT_VERSION,
+            SCHEMA_VERSION,
+            status,
+            error,
+            1 if config.provider == "mock" else 0,
+            started_at,
+            time.time(),
+        ),
+    ).lastrowid
+    store_payloads(conn, run_id, PROMPT_VERSION, calls)
+    return run_id
+
+
 def _store_analysis_failure(
-    experiment_id: int,
+    experiment: ExperimentOut,
     config: LLMConfig,
     error: str,
+    *,
+    started_at: Optional[float] = None,
+    calls=(),
 ) -> None:
     with get_conn() as conn:
+        run_id = _record_analysis_run(
+            conn,
+            experiment,
+            config,
+            status="failed",
+            error=error,
+            started_at=started_at or time.time(),
+            calls=list(calls),
+        )
         conn.execute(
             """
             UPDATE experiment_analyses
@@ -475,7 +526,8 @@ def _store_analysis_failure(
                 prompt_version = ?, schema_version = ?,
                 decision_method = 'reasoning_llm', narrative = NULL,
                 recommendation_variant_key = NULL, recommendation_reason = NULL,
-                risks_json = '[]', error = ?, created_at = ?
+                risks_json = '[]', error = ?, created_at = ?,
+                intelligence_run_id = ?
             WHERE experiment_id = ?
             """,
             (
@@ -485,7 +537,8 @@ def _store_analysis_failure(
                 SCHEMA_VERSION,
                 error,
                 time.time(),
-                experiment_id,
+                run_id,
+                experiment.id,
             ),
         )
 
@@ -494,13 +547,15 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
     config = LLMConfig.intelligence_from_env()
     if config.provider == "mock" or not is_reasoning_model(config.provider, config.model):
         _store_analysis_failure(
-            experiment.id,
+            experiment,
             config,
             "Experiment interpretation requires a configured reasoning model",
         )
         return
+    started_at = time.time()
+    client = None
     try:
-        client = create_llm_client(config)
+        client = wrap_for_recording(create_llm_client(config))
         allowed_keys = [
             variant.variant_key
             for variant in experiment.variants
@@ -548,6 +603,15 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
         if not isinstance(risks, list):
             raise ValueError("risks must be an array")
         with get_conn() as conn:
+            run_id = _record_analysis_run(
+                conn,
+                experiment,
+                config,
+                status="completed",
+                error=None,
+                started_at=started_at,
+                calls=recorded_calls(client),
+            )
             conn.execute(
                 """
                 UPDATE experiment_analyses
@@ -555,7 +619,8 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
                     prompt_version = ?, schema_version = ?,
                     decision_method = 'reasoning_llm', narrative = ?,
                     recommendation_variant_key = ?, recommendation_reason = ?,
-                    risks_json = ?, error = NULL, created_at = ?
+                    risks_json = ?, error = NULL, created_at = ?,
+                    intelligence_run_id = ?
                 WHERE experiment_id = ?
                 """,
                 (
@@ -568,11 +633,18 @@ def _run_reasoning_analysis(experiment: ExperimentOut) -> None:
                     recommendation_reason.strip(),
                     json.dumps([str(item) for item in risks]),
                     time.time(),
+                    run_id,
                     experiment.id,
                 ),
             )
     except Exception as exc:
-        _store_analysis_failure(experiment.id, config, str(exc))
+        _store_analysis_failure(
+            experiment,
+            config,
+            str(exc),
+            started_at=started_at,
+            calls=recorded_calls(client),
+        )
 
 
 @router.post("/experiments/{experiment_id}/run", response_model=ExperimentOut)

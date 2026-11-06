@@ -338,5 +338,19 @@
 | 解決観点 | canonical_source / order_and_budget |
 | 見分け方・設計時の問い | 同じモデルを呼ぶ全経路が上限を同じ設定から読むか。推論に出力枠を先に使うモデルで、上限が本文に足りるか。応答の形式不一致（unanchored-reference-strict-validation）ではなく、本文自体が空である点を問う。 |
 
+### reasoning-run-record
+
+2026-11-06に外部検証（sim-sandbox E-0009/E-0010）から暫定追加。推論runの記録・再実行・状態の扱いに関する原因をまとめる。
+
+#### reasoning-io-not-persisted
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 生成器の入出力（要求・応答・usage）を保存せず、解析後の結果と失敗文言だけを残す |
+| 典型座標 | connection.information + governance.review |
+| 発見観点 | reproduction / data_inspection |
+| 解決観点 | first_class_state / carry_through |
+| 見分け方・設計時の問い | 検証で落ちた応答について、モデルが実際に書いた値を後から読めるか。揺れの原因がプロンプトか応答かを記録だけで切り分けられるか。応答の形式不一致そのもの（unanchored-reference-strict-validation）ではなく、不一致を調べる材料が残らない点を問う。 |
+
 型の追加時は上記の項目を揃え、同じ変更で少なくとも1つのエントリから参照する。
 単純な局所処理の不良も対象。該当例が得られる前に想像で辞書の型を増やさない。

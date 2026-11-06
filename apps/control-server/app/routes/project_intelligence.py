@@ -51,6 +51,12 @@ from ..git_ops import (
     resolve_head,
     working_tree_status,
 )
+from ..intelligence_payloads import (
+    list_payloads,
+    recorded_calls,
+    store_payloads,
+    wrap_for_recording,
+)
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..refresh_proposal import (
     REVIEW_REQUIRED_NOTE,
@@ -122,6 +128,8 @@ from ..models import (
     FeatureEvidence,
     GitHubIssueStatusOut,
     IntelligenceRunOut,
+    IntelligenceRunPayloadOut,
+    IntelligenceRunPayloadsOut,
     IssueDraftCreateRequest,
     IssueDraftOut,
     IssueDraftUpdateRequest,
@@ -1611,6 +1619,7 @@ def generate_drafts_endpoint(
 
     llm_config = _resolve_intelligence_config()
 
+    llm_client = None
     started_at = time.time()
     try:
         if llm_config.provider != "mock" and not is_reasoning_model(
@@ -1621,7 +1630,7 @@ def generate_drafts_endpoint(
             )
         if not indexed_files:
             raise LLMError("Snapshot contains no files")
-        llm_client = create_llm_client(llm_config)
+        llm_client = wrap_for_recording(create_llm_client(llm_config))
         result = generate_drafts(llm_client, llm_config, indexed_files)
     except LLMError as exc:
         result = GenerationResult(
@@ -1664,6 +1673,7 @@ def generate_drafts_endpoint(
                 ),
             )
             run_id = cur.lastrowid
+            store_payloads(conn, run_id, PROMPT_VERSION, recorded_calls(llm_client))
 
             sp_draft_out = None
             if result.system_profile:
@@ -1777,6 +1787,34 @@ def generate_drafts_endpoint(
         intelligence_run=_intelligence_run_out(run_row),
         system_profile_draft=sp_draft_out,
         feature_drafts=feature_drafts_out,
+    )
+
+
+@router.get(
+    "/intelligence-runs/{run_id}/payloads",
+    response_model=IntelligenceRunPayloadsOut,
+)
+def get_intelligence_run_payloads(
+    run_id: int,
+    system_id: int = Depends(get_system_id),
+) -> IntelligenceRunPayloadsOut:
+    """Return the stored LLM request/response pairs of one reasoning run.
+
+    IK-0029: kept for drafts, code-links, probe plans and experiment analysis,
+    including runs whose response failed validation. Runs recorded before the
+    table existed simply return an empty list.
+    """
+    with get_conn() as conn:
+        run_row = conn.execute(
+            "SELECT * FROM intelligence_runs WHERE id = ? AND system_id = ?",
+            (run_id, system_id),
+        ).fetchone()
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="Intelligence run not found")
+        payloads = list_payloads(conn, run_id)
+    return IntelligenceRunPayloadsOut(
+        intelligence_run=_intelligence_run_out(run_row),
+        payloads=[IntelligenceRunPayloadOut(**item) for item in payloads],
     )
 
 
@@ -3732,6 +3770,7 @@ def generate_code_links_endpoint(
 
     llm_config = _resolve_intelligence_config()
 
+    llm_client = None
     started_at = time.time()
     try:
         if llm_config.provider != "mock" and not is_reasoning_model(
@@ -3740,7 +3779,7 @@ def generate_code_links_endpoint(
             raise LLMError(
                 "Feature-to-code mapping requires a configured reasoning model"
             )
-        llm_client = create_llm_client(llm_config)
+        llm_client = wrap_for_recording(create_llm_client(llm_config))
         mapping_result = generate_code_mapping(llm_client, llm_config, features, symbols)
     except LLMError as exc:
         mapping_result = type("R", (), {
@@ -3785,6 +3824,7 @@ def generate_code_links_endpoint(
                 ),
             )
             run_id = cur.lastrowid
+            store_payloads(conn, run_id, MAPPING_PROMPT_VERSION, recorded_calls(llm_client))
 
             now = time.time()
             for link in mapping_result.links:
@@ -4070,6 +4110,7 @@ def generate_probe_plan_endpoint(
 
     llm_config = _resolve_intelligence_config()
 
+    llm_client = None
     started_at = time.time()
     try:
         if llm_config.provider != "mock" and not is_reasoning_model(
@@ -4078,7 +4119,7 @@ def generate_probe_plan_endpoint(
             raise LLMError(
                 "Probe plan generation requires a configured reasoning model"
             )
-        llm_client = create_llm_client(llm_config)
+        llm_client = wrap_for_recording(create_llm_client(llm_config))
         plan_result = generate_probe_plan(
             llm_client,
             llm_config,
@@ -4128,6 +4169,7 @@ def generate_probe_plan_endpoint(
                 ),
             )
             run_id = cur.lastrowid
+            store_payloads(conn, run_id, PLAN_PROMPT_VERSION, recorded_calls(llm_client))
 
             plan_status = "proposed" if plan_result.error is None else "rejected"
             cur = conn.execute(
