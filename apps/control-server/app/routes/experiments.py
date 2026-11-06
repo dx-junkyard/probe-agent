@@ -944,7 +944,7 @@ _RECORD_TEXT = {
             "adopted": "採用",
             "rejected": "不採用",
             "needs_more_data": "追加データが必要",
-            "undecided": "未判断",
+            "undecided": "未",
         },
     },
     "English": {
@@ -965,7 +965,7 @@ _RECORD_TEXT = {
             "adopted": "adopted",
             "rejected": "rejected",
             "needs_more_data": "needs more data",
-            "undecided": "undecided",
+            "undecided": "not yet",
         },
     },
 }
@@ -1026,34 +1026,43 @@ def _record_conditions(experiment: ExperimentOut, text) -> str:
     return "\n".join(lines)
 
 
-def _record_result_summary(
+def _record_analysis_summary(
     experiment: ExperimentOut, analysis: Optional[ExperimentAnalysisOut], text
 ) -> str:
-    lines = []
+    """LLM の解釈と推奨（助言）の文。人の判断とは混ぜない（IK-0036）。"""
     if analysis is None:
-        lines.append(
+        return (
             f"{text['analysis']}: {text['no_analysis']}"
             f"{text['open']}{experiment.analysis.status}{text['close']}"
         )
+    heading = text["analysis"]
+    if analysis.version_id is not None:
+        heading += f"{text['open']}v{analysis.version_id}{text['close']}"
+    lines = [f"{heading}: {(analysis.narrative or '').strip()}"]
+    if analysis.recommendation_variant_key:
+        target = _variant_name(experiment, analysis.recommendation_variant_key, text)
     else:
-        heading = text["analysis"]
-        if analysis.version_id is not None:
-            heading += f"{text['open']}v{analysis.version_id}{text['close']}"
-        lines.append(f"{heading}: {(analysis.narrative or '').strip()}")
-        if analysis.recommendation_variant_key:
-            target = _variant_name(experiment, analysis.recommendation_variant_key, text)
-        else:
-            target = text["no_recommendation"]
-        reason = (analysis.recommendation_reason or "").strip()
-        lines.append(
-            f"{text['recommendation']}: {target}" + (f": {reason}" if reason else "")
-        )
+        target = text["no_recommendation"]
+    reason = (analysis.recommendation_reason or "").strip()
+    lines.append(f"{text['recommendation']}: {target}" + (f": {reason}" if reason else ""))
+    return "\n".join(lines)
+
+
+def _record_result_summary(experiment: ExperimentOut, text) -> str:
+    """台帳の結果の文は人の判断だけで組み立てる（IK-0036）。
+
+    LLM の推奨（助言）を同じ文に入れると、台帳を読む学習者に助言が判断として
+    読まれる（Experiment #2 では助言 n600 と判断 baseline が食い違った）。
+    判断が無ければ「未」とだけ書き、メモも写さない。
+    """
     decision = experiment.human_decision or "undecided"
+    if decision not in DECIDED:
+        return f"{text['decision']}: {text['decisions']['undecided']}"
     decided = text["decisions"].get(decision, decision)
     if experiment.human_decision_variant_key:
         chosen = _variant_name(experiment, experiment.human_decision_variant_key, text)
         decided += f"{text['open']}{chosen}{text['close']}"
-    lines.append(f"{text['decision']}: {decided}")
+    lines = [f"{text['decision']}: {decided}"]
     note = (experiment.human_decision_note or "").strip()
     if note:
         lines.append(f"{text['note']}: {note}")
@@ -1079,7 +1088,8 @@ def experiment_record(experiment: ExperimentOut) -> ExperimentRecordOut:
         url=_record_url(experiment.id),
         executed_at=_iso_utc(experiment.completed_at),
         conditions=_record_conditions(experiment, text),
-        result_summary=_record_result_summary(experiment, analysis, text),
+        result_summary=_record_result_summary(experiment, text),
+        analysis_summary=_record_analysis_summary(experiment, analysis, text),
         complete=complete,
         detail=ExperimentRecordDetailOut(
             experiment_id=experiment.id,

@@ -1044,7 +1044,8 @@ class ExperimentRecordOut(BaseModel):
     """台帳（疑義台帳の外部検証の線）に写せる Experiment の記録（IK-0035）。
 
     上位の 6 項目は episteme-graph の ``external_ref`` と同じキーで、値はすべて文字列。
-    LLM を使わず Experiment の行から決定論的に組み立てる。
+    LLM を使わず Experiment の行から決定論的に組み立てる。``result_summary`` は人の判断
+    だけ、LLM の解釈と推奨（助言）は ``analysis_summary`` に分ける（IK-0036）。
     """
 
     tool: str
@@ -1053,6 +1054,7 @@ class ExperimentRecordOut(BaseModel):
     executed_at: str
     conditions: str
     result_summary: str
+    analysis_summary: str
     complete: bool
     detail: ExperimentRecordDetailOut
 

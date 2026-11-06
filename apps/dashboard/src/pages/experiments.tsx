@@ -823,6 +823,12 @@ function ExperimentRecordBlock({ id }: { id: number }) {
           {`${data.conditions}\n\n${data.result_summary}`}
         </pre>
       )}
+      {/* IK-0036: 助言は判断と別の枠に出す（台帳の結果の文には入らない）。 */}
+      {data && (
+        <pre className="mt-2 rounded-md border p-3 text-xs text-muted-foreground overflow-x-auto whitespace-pre-wrap">
+          {data.analysis_summary}
+        </pre>
+      )}
     </div>
   );
 }

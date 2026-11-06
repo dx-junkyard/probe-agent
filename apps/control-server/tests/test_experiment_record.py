@@ -1,4 +1,4 @@
-"""台帳に写す Experiment の記録（IK-0035）。"""
+"""台帳に写す Experiment の記録（IK-0035 / IK-0036）。"""
 
 import pytest
 
@@ -48,13 +48,14 @@ def test_record_is_incomplete_until_a_human_decides(admin_client, setup, monkeyp
         "- return two (variant-1): changes numeric output",
         "- return three (variant-2): changes numeric output",
     ]
-    assert "Interpretation" in record["result_summary"]
-    assert GOOD["narrative"] in record["result_summary"]
-    assert (
-        "Recommendation (advisory): return two (variant-1): closest to objective"
-        in record["result_summary"]
-    )
-    assert record["result_summary"].splitlines()[-1] == "Human decision: undecided"
+    # IK-0036: 判断が無ければ結果の文は「未」だけ。LLM の解釈・推奨は別キー。
+    assert record["result_summary"] == "Human decision: not yet"
+    assert record["analysis_summary"].splitlines() == [
+        f"Interpretation: {GOOD['narrative']}"
+        if experiment["analysis"]["version_id"] is None
+        else f"Interpretation (v{experiment['analysis']['version_id']}): {GOOD['narrative']}",
+        "Recommendation (advisory): return two (variant-1): closest to objective",
+    ]
 
     detail = record["detail"]
     assert detail["experiment_id"] == experiment["id"]
@@ -86,11 +87,14 @@ def test_record_carries_decision_and_is_deterministic(admin_client, setup, monke
 
     record = first.json()
     assert record["complete"] is True
-    lines = record["result_summary"].splitlines()
-    assert lines[-2:] == [
+    assert record["result_summary"].splitlines() == [
         "Human decision: adopted (return three (variant-2))",
         "Decision note: three is right",
     ]
+    # 助言（variant-1）は判断（variant-2）の文に混ざらない（IK-0036）。
+    assert "variant-1" not in record["result_summary"]
+    assert "Recommendation" not in record["result_summary"]
+    assert "return two (variant-1)" in record["analysis_summary"]
     assert record["detail"]["human_decision_variant_key"] == "variant-2"
 
 
@@ -113,9 +117,12 @@ def test_record_text_follows_japanese_objective(admin_client, setup, monkeypatch
     assert conditions[0] == "目的: 計算結果を比べる"
     assert conditions[3] == "- Baseline（baseline・基準）"
     assert conditions[4] == "- return two（variant-1）: 戻り値を 2 に"
-    summary = record["result_summary"].splitlines()
-    assert summary[1] == "推奨（助言）: return two（variant-1）: closest to objective"
-    assert summary[-2:] == ["人の判断: 追加データが必要", "判断メモ: シードを増やす"]
+    analysis = record["analysis_summary"].splitlines()
+    assert analysis[1] == "推奨（助言）: return two（variant-1）: closest to objective"
+    assert record["result_summary"].splitlines() == [
+        "人の判断: 追加データが必要",
+        "判断メモ: シードを増やす",
+    ]
     assert record["complete"] is True
 
 
@@ -135,7 +142,11 @@ def test_record_without_completed_analysis_is_incomplete(admin_client, setup, mo
     ).json()
     assert record["complete"] is False
     assert record["detail"]["analysis_version"] is None
-    assert record["result_summary"].splitlines()[0].startswith("Interpretation: none (")
+    assert record["analysis_summary"].startswith("Interpretation: none (")
+    assert record["result_summary"].splitlines() == [
+        "Human decision: rejected",
+        "Decision note: no",
+    ]
 
 
 def test_record_url_uses_dashboard_base_when_configured(admin_client, setup, monkeypatch):
@@ -161,3 +172,23 @@ def test_record_is_404_for_missing_or_other_system(admin_client, setup, monkeypa
     other_headers = _headers(token, other.json()["id"])
     r = admin_client.get(f"/experiments/{experiment['id']}/record", headers=other_headers)
     assert r.status_code == 404
+
+
+def test_undecided_japanese_record_says_not_yet_without_note(
+    admin_client, setup, monkeypatch
+):
+    headers, snapshot = setup
+    payload = _create_payload(snapshot["id"])
+    payload["objective"] = "計算結果を比べる"
+    experiment = _run(admin_client, headers, payload, monkeypatch)
+    admin_client.put(
+        f"/experiments/{experiment['id']}/decision",
+        json={"decision": "undecided", "note": "まだ見ていない"},
+        headers=headers,
+    )
+    record = admin_client.get(
+        f"/experiments/{experiment['id']}/record", headers=headers
+    ).json()
+    assert record["result_summary"] == "人の判断: 未"
+    assert record["complete"] is False
+    assert record["analysis_summary"].startswith("解釈")

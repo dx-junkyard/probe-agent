@@ -3175,7 +3175,8 @@ export interface ExperimentRecordOut {
   url: string;
   executed_at: string;
   conditions: string;
-  result_summary: string;
+  result_summary: string; // 人の判断だけ（IK-0036）
+  analysis_summary: string; // LLM の解釈と推奨（助言）
   complete: boolean;
   detail: Record<string, unknown>;
 }
