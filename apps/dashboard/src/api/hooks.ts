@@ -17,7 +17,7 @@ import type {
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
   ApiRoleCardsOut, ExplanationRefreshOut, RefreshProposalRequest,
   CapabilityHierarchyOut, CapabilityHierarchyDriftOut,
-  ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
+  ProbePatchOut, GenerationRun, ExperimentOut, ExperimentRecordOut, MeResponse,
   EvaluationCriterion,
   SystemProfile,
   WorkspaceOut, WorkspaceDetailOut, WorkspaceContextItemOut,
@@ -2052,6 +2052,15 @@ export function useExperiment(id: number | null) {
     queryKey: [...sysKey("experiment"), id],
     queryFn: () => api.get<ExperimentOut>(`/experiments/${id}`),
     enabled: !!id && !!getSystemId(),
+  });
+}
+
+// IK-0035: 判断の保存で invalidate される "experiments" の下に置く。
+export function useExperimentRecord(id: number) {
+  return useQuery({
+    queryKey: sysKey("experiments", "record", id),
+    queryFn: () => api.get<ExperimentRecordOut>(`/experiments/${id}/record`),
+    enabled: !!getSystemId(),
   });
 }
 

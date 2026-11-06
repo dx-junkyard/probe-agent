@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
-  useExperiments, useRunExperiment, useExperimentDecision,
+  useExperiments, useRunExperiment, useExperimentDecision, useExperimentRecord,
   useCreateExperiment, useSnapshots, useLatestDrafts,
   useWorkspaceProposalDraft, useVariantExperimentPayload,
   useGithubAppStatus, useGithubConnections, useSnapshotPreflight,
@@ -17,6 +17,7 @@ import { Label } from "@/components/ui/label";
 import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
+import { copyText } from "@/lib/clipboard";
 import { Play, Download, Plus, Trash2, GitPullRequest, Crosshair, Bot } from "lucide-react";
 import type { ExperimentOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
@@ -780,6 +781,8 @@ function ExperimentCard({
             </div>
           )}
 
+          <ExperimentRecordBlock id={exp.id} />
+
           {exp.comparison && Object.keys(exp.comparison).length > 0 && (
             <div>
               <h4 className="text-sm font-medium mb-2">比較結果</h4>
@@ -791,6 +794,36 @@ function ExperimentCard({
         </CardContent>
       )}
     </Card>
+  );
+}
+
+// IK-0035: 台帳（疑義台帳の外部検証の線）に写す記録。サーバーが決定論的に組み立てた
+// JSON をそのまま表示・コピーする（ここでは整形しない）。
+function ExperimentRecordBlock({ id }: { id: number }) {
+  const { data, isError, error } = useExperimentRecord(id);
+  const json = data ? JSON.stringify(data, null, 2) : "";
+  const copy = async () => {
+    if (await copyText(json)) toast.success("記録を JSON でコピーしました");
+    else toast.error("コピーできませんでした（ブラウザの権限を確認してください）");
+  };
+  return (
+    <div data-testid={`experiment-record-${id}`}>
+      <div className="flex items-center justify-between mb-2">
+        <h4 className="text-sm font-medium flex items-center gap-2">
+          台帳用の記録
+          {data && !data.complete && <Badge variant="warning">未完（解釈か判断がまだ）</Badge>}
+        </h4>
+        <Button size="sm" variant="ghost" onClick={copy} disabled={!data}>
+          JSON をコピー
+        </Button>
+      </div>
+      {isError && <p className="text-xs text-destructive">{String(error)}</p>}
+      {data && (
+        <pre className="rounded-md bg-muted p-3 text-xs overflow-x-auto whitespace-pre-wrap">
+          {`${data.conditions}\n\n${data.result_summary}`}
+        </pre>
+      )}
+    </div>
   );
 }
 

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -24,6 +25,9 @@ from ..models import (
     ExperimentCreate,
     ExperimentDecisionUpdate,
     ExperimentOut,
+    ExperimentRecordDetailOut,
+    ExperimentRecordOut,
+    ExperimentRecordVariantOut,
     ExperimentVariantResultOut,
 )
 from ..validation_runner import load_validation_config_text
@@ -917,6 +921,199 @@ def analyze_experiment(
         current = _experiment_out(conn, row)
     _run_reasoning_analysis(current)
     return get_experiment(experiment_id, system_id)
+
+
+RECORD_TOOL = "probe-agent"
+DECIDED = ("adopted", "rejected", "needs_more_data")
+_RECORD_TEXT = {
+    "Japanese": {
+        "objective": "目的",
+        "snapshot": "スナップショット",
+        "variants": "variant",
+        "baseline": "基準",
+        "analysis": "解釈",
+        "no_analysis": "なし",
+        "recommendation": "推奨（助言）",
+        "no_recommendation": "なし",
+        "decision": "人の判断",
+        "note": "判断メモ",
+        "open": "（",
+        "close": "）",
+        "sep": "・",
+        "decisions": {
+            "adopted": "採用",
+            "rejected": "不採用",
+            "needs_more_data": "追加データが必要",
+            "undecided": "未判断",
+        },
+    },
+    "English": {
+        "objective": "Objective",
+        "snapshot": "Snapshot",
+        "variants": "Variants",
+        "baseline": "baseline variant",
+        "analysis": "Interpretation",
+        "no_analysis": "none",
+        "recommendation": "Recommendation (advisory)",
+        "no_recommendation": "none",
+        "decision": "Human decision",
+        "note": "Decision note",
+        "open": " (",
+        "close": ")",
+        "sep": ", ",
+        "decisions": {
+            "adopted": "adopted",
+            "rejected": "rejected",
+            "needs_more_data": "needs more data",
+            "undecided": "undecided",
+        },
+    },
+}
+
+
+def _record_url(experiment_id: int) -> str:
+    """dashboard の Experiment 行への URL（IK-0035）。
+
+    control server は dashboard の公開先を知らないので、``PROBE_DASHBOARD_URL``
+    が設定されているときだけ組み立てる。未設定なら空文字（台帳では任意項目）。
+    """
+    base = (os.getenv("PROBE_DASHBOARD_URL") or "").strip().rstrip("/")
+    if not base:
+        return ""
+    return f"{base}/experiments?experiment={experiment_id}"
+
+
+def _iso_utc(timestamp: Optional[float]) -> str:
+    if timestamp is None:
+        return ""
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="seconds")
+
+
+def _recorded_analysis(experiment: ExperimentOut) -> Optional[ExperimentAnalysisOut]:
+    """台帳に写す解釈: 現在の解釈が完了していればそれ、なければ履歴の最新の完了版。"""
+    if experiment.analysis.status == "completed":
+        return experiment.analysis
+    for version in experiment.analysis_history:  # 新しい順
+        if version.status == "completed":
+            return version
+    return None
+
+
+def _variant_name(experiment: ExperimentOut, variant_key: Optional[str], text) -> str:
+    labels = {v.variant_key: v.label for v in experiment.variants}
+    label = labels.get(variant_key or "")
+    if label is None or label == variant_key:
+        return variant_key or ""
+    return f"{label}{text['open']}{variant_key}{text['close']}"
+
+
+def _record_conditions(experiment: ExperimentOut, text) -> str:
+    lines = [
+        f"{text['objective']}: {experiment.objective}",
+        f"{text['snapshot']}: #{experiment.snapshot_id}"
+        f"{text['open']}baseline_commit {experiment.baseline_commit[:7]}{text['close']}",
+        f"{text['variants']}:",
+    ]
+    for variant in experiment.variants:
+        tag = variant.variant_key
+        if variant.is_baseline:
+            tag += text["sep"] + text["baseline"]
+        line = f"- {variant.label}{text['open']}{tag}{text['close']}"
+        summary = (variant.risk_note or "").strip()
+        if summary:
+            line += f": {summary}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _record_result_summary(
+    experiment: ExperimentOut, analysis: Optional[ExperimentAnalysisOut], text
+) -> str:
+    lines = []
+    if analysis is None:
+        lines.append(
+            f"{text['analysis']}: {text['no_analysis']}"
+            f"{text['open']}{experiment.analysis.status}{text['close']}"
+        )
+    else:
+        heading = text["analysis"]
+        if analysis.version_id is not None:
+            heading += f"{text['open']}v{analysis.version_id}{text['close']}"
+        lines.append(f"{heading}: {(analysis.narrative or '').strip()}")
+        if analysis.recommendation_variant_key:
+            target = _variant_name(experiment, analysis.recommendation_variant_key, text)
+        else:
+            target = text["no_recommendation"]
+        reason = (analysis.recommendation_reason or "").strip()
+        lines.append(
+            f"{text['recommendation']}: {target}" + (f": {reason}" if reason else "")
+        )
+    decision = experiment.human_decision or "undecided"
+    decided = text["decisions"].get(decision, decision)
+    if experiment.human_decision_variant_key:
+        chosen = _variant_name(experiment, experiment.human_decision_variant_key, text)
+        decided += f"{text['open']}{chosen}{text['close']}"
+    lines.append(f"{text['decision']}: {decided}")
+    note = (experiment.human_decision_note or "").strip()
+    if note:
+        lines.append(f"{text['note']}: {note}")
+    return "\n".join(lines)
+
+
+def experiment_record(experiment: ExperimentOut) -> ExperimentRecordOut:
+    """台帳の外部検証の線に写せる記録を組み立てる（IK-0035）。
+
+    LLM も乱数も時刻も使わない: 同じ Experiment の行からは常に同じ記録になる。
+    文の言語は解釈と同じく objective の言語（IK-0030 の ``_output_language``）。
+    """
+    text = _RECORD_TEXT[_output_language(experiment.objective)]
+    analysis = _recorded_analysis(experiment)
+    complete = (
+        experiment.status == "completed"
+        and analysis is not None
+        and experiment.human_decision in DECIDED
+    )
+    return ExperimentRecordOut(
+        tool=RECORD_TOOL,
+        run_ref=f"experiment:{experiment.id}",
+        url=_record_url(experiment.id),
+        executed_at=_iso_utc(experiment.completed_at),
+        conditions=_record_conditions(experiment, text),
+        result_summary=_record_result_summary(experiment, analysis, text),
+        complete=complete,
+        detail=ExperimentRecordDetailOut(
+            experiment_id=experiment.id,
+            feature_id=experiment.feature_id,
+            snapshot_id=experiment.snapshot_id,
+            baseline_commit=experiment.baseline_commit,
+            status=experiment.status,
+            variants=[
+                ExperimentRecordVariantOut(
+                    variant_key=v.variant_key,
+                    label=v.label,
+                    status=v.status,
+                    test_pass_rate=v.metrics.get("test_pass_rate"),
+                    criteria_pass_rate=v.metrics.get("criteria_pass_rate"),
+                )
+                for v in experiment.variants
+            ],
+            analysis_version=analysis.version_id if analysis is not None else None,
+            human_decision=experiment.human_decision,
+            human_decision_variant_key=experiment.human_decision_variant_key,
+        ),
+    )
+
+
+@router.get("/experiments/{experiment_id}/record", response_model=ExperimentRecordOut)
+def get_experiment_record(
+    experiment_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ExperimentRecordOut:
+    """台帳に写す記録を返す読み取り専用の口（IK-0035）。何も書き込まない。"""
+    with get_conn() as conn:
+        row = _get_experiment_or_404(conn, experiment_id, system_id)
+        experiment = _experiment_out(conn, row)
+    return experiment_record(experiment)
 
 
 @router.post("/experiments/{experiment_id}/run", response_model=ExperimentOut)

@@ -11,6 +11,8 @@ services:
       PROBE_API_KEY: ${PROBE_API_KEY:-}
       PROBE_DB_PATH: /data/probe.db
       PROBE_EXECUTION_BACKEND: ${PROBE_EXECUTION_BACKEND:-inprocess}
+      # GET /experiments/{id}/record の url（dashboard の Experiment 行）の組み立て先（IK-0035）
+      PROBE_DASHBOARD_URL: ${PROBE_DASHBOARD_URL:-http://localhost:8501}
       CONTROL_API_KEYS: ${CONTROL_API_KEYS:-}
       CONTROL_ADMIN_USERNAME: ${CONTROL_ADMIN_USERNAME:-}
       CONTROL_ADMIN_PASSWORD: ${CONTROL_ADMIN_PASSWORD:-}

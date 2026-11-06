@@ -3168,6 +3168,18 @@ export interface ExperimentOut {
   completed_at: string | null;
 }
 
+// IK-0035: GET /experiments/{id}/record（台帳の外部検証の線に写す記録）
+export interface ExperimentRecordOut {
+  tool: string;
+  run_ref: string;
+  url: string;
+  executed_at: string;
+  conditions: string;
+  result_summary: string;
+  complete: boolean;
+  detail: Record<string, unknown>;
+}
+
 export interface EvaluationCriterion {
   id: number;
   component_id: string;
