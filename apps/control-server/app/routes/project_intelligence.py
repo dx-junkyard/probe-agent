@@ -4258,6 +4258,19 @@ def generate_probe_plan_endpoint(
             relation_reason=lr["relation_reason"],
         ))
 
+    # IK-0037: component_id is assigned by the system per (path,
+    # qualified_name) -- the id already in code, else the last planned id,
+    # else a deterministic derivation -- never by the model.
+    from ..component_ids import assign_component_ids
+
+    with get_conn() as conn:
+        assignments = assign_component_ids(
+            conn,
+            system_id,
+            [(link.symbol_path, link.symbol_qualified_name) for link in accepted_links],
+        )
+    component_ids = {key: a.component_id for key, a in assignments.items()}
+
     llm_config = _resolve_intelligence_config()
 
     llm_client = None
@@ -4281,6 +4294,7 @@ def generate_probe_plan_endpoint(
             feature_risks=json.loads(fd_row["risks"]),
             accepted_links=accepted_links,
             objective_hint=objective,
+            component_ids=component_ids,
         )
     except LLMError as exc:
         from ..probe_planner import PlanResult

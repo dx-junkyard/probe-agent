@@ -380,7 +380,17 @@
 | 典型座標 | connection.version + structure.representation |
 | 発見観点 | reproduction / data_inspection |
 | 解決観点 | carry_through / representation_change |
-| 見分け方・設計時の問い | 再生成時に前回の識別子一覧を写せる形で生成器に渡しているか。生成後に名前の正規形で前回の識別子へ解決しているか。どの識別子を引き継ぎ、どれを新規にしたかが応答に残るか。 |
+| 見分け方・設計時の問い | 再生成時に前回の識別子一覧を写せる形で生成器に渡しているか。生成後に名前の正規形で前回の識別子へ解決しているか。どの識別子を引き継ぎ、どれを新規にしたかが応答に残るか。2026-11-07以降、写させる方式は llm-assigned-stable-identifier（系の台帳とハンドル、IK-0038）に置き換えた。 |
+
+#### llm-assigned-stable-identifier
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 変わってはならない識別子（後段の主キー・参照先）を生成器に作らせ、または生成器が書いた識別子を候補と照合せずに保存し、系が付番・保持していない |
+| 典型座標 | structure.responsibility + governance.assignment |
+| 発見観点 | inventory / trace_walk |
+| 解決観点 | responsibility_move / canonical_source |
+| 見分け方・設計時の問い | 利用者の規則（2026-11-07）: 識別子・個別名は系が付番・保持し、LLMはそれに紐づく内容だけを返す（または new と示す）。例外は理由を明記。生成器の出力スキーマに、保存後に主キーや参照先になる文字列・整数が含まれていないか。含まれるなら、系が渡した候補（ハンドル）への参照に置き換えたか、受け取った値を渡した候補集合と照合して落とした記録を残すか。前回の識別子を写させて照合する方式（regenerated-identifier-drift の IK-0032）は生成器が新しいidを作る余地を残すので、系の台帳（registry）とハンドルへ移す。 |
 
 #### regeneration-drops-review-state
 
