@@ -116,7 +116,7 @@ test("creating the first System does not bypass the unsaved draft confirmation d
   const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
   fireEvent.click(screen.getByTestId("header-create-system-button"));
   fireEvent.change(screen.getByLabelText("Name *"), { target: { value: "created" } });
-  fireEvent.click(screen.getByRole("button", { name: "Create", exact: true }));
+  fireEvent.click(screen.getByRole("button", { name: "Create" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(confirm).toHaveBeenCalledOnce();
   expect(screen.getByLabelText("未保存メモ")).toHaveValue("初回のメモ");
