@@ -1047,7 +1047,8 @@ creating incomplete persistence or execution paths for later phases.
       next line.
     - **The loop** (#371): `components/improvement-loop/model.ts` is the only
       place that decides the stage, and it is pure. The stage comes from
-      persisted facts (a version's replay/promotion state), never from the
+      persisted facts (a version's replay/promotion state, or the focused
+      Simulation Workbench run and Replay approval), never from the
       route — Candidate Studio alone serves three stages. The rail navigates
       and never executes; each stage states what its primary action *produces*
       in the developer's terms, because 「送信」/「promote」/「Experimentへ送る」

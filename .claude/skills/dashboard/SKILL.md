@@ -827,7 +827,8 @@ the reverse — puts it back on top of the primary action at narrow widths.
   未選択で着地するリンクになる。rail の現在地も、一覧の先頭ではなく開発者が
   開いたレコードに従わせる。
 - 改善ループの現在地は `components/improvement-loop/model.ts` だけが決める。
-  純関数で、route ではなく永続事実(version の replay/promotion 状態)から
+  純関数で、route ではなく永続事実(version の replay/promotion 状態、または
+  Workbenchで選択しているrunとReplay承認)から
   決まる — Candidate Studio 1画面が3段階を兼ねているため。rail は遷移する
   だけで実行しない。各段階は「その操作が何を作るか」を利用者の言葉で示す。
 - Trace 詳細は既定で折りたたむ (`TracePayloadPanel`)。展開前に型・件数・
@@ -1053,6 +1054,9 @@ mutation も権限も追加しない。
   保存後も「未保存」が消えず、離脱のたびに確認が出る。
 - **送信中の編集を成功時に上書きしない** (review R3)。送信した下書きの
   signature を持ち、応答時点の下書き (ref で読む) と一致するときだけ初期化する。
+  Workbenchのソース・貼り付けパッチ・改善目標と、Candidate Studioの未送信指示も
+  共通の未保存保護へ登録する。対象Set/Sessionを変えるときだけ確認後に初期化し、
+  同じ対象の再取得で編集内容を上書きしない。
 - **取得失敗を 0 件・読み込み中・未作成にしない。** `isError && !data` は
   `components/query-state.tsx` の `QueryErrorState` (原因の種類 + 再試行) を
   出す。0 件の文言や作成 CTA を失敗時に出さない。失敗から対象の不存在
