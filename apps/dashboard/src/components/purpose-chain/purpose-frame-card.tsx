@@ -19,7 +19,7 @@
 import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { ELEMENT_KIND_HEADING, FRAME_ELEMENT_ORDER } from "./model";
+import { ELEMENT_KIND_HEADING, FRAME_ELEMENT_ORDER, frameEntirelyUnknown } from "./model";
 import type { OverviewOut, PurposeElementOut, PurposeQuestionOut } from "@/api/types";
 
 /** `unknown` (読めたが記録がない) と `unavailable` (読めなかった) は別の値で
@@ -62,11 +62,110 @@ export function PurposeFrameCard({ overview, question, questionState }: PurposeF
   if (degraded || !chain) {
     return (
       <Card data-testid="overview-purpose-frame-unavailable">
-        <CardHeader>
+        <CardHeader className="p-4 pb-2">
           <CardTitle as="h2" className="text-lg">目的の連鎖 (Purpose Chain)</CardTitle>
         </CardHeader>
-        <CardContent className="text-base text-muted-foreground">
+        <CardContent className="p-4 pt-0 text-base text-muted-foreground">
           <p>対象者・望ましい変化・システムの介入を取得できませんでした。</p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // 最重要 unknown があるときだけ、文脈付き質問 1 件 (§3.1). Loading /
+  // no-question / question / error are four different renders, never
+  // silence standing in for "still loading".
+  //
+  // A1 (UX 監査 2026-11-17): the question's CTA is a text link, never a
+  // filled button. The Overview's only filled primary control is
+  // `next_action`'s (#383); a second one of the same weight here read as a
+  // competing 「次の一歩」 on first use. The destination is unchanged.
+  const questionBlock =
+    questionState === "loading" ? (
+      <p className="text-sm text-muted-foreground" data-testid="overview-purpose-question-loading">
+        確認が必要な点を調べています…
+      </p>
+    ) : questionState === "error" ? (
+      <p className="text-sm text-muted-foreground" data-testid="overview-purpose-question-error">
+        次の質問を取得できませんでした。
+      </p>
+    ) : question ? (
+      <div
+        className="rounded-md border border-amber-300 bg-amber-50 p-2.5 text-sm space-y-1 dark:border-amber-800 dark:bg-amber-950/20"
+        data-testid="overview-purpose-question"
+        data-help-id="overview.purpose_frame.question"
+      >
+        <p className="font-medium">{question.prompt}</p>
+        <p id={`overview-purpose-question-why-${question.need_id}`} className="text-muted-foreground">
+          {question.why_now}
+        </p>
+        {question.unlocks && (
+          <p className="text-muted-foreground">回答すると: {question.unlocks}</p>
+        )}
+        <Link
+          to={purposeInterviewHref(sessionId, question.need_id)}
+          className="inline-block text-sm text-primary underline underline-offset-2"
+          data-testid="overview-purpose-question-cta"
+          data-cta-variant="link"
+          aria-describedby={`overview-purpose-question-why-${question.need_id}`}
+        >
+          {question.answerability === "system_researchable"
+            ? "調査を依頼する"
+            : "1つの質問に答える"}
+        </Link>
+      </div>
+    ) : sessionId != null ? (
+      <p className="text-sm text-muted-foreground" data-testid="overview-purpose-question-none">
+        現時点で追加の確認は必要ありません。
+      </p>
+    ) : null;
+  // B11 (UX 監査 2026-11-17): セッションが無いときに「追加の確認は必要
+  // ありません」を出すと、直後の「まだインタビュー セッションが
+  // ありません」と矛盾して読める。質問が無いことを肯定文で示すのは
+  // サーバーがセッションを返したときだけ。need の有無はクライアントで
+  // 推測しない (next-question の結果とセッションの有無だけを使う)。
+  // A1: the start link stays a quiet in-sentence link -- while `next_action`
+  // points at another operation (e.g. Repository を設定する), a louder control
+  // here would compete with it. It is never removed.
+  const noSessionNote =
+    sessionId == null ? (
+      <p className="text-sm text-muted-foreground" data-testid="overview-purpose-no-session">
+        まだインタビュー セッションがありません。
+        <Link
+          to="/interview"
+          className="ml-1 text-primary underline underline-offset-2"
+          data-cta-variant="link"
+        >
+          インタビューを開始する
+        </Link>
+      </p>
+    ) : null;
+
+  // A1: when the server reports all three slots `unknown`, three rows of
+  // 「まだわかっていません」 carry one fact and pushed 「次にすること」 out of
+  // the first view. They collapse to one sentence. Any slot with content (or
+  // a slot that could not be read) keeps the per-slot display.
+  if (frameEntirelyUnknown(chain)) {
+    const headings = FRAME_ELEMENT_ORDER.map((kind) => ELEMENT_KIND_HEADING[kind]).join("・");
+    return (
+      <Card
+        data-testid="overview-purpose-frame"
+        data-help-id="overview.purpose_frame"
+        data-frame-compact="true"
+      >
+        <CardContent className="space-y-2 p-4">
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <CardTitle as="h2" className="text-base">目的の連鎖 (Purpose Chain)</CardTitle>
+            <p
+              className="text-sm text-muted-foreground"
+              data-testid="overview-purpose-frame-summary"
+              data-element-state="unknown"
+            >
+              {headings}は、まだわかっていません。
+            </p>
+          </div>
+          {questionBlock}
+          {noSessionNote}
         </CardContent>
       </Card>
     );
@@ -74,13 +173,13 @@ export function PurposeFrameCard({ overview, question, questionState }: PurposeF
 
   return (
     <Card data-testid="overview-purpose-frame" data-help-id="overview.purpose_frame">
-      <CardHeader>
+      <CardHeader className="p-4 pb-2">
         <CardTitle as="h2" className="text-lg">目的の連鎖 (Purpose Chain)</CardTitle>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-3 p-4 pt-0">
         {/* An ordered list: the DOM order and the causal order are the same,
             so a screen reader gets the same priority as the eye (§3.4). */}
-        <ol className="space-y-3">
+        <ol className="space-y-2">
           {FRAME_ELEMENT_ORDER.map((kind, i) => {
             const element = chain.frame[kind];
             const note = elementStateNote(element);
@@ -132,54 +231,8 @@ export function PurposeFrameCard({ overview, question, questionState }: PurposeF
           })}
         </ol>
 
-        {/* 最重要 unknown があるときだけ、文脈付き質問 1 件 (§3.1). Loading /
-            no-question / question / error are four different renders, never
-            silence standing in for "still loading". */}
-        {questionState === "loading" ? (
-          <p className="text-sm text-muted-foreground" data-testid="overview-purpose-question-loading">
-            確認が必要な点を調べています…
-          </p>
-        ) : questionState === "error" ? (
-          <p className="text-sm text-muted-foreground" data-testid="overview-purpose-question-error">
-            次の質問を取得できませんでした。
-          </p>
-        ) : question ? (
-          <div
-            className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm space-y-1 dark:border-amber-800 dark:bg-amber-950/20"
-            data-testid="overview-purpose-question"
-            data-help-id="overview.purpose_frame.question"
-          >
-            <p className="font-medium">{question.prompt}</p>
-            <p id={`overview-purpose-question-why-${question.need_id}`} className="text-muted-foreground">
-              {question.why_now}
-            </p>
-            {question.unlocks && (
-              <p className="text-muted-foreground">回答すると: {question.unlocks}</p>
-            )}
-            <Link
-              to={purposeInterviewHref(sessionId, question.need_id)}
-              className="mt-1 inline-block text-sm text-primary underline underline-offset-2"
-              data-testid="overview-purpose-question-cta"
-              aria-describedby={`overview-purpose-question-why-${question.need_id}`}
-            >
-              {question.answerability === "system_researchable"
-                ? "調査を依頼する"
-                : "1つの質問に答える"}
-            </Link>
-          </div>
-        ) : (
-          <p className="text-sm text-muted-foreground" data-testid="overview-purpose-question-none">
-            現時点で追加の確認は必要ありません。
-          </p>
-        )}
-        {sessionId == null && (
-          <p className="text-sm text-muted-foreground" data-testid="overview-purpose-no-session">
-            まだインタビュー セッションがありません。
-            <Link to="/interview" className="ml-1 text-primary underline underline-offset-2">
-              インタビューを開始する
-            </Link>
-          </p>
-        )}
+        {questionBlock}
+        {noSessionNote}
       </CardContent>
     </Card>
   );

@@ -159,7 +159,7 @@ export default function ComponentsPage() {
             <p>コードに入れた計測点と、届いているかどうかは「計測カバレッジ」で確かめられます。</p>
             <div className="flex flex-wrap gap-2">
               <Button size="sm" variant="outline" onClick={() => navigate("/instrumentation-coverage")}>計測カバレッジを開く</Button>
-              <Button size="sm" variant="ghost" onClick={() => navigate("/setup-guide")}>Setup Guide</Button>
+              <Button size="sm" variant="ghost" onClick={() => navigate("/setup-guide")}>接続ガイド</Button>
             </div>
           </div>
         ) : (

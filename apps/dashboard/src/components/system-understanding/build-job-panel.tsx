@@ -18,13 +18,13 @@ import type {
 // Build job step names (Issue #109) differ from the artifact pipeline shown
 // in PipelineChecklist.
 const JOB_STEP_LABELS: Record<string, string> = {
-  symbol_index: "Symbol index",
-  entrypoint_index: "Entrypoint discovery",
-  documentation_index: "Documentation index",
-  claim_scan: "Documentation claim scan (LLM)",
-  understanding_graph: "Understanding graph",
-  docs_code_reconcile: "Docs-code reconcile",
-  capability_hierarchy: "Capability hierarchy",
+  symbol_index: "Symbol 索引",
+  entrypoint_index: "Entrypoint 検出",
+  documentation_index: "ドキュメント索引",
+  claim_scan: "ドキュメント主張スキャン（LLM）",
+  understanding_graph: "Understanding グラフ",
+  docs_code_reconcile: "Docs-code 照合",
+  capability_hierarchy: "Capability 階層",
 };
 
 export const TERMINAL_JOB_STATUSES = ["completed", "partial", "failed", "cancelled"];
@@ -82,13 +82,13 @@ function JobStepRow({ job, step, active }: {
         <span className="flex-1">
           {label}
           {step.reused_existing && (
-            <Badge variant="outline" className="ml-2 text-xs">reused</Badge>
+            <Badge variant="outline" className="ml-2 text-xs">再利用</Badge>
           )}
         </span>
         {isClaimScan && tasks && tasks.total > 0 && (
           <span className="text-xs text-muted-foreground" data-testid="job-llm-progress">
-            chunks {tasks.completed}/{tasks.total}
-            {tasks.failed > 0 && ` (${tasks.failed} failed)`}
+            チャンク {tasks.completed}/{tasks.total}
+            {tasks.failed > 0 && `（${tasks.failed} 件失敗）`}
           </span>
         )}
         {duration && <span className="text-xs text-muted-foreground">{duration}</span>}
@@ -104,7 +104,7 @@ function JobStepRow({ job, step, active }: {
             disabled={retryStep.isPending}
             onClick={() => retryStep.mutate({ jobId: job.id, step: step.step })}
           >
-            Retry
+            再試行
           </Button>
         )}
         {cancellable && (
@@ -116,7 +116,7 @@ function JobStepRow({ job, step, active }: {
             disabled={cancelStep.isPending}
             onClick={() => cancelStep.mutate({ jobId: job.id, step: step.step })}
           >
-            Cancel
+            中止
           </Button>
         )}
       </div>
@@ -146,13 +146,13 @@ export function BuildJobPanel({ job }: { job: SystemUnderstandingBuildOut }) {
       <CardHeader className="pb-2">
         <div className="flex items-center justify-between">
           <CardTitle className="text-base flex items-center gap-2">
-            Build job #{job.id}
+            Build ジョブ #{job.id}
             <Badge variant={jobStatusVariant(job.status)} className="text-xs" data-testid="job-status">
               {job.status}
             </Badge>
             {job.is_stuck && (
               <Badge variant="destructive" className="text-xs" data-testid="job-stuck">
-                stuck
+                停止の疑い
               </Badge>
             )}
           </CardTitle>
@@ -166,7 +166,7 @@ export function BuildJobPanel({ job }: { job: SystemUnderstandingBuildOut }) {
                 disabled={cancelJob.isPending || job.cancel_requested}
                 onClick={() => cancelJob.mutate(job.id)}
               >
-                {job.cancel_requested ? "Cancelling..." : "Cancel"}
+                {job.cancel_requested ? "中止しています..." : "中止"}
               </Button>
             )}
             {(retryableJob || job.is_stuck) && (
@@ -178,29 +178,29 @@ export function BuildJobPanel({ job }: { job: SystemUnderstandingBuildOut }) {
                 disabled={retryJob.isPending}
                 onClick={() => retryJob.mutate({ jobId: job.id })}
               >
-                Retry failed steps
+                失敗したステップを再試行
               </Button>
             )}
           </div>
         </div>
         <CardDescription>
-          {completedSteps}/{job.steps.length} steps completed
+          {completedSteps}/{job.steps.length} ステップ完了
           {active && job.current_step && (
-            <> — running: {JOB_STEP_LABELS[job.current_step] ?? job.current_step}</>
+            <> — 実行中: {JOB_STEP_LABELS[job.current_step] ?? job.current_step}</>
           )}
-          {active && " . This page keeps working normally while the build runs in the background."}
+          {active && "。Build はバックグラウンドで実行されるため、この画面はそのまま操作できます。"}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         {job.is_stuck && (
           <p className="text-xs text-destructive">
-            No heartbeat has been received recently; the worker may have died.
-            Retry to resume from the last persisted step.
+            しばらく heartbeat を受信していません。worker が停止している可能性があります。
+            再試行すると、最後に保存されたステップから再開します。
           </p>
         )}
         {job.error && (
           <p className="text-sm text-destructive" data-testid="job-error">
-            Last error: {job.error}
+            直近のエラー: {job.error}
           </p>
         )}
         <ul className="space-y-2" data-testid="job-steps">
@@ -210,10 +210,10 @@ export function BuildJobPanel({ job }: { job: SystemUnderstandingBuildOut }) {
         </ul>
         {job.artifact_counts && (
           <div className="flex flex-wrap gap-4 border-t pt-3 text-xs text-muted-foreground" data-testid="job-artifact-counts">
-            <span>Symbols: {job.artifact_counts.symbols}</span>
-            <span>Entrypoints: {job.artifact_counts.entrypoints}</span>
-            <span>Doc claims: {job.artifact_counts.understanding_graph_claims}</span>
-            <span>Hierarchy nodes: {job.artifact_counts.capability_hierarchy_nodes}</span>
+            <span>Symbol: {job.artifact_counts.symbols}</span>
+            <span>Entrypoint: {job.artifact_counts.entrypoints}</span>
+            <span>ドキュメント主張: {job.artifact_counts.understanding_graph_claims}</span>
+            <span>階層ノード: {job.artifact_counts.capability_hierarchy_nodes}</span>
           </div>
         )}
       </CardContent>

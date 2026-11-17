@@ -103,7 +103,7 @@ function AddToWorkspaceDialog({ open, onOpenChange, itemType, itemId, label }: {
         ) : (
           <div className="space-y-2">
             <Label>タイトル</Label>
-            <Input value={newTitle} onChange={e => setNewTitle(e.target.value)} placeholder="Improve summarizer quality" />
+            <Input value={newTitle} onChange={e => setNewTitle(e.target.value)} placeholder="例: 要約の品質を改善する" />
           </div>
         )}
         <Button className="w-full" disabled={!canSubmit || submitting} onClick={handleAdd}>

@@ -11,6 +11,7 @@
 //   R2 の分岐      = BackRequestNotice (E8 は情報区分なので主作業カード内)
 
 import { AlertTriangle, Info, Loader2 } from "lucide-react";
+import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -148,8 +149,11 @@ export function WorkflowLocationCard({
 
   return (
     <Card data-testid="workflow-location" className="border-primary/40">
-      <CardContent className="space-y-2 py-4">
-        <div className="flex flex-wrap items-center gap-2">
+      {/* 縦の予算 (#358 / UX 監査 2026-11-17 B3): 状態名・目的・履歴入口を
+          1 行に並べ、余白を詰める。主作業面を 1280 x 720 の最初のビューへ
+          入れるための値なので、行を足すときは実測し直すこと。 */}
+      <CardContent className="space-y-1.5 px-4 py-3" data-density="compact">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <Badge variant="outline" data-testid="workflow-state-label">
             {WORKFLOW_STATE_LABELS[state]}
           </Badge>
@@ -158,9 +162,11 @@ export function WorkflowLocationCard({
               {TERMINAL_LABELS[workflow.terminal_kind]}
             </Badge>
           ) : null}
+          <p className="text-sm text-muted-foreground" data-testid="workflow-state-goal">
+            {WORKFLOW_STATE_GOALS[state]}
+          </p>
           {historyEntry}
         </div>
-        <p className="text-sm text-muted-foreground">{WORKFLOW_STATE_GOALS[state]}</p>
         {state === "W1" ? (
           <div className="space-y-1" data-testid="workflow-running">
             {running.map(run => (
@@ -237,24 +243,117 @@ function WorkflowExceptionCard({
   onLeaveSafely?: () => void;
 }) {
   const blocking = exception.severity === "blocking";
+  // 回復の導線 (前提画面へのリンク / 再試行 / 安全に離れる)。区分によらず
+  // 同じ 3 つだけで、迂回路は置かない (§5.3-7)。
+  const actions = (
+    <div className="flex flex-wrap gap-2" data-testid="workflow-exception-actions">
+      {/* UX 監査 2026-11-17 B4: 別画面の操作が前提として欠けているとき
+          は、その画面への導線を同じ枠に置く。リンクを付けるかはサーバー
+          の有限値 `prerequisite` だけで決め、失敗文言は読まない。 */}
+      {exception.prerequisite ? (
+        <Link
+          to={PREREQUISITE_LINKS[exception.prerequisite].to}
+          // 状態の主操作と競合させないため、主操作の見た目にはしない。
+          className="inline-flex h-8 items-center justify-center rounded-md border border-input bg-background px-3 text-xs font-medium shadow-sm hover:bg-accent hover:text-accent-foreground"
+          data-testid={`workflow-prerequisite-${exception.prerequisite}`}
+        >
+          {PREREQUISITE_LINKS[exception.prerequisite].label}
+        </Link>
+      ) : null}
+      {exception.recovery_process_kind && onRetry ? (
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={retryPending}
+          onClick={() => onRetry(exception.recovery_process_kind!)}
+          data-testid={`workflow-retry-${exception.recovery_process_kind}`}
+        >
+          もう一度実行する
+        </Button>
+      ) : null}
+      {blocking && onLeaveSafely ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={onLeaveSafely}
+          data-testid="workflow-leave-safely"
+        >
+          中断・引き継ぎで終える
+        </Button>
+      ) : null}
+    </div>
+  );
+  // 失敗の詳細・回復条件・例外コード。例外コードは仕様・履歴と突き合わせる
+  // ための補足で、利用者向けの主表示ではない (UX 監査 2026-11-17 B3)。
+  const supplement = (
+    <>
+      {exception.detail ? (
+        <p className="text-xs text-muted-foreground break-words">{exception.detail}</p>
+      ) : null}
+      {exception.recovery_condition ? (
+        <p className="text-xs text-muted-foreground">{exception.recovery_condition}</p>
+      ) : null}
+      <p
+        className="text-[10px] text-muted-foreground/80"
+        data-testid="workflow-exception-code"
+      >
+        例外コード {exception.code}
+      </p>
+    </>
+  );
+  const badge = (
+    <>
+      <AlertTriangle
+        className={blocking ? "h-4 w-4 shrink-0 text-destructive" : "h-4 w-4 shrink-0 text-muted-foreground"}
+        aria-hidden
+      />
+      {/* 色だけで状態を伝えない (原則 P8): 区分は必ずテキストで示す。 */}
+      <Badge variant={blocking ? "destructive" : "warning"} className="shrink-0">
+        {blocking ? "作業を進められません" : "一部の情報が欠けています"}
+      </Badge>
+    </>
+  );
+
+  if (!blocking) {
+    // 劣化は主作業を止めない (§5.3-5)。主作業面を最初のビュー (1280 x 720)
+    // から押し出さないよう、区分 + 1 行の要約 + 導線だけを常に見せ、
+    // 詳細・回復条件・コードは既定で閉じた折りたたみへ入れる (UX 監査
+    // 2026-11-17 B3 の実測)。ブロッキングはここを通らず、全文を開いて出す。
+    return (
+      <Card
+        className="border-warning/60"
+        data-testid={`workflow-exception-${exception.code}`}
+        data-severity={exception.severity}
+        data-density="compact"
+      >
+        <CardContent className="space-y-1.5 px-4 py-2 text-sm">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            {badge}
+            <p className="min-w-0 flex-1">{exception.message}</p>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            {actions}
+            <details
+              className="text-xs text-muted-foreground"
+              data-testid="workflow-exception-supplement"
+            >
+              <summary className="cursor-pointer">詳細と回復条件</summary>
+              <div className="mt-1 space-y-1">{supplement}</div>
+            </details>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
   return (
     <Card
-      className={blocking ? "border-destructive/60" : "border-warning/60"}
+      className="border-destructive/60"
       data-testid={`workflow-exception-${exception.code}`}
       data-severity={exception.severity}
     >
       <CardContent className="space-y-2 py-3 text-sm">
-        <div className="flex items-center gap-2">
-          <AlertTriangle
-            className={blocking ? "h-4 w-4 text-destructive" : "h-4 w-4 text-muted-foreground"}
-            aria-hidden
-          />
-          {/* 色だけで状態を伝えない (原則 P8): 区分は必ずテキストで示す。 */}
-          <Badge variant={blocking ? "destructive" : "warning"}>
-            {blocking ? "作業を進められません" : "一部の情報が欠けています"}
-          </Badge>
-          <span className="text-muted-foreground">{exception.code}</span>
-        </div>
+        <div className="flex items-center gap-2">{badge}</div>
         <p>{exception.message}</p>
         {exception.detail ? (
           <p className="text-xs text-muted-foreground break-words">{exception.detail}</p>
@@ -262,35 +361,28 @@ function WorkflowExceptionCard({
         {exception.recovery_condition ? (
           <p className="text-xs text-muted-foreground">{exception.recovery_condition}</p>
         ) : null}
-        <div className="flex flex-wrap gap-2">
-          {/* 復旧操作は「同じ処理の再試行」と「安全な終端へ抜ける」の 2 つだけ
-              (§5.3-7)。人間のゲートを飛ばす迂回路は置かない。 */}
-          {exception.recovery_process_kind && onRetry ? (
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={retryPending}
-              onClick={() => onRetry(exception.recovery_process_kind!)}
-              data-testid={`workflow-retry-${exception.recovery_process_kind}`}
-            >
-              もう一度実行する
-            </Button>
-          ) : null}
-          {blocking && onLeaveSafely ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={onLeaveSafely}
-              data-testid="workflow-leave-safely"
-            >
-              中断・引き継ぎで終える
-            </Button>
-          ) : null}
-        </div>
+        {actions}
+        <p
+          className="text-[10px] text-muted-foreground/80"
+          data-testid="workflow-exception-code"
+        >
+          例外コード {exception.code}
+        </p>
       </CardContent>
     </Card>
   );
 }
+
+/** `prerequisite` (有限値) → 前提を満たせる画面。 */
+const PREREQUISITE_LINKS: Record<
+  NonNullable<InterviewWorkflowExceptionOut["prerequisite"]>,
+  { to: string; label: string }
+> = {
+  system_understanding_graph: {
+    to: "/system-understanding",
+    label: "System Understanding で理解グラフを構築する",
+  },
+};
 
 /**
  * E8 — 確認待ちの戻り。情報区分なので `R5` ではなく現在地の作業面に

@@ -16,7 +16,7 @@ import {
   useDiagnosticFocus, useDiagnosticHighlight, DiagnosticFixCallout,
 } from "@/components/diagnostic-fix";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
@@ -111,9 +111,9 @@ export default function RepositoryPage() {
         onCreateSnapshot={() =>
           createSnapshot.mutateAsync().then(s => {
             if (s.status === "failed") {
-              toast.error(`Snapshot failed: ${s.error_summary ?? "unknown error"}`);
+              toast.error(`Snapshotの作成に失敗しました: ${s.error_summary ?? "不明なエラー"}`);
             } else {
-              toast.success("Snapshot created");
+              toast.success("Snapshotを作成しました");
             }
             setTab("snapshots");
           }).catch(e => toast.error(String(e)))
@@ -121,7 +121,7 @@ export default function RepositoryPage() {
         creatingSnapshot={createSnapshot.isPending}
         onIndexSymbols={() =>
           indexSymbols.mutateAsync().then(() => {
-            toast.success("Symbols indexed");
+            toast.success("symbol indexを更新しました");
             setTab("symbols");
           }).catch(e => toast.error(String(e)))
         }
@@ -130,10 +130,10 @@ export default function RepositoryPage() {
 
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
-          <TabsTrigger value="config">Configuration</TabsTrigger>
-          <TabsTrigger value="snapshots">Snapshots</TabsTrigger>
-          <TabsTrigger value="symbols">Symbols</TabsTrigger>
-          <TabsTrigger value="api-scan">API Scan</TabsTrigger>
+          <TabsTrigger value="config">設定</TabsTrigger>
+          <TabsTrigger value="snapshots">Snapshot</TabsTrigger>
+          <TabsTrigger value="symbols">symbol</TabsTrigger>
+          <TabsTrigger value="api-scan">API定義スキャン</TabsTrigger>
         </TabsList>
 
         {/* UX-03: 設定フォームの編集内容はタブ往復で失わない。 */}
@@ -142,8 +142,8 @@ export default function RepositoryPage() {
           <DiagnosticFixCallout anchor="repo-patterns" className="mb-3" />
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">Repository Configuration</CardTitle>
-              <CardDescription>Configure the target repository for analysis</CardDescription>
+              <CardTitle className="text-base">Repository設定</CardTitle>
+              <CardDescription>解析の対象にするRepositoryを設定します</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               {configLoading || candidatesLoading ? (
@@ -155,7 +155,7 @@ export default function RepositoryPage() {
                   candidates={candidates ?? []}
                   onSave={async (data) => {
                     await updateConfig.mutateAsync(data);
-                    toast.success("Repository config saved");
+                    toast.success("Repository設定を保存しました");
                   }}
                   isPending={updateConfig.isPending}
                 />
@@ -169,8 +169,8 @@ export default function RepositoryPage() {
           <Card>
             <CardHeader className="flex flex-row items-center justify-between">
               <div>
-                <CardTitle className="text-base">Snapshots</CardTitle>
-                <CardDescription>Point-in-time snapshots of the repository</CardDescription>
+                <CardTitle className="text-base">Snapshot</CardTitle>
+                <CardDescription>ある時点のcommit済みRepositoryを固定した記録です</CardDescription>
               </div>
               <Button
                 {...snapshotHighlight}
@@ -178,10 +178,10 @@ export default function RepositoryPage() {
                 variant="outline"
                 onClick={() => createSnapshot.mutateAsync().then(s => {
                   if (s.status === "failed") {
-                    toast.error(`Snapshot failed: ${s.error_summary ?? "unknown error"}`);
+                    toast.error(`Snapshotの作成に失敗しました: ${s.error_summary ?? "不明なエラー"}`);
                   } else {
-                    toast.success("Snapshot created", {
-                      description: s.warnings?.length ? `with ${s.warnings.length} warning(s)` : "All files indexed successfully.",
+                    toast.success("Snapshotを作成しました", {
+                      description: s.warnings?.length ? `警告が${s.warnings.length}件あります` : "すべてのファイルを取り込みました。",
                     });
                   }
                 }).catch(e => toast.error(String(e)))}
@@ -202,14 +202,14 @@ export default function RepositoryPage() {
                 <p className="text-xs text-muted-foreground mb-3" data-testid="create-snapshot-not-configured-reason">
                   {configGate.summary} {configGate.remediation}{" "}
                   {configGate.to && (
-                    <Link to={configGate.to} className="underline">{configGate.actionLabel ?? "Go to Repository"}</Link>
+                    <Link to={configGate.to} className="underline">{configGate.actionLabel ?? "Repository設定へ"}</Link>
                   )}
                 </p>
               )}
               {snapsLoading ? (
                 <div className="space-y-2">{[1,2,3].map(i=><Skeleton key={i} className="h-16 w-full"/>)}</div>
               ) : !snapshots?.length ? (
-                <p className="text-sm text-muted-foreground text-center py-8">No snapshots yet</p>
+                <p className="text-sm text-muted-foreground text-center py-8">Snapshotはまだありません</p>
               ) : (
                 <div className="space-y-3">
                   {snapshots.map(s => (
@@ -237,13 +237,13 @@ export default function RepositoryPage() {
                             )}
                           </div>
                           <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                            <span><FolderTree className="inline h-3 w-3 mr-1" />{s.file_count} files</span>
-                            <span>{formatBytes(s.total_size)} total</span>
+                            <span><FolderTree className="inline h-3 w-3 mr-1" />{s.file_count}ファイル</span>
+                            <span>合計 {formatBytes(s.total_size)}</span>
                             {s.indexed_size > 0 && s.indexed_size !== s.total_size && (
-                              <span>{formatBytes(s.indexed_size)} indexed</span>
+                              <span>取り込み {formatBytes(s.indexed_size)}</span>
                             )}
                             {s.metadata_only_count > 0 && (
-                              <span className="text-yellow-600">{s.metadata_only_count} content omitted</span>
+                              <span className="text-yellow-600">内容省略 {s.metadata_only_count}件</span>
                             )}
                             <span>{formatTimestamp(s.created_at)}</span>
                           </div>
@@ -268,7 +268,7 @@ export default function RepositoryPage() {
                       {latestSnapshot?.id === s.id && latestSnapshot.files.length > 0 && (
                         <details className="text-xs">
                           <summary className="cursor-pointer text-muted-foreground">
-                            Inspect indexed and omitted files
+                            取り込んだファイルと省略したファイルを確認
                           </summary>
                           <div className="mt-2 max-h-64 space-y-1 overflow-y-auto rounded border p-2">
                             {(() => {
@@ -294,7 +294,7 @@ export default function RepositoryPage() {
                                   ))}
                                   {omittedCount > 0 && (
                                     <p className="text-muted-foreground text-xs italic mt-2">
-                                      {omittedCount} additional indexed file(s) omitted from this view.
+                                      ほかに取り込んだファイルが{omittedCount}件あります（この一覧では省略しています）。
                                     </p>
                                   )}
                                 </>
@@ -315,40 +315,40 @@ export default function RepositoryPage() {
           <Card>
             <CardHeader className="flex flex-row items-center justify-between">
               <div>
-                <CardTitle className="text-base">Code Symbols</CardTitle>
-                <CardDescription>Indexed functions, classes, and modules</CardDescription>
+                <CardTitle className="text-base">コードのsymbol</CardTitle>
+                <CardDescription>indexした関数・クラス・モジュールです</CardDescription>
               </div>
               <Button
                 size="sm"
-                onClick={() => indexSymbols.mutateAsync().then(() => toast.success("Symbols indexed")).catch(e => toast.error(String(e)))}
+                onClick={() => indexSymbols.mutateAsync().then(() => toast.success("symbol indexを更新しました")).catch(e => toast.error(String(e)))}
                 disabled={indexSymbols.isPending || !repoStatus?.latest_snapshot}
-                title={!repoStatus?.latest_snapshot ? "Create a snapshot before indexing symbols" : undefined}
+                title={!repoStatus?.latest_snapshot ? "symbolをindexする前にSnapshotを作成してください" : undefined}
               >
                 <Code2 className={`h-4 w-4 mr-1 ${indexSymbols.isPending ? "animate-spin" : ""}`} />
-                Index Symbols
+                symbol indexを更新
               </Button>
             </CardHeader>
             <CardContent>
               {!repoStatus?.latest_snapshot && (
                 <p className="text-xs text-muted-foreground mb-3" data-testid="index-symbols-no-snapshot-reason">
-                  No snapshot yet — create one in the Snapshots tab before indexing symbols.
+                  Snapshotがまだありません。symbolをindexする前に、SnapshotタブでSnapshotを作成してください。
                 </p>
               )}
               {symLoading ? (
                 <div className="space-y-2">{[1,2,3].map(i=><Skeleton key={i} className="h-10 w-full"/>)}</div>
               ) : !symbolIndex?.symbols?.length ? (
-                <p className="text-sm text-muted-foreground text-center py-8">No symbols indexed yet</p>
+                <p className="text-sm text-muted-foreground text-center py-8">indexしたsymbolはまだありません</p>
               ) : (
                 <>
-                  <p className="text-sm text-muted-foreground mb-4">{symbolIndex.symbol_count} symbols indexed</p>
+                  <p className="text-sm text-muted-foreground mb-4">{symbolIndex.symbol_count}件のsymbolをindexしました</p>
                   <div className="overflow-x-auto max-h-96 overflow-y-auto">
                     <table className="w-full text-sm">
                       <thead className="sticky top-0 bg-card">
                         <tr className="border-b text-left">
-                          <th className="pb-2 font-medium text-muted-foreground">Symbol</th>
-                          <th className="pb-2 font-medium text-muted-foreground">Kind</th>
-                          <th className="pb-2 font-medium text-muted-foreground">Path</th>
-                          <th className="pb-2 font-medium text-muted-foreground text-right">Lines</th>
+                          <th className="pb-2 font-medium text-muted-foreground">symbol</th>
+                          <th className="pb-2 font-medium text-muted-foreground">種類</th>
+                          <th className="pb-2 font-medium text-muted-foreground">パス</th>
+                          <th className="pb-2 font-medium text-muted-foreground text-right">行</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -382,11 +382,18 @@ function shortSha(sha: string | null | undefined): string {
 }
 
 function repositoryLagLabel(status: RepositoryStatus): string {
+  // B7: 比べる Snapshot が無いときは「差分を確認できません」ではなく、無いと言う。
+  if (!status.latest_snapshot) return "Snapshot未作成";
   if (status.head_relation === "same") return "最新";
   if (status.head_relation === "behind" && status.commits_behind != null) {
     return `${status.commits_behind} commit遅れ`;
   }
   if (status.head_relation === "diverged") return "履歴が分岐しています";
+  // B7 (続き): 比べられなかった理由が最新 Snapshot の処理状態 (#369 の
+  // processing state、サーバー応答の `latest_snapshot.status`) にあるなら、
+  // その事実を言う。
+  if (status.latest_snapshot.status === "failed") return "最新Snapshotの作成に失敗";
+  if (status.latest_snapshot.status === "indexing") return "Snapshot作成中";
   return "差分を確認できません";
 }
 
@@ -454,6 +461,14 @@ function RepositoryRefreshHub({
     resyncJob.status !== "completed"
     || resyncJob.snapshot_id === status.latest_snapshot?.id
   );
+  // B5: 準備ができた後は「システムを理解する」が次の作業。古い Capability が
+  // ある (既存の「System Understandingを構築」が出る) とき、または Snapshot /
+  // symbol がまた古くなったときは、更新ボタンが主ボタンのまま。
+  const showInterviewCta = showResyncJob
+    && resyncJob?.status === "completed"
+    && resyncJob.stale_capability_count === 0
+    && !status.snapshot_stale
+    && !status.symbols_stale;
 
   return (
     <Card data-testid="refresh-hub">
@@ -514,7 +529,25 @@ function RepositoryRefreshHub({
               <CheckCircle2 className="h-3 w-3" /> 最新です
             </Badge>
           )}
-          {status.snapshot_stale && (
+          {/* UX 監査 2026-11-17 B7: Snapshot が無いことと Snapshot が古いことは
+              別の事実。サーバーの `snapshot_stale` は「ready な Snapshot が無い」
+              場合にも true になるので、同じ応答の `latest_snapshot` の有無で
+              表示を分ける (新しい判定は作らない)。 */}
+          {status.snapshot_stale && !status.latest_snapshot && (
+            <Badge variant="warning" data-testid="snapshot-missing-badge">Snapshot未作成</Badge>
+          )}
+          {/* B7 (続き): 最新の Snapshot が失敗・作成中なのは「HEADより古い」とは
+              別の事実。サーバーの `latest_snapshot.status` (ready / indexing /
+              failed) だけで分ける。 */}
+          {status.snapshot_stale && status.latest_snapshot?.status === "failed" && (
+            <Badge variant="destructive" data-testid="snapshot-failed-badge">最新Snapshotの作成に失敗</Badge>
+          )}
+          {status.snapshot_stale && status.latest_snapshot?.status === "indexing" && (
+            <Badge variant="warning" data-testid="snapshot-indexing-badge">Snapshot作成中</Badge>
+          )}
+          {status.snapshot_stale && status.latest_snapshot
+            && status.latest_snapshot.status !== "failed"
+            && status.latest_snapshot.status !== "indexing" && (
             <Badge variant="destructive" data-testid="snapshot-stale-badge">SnapshotがHEADより古い</Badge>
           )}
           {status.symbols_stale && !status.snapshot_stale && (
@@ -534,7 +567,11 @@ function RepositoryRefreshHub({
 
         {status.snapshot_stale && (
           <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
-            {status.latest_snapshot
+            {status.latest_snapshot?.status === "failed"
+              ? <>最新のSnapshot #{status.latest_snapshot.id}（<code>{shortSha(status.latest_snapshot.commit_sha)}</code>）の作成に失敗しました。原因を確認してSnapshotを作成し直してください。RepositoryのHEADは<code>{shortSha(status.current_head)}</code>です。</>
+              : status.latest_snapshot?.status === "indexing"
+              ? <>Snapshot #{status.latest_snapshot.id}（<code>{shortSha(status.latest_snapshot.commit_sha)}</code>）を作成しています。完了するまでお待ちください。</>
+              : status.latest_snapshot
               ? <>現在の解析はSnapshot #{status.latest_snapshot.id}（<code>{shortSha(status.latest_snapshot.commit_sha)}</code>）に基づいていますが、RepositoryのHEADは<code>{shortSha(status.current_head)}</code>です。新しいpatchを生成する前にSnapshotを更新してください。</>
               : <>HEAD <code>{shortSha(status.current_head)}</code>のSnapshotがまだありません。最初のSnapshotを作成して解析を開始してください。</>}
           </div>
@@ -575,6 +612,21 @@ function RepositoryRefreshHub({
                 <div className="text-emerald-700 dark:text-emerald-300">
                   Snapshot #{resyncJob.snapshot_id} とsymbol indexの準備ができました。
                 </div>
+                {/* UX 監査 2026-11-17 B5: 準備ができた後の次の作業への導線。遷移で
+                    あって実行ではない (Overview の next_action と同じ行き先)。古い
+                    Capability がある場合は下の「System Understandingを構築」が
+                    次の作業なので、導線を 2 つ並べない。 */}
+                {showInterviewCta && (
+                  <div className="pt-1">
+                    <Link
+                      to="/interview"
+                      className={buttonVariants({ size: "sm" })}
+                      data-testid="resync-next-interview-cta"
+                    >
+                      システムを理解する
+                    </Link>
+                  </div>
+                )}
                 {resyncJob.stale_capability_count > 0 && (
                   <div data-testid="stale-capability-guidance">
                     <span>{resyncJob.stale_capability_count}件のCapabilityが古いSnapshotを参照しています。 </span>
@@ -602,6 +654,8 @@ function RepositoryRefreshHub({
         <div className="space-y-2">
           <Button
             size="sm"
+            // B5: 次の作業への CTA が出ている間は主ボタンを 2 つ並べない。
+            variant={showInterviewCta ? "outline" : "default"}
             data-testid="repository-resync-button"
             onClick={() => startResync.mutateAsync()
               .then(() => toast.success("Repositoryの更新を開始しました"))
@@ -644,9 +698,9 @@ function ApiScanPanel() {
     runScan.mutateAsync()
       .then((r) => {
         if (r.status === "completed") {
-          toast.success(`Scan complete: ${r.extracted_count} API endpoint(s) from ${r.patterns.length} pattern(s)`);
+          toast.success(`スキャン完了: ${r.patterns.length}件のパターンから${r.extracted_count}件のAPI endpointを抽出しました`);
         } else {
-          toast.error(r.error || "API scan failed");
+          toast.error(r.error || "API定義スキャンに失敗しました");
         }
       })
       .catch((e) => toast.error(String(e)));
@@ -659,19 +713,18 @@ function ApiScanPanel() {
       <CardHeader className="flex flex-row items-start justify-between gap-4">
         <div>
           <CardTitle className="text-base flex items-center gap-2">
-            <ScanSearch className="h-4 w-4" /> API Definition Scan
+            <ScanSearch className="h-4 w-4" /> API定義スキャン
           </CardTitle>
           <CardDescription>
-            Use a reasoning model to find where API definitions live across any
-            framework/language and generate regexes that extract them. The regexes
-            are applied deterministically to the pinned snapshot. Requires a
-            configured reasoning model; results are LLM-generated — review before
-            trusting.
+            reasoning modelで、framework・言語を問わずAPI定義の場所を探し、それを
+            抽出する正規表現を生成します。正規表現は固定したSnapshotへ決定的に適用
+            します。reasoning modelの設定が必要です。結果はLLMが生成したものなので、
+            信頼する前に確認してください。
           </CardDescription>
         </div>
         <Button size="sm" onClick={onScan} disabled={runScan.isPending}>
           <Sparkles className={`h-4 w-4 mr-1 ${runScan.isPending ? "animate-spin" : ""}`} />
-          {runScan.isPending ? "Scanning…" : "Scan API definitions"}
+          {runScan.isPending ? "スキャン中…" : "API定義をスキャン"}
         </Button>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -679,28 +732,28 @@ function ApiScanPanel() {
           <div className="space-y-2">{[1,2,3].map(i=><Skeleton key={i} className="h-10 w-full"/>)}</div>
         ) : !result || result.status === "none" ? (
           <p className="text-sm text-muted-foreground text-center py-8">
-            No API scan yet. Create a snapshot, then run a scan to detect APIs in
-            frameworks the deterministic indexer does not support.
+            API定義スキャンはまだ実行していません。Snapshotを作成してからスキャンすると、
+            決定的なindexerが対応していないframeworkのAPIも検出できます。
           </p>
         ) : result.status === "failed" ? (
           <div className="rounded-md border border-red-300 bg-red-50 dark:bg-red-950/20 dark:border-red-800 px-4 py-3 text-sm text-red-800 dark:text-red-200">
             <div className="flex items-center gap-2 font-medium">
-              <AlertTriangle className="h-4 w-4" /> Scan failed
+              <AlertTriangle className="h-4 w-4" /> スキャンに失敗しました
               {result.is_mock && <Badge variant="outline" className="text-[10px]">mock</Badge>}
             </div>
             <p className="mt-1">{result.error}</p>
             <p className="mt-1 text-xs">
-              API scanning requires a real reasoning model (set
-              INTELLIGENCE_LLM_PROVIDER / INTELLIGENCE_LLM_MODEL, or LLM_PROVIDER /
-              LLM_MODEL). No heuristic fallback is used.
+              API定義スキャンには実際のreasoning modelが必要です
+              （INTELLIGENCE_LLM_PROVIDER / INTELLIGENCE_LLM_MODEL、または LLM_PROVIDER /
+              LLM_MODEL を設定してください）。ヒューリスティックな代替処理は行いません。
             </p>
           </div>
         ) : (
           <>
             <div className="flex flex-wrap items-center gap-3 text-sm">
-              <Badge variant="secondary">{result.extracted_count} API endpoint(s)</Badge>
+              <Badge variant="secondary">{result.extracted_count}件のAPI endpoint</Badge>
               <span className="text-muted-foreground">
-                {result.patterns.length} pattern(s)
+                {result.patterns.length}件のパターン
                 {result.provider && ` · ${result.provider}/${result.model}`}
               </span>
               {result.frameworks.map(f => (
@@ -720,7 +773,7 @@ function ApiScanPanel() {
                     <Badge variant="outline" className="text-[10px]">{p.framework}</Badge>
                     <Badge variant="outline" className="text-[10px]">{p.language}</Badge>
                     <span className="text-xs text-muted-foreground">{p.file_glob}</span>
-                    <span className="ml-auto text-xs">{p.match_count} match(es)</span>
+                    <span className="ml-auto text-xs">{p.match_count}件一致</span>
                     <span className="text-xs text-muted-foreground">{Math.round(p.confidence * 100)}%</span>
                   </div>
                   <code className="block text-xs font-mono bg-muted/50 rounded px-2 py-1 break-all">{p.regex}</code>
@@ -729,10 +782,9 @@ function ApiScanPanel() {
               ))}
             </div>
             <p className="text-[11px] text-muted-foreground">
-              Extracted endpoints appear in the{" "}
-              <span className="font-medium">Flow Explorer</span> API list, marked
-              as LLM-sourced. They are listed for visibility; a process tree
-              cannot yet be rooted from an LLM-only endpoint.
+              抽出したendpointは<span className="font-medium">Flow Explorer</span>の
+              API一覧に、LLM由来として表示されます。確認のための表示であり、LLMだけが
+              見つけたendpointを起点にした処理ツリーはまだ作れません。
             </p>
           </>
         )}
@@ -782,10 +834,10 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
       <div {...repoPathHighlight} className={`space-y-2 ${repoPathHighlight.className}`}>
         <Label htmlFor="repo-config-path">Repository</Label>
         <Select id="repo-config-path" value={repoPath} onChange={e => setRepoPath(e.target.value)}>
-          <option value="">Select repository...</option>
+          <option value="">Repositoryを選択...</option>
           {config?.repo_path && !candidates.some(candidate => candidate.path === config.repo_path) && (
             <option value={config.repo_path} disabled>
-              Unavailable: {config.repo_path}
+              利用できません: {config.repo_path}
             </option>
           )}
           {candidates.map(candidate => (
@@ -795,24 +847,30 @@ function RepoConfigForm({ config, candidates, onSave, isPending }: {
           ))}
         </Select>
         {!candidates.length && (
-          <p className="text-xs text-destructive">
-            No Git repositories were found below the configured repository root.
-          </p>
+          // UX 監査 2026-11-17 B2: 原因だけでなく解決手順を同じ場所に出す。
+          <div className="space-y-1 text-xs" data-testid="repo-candidates-empty">
+            <p className="text-destructive">
+              設定されたRepositoryルートの下にGitリポジトリが見つかりませんでした。
+            </p>
+            <p className="text-muted-foreground" data-testid="repo-candidates-empty-remediation">
+              Control Serverの環境変数 <code>PROBE_REPOSITORY_ROOTS</code> に、Gitリポジトリを含む親ディレクトリの絶対パスを設定し、Control Serverを再起動してください。
+            </p>
+          </div>
         )}
       </div>
       <div {...patternsHighlight} className={`space-y-4 ${patternsHighlight.className}`}>
         <div className="space-y-2">
-          <Label htmlFor="repo-config-include">Include Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
+          <Label htmlFor="repo-config-include">対象パターン（Include） <span className="text-muted-foreground font-normal">（1行に1つ）</span></Label>
           <Textarea id="repo-config-include" value={includePatterns} onChange={e => setIncludePatterns(e.target.value)} placeholder={"*.py\n*.js"} rows={3} />
         </div>
         <div className="space-y-2">
-          <Label htmlFor="repo-config-exclude">Exclude Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
+          <Label htmlFor="repo-config-exclude">除外パターン（Exclude） <span className="text-muted-foreground font-normal">（1行に1つ）</span></Label>
           <Textarea id="repo-config-exclude" value={excludePatterns} onChange={e => setExcludePatterns(e.target.value)} placeholder={"test_*\n__pycache__"} rows={3} />
         </div>
       </div>
       <div className="flex items-center gap-3">
         <Button onClick={handleSave} disabled={isPending || !repoPath || !candidates.some(candidate => candidate.path === repoPath)}>
-          {isPending ? "Saving..." : "Save Configuration"}
+          {isPending ? "保存中..." : "設定を保存"}
         </Button>
         {dirty && (
           <span className="text-xs text-amber-700 dark:text-amber-400" role="status" data-testid="repo-config-unsaved">

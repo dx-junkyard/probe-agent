@@ -419,12 +419,12 @@ Sub 3（#238）の領分であり、#236 は対象外。
 
 | フェーズ | ラベル（`state_messages.phase_label`） | 完了条件 |
 | --- | --- | --- |
-| `setup` | 必要最低限の設定 | 対象リポジトリ登録済み、かつ repository / database / auth / llm 系診断（`system_diagnostics.DiagnosticCheck.category`）に `error` / `blocked` が無い |
-| `preparation` | 分析準備 | setup 完了、かつ ready snapshot 存在、かつ決定的 8 ステップ Pipeline Checklist（`system_understanding_service.compute_pipeline_steps` — repository_configured / snapshot_ready / documentation_indexed / documentation_claims_scanned / symbols_indexed / entrypoints_discovered / docs_code_reconciled / capability_hierarchy_ready）が全て `complete`、かつ Purpose / Capabilities が `evaluate_understanding` の `satisfied_current` または `baseline_reusable`。Issue #256 で計装経路確立の OR 条件は `instrumentation` フェーズへ移り、preparation 自体の完了条件からは外れた |
-| `instrumentation` | プローブ設定 | preparation 完了、かつ（適用済み probe patch が存在 **または** 承認済み probe plan が 1 件以上 **または** SDK 接続状態が `no_signal` でない）のいずれか |
-| `observation` | 観測 | instrumentation 完了、かつ SDK 接続状態が実際に `receiving`（`no_signal` はもちろん `smoke_only` でも満たさない） |
-| `evaluation` | 候補評価 | observation 完了、かつ（human_decision が記録された experiment が 1 件以上 **または** 完了した replay variant run が 1 件以上） |
-| `publish` | 公開 | evaluation 完了、かつ publish job が `completed`。全フェーズ充足時の表示上の終端フェーズでもある（この場合 `user_phase` は `"publish"` を返すが、`phases[-1].complete` 自体は publish job が実際に成功するまで `false` のまま） |
+| `setup` | 対象の登録 | 対象リポジトリ登録済み、かつ repository / database / auth / llm 系診断（`system_diagnostics.DiagnosticCheck.category`）に `error` / `blocked` が無い |
+| `preparation` | システムの理解 | setup 完了、かつ ready snapshot 存在、かつ決定的 8 ステップ Pipeline Checklist（`system_understanding_service.compute_pipeline_steps` — repository_configured / snapshot_ready / documentation_indexed / documentation_claims_scanned / symbols_indexed / entrypoints_discovered / docs_code_reconciled / capability_hierarchy_ready）が全て `complete`、かつ Purpose / Capabilities が `evaluate_understanding` の `satisfied_current` または `baseline_reusable`。Issue #256 で計装経路確立の OR 条件は `instrumentation` フェーズへ移り、preparation 自体の完了条件からは外れた |
+| `instrumentation` | 計測の組み込み | preparation 完了、かつ（適用済み probe patch が存在 **または** 承認済み probe plan が 1 件以上 **または** SDK 接続状態が `no_signal` でない）のいずれか |
+| `observation` | 実行時の観測 | instrumentation 完了、かつ SDK 接続状態が実際に `receiving`（`no_signal` はもちろん `smoke_only` でも満たさない） |
+| `evaluation` | 候補の評価 | observation 完了、かつ（human_decision が記録された experiment が 1 件以上 **または** 完了した replay variant run が 1 件以上） |
+| `publish` | 変更の公開 | evaluation 完了、かつ publish job が `completed`。全フェーズ充足時の表示上の終端フェーズでもある（この場合 `user_phase` は `"publish"` を返すが、`phases[-1].complete` 自体は publish job が実際に成功するまで `false` のまま） |
 
 現在フェーズ = 完了条件を満たさない最初のフェーズ（全て満たせば表示上の
 終端 `"publish"`）。導出は `system_state.derive_user_phase(facts:

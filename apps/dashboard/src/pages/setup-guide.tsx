@@ -453,7 +453,7 @@ curl -sS -w "\\nHTTP %{http_code}\\n" -X POST "$PROBE_SERVER_URL/traces" \\
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
-          <LifeBuoy className="h-6 w-6" /> 接続セットアップガイド
+          <LifeBuoy className="h-6 w-6" /> 接続ガイド
         </h1>
         <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
           レビュー用 patch の適用から、監視対象アプリの設定、probe-agent との疎通確認までを一続きで案内します。

@@ -21,6 +21,7 @@ import type {
   SystemStateItem,
 } from "@/api/types";
 import { systemStateTarget } from "@/components/system-state";
+import { headerCoversItem, useHeaderTextNotice } from "@/components/connectivity-badge";
 import { openModalSurfaceCount, useModalSurface } from "@/lib/modal-surface";
 import { ASSISTANT_SIDE_BY_SIDE_QUERY, useMediaQuery } from "@/lib/use-media-query";
 import { Textarea } from "@/components/ui/textarea";
@@ -661,7 +662,15 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     () => (ctx?.screen_checks ?? []).filter((c) => c.severity !== "ok"),
     [ctx],
   );
-  const rawNoticeText = focusedStateItem?.summary ?? snapshotNotice ?? null;
+  // UX audit 2026-11-17 A3: when the header's text notice already names this
+  // item's cause (same `state_id` / `dedupe_key`), the floating notice stays
+  // hidden so one summary is not shown on two surfaces at once. The item
+  // still scopes the assistant's question context below.
+  const headerNotice = useHeaderTextNotice();
+  const noticeCoveredByHeader = headerCoversItem(headerNotice, focusedStateItem);
+  const rawNoticeText = noticeCoveredByHeader
+    ? null
+    : focusedStateItem?.summary ?? snapshotNotice ?? null;
   // The floating notice sits over page content (bottom-right) and used to
   // have no way to dismiss it, so it kept hiding table rows and banners.
   // Dismissing hides that exact text for this tab; a different notice shows again.
@@ -679,7 +688,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
     if (target) navigate(target);
   });
   const focusedQuestion = focusedStateItem
-    ? `What should I do about: ${focusedStateItem.summary}`
+    ? `「${focusedStateItem.summary}」にはどう対応すればよいですか？`
     : null;
 
   // UX-20: 入力内容に合わせて高さを伸ばす (上限は CSS の max-h)。
@@ -1016,7 +1025,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             variant="ghost"
             size="icon"
             onClick={() => setOpen(false)}
-            title="Close assistant"
+            title="アシスタントを閉じる"
             aria-label="アシスタントを閉じる"
             data-testid="assistant-close"
           >
@@ -1144,7 +1153,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
         )}
         {focusedStateItem && (
           <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 space-y-2 dark:border-amber-800 dark:bg-amber-950" data-testid="assistant-current-issue">
-            <p className="text-xs font-medium">Current issue</p>
+            <p className="text-xs font-medium">現在の問題</p>
             <p className="text-sm font-medium">{focusedStateItem.summary}</p>
             <p className="text-xs text-muted-foreground">{focusedStateItem.detail}</p>
             {focusedStateItem.remediation && <p className="text-xs">{focusedStateItem.remediation}</p>}
@@ -1161,8 +1170,8 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
               <DiagnosticSeverityIcon severity={ctx.state_severity} />
               <p className="text-xs font-medium">
                 {failingChecks.length === 0
-                  ? "All checks related to this screen are passing."
-                  : `${failingChecks.length} check(s) need attention on this screen.`}
+                  ? "この画面に関係する確認項目はすべて問題ありません。"
+                  : `この画面で対応が必要な確認項目が ${failingChecks.length} 件あります。`}
               </p>
             </div>
             {failingChecks.map((c) => (
@@ -1178,7 +1187,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
 
         {ctx && ctx.suggested_questions.length > 0 && messages.length === 0 && (
           <div className="space-y-1">
-            <p className="text-[11px] font-medium text-muted-foreground">Suggested questions</p>
+            <p className="text-[11px] font-medium text-muted-foreground">質問の例</p>
             <div className="flex flex-col items-start gap-1">
               {focusedQuestion && (
                 <button
@@ -1334,7 +1343,7 @@ export function AssistantPanel({ focusedStateItem, snapshotNotice, onSnapshotNot
             type="submit"
             size="icon"
             disabled={ask.isPending || !question.trim() || threadResolving}
-            title="Send"
+            title="送信"
             aria-label="送信"
             data-testid="assistant-send"
           >

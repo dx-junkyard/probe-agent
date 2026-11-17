@@ -197,7 +197,28 @@ def _back_request_out(row: dict) -> InterviewBackRequestOut:
     )
 
 
-def _build_exceptions(decision, gathered, pending_back_request) -> List[InterviewWorkflowExceptionOut]:
+#: Process kinds whose input includes the snapshot's persisted understanding
+#: graph (`_rebuild_understanding_core` refuses to run without one).
+_GRAPH_CONSUMING_PROCESS_KINDS = ("understanding_build", "understanding_update")
+
+
+def _snapshot_graph_missing(conn, system_id: int, session: Optional[dict]) -> bool:
+    """Deterministic existence check of the session snapshot's graph row --
+    the same table `_load_graph_for_snapshot` reads. A fact about the
+    prerequisite, not a reading of the failure message."""
+    if not session:
+        return False
+    row = conn.execute(
+        """SELECT 1 FROM understanding_graph_snapshots
+           WHERE system_id = ? AND snapshot_id = ? LIMIT 1""",
+        (system_id, session["snapshot_id"]),
+    ).fetchone()
+    return row is None
+
+
+def _build_exceptions(
+    decision, gathered, pending_back_request, *, graph_missing: bool = False
+) -> List[InterviewWorkflowExceptionOut]:
     """Only exceptions that are CURRENTLY blocking or degrading, plus the
     informational branches the primary work card has to render (spec §5.3-4:
     a past error that no longer affects the current work never appears here).
@@ -241,6 +262,12 @@ def _build_exceptions(decision, gathered, pending_back_request) -> List[Intervie
                 recovery_process_kind=row["process_kind"],
                 recovery_condition=_RECOVERY_CONDITION.get(
                     code, _RECOVERY_CONDITION["E14"]
+                ),
+                prerequisite=(
+                    "system_understanding_graph"
+                    if graph_missing
+                    and row["process_kind"] in _GRAPH_CONSUMING_PROCESS_KINDS
+                    else None
                 ),
             )
         )
@@ -299,6 +326,7 @@ def _state_out(conn, system_id: int, session_id: Optional[int]) -> InterviewWork
             blocking_failure_states=sorted(facts.blocking_failure_states),
             understanding_unconfirmed=facts.understanding_unconfirmed,
             open_required_questions=facts.open_required_questions,
+            zero_base_pending=facts.zero_base_pending,
             outstanding_alignment_items=facts.outstanding_alignment_items,
             proposals_needing_review=facts.proposals_needing_review,
             proposals_generatable=facts.proposals_generatable,
@@ -311,7 +339,12 @@ def _state_out(conn, system_id: int, session_id: Optional[int]) -> InterviewWork
         unresolved_failures=[
             _run_out(r) for r in gathered.blocking_failures + gathered.degraded_failures
         ],
-        exceptions=_build_exceptions(decision, gathered, pending),
+        exceptions=_build_exceptions(
+            decision,
+            gathered,
+            pending,
+            graph_missing=_snapshot_graph_missing(conn, system_id, gathered.session),
+        ),
         diff_materialized_at=(
             gathered.session["materialized_at"] if gathered.session else None
         ),

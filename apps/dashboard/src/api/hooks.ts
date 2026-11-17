@@ -488,9 +488,28 @@ export function useUpdateRepositoryConfig() {
   return useMutation({
     mutationFn: (data: { repo_path: string; include_patterns?: string[]; exclude_patterns?: string[] }) =>
       api.put<RepositoryConfigOut>("/repository", data),
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("repoConfig") }),
+    // UX 監査 2026-11-17 B1: 保存で変わる事実は設定行だけではない。上部
+    // バナー (`/system-state`)、Repository更新カード (`/repository/status`)、
+    // 推奨 Snapshot の判定 (`/snapshot-preflight`) はどれも設定済みかどうかと
+    // 対象 repository の HEAD を読むので、設定行だけを無効化すると「未設定」が
+    // 再読み込みまで残る。
+    onSuccess: () => {
+      for (const key of REPOSITORY_CONFIG_DEPENDENT_QUERY_BASES) {
+        qc.invalidateQueries({ queryKey: sysKey(key) });
+      }
+    },
   });
 }
+
+/** Repository 設定の保存で読み直しが必要になる query の base key (B1)。 */
+export const REPOSITORY_CONFIG_DEPENDENT_QUERY_BASES = [
+  "repoConfig",
+  "repositoryStatus",
+  "system-state",
+  "snapshotPreflight",
+  // Overview の次の1操作は repository の設定有無を読む (#380 load_repository_fact)。
+  "overview",
+] as const;
 
 export function useSnapshots() {
   return useQuery({

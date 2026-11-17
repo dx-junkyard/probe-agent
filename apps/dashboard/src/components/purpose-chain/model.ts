@@ -131,6 +131,15 @@ export function frameSlots(chain: PurposeChainOut): FrameSlot[] {
   return FRAME_ELEMENT_ORDER.map((kind) => ({ kind, element: chain.frame[kind] ?? null }));
 }
 
+/** A1 (UX 監査 2026-11-17): true only when the SERVER reported every frame
+ * slot as `unknown` (読めたが記録がない). A missing slot (`null`) or an
+ * `unavailable` one is NOT folded in -- 「読めなかった」 is a different answer
+ * from 「まだわかっていない」 (§0 invariant 6), so those keep the per-slot
+ * display. This reads `state` verbatim; it never guesses from statement text. */
+export function frameEntirelyUnknown(chain: PurposeChainOut): boolean {
+  return FRAME_ELEMENT_ORDER.every((kind) => chain.frame[kind]?.state === "unknown");
+}
+
 /** `intervention` claims beyond the single frame slot. Structural filtering
  * only (kind + not-the-frame-slot-id), never a semantic re-classification. */
 export function additionalInterventionElements(chain: PurposeChainOut): PurposeElementOut[] {

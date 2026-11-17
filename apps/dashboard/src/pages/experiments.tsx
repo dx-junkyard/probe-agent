@@ -179,7 +179,7 @@ export default function ExperimentsPage() {
   const defaultObjective = workspaceDraft?.draft_type === "experiment_draft"
     ? workspaceDraft.payload.objective ?? ""
     : fromTraceParam
-      ? `Investigate trace ${fromTraceParam}${fromComponentParam ? ` (component ${fromComponentParam})` : ""}`
+      ? `Trace ${fromTraceParam} を調査する${fromComponentParam ? `（component ${fromComponentParam}）` : ""}`
       : "";
   const formObjective = newObjective ?? defaultObjective;
   const formVariants = variants ?? (replayPayload ? replayVariants : draftVariants);
@@ -437,10 +437,10 @@ export default function ExperimentsPage() {
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
               Decision Workspaceの提案 #{workspaceDraft.proposal_id} から入力済みです。
               {(workspaceDraft.payload.constraints?.length ?? 0) > 0 && (
-                <span className="ml-2">Constraints: {workspaceDraft.payload.constraints?.join(", ")}.</span>
+                <span className="ml-2">制約: {workspaceDraft.payload.constraints?.join("、")}。</span>
               )}
               {(workspaceDraft.payload.evaluation_criteria?.length ?? 0) > 0 && (
-                <span className="ml-2">Evaluation: {workspaceDraft.payload.evaluation_criteria?.join(", ")}.</span>
+                <span className="ml-2">評価基準: {workspaceDraft.payload.evaluation_criteria?.join("、")}。</span>
               )}
               {workspaceDraft.missing_fields.length > 0 && (
                 <span className="ml-1 text-muted-foreground">
@@ -487,7 +487,7 @@ export default function ExperimentsPage() {
                 <optgroup label="過去のSnapshot（再現用途）">
                   {olderSnapshots.map(s => (
                     <option key={s.id} value={s.id}>
-                      #{s.id} — {s.commit_sha?.slice(0, 8)} ({s.file_count} files)
+                      #{s.id} — {s.commit_sha?.slice(0, 8)}（{s.file_count} ファイル）
                     </option>
                   ))}
                 </optgroup>
@@ -621,11 +621,11 @@ function ExperimentCard({
     };
     if (decisionVal === "adopted") {
       if (!decisionVariant) {
-        toast.error("Select a variant to adopt");
+        toast.error("採用する候補を選択してください");
         return;
       }
       if (!decisionNote.trim()) {
-        toast.error("A note is required for adoption");
+        toast.error("採用するには判断理由の入力が必要です");
         return;
       }
       payload.variant_key = decisionVariant;
@@ -635,7 +635,7 @@ function ExperimentCard({
     }
     try {
       await makeDecision.mutateAsync(payload);
-      toast.success("Decision saved");
+      toast.success("判断を保存しました");
     } catch (err) { toast.error(String(err)); }
   };
 
@@ -648,7 +648,7 @@ function ExperimentCard({
               Experiment #{exp.id}
               <Badge variant={STATUS_VARIANT[exp.status] ?? "secondary"}>{exp.status}</Badge>
               {exp.human_decision && exp.human_decision !== "undecided" && (
-                <Badge variant="outline">{exp.human_decision}</Badge>
+                <Badge variant="outline">{DECISION_LABELS[exp.human_decision] ?? exp.human_decision}</Badge>
               )}
             </CardTitle>
             <CardDescription className="mt-1">
@@ -669,11 +669,11 @@ function ExperimentCard({
             {exp.status === "draft" && (
               <Button
                 size="sm"
-                onClick={() => runExperiment.mutateAsync(exp.id).then(() => toast.success("Experiment started")).catch(e => toast.error(String(e)))}
+                onClick={() => runExperiment.mutateAsync(exp.id).then(() => toast.success("Experiment を開始しました")).catch(e => toast.error(String(e)))}
                 disabled={runExperiment.isPending}
               >
                 <Play className="h-4 w-4 mr-1" />
-                Run Experiment
+                Experiment を実行
               </Button>
             )}
           </div>
@@ -749,7 +749,7 @@ function ExperimentCard({
                             URL.revokeObjectURL(url);
                           }}
                         >
-                          <Download className="h-3 w-3 mr-1" /> Patch
+                          <Download className="h-3 w-3 mr-1" /> 差分をダウンロード
                         </Button>
                       )}
                     </div>

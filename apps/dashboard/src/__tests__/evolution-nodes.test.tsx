@@ -50,15 +50,17 @@ vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
 }));
 
-function wrapper({ children }: { children: ReactNode }) {
-  const qc = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
-  return (
-    <MemoryRouter>
-      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
-    </MemoryRouter>
-  );
+function makeWrapper(initialPath = "/evolution-nodes") {
+  return function wrapper({ children }: { children: ReactNode }) {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    return (
+      <MemoryRouter initialEntries={[initialPath]}>
+        <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+      </MemoryRouter>
+    );
+  };
 }
 
 const NODE_SUMMARY = {
@@ -127,12 +129,12 @@ function routeGet(overrides: Partial<EvolutionNodeProjectionOut> = {}) {
   });
 }
 
-async function renderPage() {
+async function renderPage(initialPath = "/evolution-nodes") {
   // Loaded dynamically: a static import is hoisted above `const mockApi`,
   // so the vi.mock factory would run before it exists. Same pattern as
   // cell-fabric.test.tsx.
   const { default: EvolutionNodesPage } = await import("@/pages/evolution-nodes");
-  return render(<EvolutionNodesPage />, { wrapper });
+  return render(<EvolutionNodesPage />, { wrapper: makeWrapper(initialPath) });
 }
 
 beforeEach(() => {
@@ -177,7 +179,7 @@ test("読めなかった軸は「取得できませんでした」で、未リ�
   expect(screen.getByText("未リンク")).toBeInTheDocument();
 });
 
-test("拒否された遷移はサーバーの有限な reason_code をそのまま表示する", async () => {
+test("拒否された遷移は有限な reason_code に対応する日本語文で何が足りないかを示す", async () => {
   routeGet();
   mockApi.post.mockRejectedValue(
     new ApiError(422, "target 'established' requires evidence", "evidence_missing"),
@@ -188,10 +190,49 @@ test("拒否された遷移はサーバーの有限な reason_code をそのま�
   fireEvent.click(await screen.findByText("established / 固定化済み"));
   fireEvent.click(screen.getByText("遷移を要求する"));
 
-  // 画面は遷移表を持たないので、コードを言い換えることも
-  // ボタンを先回りで無効化することもできない。
-  expect(await screen.findByText("evidence_missing")).toBeInTheDocument();
-  expect(screen.getByText("target 'established' requires evidence")).toBeInTheDocument();
+  // 画面は遷移表を持たないので先回りの無効化はしない。拒否されたら、
+  // サーバーの有限コードに対応する固定の日本語文を出し、コードは補足に残す。
+  const box = await screen.findByTestId("evolution-transition-rejection");
+  expect(box).toHaveTextContent("根拠 (evidence) を 1 件以上指定する必要があります");
+  expect(box).toHaveTextContent("evidence_missing");
+  expect(box).not.toHaveTextContent("target 'established' requires evidence");
+});
+
+test("表に無い拒否コードはサーバーの文言へ fallback する", async () => {
+  routeGet();
+  mockApi.post.mockRejectedValue(new ApiError(422, "server says no", "some_future_code"));
+  await renderPage();
+
+  fireEvent.click(await screen.findByText("address-normalizer"));
+  fireEvent.click(await screen.findByText("遷移を要求する"));
+
+  const box = await screen.findByTestId("evolution-transition-rejection");
+  expect(box).toHaveTextContent("server says no");
+  expect(box).toHaveTextContent("some_future_code");
+});
+
+test("?node=<node_key> の deep link で該当 Node が選択されて開く", async () => {
+  routeGet();
+  await renderPage("/evolution-nodes?node=address-normalizer");
+
+  expect(await screen.findByText("Cell Improvement status")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /address-normalizer/, pressed: true })).toBeInTheDocument();
+});
+
+test("?node= の Node が無いときは別の Node を代わりに選ばず、その旨を出す", async () => {
+  routeGet();
+  await renderPage("/evolution-nodes?node=missing-node");
+
+  expect(await screen.findByTestId("evolution-node-selection-not-found")).toHaveTextContent("missing-node");
+  expect(screen.queryByText("Cell Improvement status")).not.toBeInTheDocument();
+  expect(mockApi.get).not.toHaveBeenCalledWith("/evolution-nodes/7");
+});
+
+test("?node= があり一覧取得に失敗したときは、選べなかったことを出す", async () => {
+  mockApi.get.mockRejectedValue(new ApiError(500, "boom"));
+  await renderPage("/evolution-nodes?node=address-normalizer");
+
+  expect(await screen.findByTestId("evolution-node-selection-unavailable")).toHaveTextContent("address-normalizer");
 });
 
 test("重複した遷移要求は失敗ではなく重複として扱われる", async () => {

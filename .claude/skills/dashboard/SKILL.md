@@ -135,7 +135,16 @@ The dashboard should support:
   (on System Understanding, non-error/blocked items are held back while a
   build is running, a deterministic condition); the header badge reads
   deduped `notification_items`; the persistent notice reads
-  `notification_items[0]`; the
+  `notification_items[0]` (hidden while the header's text notice already
+  names the same `state_id` / `dedupe_key`, via `headerCoversItem`); the
+  header's one text notice (`useHeaderTextNotice` in
+  `connectivity-badge.tsx`) shows, while `user_phase` is setup/preparation
+  and no real workload was ever received, the Overview's server-decided
+  `next_action` (falling back to `notification_items[0] ?? primary_item` only
+  when the Overview has no action), because `notification_items` is
+  severity-ordered and can name a different cause than the Overview's causal
+  first-match table (UX audit 2026-11-17 A3); otherwise it is the #370
+  `freshness` badge; the
   Pipeline Checklist CTA reads the `StateItem` whose
   `related_pipeline_steps` names the first incomplete step (the old
   `STEP_CTA` map survives only as last-resort fallback); the header
@@ -775,6 +784,25 @@ the reverse — puts it back on top of the primary action at narrow widths.
   「props 変化に応じた state 調整」で畳む(effect だと一度古い状態で描いてから
   畳み直すちらつきになる)。
 
+### 理解の構築に失敗したときの最初のビュー (UX 監査 2026-11-17 B3/B4)
+
+- **初回構築の失敗はサーバーが `W3` + `E3-b` と判定する**(理解が空なら
+  ゼロベース質問が続行材料。事実 `zero_base_pending`)。Dashboard は再判定
+  しない。`E3-a` を見たら理解に内容がある前提で描く。
+- **「次にやること」はサーバーの状態と競合させない。** `cockpit/model.ts` の
+  `workflowGate` はサーバー値の写し(`blocked` = E2 以外のブロッキング例外、
+  `answer_from_scratch` = `W3` かつ `zero_base_pending`)。`blocked` は
+  `resolve_exception`(CTA なし — 回復操作は例外カードだけ)、
+  `answer_from_scratch` は Q&A 取得状態より先に `state_primary`。
+- **失敗文は例外カード 1 枠だけ。** 会話欄の zero-base notice は理解失敗の
+  例外が出ている間は描かず、開発者の発言が 0 件の間はシステムの失敗発言を
+  「システムの記録」として畳む(判定は role と例外の有無だけ)。例外コードは
+  カード末尾の補足。別画面の前提は `exception.prerequisite`(有限値)から
+  リンクにし、失敗文言を正規表現で読まない。
+- **「会話からの補足」は main column の末尾**(全体像の後ろ)。現在地より上に
+  置かない。Purpose Chain は `workflowGate` がある間 `deferred`(位置は
+  Brief の直後のまま、中身だけ閉じる)。
+
 実ブラウザでの確認は、`container.innerHTML` を書き出して `dist/assets/*.css`
 と一緒に静的 HTML へ入れ、Chromium (`/opt/pw-browsers/chromium`) で測ると
 本番と同じ CSS のまま寸法を検証できる。Playwright はリポジトリの依存には
@@ -1098,6 +1126,16 @@ mutation も権限も追加しない。
   画面検索 (`keywords` は表示しない日本語の目的語)、現在地は「表示中」の
   文字バッジ。**利用可能なリンクを半透明にしない** — 将来フェーズは見出しの
   「これから」で示す (#257 の減光を置き換えた)。
+  - **段階の呼び名はサーバーの 1 表** (UX 監査 2026-11-17 A5):
+    `state_messages.PHASE_LABELS` (= `overview_projection.LOOP_STAGE_LABELS`)
+    を、ヘッダーのフェーズ表示・サイドバーのグループ見出し
+    (`phases[].label`、2 段階のグループは「A / B」)・Overview の改善ループが
+    そのまま出す。`USER_PHASE_LABELS` は同じ語の fallback で、見出しを
+    クライアントで別の語に書かない。グループの testid は `key` から作る。
+  - **「目的から始める」の行き先は下のグループの主要入口に重ねない** (A7)。
+    現在地バッジはその入口側に出す。折りたたみ時 (目的の入口が無い) は全項目を
+    アイコンで出す。「現状を理解する」は Overview の CTA と同じ `/interview`
+    (A4)。`/system-understanding` はコード由来の根拠と解析状況の画面。
 - **アシスタントパネル**: 幅 1280px 以上は本文と並ぶ非モーダル
   (`data-layout="side"`、`role="complementary"`)、未満はモーダル。会話一覧を
   ライブ領域にしない (履歴読込で全件読み上げになる) — 新しい出来事だけを

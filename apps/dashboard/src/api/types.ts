@@ -5687,6 +5687,8 @@ export interface InterviewWorkflowFactsOut {
   blocking_failure_states: string[];
   understanding_unconfirmed: boolean;
   open_required_questions: number;
+  // §2.2 行 7 の「ゼロベース質問の未完」。古い Control Server は返さない。
+  zero_base_pending?: boolean;
   outstanding_alignment_items: number;
   proposals_needing_review: number;
   proposals_generatable: boolean;
@@ -5728,6 +5730,10 @@ export interface InterviewWorkflowExceptionOut {
   detail: string | null;
   recovery_process_kind: InterviewProcessKind | null;
   recovery_condition: string | null;
+  // 別画面が持つ前提が今欠けていることを示す有限値 (UX 監査 2026-11-17 B4)。
+  // 失敗文言ではなくサーバーが永続化された事実から決める。古い Control
+  // Server は返さないので省略可。
+  prerequisite?: "system_understanding_graph" | null;
 }
 
 export interface InterviewWorkflowStateOut {

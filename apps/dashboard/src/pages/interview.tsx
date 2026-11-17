@@ -82,6 +82,7 @@ import {
   type CockpitCategoryKey,
   type CockpitQaFetchStatus,
   type CockpitUnresolvedItem,
+  type CockpitWorkflowGate,
 } from "@/components/system-understanding/cockpit/model";
 import {
   focusCockpitTarget,
@@ -1685,6 +1686,16 @@ export default function InterviewPage() {
       : qaListLoading
         ? "loading"
         : "unavailable";
+  // UX 監査 2026-11-17 B3: 「次にやること」がサーバーの判定と競合しないよう、
+  // サーバーが返した 2 つの事実だけをそのまま写す (状態は導出しない)。E2 は
+  // 更新系操作だけを止める例外で、専用バナーが担うので除く。
+  const cockpitWorkflowGate: CockpitWorkflowGate = !workflow
+    ? null
+    : workflow.exceptions.some(e => e.severity === "blocking" && e.code !== "E2")
+      ? "blocked"
+      : workflow.state === "W3" && workflow.facts.zero_base_pending === true
+        ? "answer_from_scratch"
+        : null;
   const cockpit = useMemo(
     () => buildCockpitModel({
       understanding: session?.current_understanding,
@@ -1693,6 +1704,7 @@ export default function InterviewPage() {
       openQuestions: session?.open_questions,
       qaItems: qaListForFocus?.items,
       qaFetchStatus,
+      workflowGate: cockpitWorkflowGate,
     }),
     [
       session?.current_understanding,
@@ -1701,6 +1713,7 @@ export default function InterviewPage() {
       session?.open_questions,
       qaListForFocus?.items,
       qaFetchStatus,
+      cockpitWorkflowGate,
     ],
   );
   // 選択中カテゴリ。開発者が選ぶまではモデルの既定 (未設定 → 要確認 → 先頭)。
@@ -1774,6 +1787,13 @@ export default function InterviewPage() {
   // (§4.4: 失敗内容・影響・復旧条件・再試行を同じ枠に置く) ため、各パネル
   // 側には置かない。`E14` だけは専用の例外カードを持たない (失敗した処理の
   // 側に現れる) ので、その処理のパネル内が唯一の復旧場所になる。
+  // 理解の構築・更新の失敗が、サーバーの現在の例外として出ているか。
+  const understandingFailureShown = (workflow?.exceptions ?? []).some(
+    e =>
+      (e.severity === "blocking" || e.severity === "degraded")
+      && (e.recovery_process_kind === "understanding_build"
+        || e.recovery_process_kind === "understanding_update"),
+  );
   const auxiliaryProcessFailed = (workflow?.unresolved_failures ?? []).some(
     f => f.process_kind === "question_routing" || f.process_kind === "runtime_reality_check",
   );
@@ -1999,9 +2019,13 @@ export default function InterviewPage() {
   const nextStepActionLabel =
     cockpit.nextStep.kind === "retry_qa"
       ? "Q&A を再取得"
-      : (cockpit.nextStep.actionLabel ?? stateActionLabel);
+      : cockpit.nextStep.kind === "resolve_exception"
+        // 回復操作は例外カードにだけ置く (§4.4)。2 つ目の CTA を作らない。
+        ? null
+        : (cockpit.nextStep.actionLabel ?? stateActionLabel);
   const runNextStep = () => {
     const step = cockpit.nextStep;
+    if (step.kind === "resolve_exception") return;
     if (step.kind === "retry_qa") {
       void refetchQaList();
       return;
@@ -2039,7 +2063,9 @@ export default function InterviewPage() {
       case "zero_base":
         return zeroBaseComplete
           ? "必要な回答が揃いました。「この内容で提案生成に進む」で内容を確定すると提案を生成できます。"
-          : "自動では十分な理解を構築できませんでした。表示される質問に1つずつ回答してください。";
+          // 「構築できなかった」こと自体は例外カード (E3-b) が 1 箇所で
+          // 伝える (§4.4)。ここは次の操作だけを言う。
+          : "下の会話に表示される質問に 1 つずつ回答してください。回答から理解を組み立てます。";
       case "ready_for_proposals":
         return proposalNarrowing
           ? "提案に必要な情報がまだ不足しています。表示中の確認質問に回答して対象を絞り込んでください。回答を送信するたびに提案生成を再試行します。"
@@ -2382,6 +2408,31 @@ export default function InterviewPage() {
   // Issue #351 の「現在のシステム理解」。Issue #360 で **位置だけ** が状態に
   // よって変わるようになったので、JSX を 1 つの値にして 2 箇所から使い分ける
   // (描かれるのは常に 1 つ)。中身・表示密度・主操作の規則は #351 のまま。
+  // UX 監査 2026-11-17 B3: 開発者がまだ 1 度も発言しておらず、理解の構築
+  // 失敗が例外カードに出ている間、会話欄にあるのはシステムが記録した失敗の
+  // 発言だけで、例外カードと同じ失敗を繰り返す (§4.4)。その間は「システムの
+  // 記録」として畳み、回答欄の下へ回す (回答欄を最初のビューへ入れるため)。
+  // 判定は発言者 (role) と例外の有無だけで、文言は読まない。
+  const collapseConversationLog = !!session
+    && understandingFailureShown
+    && userMessageCount === 0
+    && session.messages.length > 0;
+  const renderConversationMessages = () => (
+    <div className="space-y-2 max-h-[26rem] overflow-y-auto pr-1">
+      {(session?.messages ?? []).length === 0 ? (
+        <div className="text-sm text-muted-foreground">まだ会話はありません。</div>
+      ) : (session?.messages ?? []).map(m => (
+        <div key={m.id} className="rounded-md border p-3 text-sm">
+          <div className="flex items-center justify-between gap-2 mb-1">
+            <Badge variant={m.role === "assistant" ? "secondary" : "outline"}>{m.role}</Badge>
+            <span className="text-xs text-muted-foreground">{formatTimestamp(m.created_at)}</span>
+          </div>
+          <p className="whitespace-pre-wrap break-words">{m.content}</p>
+        </div>
+      ))}
+    </div>
+  );
+
   const understandingBriefPanel = session ? (
     <div data-help-id="interview.brief">
       <UnderstandingBriefPanel
@@ -2432,6 +2483,11 @@ export default function InterviewPage() {
     <PurposeFramePanel
       sessionId={selectedSessionId}
       initialNeedId={searchParams.get("purpose_need")}
+      // UX 監査 2026-11-17 B3: ブロッキング例外の間、またはゼロベース質問で
+      // 理解を組み立てている間は、この面の問いが主作業と競合する。位置
+      // (Brief の直後) は変えず、中身を閉じて見せる。Overview から特定の
+      // 問いを指して来たとき (`purpose_need`) は開いたまま。
+      deferred={cockpitWorkflowGate !== null && !searchParams.get("purpose_need")}
     />
   ) : null;
 
@@ -2444,29 +2500,19 @@ export default function InterviewPage() {
     // 画面上部の縦余白を詰める。ここで稼いだぶんがそのまま主作業面の上端を
     // 押し上げる。
     <div className="space-y-4" data-help-id="interview">
-      <div className="flex items-start justify-between gap-3 flex-wrap">
-        <div>
+      <div className="flex items-start justify-between gap-3 flex-wrap md:flex-nowrap">
+        {/* 右のセッション選択を下の行へ押し出さないよう、左は縮められる
+            (見出し行が収まらないときは、左の中でメタ情報だけが折り返す)。 */}
+        <div className="min-w-0 flex-1">
+          {/* 縦の予算 (UX 監査 2026-11-17 B3): セッション番号 / Snapshot /
+              ステータスは見出しと同じ行に並べる (#361 の常設表示はそのまま)。 */}
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
             <MessageSquareText className="h-6 w-6" /> インタビュー・コックピット
           </h1>
-          {/* 画面の説明はこれから始める人のためのもの。セッションが動いて
-              いる間は現在地カードと「次にやること」が同じことをより具体的に
-              言っているので出さない -- 3 行ぶんの高さは、そのまま主作業面を
-              画面外へ押し下げる代償になる (レビュー指摘 P1)。 */}
-          {!session && (
-            <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
-              理解の全体像を確認し、曖昧な箇所を順番に解消します。開始すると、
-              ドキュメントとコードの自動分析からシステム理解を構築し、確認と不足情報の
-              質問を経て提案生成へ進みます。
-            </p>
-          )}
-          {/* Issue #356 §1: セッション番号 / Snapshot 番号 / ステータス。
-              Issue #361 でここが唯一の常設表示になった (右カラムのセッション
-              情報カードからは同じ 3 つを外した)。参加者・最終更新・根拠件数・
-              保存状態は補助情報の中で、このボタンから開く。 */}
           {session && (
             <div
-              className="mt-2 flex flex-wrap items-center gap-2"
+              className="flex flex-wrap items-center gap-2"
               data-testid="cockpit-header-meta"
               data-help-id="interview.session_selector"
             >
@@ -2483,6 +2529,22 @@ export default function InterviewPage() {
               </button>
             </div>
           )}
+          </div>
+          {/* 画面の説明はこれから始める人のためのもの。セッションが動いて
+              いる間は現在地カードと「次にやること」が同じことをより具体的に
+              言っているので出さない -- 3 行ぶんの高さは、そのまま主作業面を
+              画面外へ押し下げる代償になる (レビュー指摘 P1)。 */}
+          {!session && (
+            <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
+              理解の全体像を確認し、曖昧な箇所を順番に解消します。開始すると、
+              System Understanding の理解グラフからシステム理解を構築し(未構築なら
+              質問への回答から組み立て)、確認と不足情報の質問を経て提案生成へ進みます。
+            </p>
+          )}
+          {/* Issue #356 §1: セッション番号 / Snapshot 番号 / ステータス。
+              Issue #361 でここが唯一の常設表示になった (右カラムのセッション
+              情報カードからは同じ 3 つを外した)。参加者・最終更新・根拠件数・
+              保存状態は補助情報の中で、このボタンから開く。 */}
         </div>
         <div className="flex items-center gap-2" data-help-id="interview.session_selector">
           {/* 変更履歴への既存導線 (R6 の「履歴と監査情報」) を維持する。 */}
@@ -2591,8 +2653,10 @@ export default function InterviewPage() {
           <Card data-testid="work-surface-W0-A" data-help-id="interview.work_surface">
             <CardContent className="py-8 text-center space-y-3 text-sm">
               <p className="text-muted-foreground">
+                {/* UX 監査 2026-11-17 B4: snapshot の作成は理解の構築を始めない
+                    (理解グラフは System Understanding で構築する)。 */}
                 このリポジトリにはまだ snapshot がありません。Repository 画面で
-                snapshot を作成すると、システム理解の構築が自動で始まります。
+                snapshot を作成すると、インタビューを開始できます。
               </p>
               <Link
                 className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"
@@ -2645,7 +2709,15 @@ export default function InterviewPage() {
               <CardContent className="py-10 text-center space-y-3">
                 <p className="text-sm text-muted-foreground">
                   対象 snapshot: {workflow.latest_ready_snapshot_id ?? "-"}。
-                  開始すると、ドキュメントとコードの自動分析からシステム理解の構築が始まります。
+                  開始すると、この snapshot の理解グラフをもとにシステム理解の構築が始まります。
+                  理解グラフが未構築でも開始でき、その場合は質問への回答から理解を組み立てます。
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  理解グラフは{" "}
+                  <Link className="underline underline-offset-2" to="/system-understanding">
+                    System Understanding
+                  </Link>
+                  {" "}で構築できます。
                 </p>
                 <Button
                   onClick={startSession}
@@ -2665,9 +2737,6 @@ export default function InterviewPage() {
           {/* R1 — 現在地。全状態で 1 箇所のみ。「次にやること」が指す操作は
               その状態の主操作そのもの (原則 P2)。進捗ステップも同じカードへ
               まとめる (§3.2 #9/#11/#50/#63 の統合)。 */}
-          <div id="discussion-contributions" data-testid="discussion-contributions" className="scroll-mt-4">
-            <InterviewContributions key={selectedSessionId} sessionId={selectedSessionId} />
-          </div>
           {workflow && (
             <div data-help-id="interview.workflow_state">
               <WorkflowLocationCard
@@ -2835,29 +2904,25 @@ export default function InterviewPage() {
                   data-testid={showUnderstandingWork ? "work-surface-W2" : "work-surface-W3"}
                   data-help-id="interview.work_surface"
                 >
-              <Card>
-                <CardHeader>
+              <Card data-testid="conversation-card">
+                {/* 縦の予算 (UX 監査 2026-11-17 B3): 見出しの余白を詰める。
+                    ゼロベース質問で理解を組み立てている間は、何をするかを
+                    現在地カードと status summary が既に言っているので説明文を
+                    出さない。 */}
+                <CardHeader className="px-4 pt-3 pb-2">
                   <CardTitle className="text-sm">会話</CardTitle>
-                  <CardDescription>
-                    {isProposalStage
-                      ? "ターンは固定スナップショットのコンテキストに基づきます。"
-                      : "システムからの確認・質問に回答すると、自動的に次の確認へ進みます。"}
-                  </CardDescription>
+                  {cockpitWorkflowGate !== "answer_from_scratch" && (
+                    <CardDescription data-testid="conversation-description">
+                      {isProposalStage
+                        ? "ターンは固定スナップショットのコンテキストに基づきます。"
+                        : "システムからの確認・質問に回答すると、自動的に次の確認へ進みます。"}
+                    </CardDescription>
+                  )}
                 </CardHeader>
-                <CardContent className="space-y-3">
-                  <div className="space-y-2 max-h-[26rem] overflow-y-auto pr-1">
-                    {session.messages.length === 0 ? (
-                      <div className="text-sm text-muted-foreground">まだ会話はありません。</div>
-                    ) : session.messages.map(m => (
-                      <div key={m.id} className="rounded-md border p-3 text-sm">
-                        <div className="flex items-center justify-between gap-2 mb-1">
-                          <Badge variant={m.role === "assistant" ? "secondary" : "outline"}>{m.role}</Badge>
-                          <span className="text-xs text-muted-foreground">{formatTimestamp(m.created_at)}</span>
-                        </div>
-                        <p className="whitespace-pre-wrap break-words">{m.content}</p>
-                      </div>
-                    ))}
-                  </div>
+                <CardContent className="space-y-3 px-4 pb-4">
+                  {/* UX 監査 2026-11-17 B3: 畳んだシステムの記録は回答欄の
+                      下へ回す (`collapseConversationLog`)。 */}
+                  {!collapseConversationLog && renderConversationMessages()}
 
                   {uiState === "preparing" ? (
                     <div className="rounded-md border p-4 text-sm text-muted-foreground flex items-center gap-2" data-testid="preparing-indicator">
@@ -2876,15 +2941,17 @@ export default function InterviewPage() {
                     </div>
                   ) : (
                     <>
-                      {uiState === "zero_base" && (
+                      {/* UX 監査 2026-11-17 B3: 理解の構築失敗が現在の例外
+                          (E3-a / E3-b) として出ている間は、失敗内容・影響・
+                          再試行は例外カードの 1 枠が担う (§4.4)。ここで同じ
+                          失敗文と last_error を重ねない。例外が無いのに理解が
+                          空のとき (構築は成功したが中身が無い) だけ案内する。 */}
+                      {uiState === "zero_base" && !understandingFailureShown && (
                         <div
                           className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-3 text-xs text-amber-900 dark:text-amber-100"
                           data-testid="zero-base-notice"
                         >
                           自動では十分なシステム理解を構築できませんでした。ゼロベースのインタビューに切り替えます。
-                          {session.last_error && (
-                            <div className="mt-1 font-mono break-words">{session.last_error}</div>
-                          )}
                         </div>
                       )}
                       {focusedQuestion && (
@@ -3022,7 +3089,10 @@ export default function InterviewPage() {
                       )}
                       <Textarea
                         ref={messageInputRef}
-                        rows={4}
+                        // 縦の予算 (UX 監査 2026-11-17 B3)。長い回答は自動で
+                        // スクロールできるので 3 行で足りる。
+                        rows={3}
+                        data-testid="conversation-answer-input"
                         value={message}
                         onChange={e => setMessage(e.target.value)}
                         placeholder={isProposalStage && unlocked && !proposalNarrowing
@@ -3056,6 +3126,14 @@ export default function InterviewPage() {
                         </div>
                       )}
                     </>
+                  )}
+                  {collapseConversationLog && (
+                    <details data-testid="conversation-system-log">
+                      <summary className="cursor-pointer text-xs text-muted-foreground">
+                        システムの記録 ({session.messages.length} 件)
+                      </summary>
+                      <div className="mt-2">{renderConversationMessages()}</div>
+                    </details>
                   )}
                 </CardContent>
               </Card>
@@ -3469,6 +3547,17 @@ git commit`}
                   onRetryQa={() => void refetchQaList()}
                   onGoToDetail={() => openCockpitTarget(["cockpit-detail-panel"])}
                 />
+              </div>
+
+              {/* 会話からの補足 (interest-led-interview-discussion)。状態の
+                  主操作ではない任意の相談・補足の入口なので、#358 の順序契約
+                  (現在地 → 例外 → status summary → 作業面 → 未解決事項 →
+                  全体像) の後ろに置く。現在地より上に置くと、競合する
+                  「次の一歩」がファーストビューの先頭に立つ (UX 監査
+                  2026-11-17 B3)。`#discussion-contributions` への遷移は
+                  上の effect が引き続き扱う。 */}
+              <div id="discussion-contributions" data-testid="discussion-contributions" className="scroll-mt-4">
+                <InterviewContributions key={selectedSessionId} sessionId={selectedSessionId} />
               </div>
             </div>
 

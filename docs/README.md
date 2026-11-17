@@ -101,6 +101,7 @@ Vision / Stakeholder Value
 | [課題・ソリューションの抽象化層の検討](02-challenges-and-decisions/improvement-plans/2026-09-27-knowledge-abstraction.md) | 2026-09-27、既存20件の検討と2候補の手動試行の導入判断 |
 | [System Understanding UX Gap Analysis](02-challenges-and-decisions/ux-gap-analysis-system-understanding.md) | 状態矛盾・導線・用語・テスト不足の調査と改善提案 |
 | [End-to-end UX Audit](02-challenges-and-decisions/end-to-end-ux-audit-2026-08-11.md) | 2026-08-11 時点の優先度付き UX 監査 |
+| [UX 監査 2026-11-17](02-challenges-and-decisions/ux-audit-2026-11-17.md) | 2026-11-17、入口・初回導線・連鎖の断点・確認操作の 54 件と 4 波の改善策 |
 
 ここにある課題は「現在も未解決」とは限らない。現行状態は Issue、コード、テスト、
 canonical contract を確認する。

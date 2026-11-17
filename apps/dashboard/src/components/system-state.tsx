@@ -70,15 +70,31 @@ export function SystemStateAction({
  * Issue #240: `phases[].label` (server-provided, Japanese) is now the
  * canonical label. This map is only the fallback used when a phase entry
  * has no `label` (older Control Server).
+ *
+ * UX audit 2026-11-17 A5: the header, the sidebar's group headings, and the
+ * Overview's improvement-loop rail all show the server's one stage name
+ * (`state_messages.PHASE_LABELS`). This fallback carries the same words.
  */
 export const USER_PHASE_LABELS: Record<UserPhase, string> = {
-  setup: "必要最低限の設定",
-  preparation: "分析準備",
-  instrumentation: "プローブ設定",
-  observation: "観測",
-  evaluation: "候補評価",
-  publish: "公開",
+  setup: "対象の登録",
+  preparation: "システムの理解",
+  instrumentation: "計測の組み込み",
+  observation: "実行時の観測",
+  evaluation: "候補の評価",
+  publish: "変更の公開",
 };
+
+/**
+ * The display name of one phase: the server's `phases[].label` when present,
+ * then the fallback map, then the raw token. Shared by the header strip and
+ * the sidebar headings so they cannot choose differently.
+ */
+export function userPhaseLabel(
+  phase: UserPhase,
+  phases: { phase: UserPhase; label?: string | null }[] | undefined,
+): string {
+  return phases?.find((p) => p.phase === phase)?.label || USER_PHASE_LABELS[phase] || phase;
+}
 
 /** Mirrors the server's fixed PHASE_ORDER (Issue #237; extended to 6 phases
  * by Issue #256) — a finite enum ordering, not client-side state derivation. */
@@ -119,9 +135,7 @@ export function UserPhaseIndicator() {
   // Issue #240: prefer the server-provided label for the current phase
   // (looked up from the same `phases` entries rendered below), falling back
   // to the fixed client-side map, then the raw token.
-  const currentPhaseLabel = data.phases.find((p) => p.phase === data.user_phase)?.label
-    ?? USER_PHASE_LABELS[data.user_phase]
-    ?? data.user_phase;
+  const currentPhaseLabel = userPhaseLabel(data.user_phase, data.phases);
   return (
     <>
     {/* Issue #466 (UX-14): ヘッダー幅 36rem〜64rem では現在のフェーズ名だけを示す。 */}

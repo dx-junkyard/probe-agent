@@ -479,7 +479,7 @@ class TestEstablishmentGate:
     ):
         """Even a request that satisfies every DOMAIN precondition (stable
         pin, linked evidence) may not establish through this endpoint: the
-        sanctioned path is POST /stabilization-packages/{id}/approve."""
+        sanctioned path is POST /stabilization/packages/{id}/approve."""
         token = _login(admin_client)
         system_id = _create_system(admin_client, token, "EN-API-EstGate")
         node = _create_node(admin_client, token, system_id, "gate")
@@ -507,7 +507,7 @@ class TestEstablishmentGate:
         assert r.status_code == 422, r.text
         detail = r.json()["detail"]
         assert detail["code"] == "establishment_via_stabilization_required"
-        assert "/stabilization-packages/" in detail["message"]
+        assert "/stabilization/packages/{package_id}/approve" in detail["message"]
 
         from app.routes.evolution_nodes import ROUTE_TRANSITION_REJECTION_CODES
 

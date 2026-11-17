@@ -226,9 +226,9 @@ describe("UX-09: ログイン後の復帰先はアプリ内に限る", () => {
     );
 
     expect(await screen.findByTestId("login-return-to")).toHaveTextContent("/experiments?experiment=3#decision");
-    fireEvent.change(screen.getByLabelText("Username"), { target: { value: "dev" } });
-    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "pw" } });
-    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Sign in" })); });
+    fireEvent.change(screen.getByLabelText("ユーザー名"), { target: { value: "dev" } });
+    fireEvent.change(screen.getByLabelText("パスワード"), { target: { value: "pw" } });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "ログイン" })); });
     expect(await screen.findByTestId("landed", {}, { timeout: 3000 })).toHaveTextContent("/experiments?experiment=3#decision");
   });
 
@@ -241,10 +241,10 @@ describe("UX-09: ログイン後の復帰先はアプリ内に限る", () => {
     const { default: LoginPage } = await import("@/pages/login");
     await renderWithAuth(<Routes><Route path="/login" element={<LoginPage />} /></Routes>, "/login");
     expect(await screen.findByTestId("auth-bootstrap-error")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Password")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("パスワード")).not.toBeInTheDocument();
     reachable = true;
     fireEvent.click(screen.getByTestId("auth-bootstrap-retry"));
-    expect(await screen.findByLabelText("Password")).toBeInTheDocument();
+    expect(await screen.findByLabelText("パスワード")).toBeInTheDocument();
   });
 });
 

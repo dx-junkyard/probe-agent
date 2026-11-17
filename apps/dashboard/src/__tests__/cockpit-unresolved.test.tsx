@@ -318,7 +318,7 @@ describe("nextStep の決定表", () => {
     expect(m.nextStep.targetTestIds).toEqual([]);
   });
 
-  it("種別は 4 値の有限集合に閉じている", () => {
+  it("種別は 5 値の有限集合に閉じている", () => {
     const kinds = new Set(
       [
         model({ understanding: fullUnderstanding(), gaps: [], openQuestions: [], qaItems: undefined, qaFetchStatus: "unavailable" }),
@@ -326,10 +326,12 @@ describe("nextStep の決定表", () => {
         model({ understanding: fullUnderstanding({ vision: [] }), gaps: [], openQuestions: [], qaItems: [] }),
         model({ understanding: fullUnderstanding(), gaps: [], openQuestions: [openQuestion({ question: "q", category: "api" })], qaItems: [] }),
         model({ understanding: fullUnderstanding(), gaps: [], openQuestions: [], qaItems: [] }),
+        model({ understanding: fullUnderstanding(), gaps: [], openQuestions: [], qaItems: [], workflowGate: "blocked" }),
+        model({ understanding: null, gaps: [], openQuestions: [], qaItems: [], workflowGate: "answer_from_scratch" }),
       ].map(m => m.nextStep.kind),
     );
     for (const kind of kinds) {
-      expect(["answer_question", "fix_category", "retry_qa", "state_primary"]).toContain(kind);
+      expect(["answer_question", "fix_category", "retry_qa", "state_primary", "resolve_exception"]).toContain(kind);
     }
   });
 });

@@ -8631,6 +8631,8 @@ class InterviewWorkflowFactsOut(BaseModel):
     blocking_failure_states: List[str] = []
     understanding_unconfirmed: bool
     open_required_questions: int
+    # Spec §2.2 row 7 「ゼロベース質問の未完」 (separate from the Q&A count).
+    zero_base_pending: bool = False
     outstanding_alignment_items: int
     proposals_needing_review: int
     proposals_generatable: bool
@@ -8679,6 +8681,12 @@ class InterviewWorkflowExceptionOut(BaseModel):
     detail: Optional[str] = None
     recovery_process_kind: Optional[str] = None
     recovery_condition: Optional[str] = None
+    # A prerequisite owned by ANOTHER screen that is missing right now, read
+    # from a persisted fact (never from the failure text). The Dashboard turns
+    # it into a link to that screen; it is not a recovery operation of this
+    # screen and passes no gate. `system_understanding_graph`: the session's
+    # snapshot has no persisted understanding graph.
+    prerequisite: Optional[Literal["system_understanding_graph"]] = None
 
 
 class InterviewWorkflowStateOut(BaseModel):

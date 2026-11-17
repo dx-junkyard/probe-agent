@@ -46,21 +46,21 @@ function SeverityIcon({ severity }: { severity: string }) {
 const CREATE_ISSUE_ACTION = "実装 issue を作成";
 
 const ISSUE_DRAFT_STATUS_LABELS: Record<IssueDraftStatus, string> = {
-  draft: "Draft",
-  copied: "Copied",
-  external_created: "Issue created",
-  closed: "Closed",
-  rejected: "Rejected",
+  draft: "下書き",
+  copied: "コピー済み",
+  external_created: "Issue 作成済み",
+  closed: "クローズ済み",
+  rejected: "却下",
 };
 
 function copyMarkdown(text: string) {
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(text).then(
-      () => toast.success("Markdown copied to clipboard"),
-      () => toast.error("Could not copy Markdown"),
+      () => toast.success("Markdown をクリップボードにコピーしました"),
+      () => toast.error("Markdown をコピーできませんでした"),
     );
   } else {
-    toast.error("Clipboard is not available");
+    toast.error("クリップボードを利用できません");
   }
 }
 
@@ -73,7 +73,7 @@ function IssueDraftDialog({ draftId, onClose }: { draftId: number | null; onClos
   return (
     <Dialog open={draftId != null} onOpenChange={(o) => { if (!o) onClose(); }}>
       <DialogHeader>
-        <DialogTitle>Issue draft</DialogTitle>
+        <DialogTitle>Issue 下書き</DialogTitle>
       </DialogHeader>
       {isLoading || !draft ? (
         <div className="space-y-2" data-testid="issue-draft-loading">
@@ -103,16 +103,16 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
       onSuccess: (updated) => {
         setExternalUrl(updated.external_url ?? "");
         setStatus(updated.status);
-        toast.success("GitHub issue created");
+        toast.success("GitHub Issue を作成しました");
       },
-      onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Could not create GitHub issue"),
+      onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "GitHub Issue を作成できませんでした"),
     });
   };
 
   const saveContent = () => {
     update.mutate(
       { id: draft.id, body: { title, body_markdown: body, status } },
-      { onSuccess: () => toast.success("Draft saved") },
+      { onSuccess: () => toast.success("下書きを保存しました") },
     );
   };
 
@@ -126,8 +126,8 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
         },
       },
       {
-        onSuccess: () => toast.success(externalUrl.trim() ? "External URL registered" : "External URL cleared"),
-        onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Could not register URL"),
+        onSuccess: () => toast.success(externalUrl.trim() ? "外部 Issue の URL を登録しました" : "外部 Issue の URL を解除しました"),
+        onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "URL を登録できませんでした"),
       },
     );
   };
@@ -137,21 +137,21 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
           {/* Issue #158: show which snapshot/commit the draft was generated from
               and whether that analysis is now stale relative to the latest snapshot. */}
           <div className="rounded-md border px-3 py-2 text-xs text-muted-foreground" data-testid="issue-draft-provenance">
-            Generated from{" "}
-            {draft.snapshot_id != null ? <>snapshot #{draft.snapshot_id}</> : "an unknown snapshot"}
-            {draft.commit_sha ? <> at <code className="font-mono">{draft.commit_sha.slice(0, 8)}</code></> : null}.
+            生成元:{" "}
+            {draft.snapshot_id != null ? <>Snapshot #{draft.snapshot_id}</> : "不明な Snapshot"}
+            {draft.commit_sha ? <>（<code className="font-mono">{draft.commit_sha.slice(0, 8)}</code>）</> : null}。
             {draft.stale && (
               <span
                 className="ml-1 font-medium text-amber-700 dark:text-amber-400"
                 data-testid="issue-draft-stale"
               >
-                {" "}The repository has a newer snapshot — this draft may be stale. Refresh
-                System Understanding and regenerate the draft before creating a new issue.
+                リポジトリに新しい Snapshot があるため、この下書きは古い可能性があります。
+                新しい Issue を作成する前に System Understanding を更新し、下書きを再生成してください。
               </span>
             )}
           </div>
           <div className="space-y-1.5">
-            <Label htmlFor="issue-draft-title">Title</Label>
+            <Label htmlFor="issue-draft-title">タイトル</Label>
             <Input
               id="issue-draft-title"
               value={title}
@@ -161,7 +161,7 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
           </div>
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">
-              <Label htmlFor="issue-draft-body">Markdown body</Label>
+              <Label htmlFor="issue-draft-body">Markdown 本文</Label>
               <Button
                 variant="outline"
                 size="sm"
@@ -169,7 +169,7 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
                 onClick={() => copyMarkdown(body)}
                 data-testid="issue-draft-copy"
               >
-                <Copy className="h-3 w-3 mr-1" /> Copy Markdown
+                <Copy className="h-3 w-3 mr-1" /> Markdown をコピー
               </Button>
             </div>
             <Textarea
@@ -183,7 +183,7 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
           </div>
           <div className="flex items-end gap-2">
             <div className="space-y-1.5">
-              <Label htmlFor="issue-draft-status">Status</Label>
+              <Label htmlFor="issue-draft-status">状態</Label>
               <Select
                 id="issue-draft-status"
                 value={status}
@@ -197,17 +197,17 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
               </Select>
             </div>
             <Button onClick={saveContent} disabled={update.isPending} data-testid="issue-draft-save">
-              Save
+              保存
             </Button>
           </div>
           <div className="space-y-1.5 border-t pt-4">
-            <Label htmlFor="issue-draft-url">External issue URL</Label>
+            <Label htmlFor="issue-draft-url">外部 Issue の URL</Label>
             {githubStatus.data?.available ? (
               <div className="flex items-center justify-between gap-2 rounded-md border px-3 py-2" data-testid="issue-draft-github-available">
                 <p className="text-xs text-muted-foreground">
-                  GitHub is configured for{" "}
-                  <code className="font-mono">{githubStatus.data.owner}/{githubStatus.data.repo}</code>.
-                  Create the issue directly, or paste an existing tracker URL below.
+                  GitHub の連携先は{" "}
+                  <code className="font-mono">{githubStatus.data.owner}/{githubStatus.data.repo}</code>{" "}
+                  です。ここで Issue を直接作成するか、既存の Issue の URL を下に貼り付けてください。
                 </p>
                 <Button
                   size="sm"
@@ -216,13 +216,13 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
                   disabled={createGithubIssue.isPending}
                   data-testid="issue-draft-create-github"
                 >
-                  Create GitHub issue
+                  GitHub Issue を作成
                 </Button>
               </div>
             ) : (
               <p className="text-xs text-muted-foreground" data-testid="issue-draft-github-unavailable">
-                Create the issue in your tracker (GitHub, GitLab, Jira, ...), then paste its URL here.
-                {githubStatus.data?.reason ? ` (${githubStatus.data.reason})` : ""}
+                利用中の Issue 管理ツール（GitHub、GitLab、Jira など）で Issue を作成し、その URL をここに貼り付けてください。
+                {githubStatus.data?.reason ? `（${githubStatus.data.reason}）` : ""}
               </p>
             )}
             <div className="flex gap-2">
@@ -239,7 +239,7 @@ function IssueDraftEditor({ draft }: { draft: IssueDraft }) {
                 disabled={update.isPending}
                 data-testid="issue-draft-register-url"
               >
-                Register
+                登録
               </Button>
             </div>
             {draft.external_url && (
@@ -273,7 +273,7 @@ function IssueDraftBadges({ drafts, onOpen }: { drafts: IssueDraftRef[]; onOpen:
               onClick={() => onOpen(d.id)}
               data-testid="gap-issue-draft-open"
             >
-              <FileText className="h-3 w-3 mr-1" /> Issue draft · {statusLabel}
+              <FileText className="h-3 w-3 mr-1" /> Issue 下書き · {statusLabel}
             </Button>
             {d.external_url && (
               <a
@@ -283,7 +283,7 @@ function IssueDraftBadges({ drafts, onOpen }: { drafts: IssueDraftRef[]; onOpen:
                 className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
                 data-testid="gap-issue-draft-url"
               >
-                <ExternalLink className="h-3 w-3" /> issue
+                <ExternalLink className="h-3 w-3" /> Issue
               </a>
             )}
           </div>
@@ -306,7 +306,7 @@ function GapCard({ gap, snapshotId, commitSha }: {
 
   const transition = (status: GapTriageStatus) => {
     if (!gap.gap_key || !gap.content_fingerprint) {
-      toast.error("Gap identity is missing. Refresh System Understanding.");
+      toast.error("Gap の識別情報がありません。System Understanding を更新してください。");
       return;
     }
     updateTriage.mutate(
@@ -316,9 +316,9 @@ function GapCard({ gap, snapshotId, commitSha }: {
         status,
       },
       {
-        onSuccess: () => toast.success(`Gap marked ${status}`),
+        onSuccess: () => toast.success(`Gap の判定を ${status} にしました`),
         onError: (e: unknown) => toast.error(
-          e instanceof Error ? e.message : "Could not update gap triage",
+          e instanceof Error ? e.message : "Gap の判定を更新できませんでした",
         ),
       },
     );
@@ -334,9 +334,9 @@ function GapCard({ gap, snapshotId, commitSha }: {
       {
         onSuccess: (draft) => {
           setOpenDraftId(draft.id);
-          toast.success("Issue draft generated");
+          toast.success("Issue 下書きを生成しました");
         },
-        onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Could not generate draft"),
+        onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "下書きを生成できませんでした"),
       },
     );
   };
@@ -346,7 +346,7 @@ function GapCard({ gap, snapshotId, commitSha }: {
       <div className="flex items-start gap-2">
         <SeverityIcon severity={gap.severity} />
         <div className="flex-1 min-w-0">
-          <p className="text-sm font-medium">{gap.title ?? gap.node_name ?? "Unknown gap"}</p>
+          <p className="text-sm font-medium">{gap.title ?? gap.node_name ?? "名称不明の Gap"}</p>
           <div className="flex flex-wrap items-center gap-1.5 mt-1">
             <Badge variant="outline" className="text-xs">{gap.gap_type}</Badge>
             <Badge variant={gap.severity === "warning" ? "secondary" : "outline"} className="text-xs">{gap.severity}</Badge>
@@ -368,7 +368,7 @@ function GapCard({ gap, snapshotId, commitSha }: {
 
       {gap.triage_reopen_reason && (
         <p className="text-xs text-amber-700 dark:text-amber-400 pl-6" data-testid="gap-triage-reopened">
-          Previous decision was reopened because this gap changed after it was triaged.
+          判定後にこの Gap の内容が変わったため、以前の判定を取り消して未判定に戻しました。
         </p>
       )}
 
@@ -392,7 +392,7 @@ function GapCard({ gap, snapshotId, commitSha }: {
             </div>
           ))}
           {gap.entrypoint_refs.map((er, i) => {
-            const label = [er.entrypoint_type, er.entrypoint_ref].filter(Boolean).join(": ") || "Unknown entrypoint";
+            const label = [er.entrypoint_type, er.entrypoint_ref].filter(Boolean).join(": ") || "不明な entrypoint";
             // Issue #176: carry the gap's capability key so Flow Explorer shows
             // a way back to the capability this gap was found under.
             const flowLink = er.entrypoint_type && er.entrypoint_ref
@@ -432,7 +432,7 @@ function GapCard({ gap, snapshotId, commitSha }: {
             disabled={updateTriage.isPending || !gap.gap_key}
             data-testid="gap-triage-acknowledge"
           >
-            Acknowledge
+            確認済みにする
           </Button>
         )}
         {triageStatus === "acknowledged" && (
@@ -445,7 +445,7 @@ function GapCard({ gap, snapshotId, commitSha }: {
               disabled={updateTriage.isPending}
               data-testid="gap-triage-dismiss"
             >
-              Dismiss
+              対応しない
             </Button>
             <Button
               variant="outline"
@@ -455,7 +455,7 @@ function GapCard({ gap, snapshotId, commitSha }: {
               disabled={updateTriage.isPending}
               data-testid="gap-triage-resolve"
             >
-              Resolve
+              解決済みにする
             </Button>
             <Button
               variant="ghost"
@@ -465,7 +465,7 @@ function GapCard({ gap, snapshotId, commitSha }: {
               disabled={updateTriage.isPending}
               data-testid="gap-triage-reopen"
             >
-              Reopen
+              未判定に戻す
             </Button>
           </>
         )}
@@ -478,7 +478,7 @@ function GapCard({ gap, snapshotId, commitSha }: {
             disabled={updateTriage.isPending}
             data-testid="gap-triage-reopen"
           >
-            Reopen
+            未判定に戻す
           </Button>
         )}
       </div>
@@ -499,7 +499,7 @@ function GapCard({ gap, snapshotId, commitSha }: {
                   data-testid="gap-create-issue"
                 >
                   <FilePlus2 className="h-3 w-3 mr-1" />
-                  {drafts.length > 0 ? "Open issue draft" : na.action}
+                  {drafts.length > 0 ? "Issue 下書きを開く" : na.action}
                 </Button>
               );
             }
@@ -576,11 +576,11 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
     return (
       <Card id="gap-worklist" data-testid="gap-worklist">
         <CardHeader>
-          <CardTitle className="text-base">Docs-Code Gaps</CardTitle>
+          <CardTitle className="text-base">Docs-code Gap</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-sm text-muted-foreground" data-testid="no-gaps-message">
-            No significant differences found between documentation and code.
+            ドキュメントとコードの間に大きな差分は見つかりませんでした。
           </p>
           <GapTrendSummary gapTrend={gapTrend} />
         </CardContent>
@@ -605,11 +605,11 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
   return (
     <Card id="gap-worklist" data-testid="gap-worklist">
       <CardHeader>
-        <CardTitle className="text-base">Docs-Code Gap Worklist</CardTitle>
+        <CardTitle className="text-base">Docs-code Gap 作業リスト</CardTitle>
         <CardDescription>
-          {openGaps.length} untriaged / {triagedCount} triaged ({gaps.length} total)
+          未判定 {openGaps.length} 件 / 判定済み {triagedCount} 件（全 {gaps.length} 件）
           {Object.entries(severityCounts).map(([sev, cnt]) => (
-            <span key={sev}> / {cnt} {sev}</span>
+            <span key={sev}> / {sev} {cnt} 件</span>
           ))}
         </CardDescription>
         <GapTrendSummary gapTrend={gapTrend} />
@@ -623,7 +623,7 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
             onClick={() => { setShowAll(false); setTypeFilter(null); setCapabilityFilter(null); }}
             data-testid="gap-filter-open"
           >
-            Untriaged ({openGaps.length})
+            未判定 ({openGaps.length})
           </Button>
           <Button
             variant={showAll ? "default" : "outline"}
@@ -632,7 +632,7 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
             onClick={() => { setShowAll(true); setTypeFilter(null); setCapabilityFilter(null); }}
             data-testid="gap-filter-all"
           >
-            All ({gaps.length})
+            すべて ({gaps.length})
           </Button>
         </div>
 
@@ -644,7 +644,7 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
             className="h-7 text-xs"
             onClick={() => setTypeFilter(null)}
           >
-            All types ({triageFiltered.length})
+            すべての種類 ({triageFiltered.length})
           </Button>
           {allTypes.map((t) => {
             const count = triageFiltered.filter((g) => (g.gap_type ?? "unknown") === t).length;
@@ -671,7 +671,7 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
               className="h-7 text-xs"
               onClick={() => setCapabilityFilter(null)}
             >
-              All capabilities
+              すべての Capability
             </Button>
             {allCapabilities.map((cap) => {
               const count = triageFiltered.filter((g) => g.capability_key === cap).length;
@@ -697,7 +697,7 @@ export function GapWorklist({ gaps, gapSummary, gapTrend, snapshotId, commitSha 
           ))}
           {filtered.length === 0 && (
             <p className="text-sm text-muted-foreground" data-testid="gap-filter-empty">
-              No gaps match the current filter.
+              現在の絞り込みに一致する Gap はありません。
             </p>
           )}
         </div>

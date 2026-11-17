@@ -255,4 +255,83 @@ describe("CellFabricPage", () => {
       );
     });
   });
+
+  // B9 (UX 監査 2026-11-17)
+  function emptyDigest(): CellRootDigestOut {
+    const d = makeDigest();
+    d.digest.conclusion.overall_severity = "ok";
+    d.digest.conclusion.counts = {
+      orchestrators: 0,
+      tasks: {},
+      escalations_open_by_severity: { sev1: 0, sev2: 0, sev3: 0 },
+      asks_open: 0,
+    };
+    d.digest.conclusion.top_risks = [];
+    return d;
+  }
+
+  test("Cell が 0 件なら「リスクはありません」と断定せず、Cell の作られ方を案内する", async () => {
+    getImpl = (path: string) => {
+      if (path === "/cell-fabric/root-digest") return Promise.resolve(emptyDigest());
+      if (path === "/cell-fabric/cells") return Promise.resolve({ system_id: 1, cells: [] });
+      if (path === "/cell-fabric/asks?status=open") return Promise.resolve({ system_id: 1, asks: [] });
+      return Promise.resolve(undefined);
+    };
+    const { default: CellFabricPage } = await import("@/pages/cell-fabric");
+    render(<CellFabricPage />, { wrapper: createWrapper() });
+
+    const noCells = await screen.findByTestId("cell-fabric-no-cells");
+    expect(noCells).toHaveTextContent("Probe Cell がまだありません");
+    expect(noCells).toHaveTextContent("承認済みの Probe Point / Probe Pattern");
+    expect(screen.queryByText(/重大なリスク\(sev1\)はありません/)).not.toBeInTheDocument();
+  });
+
+  test("Cell があり sev1 が無ければ、従来どおり「重大なリスクはありません」", async () => {
+    getImpl = (path: string) => {
+      if (path === "/cell-fabric/root-digest") return Promise.resolve(emptyDigest());
+      if (path === "/cell-fabric/cells") return Promise.resolve({ system_id: 1, cells: [{ cell_id: "worker-a" }] });
+      if (path === "/cell-fabric/asks?status=open") return Promise.resolve({ system_id: 1, asks: [] });
+      return Promise.resolve(undefined);
+    };
+    const { default: CellFabricPage } = await import("@/pages/cell-fabric");
+    render(<CellFabricPage />, { wrapper: createWrapper() });
+
+    expect(await screen.findByTestId("cell-fabric-no-sev1")).toHaveTextContent("重大なリスク(sev1)はありません");
+    expect(screen.queryByTestId("cell-fabric-no-cells")).not.toBeInTheDocument();
+  });
+
+  test("Ask 一覧の取得失敗は再試行付きのエラーで、「未対応の Ask はありません」を出さない", async () => {
+    getImpl = (path: string) => {
+      if (path === "/cell-fabric/root-digest") return Promise.resolve(makeDigest());
+      if (path === "/cell-fabric/cells") return Promise.resolve({ system_id: 1, cells: [{ cell_id: "worker-a" }] });
+      if (path === "/cell-fabric/asks?status=open") return Promise.reject(new ApiError(500, "db down"));
+      return Promise.resolve(undefined);
+    };
+    const { default: CellFabricPage } = await import("@/pages/cell-fabric");
+    render(<CellFabricPage />, { wrapper: createWrapper() });
+
+    const alert = await screen.findByTestId("cell-fabric-asks-error");
+    expect(alert).toHaveTextContent("Ask 一覧を取得できませんでした");
+    expect(within(alert).getByRole("button", { name: "再試行" })).toBeInTheDocument();
+    expect(screen.queryByTestId("cell-fabric-asks-empty")).not.toBeInTheDocument();
+    expect(screen.queryByText(/未対応のAskはありません/)).not.toBeInTheDocument();
+  });
+
+  test("Ask の判断に失敗した toast はサーバーの理由を出し、String(e) をそのまま出さない", async () => {
+    const { toast } = await import("sonner");
+    const ask = makeAsk({ id: 9 });
+    getImpl = (path: string) => {
+      if (path === "/cell-fabric/root-digest") return Promise.resolve(makeDigest());
+      if (path === "/cell-fabric/cells") return Promise.resolve({ system_id: 1, cells: [{ cell_id: "worker-a" }] });
+      if (path === "/cell-fabric/asks?status=open") return Promise.resolve({ system_id: 1, asks: [ask] });
+      return Promise.resolve(undefined);
+    };
+    mockApi.post.mockRejectedValue(new ApiError(409, "Ask は既に判断済みです"));
+    const { default: CellFabricPage } = await import("@/pages/cell-fabric");
+    render(<CellFabricPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(within(await screen.findByTestId("cell-ask-9")).getByText("却下"));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Ask を更新できませんでした: Ask は既に判断済みです"));
+    expect(toast.error).not.toHaveBeenCalledWith(expect.stringContaining("Error:"));
+  });
 });

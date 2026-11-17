@@ -46,7 +46,7 @@ function ThemeToggle({ asMenuItem = false }: { asMenuItem?: boolean }) {
     );
   }
   return (
-    <Button variant="ghost" size="icon" onClick={toggle} title="Toggle theme" aria-label={dark ? "ライトテーマにする" : "ダークテーマにする"}>
+    <Button variant="ghost" size="icon" onClick={toggle} title={dark ? "ライトテーマにする" : "ダークテーマにする"} aria-label={dark ? "ライトテーマにする" : "ダークテーマにする"}>
       {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
     </Button>
   );
@@ -221,7 +221,7 @@ export function Header({
       navigate(location.pathname, { replace: true });
       selectSystem(sys.id);
       setShowCreate(false);
-      toast.success("System created");
+      toast.success("System を作成しました");
     } catch (err) {
       toast.error(String(err));
     }
@@ -300,7 +300,7 @@ export function Header({
               size="sm"
               className="shrink-0"
               onClick={() => setShowCreate(true)}
-              title="New system"
+              title="System を作成"
               data-testid="header-create-system-button"
             >
               <Plus className="h-4 w-4" />
@@ -313,7 +313,7 @@ export function Header({
             size="icon"
             className="hidden shrink-0 @3xl:inline-flex"
             onClick={() => setShowCreate(true)}
-            title="New system"
+            title="System を作成"
             aria-label="System を作成"
             data-testid="header-create-system-button"
           >
@@ -342,7 +342,7 @@ export function Header({
               )}
             </span>
           )}
-          <Button variant="ghost" size="icon" onClick={requestLogout} title="Logout" aria-label="ログアウト">
+          <Button variant="ghost" size="icon" onClick={requestLogout} title="ログアウト" aria-label="ログアウト">
             <LogOut className="h-4 w-4" />
           </Button>
         </div>
@@ -379,23 +379,23 @@ export function Header({
 
       <Dialog open={showCreate} onOpenChange={setShowCreate}>
         <DialogHeader>
-          <DialogTitle>Create System</DialogTitle>
+          <DialogTitle>System を作成</DialogTitle>
         </DialogHeader>
         <form onSubmit={handleCreate} className="space-y-4">
           <div>
-            <Label htmlFor="name">Name *</Label>
+            <Label htmlFor="name">名前（必須）</Label>
             <Input id="name" name="name" required />
           </div>
           <div>
-            <Label htmlFor="environment">Environment</Label>
-            <Input id="environment" name="environment" placeholder="production" />
+            <Label htmlFor="environment">環境</Label>
+            <Input id="environment" name="environment" placeholder="例: production" />
           </div>
           <div>
-            <Label htmlFor="description">Description</Label>
+            <Label htmlFor="description">説明</Label>
             <Input id="description" name="description" />
           </div>
           <Button type="submit" disabled={createSystem.isPending} className="w-full">
-            {createSystem.isPending ? "Creating..." : "Create"}
+            {createSystem.isPending ? "作成しています…" : "作成する"}
           </Button>
         </form>
       </Dialog>

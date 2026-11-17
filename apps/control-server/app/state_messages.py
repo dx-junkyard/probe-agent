@@ -490,15 +490,22 @@ DIAGNOSTIC_STATE_ACTION_LABEL_TEMPLATE = "「{title}」を修正"
 # observation / evaluation / publish); "preparation"'s label was also
 # updated since it used to read as "prep for diagnosis" ("診断準備"), which
 # no longer makes sense with "diagnosis" gone from the phase model.
+#
+# UX audit 2026-11-17 A5: this table is the ONE name of each stage. The
+# header's phase strip, the sidebar's group headings, and the Overview's
+# improvement-loop rail (`overview_projection.LOOP_STAGE_LABELS`, which is
+# this dict) all display these words, so the same stage is never called
+# 「必要最低限の設定」 in one place and 「Setup: 対象を登録する」 in another.
+# The Dashboard's USER_PHASE_LABELS fallback mirrors it verbatim.
 # ---------------------------------------------------------------------------
 
 PHASE_LABELS: Dict[str, str] = {
-    "setup": "必要最低限の設定",
-    "preparation": "分析準備",
-    "instrumentation": "プローブ設定",
-    "observation": "観測",
-    "evaluation": "候補評価",
-    "publish": "公開",
+    "setup": "対象の登録",
+    "preparation": "システムの理解",
+    "instrumentation": "計測の組み込み",
+    "observation": "実行時の観測",
+    "evaluation": "候補の評価",
+    "publish": "変更の公開",
 }
 
 

@@ -468,6 +468,25 @@ def _settle_initial_build(session_id: int, *, ok: bool = True):
             finish_process_run(conn, row["id"], ok=ok, error=None if ok else "build failed")
 
 
+def _store_understanding_content(session_id: int):
+    """Give the session an understanding with content.
+
+    Without it the zero-base questions remain material to continue with, so
+    an understanding failure is the degraded `E3-b` (spec §5.1). Tests that
+    need the blocking `E3-a` start from an understanding the failed update
+    would have had to replace.
+    """
+    import json as _json
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE interview_session SET current_understanding = ? WHERE id = ?",
+            (_json.dumps({"system_purpose": [{"name": "P"}]}), session_id),
+        )
+
+
 def test_w0a_without_snapshot_and_w0b_with_one(admin_client, tmp_path):
     token = _login(admin_client)
     system_id = _create_system(admin_client, token, "No Snapshot")
@@ -536,6 +555,7 @@ def test_failed_run_lands_on_its_target_state_and_a_later_success_resolves_it(
     token, system_id, snapshot_id = _setup(admin_client, tmp_path)
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
+    _store_understanding_content(session_id)
 
     with get_conn() as conn:
         run_id = start_process_run(conn, session_id, system_id, "understanding_build")
@@ -585,6 +605,78 @@ def test_understanding_failure_is_degraded_when_a_question_remains(
     assert state["rule_row"] == 7
     codes = {(e["code"], e["severity"]) for e in state["exceptions"]}
     assert ("E3-b", "degraded") in codes
+
+
+def test_rule_row_7_zero_base_questions_pending():
+    facts = WorkflowFacts(**{**_ready(), "zero_base_pending": True})
+    assert evaluate_candidate_state(facts) == ("W3", 7)
+
+
+def test_first_build_failure_continues_through_zero_base_until_confirmed(
+    admin_client, tmp_path
+):
+    """UX audit 2026-11-17 B3 (spec §5.1 / §2.2 row 7): with no understanding
+    content, the zero-base questions are the remaining material, so the
+    failure degrades (`E3-b`) and the screen is `W3` with ONE primary action
+    -- answering. The developer's manual confirmation finishes the zero-base
+    path; the failure itself is never marked solved by it."""
+    from app.db import get_conn
+    from app.interview_workflow import finish_process_run, start_process_run
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Zero Base")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+
+    with get_conn() as conn:
+        run_id = start_process_run(conn, session_id, system_id, "understanding_build")
+        finish_process_run(conn, run_id, ok=False, error="graph missing")
+
+    state = _state(admin_client, headers, session_id)
+    assert (state["state"], state["rule_row"]) == ("W3", 7)
+    assert state["primary_action"] == "submit_answer"
+    assert state["facts"]["zero_base_pending"] is True
+    assert state["facts"]["open_required_questions"] == 0
+    exc = [e for e in state["exceptions"] if e["code"] == "E3-b"]
+    assert exc and exc[0]["severity"] == "degraded"
+    assert "提示できる質問もありません" not in exc[0]["message"]
+    assert exc[0]["prerequisite"] == "system_understanding_graph"
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE interview_session SET understanding_confirmed_at = ? WHERE id = ?",
+            (time.time(), session_id),
+        )
+    after = _state(admin_client, headers, session_id)
+    assert after["facts"]["zero_base_pending"] is False
+    assert after["state"] != "W3"
+
+
+def test_graph_prerequisite_is_absent_once_the_snapshot_graph_exists(
+    admin_client, tmp_path
+):
+    from app.db import get_conn
+    from app.interview_workflow import finish_process_run, start_process_run
+
+    token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Graph Built")
+    headers = _headers(token, system_id)
+    session_id = _create_session(admin_client, headers, snapshot_id)
+    with get_conn() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(understanding_graph_snapshots)")}
+        values = {"system_id": system_id, "snapshot_id": snapshot_id, "graph_json": "{}"}
+        for col in ("created_at", "updated_at"):
+            if col in cols:
+                values[col] = time.time()
+        conn.execute(
+            f"INSERT INTO understanding_graph_snapshots ({', '.join(values)}) "
+            f"VALUES ({', '.join('?' for _ in values)})",
+            tuple(values.values()),
+        )
+        run_id = start_process_run(conn, session_id, system_id, "understanding_build")
+        finish_process_run(conn, run_id, ok=False, error="provider error")
+
+    state = _state(admin_client, headers, session_id)
+    exc = [e for e in state["exceptions"] if e["code"] == "E3-b"]
+    assert exc and exc[0]["prerequisite"] is None
 
 
 def test_stale_running_record_is_swept_into_a_failure(admin_client, tmp_path, monkeypatch):
@@ -859,6 +951,7 @@ def test_suspend_shows_w7_without_progress_and_resume_restores_the_failure(
     token, system_id, snapshot_id = _setup(admin_client, tmp_path)
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
+    _store_understanding_content(session_id)
 
     with get_conn() as conn:
         run_id = start_process_run(conn, session_id, system_id, "understanding_build")
@@ -1179,9 +1272,15 @@ def test_creating_a_session_actually_starts_the_build(
 
     Creating a session through the API alone -- no Dashboard, no follow-up
     call -- must perform the investigation and leave a finished outcome. With
-    no reasoning model configured that outcome is a failure, which is the
-    correct, recoverable `E3-a`; the point is that the state stops being
-    「システムが調べている」 without anyone sending another request.
+    no reasoning model configured that outcome is a failure; the point is that
+    the state stops being 「システムが調べている」 without anyone sending
+    another request.
+
+    UX audit 2026-11-17 B3: a first build that fails leaves no understanding,
+    so the zero-base questions are the material to continue with (spec §5.1,
+    §2.2 row 7). That is the degraded `E3-b` at `W3`, never `E3-a` -- the
+    blocking card used to say 「提示できる質問もありません」 above a
+    conversation that was asking the first zero-base question.
     """
     monkeypatch.setenv("PROBE_INTERVIEW_EAGER_INITIAL_BUILD", "1")
     from app.db import get_conn
@@ -1207,9 +1306,17 @@ def test_creating_a_session_actually_starts_the_build(
     ]
 
     state = _state(admin_client, headers, session_id)
-    assert state["state"] != "W1"
-    assert state["facts"]["blocking_failure_states"] == ["W2"]
-    assert [e["code"] for e in state["exceptions"] if e["severity"] == "blocking"] == ["E3-a"]
+    assert state["state"] == "W3"
+    assert state["rule_row"] == 7
+    assert state["primary_action"] == "submit_answer"
+    assert state["facts"]["blocking_failure_states"] == []
+    assert state["facts"]["zero_base_pending"] is True
+    assert not [e for e in state["exceptions"] if e["severity"] == "blocking"]
+    degraded = [e for e in state["exceptions"] if e["severity"] == "degraded"]
+    assert [e["code"] for e in degraded] == ["E3-b"]
+    # B4: the snapshot has no understanding graph, which is owned by another
+    # screen -- reported as a finite prerequisite, not left to the error text.
+    assert degraded[0]["prerequisite"] == "system_understanding_graph"
 
 
 def test_a_failed_dispatch_becomes_a_recoverable_failure_immediately(
@@ -1237,10 +1344,11 @@ def test_a_failed_dispatch_becomes_a_recoverable_failure_immediately(
     session_id = r.json()["id"]
 
     state = _state(admin_client, headers, session_id)
-    assert state["state"] == "W2"
-    assert state["facts"]["blocking_failure_states"] == ["W2"]
-    blocking = [e for e in state["exceptions"] if e["severity"] == "blocking"]
-    assert blocking and "初期調査を開始できませんでした" in (blocking[0]["detail"] or "")
+    # No understanding was built, so the zero-base path carries on (`E3-b`).
+    assert state["state"] == "W3"
+    assert state["facts"]["blocking_failure_states"] == []
+    degraded = [e for e in state["exceptions"] if e["severity"] == "degraded"]
+    assert degraded and "初期調査を開始できませんでした" in (degraded[0]["detail"] or "")
 
 
 def test_overlapping_runs_of_one_kind_never_share_a_record(admin_client, tmp_path):
@@ -1405,6 +1513,7 @@ def test_a_later_finishing_run_resolves_an_earlier_failure(admin_client, tmp_pat
     token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Overlap")
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
+    _store_understanding_content(session_id)
 
     with get_conn() as conn:
         first = start_process_run(conn, session_id, system_id, "understanding_build")
@@ -1434,6 +1543,7 @@ def test_a_stale_swept_run_is_corrected_by_its_real_outcome(admin_client, tmp_pa
     token, system_id, snapshot_id = _setup(admin_client, tmp_path, "Stale Repair")
     headers = _headers(token, system_id)
     session_id = _create_session(admin_client, headers, snapshot_id)
+    _store_understanding_content(session_id)
 
     with get_conn() as conn:
         run_id = start_process_run(conn, session_id, system_id, "understanding_build")
