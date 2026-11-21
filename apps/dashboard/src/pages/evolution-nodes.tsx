@@ -10,8 +10,10 @@
 //
 // 1. The client re-derives nothing. Maturity, the legality of a transition,
 //    and every rejection reason come from the server. The page holds no copy
-//    of the transition table -- when a transition is refused it renders the
-//    server's finite `code` plus the server's message.
+//    of the transition table -- when a transition is refused it renders a
+//    fixed Japanese sentence keyed by the server's finite `code` (the code
+//    itself stays visible as a small note), falling back to the server's
+//    message for a code the table does not know (UX audit 2026-11-17 C6).
 // 2. The four axes stay four readings (ADR-6). `maturity`,
 //    `improvement_status` and `policy_mode` are shown side by side and never
 //    merged into one status word. The fourth axis is absent from the server
@@ -20,6 +22,7 @@
 //    null) and 「未リンク」 are three different sentences (#380). A value that
 //    could not be read is never displayed as zero, empty, or "none".
 import { useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   useEvolutionNodes, useEvolutionNode, useEvolutionNodeEvents,
   useCreateEvolutionNode, useTransitionEvolutionNode,
@@ -32,6 +35,12 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatTimestamp } from "@/lib/utils";
 import { toast } from "sonner";
+import {
+  describeTransitionRejection, type EvolutionTransitionRejection,
+} from "@/components/evolution-node/transition-rejection";
+import {
+  EVOLUTION_DECISION_LOCATIONS, decisionRowAnchor, decisionRowLabel, fillNodeId,
+} from "@/components/evolution-node/decision-locations";
 import type {
   EvolutionMaturityState, EvolutionNodeProjectionOut, EvolutionNodeEventOut,
 } from "@/api/types";
@@ -141,7 +150,7 @@ function NodeDetail({ projection }: { projection: EvolutionNodeProjectionOut }) 
   const transition = useTransitionEvolutionNode(projection.node_id);
   const [target, setTarget] = useState<EvolutionMaturityState>("validating");
   const [reason, setReason] = useState("");
-  const [rejection, setRejection] = useState<{ code: string; message: string } | null>(null);
+  const [rejection, setRejection] = useState<EvolutionTransitionRejection | null>(null);
 
   const version = projection.current_version;
   const implementation = projection.current_implementation;
@@ -160,14 +169,11 @@ function NodeDetail({ projection }: { projection: EvolutionNodeProjectionOut }) 
           );
         },
         onError: (error) => {
-          // The server's finite rejection code, shown as-is. The page holds
-          // no transition table of its own, so it can neither pre-empt this
-          // nor paraphrase it.
+          // The server's finite rejection code decides the sentence; the
+          // page holds no transition table of its own, so it never pre-empts
+          // a refusal. Unknown codes fall back to the server's message.
           const apiError = error as ApiError;
-          setRejection({
-            code: apiError.code ?? "unknown",
-            message: apiError.detail || "遷移できませんでした",
-          });
+          setRejection(describeTransitionRejection(apiError.code, apiError.detail));
         },
       },
     );
@@ -332,13 +338,31 @@ function NodeDetail({ projection }: { projection: EvolutionNodeProjectionOut }) 
             {transition.isPending ? "送信中…" : "遷移を要求する"}
           </Button>
           {rejection && (
-            <div className="rounded border border-destructive p-3 text-sm">
-              <div className="font-mono text-xs text-destructive">{rejection.code}</div>
+            <div
+              role="alert"
+              className="rounded border border-destructive p-3 text-sm"
+              data-testid="evolution-transition-rejection"
+            >
+              <div className="font-medium text-destructive">遷移できませんでした</div>
               <div className="mt-1">{rejection.message}</div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                拒否コード: <span className="font-mono">{rejection.code}</span>
+              </div>
+              {rejection.decision && (
+                <a
+                  href={`#${decisionRowAnchor(rejection.decision)}`}
+                  className="mt-1 inline-block text-xs underline"
+                  data-testid="evolution-transition-rejection-decision"
+                >
+                  「{decisionRowLabel(rejection.decision)}」をどこで行えるかを見る
+                </a>
+              )}
             </div>
           )}
         </CardContent>
       </Card>
+
+      <DecisionLocationsCard nodeId={projection.node_id} />
 
       <Card>
         <CardHeader>
@@ -375,21 +399,133 @@ function NodeDetail({ projection }: { projection: EvolutionNodeProjectionOut }) 
   );
 }
 
+/** UX audit 2026-11-17 C7: which decisions about this Node can be made
+ * where. A fixed table of code facts (not a server state verdict), shown so
+ * the developer can tell what is "画面未対応（API のみ）" until #401 builds the
+ * lifecycle screens. Rows never change with the Node's state. */
+function DecisionLocationsCard({ nodeId }: { nodeId: number }) {
+  return (
+    <Card data-testid="evolution-decision-locations">
+      <CardHeader>
+        <CardTitle>この Node で行える判断</CardTitle>
+        <CardDescription>
+          判断ごとに、どこで行えるかを示します。「画面未対応（API のみ）」の判断は、
+          lifecycle 画面の統合（#401）までは API を直接呼んで行います。いずれの判断も
+          人間の判断（decision_method: manual）として記録されます。
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b text-left text-xs text-muted-foreground">
+              <th scope="col" className="py-2 pr-2">判断</th>
+              <th scope="col" className="py-2">どこで行えるか</th>
+            </tr>
+          </thead>
+          <tbody>
+            {EVOLUTION_DECISION_LOCATIONS.map((row) => (
+              <tr
+                key={row.id}
+                id={decisionRowAnchor(row.id)}
+                className="border-b align-top"
+                data-testid={`evolution-decision-${row.id}`}
+              >
+                <td className="py-2 pr-2">{row.label}</td>
+                <td className="py-2 space-y-1">
+                  {row.location.kind === "this_screen" ? (
+                    <>
+                      <Badge variant="success">この画面でできる</Badge>
+                      <div className="text-xs text-muted-foreground">{row.location.note}</div>
+                    </>
+                  ) : row.location.kind === "flow_agents" ? (
+                    <>
+                      <Badge variant="secondary">Flow・エージェント群でできる</Badge>
+                      <div className="text-xs">
+                        <Link to={row.location.to} className="underline">
+                          Flow・エージェント群を開く
+                        </Link>
+                      </div>
+                      <div className="text-xs text-muted-foreground">{row.location.note}</div>
+                    </>
+                  ) : (
+                    <>
+                      <Badge variant="outline">画面未対応（API のみ）</Badge>
+                      <ul className="text-xs">
+                        {row.location.endpoints.map((endpoint) => (
+                          <li key={endpoint} className="font-mono">
+                            {fillNodeId(endpoint, nodeId)}
+                          </li>
+                        ))}
+                      </ul>
+                      {row.location.note && (
+                        <div className="text-xs text-muted-foreground">{row.location.note}</div>
+                      )}
+                    </>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** The selection, resolved from the URL (`?node=<node_key>`).
+ *
+ * The URL is the only source of the selection (dashboard SKILL「選択は URL が
+ * 唯一の正本」): Functional Lineage links here as `/evolution-nodes?node=<key>`,
+ * and a click in the list writes the same parameter. A key that is not in
+ * the list never falls back to some other Node -- selecting a substitute would
+ * show a different Node as the one the link named. */
+type NodeSelection =
+  | { kind: "none" }
+  | { kind: "pending"; nodeKey: string }
+  | { kind: "list_unavailable"; nodeKey: string }
+  | { kind: "not_found"; nodeKey: string }
+  | { kind: "selected"; nodeKey: string; nodeId: number };
+
 export default function EvolutionNodesPage() {
   const nodes = useEvolutionNodes();
   const createNode = useCreateEvolutionNode();
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
   const [newKey, setNewKey] = useState("");
+
+  const requestedKey = searchParams.get("node");
+  const nodeList = nodes.data?.nodes ?? [];
+  const matched = requestedKey ? nodeList.find((n) => n.node_key === requestedKey) : undefined;
+  const selection: NodeSelection = !requestedKey
+    ? { kind: "none" }
+    : matched
+      ? { kind: "selected", nodeKey: requestedKey, nodeId: matched.id }
+      : nodes.isError && !nodes.data
+        ? { kind: "list_unavailable", nodeKey: requestedKey }
+        // While the list is loading or being refetched (e.g. right after a
+        // create invalidated it) a missing key is not yet "not found".
+        : nodes.isLoading || nodes.isFetching || !nodes.data
+          ? { kind: "pending", nodeKey: requestedKey }
+          : { kind: "not_found", nodeKey: requestedKey };
+  const selectedId = selection.kind === "selected" ? selection.nodeId : null;
   const detail = useEvolutionNode(selectedId);
+
+  const selectNode = (nodeKey: string | null) => {
+    const next = new URLSearchParams(searchParams);
+    if (nodeKey) next.set("node", nodeKey);
+    else next.delete("node");
+    // Pushed (not replaced) so the browser's back button returns to the
+    // previous selection.
+    setSearchParams(next);
+  };
 
   return (
     <div className="space-y-4">
       <div>
         <h1 className="text-xl font-semibold">Evolution Node</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          進化する処理単位の契約・実装方式・成熟度・lineage を確認します。これは
-          Phase 1 の読み取り中心の inspector です。設計・探索・運用の導線は
-          Phase 6 で統合されます。
+          進化する処理単位 (Node) の契約・実装方式・成熟度と、その変更記録を確認します。
+          この画面でできるのは、Node の作成、内容の確認、成熟度の変更の要求です。
+          契約 version・実装の登録や、固定化 (established) の承認はこの画面ではできません。
         </p>
       </div>
 
@@ -417,7 +553,7 @@ export default function EvolutionNodesPage() {
                 {
                   onSuccess: (node) => {
                     setNewKey("");
-                    setSelectedId(node.id);
+                    selectNode(node.node_key);
                     toast.success("Node を作成しました");
                   },
                   onError: (error) =>
@@ -456,7 +592,8 @@ export default function EvolutionNodesPage() {
                   <li key={node.id}>
                     <button
                       type="button"
-                      onClick={() => setSelectedId(node.id)}
+                      onClick={() => selectNode(node.node_key)}
+                      aria-pressed={node.id === selectedId}
                       className={`w-full rounded border p-2 text-left text-sm ${
                         node.id === selectedId ? "border-primary" : ""
                       }`}
@@ -474,10 +611,34 @@ export default function EvolutionNodesPage() {
         </Card>
 
         <div>
-          {selectedId === null ? (
+          {selection.kind === "none" ? (
             <Card>
               <CardContent className="p-6 text-sm text-muted-foreground">
                 左の一覧から Node を選択してください。
+              </CardContent>
+            </Card>
+          ) : selection.kind === "pending" ? (
+            <Skeleton className="h-64 w-full" />
+          ) : selection.kind === "list_unavailable" ? (
+            <Card>
+              <CardContent className="p-6 text-sm text-destructive" data-testid="evolution-node-selection-unavailable">
+                Node 一覧を取得できなかったため、node_key「
+                <span className="font-mono">{selection.nodeKey}</span>」の Node を表示できません。
+                <Button variant="link" size="sm" onClick={() => nodes.refetch()}>
+                  再試行
+                </Button>
+              </CardContent>
+            </Card>
+          ) : selection.kind === "not_found" ? (
+            <Card>
+              <CardContent className="space-y-2 p-6 text-sm" data-testid="evolution-node-selection-not-found">
+                <p>
+                  node_key「<span className="font-mono">{selection.nodeKey}</span>」の Node は
+                  この System にありません。別の Node は自動では選びません。
+                </p>
+                <Button variant="outline" size="sm" onClick={() => selectNode(null)}>
+                  選択を解除して一覧から選ぶ
+                </Button>
               </CardContent>
             </Card>
           ) : detail.isLoading ? (

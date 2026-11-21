@@ -732,6 +732,46 @@ describe("CockpitStatusSummary", () => {
     expect(screen.queryByTestId("cockpit-next-step-action")).toBeNull();
   });
 
+  // UX 監査 2026-11-17 B3: サーバー判定と競合する「次にやること」を出さない。
+  it("ブロッキング例外があるときは別の操作を主 CTA にしない", () => {
+    const m = model({
+      understanding: null,
+      gaps: [],
+      openQuestions: [],
+      qaItems: [],
+      workflowGate: "blocked",
+    });
+    // 理解が無いので本来なら「Vision を定義する」(fix_category) になる。
+    expect(m.missingCount).toBeGreaterThan(0);
+    expect(m.nextStep.kind).toBe("resolve_exception");
+    expect(m.nextStep.actionLabel).toBeNull();
+    expect(m.nextStep.targetTestIds).toEqual([]);
+  });
+
+  it("ゼロベース質問が未完のときは、未設定カテゴリより回答を先に指す", () => {
+    const m = model({
+      understanding: null,
+      gaps: [],
+      openQuestions: [],
+      qaItems: undefined,
+      qaFetchStatus: "unavailable",
+      workflowGate: "answer_from_scratch",
+    });
+    expect(m.nextStep.kind).toBe("state_primary");
+    expect(m.nextStep.title).toBe("表示中の質問に答える");
+    // 文言はページ側 (サーバーの主操作) が持つ。
+    expect(m.nextStep.actionLabel).toBeNull();
+  });
+
+  it("完成度 0% は「0% まで固まっています」と言わない", () => {
+    const m = model({ understanding: null, gaps: [], openQuestions: [], qaItems: [] });
+    expect(m.completionPercent).toBe(0);
+    render(<CockpitStatusSummary model={m} actionLabel={null} onRunNextStep={() => {}} />);
+    expect(screen.getByTestId("cockpit-completion-headline").textContent).toBe(
+      "理解の全体像はまだ固まっていません",
+    );
+  });
+
   it("CTA を押すと次にやることのハンドラが呼ばれる", () => {
     const onRun = vi.fn();
     const m = model({

@@ -186,9 +186,13 @@ describe("Mobile navigation Drawer at 390px (Issue #362)", () => {
 
     // The Drawer renders the very same nav list as the rail.
     const drawerNav = within(drawer).getByTestId("sidebar-nav");
-    for (const label of ["Overview", "Repository", "Interview", "Experiments", "GitHub"]) {
+    for (const label of ["Overview", "Repository", "Components / Traces", "GitHub"]) {
       expect(within(drawerNav).getByText(label)).toBeInTheDocument();
     }
+    // UX audit 2026-11-17 A7: Interview / AI Candidate Studio come from the
+    // purpose block (C13: candidates start in Candidate Studio).
+    expect(within(drawerNav).getByRole("link", { name: /現状を理解する/ })).toHaveAttribute("href", "/interview");
+    expect(within(drawerNav).getByRole("link", { name: /候補を比較評価する/ })).toHaveAttribute("href", "/candidate-studio");
     // Rail + Drawer: exactly two nav lists exist while open, never more.
     expect(screen.getAllByTestId("sidebar-nav")).toHaveLength(2);
 

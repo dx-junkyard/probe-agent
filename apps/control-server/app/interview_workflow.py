@@ -187,6 +187,12 @@ class WorkflowFacts:
     understanding_unconfirmed: bool = False
     # Rule 7.
     open_required_questions: int = 0
+    # Rule 7 -- spec §2.2 row 7's 「ゼロベース質問の未完」. The zero-base
+    # questions are the fixed path the Dashboard offers once an automatic
+    # build left no understanding content; they are finished only by the
+    # developer's manual confirmation (`understanding_confirmed_at`), so they
+    # have no `interview_qa` row and are a separate fact from the count above.
+    zero_base_pending: bool = False
     # Rule 9.
     outstanding_alignment_items: int = 0
     # Rule 11.
@@ -246,8 +252,9 @@ def evaluate_candidate_state(facts: WorkflowFacts) -> Tuple[str, int]:
     # 6: understanding present but unconfirmed (or capability re-confirmation).
     if facts.understanding_unconfirmed:
         return "W2", 6
-    # 7: a required question is still unanswered.
-    if facts.open_required_questions > 0:
+    # 7: a required question is still unanswered -- an open Q&A row, or the
+    #    zero-base questions not yet finished.
+    if facts.open_required_questions > 0 or facts.zero_base_pending:
         return "W3", 7
     # 8: unresolved blocking failure targeting W4 (E4-a).
     if "W4" in facts.blocking_failure_states:
@@ -379,7 +386,13 @@ def classify_failure(conn, session_id: int, system_id: int, process_kind: str) -
     remains at the moment of failure, NOT by which process failed.
 
     * understanding build/update -- blocking (`E3-a`) only when no question
-      can be offered; otherwise degraded (`E3-b`, the zero-base path).
+      can be offered; otherwise degraded (`E3-b`, the zero-base path). A
+      question can be offered when an open Q&A row exists OR the zero-base
+      questions apply, i.e. the session has no understanding content and the
+      developer has not confirmed one (`zero_base_offerable`). Counting only
+      Q&A rows made every first-build failure `E3-a` while the conversation
+      card was asking the zero-base questions -- the exception said 「提示
+      できる質問もありません」 next to a question.
     * alignment build -- blocking (`E4-a`) only on the first build, i.e. when
       no non-superseded item exists; otherwise degraded (`E4-b`).
     * diff generation -- always blocking (`E12` generation failure): with no
@@ -397,6 +410,12 @@ def classify_failure(conn, session_id: int, system_id: int, process_kind: str) -
             (session_id, system_id),
         ).fetchone()[0]
         if offerable > 0:
+            return "degraded", None
+        session = conn.execute(
+            """SELECT * FROM interview_session WHERE id = ? AND system_id = ?""",
+            (session_id, system_id),
+        ).fetchone()
+        if session is not None and zero_base_offerable(session):
             return "degraded", None
         return "blocking", target
 
@@ -717,6 +736,37 @@ def _has_understanding_content(understanding: Optional[dict]) -> bool:
     return False
 
 
+def _session_understanding(session) -> Optional[dict]:
+    import json as _json
+
+    raw = session["current_understanding"]
+    if not raw:
+        return None
+    try:
+        value = _json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def zero_base_offerable(session) -> bool:
+    """Whether the zero-base questions can carry the interview (spec §5.1).
+
+    Structural only: the session has no understanding content and the
+    developer has not confirmed one. The zero-base questions are exactly the
+    material that remains in that case, and the developer's manual
+    confirmation is what finishes them.
+    """
+    confirmed_at = (
+        session["understanding_confirmed_at"]
+        if "understanding_confirmed_at" in session.keys()
+        else None
+    )
+    return confirmed_at is None and not _has_understanding_content(
+        _session_understanding(session)
+    )
+
+
 def _latest_finished_runs(conn, session_id: int, system_id: int) -> List[dict]:
     """The most recent COMPLETED run of each process kind, one row per kind.
 
@@ -967,6 +1017,26 @@ def gather_facts(conn, system_id: int, session_id: Optional[int]) -> GatheredFac
         (session_id, system_id),
     ).fetchone()[0]
 
+    # Spec §2.2 row 7 「ゼロベース質問の未完」: the automatic build was
+    # attempted and left nothing to confirm, so the conversation now asks the
+    # fixed zero-base questions. "Attempted" is read from the same persisted
+    # facts the conversation surface uses (a recorded error or a stored-but-
+    # empty understanding) plus an unresolved understanding failure, so a
+    # failure that never reached `last_error` cannot drop the session out of
+    # `W3` either.
+    understanding_failed = any(
+        r["process_kind"] in ("understanding_build", "understanding_update")
+        for r in blocking + degraded
+    )
+    zero_base_pending = bool(
+        zero_base_offerable(session)
+        and (
+            ("last_error" in session.keys() and session["last_error"])
+            or session["current_understanding"] is not None
+            or understanding_failed
+        )
+    )
+
     facts = WorkflowFacts(
         has_snapshot=has_snapshot,
         has_session=True,
@@ -977,6 +1047,7 @@ def gather_facts(conn, system_id: int, session_id: Optional[int]) -> GatheredFac
         ),
         understanding_unconfirmed=understanding_unconfirmed,
         open_required_questions=open_questions,
+        zero_base_pending=zero_base_pending,
         outstanding_alignment_items=outstanding_alignment,
         proposals_needing_review=needing_review,
         proposals_generatable=proposals_generatable,

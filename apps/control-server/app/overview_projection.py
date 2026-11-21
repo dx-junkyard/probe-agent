@@ -62,6 +62,7 @@ from . import (
     purpose_needs,
     replay_readiness,
     state_facts,
+    state_messages,
     system_state,
     understanding_brief,
 )
@@ -200,17 +201,13 @@ FRESHNESS_LABELS: Dict[str, str] = {
 #: The six loop stages under the names the developer reads. The keys are
 #: `system_state.PHASE_ORDER` verbatim -- the mapping is a rename, not a
 #: second model, so the sidebar's user_phase and this rail can never disagree.
-LOOP_STAGE_LABELS: Dict[str, str] = {
-    "setup": "Setup: 対象を登録する",
-    "preparation": "Understand: システムを理解する",
-    "instrumentation": "Instrument: 計測を組み込む",
-    "observation": "Observe: 実行時を観測する",
-    "evaluation": "Evaluate: 候補を評価する",
-    "publish": "Publish: 変更を公開する",
-}
+#: UX audit 2026-11-17 A5: the names themselves are `state_messages.PHASE_LABELS`
+#: (the header and the sidebar headings read the same table), never a second
+#: wording of the same stage.
+LOOP_STAGE_LABELS: Dict[str, str] = dict(state_messages.PHASE_LABELS)
 
 LOOP_STAGE_MEANINGS: Dict[str, str] = {
-    "setup": "対象リポジトリを登録し、解析できる状態にします。",
+    "setup": "対象リポジトリを登録し、解析と推論に必要な設定を整えます。",
     "preparation": "このシステムが何のためにあり、何ができるかを、根拠つきで確定します。",
     "instrumentation": "確定した理解のどこを観測するかを決め、計測を組み込みます。",
     "observation": "実際の入出力・エラー・所要時間を受け取り、理解と突き合わせます。",
@@ -219,7 +216,13 @@ LOOP_STAGE_MEANINGS: Dict[str, str] = {
 }
 
 LOOP_STAGE_COMPLETION_HINT: Dict[str, str] = {
-    "setup": "解析できる snapshot が 1 件そろうこと。",
+    # UX audit 2026-11-17 A6: this sentence must state what actually ends
+    # the stage -- `derive_user_phase`'s `setup_complete` (repository
+    # registered AND no repository / database / auth / llm diagnostic is
+    # error/blocked). It used to say "a snapshot is ready", so a system with
+    # a ready snapshot but no reasoning model stayed here while the hint
+    # claimed its condition was already met.
+    "setup": "対象リポジトリを登録し、リポジトリ・データベース・認証・LLM(reasoning モデル)の設定に進行を止める問題が無いこと。",
     "preparation": "System Purpose と主要機能をあなたが確認済みにすること。",
     "instrumentation": "承認済みの計測経路が 1 本できること。",
     "observation": "実際の Trace を受信し続けている状態になること。",

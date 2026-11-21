@@ -7,12 +7,17 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { BlueprintLaneCellOut } from "@/api/types";
 import { BLUEPRINT_LANE_LABEL, LANE_STATE_LABEL } from "./model";
+import { STAKEHOLDER_ROLE_LABEL } from "@/components/stakeholder-network/model";
+import { StepLinkForms } from "./step-link-forms";
 
 export function BlueprintDetailPane({
+  journeyKey,
   stepKey,
   cell,
   onOpenRequirement,
 }: {
+  /** When given, the pane offers the Step's link forms (C1). */
+  journeyKey?: string | null;
   stepKey: string | null;
   cell: BlueprintLaneCellOut | null;
   onOpenRequirement?: (requirementKey: string) => void;
@@ -51,7 +56,7 @@ export function BlueprintDetailPane({
             <ul className="mt-1 space-y-1">
               {cell.stakeholder_links.map((link) => (
                 <li key={link.id} data-testid="blueprint-detail-stakeholder-link">
-                  {link.stakeholder_name ?? link.stakeholder_key} ({link.role})
+                  {link.stakeholder_name ?? link.stakeholder_key}({STAKEHOLDER_ROLE_LABEL[link.role]})
                   {link.recheck_state === "stale" ? (
                     <Badge variant="warning" className="ml-2">
                       要再確認
@@ -176,6 +181,15 @@ export function BlueprintDetailPane({
               ))}
             </ul>
           </div>
+        ) : null}
+
+        {journeyKey ? (
+          <StepLinkForms
+            key={`${journeyKey}:${stepKey}:${cell.lane_kind}`}
+            journeyKey={journeyKey}
+            stepKey={stepKey}
+            laneKind={cell.lane_kind}
+          />
         ) : null}
       </CardContent>
     </Card>

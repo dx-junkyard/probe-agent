@@ -58,10 +58,10 @@ export function useRepositoryConfiguredGate(): RepositoryGate {
   }
   return {
     blocked: true,
-    summary: "No target repository is configured for this System.",
-    remediation: "Configure the target repository in the Repository tab.",
+    summary: "この System には対象 Repository が設定されていません。",
+    remediation: "Repository 画面で対象 Repository を設定してください。",
     to: "/repository",
-    actionLabel: "Go to Repository",
+    actionLabel: "Repository を開く",
   };
 }
 
@@ -88,10 +88,10 @@ export function useRepositoryReadySnapshotGate(): RepositoryGate {
   if (!status.latest_snapshot || status.latest_snapshot.status !== "ready") {
     return {
       blocked: true,
-      summary: "No ready repository snapshot exists yet.",
-      remediation: "Create a snapshot in the Repository tab before continuing.",
+      summary: "利用できる（ready の）Repository の Snapshot がまだありません。",
+      remediation: "続ける前に、Repository 画面で Snapshot を作成してください。",
       to: "/repository",
-      actionLabel: "Go to Repository",
+      actionLabel: "Repository を開く",
     };
   }
   return UNBLOCKED;

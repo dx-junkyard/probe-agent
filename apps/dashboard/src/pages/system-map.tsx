@@ -4,6 +4,7 @@ import { useInstrumentationCoverage, useProductFeatures } from "@/api/hooks";
 import type { InstrumentationPointOut, InstrumentationStatus } from "@/api/types";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { QueryErrorState } from "@/components/query-state";
 
 const STATUS: Record<InstrumentationStatus, { label: string; Icon: typeof CheckCircle; cls: string }> = {
   receiving: { label: "受信中", Icon: CheckCircle, cls: "text-emerald-700 dark:text-emerald-400" },
@@ -33,10 +34,60 @@ function Point({ p }: { p: InstrumentationPointOut }) {
  * says it implements it (probe-agent: metadata naming the Feature id), the
  * entrypoint it sits behind, and whether its instrumentation reports.
  */
+// B8 (UX 監査 2026-11-17): 読み込み中・取得失敗・取得成功 0 件は別の表示。
+// 取得に失敗した側の件数は 0 として出さない (対象が本当に無いのかは分からない)。
+// Feature の登録先は UX Design Studio の Requirement 詳細 (Requirement → Feature
+// の編集面、Issue #427 §7.2.1)。
+const FEATURE_REGISTER_LINK = "/ux-design-studio?tab=requirements";
+
 export default function SystemMapPage() {
   const features = useProductFeatures();
   const coverage = useInstrumentationCoverage();
-  if (features.isLoading || coverage.isLoading) return <Skeleton className="h-64 w-full" />;
+
+  const header = (
+    <CardHeader>
+      <CardTitle as="h1" className="flex items-center gap-2"><MapIcon className="h-5 w-5" aria-hidden />システムマップ</CardTitle>
+      <CardDescription>
+        登録した Feature ごとに、それを実装しているコード（probe-agent: メタデータに Feature の番号が書かれた関数）、
+        その入口（API）、計測の受信状況を並べます。Feature とコードの対応はメタデータの記述から決定的に作っており、推測はしていません。
+      </CardDescription>
+    </CardHeader>
+  );
+
+  if (features.isLoading || coverage.isLoading) {
+    return (
+      <div className="space-y-4">
+        <Card>{header}</Card>
+        <Skeleton className="h-64 w-full" data-testid="system-map-loading" />
+      </div>
+    );
+  }
+
+  if (features.isError || coverage.isError) {
+    return (
+      <div className="space-y-4">
+        <Card>{header}</Card>
+        {features.isError && (
+          <QueryErrorState
+            target="Feature 一覧"
+            error={features.error}
+            onRetry={() => void features.refetch()}
+            retrying={features.isFetching}
+            data-testid="system-map-features-error"
+          />
+        )}
+        {coverage.isError && (
+          <QueryErrorState
+            target="計測点の一覧"
+            error={coverage.error}
+            onRetry={() => void coverage.refetch()}
+            retrying={coverage.isFetching}
+            data-testid="system-map-coverage-error"
+          />
+        )}
+      </div>
+    );
+  }
 
   const points = coverage.data?.points ?? [];
   const byFeature = new Map<string, InstrumentationPointOut[]>();
@@ -48,14 +99,8 @@ export default function SystemMapPage() {
   return (
     <div className="space-y-4">
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2"><MapIcon className="h-5 w-5" aria-hidden />システムマップ</CardTitle>
-          <CardDescription>
-            登録した Feature ごとに、それを実装しているコード（probe-agent: メタデータに Feature の番号が書かれた関数）、
-            その入口（API）、計測の受信状況を並べます。Feature とコードの対応はメタデータの記述から決定的に作っており、推測はしていません。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-3 text-sm">
+        {header}
+        <CardContent className="flex flex-wrap gap-3 text-sm" data-testid="system-map-counts">
           <span>Feature {list.length} 件</span>
           <span>コードと対応 {linked} 件</span>
           <span>計測点 {points.length} 件</span>
@@ -67,6 +112,21 @@ export default function SystemMapPage() {
           <Link className="ml-auto underline" to="/instrumentation-coverage">計測カバレッジへ</Link>
         </CardContent>
       </Card>
+
+      {list.length === 0 && (
+        <Card data-testid="system-map-features-empty">
+          <CardContent className="py-4 space-y-2 text-sm">
+            <p className="font-medium">Feature はまだ登録されていません。</p>
+            <p className="text-muted-foreground">
+              Feature は UX Design Studio の Requirement 詳細から作成します。作成した Feature の番号を
+              コードの probe-agent: メタデータに書くと、ここにそのコードと計測の受信状況が並びます。
+            </p>
+            <Link className="inline-block underline text-primary" to={FEATURE_REGISTER_LINK}>
+              UX Design Studio で Feature を作成する
+            </Link>
+          </CardContent>
+        </Card>
+      )}
 
       <div className="grid gap-3 lg:grid-cols-2">
         {list.map((f) => {

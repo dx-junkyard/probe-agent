@@ -251,12 +251,75 @@ describe("purpose-chain/model.ts", () => {
 
 describe("PurposeFrameCard (Overview Level 0, §3.1)", () => {
   // State 1: 3要素すべて unknown
-  test("state 1: all 3 elements unknown render as distinct 'not yet known' notes, never a fabricated statement", () => {
+  test("state 1: all 3 elements unknown collapse to ONE 'not yet known' sentence, never a fabricated statement", () => {
+    // A1 (UX 監査 2026-11-17): three rows of 「まだわかっていません」 carried one
+    // fact and pushed 「次にすること」 out of the first view.
     wrap(<PurposeFrameCard overview={overview()} question={null} questionState="ready" />);
     const card = screen.getByTestId("overview-purpose-frame");
+    expect(card).toHaveAttribute("data-frame-compact", "true");
+    const summary = within(card).getByTestId("overview-purpose-frame-summary");
+    expect(summary).toHaveTextContent(
+      "対象者と現在の課題・望ましい変化・システムの介入は、まだわかっていません。",
+    );
+    expect(within(card).queryByRole("list")).not.toBeInTheDocument();
     for (const kind of ["beneficiary_problem", "desired_change", "intervention"]) {
-      const li = within(card).getByTestId(`overview-purpose-element-${kind}`);
-      expect(li).toHaveTextContent("まだわかっていません");
+      expect(within(card).queryByTestId(`overview-purpose-element-${kind}`)).not.toBeInTheDocument();
+    }
+    // The heading survives so the page outline is unchanged.
+    expect(within(card).getByRole("heading", { level: 2 })).toHaveTextContent("目的の連鎖");
+  });
+
+  test("A1: one element with content keeps the per-slot list (no collapse)", () => {
+    const c = chain({
+      frame: {
+        beneficiary_problem: element({
+          id: "beneficiary_problem", kind: "beneficiary_problem", state: "present",
+          display_statement: "既存顧客の手戻り",
+        }),
+        desired_change: element({ id: "desired_change", kind: "desired_change", state: "unknown" }),
+        intervention: element({ id: "intervention", kind: "intervention", state: "unknown" }),
+      },
+    });
+    wrap(<PurposeFrameCard overview={overview({ purpose_chain: c })} question={null} questionState="ready" />);
+    const card = screen.getByTestId("overview-purpose-frame");
+    expect(card).not.toHaveAttribute("data-frame-compact");
+    expect(screen.queryByTestId("overview-purpose-frame-summary")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-purpose-element-beneficiary_problem")).toHaveTextContent("既存顧客の手戻り");
+    expect(screen.getByTestId("overview-purpose-element-desired_change")).toHaveTextContent("まだわかっていません");
+  });
+
+  test("A1: an unavailable or missing slot is not folded into 'まだわかっていません'", () => {
+    // 「読めなかった」 is a different answer from 「まだわかっていない」.
+    const c = chain({
+      frame: {
+        beneficiary_problem: element({ id: "beneficiary_problem", kind: "beneficiary_problem", state: "unknown" }),
+        desired_change: element({ id: "desired_change", kind: "desired_change", state: "unavailable" }),
+        intervention: null,
+      },
+    });
+    wrap(<PurposeFrameCard overview={overview({ purpose_chain: c })} question={null} questionState="ready" />);
+    expect(screen.queryByTestId("overview-purpose-frame-summary")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-purpose-element-desired_change")).toHaveTextContent("取得できません");
+    expect(screen.getByTestId("overview-purpose-element-intervention")).toHaveTextContent("取得できません");
+  });
+
+  test("A1: the collapsed frame keeps the question and the quiet start-interview link, neither as a filled button", () => {
+    wrap(
+      <PurposeFrameCard
+        overview={overview({ interview_session_id: null, purpose_chain: chain({ session_id: null }) })}
+        question={question()}
+        questionState="ready"
+      />,
+    );
+    const card = screen.getByTestId("overview-purpose-frame");
+    expect(card).toHaveAttribute("data-frame-compact", "true");
+    const cta = within(card).getByTestId("overview-purpose-question-cta");
+    expect(cta).toHaveAttribute("data-cta-variant", "link");
+    const start = within(card).getByRole("link", { name: "インタビューを開始する" });
+    expect(start).toHaveAttribute("href", "/interview");
+    expect(start).toHaveAttribute("data-cta-variant", "link");
+    for (const link of within(card).getAllByRole("link")) {
+      expect(link.className).not.toMatch(/\bbg-primary\b/);
     }
   });
 
@@ -394,6 +457,10 @@ describe("PurposeFrameCard (Overview Level 0, §3.1)", () => {
       />,
     );
     expect(screen.getByTestId("overview-purpose-no-session")).toBeInTheDocument();
+    // B11 (UX 監査 2026-11-17): セッションが無いのに「追加の確認は必要
+    // ありません」と言うと、直後の「セッションがありません」と矛盾する。
+    expect(screen.queryByTestId("overview-purpose-question-none")).not.toBeInTheDocument();
+    expect(screen.queryByText(/追加の確認は必要ありません/)).not.toBeInTheDocument();
   });
 
   // State 12 (structural half): action/CTA regions wrap rather than assuming

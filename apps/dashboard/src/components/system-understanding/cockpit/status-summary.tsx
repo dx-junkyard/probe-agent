@@ -33,6 +33,7 @@ export function CockpitStatusSummary({
   onRunNextStep: () => void;
 }) {
   const percent = model.completionPercent;
+  const showDescription = model.nextStep.kind !== "state_primary";
   // 取得できていない値は 0 ではなく「—」。0 件と未取得を同じ表示にしない。
   const questionTotal = model.qa ? String(model.qa.total) : "—";
   // 要確認は Q&A 未取得のとき「今わかっている分」の下限にすぎないので、
@@ -58,33 +59,39 @@ export function CockpitStatusSummary({
 
   return (
     <Card data-testid="cockpit-status-summary">
-      <CardContent className="space-y-2 p-3">
+      <CardContent className="space-y-1.5 px-3 py-2">
         {/* 主役。ファーストビューで最も強い要素はここ 1 つだけ。
-            レビュー指摘 P1: 以前はここが約 290px あり、主作業面が初期
-            ビューポート (1280 x 720) の外へ押し出されていた。「次にやること」
-            と CTA を 1 行に並べ、統計は既定で畳んで縦を詰める -- 主操作と
-            その作業面が同時に見えないなら、この面は目的を果たしていない。 */}
+            レビュー指摘 P1 / UX 監査 2026-11-17 B3: 主作業面を初期ビュー
+            ポート (1280 x 720) へ入れるため、ラベルと見出しを 1 行にし、
+            統計は既定で畳む。`state_primary` (状態自身の主操作へ進む) の
+            説明文は、直上の現在地カードが同じ主操作を言っているので出さない
+            -- 二度言うぶんの高さがそのまま回答欄を画面外へ押し出していた。 */}
         <div
-          className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2"
+          className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1"
           data-testid="cockpit-next-step"
         >
           <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              <Lightbulb className="h-3.5 w-3.5" /> 次にやること
-            </div>
-            <h2
-              className="text-base font-semibold tracking-tight break-words"
-              data-testid="cockpit-next-step-title"
-            >
-              {model.nextStep.title}
+            <h2 className="flex flex-wrap items-baseline gap-x-2 break-words">
+              <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                <Lightbulb className="h-3.5 w-3.5" /> 次にやること
+              </span>
+              <span
+                className="text-base font-semibold tracking-tight"
+                data-testid="cockpit-next-step-title"
+              >
+                {model.nextStep.title}
+              </span>
             </h2>
-            {/* 説明は 2 行まで。全文は title 属性で読める。 */}
-            <p
-              className="line-clamp-2 text-xs leading-5 text-muted-foreground break-words"
-              title={model.nextStep.description}
-            >
-              {model.nextStep.description}
-            </p>
+            {showDescription && (
+              // 説明は 2 行まで。全文は title 属性で読める。
+              <p
+                className="line-clamp-2 text-xs leading-5 text-muted-foreground break-words"
+                title={model.nextStep.description}
+                data-testid="cockpit-next-step-description"
+              >
+                {model.nextStep.description}
+              </p>
+            )}
           </div>
           {actionLabel && (
             <Button
@@ -104,12 +111,16 @@ export function CockpitStatusSummary({
             要確認数・未設定数は summary に残す。閉じた details の本文は
             視覚上もアクセシビリティツリー上も初期表示ではないため、DOM に
             存在するだけでは #356 の要件を満たさない。 */}
-        <details className="border-t pt-2" data-testid="cockpit-status-stats">
+        <details className="border-t pt-1.5" data-testid="cockpit-status-stats">
           <summary className="cursor-pointer text-[11px] text-muted-foreground">
             <span data-testid="cockpit-completion-headline">
               {percent == null
                 ? "理解の完成度はまだ確定できません"
-                : `理解の全体像は ${percent}% まで固まっています`}
+                : percent === 0
+                  // 「0% まで固まっています」は何も固まっていないことを
+                  // 進捗のように言ってしまう (UX 監査 2026-11-17 B3)。
+                  ? "理解の全体像はまだ固まっていません"
+                  : `理解の全体像は ${percent}% まで固まっています`}
             </span>
             <span className="ml-2" data-testid="cockpit-status-compact-counts">
               要確認 {reviewValue} · 未設定 {model.missingCount}件

@@ -280,9 +280,11 @@ describe("UX-13: ナビゲーションの段階化・検索・現在地", () => 
   test("目的別の入口から開始地点を選べる", async () => {
     await renderSidebar();
     const entries = screen.getByTestId("sidebar-purpose-entries");
-    expect(within(entries).getByRole("link", { name: /現状を理解する/ })).toHaveAttribute("href", "/system-understanding");
+    // UX audit 2026-11-17 A4: the same destination as Overview's CTA.
+    expect(within(entries).getByRole("link", { name: /現状を理解する/ })).toHaveAttribute("href", "/interview");
     expect(within(entries).getByRole("link", { name: /要件を設計する/ })).toHaveAttribute("href", "/ux-design-studio");
-    expect(within(entries).getByRole("link", { name: /候補を比較評価する/ })).toHaveAttribute("href", "/experiments");
+    // UX audit 2026-11-17 C13: Candidate Studio needs no hand-written patch.
+    expect(within(entries).getByRole("link", { name: /候補を比較評価する/ })).toHaveAttribute("href", "/candidate-studio");
     expect(within(entries).getByRole("link", { name: /全体を見渡す/ })).toHaveAttribute("href", "/system-map");
     expect(within(entries).getByRole("link", { name: /動作を確かめる/ })).toHaveAttribute("href", "/instrumentation-coverage");
   });
@@ -319,6 +321,65 @@ describe("UX-13: ナビゲーションの段階化・検索・現在地", () => 
     fireEvent.keyDown(search, { key: "Escape" });
     expect(search).toHaveValue("");
     expect(screen.queryByTestId("sidebar-search-results")).not.toBeInTheDocument();
+  });
+
+  test("UX 監査 2026-11-17 A7: 初期表示で同じ行き先のリンクが 2 本出ない", async () => {
+    await renderSidebar("/interview");
+    const nav = screen.getByTestId("sidebar-nav");
+    const hrefs = within(nav).getAllByRole("link").map((a) => a.getAttribute("href"));
+    expect(hrefs.length).toBe(new Set(hrefs).size);
+    // 現在地の「表示中」は目的の入口側に 1 つだけ出る。
+    const badges = within(nav).getAllByTestId("sidebar-current-badge");
+    expect(badges).toHaveLength(1);
+    expect(screen.getByTestId("sidebar-purpose-interview")).toContainElement(badges[0]);
+  });
+
+  test("UX 監査 2026-11-17 A7: 折りたたみ時は目的の入口が無いので全項目をアイコンで出す", async () => {
+    await renderSidebar();
+    fireEvent.click(screen.getByTestId("sidebar-collapse-toggle"));
+    expect(screen.queryByTestId("sidebar-purpose-entries")).not.toBeInTheDocument();
+    const nav = screen.getByTestId("sidebar-nav");
+    for (const href of ["/interview", "/candidate-studio", "/experiments", "/system-map", "/ux-design-studio", "/instrumentation-coverage"]) {
+      expect(nav.querySelector(`a[href="${href}"]`)).toBeTruthy();
+    }
+  });
+
+  test("UX 監査 2026-11-17 C12: 設計 lineage の 5 画面は上流から下流の順に並ぶ", async () => {
+    await renderSidebar();
+    const group = screen.getByTestId("sidebar-group-understand");
+    const order = ["/stakeholder-value-network", "/objective-map", "/journey-blueprint", "/functional-lineage"];
+    const hrefs = Array.from(group.querySelectorAll("a")).map((a) => a.getAttribute("href"));
+    const positions = order.map((href) => hrefs.indexOf(href));
+    expect(positions.every((p) => p >= 0)).toBe(true);
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions);
+    // Objective Map は主要入口 (詳細ビューの外) にある。
+    const details = screen.getByTestId("sidebar-details-understand");
+    expect(details.querySelector('a[href="/objective-map"]')).toBeNull();
+    expect(details.querySelector('a[href="/stakeholder-value-network"]')).toBeNull();
+    // 折りたたみ時 (目的の入口なし) は UX Design Studio が Objective Map と
+    // Journey Service Blueprint の間に来る。
+    fireEvent.click(screen.getByTestId("sidebar-collapse-toggle"));
+    const collapsed = Array.from(screen.getByTestId("sidebar-nav").querySelectorAll("a")).map((a) => a.getAttribute("href"));
+    const lineage = ["/stakeholder-value-network", "/objective-map", "/ux-design-studio", "/journey-blueprint", "/functional-lineage"]
+      .map((href) => collapsed.indexOf(href));
+    expect(lineage.every((p) => p >= 0)).toBe(true);
+    expect([...lineage].sort((a, b) => a - b)).toEqual(lineage);
+  });
+
+  test("UX 監査 2026-11-17 C13: Observe & Evaluate では AI Candidate Studio が Experiments より前", async () => {
+    await renderSidebar();
+    fireEvent.click(screen.getByTestId("sidebar-collapse-toggle"));
+    const hrefs = Array.from(screen.getByTestId("sidebar-nav").querySelectorAll("a")).map((a) => a.getAttribute("href"));
+    expect(hrefs.indexOf("/candidate-studio")).toBeGreaterThanOrEqual(0);
+    expect(hrefs.indexOf("/candidate-studio")).toBeLessThan(hrefs.indexOf("/experiments"));
+  });
+
+  test("UX 監査 2026-11-17 A5: グループ見出しはサーバーの段階名を出し、未提供時は同じ語の fallback を出す", async () => {
+    await renderSidebar();
+    expect(screen.getByTestId("sidebar-group-heading-setup")).toHaveTextContent("対象の登録");
+    expect(screen.getByTestId("sidebar-group-heading-understand")).toHaveTextContent("システムの理解");
+    // 1 グループ = 2 段階 が見出しから読める。
+    expect(screen.getByTestId("sidebar-group-heading-observe-&-evaluate")).toHaveTextContent("実行時の観測 / 候補の評価");
   });
 
   test("補足文は省略 (truncate) されない", async () => {

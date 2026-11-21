@@ -1400,6 +1400,23 @@ CREATE TABLE IF NOT EXISTS intelligence_runs (
 CREATE INDEX IF NOT EXISTS idx_intelligence_runs_system
     ON intelligence_runs (system_id, id DESC);
 
+-- IK-0029: the exact request/response of a reasoning run, kept even when the
+-- response fails validation. Additive: older runs simply have no rows.
+CREATE TABLE IF NOT EXISTS intelligence_run_payloads (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id          INTEGER NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('request', 'response')),
+    prompt_version  TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    usage_json      TEXT,
+    finish_reason   TEXT,
+    created_at      REAL NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_intelligence_run_payloads_run
+    ON intelligence_run_payloads (run_id, id);
+
 CREATE TABLE IF NOT EXISTS system_profile_drafts (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id            INTEGER NOT NULL,
@@ -1442,6 +1459,26 @@ CREATE TABLE IF NOT EXISTS feature_drafts (
 
 CREATE INDEX IF NOT EXISTS idx_feature_drafts_system
     ON feature_drafts (system_id, id DESC);
+
+-- IK-0038: run-independent Feature registry. feature_key is the
+-- feature_id every drafts run, experiment, probe plan and code link uses; it
+-- is minted and kept by the system (never by the drafts LLM). retired_at
+-- NULL = live (shown to the model as a handle F1..Fn).
+CREATE TABLE IF NOT EXISTS feature_registry (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    feature_key   TEXT NOT NULL,
+    display_name  TEXT NOT NULL,
+    summary       TEXT NOT NULL DEFAULT '',
+    origin        TEXT NOT NULL DEFAULT 'minted'
+                  CHECK (origin IN ('minted', 'migrated')),
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    last_run_id   INTEGER,
+    retired_at    REAL,
+    UNIQUE (system_id, feature_key),
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS draft_evidence (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1800,6 +1837,14 @@ CREATE TABLE IF NOT EXISTS probe_points (
     replayability        TEXT NOT NULL DEFAULT '',
     denylist_hit         TEXT,
     status               TEXT NOT NULL DEFAULT 'proposed',
+    -- UX audit 2026-11-17 C4: opt-in input capture (#243) chosen per point by
+    -- the human who approved it. 0 is the default and also the only value a
+    -- non-approved point may hold; the decision columns record who decided
+    -- the current status (always 'manual'; NULL on legacy rows).
+    replay_capture       INTEGER NOT NULL DEFAULT 0,
+    decided_by_user_id   INTEGER,
+    decision_method      TEXT,
+    decided_at           REAL,
     created_at           REAL NOT NULL,
     updated_at           REAL NOT NULL,
     FOREIGN KEY (plan_id) REFERENCES probe_plans (id) ON DELETE CASCADE,
@@ -1989,6 +2034,32 @@ CREATE TABLE IF NOT EXISTS experiment_analyses (
     created_at           REAL,
     FOREIGN KEY (experiment_id) REFERENCES experiments (id) ON DELETE CASCADE
 );
+
+-- IK-0030: every interpretation attempt of an Experiment, newest last.
+-- experiment_analyses stays the "current" row; re-analysis or a re-run no
+-- longer destroys the previous interpretation.
+CREATE TABLE IF NOT EXISTS experiment_analysis_versions (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id        INTEGER NOT NULL,
+    status               TEXT NOT NULL,
+    provider             TEXT,
+    model                TEXT,
+    prompt_version       TEXT,
+    schema_version       TEXT,
+    decision_method      TEXT,
+    narrative            TEXT,
+    recommendation_variant_key TEXT,
+    recommendation_reason TEXT,
+    risks_json           TEXT NOT NULL DEFAULT '[]',
+    notes_json           TEXT NOT NULL DEFAULT '[]',
+    error                TEXT,
+    intelligence_run_id  INTEGER,
+    created_at           REAL,
+    FOREIGN KEY (experiment_id) REFERENCES experiments (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiment_analysis_versions_experiment
+    ON experiment_analysis_versions (experiment_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS workspaces (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -9613,6 +9684,30 @@ def _migrate_cell_improvement_event_types(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_feature_registry(conn: sqlite3.Connection) -> None:
+    """Seed the Feature registry from each System's latest drafts run (IK-0038).
+
+    Before the registry, feature ids lived only in feature_drafts rows and
+    were re-matched against the latest completed run (IK-0032). Each id of
+    that run becomes a live registry key unchanged, so experiments, probe
+    plans and code links that refer to it keep working. Systems that already
+    have registry rows are left alone (idempotent).
+    """
+    if not _columns(conn, "feature_registry"):
+        return
+    from .feature_registry import ensure_seeded
+
+    system_ids = [
+        row["system_id"]
+        for row in conn.execute(
+            """SELECT DISTINCT system_id FROM intelligence_runs
+               WHERE run_type = 'repository_drafts' AND status = 'completed'"""
+        ).fetchall()
+    ]
+    for system_id in system_ids:
+        ensure_seeded(conn, system_id)
+
+
 def _migrate_cell_ask_decision_note(conn: sqlite3.Connection) -> None:
     """Separate legacy Ask decision notes from the finite decision value.
 
@@ -10779,6 +10874,26 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE probe_plans ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'"
             )
+        # UX audit 2026-11-17 C4: per-point opt-in input capture + who decided
+        # the point's status. Existing rows get capture off (the #243 default)
+        # and NULL decision columns -- they never recorded an approver, and
+        # one is not invented here.
+        point_cols = _columns(conn, "probe_points")
+        if point_cols and "replay_capture" not in point_cols:
+            conn.execute(
+                "ALTER TABLE probe_points "
+                "ADD COLUMN replay_capture INTEGER NOT NULL DEFAULT 0"
+            )
+        if point_cols:
+            _add_column_if_missing(
+                conn, "probe_points", point_cols, "decided_by_user_id", "INTEGER"
+            )
+            _add_column_if_missing(
+                conn, "probe_points", point_cols, "decision_method", "TEXT"
+            )
+            _add_column_if_missing(
+                conn, "probe_points", point_cols, "decided_at", "REAL"
+            )
         graph_cols = _columns(conn, "understanding_graph_snapshots")
         if graph_cols and "snapshot_id" not in graph_cols:
             conn.execute(
@@ -11352,9 +11467,44 @@ def init_db() -> None:
                     conn, "assistant_discussion_turn", turn_cols, column, definition
                 )
         _migrate_alignment_manual_recheck_targets(conn)
+        # IK-0029: the analysis row points at the intelligence_run that holds
+        # its request/response payloads. Nullable; older analyses have none.
+        _add_column_if_missing(
+            conn,
+            "experiment_analyses",
+            _columns(conn, "experiment_analyses"),
+            "intelligence_run_id",
+            "INTEGER",
+        )
+        # IK-0030/IK-0031: normalisation notes of the current analysis and the
+        # version row it mirrors. Nullable; older analyses have neither.
+        _add_column_if_missing(
+            conn,
+            "experiment_analyses",
+            _columns(conn, "experiment_analyses"),
+            "notes_json",
+            "TEXT",
+        )
+        # IK-0033: per-run diagnostics (code-links: dropped links and carried
+        # over reviews). Nullable; older runs have none.
+        _add_column_if_missing(
+            conn,
+            "intelligence_runs",
+            _columns(conn, "intelligence_runs"),
+            "diagnostics_json",
+            "TEXT",
+        )
+        _add_column_if_missing(
+            conn,
+            "experiment_analyses",
+            _columns(conn, "experiment_analyses"),
+            "version_id",
+            "INTEGER",
+        )
         # Issue #464: runs last among the column migrations because its
         # backfill reads the columns every earlier migration installed.
         _migrate_canonical_understanding(conn)
+        _migrate_feature_registry(conn)
         # Runs after EVERY migration above: it repairs whatever state the
         # schema is actually in, including damage a rebuild migration in this
         # same startup would have caused, so it cannot be ordered against the

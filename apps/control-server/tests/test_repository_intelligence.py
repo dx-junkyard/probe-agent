@@ -735,7 +735,7 @@ class TestDraftGeneration:
         assert run["provider"] == "mock"
         assert run["is_mock"] is True
         assert run["decision_method"] == "reasoning_llm"
-        assert run["prompt_version"] == "v1"
+        assert run["prompt_version"] == "v3"
 
         sp = body["system_profile_draft"]
         assert sp is not None
@@ -892,7 +892,7 @@ class TestDraftGeneration:
         monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
         monkeypatch.setenv("LLM_API_KEY", "unused")
         r = admin_client.post("/repository/drafts/generate", headers=h)
-        assert r.status_code == 201
+        assert r.status_code == 502
         run = r.json()["intelligence_run"]
         assert run["status"] == "failed"
         assert "reasoning model" in run["error_details"]
@@ -923,8 +923,11 @@ class TestDraftGeneration:
                             "success_criteria": [],
                             "evidence": [
                                 {
+                                    # start_line が末尾を越える = 裏付けが無い引用。
+                                    # end_line だけの超過は末尾に丸めて受理する（IK-0026、
+                                    # test_draft_generator_evidence.py）。
                                     "path": "README.md",
-                                    "start_line": 1,
+                                    "start_line": 9999,
                                     "end_line": 9999,
                                     "summary": "outside file bounds",
                                 }
@@ -970,7 +973,7 @@ class TestDraftGeneration:
             lambda _config: InvalidEvidenceClient(),
         )
         r = admin_client.post("/repository/drafts/generate", headers=h)
-        assert r.status_code == 201
+        assert r.status_code == 422
         body = r.json()
         assert body["intelligence_run"]["status"] == "failed"
         assert "line range exceeds" in body["intelligence_run"]["error_details"]
@@ -1022,8 +1025,8 @@ class TestIntelligenceRunAudit:
         run = r.json()["intelligence_run"]
         assert run["provider"] == "mock"
         assert run["model"] == "mock"
-        assert run["prompt_version"] == "v1"
-        assert run["schema_version"] == "v1"
+        assert run["prompt_version"] == "v3"
+        assert run["schema_version"] == "v2"
         assert run["decision_method"] == "reasoning_llm"
         assert run["started_at"] > 0
         assert run["completed_at"] >= run["started_at"]

@@ -119,6 +119,10 @@ class InProcessExecutionBackend:
                     "--ro-bind",
                     "/",
                     "/",
+                    # A minimal writable /dev (null, zero, random, ...): with /dev
+                    # read-only, any `> /dev/null` in a test or smoke command fails.
+                    "--dev",
+                    "/dev",
                     "--tmpfs",
                     "/tmp",
                     "--tmpfs",

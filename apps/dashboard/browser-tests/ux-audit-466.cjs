@@ -40,9 +40,9 @@ function expectTrue(label, actual) {
 
 async function login(page) {
   await page.goto(`${APP}/login`);
-  await page.getByLabel("Username").fill(USER);
-  await page.getByLabel("Password").fill(PASS);
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByLabel("ユーザー名").fill(USER);
+  await page.getByLabel("パスワード").fill(PASS);
+  await page.getByRole("button", { name: "ログイン" }).click();
   await page.waitForURL((url) => !url.pathname.startsWith("/login"));
 }
 
@@ -79,9 +79,9 @@ function overlaps(a, b) {
   await page.waitForURL(/\/login/);
   expect("login URL keeps the destination", new URL(page.url()).searchParams.get("next"), "/workspaces?open=1#decision");
   expectTrue("login page states where it returns", await page.getByTestId("login-return-to").isVisible());
-  await page.getByLabel("Username").fill(USER);
-  await page.getByLabel("Password").fill(PASS);
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByLabel("ユーザー名").fill(USER);
+  await page.getByLabel("パスワード").fill(PASS);
+  await page.getByRole("button", { name: "ログイン" }).click();
   await page.waitForURL(/\/workspaces/);
   const landed = new URL(page.url());
   expect("landed on the shared target", `${landed.pathname}${landed.search}${landed.hash}`, "/workspaces?open=1#decision");
@@ -163,7 +163,7 @@ function overlaps(a, b) {
   const createButton = page.getByTestId("header-create-system-button");
   await createButton.focus();
   await page.keyboard.press("Enter");
-  const createDialog = page.getByRole("dialog", { name: "Create System" });
+  const createDialog = page.getByRole("dialog", { name: "System を作成" });
   await createDialog.waitFor();
   expect("exactly one dialog", await page.getByRole("dialog").count(), 1);
   expect("aria-modal", await createDialog.getAttribute("aria-modal"), "true");
@@ -286,7 +286,7 @@ function overlaps(a, b) {
   console.log("UX-03: 未保存入力の画面離脱で確認が出る");
   let dialogSeen = null;
   page.once("dialog", async (d) => { dialogSeen = d.message(); await d.dismiss(); });
-  await page.getByRole("link", { name: /Setup Guide/ }).first().click();
+  await page.getByRole("link", { name: /接続ガイド/ }).first().click();
   await page.waitForTimeout(300);
   expectTrue("discard confirmation before leaving", !!dialogSeen);
   expectTrue("still on Repository after dismiss", page.url().includes("/repository"));
@@ -326,10 +326,10 @@ function overlaps(a, b) {
   await page.route("**/api/repository/probe-plans", (route) => route.fulfill({ status: 500, body: JSON.stringify({ detail: "injected" }) }));
   await page.goto(`${APP}/probe-planner`);
   await page.getByTestId("probe-plans-error").waitFor();
-  expect("no 0-件 message on failure", await page.getByText(/No probe plans yet/).count(), 0);
+  expect("no 0-件 message on failure", await page.getByText(/Probe Plan はまだありません/).count(), 0);
   await page.unroute("**/api/repository/probe-plans");
   await page.getByTestId("probe-plans-error").getByRole("button", { name: "再試行" }).click();
-  await page.getByText(/No probe plans yet/).waitFor();
+  await page.getByText(/Probe Plan はまだありません/).waitFor();
   expectTrue("retry recovers to the real 0 件", true);
 
   console.log("UX-12: Journey が 0 件なら作成へ誘導");

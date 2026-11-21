@@ -35,6 +35,10 @@ class IntelligenceRunType(str, Enum):
     # ClaimsGenerationResult.decision_method`.
     DISCUSSION_CONTEXT_CLAIM = "discussion_context_claim"
     ENTRYPOINT_INDEX = "entrypoint_index"
+    # IK-0029/IK-0030: the advisory interpretation of a completed Experiment's
+    # deterministic metrics. Recorded as a run so its exact request/response
+    # lands in intelligence_run_payloads like every other reasoning run.
+    EXPERIMENT_ANALYSIS = "experiment_analysis"
     EXPLANATION_REFRESH = "explanation_refresh"
     FEATURE_CODE_MAPPING = "feature_code_mapping"
     # Epic #412 Phase 3 (#415): a reasoning run that DRAFTS a Flow-scoped

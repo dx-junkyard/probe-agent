@@ -804,6 +804,24 @@ class IntelligenceRunOut(BaseModel):
     budget_elapsed_seconds: Optional[float] = None
 
 
+class IntelligenceRunPayloadOut(BaseModel):
+    """One stored LLM request or response of a reasoning run (IK-0029)."""
+
+    id: int
+    run_id: int
+    kind: Literal["request", "response"]
+    prompt_version: str
+    text: str
+    usage: Optional[Dict[str, Any]] = None
+    finish_reason: Optional[str] = None
+    created_at: float
+
+
+class IntelligenceRunPayloadsOut(BaseModel):
+    intelligence_run: IntelligenceRunOut
+    payloads: List[IntelligenceRunPayloadOut] = Field(default_factory=list)
+
+
 class FeatureEvidence(BaseModel):
     path: str
     start_line: int = 0
@@ -904,8 +922,15 @@ class ExperimentCreate(BaseModel):
     feature_id: str = Field(..., min_length=1, max_length=200)
     objective: str = Field(..., min_length=1, max_length=5000)
     snapshot_id: int
+    # The non-baseline candidates only. The server always adds the pinned-commit
+    # baseline itself (`create_experiment`), so ONE candidate already makes a
+    # two-way baseline-vs-candidate comparison -- the comparison adoption needs
+    # (a completed baseline + a completed non-baseline variant). Requiring two
+    # client candidates (the original #26 minimum) had no recorded rationale and
+    # made a single Candidate Studio / Simulation Workbench candidate unusable
+    # (UX audit 2026-11-17 C3).
     variants: List[ExperimentVariantCreate] = Field(
-        ..., min_length=2, max_length=10
+        ..., min_length=1, max_length=10
     )
     # Issue #369: required when the chosen snapshot is definitively behind
     # HEAD. Continuing on an older snapshot is legitimate (reproduction runs),
@@ -961,6 +986,12 @@ class ExperimentAnalysisOut(BaseModel):
     risks: List[str] = Field(default_factory=list)
     error: Optional[str] = None
     created_at: Optional[float] = None
+    # IK-0030: the version row this analysis is (None for a legacy row that
+    # predates versioning) and the intelligence_run holding its payloads.
+    version_id: Optional[int] = None
+    intelligence_run_id: Optional[int] = None
+    # IK-0031: what validation normalised or dropped instead of failing.
+    notes: List[str] = Field(default_factory=list)
 
 
 class ExperimentDecisionUpdate(BaseModel):
@@ -988,9 +1019,62 @@ class ExperimentOut(BaseModel):
     variants: List[ExperimentVariantResultOut] = Field(default_factory=list)
     comparison: dict[str, Any] = Field(default_factory=dict)
     analysis: ExperimentAnalysisOut
+    # IK-0030: every interpretation attempt, newest first (includes the
+    # current one once it has been recorded as a version).
+    analysis_history: List[ExperimentAnalysisOut] = Field(default_factory=list)
     created_at: float
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    # UX audit 2026-11-17 D7: whether `POST /experiments/{id}/run` would accept
+    # this Experiment right now. Mirrors that endpoint's own guards (not
+    # running, not a governed #415 execution) so the Dashboard never offers a
+    # control that is certain to be refused.
+    run_allowed: bool = False
+    # UX audit 2026-11-17 C5: the `probe_patches` transport row of the CURRENT
+    # adoption, resolved through `improvement_publish_artifacts` for exactly
+    # (this experiment, the adopted variant) -- never a System-wide lookup
+    # (#380). `None` when the Experiment is not adopted or the artifact row
+    # does not exist.
+    adopted_improvement_patch_id: Optional[int] = None
+
+
+class ExperimentRecordVariantOut(BaseModel):
+    variant_key: str
+    label: str
+    status: str
+    test_pass_rate: Optional[float] = None
+    criteria_pass_rate: Optional[float] = None
+
+
+class ExperimentRecordDetailOut(BaseModel):
+    experiment_id: int
+    feature_id: str
+    snapshot_id: int
+    baseline_commit: str
+    status: str
+    variants: List[ExperimentRecordVariantOut] = Field(default_factory=list)
+    analysis_version: Optional[int] = None
+    human_decision: str
+    human_decision_variant_key: Optional[str] = None
+
+
+class ExperimentRecordOut(BaseModel):
+    """台帳（疑義台帳の外部検証の線）に写せる Experiment の記録（IK-0035）。
+
+    上位の 6 項目は episteme-graph の ``external_ref`` と同じキーで、値はすべて文字列。
+    LLM を使わず Experiment の行から決定論的に組み立てる。``result_summary`` は人の判断
+    だけ、LLM の解釈と推奨（助言）は ``analysis_summary`` に分ける（IK-0036）。
+    """
+
+    tool: str
+    run_ref: str
+    url: str
+    executed_at: str
+    conditions: str
+    result_summary: str
+    analysis_summary: str
+    complete: bool
+    detail: ExperimentRecordDetailOut
 
 
 class SystemProfileDraftOut(BaseModel):
@@ -1026,10 +1110,34 @@ class FeatureDraftOut(BaseModel):
     created_at: float
 
 
+class FeatureIdResolutionOut(BaseModel):
+    """How each drafted feature got its registry key (IK-0038; IK-0032 shape kept).
+
+    ``reused`` / ``new``: keys matched / minted. ``resolved`` is always empty
+    since IK-0038 (no slug rewriting). ``handle_matched``: {handle,
+    feature_key}. ``minted``: {feature_key, display_name}. ``slug_matches``:
+    new features whose name slug equals an existing key (logged only).
+    ``dropped`` / ``normalized``: K-0001 adjustments. ``not_referenced``:
+    live keys this run did not mention.
+    """
+
+    previous_run_id: Optional[int] = None
+    reused: List[str] = Field(default_factory=list)
+    resolved: List[Dict[str, str]] = Field(default_factory=list)
+    new: List[str] = Field(default_factory=list)
+    handle_matched: List[Dict[str, str]] = Field(default_factory=list)
+    minted: List[Dict[str, str]] = Field(default_factory=list)
+    slug_matches: List[Dict[str, str]] = Field(default_factory=list)
+    dropped: List[Dict[str, Any]] = Field(default_factory=list)
+    normalized: List[Dict[str, Any]] = Field(default_factory=list)
+    not_referenced: List[str] = Field(default_factory=list)
+
+
 class DraftGenerationResult(BaseModel):
     intelligence_run: IntelligenceRunOut
     system_profile_draft: Optional[SystemProfileDraftOut] = None
     feature_drafts: List[FeatureDraftOut] = Field(default_factory=list)
+    feature_id_resolution: Optional[FeatureIdResolutionOut] = None
 
 
 class LatestDraftsOut(BaseModel):
@@ -1319,12 +1427,24 @@ class FeatureCodeLinkOut(BaseModel):
     updated_at: float
 
 
+class DroppedCodeLinkOut(BaseModel):
+    """IK-0033: a link the model proposed that could not be resolved."""
+
+    feature_id: str
+    raw_symbol: str
+    reason: str
+
+
 class FeatureCodeLinksOut(BaseModel):
     system_id: int
     snapshot_id: Optional[int] = None
     intelligence_run: Optional[IntelligenceRunOut] = None
     links: List[FeatureCodeLinkOut] = Field(default_factory=list)
     is_mock: bool = False
+    # IK-0033: unresolved links dropped one by one, and how many links took
+    # over an accepted/rejected review from an earlier mapping run.
+    dropped_links: List[DroppedCodeLinkOut] = Field(default_factory=list)
+    carried_over_reviews: int = 0
 
 
 class LinkReviewUpdate(BaseModel):
@@ -1351,6 +1471,12 @@ class ProbePointOut(BaseModel):
     replayability: str
     denylist_hit: Optional[str] = None
     status: ProbePointStatus = "proposed"
+    # UX audit 2026-11-17 C4: opt-in input capture (#243), chosen by the
+    # approving human per point. Never True on a non-approved point.
+    replay_capture: bool = False
+    decided_by_user_id: Optional[int] = None
+    decision_method: Optional[Literal["manual"]] = None
+    decided_at: Optional[float] = None
     created_at: float
     updated_at: float
 
@@ -1374,6 +1500,11 @@ class ProbePlanOut(BaseModel):
 
 class ProbePointStatusUpdate(BaseModel):
     status: ProbePointStatus
+    # UX audit 2026-11-17 C4: "入力を保存する(Replay に使う)". Omitted means
+    # off -- capture is never enabled by default (#243 opt-in, Principle 9).
+    # Only valid together with status='approved'; the approver comes from the
+    # authenticated principal, never from this body.
+    replay_capture: Optional[bool] = None
 
 
 class ProbePatchApplyRequest(BaseModel):
@@ -1432,6 +1563,18 @@ class ProbePatchOut(BaseModel):
     applied_by_user_id: Optional[int] = None
     validation_runs: List[ValidationRunOut] = Field(default_factory=list)
     created_at: float
+    # UX audit 2026-11-17 C5: where this transport row came from. `improvement`
+    # iff an `improvement_publish_artifacts` row names this patch (the adopted
+    # Experiment variant lineage, #380); otherwise `probe_plan` (a Probe Plan
+    # measurement patch). The Dashboard renders these and never infers them.
+    origin: Literal["probe_plan", "improvement"] = "probe_plan"
+    improvement_experiment_id: Optional[int] = None
+    improvement_variant_key: Optional[str] = None
+    improvement_variant_label: Optional[str] = None
+    # Whether that experiment's current human decision still adopts this
+    # variant. A later re-decision leaves the artifact in place, so the patch
+    # can still be an improvement artifact that is no longer the adopted one.
+    improvement_adoption_current: Optional[bool] = None
 
 
 class ProbePlansListOut(BaseModel):
@@ -3099,6 +3242,10 @@ class InterviewDialogueTurnOut(BaseModel):
     # fallback — the question is still asked — so this is surfaced for operator
     # visibility, not an error.
     evidence_refs_dropped: int = 0
+    # IK-0039: proposals dropped (symbol not in the candidate set given to the
+    # model) and references corrected (symbol_id re-derived, unknown
+    # feature_id cleared). Also stored in the run's diagnostics_json.
+    proposal_diagnostics: List[Dict[str, Any]] = Field(default_factory=list)
     # Evidence targets pass 1 asked for beyond INTERVIEW_EVIDENCE_MAX_FILES.
     # They were not read; the turn continued with the first N (cost-budget
     # truncation), so the omission is reported rather than hidden.
@@ -7714,6 +7861,41 @@ class CandidateSessionOut(BaseModel):
     updated_at: float
     messages: List[CandidateMessageOut] = Field(default_factory=list)
     versions: List[CandidateVersionOut] = Field(default_factory=list)
+    # Issue #369: the stale-snapshot decision recorded when the session was
+    # created (`stale_ack_reason` is the developer's own reason --
+    # `decision_method: manual`).
+    snapshot_freshness: Optional[SnapshotFreshnessState] = None
+    head_sha_at_creation: Optional[str] = None
+    stale_ack_reason: Optional[str] = None
+    # UX audit 2026-11-17 C13: the start screen lists existing sessions, so
+    # the list endpoint (which omits messages/versions) still reports the
+    # newest version's persisted state. ``None`` = the session has no version.
+    version_count: int = 0
+    latest_version_number: Optional[int] = None
+    latest_version_status: Optional[CandidateVersionStatus] = None
+    latest_version_replay_status: Optional[CandidateReplayStatus] = None
+
+
+# UX audit 2026-11-17 C8: whether a candidate replay on the session's pinned
+# snapshot may reuse the stale-snapshot reason recorded on the session. First
+# match, decided by `routes/candidate_studio.classify_candidate_replay_stale`:
+#   not_required -- the snapshot is not definitively stale now;
+#   not_recorded -- it is stale and the session recorded no reason;
+#   head_moved   -- the session's reason was given against a different HEAD
+#                   (or the session was not stale then), so it does not cover
+#                   the current premise and a new reason is required;
+#   inheritable  -- same pinned snapshot, same HEAD as when the reason was
+#                   given: the session's reason is reused verbatim.
+CandidateReplayStaleReasonState = Literal[
+    "not_required", "not_recorded", "head_moved", "inheritable"
+]
+
+
+class CandidateReplayPreflightOut(BaseModel):
+    preflight: SnapshotPreflightOut
+    stale_reason_state: CandidateReplayStaleReasonState
+    session_stale_ack_reason: Optional[str] = None
+    session_head_sha_at_creation: Optional[str] = None
 
 
 class CandidateMessageCreate(BaseModel):
@@ -7740,6 +7922,10 @@ class CandidateReplayCreate(BaseModel):
 
     snapshot_id: Optional[int] = None
     flow_experiment_proposal_id: Optional[int] = None
+    # UX audit 2026-11-17 C8: a reason entered at replay time. Required only
+    # when the snapshot is stale AND the session's own reason does not cover
+    # the current HEAD (see CandidateReplayStaleReasonState).
+    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
 
 
 class CandidatePromotionOut(BaseModel):
@@ -8525,6 +8711,8 @@ class InterviewWorkflowFactsOut(BaseModel):
     blocking_failure_states: List[str] = []
     understanding_unconfirmed: bool
     open_required_questions: int
+    # Spec §2.2 row 7 「ゼロベース質問の未完」 (separate from the Q&A count).
+    zero_base_pending: bool = False
     outstanding_alignment_items: int
     proposals_needing_review: int
     proposals_generatable: bool
@@ -8573,6 +8761,12 @@ class InterviewWorkflowExceptionOut(BaseModel):
     detail: Optional[str] = None
     recovery_process_kind: Optional[str] = None
     recovery_condition: Optional[str] = None
+    # A prerequisite owned by ANOTHER screen that is missing right now, read
+    # from a persisted fact (never from the failure text). The Dashboard turns
+    # it into a link to that screen; it is not a recovery operation of this
+    # screen and passes no gate. `system_understanding_graph`: the session's
+    # snapshot has no persisted understanding graph.
+    prerequisite: Optional[Literal["system_understanding_graph"]] = None
 
 
 class InterviewWorkflowStateOut(BaseModel):

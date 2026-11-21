@@ -24,6 +24,7 @@ import { useDiagnosticHighlight, DiagnosticFixCallout } from "@/components/diagn
 import { cn, formatTimestamp } from "@/lib/utils";
 import { ApiError } from "@/api/client";
 import { SystemStateBanner } from "@/components/system-state";
+import { QueryErrorState } from "@/components/query-state";
 import {
   RefreshCw, Boxes, Target,
 } from "lucide-react";
@@ -35,6 +36,7 @@ import type {
   SystemDiagnosticCheck,
   SystemStateItem,
   SystemUnderstandingOut,
+  SystemUnderstandingPipelineStep,
   SystemUnderstandingStageStatus,
   SystemUnderstandingPurpose,
   SystemUnderstandingPurposeView,
@@ -65,8 +67,8 @@ function InstrumentSummary({ counts }: { counts?: Record<string, number> }) {
   if (!hasCounts) {
     return (
       <p className="text-sm text-muted-foreground" data-testid="stage-summary-instrument">
-        Probe plan and patch status live in Probe Planner. Approve a plan and validate
-        its patch there once observation points are chosen above.
+        Probe plan と patch の状態は Probe Planner で確認します。上で観測箇所を決めたら、
+        Probe Planner で plan を承認し、patch を検証してください。
       </p>
     );
   }
@@ -74,15 +76,15 @@ function InstrumentSummary({ counts }: { counts?: Record<string, number> }) {
   return (
     <ul className="text-sm space-y-1" data-testid="stage-summary-instrument">
       <li>
-        <Link to="/probe-planner" className="text-primary hover:underline">Proposed</Link>
+        <Link to="/probe-planner" className="text-primary hover:underline">提案中</Link>
         : {proposed}
       </li>
       <li>
-        <Link to="/probe-planner" className="text-primary hover:underline">Approved without patch</Link>
+        <Link to="/probe-planner" className="text-primary hover:underline">承認済み・patch 未作成</Link>
         : {approvedWithoutPatch}
       </li>
       <li>
-        <Link to="/probe-planner" className="text-primary hover:underline">Validated</Link>
+        <Link to="/probe-planner" className="text-primary hover:underline">検証済み</Link>
         : {validated}
       </li>
     </ul>
@@ -101,7 +103,7 @@ function EvaluateSummary({ counts }: { counts?: Record<string, number> }) {
   if (!hasCounts) {
     return (
       <p className="text-sm text-muted-foreground" data-testid="stage-summary-evaluate">
-        Trace comparisons, experiment runs, and adoption decisions live in Experiments.
+        Trace の比較、experiment の実行、採否の判断は Experiments で行います。
       </p>
     );
   }
@@ -109,11 +111,11 @@ function EvaluateSummary({ counts }: { counts?: Record<string, number> }) {
   return (
     <ul className="text-sm space-y-1" data-testid="stage-summary-evaluate">
       <li>
-        <Link to="/experiments" className="text-primary hover:underline">Undecided</Link>
+        <Link to="/experiments" className="text-primary hover:underline">未判断</Link>
         : {undecided}
       </li>
       <li>
-        <Link to="/experiments" className="text-primary hover:underline">Decided</Link>
+        <Link to="/experiments" className="text-primary hover:underline">判断済み</Link>
         : {decided}
       </li>
     </ul>
@@ -125,8 +127,8 @@ function EntryCards({ purposeDefined }: { purposeDefined: boolean }) {
     <div className="space-y-2">
       {!purposeDefined && (
         <p className="text-xs text-muted-foreground" data-testid="entry-cards-prereq-note">
-          Best used after the System Purpose is defined — the purpose gives
-          capabilities, observation candidates, and probe plans their meaning.
+          System Purpose を決めてから使うと効果的です。目的が決まっていると、
+          capability・観測候補・probe plan の意味づけができます。
         </p>
       )}
       <div className={cn("grid gap-4 md:grid-cols-2", !purposeDefined && "opacity-70")}>
@@ -135,12 +137,12 @@ function EntryCards({ purposeDefined }: { purposeDefined: boolean }) {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm flex items-center gap-2">
               <Boxes className="h-4 w-4" />
-              Start from Capability
+              Capability から始める
             </CardTitle>
           </CardHeader>
           <CardContent className="text-xs text-muted-foreground">
-            Browse capabilities discovered from source metadata and code structure.
-            Drill into elements, see related APIs, and identify probe candidates.
+            ソースのメタデータとコード構造から見つかった capability を一覧します。
+            要素を掘り下げ、関連する API と probe の候補を確認できます。
           </CardContent>
         </Card>
       </Link>
@@ -149,17 +151,77 @@ function EntryCards({ purposeDefined }: { purposeDefined: boolean }) {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm flex items-center gap-2">
               <Target className="h-4 w-4" />
-              Start from Feature
+              Feature から始める
             </CardTitle>
           </CardHeader>
           <CardContent className="text-xs text-muted-foreground">
-            Explore features extracted from documentation, map them to code symbols
-            via Feature-to-Code Links, and trace their capability connections.
+            ドキュメントから抽出した Feature を確認し、Feature-to-Code Link でコードの
+            symbol と対応づけ、capability とのつながりをたどります。
           </CardContent>
         </Card>
       </Link>
       </div>
     </div>
+  );
+}
+
+/**
+ * B6 (UX 監査 2026-11-17): gap が 0 件でも、それが「照合して差が無かった」
+ * のか「まだ照合していない」のかは別の事実。判定は server が返す
+ * docs_code_reconciled パイプラインステップの status だけで行い、
+ * `complete` 以外 (missing / warning / blocked / failed / ステップ無し) では
+ * 「差は見つかりませんでした」を出さない。
+ *
+ * `complete` で件数推移 (gap_trend) が無いときも日本語の「差なし」をここで
+ * 出す。推移があるときだけ GapWorklist に任せる (推移表示はそちらにしか無い)。
+ */
+function GapsEmpty({ step }: { step: SystemUnderstandingPipelineStep | undefined }) {
+  if (step?.status === "complete") {
+    return (
+      <Card id="gap-worklist" data-testid="gap-worklist">
+        <CardHeader>
+          <CardTitle className="text-base">Docs-code の差分</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-muted-foreground" data-testid="no-gaps-message">
+            Docs-code 照合を実行した結果、ドキュメントとコードの間に目立った差は見つかりませんでした。
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+  let message: string;
+  if (!step) {
+    message = "Docs-code 照合の状態を取得できなかったため、差の有無はまだ分かりません。";
+  } else if (step.status === "warning") {
+    message =
+      "Docs-code 照合に必要なデータが一部しか揃っていないため、差の有無はまだ確認できていません。" +
+      "Build / Refresh を実行すると照合されます。";
+  } else if (step.status === "missing") {
+    message =
+      "Docs-code 照合はまだ実行されていないため、差の有無は分かりません。" +
+      "Build / Refresh を実行すると照合されます。";
+  } else {
+    message =
+      `Docs-code 照合が完了していない (status: ${step.status}) ため、差の有無は分かりません。` +
+      "パイプラインの状態で理由を確認してください。";
+  }
+  return (
+    <Card id="gap-worklist" data-testid="gap-worklist">
+      <CardHeader>
+        <CardTitle className="text-base">Docs-code の差分</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-1">
+        <p
+          className="text-sm text-muted-foreground"
+          data-testid="gaps-not-reconciled"
+          data-reconcile-status={step?.status ?? "unknown"}
+        >
+          {message}
+        </p>
+        {step?.detail && <p className="text-xs text-muted-foreground">{step.detail}</p>}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -254,11 +316,24 @@ function PurposeConfirmationControl({
     }
   };
 
+  // UX audit 2026-11-17 A4: this button records something narrower than the
+  // Interview's 理解の確認. Its label is bound to the #275 spec and tests, so
+  // the distinction is stated beside it instead of renaming it.
+  const scopeNote = (
+    <p className="text-xs text-muted-foreground" data-testid="purpose-confirm-scope-note">
+      System Profile の記述と、AI がコードと文書から読み取った目的が一致していることの記録です。
+      Interview での理解の確認や、確定した理解(正準)の更新とは別の記録です。
+    </p>
+  );
+
   if (confirmation && !confirmation.stale) {
     return (
-      <div className="flex items-center gap-2 text-sm" data-testid="purpose-confirmed">
-        <Badge variant="outline">確認済み</Badge>
-        <span className="text-muted-foreground">{formatTimestamp(confirmation.created_at)}</span>
+      <div className="space-y-1">
+        <div className="flex items-center gap-2 text-sm" data-testid="purpose-confirmed">
+          <Badge variant="outline">確認済み</Badge>
+          <span className="text-muted-foreground">{formatTimestamp(confirmation.created_at)}</span>
+        </div>
+        {scopeNote}
       </div>
     );
   }
@@ -281,6 +356,7 @@ function PurposeConfirmationControl({
       >
         一致を確認した
       </Button>
+      {scopeNote}
       {(snapshotId == null || understandingBuildId == null) && (
         <p className="text-xs text-muted-foreground" data-testid="purpose-confirm-build-required">
           System Understanding の Build 完了後に確認できます。
@@ -390,6 +466,7 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
   const observeStage = findStage(data.stages, "observe");
   const instrumentStage = findStage(data.stages, "instrument");
   const evaluateStage = findStage(data.stages, "evaluate");
+  const reconcileStep = pipeline.find((s) => s.step === "docs_code_reconciled");
 
   return (
     <div className="space-y-10">
@@ -406,9 +483,9 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
           <Card data-testid="pipeline-collapsed">
             <CardContent className="py-3 flex items-center justify-between gap-4 flex-wrap">
               <p className="text-sm">
-                <span className="font-medium">Pipeline Status</span>{" "}
+                <span className="font-medium">パイプラインの状態</span>{" "}
                 <span className="text-muted-foreground">
-                  — {pipeline.length}/{pipeline.length} steps complete
+                  — 全 {pipeline.length} ステップ中 {pipeline.length} ステップ完了
                 </span>
               </p>
               <Button
@@ -417,7 +494,7 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
                 onClick={() => setPipelineExpandedByUser(true)}
                 data-testid="pipeline-expand"
               >
-                Show details
+                詳細を表示
               </Button>
             </CardContent>
           </Card>
@@ -425,7 +502,7 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
           <Card>
             <CardHeader>
               <CardTitle className="text-base flex items-center justify-between gap-4">
-                Pipeline Status
+                パイプラインの状態
                 {allComplete && (
                   <Button
                     variant="ghost"
@@ -433,14 +510,14 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
                     onClick={() => setPipelineExpandedByUser(false)}
                     data-testid="pipeline-collapse"
                   >
-                    Collapse
+                    折りたたむ
                   </Button>
                 )}
               </CardTitle>
               <CardDescription>
-                Progress through the system understanding pipeline. Steps that are
-                missing or blocked show a "Why?" button when a configuration
-                diagnostic or a recent run failure explains them.
+                System Understanding のパイプラインの進み具合です。未完了や停止中の
+                ステップは、設定の診断や直近の実行失敗で理由が分かる場合に
+                理由を確認するボタンを表示します。
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -467,28 +544,30 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
         {/* Metadata Coverage */}
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Metadata Coverage</CardTitle>
+            <CardTitle className="text-base">メタデータの網羅状況</CardTitle>
           </CardHeader>
           <CardContent>
             {data.metadata_coverage ? (
               <div className="grid grid-cols-2 gap-4 text-sm" data-testid="metadata-coverage">
                 <div>
-                  <p className="text-muted-foreground">Symbols</p>
+                  <p className="text-muted-foreground">symbol</p>
                   <p className="text-lg font-semibold">{data.metadata_coverage.symbol_count}</p>
                   <p className="text-xs text-muted-foreground">
-                    {data.metadata_coverage.symbols_with_source_metadata} with metadata
+                    うちメタデータあり {data.metadata_coverage.symbols_with_source_metadata}
                   </p>
                 </div>
                 <div>
-                  <p className="text-muted-foreground">Entrypoints</p>
+                  <p className="text-muted-foreground">entrypoint</p>
                   <p className="text-lg font-semibold">{data.metadata_coverage.entrypoint_count}</p>
                   <p className="text-xs text-muted-foreground">
-                    {data.metadata_coverage.entrypoints_with_capability_link} with capability link
+                    うち capability と対応 {data.metadata_coverage.entrypoints_with_capability_link}
                   </p>
                 </div>
               </div>
             ) : (
-              <p className="text-sm text-muted-foreground">Run a build to see coverage.</p>
+              <p className="text-sm text-muted-foreground" data-testid="metadata-coverage-empty">
+                まだ集計されていません。Build / Refresh を実行すると網羅状況が表示されます。
+              </p>
             )}
           </CardContent>
         </Card>
@@ -500,7 +579,7 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
               <CardTitle className="text-base">Core Capabilities</CardTitle>
               <CardDescription>
                 <Link to="/capability-map" className="hover:underline text-primary">
-                  View full Capability Map
+                  Capability Map ですべて見る
                 </Link>
               </CardDescription>
             </CardHeader>
@@ -524,10 +603,10 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
         {data.major_symbols.length > 0 && (
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">Major Functions / Source Symbols</CardTitle>
+              <CardTitle className="text-base">主要な関数・ソース symbol</CardTitle>
               <CardDescription>
                 <Link to="/repository" className="hover:underline text-primary">
-                  View in Repository
+                  Repository で見る
                 </Link>
               </CardDescription>
             </CardHeader>
@@ -536,10 +615,10 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b text-left">
-                      <th className="pb-2 font-medium text-muted-foreground">Path</th>
-                      <th className="pb-2 font-medium text-muted-foreground">Name</th>
-                      <th className="pb-2 font-medium text-muted-foreground">Kind</th>
-                      <th className="pb-2 font-medium text-muted-foreground">Route</th>
+                      <th className="pb-2 font-medium text-muted-foreground">パス</th>
+                      <th className="pb-2 font-medium text-muted-foreground">名前</th>
+                      <th className="pb-2 font-medium text-muted-foreground">種別</th>
+                      <th className="pb-2 font-medium text-muted-foreground">ルート</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -565,7 +644,7 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
                 </table>
                 {data.major_symbols.length > 20 && (
                   <p className="text-xs text-muted-foreground mt-2">
-                    Showing 20 of {data.major_symbols.length}.
+                    {data.major_symbols.length} 件中 20 件を表示しています。
                   </p>
                 )}
               </div>
@@ -573,14 +652,21 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
           </Card>
         )}
 
-        {/* Docs-Code Gap Worklist */}
-        <GapWorklist
-          gaps={data.gaps}
-          gapSummary={data.gap_summary}
-          gapTrend={data.gap_trend}
-          snapshotId={data.snapshot_id}
-          commitSha={data.commit_sha}
-        />
+        {/* Docs-Code Gap Worklist. B6 (UX 監査 2026-11-17): 「差が無い」と
+            言えるのは server の docs_code_reconciled ステップが complete の
+            ときだけ。未照合を「差なし」と表示しない。 */}
+        {data.gaps.length === 0 && data.gap_summary.length === 0 &&
+          (reconcileStep?.status !== "complete" || (data.gap_trend ?? []).length === 0) ? (
+          <GapsEmpty step={reconcileStep} />
+        ) : (
+          <GapWorklist
+            gaps={data.gaps}
+            gapSummary={data.gap_summary}
+            gapTrend={data.gap_trend}
+            snapshotId={data.snapshot_id}
+            commitSha={data.commit_sha}
+          />
+        )}
       </StageSection>
 
       <StageSection
@@ -595,10 +681,10 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
         {data.entrypoints.length > 0 ? (
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">Key API / Entrypoints</CardTitle>
+              <CardTitle className="text-base">主要な API / entrypoint</CardTitle>
               <CardDescription>
                 <Link to="/flow-explorer" className="hover:underline text-primary">
-                  View in Flow Explorer
+                  Flow Explorer で見る
                 </Link>
               </CardDescription>
             </CardHeader>
@@ -607,10 +693,10 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b text-left">
-                      <th className="pb-2 font-medium text-muted-foreground">Type</th>
+                      <th className="pb-2 font-medium text-muted-foreground">種別</th>
                       <th className="pb-2 font-medium text-muted-foreground">ID</th>
-                      <th className="pb-2 font-medium text-muted-foreground">Category</th>
-                      <th className="pb-2 font-medium text-muted-foreground">Label</th>
+                      <th className="pb-2 font-medium text-muted-foreground">カテゴリ</th>
+                      <th className="pb-2 font-medium text-muted-foreground">ラベル</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -636,8 +722,8 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
                 </table>
                 {data.entrypoints.length > 20 && (
                   <p className="text-xs text-muted-foreground mt-2">
-                    Showing 20 of {data.entrypoints.length}.{" "}
-                    <Link to="/flow-explorer" className="hover:underline text-primary">View all</Link>
+                    {data.entrypoints.length} 件中 20 件を表示しています。{" "}
+                    <Link to="/flow-explorer" className="hover:underline text-primary">すべて見る</Link>
                   </p>
                 )}
               </div>
@@ -645,8 +731,8 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
           </Card>
         ) : (
           <p className="text-sm text-muted-foreground">
-            No entrypoints discovered yet. Once entrypoints are indexed, pick observation
-            points here before moving to instrumentation.
+            entrypoint はまだ見つかっていません。entrypoint が索引されたら、計装へ進む前に
+            ここで観測箇所を選んでください。
           </p>
         )}
       </StageSection>
@@ -680,7 +766,7 @@ function DataView({ data, checksByStep, pageItems, onRunBuild, buildDisabled }: 
 }
 
 export default function SystemUnderstandingPage() {
-  const { data, isLoading, error } = useSystemUnderstanding();
+  const { data, isLoading, error, refetch, isFetching } = useSystemUnderstanding();
   const { data: diagnostics } = useSystemDiagnostics();
   const { data: systemState } = useSystemState();
   const build = useBuildSystemUnderstanding();
@@ -753,7 +839,17 @@ export default function SystemUnderstandingPage() {
           <p className="text-muted-foreground mt-1">
             {data?.commit_sha
               ? `Snapshot #${data.snapshot_id} — ${data.commit_sha.slice(0, 8)}`
-              : "Unified view of what is known about this system"}
+              : "この System について分かっていることをまとめて表示します"}
+          </p>
+          {/* UX audit 2026-11-17 A4: 「システム理解」 has one destination. This
+              screen is the evidence and pipeline view; the confirmed
+              understanding (canonical head) lives in the Interview. */}
+          <p className="mt-2 max-w-3xl text-sm text-muted-foreground" data-testid="system-understanding-role-note">
+            この画面は、コードと文書から機械的に読み取った根拠と、解析パイプラインの状態を見る画面です。
+            確定した理解の確認と質問への回答は Interview で行います。{" "}
+            <Link to="/interview" className="text-primary hover:underline" data-testid="system-understanding-interview-link">
+              Interview へ移動
+            </Link>
           </p>
         </div>
         <Button
@@ -767,12 +863,12 @@ export default function SystemUnderstandingPage() {
           {build.isPending || buildRunning ? (
             <>
               <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
-              Building...
+              Build 実行中…
             </>
           ) : (
             <>
               <RefreshCw className="h-4 w-4 mr-2" />
-              Build / Refresh
+              Build / Refresh を実行
             </>
           )}
         </Button>
@@ -782,7 +878,7 @@ export default function SystemUnderstandingPage() {
         <p className="text-xs text-destructive" data-testid="build-blocked-reason">
           {repoGate.summary} {repoGate.remediation}{" "}
           {repoGate.to && (
-            <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Go to Repository"}</Link>
+            <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Repository 設定へ"}</Link>
           )}
         </p>
       )}
@@ -828,19 +924,21 @@ export default function SystemUnderstandingPage() {
         <Card data-testid="build-failed">
           <CardContent className="py-4">
             <p className="text-sm text-destructive">
-              Last build {latestBuild.status === "partial" ? "partially failed" : "failed"}
-              {latestBuild.error ? `: ${latestBuild.error}` : "."}
+              {latestBuild.status === "partial" ? "前回の build は一部が失敗しました" : "前回の build は失敗しました"}
+              {latestBuild.error ? `: ${latestBuild.error}` : "。"}
             </p>
           </CardContent>
         </Card>
       )}
 
       {error && (
-        <Card>
-          <CardContent className="py-4">
-            <p className="text-sm text-destructive">Failed to load system understanding: {String(error)}</p>
-          </CardContent>
-        </Card>
+        <QueryErrorState
+          target="System Understanding"
+          error={error}
+          onRetry={() => void refetch()}
+          retrying={isFetching}
+          data-testid="system-understanding-load-error"
+        />
       )}
 
       {isLoading ? (

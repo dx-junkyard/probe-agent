@@ -646,7 +646,7 @@ class TestProbePlanGeneration:
             "/repository/probe-plans/generate?feature_id=user-management",
             headers=h,
         )
-        assert r.status_code == 201
+        assert r.status_code == 502
         data = r.json()
         run = data.get("intelligence_run", {})
         assert run.get("status") == "failed"
@@ -1281,3 +1281,256 @@ class TestPatchesList:
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/x-diff")
         assert "@probe" in r.text
+
+
+# ---------------------------------------------------------------------------
+# UX audit 2026-11-17 C4: per-point opt-in input capture chosen at approval
+# ---------------------------------------------------------------------------
+
+
+def _generate_plan(client, h, monkeypatch):
+    _enable_reasoning(monkeypatch, _ReasoningProbePlanClient)
+    from app.llm import get_llm_client
+    get_llm_client.cache_clear()
+    r = client.post(
+        "/repository/probe-plans/generate?feature_id=user-management",
+        headers=h,
+    )
+    assert r.status_code in (200, 201), r.text
+    return r.json()
+
+
+class TestInstrumentFileReplayCapture:
+    def test_only_selected_points_get_replay_capture(self):
+        """The generated decorator text is fixed exactly per point."""
+        from app.patch_generator import ApprovedPoint, instrument_file
+
+        source = textwrap.dedent("""\
+            def summarize(text):
+                return text[:80]
+
+
+            def classify(item):
+                return item.get("type")
+        """)
+        points = [
+            ApprovedPoint(
+                component_id="summarize-c", path="m.py", symbol="summarize",
+                recommended_mode="trace", line_start=1, line_end=2,
+                replay_capture=True,
+            ),
+            ApprovedPoint(
+                component_id="classify-c", path="m.py", symbol="classify",
+                recommended_mode="trace", line_start=5, line_end=6,
+            ),
+        ]
+        patched, skipped = instrument_file(source, points)
+        assert not skipped
+        assert patched == textwrap.dedent("""\
+            from probe_agent import probe
+            @probe(component_id="summarize-c", replay_capture=True)
+            def summarize(text):
+                return text[:80]
+
+
+            @probe(component_id="classify-c")
+            def classify(item):
+                return item.get("type")
+        """)
+
+    def test_default_is_no_capture(self):
+        from app.patch_generator import ApprovedPoint
+
+        point = ApprovedPoint(
+            component_id="c", path="m.py", symbol="f",
+            recommended_mode="trace", line_start=1, line_end=1,
+        )
+        assert point.replay_capture is False
+
+    def test_generated_decorator_is_accepted_by_the_sdk(self):
+        """`replay_capture=True` is the SDK's own defaults form."""
+        from probe_agent import probe
+
+        @probe(component_id="c4-sdk-shape", replay_capture=True)
+        def f(x):
+            return x
+
+        assert f(3) == 3
+
+
+class TestProbePointReplayCaptureDecision:
+    def test_capture_is_recorded_as_manual_decision_and_reaches_patch(
+        self, admin_client, git_repo, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "c4-capture")
+        h = _setup_full_pipeline(
+            admin_client, token, system["id"], git_repo, monkeypatch,
+        )
+        monkeypatch.setenv("PROBE_WORKTREE_BASE", str(tmp_path / "worktrees"))
+        plan = _generate_plan(admin_client, h, monkeypatch)
+        point = plan["probe_points"][0]
+        assert point["replay_capture"] is False
+        assert point["decision_method"] is None
+
+        me = admin_client.get("/auth/me", headers=_bearer(token)).json()
+        r = admin_client.put(
+            f"/repository/probe-points/{point['id']}/status",
+            json={"status": "approved", "replay_capture": True},
+            headers=h,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["replay_capture"] is True
+        assert body["decision_method"] == "manual"
+        assert body["decided_by_user_id"] == me["user"]["id"]
+        assert body["decided_at"] is not None
+
+        r = admin_client.post(
+            f"/repository/probe-plans/{plan['id']}/patch", headers=h,
+        )
+        assert r.status_code == 201, r.text
+        assert (
+            f'+@probe(component_id="{point["component_id"]}", replay_capture=True)\n'
+            in r.json()["diff"]
+        )
+
+    def test_approval_without_choice_keeps_capture_off(
+        self, admin_client, git_repo, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "c4-default-off")
+        h = _setup_full_pipeline(
+            admin_client, token, system["id"], git_repo, monkeypatch,
+        )
+        monkeypatch.setenv("PROBE_WORKTREE_BASE", str(tmp_path / "worktrees"))
+        plan = _generate_plan(admin_client, h, monkeypatch)
+        point = plan["probe_points"][0]
+
+        r = admin_client.put(
+            f"/repository/probe-points/{point['id']}/status",
+            json={"status": "approved"},
+            headers=h,
+        )
+        assert r.status_code == 200
+        assert r.json()["replay_capture"] is False
+        assert r.json()["decision_method"] == "manual"
+
+        r = admin_client.post(
+            f"/repository/probe-plans/{plan['id']}/patch", headers=h,
+        )
+        diff = r.json()["diff"]
+        assert f'+@probe(component_id="{point["component_id"]}")\n' in diff
+        assert "replay_capture" not in diff
+
+    def test_rejecting_clears_capture_and_capture_requires_approval(
+        self, admin_client, git_repo, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "c4-reject")
+        h = _setup_full_pipeline(
+            admin_client, token, system["id"], git_repo, monkeypatch,
+        )
+        plan = _generate_plan(admin_client, h, monkeypatch)
+        pid = plan["probe_points"][0]["id"]
+        url = f"/repository/probe-points/{pid}/status"
+
+        r = admin_client.put(
+            url, json={"status": "rejected", "replay_capture": True}, headers=h,
+        )
+        assert r.status_code == 422
+
+        admin_client.put(
+            url, json={"status": "approved", "replay_capture": True}, headers=h,
+        )
+        r = admin_client.put(url, json={"status": "rejected"}, headers=h)
+        assert r.status_code == 200
+        assert r.json()["replay_capture"] is False
+
+    def test_high_side_effect_risk_refuses_capture(
+        self, admin_client, git_repo, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "c4-high-risk")
+        h = _setup_full_pipeline(
+            admin_client, token, system["id"], git_repo, monkeypatch,
+        )
+        plan = _generate_plan(admin_client, h, monkeypatch)
+        pid = plan["probe_points"][0]["id"]
+        from app.db import get_conn
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE probe_points SET side_effect_risk = 'high' WHERE id = ?",
+                (pid,),
+            )
+        url = f"/repository/probe-points/{pid}/status"
+        r = admin_client.put(
+            url, json={"status": "approved", "replay_capture": True}, headers=h,
+        )
+        assert r.status_code == 409
+        # Approval itself is still possible -- only capture is refused.
+        r = admin_client.put(url, json={"status": "approved"}, headers=h)
+        assert r.status_code == 200
+        assert r.json()["replay_capture"] is False
+
+    def test_decision_is_system_scoped(
+        self, admin_client, git_repo, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        system1 = _create_system(admin_client, token, "c4-sys-1")
+        system2 = _create_system(admin_client, token, "c4-sys-2")
+        h1 = _setup_full_pipeline(
+            admin_client, token, system1["id"], git_repo, monkeypatch,
+        )
+        plan = _generate_plan(admin_client, h1, monkeypatch)
+        pid = plan["probe_points"][0]["id"]
+
+        h2 = _headers(token, system2["id"])
+        r = admin_client.put(
+            f"/repository/probe-points/{pid}/status",
+            json={"status": "approved", "replay_capture": True},
+            headers=h2,
+        )
+        assert r.status_code == 404
+        r = admin_client.get(f"/repository/probe-plans/{plan['id']}", headers=h1)
+        point = r.json()["probe_points"][0]
+        assert point["status"] == "proposed"
+        assert point["replay_capture"] is False
+
+
+def test_legacy_probe_points_table_migrates_with_capture_off(tmp_path, monkeypatch):
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE probe_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL, system_id INTEGER NOT NULL,
+            component_id TEXT NOT NULL, feature_id TEXT NOT NULL,
+            path TEXT NOT NULL, symbol TEXT NOT NULL,
+            line_start INTEGER NOT NULL, line_end INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            recommended_mode TEXT NOT NULL DEFAULT 'trace',
+            side_effect_risk TEXT NOT NULL DEFAULT 'low',
+            replayability TEXT NOT NULL DEFAULT '',
+            denylist_hit TEXT,
+            status TEXT NOT NULL DEFAULT 'approved',
+            created_at REAL NOT NULL, updated_at REAL NOT NULL
+        );
+        INSERT INTO probe_points (plan_id, system_id, component_id, feature_id,
+            path, symbol, line_start, line_end, reason, status, created_at, updated_at)
+        VALUES (1, 1, 'c', 'f', 'p.py', 's', 1, 2, 'r', 'approved', 0, 0);
+    """)
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("PROBE_DB_PATH", str(db_path))
+    from app.db import init_db, get_conn
+    init_db()
+    with get_conn() as c:
+        row = c.execute("SELECT * FROM probe_points").fetchone()
+    assert row["replay_capture"] == 0
+    assert row["decided_by_user_id"] is None
+    assert row["decision_method"] is None
+    assert row["decided_at"] is None

@@ -989,6 +989,9 @@ export interface InterviewDialogueTurnOut {
   // Issue #142: count of question evidence_refs dropped as unverifiable
   // (graceful fallback, not an error).
   evidence_refs_dropped: number;
+  // IK-0039: proposals dropped / references corrected because the model named
+  // a symbol or feature outside the candidate set it was given.
+  proposal_diagnostics?: Array<Record<string, unknown>>;
   // Evidence targets pass 1 asked for beyond INTERVIEW_EVIDENCE_MAX_FILES (not read).
   evidence_targets_omitted: number;
 }
@@ -2655,6 +2658,12 @@ export interface ProbePointOut {
   replayability: string;
   denylist_hit: boolean;
   status: string;
+  /** UX audit 2026-11-17 C4: opt-in input capture chosen by the approver.
+   *  Optional so an older Control Server (no field) reads as "off". */
+  replay_capture?: boolean;
+  decided_by_user_id?: number | null;
+  decision_method?: "manual" | null;
+  decided_at?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -3090,6 +3099,13 @@ export interface ProbePatchOut {
   applied_by_user_id: number | null;
   validation_runs: ValidationRunOut[];
   created_at: string;
+  // UX audit 2026-11-17 C5: server-decided lineage (improvement_publish_artifacts).
+  // Optional so an older Control Server reads as probe_plan-less (undefined).
+  origin?: "probe_plan" | "improvement";
+  improvement_experiment_id?: number | null;
+  improvement_variant_key?: string | null;
+  improvement_variant_label?: string | null;
+  improvement_adoption_current?: boolean | null;
 }
 
 export interface GenerationRun {
@@ -3166,6 +3182,23 @@ export interface ExperimentOut {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  // UX audit 2026-11-17 D7: the run endpoint's own guards (not running, not governed).
+  run_allowed?: boolean;
+  // UX audit 2026-11-17 C5: the current adoption's publish patch (exact lineage).
+  adopted_improvement_patch_id?: number | null;
+}
+
+// IK-0035: GET /experiments/{id}/record（台帳の外部検証の線に写す記録）
+export interface ExperimentRecordOut {
+  tool: string;
+  run_ref: string;
+  url: string;
+  executed_at: string;
+  conditions: string;
+  result_summary: string; // 人の判断だけ（IK-0036）
+  analysis_summary: string; // LLM の解釈と推奨（助言）
+  complete: boolean;
+  detail: Record<string, unknown>;
 }
 
 export interface EvaluationCriterion {
@@ -5062,6 +5095,31 @@ export interface CandidateSessionOut {
   // single-session endpoint (GET /candidate-sessions/{id}).
   messages: CandidateMessageOut[];
   versions: CandidateVersionOut[];
+  // Issue #369: the stale-snapshot decision recorded at session creation.
+  snapshot_freshness?: SnapshotFreshnessState | null;
+  head_sha_at_creation?: string | null;
+  stale_ack_reason?: string | null;
+  // UX audit 2026-11-17 C13: newest version's persisted state, present on the
+  // list endpoint too. null = the session has no version yet.
+  version_count?: number;
+  latest_version_number?: number | null;
+  latest_version_status?: CandidateVersionStatus | null;
+  latest_version_replay_status?: CandidateReplayStatus | null;
+}
+
+// UX audit 2026-11-17 C8: whether the session's own stale reason covers a
+// candidate replay now. Decided by the server (first match).
+export type CandidateReplayStaleReasonState =
+  | "not_required"
+  | "not_recorded"
+  | "head_moved"
+  | "inheritable";
+
+export interface CandidateReplayPreflightOut {
+  preflight: SnapshotPreflightOut;
+  stale_reason_state: CandidateReplayStaleReasonState;
+  session_stale_ack_reason: string | null;
+  session_head_sha_at_creation: string | null;
 }
 
 export interface CandidateSessionCreateRequest {
@@ -5671,6 +5729,8 @@ export interface InterviewWorkflowFactsOut {
   blocking_failure_states: string[];
   understanding_unconfirmed: boolean;
   open_required_questions: number;
+  // §2.2 行 7 の「ゼロベース質問の未完」。古い Control Server は返さない。
+  zero_base_pending?: boolean;
   outstanding_alignment_items: number;
   proposals_needing_review: number;
   proposals_generatable: boolean;
@@ -5712,6 +5772,10 @@ export interface InterviewWorkflowExceptionOut {
   detail: string | null;
   recovery_process_kind: InterviewProcessKind | null;
   recovery_condition: string | null;
+  // 別画面が持つ前提が今欠けていることを示す有限値 (UX 監査 2026-11-17 B4)。
+  // 失敗文言ではなくサーバーが永続化された事実から決める。古い Control
+  // Server は返さないので省略可。
+  prerequisite?: "system_understanding_graph" | null;
 }
 
 export interface InterviewWorkflowStateOut {
@@ -8234,6 +8298,277 @@ export interface ValueNetworkOut {
   degraded_detail: Record<string, string>;
 }
 
+// --- Issue #420 write API (`/stakeholder-network/*`), used by the UX audit
+// 2026-11-17 C1 editing surface. None of the request types carries
+// `created_by` / `decided_by` / `decision_method` / `authored_by_kind`: the
+// server derives all four from the route and the authenticated Principal
+// (§10), and rejects extra body fields. No amount / sum column exists
+// anywhere (§11: money is described, never processed).
+
+export type StakeholderNeedKind = "unmet_need" | "problem" | "constraint" | "expectation";
+
+export type EnvironmentObservationConfidence = "observed" | "reported" | "assumed";
+
+export type EnvironmentImpactKind = "creates" | "worsens" | "relieves" | "invalidates" | "constrains";
+
+export type StakeholderDecisionKind = "confirm" | "reject" | "retire" | "reinstate";
+
+export type StakeholderDecisionSubjectKind =
+  | "stakeholder" | "stakeholder_need" | "environment_observation"
+  | "value_exchange" | "stakeholder_ref" | "stakeholder_role_assignment";
+
+export interface StakeholderRevisionOut {
+  id: number;
+  stakeholder_id: number;
+  revision_number: number;
+  display_name: string;
+  stakeholder_kind: ValueNetworkStakeholderKind;
+  description: string;
+  context_note: string;
+  content_digest: string;
+  authored_by_kind: ValueNetworkAuthorshipKind;
+  decision_method: string;
+  change_note: string;
+  created_by: string | null;
+  created_at: number;
+  revision_state: "current" | "superseded";
+  superseded_by_id: number | null;
+}
+
+export interface StakeholderOut {
+  id: number;
+  system_id: number;
+  stakeholder_key: string;
+  current_revision_id: number | null;
+  current_revision_number: number | null;
+  display_name: string;
+  stakeholder_kind: ValueNetworkStakeholderKind;
+  design_status: ValueNetworkDesignStatus;
+  recheck_state: ValueNetworkRecheckState;
+  created_by: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface StakeholderDetailOut extends StakeholderOut {
+  current_revision: StakeholderRevisionOut | null;
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface StakeholderCreateRequest {
+  stakeholder_key: string;
+  display_name: string;
+  stakeholder_kind: ValueNetworkStakeholderKind;
+  description: string;
+  context_note: string;
+}
+
+export interface StakeholderRevisionCreateRequest {
+  display_name: string;
+  stakeholder_kind: ValueNetworkStakeholderKind;
+  description: string;
+  context_note: string;
+  change_note: string;
+}
+
+export interface StakeholderNeedRevisionOut {
+  id: number;
+  need_id: number;
+  revision_number: number;
+  need_kind: StakeholderNeedKind;
+  statement: string;
+  rationale: string;
+  stakeholder_key: string;
+  content_digest: string;
+  authored_by_kind: ValueNetworkAuthorshipKind;
+  created_at: number;
+}
+
+export interface StakeholderNeedOut {
+  id: number;
+  system_id: number;
+  need_key: string;
+  current_revision_id: number | null;
+  current_revision_number: number | null;
+  need_kind: StakeholderNeedKind;
+  statement: string;
+  stakeholder_key: string;
+  design_status: ValueNetworkDesignStatus;
+  recheck_state: ValueNetworkRecheckState;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface StakeholderNeedDetailOut extends StakeholderNeedOut {
+  current_revision: StakeholderNeedRevisionOut | null;
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface StakeholderNeedListOut {
+  system_id: number;
+  generated_at: number;
+  needs: StakeholderNeedOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface StakeholderNeedCreateRequest {
+  need_key: string;
+  stakeholder_key: string;
+  need_kind: StakeholderNeedKind;
+  statement: string;
+  rationale: string;
+}
+
+export interface StakeholderNeedRevisionCreateRequest {
+  need_kind: StakeholderNeedKind;
+  statement: string;
+  rationale: string;
+  stakeholder_key: string;
+  change_note: string;
+}
+
+export interface EnvironmentObservationImpactOut {
+  id: number;
+  observation_id: number;
+  impact_kind: EnvironmentImpactKind;
+  target_ref_kind: ValueNetworkRefKind;
+  target_ref: string;
+  target_resolution: ValueNetworkRefTargetResolution;
+  note: string;
+  created_at: number;
+}
+
+export interface EnvironmentObservationOut {
+  id: number;
+  system_id: number;
+  observation_key: string;
+  statement: string;
+  source_note: string;
+  observation_confidence: EnvironmentObservationConfidence;
+  observed_at: number | null;
+  supersedes_observation_key: string | null;
+  content_digest: string;
+  authored_by_kind: ValueNetworkAuthorshipKind;
+  design_status: ValueNetworkDesignStatus;
+  recheck_state: ValueNetworkRecheckState;
+  created_at: number;
+}
+
+export interface EnvironmentObservationDetailOut extends EnvironmentObservationOut {
+  impacts: EnvironmentObservationImpactOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface EnvironmentObservationListOut {
+  system_id: number;
+  generated_at: number;
+  observations: EnvironmentObservationOut[];
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+export interface EnvironmentObservationImpactInput {
+  impact_kind: EnvironmentImpactKind;
+  target_ref_kind: ValueNetworkRefKind;
+  target_ref: string;
+  note: string;
+}
+
+export interface EnvironmentObservationCreateRequest {
+  observation_key: string;
+  statement: string;
+  source_note: string;
+  observation_confidence: EnvironmentObservationConfidence;
+  supersedes_observation_key: string | null;
+  impacts: EnvironmentObservationImpactInput[];
+}
+
+export interface ValueExchangeRevisionOut {
+  id: number;
+  exchange_id: number;
+  revision_number: number;
+  provider_stakeholder_key: string;
+  receiver_stakeholder_key: string;
+  exchange_kind: ValueNetworkExchangeKind;
+  value_statement: string;
+  consideration_state: ValueNetworkConsiderationState;
+  consideration_kind: ValueNetworkExchangeKind | null;
+  consideration_statement: string;
+  channel: string;
+  trigger: string;
+  cadence: ValueNetworkCadence;
+  valid_from: number | null;
+  valid_to: number | null;
+  content_digest: string;
+  authored_by_kind: ValueNetworkAuthorshipKind;
+  created_at: number;
+}
+
+export interface ValueExchangeDetailOut {
+  id: number;
+  system_id: number;
+  exchange_key: string;
+  current_revision_id: number | null;
+  current_revision_number: number | null;
+  provider_stakeholder_key: string;
+  receiver_stakeholder_key: string;
+  exchange_kind: ValueNetworkExchangeKind | null;
+  value_statement: string;
+  validity_state: ValueNetworkValidityState;
+  design_status: ValueNetworkDesignStatus;
+  recheck_state: ValueNetworkRecheckState;
+  created_at: number;
+  updated_at: number;
+  current_revision: ValueExchangeRevisionOut | null;
+  degraded_sections: string[];
+  degraded_detail: Record<string, string>;
+}
+
+/** Shared by create and revision: `exchange_key` only on create,
+ * `change_note` only on revision. */
+export interface ValueExchangeContentRequest {
+  provider_stakeholder_key: string;
+  receiver_stakeholder_key: string;
+  exchange_kind: ValueNetworkExchangeKind;
+  value_statement: string;
+  consideration_state: ValueNetworkConsiderationState;
+  consideration_kind: ValueNetworkExchangeKind | null;
+  consideration_statement: string;
+  channel: string;
+  trigger: string;
+  cadence: ValueNetworkCadence;
+}
+
+export interface ValueExchangeCreateRequest extends ValueExchangeContentRequest {
+  exchange_key: string;
+}
+
+export interface ValueExchangeRevisionCreateRequest extends ValueExchangeContentRequest {
+  change_note: string;
+}
+
+export interface StakeholderDecisionCreateRequest {
+  subject_kind: StakeholderDecisionSubjectKind;
+  subject_key: string;
+  decision: StakeholderDecisionKind;
+  rationale: string;
+  /** The digest of the content the developer was looking at; the server
+   * refuses (409 `stakeholder_decision_stale_digest`) when it moved. */
+  captured_digest: string;
+}
+
+export interface StakeholderDecisionOut {
+  id: number;
+  subject_kind: StakeholderDecisionSubjectKind;
+  subject_key: string;
+  decision: StakeholderDecisionKind;
+  created_at: number;
+}
+
 
 // === Epic #418 / Issue #423 — Journey Service Blueprint types ===
 // (Issue #423 owns everything below this marker.)
@@ -9063,11 +9398,50 @@ export interface ProductGapOut {
   effective_target_availability: ProductGapEffectiveTargetAvailability;
   lifecycle: ProductGapLifecycle;
   priority_band: ProductGapPriorityBand;
+  /** Latest non-superseded resolution choice; `undecided` when none. A third
+   * axis beside `lifecycle` and `priority_band` -- never moves either.
+   * Optional only because an older Control Server does not send it. */
+  resolution_approach?: "undecided" | ProductGapResolutionApproach;
+  resolution_feature_key?: string | null;
   recheck_state: ProductRecheckState;
   read_flags: ProductGapReadFlag[];
   created_by: string | null;
   created_at: number;
   updated_at: number;
+}
+
+/** How a human chose to close a Gap (`ProductGapResolutionApproach` on the
+ * server). Its own manual-only ledger; it never moves `lifecycle`. */
+export type ProductGapResolutionApproach =
+  | "feature_new"
+  | "feature_extend"
+  | "operation"
+  | "sponsor_decision"
+  | "out_of_scope";
+
+export interface ProductGapResolutionChoiceOut {
+  id: number;
+  gap_id: number;
+  gap_key: string;
+  approach: ProductGapResolutionApproach;
+  feature_key: string | null;
+  rationale: string;
+  captured_digest: string;
+  captured_revision_id: number | null;
+  decision_method: "manual";
+  decided_by: string | null;
+  superseded_by_id: number | null;
+  created_at: number;
+}
+
+/** `feature_key` is required for `feature_extend`, optional for
+ * `feature_new`, refused for the non-feature approaches; `rationale` is
+ * required. The server enforces all three. */
+export interface ProductGapResolutionChoiceCreateRequest {
+  approach: ProductGapResolutionApproach;
+  feature_key?: string | null;
+  rationale: string;
+  captured_digest?: string;
 }
 
 /** A Journey that names this Gap as its reason to exist, read by reverse
@@ -9086,6 +9460,8 @@ export interface ProductGapDetailOut extends ProductGapOut {
   evidence_refs: ProductGapEvidenceOut[];
   artifact_links: ProductGapArtifactOut[];
   decisions: ProductGapDecisionOut[];
+  /** Optional only because an older Control Server does not send it. */
+  resolution_choices?: ProductGapResolutionChoiceOut[];
   degraded_sections: string[];
   degraded_detail: Record<string, string>;
 }

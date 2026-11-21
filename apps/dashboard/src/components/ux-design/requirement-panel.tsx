@@ -19,10 +19,15 @@ import {
   useUxJourneys, useUxJourneyDetail, useSolutionDesigns, useSolutionDesignDetailsBatch,
   useProductFeatures, useProductFeatureDetailsBatch, useCreateProductFeature,
   useAddProductFeatureRequirementLink, useDiscussionSaveRequest,
+  useAddProductFeatureRevision, useRecordProductFeatureDecision,
 } from "@/api/hooks";
 import type {
+  ProductFeatureDetailOut, ProductMilestoneDecisionKind,
   UxAcceptanceCriterionInput, UxRequirementKind, UxVerificationMethod,
 } from "@/api/types";
+import {
+  DecisionConfirmDialog, RejectedNotice, rejectionFromError, useDecisionDialog, type Rejection,
+} from "@/components/product-objective/decision-confirm";
 import {
   DESIGN_STATUS_LABEL, DESIGN_RECHECK_STATE_LABEL, REQUIREMENT_KIND_LABEL,
   REF_RECHECK_STATE_LABEL, REF_TARGET_RESOLUTION_LABEL, VERIFICATION_METHOD_LABEL,
@@ -43,7 +48,7 @@ import {
   FieldErrorText, FormErrorBanner, LoadErrorCard, LoadingBlock, SectionHeading,
   StateBadge, useFieldRefs,
 } from "./shared";
-import { useFormValidation, useUiDraftSource } from "@/lib/ui-draft";
+import { useFormValidation, useUiDraftSource, useUnsavedChangesGuard } from "@/lib/ui-draft";
 import { clearFormDraftOpenRequest, peekPendingFormDraftPatch, useFormDraftOpenRequest, useFormDraftReceiver } from "@/lib/form-draft-inbox";
 import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
 import { prepareAcceptanceCriteria } from "@/lib/acceptance-criteria-draft";
@@ -54,7 +59,10 @@ const VERIFICATION_METHODS: UxVerificationMethod[] = [
   "manual_review", "replay", "experiment", "runtime_observation", "not_verifiable",
 ];
 
-function RequirementCreateForm() {
+/** UX audit 2026-11-17 C11: a successful create SELECTS the new Requirement
+ * (`onCreated`), so the developer lands on it instead of having to find it in
+ * the list -- the same behaviour Objective / Milestone creation already has. */
+function RequirementCreateForm({ onCreated }: { onCreated?: (requirementKey: string) => void }) {
   const create = useCreateUxRequirement();
   const [key, setKey] = useState("");
   const [kind, setKind] = useState<UxRequirementKind>("functional");
@@ -67,10 +75,11 @@ function RequirementCreateForm() {
     create.mutate(
       { requirement_key: key.trim(), requirement_kind: kind },
       {
-        onSuccess: () => {
+        onSuccess: (out) => {
           validation.resolveSuccess(token);
           setKey("");
           toast.success("Requirement を作成しました");
+          onCreated?.(out.requirement_key);
         },
         onError: (error) => {
           const apiError = error as ApiError;
@@ -129,7 +138,7 @@ function RequirementList({
         <CardDescription>機能要件・非機能要件・制約・対象外。</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <RequirementCreateForm />
+        <RequirementCreateForm onCreated={onSelect} />
         {requirements.isLoading ? (
           <LoadingBlock testId="ux-requirement-list-loading" />
         ) : requirements.isError ? (
@@ -483,11 +492,22 @@ function RequirementRevisionForm({ requirementKey, onDone }: { requirementKey: s
   );
 }
 
-function StepLinkForm({ requirementKey, onDone }: { requirementKey: string; onDone: () => void }) {
+/** Requirement -> Journey Step link. `initialJourneyKey` / `initialStepKey`
+ * preselect the pair when the form is opened FROM a Step (UX audit C11), so
+ * the developer does not pick again what they were already looking at; both
+ * stay editable. */
+export function StepLinkForm({
+  requirementKey, onDone, initialJourneyKey = "", initialStepKey = "",
+}: {
+  requirementKey: string;
+  onDone: () => void;
+  initialJourneyKey?: string;
+  initialStepKey?: string;
+}) {
   const journeys = useUxJourneys();
-  const [journeyKey, setJourneyKey] = useState("");
+  const [journeyKey, setJourneyKey] = useState(initialJourneyKey);
   const journeyDetail = useUxJourneyDetail(journeyKey || null);
-  const [stepKey, setStepKey] = useState("");
+  const [stepKey, setStepKey] = useState(initialStepKey);
   const [note, setNote] = useState("");
   const addLink = useAddUxRequirementStepLink(requirementKey);
   const steps = stepsInOrder(journeyDetail.data?.current_revision);
@@ -507,7 +527,7 @@ function StepLinkForm({ requirementKey, onDone }: { requirementKey: string; onDo
 
   return (
     <div className="space-y-2 rounded border p-2" data-testid="ux-requirement-step-link-form">
-      <Select value={journeyKey} onChange={(e) => { setJourneyKey(e.target.value); setStepKey(""); }}>
+      <Select aria-label="紐づける Journey" value={journeyKey} onChange={(e) => { setJourneyKey(e.target.value); setStepKey(""); }}>
         <option value="">Journey を選択</option>
         {(journeys.data?.journeys ?? []).map((j) => (
           <option key={j.journey_key} value={j.journey_key}>
@@ -516,7 +536,7 @@ function StepLinkForm({ requirementKey, onDone }: { requirementKey: string; onDo
         ))}
       </Select>
       {journeyKey && (
-        <Select value={stepKey} onChange={(e) => setStepKey(e.target.value)}>
+        <Select aria-label="紐づける Step" value={stepKey} onChange={(e) => setStepKey(e.target.value)}>
           <option value="">Step を選択</option>
           {steps.map((s) => (
             <option key={s.step_key} value={s.step_key}>
@@ -526,9 +546,50 @@ function StepLinkForm({ requirementKey, onDone }: { requirementKey: string; onDo
         </Select>
       )}
       <Input placeholder="メモ(任意)" value={note} onChange={(e) => setNote(e.target.value)} />
-      <Button size="sm" disabled={!journeyKey || !stepKey || addLink.isPending} onClick={submit}>
+      <Button size="sm" disabled={!journeyKey || !stepKey || addLink.isPending} onClick={submit} data-testid="ux-requirement-step-link-submit">
         {addLink.isPending ? "追加中…" : "紐づける"}
       </Button>
+    </div>
+  );
+}
+
+/**
+ * UX audit 2026-11-17 C11: create a Requirement FROM a Journey Step and link
+ * it to that Step, without leaving the Step. Two explicit submissions, in
+ * order: the create (the same endpoint the Requirement tab uses), then the
+ * existing `StepLinkForm` with this Journey and Step preselected. After the
+ * link is recorded the new Requirement is opened (`onLinked`).
+ */
+export function RequirementCreateAndLinkForm({
+  journeyKey, stepKey, onLinked, onCancel,
+}: {
+  journeyKey: string;
+  stepKey: string;
+  onLinked: (requirementKey: string) => void;
+  onCancel: () => void;
+}) {
+  const [createdKey, setCreatedKey] = useState<string | null>(null);
+  return (
+    <div className="space-y-2 rounded border p-2" data-testid="ux-step-requirement-create-and-link">
+      {createdKey === null ? (
+        <>
+          <p className="text-xs font-semibold">1. Requirement を作成する</p>
+          <RequirementCreateForm onCreated={setCreatedKey} />
+        </>
+      ) : (
+        <>
+          <p className="text-xs font-semibold" data-testid="ux-step-requirement-created">
+            2. 作成した Requirement「{createdKey}」をこの Step に紐づける
+          </p>
+          <StepLinkForm
+            requirementKey={createdKey}
+            initialJourneyKey={journeyKey}
+            initialStepKey={stepKey}
+            onDone={() => onLinked(createdKey)}
+          />
+        </>
+      )}
+      <Button size="sm" variant="ghost" onClick={onCancel}>閉じる</Button>
     </div>
   );
 }
@@ -583,6 +644,121 @@ function SolutionDesignsForRequirement({
             </li>
           ))}
         </ul>
+      )}
+    </div>
+  );
+}
+
+const FEATURE_DECISION_VALUES: ProductMilestoneDecisionKind[] = ["confirm", "reject", "retire", "reinstate"];
+const FEATURE_DECISION_LABEL: Record<ProductMilestoneDecisionKind, string> = {
+  confirm: "確定する",
+  reject: "却下する",
+  retire: "廃止する",
+  reinstate: "再提案に戻す",
+};
+
+/**
+ * UX audit 2026-11-17 C2: a Feature's content (append-only revision) and its
+ * definition decision, on the Requirement where the developer meets it.
+ * Before this a Feature could only be created by key and then stayed
+ * 「未確定」 forever, because no screen could save a version or confirm it.
+ *
+ * The revision form is seeded from the CURRENT revision (the endpoint stores
+ * a full snapshot, #427 review) and the component is keyed per Feature, so
+ * text typed for one Feature never lands on another. The decision goes
+ * through the confirmation dialog and sends the current revision's
+ * `content_digest`; no transition table is held here -- a refusal is the
+ * server's `product_feature_not_decidable`, shown with the current state.
+ */
+function FeatureWorkPanel({ feature }: { feature: ProductFeatureDetailOut }) {
+  const current = feature.current_revision;
+  const addRevision = useAddProductFeatureRevision(feature.feature_key);
+  const record = useRecordProductFeatureDecision(feature.feature_key);
+  const dialog = useDecisionDialog<ProductMilestoneDecisionKind>();
+  const [title, setTitle] = useState(current?.title ?? "");
+  const [statement, setStatement] = useState(current?.statement ?? "");
+  const [rationale, setRationale] = useState(current?.rationale ?? "");
+  const [scopeNote, setScopeNote] = useState(current?.scope_note ?? "");
+  const [summary, setSummary] = useState(current?.summary ?? "");
+  const [rejection, setRejection] = useState<Rejection | null>(null);
+  const dirty =
+    title !== (current?.title ?? "")
+    || statement !== (current?.statement ?? "")
+    || rationale !== (current?.rationale ?? "")
+    || scopeNote !== (current?.scope_note ?? "")
+    || summary !== (current?.summary ?? "");
+  useUnsavedChangesGuard(`product-feature-revision:${feature.feature_key}`, dirty);
+  const stateLabel = PRODUCT_DESIGN_STATUS_LABEL[feature.design_status];
+
+  function saveRevision() {
+    setRejection(null);
+    addRevision.mutate(
+      { title, statement, rationale, scope_note: scopeNote, summary },
+      {
+        onSuccess: () => toast.success("Feature の版を保存しました"),
+        onError: (error) => setRejection(rejectionFromError(error, "版を保存できませんでした")),
+      },
+    );
+  }
+
+  function decide(decision: ProductMilestoneDecisionKind, reason: string) {
+    setRejection(null);
+    record.mutate(
+      { decision, rationale: reason, captured_digest: current?.content_digest ?? "" },
+      {
+        onSuccess: () => { dialog.close(); toast.success(`Feature を「${FEATURE_DECISION_LABEL[decision]}」として記録しました`); },
+        onError: (error) => {
+          dialog.close();
+          setRejection(rejectionFromError(error, "記録できませんでした", `現在の状態: ${stateLabel}`));
+        },
+      },
+    );
+  }
+
+  return (
+    <div className="mt-2 space-y-2" data-testid={`ux-requirement-feature-work-${feature.feature_key}`}>
+      <p className="text-xs font-semibold">版を保存する(新しい版として追記されます)</p>
+      <Input aria-label="Feature のタイトル" placeholder="タイトル" value={title} onChange={(e) => setTitle(e.target.value)} />
+      <Textarea aria-label="Feature の内容" placeholder="この Feature が提供すること(statement)" value={statement} onChange={(e) => setStatement(e.target.value)} rows={2} />
+      <Textarea aria-label="Feature の理由" placeholder="理由(rationale)" value={rationale} onChange={(e) => setRationale(e.target.value)} rows={2} />
+      <Input aria-label="Feature の範囲" placeholder="範囲の補足(scope_note)" value={scopeNote} onChange={(e) => setScopeNote(e.target.value)} />
+      <Textarea aria-label="Feature の要約" placeholder="要約" value={summary} onChange={(e) => setSummary(e.target.value)} rows={2} />
+      <Button size="sm" variant="outline" disabled={addRevision.isPending || !dirty} onClick={saveRevision} data-testid={`ux-requirement-feature-revision-submit-${feature.feature_key}`}>
+        {addRevision.isPending ? "保存中…" : "版を保存する"}
+      </Button>
+
+      <div className="space-y-1 border-t pt-2">
+        <p className="text-xs font-semibold">Feature の定義を確定する(人間の判断として記録されます)</p>
+        <p className="text-xs" data-testid={`ux-requirement-feature-state-${feature.feature_key}`}>現在の状態: {stateLabel}</p>
+        {dirty && (
+          <p className="text-xs text-amber-700 dark:text-amber-300">
+            保存していない変更があります。確定は保存済みの版に対して記録されます。
+          </p>
+        )}
+        <div className="flex flex-wrap gap-2">
+          {FEATURE_DECISION_VALUES.map((d) => (
+            <Button
+              key={d} size="sm" variant="outline" disabled={record.isPending}
+              onClick={() => dialog.open(d)}
+              data-testid={`ux-requirement-feature-decision-${feature.feature_key}-${d}`}
+            >
+              {FEATURE_DECISION_LABEL[d]}
+            </Button>
+          ))}
+        </div>
+      </div>
+      {rejection && <RejectedNotice {...rejection} testId={`ux-requirement-feature-rejected-${feature.feature_key}`} />}
+      {dialog.pendingKind && (
+        <DecisionConfirmDialog
+          open
+          onOpenChange={(open) => { if (!open) dialog.close(); }}
+          title={`Feature「${feature.title || feature.feature_key}」を${FEATURE_DECISION_LABEL[dialog.pendingKind]}`}
+          currentStateText={`現在の状態: ${stateLabel}${current ? `(第 ${current.revision_number} 版)` : "(まだ版がありません)"}`}
+          consequence="判断の記録だけを追加します。実装・publish・Solution Design の採用は変わりません。前の判断は履歴に残ります。"
+          confirmLabel={FEATURE_DECISION_LABEL[dialog.pendingKind]}
+          pending={record.isPending}
+          onConfirm={(reason) => decide(dialog.pendingKind!, reason)}
+        />
       )}
     </div>
   );
@@ -698,6 +874,16 @@ function FeaturesForRequirement({
                   tone={link.recheck_state === "current" ? "outline" : "warning"}
                 />
               </div>
+              {/* Open by default while the Feature has no version yet or is
+                  still unconfirmed -- that is exactly when it needs work. */}
+              <details
+                className="mt-1"
+                open={feature.current_revision === null || feature.design_status === "proposed"}
+                data-testid={`ux-requirement-feature-details-${feature.feature_key}`}
+              >
+                <summary className="cursor-pointer text-xs text-primary">版の保存と確定</summary>
+                <FeatureWorkPanel key={feature.feature_key} feature={feature} />
+              </details>
             </li>
           ))}
         </ul>

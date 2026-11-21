@@ -9,7 +9,11 @@
 // decision -- cell_asks.execution_approved never becomes true here).
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { useCellRootDigest, useCellAsks, useSyncCellAsks, useDecideCellAsk } from "@/api/hooks";
+import { useQuery } from "@tanstack/react-query";
+import { useCellRootDigest, useCellAsks, useSyncCellAsks, useDecideCellAsk, sysKey } from "@/api/hooks";
+import { api, getSystemId } from "@/api/client";
+import { QueryErrorState } from "@/components/query-state";
+import { describeRequestFailure } from "@/lib/request-state";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -62,6 +66,30 @@ function EvidenceRefList({ refs, cellId }: { refs: string[]; cellId?: string }) 
   );
 }
 
+// B9 (UX 監査 2026-11-17): Cell が 0 件かどうかはサーバーの Cell 一覧
+// (GET /cell-fabric/cells) の件数だけで決める。digest の sev1 0 件は
+// 「Cell があってリスクが無い」ことであって、Cell が無い System で
+// 「リスクはありません」と断定してよい根拠ではない。
+function useCellCount() {
+  return useQuery({
+    queryKey: sysKey("cellFabricCells"),
+    queryFn: () => api.get<{ system_id: number; cells: unknown[] }>("/cell-fabric/cells"),
+    enabled: !!getSystemId(),
+  });
+}
+
+// 操作の失敗を toast へ。String(e) は出さず、サーバーの理由 (detail) が
+// あればそれを添える。describeRequestFailure の summary は「取得」の文なので
+// 操作の失敗には使わない。
+function actionFailureMessage(action: string, e: unknown): string {
+  const failure = describeRequestFailure(e);
+  if (failure.detail) return `${action}できませんでした: ${failure.detail}`;
+  if (failure.kind === "offline" || failure.kind === "network" || failure.kind === "timeout") {
+    return `${action}できませんでした。サーバーに接続できているか確認して、もう一度お試しください。`;
+  }
+  return `${action}できませんでした。もう一度お試しください。`;
+}
+
 function RiskEntryRow({ entry }: { entry: CellAskDigestEntry }) {
   return (
     <div className="rounded-lg border p-3 text-sm space-y-1">
@@ -79,7 +107,9 @@ function RiskEntryRow({ entry }: { entry: CellAskDigestEntry }) {
 }
 
 export default function CellFabricPage() {
-  const { data, isLoading, error } = useCellRootDigest();
+  const { data, isLoading, error, refetch, isFetching } = useCellRootDigest();
+  const cellCount = useCellCount();
+  const noCells = cellCount.isSuccess && (cellCount.data?.cells?.length ?? 0) === 0;
   const [showKeyPoints, setShowKeyPoints] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
   const [showAudit, setShowAudit] = useState(false);
@@ -97,15 +127,18 @@ export default function CellFabricPage() {
       {isLoading ? (
         <div className="space-y-4">{[1, 2].map(i => <Skeleton key={i} className="h-32 w-full" />)}</div>
       ) : error ? (
-        <Card>
-          <CardContent className="py-8 text-center text-sm text-muted-foreground">
-            {String((error as Error).message ?? error)}
-          </CardContent>
-        </Card>
+        <QueryErrorState
+          target="Cell Fabric のダイジェスト"
+          error={error}
+          onRetry={() => void refetch()}
+          retrying={isFetching}
+          data-testid="cell-fabric-digest-error"
+        />
       ) : !data ? null : (
         <>
           <ConclusionCard
             digest={data.digest}
+            noCells={noCells}
             showKeyPoints={showKeyPoints}
             onToggleKeyPoints={() => setShowKeyPoints(v => !v)}
           />
@@ -129,8 +162,9 @@ export default function CellFabricPage() {
   );
 }
 
-function ConclusionCard({ digest, showKeyPoints, onToggleKeyPoints }: {
+function ConclusionCard({ digest, noCells, showKeyPoints, onToggleKeyPoints }: {
   digest: NonNullable<ReturnType<typeof useCellRootDigest>["data"]>["digest"];
+  noCells: boolean;
   showKeyPoints: boolean;
   onToggleKeyPoints: () => void;
 }) {
@@ -151,8 +185,18 @@ function ConclusionCard({ digest, showKeyPoints, onToggleKeyPoints }: {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        {top_risks.length === 0 ? (
-          <div className="text-sm text-muted-foreground">重大なリスク(sev1)はありません。</div>
+        {noCells && top_risks.length === 0 ? (
+          <div className="text-sm space-y-1" data-testid="cell-fabric-no-cells">
+            <p className="font-medium">Probe Cell がまだありません。</p>
+            <p className="text-muted-foreground">
+              Probe Cell は、承認済みの Probe Point / Probe Pattern に割り当てて作られます。
+              Cell ができると、ここにその状態とリスクが集約されます。承認済みの Probe Point が
+              まだ無い場合は、Probe Planner で Probe Plan を承認するところから始めます。
+            </p>
+            <Link className="inline-block underline text-primary" to="/probe-planner">Probe Planner を開く</Link>
+          </div>
+        ) : top_risks.length === 0 ? (
+          <div className="text-sm text-muted-foreground" data-testid="cell-fabric-no-sev1">重大なリスク(sev1)はありません。</div>
         ) : (
           <div className="space-y-2">
             <div className="text-sm font-medium">最重要リスク(最大3件)</div>
@@ -328,7 +372,7 @@ function KeyPointsSection({
 }
 
 function AskListSection() {
-  const { data, isLoading } = useCellAsks("open");
+  const { data, isLoading, isError, error, refetch, isFetching } = useCellAsks("open");
   const sync = useSyncCellAsks();
   const decide = useDecideCellAsk();
   const asks = data?.asks ?? [];
@@ -336,7 +380,7 @@ function AskListSection() {
   const handleDecide = (ask: CellAskOut, decision: CellAskDecision) => {
     decide.mutateAsync({ askId: ask.id, decision })
       .then(() => toast.success("Askを更新しました"))
-      .catch(e => toast.error(String(e)));
+      .catch(e => toast.error(actionFailureMessage("Ask を更新", e)));
   };
 
   return (
@@ -354,7 +398,7 @@ function AskListSection() {
             onClick={() =>
               sync.mutateAsync()
                 .then(r => toast.success(`同期しました(新規${r.created}件 / 重複${r.deduped}件)`))
-                .catch(e => toast.error(String(e)))
+                .catch(e => toast.error(actionFailureMessage("Ask を同期", e)))
             }
           >
             {sync.isPending ? "同期中..." : "Askを同期"}
@@ -364,8 +408,16 @@ function AskListSection() {
       <CardContent className="space-y-2">
         {isLoading ? (
           <Skeleton className="h-16 w-full" />
+        ) : isError ? (
+          <QueryErrorState
+            target="Ask 一覧"
+            error={error}
+            onRetry={() => void refetch()}
+            retrying={isFetching}
+            data-testid="cell-fabric-asks-error"
+          />
         ) : asks.length === 0 ? (
-          <div className="text-sm text-muted-foreground">未対応のAskはありません。</div>
+          <div className="text-sm text-muted-foreground" data-testid="cell-fabric-asks-empty">未対応のAskはありません。</div>
         ) : (
           asks.map(ask => (
             <div key={ask.id} className="rounded-lg border p-3 text-sm space-y-2" data-testid={`cell-ask-${ask.id}`}>

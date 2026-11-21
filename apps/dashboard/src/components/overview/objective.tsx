@@ -130,12 +130,18 @@ export function ObjectiveCard({ overview }: { overview: OverviewOut }) {
               `complete` row (`next_step: "none"`) has an empty server reason
               (`_decide_next_step` row 15), so this is the one place a fixed
               fallback sentence is used, never a fabricated reason. */}
+          {/* A1 (UX 監査 2026-11-17): outline, not filled. `next_action` and
+              `next_step` are separate fields and neither overrides the other
+              (#427), but only `next_action`'s CTA is the page's primary
+              action; a second filled button read as a competing 「次の一歩」.
+              Destination unchanged. */}
           {hasAction ? (
             <>
               <Link
                 to={objectiveNextStepHref(objective, overview.interview_session_id)}
-                className="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+                className="inline-flex items-center rounded-md border border-input bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent hover:text-accent-foreground"
                 data-testid="overview-objective-cta"
+                data-cta-variant="outline"
                 data-next-step-key={objective.next_step}
               >
                 {NEXT_STEP_CTA_LABEL[objective.next_step]}

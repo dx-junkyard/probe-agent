@@ -1089,6 +1089,27 @@ def create_replay_variant_run(
     matrix (Issue #245). Reuses Phase B's approval gate, snapshot
     resolution, and symbol resolution verbatim; ``POST /replay-runs``
     (baseline-only) is unchanged."""
+    return run_replay_variants(payload, system_id=system_id, response=response)
+
+
+def run_replay_variants(
+    payload: ReplayVariantRunCreate,
+    *,
+    system_id: int,
+    response: Optional[Response] = None,
+    snapshot_decision: Optional[tuple] = None,
+) -> ReplayVariantRunOut:
+    """Body of ``POST /replay-variant-runs``.
+
+    ``snapshot_decision`` is the ``(freshness, head_sha, stale_ack_reason)``
+    triple an internal caller (Candidate Studio's candidate replay, UX audit
+    2026-11-17 C8) has ALREADY obtained from ``require_snapshot_preflight``
+    for this same snapshot. Passing it skips a second preflight, so the HEAD
+    the caller validated its reason against is exactly the HEAD recorded on
+    the run -- a second evaluation could observe a newer HEAD and record it
+    next to a reason that was accepted for an older one. The HTTP route never
+    passes it.
+    """
     now = time.time()
     timeout_seconds = replay_timeout_seconds()
 
@@ -1097,11 +1118,11 @@ def create_replay_variant_run(
     # so continuing on one that is behind HEAD is the same manual decision and
     # is recorded on the run. Evaluated BEFORE the connection is opened --
     # `gather_preflight` runs `git` subprocesses and the lock is non-reentrant.
-    snapshot_freshness, head_sha_at_creation, stale_ack_reason = (
-        require_snapshot_preflight(
+    if snapshot_decision is None:
+        snapshot_decision = require_snapshot_preflight(
             system_id, payload.snapshot_id, payload.stale_snapshot_reason
         )
-    )
+    snapshot_freshness, head_sha_at_creation, stale_ack_reason = snapshot_decision
 
     with get_conn() as conn:
         replay_set = _get_set_or_404(conn, payload.replay_set_id, system_id)

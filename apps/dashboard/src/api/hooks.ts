@@ -17,7 +17,7 @@ import type {
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
   ApiRoleCardsOut, ExplanationRefreshOut, RefreshProposalRequest,
   CapabilityHierarchyOut, CapabilityHierarchyDriftOut,
-  ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
+  ProbePatchOut, GenerationRun, ExperimentOut, ExperimentRecordOut, MeResponse,
   EvaluationCriterion,
   SystemProfile,
   WorkspaceOut, WorkspaceDetailOut, WorkspaceContextItemOut,
@@ -101,6 +101,7 @@ import type {
   ReplayApprovalStateOut, ReplayApprovalOut,
   ReplayVariantExperimentPayloadOut, ReplayRegressionScaffoldOut,
   CandidateSessionOut, CandidateSessionCreateRequest, CandidateVersionOut,
+  CandidateReplayPreflightOut,
   CandidatePromotionOut,
   BootstrapStatusOut,
   KnowledgeArea, HandoffOriginKind, HandoffPriority, HandoffStatus,
@@ -112,6 +113,12 @@ import type {
   PurposeExperienceHypothesisOut, PurposeReuseHypothesisOut, PurposeOutcomeCriterionOut,
   PurposeVerificationStateOut, PurposeOutcomeEvidenceSource, PurposeOutcomeVerdict,
   ValueNetworkOut,
+  StakeholderOut, StakeholderDetailOut, StakeholderCreateRequest, StakeholderRevisionCreateRequest,
+  StakeholderNeedListOut, StakeholderNeedDetailOut, StakeholderNeedCreateRequest,
+  StakeholderNeedRevisionCreateRequest,
+  EnvironmentObservationListOut, EnvironmentObservationDetailOut, EnvironmentObservationCreateRequest,
+  ValueExchangeDetailOut, ValueExchangeCreateRequest, ValueExchangeRevisionCreateRequest,
+  StakeholderDecisionCreateRequest, StakeholderDecisionOut,
   BlueprintOut, BlueprintDiffOut,
   JourneyStepStakeholderLinkCreateRequest, JourneyStepStakeholderLinkOut,
   JourneyStepDeliveryLinkCreateRequest, JourneyStepDeliveryLinkOut,
@@ -130,6 +137,14 @@ import type {
   ProductMilestoneAssessmentOut,
   ProductFeatureListOut, ProductFeatureDetailOut, ProductFeatureCreateRequest,
   ProductFeatureRequirementLinkCreateRequest, ProductFeatureRequirementLinkOut,
+  // UX audit 2026-11-17 C2: Objective parent / upstream ref, Gap source /
+  // evidence / resolution choice, Feature revision / decision.
+  ProductObjectiveParentSetRequest, ProductObjectiveRefCreateRequest, ProductObjectiveRefOut,
+  ProductGapSourceRefCreateRequest, ProductGapSourceOut,
+  ProductGapEvidenceRefCreateRequest, ProductGapEvidenceOut,
+  ProductGapResolutionChoiceCreateRequest, ProductGapResolutionChoiceOut,
+  ProductFeatureOut, ProductFeatureRevisionCreateRequest,
+  ProductFeatureDecisionCreateRequest, ProductFeatureDecisionOut,
 } from "./types";
 
 export function sysKey(base: string, ...extra: unknown[]) {
@@ -488,9 +503,28 @@ export function useUpdateRepositoryConfig() {
   return useMutation({
     mutationFn: (data: { repo_path: string; include_patterns?: string[]; exclude_patterns?: string[] }) =>
       api.put<RepositoryConfigOut>("/repository", data),
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("repoConfig") }),
+    // UX 監査 2026-11-17 B1: 保存で変わる事実は設定行だけではない。上部
+    // バナー (`/system-state`)、Repository更新カード (`/repository/status`)、
+    // 推奨 Snapshot の判定 (`/snapshot-preflight`) はどれも設定済みかどうかと
+    // 対象 repository の HEAD を読むので、設定行だけを無効化すると「未設定」が
+    // 再読み込みまで残る。
+    onSuccess: () => {
+      for (const key of REPOSITORY_CONFIG_DEPENDENT_QUERY_BASES) {
+        qc.invalidateQueries({ queryKey: sysKey(key) });
+      }
+    },
   });
 }
+
+/** Repository 設定の保存で読み直しが必要になる query の base key (B1)。 */
+export const REPOSITORY_CONFIG_DEPENDENT_QUERY_BASES = [
+  "repoConfig",
+  "repositoryStatus",
+  "system-state",
+  "snapshotPreflight",
+  // Overview の次の1操作は repository の設定有無を読む (#380 load_repository_fact)。
+  "overview",
+] as const;
 
 export function useSnapshots() {
   return useQuery({
@@ -619,7 +653,10 @@ export function useGenerateDrafts() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.post<DraftGenerationResultOut>("/repository/drafts/generate"),
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("drafts") }),
+    // IK-0034: a failed run answers 422/502 with the persisted run in the body
+    // and its error_details as `detail` (shown by ApiError); refresh either way
+    // so the failed run is visible.
+    onSettled: () => qc.invalidateQueries({ queryKey: sysKey("drafts") }),
   });
 }
 
@@ -670,7 +707,7 @@ export function useGenerateCodeLinks() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.post("/repository/code-links/generate"),
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("codeLinks") }),
+    onSettled: () => qc.invalidateQueries({ queryKey: sysKey("codeLinks") }),
   });
 }
 
@@ -699,15 +736,25 @@ export function useGenerateProbePlan() {
       if (objective?.trim()) query.set("objective", objective.trim());
       return api.post(`/repository/probe-plans/generate?${query.toString()}`);
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
+    onSettled: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
   });
 }
 
 export function useUpdateProbePointStatus() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ pointId, status }: { pointId: number; status: string }) =>
-      api.put(`/repository/probe-points/${pointId}/status`, { status }),
+    // UX audit 2026-11-17 C4: `replayCapture` is the approver's explicit
+    // "入力を保存する(Replay に使う)" choice. It is sent only when approving;
+    // omitting it keeps capture off on the server (#243 opt-in).
+    mutationFn: ({ pointId, status, replayCapture }: {
+      pointId: number; status: string; replayCapture?: boolean;
+    }) =>
+      api.put(
+        `/repository/probe-points/${pointId}/status`,
+        status === "approved" && replayCapture !== undefined
+          ? { status, replay_capture: replayCapture }
+          : { status },
+      ),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
   });
 }
@@ -2041,6 +2088,10 @@ export function useExperiments() {
     queryKey: sysKey("experiments"),
     queryFn: () => api.get<ExperimentOut[]>("/experiments"),
     enabled: !!getSystemId(),
+    // UX audit 2026-11-17 D7: poll only while a run is in flight; a finished
+    // (completed / failed / draft) list stops polling, like usePublishJobs.
+    refetchInterval: (query) =>
+      (query.state.data ?? []).some(e => e.status === "running") ? 2000 : false,
   });
 }
 
@@ -2049,6 +2100,16 @@ export function useExperiment(id: number | null) {
     queryKey: [...sysKey("experiment"), id],
     queryFn: () => api.get<ExperimentOut>(`/experiments/${id}`),
     enabled: !!id && !!getSystemId(),
+    refetchInterval: (query) => (query.state.data?.status === "running" ? 2000 : false),
+  });
+}
+
+// IK-0035: 判断の保存で invalidate される "experiments" の下に置く。
+export function useExperimentRecord(id: number) {
+  return useQuery({
+    queryKey: sysKey("experiments", "record", id),
+    queryFn: () => api.get<ExperimentRecordOut>(`/experiments/${id}/record`),
+    enabled: !!getSystemId(),
   });
 }
 
@@ -2065,7 +2126,9 @@ export function useRunExperiment() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: number) => api.post<ExperimentOut>(`/experiments/${id}/run`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("experiments") }),
+    // onSettled, not onSuccess: a refused or failed run can still have moved
+    // the persisted status (e.g. to `failed`), and the list must show it (D7).
+    onSettled: () => qc.invalidateQueries({ queryKey: sysKey("experiments") }),
   });
 }
 
@@ -3180,6 +3243,9 @@ export function useCreateReplayVariantRun() {
       replay_set_id: number;
       snapshot_id?: number | null;
       variants: { label: string; patch_text: string; source?: string }[];
+      // Issue #369 / UX audit 2026-11-17 C8: the developer's reason for
+      // continuing on a stale snapshot. Never pre-filled.
+      stale_snapshot_reason?: string;
     }) => api.post<ReplayVariantRunOut>("/replay-variant-runs", data),
     onSuccess: (_d, vars) =>
       qc.invalidateQueries({ queryKey: sysKey("replayVariantRuns", vars.replay_set_id) }),
@@ -3345,13 +3411,34 @@ export function useCandidateVersion(versionId: number | null) {
 export function useReplayCandidateVersion() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ versionId }: {
+    mutationFn: ({ versionId, staleSnapshotReason }: {
       versionId: number;
       sessionId: number;
+      // UX audit 2026-11-17 C8: only when the session's own reason no longer
+      // covers the current HEAD (server's `stale_reason_state`).
+      staleSnapshotReason?: string;
     }) =>
-      api.post<CandidateVersionOut>(`/candidate-versions/${versionId}/replay`, {}),
-    onSuccess: (_d, vars) =>
-      qc.invalidateQueries({ queryKey: sysKey("candidateSession", vars.sessionId) }),
+      api.post<CandidateVersionOut>(
+        `/candidate-versions/${versionId}/replay`,
+        staleSnapshotReason?.trim() ? { stale_snapshot_reason: staleSnapshotReason.trim() } : {},
+      ),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: sysKey("candidateSession", vars.sessionId) });
+      qc.invalidateQueries({ queryKey: sysKey("candidateSessions") });
+    },
+    onError: (_e, vars) =>
+      qc.invalidateQueries({ queryKey: sysKey("candidateReplayPreflight", vars.sessionId) }),
+  });
+}
+
+// UX audit 2026-11-17 C8: whether a candidate replay on the session's pinned
+// snapshot needs a new stale reason. The server decides; this only fetches.
+export function useCandidateReplayPreflight(sessionId: number | null) {
+  return useQuery({
+    queryKey: sysKey("candidateReplayPreflight", sessionId),
+    queryFn: () =>
+      api.get<CandidateReplayPreflightOut>(`/candidate-sessions/${sessionId}/replay-preflight`),
+    enabled: !!getSystemId() && sessionId != null,
   });
 }
 
@@ -4709,11 +4796,170 @@ export function useValueNetwork() {
   });
 }
 
+// --- UX audit 2026-11-17 C1: the `/stakeholder-network/*` write surface ---
+//
+// Every write is `decision_method: manual`; the actor is taken from the
+// authenticated Principal on the server, never sent in a body. A write
+// changes facts several projections read (the Value Network's nodes/edges/
+// notices, the Blueprint's resolved names, Functional Lineage), so every
+// success invalidates all of them rather than one.
+
+const STAKEHOLDER_NETWORK_QUERY_BASES = [
+  "stakeholder-value-network", "stakeholder-network-stakeholder", "stakeholder-network-needs",
+  "stakeholder-network-need", "stakeholder-network-observations", "stakeholder-network-observation",
+  "stakeholder-network-exchange", "journey-blueprint", "functional-lineage",
+] as const;
+
+function invalidateStakeholderNetwork(qc: ReturnType<typeof useQueryClient>) {
+  for (const base of STAKEHOLDER_NETWORK_QUERY_BASES) {
+    qc.invalidateQueries({ queryKey: sysKey(base) });
+  }
+}
+
+export function useStakeholderDetail(stakeholderKey: string | null) {
+  return useQuery<StakeholderDetailOut>({
+    queryKey: sysKey("stakeholder-network-stakeholder", stakeholderKey),
+    queryFn: () =>
+      api.get<StakeholderDetailOut>(`/stakeholder-network/stakeholders/${encodeURIComponent(stakeholderKey ?? "")}`),
+    enabled: !!stakeholderKey && !!getSystemId(),
+  });
+}
+
+export function useStakeholderNeeds() {
+  return useQuery<StakeholderNeedListOut>({
+    queryKey: sysKey("stakeholder-network-needs"),
+    queryFn: () => api.get<StakeholderNeedListOut>("/stakeholder-network/needs"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useStakeholderNeedDetail(needKey: string | null) {
+  return useQuery<StakeholderNeedDetailOut>({
+    queryKey: sysKey("stakeholder-network-need", needKey),
+    queryFn: () =>
+      api.get<StakeholderNeedDetailOut>(`/stakeholder-network/needs/${encodeURIComponent(needKey ?? "")}`),
+    enabled: !!needKey && !!getSystemId(),
+  });
+}
+
+export function useEnvironmentObservations() {
+  return useQuery<EnvironmentObservationListOut>({
+    queryKey: sysKey("stakeholder-network-observations"),
+    queryFn: () => api.get<EnvironmentObservationListOut>("/stakeholder-network/observations"),
+    enabled: !!getSystemId(),
+  });
+}
+
+/** Observation impacts are only on the detail response, so the Stakeholder
+ * pane reads each observation's detail to know which ones point at it. */
+export function useEnvironmentObservationDetails(observationKeys: string[]) {
+  return useQueries({
+    queries: observationKeys.map((key) => ({
+      queryKey: sysKey("stakeholder-network-observation", key),
+      queryFn: () =>
+        api.get<EnvironmentObservationDetailOut>(`/stakeholder-network/observations/${encodeURIComponent(key)}`),
+      enabled: !!getSystemId(),
+    })),
+  });
+}
+
+export function useValueExchangeDetail(exchangeKey: string | null) {
+  return useQuery<ValueExchangeDetailOut>({
+    queryKey: sysKey("stakeholder-network-exchange", exchangeKey),
+    queryFn: () =>
+      api.get<ValueExchangeDetailOut>(`/stakeholder-network/exchanges/${encodeURIComponent(exchangeKey ?? "")}`),
+    enabled: !!exchangeKey && !!getSystemId(),
+  });
+}
+
+export function useCreateStakeholder() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: StakeholderCreateRequest) => api.post<StakeholderOut>("/stakeholder-network/stakeholders", body),
+    onSuccess: () => invalidateStakeholderNetwork(qc),
+  });
+}
+
+export function useAddStakeholderRevision() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { stakeholderKey: string; body: StakeholderRevisionCreateRequest }) =>
+      api.post<StakeholderDetailOut>(
+        `/stakeholder-network/stakeholders/${encodeURIComponent(vars.stakeholderKey)}/revisions`, vars.body,
+      ),
+    onSuccess: () => invalidateStakeholderNetwork(qc),
+  });
+}
+
+export function useCreateStakeholderNeed() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: StakeholderNeedCreateRequest) =>
+      api.post<StakeholderNeedDetailOut>("/stakeholder-network/needs", body),
+    onSuccess: () => invalidateStakeholderNetwork(qc),
+  });
+}
+
+export function useAddStakeholderNeedRevision() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { needKey: string; body: StakeholderNeedRevisionCreateRequest }) =>
+      api.post<StakeholderNeedDetailOut>(
+        `/stakeholder-network/needs/${encodeURIComponent(vars.needKey)}/revisions`, vars.body,
+      ),
+    onSuccess: () => invalidateStakeholderNetwork(qc),
+  });
+}
+
+export function useCreateEnvironmentObservation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: EnvironmentObservationCreateRequest) =>
+      api.post<EnvironmentObservationDetailOut>("/stakeholder-network/observations", body),
+    onSuccess: () => invalidateStakeholderNetwork(qc),
+  });
+}
+
+export function useCreateValueExchange() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ValueExchangeCreateRequest) =>
+      api.post<ValueExchangeDetailOut>("/stakeholder-network/exchanges", body),
+    onSuccess: () => invalidateStakeholderNetwork(qc),
+  });
+}
+
+export function useAddValueExchangeRevision() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { exchangeKey: string; body: ValueExchangeRevisionCreateRequest }) =>
+      api.post<ValueExchangeDetailOut>(
+        `/stakeholder-network/exchanges/${encodeURIComponent(vars.exchangeKey)}/revisions`, vars.body,
+      ),
+    onSuccess: () => invalidateStakeholderNetwork(qc),
+  });
+}
+
+/** confirm / reject / retire / reinstate. The only write that moves
+ * `design_status`; the screen never sets that value itself. */
+export function useRecordStakeholderDecision() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: StakeholderDecisionCreateRequest) =>
+      api.post<StakeholderDecisionOut>("/stakeholder-network/decisions", body),
+    onSuccess: () => invalidateStakeholderNetwork(qc),
+  });
+}
+
 
 // === Epic #418 / Issue #423 — Journey Service Blueprint hooks ===
 // (Issue #423 owns everything below this marker.)
 
-const JOURNEY_BLUEPRINT_QUERY_BASES = ["journey-blueprint", "journey-blueprint-diff"] as const;
+// A Step link also changes the Value Network's structural notices
+// (`exchange_without_journey`) and Functional Lineage's edges.
+const JOURNEY_BLUEPRINT_QUERY_BASES = [
+  "journey-blueprint", "journey-blueprint-diff", "stakeholder-value-network", "functional-lineage",
+] as const;
 
 function invalidateJourneyBlueprint(qc: ReturnType<typeof useQueryClient>) {
   for (const base of JOURNEY_BLUEPRINT_QUERY_BASES) {
@@ -4853,6 +5099,36 @@ export function useAddProductFeatureRequirementLink(featureKey: string | null) {
   });
 }
 
+/** `POST /product-features/{feature_key}/revisions` (§7.2) -- append-only
+ * content. The endpoint stores a FULL snapshot, so the caller seeds its form
+ * from the current revision (#427 review). `authored_by_kind` /
+ * `decision_method` are fixed to `developer` / `manual` by the server. */
+export function useAddProductFeatureRevision(featureKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductFeatureRevisionCreateRequest) =>
+      api.post<ProductFeatureOut>(
+        `/product-features/${encodeURIComponent(featureKey ?? "")}/revisions`, body,
+      ),
+    onSuccess: () => invalidateProductFeature(qc),
+  });
+}
+
+/** `POST /product-features/{feature_key}/decisions` (§7.2) --
+ * confirm / reject / retire / reinstate on the Feature's definition. An
+ * illegal transition comes back as the server's own
+ * `product_feature_not_decidable`; no legality table is held here. */
+export function useRecordProductFeatureDecision(featureKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductFeatureDecisionCreateRequest) =>
+      api.post<ProductFeatureDecisionOut>(
+        `/product-features/${encodeURIComponent(featureKey ?? "")}/decisions`, body,
+      ),
+    onSuccess: () => invalidateProductFeature(qc),
+  });
+}
+
 // === Epic #427 / Issue #432 — Objective Map / Gap Workbench hooks ===
 //
 // `docs/01-specifications/product/product-objective-lineage.md` §9. Both projections are read-only and
@@ -4977,6 +5253,44 @@ export function useAddProductGapRevision(gapKey: string | null) {
   });
 }
 
+/** `POST /product-gaps/{gap_key}/source-refs` (§5.4). The server resolves the
+ * source through the kind's one resolver and captures the pins itself; a
+ * reference it cannot resolve comes back as 422
+ * `product_gap_source_ref_unresolvable`, a duplicate as 409
+ * `product_gap_source_duplicate`. */
+export function useAddProductGapSourceRef(gapKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductGapSourceRefCreateRequest) =>
+      api.post<ProductGapSourceOut>(`/product-gaps/${encodeURIComponent(gapKey ?? "")}/source-refs`, body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** `POST /product-gaps/{gap_key}/evidence-refs` (§5.9). A reference only --
+ * no body column exists for evidence content. */
+export function useAddProductGapEvidenceRef(gapKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductGapEvidenceRefCreateRequest) =>
+      api.post<ProductGapEvidenceOut>(`/product-gaps/${encodeURIComponent(gapKey ?? "")}/evidence-refs`, body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** `POST /product-gaps/{gap_key}/resolution-choices` -- how a human chose to
+ * close the Gap. Never moves `lifecycle` or `priority_band`. */
+export function useRecordProductGapResolutionChoice(gapKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductGapResolutionChoiceCreateRequest) =>
+      api.post<ProductGapResolutionChoiceOut>(
+        `/product-gaps/${encodeURIComponent(gapKey ?? "")}/resolution-choices`, body,
+      ),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
 // --- #429 Objective ---------------------------------------------------------
 
 /** `GET /product-objectives/{objective_key}` -- the full detail (current
@@ -5021,6 +5335,60 @@ export function useRecordProductObjectiveDecision(objectiveKey: string | null) {
     mutationFn: (body: ProductObjectiveDecisionCreateRequest) =>
       api.post<ProductObjectiveDecisionOut>(`/product-objectives/${encodeURIComponent(objectiveKey ?? "")}/decisions`, body),
     onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** `POST /product-objectives/{key}/parent` (§4.4). Self-reference and cycles
+ * are refused by the server (422 `product_objective_parent_self` /
+ * `product_objective_parent_cycle`) over the CURRENT parent graph; this hook
+ * never pre-checks either. */
+export function useSetProductObjectiveParent(objectiveKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductObjectiveParentSetRequest) =>
+      api.post<ProductObjectiveOut>(`/product-objectives/${encodeURIComponent(objectiveKey ?? "")}/parent`, body),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** `DELETE /product-objectives/{key}/parent` (§4.4). Not a deletion: the
+ * server appends a tombstone row carrying this rationale, so who detached
+ * the Objective and why stays on record. The rationale rides as a query
+ * parameter because a DELETE body is not reliably transported. */
+export function useClearProductObjectiveParent(objectiveKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ rationale }: { rationale: string }) =>
+      api.delete<ProductObjectiveOut>(
+        `/product-objectives/${encodeURIComponent(objectiveKey ?? "")}/parent?rationale=${encodeURIComponent(rationale)}`,
+      ),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** `POST /product-objectives/{key}/upstream-refs` (§4.6): a reference to a
+ * Vision claim / Purpose element or relation / Capability / Need. The
+ * server captures the digest; the target's content is never copied. */
+export function useAddProductObjectiveUpstreamRef(objectiveKey: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ProductObjectiveRefCreateRequest) =>
+      api.post<ProductObjectiveRefOut>(
+        `/product-objectives/${encodeURIComponent(objectiveKey ?? "")}/upstream-refs`, body,
+      ),
+    onSuccess: () => invalidateProductObjective(qc),
+  });
+}
+
+/** `GET /purpose-chain` without `session_id`: the same projection the
+ * `purpose_element` / `purpose_relation` reference resolvers read
+ * (`derive_purpose_chain(conn, system_id, None)`), so a candidate picked
+ * from this list is one the server can resolve. */
+export function useSystemPurposeChain() {
+  return useQuery<PurposeChainOut>({
+    queryKey: [...sysKey("purposeChain"), "system"],
+    queryFn: () => api.get<PurposeChainOut>("/purpose-chain"),
+    enabled: !!getSystemId(),
   });
 }
 

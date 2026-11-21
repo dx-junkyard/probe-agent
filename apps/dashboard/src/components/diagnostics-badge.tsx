@@ -254,7 +254,7 @@ function DegradedBadge() {
         variant="ghost"
         size="sm"
         onClick={() => setOpen(true)}
-        title="System state unavailable"
+        title="システムの状態を取得できません"
         data-testid="diagnostics-badge"
         data-state="error"
         className="relative gap-1.5"
@@ -263,9 +263,9 @@ function DegradedBadge() {
         <span data-testid="diagnostics-badge-error" className="text-xs font-semibold text-muted-foreground">?</span>
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogHeader><DialogTitle>System State</DialogTitle></DialogHeader>
+        <DialogHeader><DialogTitle>システムの状態</DialogTitle></DialogHeader>
         <p className="text-sm text-muted-foreground" data-testid="diagnostics-badge-error-message">
-          System state could not be loaded. Check the Control Server connection and retry.
+          システムの状態を取得できませんでした。Control Server への接続を確認してから、画面を再読み込みしてください。
         </p>
       </Dialog>
     </>
@@ -302,7 +302,7 @@ export function DiagnosticsBadge() {
         variant="ghost"
         size="sm"
         onClick={() => setOpen(true)}
-        title="System state"
+        title="システムの状態"
         data-testid="diagnostics-badge"
         className="relative gap-1.5"
       >
@@ -310,7 +310,7 @@ export function DiagnosticsBadge() {
         {attention > 0 && <span data-testid="diagnostics-badge-count" className={`text-xs font-semibold ${errorCount > 0 ? "text-red-600" : "text-yellow-600"}`}>{attention}</span>}
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogHeader><DialogTitle>System State</DialogTitle></DialogHeader>
+        <DialogHeader><DialogTitle>システムの状態</DialogTitle></DialogHeader>
         <div className="space-y-3">
           {items.length === 0 ? <p className="text-sm text-muted-foreground">対応が必要な状態はありません。</p> : items.map((item) => {
             const actionable = item.user_action_kind !== "none" && item.user_action_kind !== "wait";

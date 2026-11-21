@@ -21,16 +21,22 @@ export function NextActionCard({ overview }: { overview: OverviewOut }) {
 
   return (
     <Card data-testid="overview-next-action" data-action-state={overview.next_action_state} data-help-id="overview.next_action">
-      <CardHeader>
+      <CardHeader className="p-4 pb-2">
         <CardTitle as="h2" className="text-lg">次にすること</CardTitle>
       </CardHeader>
-      <CardContent className="space-y-3">
+      <CardContent className="space-y-3 p-4 pt-0">
         {action ? (
           <>
+            {/* A1 (UX 監査 2026-11-17): the Overview's ONLY filled button.
+                The Objective `next_step` and the Purpose Frame question are
+                rendered as outline / link so they never read as a competing
+                primary action. The CTA leads the card (above its reasons) so
+                it lands inside the first view. */}
             <Link
               to={targetHref(action.target)}
               className="inline-flex items-center rounded-md bg-primary px-4 py-2 text-base font-medium text-primary-foreground hover:bg-primary/90"
               data-testid="overview-next-action-cta"
+              data-cta-variant="primary"
               data-action-key={action.key}
             >
               {action.label}
@@ -58,7 +64,7 @@ export function NextActionCard({ overview }: { overview: OverviewOut }) {
             )}
             {action.source_finding_ids.length > 0 && (
               <p className="text-sm text-muted-foreground" data-testid="overview-next-action-sources">
-                上の「今わかったこと」{action.source_finding_ids.length} 件が理由です。
+                「今わかったこと」の {action.source_finding_ids.length} 件が理由です。
               </p>
             )}
           </>

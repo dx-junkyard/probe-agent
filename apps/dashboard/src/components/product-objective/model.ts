@@ -74,7 +74,11 @@ import type {
   ProductObjectiveNextStepState,
   ProductObjectiveState,
   ProductRecheckState,
+  ProductRefKind,
+  ProductRefRecheckState,
+  ProductRefRelationStatus,
   ProductRefTargetResolution,
+  ProductGapResolutionApproach,
   ProductRevisionState,
 } from "@/api/types";
 
@@ -283,6 +287,39 @@ export const GAP_EVIDENCE_KIND_LABEL: Record<ProductGapEvidenceKind, string> = {
   external_report: "外部の報告",
   repository_path: "リポジトリ内のパス",
   other: "その他",
+};
+
+/** §4.6's five upstream reference kinds of an Objective. */
+export const OBJECTIVE_REF_KIND_LABEL: Record<ProductRefKind, string> = {
+  vision_claim: "Vision",
+  purpose_element: "Purpose 要素",
+  purpose_relation: "Purpose の関係",
+  capability_entity: "Capability",
+  stakeholder_need: "Stakeholder の Need",
+};
+
+/** §4.6's `relation_status` -- who asserted the reference. */
+export const REF_RELATION_STATUS_LABEL: Record<ProductRefRelationStatus, string> = {
+  confirmed: "人が設定",
+  proposed: "AI 提案",
+  derived: "自動導出",
+};
+
+export const REF_RECHECK_STATE_LABEL: Record<ProductRefRecheckState, string> = {
+  current: "参照時点から変化なし",
+  stale: "参照時点から変化あり",
+  not_captured: "参照時点の内容が未記録",
+};
+
+/** How a human chose to close a Gap. A third axis beside lifecycle and
+ * priority band; recording it never resolves the Gap. */
+export const GAP_RESOLUTION_APPROACH_LABEL: Record<"undecided" | ProductGapResolutionApproach, string> = {
+  undecided: "まだ決めていません",
+  feature_new: "新しい Feature で解消する",
+  feature_extend: "既存の Feature を拡張して解消する",
+  operation: "運用で解消する",
+  sponsor_decision: "責任者の判断に委ねる",
+  out_of_scope: "対象外とする",
 };
 
 export const GAP_ARTIFACT_LINK_KIND_LABEL: Record<ProductGapArtifactLinkKind, string> = {

@@ -62,6 +62,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // 空配列を「0 件」として描かない。以後の再取得では画面を読み込み表示へ
   // 戻さない (開いているダイアログ等を消さないため)。
   const [systemsSettledOnce, setSystemsSettledOnce] = useState(false);
+  const systemsFetchedOnce = useRef(false);
   // イベントハンドラー (401 通知) と login から最新のユーザーを読むための参照。
   // setUser と同じ場所で更新する。
   const userRef = useRef<UserOut | null>(null);
@@ -97,10 +98,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSystemsStatus("ready");
       setSystemsSettledOnce(true);
       setSystemsError(null);
-      if (s.length > 0 && !getSystemId()) {
+      // Default only on the first successful load. Later refreshes (including
+      // after Create System) must leave switching to the draft-aware selector.
+      if (!systemsFetchedOnce.current && s.length > 0 && !getSystemId()) {
         setSystemId(s[0].id);
         setSystemIdState(s[0].id);
       }
+      systemsFetchedOnce.current = true;
     } catch (err) {
       // 既に持っている一覧は消さない (再試行の失敗で画面を空にしない)。
       const failure = describeRequestFailure(err);
@@ -198,6 +202,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setSystems([]);
     setSystemsStatus("loading");
     setSystemsSettledOnce(false);
+    systemsFetchedOnce.current = false;
     setSystemIdState(null);
     setSessionExpired(false);
     qc.clear();

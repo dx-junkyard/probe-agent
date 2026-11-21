@@ -19,6 +19,16 @@
 | 解決観点 | vocabulary_table / guardrail_fix |
 | 見分け方・設計時の問い | 生成例が正規値か、表示ラベルか。生成時と適用時に同じ語彙を使うか。 |
 
+#### downstream-record-assembled-by-hand
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 後段（外部の台帳）が受け取る記録の形を前段が出さず、人が詳細のJSONから毎回組み立てて写す |
+| 典型座標 | connection.contract + connection.information |
+| 発見観点 | external_constraint / boundary_walk |
+| 解決観点 | explicit_contract / carry_through |
+| 見分け方・設計時の問い | 後段の入力の項目（必須・任意）を前段の出力だけで埋められるか。同じ実行から誰が何度組み立てても同じ記録になるか（LLMや時刻を挟まない）。記録が未完（判断待ち等）であることを記録自身が言うか。 |
+
 ### delivery-path
 
 対象への到達に関する原因をまとめる。
@@ -289,6 +299,118 @@
 | 発見観点 | invariant_audit / inventory |
 | 解決観点 | explicit_contract / responsibility_move |
 | 見分け方・設計時の問い | 分類未確定でも根拠付きcandidateとして検索・試行できるか。単なる証拠不足による未登録とは区別する。 |
+
+### execution-environment
+
+隔離実行の環境が実際に使えるか、実行に要るものを揃えられるかを扱う。2026-11-03に外部検証の実施記録から追加。
+
+#### sandbox-presence-as-capability
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 隔離実行ツールの存在を可用性と見なし、実環境での起動可否を事前に検査しない |
+| 典型座標 | connection.condition + governance.completion |
+| 発見観点 | reproduction / inventory |
+| 解決観点 | fail_closed / explicit_contract |
+| 見分け方・設計時の問い | ツールが存在するが権限不足で動かない環境で、診断が失敗を示すか。ツール不在時のfail closed（既存）とは検出対象が異なる。 |
+
+#### isolated-runtime-dependency-unprovisioned
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 隔離実行で外部取得を禁じたまま、実行に要る依存の供給経路と担当を定めない |
+| 典型座標 | connection.contract + structure.responsibility |
+| 発見観点 | boundary_walk / external_constraint |
+| 解決観点 | explicit_contract / responsibility_move |
+| 見分け方・設計時の問い | network=falseのまま第三者ライブラリ依存の対象を、文書化された手順で再作成後も実行できるか。隔離自体が動かない問題（IK-0024）とは別に、隔離が動いても依存が無い点を問う。 |
+
+### generated-reference
+
+2026-11-03に外部検証（sim-sandbox E-0002）から暫定追加。
+
+#### unanchored-reference-strict-validation
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 生成器に参照座標の手がかりを渡さずに座標を要求し、1件の逸脱で生成結果全体を破棄する |
+| 典型座標 | connection.contract + connection.information |
+| 発見観点 | reproduction / trace_walk |
+| 解決観点 | carry_through / explicit_contract |
+| 見分け方・設計時の問い | 生成器が座標（行番号等）を数えずに読み取れる形で入力を受け取るか。座標の逸脱1件で他の有効な結果まで捨てていないか。語彙の不一致（generation-contract-mismatch）ではなく、座標の算出に要る情報が渡らない点を問う。識別子（IK-0027）では派生形が3つ出た: (1)名前のslug化（列挙idでなく名前からidを自作）、(2)一覧表記の装飾の転写（`(kind)` を名前に写す）、(3)経路由来のモジュール接頭辞の付加（`pkg.mod.Name`、索引は `Name`）。提示形式の明示に加え、既知の変形を照合側で正規化してから落とすかを問う。 |
+
+#### hardcoded-output-budget-diverges
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 同じ生成器を呼ぶ経路の一部が出力上限を共有設定でなく小さい固定値で持ち、上限内で本文が残らず空応答になる |
+| 典型座標 | governance.budget + structure.aggregation |
+| 発見観点 | reproduction / inventory |
+| 解決観点 | canonical_source / order_and_budget |
+| 見分け方・設計時の問い | 同じモデルを呼ぶ全経路が上限を同じ設定から読むか。推論に出力枠を先に使うモデルで、上限が本文に足りるか。応答の形式不一致（unanchored-reference-strict-validation）ではなく、本文自体が空である点を問う。 |
+
+### reasoning-run-record
+
+2026-11-06に外部検証（sim-sandbox E-0009/E-0010）から暫定追加。推論runの記録・再実行・状態の扱いに関する原因をまとめる。
+
+#### reasoning-io-not-persisted
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 生成器の入出力（要求・応答・usage）を保存せず、解析後の結果と失敗文言だけを残す |
+| 典型座標 | connection.information + governance.review |
+| 発見観点 | reproduction / data_inspection |
+| 解決観点 | first_class_state / carry_through |
+| 見分け方・設計時の問い | 検証で落ちた応答について、モデルが実際に書いた値を後から読めるか。揺れの原因がプロンプトか応答かを記録だけで切り分けられるか。応答の形式不一致そのもの（unanchored-reference-strict-validation）ではなく、不一致を調べる材料が残らない点を問う。 |
+
+#### interpretation-without-subject-meaning
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 解釈器に比較対象の識別子と数値だけを渡し、対象が何を変えたか（意図・差分）を渡さないので、名前から意味を推測させる。解釈は上書きされ再実行もできない |
+| 典型座標 | connection.information + governance.resume |
+| 発見観点 | reproduction / trace_walk |
+| 解決観点 | carry_through / state_transition |
+| 見分け方・設計時の問い | 解釈プロンプトに各対象の意図（risk_note・source・差分の抜粋）が入っているか。出力言語を入力（目的文）から決めて明示しているか。解釈だけを再実行でき、前回の解釈が履歴に残るか。 |
+
+#### regenerated-identifier-drift
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 再生成のたびに生成器が識別子を新しく作り、前回の識別子を参照する後段（実験・計画・紐付け）と切れる |
+| 典型座標 | connection.version + structure.representation |
+| 発見観点 | reproduction / data_inspection |
+| 解決観点 | carry_through / representation_change |
+| 見分け方・設計時の問い | 再生成時に前回の識別子一覧を写せる形で生成器に渡しているか。生成後に名前の正規形で前回の識別子へ解決しているか。どの識別子を引き継ぎ、どれを新規にしたかが応答に残るか。2026-11-07以降、写させる方式は llm-assigned-stable-identifier（系の台帳とハンドル、IK-0038）に置き換えた。 |
+
+#### llm-assigned-stable-identifier
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 変わってはならない識別子（後段の主キー・参照先）を生成器に作らせ、または生成器が書いた識別子を候補と照合せずに保存し、系が付番・保持していない |
+| 典型座標 | structure.responsibility + governance.assignment |
+| 発見観点 | inventory / trace_walk |
+| 解決観点 | responsibility_move / canonical_source |
+| 見分け方・設計時の問い | 利用者の規則（2026-11-07）: 識別子・個別名は系が付番・保持し、LLMはそれに紐づく内容だけを返す（または new と示す）。例外は理由を明記。生成器の出力スキーマに、保存後に主キーや参照先になる文字列・整数が含まれていないか。含まれるなら、系が渡した候補（ハンドル）への参照に置き換えたか、受け取った値を渡した候補集合と照合して落とした記録を残すか。前回の識別子を写させて照合する方式（regenerated-identifier-drift の IK-0032）は生成器が新しいidを作る余地を残すので、系の台帳（registry）とハンドルへ移す。 |
+
+#### regeneration-drops-review-state
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 生成結果の再生成が人の確認状態（承認・却下）を引き継がずに新しい未確認の行で置き換え、生成段で落とした候補も記録しない |
+| 典型座標 | governance.review + connection.information |
+| 発見観点 | reproduction / data_inspection |
+| 解決観点 | carry_through / first_class_state |
+| 見分け方・設計時の問い | 再生成後も、同じ対象への人の判断が見えるか。生成器が挙げたが解決できずに落ちた候補の数と中身が応答・ログに出るか。件数の振れを「挙げなかった」と「落ちた」に分けられるか。 |
+
+#### failure-reported-as-created
+
+| 項目 | 内容 |
+| --- | --- |
+| 一般形 | 失敗を記録した結果行を作れたことを成功とみなし、生成の失敗に2xx（作成）を返す |
+| 典型座標 | connection.contract + governance.completion |
+| 発見観点 | doc_code_diff / boundary_walk |
+| 解決観点 | explicit_contract / single_point_fix |
+| 見分け方・設計時の問い | 呼び出し側がHTTPステータスだけで失敗を判定できるか。失敗の本文（記録済みの行と理由）が非2xxでも読めるか。出力の検証失敗（422）と上流の失敗（502）を区別しているか。 |
 
 型の追加時は上記の項目を揃え、同じ変更で少なくとも1つのエントリから参照する。
 単純な局所処理の不良も対象。該当例が得られる前に想像で辞書の型を増やさない。

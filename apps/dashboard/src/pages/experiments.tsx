@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
-  useExperiments, useRunExperiment, useExperimentDecision,
+  useExperiments, useRunExperiment, useExperimentDecision, useExperimentRecord,
   useCreateExperiment, useSnapshots, useLatestDrafts,
   useWorkspaceProposalDraft, useVariantExperimentPayload,
   useGithubAppStatus, useGithubConnections, useSnapshotPreflight,
@@ -17,6 +17,7 @@ import { Label } from "@/components/ui/label";
 import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
+import { copyText } from "@/lib/clipboard";
 import { Play, Download, Plus, Trash2, GitPullRequest, Crosshair, Bot } from "lucide-react";
 import type { ExperimentOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
@@ -26,7 +27,10 @@ import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 import { FormField } from "@/components/ui/form-field";
 import { useAuth } from "@/api/auth";
 import { useUnsavedChangesGuard } from "@/lib/ui-draft";
-import { checkVariants, describeMissing, VARIANT_FIELD_LABEL } from "@/lib/experiment-variants";
+import {
+  checkVariants, describeMissing, VARIANT_FIELD_LABEL, MIN_EXPERIMENT_VARIANTS, MAX_EXPERIMENT_VARIANTS,
+} from "@/lib/experiment-variants";
+import { describeRequestFailure } from "@/lib/request-state";
 
 const STATUS_VARIANT: Record<string, "default" | "success" | "destructive" | "secondary" | "warning"> = {
   draft: "secondary",
@@ -48,6 +52,37 @@ interface VariantInput {
   patch_text: string;
   risk_note: string;
 }
+
+const emptyVariant = (): VariantInput => ({ label: "", patch_text: "", risk_note: "" });
+
+// UX 監査 2026-11-17 D7: 操作の失敗を toast へ。String(e) は出さず、サーバーの
+// 理由 (detail) と、構造化された拒否コード・次の操作があれば添える。
+// `ApiError` を instanceof で判定しない (テストは client をモックする) ので、
+// 形 (denialCode / nextAction) だけを読む。
+function actionFailureMessage(action: string, e: unknown): string {
+  const failure = describeRequestFailure(e);
+  const structured = (e ?? {}) as { denialCode?: unknown; nextAction?: unknown };
+  const parts: string[] = [];
+  if (failure.detail) parts.push(`${action}できませんでした: ${failure.detail}`);
+  else if (failure.kind === "offline" || failure.kind === "network" || failure.kind === "timeout") {
+    parts.push(`${action}できませんでした。サーバーに接続できているか確認して、もう一度お試しください。`);
+  } else if (failure.kind === "forbidden") {
+    parts.push(`${action}できませんでした。この操作を行う権限がありません。`);
+  } else {
+    parts.push(`${action}できませんでした。もう一度お試しください。`);
+  }
+  if (typeof structured.denialCode === "string" && structured.denialCode) {
+    parts.push(`(拒否コード: ${structured.denialCode})`);
+  }
+  if (typeof structured.nextAction === "string" && structured.nextAction) {
+    parts.push(`次の操作: ${structured.nextAction}`);
+  }
+  return parts.join(" ");
+}
+
+// GitHub publish が使えるか。使えないときは理由を 1 つに決めて表示する
+// (UX 監査 C5: リンクを黙って消さない)。
+type GithubPublishAvailability = "available" | "app_unconfigured" | "no_connection" | "unknown" | "loading";
 
 export default function ExperimentsPage() {
   const { systemId, systems } = useAuth();
@@ -92,10 +127,16 @@ export default function ExperimentsPage() {
   // (Issue #216). Same availability rule as the Probe Planner apply-success
   // next-action -- App configured AND at least one connected repo -- so the
   // developer is never handed a link that leads nowhere.
-  const { data: githubAppStatus } = useGithubAppStatus();
-  const { data: githubConnections } = useGithubConnections();
-  const githubPublishAvailable = !!githubAppStatus?.configured
-    && (githubConnections ?? []).some(c => c.status === "connected");
+  const { data: githubAppStatus, isError: githubAppStatusError } = useGithubAppStatus();
+  const { data: githubConnections, isError: githubConnectionsError } = useGithubConnections();
+  const githubPublish: GithubPublishAvailability =
+    githubAppStatus && !githubAppStatus.configured
+      ? "app_unconfigured"
+      : githubAppStatus && githubConnections
+        ? (githubConnections.some(c => c.status === "connected") ? "available" : "no_connection")
+        : githubAppStatusError || githubConnectionsError
+          ? "unknown"
+          : "loading";
   const { data: snapshots } = useSnapshots();
   const { data: drafts } = useLatestDrafts();
   // The URL-driven selection and the developer's own expansion are kept as two
@@ -140,12 +181,23 @@ export default function ExperimentsPage() {
   // Issue #369: the shared preflight decides both axes for the selected
   // snapshot (or the recommended one when nothing is selected yet). The page
   // never re-derives `ready`/`current` itself.
+  const readySnapshots = snapshots?.filter(s => s.status === "ready") ?? [];
+  // UX 監査 2026-11-17 C3: Simulation Workbench / Candidate Studio から来た
+  // 候補は、その replay run が pin した Snapshot で評価されている。payload の
+  // origin.snapshot_id (サーバーが run から返す値) を初期値にし、選び直させない。
+  // 一覧に無い (ready でない・別 System) 場合は初期値にせず、その旨を出す。
+  const replaySnapshotRaw = replayPayload?.origin?.snapshot_id;
+  const replaySnapshotId = typeof replaySnapshotRaw === "number" ? replaySnapshotRaw : null;
+  const replaySnapshotSelectable =
+    replaySnapshotId !== null && readySnapshots.some(s => s.id === replaySnapshotId);
+  const formSnapshotId = newSnapshotId
+    || (replaySnapshotSelectable && replaySnapshotId !== null ? String(replaySnapshotId) : "");
+
   const { data: preflight, isLoading: preflightLoading } = useSnapshotPreflight(
-    newSnapshotId ? Number(newSnapshotId) : null,
+    formSnapshotId ? Number(formSnapshotId) : null,
   );
   const [staleReason, setStaleReason] = useState("");
 
-  const readySnapshots = snapshots?.filter(s => s.status === "ready") ?? [];
   // Exactly one recommendation, from the server. Older ready snapshots stay
   // reachable for reproduction runs, but are not offered as equals.
   const recommendedId = preflight?.recommended_snapshot_id ?? null;
@@ -164,21 +216,23 @@ export default function ExperimentsPage() {
       risk_note: "",
     }))
     : [];
-  while (draftVariants.length < 2) {
-    draftVariants.push({ label: "", patch_text: "", risk_note: "" });
+  while (draftVariants.length < MIN_EXPERIMENT_VARIANTS) {
+    draftVariants.push(emptyVariant());
   }
+  // C3: baseline はサーバーが自動で足すので、引き継いだ候補 1 件だけで作成できる。
+  // 空の 2 件目を足さない (足すと「もう 1 件必要」に見える)。
   const replayVariants = replayPayload
     ? [{ label: replayPayload.label, patch_text: replayPayload.patch_text, risk_note: replayPayload.risk_note }]
     : [];
-  while (replayVariants.length < 2) {
-    replayVariants.push({ label: "", patch_text: "", risk_note: "" });
+  while (replayVariants.length < MIN_EXPERIMENT_VARIANTS) {
+    replayVariants.push(emptyVariant());
   }
   const formFeatureId = newFeatureId
     ?? (workspaceDraft?.draft_type === "experiment_draft" ? workspaceDraft.payload.feature_id ?? "" : "");
   const defaultObjective = workspaceDraft?.draft_type === "experiment_draft"
     ? workspaceDraft.payload.objective ?? ""
     : fromTraceParam
-      ? `Investigate trace ${fromTraceParam}${fromComponentParam ? ` (component ${fromComponentParam})` : ""}`
+      ? `Trace ${fromTraceParam} を調査する${fromComponentParam ? `（component ${fromComponentParam}）` : ""}`
       : "";
   const formObjective = newObjective ?? defaultObjective;
   const formVariants = variants ?? (replayPayload ? replayVariants : draftVariants);
@@ -220,7 +274,7 @@ export default function ExperimentsPage() {
   // 含まれず保存もされていない) まで消える。応答時点の下書きは ref で読む
   // (handler の closure は送信時点の値しか持たない)。
   const draftSignature = JSON.stringify([
-    systemId, formFeatureId, formObjective, newSnapshotId, staleReason, formVariants,
+    systemId, formFeatureId, formObjective, formSnapshotId, staleReason, formVariants,
   ]);
   const draftSignatureRef = useRef(draftSignature);
   useEffect(() => {
@@ -237,15 +291,19 @@ export default function ExperimentsPage() {
   };
 
   const handleCreate = async () => {
-    if (!formFeatureId || !formObjective.trim() || !newSnapshotId) return;
+    if (!formFeatureId || !formObjective.trim() || !formSnapshotId) return;
     setSubmitAttempted(true);
     if (variantCheck.partial.length > 0) {
       toast.error(`${variantCheck.partial.map(describeMissing).join("。")}。入力するか、候補を削除してください。`);
       return;
     }
     const validVariants = variantCheck.complete.map(r => formVariants[r.index]);
-    if (validVariants.length < 2) {
-      toast.error("ラベルとpatchを入力した比較候補が2件以上必要です");
+    if (validVariants.length < MIN_EXPERIMENT_VARIANTS) {
+      toast.error(`ラベルとpatchを入力した比較候補が${MIN_EXPERIMENT_VARIANTS}件以上必要です(baselineは自動で追加されます)`);
+      return;
+    }
+    if (validVariants.length > MAX_EXPERIMENT_VARIANTS) {
+      toast.error(`比較候補は${MAX_EXPERIMENT_VARIANTS}件までです`);
       return;
     }
     const submittedSystemId = systemId;
@@ -254,7 +312,7 @@ export default function ExperimentsPage() {
       await createExperiment.mutateAsync({
         feature_id: formFeatureId,
         objective: formObjective.trim(),
-        snapshot_id: Number(newSnapshotId),
+        snapshot_id: Number(formSnapshotId),
         variants: validVariants.map(v => ({
           label: v.label.trim(),
           patch_text: v.patch_text,
@@ -284,7 +342,7 @@ export default function ExperimentsPage() {
       }
     } catch (err) {
       // 失敗時は下書きを残す (再送や修正のため)。
-      toast.error(String(err));
+      toast.error(actionFailureMessage("Experimentを作成", err));
     }
   };
 
@@ -293,16 +351,17 @@ export default function ExperimentsPage() {
   };
 
   const addVariant = () => {
-    setVariants([...formVariants, { label: "", patch_text: "", risk_note: "" }]);
+    if (formVariants.length >= MAX_EXPERIMENT_VARIANTS) return;
+    setVariants([...formVariants, emptyVariant()]);
   };
 
   const removeVariant = (idx: number) => {
-    if (formVariants.length <= 2) return;
+    if (formVariants.length <= MIN_EXPERIMENT_VARIANTS) return;
     setVariants(formVariants.filter((_, i) => i !== idx));
   };
 
   const clearVariant = (idx: number) => {
-    setVariants(formVariants.map((v, i) => i === idx ? { label: "", patch_text: "", risk_note: "" } : v));
+    setVariants(formVariants.map((v, i) => i === idx ? emptyVariant() : v));
   };
 
   return (
@@ -333,10 +392,7 @@ export default function ExperimentsPage() {
           if (!hasDraft) {
             setNewFeatureId("");
             setNewObjective("");
-            setVariants([
-              { label: "", patch_text: "", risk_note: "" },
-              { label: "", patch_text: "", risk_note: "" },
-            ]);
+            setVariants([emptyVariant()]);
           }
           setShowCreate(true);
         }}>
@@ -367,7 +423,10 @@ export default function ExperimentsPage() {
       ) : isError ? (
         <Card role="alert"><CardContent className="space-y-3 py-8 text-center">
           <p className="text-sm font-medium">Experiment一覧を取得できませんでした。</p>
-          <p className="text-xs text-muted-foreground">{String(error)}</p>
+          <p className="text-xs text-muted-foreground">
+            {describeRequestFailure(error).summary}
+            {describeRequestFailure(error).detail ? ` ${describeRequestFailure(error).detail}` : ""}
+          </p>
           <Button size="sm" variant="outline" onClick={() => refetch()}>再試行</Button>
         </CardContent></Card>
       ) : !experiments?.length ? (
@@ -390,7 +449,7 @@ export default function ExperimentsPage() {
               }}
               runExperiment={runExperiment}
               makeDecision={makeDecision}
-              githubPublishAvailable={githubPublishAvailable}
+              githubPublish={githubPublish}
               capabilityContext={capabilityContext}
             />
           ))}
@@ -420,7 +479,19 @@ export default function ExperimentsPage() {
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
               Replay候補run #{replayRunId}、候補 #{replayVariantId} ({replayPayload.source}) から入力済みです。
               {replayPayload.risk_note && <span className="ml-2">{replayPayload.risk_note}</span>}
-              <span className="ml-1 text-muted-foreground">残り: Feature、評価目的、Snapshot。</span>
+              <span className="ml-1 text-muted-foreground">
+                {replaySnapshotSelectable
+                  ? `Snapshot #${replaySnapshotId} は replay run から引き継ぎました。残り: Feature、評価目的。`
+                  : "残り: Feature、評価目的、Snapshot。"}
+              </span>
+              {replaySnapshotId !== null && !replaySnapshotSelectable && (
+                <span className="mt-1 block text-amber-700 dark:text-amber-400" data-testid="experiment-replay-snapshot-unavailable">
+                  replay run の Snapshot #{replaySnapshotId} は選択できる状態(ready)の一覧にありません。下で Snapshot を選んでください。
+                </span>
+              )}
+              <span className="mt-1 block text-muted-foreground">
+                baseline(pinned commit)は自動で比較に加わるため、この候補 1 件だけで作成できます。
+              </span>
             </div>
           )}
           {!replayPayload && fromTraceParam && (
@@ -436,10 +507,10 @@ export default function ExperimentsPage() {
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
               Decision Workspaceの提案 #{workspaceDraft.proposal_id} から入力済みです。
               {(workspaceDraft.payload.constraints?.length ?? 0) > 0 && (
-                <span className="ml-2">Constraints: {workspaceDraft.payload.constraints?.join(", ")}.</span>
+                <span className="ml-2">制約: {workspaceDraft.payload.constraints?.join("、")}。</span>
               )}
               {(workspaceDraft.payload.evaluation_criteria?.length ?? 0) > 0 && (
-                <span className="ml-2">Evaluation: {workspaceDraft.payload.evaluation_criteria?.join(", ")}.</span>
+                <span className="ml-2">評価基準: {workspaceDraft.payload.evaluation_criteria?.join("、")}。</span>
               )}
               {workspaceDraft.missing_fields.length > 0 && (
                 <span className="ml-1 text-muted-foreground">
@@ -475,7 +546,7 @@ export default function ExperimentsPage() {
               selected. */}
           <div className="space-y-2">
             <Label htmlFor="experiment-create-snapshot">Snapshot</Label>
-            <Select id="experiment-create-snapshot" value={newSnapshotId} onChange={e => setNewSnapshotId(e.target.value)}>
+            <Select id="experiment-create-snapshot" value={formSnapshotId} onChange={e => setNewSnapshotId(e.target.value)}>
               <option value="">Snapshotを選択...</option>
               {recommendedSnapshot && (
                 <option value={recommendedSnapshot.id}>
@@ -486,7 +557,7 @@ export default function ExperimentsPage() {
                 <optgroup label="過去のSnapshot（再現用途）">
                   {olderSnapshots.map(s => (
                     <option key={s.id} value={s.id}>
-                      #{s.id} — {s.commit_sha?.slice(0, 8)} ({s.file_count} files)
+                      #{s.id} — {s.commit_sha?.slice(0, 8)}（{s.file_count} ファイル）
                     </option>
                   ))}
                 </optgroup>
@@ -502,10 +573,13 @@ export default function ExperimentsPage() {
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <Label>比較候補</Label>
-              <Button variant="ghost" size="sm" onClick={addVariant}>
+              <Button variant="ghost" size="sm" onClick={addVariant} disabled={formVariants.length >= MAX_EXPERIMENT_VARIANTS}>
                 <Plus className="h-3 w-3 mr-1" /> 候補を追加
               </Button>
             </div>
+            <p className="text-xs text-muted-foreground" data-testid="experiment-variant-baseline-note">
+              baseline(pinned commit のまま)は自動で追加されます。候補は{MIN_EXPERIMENT_VARIANTS}〜{MAX_EXPERIMENT_VARIANTS}件です。
+            </p>
             {formVariants.map((v, i) => {
               const row = variantCheck.rows[i];
               const showRowError = submitAttempted && row?.state === "partial";
@@ -524,7 +598,7 @@ export default function ExperimentsPage() {
                       候補 {i + 1}
                       {row?.state === "partial" && <span className="ml-2 text-amber-700 dark:text-amber-400">入力途中</span>}
                     </span>
-                    {formVariants.length > 2 ? (
+                    {formVariants.length > MIN_EXPERIMENT_VARIANTS ? (
                       <Button variant="ghost" size="icon" className="h-6 w-6" aria-label={`候補 ${i + 1} を削除`} onClick={() => removeVariant(i)}>
                         <Trash2 className="h-3 w-3" />
                       </Button>
@@ -558,7 +632,7 @@ export default function ExperimentsPage() {
                   />
                   {showRowError && (
                     <p id={errorId} role="alert" className="text-xs text-destructive" data-testid={`experiment-variant-error-${i}`}>
-                      {describeMissing(row)}。入力するか、{formVariants.length > 2 ? "この候補を削除" : "入力をクリア"}してください。
+                      {describeMissing(row)}。入力するか、{formVariants.length > MIN_EXPERIMENT_VARIANTS ? "この候補を削除" : "入力をクリア"}してください。
                     </p>
                   )}
                 </div>
@@ -573,7 +647,7 @@ export default function ExperimentsPage() {
           )}
           <Button
             onClick={handleCreate}
-            disabled={createExperiment.isPending || !formFeatureId || !formObjective.trim() || !newSnapshotId || variantCheck.complete.length < 2 || staleAckMissing || preflight?.verdict === "blocked"}
+            disabled={createExperiment.isPending || !formFeatureId || !formObjective.trim() || !formSnapshotId || variantCheck.complete.length < MIN_EXPERIMENT_VARIANTS || staleAckMissing || preflight?.verdict === "blocked"}
             title={
               staleAckMissing
                 ? "HEADより古いSnapshotを使う理由を入力してください"
@@ -597,14 +671,14 @@ export default function ExperimentsPage() {
 }
 
 function ExperimentCard({
-  exp, expanded, onToggle, runExperiment, makeDecision, githubPublishAvailable, capabilityContext,
+  exp, expanded, onToggle, runExperiment, makeDecision, githubPublish, capabilityContext,
 }: {
   exp: ExperimentOut;
   expanded: boolean;
   onToggle: () => void;
   runExperiment: ReturnType<typeof useRunExperiment>;
   makeDecision: ReturnType<typeof useExperimentDecision>;
-  githubPublishAvailable: boolean;
+  githubPublish: GithubPublishAvailability;
   capabilityContext: string | null;
 }) {
   const [decisionVal, setDecisionVal] = useState(exp.human_decision ?? "undecided");
@@ -620,11 +694,11 @@ function ExperimentCard({
     };
     if (decisionVal === "adopted") {
       if (!decisionVariant) {
-        toast.error("Select a variant to adopt");
+        toast.error("採用する候補を選択してください");
         return;
       }
       if (!decisionNote.trim()) {
-        toast.error("A note is required for adoption");
+        toast.error("採用するには判断理由の入力が必要です");
         return;
       }
       payload.variant_key = decisionVariant;
@@ -634,9 +708,18 @@ function ExperimentCard({
     }
     try {
       await makeDecision.mutateAsync(payload);
-      toast.success("Decision saved");
-    } catch (err) { toast.error(String(err)); }
+      toast.success("判断を保存しました");
+    } catch (err) { toast.error(actionFailureMessage("判断を保存", err)); }
   };
+
+  // D7: 実行できる状態はサーバーの run_allowed (run endpoint と同じ条件) が決める。
+  // そのうち画面から出すのは draft (実行) と failed (再実行) だけ。completed の
+  // 再実行はサーバーが許すが、判断の根拠になっている結果を上書きするので出さない。
+  // 古い Control Server (run_allowed なし) では従来どおり draft だけ。
+  const serverAllowsRun = exp.run_allowed ?? exp.status === "draft";
+  const runLabel = exp.status === "failed" ? "再実行" : "Experiment を実行";
+  const showRun = serverAllowsRun && (exp.status === "draft" || exp.status === "failed");
+  const runningThis = runExperiment.isPending && runExperiment.variables === exp.id;
 
   return (
     <Card data-testid={`experiment-row-${exp.id}`} data-expanded={expanded}>
@@ -647,7 +730,7 @@ function ExperimentCard({
               Experiment #{exp.id}
               <Badge variant={STATUS_VARIANT[exp.status] ?? "secondary"}>{exp.status}</Badge>
               {exp.human_decision && exp.human_decision !== "undecided" && (
-                <Badge variant="outline">{exp.human_decision}</Badge>
+                <Badge variant="outline">{DECISION_LABELS[exp.human_decision] ?? exp.human_decision}</Badge>
               )}
             </CardTitle>
             <CardDescription className="mt-1">
@@ -665,17 +748,35 @@ function ExperimentCard({
       {expanded && (
         <CardContent className="space-y-4" data-testid={`experiment-detail-${exp.id}`}>
           <div className="flex gap-2">
-            {exp.status === "draft" && (
+            {showRun && (
               <Button
                 size="sm"
-                onClick={() => runExperiment.mutateAsync(exp.id).then(() => toast.success("Experiment started")).catch(e => toast.error(String(e)))}
+                data-testid={`experiment-run-${exp.id}`}
+                onClick={() => runExperiment.mutateAsync(exp.id)
+                  .then((result) => {
+                    if (result?.status === "failed") toast.error("Experiment の実行が失敗しました。下の失敗の記録を確認してください。");
+                    else toast.success("Experiment の実行が終わりました");
+                  })
+                  .catch(e => toast.error(actionFailureMessage(exp.status === "failed" ? "再実行" : "実行", e)))}
                 disabled={runExperiment.isPending}
               >
                 <Play className="h-4 w-4 mr-1" />
-                Run Experiment
+                {runningThis ? "実行中..." : runLabel}
               </Button>
             )}
+            {exp.status === "running" && (
+              <p className="text-xs text-muted-foreground" role="status" data-testid={`experiment-running-${exp.id}`}>
+                実行中です。終わると自動で表示を更新します。
+              </p>
+            )}
           </div>
+
+          {exp.error && (
+            <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs" data-testid={`experiment-error-${exp.id}`}>
+              <div className="font-medium text-destructive">実行の失敗</div>
+              <p className="mt-1 whitespace-pre-wrap">{exp.error}</p>
+            </div>
+          )}
 
           {exp.status === "completed" && (
             <div className="rounded-lg border p-4 space-y-3">
@@ -719,7 +820,8 @@ function ExperimentCard({
               made earlier, on every load -- deterministic and simple. */}
           <ExperimentNextAction
             humanDecision={exp.human_decision}
-            githubPublishAvailable={githubPublishAvailable}
+            githubPublish={githubPublish}
+            adoptedPatchId={exp.adopted_improvement_patch_id ?? null}
             capabilityContext={capabilityContext}
           />
 
@@ -748,12 +850,13 @@ function ExperimentCard({
                             URL.revokeObjectURL(url);
                           }}
                         >
-                          <Download className="h-3 w-3 mr-1" /> Patch
+                          <Download className="h-3 w-3 mr-1" /> 差分をダウンロード
                         </Button>
                       )}
                     </div>
                     {v.risk_note && <p className="text-xs text-muted-foreground mb-1">{v.risk_note}</p>}
-                    {v.error && <p className="text-xs text-destructive mb-2">{v.error}</p>}
+                    {v.error && <p className="text-xs text-destructive mb-2" data-testid={`experiment-variant-failure-${v.variant_key}`}>{v.error}</p>}
+                    <FailedCommands variant={v} />
                     {v.metrics && Object.keys(v.metrics).length > 0 && (
                       <div className="overflow-x-auto">
                         <table className="w-full text-xs">
@@ -780,6 +883,8 @@ function ExperimentCard({
             </div>
           )}
 
+          <ExperimentRecordBlock id={exp.id} />
+
           {exp.comparison && Object.keys(exp.comparison).length > 0 && (
             <div>
               <h4 className="text-sm font-medium mb-2">比較結果</h4>
@@ -794,34 +899,97 @@ function ExperimentCard({
   );
 }
 
+// IK-0035: 台帳（疑義台帳の外部検証の線）に写す記録。サーバーが決定論的に組み立てた
+// JSON をそのまま表示・コピーする（ここでは整形しない）。
+function ExperimentRecordBlock({ id }: { id: number }) {
+  const { data, isError, error } = useExperimentRecord(id);
+  const json = data ? JSON.stringify(data, null, 2) : "";
+  const copy = async () => {
+    if (await copyText(json)) toast.success("記録を JSON でコピーしました");
+    else toast.error("コピーできませんでした（ブラウザの権限を確認してください）");
+  };
+  return (
+    <div data-testid={`experiment-record-${id}`}>
+      <div className="flex items-center justify-between mb-2">
+        <h4 className="text-sm font-medium flex items-center gap-2">
+          台帳用の記録
+          {data && !data.complete && <Badge variant="warning">未完（解釈か判断がまだ）</Badge>}
+        </h4>
+        <Button size="sm" variant="ghost" onClick={copy} disabled={!data}>
+          JSON をコピー
+        </Button>
+      </div>
+      {isError && (
+        <p className="text-xs text-destructive">
+          {describeRequestFailure(error).summary}
+          {describeRequestFailure(error).detail ? ` ${describeRequestFailure(error).detail}` : ""}
+        </p>
+      )}
+      {data && (
+        <pre className="rounded-md bg-muted p-3 text-xs overflow-x-auto whitespace-pre-wrap">
+          {`${data.conditions}\n\n${data.result_summary}`}
+        </pre>
+      )}
+      {/* IK-0036: 助言は判断と別の枠に出す（台帳の結果の文には入らない）。 */}
+      {data && (
+        <pre className="mt-2 rounded-md border p-3 text-xs text-muted-foreground overflow-x-auto whitespace-pre-wrap">
+          {data.analysis_summary}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 // Issue #259: closes the "decision saved -> dead end" gap. `Candidate Studio`
 // never gets a `component_id` prefill here -- an Experiment record (and its
 // variants) carries only `feature_id`, never a `component_id`, in any typed
 // field, so there is nothing deterministic to prefill (Principle 6); linking
 // bare to /candidate-studio lets the developer pick the component there.
-function ExperimentNextAction({ humanDecision, githubPublishAvailable, capabilityContext }: {
+function ExperimentNextAction({ humanDecision, githubPublish, adoptedPatchId, capabilityContext }: {
   humanDecision: string | null;
-  githubPublishAvailable: boolean;
+  githubPublish: GithubPublishAvailability;
+  adoptedPatchId: number | null;
   capabilityContext: string | null;
 }) {
   if (humanDecision === "adopted") {
     const probePlannerHref = capabilityContext
       ? `/probe-planner?capability=${encodeURIComponent(capabilityContext)}`
       : "/probe-planner";
+    // UX 監査 2026-11-17 C5: 採用した候補の patch を `?patch=` で渡す。GitHub
+    // 画面はこの param で Publish Jobs タブを開き、その patch を選んだ作成
+    // ダイアログを開く (開くだけ。承認と publish は従来どおり人が行う)。
+    // patch id はサーバーが採用の lineage から決めた値で、ここで推測しない。
+    const publishHref = adoptedPatchId !== null ? `/github?patch=${adoptedPatchId}` : "/github";
     return (
       <div className="rounded-lg border p-3 space-y-2 text-xs" data-testid="experiment-next-action-adopted">
         <div className="text-sm font-medium">次のステップ</div>
-        {/* GitHub publish link only appears when the workflow is actually
-            usable (App configured + at least one connected repo) -- shown
-            or hidden by the caller's githubPublishAvailable, never here. */}
-        {githubPublishAvailable && (
+        {githubPublish === "available" && (
           <Link
-            to="/github"
+            to={publishHref}
             className="flex items-center gap-1.5 text-primary hover:underline"
             data-testid="experiment-github-publish-link"
           >
-            <GitPullRequest className="h-3.5 w-3.5" /> 採用した変更をGitHubで公開する
+            <GitPullRequest className="h-3.5 w-3.5" />
+            {adoptedPatchId !== null
+              ? `採用した変更(patch #${adoptedPatchId})をGitHubで公開する`
+              : "採用した変更をGitHubで公開する"}
           </Link>
+        )}
+        {githubPublish === "available" && adoptedPatchId === null && (
+          <p className="text-muted-foreground" data-testid="experiment-github-publish-patch-unknown">
+            公開用の patch を特定できなかったため、GitHub 画面で patch を選んでください。
+          </p>
+        )}
+        {(githubPublish === "app_unconfigured" || githubPublish === "no_connection" || githubPublish === "unknown") && (
+          <p className="text-muted-foreground" data-testid="experiment-github-publish-unavailable">
+            {githubPublish === "app_unconfigured"
+              ? "GitHub App が未設定のため、まだ公開できません。"
+              : githubPublish === "no_connection"
+                ? "接続済み(connected)のリポジトリが無いため、まだ公開できません。"
+                : "GitHub の設定状態を確認できなかったため、公開できるか分かりません。"}
+            {" "}
+            <Link to="/github" className="text-primary hover:underline">GitHub 画面で設定する</Link>
+          </p>
         )}
         <Link
           to={probePlannerHref}
@@ -850,4 +1018,37 @@ function ExperimentNextAction({ humanDecision, githubPublishAvailable, capabilit
   }
 
   return null;
+}
+
+// D7: 失敗した候補で、終了コードが 0 以外・timeout のコマンドだけを出す。
+// 出力は保存済みの値 (サーバーが切り詰め済みなら truncated を明示) をそのまま。
+function FailedCommands({ variant }: { variant: ExperimentOut["variants"][number] }) {
+  if (variant.status !== "failed") return null;
+  const failed = (variant.commands ?? []).filter(c => c.timed_out || (c.exit_code !== null && c.exit_code !== 0));
+  if (failed.length === 0) return null;
+  return (
+    <details className="mb-2 text-xs" data-testid={`experiment-variant-failed-commands-${variant.variant_key}`}>
+      <summary className="cursor-pointer text-destructive">失敗したコマンド({failed.length}件)</summary>
+      <div className="mt-2 space-y-2">
+        {failed.map(c => (
+          <div key={c.id} className="rounded border p-2">
+            <div className="font-mono">{c.command}</div>
+            <div className="text-muted-foreground">
+              {c.timed_out ? "時間切れ" : `終了コード ${c.exit_code}`}
+            </div>
+            {c.stderr && (
+              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-muted p-2">
+                {c.stderr}{c.stderr_truncated ? "\n…(切り詰め済み)" : ""}
+              </pre>
+            )}
+            {c.stdout && (
+              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-muted p-2">
+                {c.stdout}{c.stdout_truncated ? "\n…(切り詰め済み)" : ""}
+              </pre>
+            )}
+          </div>
+        ))}
+      </div>
+    </details>
+  );
 }

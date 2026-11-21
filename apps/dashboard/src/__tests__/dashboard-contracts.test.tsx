@@ -1,7 +1,7 @@
 /// <reference types="vitest/globals" />
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, MemoryRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, MemoryRouter, Routes, Route, useLocation } from "react-router-dom";
 import { vi } from "vitest";
 import type { ReactNode } from "react";
 import type { SystemStateItem } from "@/api/types";
@@ -256,7 +256,7 @@ describe("Repository config page", () => {
     fireEvent.change(includeTextarea!, { target: { value: "*.py\n*.ts" } });
     fireEvent.change(excludeTextarea!, { target: { value: "node_modules" } });
 
-    fireEvent.click(screen.getByText("Save Configuration"));
+    fireEvent.click(screen.getByText("設定を保存"));
 
     await waitFor(() => {
       expect(mockApi.put).toHaveBeenCalledWith("/repository", {
@@ -309,18 +309,23 @@ describe("Experiment creation", () => {
     mockSystemId = 1;
   });
 
-  test("button disabled when fewer than 2 valid variants", async () => {
+  // UX 監査 2026-11-17 C3: baseline はサーバーが自動で足すので、候補 1 件で作成できる。
+  test("button disabled with no complete candidate, enabled with one (baseline is automatic)", async () => {
     setupExperimentMocks();
     await openCreateDialog();
     fillBasicFields();
 
+    const createBtn = screen.getAllByRole("button", { name: "Experimentを作成" }).at(-1);
+    expect(createBtn).toBeDisabled();
+    expect(screen.getByTestId("experiment-variant-baseline-note")).toHaveTextContent("baseline");
+
     const labelInputs = screen.getAllByPlaceholderText("ラベル（例: optimized-v1）");
     const patchInputs = screen.getAllByPlaceholderText("Patch内容（unified diff形式）");
+    expect(labelInputs).toHaveLength(1);
     fireEvent.change(labelInputs[0], { target: { value: "variant-a" } });
     fireEvent.change(patchInputs[0], { target: { value: "patch-a" } });
 
-    const createBtn = screen.getAllByRole("button", { name: "Experimentを作成" }).at(-1);
-    expect(createBtn).toBeDisabled();
+    expect(screen.getAllByRole("button", { name: "Experimentを作成" }).at(-1)).not.toBeDisabled();
   });
 
   test("submits when 2 valid variants are provided", async () => {
@@ -332,6 +337,7 @@ describe("Experiment creation", () => {
 
     await openCreateDialog();
     fillBasicFields();
+    fireEvent.click(screen.getByRole("button", { name: /候補を追加/ }));
 
     const labelInputs = screen.getAllByPlaceholderText("ラベル（例: optimized-v1）");
     const patchInputs = screen.getAllByPlaceholderText("Patch内容（unified diff形式）");
@@ -359,15 +365,16 @@ describe("Experiment creation", () => {
     });
   });
 
-  test("cannot delete variants below 2", async () => {
+  test("cannot delete the last candidate", async () => {
     setupExperimentMocks();
     await openCreateDialog();
 
     expect(screen.getByText("候補 1")).toBeInTheDocument();
-    expect(screen.getByText("候補 2")).toBeInTheDocument();
+    expect(screen.queryByText("候補 2")).not.toBeInTheDocument();
 
-    const trashIcons = document.querySelectorAll(".lucide-trash-2");
-    expect(trashIcons.length).toBe(0);
+    expect(document.querySelectorAll(".lucide-trash-2").length).toBe(0);
+    fireEvent.click(screen.getByRole("button", { name: /候補を追加/ }));
+    expect(document.querySelectorAll(".lucide-trash-2").length).toBe(2);
   });
 
   test("shows a back link to the capability when ?capability= is present", async () => {
@@ -615,10 +622,10 @@ describe("Probe Patch application", () => {
 
     await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Feature: feat-1"));
-    await waitFor(() => expect(screen.getByText("Apply")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("Apply"));
+    await waitFor(() => expect(screen.getByText("リポジトリへ適用")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("リポジトリへ適用"));
 
-    const confirmButton = await screen.findByText("Apply to Repository");
+    const confirmButton = await screen.findByText("適用を実行");
     expect(confirmButton).toBeDisabled();
     fireEvent.change(screen.getByPlaceholderText("APPLY"), {
       target: { value: "APPLY" },
@@ -771,7 +778,7 @@ describe("Probe Planner ?plan= deep link", () => {
     });
     // Expanded content (Probe Points section) is rendered only for the open card.
     await waitFor(() => {
-      expect(screen.getByText("Probe Points (0)")).toBeInTheDocument();
+      expect(screen.getByText("Probe Point（0 件）")).toBeInTheDocument();
     });
     const { toast } = await import("sonner");
     expect(toast.error).not.toHaveBeenCalled();
@@ -785,7 +792,7 @@ describe("Probe Planner ?plan= deep link", () => {
       expect(screen.getByText("Feature: feat-1")).toBeInTheDocument();
       expect(screen.getByText("Feature: feat-2")).toBeInTheDocument();
     });
-    expect(screen.queryByText(/Probe Points \(/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Probe Point（/)).not.toBeInTheDocument();
     const { toast } = await import("sonner");
     expect(toast.error).not.toHaveBeenCalled();
   });
@@ -800,9 +807,9 @@ describe("Probe Planner ?plan= deep link", () => {
     });
     const { toast } = await import("sonner");
     await waitFor(() => {
-      expect(toast.error).toHaveBeenCalledWith("Probe plan #999 was not found.");
+      expect(toast.error).toHaveBeenCalledWith("Probe Plan #999 が見つかりません。");
     });
-    expect(screen.queryByText(/Probe Points \(/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Probe Point（/)).not.toBeInTheDocument();
   });
 });
 
@@ -991,7 +998,7 @@ describe("Probe Patch HEAD-changed recovery", () => {
     expect(await screen.findByTestId("patch-stale-badge")).toBeInTheDocument();
     const recovery = await screen.findByTestId("patch-recovery");
     expect(within(recovery).getByText(/git apply --check/)).toBeInTheDocument();
-    expect(within(recovery).getByText(/cannot be applied after HEAD changed/i)).toBeInTheDocument();
+    expect(within(recovery).getByText(/HEAD が変わった後は適用できません/)).toBeInTheDocument();
   });
 });
 
@@ -2050,7 +2057,7 @@ describe("Probe Planner capability back link (Issue #176)", () => {
     mockTwoPlans();
     await renderProbePlannerAt("/probe-planner?plan=11&capability=doc-analysis");
 
-    await screen.findByText("Probe Points (0)");
+    await screen.findByText("Probe Point（0 件）");
     const link = screen.getByTestId("open-experiments-with-capability");
     expect(link).toHaveAttribute("href", "/experiments?capability=doc-analysis");
   });
@@ -2870,6 +2877,17 @@ describe("Interview page", () => {
     expect(screen.getByTestId("workflow-leave-safely")).toBeInTheDocument();
     // 同じ再試行が別パネルにも並ばない (原則 P7)。
     expect(screen.queryByTestId("understanding-recovery-build")).toBeNull();
+    // UX 監査 2026-11-17 B3: ブロッキング中、status summary は別の操作
+    // (「Vision を定義する」など) を主 CTA にしない。
+    expect(screen.getByTestId("cockpit-next-step-title").textContent).toBe("失敗した処理を解消する");
+    expect(screen.queryByTestId("cockpit-next-step-action")).toBeNull();
+    // 別画面の前提が欠けているとサーバーが言わない限り、リンクは出さない
+    // (失敗文言からリンクを推測しない)。
+    expect(within(blocking).queryByTestId("workflow-prerequisite-system_understanding_graph")).toBeNull();
+    // ブロッキングは従来の大きさのまま: 詳細・回復条件を折りたたまない。
+    expect(blocking).not.toHaveAttribute("data-density");
+    expect(within(blocking).queryByTestId("workflow-exception-supplement")).toBeNull();
+    expect(within(blocking).getByText("reasoning model is not configured")).toBeVisible();
   });
 
   test("劣化例外 (E3-b) は主操作を止めず、ブロッキングとは別のラベルで示す (Issue #349)", async () => {
@@ -3386,13 +3404,14 @@ describe("Interview page", () => {
       workflow: {
         state: "W3", candidate_state: "W3", rule_row: 7, reached_state: "W3",
         primary_action: "submit_answer",
-        facts: { open_required_questions: 1 },
+        facts: { open_required_questions: 0, zero_base_pending: true },
         exceptions: [{
           code: "E3-b", severity: "degraded", target_state: null,
           message: "自動でのシステム理解を構築できませんでした。以降は質問で理解を組み立てます。",
           detail: "reasoning model is not configured",
           recovery_process_kind: "understanding_build",
           recovery_condition: "以降の理解更新が成功すると解消します。",
+          prerequisite: "system_understanding_graph",
         }],
         unresolved_failures: [{
           id: 1, session_id: 7, system_id: 1, process_kind: "understanding_build",
@@ -3406,6 +3425,9 @@ describe("Interview page", () => {
         last_error: "reasoning model is not configured",
         understanding_confirmed_at: null,
         understanding_confirmed_by: null,
+        messages: [
+          { id: 1, session_id: 7, role: "assistant", content: "理解の更新に失敗しました: (記録)", intelligence_run_id: null, created_at: 1 },
+        ],
       },
       proposals: [],
     });
@@ -3422,14 +3444,77 @@ describe("Interview page", () => {
       </QueryClientProvider>,
     );
 
-    const notice = await screen.findByTestId("zero-base-notice");
-    expect(notice.textContent).toContain("ゼロベース");
-    expect(notice.textContent).toContain("reasoning model is not configured");
+    // UX 監査 2026-11-17 B3: 失敗・影響・回復は例外カード 1 枠だけが言う
+    // (§4.4)。会話欄の notice は重ねず、生のエラーも 1 回しか出ない。
+    const exception = await screen.findByTestId("workflow-exception-E3-b");
+    expect(exception.textContent).toContain("以降は質問で理解を組み立てます");
+    expect(screen.queryByTestId("zero-base-notice")).toBeNull();
+    expect(screen.getAllByText("reasoning model is not configured")).toHaveLength(1);
+    expect(screen.queryByText(/提示できる質問もありません/)).toBeNull();
+    // 例外コードは主表示ではなく補足。
+    expect(within(exception).getByTestId("workflow-exception-code").textContent).toContain("E3-b");
+    // B4: 別画面の前提は、サーバーの有限値からリンクにする。
+    expect(
+      within(exception).getByTestId("workflow-prerequisite-system_understanding_graph"),
+    ).toHaveAttribute("href", "/system-understanding");
 
     // The zero-base interview asks one focused question at a time,
     // starting with the target goal.
     const question = screen.getByTestId("focused-question");
     expect(question.textContent).toContain("達成したい目標");
+
+    // 「次にやること」は 1 つ: 理解が無いのに「この理解で進む」や
+    // 「Vision を定義する」を出さず、回答 (= サーバーの主操作) を指す。
+    expect(screen.getByTestId("workflow-next-action").textContent).toContain("回答を送信");
+    expect(screen.queryByText(/この理解で進む/)).toBeNull();
+    expect(screen.getByTestId("cockpit-next-step-title").textContent).toBe("表示中の質問に答える");
+    expect(screen.getByTestId("cockpit-next-step-action").textContent).toContain("回答を送信");
+
+    // #358 の順序契約: 現在地 → 例外 → status summary → 作業面。会話からの
+    // 補足は作業面より後ろ。
+    const order = [
+      "workflow-location",
+      "workflow-exception-E3-b",
+      "cockpit-status-summary",
+      "work-surface-W3",
+      "discussion-contributions",
+    ].map(id => screen.getByTestId(id));
+    for (let i = 1; i < order.length; i += 1) {
+      expect(
+        order[i - 1].compareDocumentPosition(order[i]) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+
+    // 縦の予算 (実画面 1280x720 で回答欄の下端を 720px 以内へ入れる)。jsdom
+    // では高さを測れないので、高さを決める構造を固定する。
+    // - 劣化の例外カードは要約 + 導線だけを見せ、詳細・回復条件・コードは
+    //   既定で閉じた折りたたみの中。
+    expect(exception).toHaveAttribute("data-density", "compact");
+    const supplement = within(exception).getByTestId("workflow-exception-supplement");
+    expect(supplement.tagName).toBe("DETAILS");
+    expect((supplement as HTMLDetailsElement).open).toBe(false);
+    expect(within(supplement).getByText("reasoning model is not configured")).toBeInTheDocument();
+    expect(within(supplement).getByTestId("workflow-exception-code")).toBeInTheDocument();
+    // - 現在地カードは状態名と目的を 1 行に並べる。
+    const goal = screen.getByTestId("workflow-state-goal");
+    expect(goal.parentElement).toBe(screen.getByTestId("workflow-state-label").parentElement);
+    // - status summary は状態の主操作を指すとき説明文を出さない (現在地と重複)。
+    expect(screen.queryByTestId("cockpit-next-step-description")).toBeNull();
+    expect((screen.getByTestId("cockpit-status-stats") as HTMLDetailsElement).open).toBe(false);
+    // - 会話カードは説明文を出さず、回答欄 (3 行) をシステムの記録より先に置く。
+    const card = screen.getByTestId("conversation-card");
+    expect(within(card).queryByTestId("conversation-description")).toBeNull();
+    const input = within(card).getByTestId("conversation-answer-input");
+    expect(input).toHaveAttribute("rows", "3");
+    expect(
+      screen.getByTestId("focused-question").compareDocumentPosition(input)
+        & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    const log = screen.getByTestId("conversation-system-log");
+    expect((log as HTMLDetailsElement).open).toBe(false);
+    expect(input.compareDocumentPosition(log) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // - セッション情報は見出しと同じ行。
+    expect(screen.getByTestId("cockpit-header-meta").parentElement?.querySelector("h1")).not.toBeNull();
   });
 
   test("zero-base flow requires explicit confirmation before proposals unlock (Issue #123)", async () => {
@@ -4483,6 +4568,27 @@ describe("Interview page", () => {
     });
   });
 
+  test.each([403, 404])("セッション詳細のHTTP %sから一覧へ戻ると古い選択を再取得しない", async (status) => {
+    mockInterviewApi();
+    const baseGet = mockApi.get.getMockImplementation();
+    mockApi.get.mockImplementation((path: string) => path === "/interview/sessions/999"
+      ? Promise.reject(new ApiError(status, "Interview session not available"))
+      : baseGet?.(path) ?? Promise.resolve(null));
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const { default: InterviewPage } = await import("@/pages/interview");
+    function Location() {
+      const location = useLocation();
+      return <span data-testid="interview-recovery-location">{location.pathname}{location.search}{location.hash}</span>;
+    }
+    render(<QueryClientProvider client={qc}><MemoryRouter initialEntries={["/interview?session=999&purpose_need=old#detail"]}>
+      <InterviewPage /><Location />
+    </MemoryRouter></QueryClientProvider>);
+    fireEvent.click(await screen.findByTestId("interview-load-error-return"));
+    await waitFor(() => expect(screen.queryByTestId("interview-load-error")).not.toBeInTheDocument());
+    expect(screen.getByTestId("interview-recovery-location")).toHaveTextContent(/^\/interview$/);
+    expect(screen.getByRole("option", { name: "セッション未選択" }).closest("select")).toHaveValue("");
+  });
+
   test("セッション詳細の取得に失敗したらエラーと再試行を出す", async () => {
     mockInterviewApi();
     const baseGet = mockApi.get.getMockImplementation();
@@ -5308,20 +5414,33 @@ describe("Sidebar phase-linked navigation (Issue #257)", () => {
 
     const nav = screen.getByTestId("sidebar-nav");
     for (const label of [
-      "Overview", "Setup Guide", "Repository", "Settings",
-      "System Understanding", "Capability Map", "Feature Map", "Flow Explorer", "Interview",
+      "Overview", "接続ガイド", "Repository", "Settings",
+      "System Understanding", "Capability Map", "Feature Map", "Flow Explorer",
       "Probe Planner", "Probe Patterns", "Connect SDK",
-      "Components / Traces", "Trace Lineage", "Trace Analyzers", "Experiments",
-      "Simulation Workbench", "AI Candidate Studio", "Decision Workspace",
+      "Components / Traces", "Trace Lineage", "Trace Analyzers",
+      "Simulation Workbench", "Experiments", "Decision Workspace",
       "GitHub", "Generate",
     ]) {
       expect(within(nav).getByText(label)).toBeTruthy();
+    }
+    // UX audit 2026-11-17 A7: Interview / AI Candidate Studio / システムマップ / UX
+    // Design Studio / 計測カバレッジ are reached from 「目的から始める」 and
+    // are not repeated as group entries (C13: 「候補を比較評価する」 now
+    // opens AI Candidate Studio, so Experiments is a group entry again).
+    const purpose = screen.getByTestId("sidebar-purpose-entries");
+    for (const href of ["/interview", "/candidate-studio", "/system-map", "/ux-design-studio", "/instrumentation-coverage"]) {
+      expect(purpose.querySelector(`a[href="${href}"]`)).toBeTruthy();
     }
     // Old label is gone, replaced by "Components / Traces".
     expect(within(nav).queryByText("Components")).toBeNull();
 
     // Group membership per the #257 design mapping.
     expect(within(screen.getByTestId("sidebar-group-instrument")).getByText("Probe Patterns")).toBeTruthy();
+    // UX audit 2026-11-17 A2: the connection guide sits beside Connect SDK,
+    // and the Setup group starts with Repository (Overview's first step).
+    expect(within(screen.getByTestId("sidebar-group-instrument")).getByText("接続ガイド")).toBeTruthy();
+    expect(within(screen.getByTestId("sidebar-group-setup")).queryByText("接続ガイド")).toBeNull();
+    expect(within(screen.getByTestId("sidebar-group-setup")).getAllByRole("link")[0].getAttribute("href")).toBe("/repository");
     expect(within(screen.getByTestId("sidebar-group-publish")).getByText("GitHub")).toBeTruthy();
     expect(within(screen.getByTestId("sidebar-group-other")).getByText("Generate")).toBeTruthy();
   });
@@ -5415,6 +5534,17 @@ describe("Sidebar phase-linked navigation (Issue #257)", () => {
     const generateLink = within(other).getByText("Generate").closest("a");
     expect(generateLink?.getAttribute("href")).toBe("/generation");
     expect(generateLink?.getAttribute("title")).toBe("旧世代の候補生成。AI Candidate Studio を推奨");
+  });
+
+  test("UX audit 2026-11-17 A5: group headings are the server's phases[].label, verbatim", async () => {
+    const state = stateWithPhase("preparation");
+    state.phases = state.phases.map((p) => ({ ...p, label: `サーバー:${p.phase}` }));
+    await renderSidebar(state);
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar-group-heading-understand").textContent).toContain("サーバー:preparation"),
+    );
+    expect(screen.getByTestId("sidebar-group-heading-observe-&-evaluate").textContent)
+      .toContain("サーバー:observation / サーバー:evaluation");
   });
 });
 
@@ -5927,7 +6057,7 @@ describe("System Understanding page", () => {
     const checklist = await screen.findByTestId("pipeline-checklist");
     expect(checklist.textContent).toContain("コードシンボル索引");
     // A step without a server label still falls back to STEP_LABELS.
-    expect(checklist.textContent).toContain("Snapshot ready");
+    expect(checklist.textContent).toContain("Snapshot 作成済み");
   });
 
   test("renders reasoning model blocked state without heuristic fallback", async () => {
@@ -6004,7 +6134,7 @@ describe("System Understanding page", () => {
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
 
-    expect(await screen.findByTestId("gap-filter-open")).toHaveTextContent("Untriaged (1)");
+    expect(await screen.findByTestId("gap-filter-open")).toHaveTextContent("未判定 (1)");
     expect(screen.getAllByTestId("gap-card")).toHaveLength(1);
     expect(screen.getByTestId("gap-triage-status")).toHaveTextContent("open");
 
@@ -6090,10 +6220,10 @@ describe("System Understanding page", () => {
       expect(screen.getByTestId("stage-section-understand")).toBeTruthy();
     });
 
-    expect(screen.getByTestId("stage-title-understand").textContent).toBe("Understand");
-    expect(screen.getByTestId("stage-title-observe").textContent).toBe("Decide Where to Observe");
-    expect(screen.getByTestId("stage-title-instrument").textContent).toBe("Instrument");
-    expect(screen.getByTestId("stage-title-evaluate").textContent).toBe("Evaluate");
+    expect(screen.getByTestId("stage-title-understand").textContent).toBe("理解する");
+    expect(screen.getByTestId("stage-title-observe").textContent).toBe("観測箇所を決める");
+    expect(screen.getByTestId("stage-title-instrument").textContent).toBe("計装する");
+    expect(screen.getByTestId("stage-title-evaluate").textContent).toBe("評価する");
 
     // Existing pipeline checklist / gap worklist / capabilities elements
     // survive the reorganization. With every step complete the checklist is
@@ -6127,7 +6257,38 @@ describe("System Understanding page", () => {
       expect(screen.getByTestId("no-gaps-message")).toBeTruthy();
     });
 
-    expect(screen.getByText(/No significant differences/)).toBeTruthy();
+    expect(screen.getByText(/目立った差は見つかりませんでした/)).toBeTruthy();
+    expect(screen.queryByTestId("gaps-not-reconciled")).toBeNull();
+  });
+
+  // B6 (UX 監査 2026-11-17): 未照合を「差なし」と表示しない。判定は server の
+  // docs_code_reconciled ステップの status だけ。
+  test.each([
+    ["missing", /まだ実行されていない/],
+    ["warning", /一部しか揃っていない/],
+    ["blocked", /完了していない/],
+  ])("does not claim 'no gaps' when docs_code_reconciled is %s", async (status, text) => {
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/repository/system-understanding"
+        ? Promise.resolve({
+          ...completeResponse,
+          gaps: [],
+          gap_summary: [],
+          pipeline: completeResponse.pipeline.map((s: { step: string; status: string }) =>
+            s.step === "docs_code_reconciled" ? { ...s, status } : s,
+          ),
+        })
+        : Promise.resolve(null),
+    );
+
+    const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
+    render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    const note = await screen.findByTestId("gaps-not-reconciled");
+    expect(note.getAttribute("data-reconcile-status")).toBe(status);
+    expect(note.textContent).toMatch(text);
+    expect(screen.queryByTestId("no-gaps-message")).toBeNull();
+    expect(screen.queryByText(/見つかりませんでした/)).toBeNull();
   });
 
   test("renders gap type filter buttons", async () => {
@@ -6144,7 +6305,7 @@ describe("System Understanding page", () => {
       expect(screen.getByTestId("gap-summary")).toBeTruthy();
     });
 
-    expect(screen.getByText("All (2)")).toBeTruthy();
+    expect(screen.getByText("すべて (2)")).toBeTruthy();
     expect(screen.getByText("unclassified_entrypoint (1)")).toBeTruthy();
     expect(screen.getByText("docs_only (1)")).toBeTruthy();
   });
@@ -6164,9 +6325,9 @@ describe("System Understanding page", () => {
     });
 
     expect(screen.getByText("100")).toBeTruthy();
-    expect(screen.getByText("2 with metadata")).toBeTruthy();
+    expect(screen.getByText("うちメタデータあり 2")).toBeTruthy();
     expect(screen.getByText("20")).toBeTruthy();
-    expect(screen.getByText("1 with capability link")).toBeTruthy();
+    expect(screen.getByText("うち capability と対応 1")).toBeTruthy();
   });
 
   test("build button triggers POST and refreshes", async () => {
@@ -6407,8 +6568,8 @@ describe("System Understanding page", () => {
     });
     const link = screen.getByTestId("gap-issue-draft-url");
     expect(link.getAttribute("href")).toBe("https://x.test/1");
-    // Existing draft flips the action button label to "Open issue draft".
-    expect(screen.getByText("Open issue draft")).toBeTruthy();
+    // Existing draft flips the action button label to "Issue 下書きを開く".
+    expect(screen.getByText("Issue 下書きを開く")).toBeTruthy();
   });
 
   // ── Canonical page banner replaces the primary action card (Issue #239) ──
@@ -6572,10 +6733,10 @@ describe("System Understanding page", () => {
       expect(screen.getByTestId("stage-status-understand")).toBeTruthy();
     });
 
-    expect(screen.getByTestId("stage-status-understand").textContent).toBe("Complete");
-    expect(screen.getByTestId("stage-status-observe").textContent).toBe("In progress");
-    expect(screen.getByTestId("stage-status-instrument").textContent).toBe("Not started");
-    expect(screen.getByTestId("stage-status-evaluate").textContent).toBe("Not started");
+    expect(screen.getByTestId("stage-status-understand").textContent).toBe("完了");
+    expect(screen.getByTestId("stage-status-observe").textContent).toBe("進行中");
+    expect(screen.getByTestId("stage-status-instrument").textContent).toBe("未着手");
+    expect(screen.getByTestId("stage-status-evaluate").textContent).toBe("未着手");
 
     expect(screen.getByTestId("stage-counts-observe").textContent).toContain("entrypoints: 3");
     expect(screen.getByTestId("stage-counts-observe").textContent).toContain("unclassified: 1");
@@ -6610,11 +6771,11 @@ describe("System Understanding page", () => {
     });
 
     const instrumentSummary = screen.getByTestId("stage-summary-instrument");
-    expect(instrumentSummary.textContent).toContain("Proposed");
+    expect(instrumentSummary.textContent).toContain("提案中");
     expect(instrumentSummary.textContent).toContain("2");
-    expect(instrumentSummary.textContent).toContain("Approved without patch");
+    expect(instrumentSummary.textContent).toContain("承認済み・patch 未作成");
     expect(instrumentSummary.textContent).toContain("1");
-    expect(instrumentSummary.textContent).toContain("Validated");
+    expect(instrumentSummary.textContent).toContain("検証済み");
     const instrumentLinks = within(instrumentSummary).getAllByRole("link");
     expect(instrumentLinks.length).toBeGreaterThan(0);
     for (const link of instrumentLinks) {
@@ -6622,9 +6783,9 @@ describe("System Understanding page", () => {
     }
 
     const evaluateSummary = screen.getByTestId("stage-summary-evaluate");
-    expect(evaluateSummary.textContent).toContain("Undecided");
+    expect(evaluateSummary.textContent).toContain("未判断");
     expect(evaluateSummary.textContent).toContain("1");
-    expect(evaluateSummary.textContent).toContain("Decided");
+    expect(evaluateSummary.textContent).toContain("判断済み");
     expect(evaluateSummary.textContent).toContain("2");
     const evaluateLinks = within(evaluateSummary).getAllByRole("link");
     expect(evaluateLinks.length).toBeGreaterThan(0);
@@ -6657,10 +6818,10 @@ describe("System Understanding page", () => {
     });
 
     expect(screen.getByTestId("stage-summary-instrument").textContent).toContain(
-      "Probe plan and patch status live in Probe Planner",
+      "Probe plan と patch の状態は Probe Planner で確認します",
     );
     expect(screen.getByTestId("stage-summary-evaluate").textContent).toContain(
-      "Trace comparisons, experiment runs, and adoption decisions live in Experiments",
+      "採否の判断は Experiments で行います",
     );
   });
 
@@ -6684,10 +6845,10 @@ describe("System Understanding page", () => {
     expect(screen.queryByTestId("stage-status-instrument")).toBeNull();
     expect(screen.queryByTestId("stage-status-evaluate")).toBeNull();
     expect(screen.getByTestId("stage-summary-instrument").textContent).toContain(
-      "Probe plan and patch status live in Probe Planner",
+      "Probe plan と patch の状態は Probe Planner で確認します",
     );
     expect(screen.getByTestId("stage-summary-evaluate").textContent).toContain(
-      "Trace comparisons, experiment runs, and adoption decisions live in Experiments",
+      "採否の判断は Experiments で行います",
     );
   });
 
@@ -7034,9 +7195,9 @@ describe("System Understanding build job panel (Issue #109)", () => {
     expect(screen.getByTestId("job-status").textContent).toBe("running");
     expect(screen.getByTestId("job-steps").children.length).toBe(7);
     expect(screen.getByTestId("job-step-claim_scan").textContent).toContain("running");
-    expect(screen.getByTestId("job-llm-progress").textContent).toContain("chunks 4/8");
-    expect(screen.getByTestId("job-step-symbol_index").textContent).toContain("reused");
-    expect(screen.getByTestId("job-artifact-counts").textContent).toContain("Symbols: 42");
+    expect(screen.getByTestId("job-llm-progress").textContent).toContain("チャンク 4/8");
+    expect(screen.getByTestId("job-step-symbol_index").textContent).toContain("再利用");
+    expect(screen.getByTestId("job-artifact-counts").textContent).toContain("Symbol: 42");
     expect(screen.getByTestId("job-cancel")).toBeTruthy();
 
     fireEvent.click(screen.getByTestId("job-cancel"));
@@ -7298,7 +7459,7 @@ describe("System settings diagnostics", () => {
     fireEvent.click(badge);
 
     await waitFor(() => {
-      expect(screen.getByText("System State")).toBeTruthy();
+      expect(screen.getByText("システムの状態")).toBeTruthy();
     });
 
     // Items render the server's summary and remediation verbatim.
@@ -7428,7 +7589,7 @@ describe("System settings diagnostics", () => {
     // Did not navigate away.
     expect(window.location.pathname).toBe("/");
     // The list dialog closed so the two modals don't stack.
-    expect(screen.queryByText("System State")).toBeNull();
+    expect(screen.queryByText("システムの状態")).toBeNull();
   });
 
   test("badge renders without count when no item needs attention", async () => {
@@ -7652,7 +7813,7 @@ describe("System settings diagnostics", () => {
     expect(envDialog.textContent).toContain("Repository root allowlist");
     // Did not navigate away, and the list dialog closed so the modals don't stack.
     expect(window.location.pathname).toBe("/");
-    expect(screen.queryByText("System State")).toBeNull();
+    expect(screen.queryByText("システムの状態")).toBeNull();
   });
 
   test("System Understanding pipeline rows link missing/blocked steps to diagnostics", async () => {
@@ -7842,7 +8003,7 @@ describe("Per-screen assistant panel", () => {
     expect(screen.getByText("System Understanding")).toBeTruthy();
     expect(screen.getByText(/repository understanding pipeline/)).toBeTruthy();
     const state = await screen.findByTestId("assistant-state-summary");
-    expect(state.textContent).toContain("1 check(s) need attention");
+    expect(state.textContent).toContain("対応が必要な確認項目が 1 件あります");
     expect(state.textContent).toContain("effective intelligence provider is 'mock'");
 
     // Diagnostics-derived question is offered first.
@@ -8399,7 +8560,7 @@ describe("Probe Planner manual feature-id escape hatch (Issue #212)", () => {
 
     await renderProbePlannerAt("/probe-planner");
 
-    fireEvent.click(await screen.findByText("Generate Plan"));
+    fireEvent.click(await screen.findByText("Probe Plan を生成"));
 
     const note = await screen.findByTestId("planner-no-drafts-note");
     expect(within(note).getByText("Feature Map").closest("a"))
@@ -8520,7 +8681,7 @@ describe("Hub success summary and pipeline collapse (Issue #211)", () => {
     expect(summary.textContent).toContain("10 エントリポイント");
 
     const collapsed = screen.getByTestId("pipeline-collapsed");
-    expect(collapsed.textContent).toContain("8/8 steps complete");
+    expect(collapsed.textContent).toContain("全 8 ステップ中 8 ステップ完了");
 
     // Purpose is defined, so the entry cards carry no prerequisite note.
     expect(screen.queryByTestId("entry-cards-prereq-note")).not.toBeInTheDocument();
@@ -8787,6 +8948,12 @@ describe("System Purpose side-by-side views (Issue #94/#275)", () => {
 
     const { default: SystemUnderstandingPage } = await import("@/pages/system-understanding");
     render(<SystemUnderstandingPage />, { wrapper: createWrapper() });
+
+    // UX audit 2026-11-17 A4: the button states what it records, and the
+    // page names the Interview as the place the understanding is confirmed.
+    expect(await screen.findByTestId("purpose-confirm-scope-note")).toHaveTextContent("Interview での理解の確認");
+    expect(screen.getByTestId("system-understanding-role-note")).toHaveTextContent("確定した理解の確認と質問への回答は Interview で行います");
+    expect(screen.getByTestId("system-understanding-interview-link")).toHaveAttribute("href", "/interview");
 
     fireEvent.click(await screen.findByTestId("purpose-confirm-button"));
 
@@ -9884,7 +10051,7 @@ describe("Components trace row: Replay actions (Issue #246)", () => {
     });
     expect(
       screen.getByPlaceholderText("この比較で確認したいこと"),
-    ).toHaveValue("Investigate trace trace-replayable-0001 (component norm)");
+    ).toHaveValue("Trace trace-replayable-0001 を調査する（component norm）");
   });
 });
 
@@ -10274,7 +10441,7 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     const guide = await screen.findByTestId("prerequisite-guide");
     expect(guide.getAttribute("data-current-phase")).toBe("setup");
     // Phase name and the server StateItem copy are shown verbatim.
-    expect(screen.getByTestId("prerequisite-guide-phase").textContent).toContain("必要最低限の設定");
+    expect(screen.getByTestId("prerequisite-guide-phase").textContent).toContain("対象の登録");
     expect(screen.getByText("対象リポジトリが未設定です。")).toBeTruthy();
     expect(screen.getByText("Repository タブでリポジトリを設定してください。")).toBeTruthy();
     // CTA carries the server-supplied action label.
@@ -10351,7 +10518,7 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
     render(<ProbePlannerPage />, { wrapper: createWrapper() });
 
-    fireEvent.click(await screen.findByText("Generate Plan"));
+    fireEvent.click(await screen.findByText("Probe Plan を生成"));
     expect(await screen.findByTestId("planner-prerequisite-guide")).toBeInTheDocument();
   });
 
@@ -10364,7 +10531,7 @@ describe("PrerequisiteGuide (Issue #241)", () => {
     const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
     render(<ProbePlannerPage />, { wrapper: createWrapper() });
 
-    fireEvent.click(await screen.findByText("Generate Plan"));
+    fireEvent.click(await screen.findByText("Probe Plan を生成"));
     // Dialog opened (feature label present) but no prerequisite gate.
     expect(await screen.findByText("Feature")).toBeInTheDocument();
     expect(screen.queryByTestId("planner-prerequisite-guide")).not.toBeInTheDocument();
@@ -10419,10 +10586,10 @@ describe("Dashboard action gating (Issue #255)", () => {
     expect(await screen.findByTestId("patch-stale-badge")).toBeInTheDocument();
     const reason = await screen.findByTestId("patch-apply-stale-reason");
     expect(reason).toHaveTextContent(/abcdef12/);
-    expect(screen.getByRole("button", { name: /Apply/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /リポジトリへ適用/ })).toBeDisabled();
 
     const { toast } = await import("sonner");
-    expect(toast.success).not.toHaveBeenCalledWith("Patch applied to repository");
+    expect(toast.success).not.toHaveBeenCalledWith("patch をリポジトリへ適用しました");
   });
 
   test("Connect SDK: Issue Token is disabled with a visible reason when no System is selected", async () => {
@@ -10480,9 +10647,9 @@ describe("Dashboard action gating (Issue #255)", () => {
 
     // The Symbols tab's button must be gated the same way instead of being
     // clickable with nothing to index.
-    fireEvent.click(screen.getByRole("tab", { name: "Symbols" }));
+    fireEvent.click(screen.getByRole("tab", { name: "symbol" }));
     expect(await screen.findByTestId("index-symbols-no-snapshot-reason")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Index Symbols" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "symbol indexを更新" })).toBeDisabled();
   });
 });
 
@@ -10561,13 +10728,13 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
     render(<ProbePlannerPage />, { wrapper: createWrapper() });
 
-    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    const button = await screen.findByRole("button", { name: "Probe Plan を生成" });
     await waitFor(() => expect(button).toBeDisabled());
     expect(await screen.findByTestId("generate-plan-blocked-reason")).toBeInTheDocument();
 
     // Clicking a disabled button must not open the dialog / reach the mutation.
     fireEvent.click(button);
-    expect(screen.queryByText("Observation objective")).not.toBeInTheDocument();
+    expect(screen.queryByText("観測の目的")).not.toBeInTheDocument();
   });
 
   test("Probe Planner: Generate Plan's reason reuses the repository.configuration.missing catalog copy when present", async () => {
@@ -10602,10 +10769,10 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
     render(<ProbePlannerPage />, { wrapper: createWrapper() });
 
-    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    const button = await screen.findByRole("button", { name: "Probe Plan を生成" });
     await waitFor(() => expect(button).toBeDisabled());
     expect(await screen.findByTestId("generate-plan-blocked-reason")).toHaveTextContent(
-      /no ready repository snapshot/i,
+      /Repository の Snapshot がまだありません/,
     );
   });
 
@@ -10621,7 +10788,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     render(<ProbePlannerPage />, { wrapper: createWrapper() });
 
     await waitFor(() => expect(mockApi.get).toHaveBeenCalledWith("/repository/status"));
-    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    const button = await screen.findByRole("button", { name: "Probe Plan を生成" });
     expect(button).not.toBeDisabled();
     expect(screen.queryByTestId("generate-plan-blocked-reason")).not.toBeInTheDocument();
   });
@@ -10636,7 +10803,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
     render(<ProbePlannerPage />, { wrapper: createWrapper() });
 
-    const button = await screen.findByRole("button", { name: "Generate Plan" });
+    const button = await screen.findByRole("button", { name: "Probe Plan を生成" });
     await waitFor(() => expect(button).not.toBeDisabled());
     expect(screen.queryByTestId("generate-plan-blocked-reason")).not.toBeInTheDocument();
   });
@@ -10673,7 +10840,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Feature: feat-1"));
 
-    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    const genPatchButton = await screen.findByRole("button", { name: /patch を生成/ });
     expect(genPatchButton).toBeDisabled();
     expect(await screen.findByTestId("generate-patch-no-points-reason")).toBeInTheDocument();
   });
@@ -10698,7 +10865,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Feature: feat-1"));
 
-    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    const genPatchButton = await screen.findByRole("button", { name: /patch を生成/ });
     expect(genPatchButton).toBeDisabled();
     expect(await screen.findByTestId("generate-patch-no-points-reason")).toBeInTheDocument();
   });
@@ -10726,7 +10893,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Feature: feat-1"));
 
-    const genPatchButton = await screen.findByRole("button", { name: /Generate Patch/ });
+    const genPatchButton = await screen.findByRole("button", { name: /patch を生成/ });
     await waitFor(() => expect(genPatchButton).not.toBeDisabled());
     expect(screen.queryByTestId("generate-patch-no-points-reason")).not.toBeInTheDocument();
   });
@@ -10754,7 +10921,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Feature: feat-1"));
 
-    const validateButton = await screen.findByRole("button", { name: /Validate/ });
+    const validateButton = await screen.findByRole("button", { name: /検証を実行/ });
     expect(validateButton).toBeDisabled();
     const reason = await screen.findByTestId("validate-patch-failed-reason");
     expect(reason).toHaveTextContent("git apply failed");
@@ -10783,7 +10950,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Feature: feat-1"));
 
-    const validateButton = await screen.findByRole("button", { name: /Validate/ });
+    const validateButton = await screen.findByRole("button", { name: /検証を実行/ });
     await waitFor(() => expect(validateButton).not.toBeDisabled());
     expect(screen.queryByTestId("validate-patch-failed-reason")).not.toBeInTheDocument();
   });
@@ -10882,7 +11049,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     const { default: RepositoryPage } = await import("@/pages/repository");
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Snapshots" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Snapshot" }));
     const button = await screen.findByRole("button", { name: /Snapshotのみ作成/ });
     await waitFor(() => expect(button).toBeDisabled());
     expect(await screen.findByTestId("create-snapshot-not-configured-reason")).toBeInTheDocument();
@@ -10896,7 +11063,7 @@ describe("Prerequisite-based action gating (Issue #258)", () => {
     const { default: RepositoryPage } = await import("@/pages/repository");
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Snapshots" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Snapshot" }));
     const button = await screen.findByRole("button", { name: /Snapshotのみ作成/ });
     await waitFor(() => expect(button).not.toBeDisabled());
     expect(screen.queryByTestId("create-snapshot-not-configured-reason")).not.toBeInTheDocument();
@@ -11042,7 +11209,10 @@ describe("Sidebar Observe & Evaluate subtexts (Issue #267)", () => {
 
     const group = screen.getByTestId("sidebar-group-observe-&-evaluate");
     expect(within(group).getByText("手動でdiffを編集して検証")).toBeInTheDocument();
-    expect(within(group).getByText("会話でAIに指示して候補生成")).toBeInTheDocument();
+    // UX audit 2026-11-17 C13: AI Candidate Studio is reached from
+    // 「目的から始める」, so its group entry (and subtitle) is left out (A7);
+    // Experiments is a group entry again.
+    expect(within(group).getByText("候補のバッチ実行と評価")).toBeInTheDocument();
   });
 });
 

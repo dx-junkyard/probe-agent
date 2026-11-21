@@ -70,6 +70,27 @@ def _context_pack(symbols=None) -> InterviewContextPack:
     )
 
 
+def _denylist_pack() -> InterviewContextPack:
+    """The default pack plus the denylisted symbols the tests propose.
+
+    Since IK-0039 a proposal must name a symbol the model was given.
+    """
+    extra = [
+        (2, "src/billing.py", "billing.process_payment"),
+        (3, "src/auth.py", "auth.authenticate"),
+        (4, "src/notifications.py", "notifications.send_email"),
+    ]
+    symbols = list(_context_pack().symbols) + [
+        InterviewSymbolItem(
+            symbol_id=sid, path=path, qualified_name=qname, kind="function",
+            start_line=1, end_line=10, classification="unclassified",
+            has_metadata=False, evidence=_evidence(path=path, qname=qname),
+        )
+        for sid, path, qname in extra
+    ]
+    return _context_pack(symbols)
+
+
 class FakeLLMClient(LLMClient):
     """Test double that returns a canned JSON response."""
 
@@ -265,7 +286,7 @@ def test_denylisted_payment_symbol_excluded():
 
     result = generate_interview_turn(
         client, config,
-        context_pack=_context_pack(),
+        context_pack=_denylist_pack(),
         history=[],
         user_message="Propose metadata for the billing module.",
     )
@@ -295,7 +316,7 @@ def test_denylisted_auth_symbol_excluded():
 
     result = generate_interview_turn(
         client, config,
-        context_pack=_context_pack(),
+        context_pack=_denylist_pack(),
         history=[],
         user_message="Propose metadata.",
     )
@@ -321,7 +342,7 @@ def test_denylisted_email_symbol_excluded():
 
     result = generate_interview_turn(
         client, config,
-        context_pack=_context_pack(),
+        context_pack=_denylist_pack(),
         history=[],
         user_message="Propose metadata.",
     )
@@ -526,7 +547,7 @@ def test_multiple_proposals_with_mixed_denylist():
 
     result = generate_interview_turn(
         client, config,
-        context_pack=_context_pack(),
+        context_pack=_denylist_pack(),
         history=[],
         user_message="Propose metadata for both.",
     )

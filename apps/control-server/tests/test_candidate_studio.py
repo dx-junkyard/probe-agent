@@ -1087,3 +1087,168 @@ def test_variant_run_uses_the_same_stale_snapshot_gate(
     )
     assert blocked.status_code == 409, blocked.text
     assert blocked.json()["detail"]["code"] == "stale_snapshot_not_acknowledged"
+
+
+def _move_head(repo):
+    (repo / "svc.py").write_text(SVC_SOURCE + "\n# moved\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "move head")
+
+
+def _stale_session_with_version(client, repo, headers):
+    _post_trace(client, headers, "t1", "norm", args=("hello",),
+                output="{'kind': 'a', 'size': 5}")
+    _move_head(repo)
+    session = _create_session(
+        client, headers, trace_id="t1",
+        stale_snapshot_reason="当時のコードで再現するため",
+    )
+    assert session.status_code == 201, session.text
+    session = session.json()
+    version = _generate(client, headers, session["id"])
+    assert version.status_code == 201, version.text
+    _approve(client, headers, "norm")
+    return session, version.json()
+
+
+def _replay_run_row(db_file, run_id):
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT snapshot_freshness, head_sha_at_creation, stale_ack_reason"
+            " FROM replay_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def test_c8_stale_session_reason_is_inherited_by_candidate_replay(
+    admin_client, replay_repo, db_file
+):
+    """UX audit 2026-11-17 C8. Before the fix this replay was a 409
+    ``stale_snapshot_not_acknowledged``: the session's reason never reached
+    the inner variant run, and the replay endpoint accepted no reason."""
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    session, version = _stale_session_with_version(admin_client, replay_repo, headers)
+
+    preflight = admin_client.get(
+        f"/candidate-sessions/{session['id']}/replay-preflight", headers=headers
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["stale_reason_state"] == "inheritable"
+    assert preflight.json()["preflight"]["requires_stale_acknowledgement"] is True
+
+    replayed = admin_client.post(
+        f"/candidate-versions/{version['id']}/replay", json={}, headers=headers
+    )
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["replay_status"] == "completed"
+    row = _replay_run_row(db_file, replayed.json()["replay_run_id"])
+    assert row["snapshot_freshness"] == "stale"
+    assert row["stale_ack_reason"] == "当時のコードで再現するため"
+    assert row["head_sha_at_creation"] == session["head_sha_at_creation"]
+
+
+def test_c8_reason_is_not_inherited_once_head_moves_again(
+    admin_client, replay_repo, db_file
+):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    session, version = _stale_session_with_version(admin_client, replay_repo, headers)
+    (replay_repo / "other.py").write_text("x = 1\n")
+    _git(replay_repo, "add", ".")
+    _git(replay_repo, "commit", "-m", "move head again")
+
+    preflight = admin_client.get(
+        f"/candidate-sessions/{session['id']}/replay-preflight", headers=headers
+    ).json()
+    assert preflight["stale_reason_state"] == "head_moved"
+
+    blocked = admin_client.post(
+        f"/candidate-versions/{version['id']}/replay", json={}, headers=headers
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "stale_snapshot_not_acknowledged"
+    assert blocked.json()["detail"]["stale_reason_state"] == "head_moved"
+    # The refusal happens before the candidate is marked running.
+    assert admin_client.get(
+        f"/candidate-versions/{version['id']}", headers=headers
+    ).json()["replay_status"] == "not_run"
+
+    replayed = admin_client.post(
+        f"/candidate-versions/{version['id']}/replay",
+        json={"stale_snapshot_reason": "HEAD 更新後も当時の挙動を確認したい"},
+        headers=headers,
+    )
+    assert replayed.status_code == 200, replayed.text
+    row = _replay_run_row(db_file, replayed.json()["replay_run_id"])
+    assert row["stale_ack_reason"] == "HEAD 更新後も当時の挙動を確認したい"
+    assert row["head_sha_at_creation"] != session["head_sha_at_creation"]
+
+
+def test_c8_session_created_on_current_snapshot_requires_a_replay_reason(
+    admin_client, replay_repo, db_file
+):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "t1", "norm", args=("hello",), output="ok")
+    session = _create_session(admin_client, headers, trace_id="t1").json()
+    assert session["snapshot_freshness"] == "current"
+    assert session["stale_ack_reason"] is None
+    version = _generate(admin_client, headers, session["id"]).json()
+    _approve(admin_client, headers, "norm")
+    _move_head(replay_repo)
+
+    blocked = admin_client.post(
+        f"/candidate-versions/{version['id']}/replay", json={}, headers=headers
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["stale_reason_state"] == "not_recorded"
+
+    replayed = admin_client.post(
+        f"/candidate-versions/{version['id']}/replay",
+        json={"stale_snapshot_reason": "開始時点のコードで比較する"},
+        headers=headers,
+    )
+    assert replayed.status_code == 200, replayed.text
+    assert _replay_run_row(
+        db_file, replayed.json()["replay_run_id"]
+    )["stale_ack_reason"] == "開始時点のコードで比較する"
+
+
+def test_current_snapshot_replay_records_no_reason(admin_client, replay_repo, db_file):
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "t1", "norm", args=("hello",), output="ok")
+    session = _create_session(admin_client, headers, trace_id="t1").json()
+    version = _generate(admin_client, headers, session["id"]).json()
+    _approve(admin_client, headers, "norm")
+    assert admin_client.get(
+        f"/candidate-sessions/{session['id']}/replay-preflight", headers=headers
+    ).json()["stale_reason_state"] == "not_required"
+    replayed = admin_client.post(
+        f"/candidate-versions/{version['id']}/replay", json={}, headers=headers
+    )
+    assert replayed.status_code == 200, replayed.text
+    row = _replay_run_row(db_file, replayed.json()["replay_run_id"])
+    assert row["snapshot_freshness"] == "current"
+    assert row["stale_ack_reason"] is None
+
+
+def test_session_list_reports_latest_version_state(admin_client, replay_repo):
+    """UX audit 2026-11-17 C13: the start screen lists existing sessions."""
+    _, _, headers, _ = _prepare(admin_client, replay_repo)
+    _post_trace(admin_client, headers, "t1", "norm", args=("hello",), output="ok")
+    empty = _create_session(admin_client, headers, trace_id="t1").json()
+    session = _create_session(admin_client, headers, trace_id="t1").json()
+    _generate(admin_client, headers, session["id"])
+    _generate(admin_client, headers, session["id"])
+
+    listed = admin_client.get("/candidate-sessions", headers=headers)
+    assert listed.status_code == 200, listed.text
+    by_id = {s["id"]: s for s in listed.json()}
+    assert by_id[empty["id"]]["version_count"] == 0
+    assert by_id[empty["id"]]["latest_version_status"] is None
+    assert by_id[session["id"]]["version_count"] == 2
+    assert by_id[session["id"]]["latest_version_number"] == 2
+    assert by_id[session["id"]]["latest_version_status"] == "proposed"
+    assert by_id[session["id"]]["latest_version_replay_status"] == "not_run"

@@ -17,11 +17,11 @@
 
 import { useState } from "react";
 import { useUiDraftRegistry } from "@/lib/ui-draft";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { useSolutionDesigns, useUxJourneys, useUxRequirements } from "@/api/hooks";
+import { useObjectiveMap, useSolutionDesigns, useUxJourneys, useUxRequirements } from "@/api/hooks";
 import { decideNextDesignAction } from "@/components/ux-design/model";
 import { JourneyPanel } from "@/components/ux-design/journey-panel";
 import { RequirementPanel } from "@/components/ux-design/requirement-panel";
@@ -46,12 +46,18 @@ function NextDecisionCard({
   const journeys = useUxJourneys();
   const requirements = useUxRequirements();
   const designs = useSolutionDesigns();
+  // UX audit 2026-11-17 C12: whether the System has any Objective yet. Only a
+  // successful read counts -- a failed or pending read leaves the count
+  // unknown, and the table then skips that row instead of assuming zero.
+  const objectiveMap = useObjectiveMap();
+  const navigate = useNavigate();
 
   const loading = journeys.isLoading || requirements.isLoading || designs.isLoading;
   const decision = decideNextDesignAction({
     journeys: journeys.data?.journeys ?? null,
     requirements: requirements.data?.requirements ?? null,
     designs: designs.data?.designs ?? null,
+    objectiveCount: objectiveMap.data ? objectiveMap.data.nodes.length : null,
   });
 
   return (
@@ -74,7 +80,17 @@ function NextDecisionCard({
             <p className="text-xs text-muted-foreground" data-testid="ux-design-next-decision-reason">
               {decision.reason}
             </p>
-            {decision.target && decision.actionLabel ? (
+            {decision.route && decision.actionLabel ? (
+              <Button
+                size="sm"
+                data-testid="ux-design-next-decision-cta"
+                // A navigation, never an execute (#358). Unsaved input is
+                // protected by the app-wide router blocker.
+                onClick={() => navigate(decision.route!)}
+              >
+                {decision.actionLabel}
+              </Button>
+            ) : decision.target && decision.actionLabel ? (
               <Button
                 size="sm"
                 data-testid="ux-design-next-decision-cta"

@@ -766,9 +766,16 @@ export interface PurposeFramePanelProps {
    * hint — the server decides the actual fallback via `fallback_reason`
    * (§2.7), never re-checked here. */
   initialNeedId?: string | null;
+  /**
+   * 状態の主作業が別にあり、この面の問いを並べると次の一歩が競合するとき
+   * (ブロッキング例外がある / ゼロベース質問で理解を組み立てている間)、
+   * 中身を閉じた折りたたみに入れる。内容・操作・取得は変えない
+   * (UX 監査 2026-11-17 B3)。判定は呼び出し側がサーバーの値から渡す。
+   */
+  deferred?: boolean;
 }
 
-export function PurposeFramePanel({ sessionId, initialNeedId }: PurposeFramePanelProps) {
+export function PurposeFramePanel({ sessionId, initialNeedId, deferred = false }: PurposeFramePanelProps) {
   const chainQuery = usePurposeChain(sessionId);
   const questionQuery = usePurposeNextQuestion(sessionId, initialNeedId);
 
@@ -803,15 +810,9 @@ export function PurposeFramePanel({ sessionId, initialNeedId }: PurposeFramePane
   const slots = frameSlots(chain);
   const extraIntervention = additionalInterventionElements(chain);
 
-  return (
-    <Card data-testid="purpose-frame-panel" data-frame-state={chain.frame_state}>
-      <CardHeader>
-        <CardTitle as="h2" className="text-sm">Purpose Chain — 目的の連鎖</CardTitle>
-        <CardDescription>
-          対象者と課題から、望ましい変化・システムの介入・Capabilities までを、判断できる根拠つきで確認します。
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-2">
+  const body = (
+    <>
+
         {chain.degraded_sections.length > 0 && (
           <p className="text-xs text-amber-700 dark:text-amber-300" data-testid="purpose-frame-degraded">
             一部を取得できませんでした: {chain.degraded_sections.join("、")}
@@ -879,6 +880,28 @@ export function PurposeFramePanel({ sessionId, initialNeedId }: PurposeFramePane
             <VerificationStateSection sessionId={chain.session_id} />
             <VerificationPromptSection sessionId={chain.session_id} />
           </>
+        )}
+    </>
+  );
+
+  return (
+    <Card data-testid="purpose-frame-panel" data-frame-state={chain.frame_state}>
+      <CardHeader>
+        <CardTitle as="h2" className="text-sm">Purpose Chain — 目的の連鎖</CardTitle>
+        <CardDescription>
+          対象者と課題から、望ましい変化・システムの介入・Capabilities までを、判断できる根拠つきで確認します。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {deferred ? (
+          <details data-testid="purpose-frame-deferred">
+            <summary className="cursor-pointer text-xs text-muted-foreground">
+              いまは上の作業を先に進めてください。目的の連鎖を開く
+            </summary>
+            <div className="mt-2 space-y-2">{body}</div>
+          </details>
+        ) : (
+          body
         )}
       </CardContent>
     </Card>

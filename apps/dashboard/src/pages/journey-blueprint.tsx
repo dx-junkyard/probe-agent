@@ -20,7 +20,8 @@ import { BlueprintGrid } from "@/components/journey-blueprint/blueprint-grid";
 import { BlueprintDetailPane } from "@/components/journey-blueprint/detail-pane";
 import { BlueprintDiffPanel } from "@/components/journey-blueprint/diff-panel";
 import { BLUEPRINT_BASELINE_STATE_LABEL } from "@/components/journey-blueprint/model";
-import type { BlueprintLaneCellOut } from "@/api/types";
+import type { BlueprintLaneKind } from "@/api/types";
+import { useUiDraftRegistry } from "@/lib/ui-draft";
 
 type ViewMode = "blueprint" | "diff";
 
@@ -42,7 +43,19 @@ export default function JourneyBlueprintPage() {
   const [hasChosenJourney, setHasChosenJourney] = useState(searchParams.get("journey") !== null);
   const [chosenJourneyKey, setChosenJourneyKey] = useState<string | null>(searchParams.get("journey"));
   const [view, setView] = useState<ViewMode>(isViewMode(searchParams.get("view")) ? (searchParams.get("view") as ViewMode) : "blueprint");
-  const [selected, setSelected] = useState<{ stepKey: string; cell: BlueprintLaneCellOut } | null>(null);
+  // The selection is (Step, lane) -- never a copy of the cell. The cell is
+  // read from the CURRENT blueprint response every render, so a link added
+  // from the detail pane shows up there as soon as the server re-answers.
+  const [selected, setSelected] = useState<{ stepKey: string; laneKind: BlueprintLaneKind } | null>(null);
+  const draftRegistry = useUiDraftRegistry();
+
+  function onSelectCell(stepKey: string, laneKind: BlueprintLaneKind) {
+    if (selected && selected.stepKey === stepKey && selected.laneKind === laneKind) return;
+    // The link forms are remounted per cell; ask before that silently drops
+    // a half-filled form (the shared discard prompt, asked once).
+    if (draftRegistry?.confirmDiscard && !draftRegistry.confirmDiscard()) return;
+    setSelected({ stepKey, laneKind });
+  }
 
   // Auto-select the first Journey until the developer chooses for themselves,
   // and never afterwards. DERIVED during render rather than written back by an
@@ -84,6 +97,9 @@ export default function JourneyBlueprintPage() {
   }
 
   const blueprint = useJourneyBlueprint(journeyKey);
+  const selectedCell = selected
+    ? blueprint.data?.steps.find((s) => s.step_key === selected.stepKey)?.lanes[selected.laneKind] ?? null
+    : null;
   const diff = useJourneyBlueprintDiff(view === "diff" ? journeyKey : null);
 
   // §9.4's cross-view navigation: the selected Journey carries over as
@@ -224,7 +240,7 @@ export default function JourneyBlueprintPage() {
                   ) : null}
                   <BlueprintGrid
                     blueprint={blueprint.data}
-                    onSelectCell={(stepKey, cell) => setSelected({ stepKey, cell })}
+                    onSelectCell={(stepKey, cell) => onSelectCell(stepKey, cell.lane_kind)}
                   />
                 </>
               ) : null
@@ -245,8 +261,9 @@ export default function JourneyBlueprintPage() {
             // would become the grid item and the Card inside would stop
             // stretching to the row.
             <BlueprintDetailPane
-              stepKey={selected?.stepKey ?? null}
-              cell={selected?.cell ?? null}
+              journeyKey={journeyKey}
+              stepKey={selectedCell ? selected?.stepKey ?? null : null}
+              cell={selectedCell}
               onOpenRequirement={openRequirement}
             />
           ) : null}

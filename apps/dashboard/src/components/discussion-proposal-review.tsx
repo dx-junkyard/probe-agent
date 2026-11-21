@@ -50,6 +50,7 @@ import { useUiDraftRegistry } from "@/lib/ui-draft";
 import { Badge } from "@/components/ui/badge";
 import { getSystemId } from "@/api/client";
 import { Button } from "@/components/ui/button";
+import { QueryErrorState } from "@/components/query-state";
 
 const ELIGIBILITY_LABEL: Record<DiscussionProposalItemEligibility, string> = {
   appliable: "反映可能",
@@ -425,26 +426,25 @@ function ProposalDetail({
       <div className="flex flex-wrap gap-2">
         <Button
           size="sm"
-          disabled={selectedAppliable.length === 0 || !canPrefill || busy}
+          disabled={selectedAppliable.length === 0 || !canPrefill || busy || applyMutation.isPending}
           onClick={dispatchPrefill}
           data-testid="discussion-proposal-prefill"
         >
           {busy ? "反映中…" : "選択した項目をフォームへ反映する"}
         </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={selectedAppliable.length === 0 || applyMutation.isPending}
-          onClick={() =>
-            applyMutation.mutate(
-              { item_ids: selectedAppliable },
-              { onSuccess: () => setSelected(new Set()) },
-            )
-          }
-          data-testid="discussion-proposal-apply"
-        >
-          {applyMutation.isPending ? "適用中…" : "直接適用する(互換)"}
-        </Button>
+        <details className="text-xs">
+          <summary className="cursor-pointer py-2">詳細: フォームを使わず保存する</summary>
+          <p className="mb-2 text-muted-foreground">選択した項目を既存の内容へ直接保存します。フォームで編集・保存する手順を省略します。</p>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={selectedAppliable.length === 0 || applyMutation.isPending || busy}
+            onClick={() => applyMutation.mutate({ item_ids: selectedAppliable }, { onSuccess: () => { setSelected(new Set()); setDeliveryMessage("選択した変更を既存の内容へ保存しました。"); } })}
+            data-testid="discussion-proposal-apply"
+          >
+            {applyMutation.isPending ? "保存中…" : "選択した変更を直接保存する"}
+          </Button>
+        </details>
         <Button
           size="sm"
           variant="ghost"
@@ -460,9 +460,10 @@ function ProposalDetail({
           {rejectMutation.isPending ? "却下中…" : "却下する"}
         </Button>
       </div>
+      {canPrefill && <p className="text-[11px] text-muted-foreground">フォームへの反映は未保存の下書きを作ります。反映先で内容を確認し、保存してください。</p>}
       {!canPrefill && (
         <p className="text-[11px] text-muted-foreground" data-testid="discussion-proposal-prefill-unsupported">
-          この対象はフォームへの反映に対応していません。「直接適用する」を使うか、対象の画面から直接編集してください。
+          この対象はフォームへの反映に対応していません。詳細の「選択した変更を直接保存する」を使うか、対象の画面から直接編集してください。
         </p>
       )}
       {applyMutation.isError && (
@@ -521,7 +522,7 @@ export function DiscussionProposalReview({ thread }: { thread: AssistantDiscussi
         <Button
           size="sm"
           variant="outline"
-          disabled={createProposal.isPending}
+          disabled={createProposal.isPending || (proposalsQuery.isError && !proposalsQuery.data)}
           onClick={() => createProposal.mutate(undefined, { onSuccess: (p) => setChosenId(p.id) })}
           data-testid="discussion-proposal-generate"
         >
@@ -533,7 +534,8 @@ export function DiscussionProposalReview({ thread }: { thread: AssistantDiscussi
           {classifyDiscussionError(createProposal.error).message}
         </p>
       )}
-      {proposalsQuery.isLoading ? (
+      {proposalsQuery.isError && <QueryErrorState target="変更候補一覧" error={proposalsQuery.error} onRetry={() => void proposalsQuery.refetch()} retrying={proposalsQuery.isFetching} data-testid="discussion-proposals-error" />}
+      {proposalsQuery.isError && !proposalsQuery.data ? null : proposalsQuery.isLoading ? (
         <p className="text-xs text-muted-foreground">読み込み中…</p>
       ) : proposals.length === 0 ? (
         <p className="text-xs text-muted-foreground" data-testid="discussion-proposal-empty">

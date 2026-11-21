@@ -409,7 +409,7 @@ def summarize(text: str) -> str:
         className="inline-flex items-center gap-1.5 text-sm text-primary hover:underline"
         data-testid="connect-sdk-setup-guide-link"
       >
-        Setup Guide で接続を確認する
+        接続ガイドで接続を確認する
         <ArrowRight className="h-3.5 w-3.5" />
       </Link>
     </div>

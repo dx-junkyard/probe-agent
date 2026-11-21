@@ -189,7 +189,7 @@ describe("StakeholderValueNetworkPage empty/error/degraded states", () => {
     mockApi.get.mockResolvedValue(valueNetworkOut());
     await renderPage();
     await waitFor(() => expect(screen.getByTestId("value-network-node-list")).toBeInTheDocument());
-    fireEvent.change(screen.getByLabelText("role で絞り込み"), { target: { value: "regulator" } });
+    fireEvent.change(screen.getByLabelText("役割で絞り込み"), { target: { value: "regulator" } });
     await waitFor(() => expect(screen.getByTestId("value-network-filtered-empty")).toBeInTheDocument());
     expect(screen.queryByTestId("value-network-no-data")).not.toBeInTheDocument();
   });

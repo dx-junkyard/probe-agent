@@ -44,7 +44,7 @@ export default function LoginPage() {
       await login(fd.get("username") as string, fd.get("password") as string);
       navigate(returnTo, { replace: true });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Login failed");
+      setError(err instanceof Error ? err.message : "ログインできませんでした");
     } finally {
       setPending(false);
     }
@@ -59,7 +59,7 @@ export default function LoginPage() {
           </div>
           <CardTitle className="text-xl">Probe Agent</CardTitle>
           <CardDescription>
-            {showBootstrapGuide ? "初期設定が必要です" : "Sign in to your dashboard"}
+            {showBootstrapGuide ? "初期設定が必要です" : "ダッシュボードにログインします"}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -110,15 +110,15 @@ export default function LoginPage() {
                 </div>
               )}
               <div className="space-y-2">
-                <Label htmlFor="username">Username</Label>
+                <Label htmlFor="username">ユーザー名</Label>
                 <Input id="username" name="username" required autoFocus />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="password">Password</Label>
+                <Label htmlFor="password">パスワード</Label>
                 <Input id="password" name="password" type="password" required />
               </div>
               <Button type="submit" className="w-full" disabled={pending}>
-                {pending ? "Signing in..." : "Sign in"}
+                {pending ? "ログインしています…" : "ログイン"}
               </Button>
             </form>
           )}

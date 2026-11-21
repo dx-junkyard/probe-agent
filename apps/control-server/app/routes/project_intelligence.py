@@ -19,6 +19,7 @@ import hashlib
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.responses import JSONResponse
 
 from ..auth import Principal, get_system_id, require_user
 from ..capability_hierarchy import (
@@ -50,6 +51,12 @@ from ..git_ops import (
     repository_head_relation,
     resolve_head,
     working_tree_status,
+)
+from ..intelligence_payloads import (
+    list_payloads,
+    recorded_calls,
+    store_payloads,
+    wrap_for_recording,
 )
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..refresh_proposal import (
@@ -121,7 +128,10 @@ from ..models import (
     FeatureDraftOut,
     FeatureEvidence,
     GitHubIssueStatusOut,
+    FeatureIdResolutionOut,
     IntelligenceRunOut,
+    IntelligenceRunPayloadOut,
+    IntelligenceRunPayloadsOut,
     IssueDraftCreateRequest,
     IssueDraftOut,
     IssueDraftUpdateRequest,
@@ -206,7 +216,9 @@ def _probe_patch_out(conn, row) -> ProbePatchOut:
         snapshot_id=row["snapshot_id"],
         commit_sha=row["commit_sha"],
         diff=row["diff"],
-        worktree_path=row["worktree_path"],
+        # NULL for an improvement transport row (it never had a worktree);
+        # left as-is it made the whole patch list fail validation (C5).
+        worktree_path=row["worktree_path"] or "",
         skipped=json.loads(row["skipped"]),
         status=row["status"],
         error=row["error"],
@@ -218,7 +230,39 @@ def _probe_patch_out(conn, row) -> ProbePatchOut:
         applied_by_user_id=row["applied_by_user_id"],
         validation_runs=validation_runs,
         created_at=row["created_at"],
+        **_probe_patch_origin(conn, row),
     )
+
+
+def _probe_patch_origin(conn, row) -> dict:
+    """UX audit 2026-11-17 C5: which lineage produced this transport row.
+
+    An adopted Experiment variant's publish patch is identified by its
+    ``improvement_publish_artifacts`` row (#380) -- never by the plan's
+    ``origin`` text or by timing. Same System, exact ``patch_id``.
+    """
+    artifact = conn.execute(
+        """SELECT a.experiment_id, v.variant_key, v.label,
+                  e.human_decision, e.human_decision_variant_key
+             FROM improvement_publish_artifacts a
+             JOIN experiment_variants v ON v.id = a.variant_id
+             JOIN experiments e ON e.id = a.experiment_id
+            WHERE a.patch_id = ? AND a.system_id = ? AND e.system_id = a.system_id
+            ORDER BY a.id DESC LIMIT 1""",
+        (row["id"], row["system_id"]),
+    ).fetchone()
+    if artifact is None:
+        return {"origin": "probe_plan"}
+    return {
+        "origin": "improvement",
+        "improvement_experiment_id": artifact["experiment_id"],
+        "improvement_variant_key": artifact["variant_key"],
+        "improvement_variant_label": artifact["label"],
+        "improvement_adoption_current": (
+            artifact["human_decision"] == "adopted"
+            and artifact["human_decision_variant_key"] == artifact["variant_key"]
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1537,6 +1581,68 @@ def _feature_draft_out(conn, row) -> FeatureDraftOut:
     )
 
 
+VALIDATION_FAILURE_PREFIX = "Failed to parse LLM response"
+
+
+def failed_run_status(error_details: Optional[str]) -> int:
+    """HTTP status for a failed reasoning run (IK-0034).
+
+    422 when the model answered but its output failed validation (the
+    generators prefix those errors with ``Failed to parse LLM response``);
+    502 for everything else -- the provider call failed, or no usable
+    reasoning model was configured, so no valid answer was obtained upstream.
+    """
+    if (error_details or "").startswith(VALIDATION_FAILURE_PREFIX):
+        return 422
+    return 502
+
+
+def _failed_run_response(body, run) -> Optional[JSONResponse]:
+    """Return the run body with a non-2xx status when the run failed.
+
+    The body is the same as on success (the persisted intelligence_run with
+    status failed + error_details, and whatever was saved), plus ``detail``
+    carrying error_details so generic clients show the reason.
+    """
+    if run is None or run.status != "failed":
+        return None
+    content = body.model_dump(mode="json")
+    content["detail"] = run.error_details or "Reasoning run failed"
+    return JSONResponse(status_code=failed_run_status(run.error_details), content=content)
+
+
+def _feature_registry_for_prompt(system_id: int):
+    """The System's live Feature registry, seeded on first use (IK-0038).
+
+    Returns (latest completed drafts run id, live entries with handles
+    F1..Fn, every key the System has used). The registry is independent of
+    runs and snapshots; an empty one is seeded from the latest completed
+    drafts run so existing feature ids stay valid.
+    """
+    from ..feature_registry import ensure_seeded, live_entries, taken_keys
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ensure_seeded(conn, system_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        run_row = conn.execute(
+            """
+            SELECT id FROM intelligence_runs
+            WHERE system_id = ? AND run_type = 'repository_drafts'
+              AND status = 'completed'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        entries = live_entries(conn, system_id)
+        taken = taken_keys(conn, system_id)
+    return (run_row["id"] if run_row is not None else None), entries, taken
+
+
 @router.post(
     "/repository/drafts/generate",
     response_model=DraftGenerationResult,
@@ -1609,8 +1715,11 @@ def generate_drafts_endpoint(
             )
         )
 
+    previous_run_id, registry_entries, taken = _feature_registry_for_prompt(system_id)
+
     llm_config = _resolve_intelligence_config()
 
+    llm_client = None
     started_at = time.time()
     try:
         if llm_config.provider != "mock" and not is_reasoning_model(
@@ -1621,8 +1730,10 @@ def generate_drafts_endpoint(
             )
         if not indexed_files:
             raise LLMError("Snapshot contains no files")
-        llm_client = create_llm_client(llm_config)
-        result = generate_drafts(llm_client, llm_config, indexed_files)
+        llm_client = wrap_for_recording(create_llm_client(llm_config))
+        result = generate_drafts(
+            llm_client, llm_config, indexed_files, registry_entries, taken
+        )
     except LLMError as exc:
         result = GenerationResult(
             provider=llm_config.provider,
@@ -1664,6 +1775,14 @@ def generate_drafts_endpoint(
                 ),
             )
             run_id = cur.lastrowid
+            store_payloads(conn, run_id, PROMPT_VERSION, recorded_calls(llm_client))
+            if result.error is None:
+                from ..feature_registry import record_run
+
+                record_run(
+                    conn, system_id, run_id,
+                    result.registry_matched, result.registry_minted,
+                )
 
             sp_draft_out = None
             if result.system_profile:
@@ -1773,10 +1892,54 @@ def generate_drafts_endpoint(
             conn.execute("ROLLBACK")
             raise
 
-    return DraftGenerationResult(
+    id_resolution = None
+    if result.id_resolution is not None:
+        id_resolution = FeatureIdResolutionOut(
+            previous_run_id=previous_run_id,
+            reused=result.id_resolution.reused,
+            resolved=result.id_resolution.resolved,
+            new=result.id_resolution.new,
+            handle_matched=result.id_resolution.handle_matched,
+            minted=result.id_resolution.minted,
+            slug_matches=result.id_resolution.slug_matches,
+            dropped=result.id_resolution.dropped,
+            normalized=result.id_resolution.normalized,
+            not_referenced=result.id_resolution.not_referenced,
+        )
+    body = DraftGenerationResult(
         intelligence_run=_intelligence_run_out(run_row),
         system_profile_draft=sp_draft_out,
         feature_drafts=feature_drafts_out,
+        feature_id_resolution=id_resolution,
+    )
+    return _failed_run_response(body, body.intelligence_run) or body
+
+
+@router.get(
+    "/intelligence-runs/{run_id}/payloads",
+    response_model=IntelligenceRunPayloadsOut,
+)
+def get_intelligence_run_payloads(
+    run_id: int,
+    system_id: int = Depends(get_system_id),
+) -> IntelligenceRunPayloadsOut:
+    """Return the stored LLM request/response pairs of one reasoning run.
+
+    IK-0029: kept for drafts, code-links, probe plans and experiment analysis,
+    including runs whose response failed validation. Runs recorded before the
+    table existed simply return an empty list.
+    """
+    with get_conn() as conn:
+        run_row = conn.execute(
+            "SELECT * FROM intelligence_runs WHERE id = ? AND system_id = ?",
+            (run_id, system_id),
+        ).fetchone()
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="Intelligence run not found")
+        payloads = list_payloads(conn, run_id)
+    return IntelligenceRunPayloadsOut(
+        intelligence_run=_intelligence_run_out(run_row),
+        payloads=[IntelligenceRunPayloadOut(**item) for item in payloads],
     )
 
 
@@ -3612,6 +3775,16 @@ def _link_out(conn, row) -> FeatureCodeLinkOut:
     )
 
 
+def _mapping_diagnostics(run_row) -> dict:
+    """Dropped links and carried-over reviews of a mapping run (IK-0033)."""
+    raw = run_row["diagnostics_json"] if "diagnostics_json" in run_row.keys() else None
+    data = json.loads(raw) if raw else {}
+    return {
+        "dropped_links": data.get("dropped_links", []),
+        "carried_over_reviews": data.get("carried_over_reviews", 0),
+    }
+
+
 @router.post(
     "/repository/code-links/generate",
     response_model=FeatureCodeLinksOut,
@@ -3732,6 +3905,7 @@ def generate_code_links_endpoint(
 
     llm_config = _resolve_intelligence_config()
 
+    llm_client = None
     started_at = time.time()
     try:
         if llm_config.provider != "mock" and not is_reasoning_model(
@@ -3740,7 +3914,7 @@ def generate_code_links_endpoint(
             raise LLMError(
                 "Feature-to-code mapping requires a configured reasoning model"
             )
-        llm_client = create_llm_client(llm_config)
+        llm_client = wrap_for_recording(create_llm_client(llm_config))
         mapping_result = generate_code_mapping(llm_client, llm_config, features, symbols)
     except LLMError as exc:
         mapping_result = type("R", (), {
@@ -3753,10 +3927,30 @@ def generate_code_links_endpoint(
     completed_at = time.time()
 
     status = "completed" if mapping_result.error is None else "failed"
+    dropped_links = list(getattr(mapping_result, "dropped", []) or [])
 
     symbol_key_to_id = {}
     for sr in sym_rows:
         symbol_key_to_id[(sr["path"], sr["qualified_name"])] = sr["id"]
+
+    # IK-0033: a human review of the same (feature_id, path, symbol) in an
+    # earlier mapping run carries over; the latest review wins.
+    with get_conn() as conn:
+        prior_reviews = {
+            (r["feature_id"], r["path"], r["qualified_name"]): r["review_status"]
+            for r in conn.execute(
+                """
+                SELECT fcl.feature_id, cs.path, cs.qualified_name, fcl.review_status
+                FROM feature_code_links fcl
+                JOIN code_symbols cs ON fcl.symbol_id = cs.id
+                WHERE fcl.system_id = ?
+                  AND fcl.review_status IN ('accepted', 'rejected')
+                ORDER BY fcl.updated_at, fcl.id
+                """,
+                (system_id,),
+            ).fetchall()
+        }
+    carried_over = 0
 
     with get_conn() as conn:
         conn.execute("BEGIN")
@@ -3785,6 +3979,7 @@ def generate_code_links_endpoint(
                 ),
             )
             run_id = cur.lastrowid
+            store_payloads(conn, run_id, MAPPING_PROMPT_VERSION, recorded_calls(llm_client))
 
             now = time.time()
             for link in mapping_result.links:
@@ -3793,6 +3988,12 @@ def generate_code_links_endpoint(
                 )
                 if symbol_id is None:
                     continue
+                review_status = prior_reviews.get(
+                    (link.feature_id, link.symbol_path, link.symbol_qualified_name),
+                    "proposed",
+                )
+                if review_status != "proposed":
+                    carried_over += 1
                 conn.execute(
                     """
                     INSERT INTO feature_code_links
@@ -3800,7 +4001,7 @@ def generate_code_links_endpoint(
                          feature_id, symbol_id, relation_reason,
                          confidence, source, review_status,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         system_id,
@@ -3811,10 +4012,24 @@ def generate_code_links_endpoint(
                         link.relation_reason,
                         link.confidence,
                         link.source,
+                        review_status,
                         now,
                         now,
                     ),
                 )
+            conn.execute(
+                "UPDATE intelligence_runs SET diagnostics_json = ? WHERE id = ?",
+                (
+                    json.dumps(
+                        {
+                            "dropped_links": dropped_links,
+                            "carried_over_reviews": carried_over,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    run_id,
+                ),
+            )
 
             run_row = conn.execute(
                 "SELECT * FROM intelligence_runs WHERE id = ?",
@@ -3836,13 +4051,15 @@ def generate_code_links_endpoint(
             conn.execute("ROLLBACK")
             raise
 
-    return FeatureCodeLinksOut(
+    body = FeatureCodeLinksOut(
         system_id=system_id,
         snapshot_id=snapshot_id,
         intelligence_run=_intelligence_run_out(run_row),
         links=links_out,
         is_mock=mapping_result.is_mock,
+        **_mapping_diagnostics(run_row),
     )
+    return _failed_run_response(body, body.intelligence_run) or body
 
 
 @router.get("/repository/code-links", response_model=FeatureCodeLinksOut)
@@ -3876,6 +4093,7 @@ def get_code_links(
             intelligence_run=_intelligence_run_out(run_row),
             links=[_link_out(conn, lr) for lr in link_rows],
             is_mock=bool(run_row["is_mock"]),
+            **_mapping_diagnostics(run_row),
         )
 
 
@@ -3933,6 +4151,10 @@ def _probe_point_out(row) -> ProbePointOut:
         replayability=row["replayability"],
         denylist_hit=row["denylist_hit"],
         status=row["status"],
+        replay_capture=bool(row["replay_capture"]),
+        decided_by_user_id=row["decided_by_user_id"],
+        decision_method=row["decision_method"],
+        decided_at=row["decided_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -4068,8 +4290,22 @@ def generate_probe_plan_endpoint(
             relation_reason=lr["relation_reason"],
         ))
 
+    # IK-0037: component_id is assigned by the system per (path,
+    # qualified_name) -- the id already in code, else the last planned id,
+    # else a deterministic derivation -- never by the model.
+    from ..component_ids import assign_component_ids
+
+    with get_conn() as conn:
+        assignments = assign_component_ids(
+            conn,
+            system_id,
+            [(link.symbol_path, link.symbol_qualified_name) for link in accepted_links],
+        )
+    component_ids = {key: a.component_id for key, a in assignments.items()}
+
     llm_config = _resolve_intelligence_config()
 
+    llm_client = None
     started_at = time.time()
     try:
         if llm_config.provider != "mock" and not is_reasoning_model(
@@ -4078,7 +4314,7 @@ def generate_probe_plan_endpoint(
             raise LLMError(
                 "Probe plan generation requires a configured reasoning model"
             )
-        llm_client = create_llm_client(llm_config)
+        llm_client = wrap_for_recording(create_llm_client(llm_config))
         plan_result = generate_probe_plan(
             llm_client,
             llm_config,
@@ -4090,6 +4326,7 @@ def generate_probe_plan_endpoint(
             feature_risks=json.loads(fd_row["risks"]),
             accepted_links=accepted_links,
             objective_hint=objective,
+            component_ids=component_ids,
         )
     except LLMError as exc:
         from ..probe_planner import PlanResult
@@ -4128,6 +4365,7 @@ def generate_probe_plan_endpoint(
                 ),
             )
             run_id = cur.lastrowid
+            store_payloads(conn, run_id, PLAN_PROMPT_VERSION, recorded_calls(llm_client))
 
             plan_status = "proposed" if plan_result.error is None else "rejected"
             cur = conn.execute(
@@ -4178,7 +4416,7 @@ def generate_probe_plan_endpoint(
             conn.execute("ROLLBACK")
             raise
 
-    return result
+    return _failed_run_response(result, result.intelligence_run) or result
 
 
 @router.get("/repository/probe-plans", response_model=ProbePlansListOut)
@@ -4229,8 +4467,25 @@ def update_probe_point_status(
     point_id: int,
     payload: ProbePointStatusUpdate,
     system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
 ) -> ProbePointOut:
+    """Record a human's decision on one probe point.
+
+    UX audit 2026-11-17 C4: the same decision carries whether this point's
+    inputs are captured for Replay (``@probe(..., replay_capture=True)``).
+    Capture stays off unless the approver turns it on (#243 opt-in), it is
+    refused on a point whose side-effect risk is ``high`` (Principle 4 -- the
+    risk is the point's existing finite value, no new judgement), and it can
+    only be set together with ``approved``. The approver is the authenticated
+    principal, recorded as ``decision_method='manual'``.
+    """
     now = time.time()
+    replay_capture = bool(payload.replay_capture)
+    if replay_capture and payload.status != "approved":
+        raise HTTPException(
+            status_code=422,
+            detail="replay_capture can only be chosen when approving a probe point",
+        )
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM probe_points WHERE id = ? AND system_id = ?",
@@ -4243,9 +4498,23 @@ def update_probe_point_status(
                 status_code=409,
                 detail="Safety-denylisted probe points cannot be approved",
             )
+        if replay_capture and row["side_effect_risk"] == "high":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Input capture cannot be enabled on a probe point with high "
+                    "side-effect risk"
+                ),
+            )
         conn.execute(
-            """UPDATE probe_points SET status = ?, updated_at = ? WHERE id = ?""",
-            (payload.status, now, point_id),
+            """UPDATE probe_points
+                  SET status = ?, replay_capture = ?, decided_by_user_id = ?,
+                      decision_method = 'manual', decided_at = ?, updated_at = ?
+                WHERE id = ? AND system_id = ?""",
+            (
+                payload.status, 1 if replay_capture else 0, principal.user_id,
+                now, now, point_id, system_id,
+            ),
         )
         row = conn.execute(
             "SELECT * FROM probe_points WHERE id = ?", (point_id,),
@@ -5511,6 +5780,7 @@ def generate_patch_endpoint(
             recommended_mode=r["recommended_mode"],
             line_start=r["line_start"],
             line_end=r["line_end"],
+            replay_capture=bool(r["replay_capture"]),
         )
         for r in point_rows
     ]

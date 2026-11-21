@@ -14,17 +14,17 @@ export type Stage = NextActionCategory;
 export const STAGES: Stage[] = ["understand", "observe", "instrument", "evaluate"];
 
 export const STAGE_LABELS: Record<Stage, string> = {
-  understand: "Understand",
-  observe: "Decide Where to Observe",
-  instrument: "Instrument",
-  evaluate: "Evaluate",
+  understand: "理解する",
+  observe: "観測箇所を決める",
+  instrument: "計装する",
+  evaluate: "評価する",
 };
 
 export const STAGE_DESCRIPTIONS: Record<Stage, string> = {
-  understand: "Docs, symbols, capabilities, and docs-code gaps discovered from the repository.",
-  observe: "Entrypoints and flows worth watching before choosing where to instrument.",
-  instrument: "Probe plans, patches, and validation state for the observed entrypoints.",
-  evaluate: "Traces, experiments, and the decisions recorded from them.",
+  understand: "リポジトリから発見された docs・symbol・capability・docs-code gap。",
+  observe: "計装先を選ぶ前に確認すべき entrypoint と flow。",
+  instrument: "観測対象の entrypoint に対する probe plan・patch・検証状態。",
+  evaluate: "記録されたトレース・experiment・判断結果。",
 };
 
 // Issue #202: finite stage completion status, badged next to each stage
@@ -33,10 +33,10 @@ export const STAGE_DESCRIPTIONS: Record<Stage, string> = {
 export type StageStatusValue = "not_started" | "in_progress" | "blocked" | "complete";
 
 export const STAGE_STATUS_LABELS: Record<StageStatusValue, string> = {
-  not_started: "Not started",
-  in_progress: "In progress",
-  blocked: "Blocked",
-  complete: "Complete",
+  not_started: "未着手",
+  in_progress: "進行中",
+  blocked: "進行不可",
+  complete: "完了",
 };
 
 export const STAGE_STATUS_BADGE_VARIANT: Record<
@@ -81,7 +81,8 @@ export function StageSection({ stage, index, status, counts, label, description,
   status?: string;
   counts?: Record<string, number>;
   // Issue #240: server-supplied Japanese label/description. When absent
-  // (older server or a fixture), fall back to the local English maps.
+  // (older server or a fixture), fall back to the local maps, which mirror
+  // state_messages.STAGE_MESSAGES.
   label?: string;
   description?: string;
   children: ReactNode;
@@ -125,7 +126,7 @@ export function StageSection({ stage, index, status, counts, label, description,
 
       {links.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 text-xs" data-testid={`stage-links-${stage}`}>
-          <span className="text-muted-foreground">Related pages:</span>
+          <span className="text-muted-foreground">関連ページ:</span>
           {links.map((l) => (
             <Link
               key={l.to}

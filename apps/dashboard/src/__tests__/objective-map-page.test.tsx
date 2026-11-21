@@ -291,6 +291,11 @@ describe("ObjectiveMapPage rendering", () => {
     await waitFor(() => expect(screen.getByTestId("gap-decision-acknowledge")).toBeInTheDocument());
 
     fireEvent.click(screen.getByTestId("gap-decision-acknowledge"));
+    // UX audit 2026-11-17 D8: the button opens the confirmation; nothing is
+    // recorded until the developer confirms it there.
+    await screen.findByTestId("decision-confirm-dialog");
+    expect(mockApi.post).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("decision-confirm-submit"));
     await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
       "/product-gaps/g1/decisions",
       expect.objectContaining({ decision: "acknowledge" }),
@@ -353,6 +358,7 @@ describe("ObjectiveMapPage: Gap decision digest (§B)", () => {
     fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
     fireEvent.click(await screen.findByTestId("gap-entry-g1"));
     fireEvent.click(await screen.findByTestId("gap-decision-acknowledge"));
+    fireEvent.click(await screen.findByTestId("decision-confirm-submit"));
 
     await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
       "/product-gaps/g1/decisions",
@@ -374,6 +380,7 @@ describe("ObjectiveMapPage: Gap decision digest (§B)", () => {
     fireEvent.click(await screen.findByTestId("objective-map-tab-gaps"));
     fireEvent.click(await screen.findByTestId("gap-entry-g1"));
     fireEvent.click(await screen.findByTestId("gap-decision-prioritize"));
+    fireEvent.click(await screen.findByTestId("decision-confirm-submit"));
 
     await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
       "/product-gaps/g1/decisions",
@@ -395,6 +402,7 @@ describe("ObjectiveMapPage: Gap decision digest (§B)", () => {
 
     const getCallsBeforeRetry = mockApi.get.mock.calls.length;
     fireEvent.click(await screen.findByTestId("gap-decision-acknowledge"));
+    fireEvent.click(await screen.findByTestId("decision-confirm-submit"));
 
     await waitFor(() => expect(screen.getByTestId("stale-digest-notice")).toBeInTheDocument());
     // Never a silent/automatic retry with the new digest.
@@ -541,6 +549,9 @@ describe("ObjectiveMapPage: Objective/Milestone/Gap forms reach a usable operati
     await renderPage();
     fireEvent.click(within(await screen.findByTestId("objective-node-o1")).getByText("決済の離脱率を下げる"));
     fireEvent.click(await screen.findByTestId("objective-decision-confirm"));
+    // The dialog names the Objective and its current state (server value).
+    expect(await screen.findByTestId("decision-confirm-dialog")).toHaveTextContent("現在の状態: 確定済み");
+    fireEvent.click(screen.getByTestId("decision-confirm-submit"));
 
     await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
       "/product-objectives/o1/decisions",
@@ -568,6 +579,7 @@ describe("ObjectiveMapPage: Objective/Milestone/Gap forms reach a usable operati
     // click here would collapse them again.
     fireEvent.click(await screen.findByTestId("milestone-node-m1"));
     fireEvent.click(await screen.findByTestId("milestone-assessment-met"));
+    fireEvent.click(await screen.findByTestId("decision-confirm-submit"));
 
     await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
       "/product-milestones/m1/assessments",
@@ -908,7 +920,10 @@ describe("ObjectiveMapPage per-entity form state", () => {
     expect((screen.getByLabelText("Vision への意図") as HTMLTextAreaElement).value).toBe("o2 の意図");
   });
 
-  it("does not carry a Gap rationale over to another Gap", async () => {
+  // The decision rationale now lives in the confirmation dialog (D8), which
+  // is mounted only while open; the per-Gap form state this guards is the
+  // evidence reference typed in the Gap detail.
+  it("does not carry a Gap form input over to another Gap", async () => {
     const workbench = gapWorkbench({
       entries: [gapEntry({ gap_key: "g1" }), gapEntry({ id: 2, gap_key: "g2", title: "二件目" })],
     });
@@ -924,12 +939,13 @@ describe("ObjectiveMapPage per-entity form state", () => {
     fireEvent.click(await screen.findByTestId("gap-entry-g1"));
     await waitFor(() => expect(screen.getByTestId("gap-detail-g1")).toBeInTheDocument());
 
-    const rationale = screen.getByPlaceholderText("理由(任意)") as HTMLTextAreaElement;
-    fireEvent.change(rationale, { target: { value: "g1 についての理由" } });
+    const evidence = screen.getByLabelText("証跡の参照") as HTMLInputElement;
+    fireEvent.change(evidence, { target: { value: "g1 についての報告" } });
 
+    confirmSpy.mockReturnValue(true);
     fireEvent.click(screen.getByTestId("gap-entry-g2"));
     await waitFor(() => expect(screen.getByTestId("gap-detail-g2")).toBeInTheDocument());
-    expect((screen.getByPlaceholderText("理由(任意)") as HTMLTextAreaElement).value).toBe("");
+    expect((screen.getByLabelText("証跡の参照") as HTMLInputElement).value).toBe("");
   });
 
   it("re-seeds the priority band from the newly selected Gap, not the previous one", async () => {
@@ -960,6 +976,7 @@ describe("ObjectiveMapPage per-entity form state", () => {
     expect((screen.getByLabelText("優先バンド") as HTMLSelectElement).value).toBe("watch");
 
     fireEvent.click(screen.getByTestId("gap-decision-prioritize"));
+    fireEvent.click(await screen.findByTestId("decision-confirm-submit"));
     await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
       "/product-gaps/g2/decisions",
       expect.objectContaining({ decision: "prioritize", priority_band: "watch" }),
@@ -1040,7 +1057,7 @@ describe("ObjectiveMapPage unsaved-work guard", () => {
       .toBe("まだ記録していない意図");
   });
 
-  it("prompts for a Gap rationale too, not only revision text", async () => {
+  it("prompts for a Gap evidence reference too, not only revision text", async () => {
     confirmSpy.mockReturnValue(false);
     const workbench = gapWorkbench({
       entries: [gapEntry({ gap_key: "g1" }), gapEntry({ id: 2, gap_key: "g2", title: "二件目" })],
@@ -1057,7 +1074,7 @@ describe("ObjectiveMapPage unsaved-work guard", () => {
     fireEvent.click(await screen.findByTestId("gap-entry-g1"));
     await waitFor(() => expect(screen.getByTestId("gap-detail-g1")).toBeInTheDocument());
 
-    fireEvent.change(screen.getByPlaceholderText("理由(任意)"), { target: { value: "未保存の理由" } });
+    fireEvent.change(screen.getByLabelText("証跡の参照"), { target: { value: "未保存の報告" } });
     fireEvent.click(screen.getByTestId("gap-entry-g2"));
 
     expect(confirmSpy).toHaveBeenCalled();
@@ -1074,5 +1091,168 @@ describe("ObjectiveMapPage unsaved-work guard", () => {
     fireEvent.click(screen.getByTestId("objective-map-tab-gaps"));
 
     expect(confirmSpy).not.toHaveBeenCalled();
+  });
+});
+
+// --- UX audit 2026-11-17 C2 / C9 / D8 ------------------------------------------
+
+describe("UX 監査 2026-11-17 C2/C9/D8: Objective と Gap の操作面", () => {
+  beforeEach(() => { mockApi.get.mockReset(); mockApi.post.mockReset(); mockApi.delete.mockReset(); });
+
+  function twoNodeMap() {
+    return objectiveMap({
+      nodes: [node(), node({ id: 2, objective_key: "o2", title: "親にする目標", milestones: [] })],
+      root_objective_ids: [1, 2],
+    });
+  }
+
+  function mockObjectiveRoutes(extra: Record<string, unknown> = {}, detail = objectiveDetail()) {
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(twoNodeMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      if (path === "/product-objectives/o1") return Promise.resolve(detail);
+      if (path && path in extra) return Promise.resolve(extra[path]);
+      return Promise.resolve(null);
+    });
+  }
+
+  it("親 Objective は同じ System の Objective から選び、自分自身は候補に出ない", async () => {
+    mockObjectiveRoutes();
+    mockApi.post.mockResolvedValue({ ...objectiveDetail(), parent_objective_key: "o2" });
+    await renderAt("/objective-map?objective=o1");
+    const select = await screen.findByTestId("objective-parent-select") as HTMLSelectElement;
+    const values = Array.from(select.options).map((o) => o.value);
+    expect(values).toContain("o2");
+    expect(values).not.toContain("o1");
+    fireEvent.change(select, { target: { value: "o2" } });
+    fireEvent.click(screen.getByTestId("objective-parent-set"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-objectives/o1/parent", { parent_objective_key: "o2", rationale: "" },
+    ));
+  });
+
+  it("循環の拒否はサーバーの日本語の理由で出す (クライアントでは判定しない)", async () => {
+    mockObjectiveRoutes();
+    mockApi.post.mockRejectedValue(new ApiError(422, "この親付けは循環を作るため設定できません。", "product_objective_parent_cycle"));
+    await renderAt("/objective-map?objective=o1");
+    fireEvent.change(await screen.findByTestId("objective-parent-select"), { target: { value: "o2" } });
+    fireEvent.click(screen.getByTestId("objective-parent-set"));
+    expect(await screen.findByTestId("objective-parent-rejected")).toHaveTextContent("この親付けは循環を作るため設定できません。");
+  });
+
+  it("親からの切り離しは確認ダイアログで理由を添えて tombstone を記録する", async () => {
+    mockObjectiveRoutes({}, objectiveDetail({ parent_objective_id: 2, parent_objective_key: "o2" }));
+    mockApi.delete.mockResolvedValue(objectiveDetail());
+    await renderAt("/objective-map?objective=o1");
+    fireEvent.click(await screen.findByTestId("objective-parent-clear"));
+    fireEvent.change(await screen.findByTestId("decision-confirm-reason"), { target: { value: "独立した目標にする" } });
+    expect(mockApi.delete).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("decision-confirm-submit"));
+    await waitFor(() => expect(mockApi.delete).toHaveBeenCalledWith(
+      `/product-objectives/o1/parent?rationale=${encodeURIComponent("独立した目標にする")}`,
+    ));
+  });
+
+  it("Vision への上流参照は最新 Interview の Vision から選ぶ", async () => {
+    mockObjectiveRoutes({
+      "/interview/sessions": [{ id: 3 }, { id: 7 }],
+      "/interview/understanding-brief?session_id=7": {
+        vision: { name: "誰でも迷わず決済できる", confirmation_label: "確認済み" },
+      },
+    });
+    mockApi.post.mockResolvedValue({ id: 1 });
+    await renderAt("/objective-map?objective=o1");
+    const target = await screen.findByTestId("objective-upstream-ref-target");
+    fireEvent.change(target, { target: { value: "誰でも迷わず決済できる" } });
+    fireEvent.click(screen.getByTestId("objective-upstream-ref-submit"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-objectives/o1/upstream-refs",
+      { ref_kind: "vision_claim", target_ref: "誰でも迷わず決済できる", note: "" },
+    ));
+  });
+
+  it("Objective の判断の見出しは Gap 用の「解消状態を変える」ではない", async () => {
+    mockObjectiveRoutes();
+    await renderAt("/objective-map?objective=o1");
+    const controls = await screen.findByTestId("objective-decision-controls");
+    expect(controls).not.toHaveTextContent("解消状態");
+    expect(controls).toHaveTextContent("Objective の状態を記録する");
+    expect(screen.getByTestId("objective-decision-current-state")).toHaveTextContent("確定済み");
+  });
+
+  it("未確定の Milestone では達成判定のボタンを出さず、理由を出す", async () => {
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(objectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      if (path === "/product-objectives/o1") return Promise.resolve(objectiveDetail());
+      if (path === "/product-milestones/m1") return Promise.resolve(milestoneDetail({ design_status: "proposed" }));
+      return Promise.resolve(null);
+    });
+    await renderAt("/objective-map?objective=o1&milestone=m1");
+    expect(await screen.findByTestId("milestone-assessment-not-available")).toHaveTextContent("定義がまだ確定していない");
+    expect(screen.queryByTestId("milestone-assessment-met")).not.toBeInTheDocument();
+  });
+
+  it("Gap の検出元は種類を選び、その種類の一覧から選ぶ", async () => {
+    mockApi.get.mockImplementation((path?: string) => {
+      if (path === "/objective-map") return Promise.resolve(objectiveMap());
+      if (path === "/gap-workbench") return Promise.resolve(gapWorkbench());
+      if (path === "/product-gaps/g1") return Promise.resolve(gapDetail());
+      if (path === "/functional-lineage") {
+        return Promise.resolve({
+          system_id: 1, generated_at: 1, nodes: [], edges: [], degraded_sections: [], degraded_detail: {},
+          gaps: [{ code: "requirement_without_feature", severity: "warning", subject_kind: "requirement", subject_ref: "r1" }],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue({ id: 1 });
+    await renderAt("/objective-map?view=gaps&gap=g1");
+    const target = await screen.findByTestId("gap-source-ref-target");
+    fireEvent.change(target, { target: { value: "requirement_without_feature|requirement|r1" } });
+    fireEvent.click(screen.getByTestId("gap-source-ref-submit"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-gaps/g1/source-refs",
+      { source_kind: "functional_lineage_gap", source_ref: "requirement_without_feature|requirement|r1", note: "" },
+    ));
+  });
+
+  it("一覧の無い検出元は手入力を残し、その旨を明示する。拒否は日本語で出す", async () => {
+    mockRoutes({ objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(), gap: gapDetail() });
+    mockApi.post.mockRejectedValue(new ApiError(422, "検出元の参照の形式が違います。", "product_gap_source_ref_unresolvable"));
+    await renderAt("/objective-map?view=gaps&gap=g1");
+    fireEvent.change(await screen.findByTestId("gap-source-ref-kind"), { target: { value: "node_anomaly" } });
+    expect(await screen.findByTestId("gap-source-ref-target-not-listable")).toHaveTextContent("一覧から選べない種類です");
+    fireEvent.change(screen.getByTestId("gap-source-ref-target"), { target: { value: "bad" } });
+    fireEvent.click(screen.getByTestId("gap-source-ref-submit"));
+    expect(await screen.findByTestId("gap-source-ref-rejected")).toHaveTextContent("検出元の参照の形式が違います。");
+  });
+
+  it("証跡を参照として追加する", async () => {
+    mockRoutes({ objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(), gap: gapDetail() });
+    mockApi.post.mockResolvedValue({ id: 1 });
+    await renderAt("/objective-map?view=gaps&gap=g1");
+    fireEvent.change(await screen.findByLabelText("証跡の参照"), { target: { value: "サポート窓口 11/10" } });
+    fireEvent.click(screen.getByTestId("gap-evidence-ref-submit"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-gaps/g1/evidence-refs",
+      { evidence_kind: "human_report", evidence_ref: "サポート窓口 11/10", note: "" },
+    ));
+  });
+
+  it("解消方針は確認ダイアログで理由を必須にして記録する", async () => {
+    mockRoutes({ objectiveMap: objectiveMap(), gapWorkbench: gapWorkbench(), gap: gapDetail() });
+    mockApi.post.mockResolvedValue({ id: 1 });
+    await renderAt("/objective-map?view=gaps&gap=g1");
+    fireEvent.change(await screen.findByTestId("gap-resolution-approach"), { target: { value: "operation" } });
+    fireEvent.click(screen.getByTestId("gap-resolution-submit"));
+    const submit = await screen.findByTestId("decision-confirm-submit");
+    expect(submit).toBeDisabled();
+    fireEvent.change(screen.getByTestId("decision-confirm-reason"), { target: { value: "運用手順で対応する" } });
+    fireEvent.click(submit);
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-gaps/g1/resolution-choices",
+      expect.objectContaining({ approach: "operation", rationale: "運用手順で対応する", feature_key: null }),
+    ));
   });
 });

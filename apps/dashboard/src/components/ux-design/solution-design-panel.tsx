@@ -34,12 +34,20 @@ import {
 import { useFormValidation, useUiDraftSource } from "@/lib/ui-draft";
 import { peekPendingFormDraftPatch, useFormDraftReceiver } from "@/lib/form-draft-inbox";
 import { FormDraftConflictBanner } from "@/components/form-draft-conflict";
+import { ReferenceTargetPicker } from "@/components/product-objective/reference-picker";
 
 const TARGET_KINDS: SolutionTargetKind[] = [
   "capability", "static_flow", "runtime_flow", "evolution_node",
   "component", "cell_definition", "cell_binding", "probe_point",
 ];
 const OPTION_DECISIONS: SolutionDesignOptionDecision[] = ["adopt", "hold", "reject", "withdraw"];
+/** The documented `target_ref` shape for the kinds with no list here
+ * (`ux-design-lineage.md` §3.3). A hint only -- the server checks it. */
+const MANUAL_TARGET_PLACEHOLDER: Partial<Record<SolutionTargetKind, string>> = {
+  cell_definition: "cell_id",
+  cell_binding: "Cell Binding の id",
+  probe_point: "承認済み Probe Point の id",
+};
 
 function SolutionDesignCreateForm() {
   const create = useCreateSolutionDesign();
@@ -400,7 +408,14 @@ function AddTargetLinkForm({
         <Select
           ref={fieldRefs.register("target_kind")}
           value={targetKind}
-          onChange={(e) => { setTargetKind(e.target.value as SolutionTargetKind); validation.clearField("target_kind"); }}
+          aria-label="実装対象の種類"
+          onChange={(e) => {
+            setTargetKind(e.target.value as SolutionTargetKind);
+            // A ref picked for one kind is never sent under another.
+            setTargetRef("");
+            setSnapshotId("");
+            validation.clearField("target_kind");
+          }}
         >
           {TARGET_KINDS.map((k) => (
             <option key={k} value={k}>
@@ -410,26 +425,26 @@ function AddTargetLinkForm({
         </Select>
         <FieldErrorText message={validation.fieldErrors.target_kind?.message} />
       </div>
+      {/* UX audit 2026-11-17 C9: the target (and, for a static Flow, its
+          Snapshot) is picked from that kind's own list. Cell definition /
+          Cell Binding / Probe Point have no System-wide list here, so those
+          keep a typed field and say so. */}
       <div>
-        <Input
-          ref={fieldRefs.register("target_ref")}
-          placeholder="target_ref"
+        <ReferenceTargetPicker
+          kind={targetKind}
           value={targetRef}
-          onChange={(e) => { setTargetRef(e.target.value); validation.clearField("target_ref"); }}
+          onChange={(v) => { setTargetRef(v); validation.clearField("target_ref"); validation.clearField("captured_snapshot_id"); }}
+          snapshotId={snapshotId}
+          onSnapshotIdChange={(v) => { setSnapshotId(v); validation.clearField("captured_snapshot_id"); }}
+          ariaLabel="実装対象"
+          manualPlaceholder={MANUAL_TARGET_PLACEHOLDER[targetKind]}
+          testId="ux-solution-design-target-ref"
         />
         <FieldErrorText message={validation.fieldErrors.target_ref?.message} />
-      </div>
-      {targetKind === "static_flow" && (
-        <div>
-          <Input
-            ref={fieldRefs.register("captured_snapshot_id")}
-            placeholder="captured_snapshot_id(静的 Flow に必須)"
-            value={snapshotId}
-            onChange={(e) => { setSnapshotId(e.target.value); validation.clearField("captured_snapshot_id"); }}
-          />
+        {targetKind === "static_flow" && (
           <FieldErrorText message={validation.fieldErrors.captured_snapshot_id?.message} />
-        </div>
-      )}
+        )}
+      </div>
       <Input placeholder="メモ(任意)" value={note} onChange={(e) => setNote(e.target.value)} />
       <Button size="sm" disabled={!optionKey || !targetRef.trim() || add.isPending} onClick={submit}>
         {add.isPending ? "追加中…" : "紐づける"}

@@ -327,10 +327,28 @@ export interface CockpitCategoryView {
  * スコアや確信度ではない。
  */
 export type CockpitNextStepKind =
-  | "answer_question"  // 未解決の確認事項に答える
-  | "fix_category"     // 未設定 / 要確認のカテゴリを直す
-  | "retry_qa"         // Q&A を取得できていないので再取得する
-  | "state_primary";   // 確認事項が無い。状態の主操作へ進む
+  | "answer_question"
+  | "fix_category"
+  | "retry_qa"
+  | "state_primary"
+  | "resolve_exception";
+
+// 各値の意味:
+//   answer_question   未解決の確認事項に答える
+//   fix_category      未設定 / 要確認のカテゴリを直す
+//   retry_qa          Q&A を取得できていないので再取得する
+//   state_primary     状態の主操作へ進む (文言と移動先はページ側)
+//   resolve_exception ブロッキング例外がある。例外カードの回復操作が唯一の
+//                     次の一歩なので、ここでは CTA を出さない
+
+/**
+ * サーバーのワークフロー判定 (`GET /interview/workflow-state`) のうち、
+ * 「次にやること」を決めるのに要る 2 つの事実 (UX 監査 2026-11-17 B3)。
+ * どちらもサーバーが決めた値をそのまま写すだけで、ここで状態を導出しない。
+ *   blocked             ブロッキング例外がある (E2 を除く)
+ *   answer_from_scratch W3 かつゼロベース質問が未完 (`zero_base_pending`)
+ */
+export type CockpitWorkflowGate = "blocked" | "answer_from_scratch" | null;
 
 export interface CockpitNextStep {
   kind: CockpitNextStepKind;
@@ -665,6 +683,8 @@ export interface CockpitInput {
    * 質問由来の件数を 0 件という確定値として出さない。
    */
   qaFetchStatus?: CockpitQaFetchStatus;
+  /** サーバー判定由来のゲート。省略時は `null` (ゲートなし)。 */
+  workflowGate?: CockpitWorkflowGate;
 }
 
 /** カテゴリを直す CTA の移動先 (詳細ペイン)。 */
@@ -674,10 +694,19 @@ const NEXT_STEP_CATEGORY_TARGET = "cockpit-detail-panel";
  * 「次にやること」を決める (issue #360)。
  *
  * **決定的な first-match の固定表**であり、スコアでも確信度でもない。
- * 分岐は 6 行で、結果は `CockpitNextStepKind` の 4 値に閉じている
+ * 分岐は 8 行で、結果は `CockpitNextStepKind` の 5 値に閉じている
  * (Core Design Principle 6)。
  *
  * 並び順の理由は「今すぐ実行できるものを先に出す」:
+ *   0. ブロッキング例外がある → 主作業を進められない。回復操作 (再試行 /
+ *      安全に離れる) は例外カードの 1 枠にあり (§4.4)、ここで別の操作
+ *      (「Vision を定義する」など) を主 CTA にすると次の一歩が競合する
+ *      (UX 監査 2026-11-17 B3)。CTA は出さない。
+ *   0b. ゼロベース質問が未完 → 理解が無いので全カテゴリが未設定になるが、
+ *      それを埋める手段こそ表示中の質問への回答。行 3 の「定義する」を
+ *      出すと作業面の回答欄と競合するので、状態の主操作 (回答) を指す。
+ *      ゼロベース質問は Q&A の行を持たないので、Q&A の取得状態 (行 1/2)
+ *      より先に評価する。
  *   1. Q&A が取得できていない → 何件残っているか判定できないので、まず再取得。
  *   2. Q&A を読み込み中 → 確定前に何も勧められない。状態の主操作のまま待つ。
  *   3. 未設定カテゴリ → 内容が無いので、質問に答えても埋まらない。定義が先。
@@ -691,9 +720,35 @@ function decideNextStep(args: {
   review: CockpitCategoryView[];
   unresolved: CockpitUnresolvedItem[];
   qaFetchStatus: CockpitQaFetchStatus;
+  workflowGate: CockpitWorkflowGate;
 }): CockpitNextStep {
-  const { missing, review, unresolved, qaFetchStatus } = args;
+  const { missing, review, unresolved, qaFetchStatus, workflowGate } = args;
 
+  if (workflowGate === "blocked") {
+    return {
+      kind: "resolve_exception",
+      title: "失敗した処理を解消する",
+      description:
+        "上の例外カードで、同じ処理をもう一度実行するか、中断・引き継ぎで安全に離れてください。",
+      category: null,
+      item: null,
+      actionLabel: null,
+      targetTestIds: [],
+    };
+  }
+  if (workflowGate === "answer_from_scratch") {
+    return {
+      kind: "state_primary",
+      title: "表示中の質問に答える",
+      description:
+        "自動ではシステム理解を構築できなかったため、質問への回答から理解を組み立てます。",
+      category: null,
+      item: null,
+      // 文言 (= サーバーの主操作) と移動先 (= 作業面) はページ側が持つ。
+      actionLabel: null,
+      targetTestIds: [],
+    };
+  }
   if (qaFetchStatus === "unavailable") {
     return {
       kind: "retry_qa",
@@ -833,7 +888,13 @@ export function buildCockpitModel(input: CockpitInput): CockpitModel {
   const pending = categories.filter(c => c.status == null);
   const defaultCategory = (missing[0] ?? review[0] ?? categories[0]).key;
 
-  const nextStep = decideNextStep({ missing, review, unresolved, qaFetchStatus });
+  const nextStep = decideNextStep({
+    missing,
+    review,
+    unresolved,
+    qaFetchStatus,
+    workflowGate: input.workflowGate ?? null,
+  });
 
   return {
     categories,

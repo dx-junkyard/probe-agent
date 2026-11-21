@@ -347,7 +347,7 @@ def transition_evolution_node(
     evaluator's own `llm_state_not_allowed` refusal stays visible verbatim.
 
     `to_state='established'` has one sanctioned path (Phase 4's
-    Stabilization gate, `POST /stabilization-packages/{id}/approve`); the
+    Stabilization gate, `POST /stabilization/packages/{id}/approve`); the
     one exception is `monitoring -> established`, which merely records that
     observation stopped and remains a manual API operation.
     """
@@ -389,7 +389,7 @@ def transition_evolution_node(
                                 "establishment goes through the Stabilization "
                                 "gate: assemble a Stabilization Evidence "
                                 "Package and approve it via POST "
-                                "/stabilization-packages/{package_id}/approve. "
+                                "/stabilization/packages/{package_id}/approve. "
                                 "Only 'monitoring' -> 'established' (recording "
                                 "that observation stopped) may be requested "
                                 "here directly."

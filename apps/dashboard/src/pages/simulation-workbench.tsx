@@ -37,6 +37,9 @@ import { ApprovalPanel } from "@/components/replay-approval-panel";
 import { ResultMatrix } from "@/components/replay-result-matrix";
 import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 import { SnapshotPreflightPanel } from "@/components/snapshot-preflight";
+import { QueryErrorState } from "@/components/query-state";
+import { useUnsavedChangesGuard, useUiDraftRegistry } from "@/lib/ui-draft";
+import { formatTimestamp } from "@/lib/utils";
 
 // Simulation Workbench (Issue #242 Phase D / #246). Display + composition
 // only: every judgement/execution/comparison decision below is made by the
@@ -57,17 +60,27 @@ const SKIP_GUIDANCE: Record<string, string> = {
 };
 
 export default function SimulationWorkbenchPage() {
+  const [searchParams] = useSearchParams();
+  // A confirmed target change starts a fresh editor. The shared router guard
+  // runs before the URL changes, including browser Back/Forward.
+  return <Workbench key={searchParams.get("replay_set_id") ?? "none"} />;
+}
+
+function Workbench() {
   const navigate = useNavigate();
+  const drafts = useUiDraftRegistry();
   const [searchParams, setSearchParams] = useSearchParams();
   const replaySetIdParam = searchParams.get("replay_set_id");
   const selectedSetId =
     replaySetIdParam && Number.isInteger(Number(replaySetIdParam))
       ? Number(replaySetIdParam)
       : null;
-  const selectSet = (id: number) => setSearchParams({ replay_set_id: String(id) });
+  const selectSet = (id: number) => {
+    if (id === selectedSetId || drafts?.confirmDiscard?.() === false) return;
+    setSearchParams({ replay_set_id: String(id) });
+  };
 
   const { data: sets, isLoading: setsLoading, isError: setsError, refetch: refetchSets } = useReplaySets();
-  const { data: snapshotPreflight } = useSnapshotPreflight();
   const { data: replaySet, isLoading: setLoading, isError: setError, error: replaySetError, refetch: refetchSet } = useReplaySet(selectedSetId);
   const componentId = replaySet?.component_id ?? null;
 
@@ -80,7 +93,8 @@ export default function SimulationWorkbenchPage() {
     return map;
   }, [componentTraces]);
 
-  const { data: source } = useReplaySetSource(selectedSetId);
+  const sourceQuery = useReplaySetSource(selectedSetId);
+  const { data: source } = sourceQuery;
   const [editedSource, setEditedSource] = useState<string>("");
   // Reset the edit buffer whenever the fetched pinned-snapshot source text
   // actually changes (new Replay Set / new snapshot) -- adjusted during
@@ -93,22 +107,43 @@ export default function SimulationWorkbenchPage() {
   const [lastLoadedSourceIdentity, setLastLoadedSourceIdentity] = useState<string | undefined>(
     undefined,
   );
-  if (source?.source != null && sourceIdentity !== lastLoadedSourceIdentity) {
+  const [originalSource, setOriginalSource] = useState("");
+  const sourceEdited = editedSource !== originalSource;
+  if (source?.source != null && sourceIdentity !== lastLoadedSourceIdentity && !sourceEdited) {
     setLastLoadedSourceIdentity(sourceIdentity);
     setEditedSource(source.source);
+    setOriginalSource(source.source);
   }
+  const sourceChanged = !!source && sourceIdentity !== lastLoadedSourceIdentity && sourceEdited;
+
+  // UX audit 2026-11-17 C8: evaluate the snapshot the run will actually pin
+  // (the Replay Set source's), not only the recommended one, and let the
+  // developer record why a stale one is intended. Without this input a stale
+  // snapshot made every Run a 409 with no way to continue. The reason is a
+  // `decision_method: manual` fact -- it is never pre-filled.
+  const { data: snapshotPreflight, isLoading: preflightLoading } = useSnapshotPreflight(
+    source?.snapshot_id ?? null,
+  );
+  const [staleReason, setStaleReason] = useState("");
+  const staleAckRequired = !!snapshotPreflight?.requires_stale_acknowledgement;
+  const staleAckMissing = staleAckRequired && !staleReason.trim();
+  const staleReasonPayload = staleAckRequired && staleReason.trim()
+    ? { stale_snapshot_reason: staleReason.trim() }
+    : {};
 
   const [pastedPatch, setPastedPatch] = useState("");
   const [draftTraceId, setDraftTraceId] = useState<string | null>(null);
   const [draftObjective, setDraftObjective] = useState("");
   const [lastDraft, setLastDraft] = useState<ReplayVariantDraftOut | null>(null);
   const activeDraft = lastDraft?.replay_set_id === selectedSetId ? lastDraft : null;
+  useUnsavedChangesGuard(`workbench:${selectedSetId}`, sourceEdited || !!pastedPatch.trim() || !!draftObjective.trim());
 
   const sourceDiff = useReplaySourceDiff();
   const createVariantRun = useCreateReplayVariantRun();
   const createDraft = useCreateReplayVariantDraft();
 
-  const { data: variantRuns } = useReplayVariantRuns(selectedSetId);
+  const runsQuery = useReplayVariantRuns(selectedSetId);
+  const { data: variantRuns } = runsQuery;
   const [activeRunId, setActiveRunId] = useState<number | null>(null);
   // Same render-time-adjustment pattern: reset to "no run selected" when the
   // Replay Set changes, then default to the most recent run once it loads.
@@ -122,12 +157,13 @@ export default function SimulationWorkbenchPage() {
     setActiveRunId(variantRuns[0].id);
     effectiveActiveRunId = variantRuns[0].id;
   }
-  const { data: activeRun } = useReplayVariantRun(effectiveActiveRunId);
+  const runQuery = useReplayVariantRun(effectiveActiveRunId);
+  const { data: activeRun } = runQuery;
 
-  const canRun = !!approvalState?.active;
+  const canRun = !!approvalState?.active && !staleAckMissing;
 
   const handleRunDirectEdit = async () => {
-    if (!selectedSetId || !source) return;
+    if (!selectedSetId || !source || sourceChanged) return;
     try {
       const diff = await sourceDiff.mutateAsync({
         replay_set_id: selectedSetId,
@@ -138,6 +174,7 @@ export default function SimulationWorkbenchPage() {
         replay_set_id: selectedSetId,
         snapshot_id: source?.snapshot_id,
         variants: [{ label: "Direct edit", patch_text: diff.patch_text, source: "manual" }],
+        ...staleReasonPayload,
       });
       setActiveRunId(run.id);
       toast.success("Replay variant runが完了しました");
@@ -153,6 +190,7 @@ export default function SimulationWorkbenchPage() {
         replay_set_id: selectedSetId,
         snapshot_id: source?.snapshot_id,
         variants: [{ label: "Pasted patch", patch_text: pastedPatch, source: "pasted" }],
+        ...staleReasonPayload,
       });
       setActiveRunId(run.id);
       toast.success("Replay variant runが完了しました");
@@ -190,6 +228,7 @@ export default function SimulationWorkbenchPage() {
             source: "llm_draft",
           },
         ],
+        ...staleReasonPayload,
       });
       setActiveRunId(run.id);
       toast.success("Replay variant runが完了しました");
@@ -202,9 +241,14 @@ export default function SimulationWorkbenchPage() {
     <div className="space-y-6">
       {/* Issue #371: the Workbench is the multi-candidate detail mode of the
           same loop, not a separate product. */}
-      <ImprovementLoopRail componentId={componentId} replaySetId={selectedSetId} />
+      <ImprovementLoopRail componentId={componentId} replaySetId={selectedSetId} replayRun={activeRun} approved={!!approvalState?.active} />
       {/* Issue #369 (review finding 4): same shared preflight, same words. */}
-      <SnapshotPreflightPanel preflight={snapshotPreflight} />
+      <SnapshotPreflightPanel
+        preflight={snapshotPreflight}
+        isLoading={preflightLoading}
+        staleReason={staleReason}
+        onStaleReasonChange={setStaleReason}
+      />
       <div className="flex items-center justify-between gap-3">
         <h1 className="text-2xl font-bold tracking-tight">Simulation Workbench</h1>
         <div className="flex items-center gap-2">
@@ -223,13 +267,17 @@ export default function SimulationWorkbenchPage() {
           )}
           <div className="w-72">
             <Select
+              aria-label="Replay Set"
               value={selectedSetId ? String(selectedSetId) : ""}
               onChange={(e) => e.target.value && selectSet(Number(e.target.value))}
             >
               <option value="">Replay Setを選択...</option>
               {sets?.map((s) => (
                 <option key={s.id} value={s.id}>
-                  {s.name || `Set #${s.id}`} — {s.component_id} ({s.trace_ids.length})
+                  {/* UX audit F6: adding a Trace creates a NEW Set under the
+                      same name, so the id, creation time, and size are what
+                      tell the versions apart. */}
+                  {s.name || `Set #${s.id}`} #{s.id} — {s.component_id} · {s.trace_ids.length}件 · {formatTimestamp(s.created_at)}
                 </option>
               ))}
             </Select>
@@ -301,15 +349,35 @@ export default function SimulationWorkbenchPage() {
                   <CardTitle className="text-sm">候補ソース</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-3">
+                  {sourceQuery.isError && (
+                    <QueryErrorState target="候補ソース" error={sourceQuery.error} onRetry={() => sourceQuery.refetch()} />
+                  )}
+                  {sourceQuery.isLoading && <p role="status" className="text-xs">候補ソースを読み込んでいます…</p>}
+                  {sourceChanged && (
+                    <div role="alert" className="space-y-2 rounded border p-3 text-xs">
+                      <p>参照元のSnapshotが変わりました。編集中のソースは保持しています。内容を控えてから最新のソースを読み直してください。</p>
+                      <Button size="sm" variant="outline" onClick={() => {
+                        if (drafts?.confirmDiscard?.() === false || !source) return;
+                        setEditedSource(source.source);
+                        setOriginalSource(source.source);
+                        setLastLoadedSourceIdentity(sourceIdentity);
+                      }}>編集を破棄してソースを読み直す</Button>
+                    </div>
+                  )}
                   {source && (
                     <p className="text-xs text-muted-foreground font-mono break-all">
                       {source.path} :: {source.qualified_name} (lines {source.start_line}-
                       {source.end_line}) @ {source.commit_sha.slice(0, 8)}
                     </p>
                   )}
-                  {!canRun && (
+                  {!approvalState?.active && (
                     <p className="text-xs text-amber-700 dark:text-amber-300">
                       このcomponentのReplayは未承認です -- 上で承認されるまでRunは無効化されます。
+                    </p>
+                  )}
+                  {staleAckMissing && (
+                    <p className="text-xs text-amber-700 dark:text-amber-300" data-testid="workbench-stale-ack-missing">
+                      Snapshot が HEAD より古いため、上の「開始前の確認」にこの Snapshot を使う理由を入力するまで Run は無効です。
                     </p>
                   )}
                   <Tabs defaultValue="direct">
@@ -321,6 +389,7 @@ export default function SimulationWorkbenchPage() {
                     <TabsContent value="direct">
                       <div className="space-y-2">
                         <Textarea
+                          aria-label="候補ソース"
                           value={editedSource}
                           onChange={(e) => setEditedSource(e.target.value)}
                           rows={14}
@@ -333,6 +402,7 @@ export default function SimulationWorkbenchPage() {
                           disabled={
                             !canRun ||
                             !source ||
+                            sourceChanged ||
                             editedSource === source.source ||
                             sourceDiff.isPending ||
                             createVariantRun.isPending
@@ -454,15 +524,20 @@ export default function SimulationWorkbenchPage() {
           )}
 
           <div data-testid="workbench-result-matrix">
-            <ResultMatrix run={activeRun} recordedByTraceId={recordedByTraceId} />
+            {runsQuery.isError && <QueryErrorState target="Replay実行履歴" error={runsQuery.error} onRetry={() => runsQuery.refetch()} />}
+            {runQuery.isError && <QueryErrorState target="Replay実行結果" error={runQuery.error} onRetry={() => runQuery.refetch()} />}
+            {(runsQuery.isLoading || (effectiveActiveRunId != null && runQuery.isLoading)) && <p role="status" className="text-sm">Replay実行結果を読み込んでいます…</p>}
+            {activeRun || (!runsQuery.isError && !runsQuery.isLoading && effectiveActiveRunId == null) ? (
+              <ResultMatrix run={activeRun} recordedByTraceId={recordedByTraceId} />
+            ) : null}
           </div>
 
-          <EscalationPanel
+          {(activeRun || (!runsQuery.isError && !runsQuery.isLoading && effectiveActiveRunId == null)) && <EscalationPanel
             run={activeRun}
             componentId={componentId}
             source={source ?? null}
             selectedTraceId={draftTraceId}
-          />
+          />}
         </div>
       )}
     </div>

@@ -10,7 +10,8 @@ import { cn } from "@/lib/utils";
 import { useAuth } from "@/api/auth";
 import { useSystemState } from "@/api/hooks";
 import { useModalSurface } from "@/lib/modal-surface";
-import type { UserPhase } from "@/api/types";
+import type { SystemStatePhaseCompletion, UserPhase } from "@/api/types";
+import { userPhaseLabel } from "@/components/system-state";
 import { useRef, useState, type RefObject } from "react";
 
 // Issue #179 introduced fixed, explicit headings (Hub / Detail views /
@@ -50,38 +51,71 @@ type NavItem = {
 // Issue #257: a group carries `phases` only when it has phase meaning.
 // Overview and Other opt out entirely (no `phases` field) since neither
 // belongs to a single step of the improvement flow.
-type NavGroup = { heading: string | null; items: NavItem[]; phases?: UserPhase[] };
+//
+// UX audit 2026-11-17 A5: a phase-linked group has NO heading of its own. Its
+// heading is the server's stage name (`phases[].label`, i.e.
+// `state_messages.PHASE_LABELS` -- the same words the header strip and the
+// Overview's loop rail show), with `USER_PHASE_LABELS` as the older-server
+// fallback. A group spanning two phases shows both names, so 1 group = 2
+// stages is readable from the heading. `key` is the stable test/storage id.
+type NavGroup = { key: string; heading: string | null; items: NavItem[]; phases?: UserPhase[] };
 
 const NAV_GROUPS: NavGroup[] = [
   {
+    key: "overview",
     heading: null,
     items: [{ to: "/", icon: LayoutDashboard, label: "Overview" }],
   },
   {
-    heading: "Setup",
+    key: "setup",
+    heading: null,
     phases: ["setup"],
     items: [
-      { to: "/setup-guide", icon: LifeBuoy, label: "Setup Guide" },
+      // UX audit 2026-11-17 A2: the group's first entry must be the setup
+      // phase's first operation (Overview says 「Repository を設定する」).
+      // The connection guide lives beside Connect SDK below.
       { to: "/repository", icon: GitBranch, label: "Repository" },
       { to: "/settings", icon: Settings, label: "Settings" },
     ],
   },
   {
-    heading: "Understand",
+    key: "understand",
+    heading: null,
     phases: ["preparation"],
     items: [
-      { to: "/system-understanding", icon: Brain, label: "System Understanding", keywords: ["現状", "理解"] },
+      { to: "/system-map", icon: Map, label: "システムマップ", keywords: ["system map", "system-map", "全体", "全体を見渡す"] },
+      // UX audit 2026-11-17 A4: 「システム理解」 means Interview -- the screen
+      // that reads the canonical head, where the understanding is confirmed
+      // and questions are answered. It sits above System Understanding, which
+      // shows the code/document evidence and the analysis pipeline.
+      { to: "/interview", icon: MessageSquareText, label: "Interview", keywords: ["インタビュー", "理解", "現状"] },
+      {
+        to: "/system-understanding", icon: Brain, label: "System Understanding", keywords: ["根拠", "解析", "パイプライン"],
+        subtitle: "コードと文書から読み取った根拠と解析状況",
+      },
       { to: "/capability-map", icon: Network, label: "Capability Map", detail: true },
       { to: "/feature-map", icon: Map, label: "Feature Map", detail: true },
       { to: "/flow-explorer", icon: Workflow, label: "Flow Explorer", detail: true },
-      { to: "/interview", icon: MessageSquareText, label: "Interview", keywords: ["インタビュー", "理解"] },
+      // UX audit 2026-11-17 C12: the design lineage reads upstream ->
+      // downstream -- who the System serves (Stakeholder Value Network) ->
+      // what it aims for (Objective Map) -> how it is used (UX Design
+      // Studio) -> how it is delivered (Journey Service Blueprint) -> how it
+      // is traced into code (Functional Lineage). The first two are main
+      // entries so an empty System can read where to start: a detail-view
+      // item renders BELOW every main entry, so keeping Objective Map there
+      // put the head of the chain after its downstream. UX Design Studio is
+      // reached from 「目的から始める」 (A7) while that block is shown.
+      {
+        to: "/stakeholder-value-network", icon: Users, label: "Stakeholder Value Network",
+        subtitle: "当事者とValue Exchangeの追跡", keywords: ["当事者", "利用者", "価値"],
+      },
+      {
+        to: "/objective-map", icon: Target, label: "Objective Map",
+        subtitle: "Vision へ向かうObjective/Milestone とGap Workbench", keywords: ["目標", "中間目標", "Gap"],
+      },
       {
         to: "/ux-design-studio", icon: PenTool, label: "UX Design Studio", keywords: ["要件", "設計", "体験"],
         subtitle: "Journey/Requirement/Solution Designの追跡",
-      },
-      {
-        to: "/stakeholder-value-network", icon: Users, label: "Stakeholder Value Network",
-        subtitle: "当事者とValue Exchangeの追跡", detail: true,
       },
       {
         to: "/journey-blueprint", icon: Rows3, label: "Journey Service Blueprint",
@@ -91,14 +125,11 @@ const NAV_GROUPS: NavGroup[] = [
         to: "/functional-lineage", icon: GitFork, label: "Functional Lineage",
         subtitle: "Purpose → Capability → 実装 → Outcome の追跡とGap", detail: true,
       },
-      {
-        to: "/objective-map", icon: Target, label: "Objective Map",
-        subtitle: "Vision へ向かうObjective/Milestone とGap Workbench", detail: true,
-      },
     ],
   },
   {
-    heading: "Instrument",
+    key: "instrument",
+    heading: null,
     phases: ["instrumentation"],
     items: [
       { to: "/probe-planner", icon: Crosshair, label: "Probe Planner" },
@@ -108,6 +139,13 @@ const NAV_GROUPS: NavGroup[] = [
       // touched here (owned by other in-flight sub-issues).
       { to: "/probe-patterns", icon: BookMarked, label: "Probe Patterns" },
       { to: "/connect-sdk", icon: Plug, label: "Connect SDK" },
+      // UX audit 2026-11-17 A2: the page's content is the SDK connection
+      // walkthrough (token → install → first trace), so it sits next to
+      // Connect SDK. Route unchanged; the old name stays searchable.
+      {
+        to: "/setup-guide", icon: LifeBuoy, label: "接続ガイド",
+        keywords: ["setup guide", "setup-guide", "セットアップ", "接続"],
+      },
       {
         to: "/instrumentation-coverage", icon: Radio, label: "計測カバレッジ", keywords: ["coverage", "動作確認", "ライブ"],
         subtitle: "計測点ごとの受信状況とライブ表示",
@@ -115,7 +153,8 @@ const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    heading: "Observe & Evaluate",
+    key: "observe-&-evaluate",
+    heading: null,
     // Two server phases share one group: observation (trace/shadow
     // watching) and evaluation (candidate judging) both live on these same
     // pages, so splitting them into two nav groups would not match the UI.
@@ -135,6 +174,14 @@ const NAV_GROUPS: NavGroup[] = [
         to: "/trace-analyzers", icon: Filter, label: "Trace Analyzers",
         subtitle: "パターン抽出とshadow diff検出", detail: true,
       },
+      // UX audit 2026-11-17 C13: candidates start in AI Candidate Studio
+      // (Components -> Candidate Studio), which needs no hand-written patch;
+      // Experiments comes after it, as the batch evaluation of candidates
+      // already made.
+      {
+        to: "/candidate-studio", icon: Bot, label: "AI Candidate Studio", keywords: ["候補", "比較", "評価"],
+        subtitle: "会話でAIに指示して候補生成",
+      },
       {
         to: "/experiments", icon: FlaskConical, label: "Experiments", keywords: ["比較", "評価", "実験"],
         subtitle: "候補のバッチ実行と評価",
@@ -142,10 +189,6 @@ const NAV_GROUPS: NavGroup[] = [
       {
         to: "/simulation-workbench", icon: Beaker, label: "Simulation Workbench",
         subtitle: "手動でdiffを編集して検証", detail: true,
-      },
-      {
-        to: "/candidate-studio", icon: Bot, label: "AI Candidate Studio",
-        subtitle: "会話でAIに指示して候補生成",
       },
       {
         to: "/workspaces", icon: MessageSquare, label: "Decision Workspace",
@@ -170,12 +213,14 @@ const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    heading: "Publish",
+    key: "publish",
+    heading: null,
     phases: ["publish"],
     items: [{ to: "/github", icon: GitMerge, label: "GitHub" }],
   },
   {
-    heading: "Other",
+    key: "other",
+    heading: "その他",
     items: [
       // Issue #257 (Generate, decision b): option (a) removal is out of
       // scope ("ページの機能変更・削除は含まない") and option (c) would add
@@ -247,12 +292,35 @@ function SidebarBrand({ collapsed }: { collapsed: boolean }) {
 const PURPOSE_ENTRIES: { to: string; icon: typeof LayoutDashboard; label: string; hint: string }[] = [
   // 全体像: Feature → コード → 入口 → 計測の受信状況を 1 枚で見る。
   { to: "/system-map", icon: Map, label: "全体を見渡す", hint: "システムマップを開く" },
-  { to: "/system-understanding", icon: Brain, label: "現状を理解する", hint: "System Understanding を開く" },
+  // UX audit 2026-11-17 A4: the same destination as Overview's
+  // 「システムを理解する」 CTA -- one screen for 「システム理解」.
+  { to: "/interview", icon: MessageSquareText, label: "現状を理解する", hint: "Interview を開く" },
   { to: "/ux-design-studio", icon: PenTool, label: "要件を設計する", hint: "UX Design Studio を開く" },
   // probe を入れた所が動いているかを、計測点ごとの受信状況とライブ表示で確かめる。
   { to: "/instrumentation-coverage", icon: Radio, label: "動作を確かめる", hint: "計測カバレッジを開く" },
-  { to: "/experiments", icon: FlaskConical, label: "候補を比較評価する", hint: "Experiments を開く" },
+  // UX audit 2026-11-17 C13: AI Candidate Studio, not Experiments --
+  // Experiments needs a hand-written patch, Candidate Studio starts from a
+  // component and an improvement goal.
+  { to: "/candidate-studio", icon: Bot, label: "候補を比較評価する", hint: "AI Candidate Studio を開く" },
 ];
+
+/**
+ * UX audit 2026-11-17 A7: the destinations 「目的から始める」 already offers.
+ * While that block is shown (expanded rail / Drawer, not searching) these are
+ * left out of the groups' main entries below, so no link appears twice. The
+ * collapsed rail has no purpose block, so it still shows every item as an
+ * icon, and the screen search still matches them inside their own group.
+ */
+const PURPOSE_ENTRY_ROUTES = new Set(PURPOSE_ENTRIES.map((entry) => entry.to));
+
+/** Display heading of a group: the server's stage name(s) for a phase-linked group. */
+function groupHeading(
+  group: NavGroup,
+  phases: { phase: UserPhase; label?: string | null }[] | undefined,
+): string | null {
+  if (!group.phases || group.phases.length === 0) return group.heading;
+  return group.phases.map((phase) => userPhaseLabel(phase, phases)).join(" / ");
+}
 
 function isItemActive(to: string, pathname: string): boolean {
   return to === "/" ? pathname === "/" : pathname.startsWith(to);
@@ -353,12 +421,14 @@ function SidebarNavList({
   groups,
   collapsed,
   userPhase,
+  phases,
   onNavigate,
   view,
 }: {
   groups: NavGroup[];
   collapsed: boolean;
   userPhase: UserPhase | undefined;
+  phases: SystemStatePhaseCompletion[] | undefined;
   onNavigate?: () => void;
   view: NavViewState;
 }) {
@@ -368,7 +438,7 @@ function SidebarNavList({
     ? groups.flatMap((group) =>
       group.items
         .filter((item) => matchNavItem(item, view.query))
-        .map((item) => ({ item, heading: group.heading })),
+        .map((item) => ({ item, heading: groupHeading(group, phases) })),
     )
     : [];
   return (
@@ -416,37 +486,62 @@ function SidebarNavList({
           {!collapsed && (
             <div className="space-y-0.5" data-testid="sidebar-purpose-entries">
               <p className="px-3 pb-1 text-xs font-semibold text-muted-foreground">目的から始める</p>
-              {PURPOSE_ENTRIES.map((entry) => (
-                <NavLink
-                  key={entry.to}
-                  to={entry.to}
-                  onClick={onNavigate}
-                  className="flex items-center gap-3 rounded-lg px-3 py-1.5 text-sm text-foreground/90 hover:bg-secondary/50 hover:text-foreground"
-                  data-testid={`sidebar-purpose-${entry.to.replace(/\//g, "")}`}
-                  // 目的の入口は同じ画面への近道なので、現在地の表示は下の
-                  // 機能一覧の側だけで行う (同じ画面に「表示中」が 2 つ出ない)。
-                  aria-current={undefined}
-                >
-                  <entry.icon className="h-4 w-4 shrink-0" />
-                  <span className="flex flex-col">
-                    <span className="font-medium">{entry.label}</span>
-                    <span className="text-[11px] text-muted-foreground">{entry.hint}</span>
-                  </span>
-                </NavLink>
-              ))}
+              {PURPOSE_ENTRIES.map((entry) => {
+                // UX audit 2026-11-17 A7: these destinations are no longer
+                // repeated in the groups below, so the current-location
+                // marker lives here (still exactly one 「表示中」 per screen).
+                const active = isItemActive(entry.to, location.pathname);
+                return (
+                  <NavLink
+                    key={entry.to}
+                    to={entry.to}
+                    onClick={onNavigate}
+                    className={cn(
+                      "flex items-center gap-3 rounded-lg px-3 py-1.5 text-sm",
+                      active
+                        ? "bg-secondary text-foreground"
+                        : "text-foreground/90 hover:bg-secondary/50 hover:text-foreground",
+                    )}
+                    data-testid={`sidebar-purpose-${entry.to.replace(/\//g, "")}`}
+                  >
+                    <entry.icon className="h-4 w-4 shrink-0" />
+                    <span className="flex flex-col">
+                      <span className="flex flex-wrap items-center gap-1.5 font-medium">
+                        <span>{entry.label}</span>
+                        {active && (
+                          <span
+                            className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-medium text-primary-foreground"
+                            data-testid="sidebar-current-badge"
+                          >
+                            表示中
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-[11px] text-muted-foreground">{entry.hint}</span>
+                    </span>
+                  </NavLink>
+                );
+              })}
             </div>
           )}
-          {groups.map((group, gi) => {
-            const slug = group.heading ? group.heading.toLowerCase().replace(/\s+/g, "-") : undefined;
+          {groups.map((group) => {
+            const slug = group.key;
+            const heading = groupHeading(group, phases);
             const phaseState = phaseGroupState(group.phases, userPhase);
-            const primary = collapsed ? group.items : group.items.filter((item) => !item.detail);
+            // UX audit 2026-11-17 A7: with the purpose block visible, its
+            // destinations are not repeated as main entries here. The
+            // collapsed rail has no purpose block and keeps every item.
+            const primary = collapsed
+              ? group.items
+              : group.items.filter((item) => !item.detail && !PURPOSE_ENTRY_ROUTES.has(item.to));
             const details = collapsed ? [] : group.items.filter((item) => item.detail);
             const activeInDetails = details.some((item) => isItemActive(item.to, location.pathname));
-            const detailsKey = group.heading ?? `group-${gi}`;
+            const detailsKey = group.key;
             const detailsOpen = view.detailsOpen[detailsKey] ?? activeInDetails;
+            if (primary.length === 0 && details.length === 0) return null;
             return (
               <div
-                key={group.heading ?? `group-${gi}`}
+                key={group.key}
                 // Issue #466 (UX-13): 将来フェーズのグループも半透明にしない。
                 // リンクは操作できるので、無効に見せてはいけない。フェーズの
                 // 位置は見出しの文字 (「現在」「これから」) で伝える。
@@ -457,14 +552,15 @@ function SidebarNavList({
                 // Overview and Other have no phase and stay undefined.
                 data-phase-state={group.phases ? phaseState : undefined}
               >
-                {group.heading && !collapsed && (
+                {heading && !collapsed && (
                   <p
                     className={cn(
-                      "flex items-center gap-1.5 px-3 pb-1 text-xs font-semibold uppercase tracking-wide",
+                      "flex flex-wrap items-center gap-1.5 px-3 pb-1 text-xs font-semibold tracking-wide",
                       phaseState === "current" ? "text-primary" : "text-muted-foreground",
                     )}
+                    data-testid={`sidebar-group-heading-${slug}`}
                   >
-                    {group.heading}
+                    {heading}
                     {phaseState === "current" && (
                       <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-primary">
                         現在
@@ -595,7 +691,7 @@ export function Sidebar({
           <SidebarBrand collapsed={collapsed} />
         </div>
 
-        <SidebarNavList groups={groups} collapsed={collapsed} userPhase={userPhase} view={view} />
+        <SidebarNavList groups={groups} collapsed={collapsed} userPhase={userPhase} phases={systemState?.phases} view={view} />
 
         <button
           onClick={() => setCollapsed(!collapsed)}
@@ -644,6 +740,7 @@ export function Sidebar({
               groups={groups}
               collapsed={false}
               userPhase={userPhase}
+              phases={systemState?.phases}
               onNavigate={onNavClose}
               view={view}
             />

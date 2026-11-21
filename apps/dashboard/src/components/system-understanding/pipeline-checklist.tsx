@@ -15,15 +15,16 @@ import type {
   SystemUnderstandingPipelineStep,
 } from "@/api/types";
 
+// Client-side fallback only; mirrors state_messages.PIPELINE_STEP_LABELS.
 export const STEP_LABELS: Record<string, string> = {
-  repository_configured: "Repository configured",
-  snapshot_ready: "Snapshot ready",
-  documentation_indexed: "Documentation indexed",
-  documentation_claims_scanned: "Documentation claims scanned",
-  symbols_indexed: "Code symbols indexed",
-  entrypoints_discovered: "Entrypoints discovered",
-  docs_code_reconciled: "Docs-code reconciled",
-  capability_hierarchy_ready: "Capability hierarchy ready",
+  repository_configured: "リポジトリ設定",
+  snapshot_ready: "Snapshot 作成済み",
+  documentation_indexed: "ドキュメント索引",
+  documentation_claims_scanned: "ドキュメント主張スキャン",
+  symbols_indexed: "コードシンボル索引",
+  entrypoints_discovered: "エントリポイント検出",
+  docs_code_reconciled: "Docs-code 照合",
+  capability_hierarchy_ready: "Capability 階層",
 };
 
 const STEP_LINKS: Record<string, string> = {
@@ -158,7 +159,7 @@ export function PipelineChecklist({ steps, checksByStep, pageItems, onRunBuild, 
                   onClick={onRunBuild}
                   disabled={buildDisabled}
                 >
-                  {stateItem.target_ui?.action_label || "Run Build / Refresh"}
+                  {stateItem.target_ui?.action_label || "Build / Refresh を実行"}
                 </Button>
               )}
               {stateItem && stateItem.user_action_kind !== "build" && (
@@ -179,7 +180,7 @@ export function PipelineChecklist({ steps, checksByStep, pageItems, onRunBuild, 
                   onClick={() => setExpandedStep(expanded ? null : s.step)}
                 >
                   <Stethoscope className="h-3 w-3" />
-                  Why? ({relatedChecks.length})
+                  原因を見る ({relatedChecks.length})
                 </Button>
               )}
             </div>

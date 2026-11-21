@@ -18,6 +18,7 @@
 // second, separate narrow-width layout: the responsive grid just collapses
 // the two columns into one.
 
+import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Link } from "react-router-dom";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -40,6 +41,9 @@ import {
 } from "@/components/stakeholder-network/model";
 import { DegradedNote, EmptyNote, LoadErrorCard, LoadingBlock, StateBadge } from "@/components/stakeholder-network/shared";
 import { ValueNetworkGraph } from "@/components/stakeholder-network/graph";
+import {
+  ExchangeCreateForm, ExchangeEditor, NeedSection, ObservationSection, StakeholderCreateForm, StakeholderEditor,
+} from "@/components/stakeholder-network/editors";
 
 const EXCHANGE_KIND_VALUES: ValueNetworkExchangeKind[] = [
   "experience", "service", "information", "money", "authority", "obligation", "risk",
@@ -63,7 +67,7 @@ function FiltersBar({
         value={filters.exchangeKind ?? ""}
         onChange={(e) => onChange({ ...filters, exchangeKind: (e.target.value || null) as never })}
       >
-        <option value="">exchange_kind: すべて</option>
+        <option value="">渡すものの種類: すべて</option>
         {EXCHANGE_KIND_VALUES.map((k) => (
           <option key={k} value={k}>
             {EXCHANGE_KIND_LABEL[k]}
@@ -71,11 +75,11 @@ function FiltersBar({
         ))}
       </Select>
       <Select
-        aria-label="role で絞り込み"
+        aria-label="役割で絞り込み"
         value={filters.role ?? ""}
         onChange={(e) => onChange({ ...filters, role: (e.target.value || null) as never })}
       >
-        <option value="">role: すべて</option>
+        <option value="">役割: すべて</option>
         {ROLE_VALUES.map((r) => (
           <option key={r} value={r}>
             {STAKEHOLDER_ROLE_LABEL[r]}
@@ -83,11 +87,11 @@ function FiltersBar({
         ))}
       </Select>
       <Select
-        aria-label="design_status で絞り込み"
+        aria-label="確定状態で絞り込み"
         value={filters.designStatus ?? ""}
         onChange={(e) => onChange({ ...filters, designStatus: (e.target.value || null) as never })}
       >
-        <option value="">design_status: すべて</option>
+        <option value="">確定状態: すべて</option>
         {DESIGN_STATUS_VALUES.map((s) => (
           <option key={s} value={s}>
             {DESIGN_STATUS_LABEL[s]}
@@ -267,6 +271,9 @@ function NodeDetailPane({
         )}
       </div>
       <NoticesList notices={notices} />
+      <StakeholderEditor stakeholderKey={node.stakeholder_key} />
+      <NeedSection stakeholderKey={node.stakeholder_key} />
+      <ObservationSection stakeholderKey={node.stakeholder_key} />
     </div>
   );
 }
@@ -274,9 +281,11 @@ function NodeDetailPane({
 function EdgeDetailPane({
   edge,
   notices,
+  stakeholders,
 }: {
   edge: ValueNetworkEdgeOut;
   notices: ReturnType<typeof noticesForSubject>;
+  stakeholders: ValueNetworkNodeOut[];
 }) {
   return (
     <div className="space-y-3" data-testid="value-network-edge-detail">
@@ -336,6 +345,7 @@ function EdgeDetailPane({
         )}
       </div>
       <NoticesList notices={notices} />
+      <ExchangeEditor exchangeKey={edge.exchange_key} stakeholders={stakeholders} />
     </div>
   );
 }
@@ -358,7 +368,7 @@ function NoticesList({ notices }: { notices: ReturnType<typeof noticesForSubject
 
 export default function StakeholderValueNetworkPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const { data, isLoading, isError, error, refetch } = useValueNetwork();
+  const { data, isLoading, isError, error, refetch, isFetching } = useValueNetwork();
 
   const filters = filtersFromSearchParams(searchParams);
   const selectedNodeKey = searchParams.get("node");
@@ -387,6 +397,22 @@ export default function StakeholderValueNetworkPage() {
       params.delete("node");
     });
   }
+
+  // C1: a created entity becomes the selection. The URL write is deferred to
+  // an effect so it runs AFTER the create form has re-rendered empty -- the
+  // URL change goes through the unsaved-changes blocker, which would
+  // otherwise still see the just-submitted form as dirty and ask whether to
+  // discard input that was in fact saved.
+  const [pendingSelection, setPendingSelection] = useState<{ kind: "node" | "edge"; key: string } | null>(null);
+  useEffect(() => {
+    if (!pendingSelection) return;
+    if (pendingSelection.kind === "node") selectNode(pendingSelection.key);
+    else selectEdge(pendingSelection.key);
+    // Never cleared: each creation sets a NEW object, so the effect runs
+    // exactly once per created entity. selectNode/selectEdge are re-created
+    // every render; the effect is driven by the pending value alone.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingSelection]);
 
   const nodes = data?.nodes ?? [];
   const edges = data?.edges ?? [];
@@ -418,9 +444,9 @@ export default function StakeholderValueNetworkPage() {
           <h1 className="text-2xl font-bold tracking-tight">Stakeholder Value Network</h1>
           <p className="mt-1 text-sm text-muted-foreground">
             Stakeholder(当事者)と Value Exchange(何を渡し何を受け取るか)の関係を確認します。
-            状態・staleness・気づいたことはすべてサーバーの判定をそのまま表示し、この画面では
-            再計算しません。表示位置(レイアウト)は保存されず、確定・却下などの判断もこの画面
-            からは行いません。
+            Stakeholder・Need・環境の観測・Value Exchange をこの画面で登録・編集し、確定・却下などの
+            判断を記録できます。状態・再確認の要否・気づいたことはサーバーの判定をそのまま表示します。
+            図の表示位置(レイアウト)は保存しません。
           </p>
         </div>
         <Link to={functionalLineageHref} className="text-sm text-primary underline" data-testid="value-network-to-functional-lineage">
@@ -443,7 +469,10 @@ export default function StakeholderValueNetworkPage() {
           <FiltersBar filters={filters} onChange={onFiltersChange} />
 
           {state === "no_data" && (
-            <EmptyNote testId="value-network-no-data">まだありません。Stakeholder / Value Exchange を登録してください。</EmptyNote>
+            <EmptyNote testId="value-network-no-data">
+              まだ Stakeholder も Value Exchange もありません。下の「Stakeholder を追加」から当事者を登録し、
+              続けて「Value Exchange を追加」で当事者の間で何を渡すかを登録してください。
+            </EmptyNote>
           )}
           {state === "filtered_empty" && (
             <EmptyNote testId="value-network-filtered-empty">
@@ -475,15 +504,25 @@ export default function StakeholderValueNetworkPage() {
             </Card>
           )}
 
-          {state === "ready" && (
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-[1fr_1fr_1.2fr]">
+          {/* The lists and their create forms render in every state, including
+              no data: the empty-state copy points at these forms. */}
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-[1fr_1fr_1.2fr]">
               <Card>
                 <CardHeader>
                   <CardTitle as="h2" className="text-base">
                     Stakeholder({displayedNodes.length})
                   </CardTitle>
                 </CardHeader>
-                <CardContent>
+                <CardContent className="space-y-3">
+                  <details className="rounded border p-2" open={nodes.length === 0} data-testid="stakeholder-create-section">
+                    <summary className="cursor-pointer text-sm font-medium">Stakeholder を追加</summary>
+                    <div className="mt-2">
+                      <StakeholderCreateForm onCreated={(key) => setPendingSelection({ kind: "node", key })} />
+                    </div>
+                  </details>
+                  {displayedNodes.length === 0 && nodes.length > 0 && (
+                    <EmptyNote>絞り込み条件に一致する Stakeholder はありません。</EmptyNote>
+                  )}
                   <ul className="space-y-2" data-testid="value-network-node-list">
                     {displayedNodes.map((n) => (
                       <NodeListItem
@@ -504,7 +543,13 @@ export default function StakeholderValueNetworkPage() {
                     Value Exchange({filteredEdges.length})
                   </CardTitle>
                 </CardHeader>
-                <CardContent>
+                <CardContent className="space-y-3">
+                  <details className="rounded border p-2" open={edges.length === 0 && nodes.length > 0} data-testid="exchange-create-section">
+                    <summary className="cursor-pointer text-sm font-medium">Value Exchange を追加</summary>
+                    <div className="mt-2">
+                      <ExchangeCreateForm stakeholders={nodes} onCreated={(key) => setPendingSelection({ kind: "edge", key })} />
+                    </div>
+                  </details>
                   {filteredEdges.length === 0 ? (
                     <EmptyNote>該当する Value Exchange はありません。</EmptyNote>
                   ) : (
@@ -532,24 +577,32 @@ export default function StakeholderValueNetworkPage() {
                 <CardContent>
                   {selectedNode ? (
                     <NodeDetailPane
+                      key={`node:${selectedNode.stakeholder_key}`}
                       node={selectedNode}
                       edges={edges}
                       notices={noticesForSubject(notices, "stakeholder", selectedNode.stakeholder_key)}
                     />
                   ) : selectedEdge ? (
                     <EdgeDetailPane
+                      key={`edge:${selectedEdge.exchange_key}`}
                       edge={selectedEdge}
                       notices={noticesForSubject(notices, "value_exchange", selectedEdge.exchange_key)}
+                      stakeholders={nodes}
                     />
+                  ) : selectedNodeKey || selectedEdgeKey ? (
+                    <EmptyNote testId="value-network-selection-missing">
+                      {isFetching
+                        ? "選択した項目を読み込んでいます…"
+                        : "選択した項目が見つかりません。一覧から選び直してください。"}
+                    </EmptyNote>
                   ) : (
                     <EmptyNote testId="value-network-no-selection">
-                      左の一覧から Stakeholder または Value Exchange を選択してください。
+                      一覧から Stakeholder または Value Exchange を選択すると、ここで内容の編集と判断の記録ができます。
                     </EmptyNote>
                   )}
                 </CardContent>
               </Card>
             </div>
-          )}
         </>
       )}
     </div>

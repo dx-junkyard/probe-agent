@@ -431,3 +431,109 @@ def test_creation_on_a_current_snapshot_records_current_and_needs_no_reason(
         conn.close()
     assert row["snapshot_freshness"] == "current"
     assert row["stale_ack_reason"] is None
+
+
+# --- UX audit 2026-11-17 C3 / C5 / D7 ----------------------------------------
+
+
+def test_one_candidate_plus_the_automatic_baseline_is_enough(
+    admin_client, experiment_repo
+):
+    """C3: the client sends candidates only; the server adds the baseline, so
+    one candidate already makes the baseline-vs-candidate comparison."""
+    headers, snapshot = _setup_snapshot(admin_client, experiment_repo)
+    payload = _create_payload(snapshot["id"])
+    payload["variants"] = payload["variants"][:1]
+    created = admin_client.post("/experiments", json=payload, headers=headers)
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert [v["variant_key"] for v in body["variants"]] == ["baseline", "variant-1"]
+    assert body["run_allowed"] is True
+
+    none = dict(payload, variants=[])
+    assert admin_client.post("/experiments", json=none, headers=headers).status_code == 422
+    too_many = dict(payload, variants=payload["variants"] * 11)
+    assert (
+        admin_client.post("/experiments", json=too_many, headers=headers).status_code
+        == 422
+    )
+
+
+def test_adoption_exposes_the_exact_improvement_patch_and_its_origin(
+    admin_client, experiment_repo
+):
+    """C5: the adopted variant's publish patch is resolved from its own
+    lineage, and the patch list says where each transport row came from."""
+    headers, snapshot = _setup_snapshot(admin_client, experiment_repo)
+    payload = _create_payload(snapshot["id"])
+    payload["variants"] = payload["variants"][:1]
+    created = admin_client.post("/experiments", json=payload, headers=headers).json()
+    assert created["adopted_improvement_patch_id"] is None
+    result = admin_client.post(
+        f"/experiments/{created['id']}/run", headers=headers
+    ).json()
+    assert result["status"] == "completed"
+    # A finished, non-governed Experiment may be re-run (D7).
+    assert result["run_allowed"] is True
+
+    adopted = admin_client.put(
+        f"/experiments/{created['id']}/decision",
+        json={"decision": "adopted", "variant_key": "variant-1", "note": "reviewed"},
+        headers=headers,
+    ).json()
+    patch_id = adopted["adopted_improvement_patch_id"]
+    assert isinstance(patch_id, int)
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        artifact = conn.execute(
+            "SELECT patch_id FROM improvement_publish_artifacts WHERE experiment_id = ?",
+            (created["id"],),
+        ).fetchone()
+    assert artifact["patch_id"] == patch_id
+    detail = admin_client.get(f"/experiments/{created['id']}", headers=headers).json()
+    assert detail["adopted_improvement_patch_id"] == patch_id
+
+    patches = admin_client.get("/repository/probe-patches", headers=headers).json()
+    improvement = next(p for p in patches if p["id"] == patch_id)
+    assert improvement["origin"] == "improvement"
+    assert improvement["improvement_experiment_id"] == created["id"]
+    assert improvement["improvement_variant_key"] == "variant-1"
+    assert improvement["improvement_variant_label"] == "return two"
+    assert improvement["improvement_adoption_current"] is True
+
+    # Re-deciding keeps the artifact (it is lineage, not state) but it is no
+    # longer the current adoption, and the experiment no longer names a patch.
+    rejected = admin_client.put(
+        f"/experiments/{created['id']}/decision",
+        json={"decision": "rejected", "note": "changed my mind"},
+        headers=headers,
+    ).json()
+    assert rejected["adopted_improvement_patch_id"] is None
+    patches = admin_client.get("/repository/probe-patches", headers=headers).json()
+    stale = next(p for p in patches if p["id"] == patch_id)
+    assert stale["origin"] == "improvement"
+    assert stale["improvement_adoption_current"] is False
+
+
+def test_another_systems_adoption_is_not_reported(admin_client, experiment_repo):
+    headers, snapshot = _setup_snapshot(admin_client, experiment_repo)
+    payload = _create_payload(snapshot["id"])
+    payload["variants"] = payload["variants"][:1]
+    created = admin_client.post("/experiments", json=payload, headers=headers).json()
+    admin_client.post(f"/experiments/{created['id']}/run", headers=headers)
+    admin_client.put(
+        f"/experiments/{created['id']}/decision",
+        json={"decision": "adopted", "variant_key": "variant-1", "note": "ok"},
+        headers=headers,
+    )
+    token = headers["Authorization"].split(" ", 1)[1]
+    other = admin_client.post(
+        "/systems", json={"name": "other", "environment": "test"},
+        headers=_headers(token),
+    ).json()
+    other_patches = admin_client.get(
+        "/repository/probe-patches", headers=_headers(token, other["id"])
+    ).json()
+    assert other_patches == []

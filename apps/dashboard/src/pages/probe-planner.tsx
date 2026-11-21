@@ -18,7 +18,7 @@ import { formatTimestamp } from "@/lib/utils";
 import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch, FlaskConical, GitPullRequest } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import type { ProbePatchOut } from "@/api/types";
+import type { ProbePatchOut, ProbePlanOut, ProbePointOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
 import { PrerequisiteGuide } from "@/components/prerequisite-guide";
@@ -44,6 +44,9 @@ export default function ProbePlannerPage() {
   const plansFailed = plansQuery.isError && !plansData;
   const generatePlan = useGenerateProbePlan();
   const updatePointStatus = useUpdateProbePointStatus();
+  // UX audit 2026-11-17 C4: the approver's pending "入力を保存する" choice per
+  // point. Unset means "follow what the server recorded" (off by default).
+  const [captureChoice, setCaptureChoice] = useState<Record<number, boolean>>({});
   const { data: patches } = useProbePatches();
   const { data: repoStatus } = useRepositoryStatus();
   // Issue #241: an upstream gate (informational, never a hard block). The
@@ -104,7 +107,7 @@ export default function ProbePlannerPage() {
     if (planMatch) {
       cardRefs.current[planId]?.scrollIntoView?.({ behavior: "smooth", block: "start" });
     } else {
-      toast.error(`Probe plan #${planId} was not found.`);
+      toast.error(`Probe Plan #${planId} が見つかりません。`);
     }
   }, [planId, isLoading, planMatch, plansFailed]);
 
@@ -130,7 +133,7 @@ export default function ProbePlannerPage() {
         featureId: formFeatureId.trim(),
         objective: formObjective.trim() || undefined,
       });
-      toast.success("Plan generated");
+      toast.success("Probe Plan を生成しました");
       setShowGenerate(false);
       setDraftDismissed(true);
       setFeatureId(null);
@@ -150,7 +153,7 @@ export default function ProbePlannerPage() {
           className="inline-flex items-center text-xs text-primary hover:underline"
           data-testid="back-to-capability"
         >
-          ← Back to Capability: {capabilityContext}
+          ← Capability に戻る: {capabilityContext}
         </Link>
       )}
       <div className="flex items-center justify-between">
@@ -168,7 +171,7 @@ export default function ProbePlannerPage() {
           title={repoGate.blocked ? [repoGate.summary, repoGate.remediation].filter(Boolean).join(" ") : undefined}
         >
           <Crosshair className="h-4 w-4 mr-1" />
-          {generatePlan.isPending ? "Generating..." : "Generate Plan"}
+          {generatePlan.isPending ? "生成中..." : "Probe Plan を生成"}
         </Button>
       </div>
 
@@ -176,14 +179,14 @@ export default function ProbePlannerPage() {
         <p className="text-xs text-destructive" data-testid="generate-plan-blocked-reason">
           {repoGate.summary} {repoGate.remediation}{" "}
           {repoGate.to && (
-            <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Go to Repository"}</Link>
+            <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Repository へ移動"}</Link>
           )}
         </p>
       )}
 
       {plansData?.is_mock && (
         <div className="rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
-          Mock data — not from a real LLM analysis.
+          Mock データです（実際の LLM 解析の結果ではありません）。
         </div>
       )}
 
@@ -198,7 +201,7 @@ export default function ProbePlannerPage() {
           data-testid="probe-plans-error"
         />
       ) : !plans.length ? (
-        <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">No probe plans yet. Generate a plan to start.</CardContent></Card>
+        <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">Probe Plan はまだありません。「Probe Plan を生成」から作成してください。</CardContent></Card>
       ) : (
         <div className="space-y-4">
           {plans.map(plan => {
@@ -237,7 +240,7 @@ export default function ProbePlannerPage() {
                     <div className="flex items-center gap-2 shrink-0">
                       <span className="text-xs text-muted-foreground">{formatTimestamp(plan.created_at)}</span>
                       <div onClick={e => e.stopPropagation()}>
-                        <AddToWorkspaceButton itemType="probe_plan" itemId={String(plan.id)} label={`Plan: ${plan.feature_id}`} />
+                        <AddToWorkspaceButton itemType="probe_plan" itemId={String(plan.id)} label={`Probe Plan: ${plan.feature_id}`} />
                       </div>
                     </div>
                   </div>
@@ -245,16 +248,58 @@ export default function ProbePlannerPage() {
                 {expanded && (
                   <CardContent className="space-y-4">
                     <div>
-                      <h4 className="text-sm font-medium mb-2">Probe Points ({plan.probe_points.length})</h4>
+                      <h4 className="text-sm font-medium mb-2">Probe Point（{plan.probe_points.length} 件）</h4>
                       <div className="space-y-2">
-                        {plan.probe_points.map(pt => (
-                          <div key={pt.id} className="flex items-center justify-between rounded-lg border p-3 text-sm">
+                        {plan.probe_points.map(pt => {
+                          const capture = replayCaptureAvailability(pt);
+                          const recorded = !!pt.replay_capture;
+                          const chosen = capture.selectable
+                            ? (captureChoice[pt.id] ?? recorded)
+                            : false;
+                          return (
+                          <div key={pt.id} className="flex items-start justify-between rounded-lg border p-3 text-sm" data-testid={`probe-point-${pt.id}`}>
                             <div className="space-y-1">
                               <div className="font-mono text-xs">{pt.path}:{pt.symbol}</div>
                               <div className="text-xs text-muted-foreground">
-                                Lines {pt.line_start}–{pt.line_end} · Mode: {pt.recommended_mode} · Risk: {pt.side_effect_risk}
+                                行 {pt.line_start}–{pt.line_end} · 推奨 mode: {pt.recommended_mode} · 副作用リスク: {pt.side_effect_risk}
                               </div>
                               <div className="text-xs">{pt.reason}</div>
+                              {/* UX audit 2026-11-17 C4: opt-in input capture for
+                                  Replay, decided by the approver per point. The
+                                  risk and replayability shown are the point's own
+                                  stored values -- nothing is re-judged here. */}
+                              <div className="mt-2 rounded-md border bg-muted/40 p-2 text-xs space-y-1" data-testid={`replay-capture-${pt.id}`}>
+                                <label className="flex items-center gap-2">
+                                  <input
+                                    type="checkbox"
+                                    checked={chosen}
+                                    disabled={!capture.selectable}
+                                    onChange={e => setCaptureChoice(prev => ({ ...prev, [pt.id]: e.target.checked }))}
+                                    data-testid={`replay-capture-checkbox-${pt.id}`}
+                                  />
+                                  <span className="font-medium">入力を保存する（Replay に使う）</span>
+                                </label>
+                                <div className="text-muted-foreground">
+                                  副作用リスク: {pt.side_effect_risk} · Replay の見込み: {pt.replayability || "未記載"}
+                                </div>
+                                {!capture.selectable ? (
+                                  <p className="text-destructive" data-testid={`replay-capture-disabled-${pt.id}`}>
+                                    {capture.reason}
+                                  </p>
+                                ) : (
+                                  <p className="text-muted-foreground">
+                                    既定では保存しません。選んだ場合は承認ボタンを押したときに、承認と同じあなたの判断として記録されます。
+                                    保存される入力には SDK と Control Server の秘匿値の除去が掛かります。
+                                    {capture.caution ? ` ${capture.caution}` : ""}
+                                  </p>
+                                )}
+                                {pt.status === "approved" && (
+                                  <p data-testid={`replay-capture-recorded-${pt.id}`}>
+                                    記録済みの判断: {recorded ? "入力を保存する" : "入力を保存しない"}
+                                    {capture.selectable && chosen !== recorded && "（変更は承認ボタンで記録されます）"}
+                                  </p>
+                                )}
+                              </div>
                             </div>
                             <div className="flex items-center gap-1 shrink-0 ml-4">
                               <Badge variant={pt.status === "approved" ? "success" : pt.status === "rejected" ? "destructive" : "secondary"}>
@@ -262,31 +307,34 @@ export default function ProbePlannerPage() {
                               </Badge>
                               <Button
                                 variant="ghost" size="icon" className="h-7 w-7"
-                                onClick={() => updatePointStatus.mutateAsync({ pointId: pt.id, status: "approved" }).catch(e => toast.error(String(e)))}
+                                aria-label="承認する"
+                                onClick={() => updatePointStatus.mutateAsync({ pointId: pt.id, status: "approved", replayCapture: chosen }).catch(e => toast.error(String(e)))}
                               >
                                 <CheckCircle className="h-4 w-4 text-emerald-600" />
                               </Button>
                               <Button
                                 variant="ghost" size="icon" className="h-7 w-7"
+                                aria-label="却下する"
                                 onClick={() => updatePointStatus.mutateAsync({ pointId: pt.id, status: "rejected" }).catch(e => toast.error(String(e)))}
                               >
                                 <XCircle className="h-4 w-4 text-red-500" />
                               </Button>
                             </div>
                           </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     </div>
 
                     <div className="flex gap-2">
                       <Button
                         size="sm" variant="outline"
-                        onClick={() => generatePatch.mutateAsync(plan.id).then(() => toast.success("Patch generated")).catch(e => toast.error(String(e)))}
+                        onClick={() => generatePatch.mutateAsync(plan.id).then(() => toast.success("patch を生成しました")).catch(e => toast.error(String(e)))}
                         disabled={generatePatch.isPending || !canGeneratePatch}
-                        title={!canGeneratePatch ? "Approve at least one non-denylisted probe point before generating a patch." : undefined}
+                        title={!canGeneratePatch ? "patch を生成する前に、denylist に該当しない Probe Point を 1 つ以上承認してください。" : undefined}
                       >
                         <FileCode className="h-4 w-4 mr-1" />
-                        Generate Patch
+                        patch を生成
                       </Button>
                       {capabilityContext && (
                         <Link
@@ -301,14 +349,14 @@ export default function ProbePlannerPage() {
                     </div>
                     {!canGeneratePatch && (
                       <p className="text-xs text-muted-foreground" data-testid="generate-patch-no-points-reason">
-                        No approved probe points yet — approve at least one point above (denylisted
-                        points cannot be used) before generating a patch.
+                        承認済みの Probe Point がまだありません。patch を生成する前に、上の Probe Point を
+                        1 つ以上承認してください（denylist に該当する Probe Point は使えません）。
                       </p>
                     )}
 
                     {planPatches.length > 0 && (
                       <div>
-                        <h4 className="text-sm font-medium mb-2">Patches</h4>
+                        <h4 className="text-sm font-medium mb-2">patch</h4>
                         {planPatches.map(patch => {
                           // Issue #255: the same staleness condition drives both the
                           // badge and the Apply button's disabled state, so the button
@@ -326,22 +374,22 @@ export default function ProbePlannerPage() {
                                 <Badge variant={patch.apply_status === "applied" ? "success" : patch.status === "failed" ? "destructive" : "secondary"}>
                                   {patch.apply_status === "applied" ? "applied" : patch.status}
                                 </Badge>
-                                <span className="font-mono text-xs" title="Generated for this commit">
+                                <span className="font-mono text-xs" title="この commit に対して生成した patch">
                                   {patch.commit_sha?.slice(0, 8)}
                                 </span>
                                 {patchStale && (
-                                  <Badge variant="destructive" data-testid="patch-stale-badge">HEAD changed</Badge>
+                                  <Badge variant="destructive" data-testid="patch-stale-badge">HEAD が変更されています</Badge>
                                 )}
                               </div>
                               <div className="flex gap-1">
                                 <Button
                                   size="sm" variant="outline"
-                                  onClick={() => validatePatch.mutateAsync(patch.id).then(() => toast.success("Validation started")).catch(e => toast.error(String(e)))}
+                                  onClick={() => validatePatch.mutateAsync(patch.id).then(() => toast.success("検証を開始しました")).catch(e => toast.error(String(e)))}
                                   disabled={validatePatch.isPending || patch.status === "failed"}
-                                  title={patch.status === "failed" ? "Cannot validate a failed patch." : undefined}
+                                  title={patch.status === "failed" ? "生成に失敗した patch は検証できません。" : undefined}
                                 >
                                   <Play className="h-3 w-3 mr-1" />
-                                  Validate
+                                  検証を実行
                                 </Button>
                                 {patch.apply_status !== "applied" && (
                                   <Button
@@ -352,10 +400,10 @@ export default function ProbePlannerPage() {
                                       setApplyConfirmation("");
                                     }}
                                     disabled={applyPatch.isPending || patchStale}
-                                    title={patchStale ? "Regenerate the patch before applying — HEAD has changed." : undefined}
+                                    title={patchStale ? "HEAD が変わったため、適用する前に patch を再生成してください。" : undefined}
                                   >
                                     <GitBranch className="h-3 w-3 mr-1" />
-                                    Apply
+                                    リポジトリへ適用
                                   </Button>
                                 )}
                                 {patch.diff && (
@@ -369,20 +417,20 @@ export default function ProbePlannerPage() {
                                     }}
                                   >
                                     <Download className="h-3 w-3 mr-1" />
-                                    Download
+                                    差分をダウンロード
                                   </Button>
                                 )}
                               </div>
                             </div>
                             {patchStale && (
                               <p className="text-xs text-destructive" data-testid="patch-apply-stale-reason">
-                                This patch is for commit {patch.commit_sha?.slice(0, 8)}. Regenerate it before applying.
+                                この patch は commit {patch.commit_sha?.slice(0, 8)} 向けです。適用する前に再生成してください。
                               </p>
                             )}
                             {patch.status === "failed" && (
                               <p className="text-xs text-destructive" data-testid="validate-patch-failed-reason">
-                                Cannot validate a failed patch{patch.error ? `: ${patch.error}` : "."} Regenerate
-                                the patch after resolving the error.
+                                生成に失敗した patch は検証できません{patch.error ? `: ${patch.error}。` : "。"}エラーを
+                                解消してから patch を再生成してください。
                               </p>
                             )}
                             {patch.diff && (
@@ -392,7 +440,7 @@ export default function ProbePlannerPage() {
                             )}
                             {patch.apply_status === "applied" && (
                               <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/20 dark:text-emerald-200 space-y-1">
-                                <div className="font-medium">Applied to the repository working tree (no commit created).</div>
+                                <div className="font-medium">リポジトリの作業ツリーへ適用しました（commit は作成していません）。</div>
                                 {/* Issue #259: when the GitHub publish workflow is actually
                                     usable, forward to it instead of only describing manual git
                                     steps -- otherwise the manual instructions remain the
@@ -400,42 +448,46 @@ export default function ProbePlannerPage() {
                                 {githubPublishAvailable ? (
                                   <div className="space-y-1" data-testid="patch-publish-next-action">
                                     <p>
-                                      The GitHub publish workflow can commit this validated patch, push it
-                                      to a new branch, and open a Pull Request for review.
+                                      GitHub の publish ワークフローで、検証済みのこの patch を commit して新しい
+                                      branch へ push し、レビュー用の Pull Request を作成できます。
                                     </p>
                                     <Link
                                       to={`/github?patch=${patch.id}`}
                                       className="inline-flex items-center gap-1 font-medium underline"
                                       data-testid="patch-publish-link"
                                     >
-                                      <GitPullRequest className="h-3 w-3" /> Create Publish Job
+                                      <GitPullRequest className="h-3 w-3" /> Publish Job を作成
                                     </Link>
                                   </div>
                                 ) : (
                                   <ol className="list-decimal pl-4 space-y-0.5" data-testid="patch-manual-git-instructions">
-                                    <li>Review the patched files and run tests.</li>
-                                    <li>Commit the changes in the repository.</li>
+                                    <li>patch が変更したファイルを確認し、テストを実行します。</li>
+                                    <li>リポジトリで変更を commit します。</li>
                                     <li>
-                                      Create a new snapshot and rebuild analysis from the{" "}
-                                      <Link to="/repository" className="underline">Repository Refresh Hub</Link>.
+                                      <Link to="/repository" className="underline">Repository Refresh Hub</Link>{" "}
+                                      で新しい Snapshot を作成し、解析を再構築します。
                                     </li>
                                   </ol>
                                 )}
+                                {/* UX audit 2026-11-17 C4: where to watch the
+                                    instrumented components next. Navigation only;
+                                    Trace arrives only after the change is deployed. */}
+                                <PatchObservationLinks plan={plan} />
                               </div>
                             )}
                             <PatchRecovery patch={patch} currentHead={repoStatus?.current_head ?? null} />
                             {patch.apply_error && (
                               <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/20 dark:text-red-200">
-                                Apply failed: {patch.apply_error}
+                                適用に失敗しました: {patch.apply_error}
                               </div>
                             )}
                             {patch.validation_runs?.length > 0 && (
                               <div className="space-y-1">
-                                <h5 className="text-xs font-medium">Validation Runs</h5>
+                                <h5 className="text-xs font-medium">検証の実行結果</h5>
                                 {patch.validation_runs.map(vr => (
                                   <div key={vr.id} className="text-xs flex items-center gap-2">
                                     <Badge variant={vr.overall_success ? "success" : "destructive"} className="text-xs">
-                                      {vr.overall_success ? "PASS" : "FAIL"}
+                                      {vr.overall_success ? "成功" : "失敗"}
                                     </Badge>
                                     <span>{vr.variant}</span>
                                     {vr.total_duration_ms && <span className="text-muted-foreground">{vr.total_duration_ms}ms</span>}
@@ -469,7 +521,7 @@ export default function ProbePlannerPage() {
         }}
       >
         <DialogHeader>
-          <DialogTitle>Generate Probe Plan</DialogTitle>
+          <DialogTitle>Probe Plan を生成</DialogTitle>
         </DialogHeader>
         <div className="space-y-4">
           {/* Issue #241: when preparation is not complete, explain the
@@ -491,27 +543,27 @@ export default function ProbePlannerPage() {
             >
               {repoGate.summary} {repoGate.remediation}{" "}
               {repoGate.to && (
-                <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Go to Repository"}</Link>
+                <Link to={repoGate.to} className="underline">{repoGate.actionLabel ?? "Repository へ移動"}</Link>
               )}
             </div>
           )}
           {workspaceDraft?.draft_type === "probe_plan_draft" && (
             <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
-              Prefilled from Decision Workspace proposal #{workspaceDraft.proposal_id}.
+              Decision Workspace の提案 #{workspaceDraft.proposal_id} から入力しました。
               {(workspaceDraft.payload.constraints?.length ?? 0) > 0 && (
-                <span className="ml-2">Constraints: {workspaceDraft.payload.constraints?.join(", ")}.</span>
+                <span className="ml-2">制約: {workspaceDraft.payload.constraints?.join("、")}。</span>
               )}
               {(workspaceDraft.payload.evaluation_criteria?.length ?? 0) > 0 && (
-                <span className="ml-2">Evaluation: {workspaceDraft.payload.evaluation_criteria?.join(", ")}.</span>
+                <span className="ml-2">評価基準: {workspaceDraft.payload.evaluation_criteria?.join("、")}。</span>
               )}
               {workspaceDraft.missing_fields.length > 0 && (
                 <span className="ml-1 text-muted-foreground">
-                  Missing prerequisites: {workspaceDraft.missing_fields.join(", ")}.
+                  不足している前提: {workspaceDraft.missing_fields.join("、")}。
                 </span>
               )}
               {workspaceIdParam && (
                 <Link className="ml-2 underline" to={`/workspaces?open=${workspaceIdParam}`}>
-                  Back to workspace
+                  Workspace に戻る
                 </Link>
               )}
             </div>
@@ -520,7 +572,7 @@ export default function ProbePlannerPage() {
             <Label>Feature</Label>
             {features.length > 0 ? (
               <Select value={formFeatureId} onChange={e => setFeatureId(e.target.value)}>
-                <option value="">Select feature...</option>
+                <option value="">Feature を選択...</option>
                 {features.map(feature => (
                   <option key={feature.feature_id} value={feature.feature_id}>
                     {feature.feature_id} — {feature.name}
@@ -530,11 +582,11 @@ export default function ProbePlannerPage() {
             ) : (
               <div className="space-y-2" data-testid="planner-no-drafts-note">
                 <div className="rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
-                  No Feature Map drafts yet, so there is nothing to select a feature from. Generate
-                  drafts on the{" "}
-                  <Link to="/feature-map" className="underline">Feature Map</Link> page — build{" "}
+                  Feature Map の draft がまだないため、選択できる Feature がありません。{" "}
+                  <Link to="/feature-map" className="underline">Feature Map</Link>{" "}
+                  画面で draft を生成してください。Snapshot や解析がまだない場合は、先に{" "}
                   <Link to="/system-understanding" className="underline">System Understanding</Link>{" "}
-                  first if no snapshot or analysis exists yet.
+                  を構築してください。
                 </div>
                 {showManualFeatureInput ? (
                   <Input
@@ -552,18 +604,18 @@ export default function ProbePlannerPage() {
                     onClick={() => setManualFeatureEntry(true)}
                     data-testid="planner-manual-feature-toggle"
                   >
-                    Enter feature id manually (advanced)
+                    feature id を手入力する（上級者向け）
                   </Button>
                 )}
               </div>
             )}
           </div>
           <div className="space-y-2">
-            <Label>Observation objective</Label>
+            <Label>観測の目的</Label>
             <Textarea
               value={formObjective}
               onChange={e => setObjective(e.target.value)}
-              placeholder="What should this probe plan help determine?"
+              placeholder="この Probe Plan で何を判断したいですか？"
               rows={3}
             />
           </div>
@@ -572,7 +624,7 @@ export default function ProbePlannerPage() {
             onClick={generate}
             disabled={!formFeatureId.trim() || generatePlan.isPending || repoGate.blocked}
           >
-            {generatePlan.isPending ? "Generating..." : "Generate Plan"}
+            {generatePlan.isPending ? "生成中..." : "Probe Plan を生成"}
           </Button>
         </div>
       </Dialog>
@@ -587,19 +639,19 @@ export default function ProbePlannerPage() {
         }}
       >
         <DialogHeader>
-          <DialogTitle>Apply Probe Patch to Repository</DialogTitle>
+          <DialogTitle>計測 patch をリポジトリへ適用</DialogTitle>
         </DialogHeader>
         {applyTarget && (
           <div className="space-y-4">
             <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-100">
-              This writes the instrumentation patch directly to the source repository working tree. It does not create a commit.
+              計測用の patch をソースリポジトリの作業ツリーへ直接書き込みます。commit は作成しません。
             </div>
             <div className="space-y-1 text-sm">
-              <div>Snapshot commit: <code className="font-mono text-xs">{applyTarget.commit_sha}</code></div>
-              <div>The repository HEAD must match this commit and the working tree must be clean.</div>
+              <div>Snapshot の commit: <code className="font-mono text-xs">{applyTarget.commit_sha}</code></div>
+              <div>リポジトリの HEAD がこの commit と一致し、作業ツリーに未 commit の変更がないことが必要です。</div>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">Type APPLY to confirm</label>
+              <label className="text-sm font-medium">確認のため APPLY と入力してください</label>
               <Input
                 value={applyConfirmation}
                 onChange={e => setApplyConfirmation(e.target.value)}
@@ -615,13 +667,13 @@ export default function ProbePlannerPage() {
                   patchId: applyTarget.id,
                   expectedCommitSha: applyTarget.commit_sha,
                 }).then(() => {
-                  toast.success("Patch applied to repository");
+                  toast.success("patch をリポジトリへ適用しました");
                   setApplyTarget(null);
                   setApplyConfirmation("");
                 }).catch(e => toast.error(String(e)));
               }}
             >
-              {applyPatch.isPending ? "Applying..." : "Apply to Repository"}
+              {applyPatch.isPending ? "適用中..." : "適用を実行"}
             </Button>
           </div>
         )}
@@ -647,22 +699,22 @@ function PatchRecovery({ patch, currentHead }: { patch: ProbePatchOut; currentHe
     >
       {headChanged && (
         <div>
-          <div className="font-medium">Repository HEAD changed since this patch was generated.</div>
+          <div className="font-medium">この patch の生成後にリポジトリの HEAD が変わりました。</div>
           <div>
-            This patch was generated for <code>{patch.commit_sha?.slice(0, 8)}</code>; HEAD is now{" "}
-            <code>{currentHead?.slice(0, 8)}</code>. It cannot be applied after HEAD changed. Create a
-            new snapshot, rebuild the plan, and regenerate the patch from the{" "}
-            <Link to="/repository" className="underline">Repository Refresh Hub</Link>.
+            この patch は <code>{patch.commit_sha?.slice(0, 8)}</code> 向けに生成されましたが、HEAD は現在{" "}
+            <code>{currentHead?.slice(0, 8)}</code> です。HEAD が変わった後は適用できません。{" "}
+            <Link to="/repository" className="underline">Repository Refresh Hub</Link>{" "}
+            で新しい Snapshot を作成し、Probe Plan を作り直してから patch を再生成してください。
           </div>
         </div>
       )}
       {applyConflict && (
         <div>
-          <div className="font-medium">Apply the patch manually:</div>
+          <div className="font-medium">patch を手動で適用する手順:</div>
           <ol className="list-decimal pl-4 space-y-0.5">
-            <li>Download the patch, then check it before applying.</li>
-            <li>If <code>git apply --check</code> fails on a dirty tree, commit / stash / revert first.</li>
-            <li>If the conflict cannot be resolved, recreate the plan from the latest snapshot.</li>
+            <li>patch をダウンロードし、適用する前に確認します。</li>
+            <li>未 commit の変更があって <code>git apply --check</code> が失敗する場合は、先に commit / stash / revert します。</li>
+            <li>競合を解消できない場合は、最新の Snapshot から Probe Plan を作り直します。</li>
           </ol>
         </div>
       )}
@@ -672,6 +724,75 @@ function PatchRecovery({ patch, currentHead }: { patch: ProbePatchOut; currentHe
         `git apply --check ${patchFile}`,
         `git apply ${patchFile}`,
       ].join("\n")}</pre>
+    </div>
+  );
+}
+
+
+/**
+ * UX audit 2026-11-17 C4: whether the approver may choose input capture for
+ * this point. Reads only the point's existing finite values
+ * (`denylist_hit`, `side_effect_risk`), mirroring the server's own refusal
+ * (409 for `high`) -- it adds no new risk judgement (Principle 4 / 6).
+ */
+function replayCaptureAvailability(
+  pt: Pick<ProbePointOut, "denylist_hit" | "side_effect_risk">,
+): { selectable: boolean; reason?: string; caution?: string } {
+  if (pt.denylist_hit) {
+    return {
+      selectable: false,
+      reason: "安全のための除外リストに該当する計測点なので、入力は保存できません。",
+    };
+  }
+  if (pt.side_effect_risk === "high") {
+    return {
+      selectable: false,
+      reason:
+        "副作用リスクが high の計測点なので、入力は保存できません。副作用のある処理は Replay の対象にしません。",
+    };
+  }
+  if (pt.side_effect_risk === "medium") {
+    return {
+      selectable: true,
+      caution: "副作用リスクが medium です。再実行しても外部へ影響しない処理か確かめてから選んでください。",
+    };
+  }
+  return { selectable: true };
+}
+
+/**
+ * UX audit 2026-11-17 C4: after an applied patch, link to where the
+ * instrumented components are observed. Navigation only -- nothing runs.
+ */
+function PatchObservationLinks({ plan }: { plan: ProbePlanOut }) {
+  const componentIds = Array.from(new Set(
+    plan.probe_points
+      .filter(pt => pt.status === "approved" && !pt.denylist_hit && pt.component_id)
+      .map(pt => pt.component_id as string),
+  ));
+  return (
+    <div className="space-y-1 pt-1" data-testid="patch-observation-links">
+      <p>
+        変更をデプロイすると Trace が届き始めます。計測した component の観測状況は次の画面で確かめられます。
+      </p>
+      <ul className="flex flex-wrap gap-x-3 gap-y-1">
+        {componentIds.map(id => (
+          <li key={id}>
+            <Link
+              to={`/components?component=${encodeURIComponent(id)}`}
+              className="underline font-mono"
+              data-testid={`patch-observe-component-${id}`}
+            >
+              {id} の観測画面
+            </Link>
+          </li>
+        ))}
+        <li>
+          <Link to="/instrumentation-coverage" className="underline" data-testid="patch-observe-coverage">
+            計測カバレッジ
+          </Link>
+        </li>
+      </ul>
     </div>
   );
 }

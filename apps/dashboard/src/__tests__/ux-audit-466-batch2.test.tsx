@@ -140,6 +140,8 @@ describe("UX-04: 入力途中の候補を黙って除外しない", () => {
     mockExperimentsApi();
     const { dialog } = await openCreateDialog();
     fillBasics(dialog);
+    // C3 以降、初期の候補行は 1 件。3 行にするため 2 回追加する。
+    fireEvent.click(within(dialog).getByRole("button", { name: /候補を追加/ }));
     fireEvent.click(within(dialog).getByRole("button", { name: /候補を追加/ }));
     for (const [i, label, patch] of [[1, "a", "diff a"], [2, "b", "diff b"]] as const) {
       fireEvent.change(within(dialog).getByLabelText(`候補 ${i} のラベル`), { target: { value: label } });
@@ -173,6 +175,8 @@ describe("UX-04: 入力途中の候補を黙って除外しない", () => {
     mockApi.post.mockResolvedValue({ id: 9 });
     const { dialog } = await openCreateDialog();
     fillBasics(dialog);
+    // C3 以降、初期の候補行は 1 件。3 行にするため 2 回追加する。
+    fireEvent.click(within(dialog).getByRole("button", { name: /候補を追加/ }));
     fireEvent.click(within(dialog).getByRole("button", { name: /候補を追加/ }));
     for (const [i, label, patch] of [[1, "a", "diff a"], [2, "b", "diff b"]] as const) {
       fireEvent.change(within(dialog).getByLabelText(`候補 ${i} のラベル`), { target: { value: label } });
@@ -271,13 +275,13 @@ describe("UX-03: タブ往復で編集中のフォームを失わない", () => 
     const { default: RepositoryPage } = await import("@/pages/repository");
     renderAt(<RepositoryPage />, "/repository");
 
-    const include = await screen.findByLabelText(/Include Patterns/);
+    const include = await screen.findByLabelText(/対象パターン/);
     fireEvent.change(include, { target: { value: "*.py\n*.ts\nsrc/**" } });
     expect(screen.getByTestId("repo-config-unsaved")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("tab", { name: "Snapshots" }));
-    fireEvent.click(screen.getByRole("tab", { name: "Configuration" }));
-    expect(screen.getByLabelText(/Include Patterns/)).toHaveValue("*.py\n*.ts\nsrc/**");
+    fireEvent.click(screen.getByRole("tab", { name: "Snapshot" }));
+    fireEvent.click(screen.getByRole("tab", { name: "設定" }));
+    expect(screen.getByLabelText(/対象パターン/)).toHaveValue("*.py\n*.ts\nsrc/**");
   });
 });
 
@@ -298,13 +302,13 @@ describe("UX-05: 取得失敗と 0 件を区別する", () => {
     const error = await screen.findByTestId("probe-plans-error");
     expect(error).toHaveAttribute("data-failure-kind", "server");
     expect(error).toHaveTextContent("db locked");
-    expect(screen.queryByText(/No probe plans yet/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Probe Plan はまだありません/)).not.toBeInTheDocument();
     const { toast } = await import("sonner");
-    expect(toast.error).not.toHaveBeenCalledWith(expect.stringContaining("was not found"));
+    expect(toast.error).not.toHaveBeenCalledWith(expect.stringContaining("が見つかりません"));
 
     fail = false;
     fireEvent.click(within(error).getByRole("button", { name: "再試行" }));
-    expect(await screen.findByText(/No probe plans yet/)).toBeInTheDocument();
+    expect(await screen.findByText(/Probe Plan はまだありません/)).toBeInTheDocument();
   });
 
   test("Probe Planner: 権限エラー (403) も 0 件にしない", async () => {
@@ -374,6 +378,8 @@ describe("UX-05 / UX-12: Journey Service Blueprint", () => {
 describe("R3: 作成の応答待ち中に追記した内容を成功時に消さない", () => {
   async function fillComplete(dialog: HTMLElement) {
     fillBasics(dialog);
+    // C3 以降、初期の候補行は 1 件。2 件で送るため 1 回追加する。
+    fireEvent.click(within(dialog).getByRole("button", { name: /候補を追加/ }));
     for (const [i, label, patch] of [[1, "a", "diff a"], [2, "b", "diff b"]] as const) {
       fireEvent.change(within(dialog).getByLabelText(`候補 ${i} のラベル`), { target: { value: label } });
       fireEvent.change(within(dialog).getByLabelText(`候補 ${i} のpatch`), { target: { value: patch } });
@@ -432,19 +438,19 @@ describe("R4: Repository 設定の保存後に『未保存』が残らない", (
     const { default: RepositoryPage } = await import("@/pages/repository");
     renderAt(<RepositoryPage />, "/repository");
 
-    const include = await screen.findByLabelText(/Include Patterns/);
+    const include = await screen.findByLabelText(/対象パターン/);
     fireEvent.change(include, { target: { value: "*.py\n\n  *.ts  \n" } });
-    fireEvent.change(screen.getByLabelText(/Exclude Patterns/), { target: { value: " \n" } });
+    fireEvent.change(screen.getByLabelText(/除外パターン/), { target: { value: " \n" } });
     expect(screen.getByTestId("repo-config-unsaved")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Save Configuration" }));
+    fireEvent.click(screen.getByRole("button", { name: "設定を保存" }));
     await waitFor(() => expect(mockApi.put).toHaveBeenCalledWith("/repository", expect.objectContaining({
       include_patterns: ["*.py", "*.ts"], exclude_patterns: [],
     })));
     await waitFor(() => expect(screen.queryByTestId("repo-config-unsaved")).not.toBeInTheDocument());
 
     // 意味のある追加編集では再び未保存になる。
-    fireEvent.change(screen.getByLabelText(/Include Patterns/), { target: { value: "*.py\n*.ts\n*.md" } });
+    fireEvent.change(screen.getByLabelText(/対象パターン/), { target: { value: "*.py\n*.ts\n*.md" } });
     expect(screen.getByTestId("repo-config-unsaved")).toBeInTheDocument();
   });
 });

@@ -119,7 +119,7 @@ function overview(overrides: Partial<OverviewOut> = {}): OverviewOut {
     next_action_state: "available",
     next_action_message: "",
     loop_stages: [
-      { stage: "setup", label: "Setup: 対象を登録する", status: "current", meaning: "m", stage_completion_hint: "n", complete: false },
+      { stage: "setup", label: "対象の登録", status: "current", meaning: "m", stage_completion_hint: "n", complete: false },
     ],
     user_phase: "setup",
     runtime: {
@@ -220,9 +220,15 @@ describe("Overview page (Issue #384)", () => {
 
     const grid = container.querySelector(".grid");
     expect(grid).not.toBeNull();
+    // A1 (UX 監査 2026-11-17): Brief + findings share an `xl:contents`
+    // wrapper (a two-column layout from `lg`). `display: contents` removes
+    // the wrapper's own box, so at `xl` ITS children are the grid items.
+    const xlGridItems = Array.from(grid!.children).flatMap((child) =>
+      /\bxl:contents\b/.test(child.className) ? Array.from(child.children) : [child],
+    );
     const regionOf = (testId: string) => {
       const el = screen.getByTestId(testId);
-      return Array.from(grid!.children).find((child) => child.contains(el));
+      return xlGridItems.find((child) => child.contains(el));
     };
     const brief = regionOf("overview-system-brief");
     const findings = regionOf("overview-findings");
@@ -377,6 +383,79 @@ describe("Overview page (Issue #384)", () => {
     expect(cta).toHaveAttribute("data-action-key", "prepare_repository");
     expect(cta).toHaveAttribute("href", "/repository");
     await waitFor(() => expect(screen.getAllByTestId("overview-next-action-cta")).toHaveLength(1));
+  });
+
+  // A1 (UX 監査 2026-11-17): a new System with no repository showed three
+  // 「次の一歩」 -- the Purpose Frame's start link, `next_action`, and the
+  // Objective `next_step` in the same filled style. jsdom has no layout, so
+  // the first-view half of the acceptance condition is checked through the
+  // structure that produces it (one filled control, compact frame, column
+  // classes, DOM order); pixel positions need a real browser.
+  test("A1: exactly one filled primary control, and it is next_action's", async () => {
+    const unknown = (kind: "beneficiary_problem" | "desired_change" | "intervention") => ({
+      id: kind, kind, state: "unknown" as const, display_statement: "", statement: "",
+      confirmation: "ai_hypothesis" as const, confirmation_label: "", provenance: "ai_hypothesis" as const,
+      provenance_label: "", resolution_level: "L0" as const, source_kind: "none" as const,
+      source_ids: [], intent_revision_id: null, understanding_revision_id: null, snapshot_id: null,
+      evidence: [], evidence_stale: false, missing_information: [], is_mock: false,
+    });
+    const frame = {
+      beneficiary_problem: unknown("beneficiary_problem"),
+      desired_change: unknown("desired_change"),
+      intervention: unknown("intervention"),
+    };
+    mockApi.get.mockImplementation((path: string) =>
+      path === "/overview"
+        ? Promise.resolve(
+          overview({
+            interview_session_id: null,
+            purpose_chain: {
+              system_id: 1, session_id: null, generated_at: 1000, frame,
+              elements: Object.values(frame), relations: [], frame_resolution_level: "L0",
+              frame_state: "empty", snapshot_id: null, understanding_revision_id: null,
+              understanding_confirmed_at: null, degraded_sections: [], degraded_detail: {},
+            },
+            purpose_question: null,
+            objective: {
+              vision: null, active_objective: null, active_objective_count: 0,
+              next_milestone: null, primary_gap: null, next_step_requirement_key: null,
+              objective_state: null, next_step: "confirm_vision", next_step_state: "available",
+              next_step_reason: "Vision がまだ確認されていません。",
+              next_step_completion: "c", next_step_value: "v",
+              degraded_sections: [], degraded_detail: {},
+            },
+          } as Partial<OverviewOut>),
+        )
+        : Promise.resolve(null),
+    );
+    const { container } = await renderPage();
+    const cta = await screen.findByTestId("overview-next-action-cta");
+
+    const filled = Array.from(container.querySelectorAll("a, button")).filter((el) =>
+      /(^|\s)bg-primary(\s|$)/.test(el.className),
+    );
+    expect(filled).toEqual([cta]);
+    expect(screen.getByTestId("overview-objective-cta")).toHaveAttribute("data-cta-variant", "outline");
+    // The start-interview link is kept, as a quiet in-sentence link.
+    expect(within(screen.getByTestId("overview-purpose-no-session")).getByRole("link")).toHaveAttribute(
+      "data-cta-variant", "link",
+    );
+
+    // The all-unknown frame is one line, not three rows.
+    expect(screen.getByTestId("overview-purpose-frame")).toHaveAttribute("data-frame-compact", "true");
+
+    // Two columns from lg so 「次にすること」 starts at the top of the content
+    // area at 1024px; the left wrapper dissolves at xl (5/4/3 unchanged).
+    expect(screen.getByTestId("overview-main-grid").className).toMatch(/\blg:grid-cols-12\b/);
+    expect(screen.getByTestId("overview-understanding-column").className).toMatch(/\bxl:contents\b/);
+    expect(screen.getByTestId("overview-action-column").className).toMatch(/\blg:col-span-5\b/);
+    expect(screen.getByTestId("overview-action-column")).toContainElement(cta);
+
+    // The #380 reading order is unchanged: Brief → findings → next action.
+    const brief = screen.getByTestId("overview-system-brief");
+    const findings = screen.getByRole("heading", { level: 2, name: "今わかったこと" });
+    expect(brief.compareDocumentPosition(findings) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(findings.compareDocumentPosition(cta) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
 

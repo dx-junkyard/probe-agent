@@ -492,6 +492,19 @@ describe("Next action (Issue #383)", () => {
     expect(cta).toHaveAttribute("data-action-key", "confirm_understanding");
     expect(cta).toHaveAttribute("href", "/interview?session=7#understanding-brief");
     expect(screen.getAllByTestId("overview-next-action-cta")).toHaveLength(1);
+    // A1: the page's one filled primary control, placed before its reasons.
+    expect(cta).toHaveAttribute("data-cta-variant", "primary");
+    expect(cta.className).toMatch(/\bbg-primary\b/);
+    expect(
+      cta.compareDocumentPosition(screen.getByTestId("overview-next-action-reason")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // The source-finding note no longer assumes 「今わかったこと」 is above it
+    // (in the three-column layout it is to the left).
+    expect(screen.getByTestId("overview-next-action-sources")).toHaveTextContent(
+      "「今わかったこと」の 1 件が理由です。",
+    );
+    expect(screen.getByTestId("overview-next-action-sources")).not.toHaveTextContent("上の");
     expect(screen.getByTestId("overview-next-action-reason")).toHaveTextContent(action.reason);
     expect(screen.getByTestId("overview-next-action-completion")).toHaveTextContent(
       action.completion_condition,
@@ -802,6 +815,10 @@ describe("Objective (Issue #432)", () => {
     expect(cta.tagName).toBe("A");
     expect(cta).toHaveAttribute("href", "/objective-map");
     expect(cta).toHaveTextContent("Objective を作成する");
+    // A1 (UX 監査 2026-11-17): outline, never the filled primary look --
+    // only `next_action`'s CTA is the page's primary action.
+    expect(cta).toHaveAttribute("data-cta-variant", "outline");
+    expect(cta.className).not.toMatch(/\bbg-primary\b/);
   });
 
   test("waiting/unavailable next_step renders only the server's sentence -- no CTA at all (§9.3)", () => {

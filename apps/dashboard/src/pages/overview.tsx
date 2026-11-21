@@ -100,8 +100,8 @@ export default function OverviewPage() {
     return (
       <div className="space-y-4" data-testid="overview-loading">
         <PageHeading system={system} />
-        <div className="grid gap-4 xl:grid-cols-3">
-          <div className="space-y-4 xl:col-span-2">
+        <div className="grid gap-4 lg:grid-cols-3">
+          <div className="space-y-4 lg:col-span-2">
             <Skeleton className="h-64 w-full" />
             <Skeleton className="h-40 w-full" />
           </div>
@@ -203,20 +203,34 @@ export default function OverviewPage() {
           view were below the fold. Source order is unchanged by the split, so
           the single-column stack below `xl` still reads
           Brief → findings → next action → loop → runtime.
-          `items-start` keeps the short column from stretching to the tall one. */}
-      <div className="grid items-start gap-4 xl:grid-cols-12">
-        <div className="xl:col-span-5">
-          <SystemBriefCard
-            overview={overview}
-            interviewHref={interviewHref}
-            visionHref={visionHref}
-            changeSetHref={changeSetHref}
-          />
+          `items-start` keeps the short column from stretching to the tall one.
+
+          A1 (UX 監査 2026-11-17): from `lg` (1024px) the page is two columns —
+          Brief + findings stacked on the left, the action column on the right —
+          so 「次にすること」 starts at the top of the content area instead of
+          below the whole Brief. The left wrapper becomes `xl:contents`, so at
+          `xl` its two children are direct grid items again and the 5/4/3
+          three-column layout is unchanged. The DOM order (and therefore the
+          heading order) stays Brief → findings → next action → loop →
+          objective → runtime at every width. */}
+      <div className="grid items-start gap-4 lg:grid-cols-12" data-testid="overview-main-grid">
+        <div
+          className="space-y-4 lg:col-span-7 xl:contents xl:space-y-0"
+          data-testid="overview-understanding-column"
+        >
+          <div className="xl:col-span-5">
+            <SystemBriefCard
+              overview={overview}
+              interviewHref={interviewHref}
+              visionHref={visionHref}
+              changeSetHref={changeSetHref}
+            />
+          </div>
+          <div className="xl:col-span-4">
+            <FindingsCard overview={overview} />
+          </div>
         </div>
-        <div className="xl:col-span-4">
-          <FindingsCard overview={overview} />
-        </div>
-        <div className="space-y-4 xl:col-span-3">
+        <div className="space-y-4 lg:col-span-5 xl:col-span-3" data-testid="overview-action-column">
           <NextActionCard overview={overview} />
           <LoopRailCard overview={overview} />
           <ObjectiveCard overview={overview} />
@@ -262,21 +276,26 @@ function PageHeading({
   overview?: OverviewOut;
 }) {
   return (
+    // A1 (UX 監査 2026-11-17): the System name shares the h1's line and the
+    // context row sits tight under it, so the first view spends its height
+    // on 「次にすること」 rather than on page chrome. Nothing is removed.
     <div>
-      <h1 className="text-2xl font-bold tracking-tight">Overview</h1>
-      {system ? (
-        <p className="mt-1 text-muted-foreground">
-          {system.name}
-          {system.environment ? ` — ${system.environment}` : ""}
-        </p>
-      ) : (
-        <p className="mt-1 text-muted-foreground">
-          このシステムについて分かっていること、変わったこと、次にすることをまとめます。
-        </p>
-      )}
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+        <h1 className="text-2xl font-bold tracking-tight">Overview</h1>
+        {system ? (
+          <p className="text-muted-foreground" data-testid="overview-system-name">
+            {system.name}
+            {system.environment ? ` — ${system.environment}` : ""}
+          </p>
+        ) : (
+          <p className="text-muted-foreground">
+            このシステムについて分かっていること、変わったこと、次にすることをまとめます。
+          </p>
+        )}
+      </div>
       {overview && (
         <dl
-          className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground"
+          className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground"
           data-testid="overview-context"
           data-help-id="overview.header"
         >

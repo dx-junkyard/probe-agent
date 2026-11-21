@@ -17,15 +17,19 @@ probe-agent:
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from .code_indexer import CodeSymbol
+from .component_ids import derive_component_id
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
 
-PROMPT_VERSION = "v1"
-SCHEMA_VERSION = "v1"
+# v2 (IK-0037): component_id is no longer part of the model output; the
+# system assigns it per (path, qualified_name), see app/component_ids.py.
+PROMPT_VERSION = "v2"
+SCHEMA_VERSION = "v2"
 
 SAFETY_DENYLIST_KEYWORDS: List[str] = [
     "payment", "pay", "billing", "charge", "invoice",
@@ -115,7 +119,9 @@ def _build_link_context(links: List[AcceptedLink]) -> str:
     for link in links:
         decorators = ", ".join(link.decorators) if link.decorators else "none"
         doc = f' doc="{link.docstring[:100]}"' if link.docstring else ""
-        component = f" component_id={link.component_id}" if link.component_id else ""
+        component = (
+            f" already_instrumented_as={link.component_id}" if link.component_id else ""
+        )
         test = " [test]" if link.is_test else ""
         parts.append(
             f"- {link.symbol_qualified_name} ({link.symbol_kind}) "
@@ -146,8 +152,9 @@ Requested observation objective: {objective_hint}
 Accepted code links:
 {link_context}
 
-For each proposed probe point:
-- component_id: a short kebab-case identifier for the component
+For each proposed probe point (identify the symbol by its path and qualified
+name exactly as listed; do not invent a component id -- the system assigns
+and keeps component ids):
 - symbol_qualified_name: exact qualified name from the accepted links
 - symbol_path: file path of the symbol
 - reason: why this symbol should be probed
@@ -167,7 +174,6 @@ Respond with ONLY valid JSON:
   "objective": "string describing the observation goal",
   "probe_points": [
     {{
-      "component_id": "string",
       "symbol_qualified_name": "string",
       "symbol_path": "string",
       "reason": "string",
@@ -180,10 +186,29 @@ Respond with ONLY valid JSON:
 }}"""
 
 
+def _system_component_id(
+    key: Tuple[str, str],
+    link: AcceptedLink,
+    component_ids: Optional[Dict[Tuple[str, str], str]],
+) -> str:
+    """component_id for a planned symbol, assigned by the system (IK-0037).
+
+    The caller normally passes ``component_ids`` resolved against the System's
+    DB (``app.component_ids.assign_component_ids``). Without it, the id already
+    in code wins, else the deterministic derivation from (path, qualified_name).
+    """
+    if component_ids and key in component_ids:
+        return component_ids[key]
+    if link.component_id:
+        return link.component_id
+    return derive_component_id(key[0], key[1])
+
+
 def _parse_plan_response(
     raw_json: str,
     feature_id: str,
     valid_symbols: Dict[Tuple[str, str], AcceptedLink],
+    component_ids: Optional[Dict[Tuple[str, str], str]] = None,
 ) -> Tuple[str, List[ProbePointResult], List[str]]:
     data = json.loads(raw_json)
     if not isinstance(data, dict):
@@ -222,9 +247,9 @@ def _parse_plan_response(
 
         link = valid_symbols[key]
 
-        component_id = str(item.get("component_id", "")).strip()
-        if not component_id:
-            raise PlanValidationError("component_id is required")
+        # Any component_id the model still writes is ignored: the id is
+        # runtime history's key and is assigned by the system (IK-0037).
+        component_id = _system_component_id(key, link, component_ids)
 
         reason = str(item.get("reason", "")).strip()
         if not reason:
@@ -272,6 +297,7 @@ def generate_probe_plan(
     feature_risks: List[str],
     accepted_links: List[AcceptedLink],
     objective_hint: str = "",
+    component_ids: Optional[Dict[Tuple[str, str], str]] = None,
 ) -> PlanResult:
     is_mock = isinstance(client, MockLLMClient)
     if is_mock:
@@ -320,7 +346,9 @@ def generate_probe_plan(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=4096,
+            # Same budget as draft generation (see code_mapper): a 4096 cap can
+            # leave a reasoning model with no room for the answer body.
+            max_tokens=int(os.getenv("INTELLIGENCE_MAX_OUTPUT_TOKENS", "128000")),
         )
     except LLMError as exc:
         return PlanResult(
@@ -348,7 +376,7 @@ def generate_probe_plan(
                 lines = lines[:-1]
             cleaned = "\n".join(lines)
         objective, points, avoid_reasons = _parse_plan_response(
-            cleaned, feature_id, valid_symbols,
+            cleaned, feature_id, valid_symbols, component_ids,
         )
     except (json.JSONDecodeError, PlanValidationError, KeyError, TypeError) as exc:
         return PlanResult(

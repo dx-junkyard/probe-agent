@@ -99,7 +99,7 @@ describe("Login page bootstrap guidance (Issue #265)", () => {
     expect(detail).toHaveTextContent("CONTROL_ADMIN_USERNAME");
     expect(detail).toHaveTextContent("CONTROL_ADMIN_PASSWORD");
     // The plain username/password form must not render alongside it.
-    expect(screen.queryByLabelText("Username")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("ユーザー名")).not.toBeInTheDocument();
   });
 
   test("redacts the specific env var names in production", async () => {
@@ -136,7 +136,7 @@ describe("Login page bootstrap guidance (Issue #265)", () => {
     const { default: LoginPage } = await import("@/pages/login");
     render(<LoginPage />, { wrapper: createWrapper() });
 
-    await screen.findByLabelText("Username");
+    await screen.findByLabelText("ユーザー名");
     expect(screen.queryByTestId("login-bootstrap-guide")).not.toBeInTheDocument();
   });
 });

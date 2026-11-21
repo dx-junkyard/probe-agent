@@ -8,15 +8,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from .feature_registry import RegistryEntry, mint_feature_key, name_slug
 from .git_ops import IndexedFile
 from .llm import LLMClient, LLMConfig, LLMError, MockLLMClient
 
-PROMPT_VERSION = "v1"
-SCHEMA_VERSION = "v1"
+# v3 / schema v2 (IK-0038): the model no longer writes feature_id. It answers
+# each feature with {"same_as": "F<n>"} (a handle of the registry shown in the
+# prompt) or {"new": true}; the system maps handles back to registry keys and
+# mints keys for new features (app/feature_registry.py).
+PROMPT_VERSION = "v3"
+SCHEMA_VERSION = "v2"
 DEFAULT_MAX_OUTPUT_TOKENS = 128_000
 
 
@@ -49,6 +55,40 @@ class FeatureDraft:
     risks: List[str]
     evidence: List[EvidenceItem]
     decision_method: str = "reasoning_llm"
+    # IK-0038: what the model said about identity. ``same_as`` is the raw
+    # handle (or key) it referenced; ``is_new`` its explicit "new" flag;
+    # ``legacy_id`` a feature_id it still wrote (old contract, never minted).
+    same_as: Optional[str] = None
+    is_new: bool = False
+    legacy_id: Optional[str] = None
+
+
+@dataclass
+class FeatureIdResolution:
+    """How each drafted feature got its registry key (IK-0038; IK-0032 fields kept).
+
+    ``reused``: keys matched to an existing registry entry. ``new``: keys
+    minted this run. ``resolved``: kept for the IK-0032 response shape and
+    always empty now (no slug rewriting). ``handle_matched``: ``{handle,
+    feature_key}`` per matched feature. ``minted``: ``{feature_key,
+    display_name}``. ``slug_matches``: safety net -- a ``new`` feature whose
+    name slug equals an existing (registered / retired / historical) key; it
+    is only logged, the model's "new" stands. ``dropped``: items removed by
+    K-0001 normalisation (unknown handle, duplicate same_as). ``normalized``:
+    adjustments that kept an item. ``not_referenced``: live keys this run did
+    not mention (not retired automatically).
+    """
+
+    reused: List[str] = field(default_factory=list)
+    resolved: List[Dict[str, str]] = field(default_factory=list)
+    new: List[str] = field(default_factory=list)
+    previous_run_id: Optional[int] = None
+    handle_matched: List[Dict[str, str]] = field(default_factory=list)
+    minted: List[Dict[str, str]] = field(default_factory=list)
+    slug_matches: List[Dict[str, str]] = field(default_factory=list)
+    dropped: List[Dict[str, Any]] = field(default_factory=list)
+    normalized: List[Dict[str, Any]] = field(default_factory=list)
+    not_referenced: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -59,6 +99,11 @@ class GenerationResult:
     system_profile: Optional[SystemProfileDraft]
     features: List[FeatureDraft]
     error: Optional[str] = None
+    id_resolution: Optional[FeatureIdResolution] = None
+    # Registry rows to persist with the run: {feature_key: summary} for
+    # matched entries and the minted entries (IK-0038).
+    registry_matched: Dict[str, str] = field(default_factory=dict)
+    registry_minted: List[Dict[str, str]] = field(default_factory=list)
 
 
 class DraftValidationError(ValueError):
@@ -87,9 +132,17 @@ def _build_file_context(
                 continue
             total += len(text)
             selected.append(f)
+            # Number every line so evidence ranges can be read off instead of
+            # counted: unnumbered bodies made models overshoot, zero-base or
+            # invert ranges and the whole draft was rejected (IK-0026). The
+            # numbering must match line_counts (splitlines, trailing newline
+            # not counted as a line).
+            numbered = "\n".join(
+                f"{n:4d}| {line}" for n, line in enumerate(text.splitlines(), 1)
+            )
             parts.append(
                 f"### File: {f.path} (type: {source_type})\n"
-                f"<repository_file>\n{text}\n</repository_file>"
+                f"<repository_file>\n{numbered}\n</repository_file>"
             )
 
     return "\n\n".join(parts), selected
@@ -109,6 +162,9 @@ Analyze the following repository snapshot and produce:
 
 Every claim in the System Profile and every Feature MUST include evidence
 with: path (file path), start_line (1-based), end_line (1-based), and summary.
+Each line of every file below is prefixed with its 1-based line number and
+"| ". Use those numbers for start_line and end_line; do not count lines
+yourself, and never cite a number larger than the last one shown for a file.
 
 Respond with ONLY valid JSON matching this schema:
 {{
@@ -123,7 +179,8 @@ Respond with ONLY valid JSON matching this schema:
   }},
   "features": [
     {{
-      "feature_id": "string (kebab-case)",
+      "same_as": "F1 (handle of a registered feature) or null",
+      "new": false,
       "name": "string",
       "summary": "string",
       "user_value": "string",
@@ -134,9 +191,28 @@ Respond with ONLY valid JSON matching this schema:
   ]
 }}
 
-Repository contents:
+Feature identity: do NOT write a feature id. For each feature set exactly one
+of "same_as" (the handle, e.g. "F3", of the registered feature below that
+delivers the same user value) or "new": true (a feature not in the list).
+Use each handle at most once. The system assigns and keeps feature ids.
+
+{previous_features}Repository contents:
 
 {file_context}"""
+
+_PREVIOUS_FEATURES_TEMPLATE = """\
+## Registered features
+
+These features are registered for this system (handle | name | summary | main
+evidence files). Experiments, probe plans and code links refer to them:
+- When a feature you identify delivers the same user value as one listed here,
+  answer "same_as": "<handle>".
+- Answer "new": true only for a feature that is genuinely not listed.
+- Do not split or merge listed features unless the repository contents require it.
+
+{lines}
+
+"""
 
 
 def _parse_evidence(raw: Any, line_counts: Dict[str, int]) -> List[EvidenceItem]:
@@ -158,12 +234,23 @@ def _parse_evidence(raw: Any, line_counts: Dict[str, int]) -> List[EvidenceItem]
             raise DraftValidationError(
                 f"evidence line range must be integers: {path}"
             ) from exc
-        if start_line < 1 or end_line < start_line:
-            raise DraftValidationError(f"invalid evidence line range: {path}")
-        if end_line > line_counts[path]:
+        # Line numbers are a citation-precision problem, not a fabricated path
+        # (IK-0026): models still miscount or invert ranges even with numbered
+        # context. Normalise what can be normalised and only reject a range
+        # that nothing in the file can back. Keep the raw values in the error
+        # so a failed run says what the model actually wrote.
+        line_count = line_counts[path]
+        if start_line < 1:
+            start_line = 1
+        if end_line < start_line:
+            start_line, end_line = end_line, start_line
+        if start_line < 1 or start_line > line_count:
             raise DraftValidationError(
-                f"evidence line range exceeds snapshot content: {path}"
+                "evidence line range exceeds snapshot content: "
+                f"{path} ({e.get('start_line')}-{e.get('end_line')}, {line_count} lines)"
             )
+        if end_line > line_count:
+            end_line = line_count
         summary = str(e.get("summary", "")).strip()
         if not summary:
             raise DraftValidationError(f"evidence summary is required: {path}")
@@ -228,9 +315,14 @@ def _parse_draft_response(
     for fd in features_data:
         if not isinstance(fd, dict):
             raise DraftValidationError("feature items must be objects")
+        same_as = fd.get("same_as")
+        same_as = str(same_as).strip() if same_as not in (None, "", False) else None
+        new_flag = fd.get("new")
+        is_new = new_flag is True or str(new_flag).strip().lower() == "true"
+        legacy = str(fd.get("feature_id") or "").strip() or None
         features.append(
             FeatureDraft(
-                feature_id=_required_text(fd.get("feature_id"), "feature_id"),
+                feature_id="",
                 name=_required_text(fd.get("name"), "feature.name"),
                 summary=_required_text(fd.get("summary"), "feature.summary"),
                 user_value=_required_text(fd.get("user_value"), "feature.user_value"),
@@ -240,6 +332,9 @@ def _parse_draft_response(
                 risks=_string_list(fd.get("risks"), "feature.risks"),
                 evidence=_parse_evidence(fd.get("evidence"), line_counts),
                 decision_method="reasoning_llm",
+                same_as=same_as,
+                is_new=is_new,
+                legacy_id=legacy,
             )
         )
 
@@ -269,7 +364,8 @@ def _mock_drafts(files: List[IndexedFile]) -> Tuple[SystemProfileDraft, List[Fea
     features = []
     if doc_files:
         features.append(FeatureDraft(
-            feature_id="documentation-overview",
+            feature_id="",
+            legacy_id="documentation-overview",
             name="Documentation Overview",
             summary="The repository contains documentation files.",
             user_value="Developers can understand the system from docs.",
@@ -285,7 +381,8 @@ def _mock_drafts(files: List[IndexedFile]) -> Tuple[SystemProfileDraft, List[Fea
         ))
     if src_files:
         features.append(FeatureDraft(
-            feature_id="source-implementation",
+            feature_id="",
+            legacy_id="source-implementation",
             name="Source Implementation",
             summary="The repository contains source code.",
             user_value="Core functionality is implemented in source files.",
@@ -303,21 +400,153 @@ def _mock_drafts(files: List[IndexedFile]) -> Tuple[SystemProfileDraft, List[Fea
     return sp, features
 
 
+_HANDLE_RE = re.compile(r"^\s*\[?\s*f?\s*(\d+)\s*\]?\s*$", re.IGNORECASE)
+
+
+def _previous_features_block(registry: List[RegistryEntry]) -> str:
+    if not registry:
+        return ""
+    lines = []
+    for item in registry:
+        paths = ", ".join(item.evidence_paths) or "none"
+        summary = " ".join((item.summary or "").split())[:200] or "none"
+        lines.append(
+            f"- {item.handle} | name: {item.display_name} | summary: {summary} | evidence: {paths}"
+        )
+    return _PREVIOUS_FEATURES_TEMPLATE.format(lines="\n".join(lines))
+
+
+def _resolve_reference(
+    raw: str, by_handle: Dict[str, RegistryEntry], by_key: Dict[str, RegistryEntry]
+) -> Optional[RegistryEntry]:
+    """Normalise a same_as reference to a registry entry (K-0001).
+
+    Accepts the handle in any case / with brackets ("f3", "[F3]", "3"), and
+    the registry key itself (exact or slug-equal) when the model copied the
+    key instead of the handle. Anything else is unresolvable.
+    """
+    match = _HANDLE_RE.match(raw)
+    if match:
+        return by_handle.get(f"F{int(match.group(1))}")
+    if raw in by_key:
+        return by_key[raw]
+    slug = name_slug(raw)
+    for key, entry in by_key.items():
+        if name_slug(key) == slug:
+            return entry
+    return None
+
+
+def resolve_feature_refs(
+    features: List[FeatureDraft],
+    registry: List[RegistryEntry],
+    taken: Dict[str, str],
+) -> Tuple[List[FeatureDraft], FeatureIdResolution]:
+    """Map handles back to registry keys and mint keys for new features.
+
+    Normalise -> resolve -> drop only the bad item (K-0001): an unknown handle
+    or a second feature claiming an already-used handle is dropped and
+    recorded; the other features are kept. Features with neither same_as nor
+    new are treated as new, except a legacy feature_id equal to a live key,
+    which is taken as a reference to that key (recorded in ``normalized``).
+    ``taken`` maps every key the System has used to its kind
+    (registered / retired / historical); minted keys avoid all of them.
+    """
+    resolution = FeatureIdResolution()
+    by_handle = {entry.handle: entry for entry in registry}
+    by_key = {entry.feature_key: entry for entry in registry}
+    used_keys: Dict[str, int] = {}
+    taken_now = set(taken)
+    kept: List[FeatureDraft] = []
+
+    for index, feature in enumerate(features):
+        entry: Optional[RegistryEntry] = None
+        if feature.same_as is not None:
+            entry = _resolve_reference(feature.same_as, by_handle, by_key)
+            if entry is None:
+                resolution.dropped.append({
+                    "index": index, "name": feature.name,
+                    "same_as": feature.same_as, "reason": "unknown_handle",
+                })
+                continue
+            if feature.is_new:
+                resolution.normalized.append({
+                    "index": index, "name": feature.name,
+                    "note": "same_as and new both set; same_as used",
+                })
+        elif not feature.is_new and feature.legacy_id and feature.legacy_id in by_key:
+            entry = by_key[feature.legacy_id]
+            resolution.normalized.append({
+                "index": index, "name": feature.name,
+                "note": f"legacy feature_id {feature.legacy_id!r} taken as same_as",
+            })
+
+        if entry is not None:
+            if entry.feature_key in used_keys:
+                resolution.dropped.append({
+                    "index": index, "name": feature.name,
+                    "same_as": feature.same_as or entry.feature_key,
+                    "reason": "duplicate_same_as",
+                    "kept_index": used_keys[entry.feature_key],
+                })
+                continue
+            used_keys[entry.feature_key] = index
+            feature.feature_id = entry.feature_key
+            resolution.reused.append(entry.feature_key)
+            resolution.handle_matched.append(
+                {"handle": entry.handle, "feature_key": entry.feature_key}
+            )
+            kept.append(feature)
+            continue
+
+        if not feature.is_new:
+            resolution.normalized.append({
+                "index": index, "name": feature.name,
+                "note": "neither same_as nor new; treated as new",
+            })
+        key = mint_feature_key(feature.name, taken_now)
+        taken_now.add(key)
+        used_keys[key] = index
+        feature.feature_id = key
+        resolution.new.append(key)
+        resolution.minted.append({"feature_key": key, "display_name": feature.name})
+        slug = name_slug(feature.name)
+        if slug and slug in taken:
+            # Safety net only: the model said "new"; log that the name looks
+            # like an existing key so a human can merge it if it is the same.
+            resolution.slug_matches.append({
+                "feature_key": key, "name_slug": slug,
+                "matches": slug, "kind": taken[slug],
+            })
+        kept.append(feature)
+
+    resolution.not_referenced = [
+        entry.feature_key for entry in registry if entry.feature_key not in used_keys
+    ]
+    return kept, resolution
+
+
 def generate_drafts(
     client: LLMClient,
     config: LLMConfig,
     files: List[IndexedFile],
+    registry: Optional[List[RegistryEntry]] = None,
+    taken: Optional[Dict[str, str]] = None,
 ) -> GenerationResult:
+    registry = registry or []
+    taken = taken or {}
     is_mock = isinstance(client, MockLLMClient)
     if is_mock:
         sp, features = _mock_drafts(files)
-        return GenerationResult(
+        features, resolution = resolve_feature_refs(features, registry, taken)
+        return _with_registry(GenerationResult(
             provider="mock",
             model="mock",
             is_mock=True,
             system_profile=sp,
             features=features,
-        )
+            id_resolution=resolution,
+        ))
 
     file_context, context_files = _build_file_context(files)
     if not file_context:
@@ -329,7 +558,10 @@ def generate_drafts(
             features=[],
             error="Snapshot contains no readable text content",
         )
-    prompt = _DRAFT_PROMPT_TEMPLATE.format(file_context=file_context)
+    prompt = _DRAFT_PROMPT_TEMPLATE.format(
+        file_context=file_context,
+        previous_features=_previous_features_block(registry),
+    )
 
     try:
         max_output_tokens = int(
@@ -371,6 +603,13 @@ def generate_drafts(
             for file in context_files
         }
         sp, features = _parse_draft_response(cleaned, line_counts)
+        features, resolution = resolve_feature_refs(features, registry, taken)
+        if not features:
+            reasons = sorted({d["reason"] for d in resolution.dropped})
+            raise DraftValidationError(
+                "no feature left after resolving feature references "
+                f"({', '.join(reasons) or 'none'})"
+            )
     except (json.JSONDecodeError, DraftValidationError, KeyError, TypeError) as exc:
         return GenerationResult(
             provider=config.provider,
@@ -381,10 +620,25 @@ def generate_drafts(
             error=f"Failed to parse LLM response: {exc}",
         )
 
-    return GenerationResult(
+    return _with_registry(GenerationResult(
         provider=config.provider,
         model=config.model,
         is_mock=False,
         system_profile=sp,
         features=features,
-    )
+        id_resolution=resolution,
+    ))
+
+
+def _with_registry(result: GenerationResult) -> GenerationResult:
+    """Fill the registry rows a completed run must persist."""
+    resolution = result.id_resolution
+    if resolution is None:
+        return result
+    summaries = {f.feature_id: f.summary for f in result.features}
+    result.registry_matched = {key: summaries.get(key, "") for key in resolution.reused}
+    result.registry_minted = [
+        {**item, "summary": summaries.get(item["feature_key"], "")}
+        for item in resolution.minted
+    ]
+    return result

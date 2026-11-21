@@ -95,6 +95,40 @@ describe("システムマップ", () => {
     expect(screen.getByText(/この Feature 番号を書いた probe-agent: メタデータがコードにありません/)).toBeInTheDocument();
     expect(screen.getByText("Feature 2 件")).toBeInTheDocument();
     expect(screen.getByText("コードと対応 1 件")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: /システムマップ/ })).toBeInTheDocument();
+  });
+
+  // B8 (UX 監査 2026-11-17): 取得失敗を「0 件」と表示しない。
+  test("a failed fetch shows the error with a retry, never zero counts", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/instrumentation-coverage") return Promise.resolve(COVERAGE);
+      if (path === "/product-features") return Promise.reject(Object.assign(new Error("boom"), { status: 500, detail: "db down" }));
+      return Promise.resolve(null);
+    });
+    const { default: Page } = await import("@/pages/system-map");
+    wrap(<Page />);
+    const alert = await screen.findByTestId("system-map-features-error");
+    expect(alert).toHaveTextContent("Feature 一覧を取得できませんでした");
+    expect(within(alert).getByRole("button", { name: "再試行" })).toBeInTheDocument();
+    expect(screen.queryByTestId("system-map-counts")).not.toBeInTheDocument();
+    expect(screen.queryByText(/0 件/)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("system-map-features-empty")).not.toBeInTheDocument();
+  });
+
+  test("a successful empty Feature list guides to where Features are created", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/instrumentation-coverage") return Promise.resolve({ ...COVERAGE, points: [] });
+      if (path === "/product-features") {
+        return Promise.resolve({ system_id: 7, generated_at: 0, degraded_sections: [], degraded_detail: {}, features: [] });
+      }
+      return Promise.resolve(null);
+    });
+    const { default: Page } = await import("@/pages/system-map");
+    wrap(<Page />);
+    const empty = await screen.findByTestId("system-map-features-empty");
+    expect(empty).toHaveTextContent("Feature はまだ登録されていません");
+    expect(within(empty).getByRole("link")).toHaveAttribute("href", "/ux-design-studio?tab=requirements");
+    expect(screen.getByText("Feature 0 件")).toBeInTheDocument();
   });
 });
 

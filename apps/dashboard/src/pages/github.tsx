@@ -21,6 +21,7 @@ import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
+import { describeRequestFailure } from "@/lib/request-state";
 import {
   GitMerge, RefreshCw, CheckCircle2, XCircle, Trash2, Plus, ExternalLink,
   ShieldCheck, GitPullRequest, AlertTriangle, RotateCcw, History,
@@ -59,6 +60,20 @@ function publishJobStatusVariant(status: PublishJobOut["status"]) {
  * server re-checks this authoritatively at job creation and again right
  * before commit/push (Principle 8's staleness re-check) -- this is only a
  * UI convenience filter, not the source of truth. */
+/**
+ * UX 監査 2026-11-17 C5: patch の出所をサーバーの lineage 値
+ * (`origin` / `improvement_*`) だけで表示する。クライアントで推測しない。
+ * 古い Control Server (origin なし) では従来の「plan #M」表示。
+ */
+export function patchOptionLabel(patch: ProbePatchOut): string {
+  if (patch.origin === "improvement" && patch.improvement_experiment_id != null) {
+    const candidate = patch.improvement_variant_label || patch.improvement_variant_key || "候補";
+    const stale = patch.improvement_adoption_current === false ? "・現在は採用されていません" : "";
+    return `Experiment #${patch.improvement_experiment_id} 採用候補(${candidate}${stale}) · patch #${patch.id} · ${shortSha(patch.commit_sha)}`;
+  }
+  return `観測用 patch #${patch.id} · plan #${patch.plan_id} · ${shortSha(patch.commit_sha)}`;
+}
+
 function isPatchValidationGreen(patch: ProbePatchOut): boolean {
   const latest = (variant: string) => {
     const runs = patch.validation_runs.filter(r => r.variant === variant);
@@ -451,7 +466,7 @@ function CreateConnectionDialog({ open, onOpenChange }: { open: boolean; onOpenC
 
 function PublishJobsPanel({ prefillPatchId }: { prefillPatchId: number | null }) {
   const { data: connections } = useGithubConnections();
-  const { data: patches } = useProbePatches();
+  const { data: patches, isSuccess: patchesLoaded } = useProbePatches();
   const [connectionFilter, setConnectionFilter] = useState<number | null>(null);
   const { data: jobs, isLoading } = usePublishJobs(connectionFilter);
   // Issue #259: only preselect the patch carried in `?patch=` (and only
@@ -475,6 +490,9 @@ function PublishJobsPanel({ prefillPatchId }: { prefillPatchId: number | null })
   const selectedJob = jobs?.find(j => j.id === selectedJobId) ?? null;
   const connectedConnections = (connections ?? []).filter(c => c.status === "connected");
   const prefillOpen = prefillPatch !== null && !prefillDismissed;
+  // `?patch=` が届いたのに公開できる patch として見つからないときは、黙って
+  // 通常の一覧へ落とさずに理由を出す (UX 監査 C5)。
+  const prefillUnavailable = prefillPatchId !== null && patchesLoaded && prefillPatch === null;
 
   return (
     <div className="space-y-4">
@@ -497,6 +515,17 @@ function PublishJobsPanel({ prefillPatchId }: { prefillPatchId: number | null })
           </Button>
         </CardHeader>
         <CardContent className="space-y-4">
+          {prefillPatch !== null && connectedConnections.length === 0 && (
+            <p className="text-xs text-amber-700 dark:text-amber-400" role="status" data-testid="publish-prefill-no-connection">
+              patch #{prefillPatch.id} を公開するには、検証済み(connected)の Connection が必要です。
+              「Connections」タブで Connection を作成・検証してください。
+            </p>
+          )}
+          {prefillUnavailable && (
+            <p className="text-xs text-amber-700 dark:text-amber-400" role="status" data-testid="publish-prefill-unavailable">
+              指定された patch #{prefillPatchId} は、このSystemで公開できる状態(baseline・probed の検証が green)の patch に見つかりません。
+            </p>
+          )}
           <div className="w-64">
             <Select
               value={connectionFilter?.toString() ?? ""}
@@ -602,15 +631,20 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
   const patchId = patchIdOverride !== undefined ? patchIdOverride : prefillPatchId;
 
   const readyPatches = (patches ?? []).filter(isPatchValidationGreen);
+  // 接続済み Connection が 1 つだけなら、それを初期選択にする (選び直しを省く)。
+  const effectiveConnectionId = connectionId ?? (connections.length === 1 ? connections[0].id : null);
 
   const submit = async () => {
-    if (!connectionId || !patchId) return;
+    if (!effectiveConnectionId || !patchId) return;
     try {
-      await createJob.mutateAsync({ connectionId, patchId });
+      await createJob.mutateAsync({ connectionId: effectiveConnectionId, patchId });
       toast.success("Publish jobを作成しました — 準備完了後、承認待ちで一時停止します");
       onOpenChange(false);
       setPatchIdOverride(null);
-    } catch (e) { toast.error(String(e)); }
+    } catch (e) {
+      const failure = describeRequestFailure(e);
+      toast.error(failure.detail ? `Publish jobを作成できませんでした: ${failure.detail}` : "Publish jobを作成できませんでした。もう一度お試しください。");
+    }
   };
 
   return (
@@ -620,7 +654,7 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
         <div className="space-y-2">
           <Label>Connection</Label>
           <Select
-            value={connectionId?.toString() ?? ""}
+            value={effectiveConnectionId?.toString() ?? ""}
             onChange={e => setConnectionId(e.target.value ? Number(e.target.value) : null)}
             data-testid="publish-job-connection-select"
           >
@@ -632,11 +666,12 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
           )}
         </div>
         <div className="space-y-2">
-          <Label>Probe patch</Label>
+          <Label>公開する patch</Label>
           {readyPatches.length === 0 ? (
             <p className="text-xs text-muted-foreground">
-              baseline・probed両方の検証がgreenのpatchがまだありません。先に{" "}
-              <span className="font-medium">Probe Planner</span> ページでpatchを検証してください。
+              公開できる(baseline・probed両方の検証がgreenの)patchがまだありません。観測用 patch は{" "}
+              <span className="font-medium">Probe Planner</span> で検証すると、改善は{" "}
+              <span className="font-medium">Experiments</span> で候補を採用するとここに表示されます。
             </p>
           ) : (
             <Select
@@ -647,7 +682,7 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
               <option value="">patchを選択...</option>
               {readyPatches.map(p => (
                 <option key={p.id} value={p.id}>
-                  Patch #{p.id} · plan #{p.plan_id} · {shortSha(p.commit_sha)}
+                  {patchOptionLabel(p)}
                 </option>
               ))}
             </Select>
@@ -655,7 +690,7 @@ function CreatePublishJobDialog({ open, onOpenChange, connections, defaultConnec
         </div>
         <Button
           className="w-full" onClick={submit}
-          disabled={createJob.isPending || !connectionId || !patchId}
+          disabled={createJob.isPending || !effectiveConnectionId || !patchId}
         >
           {createJob.isPending ? "作成中..." : "Publish Jobを作成"}
         </Button>

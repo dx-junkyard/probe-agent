@@ -16,6 +16,7 @@ import { toast } from "sonner";
 import { MOBILE_NAV_DRAWER_ID } from "./sidebar";
 import { HelpCircle } from "lucide-react";
 import { useHelpMode } from "@/lib/help-mode";
+import { useLocation, useNavigate } from "react-router-dom";
 
 function initTheme() {
   const saved = localStorage.getItem("theme");
@@ -45,7 +46,7 @@ function ThemeToggle({ asMenuItem = false }: { asMenuItem?: boolean }) {
     );
   }
   return (
-    <Button variant="ghost" size="icon" onClick={toggle} title="Toggle theme" aria-label={dark ? "ライトテーマにする" : "ダークテーマにする"}>
+    <Button variant="ghost" size="icon" onClick={toggle} title={dark ? "ライトテーマにする" : "ダークテーマにする"} aria-label={dark ? "ライトテーマにする" : "ダークテーマにする"}>
       {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
     </Button>
   );
@@ -181,6 +182,8 @@ export function Header({
   navDrawerId = MOBILE_NAV_DRAWER_ID,
 }: HeaderProps = {}) {
   const auth = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
   const { user, systems, systemId, selectSystem, logout, refreshSystems } = auth;
   const selectedSystem = systems.find((s) => s.id === systemId);
   const selectedSystemLabel = selectedSystem
@@ -190,6 +193,13 @@ export function Header({
   const drafts = useUiDraftRegistry();
   const [showCreate, setShowCreate] = useState(false);
   const createSystem = useCreateSystem();
+  const changeSystem = (id: number) => {
+    if (id === systemId || drafts?.confirmDiscard?.() === false) return;
+    // Entity selections belong to the previous System. Keep the screen,
+    // but start it without the old query/hash rather than requesting its IDs.
+    navigate(location.pathname, { replace: true });
+    selectSystem(id);
+  };
 
   const handleCreate = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -201,9 +211,17 @@ export function Header({
         description: (fd.get("description") as string) || undefined,
       });
       await refreshSystems();
+      // Confirm immediately before switching, including edits made while the
+      // request was running. Cancelling keeps the new System and current draft.
+      if (drafts?.confirmDiscard?.() === false) {
+        setShowCreate(false);
+        toast.success("System を作成しました。現在の System で作業を続けます。");
+        return;
+      }
+      navigate(location.pathname, { replace: true });
       selectSystem(sys.id);
       setShowCreate(false);
-      toast.success("System created");
+      toast.success("System を作成しました");
     } catch (err) {
       toast.error(String(err));
     }
@@ -245,10 +263,15 @@ export function Header({
               aria-label="System"
               title={selectedSystemLabel}
               value={String(systemId ?? "")}
-              onChange={(e) => { if (drafts?.confirmDiscard?.() !== false) selectSystem(Number(e.target.value)); }}
+              onChange={(e) => changeSystem(Number(e.target.value))}
               className="w-full min-w-0 truncate"
               data-testid="header-system-select"
             >
+              {!selectedSystem && (
+                <option value={String(systemId ?? "")} disabled>
+                  {systemId === null ? "System を選択してください" : "選択していた System は利用できません"}
+                </option>
+              )}
               {systems.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.name}{s.environment ? ` / ${s.environment}` : ""}
@@ -277,7 +300,7 @@ export function Header({
               size="sm"
               className="shrink-0"
               onClick={() => setShowCreate(true)}
-              title="New system"
+              title="System を作成"
               data-testid="header-create-system-button"
             >
               <Plus className="h-4 w-4" />
@@ -290,7 +313,7 @@ export function Header({
             size="icon"
             className="hidden shrink-0 @3xl:inline-flex"
             onClick={() => setShowCreate(true)}
-            title="New system"
+            title="System を作成"
             aria-label="System を作成"
             data-testid="header-create-system-button"
           >
@@ -319,7 +342,7 @@ export function Header({
               )}
             </span>
           )}
-          <Button variant="ghost" size="icon" onClick={requestLogout} title="Logout" aria-label="ログアウト">
+          <Button variant="ghost" size="icon" onClick={requestLogout} title="ログアウト" aria-label="ログアウト">
             <LogOut className="h-4 w-4" />
           </Button>
         </div>
@@ -356,23 +379,23 @@ export function Header({
 
       <Dialog open={showCreate} onOpenChange={setShowCreate}>
         <DialogHeader>
-          <DialogTitle>Create System</DialogTitle>
+          <DialogTitle>System を作成</DialogTitle>
         </DialogHeader>
         <form onSubmit={handleCreate} className="space-y-4">
           <div>
-            <Label htmlFor="name">Name *</Label>
+            <Label htmlFor="name">名前（必須）</Label>
             <Input id="name" name="name" required />
           </div>
           <div>
-            <Label htmlFor="environment">Environment</Label>
-            <Input id="environment" name="environment" placeholder="production" />
+            <Label htmlFor="environment">環境</Label>
+            <Input id="environment" name="environment" placeholder="例: production" />
           </div>
           <div>
-            <Label htmlFor="description">Description</Label>
+            <Label htmlFor="description">説明</Label>
             <Input id="description" name="description" />
           </div>
           <Button type="submit" disabled={createSystem.isPending} className="w-full">
-            {createSystem.isPending ? "Creating..." : "Create"}
+            {createSystem.isPending ? "作成しています…" : "作成する"}
           </Button>
         </form>
       </Dialog>
