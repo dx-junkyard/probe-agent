@@ -22,7 +22,7 @@
 //    null) and 「未リンク」 are three different sentences (#380). A value that
 //    could not be read is never displayed as zero, empty, or "none".
 import { useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   useEvolutionNodes, useEvolutionNode, useEvolutionNodeEvents,
   useCreateEvolutionNode, useTransitionEvolutionNode,
@@ -38,6 +38,9 @@ import { toast } from "sonner";
 import {
   describeTransitionRejection, type EvolutionTransitionRejection,
 } from "@/components/evolution-node/transition-rejection";
+import {
+  EVOLUTION_DECISION_LOCATIONS, decisionRowAnchor, decisionRowLabel, fillNodeId,
+} from "@/components/evolution-node/decision-locations";
 import type {
   EvolutionMaturityState, EvolutionNodeProjectionOut, EvolutionNodeEventOut,
 } from "@/api/types";
@@ -345,10 +348,21 @@ function NodeDetail({ projection }: { projection: EvolutionNodeProjectionOut }) 
               <div className="mt-1 text-xs text-muted-foreground">
                 拒否コード: <span className="font-mono">{rejection.code}</span>
               </div>
+              {rejection.decision && (
+                <a
+                  href={`#${decisionRowAnchor(rejection.decision)}`}
+                  className="mt-1 inline-block text-xs underline"
+                  data-testid="evolution-transition-rejection-decision"
+                >
+                  「{decisionRowLabel(rejection.decision)}」をどこで行えるかを見る
+                </a>
+              )}
             </div>
           )}
         </CardContent>
       </Card>
+
+      <DecisionLocationsCard nodeId={projection.node_id} />
 
       <Card>
         <CardHeader>
@@ -382,6 +396,79 @@ function NodeDetail({ projection }: { projection: EvolutionNodeProjectionOut }) 
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+/** UX audit 2026-11-17 C7: which decisions about this Node can be made
+ * where. A fixed table of code facts (not a server state verdict), shown so
+ * the developer can tell what is "画面未対応（API のみ）" until #401 builds the
+ * lifecycle screens. Rows never change with the Node's state. */
+function DecisionLocationsCard({ nodeId }: { nodeId: number }) {
+  return (
+    <Card data-testid="evolution-decision-locations">
+      <CardHeader>
+        <CardTitle>この Node で行える判断</CardTitle>
+        <CardDescription>
+          判断ごとに、どこで行えるかを示します。「画面未対応（API のみ）」の判断は、
+          lifecycle 画面の統合（#401）までは API を直接呼んで行います。いずれの判断も
+          人間の判断（decision_method: manual）として記録されます。
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b text-left text-xs text-muted-foreground">
+              <th scope="col" className="py-2 pr-2">判断</th>
+              <th scope="col" className="py-2">どこで行えるか</th>
+            </tr>
+          </thead>
+          <tbody>
+            {EVOLUTION_DECISION_LOCATIONS.map((row) => (
+              <tr
+                key={row.id}
+                id={decisionRowAnchor(row.id)}
+                className="border-b align-top"
+                data-testid={`evolution-decision-${row.id}`}
+              >
+                <td className="py-2 pr-2">{row.label}</td>
+                <td className="py-2 space-y-1">
+                  {row.location.kind === "this_screen" ? (
+                    <>
+                      <Badge variant="success">この画面でできる</Badge>
+                      <div className="text-xs text-muted-foreground">{row.location.note}</div>
+                    </>
+                  ) : row.location.kind === "flow_agents" ? (
+                    <>
+                      <Badge variant="secondary">Flow・エージェント群でできる</Badge>
+                      <div className="text-xs">
+                        <Link to={row.location.to} className="underline">
+                          Flow・エージェント群を開く
+                        </Link>
+                      </div>
+                      <div className="text-xs text-muted-foreground">{row.location.note}</div>
+                    </>
+                  ) : (
+                    <>
+                      <Badge variant="outline">画面未対応（API のみ）</Badge>
+                      <ul className="text-xs">
+                        {row.location.endpoints.map((endpoint) => (
+                          <li key={endpoint} className="font-mono">
+                            {fillNodeId(endpoint, nodeId)}
+                          </li>
+                        ))}
+                      </ul>
+                      {row.location.note && (
+                        <div className="text-xs text-muted-foreground">{row.location.note}</div>
+                      )}
+                    </>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </CardContent>
+    </Card>
   );
 }
 

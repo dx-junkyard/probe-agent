@@ -164,6 +164,24 @@ def test_redacted_capture_is_downgraded_from_replayable(client, db_path):
     assert OPENAI_KEY not in row["input_capture_json"]
 
 
+def test_capture_value_shape_is_redacted_without_a_sensitive_key(client, db_path):
+    """UX audit 2026-11-17 C4: a Planner patch may now emit
+    ``replay_capture=True``. The SDK's capture masks by key name; a credential
+    passed positionally has no key, so ingestion's value-shape layer is what
+    keeps it off disk."""
+    client.post(
+        "/traces",
+        json=_trace(
+            input_capture={"args": [OPENAI_KEY], "kwargs": {}},
+            replayability="replayable",
+            replay_reasons=[],
+        ),
+    )
+    row = _stored(db_path)
+    assert OPENAI_KEY not in row["input_capture_json"]
+    assert row["replayability"] == "partial"
+
+
 def test_unreplayable_capture_is_not_upgraded(client, db_path):
     client.post(
         "/traces",

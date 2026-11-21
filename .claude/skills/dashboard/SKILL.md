@@ -27,6 +27,21 @@ The dashboard should support:
 - Repository tab
 - Feature Map tab
 - Probe Planner tab
+  - UX audit 2026-11-17 C4: each probe point carries an opt-in
+    「入力を保存する（Replay に使う）」 choice, sent with the approval
+    (`replay_capture`) and recorded server-side as the approver's
+    `decision_method: manual`. Default off (#243). The checkbox is disabled
+    with a reason when the point's own `denylist_hit` / `side_effect_risk`
+    (`high`) says so — the page adds no risk judgement of its own, and the
+    server refuses the same case with 409. An applied patch links to
+    `/components?component=<id>` and `/instrumentation-coverage` (navigation
+    only).
+- Evolution Nodes (UX audit 2026-11-17 C7): the Node detail shows the fixed
+  `components/evolution-node/decision-locations.ts` table of which decision is
+  made where (この画面 / Flow・エージェント群 / 画面未対応（API のみ） with the
+  real endpoint). It is a code-fact constant, not a state verdict; update it
+  when a decision gains a screen (#401). Rejection codes that ask for an
+  off-screen operation point at the matching row.
 - Probe Patterns tab (Issue #168, `pages/probe-patterns.tsx`): pattern
   list/detail with status (`active`/`stale`/`archived`/`superseded`),
   objective, point counts, source commit, lifecycle history, and the latest

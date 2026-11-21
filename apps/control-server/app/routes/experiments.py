@@ -192,6 +192,40 @@ def _analysis_history(conn, experiment_id: int) -> List[ExperimentAnalysisOut]:
     return [_analysis_out(row, version_id=row["id"]) for row in rows]
 
 
+def _run_allowed(row) -> bool:
+    """The exact guard set of ``run_experiment`` (UX audit 2026-11-17 D7).
+
+    Kept next to that endpoint's checks so the Dashboard's 実行 / 再実行
+    control is offered only when the run would not be refused outright.
+    """
+    governed = (
+        "flow_experiment_proposal_id" in row.keys()
+        and row["flow_experiment_proposal_id"] is not None
+    )
+    return row["status"] != "running" and not governed
+
+
+def _adopted_improvement_patch_id(conn, row) -> Optional[int]:
+    """Resolve the current adoption's publish transport patch (C5).
+
+    Exact lineage only: this experiment -> its adopted variant (by key) ->
+    ``improvement_publish_artifacts`` -> ``patch_id``. No System-wide existence
+    check and no timestamp ordering across experiments (#380).
+    """
+    if row["human_decision"] != "adopted" or not row["human_decision_variant_key"]:
+        return None
+    artifact = conn.execute(
+        """SELECT a.patch_id
+             FROM improvement_publish_artifacts a
+             JOIN experiment_variants v ON v.id = a.variant_id
+            WHERE a.experiment_id = ? AND a.system_id = ?
+              AND v.experiment_id = a.experiment_id AND v.variant_key = ?
+            ORDER BY a.id DESC LIMIT 1""",
+        (row["id"], row["system_id"], row["human_decision_variant_key"]),
+    ).fetchone()
+    return artifact["patch_id"] if artifact is not None else None
+
+
 def _experiment_out(conn, row) -> ExperimentOut:
     variant_rows = conn.execute(
         "SELECT * FROM experiment_variants WHERE experiment_id = ? ORDER BY id",
@@ -255,6 +289,8 @@ def _experiment_out(conn, row) -> ExperimentOut:
         "SELECT * FROM experiment_analyses WHERE experiment_id = ?", (row["id"],)
     ).fetchone()
     return ExperimentOut(
+        run_allowed=_run_allowed(row),
+        adopted_improvement_patch_id=_adopted_improvement_patch_id(conn, row),
         id=row["id"],
         system_id=row["system_id"],
         feature_id=row["feature_id"],

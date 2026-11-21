@@ -1329,6 +1329,14 @@ describe("実フォームの validation error 接続 (#451)", () => {
     mockGet({
       "/solution-designs": solutionDesignListOut([solutionDesignOut({ id: 20, design_key: "design-a" })]),
       "/solution-designs/design-a": solutionDesignDetailOut({ id: 20, design_key: "design-a" }),
+      // UX audit 2026-11-17 C9: the Snapshot and the entry point are picked
+      // from lists, not typed.
+      "/repository/snapshots": [{ id: 5, system_id: 1, commit_sha: "abcdef1234567890", status: "ready" }],
+      "/flow-explanation/subjects?snapshot_id=5": {
+        system_id: 1, generated_at: 1, runtime_flows: [], snapshot_id: 5, snapshot_state: "present",
+        static_flows: [{ subject_kind: "static_flow", subject_ref: "ep-1", label: "POST /checkout", entrypoint_type: "http_route", category: null, handler_path: null, handler_qualified_name: null, snapshot_id: 5 }],
+        degraded_sections: [], degraded_detail: {},
+      },
     });
     mockApi.post.mockRejectedValueOnce(
       new ApiError(
@@ -1342,13 +1350,14 @@ describe("実フォームの validation error 接続 (#451)", () => {
     fireEvent.click(await screen.findByRole("button", { name: "実装対象に紐づける" }));
 
     const form = screen.getByTestId("ux-solution-design-add-target-link-form");
-    // `captured_snapshot_id`'s input only renders for target_kind ==
-    // "static_flow" -- select it before submitting so the field (and its
-    // inline diagnostic slot) exists to attach to.
-    const selects = within(form).getAllByRole("combobox");
-    fireEvent.change(selects[1], { target: { value: "static_flow" } });
-    fireEvent.change(within(form).getByPlaceholderText("target_ref"), { target: { value: "ep-1" } });
+    fireEvent.change(within(form).getByLabelText("実装対象の種類"), { target: { value: "static_flow" } });
+    fireEvent.change(await within(form).findByLabelText("Snapshot"), { target: { value: "5" } });
+    fireEvent.change(await within(form).findByLabelText("実装対象"), { target: { value: "ep-1" } });
     fireEvent.click(within(form).getByRole("button", { name: "紐づける" }));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      expect.stringContaining("/target-links"),
+      expect.objectContaining({ target_kind: "static_flow", target_ref: "ep-1", captured_snapshot_id: 5 }),
+    ));
 
     expect(await within(form).findByText("static_flow の link には captured_snapshot_id が必須です。")).toBeInTheDocument();
     expect(within(form).queryByTestId("ux-solution-design-add-target-link-form-error")).toBeNull();
@@ -1436,4 +1445,174 @@ test("a late successful save preserves edits made while the request was pending"
   fireEvent.change(screen.getByPlaceholderText("要件の文"), { target: { value: "保存中の追加入力" } });
   await act(async () => { finish({}); });
   expect(screen.getByPlaceholderText("要件の文")).toHaveValue("保存中の追加入力");
+});
+
+// --- UX audit 2026-11-17 C2 / C9 / C11 / C12 ----------------------------------
+
+describe("UX 監査 2026-11-17 C11: 作成直後に次の作業へ進める", () => {
+  test("Journey を作成すると、その Journey が選択される", async () => {
+    mockGet({ "/ux-design/journeys/new-journey": journeyDetailOut({ journey_key: "new-journey" }) });
+    mockApi.post.mockResolvedValueOnce(journeyOut({ journey_key: "new-journey" }));
+    await renderPage();
+    const form = await screen.findByTestId("ux-journey-create-form");
+    fireEvent.change(within(form).getByPlaceholderText(/journey_key/), { target: { value: "new-journey" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Journey を作成する" }));
+    expect(await screen.findByTestId("ux-journey-detail")).toBeInTheDocument();
+    expect(screen.queryByTestId("ux-journey-none-selected")).toBeNull();
+  });
+
+  test("Requirement を作成すると、その Requirement が選択される", async () => {
+    mockGet({ "/ux-design/requirements/new-req": requirementDetailOut({ requirement_key: "new-req" }) });
+    mockApi.post.mockResolvedValueOnce(requirementOut({ requirement_key: "new-req" }));
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+    const form = await screen.findByTestId("ux-requirement-create-form");
+    fireEvent.change(within(form).getByPlaceholderText(/requirement_key/), { target: { value: "new-req" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Requirement を作成する" }));
+    expect(await screen.findByTestId("ux-requirement-detail")).toBeInTheDocument();
+  });
+
+  test("Journey Step から Requirement を作成し、その Step があらかじめ選ばれた状態で紐づける", async () => {
+    mockGet({
+      "/ux-design/journeys": journeyListOut([journeyOut({ journey_key: "checkout-to-be" })]),
+      "/ux-design/journeys/checkout-to-be": journeyDetailOut(),
+      "/ux-design/requirements/step-req": requirementDetailOut({ requirement_key: "step-req" }),
+    });
+    mockApi.post
+      .mockResolvedValueOnce(requirementOut({ requirement_key: "step-req" }))
+      .mockResolvedValueOnce({ id: 9 });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("ux-journey-item-checkout-to-be"));
+    fireEvent.click(await screen.findByTestId("ux-journey-step-item-enter-address"));
+    fireEvent.click(await screen.findByTestId("ux-journey-step-create-requirement-enter-address"));
+    const flow = await screen.findByTestId("ux-step-requirement-create-and-link");
+    fireEvent.change(within(flow).getByPlaceholderText(/requirement_key/), { target: { value: "step-req" } });
+    fireEvent.click(within(flow).getByRole("button", { name: "Requirement を作成する" }));
+    await screen.findByTestId("ux-step-requirement-created");
+    await waitFor(() => expect((within(flow).getByLabelText("紐づける Step") as HTMLSelectElement).value).toBe("enter-address"));
+    expect((within(flow).getByLabelText("紐づける Journey") as HTMLSelectElement).value).toBe("checkout-to-be");
+    fireEvent.click(within(flow).getByTestId("ux-requirement-step-link-submit"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenLastCalledWith(
+      "/ux-design/requirements/step-req/step-links",
+      { journey_key: "checkout-to-be", step_key: "enter-address", note: "" },
+    ));
+    // 紐づけ後は作成した Requirement を開く。
+    await waitFor(() => expect(screen.getByTestId("ux-design-studio-tab-requirements")).toHaveAttribute("aria-selected", "true"));
+  });
+});
+
+describe("UX 監査 2026-11-17 C2: Requirement 詳細で Feature の版を保存し確定する", () => {
+  function linkedFeature(overrides: Partial<import("@/api/types").ProductFeatureDetailOut> = {}) {
+    return productFeatureDetailOut({
+      requirement_links: [{
+        id: 1, feature_id: 30, requirement_id: 10, requirement_key: "single-page-checkout",
+        target_resolution: "resolved", recheck_state: "current", superseded_by_id: null,
+      } as unknown as import("@/api/types").ProductFeatureRequirementLinkOut],
+      ...overrides,
+    });
+  }
+
+  async function openRequirement(feature = linkedFeature()) {
+    mockGet({
+      "/ux-design/requirements": requirementListOut([requirementOut()]),
+      "/ux-design/requirements/single-page-checkout": requirementDetailOut(),
+      "/product-features": productFeatureListOut([productFeatureOut()]),
+      "/product-features/single-page-checkout-feature": feature,
+    });
+    await renderPage();
+    fireEvent.click(screen.getByTestId("ux-design-studio-tab-requirements"));
+    fireEvent.click(await screen.findByTestId("ux-requirement-item-single-page-checkout"));
+    return screen.findByTestId("ux-requirement-feature-work-single-page-checkout-feature");
+  }
+
+  test("版を保存する (現在の版から seed した全項目を送る)", async () => {
+    const panel = await openRequirement();
+    mockApi.post.mockResolvedValueOnce(productFeatureOut());
+    fireEvent.change(within(panel).getByLabelText("Feature のタイトル"), { target: { value: "1 画面決済" } });
+    fireEvent.click(within(panel).getByTestId("ux-requirement-feature-revision-submit-single-page-checkout-feature"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-features/single-page-checkout-feature/revisions",
+      { title: "1 画面決済", statement: "", rationale: "", scope_note: "", summary: "" },
+    ));
+  });
+
+  test("確定は確認ダイアログを通り、現在の版の digest を送る", async () => {
+    const panel = await openRequirement(linkedFeature({
+      current_revision: {
+        id: 1, feature_id: 30, revision_number: 1, title: "1 画面決済", statement: "", rationale: "",
+        scope_note: "", summary: "", content_digest: "feat-digest", authored_by_kind: "developer",
+        decision_method: "manual", intelligence_run_id: null, change_note: "", created_by: "dev",
+        created_at: 1000, revision_state: "current", superseded_by_id: null,
+      },
+    }));
+    mockApi.post.mockResolvedValueOnce({ id: 1 });
+    fireEvent.click(within(panel).getByTestId("ux-requirement-feature-decision-single-page-checkout-feature-confirm"));
+    expect(await screen.findByTestId("decision-confirm-dialog")).toHaveTextContent("現在の状態: 未確定");
+    expect(mockApi.post).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("decision-confirm-submit"));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/product-features/single-page-checkout-feature/decisions",
+      { decision: "confirm", rationale: "", captured_digest: "feat-digest" },
+    ));
+  });
+
+  test("取れない遷移はサーバーの拒否を日本語で現在の状態と一緒に出す", async () => {
+    const panel = await openRequirement();
+    mockApi.post.mockRejectedValueOnce(new ApiError(422, "この状態からはその決定を記録できません。", "product_feature_not_decidable"));
+    fireEvent.click(within(panel).getByTestId("ux-requirement-feature-decision-single-page-checkout-feature-reinstate"));
+    fireEvent.click(await screen.findByTestId("decision-confirm-submit"));
+    expect(await screen.findByTestId("ux-requirement-feature-rejected-single-page-checkout-feature"))
+      .toHaveTextContent("この状態からはその決定を記録できません。(現在の状態: 未確定)");
+  });
+});
+
+describe("UX 監査 2026-11-17 C9: Journey の上流参照は一覧から選ぶ", () => {
+  test("Objective を選ぶと objective_key が送られる", async () => {
+    mockGet({
+      "/ux-design/journeys": journeyListOut([journeyOut({ journey_key: "checkout-to-be" })]),
+      "/ux-design/journeys/checkout-to-be": journeyDetailOut(),
+      "/objective-map": {
+        system_id: 1, generated_at: 1, root_objective_ids: [1], degraded_sections: [], degraded_detail: {},
+        nodes: [{ id: 1, objective_key: "o1", title: "離脱を減らす", objective_state: "confirmed", recheck_state: "current",
+          parent_objective_id: null, parent_objective_key: null, child_objective_ids: [], milestones: [] }],
+      },
+    });
+    mockApi.post.mockResolvedValueOnce({ id: 1 });
+    await renderPage();
+    fireEvent.click(await screen.findByTestId("ux-journey-item-checkout-to-be"));
+    fireEvent.click(await screen.findByRole("button", { name: "参照を追加する" }));
+    fireEvent.change(await screen.findByTestId("ux-journey-upstream-ref-target"), { target: { value: "o1" } });
+    fireEvent.click(screen.getByRole("button", { name: "追加する" }));
+    await waitFor(() => expect(mockApi.post).toHaveBeenCalledWith(
+      "/ux-design/journeys/checkout-to-be/upstream-refs",
+      { ref_kind: "product_objective", target_ref: "o1", note: "" },
+    ));
+  });
+});
+
+describe("UX 監査 2026-11-17 C12: Objective が無いときは Objective Map へ案内する", () => {
+  test("Objective 0 件かつ Journey 0 件なら create_objective (Objective Map への遷移)", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    const d = decideNextDesignAction({ journeys: [], requirements: [], designs: [], objectiveCount: 0 });
+    expect(d.kind).toBe("create_objective");
+    expect(d.route).toBe("/objective-map");
+    expect(d.target).toBeNull();
+  });
+
+  test("Objective 件数が不明なら行を飛ばし、推測で 0 件にしない", async () => {
+    const { decideNextDesignAction } = await import("@/components/ux-design/model");
+    expect(decideNextDesignAction({ journeys: [], requirements: [], designs: [], objectiveCount: null }).kind)
+      .toBe("create_journey");
+    expect(decideNextDesignAction({ journeys: [], requirements: [], designs: [], objectiveCount: 2 }).kind)
+      .toBe("create_journey");
+  });
+
+  test("画面の「次に決めること」は Objective Map への CTA を出す", async () => {
+    mockGet({
+      "/objective-map": { system_id: 1, generated_at: 1, nodes: [], root_objective_ids: [], degraded_sections: [], degraded_detail: {} },
+    });
+    await renderPage();
+    expect(await screen.findByText("Objective Map で Objective を作る")).toBeInTheDocument();
+    expect(screen.getByTestId("ux-design-next-decision-cta")).toHaveTextContent("Objective Map へ移動");
+  });
 });

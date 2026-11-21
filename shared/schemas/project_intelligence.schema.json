@@ -253,6 +253,10 @@
         "replayability": { "enum": ["safe", "caution", "unsafe"] },
         "denylist_hit": { "type": ["string", "null"] },
         "status": { "enum": ["proposed", "approved", "rejected"] },
+        "replay_capture": { "type": "boolean", "description": "UX audit 2026-11-17 C4: opt-in input capture (#243) chosen by the approving human. Never true on a non-approved point." },
+        "decided_by_user_id": { "type": ["integer", "null"] },
+        "decision_method": { "enum": ["manual", null] },
+        "decided_at": { "type": ["number", "null"] },
         "created_at": { "type": "number" },
         "updated_at": { "type": "number" }
       },

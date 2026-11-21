@@ -311,7 +311,13 @@ export function FlowExperimentsPanel({
         ) : isError ? (
           <ReadFailure what="実験提案" onRetry={onRetry} />
         ) : (proposals?.length ?? 0) === 0 ? (
-          <EmptyNote>実験提案は 0 件です。（取得できなかったのではありません）</EmptyNote>
+          <EmptyNote>
+            実験提案は 0 件です。（取得できなかったのではありません）
+            <span className="block" data-testid="flow-experiments-empty-where">
+              提案の作成は画面未対応で、API のみです（下書き: <code>POST /flow-experiments/draft</code>、
+              作成: <code>POST /flow-experiments</code>）。作成された提案はここに並び、承認・却下・撤回はこの画面で行えます。
+            </span>
+          </EmptyNote>
         ) : (
           <ul className="space-y-3">
             {sortProposals(proposals ?? []).map((proposal) => (

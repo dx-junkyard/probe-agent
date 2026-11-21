@@ -495,6 +495,7 @@ export function requirementAcceptsTargetLink(requirement: UxRequirementOut): boo
 
 export type UxNextDecisionKind =
   | "unavailable"
+  | "create_objective"
   | "create_journey"
   | "confirm_journey"
   | "recheck_journey"
@@ -516,6 +517,10 @@ export interface UxNextDecision {
   target: { tab: "journeys" | "requirements" | "solutions"; key: string | null } | null;
   /** CTA label. `null` when there is no action. */
   actionLabel: string | null;
+  /** UX audit 2026-11-17 C12: a CTA that leaves the Studio for the screen
+   * that owns the upstream decision (`create_objective` -> Objective Map).
+   * Mutually exclusive with `target`; still a navigation, never an execute. */
+  route?: string | null;
 }
 
 /** Deterministic pick: the first row by key, so the same facts always name
@@ -529,8 +534,14 @@ export function decideNextDesignAction(input: {
   journeys: readonly UxJourneyOut[] | null;
   requirements: readonly UxRequirementOut[] | null;
   designs: readonly SolutionDesignOut[] | null;
+  /** UX audit 2026-11-17 C12: how many Product Objectives the System has,
+   * read from a SUCCESSFUL `GET /objective-map`. `null` / omitted means the
+   * count is not known (still loading, or the read failed) -- the row that
+   * reads it is then skipped rather than guessing zero. */
+  objectiveCount?: number | null;
 }): UxNextDecision {
   const { journeys, requirements, designs } = input;
+  const objectiveCount = input.objectiveCount ?? null;
 
   // 1. An unreadable list is never treated as an empty one.
   if (journeys === null || requirements === null || designs === null) {
@@ -543,7 +554,23 @@ export function decideNextDesignAction(input: {
     };
   }
 
-  // 2-4. Journey level (the causal head of the chain).
+  // 2. Upstream of the whole chain: an empty System starts from the
+  // Objective it is designing toward (Vision -> Objective -> Journey). Only
+  // when the count is KNOWN to be zero, and only while there is no Journey
+  // yet -- the Objective layer is optional (§427 §0), so a System that has
+  // already started designing is not sent back upstream.
+  if (objectiveCount === 0 && journeys.length === 0) {
+    return {
+      kind: "create_objective",
+      title: "Objective Map で Objective を作る",
+      reason: "この System にはまだ Product Objective も UX Journey もありません。Journey は Vision へ近づくための中間目標(Objective)に向けて設計します。",
+      target: null,
+      actionLabel: "Objective Map へ移動",
+      route: "/objective-map",
+    };
+  }
+
+  // 3-5. Journey level.
   if (journeys.length === 0) {
     return {
       kind: "create_journey",
@@ -587,7 +614,7 @@ export function decideNextDesignAction(input: {
     };
   }
 
-  // 5-7. Requirement level.
+  // 6-8. Requirement level.
   if (requirements.length === 0) {
     return {
       kind: "create_requirement",
@@ -633,7 +660,7 @@ export function decideNextDesignAction(input: {
     };
   }
 
-  // 8-10. Solution Design level.
+  // 9-11. Solution Design level.
   if (designs.length === 0) {
     return {
       kind: "create_solution_design",
@@ -664,7 +691,7 @@ export function decideNextDesignAction(input: {
     };
   }
 
-  // 11. Nothing outstanding.
+  // 12. Nothing outstanding.
   return {
     kind: "settled",
     title: "いま決めるべきことはありません",

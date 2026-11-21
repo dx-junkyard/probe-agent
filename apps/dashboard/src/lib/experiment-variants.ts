@@ -46,11 +46,16 @@ export interface VariantSetCheck {
   rows: VariantRowCheck[];
   complete: VariantRowCheck[];
   partial: VariantRowCheck[];
-  /** 送信できるか: 入力途中の行が無く、完全な候補が 2 件以上ある。 */
+  /** 送信できるか: 入力途中の行が無く、完全な候補が MIN_EXPERIMENT_VARIANTS 件以上ある。 */
   submittable: boolean;
 }
 
-export const MIN_EXPERIMENT_VARIANTS = 2;
+// UX 監査 2026-11-17 C3: baseline はサーバーが必ず自動で足す (pinned commit)。
+// ここで数えるのは利用者が送る非 baseline 候補だけなので、1 件で
+// 「baseline と候補 1 件」の比較になる。サーバーの ExperimentCreate.variants
+// (min_length=1, max_length=10) と同じ下限・上限。
+export const MIN_EXPERIMENT_VARIANTS = 1;
+export const MAX_EXPERIMENT_VARIANTS = 10;
 
 export function checkVariants(variants: readonly VariantDraft[]): VariantSetCheck {
   const rows = variants.map(classifyVariantRow);
@@ -60,7 +65,10 @@ export function checkVariants(variants: readonly VariantDraft[]): VariantSetChec
     rows,
     complete,
     partial,
-    submittable: partial.length === 0 && complete.length >= MIN_EXPERIMENT_VARIANTS,
+    submittable:
+      partial.length === 0
+      && complete.length >= MIN_EXPERIMENT_VARIANTS
+      && complete.length <= MAX_EXPERIMENT_VARIANTS,
   };
 }
 

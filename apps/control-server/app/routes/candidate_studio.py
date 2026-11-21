@@ -46,6 +46,7 @@ from ..models import (
     CandidateMessageCreate,
     CandidatePromotionOut,
     CandidateReplayCreate,
+    CandidateReplayPreflightOut,
     CandidateSessionCreate,
     CandidateSessionOut,
     CandidateVersionOut,
@@ -62,12 +63,18 @@ from .replay import (
     _resolve_component_symbol,
     _resolve_snapshot,
     create_replay_set,
-    create_replay_variant_run,
+    run_replay_variants,
     get_replay_variant_experiment_payload,
 )
 from .execution_modes import gate_execution_target
 from .replay_readiness import gather_readiness
-from .snapshot_preflight import require_snapshot_preflight
+from .snapshot_preflight import require_snapshot_preflight, to_out
+from ..snapshot_preflight import (
+    PreflightResult,
+    StaleSnapshotNotAcknowledged,
+    gather_preflight,
+    resolve_stale_decision,
+)
 
 router = APIRouter()
 
@@ -206,7 +213,23 @@ def _session_out(conn, row, *, include_children: bool = True) -> CandidateSessio
             for m in _messages(conn, row["id"])
         ]
         versions = [_version_out(conn, v) for v in _versions(conn, row["id"])]
+    # UX audit 2026-11-17 C13: the newest version's persisted state, read
+    # even when children are omitted (the session list on the start screen).
+    latest = conn.execute(
+        "SELECT version_number, status, replay_status, "
+        "(SELECT COUNT(*) FROM candidate_versions WHERE session_id = ?) AS n "
+        "FROM candidate_versions WHERE session_id = ? "
+        "ORDER BY version_number DESC LIMIT 1",
+        (row["id"], row["id"]),
+    ).fetchone()
     return CandidateSessionOut(
+        snapshot_freshness=row["snapshot_freshness"],
+        head_sha_at_creation=row["head_sha_at_creation"],
+        stale_ack_reason=row["stale_ack_reason"],
+        version_count=latest["n"] if latest else 0,
+        latest_version_number=latest["version_number"] if latest else None,
+        latest_version_status=latest["status"] if latest else None,
+        latest_version_replay_status=latest["replay_status"] if latest else None,
         id=row["id"],
         system_id=row["system_id"],
         component_id=row["component_id"],
@@ -882,6 +905,82 @@ def get_candidate_events(
 # --- replay (reuses POST /replay-variant-runs verbatim) -----------------------
 
 
+def classify_candidate_replay_stale(preflight: PreflightResult, session_row) -> str:
+    """UX audit 2026-11-17 C8. Finite, first match
+    (``CandidateReplayStaleReasonState``).
+
+    The session's stale reason is a ``decision_method: manual`` fact about a
+    specific premise: THIS pinned snapshot while HEAD was THAT commit. It is
+    reused only while that premise still holds. Once HEAD has moved again the
+    developer has not said why the snapshot is still the intended one, so the
+    old sentence must not be presented as their decision about the new state.
+    """
+    if not preflight.requires_stale_acknowledgement:
+        return "not_required"
+    reason = (session_row["stale_ack_reason"] or "").strip()
+    if not reason:
+        return "not_recorded"
+    if (
+        session_row["snapshot_freshness"] == "stale"
+        and session_row["head_sha_at_creation"]
+        and preflight.head_sha == session_row["head_sha_at_creation"]
+        and preflight.snapshot_id == session_row["snapshot_id"]
+    ):
+        return "inheritable"
+    return "head_moved"
+
+
+def _candidate_replay_snapshot_decision(
+    system_id: int, session_row, entered_reason: Optional[str]
+) -> tuple:
+    """Resolve the ``(freshness, head_sha, stale_ack_reason)`` triple for a
+    candidate replay. Runs ``git`` -- call with NO connection open.
+
+    A reason entered at replay time always wins (it is the newest manual
+    decision). Otherwise the session's reason is used only when
+    :func:`classify_candidate_replay_stale` says ``inheritable``; any other
+    stale state is refused with the shared 409, carrying the state so the
+    Dashboard can say why a new reason is needed."""
+    preflight = gather_preflight(system_id, session_row["snapshot_id"])
+    state = classify_candidate_replay_stale(preflight, session_row)
+    reason = (entered_reason or "").strip() or None
+    if reason is None and state == "inheritable":
+        reason = session_row["stale_ack_reason"].strip()
+    try:
+        return resolve_stale_decision(preflight, reason)
+    except StaleSnapshotNotAcknowledged as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "stale_snapshot_not_acknowledged",
+                "message": str(exc),
+                "recommended_snapshot_id": preflight.recommended_snapshot_id,
+                "stale_reason_state": state,
+            },
+        ) from exc
+
+
+@router.get(
+    "/candidate-sessions/{session_id}/replay-preflight",
+    response_model=CandidateReplayPreflightOut,
+)
+def get_candidate_replay_preflight(
+    session_id: int,
+    system_id: int = Depends(get_system_id),
+) -> CandidateReplayPreflightOut:
+    """Read-only: the shared Snapshot preflight for the session's pinned
+    snapshot plus whether the session's own stale reason covers it now."""
+    with get_conn() as conn:
+        session_row = _get_session_or_404(conn, session_id, system_id)
+    preflight = gather_preflight(system_id, session_row["snapshot_id"])
+    return CandidateReplayPreflightOut(
+        preflight=to_out(preflight),
+        stale_reason_state=classify_candidate_replay_stale(preflight, session_row),
+        session_stale_ack_reason=session_row["stale_ack_reason"],
+        session_head_sha_at_creation=session_row["head_sha_at_creation"],
+    )
+
+
 @router.post("/candidate-versions/{version_id}/replay", response_model=CandidateVersionOut)
 def replay_candidate_version(
     version_id: int,
@@ -889,6 +988,30 @@ def replay_candidate_version(
     system_id: int = Depends(get_system_id),
     response: Response = None,
 ) -> CandidateVersionOut:
+    # UX audit 2026-11-17 C8: the stale-snapshot gate is decided HERE, before
+    # the candidate is marked 'running' (a refusal must not strand it) and
+    # with no connection open (`gather_preflight` runs git). Previously the
+    # inner variant run evaluated it with no reason at all, so a session the
+    # developer had explicitly continued on a stale snapshot could never
+    # replay its candidates.
+    with get_conn() as conn:
+        version = _get_version_or_404(conn, version_id, system_id)
+        pre_session_row = _get_session_or_404(conn, version["session_id"], system_id)
+    if (
+        payload.snapshot_id is not None
+        and payload.snapshot_id != pre_session_row["snapshot_id"]
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Candidate replay must use the session's pinned baseline snapshot "
+                f"({pre_session_row['snapshot_id']})"
+            ),
+        )
+    snapshot_decision = _candidate_replay_snapshot_decision(
+        system_id, pre_session_row, payload.stale_snapshot_reason
+    )
+
     with get_conn() as conn:
         version = _get_version_or_404(conn, version_id, system_id)
         if version["status"] != PROPOSAL_PROPOSED or not version["patch_text"]:
@@ -915,7 +1038,7 @@ def replay_candidate_version(
         patch_text = version["patch_text"]
         # Execution-mode gate (#412 §4.3), before the candidate is marked
         # 'running' and before a worktree is touched. Surfaced here as well as
-        # inside create_replay_variant_run for the same reason the approval
+        # inside run_replay_variants for the same reason the approval
         # gate is: a refusal must not leave the immutable candidate stranded in
         # a 'running' state. The subject is the SESSION's Component -- the
         # candidate is a patch against that Component's symbol.
@@ -932,7 +1055,7 @@ def replay_candidate_version(
             snapshot_id=snapshot_id,
         )
         # Surface the human replay-approval gate here too (fail closed before
-        # touching a worktree); create_replay_variant_run enforces it again.
+        # touching a worktree); run_replay_variants enforces it again.
         if _active_approval(conn, system_id, component_id) is None:
             raise HTTPException(
                 status_code=403,
@@ -960,7 +1083,9 @@ def replay_candidate_version(
         flow_experiment_proposal_id=payload.flow_experiment_proposal_id,
     )
     try:
-        run = create_replay_variant_run(run_payload, system_id=system_id)
+        run = run_replay_variants(
+            run_payload, system_id=system_id, snapshot_decision=snapshot_decision
+        )
     except HTTPException:
         with get_conn() as conn:
             conn.execute(

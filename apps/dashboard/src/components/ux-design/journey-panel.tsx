@@ -14,6 +14,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { toast } from "sonner";
 import { ApiError } from "@/api/client";
 import { JourneyRevisionHistoryCard } from "./revision-history";
+import { RequirementCreateAndLinkForm } from "./requirement-panel";
+import { ReferenceTargetPicker } from "@/components/product-objective/reference-picker";
 import {
   useUxJourneys, useUxJourneyDetail, useUxJourneyBaselineDiff,
   useCreateUxJourney, useAddUxJourneyRevision, useAddUxJourneyUpstreamRef,
@@ -53,7 +55,9 @@ const REF_KINDS: UxRefKind[] = [
   "product_objective", "product_milestone", "product_gap",
 ];
 
-function JourneyCreateForm() {
+/** UX audit 2026-11-17 C11: a successful create SELECTS the new Journey
+ * (`onCreated`), the same behaviour Objective / Milestone creation has. */
+function JourneyCreateForm({ onCreated }: { onCreated?: (journeyKey: string) => void }) {
   const create = useCreateUxJourney();
   const [key, setKey] = useState("");
   const [perspective, setPerspective] = useState<UxJourneyPerspective>("to_be");
@@ -75,10 +79,11 @@ function JourneyCreateForm() {
         baseline_mode: perspective === "to_be" ? baselineMode : undefined,
       },
       {
-        onSuccess: () => {
+        onSuccess: (out) => {
           validation.resolveSuccess(token);
           setKey("");
           toast.success("Journey を作成しました");
+          onCreated?.(out.journey_key);
         },
         onError: (error) => {
           const apiError = error as ApiError;
@@ -151,7 +156,7 @@ function JourneyList({
         <CardDescription>現状(as-is)と目標(to-be)の利用経路。</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <JourneyCreateForm />
+        <JourneyCreateForm onCreated={onSelect} />
         {journeys.isLoading ? (
           <LoadingBlock testId="ux-journey-list-loading" />
         ) : journeys.isError ? (
@@ -545,7 +550,7 @@ function BaselineDiffCard({ journeyKey, baselineMode }: { journeyKey: string; ba
 function UpstreamRefsCard({ journeyKey, refs }: { journeyKey: string; refs: UxJourneyUpstreamRefOut[] }) {
   const addRef = useAddUxJourneyUpstreamRef(journeyKey);
   const [open, setOpen] = useState(false);
-  const [refKind, setRefKind] = useState<UxRefKind>("capability_entity");
+  const [refKind, setRefKind] = useState<UxRefKind>("product_objective");
   const [targetRef, setTargetRef] = useState("");
   const [note, setNote] = useState("");
 
@@ -598,17 +603,26 @@ function UpstreamRefsCard({ journeyKey, refs }: { journeyKey: string; refs: UxJo
       </Button>
       {open && (
         <div className="space-y-2 rounded border p-2">
-          <Select value={refKind} onChange={(e) => setRefKind(e.target.value as UxRefKind)}>
+          <Select
+            aria-label="参照の種類"
+            value={refKind}
+            onChange={(e) => { setRefKind(e.target.value as UxRefKind); setTargetRef(""); }}
+          >
             {REF_KINDS.map((k) => (
               <option key={k} value={k}>
                 {REF_KIND_LABEL[k]}
               </option>
             ))}
           </Select>
-          <Input
-            placeholder="target_ref(例: Capability の id、objective_key / milestone_key / gap_key、または要素の stable id)"
+          {/* UX audit 2026-11-17 C9: the target is picked from the chosen
+              kind's own list -- a mistyped key used to be saved and then
+              shown as 「参照先未解決」. */}
+          <ReferenceTargetPicker
+            kind={refKind}
             value={targetRef}
-            onChange={(e) => setTargetRef(e.target.value)}
+            onChange={setTargetRef}
+            ariaLabel="参照先"
+            testId="ux-journey-upstream-ref-target"
           />
           <Input placeholder="メモ(任意)" value={note} onChange={(e) => setNote(e.target.value)} />
           <Button size="sm" disabled={!targetRef.trim() || addRef.isPending} onClick={submit}>
@@ -622,13 +636,16 @@ function UpstreamRefsCard({ journeyKey, refs }: { journeyKey: string; refs: UxJo
 
 function StepDetail({
   journeyId,
+  journeyKey,
   step,
   onOpenRequirement,
 }: {
   journeyId: number;
+  journeyKey: string;
   step: UxJourneyStepOut;
   onOpenRequirement: (key: string) => void;
 }) {
+  const [createOpen, setCreateOpen] = useState(false);
   const requirements = useUxRequirements();
   const allKeys = (requirements.data?.requirements ?? []).map((r) => r.requirement_key);
   const details = useUxRequirementDetailsBatch(allKeys);
@@ -691,6 +708,26 @@ function StepDetail({
               </li>
             ))}
           </ul>
+        )}
+        {createOpen ? (
+          <div className="mt-2">
+            <RequirementCreateAndLinkForm
+              journeyKey={journeyKey}
+              stepKey={step.step_key}
+              onLinked={(key) => { setCreateOpen(false); onOpenRequirement(key); }}
+              onCancel={() => setCreateOpen(false)}
+            />
+          </div>
+        ) : (
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-2"
+            onClick={() => setCreateOpen(true)}
+            data-testid={`ux-journey-step-create-requirement-${step.step_key}`}
+          >
+            Requirement を作成して紐づける
+          </Button>
         )}
       </div>
     </div>
@@ -779,7 +816,7 @@ function JourneyDetail({
           const step = steps.find((s) => s.step_key === stepKey);
           return step ? (
             <div className="mt-2">
-              <StepDetail journeyId={j.id} step={step} onOpenRequirement={onOpenRequirement} />
+              <StepDetail journeyId={j.id} journeyKey={j.journey_key} step={step} onOpenRequirement={onOpenRequirement} />
             </div>
           ) : null;
         })()}

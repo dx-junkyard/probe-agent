@@ -216,7 +216,9 @@ def _probe_patch_out(conn, row) -> ProbePatchOut:
         snapshot_id=row["snapshot_id"],
         commit_sha=row["commit_sha"],
         diff=row["diff"],
-        worktree_path=row["worktree_path"],
+        # NULL for an improvement transport row (it never had a worktree);
+        # left as-is it made the whole patch list fail validation (C5).
+        worktree_path=row["worktree_path"] or "",
         skipped=json.loads(row["skipped"]),
         status=row["status"],
         error=row["error"],
@@ -228,7 +230,39 @@ def _probe_patch_out(conn, row) -> ProbePatchOut:
         applied_by_user_id=row["applied_by_user_id"],
         validation_runs=validation_runs,
         created_at=row["created_at"],
+        **_probe_patch_origin(conn, row),
     )
+
+
+def _probe_patch_origin(conn, row) -> dict:
+    """UX audit 2026-11-17 C5: which lineage produced this transport row.
+
+    An adopted Experiment variant's publish patch is identified by its
+    ``improvement_publish_artifacts`` row (#380) -- never by the plan's
+    ``origin`` text or by timing. Same System, exact ``patch_id``.
+    """
+    artifact = conn.execute(
+        """SELECT a.experiment_id, v.variant_key, v.label,
+                  e.human_decision, e.human_decision_variant_key
+             FROM improvement_publish_artifacts a
+             JOIN experiment_variants v ON v.id = a.variant_id
+             JOIN experiments e ON e.id = a.experiment_id
+            WHERE a.patch_id = ? AND a.system_id = ? AND e.system_id = a.system_id
+            ORDER BY a.id DESC LIMIT 1""",
+        (row["id"], row["system_id"]),
+    ).fetchone()
+    if artifact is None:
+        return {"origin": "probe_plan"}
+    return {
+        "origin": "improvement",
+        "improvement_experiment_id": artifact["experiment_id"],
+        "improvement_variant_key": artifact["variant_key"],
+        "improvement_variant_label": artifact["label"],
+        "improvement_adoption_current": (
+            artifact["human_decision"] == "adopted"
+            and artifact["human_decision_variant_key"] == artifact["variant_key"]
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4117,6 +4151,10 @@ def _probe_point_out(row) -> ProbePointOut:
         replayability=row["replayability"],
         denylist_hit=row["denylist_hit"],
         status=row["status"],
+        replay_capture=bool(row["replay_capture"]),
+        decided_by_user_id=row["decided_by_user_id"],
+        decision_method=row["decision_method"],
+        decided_at=row["decided_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -4429,8 +4467,25 @@ def update_probe_point_status(
     point_id: int,
     payload: ProbePointStatusUpdate,
     system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
 ) -> ProbePointOut:
+    """Record a human's decision on one probe point.
+
+    UX audit 2026-11-17 C4: the same decision carries whether this point's
+    inputs are captured for Replay (``@probe(..., replay_capture=True)``).
+    Capture stays off unless the approver turns it on (#243 opt-in), it is
+    refused on a point whose side-effect risk is ``high`` (Principle 4 -- the
+    risk is the point's existing finite value, no new judgement), and it can
+    only be set together with ``approved``. The approver is the authenticated
+    principal, recorded as ``decision_method='manual'``.
+    """
     now = time.time()
+    replay_capture = bool(payload.replay_capture)
+    if replay_capture and payload.status != "approved":
+        raise HTTPException(
+            status_code=422,
+            detail="replay_capture can only be chosen when approving a probe point",
+        )
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM probe_points WHERE id = ? AND system_id = ?",
@@ -4443,9 +4498,23 @@ def update_probe_point_status(
                 status_code=409,
                 detail="Safety-denylisted probe points cannot be approved",
             )
+        if replay_capture and row["side_effect_risk"] == "high":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Input capture cannot be enabled on a probe point with high "
+                    "side-effect risk"
+                ),
+            )
         conn.execute(
-            """UPDATE probe_points SET status = ?, updated_at = ? WHERE id = ?""",
-            (payload.status, now, point_id),
+            """UPDATE probe_points
+                  SET status = ?, replay_capture = ?, decided_by_user_id = ?,
+                      decision_method = 'manual', decided_at = ?, updated_at = ?
+                WHERE id = ? AND system_id = ?""",
+            (
+                payload.status, 1 if replay_capture else 0, principal.user_id,
+                now, now, point_id, system_id,
+            ),
         )
         row = conn.execute(
             "SELECT * FROM probe_points WHERE id = ?", (point_id,),
@@ -5711,6 +5780,7 @@ def generate_patch_endpoint(
             recommended_mode=r["recommended_mode"],
             line_start=r["line_start"],
             line_end=r["line_end"],
+            replay_capture=bool(r["replay_capture"]),
         )
         for r in point_rows
     ]

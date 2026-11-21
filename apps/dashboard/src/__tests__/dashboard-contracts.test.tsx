@@ -309,18 +309,23 @@ describe("Experiment creation", () => {
     mockSystemId = 1;
   });
 
-  test("button disabled when fewer than 2 valid variants", async () => {
+  // UX 監査 2026-11-17 C3: baseline はサーバーが自動で足すので、候補 1 件で作成できる。
+  test("button disabled with no complete candidate, enabled with one (baseline is automatic)", async () => {
     setupExperimentMocks();
     await openCreateDialog();
     fillBasicFields();
 
+    const createBtn = screen.getAllByRole("button", { name: "Experimentを作成" }).at(-1);
+    expect(createBtn).toBeDisabled();
+    expect(screen.getByTestId("experiment-variant-baseline-note")).toHaveTextContent("baseline");
+
     const labelInputs = screen.getAllByPlaceholderText("ラベル（例: optimized-v1）");
     const patchInputs = screen.getAllByPlaceholderText("Patch内容（unified diff形式）");
+    expect(labelInputs).toHaveLength(1);
     fireEvent.change(labelInputs[0], { target: { value: "variant-a" } });
     fireEvent.change(patchInputs[0], { target: { value: "patch-a" } });
 
-    const createBtn = screen.getAllByRole("button", { name: "Experimentを作成" }).at(-1);
-    expect(createBtn).toBeDisabled();
+    expect(screen.getAllByRole("button", { name: "Experimentを作成" }).at(-1)).not.toBeDisabled();
   });
 
   test("submits when 2 valid variants are provided", async () => {
@@ -332,6 +337,7 @@ describe("Experiment creation", () => {
 
     await openCreateDialog();
     fillBasicFields();
+    fireEvent.click(screen.getByRole("button", { name: /候補を追加/ }));
 
     const labelInputs = screen.getAllByPlaceholderText("ラベル（例: optimized-v1）");
     const patchInputs = screen.getAllByPlaceholderText("Patch内容（unified diff形式）");
@@ -359,15 +365,16 @@ describe("Experiment creation", () => {
     });
   });
 
-  test("cannot delete variants below 2", async () => {
+  test("cannot delete the last candidate", async () => {
     setupExperimentMocks();
     await openCreateDialog();
 
     expect(screen.getByText("候補 1")).toBeInTheDocument();
-    expect(screen.getByText("候補 2")).toBeInTheDocument();
+    expect(screen.queryByText("候補 2")).not.toBeInTheDocument();
 
-    const trashIcons = document.querySelectorAll(".lucide-trash-2");
-    expect(trashIcons.length).toBe(0);
+    expect(document.querySelectorAll(".lucide-trash-2").length).toBe(0);
+    fireEvent.click(screen.getByRole("button", { name: /候補を追加/ }));
+    expect(document.querySelectorAll(".lucide-trash-2").length).toBe(2);
   });
 
   test("shows a back link to the capability when ?capability= is present", async () => {
@@ -5411,16 +5418,17 @@ describe("Sidebar phase-linked navigation (Issue #257)", () => {
       "System Understanding", "Capability Map", "Feature Map", "Flow Explorer",
       "Probe Planner", "Probe Patterns", "Connect SDK",
       "Components / Traces", "Trace Lineage", "Trace Analyzers",
-      "Simulation Workbench", "AI Candidate Studio", "Decision Workspace",
+      "Simulation Workbench", "Experiments", "Decision Workspace",
       "GitHub", "Generate",
     ]) {
       expect(within(nav).getByText(label)).toBeTruthy();
     }
-    // UX audit 2026-11-17 A7: Interview / Experiments / システムマップ / UX
+    // UX audit 2026-11-17 A7: Interview / AI Candidate Studio / システムマップ / UX
     // Design Studio / 計測カバレッジ are reached from 「目的から始める」 and
-    // are not repeated as group entries.
+    // are not repeated as group entries (C13: 「候補を比較評価する」 now
+    // opens AI Candidate Studio, so Experiments is a group entry again).
     const purpose = screen.getByTestId("sidebar-purpose-entries");
-    for (const href of ["/interview", "/experiments", "/system-map", "/ux-design-studio", "/instrumentation-coverage"]) {
+    for (const href of ["/interview", "/candidate-studio", "/system-map", "/ux-design-studio", "/instrumentation-coverage"]) {
       expect(purpose.querySelector(`a[href="${href}"]`)).toBeTruthy();
     }
     // Old label is gone, replaced by "Components / Traces".
@@ -11201,7 +11209,10 @@ describe("Sidebar Observe & Evaluate subtexts (Issue #267)", () => {
 
     const group = screen.getByTestId("sidebar-group-observe-&-evaluate");
     expect(within(group).getByText("手動でdiffを編集して検証")).toBeInTheDocument();
-    expect(within(group).getByText("会話でAIに指示して候補生成")).toBeInTheDocument();
+    // UX audit 2026-11-17 C13: AI Candidate Studio is reached from
+    // 「目的から始める」, so its group entry (and subtitle) is left out (A7);
+    // Experiments is a group entry again.
+    expect(within(group).getByText("候補のバッチ実行と評価")).toBeInTheDocument();
   });
 });
 

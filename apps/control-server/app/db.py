@@ -1837,6 +1837,14 @@ CREATE TABLE IF NOT EXISTS probe_points (
     replayability        TEXT NOT NULL DEFAULT '',
     denylist_hit         TEXT,
     status               TEXT NOT NULL DEFAULT 'proposed',
+    -- UX audit 2026-11-17 C4: opt-in input capture (#243) chosen per point by
+    -- the human who approved it. 0 is the default and also the only value a
+    -- non-approved point may hold; the decision columns record who decided
+    -- the current status (always 'manual'; NULL on legacy rows).
+    replay_capture       INTEGER NOT NULL DEFAULT 0,
+    decided_by_user_id   INTEGER,
+    decision_method      TEXT,
+    decided_at           REAL,
     created_at           REAL NOT NULL,
     updated_at           REAL NOT NULL,
     FOREIGN KEY (plan_id) REFERENCES probe_plans (id) ON DELETE CASCADE,
@@ -10865,6 +10873,26 @@ def init_db() -> None:
         if plan_cols and "origin" not in plan_cols:
             conn.execute(
                 "ALTER TABLE probe_plans ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'"
+            )
+        # UX audit 2026-11-17 C4: per-point opt-in input capture + who decided
+        # the point's status. Existing rows get capture off (the #243 default)
+        # and NULL decision columns -- they never recorded an approver, and
+        # one is not invented here.
+        point_cols = _columns(conn, "probe_points")
+        if point_cols and "replay_capture" not in point_cols:
+            conn.execute(
+                "ALTER TABLE probe_points "
+                "ADD COLUMN replay_capture INTEGER NOT NULL DEFAULT 0"
+            )
+        if point_cols:
+            _add_column_if_missing(
+                conn, "probe_points", point_cols, "decided_by_user_id", "INTEGER"
+            )
+            _add_column_if_missing(
+                conn, "probe_points", point_cols, "decision_method", "TEXT"
+            )
+            _add_column_if_missing(
+                conn, "probe_points", point_cols, "decided_at", "REAL"
             )
         graph_cols = _columns(conn, "understanding_graph_snapshots")
         if graph_cols and "snapshot_id" not in graph_cols:

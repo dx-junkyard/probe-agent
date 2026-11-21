@@ -98,7 +98,7 @@ LLM 呼び出しは `app.llm` に集約し、`openai` / `anthropic` / `gemini` /
 
 - pinned commit の tracked files だけを snapshot として読み取る
 - Feature Map、code mapping、Probe Plan、temporary instrumentation patch を永続化する
-- baseline と2件以上の source patch variants を独立 worktree で実行する
+- baseline(サーバーが自動で追加)と1〜10件の source patch variants を独立 worktree で実行する(UX 監査 2026-11-17 C3: 候補 1 件でも baseline との比較になる)
 - test / smoke / workload、trace artifact、evaluation、duration を決定的に集計する
 - source patch、raw artifact、metric comparison、採用variant、human decision note を Dashboard で確認する
 - workspace は実行後に削除し、artifact は設定した retention 期間後に cleanup する

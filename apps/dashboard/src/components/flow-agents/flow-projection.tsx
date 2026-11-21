@@ -11,6 +11,7 @@
 // membership basis, the evidence ids and `degraded_sections` arrive already
 // decided by `GET /flow-explanation`.
 
+import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -67,6 +68,15 @@ function NodeCard({ node }: { node: FlowExplanationNodeOut }) {
           text={node.membership_basis}
           title={MEMBERSHIP_BASIS_LABEL[node.membership_basis]}
         />
+        {/* UX audit 2026-11-17 C7: the Node's own screen lists which
+            decisions can be made where. Navigation only. */}
+        <Link
+          to={`/evolution-nodes?node=${encodeURIComponent(node.node_key)}`}
+          className="text-xs underline"
+          data-testid={`flow-node-open-${node.node_key}`}
+        >
+          Evolution Node 画面で開く
+        </Link>
       </div>
 
       <h4 className="mt-3 text-xs font-semibold">5 つの軸（互いから導出しません）</h4>

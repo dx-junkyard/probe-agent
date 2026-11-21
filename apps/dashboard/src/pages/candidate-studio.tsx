@@ -13,6 +13,8 @@ import {
   useReplayApproval,
   useReplayVariantRun,
   useCandidateSession,
+  useCandidateSessions,
+  useCandidateReplayPreflight,
   useCreateCandidateSession,
   useSendCandidateMessage,
   useGenerateCandidateVersion,
@@ -20,7 +22,9 @@ import {
   usePromoteCandidateVersion,
 } from "@/api/hooks";
 import type {
+  CandidateReplayStatus,
   CandidateSessionCreateRequest,
+  CandidateSessionOut,
   CandidateVersionOut,
   ReplayVariantCaseResultOut,
   TraceEvent,
@@ -38,6 +42,7 @@ import { ApprovalPanel } from "@/components/replay-approval-panel";
 import { ResultMatrix } from "@/components/replay-result-matrix";
 import { cn, formatTimestamp } from "@/lib/utils";
 import { useUnsavedChangesGuard } from "@/lib/ui-draft";
+import { QueryErrorState } from "@/components/query-state";
 
 // AI Candidate Studio (Issue #252): a conversation + candidate-versioning UI
 // over the EXISTING isolated Replay stack (#243-#246). This page adds no new
@@ -82,6 +87,18 @@ function traceReplayHint(trace: TraceEvent): string {
   const reason = trace.replay_reasons?.[0];
   return `${REPLAYABILITY_LABELS[state] ?? state}${reason ? `: ${reason}` : ""}`;
 }
+
+const REPLAY_STATUS_LABEL_JA: Record<CandidateReplayStatus, string> = {
+  not_run: "Replay未実行",
+  running: "Replay実行中",
+  completed: "Replay完了",
+  failed: "Replay失敗",
+};
+
+const SESSION_STATUS_LABEL_JA: Record<CandidateSessionOut["status"], string> = {
+  active: "進行中",
+  archived: "アーカイブ済み",
+};
 
 function versionState(v: CandidateVersionOut): StudioState {
   if (v.replay_status === "running") return "replaying";
@@ -218,6 +235,8 @@ function StartView({
         </p>
       </div>
 
+      <ExistingSessions />
+
       <Card>
         <CardHeader>
           <CardTitle className="text-sm">セッションを開始</CardTitle>
@@ -350,6 +369,63 @@ function StartView({
   );
 }
 
+// UX audit 2026-11-17 C13: the start screen used to have no way back into an
+// existing session -- 「一覧へ戻る」 landed here with nothing to pick. Each row
+// renders the server's persisted state; nothing is re-derived here. A failed
+// fetch and an empty list are different answers and never share copy.
+function ExistingSessions() {
+  const { data: sessions, isLoading, isError, error, refetch, isFetching } = useCandidateSessions();
+  return (
+    <Card data-testid="candidate-session-list">
+      <CardHeader>
+        <CardTitle className="text-sm">既存のセッション</CardTitle>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <p role="status" className="text-xs text-muted-foreground">セッション一覧を読み込んでいます…</p>
+        ) : isError ? (
+          <QueryErrorState
+            target="Candidate Session 一覧"
+            error={error}
+            onRetry={() => refetch()}
+            retrying={isFetching}
+          />
+        ) : !sessions?.length ? (
+          <p className="text-xs text-muted-foreground" data-testid="candidate-session-list-empty">
+            まだセッションはありません。下の「セッションを開始」から作成してください。
+          </p>
+        ) : (
+          <ul className="divide-y">
+            {sessions.map((s) => (
+              <li key={s.id}>
+                <Link
+                  to={`/candidate-studio?session_id=${s.id}`}
+                  className="flex flex-wrap items-center gap-2 py-2 text-xs hover:underline"
+                  data-testid={`candidate-session-row-${s.id}`}
+                >
+                  <span className="font-mono font-medium">{s.component_id}</span>
+                  <span className="text-muted-foreground">#{s.id} · {formatTimestamp(s.created_at)}</span>
+                  <Badge variant="outline">{SESSION_STATUS_LABEL_JA[s.status] ?? s.status}</Badge>
+                  {s.latest_version_number != null ? (
+                    <Badge variant="secondary">
+                      最新 v{s.latest_version_number}
+                      {s.latest_version_replay_status
+                        ? ` · ${REPLAY_STATUS_LABEL_JA[s.latest_version_replay_status]}`
+                        : ""}
+                    </Badge>
+                  ) : (
+                    <span className="text-muted-foreground">候補versionなし</span>
+                  )}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 // --- Studio view: conversation + candidate-version tabs ---------------------
 
 function StudioView({ sessionId }: { sessionId: number }) {
@@ -391,6 +467,20 @@ function StudioView({ sessionId }: { sessionId: number }) {
   const { data: approvalState } = useReplayApproval(componentId);
   const canRun = !!approvalState?.active;
   useUnsavedChangesGuard(`candidate-session:${sessionId}`, draftText.trim() !== savedDraftText.trim());
+
+  // UX audit 2026-11-17 C8: the server decides whether the reason recorded
+  // when this session started still covers the pinned snapshot (same snapshot,
+  // same HEAD). When it does not, a new reason is asked for here -- never
+  // pre-filled from the old one, because it is the developer's decision about
+  // a different premise.
+  const replayPreflightQuery = useCandidateReplayPreflight(sessionId);
+  const replayPreflight = replayPreflightQuery.data;
+  const [replayStaleReason, setReplayStaleReason] = useState("");
+  const replayNeedsReason =
+    replayPreflight?.stale_reason_state === "head_moved"
+    || replayPreflight?.stale_reason_state === "not_recorded";
+  const replayReasonMissing = replayNeedsReason && !replayStaleReason.trim();
+  useUnsavedChangesGuard(`candidate-replay-reason:${sessionId}`, !!replayStaleReason.trim());
 
   if (isLoading) {
     return <Skeleton className="h-64 w-full" />;
@@ -449,8 +539,13 @@ function StudioView({ sessionId }: { sessionId: number }) {
   const handleReplay = async () => {
     if (!selectedVersion) return;
     try {
-      const version = await replay.mutateAsync({ versionId: selectedVersion.id, sessionId });
+      const version = await replay.mutateAsync({
+        versionId: selectedVersion.id,
+        sessionId,
+        staleSnapshotReason: replayNeedsReason ? replayStaleReason : undefined,
+      });
       setSelectedVersionId(version.id);
+      setReplayStaleReason("");
       if (version.replay_status === "failed") {
         toast.error("Replayは完了しましたが、runは成功しませんでした -- 評価結果を確認してください。");
       } else {
@@ -526,6 +621,34 @@ function StudioView({ sessionId }: { sessionId: number }) {
 
       {!canRun && componentId && <ApprovalPanel componentId={componentId} />}
 
+      {replayPreflight?.stale_reason_state === "inheritable" && (
+        <p className="rounded-md border px-3 py-2 text-xs text-muted-foreground" data-testid="candidate-replay-stale-inherited">
+          Snapshot は HEAD より古いままですが、HEAD はセッション開始時から変わっていないため、
+          開始時に記録した理由をこの Replay にも記録します: 「{replayPreflight.session_stale_ack_reason}」
+        </p>
+      )}
+      {replayNeedsReason && replayPreflight && (
+        <div className="space-y-2" data-testid="candidate-replay-stale-ack">
+          <p className="text-xs text-amber-700 dark:text-amber-300">
+            {replayPreflight.stale_reason_state === "head_moved"
+              ? "セッション開始後に HEAD が進んだため、開始時に記録した理由はこの Replay には使えません。改めて理由を入力してください。"
+              : "このセッションの Snapshot は現在 HEAD より古くなっています。Replay で確認する前に、この Snapshot を使う理由を入力してください。"}
+          </p>
+          <SnapshotPreflightPanel
+            preflight={replayPreflight.preflight}
+            staleReason={replayStaleReason}
+            onStaleReasonChange={setReplayStaleReason}
+          />
+        </div>
+      )}
+      {replayPreflightQuery.isError && (
+        <QueryErrorState
+          target="Replay 前の Snapshot 確認"
+          error={replayPreflightQuery.error}
+          onRetry={() => replayPreflightQuery.refetch()}
+        />
+      )}
+
       <div className="grid gap-4 lg:grid-cols-2">
         <Card data-testid="candidate-studio-conversation">
           <CardHeader>
@@ -583,6 +706,7 @@ function StudioView({ sessionId }: { sessionId: number }) {
               <PrimaryAction
                 state={state}
                 canRun={canRun}
+                replayReasonMissing={replayReasonMissing}
                 draftText={draftText}
                 generatePending={generate.isPending}
                 replayPending={replay.isPending}
@@ -746,6 +870,7 @@ function EvaluationTab({
 function PrimaryAction({
   state,
   canRun,
+  replayReasonMissing,
   draftText,
   generatePending,
   replayPending,
@@ -757,6 +882,7 @@ function PrimaryAction({
 }: {
   state: StudioState;
   canRun: boolean;
+  replayReasonMissing: boolean;
   draftText: string;
   generatePending: boolean;
   replayPending: boolean;
@@ -775,7 +901,17 @@ function PrimaryAction({
   }
   if (state === "generated") {
     return (
-      <Button onClick={onReplay} disabled={!canRun || replayPending} title={!canRun ? "このcomponentのReplayはまだ承認されていません" : undefined}>
+      <Button
+        onClick={onReplay}
+        disabled={!canRun || replayReasonMissing || replayPending}
+        title={
+          !canRun
+            ? "このcomponentのReplayはまだ承認されていません"
+            : replayReasonMissing
+              ? "この Snapshot を使う理由を入力してください"
+              : undefined
+        }
+      >
         {replayPending ? "実行中..." : "Replayで確認"}
       </Button>
     );

@@ -39,6 +39,7 @@ import { ImprovementLoopRail } from "@/components/improvement-loop/rail";
 import { SnapshotPreflightPanel } from "@/components/snapshot-preflight";
 import { QueryErrorState } from "@/components/query-state";
 import { useUnsavedChangesGuard, useUiDraftRegistry } from "@/lib/ui-draft";
+import { formatTimestamp } from "@/lib/utils";
 
 // Simulation Workbench (Issue #242 Phase D / #246). Display + composition
 // only: every judgement/execution/comparison decision below is made by the
@@ -80,7 +81,6 @@ function Workbench() {
   };
 
   const { data: sets, isLoading: setsLoading, isError: setsError, refetch: refetchSets } = useReplaySets();
-  const { data: snapshotPreflight } = useSnapshotPreflight();
   const { data: replaySet, isLoading: setLoading, isError: setError, error: replaySetError, refetch: refetchSet } = useReplaySet(selectedSetId);
   const componentId = replaySet?.component_id ?? null;
 
@@ -116,6 +116,21 @@ function Workbench() {
   }
   const sourceChanged = !!source && sourceIdentity !== lastLoadedSourceIdentity && sourceEdited;
 
+  // UX audit 2026-11-17 C8: evaluate the snapshot the run will actually pin
+  // (the Replay Set source's), not only the recommended one, and let the
+  // developer record why a stale one is intended. Without this input a stale
+  // snapshot made every Run a 409 with no way to continue. The reason is a
+  // `decision_method: manual` fact -- it is never pre-filled.
+  const { data: snapshotPreflight, isLoading: preflightLoading } = useSnapshotPreflight(
+    source?.snapshot_id ?? null,
+  );
+  const [staleReason, setStaleReason] = useState("");
+  const staleAckRequired = !!snapshotPreflight?.requires_stale_acknowledgement;
+  const staleAckMissing = staleAckRequired && !staleReason.trim();
+  const staleReasonPayload = staleAckRequired && staleReason.trim()
+    ? { stale_snapshot_reason: staleReason.trim() }
+    : {};
+
   const [pastedPatch, setPastedPatch] = useState("");
   const [draftTraceId, setDraftTraceId] = useState<string | null>(null);
   const [draftObjective, setDraftObjective] = useState("");
@@ -145,7 +160,7 @@ function Workbench() {
   const runQuery = useReplayVariantRun(effectiveActiveRunId);
   const { data: activeRun } = runQuery;
 
-  const canRun = !!approvalState?.active;
+  const canRun = !!approvalState?.active && !staleAckMissing;
 
   const handleRunDirectEdit = async () => {
     if (!selectedSetId || !source || sourceChanged) return;
@@ -159,6 +174,7 @@ function Workbench() {
         replay_set_id: selectedSetId,
         snapshot_id: source?.snapshot_id,
         variants: [{ label: "Direct edit", patch_text: diff.patch_text, source: "manual" }],
+        ...staleReasonPayload,
       });
       setActiveRunId(run.id);
       toast.success("Replay variant runが完了しました");
@@ -174,6 +190,7 @@ function Workbench() {
         replay_set_id: selectedSetId,
         snapshot_id: source?.snapshot_id,
         variants: [{ label: "Pasted patch", patch_text: pastedPatch, source: "pasted" }],
+        ...staleReasonPayload,
       });
       setActiveRunId(run.id);
       toast.success("Replay variant runが完了しました");
@@ -211,6 +228,7 @@ function Workbench() {
             source: "llm_draft",
           },
         ],
+        ...staleReasonPayload,
       });
       setActiveRunId(run.id);
       toast.success("Replay variant runが完了しました");
@@ -223,9 +241,14 @@ function Workbench() {
     <div className="space-y-6">
       {/* Issue #371: the Workbench is the multi-candidate detail mode of the
           same loop, not a separate product. */}
-      <ImprovementLoopRail componentId={componentId} replaySetId={selectedSetId} replayRun={activeRun} approved={canRun} />
+      <ImprovementLoopRail componentId={componentId} replaySetId={selectedSetId} replayRun={activeRun} approved={!!approvalState?.active} />
       {/* Issue #369 (review finding 4): same shared preflight, same words. */}
-      <SnapshotPreflightPanel preflight={snapshotPreflight} />
+      <SnapshotPreflightPanel
+        preflight={snapshotPreflight}
+        isLoading={preflightLoading}
+        staleReason={staleReason}
+        onStaleReasonChange={setStaleReason}
+      />
       <div className="flex items-center justify-between gap-3">
         <h1 className="text-2xl font-bold tracking-tight">Simulation Workbench</h1>
         <div className="flex items-center gap-2">
@@ -251,7 +274,10 @@ function Workbench() {
               <option value="">Replay Setを選択...</option>
               {sets?.map((s) => (
                 <option key={s.id} value={s.id}>
-                  {s.name || `Set #${s.id}`} — {s.component_id} ({s.trace_ids.length})
+                  {/* UX audit F6: adding a Trace creates a NEW Set under the
+                      same name, so the id, creation time, and size are what
+                      tell the versions apart. */}
+                  {s.name || `Set #${s.id}`} #{s.id} — {s.component_id} · {s.trace_ids.length}件 · {formatTimestamp(s.created_at)}
                 </option>
               ))}
             </Select>
@@ -344,9 +370,14 @@ function Workbench() {
                       {source.end_line}) @ {source.commit_sha.slice(0, 8)}
                     </p>
                   )}
-                  {!canRun && (
+                  {!approvalState?.active && (
                     <p className="text-xs text-amber-700 dark:text-amber-300">
                       このcomponentのReplayは未承認です -- 上で承認されるまでRunは無効化されます。
+                    </p>
+                  )}
+                  {staleAckMissing && (
+                    <p className="text-xs text-amber-700 dark:text-amber-300" data-testid="workbench-stale-ack-missing">
+                      Snapshot が HEAD より古いため、上の「開始前の確認」にこの Snapshot を使う理由を入力するまで Run は無効です。
                     </p>
                   )}
                   <Tabs defaultValue="direct">

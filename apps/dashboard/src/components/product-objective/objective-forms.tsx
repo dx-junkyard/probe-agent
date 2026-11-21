@@ -1,22 +1,31 @@
 // Issue #427 (Epic #427) §9.3/D: the Objective Map's own forms for the
 // finite next-step operations THIS Epic owns -- Objective create / revision
-// / decision, and Milestone create / revision / decision / assessment.
-// `confirm_vision` and `link_requirement_to_feature` are deliberately NOT
-// here; those next steps deep-link to the screens that already own that
-// surface (Interview / UX Design Studio) rather than duplicating it.
+// / decision / parent / upstream reference, and Milestone create / revision /
+// decision / assessment. `confirm_vision` and `link_requirement_to_feature`
+// are deliberately NOT here; those next steps deep-link to the screens that
+// already own that surface (Interview / UX Design Studio) rather than
+// duplicating it.
 //
 // The CTA that leads here NAVIGATES (§9.3) -- every write below happens only
-// on explicit developer submission, exactly like the Gap Workbench's
-// existing decision/artifact-link controls (§9.2 non-goal: no automatic
-// execution on selection). Every decision/assessment sends `captured_digest`
-// read from the entity's OWN response (`current_revision.content_digest`,
-// §4.2/§10.1) -- never a client-computed value -- and a stale-digest 409
-// renders `StaleDigestNotice`: a recoverable message asking the developer to
-// reload and re-read before deciding again, never a silent or automatic
-// retry (§B).
+// on explicit developer submission. Every decision/assessment sends
+// `captured_digest` read from the entity's OWN response
+// (`current_revision.content_digest`, §4.2/§10.1) -- never a client-computed
+// value -- and a stale-digest 409 renders `StaleDigestNotice`: a recoverable
+// message asking the developer to reload and re-read before deciding again,
+// never a silent or automatic retry (§B).
+//
+// UX audit 2026-11-17 D8: decisions go through `DecisionConfirmDialog`, which
+// names the subject and its CURRENT state (the server's value). No client
+// transition table exists: a refused transition comes back as the server's
+// own code and is shown in Japanese with that state alongside. The one rule
+// read straight off the server's own field is the Milestone assessment gate
+// -- the server refuses an assessment unless `design_status === "confirmed"`
+// (§4.3), so before that the assessment buttons are not offered at all; the
+// reason is shown instead.
 
 import { useState } from "react";
 import { toast } from "sonner";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -25,20 +34,28 @@ import { ApiError } from "@/api/client";
 import { useDirtyGuard } from "./unsaved-work";
 import {
   useAddProductMilestoneRevision, useAddProductObjectiveRevision,
+  useAddProductObjectiveUpstreamRef, useClearProductObjectiveParent,
   useCreateProductMilestone, useCreateProductObjective,
   useProductMilestoneDetail, useProductObjectiveDetail,
   useRecordProductMilestoneAssessment, useRecordProductMilestoneDecision,
-  useRecordProductObjectiveDecision,
+  useRecordProductObjectiveDecision, useSetProductObjectiveParent,
 } from "@/api/hooks";
 import type {
   ProductMilestoneAssessmentKind, ProductMilestoneDecisionKind,
-  ProductMilestoneVerificationMethod, ProductObjectiveDecisionKind,
-  ProductMilestoneRevisionOut, ProductObjectiveRevisionOut,
+  ProductMilestoneDetailOut, ProductMilestoneVerificationMethod, ProductObjectiveDecisionKind,
+  ProductObjectiveDetailOut, ProductMilestoneRevisionOut, ProductObjectiveRevisionOut, ProductRefKind,
 } from "@/api/types";
 import {
+  DESIGN_STATUS_LABEL, MILESTONE_ACHIEVEMENT_LABEL, MILESTONE_ASSESSABILITY_LABEL,
   MILESTONE_ASSESSMENT_ACTION_LABEL, MILESTONE_DECISION_LABEL,
-  OBJECTIVE_DECISION_LABEL, isStaleDigestErrorCode,
+  OBJECTIVE_DECISION_LABEL, OBJECTIVE_REF_KIND_LABEL, OBJECTIVE_STATE_LABEL,
+  REF_RECHECK_STATE_LABEL, REF_RELATION_STATUS_LABEL, REF_TARGET_RESOLUTION_LABEL,
+  isStaleDigestErrorCode,
 } from "./model";
+import {
+  DecisionConfirmDialog, RejectedNotice, rejectionFromError, useDecisionDialog, type Rejection,
+} from "./decision-confirm";
+import { ObjectiveParentPicker, ReferenceTargetPicker } from "./reference-picker";
 
 const OBJECTIVE_DECISION_VALUES: ProductObjectiveDecisionKind[] = [
   "confirm", "activate", "achieve", "reject", "retire", "reinstate",
@@ -58,22 +75,9 @@ const VERIFICATION_METHOD_LABEL: Record<ProductMilestoneVerificationMethod, stri
   external_report: "外部からの報告",
   unavailable: "評価方法は未設定",
 };
-
-type Rejection = { code: string; message: string };
-
-function rejectionFromError(error: unknown, fallback: string): Rejection {
-  const apiError = error as ApiError;
-  return { code: apiError.code ?? "unknown", message: apiError.detail || fallback };
-}
-
-function RejectedNotice({ code, message }: Rejection) {
-  return (
-    <div className="rounded border border-destructive p-2 text-xs" data-testid="product-decision-rejected">
-      <span className="font-mono text-destructive">{code}</span>
-      <span className="ml-2">{message}</span>
-    </div>
-  );
-}
+const OBJECTIVE_REF_KINDS: ProductRefKind[] = [
+  "vision_claim", "purpose_element", "purpose_relation", "capability_entity", "stakeholder_need",
+];
 
 /** §B: a recoverable rendering of a `*_decision_stale_digest` 409 -- the
  * content changed since this screen last read it, so the developer reloads
@@ -93,6 +97,9 @@ export function StaleDigestNotice({ onRetry }: { onRetry: () => void }) {
     </div>
   );
 }
+
+const HUMAN_DECISION_NOTE =
+  "判断の記録だけを追加します。実装・publish・他の画面の状態は変わりません。前の判断は消えず、履歴に残ります。";
 
 // --- Objective ---------------------------------------------------------------
 
@@ -137,10 +144,6 @@ export function CreateObjectiveForm({ onCreated }: { onCreated: (objectiveKey: s
  * form does not send is stored as empty. Starting blank therefore made
  * 「1 項目だけ直す」 silently blank out every other field, so the form is
  * seeded from the CURRENT revision and the developer edits from there.
- *
- * That also restores the difference between two intentions the blank form
- * could not express: a field left as it was, and a field the developer
- * deliberately cleared.
  *
  * `useState` seeds once per mount, which is correct because
  * `objective-map.tsx` remounts this panel per `(system_id, objective_key)`.
@@ -204,30 +207,191 @@ function ObjectiveRevisionForm({
   );
 }
 
+/**
+ * §4.4: the Objective's parent. Candidates are this System's Objectives
+ * (itself excluded); a cycle further up is the server's to refuse
+ * (`product_objective_parent_cycle`), never checked here. Detaching is not a
+ * deletion -- the server appends a tombstone carrying the reason, which is why
+ * it goes through the confirmation dialog with a reason field.
+ */
+function ObjectiveParentControls({ objective }: { objective: ProductObjectiveDetailOut }) {
+  const set = useSetProductObjectiveParent(objective.objective_key);
+  const clear = useClearProductObjectiveParent(objective.objective_key);
+  const [parentKey, setParentKey] = useState("");
+  const [rationale, setRationale] = useState("");
+  const [rejection, setRejection] = useState<Rejection | null>(null);
+  const [detachOpen, setDetachOpen] = useState(false);
+  useDirtyGuard(`objective-parent:${objective.objective_key}`, parentKey !== "" || rationale !== "");
+
+  function submitSet() {
+    setRejection(null);
+    set.mutate(
+      { parent_objective_key: parentKey, rationale },
+      {
+        onSuccess: () => {
+          setParentKey(""); setRationale("");
+          toast.success("親 Objective を設定しました");
+        },
+        onError: (error) => setRejection(rejectionFromError(error, "親を設定できませんでした")),
+      },
+    );
+  }
+
+  function submitClear(reason: string) {
+    setRejection(null);
+    clear.mutate(
+      { rationale: reason },
+      {
+        onSuccess: () => { setDetachOpen(false); toast.success("親 Objective から切り離しました"); },
+        onError: (error) => { setDetachOpen(false); setRejection(rejectionFromError(error, "切り離せませんでした")); },
+      },
+    );
+  }
+
+  return (
+    <div className="space-y-2 rounded border p-2" data-testid="objective-parent-controls">
+      <p className="text-xs font-semibold">親 Objective</p>
+      <p className="text-xs" data-testid="objective-parent-current">
+        {objective.parent_objective_key
+          ? <>現在の親: <span className="font-mono">{objective.parent_objective_key}</span></>
+          : "親はありません(最上位の Objective です)。"}
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <ObjectiveParentPicker
+          excludeKey={objective.objective_key}
+          value={parentKey}
+          onChange={setParentKey}
+          ariaLabel="親にする Objective"
+          testId="objective-parent-select"
+        />
+      </div>
+      <Input aria-label="親を設定する理由" placeholder="理由(任意)" value={rationale} onChange={(e) => setRationale(e.target.value)} />
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" variant="outline" disabled={!parentKey || set.isPending} onClick={submitSet} data-testid="objective-parent-set">
+          {objective.parent_objective_key ? "親を付け替える" : "親を設定する"}
+        </Button>
+        {objective.parent_objective_key && (
+          <Button size="sm" variant="ghost" disabled={clear.isPending} onClick={() => setDetachOpen(true)} data-testid="objective-parent-clear">
+            親から切り離す
+          </Button>
+        )}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        循環する親子関係はサーバーが拒否します。切り離しても履歴は残り、誰がなぜ切り離したかが記録されます。
+      </p>
+      {rejection && <RejectedNotice {...rejection} testId="objective-parent-rejected" />}
+      <DecisionConfirmDialog
+        open={detachOpen}
+        onOpenChange={setDetachOpen}
+        title={`Objective「${objective.title || objective.objective_key}」を親から切り離す`}
+        currentStateText={`現在の親: ${objective.parent_objective_key ?? "なし"}`}
+        consequence="この Objective を最上位へ戻したことを記録します。親子関係の履歴は削除されません。"
+        confirmLabel="切り離す"
+        reasonLabel="切り離す理由"
+        pending={clear.isPending}
+        onConfirm={submitClear}
+      />
+    </div>
+  );
+}
+
+/** §4.6: references from this Objective to the Vision and other upstream
+ * elements. The kind is chosen first, then the target from THAT kind's own
+ * list (UX audit C9). The server captures the digest and resolves the target
+ * at read time; nothing is copied into the Objective. */
+function ObjectiveUpstreamRefs({ objective }: { objective: ProductObjectiveDetailOut }) {
+  const add = useAddProductObjectiveUpstreamRef(objective.objective_key);
+  const [refKind, setRefKind] = useState<ProductRefKind>("vision_claim");
+  const [targetRef, setTargetRef] = useState("");
+  const [note, setNote] = useState("");
+  const [rejection, setRejection] = useState<Rejection | null>(null);
+  useDirtyGuard(`objective-upstream-ref:${objective.objective_key}`, targetRef !== "" || note !== "");
+  const refs = objective.upstream_refs.filter((r) => r.superseded_by_id === null);
+
+  function submit() {
+    setRejection(null);
+    add.mutate(
+      { ref_kind: refKind, target_ref: targetRef, note },
+      {
+        onSuccess: () => { setTargetRef(""); setNote(""); toast.success("上流への参照を追加しました"); },
+        onError: (error) => setRejection(rejectionFromError(error, "参照を追加できませんでした")),
+      },
+    );
+  }
+
+  return (
+    <div className="space-y-2 rounded border p-2" data-testid="objective-upstream-refs">
+      <p className="text-xs font-semibold">Vision・上流への参照</p>
+      {refs.length === 0 ? (
+        <p className="text-xs text-muted-foreground" data-testid="objective-upstream-refs-empty">
+          まだ Vision や上流の要素を参照していません。
+        </p>
+      ) : (
+        <ul className="space-y-1 text-xs" data-testid="objective-upstream-ref-list">
+          {refs.map((r) => (
+            <li key={r.id} className="rounded border p-1.5" data-testid={`objective-upstream-ref-${r.id}`}>
+              <div className="flex flex-wrap items-center gap-1">
+                <Badge variant="outline">{OBJECTIVE_REF_KIND_LABEL[r.ref_kind]}</Badge>
+                <span>{r.target_name ?? r.target_ref}</span>
+              </div>
+              <div className="mt-0.5 text-muted-foreground">
+                {REF_RELATION_STATUS_LABEL[r.relation_status]} / {REF_TARGET_RESOLUTION_LABEL[r.target_resolution]} / {REF_RECHECK_STATE_LABEL[r.recheck_state]}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <Select
+          aria-label="参照の種類"
+          value={refKind}
+          onChange={(e) => { setRefKind(e.target.value as ProductRefKind); setTargetRef(""); }}
+          data-testid="objective-upstream-ref-kind"
+        >
+          {OBJECTIVE_REF_KINDS.map((k) => <option key={k} value={k}>{OBJECTIVE_REF_KIND_LABEL[k]}</option>)}
+        </Select>
+        <ReferenceTargetPicker
+          kind={refKind}
+          value={targetRef}
+          onChange={setTargetRef}
+          ariaLabel="参照先"
+          testId="objective-upstream-ref-target"
+        />
+      </div>
+      <Input aria-label="参照のメモ" placeholder="メモ(任意)" value={note} onChange={(e) => setNote(e.target.value)} />
+      <Button size="sm" variant="outline" disabled={!targetRef || add.isPending} onClick={submit} data-testid="objective-upstream-ref-submit">
+        参照を追加する
+      </Button>
+      {rejection && <RejectedNotice {...rejection} testId="objective-upstream-ref-rejected" />}
+    </div>
+  );
+}
+
 function ObjectiveDecisionControls({
-  objectiveKey, capturedDigest, onStale,
+  objective, capturedDigest, onStale,
 }: {
-  objectiveKey: string;
+  objective: ProductObjectiveDetailOut;
   capturedDigest: string;
   onStale: () => void;
 }) {
-  const record = useRecordProductObjectiveDecision(objectiveKey);
-  const [rationale, setRationale] = useState("");
+  const record = useRecordProductObjectiveDecision(objective.objective_key);
+  const dialog = useDecisionDialog<ProductObjectiveDecisionKind>();
   const [rejection, setRejection] = useState<Rejection | null>(null);
   const [stale, setStale] = useState(false);
-  useDirtyGuard(`objective-decision:${objectiveKey}`, rationale !== "");
+  const stateLabel = OBJECTIVE_STATE_LABEL[objective.objective_state];
 
-  function submit(decision: ProductObjectiveDecisionKind) {
+  function submit(decision: ProductObjectiveDecisionKind, rationale: string) {
     setRejection(null);
     setStale(false);
     record.mutate(
       { decision, rationale, captured_digest: capturedDigest },
       {
-        onSuccess: () => { setRationale(""); toast.success(`「${OBJECTIVE_DECISION_LABEL[decision]}」を記録しました`); },
+        onSuccess: () => { dialog.close(); toast.success(`「${OBJECTIVE_DECISION_LABEL[decision]}」を記録しました`); },
         onError: (error) => {
+          dialog.close();
           const apiError = error as ApiError;
           if (isStaleDigestErrorCode(apiError.code)) { setStale(true); return; }
-          setRejection(rejectionFromError(error, "記録できませんでした"));
+          setRejection(rejectionFromError(error, "記録できませんでした", `現在の状態: ${stateLabel}`));
         },
       },
     );
@@ -235,29 +399,44 @@ function ObjectiveDecisionControls({
 
   return (
     <div className="space-y-2 rounded border p-2" data-testid="objective-decision-controls">
-      <p className="text-xs font-semibold">解消状態を変える(人間の判断として記録されます)</p>
-      <Textarea aria-label="理由" placeholder="理由(任意)" value={rationale} onChange={(e) => setRationale(e.target.value)} rows={2} />
+      <p className="text-xs font-semibold">Objective の状態を記録する(人間の判断として記録されます)</p>
+      <p className="text-xs" data-testid="objective-decision-current-state">現在の状態: {stateLabel}</p>
       <div className="flex flex-wrap gap-2">
         {OBJECTIVE_DECISION_VALUES.map((d) => (
           <Button
             key={d} size="sm" variant="outline" disabled={record.isPending}
-            onClick={() => submit(d)} data-testid={`objective-decision-${d}`}
+            onClick={() => dialog.open(d)} data-testid={`objective-decision-${d}`}
           >
             {OBJECTIVE_DECISION_LABEL[d]}
           </Button>
         ))}
       </div>
+      <p className="text-xs text-muted-foreground">
+        記録できるかどうかは現在の状態で決まります。記録できない操作はサーバーが理由を返します。
+      </p>
       {stale && <StaleDigestNotice onRetry={() => { setStale(false); onStale(); }} />}
       {rejection && <RejectedNotice {...rejection} />}
+      {dialog.pendingKind && (
+        <DecisionConfirmDialog
+          open
+          onOpenChange={(open) => { if (!open) dialog.close(); }}
+          title={`Objective「${objective.title || objective.objective_key}」を${OBJECTIVE_DECISION_LABEL[dialog.pendingKind]}`}
+          currentStateText={`現在の状態: ${stateLabel}`}
+          consequence={HUMAN_DECISION_NOTE}
+          confirmLabel={OBJECTIVE_DECISION_LABEL[dialog.pendingKind]}
+          pending={record.isPending}
+          onConfirm={(reason) => submit(dialog.pendingKind!, reason)}
+        />
+      )}
     </div>
   );
 }
 
-/** The selected Objective's work surface: content revision + decision
- * controls, both scoped to the ONE Objective this panel was given. Fetches
- * `GET /product-objectives/{key}` directly (§4.2's `current_revision.
- * content_digest`), separate from the Objective Map tree's own summary
- * fetch. */
+/** The selected Objective's work surface: content revision, parent, upstream
+ * references and decision controls, all scoped to the ONE Objective this
+ * panel was given. Fetches `GET /product-objectives/{key}` directly (§4.2's
+ * `current_revision.content_digest`), separate from the Objective Map tree's
+ * own summary fetch. */
 export function ObjectiveWorkPanel({ objectiveKey }: { objectiveKey: string }) {
   const detail = useProductObjectiveDetail(objectiveKey);
 
@@ -282,7 +461,9 @@ export function ObjectiveWorkPanel({ objectiveKey }: { objectiveKey: string }) {
         objectiveKey={objective.objective_key}
         current={objective.current_revision}
       />
-      <ObjectiveDecisionControls objectiveKey={objective.objective_key} capturedDigest={digest} onStale={() => detail.refetch()} />
+      <ObjectiveUpstreamRefs objective={objective} />
+      <ObjectiveParentControls objective={objective} />
+      <ObjectiveDecisionControls objective={objective} capturedDigest={digest} onStale={() => detail.refetch()} />
     </div>
   );
 }
@@ -417,29 +598,30 @@ function MilestoneRevisionForm({
 }
 
 function MilestoneDecisionControls({
-  milestoneKey, capturedDigest, onStale,
+  milestone, capturedDigest, onStale,
 }: {
-  milestoneKey: string;
+  milestone: ProductMilestoneDetailOut;
   capturedDigest: string;
   onStale: () => void;
 }) {
-  const record = useRecordProductMilestoneDecision(milestoneKey);
-  const [rationale, setRationale] = useState("");
+  const record = useRecordProductMilestoneDecision(milestone.milestone_key);
+  const dialog = useDecisionDialog<ProductMilestoneDecisionKind>();
   const [rejection, setRejection] = useState<Rejection | null>(null);
   const [stale, setStale] = useState(false);
-  useDirtyGuard(`milestone-decision:${milestoneKey}`, rationale !== "");
+  const stateLabel = DESIGN_STATUS_LABEL[milestone.design_status];
 
-  function submit(decision: ProductMilestoneDecisionKind) {
+  function submit(decision: ProductMilestoneDecisionKind, rationale: string) {
     setRejection(null);
     setStale(false);
     record.mutate(
       { decision, rationale, captured_digest: capturedDigest },
       {
-        onSuccess: () => { setRationale(""); toast.success(`「${MILESTONE_DECISION_LABEL[decision]}」を記録しました`); },
+        onSuccess: () => { dialog.close(); toast.success(`「${MILESTONE_DECISION_LABEL[decision]}」を記録しました`); },
         onError: (error) => {
+          dialog.close();
           const apiError = error as ApiError;
           if (isStaleDigestErrorCode(apiError.code)) { setStale(true); return; }
-          setRejection(rejectionFromError(error, "記録できませんでした"));
+          setRejection(rejectionFromError(error, "記録できませんでした", `定義の状態: ${stateLabel}`));
         },
       },
     );
@@ -448,12 +630,12 @@ function MilestoneDecisionControls({
   return (
     <div className="space-y-2 rounded border p-2" data-testid="milestone-decision-controls">
       <p className="text-xs font-semibold">Milestone の定義を確定する(人間の判断として記録されます)</p>
-      <Textarea aria-label="理由" placeholder="理由(任意)" value={rationale} onChange={(e) => setRationale(e.target.value)} rows={2} />
+      <p className="text-xs" data-testid="milestone-decision-current-state">定義の状態: {stateLabel}</p>
       <div className="flex flex-wrap gap-2">
         {MILESTONE_DECISION_VALUES.map((d) => (
           <Button
             key={d} size="sm" variant="outline" disabled={record.isPending}
-            onClick={() => submit(d)} data-testid={`milestone-decision-${d}`}
+            onClick={() => dialog.open(d)} data-testid={`milestone-decision-${d}`}
           >
             {MILESTONE_DECISION_LABEL[d]}
           </Button>
@@ -461,37 +643,68 @@ function MilestoneDecisionControls({
       </div>
       {stale && <StaleDigestNotice onRetry={() => { setStale(false); onStale(); }} />}
       {rejection && <RejectedNotice {...rejection} />}
+      {dialog.pendingKind && (
+        <DecisionConfirmDialog
+          open
+          onOpenChange={(open) => { if (!open) dialog.close(); }}
+          title={`Milestone「${milestone.title || milestone.milestone_key}」の定義を${MILESTONE_DECISION_LABEL[dialog.pendingKind]}`}
+          currentStateText={`定義の状態: ${stateLabel}`}
+          consequence={`${HUMAN_DECISION_NOTE} 定義の確定は達成の判定ではありません。`}
+          confirmLabel={MILESTONE_DECISION_LABEL[dialog.pendingKind]}
+          pending={record.isPending}
+          onConfirm={(reason) => submit(dialog.pendingKind!, reason)}
+        />
+      )}
     </div>
   );
 }
 
 function MilestoneAssessmentControls({
-  milestoneKey, capturedDigest, onStale,
+  milestone, capturedDigest, onStale,
 }: {
-  milestoneKey: string;
+  milestone: ProductMilestoneDetailOut;
   capturedDigest: string;
   onStale: () => void;
 }) {
-  const record = useRecordProductMilestoneAssessment(milestoneKey);
-  const [rationale, setRationale] = useState("");
+  const record = useRecordProductMilestoneAssessment(milestone.milestone_key);
+  const dialog = useDecisionDialog<ProductMilestoneAssessmentKind>();
   const [evidenceNote, setEvidenceNote] = useState("");
   const [rejection, setRejection] = useState<Rejection | null>(null);
   const [stale, setStale] = useState(false);
-  useDirtyGuard(
-    `milestone-assessment:${milestoneKey}`, rationale !== "" || evidenceNote !== "",
-  );
+  useDirtyGuard(`milestone-assessment:${milestone.milestone_key}`, evidenceNote !== "");
+  const achievementLabel = MILESTONE_ACHIEVEMENT_LABEL[milestone.achievement];
 
-  function submit(assessment: ProductMilestoneAssessmentKind) {
+  // §4.3: the server refuses any assessment while the definition is not
+  // `confirmed` (422 `product_milestone_not_assessable`). That is the
+  // server's own documented gate on a server value, so the buttons are not
+  // offered before it -- the reason is, instead.
+  if (milestone.design_status !== "confirmed") {
+    return (
+      <div className="space-y-1 rounded border p-2" data-testid="milestone-assessment-controls">
+        <p className="text-xs font-semibold">Milestone の達成を判定する</p>
+        <p className="text-xs text-muted-foreground" data-testid="milestone-assessment-not-available">
+          定義がまだ確定していないため、達成は判定できません(定義の状態: {DESIGN_STATUS_LABEL[milestone.design_status]})。
+          {milestone.design_status === "proposed"
+            ? "先に上の「確定する」で定義を確定してください。"
+            : "却下・廃止された Milestone は判定の対象になりません。"}
+        </p>
+      </div>
+    );
+  }
+
+  function submit(assessment: ProductMilestoneAssessmentKind, rationale: string) {
     setRejection(null);
     setStale(false);
     record.mutate(
       { assessment, rationale, evidence_note: evidenceNote, captured_digest: capturedDigest },
       {
         onSuccess: () => {
-          setRationale(""); setEvidenceNote("");
+          dialog.close();
+          setEvidenceNote("");
           toast.success(`「${MILESTONE_ASSESSMENT_ACTION_LABEL[assessment]}」を記録しました`);
         },
         onError: (error) => {
+          dialog.close();
           const apiError = error as ApiError;
           if (isStaleDigestErrorCode(apiError.code)) { setStale(true); return; }
           setRejection(rejectionFromError(error, "記録できませんでした"));
@@ -503,13 +716,15 @@ function MilestoneAssessmentControls({
   return (
     <div className="space-y-2 rounded border p-2" data-testid="milestone-assessment-controls">
       <p className="text-xs font-semibold">Milestone の達成を判定する(人間の判断として記録されます)</p>
-      <Textarea aria-label="判定理由" placeholder="判定理由(任意)" value={rationale} onChange={(e) => setRationale(e.target.value)} rows={2} />
+      <p className="text-xs" data-testid="milestone-assessment-current-state">
+        現在の判定: {achievementLabel}({MILESTONE_ASSESSABILITY_LABEL[milestone.assessability]})
+      </p>
       <Textarea aria-label="根拠" placeholder="根拠(任意)" value={evidenceNote} onChange={(e) => setEvidenceNote(e.target.value)} rows={2} />
       <div className="flex flex-wrap gap-2">
         {MILESTONE_ASSESSMENT_VALUES.map((a) => (
           <Button
             key={a} size="sm" variant="outline" disabled={record.isPending}
-            onClick={() => submit(a)} data-testid={`milestone-assessment-${a}`}
+            onClick={() => dialog.open(a)} data-testid={`milestone-assessment-${a}`}
           >
             {MILESTONE_ASSESSMENT_ACTION_LABEL[a]}
           </Button>
@@ -517,6 +732,19 @@ function MilestoneAssessmentControls({
       </div>
       {stale && <StaleDigestNotice onRetry={() => { setStale(false); onStale(); }} />}
       {rejection && <RejectedNotice {...rejection} />}
+      {dialog.pendingKind && (
+        <DecisionConfirmDialog
+          open
+          onOpenChange={(open) => { if (!open) dialog.close(); }}
+          title={`Milestone「${milestone.title || milestone.milestone_key}」を${MILESTONE_ASSESSMENT_ACTION_LABEL[dialog.pendingKind]}`}
+          currentStateText={`現在の判定: ${achievementLabel}`}
+          consequence={`${HUMAN_DECISION_NOTE} 達成の判定は Objective を自動で達成にしません。`}
+          confirmLabel={MILESTONE_ASSESSMENT_ACTION_LABEL[dialog.pendingKind]}
+          reasonLabel="判定理由"
+          pending={record.isPending}
+          onConfirm={(reason) => submit(dialog.pendingKind!, reason)}
+        />
+      )}
     </div>
   );
 }
@@ -549,8 +777,8 @@ export function MilestoneWorkPanel({ milestoneKey }: { milestoneKey: string }) {
         milestoneKey={milestone.milestone_key}
         current={milestone.current_revision}
       />
-      <MilestoneDecisionControls milestoneKey={milestone.milestone_key} capturedDigest={digest} onStale={() => detail.refetch()} />
-      <MilestoneAssessmentControls milestoneKey={milestone.milestone_key} capturedDigest={digest} onStale={() => detail.refetch()} />
+      <MilestoneDecisionControls milestone={milestone} capturedDigest={digest} onStale={() => detail.refetch()} />
+      <MilestoneAssessmentControls milestone={milestone} capturedDigest={digest} onStale={() => detail.refetch()} />
     </div>
   );
 }

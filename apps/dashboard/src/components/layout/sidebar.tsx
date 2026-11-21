@@ -96,13 +96,26 @@ const NAV_GROUPS: NavGroup[] = [
       { to: "/capability-map", icon: Network, label: "Capability Map", detail: true },
       { to: "/feature-map", icon: Map, label: "Feature Map", detail: true },
       { to: "/flow-explorer", icon: Workflow, label: "Flow Explorer", detail: true },
+      // UX audit 2026-11-17 C12: the design lineage reads upstream ->
+      // downstream -- who the System serves (Stakeholder Value Network) ->
+      // what it aims for (Objective Map) -> how it is used (UX Design
+      // Studio) -> how it is delivered (Journey Service Blueprint) -> how it
+      // is traced into code (Functional Lineage). The first two are main
+      // entries so an empty System can read where to start: a detail-view
+      // item renders BELOW every main entry, so keeping Objective Map there
+      // put the head of the chain after its downstream. UX Design Studio is
+      // reached from 「目的から始める」 (A7) while that block is shown.
+      {
+        to: "/stakeholder-value-network", icon: Users, label: "Stakeholder Value Network",
+        subtitle: "当事者とValue Exchangeの追跡", keywords: ["当事者", "利用者", "価値"],
+      },
+      {
+        to: "/objective-map", icon: Target, label: "Objective Map",
+        subtitle: "Vision へ向かうObjective/Milestone とGap Workbench", keywords: ["目標", "中間目標", "Gap"],
+      },
       {
         to: "/ux-design-studio", icon: PenTool, label: "UX Design Studio", keywords: ["要件", "設計", "体験"],
         subtitle: "Journey/Requirement/Solution Designの追跡",
-      },
-      {
-        to: "/stakeholder-value-network", icon: Users, label: "Stakeholder Value Network",
-        subtitle: "当事者とValue Exchangeの追跡", detail: true,
       },
       {
         to: "/journey-blueprint", icon: Rows3, label: "Journey Service Blueprint",
@@ -111,10 +124,6 @@ const NAV_GROUPS: NavGroup[] = [
       {
         to: "/functional-lineage", icon: GitFork, label: "Functional Lineage",
         subtitle: "Purpose → Capability → 実装 → Outcome の追跡とGap", detail: true,
-      },
-      {
-        to: "/objective-map", icon: Target, label: "Objective Map",
-        subtitle: "Vision へ向かうObjective/Milestone とGap Workbench", detail: true,
       },
     ],
   },
@@ -165,6 +174,14 @@ const NAV_GROUPS: NavGroup[] = [
         to: "/trace-analyzers", icon: Filter, label: "Trace Analyzers",
         subtitle: "パターン抽出とshadow diff検出", detail: true,
       },
+      // UX audit 2026-11-17 C13: candidates start in AI Candidate Studio
+      // (Components -> Candidate Studio), which needs no hand-written patch;
+      // Experiments comes after it, as the batch evaluation of candidates
+      // already made.
+      {
+        to: "/candidate-studio", icon: Bot, label: "AI Candidate Studio", keywords: ["候補", "比較", "評価"],
+        subtitle: "会話でAIに指示して候補生成",
+      },
       {
         to: "/experiments", icon: FlaskConical, label: "Experiments", keywords: ["比較", "評価", "実験"],
         subtitle: "候補のバッチ実行と評価",
@@ -172,10 +189,6 @@ const NAV_GROUPS: NavGroup[] = [
       {
         to: "/simulation-workbench", icon: Beaker, label: "Simulation Workbench",
         subtitle: "手動でdiffを編集して検証", detail: true,
-      },
-      {
-        to: "/candidate-studio", icon: Bot, label: "AI Candidate Studio",
-        subtitle: "会話でAIに指示して候補生成",
       },
       {
         to: "/workspaces", icon: MessageSquare, label: "Decision Workspace",
@@ -285,7 +298,10 @@ const PURPOSE_ENTRIES: { to: string; icon: typeof LayoutDashboard; label: string
   { to: "/ux-design-studio", icon: PenTool, label: "要件を設計する", hint: "UX Design Studio を開く" },
   // probe を入れた所が動いているかを、計測点ごとの受信状況とライブ表示で確かめる。
   { to: "/instrumentation-coverage", icon: Radio, label: "動作を確かめる", hint: "計測カバレッジを開く" },
-  { to: "/experiments", icon: FlaskConical, label: "候補を比較評価する", hint: "Experiments を開く" },
+  // UX audit 2026-11-17 C13: AI Candidate Studio, not Experiments --
+  // Experiments needs a hand-written patch, Candidate Studio starts from a
+  // component and an improvement goal.
+  { to: "/candidate-studio", icon: Bot, label: "候補を比較評価する", hint: "AI Candidate Studio を開く" },
 ];
 
 /**

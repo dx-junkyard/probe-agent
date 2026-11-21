@@ -28,6 +28,23 @@ class ApprovedPoint:
     recommended_mode: str  # "trace" | "shadow"
     line_start: int
     line_end: int
+    # UX audit 2026-11-17 C4: True only when the approving human chose
+    # "入力を保存する(Replay に使う)" for this point. The default keeps the
+    # #243 opt-in: no capture unless explicitly selected.
+    replay_capture: bool = False
+
+
+def _decorator_source(point: ApprovedPoint) -> str:
+    """The exact ``@probe(...)`` text inserted for one approved point.
+
+    ``replay_capture=True`` is the SDK's "defaults" form
+    (``probe_agent.decorator.probe``): key-name and value-shape redaction
+    (Principle 9) still apply to the captured input inside the SDK, and again
+    at Control Server ingestion.
+    """
+    if point.replay_capture:
+        return f'@probe(component_id="{point.component_id}", replay_capture=True)'
+    return f'@probe(component_id="{point.component_id}")'
 
 
 @dataclass
@@ -180,7 +197,7 @@ def instrument_file(
             existing_line = lines[insert_line_idx]
             indent = existing_line[: len(existing_line) - len(existing_line.lstrip())]
 
-        decorator_text = f'{indent}@probe(component_id="{point.component_id}")\n'
+        decorator_text = f"{indent}{_decorator_source(point)}\n"
         insertions[insert_line_idx] = decorator_text
 
     if not insertions:

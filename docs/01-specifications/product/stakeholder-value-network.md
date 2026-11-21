@@ -502,6 +502,21 @@ graph degrades gracefully to the list + detail presentation — it does not
 hide state. Empty, partial-failure, `unknown`, and `stale` are all rendered,
 never suppressed. Layout is never written back to the server.
 
+Editing surface (UX audit 2026-11-17 C1). The same screen is where §10's
+writes are made: the Stakeholder and Value Exchange lists each carry a
+create form (open by default while the list is empty, and the empty-state
+copy points at it); the selected entity's detail pane holds a revision form
+seeded from the current revision, Need and Environment Observation create /
+revise / correct-by-supersession forms, and the decision controls. Provider,
+receiver, impact targets and Journey Step link targets are **chosen from
+existing rows**, never typed as keys. Decisions go through a confirmation
+dialog and send the displayed `content_digest` as `captured_digest`; the
+buttons offered mirror `record_decision`'s finite rule (`reinstate` only from
+`rejected`/`retired`). No request body carries an actor, a
+`decision_method`, or an authorship value. Forms are remounted per entity so
+input never carries over to another one. Role assignment, references,
+evidence references, and saved view preferences have no editing surface yet.
+
 ---
 
 ## §8. Journey Service Blueprint projection (#423)

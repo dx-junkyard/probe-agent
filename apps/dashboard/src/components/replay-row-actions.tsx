@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { Play, ListPlus, FlaskConical, Bot } from "lucide-react";
+import { Play, ListPlus, FlaskConical, Bot, MoreHorizontal } from "lucide-react";
+import { formatTimestamp } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -12,8 +13,9 @@ import { useReplaySets, useCreateReplaySet } from "@/api/hooks";
 import type { Replayability } from "@/api/types";
 
 // Reusable trace row actions for the Simulation Workbench (Issue #242 Phase D
-// / #246): a replayability badge (with a reason-code tooltip) plus the three
-// one-click actions that get a trace into the Workbench or Experiments flow.
+// / #246): a replayability badge (with a reason-code tooltip) plus the actions
+// that get a trace into Candidate Studio (primary), the Workbench, or
+// Experiments (secondary, under 「その他の操作」).
 // Reused by Components' Traces tab, Trace Lineage, and analyzer example rows
 // wherever a trace_id + its owning component_id are both available.
 
@@ -68,43 +70,22 @@ export function ReplayRowActions({
 }) {
   const navigate = useNavigate();
   const [dialogMode, setDialogMode] = useState<"replay" | "add" | null>(null);
+  const moreRef = useRef<HTMLDetailsElement>(null);
+  const closeMore = () => {
+    if (moreRef.current) moreRef.current.open = false;
+  };
 
+  // UX audit 2026-11-17 C13: four equal-weight actions made the row read as
+  // four products. The one route that carries the developer from a recorded
+  // input to an evaluated candidate is Candidate Studio, so it is the single
+  // primary action; the other three stay one click away under 「その他の操作」
+  // (none removed). 「Experimentを作成」 opens the create form with no patch --
+  // the title says so rather than implying the trace is enough.
   return (
     <div className="flex items-center gap-1 flex-wrap">
       <Button
         size="sm"
-        variant="ghost"
-        className="h-7 px-2 text-xs"
-        title="このTraceをReplay Setに追加し、Simulation Workbenchを開く"
-        onClick={() => setDialogMode("replay")}
-      >
-        <Play className="h-3 w-3 mr-1" /> Replay
-      </Button>
-      <Button
-        size="sm"
-        variant="ghost"
-        className="h-7 px-2 text-xs"
-        title="このTraceを新規または既存のReplay Setに追加する"
-        onClick={() => setDialogMode("add")}
-      >
-        <ListPlus className="h-3 w-3 mr-1" /> Replay Setに追加
-      </Button>
-      <Button
-        size="sm"
-        variant="ghost"
-        className="h-7 px-2 text-xs"
-        title="このTraceからExperimentを作成する"
-        onClick={() =>
-          navigate(
-            `/experiments?from_trace=${encodeURIComponent(traceId)}&from_component=${encodeURIComponent(componentId)}`,
-          )
-        }
-      >
-        <FlaskConical className="h-3 w-3 mr-1" /> Experimentを作成
-      </Button>
-      <Button
-        size="sm"
-        variant="ghost"
+        variant="outline"
         className="h-7 px-2 text-xs"
         title="このTraceの入力を起点にAI Candidate Studioセッションを開始する"
         onClick={() =>
@@ -115,6 +96,58 @@ export function ReplayRowActions({
       >
         <Bot className="h-3 w-3 mr-1" /> この入力から改善する
       </Button>
+      <details
+        ref={moreRef}
+        className="relative"
+        data-testid="replay-row-more-actions"
+        onKeyDown={(e) => {
+          if (e.key === "Escape") closeMore();
+        }}
+      >
+        <summary className="inline-flex h-7 cursor-pointer list-none items-center rounded-md px-2 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground">
+          <MoreHorizontal className="h-3 w-3 mr-1" /> その他の操作
+        </summary>
+        <div className="absolute right-0 z-20 mt-1 flex w-56 flex-col gap-0.5 rounded-md border bg-background p-1 shadow-md">
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 justify-start px-2 text-xs"
+            title="このTraceをReplay Setに入れ、Simulation Workbenchを開く"
+            onClick={() => {
+              closeMore();
+              setDialogMode("replay");
+            }}
+          >
+            <Play className="h-3 w-3 mr-1" /> Replay
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 justify-start px-2 text-xs"
+            title="このTraceで新しいReplay Setを作る、または既存のSetにこのTraceを加えた新しい版を作る"
+            onClick={() => {
+              closeMore();
+              setDialogMode("add");
+            }}
+          >
+            <ListPlus className="h-3 w-3 mr-1" /> Replay Setに追加
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 justify-start px-2 text-xs"
+            title="Experiments の作成画面を開く（比較する patch はそこで入力します）"
+            onClick={() => {
+              closeMore();
+              navigate(
+                `/experiments?from_trace=${encodeURIComponent(traceId)}&from_component=${encodeURIComponent(componentId)}`,
+              );
+            }}
+          >
+            <FlaskConical className="h-3 w-3 mr-1" /> Experimentを作成
+          </Button>
+        </div>
+      </details>
       {dialogMode && (
         <ReplaySetDialog
           mode={dialogMode}
@@ -166,7 +199,13 @@ function ReplaySetDialog({
         name,
         trace_ids: traceIds,
       });
-      toast.success(mode === "replay" ? "Replay Setを準備しました" : "Replay Setに追加しました");
+      toast.success(
+        mode === "replay"
+          ? "Replay Setを準備しました"
+          : pickMode === "existing"
+            ? `このTraceを加えた新しい版 (Set #${created.id}) を作成しました`
+            : "Replay Setに追加しました",
+      );
       onOpenChange(false);
       if (mode === "replay") {
         navigate(`/simulation-workbench?replay_set_id=${created.id}`);
@@ -201,20 +240,25 @@ function ReplaySetDialog({
             onClick={() => setPickMode("existing")}
             disabled={!sets?.length}
           >
-            既存のSet
+            既存のSetを元にする
           </Button>
         </div>
         {pickMode === "existing" ? (
           <div className="space-y-2">
-            <Label>Replay Set</Label>
+            <Label>元にするReplay Set</Label>
             <Select value={selectedId} onChange={(e) => setSelectedId(e.target.value)}>
               <option value="">Replay Setを選択...</option>
               {sets?.map((s) => (
                 <option key={s.id} value={s.id}>
-                  {s.name || `Set #${s.id}`} ({s.trace_ids.length} traces)
+                  {s.name || `Set #${s.id}`} #{s.id} · {s.trace_ids.length}件 · {formatTimestamp(s.created_at)}
                 </option>
               ))}
             </Select>
+            {/* UX audit 2026-11-17 F6: Replay Sets are immutable -- the server
+                only INSERTs -- so this never edits the chosen Set. */}
+            <p className="text-xs text-muted-foreground" data-testid="replay-set-new-version-note">
+              選んだSetは変更されません。そのTrace群にこのTraceを加えた新しいReplay Setを同じ名前で作成します。
+            </p>
           </div>
         ) : (
           <div className="space-y-2">
@@ -231,7 +275,13 @@ function ReplaySetDialog({
           disabled={submitting || (pickMode === "existing" && !selectedId)}
           onClick={handleSubmit}
         >
-          {submitting ? "保存中..." : mode === "replay" ? "Replay" : "追加"}
+          {submitting
+            ? "保存中..."
+            : mode === "replay"
+              ? "Replay"
+              : pickMode === "existing"
+                ? "このTraceを加えた新しい版を作成"
+                : "追加"}
         </Button>
       </div>
     </Dialog>

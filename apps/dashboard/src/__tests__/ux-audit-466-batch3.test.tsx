@@ -283,7 +283,8 @@ describe("UX-13: ナビゲーションの段階化・検索・現在地", () => 
     // UX audit 2026-11-17 A4: the same destination as Overview's CTA.
     expect(within(entries).getByRole("link", { name: /現状を理解する/ })).toHaveAttribute("href", "/interview");
     expect(within(entries).getByRole("link", { name: /要件を設計する/ })).toHaveAttribute("href", "/ux-design-studio");
-    expect(within(entries).getByRole("link", { name: /候補を比較評価する/ })).toHaveAttribute("href", "/experiments");
+    // UX audit 2026-11-17 C13: Candidate Studio needs no hand-written patch.
+    expect(within(entries).getByRole("link", { name: /候補を比較評価する/ })).toHaveAttribute("href", "/candidate-studio");
     expect(within(entries).getByRole("link", { name: /全体を見渡す/ })).toHaveAttribute("href", "/system-map");
     expect(within(entries).getByRole("link", { name: /動作を確かめる/ })).toHaveAttribute("href", "/instrumentation-coverage");
   });
@@ -338,9 +339,39 @@ describe("UX-13: ナビゲーションの段階化・検索・現在地", () => 
     fireEvent.click(screen.getByTestId("sidebar-collapse-toggle"));
     expect(screen.queryByTestId("sidebar-purpose-entries")).not.toBeInTheDocument();
     const nav = screen.getByTestId("sidebar-nav");
-    for (const href of ["/interview", "/experiments", "/system-map", "/ux-design-studio", "/instrumentation-coverage"]) {
+    for (const href of ["/interview", "/candidate-studio", "/experiments", "/system-map", "/ux-design-studio", "/instrumentation-coverage"]) {
       expect(nav.querySelector(`a[href="${href}"]`)).toBeTruthy();
     }
+  });
+
+  test("UX 監査 2026-11-17 C12: 設計 lineage の 5 画面は上流から下流の順に並ぶ", async () => {
+    await renderSidebar();
+    const group = screen.getByTestId("sidebar-group-understand");
+    const order = ["/stakeholder-value-network", "/objective-map", "/journey-blueprint", "/functional-lineage"];
+    const hrefs = Array.from(group.querySelectorAll("a")).map((a) => a.getAttribute("href"));
+    const positions = order.map((href) => hrefs.indexOf(href));
+    expect(positions.every((p) => p >= 0)).toBe(true);
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions);
+    // Objective Map は主要入口 (詳細ビューの外) にある。
+    const details = screen.getByTestId("sidebar-details-understand");
+    expect(details.querySelector('a[href="/objective-map"]')).toBeNull();
+    expect(details.querySelector('a[href="/stakeholder-value-network"]')).toBeNull();
+    // 折りたたみ時 (目的の入口なし) は UX Design Studio が Objective Map と
+    // Journey Service Blueprint の間に来る。
+    fireEvent.click(screen.getByTestId("sidebar-collapse-toggle"));
+    const collapsed = Array.from(screen.getByTestId("sidebar-nav").querySelectorAll("a")).map((a) => a.getAttribute("href"));
+    const lineage = ["/stakeholder-value-network", "/objective-map", "/ux-design-studio", "/journey-blueprint", "/functional-lineage"]
+      .map((href) => collapsed.indexOf(href));
+    expect(lineage.every((p) => p >= 0)).toBe(true);
+    expect([...lineage].sort((a, b) => a - b)).toEqual(lineage);
+  });
+
+  test("UX 監査 2026-11-17 C13: Observe & Evaluate では AI Candidate Studio が Experiments より前", async () => {
+    await renderSidebar();
+    fireEvent.click(screen.getByTestId("sidebar-collapse-toggle"));
+    const hrefs = Array.from(screen.getByTestId("sidebar-nav").querySelectorAll("a")).map((a) => a.getAttribute("href"));
+    expect(hrefs.indexOf("/candidate-studio")).toBeGreaterThanOrEqual(0);
+    expect(hrefs.indexOf("/candidate-studio")).toBeLessThan(hrefs.indexOf("/experiments"));
   });
 
   test("UX 監査 2026-11-17 A5: グループ見出しはサーバーの段階名を出し、未提供時は同じ語の fallback を出す", async () => {

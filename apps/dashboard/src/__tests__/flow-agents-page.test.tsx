@@ -740,3 +740,23 @@ test("依存関係を読めなかったときは辺も外部境界も件数を�
   ).toBeInTheDocument();
   expect(screen.queryByText(/依存関係の辺が 0 件です/)).toBeNull();
 });
+
+// UX 監査 2026-11-17 C7: 画面から操作できない判断をそうと示し、Node 画面へ繋ぐ。
+test("実験提案が 0 件のとき、作成は API のみであることと実際の経路を示す", async () => {
+  routeGet({ proposals: [] });
+  await renderPage();
+
+  const note = await screen.findByTestId("flow-experiments-empty-where");
+  expect(note).toHaveTextContent("画面未対応で、API のみ");
+  expect(note).toHaveTextContent("POST /flow-experiments/draft");
+  expect(note).toHaveTextContent("POST /flow-experiments");
+});
+
+test("Node 行から Evolution Node 画面の該当 Node へ遷移できる", async () => {
+  routeGet();
+  await renderPage();
+  await settled();
+
+  const link = await screen.findByTestId("flow-node-open-address-normalizer");
+  expect(link).toHaveAttribute("href", "/evolution-nodes?node=address-normalizer");
+});

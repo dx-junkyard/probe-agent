@@ -258,3 +258,52 @@ test("一覧の取得に失敗しても空ページではなく再試行を出�
   expect(await screen.findByText(/取得できませんでした/)).toBeInTheDocument();
   expect(screen.getByText("再試行")).toBeInTheDocument();
 });
+
+// UX 監査 2026-11-17 C7: どの判断がどこで行えるかを画面から特定できる。
+test("Node 詳細に判断ごとの場所が出て、画面に無い判断は API のみと endpoint を示す", async () => {
+  routeGet();
+  await renderPage("/evolution-nodes?node=address-normalizer");
+
+  const table = await screen.findByTestId("evolution-decision-locations");
+  const { within } = await import("@testing-library/react");
+
+  const transition = within(table).getByTestId("evolution-decision-maturity_transition");
+  expect(transition).toHaveTextContent("この画面でできる");
+
+  const version = within(table).getByTestId("evolution-decision-register_version");
+  expect(version).toHaveTextContent("画面未対応（API のみ）");
+  // {node_id} はこの Node の id に置き換わる。
+  expect(version).toHaveTextContent("POST /evolution-nodes/7/versions");
+
+  const approval = within(table).getByTestId("evolution-decision-stabilization_approval");
+  expect(approval).toHaveTextContent("POST /stabilization/packages/{package_id}/approve");
+
+  for (const id of ["stabilization_parent_review", "monitoring_contract", "reopen_approval", "flow_experiment_proposal", "add_link", "register_implementation", "stabilization_package"]) {
+    expect(within(table).getByTestId(`evolution-decision-${id}`)).toHaveTextContent("画面未対応（API のみ）");
+  }
+  expect(within(table).getByTestId("evolution-decision-monitoring_contract"))
+    .toHaveTextContent("POST /node-operations/nodes/7/monitoring-contracts");
+  expect(within(table).getByTestId("evolution-decision-flow_experiment_proposal"))
+    .toHaveTextContent("POST /flow-experiments/draft");
+
+  const mode = within(table).getByTestId("evolution-decision-execution_mode_assignment");
+  expect(mode).toHaveTextContent("Flow・エージェント群でできる");
+  expect(within(mode).getByRole("link", { name: "Flow・エージェント群を開く" }))
+    .toHaveAttribute("href", "/flow-agents");
+});
+
+test("画面に無い操作を求める拒否は、判断表の該当行 (API のみ) へ案内する", async () => {
+  routeGet();
+  mockApi.post.mockRejectedValue(
+    new ApiError(422, "no version", "version_missing"),
+  );
+  await renderPage("/evolution-nodes?node=address-normalizer");
+
+  fireEvent.click(await screen.findByText("遷移を要求する"));
+  const box = await screen.findByTestId("evolution-transition-rejection");
+  expect(box).toHaveTextContent("画面未対応で API のみです");
+  expect(box).not.toHaveTextContent("先に契約 version を登録してください");
+  const guide = screen.getByTestId("evolution-transition-rejection-decision");
+  expect(guide).toHaveAttribute("href", "#evolution-decision-register_version");
+  expect(document.getElementById("evolution-decision-register_version")).not.toBeNull();
+});

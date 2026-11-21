@@ -922,8 +922,15 @@ class ExperimentCreate(BaseModel):
     feature_id: str = Field(..., min_length=1, max_length=200)
     objective: str = Field(..., min_length=1, max_length=5000)
     snapshot_id: int
+    # The non-baseline candidates only. The server always adds the pinned-commit
+    # baseline itself (`create_experiment`), so ONE candidate already makes a
+    # two-way baseline-vs-candidate comparison -- the comparison adoption needs
+    # (a completed baseline + a completed non-baseline variant). Requiring two
+    # client candidates (the original #26 minimum) had no recorded rationale and
+    # made a single Candidate Studio / Simulation Workbench candidate unusable
+    # (UX audit 2026-11-17 C3).
     variants: List[ExperimentVariantCreate] = Field(
-        ..., min_length=2, max_length=10
+        ..., min_length=1, max_length=10
     )
     # Issue #369: required when the chosen snapshot is definitively behind
     # HEAD. Continuing on an older snapshot is legitimate (reproduction runs),
@@ -1018,6 +1025,17 @@ class ExperimentOut(BaseModel):
     created_at: float
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    # UX audit 2026-11-17 D7: whether `POST /experiments/{id}/run` would accept
+    # this Experiment right now. Mirrors that endpoint's own guards (not
+    # running, not a governed #415 execution) so the Dashboard never offers a
+    # control that is certain to be refused.
+    run_allowed: bool = False
+    # UX audit 2026-11-17 C5: the `probe_patches` transport row of the CURRENT
+    # adoption, resolved through `improvement_publish_artifacts` for exactly
+    # (this experiment, the adopted variant) -- never a System-wide lookup
+    # (#380). `None` when the Experiment is not adopted or the artifact row
+    # does not exist.
+    adopted_improvement_patch_id: Optional[int] = None
 
 
 class ExperimentRecordVariantOut(BaseModel):
@@ -1453,6 +1471,12 @@ class ProbePointOut(BaseModel):
     replayability: str
     denylist_hit: Optional[str] = None
     status: ProbePointStatus = "proposed"
+    # UX audit 2026-11-17 C4: opt-in input capture (#243), chosen by the
+    # approving human per point. Never True on a non-approved point.
+    replay_capture: bool = False
+    decided_by_user_id: Optional[int] = None
+    decision_method: Optional[Literal["manual"]] = None
+    decided_at: Optional[float] = None
     created_at: float
     updated_at: float
 
@@ -1476,6 +1500,11 @@ class ProbePlanOut(BaseModel):
 
 class ProbePointStatusUpdate(BaseModel):
     status: ProbePointStatus
+    # UX audit 2026-11-17 C4: "入力を保存する(Replay に使う)". Omitted means
+    # off -- capture is never enabled by default (#243 opt-in, Principle 9).
+    # Only valid together with status='approved'; the approver comes from the
+    # authenticated principal, never from this body.
+    replay_capture: Optional[bool] = None
 
 
 class ProbePatchApplyRequest(BaseModel):
@@ -1534,6 +1563,18 @@ class ProbePatchOut(BaseModel):
     applied_by_user_id: Optional[int] = None
     validation_runs: List[ValidationRunOut] = Field(default_factory=list)
     created_at: float
+    # UX audit 2026-11-17 C5: where this transport row came from. `improvement`
+    # iff an `improvement_publish_artifacts` row names this patch (the adopted
+    # Experiment variant lineage, #380); otherwise `probe_plan` (a Probe Plan
+    # measurement patch). The Dashboard renders these and never infers them.
+    origin: Literal["probe_plan", "improvement"] = "probe_plan"
+    improvement_experiment_id: Optional[int] = None
+    improvement_variant_key: Optional[str] = None
+    improvement_variant_label: Optional[str] = None
+    # Whether that experiment's current human decision still adopts this
+    # variant. A later re-decision leaves the artifact in place, so the patch
+    # can still be an improvement artifact that is no longer the adopted one.
+    improvement_adoption_current: Optional[bool] = None
 
 
 class ProbePlansListOut(BaseModel):
@@ -7820,6 +7861,41 @@ class CandidateSessionOut(BaseModel):
     updated_at: float
     messages: List[CandidateMessageOut] = Field(default_factory=list)
     versions: List[CandidateVersionOut] = Field(default_factory=list)
+    # Issue #369: the stale-snapshot decision recorded when the session was
+    # created (`stale_ack_reason` is the developer's own reason --
+    # `decision_method: manual`).
+    snapshot_freshness: Optional[SnapshotFreshnessState] = None
+    head_sha_at_creation: Optional[str] = None
+    stale_ack_reason: Optional[str] = None
+    # UX audit 2026-11-17 C13: the start screen lists existing sessions, so
+    # the list endpoint (which omits messages/versions) still reports the
+    # newest version's persisted state. ``None`` = the session has no version.
+    version_count: int = 0
+    latest_version_number: Optional[int] = None
+    latest_version_status: Optional[CandidateVersionStatus] = None
+    latest_version_replay_status: Optional[CandidateReplayStatus] = None
+
+
+# UX audit 2026-11-17 C8: whether a candidate replay on the session's pinned
+# snapshot may reuse the stale-snapshot reason recorded on the session. First
+# match, decided by `routes/candidate_studio.classify_candidate_replay_stale`:
+#   not_required -- the snapshot is not definitively stale now;
+#   not_recorded -- it is stale and the session recorded no reason;
+#   head_moved   -- the session's reason was given against a different HEAD
+#                   (or the session was not stale then), so it does not cover
+#                   the current premise and a new reason is required;
+#   inheritable  -- same pinned snapshot, same HEAD as when the reason was
+#                   given: the session's reason is reused verbatim.
+CandidateReplayStaleReasonState = Literal[
+    "not_required", "not_recorded", "head_moved", "inheritable"
+]
+
+
+class CandidateReplayPreflightOut(BaseModel):
+    preflight: SnapshotPreflightOut
+    stale_reason_state: CandidateReplayStaleReasonState
+    session_stale_ack_reason: Optional[str] = None
+    session_head_sha_at_creation: Optional[str] = None
 
 
 class CandidateMessageCreate(BaseModel):
@@ -7846,6 +7922,10 @@ class CandidateReplayCreate(BaseModel):
 
     snapshot_id: Optional[int] = None
     flow_experiment_proposal_id: Optional[int] = None
+    # UX audit 2026-11-17 C8: a reason entered at replay time. Required only
+    # when the snapshot is stale AND the session's own reason does not cover
+    # the current HEAD (see CandidateReplayStaleReasonState).
+    stale_snapshot_reason: Optional[str] = Field(None, min_length=1, max_length=1000)
 
 
 class CandidatePromotionOut(BaseModel):

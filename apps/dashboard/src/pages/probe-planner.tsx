@@ -18,7 +18,7 @@ import { formatTimestamp } from "@/lib/utils";
 import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch, FlaskConical, GitPullRequest } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import type { ProbePatchOut } from "@/api/types";
+import type { ProbePatchOut, ProbePlanOut, ProbePointOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 import { ContextHeader } from "@/components/layout/context-header";
 import { PrerequisiteGuide } from "@/components/prerequisite-guide";
@@ -44,6 +44,9 @@ export default function ProbePlannerPage() {
   const plansFailed = plansQuery.isError && !plansData;
   const generatePlan = useGenerateProbePlan();
   const updatePointStatus = useUpdateProbePointStatus();
+  // UX audit 2026-11-17 C4: the approver's pending "入力を保存する" choice per
+  // point. Unset means "follow what the server recorded" (off by default).
+  const [captureChoice, setCaptureChoice] = useState<Record<number, boolean>>({});
   const { data: patches } = useProbePatches();
   const { data: repoStatus } = useRepositoryStatus();
   // Issue #241: an upstream gate (informational, never a hard block). The
@@ -247,14 +250,56 @@ export default function ProbePlannerPage() {
                     <div>
                       <h4 className="text-sm font-medium mb-2">Probe Point（{plan.probe_points.length} 件）</h4>
                       <div className="space-y-2">
-                        {plan.probe_points.map(pt => (
-                          <div key={pt.id} className="flex items-center justify-between rounded-lg border p-3 text-sm">
+                        {plan.probe_points.map(pt => {
+                          const capture = replayCaptureAvailability(pt);
+                          const recorded = !!pt.replay_capture;
+                          const chosen = capture.selectable
+                            ? (captureChoice[pt.id] ?? recorded)
+                            : false;
+                          return (
+                          <div key={pt.id} className="flex items-start justify-between rounded-lg border p-3 text-sm" data-testid={`probe-point-${pt.id}`}>
                             <div className="space-y-1">
                               <div className="font-mono text-xs">{pt.path}:{pt.symbol}</div>
                               <div className="text-xs text-muted-foreground">
                                 行 {pt.line_start}–{pt.line_end} · 推奨 mode: {pt.recommended_mode} · 副作用リスク: {pt.side_effect_risk}
                               </div>
                               <div className="text-xs">{pt.reason}</div>
+                              {/* UX audit 2026-11-17 C4: opt-in input capture for
+                                  Replay, decided by the approver per point. The
+                                  risk and replayability shown are the point's own
+                                  stored values -- nothing is re-judged here. */}
+                              <div className="mt-2 rounded-md border bg-muted/40 p-2 text-xs space-y-1" data-testid={`replay-capture-${pt.id}`}>
+                                <label className="flex items-center gap-2">
+                                  <input
+                                    type="checkbox"
+                                    checked={chosen}
+                                    disabled={!capture.selectable}
+                                    onChange={e => setCaptureChoice(prev => ({ ...prev, [pt.id]: e.target.checked }))}
+                                    data-testid={`replay-capture-checkbox-${pt.id}`}
+                                  />
+                                  <span className="font-medium">入力を保存する（Replay に使う）</span>
+                                </label>
+                                <div className="text-muted-foreground">
+                                  副作用リスク: {pt.side_effect_risk} · Replay の見込み: {pt.replayability || "未記載"}
+                                </div>
+                                {!capture.selectable ? (
+                                  <p className="text-destructive" data-testid={`replay-capture-disabled-${pt.id}`}>
+                                    {capture.reason}
+                                  </p>
+                                ) : (
+                                  <p className="text-muted-foreground">
+                                    既定では保存しません。選んだ場合は承認ボタンを押したときに、承認と同じあなたの判断として記録されます。
+                                    保存される入力には SDK と Control Server の秘匿値の除去が掛かります。
+                                    {capture.caution ? ` ${capture.caution}` : ""}
+                                  </p>
+                                )}
+                                {pt.status === "approved" && (
+                                  <p data-testid={`replay-capture-recorded-${pt.id}`}>
+                                    記録済みの判断: {recorded ? "入力を保存する" : "入力を保存しない"}
+                                    {capture.selectable && chosen !== recorded && "（変更は承認ボタンで記録されます）"}
+                                  </p>
+                                )}
+                              </div>
                             </div>
                             <div className="flex items-center gap-1 shrink-0 ml-4">
                               <Badge variant={pt.status === "approved" ? "success" : pt.status === "rejected" ? "destructive" : "secondary"}>
@@ -262,19 +307,22 @@ export default function ProbePlannerPage() {
                               </Badge>
                               <Button
                                 variant="ghost" size="icon" className="h-7 w-7"
-                                onClick={() => updatePointStatus.mutateAsync({ pointId: pt.id, status: "approved" }).catch(e => toast.error(String(e)))}
+                                aria-label="承認する"
+                                onClick={() => updatePointStatus.mutateAsync({ pointId: pt.id, status: "approved", replayCapture: chosen }).catch(e => toast.error(String(e)))}
                               >
                                 <CheckCircle className="h-4 w-4 text-emerald-600" />
                               </Button>
                               <Button
                                 variant="ghost" size="icon" className="h-7 w-7"
+                                aria-label="却下する"
                                 onClick={() => updatePointStatus.mutateAsync({ pointId: pt.id, status: "rejected" }).catch(e => toast.error(String(e)))}
                               >
                                 <XCircle className="h-4 w-4 text-red-500" />
                               </Button>
                             </div>
                           </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     </div>
 
@@ -421,6 +469,10 @@ export default function ProbePlannerPage() {
                                     </li>
                                   </ol>
                                 )}
+                                {/* UX audit 2026-11-17 C4: where to watch the
+                                    instrumented components next. Navigation only;
+                                    Trace arrives only after the change is deployed. */}
+                                <PatchObservationLinks plan={plan} />
                               </div>
                             )}
                             <PatchRecovery patch={patch} currentHead={repoStatus?.current_head ?? null} />
@@ -672,6 +724,75 @@ function PatchRecovery({ patch, currentHead }: { patch: ProbePatchOut; currentHe
         `git apply --check ${patchFile}`,
         `git apply ${patchFile}`,
       ].join("\n")}</pre>
+    </div>
+  );
+}
+
+
+/**
+ * UX audit 2026-11-17 C4: whether the approver may choose input capture for
+ * this point. Reads only the point's existing finite values
+ * (`denylist_hit`, `side_effect_risk`), mirroring the server's own refusal
+ * (409 for `high`) -- it adds no new risk judgement (Principle 4 / 6).
+ */
+function replayCaptureAvailability(
+  pt: Pick<ProbePointOut, "denylist_hit" | "side_effect_risk">,
+): { selectable: boolean; reason?: string; caution?: string } {
+  if (pt.denylist_hit) {
+    return {
+      selectable: false,
+      reason: "安全のための除外リストに該当する計測点なので、入力は保存できません。",
+    };
+  }
+  if (pt.side_effect_risk === "high") {
+    return {
+      selectable: false,
+      reason:
+        "副作用リスクが high の計測点なので、入力は保存できません。副作用のある処理は Replay の対象にしません。",
+    };
+  }
+  if (pt.side_effect_risk === "medium") {
+    return {
+      selectable: true,
+      caution: "副作用リスクが medium です。再実行しても外部へ影響しない処理か確かめてから選んでください。",
+    };
+  }
+  return { selectable: true };
+}
+
+/**
+ * UX audit 2026-11-17 C4: after an applied patch, link to where the
+ * instrumented components are observed. Navigation only -- nothing runs.
+ */
+function PatchObservationLinks({ plan }: { plan: ProbePlanOut }) {
+  const componentIds = Array.from(new Set(
+    plan.probe_points
+      .filter(pt => pt.status === "approved" && !pt.denylist_hit && pt.component_id)
+      .map(pt => pt.component_id as string),
+  ));
+  return (
+    <div className="space-y-1 pt-1" data-testid="patch-observation-links">
+      <p>
+        変更をデプロイすると Trace が届き始めます。計測した component の観測状況は次の画面で確かめられます。
+      </p>
+      <ul className="flex flex-wrap gap-x-3 gap-y-1">
+        {componentIds.map(id => (
+          <li key={id}>
+            <Link
+              to={`/components?component=${encodeURIComponent(id)}`}
+              className="underline font-mono"
+              data-testid={`patch-observe-component-${id}`}
+            >
+              {id} の観測画面
+            </Link>
+          </li>
+        ))}
+        <li>
+          <Link to="/instrumentation-coverage" className="underline" data-testid="patch-observe-coverage">
+            計測カバレッジ
+          </Link>
+        </li>
+      </ul>
     </div>
   );
 }

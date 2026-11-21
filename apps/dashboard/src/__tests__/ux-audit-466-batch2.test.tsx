@@ -140,6 +140,8 @@ describe("UX-04: 入力途中の候補を黙って除外しない", () => {
     mockExperimentsApi();
     const { dialog } = await openCreateDialog();
     fillBasics(dialog);
+    // C3 以降、初期の候補行は 1 件。3 行にするため 2 回追加する。
+    fireEvent.click(within(dialog).getByRole("button", { name: /候補を追加/ }));
     fireEvent.click(within(dialog).getByRole("button", { name: /候補を追加/ }));
     for (const [i, label, patch] of [[1, "a", "diff a"], [2, "b", "diff b"]] as const) {
       fireEvent.change(within(dialog).getByLabelText(`候補 ${i} のラベル`), { target: { value: label } });
@@ -173,6 +175,8 @@ describe("UX-04: 入力途中の候補を黙って除外しない", () => {
     mockApi.post.mockResolvedValue({ id: 9 });
     const { dialog } = await openCreateDialog();
     fillBasics(dialog);
+    // C3 以降、初期の候補行は 1 件。3 行にするため 2 回追加する。
+    fireEvent.click(within(dialog).getByRole("button", { name: /候補を追加/ }));
     fireEvent.click(within(dialog).getByRole("button", { name: /候補を追加/ }));
     for (const [i, label, patch] of [[1, "a", "diff a"], [2, "b", "diff b"]] as const) {
       fireEvent.change(within(dialog).getByLabelText(`候補 ${i} のラベル`), { target: { value: label } });
@@ -374,6 +378,8 @@ describe("UX-05 / UX-12: Journey Service Blueprint", () => {
 describe("R3: 作成の応答待ち中に追記した内容を成功時に消さない", () => {
   async function fillComplete(dialog: HTMLElement) {
     fillBasics(dialog);
+    // C3 以降、初期の候補行は 1 件。2 件で送るため 1 回追加する。
+    fireEvent.click(within(dialog).getByRole("button", { name: /候補を追加/ }));
     for (const [i, label, patch] of [[1, "a", "diff a"], [2, "b", "diff b"]] as const) {
       fireEvent.change(within(dialog).getByLabelText(`候補 ${i} のラベル`), { target: { value: label } });
       fireEvent.change(within(dialog).getByLabelText(`候補 ${i} のpatch`), { target: { value: patch } });

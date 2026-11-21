@@ -90,7 +90,9 @@ describe("候補編集の入力保護と復旧", () => {
     api.get.mockImplementation(async (path: string) => path.endsWith("/source") ? { ...source(), snapshot_id: 2, source: "新しいソース" } : response(path));
     await act(async () => { await qc.invalidateQueries(); });
     expect(editor).toHaveValue("編集中");
-    expect(screen.getByText(/参照元のSnapshotが変わりました/)).toBeInTheDocument();
+    // React Query notifies observers on a later macrotask, so the re-render
+    // that reads the refetched source lands after the act() above returns.
+    expect(await screen.findByText(/参照元のSnapshotが変わりました/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Run" })).toBeDisabled();
   });
 
@@ -124,10 +126,13 @@ describe("候補編集の入力保護と復旧", () => {
     let resolve!: (value: unknown) => void;
     api.post.mockImplementation(() => new Promise(r => { resolve = r; }));
     const { router } = mount("/candidate-studio?session_id=1");
-    const input = await screen.findByPlaceholderText("改善指示を入力（送信は会話の追記のみ。候補を作るには「候補を生成」）");
+    const input = await screen.findByPlaceholderText("改善の目的・制約・修正指示を入力...");
     fireEvent.change(input, { target: { value: "送信する指示" } });
     fireEvent.click(screen.getByRole("button", { name: "送信" }));
     fireEvent.change(input, { target: { value: "送信中に書いた次の指示" } });
+    // The mutation function starts on a later tick; wait until the request is
+    // actually in flight before resolving it.
+    await waitFor(() => expect(api.post).toHaveBeenCalled());
     await act(async () => { resolve({}); });
     expect(input).toHaveValue("送信中に書いた次の指示");
     fireEvent.click(screen.getByRole("link", { name: "別画面へ" }));
